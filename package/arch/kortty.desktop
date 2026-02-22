@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=KorTTY
+Comment=Modern SSH Terminal Client
+GenericName=SSH Client
+Exec=kortty
+Icon=kortty
+Terminal=false
+Type=Application
+Categories=System;TerminalEmulator;Network;
+Keywords=ssh;terminal;sftp;remote;
+StartupWMClass=KorTTY

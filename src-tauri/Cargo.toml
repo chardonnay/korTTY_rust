@@ -1,0 +1,49 @@
+[package]
+name = "kortty"
+version = "1.0.0"
+description = "KorTTY - SSH Terminal Client"
+authors = ["General Kor"]
+license = "MIT"
+repository = "https://github.com/chardonnay/korTTY_rust"
+edition = "2021"
+
+[lib]
+name = "kortty_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = ["tray-icon"] }
+tauri-plugin-dialog = "2"
+tauri-plugin-fs = "2"
+tauri-plugin-shell = "2"
+tauri-plugin-window-state = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.37", features = ["serialize"] }
+tokio = { version = "1", features = ["full"] }
+russh = "0.48"
+russh-keys = "0.48"
+russh-sftp = "2"
+async-trait = "0.1"
+aes-gcm = "0.10"
+pbkdf2 = { version = "0.12", features = ["simple"] }
+sha2 = "0.10"
+rand = "0.8"
+base64 = "0.22"
+flate2 = "1"
+zip = "2"
+reqwest = { version = "0.12", features = ["json"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+glob = "0.3"
+thiserror = "2"
+anyhow = "1"
+figlet-rs = "0.1"
+zxcvbn = "3"

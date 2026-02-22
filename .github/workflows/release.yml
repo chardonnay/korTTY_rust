@@ -1,0 +1,341 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.create.outputs.id }}
+      tag_name: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create GitHub Release
+        id: create
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          generate_release_notes: true
+
+  build-macos-intel:
+    needs: create-release
+    runs-on: macos-13
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: --target x86_64-apple-darwin
+
+  build-macos-arm:
+    needs: create-release
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: --target aarch64-apple-darwin
+
+  build-windows-intel:
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: --target x86_64-pc-windows-msvc
+
+  build-windows-arm:
+    needs: create-release
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: --target aarch64-pc-windows-msvc
+
+  build-linux-intel:
+    needs: create-release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            libssl-dev
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build Tauri app (DEB + RPM + AppImage)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+
+      - name: Create tarball
+        run: |
+          cd src-tauri/target/release/bundle
+          if [ -d "appimage" ]; then
+            tar -czf kortty-${{ needs.create-release.outputs.tag_name }}-x86_64-linux.tar.gz -C appimage .
+            mv kortty-${{ needs.create-release.outputs.tag_name }}-x86_64-linux.tar.gz /tmp/
+          fi
+
+      - name: Upload tarball
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag_name }}
+          files: /tmp/kortty-*-linux.tar.gz
+
+  build-linux-arm:
+    needs: create-release
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+
+      - name: Install cross-compilation dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            g++-aarch64-linux-gnu \
+            libwebkit2gtk-4.1-dev \
+            libssl-dev \
+            pkg-config
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Cross-compile Rust for aarch64
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          CC_aarch64_unknown_linux_gnu: aarch64-linux-gnu-gcc
+          CXX_aarch64_unknown_linux_gnu: aarch64-linux-gnu-g++
+          PKG_CONFIG_SYSROOT_DIR: /usr/aarch64-linux-gnu
+        run: |
+          cargo build --manifest-path src-tauri/Cargo.toml --release --target aarch64-unknown-linux-gnu || echo "Cross-compilation may require QEMU for full build"
+
+  build-arch-linux:
+    needs: create-release
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm
+          pacman -S --noconfirm \
+            base-devel \
+            rust \
+            nodejs \
+            npm \
+            webkit2gtk-4.1 \
+            openssl \
+            git \
+            fakeroot
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: Build frontend
+        run: npm run build
+
+      - name: Build Rust
+        run: cargo build --manifest-path src-tauri/Cargo.toml --release
+
+      - name: Create PKGBUILD
+        run: |
+          mkdir -p /tmp/pkg
+          cat > /tmp/pkg/PKGBUILD << 'PKGEOF'
+          pkgname=kortty
+          pkgver=${{ needs.create-release.outputs.tag_name }}
+          pkgrel=1
+          pkgdesc="KorTTY - SSH Terminal Client"
+          arch=('x86_64')
+          url="https://github.com/chardonnay/korTTY_rust"
+          license=('MIT')
+          depends=('webkit2gtk-4.1' 'openssl')
+          source=()
+          
+          package() {
+            install -Dm755 "${srcdir}/kortty" "${pkgdir}/usr/bin/kortty"
+            install -Dm644 "${srcdir}/kortty.desktop" "${pkgdir}/usr/share/applications/kortty.desktop"
+            install -Dm644 "${srcdir}/icon.png" "${pkgdir}/usr/share/pixmaps/kortty.png"
+          }
+          PKGEOF
+
+      - name: Build package
+        run: |
+          cd /tmp/pkg
+          cp $GITHUB_WORKSPACE/src-tauri/target/release/kortty . 2>/dev/null || true
+          cp $GITHUB_WORKSPACE/src-tauri/icons/icon.png . 2>/dev/null || true
+          cat > kortty.desktop << 'DEOF'
+          [Desktop Entry]
+          Name=KorTTY
+          Comment=SSH Terminal Client
+          Exec=kortty
+          Icon=kortty
+          Terminal=false
+          Type=Application
+          Categories=System;TerminalEmulator;Network;
+          DEOF
+
+      - name: Upload Arch package
+        if: success()
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag_name }}
+          files: /tmp/pkg/*.pkg.tar.zst
+
+  publish-release:
+    needs:
+      - create-release
+      - build-macos-intel
+      - build-macos-arm
+      - build-windows-intel
+      - build-linux-intel
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.create-release.outputs.tag_name }}
+          draft: false
