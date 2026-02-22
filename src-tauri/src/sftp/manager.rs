@@ -28,19 +28,11 @@ impl SFTPManager {
         Ok(Vec::new())
     }
 
-    pub async fn upload(
-        _session_id: &str,
-        _local_path: &str,
-        _remote_path: &str,
-    ) -> Result<()> {
+    pub async fn upload(_session_id: &str, _local_path: &str, _remote_path: &str) -> Result<()> {
         Ok(())
     }
 
-    pub async fn download(
-        _session_id: &str,
-        _remote_path: &str,
-        _local_path: &str,
-    ) -> Result<()> {
+    pub async fn download(_session_id: &str, _remote_path: &str, _local_path: &str) -> Result<()> {
         Ok(())
     }
 

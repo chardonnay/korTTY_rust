@@ -47,10 +47,8 @@ impl Vault {
             .unwrap()
             .clone()
             .ok_or_else(|| anyhow::anyhow!("Vault is locked"))?;
-        let data = base64::Engine::decode(
-            &base64::engine::general_purpose::STANDARD,
-            encrypted_b64,
-        )?;
+        let data =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encrypted_b64)?;
         let plaintext = super::encryption::EncryptionService::decrypt(&data, &key)?;
         Ok(String::from_utf8(plaintext)?)
     }

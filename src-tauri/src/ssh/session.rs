@@ -50,10 +50,7 @@ impl SSHSession {
         }
     }
 
-    pub async fn connect(
-        &mut self,
-        output_tx: mpsc::UnboundedSender<Vec<u8>>,
-    ) -> Result<()> {
+    pub async fn connect(&mut self, output_tx: mpsc::UnboundedSender<Vec<u8>>) -> Result<()> {
         self.output_tx = Some(output_tx.clone());
 
         let config = Arc::new(client::Config {
@@ -107,9 +104,7 @@ impl SSHSession {
 
     pub async fn resize(&mut self, cols: u32, rows: u32) -> Result<()> {
         if let Some(channel) = &mut self.channel {
-            channel
-                .window_change(cols, rows, 0, 0)
-                .await?;
+            channel.window_change(cols, rows, 0, 0).await?;
         }
         Ok(())
     }

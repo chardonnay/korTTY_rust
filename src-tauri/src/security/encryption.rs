@@ -18,8 +18,8 @@ impl EncryptionService {
     }
 
     pub fn encrypt(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>> {
-        let cipher = Aes256Gcm::new_from_slice(key)
-            .map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?;
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?;
 
         let mut nonce_bytes = [0u8; NONCE_LENGTH];
         rand::thread_rng().fill_bytes(&mut nonce_bytes);
@@ -39,8 +39,8 @@ impl EncryptionService {
             anyhow::bail!("Data too short for decryption");
         }
 
-        let cipher = Aes256Gcm::new_from_slice(key)
-            .map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?;
+        let cipher =
+            Aes256Gcm::new_from_slice(key).map_err(|e| anyhow::anyhow!("Invalid key: {}", e))?;
 
         let nonce = Nonce::from_slice(&data[..NONCE_LENGTH]);
         let ciphertext = &data[NONCE_LENGTH..];

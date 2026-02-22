@@ -1,6 +1,6 @@
 use crate::model::connection::ConnectionSettings;
-use crate::ssh::SSHManager;
 use crate::ssh::session::SSHSession;
+use crate::ssh::SSHManager;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 
@@ -63,7 +63,10 @@ pub async fn ssh_resize(
 ) -> Result<(), String> {
     if let Some(session_arc) = state.get_session(&session_id).await {
         let mut session = session_arc.lock().await;
-        session.resize(cols, rows).await.map_err(|e| e.to_string())?;
+        session
+            .resize(cols, rows)
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }

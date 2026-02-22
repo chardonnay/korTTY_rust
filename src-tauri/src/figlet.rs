@@ -2,7 +2,9 @@ use anyhow::Result;
 
 pub fn generate_banner(text: &str, _font: &str) -> Result<String> {
     let fig = figlet_rs::FIGfont::standard().map_err(|e| anyhow::anyhow!("{}", e))?;
-    let figure = fig.convert(text).ok_or_else(|| anyhow::anyhow!("Failed to generate banner"))?;
+    let figure = fig
+        .convert(text)
+        .ok_or_else(|| anyhow::anyhow!("Failed to generate banner"))?;
     Ok(figure.to_string())
 }
 

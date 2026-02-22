@@ -1,9 +1,9 @@
 pub mod connection;
 pub mod credential;
-pub mod ssh_key;
 pub mod gpg_key;
 pub mod project;
-pub mod theme;
-pub mod snippet;
-pub mod tunnel;
 pub mod settings;
+pub mod snippet;
+pub mod ssh_key;
+pub mod theme;
+pub mod tunnel;

@@ -1,2 +1,2 @@
-pub mod xml_repository;
 pub mod importer;
+pub mod xml_repository;

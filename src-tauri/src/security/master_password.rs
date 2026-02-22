@@ -32,7 +32,10 @@ impl MasterPassword {
         let path = config_dir.join("master-password-hash");
         let mut data = salt.to_vec();
         data.extend_from_slice(hash);
-        std::fs::write(path, base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data))?;
+        std::fs::write(
+            path,
+            base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &data),
+        )?;
         Ok(())
     }
 
@@ -43,7 +46,8 @@ impl MasterPassword {
             return Ok(None);
         }
         let encoded = std::fs::read_to_string(path)?;
-        let data = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim())?;
+        let data =
+            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded.trim())?;
         if data.len() < SALT_LENGTH + HASH_LENGTH {
             anyhow::bail!("Invalid master password hash file");
         }

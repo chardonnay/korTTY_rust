@@ -1,5 +1,8 @@
 #[tauri::command]
-pub async fn create_backup(destination: String, password: Option<String>) -> Result<String, String> {
+pub async fn create_backup(
+    destination: String,
+    password: Option<String>,
+) -> Result<String, String> {
     crate::backup::manager::BackupManager::create_backup(&destination, password.as_deref())
         .map_err(|e| e.to_string())
 }

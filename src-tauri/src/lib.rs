@@ -1,14 +1,14 @@
+pub mod backup;
 pub mod commands;
+pub mod figlet;
+pub mod i18n;
+pub mod logging;
 pub mod model;
 pub mod persistence;
 pub mod security;
-pub mod ssh;
 pub mod sftp;
-pub mod backup;
-pub mod i18n;
+pub mod ssh;
 pub mod teamwork;
-pub mod figlet;
-pub mod logging;
 
 use tracing_subscriber::{fmt, EnvFilter};
 
