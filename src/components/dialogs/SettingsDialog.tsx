@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { X, Settings } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore, GlobalSettings } from "../../store/settingsStore";
+import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -31,6 +32,7 @@ const TRANSLATION_PROVIDERS = [
 ];
 
 export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
+  const { width, height, onResizeStart } = useDialogGeometry("settings", 600, 500, 400, 300);
   const { settings, loadSettings, saveSettings } = useSettingsStore();
   const [activeTab, setActiveTab] = useState<TabId>("language");
   const [local, setLocal] = useState<GlobalSettings>(settings);
@@ -108,7 +110,8 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-kortty-surface border border-kortty-border rounded-lg shadow-2xl w-[560px] max-h-[85vh] flex flex-col">
+      <div className="bg-kortty-surface border border-kortty-border rounded-lg shadow-2xl flex flex-col relative"
+        style={{ width, height, maxWidth: "95vw", maxHeight: "95vh" }}>
         <div className="flex items-center justify-between px-4 py-3 border-b border-kortty-border">
           <h2 className="text-sm font-semibold flex items-center gap-2">
             <Settings className="w-4 h-4 text-kortty-accent" />
@@ -386,6 +389,24 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
                   />
                 </div>
               )}
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={local.defaultCommandTimestampsEnabled}
+                  onChange={(e) => update({ defaultCommandTimestampsEnabled: e.target.checked })}
+                  className="rounded border-kortty-border"
+                />
+                Enable command timestamp sidebar by default on startup
+              </label>
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={local.defaultPromptHookEnabled}
+                  onChange={(e) => update({ defaultPromptHookEnabled: e.target.checked })}
+                  className="rounded border-kortty-border"
+                />
+                Use OSC 133 prompt markers when the shell already provides them
+              </label>
             </>
           )}
         </div>
@@ -404,6 +425,15 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
           >
             Save
           </button>
+        </div>
+        <div
+          className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize opacity-40 hover:opacity-100 transition-opacity"
+          onMouseDown={onResizeStart}
+        >
+          <svg viewBox="0 0 16 16" className="w-full h-full text-kortty-text-dim">
+            <path d="M14 14L8 14L14 8Z" fill="currentColor" />
+            <path d="M14 14L11 14L14 11Z" fill="currentColor" opacity="0.5" />
+          </svg>
         </div>
       </div>
     </div>

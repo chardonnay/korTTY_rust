@@ -1,10 +1,29 @@
 import { useState, useRef, useEffect } from "react";
 
 interface MenuBarProps {
-  onToggleDashboard: () => void;
+  onNewWindow: () => void;
+  onCloseWindow: () => void;
   onNewTab: () => void;
-  onConnect?: (tabId: string, host: string, port: number, username: string, password: string) => void;
-  activeTabId?: string | null;
+  onCloseTab: () => void;
+  onToggleDashboard: () => void;
+  onQuickConnect: () => void;
+  onManageConnections: () => void;
+  onImportConnections: () => void;
+  onSettings: () => void;
+  onManageCredentials: () => void;
+  onManageSSHKeys: () => void;
+  onManageGPGKeys: () => void;
+  onSnippets: () => void;
+  onSFTPManager: () => void;
+  onAsciiArt: () => void;
+  onCreateBackup: () => void;
+  onImportBackup: () => void;
+  onTeamworkSettings: () => void;
+  onTerminalThemeEditor: () => void;
+  onGuiThemeEditor: () => void;
+  onFullscreen: () => void;
+  onQuit: () => void;
+  onAbout: () => void;
 }
 
 interface MenuItem {
@@ -20,7 +39,7 @@ interface MenuDef {
   items: MenuItem[];
 }
 
-export function MenuBar({ onToggleDashboard, onNewTab, onConnect, activeTabId }: MenuBarProps) {
+export function MenuBar(props: MenuBarProps) {
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -28,17 +47,17 @@ export function MenuBar({ onToggleDashboard, onNewTab, onConnect, activeTabId }:
     {
       label: "File",
       items: [
-        { label: "New Tab", shortcut: "Ctrl+T", action: onNewTab },
-        { label: "New Window", shortcut: "Ctrl+Shift+N" },
-        { label: "Close Tab", shortcut: "Ctrl+W" },
+        { label: "New Window", shortcut: "Ctrl+Shift+N", action: props.onNewWindow },
+        { label: "Close Window", shortcut: "Ctrl+Shift+W", action: props.onCloseWindow },
         { separator: true, label: "" },
-        { label: "Quick Connect...", shortcut: "Ctrl+K" },
+        { label: "New Tab", shortcut: "Ctrl+T", action: props.onNewTab },
+        { label: "Close Tab", shortcut: "Ctrl+W", action: props.onCloseTab },
         { separator: true, label: "" },
-        { label: "Open Project...", shortcut: "Ctrl+O" },
-        { label: "Save Project", shortcut: "Ctrl+S" },
-        { label: "Save Project As..." },
+        { label: "Quick Connect...", shortcut: "Ctrl+K", action: props.onQuickConnect },
         { separator: true, label: "" },
-        { label: "Quit", shortcut: "Ctrl+Q" },
+        { label: "Settings...", action: props.onSettings },
+        { separator: true, label: "" },
+        { label: "Quit", shortcut: "Ctrl+Q", action: props.onQuit },
       ],
     },
     {
@@ -48,59 +67,52 @@ export function MenuBar({ onToggleDashboard, onNewTab, onConnect, activeTabId }:
         { label: "Paste", shortcut: "Ctrl+Shift+V" },
         { label: "Find...", shortcut: "Ctrl+F" },
         { separator: true, label: "" },
-        { label: "Create Backup...", shortcut: "Ctrl+Shift+B" },
-        { label: "Import Backup..." },
+        { label: "Create Backup...", shortcut: "Ctrl+Shift+B", action: props.onCreateBackup },
+        { label: "Import Backup...", action: props.onImportBackup },
         { separator: true, label: "" },
-        { label: "Settings..." },
+        { label: "Terminal Theme...", action: props.onTerminalThemeEditor },
+        { label: "GUI Theme...", action: props.onGuiThemeEditor },
       ],
     },
     {
       label: "Connections",
       items: [
-        { label: "Manage Connections..." },
+        { label: "Manage Connections...", action: props.onManageConnections },
         { separator: true, label: "" },
-        { label: "Import..." },
-        { label: "Export..." },
+        { label: "Import...", action: props.onImportConnections },
+        { separator: true, label: "" },
+        { label: "Teamwork Settings...", action: props.onTeamworkSettings },
       ],
     },
     {
       label: "Management",
       items: [
-        { label: "Manage Credentials..." },
-        { label: "Manage SSH Keys..." },
-        { label: "Manage GPG Keys..." },
-        { separator: true, label: "" },
-        { label: "Snippets..." },
+        { label: "Manage Credentials...", action: props.onManageCredentials },
+        { label: "Manage SSH Keys...", action: props.onManageSSHKeys },
+        { label: "Manage GPG Keys...", action: props.onManageGPGKeys },
       ],
     },
     {
       label: "Tools",
       items: [
-        { label: "Open SFTP Manager..." },
-        { label: "ASCII Art Banner..." },
+        { label: "Open SFTP Manager...", action: props.onSFTPManager },
+        { label: "ASCII Art Banner...", action: props.onAsciiArt },
         { separator: true, label: "" },
-        { label: "Teamwork Settings..." },
+        { label: "Snippets...", action: props.onSnippets },
       ],
     },
     {
       label: "View",
       items: [
-        { label: "Toggle Dashboard", shortcut: "Ctrl+Shift+D", action: onToggleDashboard },
+        { label: "Toggle Dashboard", shortcut: "Ctrl+Shift+D", action: props.onToggleDashboard },
         { separator: true, label: "" },
-        { label: "Zoom In", shortcut: "Ctrl+=" },
-        { label: "Zoom Out", shortcut: "Ctrl+-" },
-        { label: "Reset Zoom", shortcut: "Ctrl+0" },
-        { separator: true, label: "" },
-        { label: "Fullscreen", shortcut: "F11" },
+        { label: "Fullscreen", shortcut: "F11", action: props.onFullscreen },
       ],
     },
     {
       label: "Help",
       items: [
-        { label: "User Guide" },
-        { label: "Keyboard Shortcuts" },
-        { separator: true, label: "" },
-        { label: "About KorTTY" },
+        { label: "About KorTTY", action: props.onAbout },
       ],
     },
   ];
@@ -141,11 +153,17 @@ export function MenuBar({ onToggleDashboard, onNewTab, onConnect, activeTabId }:
                   ) : (
                     <button
                       key={idx}
-                      className="w-full flex items-center justify-between px-3 py-1.5 text-xs hover:bg-kortty-accent/10 hover:text-kortty-accent disabled:opacity-40 transition-colors"
-                      disabled={item.disabled}
+                      className={`w-full flex items-center justify-between px-3 py-1.5 text-xs transition-colors ${
+                        item.action
+                          ? "hover:bg-kortty-accent/10 hover:text-kortty-accent"
+                          : "opacity-40 cursor-not-allowed"
+                      }`}
+                      disabled={!item.action || item.disabled}
                       onClick={() => {
-                        item.action?.();
-                        setOpenMenu(null);
+                        if (item.action) {
+                          item.action();
+                          setOpenMenu(null);
+                        }
                       }}
                     >
                       <span>{item.label}</span>

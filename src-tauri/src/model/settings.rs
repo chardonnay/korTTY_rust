@@ -15,6 +15,36 @@ pub enum TranslationProvider {
     Yandex,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum TeamworkSourceType {
+    Git,
+    SharedFile,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TeamworkSourceConfig {
+    pub id: String,
+    pub source_type: TeamworkSourceType,
+    pub location: String,
+    pub check_interval_minutes: u32,
+    pub read_only: bool,
+    pub enabled: bool,
+}
+
+impl Default for TeamworkSourceConfig {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            source_type: TeamworkSourceType::Git,
+            location: String::new(),
+            check_interval_minutes: 15,
+            read_only: false,
+            enabled: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GlobalSettings {
@@ -38,6 +68,16 @@ pub struct GlobalSettings {
     pub translation_provider: Option<TranslationProvider>,
     pub translation_api_key: Option<String>,
     pub translation_api_url: Option<String>,
+    pub teamwork_sources: Vec<TeamworkSourceConfig>,
+    pub teamwork_default_check_interval_minutes: u32,
+    pub teamwork_default_credential_id: Option<String>,
+    pub teamwork_default_ssh_key_id: Option<String>,
+    pub teamwork_default_username: Option<String>,
+    pub teamwork_use_temporary_key: bool,
+    #[serde(default)]
+    pub default_command_timestamps_enabled: bool,
+    #[serde(default = "default_true")]
+    pub default_prompt_hook_enabled: bool,
 }
 
 impl Default for GlobalSettings {
@@ -63,6 +103,18 @@ impl Default for GlobalSettings {
             translation_provider: None,
             translation_api_key: None,
             translation_api_url: None,
+            teamwork_sources: Vec::new(),
+            teamwork_default_check_interval_minutes: 15,
+            teamwork_default_credential_id: None,
+            teamwork_default_ssh_key_id: None,
+            teamwork_default_username: None,
+            teamwork_use_temporary_key: false,
+            default_command_timestamps_enabled: false,
+            default_prompt_hook_enabled: true,
         }
     }
+}
+
+fn default_true() -> bool {
+    true
 }

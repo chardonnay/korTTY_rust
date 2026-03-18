@@ -1,6 +1,7 @@
 pub mod connection;
 pub mod credential;
 pub mod gpg_key;
+pub mod gui_theme;
 pub mod project;
 pub mod settings;
 pub mod snippet;

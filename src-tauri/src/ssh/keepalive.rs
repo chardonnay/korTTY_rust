@@ -15,7 +15,7 @@ impl KeepaliveManager {
     }
 
     pub async fn start(&self, _session_id: &str) -> Result<()> {
-        if !self.enabled {
+        if !self.enabled || self.interval.is_zero() {
             return Ok(());
         }
         // Will be implemented in Phase 6

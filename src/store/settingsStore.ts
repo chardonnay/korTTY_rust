@@ -1,6 +1,17 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
 
+export type TeamworkSourceType = "Git" | "SharedFile";
+
+export interface TeamworkSourceConfig {
+  id: string;
+  sourceType: TeamworkSourceType;
+  location: string;
+  checkIntervalMinutes: number;
+  readOnly: boolean;
+  enabled: boolean;
+}
+
 export interface GlobalSettings {
   language: string;
   autoDetectLanguage: boolean;
@@ -22,6 +33,14 @@ export interface GlobalSettings {
   translationProvider?: "Google" | "DeepL" | "LibreTranslate" | "Microsoft" | "Yandex";
   translationApiKey?: string;
   translationApiUrl?: string;
+  teamworkSources: TeamworkSourceConfig[];
+  teamworkDefaultCheckIntervalMinutes: number;
+  teamworkDefaultCredentialId?: string;
+  teamworkDefaultSshKeyId?: string;
+  teamworkDefaultUsername?: string;
+  teamworkUseTemporaryKey: boolean;
+  defaultCommandTimestampsEnabled: boolean;
+  defaultPromptHookEnabled: boolean;
 }
 
 interface SettingsStore {
@@ -48,6 +67,11 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
     storeDashboardState: true,
     backupEncryptionType: "Password",
     maxBackups: 10,
+    teamworkSources: [],
+    teamworkDefaultCheckIntervalMinutes: 15,
+    teamworkUseTemporaryKey: false,
+    defaultCommandTimestampsEnabled: false,
+    defaultPromptHookEnabled: true,
   },
   loading: false,
 

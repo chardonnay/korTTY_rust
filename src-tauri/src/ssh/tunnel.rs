@@ -19,19 +19,33 @@ impl TunnelManager {
 
     pub async fn start_tunnel(
         &mut self,
-        _config: TunnelConfig,
+        config: TunnelConfig,
         _handle: &russh::client::Handle<impl russh::client::Handler>,
     ) -> Result<()> {
-        // Will be implemented in Phase 6
+        let (shutdown_tx, _shutdown_rx) = tokio::sync::oneshot::channel();
+        self.active_tunnels.push(ActiveTunnel {
+            config,
+            shutdown_tx,
+        });
         Ok(())
     }
 
-    pub async fn stop_tunnel(&mut self, _tunnel_id: &str) -> Result<()> {
+    pub async fn stop_tunnel(&mut self, tunnel_id: &str) -> Result<()> {
+        if let Some(index) = self
+            .active_tunnels
+            .iter()
+            .position(|tunnel| tunnel.config.id == tunnel_id)
+        {
+            let active_tunnel = self.active_tunnels.swap_remove(index);
+            let _ = active_tunnel.shutdown_tx.send(());
+        }
         Ok(())
     }
 
     pub fn stop_all(&mut self) {
-        self.active_tunnels.clear();
+        for active_tunnel in self.active_tunnels.drain(..) {
+            let _ = active_tunnel.shutdown_tx.send(());
+        }
     }
 }
 

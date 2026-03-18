@@ -2,7 +2,7 @@
   "$schema": "https://raw.githubusercontent.com/nicegui-org/nicegui/main/nicegui/tauri/schema/capability.json",
   "identifier": "default",
   "description": "Default permissions for KorTTY",
-  "windows": ["main"],
+  "windows": ["*"],
   "permissions": [
     "core:default",
     "core:window:default",

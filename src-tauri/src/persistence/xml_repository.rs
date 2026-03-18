@@ -22,7 +22,7 @@ pub fn ensure_subdirs() -> Result<()> {
     Ok(())
 }
 
-pub fn save_xml<T: Serialize>(filename: &str, data: &T) -> Result<()> {
+pub fn save_xml<T: Serialize + ?Sized>(filename: &str, data: &T) -> Result<()> {
     let path = config_dir()?.join(filename);
     let xml = quick_xml::se::to_string(data)?;
     let formatted = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{}", xml);
@@ -40,7 +40,7 @@ pub fn load_xml<T: DeserializeOwned>(filename: &str) -> Result<Option<T>> {
     Ok(Some(data))
 }
 
-pub fn save_json<T: Serialize>(filename: &str, data: &T) -> Result<()> {
+pub fn save_json<T: Serialize + ?Sized>(filename: &str, data: &T) -> Result<()> {
     let path = config_dir()?.join(filename);
     let json = serde_json::to_string_pretty(data)?;
     std::fs::write(path, json)?;

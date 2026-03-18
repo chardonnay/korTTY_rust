@@ -8,10 +8,16 @@ export interface ConnectionSettings {
   host: string;
   port: number;
   username: string;
+  connectionProtocol: "TcpIp" | "Mosh";
   authMethod: "Password" | "PrivateKey";
   password?: string;
   credentialId?: string;
   sshKeyId?: string;
+  privateKeyPath?: string;
+  privateKeyPassphrase?: string;
+  temporaryKeyContent?: string;
+  temporaryKeyExpirationMinutes?: number;
+  temporaryKeyPermanent: boolean;
   fontFamily: string;
   fontSize: number;
   columns: number;
@@ -34,6 +40,10 @@ export interface ConnectionSettings {
   tabGroup?: string;
   usageCount: number;
   lastUsed?: string;
+  connectionSource?: "Local" | "Teamwork";
+  teamworkSourceId?: string;
+  teamworkVersionToken?: string;
+  teamworkRole?: string;
 }
 
 export interface JumpServerConfig {
@@ -88,6 +98,7 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
   loadConnections: async () => {
     set({ loading: true });
     try {
+      await invoke("sync_teamwork_now").catch(() => null);
       const connections = await invoke<ConnectionSettings[]>("get_connections");
       const groups = await invoke<ConnectionGroup[]>("get_connection_groups");
       set({ connections, groups, loading: false });
@@ -121,7 +132,9 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
     host: "",
     port: 22,
     username: "",
+    connectionProtocol: "TcpIp",
     authMethod: "Password",
+    temporaryKeyPermanent: false,
     fontFamily: "JetBrains Mono",
     fontSize: 14,
     columns: 80,
@@ -140,5 +153,6 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
     commandTimestamps: false,
     tunnels: [],
     usageCount: 0,
+    connectionSource: "Local",
   }),
 }));

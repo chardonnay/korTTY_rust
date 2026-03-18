@@ -22,8 +22,11 @@ pub fn run() {
 
     let _ = persistence::xml_repository::ensure_subdirs();
 
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .manage(ssh::SSHManager::new())
+        .manage(commands::window_commands::PendingTransferStore(
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+        ))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
@@ -37,6 +40,10 @@ pub fn run() {
             commands::connection_commands::save_connection,
             commands::connection_commands::delete_connection,
             commands::connection_commands::get_connection_groups,
+            commands::teamwork_commands::sync_teamwork_now,
+            commands::teamwork_commands::restore_teamwork_connection,
+            commands::teamwork_commands::get_teamwork_connections,
+            commands::teamwork_commands::get_deleted_teamwork_connections,
             commands::settings_commands::get_settings,
             commands::settings_commands::save_settings,
             commands::credential_commands::get_credentials,
@@ -57,6 +64,10 @@ pub fn run() {
             commands::sftp_commands::sftp_rename,
             commands::sftp_commands::sftp_chmod,
             commands::sftp_commands::sftp_mkdir,
+            commands::sftp_commands::sftp_chown,
+            commands::sftp_commands::sftp_chmod_str,
+            commands::sftp_commands::sftp_check_archive_tools,
+            commands::sftp_commands::sftp_create_archive,
             commands::project_commands::save_project,
             commands::project_commands::load_project,
             commands::project_commands::get_recent_projects,
@@ -70,7 +81,25 @@ pub fn run() {
             commands::translation_commands::test_api_connection,
             commands::figlet_commands::generate_banner,
             commands::figlet_commands::get_font_list,
+            commands::theme_commands::get_themes,
+            commands::theme_commands::save_theme,
+            commands::theme_commands::delete_theme,
+            commands::theme_commands::get_active_theme_id,
+            commands::theme_commands::set_active_theme_id,
+            commands::gui_theme_commands::get_gui_themes,
+            commands::gui_theme_commands::save_gui_theme,
+            commands::gui_theme_commands::delete_gui_theme,
+            commands::gui_theme_commands::get_active_gui_theme_id,
+            commands::gui_theme_commands::set_active_gui_theme_id,
+            commands::window_commands::create_workspace_window,
+            commands::window_commands::store_pending_transfer,
+            commands::window_commands::take_pending_transfer,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running KorTTY");
+        .run(tauri::generate_context!());
+
+    if let Err(error) = app {
+        tracing::error!(error = %error, "failed to run KorTTY");
+        eprintln!("failed to run KorTTY: {error}");
+        std::process::exit(1);
+    }
 }

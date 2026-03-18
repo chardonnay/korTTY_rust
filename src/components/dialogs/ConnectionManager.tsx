@@ -1,6 +1,10 @@
 import { useState, useEffect } from "react";
 import { X, Plus, Trash2, Edit, FolderOpen, Server, ChevronRight, ChevronDown } from "lucide-react";
+import { invoke } from "@tauri-apps/api/core";
 import { useConnectionStore, ConnectionSettings } from "../../store/connectionStore";
+import { useDialogGeometry } from "../../hooks/useDialogGeometry";
+import type { ThemeData } from "../../store/themeStore";
+import { RestoreTeamworkDialog } from "./RestoreTeamworkDialog";
 
 interface ConnectionManagerProps {
   open: boolean;
@@ -10,12 +14,18 @@ interface ConnectionManagerProps {
 }
 
 export function ConnectionManager({ open, onClose, onConnect, onEdit }: ConnectionManagerProps) {
+  const { width, height, onResizeStart } = useDialogGeometry("connection-manager", 800, 600, 500, 400);
   const { connections, groups, loadConnections, deleteConnection } = useConnectionStore();
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [themes, setThemes] = useState<ThemeData[]>([]);
+  const [showRestoreDialog, setShowRestoreDialog] = useState(false);
 
   useEffect(() => {
-    if (open) loadConnections();
+    if (open) {
+      loadConnections();
+      invoke<ThemeData[]>("get_themes").then(setThemes).catch(console.error);
+    }
   }, [open, loadConnections]);
 
   if (!open) return null;
@@ -42,7 +52,8 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-kortty-surface border border-kortty-border rounded-lg shadow-2xl w-[700px] max-h-[80vh] flex flex-col">
+      <div className="bg-kortty-surface border border-kortty-border rounded-lg shadow-2xl flex flex-col relative"
+        style={{ width, height, maxWidth: "95vw", maxHeight: "95vh" }}>
         <div className="flex items-center justify-between px-4 py-3 border-b border-kortty-border">
           <h2 className="text-sm font-semibold">Connection Manager</h2>
           <button onClick={onClose} className="text-kortty-text-dim hover:text-kortty-text">
@@ -133,8 +144,26 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
                     <p>{selected.group || "—"}</p>
                   </div>
                   <div>
+                    <label className="text-kortty-text-dim">Theme</label>
+                    <div className="flex items-center gap-1.5">
+                      <span
+                        className="w-3 h-3 rounded-full border border-kortty-border shrink-0 inline-block"
+                        style={{ backgroundColor: selected.backgroundColor }}
+                      />
+                      <p>
+                        {selected.themeId
+                          ? (themes.find((t) => t.id === selected.themeId)?.name ?? "Custom")
+                          : "Custom"}
+                      </p>
+                    </div>
+                  </div>
+                  <div>
                     <label className="text-kortty-text-dim">Last Used</label>
                     <p>{selected.lastUsed || "Never"}</p>
+                  </div>
+                  <div>
+                    <label className="text-kortty-text-dim">Source</label>
+                    <p>{selected.connectionSource || "Local"}</p>
                   </div>
                 </div>
               </div>
@@ -168,6 +197,12 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
             >
               <Trash2 className="w-3 h-3" /> Delete
             </button>
+            <button
+              className="flex items-center gap-1 px-3 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors"
+              onClick={() => setShowRestoreDialog(true)}
+            >
+              Restore Teamwork...
+            </button>
           </div>
           <div className="flex gap-2">
             <button
@@ -184,6 +219,20 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
               Connect
             </button>
           </div>
+        </div>
+        <RestoreTeamworkDialog
+          open={showRestoreDialog}
+          onClose={() => setShowRestoreDialog(false)}
+          onRestored={() => loadConnections()}
+        />
+        <div
+          className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize opacity-40 hover:opacity-100 transition-opacity"
+          onMouseDown={onResizeStart}
+        >
+          <svg viewBox="0 0 16 16" className="w-full h-full text-kortty-text-dim">
+            <path d="M14 14L8 14L14 8Z" fill="currentColor" />
+            <path d="M14 14L11 14L14 11Z" fill="currentColor" opacity="0.5" />
+          </svg>
         </div>
       </div>
     </div>

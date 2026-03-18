@@ -7,6 +7,12 @@ pub enum AuthMethod {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ConnectionProtocol {
+    TcpIp,
+    Mosh,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ConnectionSettings {
     pub id: String,
@@ -15,10 +21,18 @@ pub struct ConnectionSettings {
     pub host: String,
     pub port: u16,
     pub username: String,
+    #[serde(default = "default_connection_protocol")]
+    pub connection_protocol: ConnectionProtocol,
     pub auth_method: AuthMethod,
     pub password: Option<String>,
     pub credential_id: Option<String>,
     pub ssh_key_id: Option<String>,
+    pub private_key_path: Option<String>,
+    pub private_key_passphrase: Option<String>,
+    pub temporary_key_content: Option<String>,
+    pub temporary_key_expiration_minutes: Option<u32>,
+    #[serde(default)]
+    pub temporary_key_permanent: bool,
     pub font_family: String,
     pub font_size: f32,
     pub columns: u16,
@@ -41,6 +55,10 @@ pub struct ConnectionSettings {
     pub tab_group: Option<String>,
     pub usage_count: u64,
     pub last_used: Option<String>,
+    pub connection_source: Option<ConnectionSource>,
+    pub teamwork_source_id: Option<String>,
+    pub teamwork_version_token: Option<String>,
+    pub teamwork_role: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +66,12 @@ pub enum CursorStyle {
     Block,
     Underline,
     Bar,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConnectionSource {
+    Local,
+    Teamwork,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,10 +103,16 @@ impl Default for ConnectionSettings {
             host: String::new(),
             port: 22,
             username: String::new(),
+            connection_protocol: ConnectionProtocol::TcpIp,
             auth_method: AuthMethod::Password,
             password: None,
             credential_id: None,
             ssh_key_id: None,
+            private_key_path: None,
+            private_key_passphrase: None,
+            temporary_key_content: None,
+            temporary_key_expiration_minutes: None,
+            temporary_key_permanent: false,
             font_family: "JetBrains Mono".into(),
             font_size: 14.0,
             columns: 80,
@@ -105,6 +135,10 @@ impl Default for ConnectionSettings {
             tab_group: None,
             usage_count: 0,
             last_used: None,
+            connection_source: Some(ConnectionSource::Local),
+            teamwork_source_id: None,
+            teamwork_version_token: None,
+            teamwork_role: None,
         }
     }
 }
@@ -128,4 +162,8 @@ fn default_ansi_colors() -> Vec<String> {
         "#94e2d5".into(), // Bright Cyan
         "#a6adc8".into(), // Bright White
     ]
+}
+
+fn default_connection_protocol() -> ConnectionProtocol {
+    ConnectionProtocol::TcpIp
 }

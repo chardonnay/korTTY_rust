@@ -7,6 +7,7 @@ pub struct Snippet {
     pub name: String,
     pub content: String,
     pub category: Option<String>,
+    pub language: Option<String>,
     pub favorite: bool,
     pub variables: Vec<SnippetVariable>,
 }
@@ -26,6 +27,7 @@ impl Default for Snippet {
             name: String::new(),
             content: String::new(),
             category: None,
+            language: Some("bash".to_string()),
             favorite: false,
             variables: Vec::new(),
         }

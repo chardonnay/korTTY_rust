@@ -2,6 +2,7 @@ import { useState } from "react";
 import { X, FileInput, Loader2 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
+import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 
 interface ImportDialogProps {
   open: boolean;
@@ -18,6 +19,7 @@ const SOURCES: { value: Source; label: string }[] = [
 ];
 
 export function ImportDialog({ open, onClose, onImportComplete }: ImportDialogProps) {
+  const { width, height, onResizeStart } = useDialogGeometry("import-dialog", 500, 400, 380, 300);
   const [source, setSource] = useState<Source>("MTPuTTY");
   const [filePath, setFilePath] = useState("");
   const [importCredentials, setImportCredentials] = useState(true);
@@ -79,7 +81,8 @@ export function ImportDialog({ open, onClose, onImportComplete }: ImportDialogPr
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-kortty-surface border border-kortty-border rounded-lg shadow-2xl w-[460px] flex flex-col">
+      <div className="bg-kortty-surface border border-kortty-border rounded-lg shadow-2xl flex flex-col relative"
+        style={{ width, height, maxWidth: "95vw", maxHeight: "95vh" }}>
         <div className="flex items-center justify-between px-4 py-3 border-b border-kortty-border">
           <h2 className="text-sm font-semibold flex items-center gap-2">
             <FileInput className="w-4 h-4 text-kortty-accent" />
@@ -185,6 +188,15 @@ export function ImportDialog({ open, onClose, onImportComplete }: ImportDialogPr
           >
             Close
           </button>
+        </div>
+        <div
+          className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize opacity-40 hover:opacity-100 transition-opacity"
+          onMouseDown={onResizeStart}
+        >
+          <svg viewBox="0 0 16 16" className="w-full h-full text-kortty-text-dim">
+            <path d="M14 14L8 14L14 8Z" fill="currentColor" />
+            <path d="M14 14L11 14L14 11Z" fill="currentColor" opacity="0.5" />
+          </svg>
         </div>
       </div>
     </div>

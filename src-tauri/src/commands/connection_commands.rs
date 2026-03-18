@@ -1,11 +1,22 @@
-use crate::model::connection::{ConnectionGroup, ConnectionSettings};
+use crate::model::connection::{ConnectionGroup, ConnectionSettings, ConnectionSource};
 use crate::persistence::xml_repository;
+use crate::teamwork::sync::SyncService;
 
 #[tauri::command]
 pub async fn get_connections() -> Result<Vec<ConnectionSettings>, String> {
-    let connections: Vec<ConnectionSettings> = xml_repository::load_json("connections.json")
+    let mut connections: Vec<ConnectionSettings> = xml_repository::load_json("connections.json")
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
+    for conn in &mut connections {
+        if conn.connection_source.is_none() {
+            conn.connection_source = Some(ConnectionSource::Local);
+        }
+    }
+
+    if let Ok(teamwork) = SyncService::all_teamwork_connections() {
+        connections.extend(teamwork);
+    }
+
     Ok(connections)
 }
 
@@ -26,6 +37,13 @@ pub async fn save_connection(connection: ConnectionSettings) -> Result<(), Strin
 
 #[tauri::command]
 pub async fn delete_connection(id: String) -> Result<(), String> {
+    if let Ok(teamwork) = SyncService::all_teamwork_connections() {
+        if teamwork.iter().any(|c| c.id == id) {
+            SyncService::mark_deleted(&id).map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+    }
+
     let mut connections: Vec<ConnectionSettings> = xml_repository::load_json("connections.json")
         .map_err(|e| e.to_string())?
         .unwrap_or_default();
@@ -36,9 +54,7 @@ pub async fn delete_connection(id: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn get_connection_groups() -> Result<Vec<ConnectionGroup>, String> {
-    let connections: Vec<ConnectionSettings> = xml_repository::load_json("connections.json")
-        .map_err(|e| e.to_string())?
-        .unwrap_or_default();
+    let connections = get_connections().await?;
 
     let mut groups = std::collections::HashMap::<String, Vec<String>>::new();
     for conn in &connections {

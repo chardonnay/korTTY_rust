@@ -1,8 +1,50 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback, useMemo } from "react";
 import { X, Plus, Trash2, Edit, FileCode, Star, StarOff, Upload, Download } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
+import { useDialogGeometry } from "../../hooks/useDialogGeometry";
+import CodeMirror from "@uiw/react-codemirror";
+import { oneDark } from "@codemirror/theme-one-dark";
+import { StreamLanguage } from "@codemirror/language";
+import { shell } from "@codemirror/legacy-modes/mode/shell";
+import { javascript } from "@codemirror/lang-javascript";
+import { python } from "@codemirror/lang-python";
+import { sql } from "@codemirror/lang-sql";
+import { json } from "@codemirror/lang-json";
+import { xml } from "@codemirror/lang-xml";
+import { yaml } from "@codemirror/lang-yaml";
+import { html } from "@codemirror/lang-html";
+import { css } from "@codemirror/lang-css";
+import { markdown } from "@codemirror/lang-markdown";
+import { php } from "@codemirror/lang-php";
+import { rust } from "@codemirror/lang-rust";
+import { java } from "@codemirror/lang-java";
+import { cpp } from "@codemirror/lang-cpp";
+import type { Extension } from "@codemirror/state";
+
+const LANGUAGES: { value: string; label: string; ext: () => Extension }[] = [
+  { value: "bash", label: "Bash / Shell", ext: () => StreamLanguage.define(shell) },
+  { value: "shell", label: "Shell", ext: () => StreamLanguage.define(shell) },
+  { value: "sh", label: "sh", ext: () => StreamLanguage.define(shell) },
+  { value: "zsh", label: "zsh", ext: () => StreamLanguage.define(shell) },
+  { value: "c", label: "C", ext: cpp },
+  { value: "cpp", label: "C++", ext: cpp },
+  { value: "css", label: "CSS", ext: css },
+  { value: "html", label: "HTML", ext: html },
+  { value: "java", label: "Java", ext: java },
+  { value: "javascript", label: "JavaScript", ext: javascript },
+  { value: "json", label: "JSON", ext: json },
+  { value: "markdown", label: "Markdown", ext: markdown },
+  { value: "php", label: "PHP", ext: php },
+  { value: "python", label: "Python", ext: python },
+  { value: "rust", label: "Rust", ext: rust },
+  { value: "sql", label: "SQL", ext: sql },
+  { value: "typescript", label: "TypeScript", ext: () => javascript({ typescript: true }) },
+  { value: "xml", label: "XML", ext: xml },
+  { value: "yaml", label: "YAML", ext: yaml },
+  { value: "plain", label: "Plain Text", ext: () => [] as unknown as Extension },
+];
 
 export interface SnippetVariable {
   name: string;
@@ -15,6 +57,7 @@ export interface Snippet {
   name: string;
   content: string;
   category?: string;
+  language?: string;
   favorite: boolean;
   variables: SnippetVariable[];
 }
@@ -32,12 +75,56 @@ function newSnippet(): Snippet {
     name: "",
     content: "",
     category: undefined,
+    language: "bash",
     favorite: false,
     variables: [],
   };
 }
 
+function SnippetCodeEditor({
+  value,
+  language,
+  onChange,
+}: {
+  value: string;
+  language: string;
+  onChange: (val: string) => void;
+}) {
+  const langExtensions = useMemo(() => {
+    const normalized = (language || "bash").toLowerCase();
+    const lang = LANGUAGES.find((l) => l.value === normalized);
+    if (!lang) return [];
+    const ext = lang.ext();
+    if (Array.isArray(ext) && ext.length === 0) return [];
+    return [ext];
+  }, [language]);
+
+  const handleChange = useCallback(
+    (val: string) => onChange(val),
+    [onChange],
+  );
+
+  return (
+    <CodeMirror
+      value={value}
+      onChange={handleChange}
+      extensions={langExtensions}
+      theme={oneDark}
+      className="flex-1 min-h-[120px] overflow-auto rounded border border-kortty-border text-xs [&_.cm-editor]:!bg-[#1a1b26] [&_.cm-gutters]:!bg-[#16171f] [&_.cm-gutters]:!border-r-kortty-border"
+      basicSetup={{
+        lineNumbers: true,
+        foldGutter: true,
+        highlightActiveLine: true,
+        bracketMatching: true,
+        autocompletion: false,
+        syntaxHighlighting: true,
+      }}
+    />
+  );
+}
+
 export function SnippetManager({ open, onClose }: SnippetManagerProps) {
+  const { width, height, onResizeStart } = useDialogGeometry("snippet-manager", 720, 520, 480, 360);
   const [snippets, setSnippets] = useState<Snippet[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [editing, setEditing] = useState<Snippet | null>(null);
@@ -207,7 +294,8 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-      <div className="bg-kortty-surface border border-kortty-border rounded-lg shadow-2xl w-[720px] max-h-[85vh] flex flex-col">
+      <div className="bg-kortty-surface border border-kortty-border rounded-lg shadow-2xl flex flex-col relative"
+        style={{ width, height, maxWidth: "95vw", maxHeight: "95vh" }}>
         <div className="flex items-center justify-between px-4 py-3 border-b border-kortty-border">
           <h2 className="text-sm font-semibold flex items-center gap-2">
             <FileCode className="w-4 h-4 text-kortty-accent" />
@@ -277,9 +365,9 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
             </div>
           </div>
 
-          <div className="flex-1 p-4 overflow-y-auto flex flex-col">
+          <div className="flex-1 p-4 overflow-hidden flex flex-col min-h-0">
             {editing ? (
-              <div className="space-y-3">
+              <div className="flex-1 flex flex-col space-y-3 min-h-0">
                 <div>
                   <label className="block text-xs text-kortty-text-dim mb-1">Name</label>
                   <input
@@ -302,15 +390,29 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
                     placeholder="Optional category"
                   />
                 </div>
-                <div>
-                  <label className="block text-xs text-kortty-text-dim mb-1">Content</label>
-                  <textarea
-                    className="input-field font-mono text-xs min-h-[120px] resize-y"
+                <div className="flex-1 flex flex-col min-h-0">
+                  <div className="flex items-center justify-between mb-1">
+                    <label className="text-xs text-kortty-text-dim">Content</label>
+                    <select
+                      className="input-field text-xs w-40 py-0.5"
+                      value={editing.language || "bash"}
+                      onChange={(e) =>
+                        setEditing((p) => (p ? { ...p, language: e.target.value } : null))
+                      }
+                    >
+                      {LANGUAGES.map((l) => (
+                        <option key={l.value} value={l.value}>
+                          {l.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <SnippetCodeEditor
                     value={editing.content}
-                    onChange={(e) =>
-                      setEditing((p) => (p ? { ...p, content: e.target.value } : null))
+                    language={editing.language || "bash"}
+                    onChange={(val) =>
+                      setEditing((p) => (p ? { ...p, content: val } : null))
                     }
-                    placeholder="Snippet content…"
                   />
                 </div>
                 <div>
@@ -410,6 +512,15 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
               Save
             </button>
           </div>
+        </div>
+        <div
+          className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize opacity-40 hover:opacity-100 transition-opacity"
+          onMouseDown={onResizeStart}
+        >
+          <svg viewBox="0 0 16 16" className="w-full h-full text-kortty-text-dim">
+            <path d="M14 14L8 14L14 8Z" fill="currentColor" />
+            <path d="M14 14L11 14L14 11Z" fill="currentColor" opacity="0.5" />
+          </svg>
         </div>
       </div>
     </div>
