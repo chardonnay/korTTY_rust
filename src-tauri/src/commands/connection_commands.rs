@@ -1,6 +1,8 @@
 use crate::model::connection::{ConnectionGroup, ConnectionSettings, ConnectionSource};
+use crate::persistence::exporter::{export_connections, ConnectionExportOptions, ExportFormat};
 use crate::persistence::xml_repository;
 use crate::teamwork::sync::SyncService;
+use serde::Deserialize;
 
 #[tauri::command]
 pub async fn get_connections() -> Result<Vec<ConnectionSettings>, String> {
@@ -70,4 +72,63 @@ pub async fn get_connection_groups() -> Result<Vec<ConnectionGroup>, String> {
         .into_iter()
         .map(|(name, connections)| ConnectionGroup { name, connections })
         .collect())
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub enum ConnectionExportFormat {
+    KorTTY,
+    MobaXterm,
+    MTPuTTY,
+    PuTTYConnectionManager,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ConnectionExportRequest {
+    pub path: String,
+    pub format: ConnectionExportFormat,
+    pub connection_ids: Vec<String>,
+    pub include_username: bool,
+    pub include_password: bool,
+    pub include_tunnels: bool,
+    pub include_jump_server: bool,
+}
+
+#[tauri::command]
+pub async fn export_connections_command(request: ConnectionExportRequest) -> Result<usize, String> {
+    if request.connection_ids.is_empty() {
+        return Err("Please select at least one connection".into());
+    }
+
+    let all_connections = get_connections().await?;
+    let selected: Vec<ConnectionSettings> = all_connections
+        .into_iter()
+        .filter(|connection| request.connection_ids.iter().any(|id| id == &connection.id))
+        .collect();
+
+    if selected.is_empty() {
+        return Err("No matching connections found for export".into());
+    }
+
+    let format = match request.format {
+        ConnectionExportFormat::KorTTY => ExportFormat::KorTTY,
+        ConnectionExportFormat::MobaXterm => ExportFormat::MobaXterm,
+        ConnectionExportFormat::MTPuTTY => ExportFormat::MTPuTTY,
+        ConnectionExportFormat::PuTTYConnectionManager => ExportFormat::PuTTYConnectionManager,
+    };
+    let options = ConnectionExportOptions {
+        include_username: request.include_username,
+        include_password: request.include_password,
+        include_tunnels: request.include_tunnels,
+        include_jump_server: request.include_jump_server,
+    };
+
+    export_connections(
+        &selected,
+        std::path::Path::new(&request.path),
+        format,
+        &options,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(selected.len())
 }

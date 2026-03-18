@@ -2,15 +2,20 @@ import { useState, useEffect } from "react";
 import { X, Plus, Trash2, Edit, Key } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
+import { EnvironmentManagerDialog } from "./EnvironmentManagerDialog";
 
-export type Environment = "Production" | "Development" | "Test" | "Staging";
+interface EnvironmentDefinition {
+  id: string;
+  displayName: string;
+  builtIn?: boolean;
+}
 
 export interface Credential {
   id: string;
   name: string;
   username: string;
   encryptedPassword?: string;
-  environment: Environment;
+  environment: string;
   serverPattern?: string;
 }
 
@@ -18,13 +23,6 @@ interface CredentialManagerProps {
   open: boolean;
   onClose: () => void;
 }
-
-const ENVIRONMENTS: Environment[] = [
-  "Production",
-  "Development",
-  "Test",
-  "Staging",
-];
 
 function newCredential(): Credential {
   return {
@@ -45,9 +43,14 @@ export function CredentialManager({ open, onClose }: CredentialManagerProps) {
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [environments, setEnvironments] = useState<EnvironmentDefinition[]>([]);
+  const [showEnvironmentManager, setShowEnvironmentManager] = useState(false);
 
   useEffect(() => {
-    if (open) loadCredentials();
+    if (open) {
+      void loadCredentials();
+      void loadEnvironments();
+    }
   }, [open]);
 
   useEffect(() => {
@@ -72,6 +75,15 @@ export function CredentialManager({ open, onClose }: CredentialManagerProps) {
       console.error("Failed to load credentials:", err);
     } finally {
       setLoading(false);
+    }
+  }
+
+  async function loadEnvironments() {
+    try {
+      const values = await invoke<EnvironmentDefinition[]>("get_environments");
+      setEnvironments(values);
+    } catch (err) {
+      console.error("Failed to load environments:", err);
     }
   }
 
@@ -114,6 +126,9 @@ export function CredentialManager({ open, onClose }: CredentialManagerProps) {
   if (!open) return null;
 
   const selected = credentials.find((c) => c.id === selectedId);
+  const availableEnvironments = environments.length > 0
+    ? environments
+    : [{ id: "Production", displayName: "Production", builtIn: true }];
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -186,19 +201,27 @@ export function CredentialManager({ open, onClose }: CredentialManagerProps) {
                   />
                 </div>
                 <div>
-                  <label className="block text-xs text-kortty-text-dim mb-1">Environment</label>
+                  <div className="flex items-center justify-between gap-2 mb-1">
+                    <label className="block text-xs text-kortty-text-dim">Environment</label>
+                    <button
+                      className="text-[11px] text-kortty-accent hover:underline"
+                      onClick={() => setShowEnvironmentManager(true)}
+                    >
+                      Manage…
+                    </button>
+                  </div>
                   <select
                     className="input-field"
                     value={editing.environment}
                     onChange={(e) =>
                       setEditing((p) =>
-                        p ? { ...p, environment: e.target.value as Environment } : null
+                        p ? { ...p, environment: e.target.value } : null
                       )
                     }
                   >
-                    {ENVIRONMENTS.map((env) => (
-                      <option key={env} value={env}>
-                        {env}
+                    {availableEnvironments.map((env) => (
+                      <option key={env.id} value={env.id}>
+                        {env.displayName}
                       </option>
                     ))}
                   </select>
@@ -274,6 +297,14 @@ export function CredentialManager({ open, onClose }: CredentialManagerProps) {
           </svg>
         </div>
       </div>
+      <EnvironmentManagerDialog
+        open={showEnvironmentManager}
+        onClose={() => setShowEnvironmentManager(false)}
+        onChanged={() => {
+          void loadEnvironments();
+          void loadCredentials();
+        }}
+      />
     </div>
   );
 }

@@ -24,6 +24,7 @@ export interface GlobalSettings {
   defaultSshKeepaliveInterval: number;
   defaultConnectionTimeout: number;
   defaultRetryCount: number;
+  showMenuBar: boolean;
   storeWindowGeometry: boolean;
   storeDashboardState: boolean;
   backupEncryptionType: "Password" | "GPG";
@@ -63,6 +64,7 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
     defaultSshKeepaliveInterval: 60,
     defaultConnectionTimeout: 15,
     defaultRetryCount: 4,
+    showMenuBar: true,
     storeWindowGeometry: true,
     storeDashboardState: true,
     backupEncryptionType: "Password",

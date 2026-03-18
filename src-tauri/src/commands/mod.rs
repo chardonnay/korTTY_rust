@@ -1,3 +1,4 @@
+pub mod ai_commands;
 pub mod backup_commands;
 pub mod connection_commands;
 pub mod credential_commands;

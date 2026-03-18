@@ -1,31 +1,59 @@
 # KorTTY - SSH Client (Rust Edition)
 
 A modern SSH terminal client built with Rust (Tauri v2) and React/TypeScript.
-Full-featured migration of [KorTTY JavaFX](https://github.com/chardonnay/korTTY).
+This repository tracks the feature migration from [KorTTY JavaFX](https://github.com/chardonnay/korTTY) to the Rust/Tauri desktop app.
 
-## Features
+## Highlights
 
-- **GUI-based**: Modern dark-themed interface with React + Tailwind CSS
-- **Tab Support**: Multiple SSH connections in one window
-- **Font Size Adjustment**: Zoom in/out (Ctrl+Plus, Ctrl+Minus, Ctrl+0)
-- **Split-Screen with Broadcast**: Split terminal view and broadcast input
-- **Multi-Window**: Multiple windows with tab drag-and-drop between them
-- **Encrypted Passwords**: AES-256-GCM encryption with master password
-- **SSH Key Management**: Centralized management with encrypted passphrases
-- **Customizable Display**: Font, colors (global or per connection)
-- **Project Management**: Save and load connection sets with history
-- **Import/Export**: Import from MTPuTTY, MobaXterm, PuTTY Connection Manager
-- **Dashboard**: Overview of all open connections
-- **SFTP Manager**: Two-panel file browser with full file operations
-- **Snippet Manager**: Create, search, favorite, organize reusable snippets
-- **ASCII Art Banner**: FIGlet banner generator with multiple styles
-- **Backup & Restore**: Encrypted backups (password or GPG)
-- **Multilanguage**: 8 built-in + dynamic translation via APIs
-- **Quick Connect**: Fast connection dialog with frequently used connections
-- **SSH Tunnels**: Local and remote port forwarding
-- **Jump Server**: Bastion host support
-- **Terminal Logging**: Automatic compressed session logging
-- **GPG Key Management**: For backup encryption
+- Multiple SSH tabs, split terminals, broadcast input, zoom control, dashboard and multi-window workflows
+- Connection manager with credentials, SSH keys, GPG keys, custom credential environments and project save/open flows
+- Import and export for KorTTY, MobaXterm, MTPuTTY and PuTTY Connection Manager
+- Built-in AI workflows: profile manager, connection test, terminal selection actions, saved chats and transcript export
+- SFTP file browser, snippet manager with XML import/export, ASCII art banner, backups and theme editors
+
+## Feature Overview
+
+### Terminal and session workflows
+
+- Tabbed SSH sessions
+- Horizontal and vertical split terminals
+- Broadcast input to all splits in a tab
+- Multi-window workspace dashboard
+- Session zoom per tab or per split pane
+- SFTP manager
+- SSH tunnels and jump-host aware connection settings
+
+### Productivity and data management
+
+- Quick Connect
+- Project open, preview, save and save-as flows
+- Connection import and export
+- Snippet manager with XML import/export
+- Backup and restore
+- Terminal and GUI theme editors
+
+### AI features
+
+- AI Manager for profile CRUD, usage/quota preview and saved chats
+- OpenAI-compatible chat completion integration
+- Terminal selection actions: `Summarize`, `Solve Problem`, `Ask...`
+- AI result/chat tabs with follow-up prompts
+- Auto title generation for saved chats
+- TXT and Markdown transcript export
+- Dedicated AI connection test with a minimal request path
+
+### Security and customization
+
+- AES-256-GCM encrypted passwords with master password support
+- SSH key management with encrypted passphrases
+- GPG key management for backup encryption
+- Per-connection terminal theme assignment
+- Toggleable menu bar and global terminal defaults
+
+## Documentation
+
+- Feature and workflow overview: [docs/FEATURE_OVERVIEW.md](docs/FEATURE_OVERVIEW.md)
+- Latest branch release notes: [RELEASE_NOTES.md](RELEASE_NOTES.md)
 
 ## Requirements
 
@@ -45,6 +73,11 @@ npm run tauri dev
 ```shell
 npm run tauri build
 ```
+
+### Build output
+
+After `npm run tauri build`, the distributable artifacts are written below `src-tauri/target/release/bundle/`.
+On macOS the primary output is typically `src-tauri/target/release/bundle/macos/KorTTY.app`, plus a DMG in `src-tauri/target/release/bundle/dmg/`.
 
 ## Pre-built Binaries
 
@@ -66,6 +99,8 @@ Pre-built packages are available on [GitHub Releases](https://github.com/chardon
 | Ctrl+Shift+Tab | Previous Tab |
 | Ctrl+O | Open Project |
 | Ctrl+S | Save Project |
+| Ctrl+Shift+Y | Open AI Manager |
+| Ctrl+Shift+L | Toggle Menu Bar |
 | Ctrl+Shift+D | Toggle Dashboard |
 | Ctrl+Plus | Zoom In |
 | Ctrl+Minus | Zoom Out |
@@ -83,10 +118,14 @@ All configuration is stored under `~/.kortty/`:
 ~/.kortty/
 ├── connections.json
 ├── credentials.json
+├── environments.json
 ├── ssh-keys.json
 ├── gpg-keys.json
 ├── global-settings.json
 ├── snippets.json
+├── ai-profiles.json
+├── ai-chats.json
+├── recent-projects.json
 ├── master-password-hash
 ├── kortty.log
 ├── history/

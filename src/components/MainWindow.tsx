@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emit, emitTo, listen } from "@tauri-apps/api/event";
 import { WebviewWindow, getAllWebviewWindows, getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
 import { MenuBar } from "./common/MenuBar";
 import { TabBar, Tab } from "./common/TabBar";
 import { StatusBar } from "./common/StatusBar";
@@ -28,10 +29,19 @@ import { ImportDialog } from "./dialogs/ImportDialog";
 import { ThemeEditor } from "./dialogs/ThemeEditor";
 import { GuiThemeEditor } from "./dialogs/GuiThemeEditor";
 import { TeamworkSettingsDialog } from "./dialogs/TeamworkSettingsDialog";
+import { ConnectionExportDialog } from "./dialogs/ConnectionExportDialog";
+import { ProjectPreviewDialog } from "./dialogs/ProjectPreviewDialog";
+import { ProjectSettingsDialog } from "./dialogs/ProjectSettingsDialog";
+import { AiActionDialog } from "./dialogs/AiActionDialog";
+import { AiManagerDialog } from "./dialogs/AiManagerDialog";
+import { AiChatTab } from "./ai/AiChatTab";
 import { SFTPManager } from "./sftp/SFTPManager";
 import { useConnectionStore, ConnectionSettings } from "../store/connectionStore";
+import { useProjectStore, type Project } from "../store/projectStore";
+import type { GlobalSettings } from "../store/settingsStore";
 import { useThemeStore } from "../store/themeStore";
 import { useGuiThemeStore } from "../store/guiThemeStore";
+import type { AiAction, AiProfile, AiRequestPayload, SavedAiChat } from "../types/ai";
 
 type DialogId =
   | null
@@ -48,9 +58,14 @@ type DialogId =
   | "backupImport"
   | "teamworkSettings"
   | "importDialog"
+  | "connectionExport"
+  | "aiAction"
+  | "aiManager"
   | "terminalThemeEditor"
   | "guiThemeEditor"
   | "sftpManager"
+  | "projectPreview"
+  | "projectSettings"
   | "about";
 
 const MIN_FONT_SIZE = 8;
@@ -107,7 +122,54 @@ type CrossWindowTransferPayload = {
 type GlobalSettingsView = {
   defaultCommandTimestampsEnabled?: boolean;
   defaultPromptHookEnabled?: boolean;
+  showMenuBar?: boolean;
 };
+
+type PendingAiAction = {
+  action: AiAction;
+  sessionId: string;
+  selectedText: string;
+  connectionDisplayName?: string;
+};
+
+function removeSessionFromTransferTree(
+  node: SplitTreeTransferNode,
+  sessionId: string,
+): SplitTreeTransferNode | null {
+  if (node.type === "leaf") {
+    return node.sessionId === sessionId ? null : node;
+  }
+
+  const children = node.children
+    .map((child) => removeSessionFromTransferTree(child, sessionId))
+    .filter((child): child is SplitTreeTransferNode => child !== null);
+
+  if (children.length === 0) return null;
+  if (children.length === 1) return children[0];
+  return { ...node, children };
+}
+
+function buildInitialSplitTree(transferTree: SplitTreeTransferNode): SplitNode {
+  const identityMap = Object.fromEntries(
+    getLeavesInOrder(transferTree).map((sessionId) => [sessionId, sessionId]),
+  );
+  return deserializeSplitTreeWithMapping(transferTree, identityMap);
+}
+
+function buildAiTabLabel(action: AiAction) {
+  switch (action) {
+    case "Summarize":
+      return "AI Summary";
+    case "SolveProblem":
+      return "AI Problem Analysis";
+    case "Ask":
+      return "AI Chat";
+    case "GenerateChatTitle":
+      return "AI Title";
+    default:
+      return "AI";
+  }
+}
 
 export function MainWindow() {
   const currentWindowLabel = getCurrentWebviewWindow().label;
@@ -117,15 +179,20 @@ export function MainWindow() {
   const [connectionCount, setConnectionCount] = useState(0);
   const [openDialog, setOpenDialog] = useState<DialogId>(null);
   const [editingConnection, setEditingConnection] = useState<ConnectionSettings | null>(null);
+  const [projectPreview, setProjectPreview] = useState<Project | null>(null);
+  const [projectSettingsDraft, setProjectSettingsDraft] = useState<Project | null>(null);
+  const [pendingAiAction, setPendingAiAction] = useState<PendingAiAction | null>(null);
   const [globalFontSize, setGlobalFontSize] = useState(DEFAULT_FONT_SIZE);
   const [tabFontSizes, setTabFontSizes] = useState<Record<string, number>>({});
   const [paneFontSizes, setPaneFontSizes] = useState<Record<string, number>>({});
   const [showTimestamps, setShowTimestamps] = useState(false);
   const [promptHookEnabled, setPromptHookEnabled] = useState(true);
+  const [showMenuBar, setShowMenuBar] = useState(true);
   const globalFontSizeRef = useRef(globalFontSize);
   globalFontSizeRef.current = globalFontSize;
   const focusedPaneSessionRef = useRef<string | null>(null);
   const { loadConnections } = useConnectionStore();
+  const { currentProject, setCurrentProject, setRecentProjects, addRecentProject } = useProjectStore();
   const { theme: activeTheme, loadActiveTheme } = useThemeStore();
   const { loadActiveGuiTheme } = useGuiThemeStore();
   const [allThemes, setAllThemes] = useState<import("../store/themeStore").ThemeData[]>([]);
@@ -141,12 +208,18 @@ export function MainWindow() {
   const [dragOverWindowLabel, setDragOverWindowLabel] = useState<string | null>(null);
   const splitResolveRef = useRef<((sessionId: string | null) => void) | null>(null);
   const splitTabRef = useRef<string | null>(null);
+  const projectSaveModeRef = useRef<"save" | "saveAs" | "edit">("save");
   const tabsRef = useRef<Tab[]>([]);
   const splitSessionsRef = useRef<Record<string, string[]>>({});
   const localSnapshotRef = useRef<WindowStateSnapshot | null>(null);
   const createSshSessionRef = useRef<(sessionId: string, info: SessionConnectInfo) => Promise<boolean>>(async () => false);
   const transferDropProcessedRef = useRef<Set<string>>(new Set());
   const processTransferPayloadRef = useRef<(payload: CrossWindowTransferPayload) => Promise<void>>(async () => {});
+  const activeTabEntry = useMemo(
+    () => tabs.find((tab) => tab.id === activeTab) ?? null,
+    [tabs, activeTab],
+  );
+  const activeTerminalSessionId = (activeTabEntry?.kind ?? "terminal") === "terminal" ? activeTabEntry?.id ?? "" : "";
 
   async function emitTransferWithRetry(
     targetLabel: string,
@@ -179,9 +252,13 @@ export function MainWindow() {
       .then((settings) => {
         setShowTimestamps(!!settings.defaultCommandTimestampsEnabled);
         setPromptHookEnabled(settings.defaultPromptHookEnabled !== false);
+        setShowMenuBar(settings.showMenuBar !== false);
       })
       .catch(console.error);
-  }, [loadConnections, loadActiveTheme, loadActiveGuiTheme]);
+    invoke<string[]>("get_recent_projects")
+      .then(setRecentProjects)
+      .catch(console.error);
+  }, [loadConnections, loadActiveTheme, loadActiveGuiTheme, setRecentProjects]);
 
   useEffect(() => {
     getCurrentWindow().setTitle(`KorTTY - ${windowName}`).catch(console.error);
@@ -234,7 +311,7 @@ export function MainWindow() {
   );
 
   useEffect(() => {
-    setConnectionCount(tabs.filter((t) => t.status === "connected").length);
+    setConnectionCount(tabs.filter((t) => (t.kind ?? "terminal") === "terminal" && t.status === "connected").length);
   }, [tabs]);
 
   // Content-based key so we only recompute the snapshot when data actually changes,
@@ -244,19 +321,21 @@ export function MainWindow() {
       JSON.stringify({
         l: currentWindowLabel,
         n: windowName,
-        t: tabs.map((tab) => ({
-          i: tab.id,
-          lb: tab.label,
-          s: tab.status,
-          h: tab.host,
-          u: tab.username,
-          p: tab.port,
-          am: tab.authMethod,
-          cid: tab.credentialId,
-          sk: tab.sshKeyId,
-          pk: tab.privateKeyPath,
-          cp: tab.connectionProtocol,
-        })),
+        t: tabs
+          .filter((tab) => (tab.kind ?? "terminal") === "terminal")
+          .map((tab) => ({
+            i: tab.id,
+            lb: tab.label,
+            s: tab.status,
+            h: tab.host,
+            u: tab.username,
+            p: tab.port,
+            am: tab.authMethod,
+            cid: tab.credentialId,
+            sk: tab.sshKeyId,
+            pk: tab.privateKeyPath,
+            cp: tab.connectionProtocol,
+          })),
         s: tabSplitSessions,
         c: splitSessionConfigs,
       }),
@@ -267,6 +346,9 @@ export function MainWindow() {
     const connections: DashboardConnectionEntry[] = [];
 
     for (const tab of tabs) {
+      if ((tab.kind ?? "terminal") === "ai") {
+        continue;
+      }
       const tabConfig =
         tab.host && tab.username
           ? {
@@ -590,6 +672,7 @@ export function MainWindow() {
 
       const newTab: Tab = {
         id: reusedTabId,
+        kind: "terminal",
         label: payload.entry.label,
         status: payload.entry.status,
         readOnlyMirror: !!payload.copyMode,
@@ -751,11 +834,13 @@ export function MainWindow() {
       const id = crypto.randomUUID();
       const newTab: Tab = {
         id,
+        kind: "terminal",
         label: conn.name || `${conn.username}@${conn.host}`,
         status: "disconnected",
         host: conn.host,
         port: conn.port,
         username: conn.username,
+        connectionId: conn.id,
         authMethod: conn.authMethod,
         password: conn.password,
         credentialId: conn.credentialId,
@@ -800,6 +885,186 @@ export function MainWindow() {
       }
     },
     [handleConnect, createSshSession],
+  );
+
+  const buildProjectSnapshot = useCallback(
+    (base?: Project | null): Project => ({
+      name: base?.name || currentProject?.name || "KorTTY Project",
+      description: base?.description || currentProject?.description,
+      filePath: base?.filePath || currentProject?.filePath,
+      connectionIds: Array.from(
+        new Set(
+          tabs
+            .map((tab) => tab.connectionId)
+            .filter((connectionId): connectionId is string => !!connectionId),
+        ),
+      ),
+      dashboardOpen: showDashboard,
+      autoReconnect: base?.autoReconnect ?? currentProject?.autoReconnect ?? true,
+      createdAt: base?.createdAt || currentProject?.createdAt,
+      lastModified: base?.lastModified || currentProject?.lastModified,
+    }),
+    [currentProject, showDashboard, tabs],
+  );
+
+  const clearWorkspaceForProject = useCallback(async () => {
+    const currentTabs = tabsRef.current;
+    const currentSplitSessions = splitSessionsRef.current;
+
+    for (const tab of currentTabs) {
+      if (tab.status === "connected") {
+        try {
+          await invoke("ssh_disconnect", { sessionId: tab.id });
+        } catch (error) {
+          console.error("Project switch disconnect failed:", error);
+        }
+      }
+      for (const splitId of currentSplitSessions[tab.id] || []) {
+        try {
+          await invoke("ssh_disconnect", { sessionId: splitId });
+        } catch (error) {
+          console.error("Project switch split disconnect failed:", error);
+        }
+      }
+    }
+
+    setTabs([]);
+    setActiveTab(null);
+    setTabSplitSessions({});
+    setSplitSessionConfigs({});
+    setTabSplitTrees({});
+    setTabInitialSplitTree({});
+  }, []);
+
+  const saveProjectToPath = useCallback(
+    async (draft: Project, forcePathPicker: boolean) => {
+      let path = draft.filePath;
+      if (forcePathPicker || !path) {
+        const selectedPath = await saveFileDialog({
+          defaultPath: draft.filePath || `${draft.name || "kortty-project"}.json`,
+          filters: [
+            { name: "KorTTY Project", extensions: ["json"] },
+            { name: "All files", extensions: ["*"] },
+          ],
+        });
+        if (!selectedPath || typeof selectedPath !== "string") {
+          return;
+        }
+        path = selectedPath;
+      }
+
+      const saved = await invoke<Project>("save_project", {
+        project: { ...buildProjectSnapshot(draft), filePath: path },
+        path,
+      });
+      setCurrentProject(saved);
+      addRecentProject(path);
+      const refreshed = await invoke<string[]>("get_recent_projects");
+      setRecentProjects(refreshed);
+    },
+    [addRecentProject, buildProjectSnapshot, setCurrentProject, setRecentProjects],
+  );
+
+  const applyProjectToWorkspace = useCallback(
+    async (project: Project, autoReconnect: boolean) => {
+      await clearWorkspaceForProject();
+      await loadConnections();
+
+      const allConnections = useConnectionStore.getState().connections;
+      const matchingConnections = project.connectionIds
+        .map((connectionId) => allConnections.find((connection) => connection.id === connectionId))
+        .filter((connection): connection is ConnectionSettings => !!connection);
+
+      const restoredTabs: Tab[] = matchingConnections.map((connection) => ({
+        id: crypto.randomUUID(),
+        kind: "terminal",
+        label: connection.name || `${connection.username}@${connection.host}`,
+        status: autoReconnect ? "connecting" : "disconnected",
+        host: connection.host,
+        port: connection.port,
+        username: connection.username,
+        connectionId: connection.id,
+        authMethod: connection.authMethod,
+        password: connection.password,
+        credentialId: connection.credentialId,
+        sshKeyId: connection.sshKeyId,
+        privateKeyPath: connection.privateKeyPath,
+        privateKeyPassphrase: connection.privateKeyPassphrase,
+        temporaryKeyContent: connection.temporaryKeyContent,
+        temporaryKeyExpirationMinutes: connection.temporaryKeyExpirationMinutes,
+        temporaryKeyPermanent: connection.temporaryKeyPermanent,
+        connectionProtocol: connection.connectionProtocol || "TcpIp",
+        themeId: connection.themeId,
+      }));
+
+      setTabs(restoredTabs);
+      setActiveTab(restoredTabs[0]?.id ?? null);
+      setShowDashboard(project.dashboardOpen);
+
+      const resolvedProject: Project = {
+        ...project,
+        autoReconnect,
+      };
+      setCurrentProject(resolvedProject);
+      if (resolvedProject.filePath) {
+        addRecentProject(resolvedProject.filePath);
+        const refreshed = await invoke<string[]>("get_recent_projects");
+        setRecentProjects(refreshed);
+      }
+
+      if (!autoReconnect) {
+        return;
+      }
+
+      for (const [index, connection] of matchingConnections.entries()) {
+        const tabId = restoredTabs[index]?.id;
+        if (!tabId) continue;
+
+        if (connection.authMethod === "Password") {
+          void handleConnect(
+            tabId,
+            connection.host,
+            connection.port,
+            connection.username,
+            connection.password || "",
+            connection.connectionProtocol || "TcpIp",
+          );
+          continue;
+        }
+
+        const ok = await createSshSession(tabId, {
+          host: connection.host,
+          port: connection.port,
+          username: connection.username,
+          authMethod: connection.authMethod,
+          password: connection.password,
+          credentialId: connection.credentialId,
+          sshKeyId: connection.sshKeyId,
+          privateKeyPath: connection.privateKeyPath,
+          privateKeyPassphrase: connection.privateKeyPassphrase,
+          temporaryKeyContent: connection.temporaryKeyContent,
+          temporaryKeyExpirationMinutes: connection.temporaryKeyExpirationMinutes,
+          temporaryKeyPermanent: connection.temporaryKeyPermanent,
+          connectionProtocol: connection.connectionProtocol || "TcpIp",
+        });
+        setTabs((previous) =>
+          previous.map((tab) =>
+            tab.id === tabId
+              ? { ...tab, status: ok ? ("connected" as const) : ("disconnected" as const) }
+              : tab,
+          ),
+        );
+      }
+    },
+    [
+      addRecentProject,
+      clearWorkspaceForProject,
+      createSshSession,
+      handleConnect,
+      loadConnections,
+      setCurrentProject,
+      setRecentProjects,
+    ],
   );
 
   const handleDisconnect = useCallback(async (tabId: string) => {
@@ -873,7 +1138,7 @@ export function MainWindow() {
 
   const addTab = useCallback(() => {
     const id = crypto.randomUUID();
-    const newTab: Tab = { id, label: "New Connection", status: "disconnected" };
+    const newTab: Tab = { id, kind: "terminal", label: "New Connection", status: "disconnected" };
     setTabs((prev) => [...prev, newTab]);
     setActiveTab(id);
   }, []);
@@ -881,15 +1146,17 @@ export function MainWindow() {
   const duplicateTab = useCallback(
     (tabId: string) => {
       const source = tabs.find((t) => t.id === tabId);
-      if (!source) return;
+      if (!source || (source.kind ?? "terminal") === "ai") return;
       const id = crypto.randomUUID();
       const newTab: Tab = {
         id,
+        kind: "terminal",
         label: source.label,
         status: "disconnected",
         host: source.host,
         port: source.port,
         username: source.username,
+        connectionId: source.connectionId,
         authMethod: source.authMethod,
         password: source.password,
         credentialId: source.credentialId,
@@ -1079,6 +1346,145 @@ export function MainWindow() {
     [tabs, activeTab, handleDisconnect, tabSplitSessions],
   );
 
+  const handleClosePrimarySplit = useCallback(
+    async (tabId: string) => {
+      const splitSessions = tabSplitSessions[tabId] || [];
+      if (splitSessions.length === 0) {
+        closeTab(tabId);
+        return;
+      }
+
+      const currentTree = tabSplitTrees[tabId];
+      const remainingTree = currentTree
+        ? removeSessionFromTransferTree(currentTree, tabId)
+        : null;
+      const promotedSessionId = remainingTree
+        ? getLeavesInOrder(remainingTree)[0]
+        : splitSessions[0];
+
+      if (!promotedSessionId) {
+        closeTab(tabId);
+        return;
+      }
+
+      const promotedConfig = splitSessionConfigs[promotedSessionId];
+      if (!promotedConfig) {
+        handleDisconnectSplitSession(tabId, promotedSessionId);
+        return;
+      }
+
+      try {
+        await invoke("ssh_disconnect", { sessionId: tabId });
+      } catch (error) {
+        console.error("Primary split disconnect failed:", error);
+      }
+
+      const remainingSplitIds = splitSessions.filter((sessionId) => sessionId !== promotedSessionId);
+      const nextTransferTree =
+        remainingTree ??
+        (remainingSplitIds.length === 0
+          ? { type: "leaf" as const, sessionId: promotedSessionId }
+          : {
+              type: "container" as const,
+              direction: "horizontal" as const,
+              children: [
+                { type: "leaf" as const, sessionId: promotedSessionId },
+                ...remainingSplitIds.map((sessionId) => ({ type: "leaf" as const, sessionId })),
+              ],
+            });
+
+      setTabs((prev) =>
+        prev.map((tab) =>
+          tab.id === tabId
+            ? {
+                ...tab,
+                id: promotedSessionId,
+                label: `${promotedConfig.username}@${promotedConfig.host}`,
+                status: "connected",
+                host: promotedConfig.host,
+                port: promotedConfig.port,
+                username: promotedConfig.username,
+                authMethod: promotedConfig.authMethod,
+                password: promotedConfig.password,
+                credentialId: promotedConfig.credentialId,
+                sshKeyId: promotedConfig.sshKeyId,
+                privateKeyPath: promotedConfig.privateKeyPath,
+                privateKeyPassphrase: promotedConfig.privateKeyPassphrase,
+                temporaryKeyContent: promotedConfig.temporaryKeyContent,
+                temporaryKeyExpirationMinutes: promotedConfig.temporaryKeyExpirationMinutes,
+                temporaryKeyPermanent: promotedConfig.temporaryKeyPermanent,
+                connectionProtocol: promotedConfig.connectionProtocol,
+              }
+            : tab,
+        ),
+      );
+
+      if (activeTab === tabId) {
+        setActiveTab(promotedSessionId);
+      }
+      focusedPaneSessionRef.current = promotedSessionId;
+
+      setTabSplitSessions((prev) => {
+        const next = { ...prev };
+        delete next[tabId];
+        next[promotedSessionId] = remainingSplitIds;
+        return next;
+      });
+
+      setSplitSessionConfigs((prev) => {
+        const next = { ...prev };
+        delete next[promotedSessionId];
+        return next;
+      });
+
+      setTabSplitTrees((prev) => {
+        const next = { ...prev };
+        delete next[tabId];
+        next[promotedSessionId] = nextTransferTree;
+        return next;
+      });
+
+      setTabInitialSplitTree((prev) => {
+        const next = { ...prev };
+        delete next[tabId];
+        next[promotedSessionId] = buildInitialSplitTree(nextTransferTree);
+        return next;
+      });
+
+      setTabFontSizes((prev) => {
+        const next = { ...prev };
+        if (next[tabId] != null) {
+          next[promotedSessionId] = next[tabId];
+          delete next[tabId];
+        }
+        return next;
+      });
+
+      setPaneFontSizes((prev) => {
+        const next: Record<string, number> = {};
+        for (const [key, value] of Object.entries(prev)) {
+          if (key === `${tabId}:${promotedSessionId}`) {
+            continue;
+          }
+          if (key.startsWith(`${tabId}:`)) {
+            next[`${promotedSessionId}:${key.slice(tabId.length + 1)}`] = value;
+          } else {
+            next[key] = value;
+          }
+        }
+        return next;
+      });
+    },
+    [
+      activeTab,
+      closeTab,
+      handleDisconnectSplitSession,
+      splitSessionConfigs,
+      tabSplitSessions,
+      tabSplitTrees,
+    ],
+  );
+
   const nextTab = useCallback(() => {
     if (tabs.length < 2) return;
     const idx = tabs.findIndex((t) => t.id === activeTab);
@@ -1098,6 +1504,7 @@ export function MainWindow() {
       const id = crypto.randomUUID();
       const newTab: Tab = {
         id,
+        kind: "terminal",
         label: `${info.username}@${info.host}`,
         status: "disconnected",
         host: info.host,
@@ -1202,6 +1609,9 @@ export function MainWindow() {
 
   const handleTabTransferDragStart = useCallback(
     (tab: Tab, e: React.DragEvent<HTMLDivElement>) => {
+      if ((tab.kind ?? "terminal") === "ai") {
+        return;
+      }
       const config: SessionConnectInfo | undefined =
         tab.host && tab.username
           ? {
@@ -1260,7 +1670,7 @@ export function MainWindow() {
     async (tabId: string, targetWindowLabel: string) => {
       if (targetWindowLabel === currentWindowLabel) return;
       const tab = tabs.find((t) => t.id === tabId);
-      if (!tab) return;
+      if (!tab || (tab.kind ?? "terminal") === "ai") return;
       const config: SessionConnectInfo | undefined =
         tab.host && tab.username
           ? {
@@ -1312,7 +1722,7 @@ export function MainWindow() {
     async (tabId: string, targetWindowLabel: string) => {
       if (targetWindowLabel === currentWindowLabel) return;
       const tab = tabs.find((t) => t.id === tabId);
-      if (!tab) return;
+      if (!tab || (tab.kind ?? "terminal") === "ai") return;
       const config: SessionConnectInfo | undefined =
         tab.host && tab.username
           ? {
@@ -1556,13 +1966,144 @@ export function MainWindow() {
 
   const handleQuit = useCallback(async () => {
     for (const tab of tabs) {
-      if (tab.status === "connected") {
+      if ((tab.kind ?? "terminal") === "terminal" && tab.status === "connected") {
         await handleDisconnect(tab.id);
       }
     }
     const win = getCurrentWindow();
     await win.close();
   }, [tabs, handleDisconnect]);
+
+  const toggleMenuBarPreference = useCallback((visible: boolean) => {
+    setShowMenuBar(visible);
+    invoke<GlobalSettings>("get_settings")
+      .then((settings) => invoke("save_settings", { settings: { ...settings, showMenuBar: visible } }))
+      .catch(console.error);
+  }, []);
+
+  const handleOpenProjectDialog = useCallback(async () => {
+    const path = await openFileDialog({
+      multiple: false,
+      directory: false,
+      filters: [
+        { name: "KorTTY Project", extensions: ["json"] },
+        { name: "All files", extensions: ["*"] },
+      ],
+    });
+    if (!path || typeof path !== "string") return;
+
+    try {
+      const project = await invoke<Project>("peek_project", { path });
+      setProjectPreview(project);
+      setOpenDialog("projectPreview");
+    } catch (error) {
+      console.error("Failed to preview project:", error);
+    }
+  }, []);
+
+  const handleSaveProject = useCallback(async () => {
+    const draft = buildProjectSnapshot(currentProject);
+    if (!currentProject?.filePath) {
+      projectSaveModeRef.current = "save";
+      setProjectSettingsDraft(draft);
+      setOpenDialog("projectSettings");
+      return;
+    }
+    try {
+      await saveProjectToPath(draft, false);
+    } catch (error) {
+      console.error("Failed to save project:", error);
+    }
+  }, [buildProjectSnapshot, currentProject, saveProjectToPath]);
+
+  const handleSaveProjectAs = useCallback(() => {
+    projectSaveModeRef.current = "saveAs";
+    setProjectSettingsDraft(buildProjectSnapshot(currentProject));
+    setOpenDialog("projectSettings");
+  }, [buildProjectSnapshot, currentProject]);
+
+  const handleEditProjectSettings = useCallback(() => {
+    projectSaveModeRef.current = "edit";
+    setProjectSettingsDraft(buildProjectSnapshot(currentProject));
+    setOpenDialog("projectSettings");
+  }, [buildProjectSnapshot, currentProject]);
+
+  const handleRequestAiAction = useCallback(async (nextAction: PendingAiAction) => {
+    if (!nextAction.selectedText.trim()) {
+      return;
+    }
+    try {
+      const profiles = await invoke<AiProfile[]>("get_ai_profiles");
+      if (profiles.length === 0) {
+        setPendingAiAction(nextAction);
+        setOpenDialog("aiManager");
+        return;
+      }
+      setPendingAiAction(nextAction);
+      setOpenDialog("aiAction");
+    } catch (error) {
+      console.error("Failed to load AI profiles:", error);
+      setPendingAiAction(nextAction);
+      setOpenDialog("aiManager");
+    }
+  }, []);
+
+  const createAiTab = useCallback((request: AiRequestPayload) => {
+    const id = crypto.randomUUID();
+    const newTab: Tab = {
+      id,
+      kind: "ai",
+      label: buildAiTabLabel(request.action),
+      status: "disconnected",
+      aiInitialRequest: request,
+    };
+    setTabs((prev) => [...prev, newTab]);
+    setActiveTab(id);
+    setPendingAiAction(null);
+    setOpenDialog(null);
+  }, []);
+
+  const handleOpenSavedAiChat = useCallback((chat: SavedAiChat) => {
+    setPendingAiAction(null);
+    const existingTab = tabs.find((tab) => (tab.kind ?? "terminal") === "ai" && tab.aiChatId === chat.id);
+    if (existingTab) {
+      setActiveTab(existingTab.id);
+      setOpenDialog(null);
+      return;
+    }
+
+    const id = crypto.randomUUID();
+    const newTab: Tab = {
+      id,
+      kind: "ai",
+      label: chat.title || "AI Chat",
+      status: "disconnected",
+      aiChatId: chat.id,
+      aiSavedChat: chat,
+    };
+    setTabs((prev) => [...prev, newTab]);
+    setActiveTab(id);
+    setOpenDialog(null);
+  }, [tabs]);
+
+  const handleCloseAiManager = useCallback(async () => {
+    if (!pendingAiAction) {
+      setOpenDialog(null);
+      return;
+    }
+
+    try {
+      const profiles = await invoke<AiProfile[]>("get_ai_profiles");
+      setOpenDialog(profiles.length > 0 ? "aiAction" : null);
+      if (profiles.length === 0) {
+        setPendingAiAction(null);
+      }
+    } catch (error) {
+      console.error("Failed to reload AI profiles:", error);
+      setOpenDialog(null);
+      setPendingAiAction(null);
+    }
+  }, [pendingAiAction]);
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
@@ -1584,12 +2125,24 @@ export function MainWindow() {
       } else if (ctrl && shift && e.key === "D") {
         e.preventDefault();
         setShowDashboard((prev) => !prev);
+      } else if (ctrl && shift && (e.key === "L" || e.key === "l")) {
+        e.preventDefault();
+        toggleMenuBarPreference(!showMenuBar);
       } else if (ctrl && !shift && e.key === "k") {
         e.preventDefault();
         setOpenDialog("quickConnect");
+      } else if (ctrl && !shift && e.key === "o") {
+        e.preventDefault();
+        void handleOpenProjectDialog();
+      } else if (ctrl && !shift && e.key === "s") {
+        e.preventDefault();
+        void handleSaveProject();
       } else if (ctrl && shift && e.key === "B") {
         e.preventDefault();
         setOpenDialog("backupCreate");
+      } else if (ctrl && shift && (e.key === "Y" || e.key === "y")) {
+        e.preventDefault();
+        setOpenDialog("aiManager");
       } else if (ctrl && !shift && e.key === "q") {
         e.preventDefault();
         handleQuit();
@@ -1650,6 +2203,11 @@ export function MainWindow() {
     activeTab,
     nextTab,
     prevTab,
+    handleOpenProjectDialog,
+    handleSaveProject,
+    showMenuBar,
+    toggleMenuBarPreference,
+    setOpenDialog,
     handleQuit,
     handleFullscreen,
     zoomIn,
@@ -1667,14 +2225,27 @@ export function MainWindow() {
     },
     onNewTab: addTab,
     onCloseTab: () => { if (activeTab) closeTab(activeTab); },
+    onOpenProject: () => {
+      void handleOpenProjectDialog();
+    },
+    onSaveProject: () => {
+      void handleSaveProject();
+    },
+    onSaveProjectAs: () => {
+      void handleSaveProjectAs();
+    },
+    onProjectSettings: handleEditProjectSettings,
+    onToggleMenuBar: () => toggleMenuBarPreference(!showMenuBar),
     onToggleDashboard: () => setShowDashboard((prev) => !prev),
     onQuickConnect: () => setOpenDialog("quickConnect"),
     onManageConnections: () => setOpenDialog("connectionManager"),
     onImportConnections: () => setOpenDialog("importDialog"),
+    onExportConnections: () => setOpenDialog("connectionExport"),
     onSettings: () => setOpenDialog("settings"),
     onManageCredentials: () => setOpenDialog("credentialManager"),
     onManageSSHKeys: () => setOpenDialog("sshKeyManager"),
     onManageGPGKeys: () => setOpenDialog("gpgKeyManager"),
+    onAiManager: () => setOpenDialog("aiManager"),
     onSnippets: () => setOpenDialog("snippetManager"),
     onSFTPManager: () => setOpenDialog("sftpManager"),
     onAsciiArt: () => setOpenDialog("asciiArt"),
@@ -1690,7 +2261,7 @@ export function MainWindow() {
 
   return (
     <div className="flex flex-col h-screen w-screen bg-kortty-bg">
-      <MenuBar {...menuActions} />
+      {showMenuBar && <MenuBar {...menuActions} />}
       <div className="flex flex-1 min-h-0">
         {showDashboard && (
           <div className="w-[300px] border-r border-kortty-border bg-kortty-surface flex-shrink-0 flex flex-col">
@@ -1793,7 +2364,23 @@ export function MainWindow() {
                 className="absolute inset-0"
                 style={{ display: tab.id === activeTab ? "block" : "none" }}
               >
-                {tab.status === "connected" ? (
+                {(tab.kind ?? "terminal") === "ai" ? (
+                  <AiChatTab
+                    tabId={tab.id}
+                    initialRequest={tab.aiInitialRequest}
+                    initialChat={tab.aiSavedChat}
+                    onTitleChange={(title) => {
+                      setTabs((prev) =>
+                        prev.map((entry) => (entry.id === tab.id ? { ...entry, label: title || "AI Chat" } : entry)),
+                      );
+                    }}
+                    onSavedChatIdChange={(savedChatId) => {
+                      setTabs((prev) =>
+                        prev.map((entry) => (entry.id === tab.id ? { ...entry, aiChatId: savedChatId } : entry)),
+                      );
+                    }}
+                  />
+                ) : tab.status === "connected" ? (
                   <TerminalSplitPane
                     primarySessionId={tab.id}
                     connected={true}
@@ -1837,6 +2424,24 @@ export function MainWindow() {
                     onToggleTimestamps={() => setShowTimestamps((s) => !s)}
                     showTimestamps={showTimestamps}
                     onReconnect={(sessionId) => handleReconnect(sessionId)}
+                    onClosePrimarySplit={() => {
+                      void handleClosePrimarySplit(tab.id);
+                    }}
+                    onAiAction={(sessionId, action, selectedText) => {
+                      const splitConfig = splitSessionConfigs[sessionId];
+                      const connectionDisplayName =
+                        sessionId === tab.id
+                          ? tab.label
+                          : splitConfig
+                            ? `${splitConfig.username}@${splitConfig.host}`
+                            : tab.label;
+                      void handleRequestAiAction({
+                        action,
+                        sessionId,
+                        selectedText,
+                        connectionDisplayName,
+                      });
+                    }}
                     onCloseRequest={() => closeTab(tab.id)}
                     onSplitSameServer={() => handleSplitSameServer(tab.id)}
                     onSplitNewServer={() => handleSplitNewServer(tab.id)}
@@ -1922,6 +2527,30 @@ export function MainWindow() {
       <SettingsDialog
         open={openDialog === "settings"}
         onClose={() => setOpenDialog(null)}
+        onSaved={(settings) => {
+          setShowMenuBar(settings.showMenuBar);
+          setShowTimestamps(settings.defaultCommandTimestampsEnabled);
+          setPromptHookEnabled(settings.defaultPromptHookEnabled !== false);
+        }}
+      />
+      <AiActionDialog
+        open={openDialog === "aiAction"}
+        action={pendingAiAction?.action ?? null}
+        selectedText={pendingAiAction?.selectedText ?? ""}
+        connectionDisplayName={pendingAiAction?.connectionDisplayName}
+        onClose={() => {
+          setOpenDialog(null);
+          setPendingAiAction(null);
+        }}
+        onManageProfiles={() => setOpenDialog("aiManager")}
+        onRun={createAiTab}
+      />
+      <AiManagerDialog
+        open={openDialog === "aiManager"}
+        onClose={() => {
+          void handleCloseAiManager();
+        }}
+        onOpenChat={handleOpenSavedAiChat}
       />
       <CredentialManager
         open={openDialog === "credentialManager"}
@@ -1958,6 +2587,10 @@ export function MainWindow() {
         open={openDialog === "importDialog"}
         onClose={() => setOpenDialog(null)}
       />
+      <ConnectionExportDialog
+        open={openDialog === "connectionExport"}
+        onClose={() => setOpenDialog(null)}
+      />
       <ThemeEditor
         open={openDialog === "terminalThemeEditor"}
         onClose={() => {
@@ -1975,7 +2608,65 @@ export function MainWindow() {
       <SFTPManager
         open={openDialog === "sftpManager"}
         onClose={() => setOpenDialog(null)}
-        sessionId={activeTab || ""}
+        sessionId={activeTerminalSessionId}
+      />
+      <ProjectPreviewDialog
+        open={openDialog === "projectPreview"}
+        project={projectPreview}
+        onClose={() => {
+          setOpenDialog(null);
+          setProjectPreview(null);
+        }}
+        onOpenProject={(autoReconnect) => {
+          if (!projectPreview) return;
+          void applyProjectToWorkspace(projectPreview, autoReconnect)
+            .then(() => {
+              setOpenDialog(null);
+              setProjectPreview(null);
+            })
+            .catch((error) => {
+              console.error("Failed to open project:", error);
+            });
+        }}
+      />
+      <ProjectSettingsDialog
+        open={openDialog === "projectSettings"}
+        project={projectSettingsDraft}
+        connectionCount={buildProjectSnapshot(projectSettingsDraft).connectionIds.length}
+        onClose={() => {
+          setOpenDialog(null);
+          setProjectSettingsDraft(null);
+        }}
+        onSave={(project) => {
+          const mode = projectSaveModeRef.current;
+          if (mode === "edit" && currentProject?.filePath) {
+            void saveProjectToPath(project, false)
+              .then(() => {
+                setOpenDialog(null);
+                setProjectSettingsDraft(null);
+              })
+              .catch((error) => {
+                console.error("Failed to update project settings:", error);
+              });
+            return;
+          }
+
+          if (mode === "edit") {
+            setCurrentProject(buildProjectSnapshot(project));
+            setOpenDialog(null);
+            setProjectSettingsDraft(null);
+            return;
+          }
+
+          void saveProjectToPath(project, mode === "saveAs")
+            .then(() => {
+              setOpenDialog(null);
+              setProjectSettingsDraft(null);
+            })
+            .catch((error) => {
+              console.error("Failed to save project:", error);
+            });
+        }}
       />
 
       {openDialog === "about" && (

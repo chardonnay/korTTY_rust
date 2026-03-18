@@ -3,6 +3,7 @@ import { createPortal } from "react-dom";
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelGroupHandle } from "react-resizable-panels";
 import { TerminalTab } from "./TerminalTab";
 import { Radio, X, ChevronRight, GripVertical } from "lucide-react";
+import type { AiAction } from "../../types/ai";
 
 // --- Split tree data model ---
 
@@ -177,6 +178,8 @@ interface ContextMenuState {
   x: number;
   y: number;
   leafId: string;
+  sessionId: string;
+  selectedText: string;
 }
 
 interface TerminalTheme {
@@ -203,6 +206,8 @@ interface TerminalSplitPaneProps {
   onToggleTimestamps: () => void;
   showTimestamps: boolean;
   onReconnect: (sessionId: string) => void;
+  onAiAction?: (sessionId: string, action: AiAction, selectedText: string) => void;
+  onClosePrimarySplit?: () => void;
   onCloseRequest?: () => void;
   onSplitSameServer: () => Promise<string | null>;
   onSplitNewServer: () => Promise<string | null>;
@@ -230,6 +235,8 @@ export function TerminalSplitPane({
   onToggleTimestamps,
   showTimestamps,
   onReconnect,
+  onAiAction,
+  onClosePrimarySplit,
   onCloseRequest,
   onSplitSameServer,
   onSplitNewServer,
@@ -437,10 +444,10 @@ export function TerminalSplitPane({
     };
   }, [removeSplit]);
 
-  const openContextMenu = useCallback((e: React.MouseEvent, leafId: string) => {
+  const openContextMenu = useCallback((e: React.MouseEvent, leafId: string, sessionId: string, selectedText = "") => {
     e.preventDefault();
     e.stopPropagation();
-    setContextMenu({ x: e.clientX, y: e.clientY, leafId });
+    setContextMenu({ x: e.clientX, y: e.clientY, leafId, sessionId, selectedText });
   }, []);
 
   useEffect(() => {
@@ -579,7 +586,7 @@ export function TerminalSplitPane({
       return (
         <div
           className="relative w-full h-full min-h-0 min-w-0 group overflow-hidden"
-          onContextMenu={(e) => openContextMenu(e, node.id)}
+          onContextMenu={(e) => openContextMenu(e, node.id, node.sessionId)}
           data-pane-session-id={node.sessionId}
         >
           <div
@@ -601,10 +608,16 @@ export function TerminalSplitPane({
             }}
             className="absolute inset-0 overflow-hidden"
           />
-          {allLeaves.length > 1 && node.id !== "primary" && !swapDrag && (
+          {allLeaves.length > 1 && !swapDrag && (
             <button
               className="absolute top-1 right-1 p-0.5 bg-kortty-surface/80 rounded opacity-0 group-hover:opacity-100 transition-opacity text-kortty-text-dim hover:text-kortty-error"
-              onClick={() => removeSplit(node.id)}
+              onClick={() => {
+                if (node.id === "primary") {
+                  onClosePrimarySplit?.();
+                  return;
+                }
+                removeSplit(node.id);
+              }}
             >
               <X className="w-3 h-3" />
             </button>
@@ -727,10 +740,12 @@ export function TerminalSplitPane({
             theme={theme}
             fontFamily={fontFamily}
             broadcastTargets={broadcast ? broadcastTargetsBySessionId[sessionId] : undefined}
-            onContextMenu={(e) => openContextMenu(e, leaf.id)}
+            onContextMenu={(e, selectedText) => openContextMenu(e, leaf.id, sessionId, selectedText)}
             onCloseRequest={
               leaf.id === "primary" && allLeaves.length <= 1
                 ? onCloseRequest
+                : leaf.id === "primary"
+                  ? onClosePrimarySplit
                 : leaf.id !== "primary"
                   ? () => removeSplit(leaf.id)
                   : undefined
@@ -747,6 +762,34 @@ export function TerminalSplitPane({
         >
           <CtxItem label="Copy" shortcut="Ctrl+C" onClick={() => menuAction(() => triggerTerminalAction("copy"))} />
           <CtxItem label="Paste" shortcut="Ctrl+V" onClick={() => menuAction(() => triggerTerminalAction("paste"))} />
+          {onAiAction && (
+            <>
+              <CtxSep />
+              <CtxSubMenu label="AI">
+                <CtxItem
+                  label="Summarize"
+                  disabled={!contextMenu.selectedText.trim()}
+                  onClick={() =>
+                    menuAction(() => onAiAction(contextMenu.sessionId, "Summarize", contextMenu.selectedText))
+                  }
+                />
+                <CtxItem
+                  label="Solve Problem"
+                  disabled={!contextMenu.selectedText.trim()}
+                  onClick={() =>
+                    menuAction(() => onAiAction(contextMenu.sessionId, "SolveProblem", contextMenu.selectedText))
+                  }
+                />
+                <CtxItem
+                  label="Ask..."
+                  disabled={!contextMenu.selectedText.trim()}
+                  onClick={() =>
+                    menuAction(() => onAiAction(contextMenu.sessionId, "Ask", contextMenu.selectedText))
+                  }
+                />
+              </CtxSubMenu>
+            </>
+          )}
           <CtxSep />
           <CtxSubMenu label="Split Horizontal">
             <CtxItem label="Same Server" onClick={() => handleSplit("horizontal", "same")} />
@@ -799,11 +842,26 @@ export function TerminalSplitPane({
   );
 }
 
-function CtxItem({ label, shortcut, onClick }: { label: string; shortcut?: string; onClick: () => void }) {
+function CtxItem({
+  label,
+  shortcut,
+  disabled = false,
+  onClick,
+}: {
+  label: string;
+  shortcut?: string;
+  disabled?: boolean;
+  onClick: () => void;
+}) {
   return (
     <button
-      className="w-full flex items-center justify-between px-3 py-1.5 text-xs text-kortty-text hover:bg-kortty-accent/10 hover:text-kortty-accent transition-colors"
-      onClick={onClick}
+      className={`w-full flex items-center justify-between px-3 py-1.5 text-xs transition-colors ${
+        disabled
+          ? "text-kortty-text-dim/60 cursor-not-allowed"
+          : "text-kortty-text hover:bg-kortty-accent/10 hover:text-kortty-accent"
+      }`}
+      onClick={disabled ? undefined : onClick}
+      disabled={disabled}
     >
       <span>{label}</span>
       {shortcut && <span className="text-kortty-text-dim ml-4 text-[10px]">{shortcut}</span>}
@@ -847,7 +905,7 @@ interface TerminalPortalProps {
   theme?: TerminalTheme;
   fontFamily?: string;
   broadcastTargets?: string[];
-  onContextMenu: (e: React.MouseEvent<HTMLDivElement>) => void;
+  onContextMenu: (e: React.MouseEvent<HTMLDivElement>, selectedText: string) => void;
   onCloseRequest?: () => void;
 }
 

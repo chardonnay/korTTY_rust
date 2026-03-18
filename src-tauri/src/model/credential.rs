@@ -1,21 +1,14 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum Environment {
-    Production,
-    Development,
-    Test,
-    Staging,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Credential {
     pub id: String,
     pub name: String,
     pub username: String,
     pub encrypted_password: Option<String>,
-    pub environment: Environment,
+    #[serde(default = "super::environment::default_environment_id")]
+    pub environment: String,
     pub server_pattern: Option<String>,
 }
 
@@ -26,7 +19,7 @@ impl Default for Credential {
             name: String::new(),
             username: String::new(),
             encrypted_password: None,
-            environment: Environment::Production,
+            environment: super::environment::default_environment_id(),
             server_pattern: None,
         }
     }

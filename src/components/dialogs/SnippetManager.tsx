@@ -69,6 +69,97 @@ interface SnippetManagerProps {
 
 const EXPORT_FORMATS = ["JSON", "XML", "YAML"] as const;
 
+function normalizeSnippetContent(rawContent: string): string {
+  const lines = rawContent.replace(/\r\n?/g, "\n").split("\n");
+
+  while (lines.length > 0 && lines[0].trim() === "") {
+    lines.shift();
+  }
+  while (lines.length > 0 && lines[lines.length - 1].trim() === "") {
+    lines.pop();
+  }
+
+  if (lines.length === 0) {
+    return "";
+  }
+
+  const commonIndent = lines.reduce((minIndent, line) => {
+    if (line.trim() === "") {
+      return minIndent;
+    }
+
+    const indent = line.match(/^[\t ]*/)?.[0].length ?? 0;
+    return Math.min(minIndent, indent);
+  }, Number.POSITIVE_INFINITY);
+
+  const indentToStrip = Number.isFinite(commonIndent) ? commonIndent : 0;
+  return lines
+    .map((line) => {
+      if (line.trim() === "") {
+        return "";
+      }
+
+      const leadingWhitespace = line.match(/^[\t ]*/)?.[0].length ?? 0;
+      return line.slice(Math.min(indentToStrip, leadingWhitespace));
+    })
+    .join("\n")
+    .trim();
+}
+
+function parseSnippetsXml(content: string): Snippet[] {
+  const parser = new DOMParser();
+  const document = parser.parseFromString(content, "application/xml");
+  if (document.querySelector("parsererror")) {
+    throw new Error("Invalid XML");
+  }
+
+  return Array.from(document.querySelectorAll("snippet")).map((element) => ({
+    id: element.getAttribute("id") || crypto.randomUUID(),
+    name: element.getAttribute("name") || "",
+    category: element.getAttribute("category") || undefined,
+    language: element.getAttribute("language") || "bash",
+    favorite: element.getAttribute("favorite") === "true",
+    content: normalizeSnippetContent(element.querySelector("content")?.textContent ?? ""),
+    variables: Array.from(element.querySelectorAll("variables > variable")).map((variable) => ({
+      name: variable.getAttribute("name") || "",
+      defaultValue: variable.getAttribute("defaultValue") || "",
+      description: variable.getAttribute("description") || undefined,
+    })),
+  }));
+}
+
+function escapeXml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function snippetsToXml(snippets: Snippet[]): string {
+  const body = snippets.map((snippet) => {
+    const variables = snippet.variables.map((variable) => (
+      `      <variable name="${escapeXml(variable.name)}" defaultValue="${escapeXml(variable.defaultValue)}"${
+        variable.description ? ` description="${escapeXml(variable.description)}"` : ""
+      } />`
+    )).join("\n");
+
+    return [
+      `  <snippet id="${escapeXml(snippet.id)}" name="${escapeXml(snippet.name)}"${
+        snippet.category ? ` category="${escapeXml(snippet.category)}"` : ""
+      }${snippet.language ? ` language="${escapeXml(snippet.language)}"` : ""} favorite="${snippet.favorite}">`,
+      `    <content>${escapeXml(snippet.content)}</content>`,
+      "    <variables>",
+      variables,
+      "    </variables>",
+      "  </snippet>",
+    ].filter(Boolean).join("\n");
+  }).join("\n");
+
+  return `<?xml version="1.0" encoding="UTF-8"?>\n<snippets>\n${body}\n</snippets>\n`;
+}
+
 function newSnippet(): Snippet {
   return {
     id: crypto.randomUUID(),
@@ -221,8 +312,7 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
           return;
         }
       } else {
-        setImportExportStatus("XML import not yet implemented");
-        return;
+        imported = parseSnippetsXml(content);
       }
       if (!Array.isArray(imported)) {
         setImportExportStatus("Invalid file format");
@@ -261,8 +351,7 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
           return;
         }
       } else {
-        setImportExportStatus("XML export not yet implemented");
-        return;
+        content = snippetsToXml(snippets);
       }
       await writeTextFile(path, content);
       setImportExportStatus(`Exported to ${path}`);

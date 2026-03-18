@@ -1,5 +1,7 @@
+pub mod ai;
 pub mod connection;
 pub mod credential;
+pub mod environment;
 pub mod gpg_key;
 pub mod gui_theme;
 pub mod project;

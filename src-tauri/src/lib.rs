@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod backup;
 pub mod commands;
 pub mod figlet;
@@ -36,10 +37,19 @@ pub fn run() {
             commands::ssh_commands::ssh_disconnect,
             commands::ssh_commands::ssh_send_input,
             commands::ssh_commands::ssh_resize,
+            commands::ai_commands::get_ai_profiles,
+            commands::ai_commands::save_ai_profile,
+            commands::ai_commands::delete_ai_profile,
+            commands::ai_commands::test_ai_profile,
+            commands::ai_commands::execute_ai_action,
+            commands::ai_commands::get_ai_chats,
+            commands::ai_commands::save_ai_chat,
+            commands::ai_commands::delete_ai_chat,
             commands::connection_commands::get_connections,
             commands::connection_commands::save_connection,
             commands::connection_commands::delete_connection,
             commands::connection_commands::get_connection_groups,
+            commands::connection_commands::export_connections_command,
             commands::teamwork_commands::sync_teamwork_now,
             commands::teamwork_commands::restore_teamwork_connection,
             commands::teamwork_commands::get_teamwork_connections,
@@ -49,6 +59,9 @@ pub fn run() {
             commands::credential_commands::get_credentials,
             commands::credential_commands::save_credential,
             commands::credential_commands::delete_credential,
+            commands::credential_commands::get_environments,
+            commands::credential_commands::save_environment,
+            commands::credential_commands::delete_environment,
             commands::key_commands::get_ssh_keys,
             commands::key_commands::save_ssh_key,
             commands::key_commands::delete_ssh_key,
@@ -70,6 +83,7 @@ pub fn run() {
             commands::sftp_commands::sftp_create_archive,
             commands::project_commands::save_project,
             commands::project_commands::load_project,
+            commands::project_commands::peek_project,
             commands::project_commands::get_recent_projects,
             commands::backup_commands::create_backup,
             commands::backup_commands::import_backup,

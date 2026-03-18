@@ -5,14 +5,21 @@ interface MenuBarProps {
   onCloseWindow: () => void;
   onNewTab: () => void;
   onCloseTab: () => void;
+  onOpenProject: () => void;
+  onSaveProject: () => void;
+  onSaveProjectAs: () => void;
+  onProjectSettings: () => void;
+  onToggleMenuBar: () => void;
   onToggleDashboard: () => void;
   onQuickConnect: () => void;
   onManageConnections: () => void;
   onImportConnections: () => void;
+  onExportConnections: () => void;
   onSettings: () => void;
   onManageCredentials: () => void;
   onManageSSHKeys: () => void;
   onManageGPGKeys: () => void;
+  onAiManager: () => void;
   onSnippets: () => void;
   onSFTPManager: () => void;
   onAsciiArt: () => void;
@@ -55,6 +62,11 @@ export function MenuBar(props: MenuBarProps) {
         { separator: true, label: "" },
         { label: "Quick Connect...", shortcut: "Ctrl+K", action: props.onQuickConnect },
         { separator: true, label: "" },
+        { label: "Open Project...", shortcut: "Ctrl+O", action: props.onOpenProject },
+        { label: "Save Project", shortcut: "Ctrl+S", action: props.onSaveProject },
+        { label: "Save Project As...", action: props.onSaveProjectAs },
+        { label: "Project Settings...", action: props.onProjectSettings },
+        { separator: true, label: "" },
         { label: "Settings...", action: props.onSettings },
         { separator: true, label: "" },
         { label: "Quit", shortcut: "Ctrl+Q", action: props.onQuit },
@@ -80,6 +92,7 @@ export function MenuBar(props: MenuBarProps) {
         { label: "Manage Connections...", action: props.onManageConnections },
         { separator: true, label: "" },
         { label: "Import...", action: props.onImportConnections },
+        { label: "Export...", action: props.onExportConnections },
         { separator: true, label: "" },
         { label: "Teamwork Settings...", action: props.onTeamworkSettings },
       ],
@@ -95,6 +108,8 @@ export function MenuBar(props: MenuBarProps) {
     {
       label: "Tools",
       items: [
+        { label: "AI Manager...", shortcut: "Ctrl+Shift+Y", action: props.onAiManager },
+        { separator: true, label: "" },
         { label: "Open SFTP Manager...", action: props.onSFTPManager },
         { label: "ASCII Art Banner...", action: props.onAsciiArt },
         { separator: true, label: "" },
@@ -105,6 +120,7 @@ export function MenuBar(props: MenuBarProps) {
       label: "View",
       items: [
         { label: "Toggle Dashboard", shortcut: "Ctrl+Shift+D", action: props.onToggleDashboard },
+        { label: "Toggle Menu Bar", shortcut: "Ctrl+Shift+L", action: props.onToggleMenuBar },
         { separator: true, label: "" },
         { label: "Fullscreen", shortcut: "F11", action: props.onFullscreen },
       ],

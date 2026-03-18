@@ -7,6 +7,7 @@ import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 interface SettingsDialogProps {
   open: boolean;
   onClose: () => void;
+  onSaved?: (settings: GlobalSettings) => void;
 }
 
 type TabId = "language" | "translation" | "backup" | "window" | "terminal";
@@ -31,7 +32,7 @@ const TRANSLATION_PROVIDERS = [
   { value: "Yandex", label: "Yandex" },
 ];
 
-export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
+export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) {
   const { width, height, onResizeStart } = useDialogGeometry("settings", 600, 500, 400, 300);
   const { settings, loadSettings, saveSettings } = useSettingsStore();
   const [activeTab, setActiveTab] = useState<TabId>("language");
@@ -61,6 +62,7 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
     setSaving(true);
     try {
       await saveSettings(local);
+      onSaved?.(local);
       onClose();
     } catch (err) {
       console.error(err);
@@ -292,6 +294,15 @@ export function SettingsDialog({ open, onClose }: SettingsDialogProps) {
 
           {activeTab === "window" && (
             <>
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={local.showMenuBar}
+                  onChange={(e) => update({ showMenuBar: e.target.checked })}
+                  className="rounded border-kortty-border"
+                />
+                Show in-window menu bar
+              </label>
               <label className="flex items-center gap-2 text-xs">
                 <input
                   type="checkbox"

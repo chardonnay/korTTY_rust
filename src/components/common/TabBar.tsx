@@ -1,14 +1,17 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { X, Plus, Terminal } from "lucide-react";
+import { Bot, X, Plus, Terminal } from "lucide-react";
+import type { AiRequestPayload, SavedAiChat } from "../../types/ai";
 
 export interface Tab {
   id: string;
+  kind?: "terminal" | "ai";
   label: string;
   status: "connected" | "connecting" | "disconnected";
   readOnlyMirror?: boolean;
   host?: string;
   port?: number;
   username?: string;
+  connectionId?: string;
   password?: string;
   authMethod?: "Password" | "PrivateKey";
   credentialId?: string;
@@ -20,6 +23,9 @@ export interface Tab {
   temporaryKeyPermanent?: boolean;
   connectionProtocol?: "TcpIp" | "Mosh";
   themeId?: string;
+  aiChatId?: string;
+  aiInitialRequest?: AiRequestPayload;
+  aiSavedChat?: SavedAiChat;
 }
 
 interface TabBarProps {
@@ -78,6 +84,9 @@ export function TabBar({
     setCtxMenu(null);
   }, []);
 
+  const contextTab = tabs.find((tab) => tab.id === ctxMenu?.tabId) ?? null;
+  const isAiContextTab = (contextTab?.kind ?? "terminal") === "ai";
+
   return (
     <div className="flex items-center h-9 bg-kortty-surface border-b border-kortty-border overflow-x-auto">
       <div className="flex items-center gap-0.5 px-1 min-w-0">
@@ -131,10 +140,16 @@ export function TabBar({
               setCtxMenu({ x: e.clientX, y: e.clientY, tabId: tab.id });
             }}
           >
-            <Terminal className="w-3.5 h-3.5 flex-shrink-0" />
-            <span
-              className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${statusColors[tab.status]}`}
-            />
+            {(tab.kind ?? "terminal") === "ai" ? (
+              <Bot className="w-3.5 h-3.5 flex-shrink-0" />
+            ) : (
+              <>
+                <Terminal className="w-3.5 h-3.5 flex-shrink-0" />
+                <span
+                  className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${statusColors[tab.status]}`}
+                />
+              </>
+            )}
             <span className="truncate">{tab.label}</span>
             <button
               className="ml-auto flex-shrink-0 opacity-0 group-hover:opacity-100 hover:text-kortty-error transition-opacity"
@@ -162,7 +177,7 @@ export function TabBar({
           className="fixed z-[100] bg-kortty-panel border border-kortty-border rounded-lg shadow-2xl py-1 min-w-[160px]"
           style={{ left: ctxMenu.x, top: ctxMenu.y }}
         >
-          {onDuplicateTab && (
+          {onDuplicateTab && !isAiContextTab && (
             <button
               className="w-full flex items-center px-3 py-1.5 text-xs text-kortty-text hover:bg-kortty-accent/10 hover:text-kortty-accent transition-colors"
               onClick={() => handleCtxAction(() => onDuplicateTab(ctxMenu.tabId))}
@@ -170,7 +185,7 @@ export function TabBar({
               Duplicate Tab
             </button>
           )}
-          {onReconnectTab && (() => {
+          {onReconnectTab && !isAiContextTab && (() => {
             const t = tabs.find((tab) => tab.id === ctxMenu.tabId);
             return t?.host ? (
               <button
@@ -181,7 +196,7 @@ export function TabBar({
               </button>
             ) : null;
           })()}
-          {otherWindows && otherWindows.length > 0 && (onMoveTabToWindow || onCopyTabToWindow) && (
+          {!isAiContextTab && otherWindows && otherWindows.length > 0 && (onMoveTabToWindow || onCopyTabToWindow) && (
             <>
               <div className="my-1 border-t border-kortty-border" />
               {onMoveTabToWindow && (

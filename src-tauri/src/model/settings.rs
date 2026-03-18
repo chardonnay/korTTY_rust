@@ -59,6 +59,8 @@ pub struct GlobalSettings {
     pub default_ssh_keepalive_interval: u32,
     pub default_connection_timeout: u32,
     pub default_retry_count: u32,
+    #[serde(default = "default_true")]
+    pub show_menu_bar: bool,
     pub store_window_geometry: bool,
     pub store_dashboard_state: bool,
     pub backup_encryption_type: BackupEncryptionType,
@@ -94,6 +96,7 @@ impl Default for GlobalSettings {
             default_ssh_keepalive_interval: 60,
             default_connection_timeout: 15,
             default_retry_count: 4,
+            show_menu_bar: true,
             store_window_geometry: true,
             store_dashboard_state: true,
             backup_encryption_type: BackupEncryptionType::Password,

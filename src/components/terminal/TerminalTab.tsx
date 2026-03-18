@@ -34,7 +34,7 @@ interface TerminalTabProps {
   scrollbackLines?: number;
   onCloseRequest?: () => void;
   broadcastTargets?: string[];
-  onContextMenu?: (e: MouseEvent<HTMLDivElement>) => void;
+  onContextMenu?: (e: MouseEvent<HTMLDivElement>, selectedText: string) => void;
 }
 
 type TimestampEntry = {
@@ -666,7 +666,7 @@ export function TerminalTab({
       <div
         ref={termRef}
         className="flex-1 min-h-0 min-w-0 overflow-hidden"
-        onContextMenu={onContextMenu}
+        onContextMenu={(event) => onContextMenu?.(event, xtermRef.current?.getSelection() ?? "")}
       />
     </div>
   );
