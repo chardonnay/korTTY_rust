@@ -15,7 +15,7 @@ interface ConnectionManagerProps {
 
 export function ConnectionManager({ open, onClose, onConnect, onEdit }: ConnectionManagerProps) {
   const { width, height, onResizeStart } = useDialogGeometry("connection-manager", 800, 600, 500, 400);
-  const { connections, groups, loadConnections, deleteConnection } = useConnectionStore();
+  const { connections, groups, loadConnections, saveConnection, deleteConnection } = useConnectionStore();
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [themes, setThemes] = useState<ThemeData[]>([]);
@@ -49,6 +49,27 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
   }
 
   const selected = connections.find((c) => c.id === selectedId);
+  const selectedTheme = selected?.themeId ? themes.find((theme) => theme.id === selected.themeId) : undefined;
+
+  async function handleThemeChange(connection: ConnectionSettings, themeId: string) {
+    const nextTheme = themes.find((theme) => theme.id === themeId);
+    const nextConnection: ConnectionSettings = nextTheme
+      ? {
+          ...connection,
+          themeId: nextTheme.id,
+          fontFamily: nextTheme.fontFamily,
+          fontSize: nextTheme.fontSize,
+          foregroundColor: nextTheme.foregroundColor,
+          backgroundColor: nextTheme.backgroundColor,
+          cursorColor: nextTheme.cursorColor,
+          ansiColors: [...nextTheme.ansiColors],
+        }
+      : {
+          ...connection,
+          themeId: undefined,
+        };
+    await saveConnection(nextConnection);
+  }
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -151,9 +172,7 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
                         style={{ backgroundColor: selected.backgroundColor }}
                       />
                       <p>
-                        {selected.themeId
-                          ? (themes.find((t) => t.id === selected.themeId)?.name ?? "Custom")
-                          : "Custom"}
+                        {selectedTheme?.name ?? (selected.themeId ? "Unknown theme" : "Custom colors")}
                       </p>
                     </div>
                   </div>
@@ -164,6 +183,50 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
                   <div>
                     <label className="text-kortty-text-dim">Source</label>
                     <p>{selected.connectionSource || "Local"}</p>
+                  </div>
+                </div>
+                <div className="rounded-lg border border-kortty-border bg-kortty-panel/40 p-3 space-y-2">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <label className="text-kortty-text-dim">Terminal Theme</label>
+                      <p className="text-[11px] text-kortty-text-dim">
+                        Applies the full palette, font, and cursor to new tabs opened from this connection.
+                      </p>
+                    </div>
+                    <select
+                      className="input-field max-w-[240px]"
+                      value={selected.themeId || ""}
+                      onChange={(event) => {
+                        void handleThemeChange(selected, event.target.value);
+                      }}
+                    >
+                      <option value="">Custom Colors</option>
+                      {themes.map((theme) => (
+                        <option key={theme.id} value={theme.id}>
+                          {theme.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2 text-[11px] text-kortty-text-dim">
+                    <span
+                      className="w-4 h-4 rounded border border-kortty-border"
+                      style={{ backgroundColor: selected.foregroundColor }}
+                      title="Foreground"
+                    />
+                    <span
+                      className="w-4 h-4 rounded border border-kortty-border"
+                      style={{ backgroundColor: selected.backgroundColor }}
+                      title="Background"
+                    />
+                    <span
+                      className="w-4 h-4 rounded border border-kortty-border"
+                      style={{ backgroundColor: selected.cursorColor }}
+                      title="Cursor"
+                    />
+                    <span className="truncate">
+                      {selectedTheme?.name ?? "Custom terminal colors"} · {selected.fontFamily}, {selected.fontSize}px
+                    </span>
                   </div>
                 </div>
               </div>

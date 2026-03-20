@@ -95,6 +95,13 @@ type DashboardConnectionEntry = {
   label: string;
   status: "connected" | "connecting" | "disconnected";
   config?: SessionConnectInfo;
+  themeId?: string;
+  fontFamily?: string;
+  fontSize?: number;
+  foregroundColor?: string;
+  backgroundColor?: string;
+  cursorColor?: string;
+  ansiColors?: string[];
 };
 
 type WindowStateSnapshot = {
@@ -131,6 +138,30 @@ type PendingAiAction = {
   selectedText: string;
   connectionDisplayName?: string;
 };
+
+type ActiveTabTransfer = {
+  tabId: string;
+  payload: CrossWindowTransferPayload;
+};
+
+type TransferConsumedPayload = {
+  kind: "tab" | "split";
+  tabId: string;
+  sessionId: string;
+  sourceWindowLabel: string;
+  acceptedByWindowLabel: string;
+};
+
+type TerminalAppearanceSnapshot = Pick<
+  Tab,
+  "themeId" | "fontFamily" | "fontSize" | "foregroundColor" | "backgroundColor" | "cursorColor" | "ansiColors"
+>;
+
+const CROSS_WINDOW_TRANSFER_MIME = "application/x-kortty-transfer";
+const CROSS_WINDOW_TRANSFER_URI_MIME = "text/uri-list";
+const CROSS_WINDOW_TRANSFER_PREFIX = "kortty-transfer:";
+const CROSS_WINDOW_TRANSFER_STORAGE_PREFIX = "kortty-transfer-payload:";
+const TERMINAL_FONT_FAMILY_FALLBACK = "JetBrains Mono, Cascadia Code, Fira Code, Menlo, monospace";
 
 function removeSessionFromTransferTree(
   node: SplitTreeTransferNode,
@@ -171,6 +202,111 @@ function buildAiTabLabel(action: AiAction) {
   }
 }
 
+function storeCrossWindowTransferPayload(payload: CrossWindowTransferPayload): string {
+  const now = Date.now();
+  for (let index = localStorage.length - 1; index >= 0; index -= 1) {
+    const key = localStorage.key(index);
+    if (!key?.startsWith(CROSS_WINDOW_TRANSFER_STORAGE_PREFIX)) {
+      continue;
+    }
+
+    try {
+      const parsed = JSON.parse(localStorage.getItem(key) ?? "null") as { createdAt?: number } | null;
+      if (!parsed?.createdAt || now - parsed.createdAt > 10 * 60 * 1000) {
+        localStorage.removeItem(key);
+      }
+    } catch {
+      localStorage.removeItem(key);
+    }
+  }
+
+  const transferId = crypto.randomUUID();
+  const storageKey = `${CROSS_WINDOW_TRANSFER_STORAGE_PREFIX}${transferId}`;
+  const serialized = JSON.stringify({
+    createdAt: now,
+    payload,
+  });
+  localStorage.setItem(storageKey, serialized);
+  return `${CROSS_WINDOW_TRANSFER_PREFIX}${transferId}`;
+}
+
+function readCrossWindowTransferPayload(token: string): CrossWindowTransferPayload | null {
+  if (!token.startsWith(CROSS_WINDOW_TRANSFER_PREFIX)) {
+    return null;
+  }
+
+  const transferId = token.slice(CROSS_WINDOW_TRANSFER_PREFIX.length);
+  if (!transferId) {
+    return null;
+  }
+
+  const storageKey = `${CROSS_WINDOW_TRANSFER_STORAGE_PREFIX}${transferId}`;
+  const raw = localStorage.getItem(storageKey);
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(raw) as { payload?: CrossWindowTransferPayload };
+    return parsed.payload ?? null;
+  } catch {
+    return null;
+  }
+}
+
+function clearCrossWindowTransferPayload(token: string): void {
+  if (!token.startsWith(CROSS_WINDOW_TRANSFER_PREFIX)) {
+    return;
+  }
+
+  const transferId = token.slice(CROSS_WINDOW_TRANSFER_PREFIX.length);
+  if (!transferId) {
+    return;
+  }
+
+  localStorage.removeItem(`${CROSS_WINDOW_TRANSFER_STORAGE_PREFIX}${transferId}`);
+}
+
+function buildFontFamilyStack(fontFamily?: string): string {
+  return fontFamily ? `${fontFamily}, ${TERMINAL_FONT_FAMILY_FALLBACK}` : TERMINAL_FONT_FAMILY_FALLBACK;
+}
+
+function copyAnsiColors(ansiColors?: string[]): string[] | undefined {
+  if (!ansiColors || ansiColors.length === 0) {
+    return undefined;
+  }
+  return [...ansiColors];
+}
+
+function buildTerminalAppearanceSnapshot(
+  appearance: Pick<
+    ConnectionSettings,
+    "themeId" | "fontFamily" | "fontSize" | "foregroundColor" | "backgroundColor" | "cursorColor" | "ansiColors"
+  >,
+): TerminalAppearanceSnapshot {
+  return {
+    themeId: appearance.themeId,
+    fontFamily: appearance.fontFamily,
+    fontSize: appearance.fontSize,
+    foregroundColor: appearance.foregroundColor,
+    backgroundColor: appearance.backgroundColor,
+    cursorColor: appearance.cursorColor,
+    ansiColors: copyAnsiColors(appearance.ansiColors),
+  };
+}
+
+function buildTerminalAppearanceFromTab(tab: Tab): TerminalAppearanceSnapshot {
+  return {
+    themeId: tab.themeId,
+    fontFamily: tab.fontFamily,
+    fontSize: tab.fontSize,
+    foregroundColor: tab.foregroundColor,
+    backgroundColor: tab.backgroundColor,
+    cursorColor: tab.cursorColor,
+    ansiColors: copyAnsiColors(tab.ansiColors),
+  };
+}
+
 export function MainWindow() {
   const currentWindowLabel = getCurrentWebviewWindow().label;
   const [tabs, setTabs] = useState<Tab[]>([]);
@@ -190,6 +326,8 @@ export function MainWindow() {
   const [showMenuBar, setShowMenuBar] = useState(true);
   const globalFontSizeRef = useRef(globalFontSize);
   globalFontSizeRef.current = globalFontSize;
+  const activeTabRef = useRef<string | null>(activeTab);
+  activeTabRef.current = activeTab;
   const focusedPaneSessionRef = useRef<string | null>(null);
   const { loadConnections } = useConnectionStore();
   const { currentProject, setCurrentProject, setRecentProjects, addRecentProject } = useProjectStore();
@@ -208,12 +346,15 @@ export function MainWindow() {
   const splitResolveRef = useRef<((sessionId: string | null) => void) | null>(null);
   const splitTabRef = useRef<string | null>(null);
   const projectSaveModeRef = useRef<"save" | "saveAs" | "edit">("save");
+  const activeTabTransferRef = useRef<ActiveTabTransfer | null>(null);
   const tabsRef = useRef<Tab[]>([]);
   const splitSessionsRef = useRef<Record<string, string[]>>({});
   const localSnapshotRef = useRef<WindowStateSnapshot | null>(null);
+  const localWindowSnapshotRef = useRef<WindowStateSnapshot | null>(null);
   const createSshSessionRef = useRef<(sessionId: string, info: SessionConnectInfo) => Promise<boolean>>(async () => false);
   const transferDropProcessedRef = useRef<Set<string>>(new Set());
   const processTransferPayloadRef = useRef<(payload: CrossWindowTransferPayload) => Promise<void>>(async () => {});
+  const pollingPendingTransferRef = useRef(false);
   const activeTabEntry = useMemo(
     () => tabs.find((tab) => tab.id === activeTab) ?? null,
     [tabs, activeTab],
@@ -227,9 +368,7 @@ export function MainWindow() {
     const payloadJson = JSON.stringify(payload);
     try {
       await invoke("store_pending_transfer", { targetLabel, payloadJson });
-    } catch {
-      // ignore store failure
-    }
+    } catch {}
     await emitTo(targetLabel, "kortty-transfer-drop", payload);
     for (let i = 0; i < 3; i++) {
       await new Promise((r) => setTimeout(r, 500));
@@ -286,24 +425,39 @@ export function MainWindow() {
   }), [activeTheme]);
 
   const defaultTerminalFontFamily = useMemo(
-    () => `${activeTheme.fontFamily}, JetBrains Mono, Cascadia Code, Fira Code, Menlo, monospace`,
+    () => buildFontFamilyStack(activeTheme.fontFamily),
     [activeTheme.fontFamily],
   );
 
   const getTabTheme = useCallback(
     (tab: Tab) => {
-      if (!tab.themeId) return { theme: defaultTerminalTheme, fontFamily: defaultTerminalFontFamily };
-      const t = allThemes.find((th) => th.id === tab.themeId);
-      if (!t) return { theme: defaultTerminalTheme, fontFamily: defaultTerminalFontFamily };
+      const selectedTheme = tab.themeId
+        ? allThemes.find((theme) => theme.id === tab.themeId)
+        : undefined;
+      if (selectedTheme) {
+        return {
+          theme: {
+            foreground: selectedTheme.foregroundColor,
+            background: selectedTheme.backgroundColor,
+            cursor: selectedTheme.cursorColor,
+            selectionBackground: selectedTheme.selectionColor + "80",
+            ansiColors: selectedTheme.ansiColors,
+          },
+          fontFamily: buildFontFamilyStack(selectedTheme.fontFamily),
+          fontSize: selectedTheme.fontSize,
+        };
+      }
+
       return {
         theme: {
-          foreground: t.foregroundColor,
-          background: t.backgroundColor,
-          cursor: t.cursorColor,
-          selectionBackground: t.selectionColor + "80",
-          ansiColors: t.ansiColors,
+          foreground: tab.foregroundColor ?? defaultTerminalTheme.foreground,
+          background: tab.backgroundColor ?? defaultTerminalTheme.background,
+          cursor: tab.cursorColor ?? defaultTerminalTheme.cursor,
+          selectionBackground: defaultTerminalTheme.selectionBackground,
+          ansiColors: copyAnsiColors(tab.ansiColors) ?? defaultTerminalTheme.ansiColors,
         },
-        fontFamily: `${t.fontFamily}, JetBrains Mono, Cascadia Code, Fira Code, Menlo, monospace`,
+        fontFamily: buildFontFamilyStack(tab.fontFamily) || defaultTerminalFontFamily,
+        fontSize: tab.fontSize ?? DEFAULT_FONT_SIZE,
       };
     },
     [allThemes, defaultTerminalTheme, defaultTerminalFontFamily],
@@ -334,6 +488,13 @@ export function MainWindow() {
             sk: tab.sshKeyId,
             pk: tab.privateKeyPath,
             cp: tab.connectionProtocol,
+            th: tab.themeId,
+            ff: tab.fontFamily,
+            fs: tab.fontSize,
+            fg: tab.foregroundColor,
+            bg: tab.backgroundColor,
+            cur: tab.cursorColor,
+            ansi: tab.ansiColors,
           })),
         s: tabSplitSessions,
         c: splitSessionConfigs,
@@ -373,6 +534,7 @@ export function MainWindow() {
         label: tab.label,
         status: tab.status,
         config: tabConfig,
+        ...buildTerminalAppearanceFromTab(tab),
       });
 
       const splitIds = tabSplitSessions[tab.id] || [];
@@ -397,6 +559,7 @@ export function MainWindow() {
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps -- key is content-based; tabs/splits/config read from closure when key changes
   }, [localWindowSnapshotKey]);
+  localWindowSnapshotRef.current = localWindowSnapshot;
 
   const workspaceWindowList = useMemo(
     () =>
@@ -492,7 +655,10 @@ export function MainWindow() {
 
     listen<{ requester: string }>("kortty-window-state-request", (event) => {
       if (event.payload.requester === currentWindowLabel) return;
-      const latest = localSnapshotRef.current ?? localWindowSnapshot;
+      const latest = localSnapshotRef.current ?? localWindowSnapshotRef.current;
+      if (!latest) {
+        return;
+      }
       emitTo(event.payload.requester, "kortty-window-state", {
         ...latest,
         updatedAt: Date.now(),
@@ -501,10 +667,13 @@ export function MainWindow() {
       offReq = fn;
     });
 
-    listen<{ kind: "tab" | "split"; tabId: string; sessionId: string }>(
+    listen<TransferConsumedPayload>(
       "kortty-transfer-consumed",
       (event) => {
         const payload = event.payload;
+        if (payload.sourceWindowLabel !== currentWindowLabel) {
+          return;
+        }
         if (payload.kind === "tab") {
           // Move only removes local UI ownership; session stays alive for target window.
           const splitSessions = splitSessionsRef.current[payload.tabId] || [];
@@ -532,7 +701,7 @@ export function MainWindow() {
           });
           setTabs((prev) => {
             const remaining = prev.filter((t) => t.id !== payload.tabId);
-            if (activeTab === payload.tabId) {
+            if (activeTabRef.current === payload.tabId) {
               setActiveTab(remaining.length > 0 ? remaining[remaining.length - 1].id : null);
             }
             return remaining;
@@ -562,7 +731,7 @@ export function MainWindow() {
       offTransferConsumed?.();
       offFocusConnection?.();
     };
-  }, [currentWindowLabel, localWindowSnapshot, activeTab]);
+  }, [currentWindowLabel]);
 
   useEffect(() => {
     let offTransferDrop: (() => void) | null = null;
@@ -594,6 +763,57 @@ export function MainWindow() {
       }
     }, 150);
     return () => clearTimeout(timer);
+  }, [currentWindowLabel]);
+
+  useEffect(() => {
+    let disposed = false;
+
+    const pollPendingTransfer = async () => {
+      if (disposed || pollingPendingTransferRef.current) {
+        return;
+      }
+
+      pollingPendingTransferRef.current = true;
+      try {
+        const raw = await invoke<string | null>("take_pending_transfer", {
+          windowLabel: currentWindowLabel,
+        });
+        if (!raw) {
+          return;
+        }
+
+        const payload = JSON.parse(raw) as CrossWindowTransferPayload;
+        if (payload.sourceWindowLabel === currentWindowLabel) {
+          return;
+        }
+
+        await processTransferPayloadRef.current(payload);
+      } catch {
+        // ignore polling failures
+      } finally {
+        pollingPendingTransferRef.current = false;
+      }
+    };
+
+    const interval = window.setInterval(() => {
+      void pollPendingTransfer();
+    }, 750);
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        void pollPendingTransfer();
+      }
+    };
+
+    window.addEventListener("focus", onVisibilityChange);
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    return () => {
+      disposed = true;
+      window.clearInterval(interval);
+      window.removeEventListener("focus", onVisibilityChange);
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+    };
   }, [currentWindowLabel]);
 
   const createSshSession = useCallback(
@@ -654,12 +874,18 @@ export function MainWindow() {
 
   const processTransferPayload = useCallback(
     async (payload: CrossWindowTransferPayload) => {
-      if (payload.sourceWindowLabel === currentWindowLabel) return;
+      if (payload.sourceWindowLabel === currentWindowLabel) {
+        return;
+      }
       const cfg = payload.entry.config;
-      if (!cfg) return;
+      if (!cfg) {
+        return;
+      }
 
       const dropKey = `${payload.sourceWindowLabel}:${payload.entry.tabId}:${payload.entry.sessionId}`;
-      if (transferDropProcessedRef.current.has(dropKey)) return;
+      if (transferDropProcessedRef.current.has(dropKey)) {
+        return;
+      }
       transferDropProcessedRef.current.add(dropKey);
       setTimeout(() => transferDropProcessedRef.current.delete(dropKey), 5000);
 
@@ -671,6 +897,8 @@ export function MainWindow() {
             kind: payload.entry.kind,
             tabId: payload.entry.tabId,
             sessionId: payload.entry.sessionId,
+            sourceWindowLabel: payload.sourceWindowLabel,
+            acceptedByWindowLabel: currentWindowLabel,
           });
         }
         return;
@@ -695,6 +923,13 @@ export function MainWindow() {
         temporaryKeyExpirationMinutes: cfg.temporaryKeyExpirationMinutes,
         temporaryKeyPermanent: cfg.temporaryKeyPermanent,
         connectionProtocol: cfg.connectionProtocol,
+        themeId: payload.entry.themeId,
+        fontFamily: payload.entry.fontFamily,
+        fontSize: payload.entry.fontSize,
+        foregroundColor: payload.entry.foregroundColor,
+        backgroundColor: payload.entry.backgroundColor,
+        cursorColor: payload.entry.cursorColor,
+        ansiColors: copyAnsiColors(payload.entry.ansiColors),
       };
       setTabs((prev) => [...prev, newTab]);
       setActiveTab(reusedTabId);
@@ -724,6 +959,8 @@ export function MainWindow() {
           kind: payload.entry.kind,
           tabId: payload.entry.tabId,
           sessionId: payload.entry.sessionId,
+          sourceWindowLabel: payload.sourceWindowLabel,
+          acceptedByWindowLabel: currentWindowLabel,
         });
       }
     },
@@ -857,7 +1094,7 @@ export function MainWindow() {
         temporaryKeyExpirationMinutes: conn.temporaryKeyExpirationMinutes,
         temporaryKeyPermanent: conn.temporaryKeyPermanent,
         connectionProtocol: conn.connectionProtocol || "TcpIp",
-        themeId: conn.themeId,
+        ...buildTerminalAppearanceSnapshot(conn),
       };
       setTabs((prev) => [...prev, newTab]);
       setActiveTab(id);
@@ -1000,7 +1237,7 @@ export function MainWindow() {
         temporaryKeyExpirationMinutes: connection.temporaryKeyExpirationMinutes,
         temporaryKeyPermanent: connection.temporaryKeyPermanent,
         connectionProtocol: connection.connectionProtocol || "TcpIp",
-        themeId: connection.themeId,
+        ...buildTerminalAppearanceSnapshot(connection),
       }));
 
       setTabs(restoredTabs);
@@ -1173,7 +1410,7 @@ export function MainWindow() {
         temporaryKeyExpirationMinutes: source.temporaryKeyExpirationMinutes,
         temporaryKeyPermanent: source.temporaryKeyPermanent,
         connectionProtocol: source.connectionProtocol,
-        themeId: source.themeId,
+        ...buildTerminalAppearanceFromTab(source),
       };
       setTabs((prev) => [...prev, newTab]);
       setActiveTab(id);
@@ -1588,6 +1825,46 @@ export function MainWindow() {
     }
   }, [currentWindowLabel]);
 
+  const findWindowLabelAtScreenPoint = useCallback(
+    async (screenX: number, screenY: number) => {
+      if (!Number.isFinite(screenX) || !Number.isFinite(screenY)) {
+        return null;
+      }
+
+      const windows = await getAllWebviewWindows();
+      for (const win of windows) {
+        if (win.label === currentWindowLabel) {
+          continue;
+        }
+
+        try {
+          const [position, size, scaleFactor] = await Promise.all([
+            win.outerPosition(),
+            win.outerSize(),
+            win.scaleFactor(),
+          ]);
+          const logicalPosition = position.toLogical(scaleFactor);
+          const logicalSize = size.toLogical(scaleFactor);
+          const isWithinHorizontalBounds =
+            screenX >= logicalPosition.x &&
+            screenX <= logicalPosition.x + logicalSize.width;
+          const isWithinVerticalBounds =
+            screenY >= logicalPosition.y &&
+            screenY <= logicalPosition.y + logicalSize.height;
+
+          if (isWithinHorizontalBounds && isWithinVerticalBounds) {
+            return win.label;
+          }
+        } catch (error) {
+          console.error("Failed to inspect target window geometry:", error);
+        }
+      }
+
+      return null;
+    },
+    [currentWindowLabel],
+  );
+
   const handleDashboardDragStart = useCallback(
     (
       entry: DashboardConnectionEntry,
@@ -1643,6 +1920,7 @@ export function MainWindow() {
         label: tab.label,
         status: tab.status,
         config,
+        ...buildTerminalAppearanceFromTab(tab),
       };
       const splitTree = tabSplitTrees[tab.id];
       const order = splitTree ? getLeavesInOrder(splitTree) : [tab.id, ...(tabSplitSessions[tab.id] || [])];
@@ -1659,17 +1937,42 @@ export function MainWindow() {
         splitEntries: splitEntries.length > 0 ? splitEntries : undefined,
         splitTree: splitTree ?? undefined,
       };
+      activeTabTransferRef.current = {
+        tabId: tab.id,
+        payload,
+      };
+      const transferToken = storeCrossWindowTransferPayload(payload);
       e.dataTransfer.effectAllowed = "copyMove";
-      e.dataTransfer.setData("application/x-kortty-transfer", JSON.stringify(payload));
-      e.dataTransfer.setData("text/plain", tab.id);
-      setShowDashboard(true);
+      e.dataTransfer.setData(CROSS_WINDOW_TRANSFER_MIME, JSON.stringify(payload));
+      e.dataTransfer.setData(CROSS_WINDOW_TRANSFER_URI_MIME, transferToken);
+      e.dataTransfer.setData("text/plain", transferToken);
     },
     [currentWindowLabel, tabSplitSessions, splitSessionConfigs, tabSplitTrees],
   );
 
-  const handleTabTransferDragEnd = useCallback(() => {
-    setDragOverWindowLabel(null);
-  }, []);
+  const handleTabTransferDragEnd = useCallback(
+    async (tab: Tab, e: React.DragEvent<HTMLDivElement>) => {
+      setDragOverWindowLabel(null);
+
+      const activeTransfer = activeTabTransferRef.current;
+      activeTabTransferRef.current = null;
+
+      if (!activeTransfer || activeTransfer.tabId !== tab.id) {
+        return;
+      }
+
+      const targetWindowLabel = await findWindowLabelAtScreenPoint(e.screenX, e.screenY);
+      if (!targetWindowLabel) {
+        return;
+      }
+
+      await emitTransferWithRetry(targetWindowLabel, {
+        ...activeTransfer.payload,
+        copyMode: e.altKey,
+      });
+    },
+    [findWindowLabelAtScreenPoint],
+  );
 
   const handleMoveTabToWindow = useCallback(
     async (tabId: string, targetWindowLabel: string) => {
@@ -1701,6 +2004,7 @@ export function MainWindow() {
         label: tab.label,
         status: tab.status,
         config,
+        ...buildTerminalAppearanceFromTab(tab),
       };
       if (!config) return;
       const splitTree = tabSplitTrees[tabId];
@@ -1753,6 +2057,7 @@ export function MainWindow() {
         label: tab.label,
         status: tab.status,
         config,
+        ...buildTerminalAppearanceFromTab(tab),
       };
       if (!config) return;
       const splitTree = tabSplitTrees[tabId];
@@ -1778,7 +2083,12 @@ export function MainWindow() {
 
   const handleWindowDragOver = useCallback(
     (targetWindowLabel: string, e: React.DragEvent<HTMLDivElement>) => {
-      if (!Array.from(e.dataTransfer.types).includes("application/x-kortty-transfer")) {
+      const dataTypes = Array.from(e.dataTransfer.types);
+      if (
+        !dataTypes.includes(CROSS_WINDOW_TRANSFER_MIME) &&
+        !dataTypes.includes(CROSS_WINDOW_TRANSFER_URI_MIME) &&
+        !dataTypes.includes("text/plain")
+      ) {
         return;
       }
       e.preventDefault();
@@ -1803,19 +2113,34 @@ export function MainWindow() {
       setDragOverWindowLabel(null);
       e.preventDefault();
       e.stopPropagation();
-      const raw = e.dataTransfer.getData("application/x-kortty-transfer");
-      if (!raw) return;
       let payload: CrossWindowTransferPayload;
-      try {
-        payload = JSON.parse(raw) as CrossWindowTransferPayload;
-      } catch {
-        return;
+      const rawCustom = e.dataTransfer.getData(CROSS_WINDOW_TRANSFER_MIME);
+      const rawUri = e.dataTransfer.getData(CROSS_WINDOW_TRANSFER_URI_MIME);
+      const rawPlainText = e.dataTransfer.getData("text/plain");
+
+      if (rawCustom) {
+        try {
+          payload = JSON.parse(rawCustom) as CrossWindowTransferPayload;
+        } catch {
+          return;
+        }
+      } else {
+        const transferToken = rawUri || rawPlainText;
+        const storedPayload = transferToken ? readCrossWindowTransferPayload(transferToken) : null;
+        if (!storedPayload) {
+          return;
+        }
+        payload = storedPayload;
       }
       const cfg = payload.entry.config;
-      if (!cfg) return;
+      if (!cfg) {
+        return;
+      }
 
       const transferKey = `${payload.sourceWindowLabel}:${payload.entry.tabId}:${payload.entry.sessionId}:${targetWindowLabel}`;
-      if (lastProcessedTransferKey.current === transferKey) return;
+      if (lastProcessedTransferKey.current === transferKey) {
+        return;
+      }
       lastProcessedTransferKey.current = transferKey;
       setTimeout(() => {
         lastProcessedTransferKey.current = null;
@@ -1824,15 +2149,23 @@ export function MainWindow() {
       if (targetWindowLabel !== currentWindowLabel) {
         const payloadToSend = { ...payload, copyMode: e.altKey };
         await emitTransferWithRetry(targetWindowLabel, payloadToSend);
+        if (rawUri || rawPlainText) {
+          clearCrossWindowTransferPayload(rawUri || rawPlainText);
+        }
         return;
       }
 
-      if (payload.sourceWindowLabel === currentWindowLabel) return;
+      if (payload.sourceWindowLabel === currentWindowLabel) {
+        return;
+      }
 
       await processTransferPayloadRef.current({
         ...payload,
         copyMode: e.altKey || payload.copyMode,
       });
+      if (rawUri || rawPlainText) {
+        clearCrossWindowTransferPayload(rawUri || rawPlainText);
+      }
     },
     [currentWindowLabel],
   );
@@ -1846,7 +2179,12 @@ export function MainWindow() {
 
   const handleWindowRootDragLeave = useCallback(
     (e: React.DragEvent<HTMLDivElement>) => {
-      if (!Array.from(e.dataTransfer.types).includes("application/x-kortty-transfer")) {
+      const dataTypes = Array.from(e.dataTransfer.types);
+      if (
+        !dataTypes.includes(CROSS_WINDOW_TRANSFER_MIME) &&
+        !dataTypes.includes(CROSS_WINDOW_TRANSFER_URI_MIME) &&
+        !dataTypes.includes("text/plain")
+      ) {
         return;
       }
       handleWindowDragLeave(e);
@@ -1856,12 +2194,28 @@ export function MainWindow() {
 
   const handleWindowRootDrop = useCallback(
     async (e: React.DragEvent<HTMLDivElement>) => {
-      if (!Array.from(e.dataTransfer.types).includes("application/x-kortty-transfer")) {
+      const dataTypes = Array.from(e.dataTransfer.types);
+      if (
+        !dataTypes.includes(CROSS_WINDOW_TRANSFER_MIME) &&
+        !dataTypes.includes(CROSS_WINDOW_TRANSFER_URI_MIME) &&
+        !dataTypes.includes("text/plain")
+      ) {
         return;
       }
       await handleWindowDrop(currentWindowLabel, e);
     },
     [currentWindowLabel, handleWindowDrop],
+  );
+
+  const getConfiguredFontSizeForTab = useCallback(
+    (tabId: string) => {
+      const tab = tabs.find((entry) => entry.id === tabId);
+      if (!tab) {
+        return globalFontSizeRef.current;
+      }
+      return getTabTheme(tab).fontSize ?? globalFontSizeRef.current;
+    },
+    [getTabTheme, tabs],
   );
 
   useEffect(() => {
@@ -1873,12 +2227,13 @@ export function MainWindow() {
     const hasMultiplePanes = (tabSplitSessions[activeTab]?.length ?? 0) > 0;
     const focusedSession = focusedPaneSessionRef.current;
     const paneKey = focusedSession ? `${activeTab}:${focusedSession}` : null;
+    const configuredFontSize = getConfiguredFontSizeForTab(activeTab);
     if (paneKey) {
       setPaneFontSizes((prev) => ({
         ...prev,
         [paneKey]: Math.min(
           MAX_FONT_SIZE,
-          (prev[paneKey] ?? tabFontSizes[activeTab] ?? globalFontSizeRef.current) + 1
+          (prev[paneKey] ?? tabFontSizes[activeTab] ?? configuredFontSize) + 1
         ),
       }));
     } else if (!hasMultiplePanes) {
@@ -1886,23 +2241,24 @@ export function MainWindow() {
         ...prev,
         [activeTab]: Math.min(
           MAX_FONT_SIZE,
-          (prev[activeTab] ?? globalFontSizeRef.current) + 1
+          (prev[activeTab] ?? configuredFontSize) + 1
         ),
       }));
     }
-  }, [activeTab, tabFontSizes, tabSplitSessions]);
+  }, [activeTab, getConfiguredFontSizeForTab, tabFontSizes, tabSplitSessions]);
 
   const zoomOut = useCallback(() => {
     if (!activeTab) return;
     const hasMultiplePanes = (tabSplitSessions[activeTab]?.length ?? 0) > 0;
     const focusedSession = focusedPaneSessionRef.current;
     const paneKey = focusedSession ? `${activeTab}:${focusedSession}` : null;
+    const configuredFontSize = getConfiguredFontSizeForTab(activeTab);
     if (paneKey) {
       setPaneFontSizes((prev) => ({
         ...prev,
         [paneKey]: Math.max(
           MIN_FONT_SIZE,
-          (prev[paneKey] ?? tabFontSizes[activeTab] ?? globalFontSizeRef.current) - 1
+          (prev[paneKey] ?? tabFontSizes[activeTab] ?? configuredFontSize) - 1
         ),
       }));
     } else if (!hasMultiplePanes) {
@@ -1910,11 +2266,11 @@ export function MainWindow() {
         ...prev,
         [activeTab]: Math.max(
           MIN_FONT_SIZE,
-          (prev[activeTab] ?? globalFontSizeRef.current) - 1
+          (prev[activeTab] ?? configuredFontSize) - 1
         ),
       }));
     }
-  }, [activeTab, tabFontSizes, tabSplitSessions]);
+  }, [activeTab, getConfiguredFontSizeForTab, tabFontSizes, tabSplitSessions]);
 
   const resetZoom = useCallback(() => {
     if (!activeTab) return;
@@ -1938,11 +2294,12 @@ export function MainWindow() {
 
   const zoomAllInTabIn = useCallback(() => {
     if (!activeTab) return;
+    const configuredFontSize = getConfiguredFontSizeForTab(activeTab);
     setTabFontSizes((prev) => ({
       ...prev,
       [activeTab]: Math.min(
         MAX_FONT_SIZE,
-        (prev[activeTab] ?? globalFontSizeRef.current) + 1
+        (prev[activeTab] ?? configuredFontSize) + 1
       ),
     }));
     setPaneFontSizes((prev) => {
@@ -1953,15 +2310,16 @@ export function MainWindow() {
       }
       return next;
     });
-  }, [activeTab]);
+  }, [activeTab, getConfiguredFontSizeForTab]);
 
   const zoomAllInTabOut = useCallback(() => {
     if (!activeTab) return;
+    const configuredFontSize = getConfiguredFontSizeForTab(activeTab);
     setTabFontSizes((prev) => ({
       ...prev,
       [activeTab]: Math.max(
         MIN_FONT_SIZE,
-        (prev[activeTab] ?? globalFontSizeRef.current) - 1
+        (prev[activeTab] ?? configuredFontSize) - 1
       ),
     }));
     setPaneFontSizes((prev) => {
@@ -1972,7 +2330,7 @@ export function MainWindow() {
       }
       return next;
     });
-  }, [activeTab]);
+  }, [activeTab, getConfiguredFontSizeForTab]);
 
   const resetZoomAllInTab = useCallback(() => {
     if (!activeTab) return;
@@ -2413,13 +2771,17 @@ export function MainWindow() {
             {dragOverWindowLabel === currentWindowLabel && (
               <div className="pointer-events-none absolute inset-0 z-40 border-2 border-dashed border-kortty-accent bg-kortty-accent/5" />
             )}
-            {tabs.map((tab) => (
-              <div
-                key={tab.id}
-                className="absolute inset-0"
-                style={{ display: tab.id === activeTab ? "block" : "none" }}
-              >
-                {(tab.kind ?? "terminal") === "ai" ? (
+            {tabs.map((tab) => {
+              const terminalAppearance = getTabTheme(tab);
+              const baseFontSize = tabFontSizes[tab.id] ?? terminalAppearance.fontSize ?? globalFontSize;
+
+              return (
+                <div
+                  key={tab.id}
+                  className="absolute inset-0"
+                  style={{ display: tab.id === activeTab ? "block" : "none" }}
+                >
+                  {(tab.kind ?? "terminal") === "ai" ? (
                   <AiChatTab
                     tabId={tab.id}
                     initialRequest={tab.aiInitialRequest}
@@ -2435,89 +2797,93 @@ export function MainWindow() {
                       );
                     }}
                   />
-                ) : tab.status === "connected" ? (
-                  <TerminalSplitPane
-                    primarySessionId={tab.id}
-                    connected={true}
-                    readOnly={!!tab.readOnlyMirror}
-                    promptHookEnabled={promptHookEnabled}
-                    initialSplitSessionIds={tabInitialSplitTree[tab.id] ? undefined : tabSplitSessions[tab.id]}
-                    initialTree={tabInitialSplitTree[tab.id]}
-                    onTreeChange={(tree) => setTabSplitTrees((prev) => ({ ...prev, [tab.id]: serializeSplitTree(tree) }))}
-                    fontSize={tabFontSizes[tab.id] ?? globalFontSize}
-                    getFontSizeForSession={(sessionId) =>
-                      paneFontSizes[`${tab.id}:${sessionId}`] ??
-                      tabFontSizes[tab.id] ??
-                      globalFontSize
-                    }
-                    onFocusSession={(sessionId) => {
-                      focusedPaneSessionRef.current = sessionId;
-                    }}
-                    onZoomIn={(sessionId) => {
-                      const key = `${tab.id}:${sessionId}`;
-                      const base = tabFontSizes[tab.id] ?? globalFontSizeRef.current;
-                      setPaneFontSizes((prev) => ({
-                        ...prev,
-                        [key]: Math.min(MAX_FONT_SIZE, (prev[key] ?? base) + 1),
-                      }));
-                    }}
-                    onZoomOut={(sessionId) => {
-                      const key = `${tab.id}:${sessionId}`;
-                      const base = tabFontSizes[tab.id] ?? globalFontSizeRef.current;
-                      setPaneFontSizes((prev) => ({
-                        ...prev,
-                        [key]: Math.max(MIN_FONT_SIZE, (prev[key] ?? base) - 1),
-                      }));
-                    }}
-                    onResetZoom={(sessionId) => {
-                      setPaneFontSizes((prev) => {
-                        const next = { ...prev };
-                        delete next[`${tab.id}:${sessionId}`];
-                        return next;
-                      });
-                    }}
-                    onToggleTimestamps={() => setShowTimestamps((s) => !s)}
-                    showTimestamps={showTimestamps}
-                    onReconnect={(sessionId) => handleReconnect(sessionId)}
-                    onClosePrimarySplit={() => {
-                      void handleClosePrimarySplit(tab.id);
-                    }}
-                    onAiAction={(sessionId, action, selectedText) => {
-                      const splitConfig = splitSessionConfigs[sessionId];
-                      const connectionDisplayName =
-                        sessionId === tab.id
-                          ? tab.label
-                          : splitConfig
-                            ? `${splitConfig.username}@${splitConfig.host}`
-                            : tab.label;
-                      void handleRequestAiAction({
-                        action,
-                        sessionId,
-                        selectedText,
-                        connectionDisplayName,
-                      });
-                    }}
-                    onCloseRequest={() => closeTab(tab.id)}
-                    onSplitSameServer={() => handleSplitSameServer(tab.id)}
-                    onSplitNewServer={() => handleSplitNewServer(tab.id)}
-                    onDisconnectSplitSession={(sessionId) => handleDisconnectSplitSession(tab.id, sessionId)}
-                  />
-                ) : (
-                  <div className="w-full h-full flex items-center justify-center">
-                    <div className="text-center text-kortty-text-dim text-sm">
-                      {tab.status === "connecting" ? (
-                        <div className="flex items-center gap-2">
-                          <div className="animate-spin w-4 h-4 border-2 border-kortty-accent border-t-transparent rounded-full" />
-                          Connecting...
-                        </div>
-                      ) : (
-                        <p>Not connected. Use the connection manager to connect.</p>
-                      )}
+                  ) : tab.status === "connected" ? (
+                    <TerminalSplitPane
+                      primarySessionId={tab.id}
+                      connected={true}
+                      readOnly={!!tab.readOnlyMirror}
+                      promptHookEnabled={promptHookEnabled}
+                      initialSplitSessionIds={tabInitialSplitTree[tab.id] ? undefined : tabSplitSessions[tab.id]}
+                      initialTree={tabInitialSplitTree[tab.id]}
+                      onTreeChange={(tree) => setTabSplitTrees((prev) => ({ ...prev, [tab.id]: serializeSplitTree(tree) }))}
+                      theme={terminalAppearance.theme}
+                      fontFamily={terminalAppearance.fontFamily}
+                      fontSize={baseFontSize}
+                      getFontSizeForSession={(sessionId) =>
+                        paneFontSizes[`${tab.id}:${sessionId}`] ??
+                        tabFontSizes[tab.id] ??
+                        terminalAppearance.fontSize ??
+                        globalFontSize
+                      }
+                      onFocusSession={(sessionId) => {
+                        focusedPaneSessionRef.current = sessionId;
+                      }}
+                      onZoomIn={(sessionId) => {
+                        const key = `${tab.id}:${sessionId}`;
+                        const base = tabFontSizes[tab.id] ?? terminalAppearance.fontSize ?? globalFontSizeRef.current;
+                        setPaneFontSizes((prev) => ({
+                          ...prev,
+                          [key]: Math.min(MAX_FONT_SIZE, (prev[key] ?? base) + 1),
+                        }));
+                      }}
+                      onZoomOut={(sessionId) => {
+                        const key = `${tab.id}:${sessionId}`;
+                        const base = tabFontSizes[tab.id] ?? terminalAppearance.fontSize ?? globalFontSizeRef.current;
+                        setPaneFontSizes((prev) => ({
+                          ...prev,
+                          [key]: Math.max(MIN_FONT_SIZE, (prev[key] ?? base) - 1),
+                        }));
+                      }}
+                      onResetZoom={(sessionId) => {
+                        setPaneFontSizes((prev) => {
+                          const next = { ...prev };
+                          delete next[`${tab.id}:${sessionId}`];
+                          return next;
+                        });
+                      }}
+                      onToggleTimestamps={() => setShowTimestamps((s) => !s)}
+                      showTimestamps={showTimestamps}
+                      onReconnect={(sessionId) => handleReconnect(sessionId)}
+                      onClosePrimarySplit={() => {
+                        void handleClosePrimarySplit(tab.id);
+                      }}
+                      onAiAction={(sessionId, action, selectedText) => {
+                        const splitConfig = splitSessionConfigs[sessionId];
+                        const connectionDisplayName =
+                          sessionId === tab.id
+                            ? tab.label
+                            : splitConfig
+                              ? `${splitConfig.username}@${splitConfig.host}`
+                              : tab.label;
+                        void handleRequestAiAction({
+                          action,
+                          sessionId,
+                          selectedText,
+                          connectionDisplayName,
+                        });
+                      }}
+                      onCloseRequest={() => closeTab(tab.id)}
+                      onSplitSameServer={() => handleSplitSameServer(tab.id)}
+                      onSplitNewServer={() => handleSplitNewServer(tab.id)}
+                      onDisconnectSplitSession={(sessionId) => handleDisconnectSplitSession(tab.id, sessionId)}
+                    />
+                  ) : (
+                    <div className="w-full h-full flex items-center justify-center">
+                      <div className="text-center text-kortty-text-dim text-sm">
+                        {tab.status === "connecting" ? (
+                          <div className="flex items-center gap-2">
+                            <div className="animate-spin w-4 h-4 border-2 border-kortty-accent border-t-transparent rounded-full" />
+                            Connecting...
+                          </div>
+                        ) : (
+                          <p>Not connected. Use the connection manager to connect.</p>
+                        )}
+                      </div>
                     </div>
-                  </div>
-                )}
-              </div>
-            ))}
+                  )}
+                </div>
+              );
+            })}
             {tabs.length === 0 && (
               <div className="w-full h-full flex items-center justify-center">
                 <div className="text-center text-kortty-text-dim">
@@ -2735,7 +3101,7 @@ export function MainWindow() {
                 <p className="text-kortty-text-dim">Built with Tauri + React + Rust</p>
               </div>
               <div className="mt-6 text-center text-[11px] text-kortty-text-dim space-y-0.5">
-                <p>&copy; 2024-2026 General Kor</p>
+                <p>&copy; 2024-2026 Daniel Mengel</p>
                 <a
                   href="https://github.com/chardonnay/korTTY_rust"
                   target="_blank"

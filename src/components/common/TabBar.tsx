@@ -2,6 +2,8 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import { Bot, X, Plus, Terminal } from "lucide-react";
 import type { AiRequestPayload, SavedAiChat } from "../../types/ai";
 
+const TAB_REORDER_MIME = "application/x-kortty-tab-reorder-id";
+
 export interface Tab {
   id: string;
   kind?: "terminal" | "ai";
@@ -23,6 +25,12 @@ export interface Tab {
   temporaryKeyPermanent?: boolean;
   connectionProtocol?: "TcpIp" | "Mosh";
   themeId?: string;
+  fontFamily?: string;
+  fontSize?: number;
+  foregroundColor?: string;
+  backgroundColor?: string;
+  cursorColor?: string;
+  ansiColors?: string[];
   aiChatId?: string;
   aiInitialRequest?: AiRequestPayload;
   aiSavedChat?: SavedAiChat;
@@ -39,7 +47,7 @@ interface TabBarProps {
   onReconnectTab?: (tabId: string) => void;
   onReorderTabs?: (draggedId: string, targetId: string) => void;
   onTabTransferDragStart?: (tab: Tab, e: React.DragEvent<HTMLDivElement>) => void;
-  onTabTransferDragEnd?: () => void;
+  onTabTransferDragEnd?: (tab: Tab, e: React.DragEvent<HTMLDivElement>) => void;
   otherWindows?: { label: string; name: string }[];
   onMoveTabToWindow?: (tabId: string, targetWindowLabel: string) => void;
   onCopyTabToWindow?: (tabId: string, targetWindowLabel: string) => void;
@@ -97,11 +105,14 @@ export function TabBar({
             onDragStart={(e) => {
               setDraggedId(tab.id);
               e.dataTransfer.effectAllowed = "move";
-              e.dataTransfer.setData("text/plain", tab.id);
+              e.dataTransfer.setData(TAB_REORDER_MIME, tab.id);
               onTabTransferDragStart?.(tab, e);
+              if (!e.dataTransfer.getData("text/plain")) {
+                e.dataTransfer.setData("text/plain", tab.id);
+              }
             }}
-            onDragEnd={() => {
-              onTabTransferDragEnd?.();
+            onDragEnd={(e) => {
+              onTabTransferDragEnd?.(tab, e);
               setDraggedId(null);
               setDropTargetId(null);
             }}
@@ -117,7 +128,7 @@ export function TabBar({
             }}
             onDrop={(e) => {
               e.preventDefault();
-              const srcId = e.dataTransfer.getData("text/plain");
+              const srcId = e.dataTransfer.getData(TAB_REORDER_MIME) || e.dataTransfer.getData("text/plain");
               if (srcId && srcId !== tab.id && onReorderTabs) {
                 onReorderTabs(srcId, tab.id);
               }

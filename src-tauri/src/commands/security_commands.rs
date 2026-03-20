@@ -32,16 +32,12 @@ pub async fn get_master_password_status(
 pub async fn set_master_password(password: String, vault: State<'_, Vault>) -> Result<(), String> {
     validate_new_master_password(&password)?;
 
-    if MasterPassword::load_hash()
-        .map_err(|e| e.to_string())?
-        .is_some()
-    {
-        return Err("A master password is already configured.".into());
-    }
-
     let salt = MasterPassword::generate_salt();
     let hash = MasterPassword::hash_password(&password, &salt);
-    MasterPassword::store_hash(&hash, &salt).map_err(|e| e.to_string())?;
+    let stored = MasterPassword::store_initial_hash(&hash, &salt).map_err(|e| e.to_string())?;
+    if !stored {
+        return Err("A master password is already configured.".into());
+    }
 
     let key = EncryptionService::derive_key(&password, &salt);
     vault.unlock(key).map_err(|e| e.to_string())
