@@ -204,7 +204,6 @@ export function MainWindow() {
   const [tabInitialSplitTree, setTabInitialSplitTree] = useState<Record<string, SplitNode>>({});
   const [windowName, setWindowName] = useState(`Window ${currentWindowLabel.slice(-4)}`);
   const [workspaceWindows, setWorkspaceWindows] = useState<Record<string, WindowStateSnapshot>>({});
-  const [transferDragActive, setTransferDragActive] = useState(false);
   const [dragOverWindowLabel, setDragOverWindowLabel] = useState<string | null>(null);
   const splitResolveRef = useRef<((sessionId: string | null) => void) | null>(null);
   const splitTabRef = useRef<string | null>(null);
@@ -407,6 +406,13 @@ export function MainWindow() {
         return a.name.localeCompare(b.name) || a.label.localeCompare(b.label);
       }),
     [workspaceWindows, currentWindowLabel],
+  );
+  const otherWorkspaceWindows = useMemo(
+    () =>
+      workspaceWindowList
+        .filter((win) => win.label !== currentWindowLabel)
+        .map((win) => ({ label: win.label, name: win.name })),
+    [workspaceWindowList, currentWindowLabel],
   );
 
   const publishWindowState = useCallback(
@@ -1653,16 +1659,15 @@ export function MainWindow() {
         splitEntries: splitEntries.length > 0 ? splitEntries : undefined,
         splitTree: splitTree ?? undefined,
       };
+      e.dataTransfer.effectAllowed = "copyMove";
       e.dataTransfer.setData("application/x-kortty-transfer", JSON.stringify(payload));
       e.dataTransfer.setData("text/plain", tab.id);
-      setTransferDragActive(true);
       setShowDashboard(true);
     },
     [currentWindowLabel, tabSplitSessions, splitSessionConfigs, tabSplitTrees],
   );
 
   const handleTabTransferDragEnd = useCallback(() => {
-    setTransferDragActive(false);
     setDragOverWindowLabel(null);
   }, []);
 
@@ -1773,13 +1778,15 @@ export function MainWindow() {
 
   const handleWindowDragOver = useCallback(
     (targetWindowLabel: string, e: React.DragEvent<HTMLDivElement>) => {
-      if (targetWindowLabel === currentWindowLabel) return;
+      if (!Array.from(e.dataTransfer.types).includes("application/x-kortty-transfer")) {
+        return;
+      }
       e.preventDefault();
       e.stopPropagation();
       e.dataTransfer.dropEffect = "move";
       setDragOverWindowLabel(targetWindowLabel);
     },
-    [currentWindowLabel],
+    [],
   );
 
   const handleWindowDragLeave = useCallback((e: React.DragEvent<HTMLDivElement>) => {
@@ -1794,7 +1801,6 @@ export function MainWindow() {
   const handleWindowDrop = useCallback(
     async (targetWindowLabel: string, e: React.DragEvent<HTMLDivElement>) => {
       setDragOverWindowLabel(null);
-      setTransferDragActive(false);
       e.preventDefault();
       e.stopPropagation();
       const raw = e.dataTransfer.getData("application/x-kortty-transfer");
@@ -1829,6 +1835,33 @@ export function MainWindow() {
       });
     },
     [currentWindowLabel],
+  );
+
+  const handleWindowRootDragOver = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      handleWindowDragOver(currentWindowLabel, e);
+    },
+    [currentWindowLabel, handleWindowDragOver],
+  );
+
+  const handleWindowRootDragLeave = useCallback(
+    (e: React.DragEvent<HTMLDivElement>) => {
+      if (!Array.from(e.dataTransfer.types).includes("application/x-kortty-transfer")) {
+        return;
+      }
+      handleWindowDragLeave(e);
+    },
+    [handleWindowDragLeave],
+  );
+
+  const handleWindowRootDrop = useCallback(
+    async (e: React.DragEvent<HTMLDivElement>) => {
+      if (!Array.from(e.dataTransfer.types).includes("application/x-kortty-transfer")) {
+        return;
+      }
+      await handleWindowDrop(currentWindowLabel, e);
+    },
+    [currentWindowLabel, handleWindowDrop],
   );
 
   useEffect(() => {
@@ -2288,7 +2321,16 @@ export function MainWindow() {
               {workspaceWindowList.map((win) => (
                 <div
                   key={win.label}
-                  className="border rounded transition-colors border-kortty-border"
+                  className={`border rounded transition-colors ${
+                    dragOverWindowLabel === win.label
+                      ? "border-kortty-accent bg-kortty-accent/5"
+                      : "border-kortty-border"
+                  }`}
+                  onDragOver={(e) => handleWindowDragOver(win.label, e)}
+                  onDragLeave={handleWindowDragLeave}
+                  onDrop={(e) => {
+                    void handleWindowDrop(win.label, e);
+                  }}
                 >
                   <div
                     className={`px-2 py-1.5 text-xs border-b border-kortty-border ${
@@ -2356,8 +2398,21 @@ export function MainWindow() {
             onDuplicateTab={duplicateTab}
             onReconnectTab={(tabId) => handleReconnectTabAll(tabId)}
             onReorderTabs={reorderTabs}
+            onTabTransferDragStart={handleTabTransferDragStart}
+            onTabTransferDragEnd={handleTabTransferDragEnd}
+            otherWindows={otherWorkspaceWindows}
+            onMoveTabToWindow={handleMoveTabToWindow}
+            onCopyTabToWindow={handleCopyTabToWindow}
           />
-          <div className="flex-1 min-h-0 bg-kortty-terminal relative overflow-hidden">
+          <div
+            className="flex-1 min-h-0 bg-kortty-terminal relative overflow-hidden"
+            onDragOver={handleWindowRootDragOver}
+            onDragLeave={handleWindowRootDragLeave}
+            onDrop={handleWindowRootDrop}
+          >
+            {dragOverWindowLabel === currentWindowLabel && (
+              <div className="pointer-events-none absolute inset-0 z-40 border-2 border-dashed border-kortty-accent bg-kortty-accent/5" />
+            )}
             {tabs.map((tab) => (
               <div
                 key={tab.id}

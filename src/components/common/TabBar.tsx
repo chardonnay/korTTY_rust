@@ -97,11 +97,8 @@ export function TabBar({
             onDragStart={(e) => {
               setDraggedId(tab.id);
               e.dataTransfer.effectAllowed = "move";
-              if (e.altKey && e.shiftKey && onTabTransferDragStart) {
-                onTabTransferDragStart(tab, e);
-              } else {
-                e.dataTransfer.setData("text/plain", tab.id);
-              }
+              e.dataTransfer.setData("text/plain", tab.id);
+              onTabTransferDragStart?.(tab, e);
             }}
             onDragEnd={() => {
               onTabTransferDragEnd?.();
