@@ -6,6 +6,7 @@ pub mod figlet_commands;
 pub mod gui_theme_commands;
 pub mod key_commands;
 pub mod project_commands;
+pub mod security_commands;
 pub mod settings_commands;
 pub mod sftp_commands;
 pub mod snippet_commands;

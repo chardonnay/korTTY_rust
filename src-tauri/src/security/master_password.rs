@@ -56,3 +56,32 @@ impl MasterPassword {
         Ok(Some((salt, hash)))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::MasterPassword;
+
+    #[test]
+    fn hash_verification_accepts_matching_password() {
+        let salt = MasterPassword::generate_salt();
+        let hash = MasterPassword::hash_password("CorrectHorseBatteryStaple", &salt);
+
+        assert!(MasterPassword::verify_password(
+            "CorrectHorseBatteryStaple",
+            &salt,
+            &hash,
+        ));
+    }
+
+    #[test]
+    fn hash_verification_rejects_wrong_password() {
+        let salt = MasterPassword::generate_salt();
+        let hash = MasterPassword::hash_password("CorrectHorseBatteryStaple", &salt);
+
+        assert!(!MasterPassword::verify_password(
+            "Tr0ub4dor&3",
+            &salt,
+            &hash,
+        ));
+    }
+}

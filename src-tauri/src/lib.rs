@@ -25,6 +25,7 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(ssh::SSHManager::new())
+        .manage(security::vault::Vault::new())
         .manage(commands::window_commands::PendingTransferStore(
             std::sync::Mutex::new(std::collections::HashMap::new()),
         ))
@@ -56,6 +57,9 @@ pub fn run() {
             commands::teamwork_commands::get_deleted_teamwork_connections,
             commands::settings_commands::get_settings,
             commands::settings_commands::save_settings,
+            commands::security_commands::get_master_password_status,
+            commands::security_commands::set_master_password,
+            commands::security_commands::unlock_master_password,
             commands::credential_commands::get_credentials,
             commands::credential_commands::save_credential,
             commands::credential_commands::delete_credential,
