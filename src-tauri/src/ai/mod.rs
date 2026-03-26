@@ -6,9 +6,10 @@ use anyhow::Result;
 use chrono::{Days, NaiveDate, Utc};
 use serde_json::Value;
 use thiserror::Error;
+use tokio::sync::oneshot;
 
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 20;
-const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 60;
+const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 1_800;
 const TEST_CONNECT_TIMEOUT_SECS: u64 = 5;
 const TEST_REQUEST_TIMEOUT_SECS: u64 = 30;
 const CONNECTION_TEST_SYSTEM_PROMPT: &str = "Reply with exactly OK.";
@@ -18,6 +19,8 @@ const CONNECTION_TEST_USER_PROMPT: &str = "Connection test.";
 pub enum AiError {
     #[error("AI API URL must be configured")]
     MissingApiUrl,
+    #[error("AI request cancelled")]
+    Cancelled,
     #[error("AI API returned status {status}: {message}")]
     ApiStatus { status: u16, message: String },
     #[error("AI API returned an empty response")]
@@ -32,13 +35,41 @@ pub async fn execute_request(
     profile: &AiProfile,
     request: &AiRequestPayload,
 ) -> Result<AiExecutionResult, AiError> {
+    execute_request_internal(profile, request, None).await
+}
+
+pub async fn execute_request_with_cancel(
+    profile: &AiProfile,
+    request: &AiRequestPayload,
+    cancel_rx: oneshot::Receiver<()>,
+) -> Result<AiExecutionResult, AiError> {
+    let mut cancel_rx = cancel_rx;
+    execute_request_internal(profile, request, Some(&mut cancel_rx)).await
+}
+
+async fn execute_request_internal(
+    profile: &AiProfile,
+    request: &AiRequestPayload,
+    cancel_rx: Option<&mut oneshot::Receiver<()>>,
+) -> Result<AiExecutionResult, AiError> {
     if profile.api_url.trim().is_empty() {
         return Err(AiError::MissingApiUrl);
     }
 
     let client = build_http_client(DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)?;
     let request_body = build_standard_request_body(profile, request);
-    let mut result = send_request_body(profile, &client, &request_body).await?;
+    let request_future = send_request_body(profile, &client, &request_body);
+    tokio::pin!(request_future);
+    let mut result = if let Some(cancel_rx) = cancel_rx {
+        tokio::select! {
+            response = &mut request_future => response?,
+            _ = cancel_rx => {
+                return Err(AiError::Cancelled);
+            }
+        }
+    } else {
+        request_future.await?
+    };
     if result.content.trim().is_empty() {
         return Err(AiError::EmptyResponse);
     }
@@ -174,6 +205,7 @@ fn build_system_prompt(request: &AiRequestPayload) -> String {
         "You are an assistant that analyzes terminal output. \
 Answer in language code {language_code}. \
 Use Markdown with short headings and concise, practical content. \
+If you need to present tabular data, use Markdown tables and never ASCII-art grid tables. \
 Do not invent facts that are not supported by the provided selection. \
 If something is uncertain, say so explicitly."
     )
@@ -189,7 +221,7 @@ fn build_user_prompt(request: &AiRequestPayload) -> String {
             "Analyze the selected terminal output as an error/problem report. Include: likely cause, concrete fix steps, and safe verification commands.\n",
         ),
         AiAction::Ask => prompt.push_str(
-            "Answer the user's question or instruction about the selected terminal text. Follow the custom request exactly, stay grounded in the provided text, and be concise and practical.\n",
+            "Answer the latest user request directly. The latest user request is the current task. Previous assistant replies are reference context only. Do not continue summarizing or continue problem analysis unless the user explicitly asks for that.\n",
         ),
         AiAction::GenerateChatTitle => prompt.push_str(
             "Generate a short, precise title for this AI chat.\nReturn exactly one plain-text line.\nDo not use Markdown, bullets, numbering, or quotation marks.\nKeep it under 80 characters and describe the topic clearly.\n",
@@ -207,26 +239,32 @@ fn build_user_prompt(request: &AiRequestPayload) -> String {
         prompt.push('\n');
     }
 
-    if matches!(request.action, AiAction::Ask | AiAction::GenerateChatTitle) {
-        if let Some(context) = request
-            .conversation_context
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            prompt.push_str("Conversation so far:\n");
-            prompt.push_str(&to_safe_text_code_block(context));
-            prompt.push('\n');
-        }
-    }
-
     if matches!(request.action, AiAction::Ask) {
         if let Some(user_prompt) = request
             .user_prompt
             .as_deref()
             .filter(|value| !value.trim().is_empty())
         {
-            prompt.push_str("User request:\n");
+            prompt.push_str("Current user request:\n");
             prompt.push_str(user_prompt.trim());
+            prompt.push('\n');
+        }
+    }
+
+    if matches!(request.action, AiAction::Ask | AiAction::GenerateChatTitle) {
+        if let Some(context) = request
+            .conversation_context
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            if matches!(request.action, AiAction::Ask) {
+                prompt.push_str(
+                    "Earlier conversation (reference only; follow the current user request first):\n",
+                );
+            } else {
+                prompt.push_str("Conversation so far:\n");
+            }
+            prompt.push_str(&to_safe_text_code_block(context));
             prompt.push('\n');
         }
     }
@@ -607,6 +645,34 @@ mod tests {
         assert_eq!(usage.prompt_tokens, 1);
         assert_eq!(usage.completion_tokens, 2);
         assert_eq!(usage.total_tokens, 3);
+    }
+
+    #[test]
+    fn ask_prompt_prioritizes_latest_user_request() {
+        let request = AiRequestPayload {
+            action: AiAction::Ask,
+            profile_id: "profile".into(),
+            selected_text: "terminal output".into(),
+            connection_display_name: Some("server".into()),
+            response_language_code: Some("de".into()),
+            user_prompt: Some("Explain step 2 in more detail.".into()),
+            conversation_context: Some("Assistant: Summary text".into()),
+        };
+
+        let prompt = build_user_prompt(&request);
+        assert!(prompt.contains("Current user request:\nExplain step 2 in more detail."));
+        assert!(prompt.contains(
+            "Earlier conversation (reference only; follow the current user request first):"
+        ));
+
+        let request_position = prompt
+            .find("Current user request:")
+            .expect("current request should be included");
+        let context_position = prompt
+            .find("Earlier conversation (reference only; follow the current user request first):")
+            .expect("conversation context should be included");
+        assert!(request_position < context_position);
+        assert!(!prompt.contains("Summarize the selected terminal text."));
     }
 
     #[test]

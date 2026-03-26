@@ -46,6 +46,32 @@ type TimestampEntry = {
   durationLabel?: string;
 };
 
+// These shims match the private @xterm/xterm 5.5.0 internals currently pinned in package.json.
+// We only touch them to guard a syncScrollArea/renderer race that has no public workaround here.
+// Prefer public APIs such as onScroll/scrollLines/scrollToLine for feature work, and re-verify
+// every field below whenever @xterm/xterm is bumped.
+type XtermViewportLike = {
+  syncScrollArea: (immediate?: boolean) => void;
+  __korttySafeSyncPatched?: boolean;
+};
+
+type XtermRendererContainerLike = {
+  value?: unknown;
+};
+
+type XtermRenderServiceLike = {
+  _renderer?: XtermRendererContainerLike;
+};
+
+type XtermCoreLike = {
+  viewport?: XtermViewportLike;
+  _renderService?: XtermRenderServiceLike;
+};
+
+type XtermTerminalWithCore = Terminal & {
+  _core?: XtermCoreLike;
+};
+
 export function TerminalTab({
   sessionId,
   connected,
@@ -88,6 +114,10 @@ export function TerminalTab({
   const isMountedRef = useRef(true);
   const observerTokenRef = useRef<{ sessionId: string; disconnected: boolean } | null>(null);
   const syncViewportMetricsRef = useRef<(() => void) | null>(null);
+  const initialFitRafRef = useRef<number | null>(null);
+  const initialFitTimeoutRef = useRef<number | null>(null);
+  const themeFitRafRef = useRef<number | null>(null);
+  const themeFitTimeoutRef = useRef<number | null>(null);
 
   function formatTimestamp(date: Date): string {
     const yyyy = date.getFullYear();
@@ -241,6 +271,88 @@ export function TerminalTab({
     invoke("ssh_resize", { sessionId: sessionIdRef.current, cols, rows }).catch(console.error);
   }
 
+  function installSafeViewportSync(term: Terminal) {
+    const terminalWithCore = term as XtermTerminalWithCore;
+    const core = terminalWithCore._core;
+    const viewport = core?.viewport;
+    if (!viewport || viewport.__korttySafeSyncPatched) {
+      return;
+    }
+
+    const originalSyncScrollArea = viewport.syncScrollArea.bind(viewport);
+    viewport.syncScrollArea = (immediate?: boolean) => {
+      const rendererValue = core?._renderService?._renderer?.value;
+      if (!rendererValue) {
+        return;
+      }
+
+      try {
+        originalSyncScrollArea(immediate);
+      } catch (error) {
+        console.warn("[TerminalTab] Suppressed xterm viewport syncScrollArea error", error);
+      }
+    };
+    viewport.__korttySafeSyncPatched = true;
+  }
+
+  function clearPendingFitTimers() {
+    if (initialFitRafRef.current != null) {
+      window.cancelAnimationFrame(initialFitRafRef.current);
+      initialFitRafRef.current = null;
+    }
+    if (initialFitTimeoutRef.current != null) {
+      window.clearTimeout(initialFitTimeoutRef.current);
+      initialFitTimeoutRef.current = null;
+    }
+    if (themeFitRafRef.current != null) {
+      window.cancelAnimationFrame(themeFitRafRef.current);
+      themeFitRafRef.current = null;
+    }
+    if (themeFitTimeoutRef.current != null) {
+      window.clearTimeout(themeFitTimeoutRef.current);
+      themeFitTimeoutRef.current = null;
+    }
+  }
+
+  function isTerminalLive(term: Terminal, fitAddon?: FitAddon | null): boolean {
+    if (!isMountedRef.current) {
+      return false;
+    }
+    if (xtermRef.current !== term) {
+      return false;
+    }
+    if (fitAddon !== undefined && fitAddonRef.current !== fitAddon) {
+      return false;
+    }
+    if (!termRef.current?.isConnected) {
+      return false;
+    }
+    return true;
+  }
+
+  function safeSyncViewportMetrics(term: Terminal) {
+    if (!isTerminalLive(term)) {
+      return;
+    }
+    syncViewportMetricsRef.current?.();
+  }
+
+  function safeFitAndResize(term: Terminal, fitAddon: FitAddon, forceResize = false) {
+    if (!isTerminalLive(term, fitAddon)) {
+      return;
+    }
+    try {
+      fitAddon.fit();
+      if (!isTerminalLive(term, fitAddon)) {
+        return;
+      }
+      sendResizeIfNeeded(term, forceResize);
+      safeSyncViewportMetrics(term);
+    } catch {
+      // terminal not visible or no longer valid
+    }
+  }
+
   // Effect 1: Terminal lifecycle – create once on mount, dispose on unmount
   useEffect(() => {
     isMountedRef.current = true;
@@ -306,6 +418,7 @@ export function TerminalTab({
     term.loadAddon(searchAddon);
 
     term.open(termRef.current);
+    installSafeViewportSync(term);
     fitAddon.fit();
 
     xtermRef.current = term;
@@ -328,15 +441,18 @@ export function TerminalTab({
     }
     syncViewportMetricsRef.current = syncViewportMetrics;
     syncViewportMetrics();
-    viewportEl?.addEventListener("scroll", syncViewportMetrics);
-
-    requestAnimationFrame(() => {
-      try { fitAddon.fit(); } catch { /* not visible */ }
-      setTimeout(() => {
-        try { fitAddon.fit(); } catch { /* not visible */ }
-        syncViewportMetrics();
-      }, 100);
+    const scrollDisposable = term.onScroll(() => {
       syncViewportMetrics();
+    });
+
+    initialFitRafRef.current = window.requestAnimationFrame(() => {
+      initialFitRafRef.current = null;
+      safeFitAndResize(term, fitAddon);
+      initialFitTimeoutRef.current = window.setTimeout(() => {
+        initialFitTimeoutRef.current = null;
+        safeFitAndResize(term, fitAddon);
+      }, 100);
+      safeSyncViewportMetrics(term);
     });
 
     term.onData((data) => {
@@ -421,13 +537,7 @@ export function TerminalTab({
     window.addEventListener("kortty-terminal-paste", handlePaste as EventListener);
 
     const resizeObserver = new ResizeObserver(() => {
-      if (!isMountedRef.current) return;
-      try {
-        fitAddon.fit();
-        sendResizeIfNeeded(term);
-      } catch {
-        // terminal not yet visible
-      }
+      safeFitAndResize(term, fitAddon);
     });
     const token = { sessionId, disconnected: false };
     observerTokenRef.current = token;
@@ -437,18 +547,20 @@ export function TerminalTab({
     console.log("[TerminalTab] ResizeObserver created", sessionId);
 
     function handleRefit() {
-      try {
-        fitAddon.fit();
-        sendResizeIfNeeded(term);
-        syncViewportMetrics();
-      } catch { /* not visible */ }
+      safeFitAndResize(term, fitAddon);
     }
 
     function handleReattach(event: Event) {
       const custom = event as CustomEvent<{ sessionId: string }>;
       if (custom.detail?.sessionId !== sessionIdRef.current) return;
       try {
+        if (!isTerminalLive(term, fitAddon)) {
+          return;
+        }
         fitAddon.fit();
+        if (!isTerminalLive(term, fitAddon)) {
+          return;
+        }
         term.refresh(0, Math.max(0, term.rows - 1));
         term.scrollToBottom();
         sendResizeIfNeeded(term);
@@ -466,9 +578,10 @@ export function TerminalTab({
       window.removeEventListener("kortty-terminal-paste", handlePaste as EventListener);
       window.removeEventListener("kortty-refit", handleRefit);
       window.removeEventListener("kortty-terminal-reattach", handleReattach as EventListener);
+      clearPendingFitTimers();
       stopPromptProbe();
       syncViewportMetricsRef.current = null;
-      viewportEl?.removeEventListener("scroll", syncViewportMetrics);
+      scrollDisposable.dispose();
       // Always disconnect ResizeObserver on every unmount to prevent leaks
       if (observerTokenRef.current) {
         observerTokenRef.current.disconnected = true;
@@ -479,13 +592,13 @@ export function TerminalTab({
         console.log("[TerminalTab] ResizeObserver disconnected", sessionId);
         resizeObserverRef.current = null;
       }
+      xtermRef.current = null;
+      fitAddonRef.current = null;
       try {
         term.dispose();
       } catch (e) {
         console.warn("[TerminalTab] term.dispose() error on unmount", e);
       }
-      xtermRef.current = null;
-      fitAddonRef.current = null;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -495,12 +608,21 @@ export function TerminalTab({
     const term = xtermRef.current;
     if (!term) return;
     lastResizeKeyRef.current = "";
+    let disposed = false;
 
     const unlisten = listen<number[]>(
       `terminal-output-${sessionId}`,
       (event) => {
+        if (disposed || xtermRef.current !== term || !isMountedRef.current) {
+          return;
+        }
         const bytes = new Uint8Array(event.payload);
-        term.write(bytes);
+        try {
+          term.write(bytes);
+        } catch (error) {
+          console.warn("[TerminalTab] Ignored terminal-output write on inactive terminal", error);
+          return;
+        }
         const text = new TextDecoder().decode(bytes);
         if (containsClearScreenSignal(text)) {
           setTimestampEntries([]);
@@ -524,6 +646,7 @@ export function TerminalTab({
     );
 
     return () => {
+      disposed = true;
       unlisten.then((fn) => fn());
     };
   }, [sessionId]);
@@ -571,21 +694,21 @@ export function TerminalTab({
       };
     }
 
-    function doFitAndResize() {
-      try {
-        fit.fit();
-        sendResizeIfNeeded(term);
-        syncViewportMetricsRef.current?.();
-      } catch {
-        // terminal not visible
-      }
-    }
+    clearPendingFitTimers();
 
-    doFitAndResize();
-    requestAnimationFrame(() => {
-      doFitAndResize();
-      setTimeout(doFitAndResize, 50);
+    safeFitAndResize(term, fit);
+    themeFitRafRef.current = window.requestAnimationFrame(() => {
+      themeFitRafRef.current = null;
+      safeFitAndResize(term, fit);
+      themeFitTimeoutRef.current = window.setTimeout(() => {
+        themeFitTimeoutRef.current = null;
+        safeFitAndResize(term, fit);
+      }, 50);
     });
+
+    return () => {
+      clearPendingFitTimers();
+    };
   }, [fontSize, fontFamily, theme]);
 
   useEffect(() => {

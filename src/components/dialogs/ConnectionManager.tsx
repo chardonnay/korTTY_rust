@@ -51,6 +51,14 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
   const selected = connections.find((c) => c.id === selectedId);
   const selectedTheme = selected?.themeId ? themes.find((theme) => theme.id === selected.themeId) : undefined;
 
+  function handleConnectSelected(connectionId: string) {
+    const latestConnection =
+      useConnectionStore.getState().connections.find((connection) => connection.id === connectionId);
+    if (latestConnection) {
+      onConnect(latestConnection);
+    }
+  }
+
   async function handleThemeChange(connection: ConnectionSettings, themeId: string) {
     const nextTheme = themes.find((theme) => theme.id === themeId);
     const nextConnection: ConnectionSettings = nextTheme
@@ -109,7 +117,7 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
                           : "text-kortty-text hover:bg-kortty-panel"
                       }`}
                       onClick={() => setSelectedId(conn.id)}
-                      onDoubleClick={() => onConnect(conn)}
+                      onDoubleClick={() => handleConnectSelected(conn.id)}
                     >
                       <Server className="w-3 h-3" />
                       <span className="truncate">{conn.name || conn.host}</span>
@@ -126,7 +134,7 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
                     : "text-kortty-text hover:bg-kortty-panel"
                 }`}
                 onClick={() => setSelectedId(conn.id)}
-                onDoubleClick={() => onConnect(conn)}
+                onDoubleClick={() => handleConnectSelected(conn.id)}
               >
                 <Server className="w-3.5 h-3.5" />
                 <span className="truncate">{conn.name || conn.host}</span>
@@ -277,7 +285,7 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
             <button
               className="px-3 py-1.5 text-xs bg-kortty-accent text-kortty-bg rounded hover:bg-kortty-accent-hover transition-colors disabled:opacity-40"
               disabled={!selected}
-              onClick={() => selected && onConnect(selected)}
+              onClick={() => selected && handleConnectSelected(selected.id)}
             >
               Connect
             </button>

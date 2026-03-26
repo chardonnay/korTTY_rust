@@ -1024,23 +1024,25 @@ export function MainWindow() {
 
   const connectFromSettings = useCallback(
     async (conn: ConnectionSettings) => {
+      const latestConnection =
+        useConnectionStore.getState().connections.find((connection) => connection.id === conn.id) ?? conn;
       if (splitResolveRef.current && splitTabRef.current) {
         const tabId = splitTabRef.current;
         const splitSessionId = crypto.randomUUID();
         const ok = await createSshSession(splitSessionId, {
-          host: conn.host,
-          port: conn.port,
-          username: conn.username,
-          authMethod: conn.authMethod,
-          password: conn.password,
-          credentialId: conn.credentialId,
-          sshKeyId: conn.sshKeyId,
-          privateKeyPath: conn.privateKeyPath,
-          privateKeyPassphrase: conn.privateKeyPassphrase,
-          temporaryKeyContent: conn.temporaryKeyContent,
-          temporaryKeyExpirationMinutes: conn.temporaryKeyExpirationMinutes,
-          temporaryKeyPermanent: conn.temporaryKeyPermanent,
-          connectionProtocol: conn.connectionProtocol || "TcpIp",
+          host: latestConnection.host,
+          port: latestConnection.port,
+          username: latestConnection.username,
+          authMethod: latestConnection.authMethod,
+          password: latestConnection.password,
+          credentialId: latestConnection.credentialId,
+          sshKeyId: latestConnection.sshKeyId,
+          privateKeyPath: latestConnection.privateKeyPath,
+          privateKeyPassphrase: latestConnection.privateKeyPassphrase,
+          temporaryKeyContent: latestConnection.temporaryKeyContent,
+          temporaryKeyExpirationMinutes: latestConnection.temporaryKeyExpirationMinutes,
+          temporaryKeyPermanent: latestConnection.temporaryKeyPermanent,
+          connectionProtocol: latestConnection.connectionProtocol || "TcpIp",
         });
         if (ok) {
           setTabSplitSessions((prev) => ({
@@ -1050,19 +1052,19 @@ export function MainWindow() {
           setSplitSessionConfigs((prev) => ({
             ...prev,
             [splitSessionId]: {
-              host: conn.host,
-              port: conn.port,
-              username: conn.username,
-              authMethod: conn.authMethod,
-              password: conn.password,
-              credentialId: conn.credentialId,
-              sshKeyId: conn.sshKeyId,
-              privateKeyPath: conn.privateKeyPath,
-              privateKeyPassphrase: conn.privateKeyPassphrase,
-              temporaryKeyContent: conn.temporaryKeyContent,
-              temporaryKeyExpirationMinutes: conn.temporaryKeyExpirationMinutes,
-              temporaryKeyPermanent: conn.temporaryKeyPermanent,
-              connectionProtocol: conn.connectionProtocol || "TcpIp",
+              host: latestConnection.host,
+              port: latestConnection.port,
+              username: latestConnection.username,
+              authMethod: latestConnection.authMethod,
+              password: latestConnection.password,
+              credentialId: latestConnection.credentialId,
+              sshKeyId: latestConnection.sshKeyId,
+              privateKeyPath: latestConnection.privateKeyPath,
+              privateKeyPassphrase: latestConnection.privateKeyPassphrase,
+              temporaryKeyContent: latestConnection.temporaryKeyContent,
+              temporaryKeyExpirationMinutes: latestConnection.temporaryKeyExpirationMinutes,
+              temporaryKeyPermanent: latestConnection.temporaryKeyPermanent,
+              connectionProtocol: latestConnection.connectionProtocol || "TcpIp",
             },
           }));
           splitResolveRef.current(splitSessionId);
@@ -1078,44 +1080,51 @@ export function MainWindow() {
       const newTab: Tab = {
         id,
         kind: "terminal",
-        label: conn.name || `${conn.username}@${conn.host}`,
+        label: latestConnection.name || `${latestConnection.username}@${latestConnection.host}`,
         status: "disconnected",
-        host: conn.host,
-        port: conn.port,
-        username: conn.username,
-        connectionId: conn.id,
-        authMethod: conn.authMethod,
-        password: conn.password,
-        credentialId: conn.credentialId,
-        sshKeyId: conn.sshKeyId,
-        privateKeyPath: conn.privateKeyPath,
-        privateKeyPassphrase: conn.privateKeyPassphrase,
-        temporaryKeyContent: conn.temporaryKeyContent,
-        temporaryKeyExpirationMinutes: conn.temporaryKeyExpirationMinutes,
-        temporaryKeyPermanent: conn.temporaryKeyPermanent,
-        connectionProtocol: conn.connectionProtocol || "TcpIp",
-        ...buildTerminalAppearanceSnapshot(conn),
+        host: latestConnection.host,
+        port: latestConnection.port,
+        username: latestConnection.username,
+        connectionId: latestConnection.id,
+        authMethod: latestConnection.authMethod,
+        password: latestConnection.password,
+        credentialId: latestConnection.credentialId,
+        sshKeyId: latestConnection.sshKeyId,
+        privateKeyPath: latestConnection.privateKeyPath,
+        privateKeyPassphrase: latestConnection.privateKeyPassphrase,
+        temporaryKeyContent: latestConnection.temporaryKeyContent,
+        temporaryKeyExpirationMinutes: latestConnection.temporaryKeyExpirationMinutes,
+        temporaryKeyPermanent: latestConnection.temporaryKeyPermanent,
+        connectionProtocol: latestConnection.connectionProtocol || "TcpIp",
+        ...buildTerminalAppearanceSnapshot(latestConnection),
       };
       setTabs((prev) => [...prev, newTab]);
       setActiveTab(id);
       setOpenDialog(null);
-      if (conn.authMethod === "Password") {
-        handleConnect(id, conn.host, conn.port, conn.username, conn.password || "", conn.connectionProtocol || "TcpIp");
+      if (latestConnection.authMethod === "Password") {
+        handleConnect(
+          id,
+          latestConnection.host,
+          latestConnection.port,
+          latestConnection.username,
+          latestConnection.password || "",
+          latestConnection.connectionProtocol || "TcpIp",
+        );
       } else {
         createSshSession(id, {
-          host: conn.host,
-          port: conn.port,
-          username: conn.username,
-          authMethod: conn.authMethod,
-          password: conn.password,
-          credentialId: conn.credentialId,
-          sshKeyId: conn.sshKeyId,
-          privateKeyPath: conn.privateKeyPath,
-          privateKeyPassphrase: conn.privateKeyPassphrase,
-          temporaryKeyContent: conn.temporaryKeyContent,
-          temporaryKeyExpirationMinutes: conn.temporaryKeyExpirationMinutes,
-          temporaryKeyPermanent: conn.temporaryKeyPermanent,
-          connectionProtocol: conn.connectionProtocol || "TcpIp",
+          host: latestConnection.host,
+          port: latestConnection.port,
+          username: latestConnection.username,
+          authMethod: latestConnection.authMethod,
+          password: latestConnection.password,
+          credentialId: latestConnection.credentialId,
+          sshKeyId: latestConnection.sshKeyId,
+          privateKeyPath: latestConnection.privateKeyPath,
+          privateKeyPassphrase: latestConnection.privateKeyPassphrase,
+          temporaryKeyContent: latestConnection.temporaryKeyContent,
+          temporaryKeyExpirationMinutes: latestConnection.temporaryKeyExpirationMinutes,
+          temporaryKeyPermanent: latestConnection.temporaryKeyPermanent,
+          connectionProtocol: latestConnection.connectionProtocol || "TcpIp",
         }).then((ok) => {
           setTabs((prev) =>
             prev.map((t) =>
@@ -2791,9 +2800,18 @@ export function MainWindow() {
                         prev.map((entry) => (entry.id === tab.id ? { ...entry, label: title || "AI Chat" } : entry)),
                       );
                     }}
-                    onSavedChatIdChange={(savedChatId) => {
+                    onSavedChatChange={(savedChat) => {
                       setTabs((prev) =>
-                        prev.map((entry) => (entry.id === tab.id ? { ...entry, aiChatId: savedChatId } : entry)),
+                        prev.map((entry) =>
+                          entry.id === tab.id
+                            ? {
+                                ...entry,
+                                label: savedChat.title || "AI Chat",
+                                aiChatId: savedChat.id,
+                                aiSavedChat: savedChat,
+                              }
+                            : entry,
+                        ),
                       );
                     }}
                   />

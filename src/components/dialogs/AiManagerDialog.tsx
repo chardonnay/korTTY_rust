@@ -35,6 +35,12 @@ function formatDate(value: string | undefined) {
   return Number.isNaN(parsed.getTime()) ? value : parsed.toLocaleDateString();
 }
 
+function formatDateTime(value: number | undefined) {
+  if (!value || value <= 0) return "Unknown";
+  const parsed = new Date(value);
+  return Number.isNaN(parsed.getTime()) ? "Unknown" : parsed.toLocaleString();
+}
+
 export function AiManagerDialog({ open, onClose, onOpenChat }: AiManagerDialogProps) {
   const { width, height, onResizeStart } = useDialogGeometry("ai-manager", 920, 620, 620, 420);
   const [activeTab, setActiveTab] = useState<TabId>("profiles");
@@ -433,6 +439,12 @@ export function AiManagerDialog({ open, onClose, onOpenChat }: AiManagerDialogPr
                     <div className="text-sm font-medium truncate">{chat.title || "AI Chat"}</div>
                     <div className="text-[11px] text-kortty-text-dim mt-1">
                       {chat.activeAiProfileName || "No profile"} | {chat.messages.length} messages
+                    </div>
+                    <div className="text-[11px] text-kortty-text-dim">
+                      Updated: {formatDateTime(chat.updatedAt)}
+                    </div>
+                    <div className="text-[11px] text-kortty-text-dim">
+                      Created: {formatDateTime(chat.createdAt)}
                     </div>
                     {chat.connectionDisplayName && (
                       <div className="text-[11px] text-kortty-text-dim truncate">

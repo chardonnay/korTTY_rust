@@ -26,6 +26,9 @@ pub fn run() {
     let app = tauri::Builder::default()
         .manage(ssh::SSHManager::new())
         .manage(security::vault::Vault::new())
+        .manage(commands::ai_commands::AiRequestCancelStore(
+            std::sync::Mutex::new(std::collections::HashMap::new()),
+        ))
         .manage(commands::window_commands::PendingTransferStore(
             std::sync::Mutex::new(std::collections::HashMap::new()),
         ))
@@ -43,6 +46,7 @@ pub fn run() {
             commands::ai_commands::delete_ai_profile,
             commands::ai_commands::test_ai_profile,
             commands::ai_commands::execute_ai_action,
+            commands::ai_commands::cancel_ai_request,
             commands::ai_commands::get_ai_chats,
             commands::ai_commands::save_ai_chat,
             commands::ai_commands::delete_ai_chat,

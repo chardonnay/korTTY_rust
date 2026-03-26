@@ -1,7 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import i18n from "./i18n";
 import { MainWindow } from "./components/MainWindow";
 import { MasterPasswordDialog } from "./components/dialogs/MasterPasswordDialog";
+import type { GlobalSettings } from "./store/settingsStore";
+import { resolveGuiLanguageCode } from "./utils/aiLanguage";
 
 type AuthPhase = "checking" | "setup" | "unlock" | "error" | "ready";
 
@@ -14,6 +17,15 @@ export default function App() {
   const [authPhase, setAuthPhase] = useState<AuthPhase>("checking");
   const [authError, setAuthError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+
+  const syncGuiLanguage = useCallback(async () => {
+    try {
+      const settings = await invoke<GlobalSettings>("get_settings");
+      await i18n.changeLanguage(resolveGuiLanguageCode(settings));
+    } catch {
+      await i18n.changeLanguage(resolveGuiLanguageCode(null));
+    }
+  }, []);
 
   const isAuthRequiredError = useCallback((error: unknown) => {
     const message = String(error).toLowerCase();
@@ -43,6 +55,10 @@ export default function App() {
       setAuthPhase(isAuthRequiredError(error) ? "unlock" : "error");
     });
   }, [isAuthRequiredError, loadAuthStatus]);
+
+  useEffect(() => {
+    void syncGuiLanguage();
+  }, [syncGuiLanguage]);
 
   useEffect(() => {
     loadAuthStatus().catch((error) => {

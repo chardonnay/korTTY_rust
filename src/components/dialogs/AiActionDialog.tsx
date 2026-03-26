@@ -3,6 +3,12 @@ import { Bot, Play, Settings2, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 import type { AiAction, AiProfile, AiRequestPayload } from "../../types/ai";
+import type { GlobalSettings } from "../../store/settingsStore";
+import {
+  AI_LANGUAGE_OPTIONS,
+  DEFAULT_AI_LANGUAGE_CODE,
+  resolveGuiLanguageCode,
+} from "../../utils/aiLanguage";
 
 interface AiActionDialogProps {
   open: boolean;
@@ -44,23 +50,47 @@ export function AiActionDialog({
   const [prompt, setPrompt] = useState("");
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState<string | null>(null);
+  const [responseLanguageCode, setResponseLanguageCode] = useState(DEFAULT_AI_LANGUAGE_CODE);
 
   useEffect(() => {
     if (!open) return;
-    setPrompt("");
-    setStatus(null);
-    setLoading(true);
-    invoke<AiProfile[]>("get_ai_profiles")
-      .then((loaded) => {
-        setProfiles(loaded);
+    let cancelled = false;
+
+    async function loadDialogState() {
+      setPrompt("");
+      setStatus(null);
+      setLoading(true);
+      try {
+        const [loadedProfiles, guiSettings] = await Promise.all([
+          invoke<AiProfile[]>("get_ai_profiles"),
+          invoke<GlobalSettings>("get_settings").catch(() => null),
+        ]);
+        if (cancelled) {
+          return;
+        }
+        setProfiles(loadedProfiles);
         setProfileId((current) =>
-          loaded.some((profile) => profile.id === current) ? current : (loaded[0]?.id || ""),
+          loadedProfiles.some((profile) => profile.id === current)
+            ? current
+            : (loadedProfiles[0]?.id || ""),
         );
-      })
-      .catch((error) => {
+        setResponseLanguageCode(resolveGuiLanguageCode(guiSettings));
+      } catch (error) {
+        if (cancelled) {
+          return;
+        }
         setStatus(`Failed to load AI profiles: ${String(error)}`);
-      })
-      .finally(() => setLoading(false));
+      } finally {
+        if (!cancelled) {
+          setLoading(false);
+        }
+      }
+    }
+
+    void loadDialogState();
+    return () => {
+      cancelled = true;
+    };
   }, [open]);
 
   const selectedProfile = useMemo(
@@ -112,6 +142,21 @@ export function AiActionDialog({
               <Settings2 className="w-3.5 h-3.5" />
               Manage Profiles
             </button>
+          </div>
+
+          <div>
+            <div className="text-xs text-kortty-text-dim">Response Language</div>
+            <select
+              className="input-field mt-1 max-w-[220px]"
+              value={responseLanguageCode}
+              onChange={(event) => setResponseLanguageCode(event.target.value)}
+            >
+              {AI_LANGUAGE_OPTIONS.map((option) => (
+                <option key={option.value} value={option.value}>
+                  {option.label}
+                </option>
+              ))}
+            </select>
           </div>
 
           {selectedProfile && (
@@ -177,7 +222,7 @@ export function AiActionDialog({
                 profileId,
                 selectedText,
                 connectionDisplayName,
-                responseLanguageCode: navigator.language.split("-")[0] || "en",
+                responseLanguageCode,
                 userPrompt: action === "Ask" ? prompt.trim() : undefined,
               })
             }

@@ -21,9 +21,22 @@ const resources = {
   nl: { translation: nl },
 };
 
+function resolveInitialLanguage(): keyof typeof resources {
+  if (typeof navigator === "undefined") {
+    return "en";
+  }
+
+  const [primaryLanguage] = navigator.language.split(/[-_]/);
+  if (primaryLanguage && primaryLanguage in resources) {
+    return primaryLanguage as keyof typeof resources;
+  }
+
+  return "en";
+}
+
 i18n.use(initReactI18next).init({
   resources,
-  lng: "en",
+  lng: resolveInitialLanguage(),
   fallbackLng: "en",
   interpolation: {
     escapeValue: false,

@@ -110,10 +110,21 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
 
   saveConnection: async (conn) => {
     try {
+      set((state) => {
+        const nextConnections = [...state.connections];
+        const existingIndex = nextConnections.findIndex((existing) => existing.id === conn.id);
+        if (existingIndex >= 0) {
+          nextConnections[existingIndex] = conn;
+        } else {
+          nextConnections.push(conn);
+        }
+        return { connections: nextConnections };
+      });
       await invoke("save_connection", { connection: conn });
       await get().loadConnections();
     } catch (err) {
       console.error("Failed to save connection:", err);
+      await get().loadConnections();
     }
   },
 
