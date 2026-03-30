@@ -683,7 +683,9 @@ pub async fn submit_terminal_agent_plan_custom_approach(
             session_id: context.request.session_id.clone(),
             phase: TerminalAgentPlanPhase::GeneratingOptions,
             summary: "Refining plan options.".into(),
-            user_message: Some("The planner is refining the plan using your custom approach.".into()),
+            user_message: Some(
+                "The planner is refining the plan using your custom approach.".into(),
+            ),
             probe_summary: Some(context.probe_summary.clone()),
             questions: Some(context.questions.clone()),
             options: Some(context.options.clone()),
@@ -839,7 +841,12 @@ pub async fn start_terminal_agent_from_plan(
     let accepted_option = context
         .accepted_option_id
         .as_ref()
-        .and_then(|accepted_id| context.options.iter().find(|option| &option.id == accepted_id))
+        .and_then(|accepted_id| {
+            context
+                .options
+                .iter()
+                .find(|option| &option.id == accepted_id)
+        })
         .cloned()
         .ok_or_else(|| "Select a plan option before starting execution".to_string())?;
 
@@ -2291,8 +2298,8 @@ fn is_clearly_read_only_command(command: &str) -> bool {
 fn is_interactive_command(command: &str) -> bool {
     let lowered = normalize_shell_whitespace(command);
     let blocked_phrases = [
-        "sudo su", "su -", "sudo -s", "sudo -i", "passwd", "visudo", "nano", "vi", "vim",
-        "less", "more", "man", "top", "htop", "read",
+        "sudo su", "su -", "sudo -s", "sudo -i", "passwd", "visudo", "nano", "vi", "vim", "less",
+        "more", "man", "top", "htop", "read",
     ];
 
     blocked_phrases
@@ -2546,10 +2553,7 @@ fn contains_unquoted_sudo_n(command: &str) -> bool {
             _ => {}
         }
 
-        if !in_single
-            && !in_double
-            && matches_shell_token_at(&chars, index, &token_chars)
-        {
+        if !in_single && !in_double && matches_shell_token_at(&chars, index, &token_chars) {
             let mut cursor = index + token_chars.len();
             while cursor < chars.len() && chars[cursor].is_whitespace() {
                 cursor += 1;
@@ -2611,10 +2615,7 @@ fn find_unquoted_shell_token(command: &str, token: &str) -> Option<usize> {
             _ => {}
         }
 
-        if !in_single
-            && !in_double
-            && matches_shell_token_at(&chars, index, &token_chars)
-        {
+        if !in_single && !in_double && matches_shell_token_at(&chars, index, &token_chars) {
             return Some(index);
         }
 
@@ -2802,10 +2803,9 @@ async fn run_silent_probe(
     ssh_manager: &SSHManager,
     session_id: &str,
 ) -> Result<TerminalAgentProbeSnapshot, TerminalAgentError> {
-    let session_arc = ssh_manager
-        .get_session(session_id)
-        .await
-        .ok_or_else(|| TerminalAgentError::Failed("The SSH session is no longer available.".into()))?;
+    let session_arc = ssh_manager.get_session(session_id).await.ok_or_else(|| {
+        TerminalAgentError::Failed("The SSH session is no longer available.".into())
+    })?;
     let session = timeout(SESSION_LOCK_TIMEOUT, session_arc.lock())
         .await
         .map_err(|_| TerminalAgentError::Failed("The SSH session is busy.".into()))?;
@@ -2931,14 +2931,9 @@ async fn request_plan_options(
     custom_approach: Option<&str>,
 ) -> Result<Vec<TerminalAgentPlanOption>, String> {
     let system_prompt = build_plan_option_system_prompt();
-    let user_prompt = build_plan_option_user_prompt(
-        request,
-        probe,
-        questions,
-        answers,
-        custom_approach,
-    )
-    .map_err(plan_error_to_string)?;
+    let user_prompt =
+        build_plan_option_user_prompt(request, probe, questions, answers, custom_approach)
+            .map_err(plan_error_to_string)?;
     let response = ai::execute_custom_prompt(profile, &system_prompt, &user_prompt, 0.1, None)
         .await
         .map_err(map_ai_error)
@@ -3062,14 +3057,16 @@ fn parse_plan_question_decision(raw_content: &str) -> Result<AgentPlanQuestionDe
         ),
         AgentPlanQuestionStatus::Questions => {
             if decision.questions.is_empty() || decision.questions.len() > 3 {
-                return Err("The planning question pass must return between 1 and 3 questions.".into());
+                return Err(
+                    "The planning question pass must return between 1 and 3 questions.".into(),
+                );
             }
-            if decision
-                .questions
-                .iter()
-                .any(|question| question.id.trim().is_empty() || question.question.trim().is_empty())
-            {
-                return Err("The planning question pass returned an incomplete question entry.".into());
+            if decision.questions.iter().any(|question| {
+                question.id.trim().is_empty() || question.question.trim().is_empty()
+            }) {
+                return Err(
+                    "The planning question pass returned an incomplete question entry.".into(),
+                );
             }
             Ok(decision)
         }
@@ -3108,10 +3105,9 @@ fn decision_to_plan_questions(
     decision: AgentPlanQuestionDecision,
 ) -> Result<Vec<TerminalAgentPlanQuestion>, String> {
     match decision.status {
-        AgentPlanQuestionStatus::Blocked => Err(non_empty_or(
-            &decision.user_message,
-            &decision.summary,
-        )),
+        AgentPlanQuestionStatus::Blocked => {
+            Err(non_empty_or(&decision.user_message, &decision.summary))
+        }
         AgentPlanQuestionStatus::Questions => Ok(decision
             .questions
             .into_iter()
@@ -3127,14 +3123,10 @@ fn decision_to_plan_options(
     decision: AgentPlanOptionDecision,
 ) -> Result<Vec<TerminalAgentPlanOption>, String> {
     match decision.status {
-        AgentPlanOptionStatus::Blocked => Err(non_empty_or(
-            &decision.user_message,
-            &decision.summary,
-        )),
-        AgentPlanOptionStatus::Done => Err(non_empty_or(
-            &decision.user_message,
-            &decision.summary,
-        )),
+        AgentPlanOptionStatus::Blocked => {
+            Err(non_empty_or(&decision.user_message, &decision.summary))
+        }
+        AgentPlanOptionStatus::Done => Err(non_empty_or(&decision.user_message, &decision.summary)),
         AgentPlanOptionStatus::Options => Ok(decision
             .options
             .into_iter()
@@ -4077,7 +4069,10 @@ __KORTTY_SUDO_L_END__"#;
         .expect("options should be accepted");
 
         assert_eq!(options.len(), 1);
-        assert_eq!(options[0].alternatives, vec!["Run PostgreSQL in a container instead"]);
+        assert_eq!(
+            options[0].alternatives,
+            vec!["Run PostgreSQL in a container instead"]
+        );
     }
 
     #[test]
