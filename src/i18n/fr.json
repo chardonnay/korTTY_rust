@@ -1,7 +1,7 @@
 {
   "app": {
     "title": "KorTTY",
-    "version": "v1.0.0"
+    "version": "v2.0.0"
   },
   "menu": {
     "file": "Fichier",

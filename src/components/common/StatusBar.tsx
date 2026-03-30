@@ -6,7 +6,7 @@ export function StatusBar({ connectionCount }: StatusBarProps) {
   return (
     <div className="flex items-center justify-between h-6 px-3 bg-kortty-surface border-t border-kortty-border text-[10px] text-kortty-text-dim select-none">
       <div className="flex items-center gap-3">
-        <span>KorTTY v1.0.0</span>
+        <span>KorTTY v2.0.0</span>
         <span>
           {connectionCount} connection{connectionCount !== 1 ? "s" : ""}
         </span>

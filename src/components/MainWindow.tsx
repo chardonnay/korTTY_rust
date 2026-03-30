@@ -4077,7 +4077,7 @@ export function MainWindow() {
               <div className="text-4xl font-mono font-bold text-kortty-accent mb-2">KorTTY</div>
               <div className="text-xs text-kortty-text-dim mb-6">SSH Terminal Client</div>
               <div className="space-y-1 text-center text-xs text-kortty-text">
-                <p>Version 1.0.0</p>
+                <p>Version 2.0.0</p>
                 <p className="text-kortty-text-dim">Built with Tauri + React + Rust</p>
               </div>
               <div className="mt-6 text-center text-[11px] text-kortty-text-dim space-y-0.5">
