@@ -5,20 +5,21 @@ pkgdesc="KorTTY - Modern SSH Terminal Client"
 arch=('x86_64' 'aarch64')
 url="https://github.com/chardonnay/korTTY_rust"
 license=('MIT')
+_repo_name="korTTY_rust"
 depends=('webkit2gtk-4.1' 'openssl' 'gtk3')
 makedepends=('rust' 'cargo' 'nodejs' 'npm' 'base-devel')
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/chardonnay/korTTY_rust/archive/v${pkgver}.tar.gz")
 sha256sums=('SKIP')
 
 build() {
-    cd "${pkgname}_rust-${pkgver}"
+    cd "${_repo_name}-${pkgver}"
     npm ci
     npm run build
     cargo build --manifest-path src-tauri/Cargo.toml --release
 }
 
 package() {
-    cd "${pkgname}_rust-${pkgver}"
+    cd "${_repo_name}-${pkgver}"
     install -Dm755 "src-tauri/target/release/kortty" "${pkgdir}/usr/bin/kortty"
     install -Dm644 "package/arch/kortty.desktop" "${pkgdir}/usr/share/applications/kortty.desktop"
     install -Dm644 "src-tauri/icons/icon.png" "${pkgdir}/usr/share/pixmaps/kortty.png"
