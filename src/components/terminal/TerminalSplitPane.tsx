@@ -3,7 +3,12 @@ import { createPortal } from "react-dom";
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelGroupHandle } from "react-resizable-panels";
 import { TerminalTab } from "./TerminalTab";
 import { Radio, X, ChevronRight, GripVertical } from "lucide-react";
-import type { AiAction } from "../../types/ai";
+import type {
+  AiAction,
+  TerminalAgentApproval,
+  TerminalAgentPasswordRequest,
+  TerminalAgentRunState,
+} from "../../types/ai";
 
 // --- Split tree data model ---
 
@@ -27,6 +32,8 @@ export type SplitNode = LeafNode | ContainerNode;
 export type SplitTreeTransferNode =
   | { type: "leaf"; sessionId: string }
   | { type: "container"; direction: "horizontal" | "vertical"; children: SplitTreeTransferNode[] };
+
+const AGENT_SPINNER_FRAMES = ["|", "/", "-", "\\"];
 
 export function serializeSplitTree(tree: SplitNode): SplitTreeTransferNode {
   if (tree.type === "leaf") {
@@ -83,6 +90,19 @@ export function deserializeSplitTreeWithMapping(
     direction: transfer.direction,
     children: transfer.children.map((c) => deserializeSplitTree(c, sessionIdMap)),
   };
+}
+
+function formatAgentElapsed(elapsedMs: number): string {
+  const totalSeconds = Math.max(0, Math.floor(elapsedMs / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+
+  if (hours > 0) {
+    return [hours, minutes, seconds].map((value) => value.toString().padStart(2, "0")).join(":");
+  }
+
+  return [minutes, seconds].map((value) => value.toString().padStart(2, "0")).join(":");
 }
 
 function getAllLeaves(node: SplitNode): LeafNode[] {
@@ -193,6 +213,7 @@ interface TerminalTheme {
 interface TerminalSplitPaneProps {
   primarySessionId: string;
   connected: boolean;
+  agentCommandName?: string;
   readOnly?: boolean;
   promptHookEnabled?: boolean;
   fontSize: number;
@@ -207,6 +228,14 @@ interface TerminalSplitPaneProps {
   showTimestamps: boolean;
   onReconnect: (sessionId: string) => void;
   onAiAction?: (sessionId: string, action: AiAction, selectedText: string) => void;
+  onStartAgent?: (sessionId: string) => void;
+  onStartAgentPlan?: (sessionId: string) => void;
+  onAgentCommand?: (sessionId: string, rawCommand: string) => void;
+  onApproveAgent?: (approval: TerminalAgentApproval) => void;
+  onApproveAgentAlways?: (approval: TerminalAgentApproval) => void;
+  onSubmitAgentPassword?: (request: TerminalAgentPasswordRequest, password: string) => void;
+  onStopAgent?: (runId: string) => void;
+  agentRunStates?: Record<string, TerminalAgentRunState | undefined>;
   onClosePrimarySplit?: () => void;
   onCloseRequest?: () => void;
   onSplitSameServer: () => Promise<string | null>;
@@ -222,6 +251,7 @@ interface TerminalSplitPaneProps {
 export function TerminalSplitPane({
   primarySessionId,
   connected,
+  agentCommandName,
   readOnly = false,
   promptHookEnabled = true,
   fontSize,
@@ -236,6 +266,14 @@ export function TerminalSplitPane({
   showTimestamps,
   onReconnect,
   onAiAction,
+  onStartAgent,
+  onStartAgentPlan,
+  onAgentCommand,
+  onApproveAgent,
+  onApproveAgentAlways,
+  onSubmitAgentPassword,
+  onStopAgent,
+  agentRunStates,
   onClosePrimarySplit,
   onCloseRequest,
   onSplitSameServer,
@@ -267,10 +305,13 @@ export function TerminalSplitPane({
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [swapDrag, setSwapDrag] = useState<{ sourceId: string; targetId: string | null } | null>(null);
   const [ctrlShiftHeld, setCtrlShiftHeld] = useState(false);
+  const [agentPasswords, setAgentPasswords] = useState<Record<string, string>>({});
+  const [agentActivityTick, setAgentActivityTick] = useState(() => Date.now());
   const menuRef = useRef<HTMLDivElement>(null);
   const panelGroupRefs = useRef<Map<string, ImperativePanelGroupHandle>>(new Map());
   const hostElementsRef = useRef<Map<string, HTMLDivElement>>(new Map());
   const slotRefs = useRef<Map<string, HTMLDivElement | null>>(new Map());
+  const agentRunStartedAtRef = useRef<Record<string, number>>({});
   const treeRef = useRef(tree);
   treeRef.current = tree;
   const swapDragRef = useRef(swapDrag);
@@ -514,6 +555,50 @@ export function TerminalSplitPane({
     [allLeaves],
   );
 
+  function isActiveAgentState(state?: TerminalAgentRunState) {
+    return state != null && !["Done", "Blocked", "Cancelled", "Failed"].includes(state.phase);
+  }
+
+  useEffect(() => {
+    const now = Date.now();
+    const activeRunIds = new Set<string>();
+
+    for (const state of Object.values(agentRunStates ?? {})) {
+      if (!state?.runId || !isActiveAgentState(state)) {
+        continue;
+      }
+      activeRunIds.add(state.runId);
+      if (agentRunStartedAtRef.current[state.runId] == null) {
+        agentRunStartedAtRef.current[state.runId] = now;
+      }
+    }
+
+    for (const runId of Object.keys(agentRunStartedAtRef.current)) {
+      if (!activeRunIds.has(runId)) {
+        delete agentRunStartedAtRef.current[runId];
+      }
+    }
+
+    if (activeRunIds.size > 0) {
+      setAgentActivityTick(now);
+    }
+  }, [agentRunStates]);
+
+  useEffect(() => {
+    const hasActiveAgent = Object.values(agentRunStates ?? {}).some((state) => isActiveAgentState(state));
+    if (!hasActiveAgent) {
+      return;
+    }
+
+    const timer = window.setInterval(() => {
+      setAgentActivityTick(Date.now());
+    }, 200);
+
+    return () => {
+      window.clearInterval(timer);
+    };
+  }, [agentRunStates]);
+
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       setCtrlShiftHeld(e.altKey && e.shiftKey && !e.metaKey && !e.ctrlKey);
@@ -583,6 +668,20 @@ export function TerminalSplitPane({
 
   function renderNode(node: SplitNode): React.ReactNode {
     if (node.type === "leaf") {
+      const agentState = agentRunStates?.[node.sessionId];
+      const pendingApproval = agentState?.pendingApproval;
+      const pendingPasswordRequest = agentState?.pendingPasswordRequest;
+      const activeAgentState = isActiveAgentState(agentState);
+      const canApprove = pendingApproval != null && !!onApproveAgent;
+      const canSubmitPassword = pendingPasswordRequest != null && !!onSubmitAgentPassword;
+      const canStop = agentState?.runId && isActiveAgentState(agentState) && !!onStopAgent;
+      const passwordValue = agentPasswords[node.sessionId] ?? "";
+      const startedAt =
+        agentState?.runId != null ? agentRunStartedAtRef.current[agentState.runId] : undefined;
+      const elapsedMs = startedAt != null ? Math.max(0, agentActivityTick - startedAt) : 0;
+      const spinnerFrame = startedAt != null
+        ? AGENT_SPINNER_FRAMES[Math.floor(elapsedMs / 200) % AGENT_SPINNER_FRAMES.length]
+        : AGENT_SPINNER_FRAMES[0];
       return (
         <div
           className="relative w-full h-full min-h-0 min-w-0 group overflow-hidden"
@@ -608,6 +707,92 @@ export function TerminalSplitPane({
             }}
             className="absolute inset-0 overflow-hidden"
           />
+          {agentState && (
+            <div className="pointer-events-none absolute left-0 right-0 top-0 z-30 bg-kortty-surface/95 border-b border-kortty-border px-2 py-1 flex items-center gap-2 text-[11px]">
+              <span className="font-medium text-kortty-accent whitespace-nowrap">AI Agent</span>
+              {activeAgentState && (
+                <>
+                  <span className="font-mono text-kortty-accent whitespace-nowrap">{spinnerFrame}</span>
+                  <span className="font-mono text-kortty-text-dim whitespace-nowrap">
+                    {formatAgentElapsed(elapsedMs)}
+                  </span>
+                </>
+              )}
+              <span className="text-kortty-text-dim whitespace-nowrap">{agentState.phase}</span>
+              <span className="text-kortty-text truncate">
+                {agentState.userMessage || agentState.summary}
+              </span>
+              {canSubmitPassword && pendingPasswordRequest && (
+                <>
+                  <input
+                    type="password"
+                    className="pointer-events-auto ml-auto w-44 rounded border border-kortty-border bg-kortty-bg px-2 py-0.5 text-[11px] text-kortty-text"
+                    placeholder="sudo password"
+                    value={passwordValue}
+                    onChange={(event) => {
+                      setAgentPasswords((prev) => ({
+                        ...prev,
+                        [node.sessionId]: event.target.value,
+                      }));
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key !== "Enter" || !passwordValue.trim()) {
+                        return;
+                      }
+                      event.preventDefault();
+                      onSubmitAgentPassword?.(pendingPasswordRequest, passwordValue);
+                      setAgentPasswords((prev) => ({
+                        ...prev,
+                        [node.sessionId]: "",
+                      }));
+                    }}
+                  />
+                  <button
+                    className="pointer-events-auto rounded bg-kortty-accent px-2 py-0.5 text-kortty-bg hover:bg-kortty-accent-hover transition-colors disabled:opacity-50"
+                    disabled={!passwordValue.trim()}
+                    onClick={() => {
+                      if (!passwordValue.trim()) {
+                        return;
+                      }
+                      onSubmitAgentPassword?.(pendingPasswordRequest, passwordValue);
+                      setAgentPasswords((prev) => ({
+                        ...prev,
+                        [node.sessionId]: "",
+                      }));
+                    }}
+                  >
+                    Unlock
+                  </button>
+                </>
+              )}
+              {canApprove && pendingApproval && (
+                <>
+                  <button
+                    className={`${canSubmitPassword ? "" : "ml-auto"} pointer-events-auto px-2 py-0.5 rounded bg-kortty-accent text-kortty-bg hover:bg-kortty-accent-hover transition-colors`}
+                    onClick={() => onApproveAgent?.(pendingApproval)}
+                  >
+                    Approve
+                  </button>
+                  {onApproveAgentAlways && (
+                    <button
+                      className="pointer-events-auto px-2 py-0.5 rounded bg-kortty-success/20 text-kortty-success hover:bg-kortty-success/30 transition-colors"
+                      onClick={() => onApproveAgentAlways(pendingApproval)}
+                    >
+                      Allow always
+                    </button>
+                  )}
+                </>
+              )}
+              {canStop && (
+                <button
+                  className={`${canApprove || canSubmitPassword ? "" : "ml-auto"} pointer-events-auto px-2 py-0.5 rounded bg-kortty-error/20 text-kortty-error hover:bg-kortty-error/30 transition-colors`}
+                  onClick={() => agentState.runId && onStopAgent?.(agentState.runId)}
+                >
+                  Stop
+                </button>
+              )}
+            </div>
+          )}
           {allLeaves.length > 1 && !swapDrag && (
             <button
               className="absolute top-1 right-1 p-0.5 bg-kortty-surface/80 rounded opacity-0 group-hover:opacity-100 transition-opacity text-kortty-text-dim hover:text-kortty-error"
@@ -733,6 +918,7 @@ export function TerminalSplitPane({
             host={host}
             sessionId={sessionId}
             connected={leaf.connected}
+            agentCommandName={agentCommandName}
             readOnly={readOnly}
             promptHookEnabled={promptHookEnabled}
             showTimestamps={showTimestamps}
@@ -741,6 +927,7 @@ export function TerminalSplitPane({
             fontFamily={fontFamily}
             broadcastTargets={broadcast ? broadcastTargetsBySessionId[sessionId] : undefined}
             onContextMenu={(e, selectedText) => openContextMenu(e, leaf.id, sessionId, selectedText)}
+            onAgentCommand={onAgentCommand}
             onCloseRequest={
               leaf.id === "primary" && allLeaves.length <= 1
                 ? onCloseRequest
@@ -780,15 +967,23 @@ export function TerminalSplitPane({
                     menuAction(() => onAiAction(contextMenu.sessionId, "SolveProblem", contextMenu.selectedText))
                   }
                 />
-                <CtxItem
-                  label="Ask..."
-                  disabled={!contextMenu.selectedText.trim()}
-                  onClick={() =>
-                    menuAction(() => onAiAction(contextMenu.sessionId, "Ask", contextMenu.selectedText))
-                  }
-                />
-              </CtxSubMenu>
-            </>
+              <CtxItem
+                label="Ask..."
+                disabled={!contextMenu.selectedText.trim()}
+                onClick={() =>
+                  menuAction(() => onAiAction(contextMenu.sessionId, "Ask", contextMenu.selectedText))
+                }
+              />
+              <CtxItem
+                label="Agent..."
+                onClick={() => menuAction(() => onStartAgent?.(contextMenu.sessionId))}
+              />
+              <CtxItem
+                label="Planning..."
+                onClick={() => menuAction(() => onStartAgentPlan?.(contextMenu.sessionId))}
+              />
+            </CtxSubMenu>
+          </>
           )}
           <CtxSep />
           <CtxSubMenu label="Split Horizontal">
@@ -898,6 +1093,7 @@ interface TerminalPortalProps {
   host: HTMLDivElement;
   sessionId: string;
   connected: boolean;
+  agentCommandName?: string;
   readOnly?: boolean;
   promptHookEnabled?: boolean;
   showTimestamps: boolean;
@@ -906,6 +1102,7 @@ interface TerminalPortalProps {
   fontFamily?: string;
   broadcastTargets?: string[];
   onContextMenu: (e: React.MouseEvent<HTMLDivElement>, selectedText: string) => void;
+  onAgentCommand?: (sessionId: string, rawCommand: string) => void;
   onCloseRequest?: () => void;
 }
 
@@ -913,6 +1110,7 @@ function TerminalPortal({
   host,
   sessionId,
   connected,
+  agentCommandName,
   readOnly = false,
   promptHookEnabled = true,
   showTimestamps,
@@ -921,12 +1119,14 @@ function TerminalPortal({
   fontFamily,
   broadcastTargets,
   onContextMenu,
+  onAgentCommand,
   onCloseRequest,
 }: TerminalPortalProps) {
   return createPortal(
     <TerminalTab
       sessionId={sessionId}
       connected={connected}
+      agentCommandName={agentCommandName}
       readOnly={readOnly}
       promptHookEnabled={promptHookEnabled}
       showTimestamps={showTimestamps}
@@ -934,6 +1134,7 @@ function TerminalPortal({
       theme={theme}
       fontFamily={fontFamily}
       onContextMenu={onContextMenu}
+      onAgentCommand={onAgentCommand}
       onCloseRequest={onCloseRequest}
       broadcastTargets={broadcastTargets}
     />,

@@ -15,6 +15,12 @@ pub enum TranslationProvider {
     Yandex,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum TerminalAgentExecutionTarget {
+    TerminalWindow,
+    ChatWindow,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TeamworkSourceType {
     Git,
@@ -80,6 +86,14 @@ pub struct GlobalSettings {
     pub default_command_timestamps_enabled: bool,
     #[serde(default = "default_true")]
     pub default_prompt_hook_enabled: bool,
+    #[serde(default)]
+    pub terminal_agent_show_debug_messages: bool,
+    #[serde(default)]
+    pub terminal_agent_show_runtime_messages: bool,
+    #[serde(default = "default_terminal_agent_command_name")]
+    pub terminal_agent_command_name: String,
+    #[serde(default = "default_terminal_agent_execution_target")]
+    pub terminal_agent_execution_target: TerminalAgentExecutionTarget,
 }
 
 impl Default for GlobalSettings {
@@ -114,10 +128,22 @@ impl Default for GlobalSettings {
             teamwork_use_temporary_key: false,
             default_command_timestamps_enabled: false,
             default_prompt_hook_enabled: true,
+            terminal_agent_show_debug_messages: false,
+            terminal_agent_show_runtime_messages: false,
+            terminal_agent_command_name: default_terminal_agent_command_name(),
+            terminal_agent_execution_target: default_terminal_agent_execution_target(),
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn default_terminal_agent_command_name() -> String {
+    "agent".into()
+}
+
+fn default_terminal_agent_execution_target() -> TerminalAgentExecutionTarget {
+    TerminalAgentExecutionTarget::TerminalWindow
 }

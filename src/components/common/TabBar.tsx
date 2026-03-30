@@ -1,6 +1,12 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { Bot, X, Plus, Terminal } from "lucide-react";
-import type { AiRequestPayload, SavedAiChat } from "../../types/ai";
+import type {
+  AiRequestPayload,
+  SavedAiChat,
+  TerminalAgentPlanRequest,
+  TerminalAgentPlanRunState,
+  TerminalAgentRequest,
+} from "../../types/ai";
 
 const TAB_REORDER_MIME = "application/x-kortty-tab-reorder-id";
 
@@ -34,6 +40,11 @@ export interface Tab {
   aiChatId?: string;
   aiInitialRequest?: AiRequestPayload;
   aiSavedChat?: SavedAiChat;
+  aiAgentRequest?: TerminalAgentRequest;
+  aiAgentRunId?: string;
+  aiAgentPlanRequest?: TerminalAgentPlanRequest;
+  aiAgentPlanRunId?: string;
+  aiAgentPlanInitialState?: TerminalAgentPlanRunState;
 }
 
 interface TabBarProps {

@@ -20,6 +20,7 @@ interface MenuBarProps {
   onManageSSHKeys: () => void;
   onManageGPGKeys: () => void;
   onAiManager: () => void;
+  onAiAgent?: () => void;
   onSnippets: () => void;
   onSFTPManager: () => void;
   onAsciiArt: () => void;
@@ -109,6 +110,7 @@ export function MenuBar(props: MenuBarProps) {
       label: "Tools",
       items: [
         { label: "AI Manager...", shortcut: "Ctrl+Shift+Y", action: props.onAiManager },
+        { label: "AI Agent...", action: props.onAiAgent },
         { separator: true, label: "" },
         { label: "Open SFTP Manager...", action: props.onSFTPManager },
         { label: "ASCII Art Banner...", action: props.onAsciiArt },

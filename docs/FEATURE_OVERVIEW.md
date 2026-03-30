@@ -40,6 +40,60 @@ The result opens in a dedicated AI tab where you can:
 - Save the chat
 - Export the transcript as TXT or Markdown
 
+### AI Agent task execution
+
+From a connected terminal session you can start the executable AI Agent in multiple ways:
+
+- Use the terminal pane context menu: `AI -> Agent...`
+- Open the dialog from the menu bar
+- Type the terminal shortcut directly at the shell prompt: `agent ...` or `agent: ...`
+
+The base command name is configurable in `Settings -> AI`. KorTTY automatically derives the matching `-ask` and `-plan` commands from that custom base name.
+
+The AI Agent workflow currently supports:
+
+- Inspecting the remote server first before asking the AI profile for the next safe step
+- Running either in the current terminal session or in a dedicated `AI Agent` tab, configurable via `Settings -> AI -> AI Agent task target`
+- Approval prompts for risky commands, including `Allow always` for the current run
+- Sudo password prompts inside the terminal overlay or the `AI Agent` tab when privileged commands require authentication
+- Temporary reuse of the sudo password for the current SSH session after it was entered once
+- Transcript copy and save actions in the dedicated `AI Agent` tab
+
+The `agent-ask` shortcut is the non-executing variant for direct Q&A:
+
+- `agent-ask <question>`
+- `agent-ask: <question>`
+
+This mode answers the question without running remote shell commands.
+
+### AI Agent planning mode
+
+Planning mode opens a dedicated `AI Agent Plan` tab and does not execute shell commands directly.
+
+You can start it with:
+
+- `AI -> Planning...` from the terminal pane context menu
+- The terminal shortcut `agent-plan <prompt>` or `agent-plan: <prompt>`
+
+The planning flow is:
+
+1. KorTTY probes the connected server
+2. The AI asks clarifying questions first
+3. You answer the questions or provide your own preferred approach
+4. The AI returns one or more implementation options
+5. You accept an option explicitly
+6. You start execution explicitly via `Start accepted plan`
+
+Each plan option includes:
+
+- Feasibility
+- Prerequisites
+- Risks
+- Alternatives
+- Ordered implementation steps
+
+Starting execution from an accepted plan hands the selected plan context over to the normal AI Agent run, which then uses the standard approval and sudo handling.
+
 ## Project workflows
 
 The project flow currently supports:

@@ -3,6 +3,13 @@ import { X, Settings } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore, GlobalSettings } from "../../store/settingsStore";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
+import {
+  DEFAULT_TERMINAL_AGENT_COMMAND_NAME,
+  getTerminalAgentAskCommandName,
+  getTerminalAgentPlanCommandName,
+  getTerminalAgentCommandNameValidationMessage,
+  normalizeTerminalAgentCommandName,
+} from "../../utils/terminalAgentCommand";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -10,7 +17,7 @@ interface SettingsDialogProps {
   onSaved?: (settings: GlobalSettings) => void;
 }
 
-type TabId = "language" | "translation" | "backup" | "window" | "terminal";
+type TabId = "language" | "translation" | "ai" | "backup" | "window" | "terminal";
 
 const LANGUAGES = [
   { value: "en", label: "English" },
@@ -61,8 +68,12 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
   async function handleSave() {
     setSaving(true);
     try {
-      await saveSettings(local);
-      onSaved?.(local);
+      const nextSettings = {
+        ...local,
+        terminalAgentCommandName: normalizeTerminalAgentCommandName(local.terminalAgentCommandName),
+      };
+      await saveSettings(nextSettings);
+      onSaved?.(nextSettings);
       onClose();
     } catch (err) {
       console.error(err);
@@ -70,6 +81,9 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
       setSaving(false);
     }
   }
+
+  const agentCommandNameError = getTerminalAgentCommandNameValidationMessage(local.terminalAgentCommandName);
+  const normalizedAgentCommandName = normalizeTerminalAgentCommandName(local.terminalAgentCommandName);
 
   async function handleTestConnection() {
     setTranslationTestResult(null);
@@ -105,6 +119,7 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
   const tabs: { id: TabId; label: string }[] = [
     { id: "language", label: "Language" },
     { id: "translation", label: "Translation" },
+    { id: "ai", label: "AI" },
     { id: "backup", label: "Backup" },
     { id: "window", label: "Window" },
     { id: "terminal", label: "Terminal" },
@@ -236,6 +251,49 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
               >
                 Generate Language File
               </button>
+            </>
+          )}
+
+          {activeTab === "ai" && (
+            <>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">Agent command name</label>
+                <input
+                  className="input-field"
+                  value={local.terminalAgentCommandName}
+                  onChange={(e) => update({ terminalAgentCommandName: e.target.value })}
+                  placeholder={DEFAULT_TERMINAL_AGENT_COMMAND_NAME}
+                />
+                <p className="mt-1 text-xs text-kortty-text-dim">
+                  Leave the field empty to use the default command names `{DEFAULT_TERMINAL_AGENT_COMMAND_NAME}`, `{getTerminalAgentAskCommandName(DEFAULT_TERMINAL_AGENT_COMMAND_NAME)}` and `{getTerminalAgentPlanCommandName(DEFAULT_TERMINAL_AGENT_COMMAND_NAME)}`.
+                </p>
+                <p className="mt-1 text-xs text-kortty-text-dim">
+                  Current shortcut trio: `{normalizedAgentCommandName}`, `{getTerminalAgentAskCommandName(normalizedAgentCommandName)}` and `{getTerminalAgentPlanCommandName(normalizedAgentCommandName)}`.
+                </p>
+                {agentCommandNameError && (
+                  <p className="mt-2 text-xs text-red-400">{agentCommandNameError}</p>
+                )}
+                <p className="mt-2 text-xs text-amber-300">
+                  Warning: the custom AI name must not be identical to an existing program or shell command.
+                  Otherwise KorTTY can only be used in a limited way because the shortcut collides with that program.
+                </p>
+              </div>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">AI Agent task target</label>
+                <select
+                  className="input-field"
+                  value={local.terminalAgentExecutionTarget}
+                  onChange={(e) => update({
+                    terminalAgentExecutionTarget: e.target.value as GlobalSettings["terminalAgentExecutionTarget"],
+                  })}
+                >
+                  <option value="TerminalWindow">Terminal window</option>
+                  <option value="ChatWindow">New chat window</option>
+                </select>
+                <p className="mt-1 text-xs text-kortty-text-dim">
+                  Choose whether AI Agent tasks run directly in the current terminal session or open as a new AI chat.
+                </p>
+              </div>
             </>
           )}
 
@@ -432,7 +490,7 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
           <button
             className="px-4 py-1.5 text-xs bg-kortty-accent text-kortty-bg rounded hover:bg-kortty-accent-hover transition-colors disabled:opacity-50"
             onClick={handleSave}
-            disabled={saving}
+            disabled={saving || !!agentCommandNameError}
           >
             Save
           </button>
