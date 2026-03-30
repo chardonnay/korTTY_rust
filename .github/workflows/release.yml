@@ -45,17 +45,10 @@ jobs:
 
   build-macos:
     needs: create-release
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-13
-            target: x86_64-apple-darwin
-            arch: x86_64
-          - runner: macos-14
-            target: aarch64-apple-darwin
-            arch: aarch64
-    runs-on: ${{ matrix.runner }}
+    runs-on: macos-14
+    env:
+      MACOS_TARGET: aarch64-apple-darwin
+      MACOS_ARCH: aarch64
     steps:
       - uses: actions/checkout@v4
 
@@ -68,7 +61,7 @@ jobs:
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: ${{ env.MACOS_TARGET }}
 
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
@@ -194,7 +187,7 @@ jobs:
       - name: Build signed Tauri macOS bundles
         if: steps.apple-secrets.outputs.available == 'true'
         shell: bash
-        run: npm run tauri build -- --target ${{ matrix.target }}
+        run: npm run tauri build -- --target ${{ env.MACOS_TARGET }}
 
       - name: Locate macOS bundles
         id: bundles
@@ -203,10 +196,10 @@ jobs:
         env:
           TAG_NAME: ${{ needs.create-release.outputs.tag_name }}
         run: |
-          BUNDLE_DIR="src-tauri/target/${{ matrix.target }}/release/bundle"
+          BUNDLE_DIR="src-tauri/target/${MACOS_TARGET}/release/bundle"
           APP_PATH="$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name 'KorTTY.app' | head -n1)"
           DMG_PATH="$(find "$BUNDLE_DIR/dmg" -maxdepth 1 -name '*.dmg' | head -n1)"
-          NOTARY_ZIP="$RUNNER_TEMP/KorTTY-notarization-${TAG_NAME}-${{ matrix.arch }}.zip"
+          NOTARY_ZIP="$RUNNER_TEMP/KorTTY-notarization-${TAG_NAME}-${MACOS_ARCH}.zip"
 
           if [ -z "$APP_PATH" ] || [ ! -d "$APP_PATH" ]; then
             echo "Signed macOS app bundle not found."
@@ -322,8 +315,8 @@ jobs:
           KORTTY_APP_PATH: ${{ steps.bundles.outputs.app_path }}
           KORTTY_DMG_PATH: ${{ steps.bundles.outputs.dmg_path }}
         run: |
-          RELEASE_ZIP="$RUNNER_TEMP/KorTTY-${TAG_NAME}-${{ matrix.arch }}-macOS.app.zip"
-          RELEASE_DMG="$RUNNER_TEMP/KorTTY-${TAG_NAME}-${{ matrix.arch }}-macOS.dmg"
+          RELEASE_ZIP="$RUNNER_TEMP/KorTTY-${TAG_NAME}-${MACOS_ARCH}-macOS.app.zip"
+          RELEASE_DMG="$RUNNER_TEMP/KorTTY-${TAG_NAME}-${MACOS_ARCH}-macOS.dmg"
 
           rm -f "$RELEASE_ZIP" "$RELEASE_DMG"
           ditto -c -k --keepParent "$KORTTY_APP_PATH" "$RELEASE_ZIP"
@@ -536,45 +529,20 @@ jobs:
       - name: Build frontend
         run: npm run build
 
-      - name: Build Rust
-        run: cargo build --manifest-path src-tauri/Cargo.toml --release
-
-      - name: Create PKGBUILD
+      - name: Prepare Arch package sources
         run: |
           mkdir -p /tmp/pkg
-          cat > /tmp/pkg/PKGBUILD << 'PKGEOF'
-          pkgname=kortty
-          pkgver=${{ needs.create-release.outputs.tag_name }}
-          pkgrel=1
-          pkgdesc="KorTTY - SSH Terminal Client"
-          arch=('x86_64')
-          url="https://github.com/chardonnay/korTTY_rust"
-          license=('MIT')
-          depends=('webkit2gtk-4.1' 'openssl')
-          source=()
-          
-          package() {
-            install -Dm755 "${srcdir}/kortty" "${pkgdir}/usr/bin/kortty"
-            install -Dm644 "${srcdir}/kortty.desktop" "${pkgdir}/usr/share/applications/kortty.desktop"
-            install -Dm644 "${srcdir}/icon.png" "${pkgdir}/usr/share/pixmaps/kortty.png"
-          }
-          PKGEOF
+          cp package/arch/PKGBUILD package/arch/kortty.desktop /tmp/pkg/
+          RELEASE_VERSION="${{ needs.create-release.outputs.tag_name }}"
+          RELEASE_VERSION="${RELEASE_VERSION#v}"
+          sed -i "s/^pkgver=.*/pkgver=${RELEASE_VERSION}/" /tmp/pkg/PKGBUILD
+          useradd -m builder
+          chown -R builder:builder /tmp/pkg
 
       - name: Build package
         run: |
-          cd /tmp/pkg
-          cp $GITHUB_WORKSPACE/src-tauri/target/release/kortty . 2>/dev/null || true
-          cp $GITHUB_WORKSPACE/src-tauri/icons/icon.png . 2>/dev/null || true
-          cat > kortty.desktop << 'DEOF'
-          [Desktop Entry]
-          Name=KorTTY
-          Comment=SSH Terminal Client
-          Exec=kortty
-          Icon=kortty
-          Terminal=false
-          Type=Application
-          Categories=System;TerminalEmulator;Network;
-          DEOF
+          su builder -c 'cd /tmp/pkg && makepkg --noconfirm --nodeps --cleanbuild --clean --force'
+          ls -l /tmp/pkg/*.pkg.tar.zst
 
       - name: Upload Arch package
         if: success()

@@ -98,7 +98,7 @@ On macOS the primary output is typically `src-tauri/target/release/bundle/macos/
 
 Pre-built packages are available on [GitHub Releases](https://github.com/chardonnay/korTTY_rust/releases):
 
-- **macOS**: Intel (x86_64) + Apple Silicon (aarch64) — DMG + ZIP
+- **macOS**: Apple Silicon (aarch64) — DMG + ZIP
 - **Windows**: Intel (x86_64) + ARM (aarch64) — MSI + ZIP
 - **Linux**: Intel (x86_64) + ARM (aarch64) — DEB + RPM + tar.gz
 - **Arch Linux**: x86_64 — pacman `.pkg.tar.zst`
