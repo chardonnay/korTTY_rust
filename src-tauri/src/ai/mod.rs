@@ -6,7 +6,7 @@ use anyhow::Result;
 use chrono::{Days, NaiveDate, Utc};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::sync::oneshot;
+use tokio::sync::{oneshot, watch};
 
 const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 20;
 const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 1_800;
@@ -91,6 +91,48 @@ pub async fn test_connection(profile: &AiProfile) -> bool {
         .await
         .map(|result| !result.content.trim().is_empty())
         .unwrap_or(false)
+}
+
+pub async fn execute_custom_prompt(
+    profile: &AiProfile,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+    cancel_rx: Option<&mut watch::Receiver<bool>>,
+) -> Result<AiExecutionResult, AiError> {
+    if profile.api_url.trim().is_empty() {
+        return Err(AiError::MissingApiUrl);
+    }
+
+    let client = build_http_client(DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)?;
+    let request_body = build_message_request_body(profile, system_prompt, user_prompt, temperature);
+    let request_future = send_request_body(profile, &client, &request_body);
+    tokio::pin!(request_future);
+
+    let mut result = if let Some(cancel_rx) = cancel_rx {
+        loop {
+            tokio::select! {
+                response = &mut request_future => break response?,
+                changed = cancel_rx.changed() => {
+                    match changed {
+                        Ok(_) if *cancel_rx.borrow() => return Err(AiError::Cancelled),
+                        Ok(_) => continue,
+                        Err(_) => continue,
+                    }
+                }
+            }
+        }
+    } else {
+        request_future.await?
+    };
+
+    if result.content.trim().is_empty() {
+        return Err(AiError::EmptyResponse);
+    }
+
+    result.active_profile_id = Some(profile.id.clone());
+    result.active_profile_name = Some(profile.name.clone());
+    Ok(result)
 }
 
 pub fn normalize_profile(profile: &mut AiProfile) {

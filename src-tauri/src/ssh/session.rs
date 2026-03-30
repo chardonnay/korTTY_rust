@@ -8,14 +8,20 @@ use russh::*;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 pub struct SSHSession {
     pub connection_id: String,
     pub settings: ConnectionSettings,
     mode: SessionMode,
     output_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
-    exec_outputs: Arc<std::sync::Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Vec<u8>>>>>,
+    exec_outputs: Arc<std::sync::Mutex<HashMap<ChannelId, ExecChannelOutput>>>,
+}
+
+#[derive(Clone)]
+struct ExecChannelOutput {
+    stdout_tx: mpsc::UnboundedSender<Vec<u8>>,
+    stderr_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 enum SessionMode {
@@ -36,7 +42,42 @@ struct MoshState {
 
 struct SSHHandler {
     output_tx: mpsc::UnboundedSender<Vec<u8>>,
-    exec_outputs: Arc<std::sync::Mutex<HashMap<ChannelId, mpsc::UnboundedSender<Vec<u8>>>>>,
+    exec_outputs: Arc<std::sync::Mutex<HashMap<ChannelId, ExecChannelOutput>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TerminalExecOutputKind {
+    Stdout,
+    Stderr,
+}
+
+#[derive(Debug, Clone)]
+pub struct TerminalExecOutput {
+    pub kind: TerminalExecOutputKind,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TerminalExecResult {
+    pub stdout: String,
+    pub stderr: String,
+    pub exit_status: Option<u32>,
+    pub exit_signal: Option<String>,
+    pub cancelled: bool,
+    pub timed_out: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecDeadlineEvent {
+    CancelRequested,
+    DeadlineElapsed,
+}
+
+#[derive(Debug, Clone)]
+enum ExecDeadlineAction {
+    Continue,
+    Break,
+    RequestStop { signal: Sig },
 }
 
 #[async_trait]
@@ -57,8 +98,32 @@ impl client::Handler for SSHHandler {
         _session: &mut client::Session,
     ) -> Result<(), Self::Error> {
         let exec_outputs = lock_mutex(&self.exec_outputs, "SSH exec output registry")?;
-        if let Some(tx) = exec_outputs.get(&channel) {
-            let _ = tx.send(data.to_vec());
+        if let Some(output) = exec_outputs.get(&channel) {
+            let _ = output.stdout_tx.send(data.to_vec());
+        } else {
+            let _ = self.output_tx.send(data.to_vec());
+        }
+        Ok(())
+    }
+
+    async fn extended_data(
+        &mut self,
+        channel: ChannelId,
+        ext: u32,
+        data: &[u8],
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let exec_outputs = lock_mutex(&self.exec_outputs, "SSH exec output registry")?;
+        if let Some(output) = exec_outputs.get(&channel) {
+            if ext == 1 {
+                if let Some(stderr_tx) = &output.stderr_tx {
+                    let _ = stderr_tx.send(data.to_vec());
+                } else {
+                    let _ = output.stdout_tx.send(data.to_vec());
+                }
+            } else {
+                let _ = output.stdout_tx.send(data.to_vec());
+            }
         } else {
             let _ = self.output_tx.send(data.to_vec());
         }
@@ -252,6 +317,191 @@ impl SSHSession {
         Ok(())
     }
 
+    fn register_exec_output(
+        &self,
+        channel_id: ChannelId,
+        stdout_tx: mpsc::UnboundedSender<Vec<u8>>,
+        stderr_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
+    ) -> Result<()> {
+        lock_mutex(&self.exec_outputs, "SSH exec output registry")?.insert(
+            channel_id,
+            ExecChannelOutput {
+                stdout_tx,
+                stderr_tx,
+            },
+        );
+        Ok(())
+    }
+
+    fn remove_exec_output(&self, channel_id: ChannelId) {
+        let _ = lock_mutex(&self.exec_outputs, "SSH exec output registry")
+            .map(|mut registry| registry.remove(&channel_id));
+    }
+
+    pub async fn exec_command_streaming(
+        &self,
+        command: &str,
+        output_tx: mpsc::UnboundedSender<TerminalExecOutput>,
+        mut cancel_rx: watch::Receiver<bool>,
+        timeout: std::time::Duration,
+        stdin_data: Option<Vec<u8>>,
+        request_pty: bool,
+    ) -> Result<TerminalExecResult> {
+        let handle = match &self.mode {
+            SessionMode::Russh { handle, .. } => handle
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("Not connected"))?,
+            SessionMode::Mosh { .. } => {
+                anyhow::bail!("exec_command_streaming is not supported for MOSH sessions");
+            }
+        };
+
+        let mut channel = handle.channel_open_session().await?;
+        let channel_id = channel.id();
+        let (stdout_tx, mut stdout_rx) = mpsc::unbounded_channel();
+        let (stderr_tx, mut stderr_rx) = mpsc::unbounded_channel();
+        self.register_exec_output(channel_id, stdout_tx, Some(stderr_tx))?;
+        if request_pty {
+            let cols = self.settings.columns as u32;
+            let rows = self.settings.rows as u32;
+            channel
+                .request_pty(false, "xterm-256color", cols, rows, 0, 0, &[])
+                .await?;
+        }
+        channel.exec(true, command).await?;
+        if let Some(stdin_data) = stdin_data.as_ref() {
+            channel.data(stdin_data.as_slice()).await?;
+            channel.eof().await?;
+        }
+
+        let mut result = TerminalExecResult::default();
+        let mut wait_deadline = Box::pin(tokio::time::sleep_until(
+            tokio::time::Instant::now() + timeout,
+        ));
+        let mut stop_requested = false;
+        let mut stdout_open = true;
+        let mut stderr_open = true;
+        let stop_grace = std::time::Duration::from_secs(2);
+
+        loop {
+            if !stdout_open && !stderr_open {
+                break;
+            }
+            tokio::select! {
+                maybe_stdout = stdout_rx.recv(), if stdout_open => {
+                    match maybe_stdout {
+                        Some(bytes) => {
+                            let text = String::from_utf8_lossy(&bytes).to_string();
+                            result.stdout.push_str(&text);
+                            let _ = output_tx.send(TerminalExecOutput {
+                                kind: TerminalExecOutputKind::Stdout,
+                                text,
+                            });
+                        }
+                        None => {
+                            stdout_open = false;
+                            if stop_requested && !stderr_open {
+                                break;
+                            }
+                        }
+                    }
+                }
+                maybe_stderr = stderr_rx.recv(), if stderr_open => {
+                    match maybe_stderr {
+                        Some(bytes) => {
+                            let text = String::from_utf8_lossy(&bytes).to_string();
+                            result.stderr.push_str(&text);
+                            let _ = output_tx.send(TerminalExecOutput {
+                                kind: TerminalExecOutputKind::Stderr,
+                                text,
+                            });
+                        }
+                        None => {
+                            stderr_open = false;
+                            if stop_requested && !stdout_open {
+                                break;
+                            }
+                        }
+                    }
+                }
+                maybe_message = channel.wait() => {
+                    match maybe_message {
+                        Some(ChannelMsg::ExitStatus { exit_status }) => {
+                            result.exit_status = Some(exit_status);
+                        }
+                        Some(ChannelMsg::ExitSignal { signal_name, .. }) => {
+                            result.exit_signal = Some(format!("{signal_name:?}"));
+                        }
+                        Some(ChannelMsg::Close) | None => break,
+                        Some(_) => {}
+                    }
+                }
+                changed = cancel_rx.changed(), if !stop_requested => {
+                    if changed.is_ok() && *cancel_rx.borrow() {
+                        match classify_exec_deadline_event(
+                            &mut result,
+                            stop_requested,
+                            ExecDeadlineEvent::CancelRequested,
+                        ) {
+                            ExecDeadlineAction::RequestStop { signal } => {
+                                let _ = channel.signal(signal).await;
+                                let _ = channel.eof().await;
+                                let _ = channel.close().await;
+                                stop_requested = true;
+                                wait_deadline
+                                    .as_mut()
+                                    .reset(tokio::time::Instant::now() + stop_grace);
+                            }
+                            ExecDeadlineAction::Break => break,
+                            ExecDeadlineAction::Continue => {}
+                        }
+                    }
+                }
+                _ = &mut wait_deadline => {
+                    match classify_exec_deadline_event(
+                        &mut result,
+                        stop_requested,
+                        ExecDeadlineEvent::DeadlineElapsed,
+                    ) {
+                        ExecDeadlineAction::RequestStop { signal } => {
+                            let _ = channel.signal(signal).await;
+                            let _ = channel.eof().await;
+                            let _ = channel.close().await;
+                            stop_requested = true;
+                            wait_deadline
+                                .as_mut()
+                                .reset(tokio::time::Instant::now() + stop_grace);
+                        }
+                        ExecDeadlineAction::Break => break,
+                        ExecDeadlineAction::Continue => {}
+                    }
+                }
+            }
+        }
+
+        self.remove_exec_output(channel_id);
+
+        while let Ok(bytes) = stdout_rx.try_recv() {
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            result.stdout.push_str(&text);
+            let _ = output_tx.send(TerminalExecOutput {
+                kind: TerminalExecOutputKind::Stdout,
+                text,
+            });
+        }
+
+        while let Ok(bytes) = stderr_rx.try_recv() {
+            let text = String::from_utf8_lossy(&bytes).to_string();
+            result.stderr.push_str(&text);
+            let _ = output_tx.send(TerminalExecOutput {
+                kind: TerminalExecOutputKind::Stderr,
+                text,
+            });
+        }
+
+        Ok(result)
+    }
+
     pub async fn exec_command(&self, command: &str) -> Result<String> {
         let handle = match &self.mode {
             SessionMode::Russh { handle, .. } => handle
@@ -266,7 +516,7 @@ impl SSHSession {
         let channel_id = channel.id();
 
         let (tx, mut rx) = mpsc::unbounded_channel();
-        lock_mutex(&self.exec_outputs, "SSH exec output registry")?.insert(channel_id, tx);
+        self.register_exec_output(channel_id, tx, None)?;
 
         channel.exec(true, command).await?;
 
@@ -281,7 +531,7 @@ impl SSHSession {
             }
         }
 
-        lock_mutex(&self.exec_outputs, "SSH exec output registry")?.remove(&channel_id);
+        self.remove_exec_output(channel_id);
         drop(channel);
 
         String::from_utf8(output)
@@ -469,4 +719,70 @@ fn is_command_available(cmd: &str) -> bool {
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
+}
+
+fn classify_exec_deadline_event(
+    result: &mut TerminalExecResult,
+    stop_requested: bool,
+    event: ExecDeadlineEvent,
+) -> ExecDeadlineAction {
+    match (stop_requested, event) {
+        (false, ExecDeadlineEvent::CancelRequested) => {
+            result.cancelled = true;
+            ExecDeadlineAction::RequestStop { signal: Sig::INT }
+        }
+        (false, ExecDeadlineEvent::DeadlineElapsed) => {
+            result.timed_out = true;
+            ExecDeadlineAction::RequestStop { signal: Sig::TERM }
+        }
+        (true, ExecDeadlineEvent::DeadlineElapsed) => ExecDeadlineAction::Break,
+        (true, ExecDeadlineEvent::CancelRequested) => ExecDeadlineAction::Continue,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cancel_requests_sigint_and_marks_result_cancelled() {
+        let mut result = TerminalExecResult::default();
+
+        let action =
+            classify_exec_deadline_event(&mut result, false, ExecDeadlineEvent::CancelRequested);
+
+        assert!(matches!(
+            action,
+            ExecDeadlineAction::RequestStop { signal: Sig::INT }
+        ));
+        assert!(result.cancelled);
+        assert!(!result.timed_out);
+    }
+
+    #[test]
+    fn timeout_requests_sigterm_and_marks_result_timed_out() {
+        let mut result = TerminalExecResult::default();
+
+        let action =
+            classify_exec_deadline_event(&mut result, false, ExecDeadlineEvent::DeadlineElapsed);
+
+        assert!(matches!(
+            action,
+            ExecDeadlineAction::RequestStop { signal: Sig::TERM }
+        ));
+        assert!(result.timed_out);
+        assert!(!result.cancelled);
+    }
+
+    #[test]
+    fn second_deadline_after_stop_breaks_exec_loop() {
+        let mut result = TerminalExecResult::default();
+
+        let action =
+            classify_exec_deadline_event(&mut result, true, ExecDeadlineEvent::DeadlineElapsed);
+
+        assert!(matches!(action, ExecDeadlineAction::Break));
+        assert!(!result.cancelled);
+        assert!(!result.timed_out);
+    }
 }

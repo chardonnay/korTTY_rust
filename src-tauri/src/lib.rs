@@ -10,6 +10,7 @@ pub mod security;
 pub mod sftp;
 pub mod ssh;
 pub mod teamwork;
+pub mod terminal_agent;
 
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -25,6 +26,8 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(ssh::SSHManager::new())
+        .manage(terminal_agent::TerminalAgentStore::new())
+        .manage(terminal_agent::TerminalAgentPlanStore::new())
         .manage(security::vault::Vault::new())
         .manage(commands::ai_commands::AiRequestCancelStore(
             std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -50,6 +53,17 @@ pub fn run() {
             commands::ai_commands::get_ai_chats,
             commands::ai_commands::save_ai_chat,
             commands::ai_commands::delete_ai_chat,
+            commands::terminal_agent_commands::start_terminal_agent,
+            commands::terminal_agent_commands::start_terminal_agent_plan,
+            commands::terminal_agent_commands::answer_terminal_agent_plan_questions,
+            commands::terminal_agent_commands::submit_terminal_agent_plan_custom_approach,
+            commands::terminal_agent_commands::choose_terminal_agent_plan_option,
+            commands::terminal_agent_commands::cancel_terminal_agent_plan,
+            commands::terminal_agent_commands::start_terminal_agent_from_plan,
+            commands::terminal_agent_commands::approve_terminal_agent,
+            commands::terminal_agent_commands::approve_terminal_agent_always,
+            commands::terminal_agent_commands::cancel_terminal_agent,
+            commands::terminal_agent_commands::submit_terminal_agent_sudo_password,
             commands::connection_commands::get_connections,
             commands::connection_commands::save_connection,
             commands::connection_commands::delete_connection,

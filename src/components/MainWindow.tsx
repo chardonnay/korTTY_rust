@@ -33,15 +33,47 @@ import { ConnectionExportDialog } from "./dialogs/ConnectionExportDialog";
 import { ProjectPreviewDialog } from "./dialogs/ProjectPreviewDialog";
 import { ProjectSettingsDialog } from "./dialogs/ProjectSettingsDialog";
 import { AiActionDialog } from "./dialogs/AiActionDialog";
+import { AiAgentDialog } from "./dialogs/AiAgentDialog";
+import { AiAgentPlanDialog } from "./dialogs/AiAgentPlanDialog";
 import { AiManagerDialog } from "./dialogs/AiManagerDialog";
 import { AiChatTab } from "./ai/AiChatTab";
+import { AiAgentRunTab } from "./ai/AiAgentRunTab";
+import { AiAgentPlanTab } from "./ai/AiAgentPlanTab";
 import { SFTPManager } from "./sftp/SFTPManager";
 import { useConnectionStore, ConnectionSettings } from "../store/connectionStore";
 import { useProjectStore, type Project } from "../store/projectStore";
 import type { GlobalSettings } from "../store/settingsStore";
 import { useThemeStore } from "../store/themeStore";
 import { useGuiThemeStore } from "../store/guiThemeStore";
-import type { AiAction, AiProfile, AiRequestPayload, SavedAiChat } from "../types/ai";
+import {
+  buildTerminalAgentAskPattern,
+  buildTerminalAgentAskPrefixPattern,
+  buildTerminalAgentCommandPattern,
+  buildTerminalAgentPlanPattern,
+  buildTerminalAgentPlanPrefixPattern,
+  buildTerminalAgentUsageText,
+  getTerminalAgentAskCommandName,
+  getTerminalAgentPlanCommandName,
+  normalizeTerminalAgentCommandName,
+} from "../utils/terminalAgentCommand";
+import type {
+  AiAction,
+  AiExecutionResult,
+  AiProfile,
+  AiRequestPayload,
+  TerminalAgentPasswordRequest,
+  SavedAiChat,
+  TerminalAgentApproval,
+  TerminalAgentExecutionTarget,
+  TerminalAgentEvent,
+  TerminalAgentPlanExecutionResponse,
+  TerminalAgentPlanRequest,
+  TerminalAgentPlanRunState,
+  TerminalAgentPlanStartResponse,
+  TerminalAgentRequest,
+  TerminalAgentRunState,
+  TerminalAgentStartResponse,
+} from "../types/ai";
 
 type DialogId =
   | null
@@ -60,6 +92,8 @@ type DialogId =
   | "importDialog"
   | "connectionExport"
   | "aiAction"
+  | "aiAgent"
+  | "aiAgentPlan"
   | "aiManager"
   | "terminalThemeEditor"
   | "guiThemeEditor"
@@ -130,12 +164,19 @@ type GlobalSettingsView = {
   defaultCommandTimestampsEnabled?: boolean;
   defaultPromptHookEnabled?: boolean;
   showMenuBar?: boolean;
+  terminalAgentCommandName?: string;
+  terminalAgentExecutionTarget?: TerminalAgentExecutionTarget;
 };
 
 type PendingAiAction = {
   action: AiAction;
   sessionId: string;
   selectedText: string;
+  connectionDisplayName?: string;
+};
+
+type PendingTerminalAgentAction = {
+  sessionId: string;
   connectionDisplayName?: string;
 };
 
@@ -200,6 +241,269 @@ function buildAiTabLabel(action: AiAction) {
     default:
       return "AI";
   }
+}
+
+type TerminalAgentShortcutInvocation = {
+  mode: "agent";
+  userPrompt: string;
+  profileLookup?: string;
+  askConfirmationBeforeEveryCommand: boolean;
+  autoApproveRootCommands: boolean;
+};
+
+type TerminalAskShortcutInvocation = {
+  mode: "ask";
+  userPrompt: string;
+};
+
+type TerminalAgentPlanShortcutInvocation = {
+  mode: "plan";
+  userPrompt: string;
+  profileLookup?: string;
+};
+
+function stripMatchingQuotes(value: string) {
+  const trimmed = value.trim();
+  if (trimmed.length >= 2) {
+    const first = trimmed[0];
+    const last = trimmed[trimmed.length - 1];
+    if ((first === "\"" || first === "'") && first === last) {
+      return trimmed.slice(1, -1);
+    }
+  }
+  return trimmed;
+}
+
+function splitTerminalAgentOptions(value: string) {
+  const parts: string[] = [];
+  let current = "";
+  let quote: "'" | "\"" | null = null;
+
+  for (const char of value) {
+    if ((char === "\"" || char === "'") && (quote === null || quote === char)) {
+      quote = quote === char ? null : char;
+      current += char;
+      continue;
+    }
+    if (char === "," && quote === null) {
+      if (current.trim()) {
+        parts.push(current.trim());
+      }
+      current = "";
+      continue;
+    }
+    current += char;
+  }
+
+  if (quote !== null) {
+    return { ok: false as const, error: "Unclosed quote in agent options." };
+  }
+  if (current.trim()) {
+    parts.push(current.trim());
+  }
+  return { ok: true as const, parts };
+}
+
+function parseTerminalAgentBooleanOption(name: string, value: string) {
+  const normalized = stripMatchingQuotes(value).trim().toLowerCase();
+  if (normalized === "true") return true;
+  if (normalized === "false") return false;
+  throw new Error(`Option \`${name}\` expects \`true\` or \`false\`.`);
+}
+
+function parseTerminalAgentShortcut(
+  rawCommand: string,
+  agentCommandName: string,
+):
+  | {
+      ok: true;
+      invocation:
+        | TerminalAgentShortcutInvocation
+        | TerminalAskShortcutInvocation
+        | TerminalAgentPlanShortcutInvocation;
+    }
+  | { ok: false; error: string } {
+  const trimmed = rawCommand.trim();
+  const normalizedAgentCommandName = normalizeTerminalAgentCommandName(agentCommandName);
+  const askCommandName = getTerminalAgentAskCommandName(normalizedAgentCommandName);
+  const planCommandName = getTerminalAgentPlanCommandName(normalizedAgentCommandName);
+  const askMatch = trimmed.match(buildTerminalAgentAskPattern(normalizedAgentCommandName));
+  if (askMatch) {
+    const [, rawPrompt = ""] = askMatch;
+    const userPrompt = rawPrompt.trim();
+    if (!userPrompt) {
+      return { ok: false, error: `The ${askCommandName} command is missing the question.` };
+    }
+    return {
+      ok: true,
+      invocation: {
+        mode: "ask",
+        userPrompt,
+      },
+    };
+  }
+  if (buildTerminalAgentAskPrefixPattern(normalizedAgentCommandName).test(trimmed)) {
+    return {
+      ok: false,
+      error: `Invalid ${askCommandName} command. Use \`${askCommandName} <question>\` or \`${askCommandName}: <question>\`.`,
+    };
+  }
+  const planMatch = trimmed.match(buildTerminalAgentPlanPattern(normalizedAgentCommandName));
+  if (planMatch) {
+    const [, rawOptions = "", rawPrompt = ""] = planMatch;
+    const userPrompt = rawPrompt.trim();
+    if (!userPrompt) {
+      return {
+        ok: false,
+        error: `The ${planCommandName} command is missing the planning task.`,
+      };
+    }
+
+    let profileLookup: string | undefined;
+
+    if (rawOptions.trim()) {
+      const splitOptions = splitTerminalAgentOptions(rawOptions);
+      if (!splitOptions.ok) {
+        return splitOptions;
+      }
+      for (const option of splitOptions.parts) {
+        const separatorIndex = option.indexOf("=");
+        if (separatorIndex <= 0) {
+          return {
+            ok: false,
+            error: `Invalid ${planCommandName} option \`${option}\`. Use \`key=value\`.`,
+          };
+        }
+        const key = option.slice(0, separatorIndex).trim().toLowerCase();
+        const value = option.slice(separatorIndex + 1).trim();
+        if (!value) {
+          return {
+            ok: false,
+            error: `${planCommandName} option \`${key}\` is missing a value.`,
+          };
+        }
+        switch (key) {
+          case "profile":
+            profileLookup = stripMatchingQuotes(value);
+            if (!profileLookup) {
+              return {
+                ok: false,
+                error: `${planCommandName} option \`profile\` must not be empty.`,
+              };
+            }
+            break;
+          default:
+            return {
+              ok: false,
+              error: `Unknown ${planCommandName} option \`${key}\`. Supported option: profile.`,
+            };
+        }
+      }
+    }
+
+    return {
+      ok: true,
+      invocation: {
+        mode: "plan",
+        userPrompt,
+        profileLookup,
+      },
+    };
+  }
+  if (buildTerminalAgentPlanPrefixPattern(normalizedAgentCommandName).test(trimmed)) {
+    return {
+      ok: false,
+      error: `Invalid ${planCommandName} command. Use \`${planCommandName} <prompt>\`, \`${planCommandName}: <prompt>\`, or \`${planCommandName}(profile=name) <prompt>\`.`,
+    };
+  }
+  const match = trimmed.match(buildTerminalAgentCommandPattern(normalizedAgentCommandName));
+  if (!match) {
+    return {
+      ok: false,
+      error: `Invalid agent command. ${buildTerminalAgentUsageText(normalizedAgentCommandName)}`,
+    };
+  }
+
+  const [, rawOptions = "", rawPrompt = ""] = match;
+  const userPrompt = rawPrompt.trim();
+  if (!userPrompt) {
+    return {
+      ok: false,
+      error: `The agent command is missing the prompt after \`${normalizedAgentCommandName}\`.`,
+    };
+  }
+
+  let profileLookup: string | undefined;
+  let askConfirmationBeforeEveryCommand = false;
+  let autoApproveRootCommands = false;
+
+  if (rawOptions.trim()) {
+    const splitOptions = splitTerminalAgentOptions(rawOptions);
+    if (!splitOptions.ok) {
+      return splitOptions;
+    }
+    for (const option of splitOptions.parts) {
+      const separatorIndex = option.indexOf("=");
+      if (separatorIndex <= 0) {
+        return {
+          ok: false,
+          error: `Invalid agent option \`${option}\`. Use \`key=value\`.`,
+        };
+      }
+      const key = option.slice(0, separatorIndex).trim().toLowerCase();
+      const value = option.slice(separatorIndex + 1).trim();
+      if (!value) {
+        return {
+          ok: false,
+          error: `Agent option \`${key}\` is missing a value.`,
+        };
+      }
+      try {
+        switch (key) {
+          case "profile":
+            profileLookup = stripMatchingQuotes(value);
+            if (!profileLookup) {
+              return {
+                ok: false,
+                error: "Agent option `profile` must not be empty.",
+              };
+            }
+            break;
+          case "ask":
+            askConfirmationBeforeEveryCommand = parseTerminalAgentBooleanOption(key, value);
+            break;
+          case "root":
+            autoApproveRootCommands = parseTerminalAgentBooleanOption(key, value);
+            break;
+          default:
+            return {
+              ok: false,
+              error: `Unknown agent option \`${key}\`. Supported options: profile, root, ask.`,
+            };
+        }
+      } catch (error) {
+        return {
+          ok: false,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }
+  }
+
+  if (askConfirmationBeforeEveryCommand) {
+    autoApproveRootCommands = false;
+  }
+
+  return {
+    ok: true,
+    invocation: {
+      mode: "agent",
+      userPrompt,
+      profileLookup,
+      askConfirmationBeforeEveryCommand,
+      autoApproveRootCommands,
+    },
+  };
 }
 
 function storeCrossWindowTransferPayload(payload: CrossWindowTransferPayload): string {
@@ -318,12 +622,19 @@ export function MainWindow() {
   const [projectPreview, setProjectPreview] = useState<Project | null>(null);
   const [projectSettingsDraft, setProjectSettingsDraft] = useState<Project | null>(null);
   const [pendingAiAction, setPendingAiAction] = useState<PendingAiAction | null>(null);
+  const [pendingTerminalAgentAction, setPendingTerminalAgentAction] = useState<PendingTerminalAgentAction | null>(null);
+  const [pendingTerminalAgentMode, setPendingTerminalAgentMode] = useState<"run" | "plan" | null>(null);
+  const [terminalAgentStates, setTerminalAgentStates] = useState<Record<string, TerminalAgentRunState>>({});
   const [globalFontSize, setGlobalFontSize] = useState(DEFAULT_FONT_SIZE);
   const [tabFontSizes, setTabFontSizes] = useState<Record<string, number>>({});
   const [paneFontSizes, setPaneFontSizes] = useState<Record<string, number>>({});
   const [showTimestamps, setShowTimestamps] = useState(false);
   const [promptHookEnabled, setPromptHookEnabled] = useState(true);
   const [showMenuBar, setShowMenuBar] = useState(true);
+  const [terminalAgentCommandName, setTerminalAgentCommandName] = useState("agent");
+  const [terminalAgentExecutionTarget, setTerminalAgentExecutionTarget] =
+    useState<TerminalAgentExecutionTarget>("TerminalWindow");
+  const [settingsReady, setSettingsReady] = useState(false);
   const globalFontSizeRef = useRef(globalFontSize);
   globalFontSizeRef.current = globalFontSize;
   const activeTabRef = useRef<string | null>(activeTab);
@@ -379,6 +690,16 @@ export function MainWindow() {
   tabsRef.current = tabs;
   splitSessionsRef.current = tabSplitSessions;
 
+  const applyGlobalSettingsView = useCallback((settings: GlobalSettingsView) => {
+    setShowTimestamps(!!settings.defaultCommandTimestampsEnabled);
+    setPromptHookEnabled(settings.defaultPromptHookEnabled !== false);
+    setShowMenuBar(settings.showMenuBar !== false);
+    setTerminalAgentCommandName(
+      normalizeTerminalAgentCommandName(settings.terminalAgentCommandName),
+    );
+    setTerminalAgentExecutionTarget(settings.terminalAgentExecutionTarget ?? "TerminalWindow");
+  }, []);
+
   useEffect(() => {
     loadConnections();
     loadActiveTheme();
@@ -388,15 +709,28 @@ export function MainWindow() {
       .catch(console.error);
     invoke<GlobalSettingsView>("get_settings")
       .then((settings) => {
-        setShowTimestamps(!!settings.defaultCommandTimestampsEnabled);
-        setPromptHookEnabled(settings.defaultPromptHookEnabled !== false);
-        setShowMenuBar(settings.showMenuBar !== false);
+        applyGlobalSettingsView(settings);
       })
-      .catch(console.error);
+      .catch(console.error)
+      .finally(() => setSettingsReady(true));
     invoke<string[]>("get_recent_projects")
       .then(setRecentProjects)
       .catch(console.error);
-  }, [loadConnections, loadActiveTheme, loadActiveGuiTheme, setRecentProjects]);
+  }, [applyGlobalSettingsView, loadConnections, loadActiveTheme, loadActiveGuiTheme, setRecentProjects]);
+
+  useEffect(() => {
+    let offSettingsUpdated: (() => void) | null = null;
+    listen<GlobalSettingsView>("kortty-settings-updated", (event) => {
+      applyGlobalSettingsView(event.payload);
+      setSettingsReady(true);
+    }).then((fn) => {
+      offSettingsUpdated = fn;
+    }).catch(console.error);
+
+    return () => {
+      offSettingsUpdated?.();
+    };
+  }, [applyGlobalSettingsView]);
 
   useEffect(() => {
     getCurrentWindow().setTitle(`KorTTY - ${windowName}`).catch(console.error);
@@ -1567,11 +1901,11 @@ export function MainWindow() {
 
   const closeTab = useCallback(
     (id: string) => {
+      const splitSessions = tabSplitSessions[id] || [];
       const tab = tabs.find((t) => t.id === id);
       if (tab?.status === "connected") {
         handleDisconnect(id);
       }
-      const splitSessions = tabSplitSessions[id] || [];
       for (const splitId of splitSessions) {
         handleDisconnect(splitId);
       }
@@ -2379,7 +2713,7 @@ export function MainWindow() {
     invoke<GlobalSettings>("get_settings")
       .then((settings) => invoke("save_settings", { settings: { ...settings, showMenuBar: visible } }))
       .catch(console.error);
-  }, []);
+  }, [showMenuBar]);
 
   const handleOpenProjectDialog = useCallback(async () => {
     const path = await openFileDialog({
@@ -2428,6 +2762,21 @@ export function MainWindow() {
     setOpenDialog("projectSettings");
   }, [buildProjectSnapshot, currentProject]);
 
+  const resolveConnectionDisplayName = useCallback((sessionId: string) => {
+    const directTab = tabs.find((tab) => tab.id === sessionId);
+    if (directTab) {
+      return directTab.label;
+    }
+
+    const splitConfig = splitSessionConfigs[sessionId];
+    if (splitConfig) {
+      return `${splitConfig.username}@${splitConfig.host}`;
+    }
+
+    const parentTabId = Object.entries(tabSplitSessions).find(([, sessionIds]) => sessionIds.includes(sessionId))?.[0];
+    return parentTabId ? tabs.find((tab) => tab.id === parentTabId)?.label : undefined;
+  }, [splitSessionConfigs, tabSplitSessions, tabs]);
+
   const handleRequestAiAction = useCallback(async (nextAction: PendingAiAction) => {
     if (!nextAction.selectedText.trim()) {
       return;
@@ -2448,6 +2797,114 @@ export function MainWindow() {
     }
   }, []);
 
+  const handleRequestTerminalAgent = useCallback(async (nextAction: PendingTerminalAgentAction) => {
+    try {
+      const profiles = await invoke<AiProfile[]>("get_ai_profiles");
+      if (profiles.length === 0) {
+        setPendingTerminalAgentAction(nextAction);
+        setPendingTerminalAgentMode("run");
+        setOpenDialog("aiManager");
+        return;
+      }
+      setPendingTerminalAgentAction(nextAction);
+      setPendingTerminalAgentMode("run");
+      setOpenDialog("aiAgent");
+    } catch (error) {
+      console.error("Failed to load AI profiles:", error);
+      setPendingTerminalAgentAction(nextAction);
+      setPendingTerminalAgentMode("run");
+      setOpenDialog("aiManager");
+    }
+  }, []);
+
+  const handleRequestTerminalAgentPlan = useCallback(async (nextAction: PendingTerminalAgentAction) => {
+    try {
+      const profiles = await invoke<AiProfile[]>("get_ai_profiles");
+      if (profiles.length === 0) {
+        setPendingTerminalAgentAction(nextAction);
+        setPendingTerminalAgentMode("plan");
+        setOpenDialog("aiManager");
+        return;
+      }
+      setPendingTerminalAgentAction(nextAction);
+      setPendingTerminalAgentMode("plan");
+      setOpenDialog("aiAgentPlan");
+    } catch (error) {
+      console.error("Failed to load AI profiles:", error);
+      setPendingTerminalAgentAction(nextAction);
+      setPendingTerminalAgentMode("plan");
+      setOpenDialog("aiManager");
+    }
+  }, []);
+
+  const isReadOnlyMirrorSession = useCallback((sessionId: string) => {
+    const directTab = tabs.find((tab) => tab.id === sessionId);
+    if (directTab) {
+      return !!directTab.readOnlyMirror;
+    }
+
+    const parentTabId = Object.entries(tabSplitSessions).find(([, sessionIds]) => sessionIds.includes(sessionId))?.[0];
+    const parentTab = parentTabId ? tabs.find((tab) => tab.id === parentTabId) : undefined;
+    return !!parentTab?.readOnlyMirror;
+  }, [tabSplitSessions, tabs]);
+
+  const loadTerminalAgentVisibilitySettings = useCallback(async () => {
+    try {
+      const settings = await invoke<GlobalSettings>("get_settings");
+      return {
+        showDebugMessages: settings.terminalAgentShowDebugMessages ?? false,
+        showRuntimeMessages: settings.terminalAgentShowRuntimeMessages ?? false,
+      };
+    } catch {
+      return {
+        showDebugMessages: false,
+        showRuntimeMessages: false,
+      };
+    }
+  }, []);
+
+  const handleStartTerminalAgent = useCallback(async (request: TerminalAgentRequest) => {
+    const response = await invoke<TerminalAgentStartResponse>("start_terminal_agent", { request });
+    if (request.executionTarget === "TerminalWindow") {
+      setTerminalAgentStates((prev) => ({
+        ...prev,
+        [request.sessionId]: {
+          runId: response.runId,
+          sessionId: request.sessionId,
+          executionTarget: request.executionTarget,
+          phase: "Starting",
+          summary: "Starting terminal agent run.",
+          userMessage: request.userPrompt,
+          turn: 0,
+        },
+      }));
+    }
+    setPendingTerminalAgentAction(null);
+    setPendingTerminalAgentMode(null);
+    setOpenDialog(null);
+    return response;
+  }, []);
+
+  const handleStartTerminalAgentPlan = useCallback(async (request: TerminalAgentPlanRequest) => {
+    const response = await invoke<TerminalAgentPlanStartResponse>("start_terminal_agent_plan", { request });
+    return response;
+  }, []);
+
+  const emitTerminalAgentNote = useCallback(async (sessionId: string, message: string) => {
+    const normalized = message.replace(/\r/g, "");
+    const lines = normalized.split("\n");
+    const payloadText = lines.map((line) => `[KorTTY Agent] ${line}\r\n`).join("");
+    const payload = Array.from(new TextEncoder().encode(payloadText));
+    await emit(`terminal-output-${sessionId}`, payload);
+  }, []);
+
+  const redrawTerminalPrompt = useCallback(async (sessionId: string) => {
+    await invoke("ssh_send_input", {
+      sessionId,
+      data: [21, 13],
+    });
+  }, []);
+
   const createAiTab = useCallback((request: AiRequestPayload) => {
     const id = crypto.randomUUID();
     const newTab: Tab = {
@@ -2462,6 +2919,282 @@ export function MainWindow() {
     setPendingAiAction(null);
     setOpenDialog(null);
   }, []);
+
+  const createAiAgentTab = useCallback((request: TerminalAgentRequest, runId: string) => {
+    const id = crypto.randomUUID();
+    const newTab: Tab = {
+      id,
+      kind: "ai",
+      label: "AI Agent",
+      status: "disconnected",
+      aiAgentRequest: request,
+      aiAgentRunId: runId,
+    };
+    setTabs((prev) => [...prev, newTab]);
+    setActiveTab(id);
+    setPendingTerminalAgentAction(null);
+    setPendingTerminalAgentMode(null);
+    setOpenDialog(null);
+  }, []);
+
+  const createAiAgentPlanTab = useCallback((
+    request: TerminalAgentPlanRequest,
+    runId = "",
+    initialState?: TerminalAgentPlanRunState,
+  ) => {
+    const id = crypto.randomUUID();
+    const newTab: Tab = {
+      id,
+      kind: "ai",
+      label: "AI Agent Plan",
+      status: "disconnected",
+      aiAgentPlanRequest: request,
+      aiAgentPlanRunId: runId,
+      aiAgentPlanInitialState: initialState,
+    };
+    setTabs((prev) => [...prev, newTab]);
+    setActiveTab(id);
+    setPendingTerminalAgentAction(null);
+    setPendingTerminalAgentMode(null);
+    setOpenDialog(null);
+    return id;
+  }, []);
+
+  const updateAiAgentPlanTab = useCallback((
+    tabId: string,
+    runId: string,
+    initialState: TerminalAgentPlanRunState,
+  ) => {
+    setTabs((prev) =>
+      prev.map((tab) =>
+        tab.id === tabId
+          ? {
+              ...tab,
+              aiAgentPlanRunId: runId,
+              aiAgentPlanInitialState: initialState,
+            }
+          : tab,
+      ),
+    );
+  }, []);
+
+  const markAiAgentPlanTabFailed = useCallback((
+    tabId: string,
+    request: TerminalAgentPlanRequest,
+    error: unknown,
+  ) => {
+    const message = `Planning start failed: ${String(error)}`;
+    setTabs((prev) =>
+      prev.map((tab) =>
+        tab.id === tabId
+          ? {
+              ...tab,
+              aiAgentPlanInitialState: {
+                runId: "",
+                sessionId: request.sessionId,
+                phase: "Failed",
+                summary: message,
+                userMessage: message,
+              },
+            }
+          : tab,
+      ),
+    );
+  }, []);
+
+  const handleLaunchTerminalAgentPlanTask = useCallback(async (request: TerminalAgentPlanRequest) => {
+    const placeholderState: TerminalAgentPlanRunState = {
+      runId: "",
+      sessionId: request.sessionId,
+      phase: "Starting",
+      summary: "Collecting remote server facts.",
+      userMessage: "Preparing the planning run and collecting remote server facts.",
+    };
+    const tabId = createAiAgentPlanTab(request, "", placeholderState);
+    try {
+      const response = await handleStartTerminalAgentPlan(request);
+      updateAiAgentPlanTab(tabId, response.runId, response.initialState);
+    } catch (error) {
+      markAiAgentPlanTabFailed(tabId, request, error);
+      throw error;
+    }
+  }, [createAiAgentPlanTab, handleStartTerminalAgentPlan, markAiAgentPlanTabFailed, updateAiAgentPlanTab]);
+
+  const handleLaunchTerminalAgentTask = useCallback(async (request: TerminalAgentRequest) => {
+    if (terminalAgentExecutionTarget === "ChatWindow") {
+      const response = await handleStartTerminalAgent({
+        ...request,
+        executionTarget: "ChatWindow",
+      });
+      createAiAgentTab(
+        {
+          ...request,
+          executionTarget: "ChatWindow",
+        },
+        response.runId,
+      );
+      return;
+    }
+
+    await handleStartTerminalAgent({
+      ...request,
+      executionTarget: "TerminalWindow",
+    });
+  }, [createAiAgentTab, handleStartTerminalAgent, terminalAgentExecutionTarget]);
+
+  const handleStartExecutionFromPlan = useCallback(async (runId: string) => {
+    const visibility = await loadTerminalAgentVisibilitySettings();
+    const response = await invoke<TerminalAgentPlanExecutionResponse>("start_terminal_agent_from_plan", {
+      runId,
+      executionTarget: terminalAgentExecutionTarget,
+      showDebugMessages: visibility.showDebugMessages,
+      showRuntimeMessages: visibility.showRuntimeMessages,
+    });
+
+    if (response.request.executionTarget === "ChatWindow") {
+      createAiAgentTab(response.request, response.runId);
+    }
+
+    return response;
+  }, [createAiAgentTab, loadTerminalAgentVisibilitySettings, terminalAgentExecutionTarget]);
+
+  const handleTerminalAgentShortcut = useCallback(async (sessionId: string, rawCommand: string) => {
+    const parsed = parseTerminalAgentShortcut(rawCommand, terminalAgentCommandName);
+    if (!parsed.ok) {
+      await emitTerminalAgentNote(sessionId, parsed.error);
+      return;
+    }
+
+    let profiles: AiProfile[] = [];
+    try {
+      profiles = await invoke<AiProfile[]>("get_ai_profiles");
+    } catch (error) {
+      await emitTerminalAgentNote(sessionId, `Failed to load AI profiles: ${String(error)}`);
+      return;
+    }
+    if (profiles.length === 0) {
+      await emitTerminalAgentNote(sessionId, "No AI profile is configured. Open AI Manager first.");
+      return;
+    }
+
+    const profileLookup = parsed.invocation.mode !== "ask"
+      ? parsed.invocation.profileLookup?.trim()
+      : undefined;
+    const normalizedLookup = profileLookup?.toLowerCase();
+    const profile = profileLookup
+      ? profiles.find((candidate) => {
+          const candidateName = candidate.name.trim();
+          const candidateId = candidate.id.trim();
+          return (
+            candidateName === profileLookup
+            || candidateId === profileLookup
+            || candidateName.toLowerCase() === normalizedLookup
+            || candidateId.toLowerCase() === normalizedLookup
+          );
+        })
+      : profiles[0];
+
+    if (!profile) {
+      await emitTerminalAgentNote(
+        sessionId,
+        `The AI profile "${profileLookup}" was not found.`,
+      );
+      return;
+    }
+
+    if (parsed.invocation.mode === "ask") {
+      const requestId = crypto.randomUUID();
+      await emitTerminalAgentNote(
+        sessionId,
+        `Starting question: ${parsed.invocation.userPrompt}`,
+      );
+      await emitTerminalAgentNote(sessionId, "Waiting for AI response...");
+      try {
+        const result = await invoke<AiExecutionResult>("execute_ai_action", {
+          request: {
+            action: "Ask",
+            profileId: profile.id,
+            selectedText: parsed.invocation.userPrompt,
+            connectionDisplayName: resolveConnectionDisplayName(sessionId),
+            userPrompt: parsed.invocation.userPrompt,
+          },
+          requestId,
+        });
+        await emitTerminalAgentNote(sessionId, result.content);
+      } catch (error) {
+        await emitTerminalAgentNote(sessionId, `Agent ask failed: ${String(error)}`);
+      }
+      try {
+        await redrawTerminalPrompt(sessionId);
+      } catch (error) {
+        console.error("Failed to redraw terminal prompt after agent-ask:", error);
+      }
+      return;
+    }
+
+    if (parsed.invocation.mode === "plan") {
+      try {
+        await handleLaunchTerminalAgentPlanTask({
+          sessionId,
+          profileId: profile.id,
+          userPrompt: parsed.invocation.userPrompt,
+          connectionDisplayName: resolveConnectionDisplayName(sessionId),
+        });
+      } catch (error) {
+        await emitTerminalAgentNote(sessionId, `Agent planning start failed: ${String(error)}`);
+      }
+      return;
+    }
+
+    const visibility = await loadTerminalAgentVisibilitySettings();
+
+    try {
+      await handleLaunchTerminalAgentTask({
+        sessionId,
+        profileId: profile.id,
+        userPrompt: parsed.invocation.userPrompt,
+        connectionDisplayName: resolveConnectionDisplayName(sessionId),
+        executionTarget: terminalAgentExecutionTarget,
+        showDebugMessages: visibility.showDebugMessages,
+        showRuntimeMessages: visibility.showRuntimeMessages,
+        askConfirmationBeforeEveryCommand: parsed.invocation.askConfirmationBeforeEveryCommand,
+        autoApproveRootCommands: parsed.invocation.autoApproveRootCommands,
+      });
+    } catch (error) {
+      await emitTerminalAgentNote(sessionId, `Agent start failed: ${String(error)}`);
+    }
+  }, [
+    emitTerminalAgentNote,
+    handleLaunchTerminalAgentTask,
+    handleLaunchTerminalAgentPlanTask,
+    loadTerminalAgentVisibilitySettings,
+    redrawTerminalPrompt,
+    resolveConnectionDisplayName,
+    terminalAgentCommandName,
+    terminalAgentExecutionTarget,
+  ]);
+
+  const handleApproveTerminalAgent = useCallback(async (approval: TerminalAgentApproval) => {
+    await invoke("approve_terminal_agent", { runId: approval.runId });
+  }, []);
+
+  const handleApproveTerminalAgentAlways = useCallback(async (approval: TerminalAgentApproval) => {
+    await invoke("approve_terminal_agent_always", { runId: approval.runId });
+  }, []);
+
+  const handleStopTerminalAgent = useCallback(async (runId: string) => {
+    await invoke("cancel_terminal_agent", { runId });
+  }, []);
+
+  const handleSubmitTerminalAgentPassword = useCallback(
+    async (request: TerminalAgentPasswordRequest, password: string) => {
+      await invoke("submit_terminal_agent_sudo_password", {
+        runId: request.runId,
+        password,
+      });
+    },
+    [],
+  );
 
   const handleOpenSavedAiChat = useCallback((chat: SavedAiChat) => {
     setPendingAiAction(null);
@@ -2487,23 +3220,150 @@ export function MainWindow() {
   }, [tabs]);
 
   const handleCloseAiManager = useCallback(async () => {
-    if (!pendingAiAction) {
-      setOpenDialog(null);
-      return;
-    }
-
     try {
       const profiles = await invoke<AiProfile[]>("get_ai_profiles");
-      setOpenDialog(profiles.length > 0 ? "aiAction" : null);
-      if (profiles.length === 0) {
+      if (pendingAiAction) {
+        setOpenDialog(profiles.length > 0 ? "aiAction" : null);
+      } else if (pendingTerminalAgentAction) {
+        setOpenDialog(
+          profiles.length > 0
+            ? (pendingTerminalAgentMode === "plan" ? "aiAgentPlan" : "aiAgent")
+            : null,
+        );
+      } else {
+        setOpenDialog(null);
+      }
+      if (profiles.length === 0 && pendingAiAction) {
         setPendingAiAction(null);
+      }
+      if (profiles.length === 0 && pendingTerminalAgentAction) {
+        setPendingTerminalAgentAction(null);
+        setPendingTerminalAgentMode(null);
       }
     } catch (error) {
       console.error("Failed to reload AI profiles:", error);
       setOpenDialog(null);
       setPendingAiAction(null);
+      setPendingTerminalAgentAction(null);
+      setPendingTerminalAgentMode(null);
     }
-  }, [pendingAiAction]);
+  }, [pendingAiAction, pendingTerminalAgentAction, pendingTerminalAgentMode]);
+
+  const handleOpenAiAgentForFocusedSession = useCallback(() => {
+    if ((activeTabEntry?.kind ?? "terminal") !== "terminal" || activeTabEntry?.status !== "connected") {
+      return;
+    }
+
+    const activeSessionIds = new Set([
+      activeTabEntry.id,
+      ...(tabSplitSessions[activeTabEntry.id] ?? []),
+    ]);
+    const focusedSessionId = focusedPaneSessionRef.current;
+    const targetSessionId =
+      focusedSessionId && activeSessionIds.has(focusedSessionId)
+        ? focusedSessionId
+        : activeTabEntry.id;
+    if (!targetSessionId) {
+      return;
+    }
+    if (isReadOnlyMirrorSession(targetSessionId)) {
+      return;
+    }
+
+    void handleRequestTerminalAgent({
+      sessionId: targetSessionId,
+      connectionDisplayName: resolveConnectionDisplayName(targetSessionId),
+    });
+  }, [activeTabEntry, handleRequestTerminalAgent, isReadOnlyMirrorSession, resolveConnectionDisplayName, tabSplitSessions]);
+
+  useEffect(() => {
+    const unlistenStatus = listen<TerminalAgentRunState>("terminal-agent-status", (event) => {
+      const nextState = event.payload;
+      setTerminalAgentStates((prev) => {
+        if (nextState.executionTarget === "ChatWindow") {
+          if (!(nextState.sessionId in prev)) {
+            return prev;
+          }
+          const { [nextState.sessionId]: _removed, ...rest } = prev;
+          return rest;
+        }
+        if (["Done", "Cancelled", "Failed", "Blocked"].includes(nextState.phase)) {
+          if (!(nextState.sessionId in prev)) {
+            return prev;
+          }
+          const { [nextState.sessionId]: _removed, ...rest } = prev;
+          return rest;
+        }
+        return {
+          ...prev,
+          [nextState.sessionId]: nextState,
+        };
+      });
+    });
+
+    const unlistenApproval = listen<TerminalAgentApproval>("terminal-agent-approval", (event) => {
+      const approval = event.payload;
+      if (approval.executionTarget === "ChatWindow") {
+        setTerminalAgentStates((prev) => {
+          if (!(approval.sessionId in prev)) {
+            return prev;
+          }
+          const { [approval.sessionId]: _removed, ...rest } = prev;
+          return rest;
+        });
+        return;
+      }
+      setTerminalAgentStates((prev) => ({
+        ...prev,
+        [approval.sessionId]: {
+          ...(prev[approval.sessionId] ?? {
+            runId: approval.runId,
+            sessionId: approval.sessionId,
+            executionTarget: approval.executionTarget,
+            phase: "AwaitingApproval",
+            summary: approval.summary,
+            turn: 0,
+          }),
+          runId: approval.runId,
+          sessionId: approval.sessionId,
+          executionTarget: approval.executionTarget,
+          phase: "AwaitingApproval",
+          summary: approval.summary,
+          userMessage: approval.userMessage,
+          pendingApproval: approval,
+        },
+      }));
+    });
+
+    const unlistenOutput = listen<TerminalAgentEvent>("terminal-agent-output", (event) => {
+      if (event.payload.executionTarget === "ChatWindow") {
+        return;
+      }
+      if (event.payload.kind !== "command_started") {
+        return;
+      }
+
+      setTerminalAgentStates((prev) => {
+        const current = prev[event.payload.sessionId];
+        if (!current) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [event.payload.sessionId]: {
+            ...current,
+            currentCommand: event.payload.command,
+          },
+        };
+      });
+    });
+
+    return () => {
+      void unlistenStatus.then((fn) => fn());
+      void unlistenApproval.then((fn) => fn());
+      void unlistenOutput.then((fn) => fn());
+    };
+  }, []);
 
   useEffect(() => {
     function handleKeyDown(e: KeyboardEvent) {
@@ -2646,6 +3506,7 @@ export function MainWindow() {
     onManageSSHKeys: () => setOpenDialog("sshKeyManager"),
     onManageGPGKeys: () => setOpenDialog("gpgKeyManager"),
     onAiManager: () => setOpenDialog("aiManager"),
+    onAiAgent: handleOpenAiAgentForFocusedSession,
     onSnippets: () => setOpenDialog("snippetManager"),
     onSFTPManager: () => setOpenDialog("sftpManager"),
     onAsciiArt: () => setOpenDialog("asciiArt"),
@@ -2658,6 +3519,16 @@ export function MainWindow() {
     onQuit: handleQuit,
     onAbout: () => setOpenDialog("about"),
   };
+
+  if (!settingsReady) {
+    return (
+      <div className="flex h-screen w-screen items-center justify-center bg-kortty-bg text-kortty-text">
+        <div className="rounded-lg border border-kortty-border bg-kortty-surface px-6 py-5 text-sm shadow-2xl">
+          Loading KorTTY settings...
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="flex flex-col h-screen w-screen bg-kortty-bg">
@@ -2791,34 +3662,63 @@ export function MainWindow() {
                   style={{ display: tab.id === activeTab ? "block" : "none" }}
                 >
                   {(tab.kind ?? "terminal") === "ai" ? (
-                  <AiChatTab
-                    tabId={tab.id}
-                    initialRequest={tab.aiInitialRequest}
-                    initialChat={tab.aiSavedChat}
-                    onTitleChange={(title) => {
-                      setTabs((prev) =>
-                        prev.map((entry) => (entry.id === tab.id ? { ...entry, label: title || "AI Chat" } : entry)),
-                      );
-                    }}
-                    onSavedChatChange={(savedChat) => {
-                      setTabs((prev) =>
-                        prev.map((entry) =>
-                          entry.id === tab.id
-                            ? {
-                                ...entry,
-                                label: savedChat.title || "AI Chat",
-                                aiChatId: savedChat.id,
-                                aiSavedChat: savedChat,
-                              }
-                            : entry,
-                        ),
-                      );
-                    }}
-                  />
+                  tab.aiAgentPlanRequest ? (
+                    <AiAgentPlanTab
+                      tabId={tab.id}
+                      initialRequest={tab.aiAgentPlanRequest}
+                      initialRunId={tab.aiAgentPlanRunId || ""}
+                      initialState={tab.aiAgentPlanInitialState}
+                      onTitleChange={(title) => {
+                        setTabs((prev) =>
+                          prev.map((entry) => (entry.id === tab.id ? { ...entry, label: title || "AI Agent Plan" } : entry)),
+                        );
+                      }}
+                      onStartExecution={async (runId) => {
+                        await handleStartExecutionFromPlan(runId);
+                      }}
+                    />
+                  ) : tab.aiAgentRequest ? (
+                    <AiAgentRunTab
+                      tabId={tab.id}
+                      initialRequest={tab.aiAgentRequest}
+                      initialRunId={tab.aiAgentRunId || ""}
+                      onTitleChange={(title) => {
+                        setTabs((prev) =>
+                          prev.map((entry) => (entry.id === tab.id ? { ...entry, label: title || "AI Agent" } : entry)),
+                        );
+                      }}
+                    />
+                  ) : (
+                    <AiChatTab
+                      tabId={tab.id}
+                      initialRequest={tab.aiInitialRequest}
+                      initialChat={tab.aiSavedChat}
+                      onTitleChange={(title) => {
+                        setTabs((prev) =>
+                          prev.map((entry) => (entry.id === tab.id ? { ...entry, label: title || "AI Chat" } : entry)),
+                        );
+                      }}
+                      onSavedChatChange={(savedChat) => {
+                        setTabs((prev) =>
+                          prev.map((entry) =>
+                            entry.id === tab.id
+                              ? {
+                                  ...entry,
+                                  label: savedChat.title || "AI Chat",
+                                  aiChatId: savedChat.id,
+                                  aiSavedChat: savedChat,
+                                }
+                              : entry,
+                          ),
+                        );
+                      }}
+                    />
+                  )
                   ) : tab.status === "connected" ? (
                     <TerminalSplitPane
                       primarySessionId={tab.id}
                       connected={true}
+                      agentCommandName={terminalAgentCommandName}
                       readOnly={!!tab.readOnlyMirror}
                       promptHookEnabled={promptHookEnabled}
                       initialSplitSessionIds={tabInitialSplitTree[tab.id] ? undefined : tabSplitSessions[tab.id]}
@@ -2862,6 +3762,7 @@ export function MainWindow() {
                       onToggleTimestamps={() => setShowTimestamps((s) => !s)}
                       showTimestamps={showTimestamps}
                       onReconnect={(sessionId) => handleReconnect(sessionId)}
+                      agentRunStates={terminalAgentStates}
                       onClosePrimarySplit={() => {
                         void handleClosePrimarySplit(tab.id);
                       }}
@@ -2879,6 +3780,39 @@ export function MainWindow() {
                           selectedText,
                           connectionDisplayName,
                         });
+                      }}
+                      onStartAgent={(sessionId) => {
+                        if (isReadOnlyMirrorSession(sessionId)) {
+                          return;
+                        }
+                        void handleRequestTerminalAgent({
+                          sessionId,
+                          connectionDisplayName: resolveConnectionDisplayName(sessionId),
+                        });
+                      }}
+                      onStartAgentPlan={(sessionId) => {
+                        if (isReadOnlyMirrorSession(sessionId)) {
+                          return;
+                        }
+                        void handleRequestTerminalAgentPlan({
+                          sessionId,
+                          connectionDisplayName: resolveConnectionDisplayName(sessionId),
+                        });
+                      }}
+                      onAgentCommand={(sessionId, rawCommand) => {
+                        void handleTerminalAgentShortcut(sessionId, rawCommand);
+                      }}
+                      onApproveAgent={(approval) => {
+                        void handleApproveTerminalAgent(approval);
+                      }}
+                      onApproveAgentAlways={(approval) => {
+                        void handleApproveTerminalAgentAlways(approval);
+                      }}
+                      onSubmitAgentPassword={(request, password) => {
+                        void handleSubmitTerminalAgentPassword(request, password);
+                      }}
+                      onStopAgent={(runId) => {
+                        void handleStopTerminalAgent(runId);
                       }}
                       onCloseRequest={() => closeTab(tab.id)}
                       onSplitSameServer={() => handleSplitSameServer(tab.id)}
@@ -2970,6 +3904,10 @@ export function MainWindow() {
           setShowMenuBar(settings.showMenuBar);
           setShowTimestamps(settings.defaultCommandTimestampsEnabled);
           setPromptHookEnabled(settings.defaultPromptHookEnabled !== false);
+          setTerminalAgentCommandName(
+            normalizeTerminalAgentCommandName(settings.terminalAgentCommandName),
+          );
+          setTerminalAgentExecutionTarget(settings.terminalAgentExecutionTarget);
         }}
       />
       <AiActionDialog
@@ -2983,6 +3921,30 @@ export function MainWindow() {
         }}
         onManageProfiles={() => setOpenDialog("aiManager")}
         onRun={createAiTab}
+      />
+      <AiAgentDialog
+        open={openDialog === "aiAgent"}
+        sessionId={pendingTerminalAgentAction?.sessionId}
+        connectionDisplayName={pendingTerminalAgentAction?.connectionDisplayName}
+        onClose={() => {
+          setOpenDialog(null);
+          setPendingTerminalAgentAction(null);
+          setPendingTerminalAgentMode(null);
+        }}
+        onManageProfiles={() => setOpenDialog("aiManager")}
+        onRun={handleLaunchTerminalAgentTask}
+      />
+      <AiAgentPlanDialog
+        open={openDialog === "aiAgentPlan"}
+        sessionId={pendingTerminalAgentAction?.sessionId}
+        connectionDisplayName={pendingTerminalAgentAction?.connectionDisplayName}
+        onClose={() => {
+          setOpenDialog(null);
+          setPendingTerminalAgentAction(null);
+          setPendingTerminalAgentMode(null);
+        }}
+        onManageProfiles={() => setOpenDialog("aiManager")}
+        onRun={handleLaunchTerminalAgentPlanTask}
       />
       <AiManagerDialog
         open={openDialog === "aiManager"}

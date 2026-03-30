@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
+import type { TerminalAgentExecutionTarget } from "../types/ai";
 
 export type TeamworkSourceType = "Git" | "SharedFile";
 
@@ -42,6 +43,10 @@ export interface GlobalSettings {
   teamworkUseTemporaryKey: boolean;
   defaultCommandTimestampsEnabled: boolean;
   defaultPromptHookEnabled: boolean;
+  terminalAgentShowDebugMessages: boolean;
+  terminalAgentShowRuntimeMessages: boolean;
+  terminalAgentCommandName: string;
+  terminalAgentExecutionTarget: TerminalAgentExecutionTarget;
 }
 
 interface SettingsStore {
@@ -74,6 +79,10 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
     teamworkUseTemporaryKey: false,
     defaultCommandTimestampsEnabled: false,
     defaultPromptHookEnabled: true,
+    terminalAgentShowDebugMessages: false,
+    terminalAgentShowRuntimeMessages: false,
+    terminalAgentCommandName: "agent",
+    terminalAgentExecutionTarget: "TerminalWindow",
   },
   loading: false,
 

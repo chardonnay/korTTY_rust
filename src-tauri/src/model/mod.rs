@@ -8,5 +8,6 @@ pub mod project;
 pub mod settings;
 pub mod snippet;
 pub mod ssh_key;
+pub mod terminal_agent;
 pub mod theme;
 pub mod tunnel;

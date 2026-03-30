@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState, type MouseEvent } from "react";
+import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
@@ -6,6 +6,11 @@ import { SearchAddon } from "@xterm/addon-search";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import "@xterm/xterm/css/xterm.css";
+import {
+  buildTerminalAgentPromptLineExtractPattern,
+  buildTerminalAgentShortcutCommandPattern,
+  normalizeTerminalAgentCommandName,
+} from "../../utils/terminalAgentCommand";
 
 /** Tracks ResizeObserver instances; finalizer runs when observer is GC'd. Logs if it was never disconnected (leak). */
 const resizeObserverRegistry = new FinalizationRegistry<{ sessionId: string; disconnected: boolean }>(
@@ -19,6 +24,7 @@ const resizeObserverRegistry = new FinalizationRegistry<{ sessionId: string; dis
 interface TerminalTabProps {
   sessionId: string;
   connected: boolean;
+  agentCommandName?: string;
   readOnly?: boolean;
   promptHookEnabled?: boolean;
   showTimestamps?: boolean;
@@ -35,6 +41,7 @@ interface TerminalTabProps {
   onCloseRequest?: () => void;
   broadcastTargets?: string[];
   onContextMenu?: (e: MouseEvent<HTMLDivElement>, selectedText: string) => void;
+  onAgentCommand?: (sessionId: string, rawCommand: string) => void;
 }
 
 type TimestampEntry = {
@@ -75,6 +82,7 @@ type XtermTerminalWithCore = Terminal & {
 export function TerminalTab({
   sessionId,
   connected,
+  agentCommandName,
   readOnly = false,
   promptHookEnabled = true,
   showTimestamps = false,
@@ -85,6 +93,7 @@ export function TerminalTab({
   onCloseRequest,
   broadcastTargets,
   onContextMenu,
+  onAgentCommand,
 }: TerminalTabProps) {
   const [timestampsCollapsed, setTimestampsCollapsed] = useState(false);
   const [hoveredMarkerId, setHoveredMarkerId] = useState<string | null>(null);
@@ -108,7 +117,13 @@ export function TerminalTab({
   const pendingCommandStartedAtRef = useRef<number | null>(null);
   const sessionIdRef = useRef(sessionId);
   const onCloseRequestRef = useRef(onCloseRequest);
+  const onAgentCommandRef = useRef(onAgentCommand);
   const broadcastTargetsRef = useRef<string[]>([]);
+  const agentShortcutBufferRef = useRef("");
+  const agentShortcutPromptReadyRef = useRef(false);
+  const agentShortcutStartedAtPromptRef = useRef(false);
+  const agentShortcutCaptureValidRef = useRef(true);
+  const agentShortcutPromptTailRef = useRef("");
   const lastResizeKeyRef = useRef("");
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const isMountedRef = useRef(true);
@@ -118,6 +133,22 @@ export function TerminalTab({
   const initialFitTimeoutRef = useRef<number | null>(null);
   const themeFitRafRef = useRef<number | null>(null);
   const themeFitTimeoutRef = useRef<number | null>(null);
+  const normalizedAgentCommandName = useMemo(
+    () => normalizeTerminalAgentCommandName(agentCommandName),
+    [agentCommandName],
+  );
+  const agentShortcutCommandPattern = useMemo(
+    () => buildTerminalAgentShortcutCommandPattern(normalizedAgentCommandName),
+    [normalizedAgentCommandName],
+  );
+  const agentPromptLineExtractPattern = useMemo(
+    () => buildTerminalAgentPromptLineExtractPattern(normalizedAgentCommandName),
+    [normalizedAgentCommandName],
+  );
+  const agentShortcutCommandPatternRef = useRef(agentShortcutCommandPattern);
+  const agentPromptLineExtractPatternRef = useRef(agentPromptLineExtractPattern);
+  agentShortcutCommandPatternRef.current = agentShortcutCommandPattern;
+  agentPromptLineExtractPatternRef.current = agentPromptLineExtractPattern;
 
   function formatTimestamp(date: Date): string {
     const yyyy = date.getFullYear();
@@ -213,6 +244,112 @@ export function TerminalTab({
     return /\x1b\]133;D;[0-9]+\x07/.test(chunk);
   }
 
+  function looksLikeAgentShortcutCommand(command: string): boolean {
+    return agentShortcutCommandPatternRef.current.test(command.trim());
+  }
+
+  function extractAgentShortcutCommandFromPromptLine(term: Terminal): string | null {
+    const active = term.buffer.active;
+    const line = active.getLine(active.cursorY);
+    if (!line) return null;
+    const currentLine = stripAnsi(line.translateToString(true)).trimEnd();
+    if (!currentLine) return null;
+    const match = currentLine.match(agentPromptLineExtractPatternRef.current);
+    const command = match?.[1]?.trim();
+    return command && looksLikeAgentShortcutCommand(command) ? command : null;
+  }
+
+  function extractAgentShortcutCommandFromPromptTail(): string | null {
+    const tail = stripAnsi(agentShortcutPromptTailRef.current).replace(/\r/g, "");
+    if (!tail) return null;
+    const lines = tail.split("\n").map((line) => line.trimEnd()).filter(Boolean);
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+      const match = lines[index]?.match(agentPromptLineExtractPatternRef.current);
+      const command = match?.[1]?.trim();
+      if (command && looksLikeAgentShortcutCommand(command)) {
+        return command;
+      }
+    }
+    return null;
+  }
+
+  function resetAgentShortcutTracking() {
+    agentShortcutBufferRef.current = "";
+    agentShortcutPromptReadyRef.current = false;
+    agentShortcutStartedAtPromptRef.current = false;
+    agentShortcutCaptureValidRef.current = true;
+    agentShortcutPromptTailRef.current = "";
+  }
+
+  function recordAgentShortcutPromptSignal(term: Terminal, chunk: string) {
+    const clean = stripAnsi(chunk).replace(/\r/g, "");
+    const tail = (agentShortcutPromptTailRef.current + clean).slice(-300);
+    agentShortcutPromptTailRef.current = tail;
+    if (
+      containsPromptReadyMarker(chunk) ||
+      /(?:^|\n)[^\n]{0,180}(?:[$#%>❯➜] ?)$/.test(tail) ||
+      /(?:^|\n)PS [^\n]*> ?$/.test(tail) ||
+      isPromptReadyInBuffer(term)
+    ) {
+      agentShortcutPromptReadyRef.current = true;
+      if (!agentShortcutStartedAtPromptRef.current) {
+        agentShortcutBufferRef.current = "";
+        agentShortcutCaptureValidRef.current = true;
+      }
+    }
+  }
+
+  function noteAgentShortcutInput(data: string) {
+    if (data === "\u0003") {
+      agentShortcutBufferRef.current = "";
+      agentShortcutStartedAtPromptRef.current = false;
+      agentShortcutCaptureValidRef.current = true;
+      agentShortcutPromptReadyRef.current = false;
+      return;
+    }
+    if (data === "\u0015") {
+      agentShortcutBufferRef.current = "";
+      agentShortcutCaptureValidRef.current = true;
+      return;
+    }
+    if (data === "\u007f" || data === "\b") {
+      if (agentShortcutStartedAtPromptRef.current && agentShortcutCaptureValidRef.current) {
+        agentShortcutBufferRef.current = agentShortcutBufferRef.current.slice(0, -1);
+      }
+      return;
+    }
+    if (data === "\r") {
+      return;
+    }
+    if (!agentShortcutStartedAtPromptRef.current) {
+      if (!agentShortcutPromptReadyRef.current) {
+        const term = xtermRef.current;
+        if (!term || !isPromptReadyInBuffer(term)) {
+          return;
+        }
+        agentShortcutPromptReadyRef.current = true;
+      }
+      if (data === "\t" || data.startsWith("\x1b") || !/^[^\x00-\x1f\x7f]+$/u.test(data)) {
+        return;
+      }
+      agentShortcutStartedAtPromptRef.current = true;
+      agentShortcutPromptReadyRef.current = false;
+      agentShortcutBufferRef.current = "";
+      agentShortcutCaptureValidRef.current = true;
+    }
+    if (data === "\t" || data.startsWith("\x1b")) {
+      agentShortcutCaptureValidRef.current = false;
+      return;
+    }
+    if (/^[^\x00-\x1f\x7f]+$/u.test(data)) {
+      if (agentShortcutCaptureValidRef.current) {
+        agentShortcutBufferRef.current += data;
+      }
+      return;
+    }
+    agentShortcutCaptureValidRef.current = false;
+  }
+
   function stopPromptProbe() {
     if (promptProbeTimerRef.current != null) {
       window.clearInterval(promptProbeTimerRef.current);
@@ -259,6 +396,7 @@ export function TerminalTab({
   promptHookEnabledRef.current = promptHookEnabled;
   sessionIdRef.current = sessionId;
   onCloseRequestRef.current = onCloseRequest;
+  onAgentCommandRef.current = onAgentCommand;
   broadcastTargetsRef.current = broadcastTargets || [];
 
   function sendResizeIfNeeded(term: Terminal, force = false) {
@@ -455,12 +593,47 @@ export function TerminalTab({
       safeSyncViewportMetrics(term);
     });
 
-    term.onData((data) => {
+    term.onData(async (data) => {
       if (data === "\x04" && onCloseRequestRef.current) {
         onCloseRequestRef.current();
         return;
       }
       if (connectedRef.current && !readOnlyRef.current) {
+        if (data !== "\r") {
+          noteAgentShortcutInput(data);
+        }
+        if (data === "\r") {
+          const currentInput =
+            agentShortcutBufferRef.current.trim()
+            || extractAgentShortcutCommandFromPromptTail()
+            || extractAgentShortcutCommandFromPromptLine(term);
+          const interceptAgentShortcut =
+            !!currentInput &&
+            agentShortcutCaptureValidRef.current &&
+            looksLikeAgentShortcutCommand(currentInput);
+          agentShortcutBufferRef.current = "";
+          agentShortcutStartedAtPromptRef.current = false;
+          agentShortcutCaptureValidRef.current = true;
+          agentShortcutPromptReadyRef.current = false;
+          if (interceptAgentShortcut) {
+            const cancelLinePayload = [21, 13];
+            const targetSessionIds = [sessionIdRef.current, ...broadcastTargetsRef.current];
+            try {
+              await Promise.all(
+                targetSessionIds.map((targetId) =>
+                  invoke("ssh_send_input", {
+                    sessionId: targetId,
+                    data: cancelLinePayload,
+                  }),
+                ),
+              );
+            } catch (error) {
+              console.error(error);
+            }
+            onAgentCommandRef.current?.(sessionIdRef.current, currentInput);
+            return;
+          }
+        }
         if (containsClearScreenSignal(data)) {
           // Reset timestamp sidebar baseline when terminal is visually cleared.
           setTimestampEntries([]);
@@ -468,6 +641,7 @@ export function TerminalTab({
           outputTailRef.current = "";
           pendingCommandStartedAtRef.current = null;
           stopPromptProbe();
+          resetAgentShortcutTracking();
         }
         if (showTimestampsRef.current && data.includes("\r")) {
           // Timestamp exactly when the command is submitted (Enter pressed).
@@ -479,6 +653,9 @@ export function TerminalTab({
           outputTailRef.current = "";
           stopPromptProbe();
           schedulePromptProbe(term);
+        }
+        if (data.includes("\r")) {
+          agentShortcutPromptTailRef.current = "";
         }
         const encoder = new TextEncoder();
         const encoded = Array.from(encoder.encode(data));
@@ -630,8 +807,10 @@ export function TerminalTab({
           outputTailRef.current = "";
           pendingCommandStartedAtRef.current = null;
           stopPromptProbe();
+          resetAgentShortcutTracking();
           return;
         }
+        recordAgentShortcutPromptSignal(term, text);
         if (showTimestampsRef.current && waitingForNextPromptRef.current) {
           if (promptHookEnabledRef.current && containsPromptReadyMarker(text)) {
             markPromptReadyNow();
@@ -657,6 +836,7 @@ export function TerminalTab({
     stopPromptProbe();
     pendingCommandStartedAtRef.current = null;
     lastPushRef.current = null;
+    resetAgentShortcutTracking();
     setTimestampEntries([]);
     setViewportScrollTop(0);
   }, [sessionId]);

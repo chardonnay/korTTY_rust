@@ -8,7 +8,7 @@ This repository tracks the feature migration from [KorTTY JavaFX](https://github
 - Multiple SSH tabs, split terminals, broadcast input, zoom control, dashboard and multi-window workflows
 - Connection manager with credentials, SSH keys, GPG keys, custom credential environments and project save/open flows
 - Import and export for KorTTY, MobaXterm, MTPuTTY and PuTTY Connection Manager
-- Built-in AI workflows: profile manager, connection test, terminal selection actions, saved chats and transcript export
+- Built-in AI workflows: profile manager, saved chats, AI Agent execution, planning mode and transcript export
 - SFTP file browser, snippet manager with XML import/export, ASCII art banner, backups and theme editors
 
 ## Feature Overview
@@ -38,9 +38,24 @@ This repository tracks the feature migration from [KorTTY JavaFX](https://github
 - OpenAI-compatible chat completion integration
 - Terminal selection actions: `Summarize`, `Solve Problem`, `Ask...`
 - AI result/chat tabs with follow-up prompts
+- AI Agent execution for connected SSH sessions with approval prompts, `Allow always`, sudo password entry and per-session sudo password caching
+- AI Agent chat tabs with transcript copy and save actions
+- AI Agent planning mode with clarifying questions, implementation options, accepted-plan handoff and explicit execution start
+- Configurable agent command trio in `Settings -> AI`: `<name>`, `<name>-ask` and `<name>-plan`
+- Configurable AI Agent task target in `Settings -> AI`: current terminal window or a dedicated AI Agent chat tab
 - Auto title generation for saved chats
 - TXT and Markdown transcript export
 - Dedicated AI connection test with a minimal request path
+
+### AI Agent shortcuts
+
+KorTTY can intercept agent commands directly from the terminal prompt. By default the shortcut trio is:
+
+- `agent <prompt>` or `agent: <prompt>` for executable AI Agent tasks
+- `agent-ask <question>` or `agent-ask: <question>` for pure Q&A without command execution
+- `agent-plan <prompt>` or `agent-plan: <prompt>` for planning-only runs that never execute commands directly
+
+The base command name is configurable in `Settings -> AI`. If you rename `agent` to `susi`, the derived shortcuts become `susi`, `susi-ask` and `susi-plan`.
 
 ### Security and customization
 
