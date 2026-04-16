@@ -94,6 +94,8 @@ pub struct GlobalSettings {
     pub terminal_agent_command_name: String,
     #[serde(default = "default_terminal_agent_execution_target")]
     pub terminal_agent_execution_target: TerminalAgentExecutionTarget,
+    #[serde(default)]
+    pub default_ai_profile_id: Option<String>,
 }
 
 impl Default for GlobalSettings {
@@ -132,6 +134,7 @@ impl Default for GlobalSettings {
             terminal_agent_show_runtime_messages: false,
             terminal_agent_command_name: default_terminal_agent_command_name(),
             terminal_agent_execution_target: default_terminal_agent_execution_target(),
+            default_ai_profile_id: None,
         }
     }
 }

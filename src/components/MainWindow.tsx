@@ -56,6 +56,7 @@ import {
   getTerminalAgentPlanCommandName,
   normalizeTerminalAgentCommandName,
 } from "../utils/terminalAgentCommand";
+import { resolvePreferredAiProfileId } from "../utils/aiProfiles";
 import type {
   AiAction,
   AiExecutionResult,
@@ -166,6 +167,7 @@ type GlobalSettingsView = {
   showMenuBar?: boolean;
   terminalAgentCommandName?: string;
   terminalAgentExecutionTarget?: TerminalAgentExecutionTarget;
+  defaultAiProfileId?: string;
 };
 
 type PendingAiAction = {
@@ -634,6 +636,8 @@ export function MainWindow() {
   const [terminalAgentCommandName, setTerminalAgentCommandName] = useState("agent");
   const [terminalAgentExecutionTarget, setTerminalAgentExecutionTarget] =
     useState<TerminalAgentExecutionTarget>("TerminalWindow");
+  const [defaultAiProfileId, setDefaultAiProfileId] = useState("");
+  const [hasConfiguredAiProfiles, setHasConfiguredAiProfiles] = useState(false);
   const [settingsReady, setSettingsReady] = useState(false);
   const globalFontSizeRef = useRef(globalFontSize);
   globalFontSizeRef.current = globalFontSize;
@@ -698,6 +702,19 @@ export function MainWindow() {
       normalizeTerminalAgentCommandName(settings.terminalAgentCommandName),
     );
     setTerminalAgentExecutionTarget(settings.terminalAgentExecutionTarget ?? "TerminalWindow");
+    setDefaultAiProfileId(settings.defaultAiProfileId ?? "");
+  }, []);
+
+  const loadAiProfileAvailability = useCallback(async () => {
+    try {
+      const profiles = await invoke<AiProfile[]>("get_ai_profiles");
+      setHasConfiguredAiProfiles(profiles.length > 0);
+      return profiles;
+    } catch (error) {
+      console.error("Failed to load AI profiles:", error);
+      setHasConfiguredAiProfiles(false);
+      return [];
+    }
   }, []);
 
   useEffect(() => {
@@ -713,10 +730,11 @@ export function MainWindow() {
       })
       .catch(console.error)
       .finally(() => setSettingsReady(true));
+    void loadAiProfileAvailability();
     invoke<string[]>("get_recent_projects")
       .then(setRecentProjects)
       .catch(console.error);
-  }, [applyGlobalSettingsView, loadConnections, loadActiveTheme, loadActiveGuiTheme, setRecentProjects]);
+  }, [applyGlobalSettingsView, loadAiProfileAvailability, loadConnections, loadActiveTheme, loadActiveGuiTheme, setRecentProjects]);
 
   useEffect(() => {
     let offSettingsUpdated: (() => void) | null = null;
@@ -2783,6 +2801,7 @@ export function MainWindow() {
     }
     try {
       const profiles = await invoke<AiProfile[]>("get_ai_profiles");
+      setHasConfiguredAiProfiles(profiles.length > 0);
       if (profiles.length === 0) {
         setPendingAiAction(nextAction);
         setOpenDialog("aiManager");
@@ -2800,6 +2819,7 @@ export function MainWindow() {
   const handleRequestTerminalAgent = useCallback(async (nextAction: PendingTerminalAgentAction) => {
     try {
       const profiles = await invoke<AiProfile[]>("get_ai_profiles");
+      setHasConfiguredAiProfiles(profiles.length > 0);
       if (profiles.length === 0) {
         setPendingTerminalAgentAction(nextAction);
         setPendingTerminalAgentMode("run");
@@ -2820,6 +2840,7 @@ export function MainWindow() {
   const handleRequestTerminalAgentPlan = useCallback(async (nextAction: PendingTerminalAgentAction) => {
     try {
       const profiles = await invoke<AiProfile[]>("get_ai_profiles");
+      setHasConfiguredAiProfiles(profiles.length > 0);
       if (profiles.length === 0) {
         setPendingTerminalAgentAction(nextAction);
         setPendingTerminalAgentMode("plan");
@@ -3068,6 +3089,7 @@ export function MainWindow() {
     let profiles: AiProfile[] = [];
     try {
       profiles = await invoke<AiProfile[]>("get_ai_profiles");
+      setHasConfiguredAiProfiles(profiles.length > 0);
     } catch (error) {
       await emitTerminalAgentNote(sessionId, `Failed to load AI profiles: ${String(error)}`);
       return;
@@ -3081,6 +3103,7 @@ export function MainWindow() {
       ? parsed.invocation.profileLookup?.trim()
       : undefined;
     const normalizedLookup = profileLookup?.toLowerCase();
+    const preferredProfileId = resolvePreferredAiProfileId(profiles, defaultAiProfileId);
     const profile = profileLookup
       ? profiles.find((candidate) => {
           const candidateName = candidate.name.trim();
@@ -3092,7 +3115,7 @@ export function MainWindow() {
             || candidateId.toLowerCase() === normalizedLookup
           );
         })
-      : profiles[0];
+      : profiles.find((candidate) => candidate.id === preferredProfileId) ?? profiles[0];
 
     if (!profile) {
       await emitTerminalAgentNote(
@@ -3172,6 +3195,7 @@ export function MainWindow() {
     resolveConnectionDisplayName,
     terminalAgentCommandName,
     terminalAgentExecutionTarget,
+    defaultAiProfileId,
   ]);
 
   const handleApproveTerminalAgent = useCallback(async (approval: TerminalAgentApproval) => {
@@ -3222,6 +3246,7 @@ export function MainWindow() {
   const handleCloseAiManager = useCallback(async () => {
     try {
       const profiles = await invoke<AiProfile[]>("get_ai_profiles");
+      setHasConfiguredAiProfiles(profiles.length > 0);
       if (pendingAiAction) {
         setOpenDialog(profiles.length > 0 ? "aiAction" : null);
       } else if (pendingTerminalAgentAction) {
@@ -3242,6 +3267,7 @@ export function MainWindow() {
       }
     } catch (error) {
       console.error("Failed to reload AI profiles:", error);
+      setHasConfiguredAiProfiles(false);
       setOpenDialog(null);
       setPendingAiAction(null);
       setPendingTerminalAgentAction(null);
@@ -3766,7 +3792,7 @@ export function MainWindow() {
                       onClosePrimarySplit={() => {
                         void handleClosePrimarySplit(tab.id);
                       }}
-                      onAiAction={(sessionId, action, selectedText) => {
+                      onAiAction={hasConfiguredAiProfiles ? ((sessionId, action, selectedText) => {
                         const splitConfig = splitSessionConfigs[sessionId];
                         const connectionDisplayName =
                           sessionId === tab.id
@@ -3780,8 +3806,8 @@ export function MainWindow() {
                           selectedText,
                           connectionDisplayName,
                         });
-                      }}
-                      onStartAgent={(sessionId) => {
+                      }) : undefined}
+                      onStartAgent={hasConfiguredAiProfiles ? ((sessionId) => {
                         if (isReadOnlyMirrorSession(sessionId)) {
                           return;
                         }
@@ -3789,8 +3815,8 @@ export function MainWindow() {
                           sessionId,
                           connectionDisplayName: resolveConnectionDisplayName(sessionId),
                         });
-                      }}
-                      onStartAgentPlan={(sessionId) => {
+                      }) : undefined}
+                      onStartAgentPlan={hasConfiguredAiProfiles ? ((sessionId) => {
                         if (isReadOnlyMirrorSession(sessionId)) {
                           return;
                         }
@@ -3798,7 +3824,7 @@ export function MainWindow() {
                           sessionId,
                           connectionDisplayName: resolveConnectionDisplayName(sessionId),
                         });
-                      }}
+                      }) : undefined}
                       onAgentCommand={(sessionId, rawCommand) => {
                         void handleTerminalAgentShortcut(sessionId, rawCommand);
                       }}

@@ -2,6 +2,7 @@ import { useState, useEffect } from "react";
 import { X, Settings } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useSettingsStore, GlobalSettings } from "../../store/settingsStore";
+import type { AiProfile } from "../../types/ai";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 import {
   DEFAULT_TERMINAL_AGENT_COMMAND_NAME,
@@ -48,10 +49,17 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
   const [translationTestResult, setTranslationTestResult] = useState<string | null>(null);
   const [translationTargetLang, setTranslationTargetLang] = useState("en");
   const [generating, setGenerating] = useState(false);
+  const [aiProfiles, setAiProfiles] = useState<AiProfile[]>([]);
 
   useEffect(() => {
     if (open) {
       loadSettings();
+      invoke<AiProfile[]>("get_ai_profiles")
+        .then(setAiProfiles)
+        .catch((error) => {
+          console.error("Failed to load AI profiles for settings:", error);
+          setAiProfiles([]);
+        });
     }
   }, [open, loadSettings]);
 
@@ -68,8 +76,13 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
   async function handleSave() {
     setSaving(true);
     try {
+      const normalizedDefaultAiProfileId =
+        local.defaultAiProfileId && aiProfiles.some((profile) => profile.id === local.defaultAiProfileId)
+          ? local.defaultAiProfileId
+          : undefined;
       const nextSettings = {
         ...local,
+        defaultAiProfileId: normalizedDefaultAiProfileId,
         terminalAgentCommandName: normalizeTerminalAgentCommandName(local.terminalAgentCommandName),
       };
       await saveSettings(nextSettings);
@@ -256,6 +269,30 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
 
           {activeTab === "ai" && (
             <>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">Default AI profile</label>
+                <select
+                  className="input-field"
+                  value={local.defaultAiProfileId || ""}
+                  onChange={(e) => update({ defaultAiProfileId: e.target.value || undefined })}
+                  disabled={aiProfiles.length === 0}
+                >
+                  <option value="">Use first available profile</option>
+                  {aiProfiles.map((profile) => (
+                    <option key={profile.id} value={profile.id}>
+                      {profile.name || "Unnamed profile"}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1 text-xs text-kortty-text-dim">
+                  This profile is preselected for AI dialogs and agent commands when no profile is chosen explicitly.
+                </p>
+                {aiProfiles.length === 0 && (
+                  <p className="mt-2 text-xs text-kortty-text-dim">
+                    No AI profile exists yet. Create one in AI Manager first.
+                  </p>
+                )}
+              </div>
               <div>
                 <label className="block text-xs text-kortty-text-dim mb-1">Agent command name</label>
                 <input

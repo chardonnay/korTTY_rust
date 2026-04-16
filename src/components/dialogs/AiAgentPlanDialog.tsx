@@ -3,6 +3,8 @@ import { invoke } from "@tauri-apps/api/core";
 import { Bot, Play, Settings2, X } from "lucide-react";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 import type { AiProfile, TerminalAgentPlanRequest } from "../../types/ai";
+import type { GlobalSettings } from "../../store/settingsStore";
+import { resolvePreferredAiProfileId } from "../../utils/aiProfiles";
 
 interface AiAgentPlanDialogProps {
   open: boolean;
@@ -41,16 +43,17 @@ export function AiAgentPlanDialog({
     setStatus(null);
     setLoading(true);
 
-    invoke<AiProfile[]>("get_ai_profiles")
-      .then((loadedProfiles) => {
+    Promise.all([
+      invoke<AiProfile[]>("get_ai_profiles"),
+      invoke<GlobalSettings>("get_settings").catch(() => null),
+    ])
+      .then(([loadedProfiles, settings]) => {
         if (cancelled) {
           return;
         }
         setProfiles(loadedProfiles);
         setProfileId((current) =>
-          loadedProfiles.some((profile) => profile.id === current)
-            ? current
-            : (loadedProfiles[0]?.id || ""),
+          resolvePreferredAiProfileId(loadedProfiles, settings?.defaultAiProfileId, current),
         );
       })
       .catch((error) => {

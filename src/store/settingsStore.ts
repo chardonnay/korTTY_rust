@@ -47,6 +47,7 @@ export interface GlobalSettings {
   terminalAgentShowRuntimeMessages: boolean;
   terminalAgentCommandName: string;
   terminalAgentExecutionTarget: TerminalAgentExecutionTarget;
+  defaultAiProfileId?: string;
 }
 
 interface SettingsStore {
@@ -83,6 +84,7 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
     terminalAgentShowRuntimeMessages: false,
     terminalAgentCommandName: "agent",
     terminalAgentExecutionTarget: "TerminalWindow",
+    defaultAiProfileId: undefined,
   },
   loading: false,
 

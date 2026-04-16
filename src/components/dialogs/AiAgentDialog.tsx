@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 import type { AiProfile, TerminalAgentRequest } from "../../types/ai";
 import type { GlobalSettings } from "../../store/settingsStore";
+import { resolvePreferredAiProfileId } from "../../utils/aiProfiles";
 
 interface AiAgentDialogProps {
   open: boolean;
@@ -57,9 +58,7 @@ export function AiAgentDialog({
         setProfiles(loadedProfiles);
         setLoadedSettings(settings);
         setProfileId((current) =>
-          loadedProfiles.some((profile) => profile.id === current)
-            ? current
-            : (loadedProfiles[0]?.id || ""),
+          resolvePreferredAiProfileId(loadedProfiles, settings?.defaultAiProfileId, current),
         );
         setShowDebugMessages(settings?.terminalAgentShowDebugMessages ?? false);
         setShowRuntimeMessages(settings?.terminalAgentShowRuntimeMessages ?? false);

@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 import type { AiAction, AiProfile, AiRequestPayload } from "../../types/ai";
 import type { GlobalSettings } from "../../store/settingsStore";
+import { resolvePreferredAiProfileId } from "../../utils/aiProfiles";
 import {
   AI_LANGUAGE_OPTIONS,
   DEFAULT_AI_LANGUAGE_CODE,
@@ -70,9 +71,7 @@ export function AiActionDialog({
         }
         setProfiles(loadedProfiles);
         setProfileId((current) =>
-          loadedProfiles.some((profile) => profile.id === current)
-            ? current
-            : (loadedProfiles[0]?.id || ""),
+          resolvePreferredAiProfileId(loadedProfiles, guiSettings?.defaultAiProfileId, current),
         );
         setResponseLanguageCode(resolveGuiLanguageCode(guiSettings));
       } catch (error) {
