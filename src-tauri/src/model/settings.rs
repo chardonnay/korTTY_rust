@@ -22,6 +22,14 @@ pub enum TerminalAgentExecutionTarget {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum TerminalAgentPanelDock {
+    Bottom,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum TeamworkSourceType {
     Git,
     SharedFile,
@@ -90,10 +98,24 @@ pub struct GlobalSettings {
     pub terminal_agent_show_debug_messages: bool,
     #[serde(default)]
     pub terminal_agent_show_runtime_messages: bool,
+    #[serde(default = "default_true")]
+    pub terminal_agent_show_run_dialog: bool,
     #[serde(default = "default_terminal_agent_command_name")]
     pub terminal_agent_command_name: String,
+    #[serde(default)]
+    pub terminal_agent_command_name_case_insensitive: bool,
     #[serde(default = "default_terminal_agent_execution_target")]
     pub terminal_agent_execution_target: TerminalAgentExecutionTarget,
+    #[serde(default)]
+    pub terminal_agent_remember_panel_layout: bool,
+    #[serde(default = "default_terminal_agent_panel_dock")]
+    pub terminal_agent_panel_dock: TerminalAgentPanelDock,
+    #[serde(default)]
+    pub terminal_agent_panel_height: Option<f64>,
+    #[serde(default)]
+    pub terminal_agent_panel_side_width: Option<f64>,
+    #[serde(default)]
+    pub terminal_agent_panel_font_size: Option<f64>,
     #[serde(default)]
     pub default_ai_profile_id: Option<String>,
 }
@@ -132,8 +154,15 @@ impl Default for GlobalSettings {
             default_prompt_hook_enabled: true,
             terminal_agent_show_debug_messages: false,
             terminal_agent_show_runtime_messages: false,
+            terminal_agent_show_run_dialog: true,
             terminal_agent_command_name: default_terminal_agent_command_name(),
+            terminal_agent_command_name_case_insensitive: false,
             terminal_agent_execution_target: default_terminal_agent_execution_target(),
+            terminal_agent_remember_panel_layout: false,
+            terminal_agent_panel_dock: default_terminal_agent_panel_dock(),
+            terminal_agent_panel_height: None,
+            terminal_agent_panel_side_width: None,
+            terminal_agent_panel_font_size: None,
             default_ai_profile_id: None,
         }
     }
@@ -149,4 +178,49 @@ fn default_terminal_agent_command_name() -> String {
 
 fn default_terminal_agent_execution_target() -> TerminalAgentExecutionTarget {
     TerminalAgentExecutionTarget::TerminalWindow
+}
+
+fn default_terminal_agent_panel_dock() -> TerminalAgentPanelDock {
+    TerminalAgentPanelDock::Bottom
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminal_agent_panel_layout_defaults_for_legacy_settings() {
+        let mut value = serde_json::to_value(GlobalSettings::default()).unwrap();
+        let object = value.as_object_mut().unwrap();
+        object.remove("terminalAgentPanelDock");
+        object.remove("terminalAgentPanelSideWidth");
+
+        let settings: GlobalSettings = serde_json::from_value(value).unwrap();
+
+        assert_eq!(
+            settings.terminal_agent_panel_dock,
+            TerminalAgentPanelDock::Bottom
+        );
+        assert_eq!(settings.terminal_agent_panel_side_width, None);
+    }
+
+    #[test]
+    fn terminal_agent_panel_layout_serializes_lowercase_dock() {
+        let settings = GlobalSettings {
+            terminal_agent_panel_dock: TerminalAgentPanelDock::Right,
+            terminal_agent_panel_side_width: Some(420.0),
+            ..Default::default()
+        };
+
+        let value = serde_json::to_value(&settings).unwrap();
+        assert_eq!(value["terminalAgentPanelDock"], "right");
+        assert_eq!(value["terminalAgentPanelSideWidth"], 420.0);
+
+        let restored: GlobalSettings = serde_json::from_value(value).unwrap();
+        assert_eq!(
+            restored.terminal_agent_panel_dock,
+            TerminalAgentPanelDock::Right
+        );
+        assert_eq!(restored.terminal_agent_panel_side_width, Some(420.0));
+    }
 }

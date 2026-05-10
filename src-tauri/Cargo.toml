@@ -49,3 +49,4 @@ anyhow = "1"
 figlet-rs = "0.1"
 zxcvbn = "3"
 portable-pty = "0.8"
+printpdf = { version = "0.9.1", default-features = false }

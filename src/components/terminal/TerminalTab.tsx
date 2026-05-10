@@ -25,7 +25,9 @@ interface TerminalTabProps {
   sessionId: string;
   connected: boolean;
   agentCommandName?: string;
+  agentCommandNameCaseInsensitive?: boolean;
   readOnly?: boolean;
+  forceAutoScroll?: boolean;
   promptHookEnabled?: boolean;
   showTimestamps?: boolean;
   theme?: {
@@ -83,7 +85,9 @@ export function TerminalTab({
   sessionId,
   connected,
   agentCommandName,
+  agentCommandNameCaseInsensitive = false,
   readOnly = false,
+  forceAutoScroll = false,
   promptHookEnabled = true,
   showTimestamps = false,
   theme,
@@ -107,6 +111,7 @@ export function TerminalTab({
   const fitAddonRef = useRef<FitAddon | null>(null);
   const connectedRef = useRef(connected);
   const readOnlyRef = useRef(readOnly);
+  const forceAutoScrollRef = useRef(forceAutoScroll);
   const showTimestampsRef = useRef(showTimestamps);
   const promptHookEnabledRef = useRef(promptHookEnabled);
   const waitingForNextPromptRef = useRef(false);
@@ -124,6 +129,7 @@ export function TerminalTab({
   const agentShortcutStartedAtPromptRef = useRef(false);
   const agentShortcutCaptureValidRef = useRef(true);
   const agentShortcutPromptTailRef = useRef("");
+  const oscBufferRef = useRef("");
   const lastResizeKeyRef = useRef("");
   const resizeObserverRef = useRef<ResizeObserver | null>(null);
   const isMountedRef = useRef(true);
@@ -138,16 +144,22 @@ export function TerminalTab({
     [agentCommandName],
   );
   const agentShortcutCommandPattern = useMemo(
-    () => buildTerminalAgentShortcutCommandPattern(normalizedAgentCommandName),
+    () => buildTerminalAgentShortcutCommandPattern(normalizedAgentCommandName, agentCommandNameCaseInsensitive),
+    [normalizedAgentCommandName, agentCommandNameCaseInsensitive],
+  );
+  const exactAgentShortcutCommandPattern = useMemo(
+    () => buildTerminalAgentShortcutCommandPattern(normalizedAgentCommandName, false),
     [normalizedAgentCommandName],
   );
   const agentPromptLineExtractPattern = useMemo(
-    () => buildTerminalAgentPromptLineExtractPattern(normalizedAgentCommandName),
-    [normalizedAgentCommandName],
+    () => buildTerminalAgentPromptLineExtractPattern(normalizedAgentCommandName, agentCommandNameCaseInsensitive),
+    [normalizedAgentCommandName, agentCommandNameCaseInsensitive],
   );
   const agentShortcutCommandPatternRef = useRef(agentShortcutCommandPattern);
+  const exactAgentShortcutCommandPatternRef = useRef(exactAgentShortcutCommandPattern);
   const agentPromptLineExtractPatternRef = useRef(agentPromptLineExtractPattern);
   agentShortcutCommandPatternRef.current = agentShortcutCommandPattern;
+  exactAgentShortcutCommandPatternRef.current = exactAgentShortcutCommandPattern;
   agentPromptLineExtractPatternRef.current = agentPromptLineExtractPattern;
 
   function formatTimestamp(date: Date): string {
@@ -246,6 +258,61 @@ export function TerminalTab({
 
   function looksLikeAgentShortcutCommand(command: string): boolean {
     return agentShortcutCommandPatternRef.current.test(command.trim());
+  }
+
+  function looksLikeExactAgentShortcutCommand(command: string): boolean {
+    return exactAgentShortcutCommandPatternRef.current.test(command.trim());
+  }
+
+  function decodeAgentOscBase64(value: string): string | null {
+    try {
+      const binary = atob(value);
+      const bytes = new Uint8Array(binary.length);
+      for (let index = 0; index < binary.length; index += 1) {
+        bytes[index] = binary.charCodeAt(index);
+      }
+      return new TextDecoder().decode(bytes);
+    } catch {
+      return null;
+    }
+  }
+
+  function handleTerminalAgentOscMarkers(text: string) {
+    if (readOnlyRef.current) {
+      oscBufferRef.current = "";
+      return;
+    }
+    const pattern = /\x1b\]777;korTTY-agent;(execute|ask|plan);([^;\x07\x1b]*);([^;\x07\x1b]*)(?:\x07|\x1b\\)/g;
+    const markerPrefix = "\x1b]777;korTTY-agent;";
+    oscBufferRef.current += text;
+    const buffer = oscBufferRef.current;
+    let processedUntil = 0;
+    let match: RegExpExecArray | null;
+    while ((match = pattern.exec(buffer)) != null) {
+      processedUntil = pattern.lastIndex;
+      const [, kind, , encodedPrompt] = match;
+      const prompt = decodeAgentOscBase64(encodedPrompt)?.trim();
+      if (!prompt) {
+        continue;
+      }
+      const command =
+        kind === "ask"
+          ? `${normalizedAgentCommandName}-ask ${prompt}`
+          : kind === "plan"
+            ? `${normalizedAgentCommandName}-plan ${prompt}`
+            : `${normalizedAgentCommandName} ${prompt}`;
+      onAgentCommandRef.current?.(sessionIdRef.current, command);
+    }
+    if (processedUntil > 0) {
+      oscBufferRef.current = buffer.slice(processedUntil);
+    } else {
+      const markerStart = buffer.lastIndexOf(markerPrefix);
+      oscBufferRef.current = markerStart >= 0 ? buffer.slice(markerStart) : "";
+    }
+    if (oscBufferRef.current.length > 8192) {
+      const markerStart = oscBufferRef.current.lastIndexOf(markerPrefix);
+      oscBufferRef.current = markerStart >= 0 ? oscBufferRef.current.slice(markerStart) : "";
+    }
   }
 
   function extractAgentShortcutCommandFromPromptLine(term: Terminal): string | null {
@@ -392,6 +459,7 @@ export function TerminalTab({
 
   connectedRef.current = connected;
   readOnlyRef.current = readOnly;
+  forceAutoScrollRef.current = forceAutoScroll;
   showTimestampsRef.current = showTimestamps;
   promptHookEnabledRef.current = promptHookEnabled;
   sessionIdRef.current = sessionId;
@@ -598,6 +666,14 @@ export function TerminalTab({
         onCloseRequestRef.current();
         return;
       }
+      if (readOnlyRef.current && (data === "\u001b" || data === "\u0003")) {
+        window.dispatchEvent(
+          new CustomEvent("kortty-terminal-agent-cancel", {
+            detail: { sessionId: sessionIdRef.current },
+          }),
+        );
+        return;
+      }
       if (connectedRef.current && !readOnlyRef.current) {
         if (data !== "\r") {
           noteAgentShortcutInput(data);
@@ -616,6 +692,12 @@ export function TerminalTab({
           agentShortcutCaptureValidRef.current = true;
           agentShortcutPromptReadyRef.current = false;
           if (interceptAgentShortcut) {
+            if (
+              promptHookEnabledRef.current &&
+              looksLikeExactAgentShortcutCommand(currentInput)
+            ) {
+              // Let the shell alias emit OSC 777 so the backend can also learn the exact remote cwd.
+            } else {
             const cancelLinePayload = [21, 13];
             const targetSessionIds = [sessionIdRef.current, ...broadcastTargetsRef.current];
             try {
@@ -632,6 +714,7 @@ export function TerminalTab({
             }
             onAgentCommandRef.current?.(sessionIdRef.current, currentInput);
             return;
+            }
           }
         }
         if (containsClearScreenSignal(data)) {
@@ -796,11 +879,19 @@ export function TerminalTab({
         const bytes = new Uint8Array(event.payload);
         try {
           term.write(bytes);
+          if (forceAutoScrollRef.current) {
+            requestAnimationFrame(() => {
+              if (xtermRef.current === term && isMountedRef.current) {
+                term.scrollToBottom();
+              }
+            });
+          }
         } catch (error) {
           console.warn("[TerminalTab] Ignored terminal-output write on inactive terminal", error);
           return;
         }
         const text = new TextDecoder().decode(bytes);
+        handleTerminalAgentOscMarkers(text);
         if (containsClearScreenSignal(text)) {
           setTimestampEntries([]);
           waitingForNextPromptRef.current = false;

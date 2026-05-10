@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Bot, Play, Settings2, X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
-import type { AiProfile, TerminalAgentRequest } from "../../types/ai";
+import type { AiProfile, TerminalAgentExecutionTarget, TerminalAgentRequest } from "../../types/ai";
 import type { GlobalSettings } from "../../store/settingsStore";
 import { resolvePreferredAiProfileId } from "../../utils/aiProfiles";
 
@@ -10,6 +10,11 @@ interface AiAgentDialogProps {
   open: boolean;
   sessionId?: string;
   connectionDisplayName?: string;
+  initialPrompt?: string;
+  initialProfileId?: string;
+  initialExecutionTarget?: TerminalAgentExecutionTarget;
+  initialAskConfirmationBeforeEveryCommand?: boolean;
+  initialAutoApproveRootCommands?: boolean;
   onClose: () => void;
   onManageProfiles: () => void;
   onRun: (request: TerminalAgentRequest) => Promise<void>;
@@ -19,6 +24,11 @@ export function AiAgentDialog({
   open,
   sessionId,
   connectionDisplayName,
+  initialPrompt,
+  initialProfileId,
+  initialExecutionTarget,
+  initialAskConfirmationBeforeEveryCommand = false,
+  initialAutoApproveRootCommands = false,
   onClose,
   onManageProfiles,
   onRun,
@@ -40,7 +50,7 @@ export function AiAgentDialog({
     }
 
     let cancelled = false;
-    setPrompt("");
+    setPrompt(initialPrompt?.trim() ?? "");
     setStatus(null);
     setProfiles([]);
     setProfileId("");
@@ -58,7 +68,11 @@ export function AiAgentDialog({
         setProfiles(loadedProfiles);
         setLoadedSettings(settings);
         setProfileId((current) =>
-          resolvePreferredAiProfileId(loadedProfiles, settings?.defaultAiProfileId, current),
+          resolvePreferredAiProfileId(
+            loadedProfiles,
+            initialProfileId || settings?.defaultAiProfileId,
+            current,
+          ),
         );
         setShowDebugMessages(settings?.terminalAgentShowDebugMessages ?? false);
         setShowRuntimeMessages(settings?.terminalAgentShowRuntimeMessages ?? false);
@@ -80,13 +94,14 @@ export function AiAgentDialog({
     return () => {
       cancelled = true;
     };
-  }, [open]);
+  }, [open, initialPrompt, initialProfileId]);
 
   const selectedProfile = useMemo(
     () => profiles.find((profile) => profile.id === profileId) ?? null,
     [profileId, profiles],
   );
-  const executionTarget = loadedSettings?.terminalAgentExecutionTarget ?? "TerminalWindow";
+  const executionTarget =
+    initialExecutionTarget ?? loadedSettings?.terminalAgentExecutionTarget ?? "TerminalWindow";
   const launchesInChatWindow = executionTarget === "ChatWindow";
 
   function persistVisibilityPreferences(
@@ -127,8 +142,10 @@ export function AiAgentDialog({
         executionTarget,
         showDebugMessages,
         showRuntimeMessages,
-        askConfirmationBeforeEveryCommand: false,
-        autoApproveRootCommands: false,
+        askConfirmationBeforeEveryCommand: initialAskConfirmationBeforeEveryCommand,
+        autoApproveRootCommands: initialAskConfirmationBeforeEveryCommand
+          ? false
+          : initialAutoApproveRootCommands,
       });
     } catch (error) {
       setStatus(`Start failed: ${String(error)}`);

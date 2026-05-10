@@ -3,6 +3,7 @@ import { invoke } from "@tauri-apps/api/core";
 import type { TerminalAgentExecutionTarget } from "../types/ai";
 
 export type TeamworkSourceType = "Git" | "SharedFile";
+export type TerminalAgentPanelDock = "bottom" | "left" | "right";
 
 export interface TeamworkSourceConfig {
   id: string;
@@ -45,8 +46,15 @@ export interface GlobalSettings {
   defaultPromptHookEnabled: boolean;
   terminalAgentShowDebugMessages: boolean;
   terminalAgentShowRuntimeMessages: boolean;
+  terminalAgentShowRunDialog: boolean;
   terminalAgentCommandName: string;
+  terminalAgentCommandNameCaseInsensitive: boolean;
   terminalAgentExecutionTarget: TerminalAgentExecutionTarget;
+  terminalAgentRememberPanelLayout: boolean;
+  terminalAgentPanelDock: TerminalAgentPanelDock;
+  terminalAgentPanelHeight?: number;
+  terminalAgentPanelSideWidth?: number;
+  terminalAgentPanelFontSize?: number;
   defaultAiProfileId?: string;
 }
 
@@ -82,8 +90,15 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
     defaultPromptHookEnabled: true,
     terminalAgentShowDebugMessages: false,
     terminalAgentShowRuntimeMessages: false,
+    terminalAgentShowRunDialog: true,
     terminalAgentCommandName: "agent",
+    terminalAgentCommandNameCaseInsensitive: false,
     terminalAgentExecutionTarget: "TerminalWindow",
+    terminalAgentRememberPanelLayout: false,
+    terminalAgentPanelDock: "bottom",
+    terminalAgentPanelHeight: undefined,
+    terminalAgentPanelSideWidth: undefined,
+    terminalAgentPanelFontSize: undefined,
     defaultAiProfileId: undefined,
   },
   loading: false,

@@ -31,6 +31,11 @@
   "bundle": {
     "active": true,
     "targets": "all",
+    "resources": [
+      "resources/fonts/noto/NotoSans-Regular.ttf",
+      "resources/fonts/noto/NotoSansMono-Regular.ttf",
+      "resources/fonts/noto/NotoSans-Bold.ttf"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

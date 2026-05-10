@@ -34,6 +34,8 @@ export interface ConnectionSettings {
   retryCount: number;
   terminalLogging: boolean;
   commandTimestamps: boolean;
+  promptHookEnabled?: boolean;
+  terminalAgentCommandName?: string;
   themeId?: string;
   jumpServer?: JumpServerConfig;
   tunnels: TunnelConfig[];
@@ -162,6 +164,8 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
     retryCount: 4,
     terminalLogging: false,
     commandTimestamps: false,
+    promptHookEnabled: true,
+    terminalAgentCommandName: "agent",
     tunnels: [],
     usageCount: 0,
     connectionSource: "Local",

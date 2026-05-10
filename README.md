@@ -8,7 +8,7 @@ This repository tracks the feature migration from [KorTTY JavaFX](https://github
 - Multiple SSH tabs, split terminals, broadcast input, zoom control, dashboard and multi-window workflows
 - Connection manager with credentials, SSH keys, GPG keys, custom credential environments and project save/open flows
 - Import and export for KorTTY, MobaXterm, MTPuTTY and PuTTY Connection Manager
-- Built-in AI workflows: profile manager, saved chats, AI Agent execution, planning mode and transcript export
+- Built-in AI workflows: profile manager, saved chats, AI Agent execution, planning mode, inline activity feed and exports
 - SFTP file browser, snippet manager with XML import/export, ASCII art banner, backups and theme editors
 
 ## Feature Overview
@@ -38,11 +38,16 @@ This repository tracks the feature migration from [KorTTY JavaFX](https://github
 - OpenAI-compatible chat completion integration
 - Terminal selection actions: `Summarize`, `Solve Problem`, `Ask...`
 - AI result/chat tabs with follow-up prompts
-- AI Agent execution for connected SSH sessions with approval prompts, `Allow always`, sudo password entry and per-session sudo password caching
+- AI Agent execution for connected SSH sessions with inline activity feed, approval prompts, `Allow always`, sudo password entry and per-session sudo password caching
 - AI Agent chat tabs with transcript copy and save actions
 - AI Agent planning mode with clarifying questions, implementation options, accepted-plan handoff and explicit execution start
 - Configurable agent command trio in `Settings -> AI`: `<name>`, `<name>-ask` and `<name>-plan`
 - Configurable AI Agent task target in `Settings -> AI`: current terminal window or a dedicated AI Agent chat tab
+- Terminal-targeted AI Agent runs show a bottom activity panel with elapsed time, token usage, collapsible details, history navigation, rerun, cancel, approval and masked sudo-password controls
+- Current-run and all-runs activity export formats: Markdown, plain text, YAML, XML, JSON, PDF and Asciidoctor; PDF export uses bundled Noto Sans Mono font assets copied from the Java source resources
+- Prompt-hook aliases emit hidden `OSC 777;korTTY-agent` markers so terminal-agent shortcuts keep the active remote `pwd -P`; explicit `OSC 7` and typed `cd`/`pushd`/`popd` updates are also tracked
+- Agent commands execute with `cd '<tracked cwd>' && ...` only when the tracked cwd is a valid absolute remote path
+- Agent command matching is case-sensitive by default; `Settings -> AI` can enable case-insensitive matching, show/hide the run dialog for shortcuts and set saved activity panel height/font size
 - Auto title generation for saved chats
 - TXT and Markdown transcript export
 - Dedicated AI connection test with a minimal request path
@@ -55,7 +60,24 @@ KorTTY can intercept agent commands directly from the terminal prompt. By defaul
 - `agent-ask <question>` or `agent-ask: <question>` for pure Q&A without command execution
 - `agent-plan <prompt>` or `agent-plan: <prompt>` for planning-only runs that never execute commands directly
 
-The base command name is configurable in `Settings -> AI`. If you rename `agent` to `susi`, the derived shortcuts become `susi`, `susi-ask` and `susi-plan`.
+The base command name is configurable in `Settings -> AI`. If you rename `agent` to `susi`, the derived shortcuts `susi`, `susi-ask` and `susi-plan` are added; the default `agent`, `agent-ask` and `agent-plan` aliases remain available for compatibility.
+
+When prompt hooks are enabled, KorTTY installs matching shell aliases for the configured shortcut trio and the default `agent` trio. The aliases emit hidden terminal markers containing the mode, `pwd -P` and prompt payload, then the Rust backend uses that cwd for subsequent remote exec calls. `agent-ask` remains non-executing and is routed through the normal AI ask/chat flow.
+
+Typed `agent ...` terminal shortcuts always run in the current terminal window, even when `Settings -> AI -> AI Agent task target` is set to a dedicated chat tab.
+
+During terminal-targeted runs, terminal output and the inline activity panel follow new Agent output automatically; the panel stays open after completion until the user closes it.
+
+### Validation path
+
+```shell
+cargo fmt --check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+npm run build
+```
+
+Manual check: connect to SSH, run `cd /tmp`, then `agent <task>` and verify the activity panel opens at the bottom and commands run relative to `/tmp`. Trigger approval and sudo-password states, confirm masked input and session-local reuse, then export current and all runs in each supported format.
 
 ### Security and customization
 

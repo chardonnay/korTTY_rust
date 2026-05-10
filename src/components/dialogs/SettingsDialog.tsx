@@ -40,6 +40,19 @@ const TRANSLATION_PROVIDERS = [
   { value: "Yandex", label: "Yandex" },
 ];
 
+const AGENT_PANEL_DOCK_OPTIONS: { value: GlobalSettings["terminalAgentPanelDock"]; label: string }[] = [
+  { value: "bottom", label: "Bottom" },
+  { value: "left", label: "Left" },
+  { value: "right", label: "Right" },
+];
+
+function clampOptionalNumber(value: number | undefined, min: number, max: number): number | undefined {
+  if (value == null || !Number.isFinite(value) || value <= 0) {
+    return undefined;
+  }
+  return Math.min(max, Math.max(min, value));
+}
+
 export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) {
   const { width, height, onResizeStart } = useDialogGeometry("settings", 600, 500, 400, 300);
   const { settings, loadSettings, saveSettings } = useSettingsStore();
@@ -84,6 +97,10 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
         ...local,
         defaultAiProfileId: normalizedDefaultAiProfileId,
         terminalAgentCommandName: normalizeTerminalAgentCommandName(local.terminalAgentCommandName),
+        terminalAgentPanelDock: local.terminalAgentPanelDock || "bottom",
+        terminalAgentPanelHeight: clampOptionalNumber(local.terminalAgentPanelHeight, 140, 520),
+        terminalAgentPanelSideWidth: clampOptionalNumber(local.terminalAgentPanelSideWidth, 360, 720),
+        terminalAgentPanelFontSize: clampOptionalNumber(local.terminalAgentPanelFontSize, 9, 20),
       };
       await saveSettings(nextSettings);
       onSaved?.(nextSettings);
@@ -330,6 +347,104 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
                 <p className="mt-1 text-xs text-kortty-text-dim">
                   Choose whether AI Agent tasks run directly in the current terminal session or open as a new AI chat.
                 </p>
+              </div>
+              <label className="flex items-center gap-2 text-xs text-kortty-text cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={local.terminalAgentShowRunDialog}
+                  onChange={(e) => update({ terminalAgentShowRunDialog: e.target.checked })}
+                />
+                <span>Show run dialog for terminal agent shortcuts</span>
+              </label>
+              <label className="flex items-center gap-2 text-xs text-kortty-text cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={local.terminalAgentCommandNameCaseInsensitive}
+                  onChange={(e) => update({ terminalAgentCommandNameCaseInsensitive: e.target.checked })}
+                />
+                <span>Match agent command names case-insensitively</span>
+              </label>
+              <label className="flex items-center gap-2 text-xs text-kortty-text cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={local.terminalAgentRememberPanelLayout}
+                  onChange={(e) => update({ terminalAgentRememberPanelLayout: e.target.checked })}
+                />
+                <span>Remember terminal agent panel layout</span>
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Saved panel position</label>
+                  <select
+                    className="input-field"
+                    value={local.terminalAgentPanelDock || "bottom"}
+                    onChange={(e) =>
+                      update({
+                        terminalAgentPanelDock: e.target.value as GlobalSettings["terminalAgentPanelDock"],
+                      })
+                    }
+                  >
+                    {AGENT_PANEL_DOCK_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Saved side width</label>
+                  <input
+                    className="input-field"
+                    type="number"
+                    min={360}
+                    max={720}
+                    value={local.terminalAgentPanelSideWidth ?? ""}
+                    onChange={(e) =>
+                      update({
+                        terminalAgentPanelSideWidth: e.target.value
+                          ? Number(e.target.value)
+                          : undefined,
+                      })
+                    }
+                    placeholder="420"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Saved panel height</label>
+                  <input
+                    className="input-field"
+                    type="number"
+                    min={140}
+                    max={520}
+                    value={local.terminalAgentPanelHeight ?? ""}
+                    onChange={(e) =>
+                      update({
+                        terminalAgentPanelHeight: e.target.value
+                          ? Number(e.target.value)
+                          : undefined,
+                      })
+                    }
+                    placeholder="260"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Saved activity font size</label>
+                  <input
+                    className="input-field"
+                    type="number"
+                    min={9}
+                    max={20}
+                    value={local.terminalAgentPanelFontSize ?? ""}
+                    onChange={(e) =>
+                      update({
+                        terminalAgentPanelFontSize: e.target.value
+                          ? Number(e.target.value)
+                          : undefined,
+                      })
+                    }
+                    placeholder="12"
+                  />
+                </div>
               </div>
             </>
           )}

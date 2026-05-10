@@ -100,30 +100,75 @@ pub async fn execute_custom_prompt(
     temperature: f64,
     cancel_rx: Option<&mut watch::Receiver<bool>>,
 ) -> Result<AiExecutionResult, AiError> {
+    execute_custom_prompt_internal(
+        profile,
+        system_prompt,
+        user_prompt,
+        temperature,
+        false,
+        cancel_rx,
+    )
+    .await
+}
+
+pub async fn execute_custom_json_prompt(
+    profile: &AiProfile,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+    cancel_rx: Option<&mut watch::Receiver<bool>>,
+) -> Result<AiExecutionResult, AiError> {
+    execute_custom_prompt_internal(
+        profile,
+        system_prompt,
+        user_prompt,
+        temperature,
+        true,
+        cancel_rx,
+    )
+    .await
+}
+
+async fn execute_custom_prompt_internal(
+    profile: &AiProfile,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+    json_response_format: bool,
+    cancel_rx: Option<&mut watch::Receiver<bool>>,
+) -> Result<AiExecutionResult, AiError> {
     if profile.api_url.trim().is_empty() {
         return Err(AiError::MissingApiUrl);
     }
 
     let client = build_http_client(DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)?;
-    let request_body = build_message_request_body(profile, system_prompt, user_prompt, temperature);
-    let request_future = send_request_body(profile, &client, &request_body);
-    tokio::pin!(request_future);
+    let request_body = build_message_request_body(
+        profile,
+        system_prompt,
+        user_prompt,
+        temperature,
+        json_response_format,
+    );
 
     let mut result = if let Some(cancel_rx) = cancel_rx {
-        loop {
-            tokio::select! {
-                response = &mut request_future => break response?,
-                changed = cancel_rx.changed() => {
-                    match changed {
-                        Ok(_) if *cancel_rx.borrow() => return Err(AiError::Cancelled),
-                        Ok(_) => continue,
-                        Err(_) => continue,
-                    }
-                }
-            }
+        let initial_result =
+            send_request_body_with_watch_cancel(profile, &client, &request_body, cancel_rx).await;
+        if json_response_format && is_unsupported_json_response_format_error(&initial_result) {
+            let fallback_body =
+                build_message_request_body(profile, system_prompt, user_prompt, temperature, false);
+            send_request_body_with_watch_cancel(profile, &client, &fallback_body, cancel_rx).await?
+        } else {
+            initial_result?
         }
     } else {
-        request_future.await?
+        let initial_result = send_request_body(profile, &client, &request_body).await;
+        if json_response_format && is_unsupported_json_response_format_error(&initial_result) {
+            let fallback_body =
+                build_message_request_body(profile, system_prompt, user_prompt, temperature, false);
+            send_request_body(profile, &client, &fallback_body).await?
+        } else {
+            initial_result?
+        }
     };
 
     if result.content.trim().is_empty() {
@@ -133,6 +178,43 @@ pub async fn execute_custom_prompt(
     result.active_profile_id = Some(profile.id.clone());
     result.active_profile_name = Some(profile.name.clone());
     Ok(result)
+}
+
+async fn send_request_body_with_watch_cancel(
+    profile: &AiProfile,
+    client: &reqwest::Client,
+    request_body: &Value,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<AiExecutionResult, AiError> {
+    let request_future = send_request_body(profile, client, request_body);
+    tokio::pin!(request_future);
+
+    loop {
+        tokio::select! {
+            response = &mut request_future => break response,
+            changed = cancel_rx.changed() => {
+                match changed {
+                    Ok(_) if *cancel_rx.borrow() => return Err(AiError::Cancelled),
+                    Ok(_) => continue,
+                    Err(_) => continue,
+                }
+            }
+        }
+    }
+}
+
+fn is_unsupported_json_response_format_error(result: &Result<AiExecutionResult, AiError>) -> bool {
+    let Err(AiError::ApiStatus { message, .. }) = result else {
+        return false;
+    };
+    looks_like_unsupported_json_response_format(message)
+}
+
+fn looks_like_unsupported_json_response_format(message: &str) -> bool {
+    let normalized = message.to_lowercase();
+    normalized.contains("response_format")
+        || normalized.contains("json_object")
+        || normalized.contains("json mode")
 }
 
 pub fn normalize_profile(profile: &mut AiProfile) {
@@ -337,6 +419,7 @@ fn build_standard_request_body(profile: &AiProfile, request: &AiRequestPayload) 
         &build_system_prompt(request),
         &build_user_prompt(request),
         0.2,
+        false,
     )
 }
 
@@ -346,6 +429,7 @@ fn build_connection_test_request_body(profile: &AiProfile) -> Value {
         CONNECTION_TEST_SYSTEM_PROMPT,
         CONNECTION_TEST_USER_PROMPT,
         0.0,
+        false,
     )
 }
 
@@ -354,8 +438,9 @@ fn build_message_request_body(
     system_prompt: &str,
     user_prompt: &str,
     temperature: f64,
+    json_response_format: bool,
 ) -> Value {
-    serde_json::json!({
+    let mut body = serde_json::json!({
         "model": (!profile.model.trim().is_empty()).then_some(profile.model.trim()),
         "messages": [
             {
@@ -368,7 +453,11 @@ fn build_message_request_body(
             }
         ],
         "temperature": temperature
-    })
+    });
+    if json_response_format {
+        body["response_format"] = serde_json::json!({ "type": "json_object" });
+    }
+    body
 }
 
 async fn send_request_body(
@@ -676,6 +765,45 @@ mod tests {
             body.pointer("/messages/1/content").and_then(Value::as_str),
             Some(CONNECTION_TEST_USER_PROMPT)
         );
+    }
+
+    #[test]
+    fn json_prompt_request_body_includes_response_format() {
+        let profile = AiProfile {
+            id: "p1".into(),
+            name: "Profile".into(),
+            api_url: "http://localhost".into(),
+            model: "gpt-4.1-mini".into(),
+            ..AiProfile::default()
+        };
+
+        let body = build_message_request_body(&profile, "system", "user", 0.1, true);
+
+        assert_eq!(
+            body.pointer("/response_format/type")
+                .and_then(Value::as_str),
+            Some("json_object")
+        );
+    }
+
+    #[test]
+    fn detects_unsupported_json_response_format_errors() {
+        let result = Err(AiError::ApiStatus {
+            status: 400,
+            message: "'response_format.type' must be 'json_schema' or 'text'".into(),
+        });
+
+        assert!(is_unsupported_json_response_format_error(&result));
+    }
+
+    #[test]
+    fn ignores_unrelated_api_status_errors_for_json_response_format_fallback() {
+        let result = Err(AiError::ApiStatus {
+            status: 401,
+            message: "invalid api key".into(),
+        });
+
+        assert!(!is_unsupported_json_response_format_error(&result));
     }
 
     #[test]

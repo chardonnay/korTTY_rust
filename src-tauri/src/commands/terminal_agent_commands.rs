@@ -56,6 +56,7 @@ pub async fn start_terminal_agent(
         ask_confirmation_before_every_command: request.ask_confirmation_before_every_command,
         auto_approve_root_commands: request.auto_approve_root_commands,
         accepted_plan_context: request.accepted_plan_context,
+        query_only: request.query_only,
     };
     let app_clone = app.clone();
     let run_id_clone = run_id.clone();
@@ -123,6 +124,7 @@ pub async fn cancel_terminal_agent_plan(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn start_terminal_agent_from_plan(
     app: AppHandle,
     state: State<'_, SSHManager>,
@@ -196,4 +198,9 @@ pub async fn submit_terminal_agent_sudo_password(
         return Err("A sudo password is required".into());
     }
     store.submit_sudo_password(run_id, password)
+}
+
+#[tauri::command]
+pub fn export_terminal_agent_activity_pdf(path: String, text: String) -> Result<(), String> {
+    terminal_agent::write_activity_pdf(&path, &text)
 }

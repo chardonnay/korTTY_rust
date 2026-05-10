@@ -34,6 +34,8 @@ pub struct TerminalAgentRequest {
     pub show_runtime_messages: bool,
     pub ask_confirmation_before_every_command: bool,
     pub auto_approve_root_commands: bool,
+    #[serde(default)]
+    pub query_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +86,67 @@ pub enum TerminalAgentPhase {
 pub enum TerminalAgentRisk {
     ReadOnly,
     RequiresConfirmation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentActivityType {
+    Message,
+    Action,
+    Thinking,
+    Question,
+    Error,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AgentActivityStatus {
+    Running,
+    Completed,
+    Cancelled,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentActivityTokenUsage {
+    pub known: bool,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub total_tokens: u64,
+}
+
+impl AgentActivityTokenUsage {
+    pub fn unknown() -> Self {
+        Self {
+            known: false,
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+        }
+    }
+
+    pub fn known(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64) -> Self {
+        Self {
+            known: true,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens: total_tokens.max(prompt_tokens.saturating_add(completion_tokens)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AgentActivity {
+    pub id: String,
+    pub activity_type: AgentActivityType,
+    pub status: AgentActivityStatus,
+    pub title: String,
+    pub summary: String,
+    pub detail: String,
+    pub token_usage: AgentActivityTokenUsage,
+    pub elapsed_seconds: u64,
+    pub collapsible: bool,
+    pub collapsed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
