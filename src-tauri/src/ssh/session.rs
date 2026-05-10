@@ -2,7 +2,6 @@ use crate::model::connection::{AuthMethod, ConnectionProtocol, ConnectionSetting
 use crate::model::ssh_key::SSHKey;
 use crate::persistence::xml_repository;
 use anyhow::Result;
-use async_trait::async_trait;
 use base64::Engine;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use russh::*;
@@ -108,13 +107,12 @@ enum ExecDeadlineAction {
     RequestStop { signal: Sig },
 }
 
-#[async_trait]
 impl client::Handler for SSHHandler {
     type Error = anyhow::Error;
 
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh_keys::PublicKey,
+        _server_public_key: &russh::keys::PublicKey,
     ) -> Result<bool, Self::Error> {
         Ok(true)
     }
@@ -243,7 +241,7 @@ impl SSHSession {
                 let authenticated = handle
                     .authenticate_password(&self.settings.username, &password)
                     .await?;
-                if !authenticated {
+                if !authenticated.success() {
                     anyhow::bail!("Password authentication failed");
                 }
             }
@@ -252,9 +250,12 @@ impl SSHSession {
                     .clone()
                     .ok_or_else(|| anyhow::anyhow!("Missing private key"))?;
                 let authenticated = handle
-                    .authenticate_publickey(&self.settings.username, Arc::new(key_pair))
+                    .authenticate_publickey(
+                        &self.settings.username,
+                        russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key_pair), None),
+                    )
                     .await?;
-                if !authenticated {
+                if !authenticated.success() {
                     anyhow::bail!("Private key authentication failed");
                 }
             }
@@ -693,7 +694,7 @@ impl SSHSession {
                 .private_key_passphrase
                 .as_deref()
                 .filter(|s| !s.trim().is_empty());
-            return russh_keys::decode_secret_key(&key_content, passphrase)
+            return russh::keys::decode_secret_key(&key_content, passphrase)
                 .map_err(|e| anyhow::anyhow!("Failed to decode temporary SSH key: {e}"));
         }
 
@@ -743,7 +744,7 @@ impl SSHSession {
             path
         };
 
-        russh_keys::load_secret_key(
+        russh::keys::load_secret_key(
             expanded_path,
             resolved_passphrase
                 .as_deref()

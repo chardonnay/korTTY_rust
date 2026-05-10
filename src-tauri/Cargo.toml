@@ -14,6 +14,10 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
+[patch.crates-io]
+# Keep russh's forked ssh-key crate RSA-free until upstream ships a non-vulnerable RSA path.
+internal-russh-forked-ssh-key = { path = "vendor/internal-russh-forked-ssh-key" }
+
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-dialog = "2"
@@ -24,10 +28,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 quick-xml = { version = "0.37", features = ["serialize"] }
 tokio = { version = "1", features = ["full"] }
-russh = "0.48"
-russh-keys = "0.48"
+russh = { version = "0.60.2", default-features = false, features = ["aws-lc-rs", "flate2"] }
 russh-sftp = "2"
-async-trait = "0.1"
 aes-gcm = "0.10"
 pbkdf2 = { version = "0.12", features = ["simple"] }
 sha2 = "0.10"
