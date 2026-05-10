@@ -48,16 +48,29 @@ From a connected terminal session you can start the executable AI Agent in multi
 - Open the dialog from the menu bar
 - Type the terminal shortcut directly at the shell prompt: `agent ...` or `agent: ...`
 
-The base command name is configurable in `Settings -> AI`. KorTTY automatically derives the matching `-ask` and `-plan` commands from that custom base name.
+The base command name is configurable in `Settings -> AI`. KorTTY automatically derives the matching `-ask` and `-plan` commands from that custom base name and keeps the default `agent`, `agent-ask` and `agent-plan` aliases available for compatibility.
 
 The AI Agent workflow currently supports:
 
 - Inspecting the remote server first before asking the AI profile for the next safe step
-- Running either in the current terminal session or in a dedicated `AI Agent` tab, configurable via `Settings -> AI -> AI Agent task target`
+- Running either in the current terminal session or in a dedicated `AI Agent` tab, configurable via `Settings -> AI -> AI Agent task target`; typed `agent ...` shell shortcuts always run in the current terminal session
 - Approval prompts for risky commands, including `Allow always` for the current run
-- Sudo password prompts inside the terminal overlay or the `AI Agent` tab when privileged commands require authentication
+- A bottom inline activity panel for terminal-targeted runs with status, elapsed time, token usage, collapsible details, expand-all, previous/next run history, rerun, cancel and close/collapse controls
+- The terminal and inline activity panel auto-scroll while the Agent produces output, and completed Agent panels remain visible until the user closes them.
+- Sudo password prompts inside the inline panel or the `AI Agent` tab when privileged commands require authentication
 - Temporary reuse of the sudo password for the current SSH session after it was entered once
+- Activity export for the current run or all panel history as Markdown, plain text, YAML, XML, JSON, PDF or Asciidoctor. PDF export is generated locally with the bundled Noto Sans Mono font copied from the Java source resources.
 - Transcript copy and save actions in the dedicated `AI Agent` tab
+- A file-type-count fast path for prompts that ask how many files under an absolute directory are plain text versus binary/non-text
+
+When prompt hooks are enabled, KorTTY installs shell aliases for `<name>`, `<name>-ask`, `<name>-plan` and the default `agent` trio. These aliases emit hidden `OSC 777;korTTY-agent` markers containing the shortcut mode, `pwd -P` and the prompt payload. KorTTY also consumes `OSC 7` cwd markers and tracks typed `cd`, `pushd` and `popd` commands. Remote AI Agent exec calls are wrapped as `cd '<tracked cwd>' && ...` only when the tracked cwd is a valid absolute path.
+
+`Settings -> AI` includes:
+
+- Show run dialog for terminal agent shortcuts
+- Case-insensitive command-name matching, disabled by default
+- Remember terminal agent panel layout
+- Saved panel height and saved activity font size
 
 The `agent-ask` shortcut is the non-executing variant for direct Q&A:
 
@@ -142,3 +155,21 @@ npm run tauri build
 ```
 
 Release artifacts are written to `src-tauri/target/release/bundle/`.
+
+## Validation path
+
+Automated checks:
+
+```bash
+cargo fmt --check --manifest-path src-tauri/Cargo.toml
+cargo test --manifest-path src-tauri/Cargo.toml
+cargo clippy --manifest-path src-tauri/Cargo.toml --all-targets -- -D warnings
+npm run build
+```
+
+Manual SSH validation:
+
+- Connect to an SSH session, `cd /tmp`, run `agent ...` and verify commands execute relative to `/tmp`.
+- Confirm active terminal input is locked during terminal-agent execution and that `Esc`, `Ctrl+C` or panel cancel aborts the run.
+- Trigger approval and sudo-password states; verify masked input and session-local password reuse.
+- Export current run and all runs in Markdown, plain text, YAML, XML, JSON, PDF and Asciidoctor; open the PDF and inspect JSON/XML/YAML structure.

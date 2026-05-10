@@ -60,4 +60,23 @@
       focus:outline-none focus:border-kortty-accent focus:ring-1 focus:ring-kortty-accent/30
       transition-colors;
   }
+
+  .icon-button {
+    @apply inline-flex h-6 w-6 items-center justify-center rounded text-kortty-text-dim
+      hover:bg-kortty-panel hover:text-kortty-text focus:outline-none
+      focus-visible:ring-2 focus-visible:ring-kortty-accent focus-visible:ring-offset-2 focus-visible:ring-offset-kortty-bg
+      disabled:opacity-40 disabled:hover:bg-transparent;
+  }
+
+  .btn-primary {
+    @apply rounded bg-kortty-accent px-2 py-1 text-kortty-bg hover:bg-kortty-accent-hover
+      focus:outline-none focus-visible:ring-2 focus-visible:ring-kortty-accent-hover focus-visible:ring-offset-2 focus-visible:ring-offset-kortty-bg
+      disabled:opacity-50 disabled:hover:bg-kortty-accent;
+  }
+
+  .btn-secondary {
+    @apply rounded bg-kortty-panel px-2 py-1 text-kortty-text hover:bg-kortty-border
+      focus:outline-none focus-visible:ring-2 focus-visible:ring-kortty-accent focus-visible:ring-offset-2 focus-visible:ring-offset-kortty-bg
+      disabled:opacity-50 disabled:hover:bg-kortty-panel;
+  }
 }

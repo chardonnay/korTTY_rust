@@ -24,6 +24,8 @@ export type TerminalAgentPlanPhase =
   | "Cancelled"
   | "Failed";
 export type TerminalAgentRisk = "read_only" | "requires_confirmation";
+export type AgentActivityType = "Message" | "Action" | "Thinking" | "Question" | "Error";
+export type AgentActivityStatus = "Running" | "Completed" | "Cancelled" | "Failed";
 export type TerminalAgentEventKind =
   | "command_started"
   | "stdout"
@@ -98,6 +100,7 @@ export interface TerminalAgentRequest {
   showRuntimeMessages: boolean;
   askConfirmationBeforeEveryCommand: boolean;
   autoApproveRootCommands: boolean;
+  queryOnly?: boolean;
 }
 
 export interface TerminalAgentPlanRequest {
@@ -222,6 +225,26 @@ export interface TerminalAgentCommandResult {
   stderrTruncated: boolean;
   cancelled: boolean;
   timedOut: boolean;
+}
+
+export interface AgentActivityTokenUsage {
+  known: boolean;
+  promptTokens: number;
+  completionTokens: number;
+  totalTokens: number;
+}
+
+export interface AgentActivity {
+  id: string;
+  activityType: AgentActivityType;
+  status: AgentActivityStatus;
+  title: string;
+  summary: string;
+  detail: string;
+  tokenUsage: AgentActivityTokenUsage;
+  elapsedSeconds: number;
+  collapsible: boolean;
+  collapsed: boolean;
 }
 
 export interface TerminalAgentRunState {

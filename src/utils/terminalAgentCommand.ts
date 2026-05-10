@@ -30,48 +30,61 @@ export function getTerminalAgentCommandNameValidationMessage(value?: string | nu
   return "Use a single command name that starts with a letter and contains only letters, numbers, `-`, or `_`.";
 }
 
-export function buildTerminalAgentCommandPattern(commandName: string): RegExp {
+function commandFlags(caseInsensitive = false): string {
+  return caseInsensitive ? "i" : "";
+}
+
+export function buildTerminalAgentCommandPattern(commandName: string, caseInsensitive = false): RegExp {
   const escapedName = escapeRegExp(normalizeTerminalAgentCommandName(commandName));
-  return new RegExp(`^${escapedName}(?:\\s*\\((.*)\\))?(?:(?:\\s*:\\s*)|\\s+)(.+)$`, "i");
+  return new RegExp(
+    `^${escapedName}(?:\\s*\\((.*)\\))?(?:(?:\\s*:\\s*)|\\s+)(.+)$`,
+    commandFlags(caseInsensitive),
+  );
 }
 
-export function buildTerminalAgentAskPattern(commandName: string): RegExp {
+export function buildTerminalAgentAskPattern(commandName: string, caseInsensitive = false): RegExp {
   const escapedAskName = escapeRegExp(getTerminalAgentAskCommandName(commandName));
-  return new RegExp(`^${escapedAskName}(?:(?:\\s*:\\s*)|\\s+)(.+)$`, "i");
+  return new RegExp(
+    `^${escapedAskName}(?:(?:\\s*:\\s*)|\\s+)(.+)$`,
+    commandFlags(caseInsensitive),
+  );
 }
 
-export function buildTerminalAgentAskPrefixPattern(commandName: string): RegExp {
+export function buildTerminalAgentAskPrefixPattern(commandName: string, caseInsensitive = false): RegExp {
   const escapedAskName = escapeRegExp(getTerminalAgentAskCommandName(commandName));
-  return new RegExp(`^${escapedAskName}\\b`, "i");
+  return new RegExp(`^${escapedAskName}\\b`, commandFlags(caseInsensitive));
 }
 
-export function buildTerminalAgentPlanPattern(commandName: string): RegExp {
+export function buildTerminalAgentPlanPattern(commandName: string, caseInsensitive = false): RegExp {
   const escapedPlanName = escapeRegExp(getTerminalAgentPlanCommandName(commandName));
-  return new RegExp(`^${escapedPlanName}(?:\\s*\\((.*)\\))?(?:(?:\\s*:\\s*)|\\s+)(.+)$`, "i");
+  return new RegExp(
+    `^${escapedPlanName}(?:\\s*\\((.*)\\))?(?:(?:\\s*:\\s*)|\\s+)(.+)$`,
+    commandFlags(caseInsensitive),
+  );
 }
 
-export function buildTerminalAgentPlanPrefixPattern(commandName: string): RegExp {
+export function buildTerminalAgentPlanPrefixPattern(commandName: string, caseInsensitive = false): RegExp {
   const escapedPlanName = escapeRegExp(getTerminalAgentPlanCommandName(commandName));
-  return new RegExp(`^${escapedPlanName}\\b`, "i");
+  return new RegExp(`^${escapedPlanName}\\b`, commandFlags(caseInsensitive));
 }
 
-export function buildTerminalAgentShortcutCommandPattern(commandName: string): RegExp {
+export function buildTerminalAgentShortcutCommandPattern(commandName: string, caseInsensitive = false): RegExp {
   const escapedName = escapeRegExp(normalizeTerminalAgentCommandName(commandName));
   const escapedAskName = escapeRegExp(getTerminalAgentAskCommandName(commandName));
   const escapedPlanName = escapeRegExp(getTerminalAgentPlanCommandName(commandName));
   return new RegExp(
     `^(?:${escapedName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+|${escapedAskName}(?:(?:\\s*:\\s*)|\\s+).+|${escapedPlanName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+)$`,
-    "i",
+    commandFlags(caseInsensitive),
   );
 }
 
-export function buildTerminalAgentPromptLineExtractPattern(commandName: string): RegExp {
+export function buildTerminalAgentPromptLineExtractPattern(commandName: string, caseInsensitive = false): RegExp {
   const escapedName = escapeRegExp(normalizeTerminalAgentCommandName(commandName));
   const escapedAskName = escapeRegExp(getTerminalAgentAskCommandName(commandName));
   const escapedPlanName = escapeRegExp(getTerminalAgentPlanCommandName(commandName));
   return new RegExp(
     `^(?:.+?(?:[$#%>❯➜]\\s+)|PS [^>]*>\\s+)?((?:${escapedName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+|${escapedAskName}(?:(?:\\s*:\\s*)|\\s+).+|${escapedPlanName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+))$`,
-    "i",
+    commandFlags(caseInsensitive),
   );
 }
 

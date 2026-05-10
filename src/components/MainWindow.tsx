@@ -42,7 +42,7 @@ import { AiAgentPlanTab } from "./ai/AiAgentPlanTab";
 import { SFTPManager } from "./sftp/SFTPManager";
 import { useConnectionStore, ConnectionSettings } from "../store/connectionStore";
 import { useProjectStore, type Project } from "../store/projectStore";
-import type { GlobalSettings } from "../store/settingsStore";
+import type { GlobalSettings, TerminalAgentPanelDock } from "../store/settingsStore";
 import { useThemeStore } from "../store/themeStore";
 import { useGuiThemeStore } from "../store/guiThemeStore";
 import {
@@ -166,8 +166,22 @@ type GlobalSettingsView = {
   defaultPromptHookEnabled?: boolean;
   showMenuBar?: boolean;
   terminalAgentCommandName?: string;
+  terminalAgentCommandNameCaseInsensitive?: boolean;
   terminalAgentExecutionTarget?: TerminalAgentExecutionTarget;
+  terminalAgentShowRunDialog?: boolean;
+  terminalAgentRememberPanelLayout?: boolean;
+  terminalAgentPanelDock?: TerminalAgentPanelDock;
+  terminalAgentPanelHeight?: number;
+  terminalAgentPanelSideWidth?: number;
+  terminalAgentPanelFontSize?: number;
   defaultAiProfileId?: string;
+};
+
+type TerminalAgentPanelLayoutSnapshot = {
+  terminalAgentPanelDock: TerminalAgentPanelDock;
+  terminalAgentPanelHeight?: number;
+  terminalAgentPanelSideWidth?: number;
+  terminalAgentPanelFontSize?: number;
 };
 
 type PendingAiAction = {
@@ -180,6 +194,11 @@ type PendingAiAction = {
 type PendingTerminalAgentAction = {
   sessionId: string;
   connectionDisplayName?: string;
+  initialPrompt?: string;
+  initialProfileId?: string;
+  initialExecutionTarget?: TerminalAgentExecutionTarget;
+  initialAskConfirmationBeforeEveryCommand?: boolean;
+  initialAutoApproveRootCommands?: boolean;
 };
 
 type ActiveTabTransfer = {
@@ -316,6 +335,7 @@ function parseTerminalAgentBooleanOption(name: string, value: string) {
 function parseTerminalAgentShortcut(
   rawCommand: string,
   agentCommandName: string,
+  caseInsensitive = false,
 ):
   | {
       ok: true;
@@ -329,7 +349,7 @@ function parseTerminalAgentShortcut(
   const normalizedAgentCommandName = normalizeTerminalAgentCommandName(agentCommandName);
   const askCommandName = getTerminalAgentAskCommandName(normalizedAgentCommandName);
   const planCommandName = getTerminalAgentPlanCommandName(normalizedAgentCommandName);
-  const askMatch = trimmed.match(buildTerminalAgentAskPattern(normalizedAgentCommandName));
+  const askMatch = trimmed.match(buildTerminalAgentAskPattern(normalizedAgentCommandName, caseInsensitive));
   if (askMatch) {
     const [, rawPrompt = ""] = askMatch;
     const userPrompt = rawPrompt.trim();
@@ -344,13 +364,13 @@ function parseTerminalAgentShortcut(
       },
     };
   }
-  if (buildTerminalAgentAskPrefixPattern(normalizedAgentCommandName).test(trimmed)) {
+  if (buildTerminalAgentAskPrefixPattern(normalizedAgentCommandName, caseInsensitive).test(trimmed)) {
     return {
       ok: false,
       error: `Invalid ${askCommandName} command. Use \`${askCommandName} <question>\` or \`${askCommandName}: <question>\`.`,
     };
   }
-  const planMatch = trimmed.match(buildTerminalAgentPlanPattern(normalizedAgentCommandName));
+  const planMatch = trimmed.match(buildTerminalAgentPlanPattern(normalizedAgentCommandName, caseInsensitive));
   if (planMatch) {
     const [, rawOptions = "", rawPrompt = ""] = planMatch;
     const userPrompt = rawPrompt.trim();
@@ -412,13 +432,13 @@ function parseTerminalAgentShortcut(
       },
     };
   }
-  if (buildTerminalAgentPlanPrefixPattern(normalizedAgentCommandName).test(trimmed)) {
+  if (buildTerminalAgentPlanPrefixPattern(normalizedAgentCommandName, caseInsensitive).test(trimmed)) {
     return {
       ok: false,
       error: `Invalid ${planCommandName} command. Use \`${planCommandName} <prompt>\`, \`${planCommandName}: <prompt>\`, or \`${planCommandName}(profile=name) <prompt>\`.`,
     };
   }
-  const match = trimmed.match(buildTerminalAgentCommandPattern(normalizedAgentCommandName));
+  const match = trimmed.match(buildTerminalAgentCommandPattern(normalizedAgentCommandName, caseInsensitive));
   if (!match) {
     return {
       ok: false,
@@ -634,6 +654,13 @@ export function MainWindow() {
   const [promptHookEnabled, setPromptHookEnabled] = useState(true);
   const [showMenuBar, setShowMenuBar] = useState(true);
   const [terminalAgentCommandName, setTerminalAgentCommandName] = useState("agent");
+  const [terminalAgentCommandNameCaseInsensitive, setTerminalAgentCommandNameCaseInsensitive] = useState(false);
+  const [terminalAgentShowRunDialog, setTerminalAgentShowRunDialog] = useState(true);
+  const [terminalAgentRememberPanelLayout, setTerminalAgentRememberPanelLayout] = useState(false);
+  const [terminalAgentPanelDock, setTerminalAgentPanelDock] = useState<TerminalAgentPanelDock>("bottom");
+  const [terminalAgentPanelHeight, setTerminalAgentPanelHeight] = useState<number | undefined>(undefined);
+  const [terminalAgentPanelSideWidth, setTerminalAgentPanelSideWidth] = useState<number | undefined>(undefined);
+  const [terminalAgentPanelFontSize, setTerminalAgentPanelFontSize] = useState<number | undefined>(undefined);
   const [terminalAgentExecutionTarget, setTerminalAgentExecutionTarget] =
     useState<TerminalAgentExecutionTarget>("TerminalWindow");
   const [defaultAiProfileId, setDefaultAiProfileId] = useState("");
@@ -670,6 +697,13 @@ export function MainWindow() {
   const transferDropProcessedRef = useRef<Set<string>>(new Set());
   const processTransferPayloadRef = useRef<(payload: CrossWindowTransferPayload) => Promise<void>>(async () => {});
   const pollingPendingTransferRef = useRef(false);
+  const terminalAgentPanelLayoutRef = useRef<TerminalAgentPanelLayoutSnapshot>({
+    terminalAgentPanelDock: "bottom",
+    terminalAgentPanelHeight: undefined,
+    terminalAgentPanelSideWidth: undefined,
+    terminalAgentPanelFontSize: undefined,
+  });
+  const terminalAgentPanelLayoutSaveTimerRef = useRef<number | null>(null);
   const activeTabEntry = useMemo(
     () => tabs.find((tab) => tab.id === activeTab) ?? null,
     [tabs, activeTab],
@@ -701,6 +735,20 @@ export function MainWindow() {
     setTerminalAgentCommandName(
       normalizeTerminalAgentCommandName(settings.terminalAgentCommandName),
     );
+    setTerminalAgentCommandNameCaseInsensitive(!!settings.terminalAgentCommandNameCaseInsensitive);
+    setTerminalAgentShowRunDialog(settings.terminalAgentShowRunDialog !== false);
+    setTerminalAgentRememberPanelLayout(!!settings.terminalAgentRememberPanelLayout);
+    const nextAgentPanelLayout = {
+      terminalAgentPanelDock: settings.terminalAgentPanelDock ?? "bottom",
+      terminalAgentPanelHeight: settings.terminalAgentPanelHeight,
+      terminalAgentPanelSideWidth: settings.terminalAgentPanelSideWidth,
+      terminalAgentPanelFontSize: settings.terminalAgentPanelFontSize,
+    };
+    terminalAgentPanelLayoutRef.current = nextAgentPanelLayout;
+    setTerminalAgentPanelDock(nextAgentPanelLayout.terminalAgentPanelDock);
+    setTerminalAgentPanelHeight(nextAgentPanelLayout.terminalAgentPanelHeight);
+    setTerminalAgentPanelSideWidth(nextAgentPanelLayout.terminalAgentPanelSideWidth);
+    setTerminalAgentPanelFontSize(nextAgentPanelLayout.terminalAgentPanelFontSize);
     setTerminalAgentExecutionTarget(settings.terminalAgentExecutionTarget ?? "TerminalWindow");
     setDefaultAiProfileId(settings.defaultAiProfileId ?? "");
   }, []);
@@ -749,6 +797,65 @@ export function MainWindow() {
       offSettingsUpdated?.();
     };
   }, [applyGlobalSettingsView]);
+
+  useEffect(() => {
+    return () => {
+      if (terminalAgentPanelLayoutSaveTimerRef.current != null) {
+        window.clearTimeout(terminalAgentPanelLayoutSaveTimerRef.current);
+      }
+    };
+  }, []);
+
+  const persistTerminalAgentPanelLayout = useCallback((patch: Partial<TerminalAgentPanelLayoutSnapshot>) => {
+    const nextLayout = {
+      ...terminalAgentPanelLayoutRef.current,
+      ...patch,
+    };
+    terminalAgentPanelLayoutRef.current = nextLayout;
+
+    if (patch.terminalAgentPanelDock !== undefined) {
+      setTerminalAgentPanelDock(patch.terminalAgentPanelDock);
+    }
+    if (patch.terminalAgentPanelHeight !== undefined) {
+      setTerminalAgentPanelHeight(patch.terminalAgentPanelHeight);
+    }
+    if (patch.terminalAgentPanelSideWidth !== undefined) {
+      setTerminalAgentPanelSideWidth(patch.terminalAgentPanelSideWidth);
+    }
+    if (patch.terminalAgentPanelFontSize !== undefined) {
+      setTerminalAgentPanelFontSize(patch.terminalAgentPanelFontSize);
+    }
+
+    if (terminalAgentPanelLayoutSaveTimerRef.current != null) {
+      window.clearTimeout(terminalAgentPanelLayoutSaveTimerRef.current);
+    }
+
+    if (!terminalAgentRememberPanelLayout) {
+      return;
+    }
+
+    terminalAgentPanelLayoutSaveTimerRef.current = window.setTimeout(() => {
+      terminalAgentPanelLayoutSaveTimerRef.current = null;
+      if (!terminalAgentRememberPanelLayout) {
+        return;
+      }
+      void invoke<GlobalSettings>("get_settings")
+        .then((settings) =>
+          invoke("save_settings", {
+            settings: {
+              ...settings,
+              terminalAgentPanelDock: nextLayout.terminalAgentPanelDock,
+              terminalAgentPanelHeight: nextLayout.terminalAgentPanelHeight,
+              terminalAgentPanelSideWidth: nextLayout.terminalAgentPanelSideWidth,
+              terminalAgentPanelFontSize: nextLayout.terminalAgentPanelFontSize,
+            },
+          }),
+        )
+        .catch((error) => {
+          console.error("Failed to save terminal agent panel layout:", error);
+        });
+    }, 250);
+  }, [terminalAgentRememberPanelLayout]);
 
   useEffect(() => {
     getCurrentWindow().setTitle(`KorTTY - ${windowName}`).catch(console.error);
@@ -1210,6 +1317,8 @@ export function MainWindow() {
             retryCount: 4,
             terminalLogging: false,
             commandTimestamps: false,
+            promptHookEnabled,
+            terminalAgentCommandName,
             tunnels: [],
             usageCount: 0,
           },
@@ -1220,7 +1329,7 @@ export function MainWindow() {
         return false;
       }
     },
-    [],
+    [promptHookEnabled, terminalAgentCommandName],
   );
   createSshSessionRef.current = createSshSession;
 
@@ -3042,7 +3151,7 @@ export function MainWindow() {
   }, [createAiAgentPlanTab, handleStartTerminalAgentPlan, markAiAgentPlanTabFailed, updateAiAgentPlanTab]);
 
   const handleLaunchTerminalAgentTask = useCallback(async (request: TerminalAgentRequest) => {
-    if (terminalAgentExecutionTarget === "ChatWindow") {
+    if (request.executionTarget === "ChatWindow") {
       const response = await handleStartTerminalAgent({
         ...request,
         executionTarget: "ChatWindow",
@@ -3061,7 +3170,7 @@ export function MainWindow() {
       ...request,
       executionTarget: "TerminalWindow",
     });
-  }, [createAiAgentTab, handleStartTerminalAgent, terminalAgentExecutionTarget]);
+  }, [createAiAgentTab, handleStartTerminalAgent]);
 
   const handleStartExecutionFromPlan = useCallback(async (runId: string) => {
     const visibility = await loadTerminalAgentVisibilitySettings();
@@ -3080,7 +3189,11 @@ export function MainWindow() {
   }, [createAiAgentTab, loadTerminalAgentVisibilitySettings, terminalAgentExecutionTarget]);
 
   const handleTerminalAgentShortcut = useCallback(async (sessionId: string, rawCommand: string) => {
-    const parsed = parseTerminalAgentShortcut(rawCommand, terminalAgentCommandName);
+    const parsed = parseTerminalAgentShortcut(
+      rawCommand,
+      terminalAgentCommandName,
+      terminalAgentCommandNameCaseInsensitive,
+    );
     if (!parsed.ok) {
       await emitTerminalAgentNote(sessionId, parsed.error);
       return;
@@ -3172,12 +3285,28 @@ export function MainWindow() {
     const visibility = await loadTerminalAgentVisibilitySettings();
 
     try {
+      if (terminalAgentShowRunDialog) {
+        setPendingTerminalAgentAction({
+          sessionId,
+          connectionDisplayName: resolveConnectionDisplayName(sessionId),
+          initialPrompt: parsed.invocation.userPrompt,
+          initialProfileId: profile.id,
+          initialExecutionTarget: "TerminalWindow",
+          initialAskConfirmationBeforeEveryCommand:
+            parsed.invocation.askConfirmationBeforeEveryCommand,
+          initialAutoApproveRootCommands: parsed.invocation.autoApproveRootCommands,
+        });
+        setPendingTerminalAgentMode("run");
+        setOpenDialog("aiAgent");
+        return;
+      }
+
       await handleLaunchTerminalAgentTask({
         sessionId,
         profileId: profile.id,
         userPrompt: parsed.invocation.userPrompt,
         connectionDisplayName: resolveConnectionDisplayName(sessionId),
-        executionTarget: terminalAgentExecutionTarget,
+        executionTarget: "TerminalWindow",
         showDebugMessages: visibility.showDebugMessages,
         showRuntimeMessages: visibility.showRuntimeMessages,
         askConfirmationBeforeEveryCommand: parsed.invocation.askConfirmationBeforeEveryCommand,
@@ -3194,7 +3323,8 @@ export function MainWindow() {
     redrawTerminalPrompt,
     resolveConnectionDisplayName,
     terminalAgentCommandName,
-    terminalAgentExecutionTarget,
+    terminalAgentCommandNameCaseInsensitive,
+    terminalAgentShowRunDialog,
     defaultAiProfileId,
   ]);
 
@@ -3307,13 +3437,6 @@ export function MainWindow() {
       const nextState = event.payload;
       setTerminalAgentStates((prev) => {
         if (nextState.executionTarget === "ChatWindow") {
-          if (!(nextState.sessionId in prev)) {
-            return prev;
-          }
-          const { [nextState.sessionId]: _removed, ...rest } = prev;
-          return rest;
-        }
-        if (["Done", "Cancelled", "Failed", "Blocked"].includes(nextState.phase)) {
           if (!(nextState.sessionId in prev)) {
             return prev;
           }
@@ -3745,8 +3868,18 @@ export function MainWindow() {
                       primarySessionId={tab.id}
                       connected={true}
                       agentCommandName={terminalAgentCommandName}
+                      agentCommandNameCaseInsensitive={terminalAgentCommandNameCaseInsensitive}
                       readOnly={!!tab.readOnlyMirror}
                       promptHookEnabled={promptHookEnabled}
+                      agentPanelDock={terminalAgentPanelDock}
+                      initialAgentPanelHeight={terminalAgentPanelHeight}
+                      initialAgentPanelSideWidth={terminalAgentPanelSideWidth}
+                      initialAgentPanelFontSize={terminalAgentPanelFontSize}
+                      getAgentPanelLabel={(sessionId, splitIndex) => {
+                        const displayName = resolveConnectionDisplayName(sessionId) ?? `Session ${sessionId.slice(0, 8)}`;
+                        return `${displayName} · ${splitIndex === 0 ? "Main" : `Split ${splitIndex + 1}`}`;
+                      }}
+                      onAgentPanelLayoutChange={persistTerminalAgentPanelLayout}
                       initialSplitSessionIds={tabInitialSplitTree[tab.id] ? undefined : tabSplitSessions[tab.id]}
                       initialTree={tabInitialSplitTree[tab.id]}
                       onTreeChange={(tree) => setTabSplitTrees((prev) => ({ ...prev, [tab.id]: serializeSplitTree(tree) }))}
@@ -3933,6 +4066,19 @@ export function MainWindow() {
           setTerminalAgentCommandName(
             normalizeTerminalAgentCommandName(settings.terminalAgentCommandName),
           );
+          setTerminalAgentCommandNameCaseInsensitive(!!settings.terminalAgentCommandNameCaseInsensitive);
+          setTerminalAgentShowRunDialog(settings.terminalAgentShowRunDialog !== false);
+          setTerminalAgentRememberPanelLayout(!!settings.terminalAgentRememberPanelLayout);
+          setTerminalAgentPanelDock(settings.terminalAgentPanelDock ?? "bottom");
+          setTerminalAgentPanelHeight(settings.terminalAgentPanelHeight);
+          setTerminalAgentPanelSideWidth(settings.terminalAgentPanelSideWidth);
+          setTerminalAgentPanelFontSize(settings.terminalAgentPanelFontSize);
+          terminalAgentPanelLayoutRef.current = {
+            terminalAgentPanelDock: settings.terminalAgentPanelDock ?? "bottom",
+            terminalAgentPanelHeight: settings.terminalAgentPanelHeight,
+            terminalAgentPanelSideWidth: settings.terminalAgentPanelSideWidth,
+            terminalAgentPanelFontSize: settings.terminalAgentPanelFontSize,
+          };
           setTerminalAgentExecutionTarget(settings.terminalAgentExecutionTarget);
         }}
       />
@@ -3952,6 +4098,13 @@ export function MainWindow() {
         open={openDialog === "aiAgent"}
         sessionId={pendingTerminalAgentAction?.sessionId}
         connectionDisplayName={pendingTerminalAgentAction?.connectionDisplayName}
+        initialPrompt={pendingTerminalAgentAction?.initialPrompt}
+        initialProfileId={pendingTerminalAgentAction?.initialProfileId}
+        initialExecutionTarget={pendingTerminalAgentAction?.initialExecutionTarget}
+        initialAskConfirmationBeforeEveryCommand={
+          pendingTerminalAgentAction?.initialAskConfirmationBeforeEveryCommand
+        }
+        initialAutoApproveRootCommands={pendingTerminalAgentAction?.initialAutoApproveRootCommands}
         onClose={() => {
           setOpenDialog(null);
           setPendingTerminalAgentAction(null);

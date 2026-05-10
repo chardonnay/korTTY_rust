@@ -72,7 +72,7 @@ pub async fn get_ai_profiles() -> Result<Vec<AiProfile>, String> {
         ai::normalize_profile(profile);
         let _ = ai::refresh_usage(profile);
     }
-    profiles.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+    profiles.sort_by_key(|profile| profile.name.to_lowercase());
     Ok(profiles)
 }
 

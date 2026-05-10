@@ -2,6 +2,7 @@ use crate::ai::{self, AiError};
 use crate::model::ai::{AiProfile, AiTokenUsage};
 use crate::model::connection::ConnectionProtocol;
 use crate::model::terminal_agent::{
+    AgentActivity, AgentActivityStatus, AgentActivityTokenUsage, AgentActivityType,
     TerminalAgentApproval, TerminalAgentCommandResult, TerminalAgentEvent, TerminalAgentEventKind,
     TerminalAgentExecutionTarget, TerminalAgentPasswordRequest, TerminalAgentPhase,
     TerminalAgentPlanExecutionResponse, TerminalAgentPlanOption, TerminalAgentPlanOptionsEvent,
@@ -29,6 +30,7 @@ const COMMAND_OUTPUT_TAIL_CHARS: usize = 4_000;
 const AGENT_EVENT_STATUS: &str = "terminal-agent-status";
 const AGENT_EVENT_OUTPUT: &str = "terminal-agent-output";
 const AGENT_EVENT_APPROVAL: &str = "terminal-agent-approval";
+const AGENT_EVENT_ACTIVITY: &str = "terminal-agent-activity";
 const AGENT_PLAN_EVENT_STATUS: &str = "terminal-agent-plan-status";
 const AGENT_PLAN_EVENT_QUESTIONS: &str = "terminal-agent-plan-questions";
 const AGENT_PLAN_EVENT_OPTIONS: &str = "terminal-agent-plan-options";
@@ -105,6 +107,18 @@ struct AgentDecision {
 
 struct ProbeExecution {
     snapshot: TerminalAgentProbeSnapshot,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileTypeCountRequest {
+    directory: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FileTypeCounts {
+    total: u64,
+    plain_text: u64,
+    binary_or_non_text: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -334,6 +348,12 @@ impl TerminalAgentStore {
     }
 }
 
+impl Default for TerminalAgentStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TerminalAgentPlanStore {
     pub fn new() -> Self {
         Self(std::sync::Mutex::new(TerminalAgentPlanStoreInner::default()))
@@ -381,6 +401,12 @@ impl TerminalAgentPlanStore {
             return Err("Terminal agent plan run not found".into());
         }
         Ok(())
+    }
+}
+
+impl Default for TerminalAgentPlanStore {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -822,6 +848,7 @@ pub fn cancel_terminal_agent_plan(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn start_terminal_agent_from_plan(
     app: &AppHandle,
     ssh_manager: &SSHManager,
@@ -864,6 +891,7 @@ pub async fn start_terminal_agent_from_plan(
         show_runtime_messages,
         ask_confirmation_before_every_command: false,
         auto_approve_root_commands: false,
+        query_only: false,
     };
 
     let (updated, ()) = plan_store.update_context(run_id, |plan| {
@@ -926,6 +954,20 @@ pub async fn run_terminal_agent(
     match outcome {
         Ok(()) => {}
         Err(TerminalAgentError::Cancelled) => {
+            emit_activity(
+                &app,
+                build_activity(
+                    format!("{run_id}:message:cancelled"),
+                    AgentActivityType::Message,
+                    AgentActivityStatus::Cancelled,
+                    "Run cancelled",
+                    "The terminal agent run was cancelled.",
+                    "",
+                    AgentActivityTokenUsage::unknown(),
+                    0,
+                    true,
+                ),
+            );
             emit_status(
                 &app,
                 TerminalAgentRunState {
@@ -955,6 +997,20 @@ pub async fn run_terminal_agent(
             }
         }
         Err(TerminalAgentError::Blocked(message)) => {
+            emit_activity(
+                &app,
+                build_activity(
+                    format!("{run_id}:error:blocked"),
+                    AgentActivityType::Error,
+                    AgentActivityStatus::Failed,
+                    "Run blocked",
+                    message.clone(),
+                    message.clone(),
+                    AgentActivityTokenUsage::unknown(),
+                    0,
+                    false,
+                ),
+            );
             emit_status(
                 &app,
                 TerminalAgentRunState {
@@ -982,6 +1038,20 @@ pub async fn run_terminal_agent(
             }
         }
         Err(TerminalAgentError::Failed(message)) => {
+            emit_activity(
+                &app,
+                build_activity(
+                    format!("{run_id}:error:failed"),
+                    AgentActivityType::Error,
+                    AgentActivityStatus::Failed,
+                    "Run failed",
+                    message.clone(),
+                    message.clone(),
+                    AgentActivityTokenUsage::unknown(),
+                    0,
+                    false,
+                ),
+            );
             emit_status(
                 &app,
                 TerminalAgentRunState {
@@ -1040,6 +1110,20 @@ async fn run_terminal_agent_inner(
             turn: 0,
         },
     );
+    emit_activity(
+        app,
+        build_activity(
+            format!("{run_id}:message:start"),
+            AgentActivityType::Message,
+            AgentActivityStatus::Completed,
+            "AI agent started",
+            format!("Starting task: {}", request.user_prompt.trim()),
+            request.user_prompt.trim(),
+            AgentActivityTokenUsage::unknown(),
+            0,
+            true,
+        ),
+    );
     if should_mirror_to_terminal(request) && request.show_runtime_messages {
         mirror_agent_note(
             app,
@@ -1051,6 +1135,13 @@ async fn run_terminal_agent_inner(
     let mut probe = run_probe(app, run_id, request, control).await?;
     let mut command_history: Vec<TerminalAgentCommandResult> = Vec::new();
     let mut reprobe_requested = false;
+
+    if try_run_file_type_count_request(app, run_id, request, control, &probe.snapshot).await? {
+        if should_mirror_to_terminal(request) {
+            redraw_interactive_shell_prompt(app, &request.session_id).await;
+        }
+        return Ok(());
+    }
 
     for turn in 1..=MAX_AGENT_TURNS {
         ensure_not_cancelled(control)?;
@@ -1076,6 +1167,8 @@ async fn run_terminal_agent_inner(
         );
 
         let decision = request_agent_decision(
+            app,
+            run_id,
             profile,
             control,
             request,
@@ -1088,6 +1181,20 @@ async fn run_terminal_agent_inner(
 
         match decision.status {
             AgentDecisionStatus::Done => {
+                emit_activity(
+                    app,
+                    build_activity(
+                        format!("{run_id}:message:done:{turn}"),
+                        AgentActivityType::Message,
+                        AgentActivityStatus::Completed,
+                        "Final answer",
+                        decision.summary.clone(),
+                        decision.user_message.clone(),
+                        AgentActivityTokenUsage::unknown(),
+                        0,
+                        false,
+                    ),
+                );
                 emit_status(
                     app,
                     TerminalAgentRunState {
@@ -1118,10 +1225,22 @@ async fn run_terminal_agent_inner(
                 return Ok(());
             }
             AgentDecisionStatus::Blocked => {
-                return Err(TerminalAgentError::Blocked(non_empty_or(
-                    &decision.user_message,
-                    &decision.summary,
-                )));
+                let message = non_empty_or(&decision.user_message, &decision.summary);
+                emit_activity(
+                    app,
+                    build_activity(
+                        format!("{run_id}:error:blocked:{turn}"),
+                        AgentActivityType::Error,
+                        AgentActivityStatus::Failed,
+                        "Agent blocked",
+                        message.clone(),
+                        message.clone(),
+                        AgentActivityTokenUsage::unknown(),
+                        0,
+                        false,
+                    ),
+                );
+                return Err(TerminalAgentError::Blocked(message));
             }
             AgentDecisionStatus::RunCommands | AgentDecisionStatus::NeedsConfirmation => {}
         }
@@ -1191,9 +1310,62 @@ async fn run_terminal_agent_inner(
         }
     }
 
-    Err(TerminalAgentError::Blocked(format!(
-        "The terminal agent reached the safety limit of {MAX_AGENT_TURNS} AI turns."
-    )))
+    if let Some(final_decision) = try_request_turn_limit_final_decision(
+        app,
+        run_id,
+        profile,
+        control,
+        request,
+        &probe.snapshot,
+        &command_history,
+    )
+    .await?
+    {
+        emit_status(
+            app,
+            TerminalAgentRunState {
+                run_id: run_id.to_string(),
+                session_id: request.session_id.clone(),
+                execution_target: request.execution_target.clone(),
+                phase: TerminalAgentPhase::Done,
+                summary: final_decision.summary.clone(),
+                user_message: Some(final_decision.user_message.clone()),
+                pending_approval: None,
+                pending_password_request: None,
+                current_command: None,
+                turn: MAX_AGENT_TURNS,
+            },
+        );
+        if should_mirror_to_terminal(request) {
+            if let Some(final_message) = build_terminal_completion_message(
+                &final_decision.user_message,
+                &command_history,
+                request.show_runtime_messages,
+            ) {
+                mirror_agent_note(app, &request.session_id, &final_message);
+            }
+            redraw_interactive_shell_prompt(app, &request.session_id).await;
+        }
+        return Ok(());
+    }
+
+    let message =
+        format!("The terminal agent reached the safety limit of {MAX_AGENT_TURNS} AI turns.");
+    emit_activity(
+        app,
+        build_activity(
+            format!("{run_id}:error:turn-limit"),
+            AgentActivityType::Error,
+            AgentActivityStatus::Failed,
+            "Turn limit reached",
+            message.clone(),
+            message.clone(),
+            AgentActivityTokenUsage::unknown(),
+            0,
+            false,
+        ),
+    );
+    Err(TerminalAgentError::Blocked(message))
 }
 
 async fn run_probe(
@@ -1224,6 +1396,23 @@ async fn run_probe(
             "Collecting remote server facts...",
         );
     }
+
+    let started_at = std::time::Instant::now();
+    let activity_id = format!("{run_id}:probe");
+    emit_activity(
+        app,
+        build_activity(
+            activity_id.clone(),
+            AgentActivityType::Action,
+            AgentActivityStatus::Running,
+            "Inspect(SSH session)",
+            "Collecting the current server state.",
+            "",
+            AgentActivityTokenUsage::unknown(),
+            0,
+            true,
+        ),
+    );
 
     let probe_command = build_probe_command();
     let exec_result = execute_remote_command(
@@ -1263,6 +1452,20 @@ async fn run_probe(
     };
 
     let snapshot = parse_probe_snapshot(&raw_output)?;
+    emit_activity(
+        app,
+        build_activity(
+            activity_id,
+            AgentActivityType::Action,
+            AgentActivityStatus::Completed,
+            "Inspect(SSH session)",
+            "Collected the current server state.",
+            build_probe_summary(&snapshot),
+            AgentActivityTokenUsage::unknown(),
+            started_at.elapsed().as_secs(),
+            true,
+        ),
+    );
     if should_mirror_to_terminal(request) && request.show_debug_messages {
         mirror_agent_note(
             app,
@@ -1277,7 +1480,189 @@ async fn run_probe(
     Ok(ProbeExecution { snapshot })
 }
 
+async fn try_run_file_type_count_request(
+    app: &AppHandle,
+    run_id: &str,
+    request: &TerminalAgentRequest,
+    control: &Arc<TerminalAgentControl>,
+    probe: &TerminalAgentProbeSnapshot,
+) -> Result<bool, TerminalAgentError> {
+    if request.query_only {
+        return Ok(false);
+    }
+    let Some(count_request) = detect_file_type_count_request(&request.user_prompt) else {
+        return Ok(false);
+    };
+
+    ensure_not_cancelled(control)?;
+    let use_passwordless_sudo = !probe.already_root && probe.passwordless_sudo;
+    let command = build_file_type_count_command(&count_request.directory, use_passwordless_sudo);
+    let planned = TerminalAgentPlannedCommand {
+        command,
+        purpose: format!(
+            "Count files and MIME text/non-text distribution under {}.",
+            count_request.directory
+        ),
+        risk: TerminalAgentRisk::ReadOnly,
+    };
+    let activity_id = format!("{run_id}:file-type-count");
+
+    if request.ask_confirmation_before_every_command {
+        let approval = TerminalAgentApproval {
+            run_id: run_id.to_string(),
+            session_id: request.session_id.clone(),
+            execution_target: request.execution_target.clone(),
+            summary: planned.purpose.clone(),
+            user_message: format!("Approval required before running: {}", planned.command),
+            commands: vec![planned.clone()],
+        };
+        wait_for_approval(app, run_id, request, control, approval, 1).await?;
+    }
+
+    let started_at = std::time::Instant::now();
+    emit_status(
+        app,
+        TerminalAgentRunState {
+            run_id: run_id.to_string(),
+            session_id: request.session_id.clone(),
+            execution_target: request.execution_target.clone(),
+            phase: TerminalAgentPhase::RunningCommands,
+            summary: planned.purpose.clone(),
+            user_message: Some(planned.command.clone()),
+            pending_approval: None,
+            pending_password_request: None,
+            current_command: Some(planned.command.clone()),
+            turn: 1,
+        },
+    );
+    emit_activity(
+        app,
+        build_activity(
+            activity_id.clone(),
+            AgentActivityType::Action,
+            AgentActivityStatus::Running,
+            "Count file types",
+            planned.purpose.clone(),
+            planned.command.clone(),
+            AgentActivityTokenUsage::unknown(),
+            0,
+            true,
+        ),
+    );
+
+    let exec_result = execute_remote_command(
+        app,
+        run_id,
+        &request.session_id,
+        &request.execution_target,
+        &planned.purpose,
+        &planned.command,
+        Some(&planned.command),
+        control,
+        false,
+        request.show_debug_messages,
+        request.show_runtime_messages,
+        should_mirror_to_terminal(request),
+        std::time::Duration::from_secs(COMMAND_TIMEOUT_SECS),
+        None,
+        false,
+    )
+    .await?;
+    let command_result = build_command_result(&planned, exec_result);
+    emit_activity(
+        app,
+        build_activity(
+            activity_id,
+            AgentActivityType::Action,
+            if command_result_has_failure(&command_result) {
+                AgentActivityStatus::Failed
+            } else {
+                AgentActivityStatus::Completed
+            },
+            "Count file types",
+            format_command_outcome(&command_result),
+            format_command_activity_detail(&command_result),
+            AgentActivityTokenUsage::unknown(),
+            started_at.elapsed().as_secs(),
+            true,
+        ),
+    );
+
+    if command_result.cancelled {
+        return Err(TerminalAgentError::Cancelled);
+    }
+    let counts = parse_file_type_count_output(&command_result.stdout_tail);
+    let (phase, summary, user_message) = match (command_result_has_failure(&command_result), counts)
+    {
+        (false, Some(counts)) => (
+            TerminalAgentPhase::Done,
+            format!(
+                "Counted files and MIME text/non-text distribution under {}.",
+                count_request.directory
+            ),
+            format_file_type_count_table(&count_request.directory, &counts),
+        ),
+        _ => (
+            TerminalAgentPhase::Blocked,
+            format!(
+                "Could not count file types under {}.",
+                count_request.directory
+            ),
+            build_file_type_count_failure_message(&count_request.directory, &command_result),
+        ),
+    };
+
+    emit_activity(
+        app,
+        build_activity(
+            format!("{run_id}:message:file-type-count"),
+            if matches!(phase, TerminalAgentPhase::Done) {
+                AgentActivityType::Message
+            } else {
+                AgentActivityType::Error
+            },
+            if matches!(phase, TerminalAgentPhase::Done) {
+                AgentActivityStatus::Completed
+            } else {
+                AgentActivityStatus::Failed
+            },
+            if matches!(phase, TerminalAgentPhase::Done) {
+                "File type count complete"
+            } else {
+                "File type count blocked"
+            },
+            summary.clone(),
+            user_message.clone(),
+            AgentActivityTokenUsage::unknown(),
+            0,
+            false,
+        ),
+    );
+    emit_status(
+        app,
+        TerminalAgentRunState {
+            run_id: run_id.to_string(),
+            session_id: request.session_id.clone(),
+            execution_target: request.execution_target.clone(),
+            phase,
+            summary: summary.clone(),
+            user_message: Some(user_message.clone()),
+            pending_approval: None,
+            pending_password_request: None,
+            current_command: None,
+            turn: 1,
+        },
+    );
+    if should_mirror_to_terminal(request) {
+        mirror_agent_note(app, &request.session_id, &user_message);
+    }
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn request_agent_decision(
+    app: &AppHandle,
+    run_id: &str,
     profile: &mut AiProfile,
     control: &Arc<TerminalAgentControl>,
     request: &TerminalAgentRequest,
@@ -1285,6 +1670,22 @@ async fn request_agent_decision(
     command_history: &[TerminalAgentCommandResult],
     turn: u8,
 ) -> Result<AgentDecision, TerminalAgentError> {
+    let started_at = std::time::Instant::now();
+    let activity_id = format!("{run_id}:thinking:{turn}");
+    emit_activity(
+        app,
+        build_activity(
+            activity_id.clone(),
+            AgentActivityType::Thinking,
+            AgentActivityStatus::Running,
+            format!("Thinking(turn {turn})"),
+            "Preparing the next terminal-agent step.",
+            "",
+            AgentActivityTokenUsage::unknown(),
+            0,
+            true,
+        ),
+    );
     let system_prompt = build_agent_system_prompt();
     let user_prompt = build_agent_user_prompt(
         request,
@@ -1294,7 +1695,7 @@ async fn request_agent_decision(
         control.cached_sudo_password()?.is_some(),
     )?;
     let mut cancel_rx = control.cancel_receiver();
-    let response = ai::execute_custom_prompt(
+    let response = ai::execute_custom_json_prompt(
         profile,
         &system_prompt,
         &user_prompt,
@@ -1304,12 +1705,13 @@ async fn request_agent_decision(
     .await
     .map_err(map_ai_error)?;
     record_profile_usage(profile, response.usage.as_ref());
+    let mut token_usage = activity_token_usage(response.usage.as_ref());
 
     if let Ok(decision) = parse_agent_decision(&response.content) {
         if let Some(reason) = decision_requires_repair(&decision, probe) {
             let repair_prompt = build_agent_semantic_repair_prompt(&response.content, &reason);
             let mut cancel_rx = control.cancel_receiver();
-            let repaired = ai::execute_custom_prompt(
+            let repaired = ai::execute_custom_json_prompt(
                 profile,
                 &system_prompt,
                 &repair_prompt,
@@ -1319,14 +1721,45 @@ async fn request_agent_decision(
             .await
             .map_err(map_ai_error)?;
             record_profile_usage(profile, repaired.usage.as_ref());
-            return parse_agent_decision(&repaired.content).map_err(TerminalAgentError::Blocked);
+            token_usage = activity_token_usage(repaired.usage.as_ref());
+            let decision =
+                parse_agent_decision(&repaired.content).map_err(TerminalAgentError::Blocked)?;
+            emit_activity(
+                app,
+                build_activity(
+                    activity_id,
+                    AgentActivityType::Thinking,
+                    AgentActivityStatus::Completed,
+                    format!("Thinking(turn {turn})"),
+                    non_empty_or(&decision.summary, "Planner response repaired."),
+                    repaired.content,
+                    token_usage,
+                    started_at.elapsed().as_secs(),
+                    true,
+                ),
+            );
+            return Ok(decision);
         }
+        emit_activity(
+            app,
+            build_activity(
+                activity_id,
+                AgentActivityType::Thinking,
+                AgentActivityStatus::Completed,
+                format!("Thinking(turn {turn})"),
+                non_empty_or(&decision.summary, "Planner response received."),
+                response.content,
+                token_usage,
+                started_at.elapsed().as_secs(),
+                true,
+            ),
+        );
         return Ok(decision);
     }
 
     let repair_prompt = build_agent_repair_prompt(&response.content);
     let mut cancel_rx = control.cancel_receiver();
-    let repaired = ai::execute_custom_prompt(
+    let repaired = ai::execute_custom_json_prompt(
         profile,
         &system_prompt,
         &repair_prompt,
@@ -1336,7 +1769,110 @@ async fn request_agent_decision(
     .await
     .map_err(map_ai_error)?;
     record_profile_usage(profile, repaired.usage.as_ref());
-    parse_agent_decision(&repaired.content).map_err(TerminalAgentError::Blocked)
+    token_usage = activity_token_usage(repaired.usage.as_ref());
+    let decision = parse_agent_decision(&repaired.content).map_err(TerminalAgentError::Blocked)?;
+    emit_activity(
+        app,
+        build_activity(
+            activity_id,
+            AgentActivityType::Thinking,
+            AgentActivityStatus::Completed,
+            format!("Thinking(turn {turn})"),
+            non_empty_or(&decision.summary, "Planner response repaired."),
+            repaired.content,
+            token_usage,
+            started_at.elapsed().as_secs(),
+            true,
+        ),
+    );
+    Ok(decision)
+}
+
+async fn try_request_turn_limit_final_decision(
+    app: &AppHandle,
+    run_id: &str,
+    profile: &mut AiProfile,
+    control: &Arc<TerminalAgentControl>,
+    request: &TerminalAgentRequest,
+    probe: &TerminalAgentProbeSnapshot,
+    command_history: &[TerminalAgentCommandResult],
+) -> Result<Option<AgentDecision>, TerminalAgentError> {
+    if command_history.is_empty() {
+        return Ok(None);
+    }
+
+    let started_at = std::time::Instant::now();
+    let activity_id = format!("{run_id}:thinking:final");
+    emit_activity(
+        app,
+        build_activity(
+            activity_id.clone(),
+            AgentActivityType::Thinking,
+            AgentActivityStatus::Running,
+            "Preparing final response",
+            "The agent reached the turn limit and is summarizing the available result.",
+            "",
+            AgentActivityTokenUsage::unknown(),
+            0,
+            true,
+        ),
+    );
+
+    let system_prompt = build_agent_turn_limit_final_system_prompt();
+    let user_prompt = build_agent_turn_limit_final_user_prompt(request, probe, command_history)?;
+    let mut cancel_rx = control.cancel_receiver();
+    let response = ai::execute_custom_json_prompt(
+        profile,
+        &system_prompt,
+        &user_prompt,
+        0.0,
+        Some(&mut cancel_rx),
+    )
+    .await
+    .map_err(map_ai_error)?;
+    record_profile_usage(profile, response.usage.as_ref());
+    let token_usage = activity_token_usage(response.usage.as_ref());
+
+    let decision = parse_agent_decision(&response.content).ok();
+    let Some(decision) = decision else {
+        emit_activity(
+            app,
+            build_activity(
+                activity_id,
+                AgentActivityType::Thinking,
+                AgentActivityStatus::Failed,
+                "Preparing final response",
+                "The final response could not be parsed.",
+                response.content,
+                token_usage,
+                started_at.elapsed().as_secs(),
+                false,
+            ),
+        );
+        return Ok(None);
+    };
+
+    let is_done = decision.status == AgentDecisionStatus::Done;
+    emit_activity(
+        app,
+        build_activity(
+            activity_id,
+            AgentActivityType::Thinking,
+            if is_done {
+                AgentActivityStatus::Completed
+            } else {
+                AgentActivityStatus::Failed
+            },
+            "Preparing final response",
+            non_empty_or(&decision.summary, "Final response prepared."),
+            response.content,
+            token_usage,
+            started_at.elapsed().as_secs(),
+            true,
+        ),
+    );
+
+    Ok(is_done.then_some(decision))
 }
 
 async fn wait_for_approval(
@@ -1352,6 +1888,26 @@ async fn wait_for_approval(
     }
 
     let user_message = approval.user_message.clone();
+    let activity_id = format!("{run_id}:question:approval:{turn}");
+    emit_activity(
+        app,
+        build_activity(
+            activity_id.clone(),
+            AgentActivityType::Question,
+            AgentActivityStatus::Running,
+            "Approval required",
+            user_message.clone(),
+            approval
+                .commands
+                .iter()
+                .map(|command| format!("$ {}", command.command))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            AgentActivityTokenUsage::unknown(),
+            0,
+            false,
+        ),
+    );
     emit_status(
         app,
         TerminalAgentRunState {
@@ -1391,9 +1947,26 @@ async fn wait_for_approval(
         }
         result = &mut approval_rx => {
             control.clear_pending_approval();
-            result.map_err(|_| TerminalAgentError::Blocked(
+            let value = result.map_err(|_| TerminalAgentError::Blocked(
                 "The terminal agent approval request is no longer active.".into(),
-            ))
+            ));
+            if value.is_ok() {
+                emit_activity(
+                    app,
+                    build_activity(
+                        activity_id,
+                        AgentActivityType::Question,
+                        AgentActivityStatus::Completed,
+                        "Approval granted",
+                        "User approved the pending commands.",
+                        "",
+                        AgentActivityTokenUsage::unknown(),
+                        0,
+                        true,
+                    ),
+                );
+            }
+            value
         }
     }
 }
@@ -1462,6 +2035,8 @@ async fn execute_command_batch(
         let mut prepared_command =
             prepare_command_execution(app, run_id, request, control, probe, planned, turn, false)
                 .await?;
+        let started_at = std::time::Instant::now();
+        let activity_id = format!("{run_id}:action:{turn}:{}", results.len() + 1);
 
         emit_status(
             app,
@@ -1477,6 +2052,20 @@ async fn execute_command_batch(
                 current_command: Some(planned.command.clone()),
                 turn,
             },
+        );
+        emit_activity(
+            app,
+            build_activity(
+                activity_id.clone(),
+                AgentActivityType::Action,
+                AgentActivityStatus::Running,
+                format!("Run({})", planned.purpose.trim()),
+                planned.command.clone(),
+                planned.command.clone(),
+                AgentActivityTokenUsage::unknown(),
+                0,
+                true,
+            ),
         );
         let exec_result = execute_remote_command(
             app,
@@ -1608,6 +2197,24 @@ async fn execute_command_batch(
             .await?;
             command_result = build_command_result(planned, retry_exec_result);
         }
+        emit_activity(
+            app,
+            build_activity(
+                activity_id,
+                AgentActivityType::Action,
+                if command_result_has_failure(&command_result) {
+                    AgentActivityStatus::Failed
+                } else {
+                    AgentActivityStatus::Completed
+                },
+                format!("Run({})", planned.purpose.trim()),
+                format_command_outcome(&command_result),
+                format_command_activity_detail(&command_result),
+                AgentActivityTokenUsage::unknown(),
+                started_at.elapsed().as_secs(),
+                true,
+            ),
+        );
         emit_output(
             app,
             TerminalAgentEvent {
@@ -1658,6 +2265,7 @@ async fn execute_command_batch(
     Ok(results)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn prepare_command_execution(
     app: &AppHandle,
     run_id: &str,
@@ -1705,6 +2313,21 @@ async fn wait_for_sudo_password(
             .into(),
         command: planned.command.clone(),
     };
+    let activity_id = format!("{run_id}:question:sudo-password:{turn}");
+    emit_activity(
+        app,
+        build_activity(
+            activity_id.clone(),
+            AgentActivityType::Question,
+            AgentActivityStatus::Running,
+            "Sudo password required",
+            password_request.user_message.clone(),
+            planned.command.clone(),
+            AgentActivityTokenUsage::unknown(),
+            0,
+            false,
+        ),
+    );
 
     emit_status(
         app,
@@ -1751,9 +2374,24 @@ async fn wait_for_sudo_password(
     }?;
 
     control.cache_sudo_password(password.clone())?;
+    emit_activity(
+        app,
+        build_activity(
+            activity_id,
+            AgentActivityType::Question,
+            AgentActivityStatus::Completed,
+            "Sudo password received",
+            "Password accepted for this run context.",
+            "",
+            AgentActivityTokenUsage::unknown(),
+            0,
+            true,
+        ),
+    );
     Ok(password)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_remote_command(
     app: &AppHandle,
     run_id: &str,
@@ -1779,6 +2417,8 @@ async fn execute_remote_command(
         .await
         .map_err(|_| TerminalAgentError::Failed("The SSH session is busy.".into()))?;
     ensure_session_supports_terminal_agent(&session).map_err(TerminalAgentError::Failed)?;
+    let tracked_working_directory = session.current_remote_directory();
+    let command_to_run = wrap_command_for_working_directory(command, &tracked_working_directory);
 
     let (output_tx, mut output_rx) = mpsc::unbounded_channel::<TerminalExecOutput>();
     let session_id_owned = session_id.to_string();
@@ -1856,7 +2496,7 @@ async fn execute_remote_command(
     let cancel_rx = control.cancel_receiver();
     let exec_result = session
         .exec_command_streaming(
-            command,
+            &command_to_run,
             output_tx,
             cancel_rx.clone(),
             timeout_duration,
@@ -2021,6 +2661,7 @@ fn build_agent_system_prompt() -> String {
         "Never propose interactive editors or pagers such as vi, vim, nano, less, more, man, top, htop.",
         "Use only package managers and service managers that are explicitly present in the probe.",
         "Package install, upgrade, and remove commands must include an explicit non-interactive confirmation flag that is valid for that package manager.",
+        "Prefer paths relative to the provided active working directory when the user task implies the current shell location.",
         "If the task is complete, set `status` to `done`.",
         "If the task cannot be completed with the known facts or there is no root access and no sudo available for privileged work, set `status` to `blocked`.",
         "If commands would change the system or need privilege, use `needs_confirmation`.",
@@ -2044,6 +2685,7 @@ fn build_agent_user_prompt(
         .map_err(|error| TerminalAgentError::Failed(error.to_string()))?;
     let runtime_state_json = serde_json::to_string_pretty(&serde_json::json!({
         "sudoPasswordCached": sudo_password_cached,
+        "activeWorkingDirectory": probe.current_dir.as_str(),
     }))
     .map_err(|error| TerminalAgentError::Failed(error.to_string()))?;
     let accepted_plan_context = request
@@ -2069,6 +2711,44 @@ fn build_agent_user_prompt(
             .unwrap_or("unknown connection"),
         accepted_plan_instruction,
         accepted_plan_context,
+    ))
+}
+
+fn build_agent_turn_limit_final_system_prompt() -> String {
+    [
+        "You are the final response writer for a remote SSH terminal automation helper.",
+        "Reply with exactly one JSON object and nothing else.",
+        "Do not use Markdown, code fences, comments, or explanations outside the JSON object.",
+        "Use only the provided probe snapshot and command results.",
+        "No more commands may be run.",
+        "Do not propose or request more commands.",
+        "Allowed `status` values: `done`, `blocked`.",
+        "Always return `commands`: [].",
+        "Return `done` when the command history contains enough evidence to answer the user's task.",
+        "Return `blocked` only when the command history proves the task is incomplete or unsafe to summarize.",
+        "JSON schema: {\"status\":\"done|blocked\",\"summary\":\"short summary\",\"userMessage\":\"final text for the user\",\"commands\":[],\"needsReprobe\":false}",
+    ]
+    .join(" ")
+}
+
+fn build_agent_turn_limit_final_user_prompt(
+    request: &TerminalAgentRequest,
+    probe: &TerminalAgentProbeSnapshot,
+    command_history: &[TerminalAgentCommandResult],
+) -> Result<String, TerminalAgentError> {
+    let probe_json = serde_json::to_string_pretty(probe)
+        .map_err(|error| TerminalAgentError::Failed(error.to_string()))?;
+    let command_history_json = serde_json::to_string_pretty(command_history)
+        .map_err(|error| TerminalAgentError::Failed(error.to_string()))?;
+    Ok(format!(
+        "Turn limit reached.\nUser task: {}\nConnection: {}\nActive terminal working directory: {}\nThe agent reached its {MAX_AGENT_TURNS}-turn safety limit. Produce the best final response from the known command results only. Write the final response now without planning more commands.\n\nRemote probe snapshot:\n```json\n{probe_json}\n```\n\nCommand results:\n```json\n{command_history_json}\n```",
+        request.user_prompt.trim(),
+        request
+            .connection_display_name
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or("unknown connection"),
+        probe.current_dir.as_str(),
     ))
 }
 
@@ -2755,6 +3435,27 @@ fn format_command_outcome(result: &TerminalAgentCommandResult) -> String {
     }
 }
 
+fn format_command_activity_detail(result: &TerminalAgentCommandResult) -> String {
+    let mut detail = format!("$ {}\n{}", result.command, format_command_outcome(result));
+    let stdout = result.stdout_tail.trim();
+    if !stdout.is_empty() {
+        detail.push_str("\n\nstdout:\n");
+        detail.push_str(stdout);
+        if result.stdout_truncated {
+            detail.push_str("\n[stdout truncated]");
+        }
+    }
+    let stderr = result.stderr_tail.trim();
+    if !stderr.is_empty() {
+        detail.push_str("\n\nstderr:\n");
+        detail.push_str(stderr);
+        if result.stderr_truncated {
+            detail.push_str("\n[stderr truncated]");
+        }
+    }
+    detail
+}
+
 fn normalize_plan_request(
     request: TerminalAgentPlanRequest,
 ) -> Result<TerminalAgentPlanRequest, String> {
@@ -2903,7 +3604,7 @@ async fn request_plan_questions(
     let system_prompt = build_plan_question_system_prompt();
     let user_prompt =
         build_plan_question_user_prompt(request, probe).map_err(plan_error_to_string)?;
-    let response = ai::execute_custom_prompt(profile, &system_prompt, &user_prompt, 0.1, None)
+    let response = ai::execute_custom_json_prompt(profile, &system_prompt, &user_prompt, 0.1, None)
         .await
         .map_err(map_ai_error)
         .map_err(plan_error_to_string)?;
@@ -2914,10 +3615,11 @@ async fn request_plan_questions(
     }
 
     let repair_prompt = build_plan_repair_prompt(&response.content, "questions");
-    let repaired = ai::execute_custom_prompt(profile, &system_prompt, &repair_prompt, 0.0, None)
-        .await
-        .map_err(map_ai_error)
-        .map_err(plan_error_to_string)?;
+    let repaired =
+        ai::execute_custom_json_prompt(profile, &system_prompt, &repair_prompt, 0.0, None)
+            .await
+            .map_err(map_ai_error)
+            .map_err(plan_error_to_string)?;
     record_profile_usage(profile, repaired.usage.as_ref());
     decision_to_plan_questions(parse_plan_question_decision(&repaired.content)?)
 }
@@ -2934,7 +3636,7 @@ async fn request_plan_options(
     let user_prompt =
         build_plan_option_user_prompt(request, probe, questions, answers, custom_approach)
             .map_err(plan_error_to_string)?;
-    let response = ai::execute_custom_prompt(profile, &system_prompt, &user_prompt, 0.1, None)
+    let response = ai::execute_custom_json_prompt(profile, &system_prompt, &user_prompt, 0.1, None)
         .await
         .map_err(map_ai_error)
         .map_err(plan_error_to_string)?;
@@ -2945,10 +3647,11 @@ async fn request_plan_options(
     }
 
     let repair_prompt = build_plan_repair_prompt(&response.content, "options");
-    let repaired = ai::execute_custom_prompt(profile, &system_prompt, &repair_prompt, 0.0, None)
-        .await
-        .map_err(map_ai_error)
-        .map_err(plan_error_to_string)?;
+    let repaired =
+        ai::execute_custom_json_prompt(profile, &system_prompt, &repair_prompt, 0.0, None)
+            .await
+            .map_err(map_ai_error)
+            .map_err(plan_error_to_string)?;
     record_profile_usage(profile, repaired.usage.as_ref());
     decision_to_plan_options(parse_plan_option_decision(&repaired.content)?)
 }
@@ -3212,8 +3915,51 @@ fn emit_status(app: &AppHandle, state: TerminalAgentRunState) {
     let _ = app.emit(AGENT_EVENT_STATUS, state);
 }
 
+fn emit_activity(app: &AppHandle, activity: AgentActivity) {
+    let _ = app.emit(AGENT_EVENT_ACTIVITY, activity);
+}
+
 fn emit_output(app: &AppHandle, event: TerminalAgentEvent) {
     let _ = app.emit(AGENT_EVENT_OUTPUT, event);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_activity(
+    id: impl Into<String>,
+    activity_type: AgentActivityType,
+    status: AgentActivityStatus,
+    title: impl Into<String>,
+    summary: impl Into<String>,
+    detail: impl Into<String>,
+    token_usage: AgentActivityTokenUsage,
+    elapsed_seconds: u64,
+    collapsed: bool,
+) -> AgentActivity {
+    let detail = detail.into();
+    AgentActivity {
+        id: id.into(),
+        activity_type,
+        status,
+        title: title.into(),
+        summary: summary.into(),
+        collapsible: !detail.trim().is_empty(),
+        detail,
+        token_usage,
+        elapsed_seconds,
+        collapsed,
+    }
+}
+
+fn activity_token_usage(usage: Option<&AiTokenUsage>) -> AgentActivityTokenUsage {
+    usage
+        .map(|usage| {
+            AgentActivityTokenUsage::known(
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+            )
+        })
+        .unwrap_or_else(AgentActivityTokenUsage::unknown)
 }
 
 async fn redraw_interactive_shell_prompt(app: &AppHandle, session_id: &str) {
@@ -3346,6 +4092,187 @@ fn rewrite_sudo_command_for_password(command: &str) -> Result<String, TerminalAg
     ))
 }
 
+fn wrap_command_for_working_directory(command: &str, working_directory: &str) -> String {
+    let cwd = working_directory.trim();
+    if !is_valid_absolute_remote_path(cwd) {
+        return command.to_string();
+    }
+    let quoted_cwd = shell_single_quote(cwd);
+    format!("if [ -d {quoted_cwd} ]; then cd {quoted_cwd}; fi && {command}")
+}
+
+fn is_valid_absolute_remote_path(path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    path.starts_with('/')
+        && !path.contains('\0')
+        && !path.contains('\n')
+        && !path.contains('\r')
+        && !path.split('/').any(|segment| segment == "..")
+}
+
+fn detect_file_type_count_request(user_prompt: &str) -> Option<FileTypeCountRequest> {
+    let prompt = user_prompt.trim();
+    if prompt.is_empty() {
+        return None;
+    }
+    let lower = prompt.to_lowercase();
+    let asks_for_count = lower.contains("how many") || lower.contains("count");
+    if !asks_for_count
+        || !lower.contains("file")
+        || !lower.contains("plain text")
+        || !lower.contains("binar")
+    {
+        return None;
+    }
+    let directory = extract_directory_path_from_file_count_prompt(prompt)?;
+    is_valid_absolute_remote_path(&directory).then_some(FileTypeCountRequest { directory })
+}
+
+fn extract_directory_path_from_file_count_prompt(prompt: &str) -> Option<String> {
+    let lower = prompt.to_lowercase();
+    for marker in ["directory", "folder", "dir"] {
+        let mut search_start = 0;
+        while let Some(relative_index) = lower[search_start..].find(marker) {
+            let marker_end = search_start + relative_index + marker.len();
+            let marker_end_char_count = lower[..marker_end].chars().count();
+            let prompt_marker_end = prompt
+                .char_indices()
+                .nth(marker_end_char_count)
+                .map(|(index, _)| index)
+                .unwrap_or(prompt.len());
+            if marker_end < lower.len()
+                && lower[marker_end..]
+                    .chars()
+                    .next()
+                    .is_some_and(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
+            {
+                search_start = marker_end;
+                continue;
+            }
+            let rest = prompt[prompt_marker_end..].trim_start();
+            let rest = rest
+                .strip_prefix(':')
+                .or_else(|| rest.strip_prefix('='))
+                .unwrap_or(rest)
+                .trim_start();
+            let (quote, path_start) = match rest.chars().next() {
+                Some('\'') => (Some('\''), 1),
+                Some('"') => (Some('"'), 1),
+                _ => (None, 0),
+            };
+            let candidate = &rest[path_start..];
+            if !candidate.starts_with('/') {
+                search_start = marker_end;
+                continue;
+            }
+            let mut path = String::new();
+            for ch in candidate.chars() {
+                if quote.is_some_and(|quote| ch == quote) {
+                    break;
+                }
+                if quote.is_none()
+                    && (ch.is_whitespace() || matches!(ch, '?' | '\'' | '"' | ';' | ':' | ','))
+                {
+                    break;
+                }
+                path.push(ch);
+            }
+            let directory = strip_trailing_path_punctuation(&path);
+            if !directory.is_empty() {
+                return Some(directory);
+            }
+            search_start = marker_end;
+        }
+    }
+    None
+}
+
+fn strip_trailing_path_punctuation(path: &str) -> String {
+    path.trim()
+        .trim_end_matches(['.', ',', ';', ':', '?', '!'])
+        .to_string()
+}
+
+fn build_file_type_count_command(directory: &str, use_passwordless_sudo: bool) -> String {
+    let script = r#"if [ ! -d "$1" ]; then
+  printf 'error=directory_not_found\n'
+  exit 2
+fi
+if ! command -v file >/dev/null 2>&1; then
+  printf 'error=file_command_not_found\n'
+  exit 127
+fi
+total=$(find "$1" -type f 2>/dev/null | wc -l | tr -d '[:space:]')
+text=$(find "$1" -type f -exec file --mime-type -b -- {} + 2>/dev/null | awk 'BEGIN { count=0 } /^text\// { count++ } END { print count }')
+case "$total" in ''|*[!0-9]*) total=0 ;; esac
+case "$text" in ''|*[!0-9]*) text=0 ;; esac
+binary=$((total - text))
+printf 'total=%s\nplain_text=%s\nbinary_or_non_text=%s\n' "$total" "$text" "$binary"
+"#;
+    let prefix = if use_passwordless_sudo {
+        "sudo -n "
+    } else {
+        ""
+    };
+    format!(
+        "{prefix}sh -lc {} sh {}",
+        shell_single_quote(script),
+        shell_single_quote(directory)
+    )
+}
+
+fn parse_file_type_count_output(stdout: &str) -> Option<FileTypeCounts> {
+    let mut total = None;
+    let mut plain_text = None;
+    let mut binary_or_non_text = None;
+    for line in stdout.lines() {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            continue;
+        };
+        let Ok(parsed) = value.trim().parse::<u64>() else {
+            continue;
+        };
+        match key.trim() {
+            "total" => total = Some(parsed),
+            "plain_text" => plain_text = Some(parsed),
+            "binary_or_non_text" => binary_or_non_text = Some(parsed),
+            _ => {}
+        }
+    }
+    Some(FileTypeCounts {
+        total: total?,
+        plain_text: plain_text?,
+        binary_or_non_text: binary_or_non_text?,
+    })
+}
+
+fn format_file_type_count_table(directory: &str, counts: &FileTypeCounts) -> String {
+    format!(
+        "File type count for `{directory}`:\n\n| Category | Count |\n| --- | ---: |\n| Total files | {} |\n| Plain text files (`text/*`) | {} |\n| Binary/non-text files | {} |",
+        counts.total, counts.plain_text, counts.binary_or_non_text
+    )
+}
+
+fn build_file_type_count_failure_message(
+    directory: &str,
+    result: &TerminalAgentCommandResult,
+) -> String {
+    let mut message = format!("Could not count file types under `{directory}`.");
+    let stdout = result.stdout_tail.trim();
+    if !stdout.is_empty() {
+        message.push_str("\n\nstdout:\n");
+        message.push_str(stdout);
+    }
+    let stderr = result.stderr_tail.trim();
+    if !stderr.is_empty() {
+        message.push_str("\n\nstderr:\n");
+        message.push_str(stderr);
+    }
+    message
+}
+
 fn encode_sudo_password(password: &str) -> Vec<u8> {
     let mut encoded = password.as_bytes().to_vec();
     encoded.push(b'\n');
@@ -3474,6 +4401,80 @@ fn normalized_non_empty_lines(input: &str) -> Vec<String> {
         .collect()
 }
 
+static NOTO_SANS_MONO_REGULAR: &[u8] =
+    include_bytes!("../resources/fonts/noto/NotoSansMono-Regular.ttf");
+
+pub fn write_activity_pdf(path: &str, text: &str) -> Result<(), String> {
+    let path = path.trim();
+    if path.is_empty() {
+        return Err("Export path is required".into());
+    }
+    let bytes = build_activity_pdf_bytes(text)?;
+    std::fs::write(path, bytes).map_err(|error| error.to_string())
+}
+
+fn build_activity_pdf_bytes(text: &str) -> Result<Vec<u8>, String> {
+    use printpdf::{
+        Mm, Op, ParsedFont, PdfDocument, PdfFontHandle, PdfPage, PdfSaveOptions, Point, Pt,
+        TextItem,
+    };
+
+    let mut warnings = Vec::new();
+    let font = ParsedFont::from_bytes(NOTO_SANS_MONO_REGULAR, 0, &mut warnings)
+        .ok_or_else(|| "Failed to parse bundled NotoSansMono font".to_string())?;
+    let mut document = PdfDocument::new("KorTTY Terminal Agent Activity");
+    let font_id = document.add_font(&font);
+    let lines = wrap_pdf_text_lines(text, 96);
+    let pages = lines
+        .chunks(56)
+        .map(|page_lines| {
+            let mut ops = vec![
+                Op::StartTextSection,
+                Op::SetTextCursor {
+                    pos: Point::new(Mm(15.0), Mm(282.0)),
+                },
+                Op::SetFont {
+                    font: PdfFontHandle::External(font_id.clone()),
+                    size: Pt(9.0),
+                },
+                Op::SetLineHeight { lh: Pt(11.0) },
+            ];
+            for (index, line) in page_lines.iter().enumerate() {
+                if index > 0 {
+                    ops.push(Op::AddLineBreak);
+                }
+                ops.push(Op::ShowText {
+                    items: vec![TextItem::Text(line.to_string())],
+                });
+            }
+            ops.push(Op::EndTextSection);
+            PdfPage::new(Mm(210.0), Mm(297.0), ops)
+        })
+        .collect::<Vec<_>>();
+    Ok(document
+        .with_pages(if pages.is_empty() {
+            vec![PdfPage::new(Mm(210.0), Mm(297.0), Vec::new())]
+        } else {
+            pages
+        })
+        .save(&PdfSaveOptions::default(), &mut Vec::new()))
+}
+
+fn wrap_pdf_text_lines(text: &str, max_chars: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for source_line in text.replace('\r', "").lines() {
+        let mut current = String::new();
+        for ch in source_line.chars() {
+            current.push(ch);
+            if current.chars().count() >= max_chars {
+                lines.push(std::mem::take(&mut current));
+            }
+        }
+        lines.push(current);
+    }
+    lines
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3515,6 +4516,7 @@ mod tests {
             show_runtime_messages: false,
             ask_confirmation_before_every_command: false,
             auto_approve_root_commands: false,
+            query_only: false,
         }
     }
 
@@ -3542,6 +4544,116 @@ mod tests {
 
         assert!(prompt.contains("Accepted plan context:"));
         assert!(prompt.contains("Install PostgreSQL"));
+    }
+
+    #[test]
+    fn activity_dto_serializes_camel_case_fields() {
+        let activity = build_activity(
+            "run-1:thinking:1",
+            AgentActivityType::Thinking,
+            AgentActivityStatus::Completed,
+            "Thinking",
+            "Done",
+            "detail",
+            AgentActivityTokenUsage::known(12, 8, 5),
+            3,
+            true,
+        );
+
+        let value = serde_json::to_value(activity).expect("activity should serialize");
+
+        assert_eq!(value["activityType"], "Thinking");
+        assert_eq!(value["status"], "Completed");
+        assert_eq!(value["tokenUsage"]["known"], true);
+        assert_eq!(value["tokenUsage"]["totalTokens"], 20);
+        assert_eq!(value["elapsedSeconds"], 3);
+    }
+
+    #[test]
+    fn wraps_commands_for_valid_absolute_working_directory() {
+        assert_eq!(
+            wrap_command_for_working_directory("ls -la", "/srv/app"),
+            "if [ -d '/srv/app' ]; then cd '/srv/app'; fi && ls -la"
+        );
+        assert_eq!(wrap_command_for_working_directory("ls -la", "~"), "ls -la");
+        assert_eq!(
+            wrap_command_for_working_directory("ls -la", "/srv/../etc"),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn detects_file_type_count_request_with_absolute_directory() {
+        let request = detect_file_type_count_request(
+            "how many files are under directory /etc ? create a tabel and show how many files are binaries and how many are plain text.",
+        )
+        .expect("file type count request should be detected");
+
+        assert_eq!(request.directory, "/etc");
+        let request = detect_file_type_count_request(
+            "zähl bitte how many files are under directory /tmp/äpfel and show how many files are binaries and how many are plain text.",
+        )
+        .expect("file type count request with non-ascii text should be detected");
+        assert_eq!(request.directory, "/tmp/äpfel");
+        assert!(detect_file_type_count_request("count files under directory /etc").is_none());
+    }
+
+    #[test]
+    fn builds_and_parses_file_type_count_command() {
+        let command = build_file_type_count_command("/tmp/has ' quote", true);
+
+        assert!(command.starts_with("sudo -n sh -lc "));
+        assert!(command.contains("'\"'\"'"));
+        assert!(command.contains("file --mime-type -b"));
+        assert!(command.contains("binary_or_non_text"));
+
+        let counts = parse_file_type_count_output("total=10\nplain_text=4\nbinary_or_non_text=6\n")
+            .expect("counts should parse");
+        assert_eq!(counts.total, 10);
+        assert_eq!(counts.plain_text, 4);
+        assert_eq!(counts.binary_or_non_text, 6);
+        assert!(format_file_type_count_table("/etc", &counts)
+            .contains("| Plain text files (`text/*`) | 4 |"));
+    }
+
+    #[test]
+    fn turn_limit_final_prompts_forbid_more_commands() {
+        let system_prompt = build_agent_turn_limit_final_system_prompt();
+        assert!(system_prompt.contains("No more commands may be run."));
+        assert!(system_prompt.contains("Allowed `status` values: `done`, `blocked`."));
+        assert!(system_prompt.contains("Always return `commands`: []."));
+
+        let user_prompt = build_agent_turn_limit_final_user_prompt(
+            &build_agent_request(),
+            &build_probe_snapshot(),
+            &[TerminalAgentCommandResult {
+                command: "find /etc -type f 2>/dev/null | wc -l".into(),
+                purpose: "Count files".into(),
+                risk: TerminalAgentRisk::ReadOnly,
+                exit_status: Some(0),
+                exit_signal: None,
+                stdout_tail: "1284\n".into(),
+                stderr_tail: String::new(),
+                stdout_truncated: false,
+                stderr_truncated: false,
+                cancelled: false,
+                timed_out: false,
+            }],
+        )
+        .expect("final prompt should build");
+        assert!(user_prompt.contains("Turn limit reached"));
+        assert!(user_prompt.contains("Active terminal working directory: /srv/app"));
+        assert!(user_prompt.contains("find /etc -type f"));
+        assert!(user_prompt.contains("1284"));
+    }
+
+    #[test]
+    fn builds_pdf_export_with_bundled_font() {
+        let bytes = build_activity_pdf_bytes("KorTTY\nAI Agent Activity")
+            .expect("PDF bytes should be generated");
+
+        assert!(bytes.starts_with(b"%PDF"));
+        assert!(bytes.len() > 1_000);
     }
 
     #[test]

@@ -49,6 +49,10 @@ pub struct ConnectionSettings {
     pub retry_count: u32,
     pub terminal_logging: bool,
     pub command_timestamps: bool,
+    #[serde(default = "default_true")]
+    pub prompt_hook_enabled: bool,
+    #[serde(default)]
+    pub terminal_agent_command_name: Option<String>,
     pub theme_id: Option<String>,
     pub jump_server: Option<JumpServerConfig>,
     pub tunnels: Vec<super::tunnel::TunnelConfig>,
@@ -129,6 +133,8 @@ impl Default for ConnectionSettings {
             retry_count: 4,
             terminal_logging: false,
             command_timestamps: false,
+            prompt_hook_enabled: true,
+            terminal_agent_command_name: None,
             theme_id: None,
             jump_server: None,
             tunnels: Vec::new(),
@@ -166,4 +172,8 @@ fn default_ansi_colors() -> Vec<String> {
 
 fn default_connection_protocol() -> ConnectionProtocol {
     ConnectionProtocol::TcpIp
+}
+
+fn default_true() -> bool {
+    true
 }

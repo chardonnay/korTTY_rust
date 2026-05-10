@@ -1,14 +1,20 @@
 import { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo, Fragment } from "react";
 import { createPortal } from "react-dom";
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { save as saveDialog } from "@tauri-apps/plugin-dialog";
+import { writeTextFile } from "@tauri-apps/plugin-fs";
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelGroupHandle } from "react-resizable-panels";
 import { TerminalTab } from "./TerminalTab";
-import { Radio, X, ChevronRight, GripVertical } from "lucide-react";
+import { Radio, X, ChevronRight, GripVertical, ChevronDown, ChevronUp, Download, Square, RotateCcw, Minus, Plus } from "lucide-react";
 import type {
+  AgentActivity,
   AiAction,
   TerminalAgentApproval,
   TerminalAgentPasswordRequest,
   TerminalAgentRunState,
 } from "../../types/ai";
+import type { TerminalAgentPanelDock } from "../../store/settingsStore";
 
 // --- Split tree data model ---
 
@@ -34,6 +40,12 @@ export type SplitTreeTransferNode =
   | { type: "container"; direction: "horizontal" | "vertical"; children: SplitTreeTransferNode[] };
 
 const AGENT_SPINNER_FRAMES = ["|", "/", "-", "\\"];
+const AGENT_PANEL_COLLAPSED_HEIGHT = 42;
+const AGENT_PANEL_SIDE_TITLE_HEIGHT = 28;
+const DEFAULT_AGENT_PANEL_HEIGHT = 260;
+const DEFAULT_AGENT_PANEL_SIDE_WIDTH = 420;
+const MIN_AGENT_PANEL_SIDE_WIDTH = 360;
+const MAX_AGENT_PANEL_SIDE_WIDTH = 720;
 
 export function serializeSplitTree(tree: SplitNode): SplitTreeTransferNode {
   if (tree.type === "leaf") {
@@ -108,6 +120,10 @@ function formatAgentElapsed(elapsedMs: number): string {
 function getAllLeaves(node: SplitNode): LeafNode[] {
   if (node.type === "leaf") return [node];
   return node.children.flatMap(getAllLeaves);
+}
+
+function clampNumber(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
 }
 
 function splitLeafInTree(
@@ -214,8 +230,20 @@ interface TerminalSplitPaneProps {
   primarySessionId: string;
   connected: boolean;
   agentCommandName?: string;
+  agentCommandNameCaseInsensitive?: boolean;
   readOnly?: boolean;
   promptHookEnabled?: boolean;
+  agentPanelDock?: TerminalAgentPanelDock;
+  initialAgentPanelHeight?: number;
+  initialAgentPanelSideWidth?: number;
+  initialAgentPanelFontSize?: number;
+  getAgentPanelLabel?: (sessionId: string, splitIndex: number) => string;
+  onAgentPanelLayoutChange?: (layout: {
+    terminalAgentPanelDock?: TerminalAgentPanelDock;
+    terminalAgentPanelHeight?: number;
+    terminalAgentPanelSideWidth?: number;
+    terminalAgentPanelFontSize?: number;
+  }) => void;
   fontSize: number;
   getFontSizeForSession?: (sessionId: string) => number;
   theme?: TerminalTheme;
@@ -252,8 +280,15 @@ export function TerminalSplitPane({
   primarySessionId,
   connected,
   agentCommandName,
+  agentCommandNameCaseInsensitive = false,
   readOnly = false,
   promptHookEnabled = true,
+  agentPanelDock = "bottom",
+  initialAgentPanelHeight,
+  initialAgentPanelSideWidth,
+  initialAgentPanelFontSize,
+  getAgentPanelLabel,
+  onAgentPanelLayoutChange,
   fontSize,
   getFontSizeForSession,
   theme,
@@ -302,16 +337,35 @@ export function TerminalSplitPane({
   useEffect(() => {
     onTreeChange?.(tree);
   }, [tree, onTreeChange]);
+
+  useEffect(() => {
+    setAgentPanelSideWidth(
+      clampNumber(initialAgentPanelSideWidth ?? DEFAULT_AGENT_PANEL_SIDE_WIDTH, MIN_AGENT_PANEL_SIDE_WIDTH, MAX_AGENT_PANEL_SIDE_WIDTH),
+    );
+  }, [initialAgentPanelSideWidth]);
+
   const [contextMenu, setContextMenu] = useState<ContextMenuState | null>(null);
   const [swapDrag, setSwapDrag] = useState<{ sourceId: string; targetId: string | null } | null>(null);
   const [ctrlShiftHeld, setCtrlShiftHeld] = useState(false);
   const [agentPasswords, setAgentPasswords] = useState<Record<string, string>>({});
   const [agentActivityTick, setAgentActivityTick] = useState(() => Date.now());
+  const [agentActivitiesByRun, setAgentActivitiesByRun] = useState<Record<string, AgentActivity[]>>({});
+  const [agentRunHistoryBySession, setAgentRunHistoryBySession] = useState<Record<string, string[]>>({});
+  const [selectedAgentRunBySession, setSelectedAgentRunBySession] = useState<Record<string, string>>({});
+  const [closedAgentPanelBySession, setClosedAgentPanelBySession] = useState<Record<string, boolean>>({});
+  const [collapsedAgentPanelBySession, setCollapsedAgentPanelBySession] = useState<Record<string, boolean>>({});
+  const [agentPanelHeights, setAgentPanelHeights] = useState<Record<string, number>>({});
+  const [agentPanelFontSizes, setAgentPanelFontSizes] = useState<Record<string, number>>({});
+  const [agentPanelSideWidth, setAgentPanelSideWidth] = useState(() =>
+    clampNumber(initialAgentPanelSideWidth ?? DEFAULT_AGENT_PANEL_SIDE_WIDTH, MIN_AGENT_PANEL_SIDE_WIDTH, MAX_AGENT_PANEL_SIDE_WIDTH),
+  );
+  const rootRef = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
   const panelGroupRefs = useRef<Map<string, ImperativePanelGroupHandle>>(new Map());
   const hostElementsRef = useRef<Map<string, HTMLDivElement>>(new Map());
   const slotRefs = useRef<Map<string, HTMLDivElement | null>>(new Map());
   const agentRunStartedAtRef = useRef<Record<string, number>>({});
+  const agentRunSessionRef = useRef<Record<string, string>>({});
   const treeRef = useRef(tree);
   treeRef.current = tree;
   const swapDragRef = useRef(swapDrag);
@@ -539,6 +593,14 @@ export function TerminalSplitPane({
     return map;
   }, [allLeaves]);
 
+  const leafIndexBySessionId = useMemo(() => {
+    const map = new Map<string, number>();
+    allLeaves.forEach((leaf, index) => {
+      map.set(leaf.sessionId, index);
+    });
+    return map;
+  }, [allLeaves]);
+
   const broadcastTargetsBySessionId = useMemo(() => {
     if (!broadcast || allLeaves.length < 2) return {};
     const result: Record<string, string[]> = {};
@@ -562,27 +624,93 @@ export function TerminalSplitPane({
   useEffect(() => {
     const now = Date.now();
     const activeRunIds = new Set<string>();
+    const knownRunIds = new Set<string>();
 
     for (const state of Object.values(agentRunStates ?? {})) {
-      if (!state?.runId || !isActiveAgentState(state)) {
+      if (!state?.runId) {
+        continue;
+      }
+      knownRunIds.add(state.runId);
+      agentRunSessionRef.current[state.runId] = state.sessionId;
+      setAgentRunHistoryBySession((prev) => {
+        const existing = prev[state.sessionId] ?? [];
+        if (existing.includes(state.runId)) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [state.sessionId]: [...existing, state.runId],
+        };
+      });
+      setSelectedAgentRunBySession((prev) => ({
+        ...prev,
+        [state.sessionId]: prev[state.sessionId] ?? state.runId,
+      }));
+      if (!isActiveAgentState(state)) {
         continue;
       }
       activeRunIds.add(state.runId);
       if (agentRunStartedAtRef.current[state.runId] == null) {
         agentRunStartedAtRef.current[state.runId] = now;
       }
+      setClosedAgentPanelBySession((prev) => ({ ...prev, [state.sessionId]: false }));
+      setSelectedAgentRunBySession((prev) => ({ ...prev, [state.sessionId]: state.runId }));
     }
 
     for (const runId of Object.keys(agentRunStartedAtRef.current)) {
-      if (!activeRunIds.has(runId)) {
+      if (!knownRunIds.has(runId)) {
         delete agentRunStartedAtRef.current[runId];
       }
     }
 
-    if (activeRunIds.size > 0) {
+    if (activeRunIds.size > 0 || knownRunIds.size > 0) {
       setAgentActivityTick(now);
     }
   }, [agentRunStates]);
+
+  useEffect(() => {
+    let disposed = false;
+    const unlisten = listen<AgentActivity>("terminal-agent-activity", (event) => {
+      if (disposed) return;
+      const runId = event.payload.id.split(":")[0];
+      if (!runId) return;
+      setAgentActivitiesByRun((prev) => {
+        const existing = prev[runId] ?? [];
+        const index = existing.findIndex((activity) => activity.id === event.payload.id);
+        const nextActivities =
+          index >= 0
+            ? existing.map((activity, i) => (i === index ? event.payload : activity))
+            : [...existing, event.payload];
+        return {
+          ...prev,
+          [runId]: nextActivities,
+        };
+      });
+      const sessionId = agentRunSessionRef.current[runId];
+      if (sessionId) {
+        setClosedAgentPanelBySession((prev) => ({ ...prev, [sessionId]: false }));
+      }
+    });
+    return () => {
+      disposed = true;
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  useEffect(() => {
+    function handleAgentCancel(event: Event) {
+      const custom = event as CustomEvent<{ sessionId: string }>;
+      const sessionId = custom.detail?.sessionId;
+      const runId = sessionId ? agentRunStates?.[sessionId]?.runId : undefined;
+      if (runId && isActiveAgentState(agentRunStates?.[sessionId])) {
+        onStopAgent?.(runId);
+      }
+    }
+    window.addEventListener("kortty-terminal-agent-cancel", handleAgentCancel as EventListener);
+    return () => {
+      window.removeEventListener("kortty-terminal-agent-cancel", handleAgentCancel as EventListener);
+    };
+  }, [agentRunStates, onStopAgent]);
 
   useEffect(() => {
     const hasActiveAgent = Object.values(agentRunStates ?? {}).some((state) => isActiveAgentState(state));
@@ -666,22 +794,216 @@ export function TerminalSplitPane({
     return () => document.removeEventListener("focusin", handleFocusIn, true);
   }, [onFocusSession]);
 
+  const handleAgentPanelDockDragEnd = useCallback((clientX: number, clientY: number) => {
+    const rect = rootRef.current?.getBoundingClientRect();
+    if (!rect) {
+      return;
+    }
+
+    const candidates: { dock: TerminalAgentPanelDock; distance: number }[] = [
+      { dock: "left", distance: Math.abs(clientX - rect.left) },
+      { dock: "right", distance: Math.abs(rect.right - clientX) },
+      { dock: "bottom", distance: Math.abs(rect.bottom - clientY) },
+    ];
+    candidates.sort((a, b) => a.distance - b.distance);
+    const nextDock = candidates[0]?.dock ?? "bottom";
+    if (nextDock !== agentPanelDock) {
+      onAgentPanelLayoutChange?.({ terminalAgentPanelDock: nextDock });
+    }
+  }, [agentPanelDock, onAgentPanelLayoutChange]);
+
+  const startAgentPanelSideResize = useCallback((event: React.MouseEvent<HTMLDivElement>) => {
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = agentPanelSideWidth;
+    const direction = agentPanelDock === "left" ? 1 : -1;
+
+    function onMove(moveEvent: MouseEvent) {
+      const nextWidth = clampNumber(
+        startWidth + (moveEvent.clientX - startX) * direction,
+        MIN_AGENT_PANEL_SIDE_WIDTH,
+        MAX_AGENT_PANEL_SIDE_WIDTH,
+      );
+      setAgentPanelSideWidth(nextWidth);
+      onAgentPanelLayoutChange?.({ terminalAgentPanelSideWidth: nextWidth });
+    }
+
+    function onUp() {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    }
+
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }, [agentPanelDock, agentPanelSideWidth, onAgentPanelLayoutChange]);
+
+  function getAgentPanelContext(node: LeafNode) {
+    const agentState = agentRunStates?.[node.sessionId];
+    if (agentState == null || closedAgentPanelBySession[node.sessionId]) {
+      return null;
+    }
+
+    const pendingApproval = agentState.pendingApproval;
+    const pendingPasswordRequest = agentState.pendingPasswordRequest;
+    const activeAgentState = isActiveAgentState(agentState);
+    const passwordValue = agentPasswords[node.sessionId] ?? "";
+    const startedAt =
+      agentState.runId != null ? agentRunStartedAtRef.current[agentState.runId] : undefined;
+    const elapsedMs = startedAt != null ? Math.max(0, agentActivityTick - startedAt) : 0;
+    const spinnerFrame = startedAt != null
+      ? AGENT_SPINNER_FRAMES[Math.floor(elapsedMs / 200) % AGENT_SPINNER_FRAMES.length]
+      : AGENT_SPINNER_FRAMES[0];
+    const agentPanelCollapsed = !!collapsedAgentPanelBySession[node.sessionId];
+    const agentPanelExpandedHeight =
+      agentPanelHeights[node.sessionId] ??
+      initialAgentPanelHeight ??
+      DEFAULT_AGENT_PANEL_HEIGHT;
+    const selectedRunId = selectedAgentRunBySession[node.sessionId] || agentState.runId;
+    const activities = agentActivitiesByRun[selectedRunId] ?? [];
+    const runIds = agentRunHistoryBySession[node.sessionId] ?? [agentState.runId];
+    const splitIndex = leafIndexBySessionId.get(node.sessionId) ?? 0;
+    const connectionLabel =
+      getAgentPanelLabel?.(node.sessionId, splitIndex) ??
+      `Session ${node.sessionId.slice(0, 8)} · ${splitIndex === 0 ? "Main" : `Split ${splitIndex + 1}`}`;
+
+    return {
+      agentState,
+      activeAgentState,
+      activities,
+      agentPanelCollapsed,
+      agentPanelExpandedHeight,
+      connectionLabel,
+      elapsedMs,
+      passwordValue,
+      pendingApproval,
+      pendingPasswordRequest,
+      runId: selectedRunId,
+      runIds,
+      selectedRunId,
+      spinnerFrame,
+    };
+  }
+
+  function renderAgentPanel(node: LeafNode, dock: TerminalAgentPanelDock) {
+    const context = getAgentPanelContext(node);
+    if (!context) {
+      return null;
+    }
+
+    return (
+      <AgentActivityPanel
+        key={`${node.sessionId}:${dock}`}
+        sessionId={node.sessionId}
+        dock={dock}
+        connectionLabel={dock === "bottom" ? undefined : context.connectionLabel}
+        agentState={context.agentState}
+        active={context.activeAgentState}
+        spinnerFrame={context.spinnerFrame}
+        elapsedMs={context.elapsedMs}
+        activities={context.activities}
+        runIds={context.runIds}
+        selectedRunId={context.selectedRunId}
+        collapsed={context.agentPanelCollapsed}
+        height={context.agentPanelExpandedHeight}
+        fontSize={
+          agentPanelFontSizes[node.sessionId] ??
+          initialAgentPanelFontSize ??
+          12
+        }
+        pendingApproval={context.pendingApproval}
+        pendingPasswordRequest={context.pendingPasswordRequest}
+        passwordValue={context.passwordValue}
+        onPasswordChange={(value) =>
+          setAgentPasswords((prev) => ({ ...prev, [node.sessionId]: value }))
+        }
+        onSubmitPassword={() => {
+          if (!context.pendingPasswordRequest || !context.passwordValue.trim()) {
+            return;
+          }
+          onSubmitAgentPassword?.(context.pendingPasswordRequest, context.passwordValue);
+          setAgentPasswords((prev) => ({ ...prev, [node.sessionId]: "" }));
+        }}
+        onApprove={() => context.pendingApproval && onApproveAgent?.(context.pendingApproval)}
+        onApproveAlways={() => context.pendingApproval && onApproveAgentAlways?.(context.pendingApproval)}
+        onCancel={() => context.agentState.runId && onStopAgent?.(context.agentState.runId)}
+        onClose={() =>
+          setClosedAgentPanelBySession((prev) => ({ ...prev, [node.sessionId]: true }))
+        }
+        onToggleCollapsed={() =>
+          setCollapsedAgentPanelBySession((prev) => ({
+            ...prev,
+            [node.sessionId]: !prev[node.sessionId],
+          }))
+        }
+        onSelectRun={(runId) =>
+          setSelectedAgentRunBySession((prev) => ({ ...prev, [node.sessionId]: runId }))
+        }
+        onRerun={() => {
+          const prompt = extractAgentPrompt(context.agentState, agentActivitiesByRun[context.runId] ?? []);
+          onAgentCommand?.(node.sessionId, `${agentCommandName ?? "agent"} ${prompt}`);
+        }}
+        onHeightChange={(height) => {
+          const nextHeight = clampNumber(height, 140, 520);
+          setAgentPanelHeights((prev) => ({ ...prev, [node.sessionId]: nextHeight }));
+          onAgentPanelLayoutChange?.({ terminalAgentPanelHeight: nextHeight });
+        }}
+        onFontSizeChange={(size) => {
+          const nextFontSize = clampNumber(size, 9, 20);
+          setAgentPanelFontSizes((prev) => ({ ...prev, [node.sessionId]: nextFontSize }));
+          onAgentPanelLayoutChange?.({ terminalAgentPanelFontSize: nextFontSize });
+        }}
+        onDockDragEnd={handleAgentPanelDockDragEnd}
+        buildAllRuns={() => {
+          const runIds = agentRunHistoryBySession[node.sessionId] ?? [];
+          return runIds.map((runId) => ({
+            runId,
+            activities: agentActivitiesByRun[runId] ?? [],
+          }));
+        }}
+      />
+    );
+  }
+
+  function renderAgentSideRail() {
+    const panels = allLeaves
+      .map((leaf) => renderAgentPanel(leaf, agentPanelDock))
+      .filter((panel): panel is NonNullable<typeof panel> => panel != null);
+
+    if (panels.length === 0 || agentPanelDock === "bottom") {
+      return null;
+    }
+
+    const resizeHandle = (
+      <div
+        className="w-1 shrink-0 cursor-col-resize bg-kortty-border/70 hover:bg-kortty-accent"
+        onMouseDown={startAgentPanelSideResize}
+      />
+    );
+
+    return (
+      <div
+        className={`flex h-full min-h-0 shrink-0 bg-kortty-surface/95 ${
+          agentPanelDock === "left" ? "border-r border-kortty-border" : "border-l border-kortty-border"
+        }`}
+        style={{ width: agentPanelSideWidth }}
+      >
+        {agentPanelDock === "right" && resizeHandle}
+        <div className="flex min-h-0 flex-1 flex-col gap-1 overflow-y-auto p-1">
+          {panels}
+        </div>
+        {agentPanelDock === "left" && resizeHandle}
+      </div>
+    );
+  }
+
   function renderNode(node: SplitNode): React.ReactNode {
     if (node.type === "leaf") {
-      const agentState = agentRunStates?.[node.sessionId];
-      const pendingApproval = agentState?.pendingApproval;
-      const pendingPasswordRequest = agentState?.pendingPasswordRequest;
-      const activeAgentState = isActiveAgentState(agentState);
-      const canApprove = pendingApproval != null && !!onApproveAgent;
-      const canSubmitPassword = pendingPasswordRequest != null && !!onSubmitAgentPassword;
-      const canStop = agentState?.runId && isActiveAgentState(agentState) && !!onStopAgent;
-      const passwordValue = agentPasswords[node.sessionId] ?? "";
-      const startedAt =
-        agentState?.runId != null ? agentRunStartedAtRef.current[agentState.runId] : undefined;
-      const elapsedMs = startedAt != null ? Math.max(0, agentActivityTick - startedAt) : 0;
-      const spinnerFrame = startedAt != null
-        ? AGENT_SPINNER_FRAMES[Math.floor(elapsedMs / 200) % AGENT_SPINNER_FRAMES.length]
-        : AGENT_SPINNER_FRAMES[0];
+      const agentPanelContext = getAgentPanelContext(node);
+      const reservedAgentPanelHeight = agentPanelDock === "bottom" && agentPanelContext
+        ? agentPanelContext.agentPanelCollapsed
+          ? AGENT_PANEL_COLLAPSED_HEIGHT
+          : agentPanelContext.agentPanelExpandedHeight
+        : 0;
       return (
         <div
           className="relative w-full h-full min-h-0 min-w-0 group overflow-hidden"
@@ -706,93 +1028,9 @@ export function TerminalSplitPane({
               }
             }}
             className="absolute inset-0 overflow-hidden"
+            style={{ bottom: reservedAgentPanelHeight }}
           />
-          {agentState && (
-            <div className="pointer-events-none absolute left-0 right-0 top-0 z-30 bg-kortty-surface/95 border-b border-kortty-border px-2 py-1 flex items-center gap-2 text-[11px]">
-              <span className="font-medium text-kortty-accent whitespace-nowrap">AI Agent</span>
-              {activeAgentState && (
-                <>
-                  <span className="font-mono text-kortty-accent whitespace-nowrap">{spinnerFrame}</span>
-                  <span className="font-mono text-kortty-text-dim whitespace-nowrap">
-                    {formatAgentElapsed(elapsedMs)}
-                  </span>
-                </>
-              )}
-              <span className="text-kortty-text-dim whitespace-nowrap">{agentState.phase}</span>
-              <span className="text-kortty-text truncate">
-                {agentState.userMessage || agentState.summary}
-              </span>
-              {canSubmitPassword && pendingPasswordRequest && (
-                <>
-                  <input
-                    type="password"
-                    className="pointer-events-auto ml-auto w-44 rounded border border-kortty-border bg-kortty-bg px-2 py-0.5 text-[11px] text-kortty-text"
-                    placeholder="sudo password"
-                    value={passwordValue}
-                    onChange={(event) => {
-                      setAgentPasswords((prev) => ({
-                        ...prev,
-                        [node.sessionId]: event.target.value,
-                      }));
-                    }}
-                    onKeyDown={(event) => {
-                      if (event.key !== "Enter" || !passwordValue.trim()) {
-                        return;
-                      }
-                      event.preventDefault();
-                      onSubmitAgentPassword?.(pendingPasswordRequest, passwordValue);
-                      setAgentPasswords((prev) => ({
-                        ...prev,
-                        [node.sessionId]: "",
-                      }));
-                    }}
-                  />
-                  <button
-                    className="pointer-events-auto rounded bg-kortty-accent px-2 py-0.5 text-kortty-bg hover:bg-kortty-accent-hover transition-colors disabled:opacity-50"
-                    disabled={!passwordValue.trim()}
-                    onClick={() => {
-                      if (!passwordValue.trim()) {
-                        return;
-                      }
-                      onSubmitAgentPassword?.(pendingPasswordRequest, passwordValue);
-                      setAgentPasswords((prev) => ({
-                        ...prev,
-                        [node.sessionId]: "",
-                      }));
-                    }}
-                  >
-                    Unlock
-                  </button>
-                </>
-              )}
-              {canApprove && pendingApproval && (
-                <>
-                  <button
-                    className={`${canSubmitPassword ? "" : "ml-auto"} pointer-events-auto px-2 py-0.5 rounded bg-kortty-accent text-kortty-bg hover:bg-kortty-accent-hover transition-colors`}
-                    onClick={() => onApproveAgent?.(pendingApproval)}
-                  >
-                    Approve
-                  </button>
-                  {onApproveAgentAlways && (
-                    <button
-                      className="pointer-events-auto px-2 py-0.5 rounded bg-kortty-success/20 text-kortty-success hover:bg-kortty-success/30 transition-colors"
-                      onClick={() => onApproveAgentAlways(pendingApproval)}
-                    >
-                      Allow always
-                    </button>
-                  )}
-                </>
-              )}
-              {canStop && (
-                <button
-                  className={`${canApprove || canSubmitPassword ? "" : "ml-auto"} pointer-events-auto px-2 py-0.5 rounded bg-kortty-error/20 text-kortty-error hover:bg-kortty-error/30 transition-colors`}
-                  onClick={() => agentState.runId && onStopAgent?.(agentState.runId)}
-                >
-                  Stop
-                </button>
-              )}
-            </div>
-          )}
+          {agentPanelDock === "bottom" && renderAgentPanel(node, "bottom")}
           {allLeaves.length > 1 && !swapDrag && (
             <button
               className="absolute top-1 right-1 p-0.5 bg-kortty-surface/80 rounded opacity-0 group-hover:opacity-100 transition-opacity text-kortty-text-dim hover:text-kortty-error"
@@ -885,7 +1123,7 @@ export function TerminalSplitPane({
   }
 
   return (
-    <div className="relative flex flex-col w-full h-full">
+    <div ref={rootRef} className="relative flex flex-col w-full h-full">
       {allLeaves.length > 1 && (
         <div className="flex items-center gap-1 px-2 py-0.5 bg-kortty-surface border-b border-kortty-border">
           <button
@@ -904,7 +1142,11 @@ export function TerminalSplitPane({
           )}
         </div>
       )}
-      <div className="flex-1 min-h-0 overflow-hidden">{renderNode(tree)}</div>
+      <div className="flex flex-1 min-h-0 overflow-hidden">
+        {agentPanelDock === "left" && renderAgentSideRail()}
+        <div className="flex-1 min-w-0 min-h-0 overflow-hidden">{renderNode(tree)}</div>
+        {agentPanelDock === "right" && renderAgentSideRail()}
+      </div>
 
       {activeSessionIds.map((sessionId) => {
         const leaf = leafBySessionId.get(sessionId);
@@ -919,7 +1161,9 @@ export function TerminalSplitPane({
             sessionId={sessionId}
             connected={leaf.connected}
             agentCommandName={agentCommandName}
-            readOnly={readOnly}
+            agentCommandNameCaseInsensitive={agentCommandNameCaseInsensitive}
+            readOnly={readOnly || isActiveAgentState(agentRunStates?.[sessionId])}
+            forceAutoScroll={isActiveAgentState(agentRunStates?.[sessionId])}
             promptHookEnabled={promptHookEnabled}
             showTimestamps={showTimestamps}
             fontSize={paneFontSize}
@@ -1037,6 +1281,565 @@ export function TerminalSplitPane({
   );
 }
 
+type AgentExportFormat = "markdown" | "text" | "yaml" | "xml" | "json" | "pdf" | "asciidoc";
+
+type AgentExportRun = {
+  runId: string;
+  activities: AgentActivity[];
+};
+
+interface AgentActivityPanelProps {
+  sessionId: string;
+  dock: TerminalAgentPanelDock;
+  connectionLabel?: string;
+  agentState: TerminalAgentRunState;
+  active: boolean;
+  spinnerFrame: string;
+  elapsedMs: number;
+  activities: AgentActivity[];
+  runIds: string[];
+  selectedRunId: string;
+  collapsed: boolean;
+  height: number;
+  fontSize: number;
+  pendingApproval?: TerminalAgentApproval;
+  pendingPasswordRequest?: TerminalAgentPasswordRequest;
+  passwordValue: string;
+  onPasswordChange: (value: string) => void;
+  onSubmitPassword: () => void;
+  onApprove: () => void;
+  onApproveAlways: () => void;
+  onCancel: () => void;
+  onClose: () => void;
+  onToggleCollapsed: () => void;
+  onSelectRun: (runId: string) => void;
+  onRerun: () => void;
+  onHeightChange: (height: number) => void;
+  onFontSizeChange: (fontSize: number) => void;
+  onDockDragEnd: (clientX: number, clientY: number) => void;
+  buildAllRuns: () => AgentExportRun[];
+}
+
+function AgentActivityPanel({
+  sessionId,
+  dock,
+  connectionLabel,
+  agentState,
+  active,
+  spinnerFrame,
+  elapsedMs,
+  activities,
+  runIds,
+  selectedRunId,
+  collapsed,
+  height,
+  fontSize,
+  pendingApproval,
+  pendingPasswordRequest,
+  passwordValue,
+  onPasswordChange,
+  onSubmitPassword,
+  onApprove,
+  onApproveAlways,
+  onCancel,
+  onClose,
+  onToggleCollapsed,
+  onSelectRun,
+  onRerun,
+  onHeightChange,
+  onFontSizeChange,
+  onDockDragEnd,
+  buildAllRuns,
+}: AgentActivityPanelProps) {
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
+  const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set());
+  const [exportFormat, setExportFormat] = useState<AgentExportFormat>("markdown");
+  const [exportStatus, setExportStatus] = useState<string | null>(null);
+  const activityViewportRef = useRef<HTMLDivElement | null>(null);
+  const selectedIndex = Math.max(0, runIds.indexOf(selectedRunId));
+  const tokenUsage = activities.reduce(
+    (sum, activity) =>
+      activity.tokenUsage?.known ? sum + activity.tokenUsage.totalTokens : sum,
+    0,
+  );
+  const activityScrollKey = activities
+    .map((activity) => `${activity.id}:${activity.status}:${activity.summary.length}:${activity.detail.length}`)
+    .join("|");
+
+  useLayoutEffect(() => {
+    if (collapsed) {
+      return;
+    }
+    const viewport = activityViewportRef.current;
+    if (!viewport) {
+      return;
+    }
+    viewport.scrollTo({ top: viewport.scrollHeight, behavior: active ? "smooth" : "auto" });
+  }, [activityScrollKey, active, collapsed, selectedRunId]);
+
+  function startResize(event: React.MouseEvent<HTMLDivElement>) {
+    event.preventDefault();
+    const startY = event.clientY;
+    const startHeight = height;
+    function onMove(moveEvent: MouseEvent) {
+      onHeightChange(Math.min(520, Math.max(140, startHeight + startY - moveEvent.clientY)));
+    }
+    function onUp() {
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+    }
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
+  function startDockDrag(event: React.MouseEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let hasMoved = false;
+    const previousCursor = document.body.style.cursor;
+    document.body.style.cursor = "grabbing";
+
+    function onMove(moveEvent: MouseEvent) {
+      if (Math.abs(moveEvent.clientX - startX) > 8 || Math.abs(moveEvent.clientY - startY) > 8) {
+        hasMoved = true;
+      }
+    }
+
+    function onUp(upEvent: MouseEvent) {
+      document.body.style.cursor = previousCursor;
+      document.removeEventListener("mousemove", onMove);
+      document.removeEventListener("mouseup", onUp);
+      if (hasMoved) {
+        onDockDragEnd(upEvent.clientX, upEvent.clientY);
+      }
+    }
+
+    document.addEventListener("mousemove", onMove);
+    document.addEventListener("mouseup", onUp);
+  }
+
+  function isActivityExpanded(activity: AgentActivity) {
+    if (!activity.collapsible) {
+      return false;
+    }
+    if (collapsedIds.has(activity.id)) {
+      return false;
+    }
+    if (expandedIds.has(activity.id)) {
+      return true;
+    }
+    return !activity.collapsed;
+  }
+
+  function toggleActivity(activity: AgentActivity) {
+    if (!activity.collapsible) {
+      return;
+    }
+    const expanded = isActivityExpanded(activity);
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      if (expanded) {
+        next.delete(activity.id);
+      } else {
+        next.add(activity.id);
+      }
+      return next;
+    });
+    setCollapsedIds((prev) => {
+      const next = new Set(prev);
+      if (expanded) {
+        next.add(activity.id);
+      } else {
+        next.delete(activity.id);
+      }
+      return next;
+    });
+  }
+
+  function toggleAllActivities() {
+    const expandableIds = activities
+      .filter((activity) => activity.collapsible)
+      .map((activity) => activity.id);
+    if (expandableIds.length === 0) {
+      return;
+    }
+
+    if (expandableIds.every((id) => {
+      const activity = activities.find((candidate) => candidate.id === id);
+      return activity != null && isActivityExpanded(activity);
+    })) {
+      setExpandedIds((prev) => {
+        const next = new Set(prev);
+        for (const id of expandableIds) {
+          next.delete(id);
+        }
+        return next;
+      });
+      setCollapsedIds((prev) => {
+        const next = new Set(prev);
+        for (const id of expandableIds) {
+          next.add(id);
+        }
+        return next;
+      });
+      return;
+    }
+
+    setExpandedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of expandableIds) {
+        next.add(id);
+      }
+      return next;
+    });
+    setCollapsedIds((prev) => {
+      const next = new Set(prev);
+      for (const id of expandableIds) {
+        next.delete(id);
+      }
+      return next;
+    });
+  }
+
+  async function exportRuns(scope: "current" | "all") {
+    setExportStatus(null);
+    try {
+      const runs =
+        scope === "current"
+          ? [{ runId: selectedRunId, activities }]
+          : buildAllRuns().filter((run) => run.activities.length > 0);
+      if (runs.length === 0) {
+        return;
+      }
+      const extension = exportExtension(exportFormat);
+      const target = await saveDialog({
+        defaultPath: `kortty-agent-${scope}.${extension}`,
+        filters: [{ name: exportFormat.toUpperCase(), extensions: [extension] }],
+      });
+      if (typeof target === "string" && target.trim()) {
+        if (exportFormat === "pdf") {
+          await invoke("export_terminal_agent_activity_pdf", {
+            path: target,
+            text: buildTextExport(runs),
+          });
+        } else {
+          await writeTextFile(target, buildAgentExportContent(exportFormat, runs));
+        }
+        setExportStatus(`Exported to ${target}`);
+      }
+    } catch (error) {
+      console.error("Failed to export terminal agent activity:", error);
+      setExportStatus(`Export failed: ${String(error)}`);
+    }
+  }
+
+  const hasSideTitle = dock !== "bottom" && !!connectionLabel;
+  const sideTitleHeight = hasSideTitle ? AGENT_PANEL_SIDE_TITLE_HEIGHT : 0;
+  const visibleHeight = collapsed
+    ? AGENT_PANEL_COLLAPSED_HEIGHT + sideTitleHeight
+    : height;
+  const contentChromeHeight = AGENT_PANEL_COLLAPSED_HEIGHT + sideTitleHeight;
+  const panelClassName = dock === "bottom"
+    ? "absolute left-0 right-0 bottom-0 z-30 border-t border-kortty-border bg-kortty-surface/95 shadow-2xl"
+    : "relative w-full shrink-0 overflow-hidden rounded border border-kortty-border bg-kortty-surface/95 shadow-xl";
+  const sideLayout = dock !== "bottom";
+  const expandableActivityCount = activities.filter((activity) => activity.collapsible).length;
+  const allExpandableExpanded =
+    expandableActivityCount > 0 &&
+    activities
+      .filter((activity) => activity.collapsible)
+      .every((activity) => isActivityExpanded(activity));
+  const controlsPanel = (
+    <div
+      className={
+        sideLayout
+          ? "shrink-0 border-b border-kortty-border p-2 text-[11px] text-kortty-text-dim"
+          : "w-64 shrink-0 border-l border-kortty-border p-2 text-[11px] text-kortty-text-dim space-y-2"
+      }
+    >
+      <div className={sideLayout ? "flex flex-wrap items-center gap-2" : "space-y-2"}>
+        {pendingPasswordRequest && (
+          <div className={sideLayout ? "flex min-w-[220px] items-center gap-1" : "space-y-1"}>
+            <input
+              type="password"
+              className="input-field text-xs"
+              placeholder="sudo password"
+              value={passwordValue}
+              onChange={(event) => onPasswordChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" && passwordValue.trim()) {
+                  onSubmitPassword();
+                }
+              }}
+            />
+            <button className={`btn-primary text-xs ${sideLayout ? "shrink-0" : "w-full"}`} disabled={!passwordValue.trim()} onClick={onSubmitPassword}>
+              Unlock
+            </button>
+          </div>
+        )}
+        {pendingApproval && (
+          <div className="flex gap-1">
+            <button className="btn-primary flex-1 text-xs" onClick={onApprove}>Approve</button>
+            <button className="btn-secondary flex-1 text-xs" onClick={onApproveAlways}>Allow always</button>
+          </div>
+        )}
+        <div className={sideLayout ? "flex min-w-[96px] items-center gap-1" : "flex items-center gap-1"}>
+          <button className="icon-button" title="Decrease font" onClick={() => onFontSizeChange(Math.max(9, fontSize - 1))}>
+            <Minus className="w-3.5 h-3.5" />
+          </button>
+          <span className="flex-1 text-center font-mono">{fontSize}px</span>
+          <button className="icon-button" title="Increase font" onClick={() => onFontSizeChange(Math.min(20, fontSize + 1))}>
+            <Plus className="w-3.5 h-3.5" />
+          </button>
+        </div>
+        <button
+          className={`btn-secondary text-xs ${sideLayout ? "shrink-0" : "w-full"}`}
+          disabled={expandableActivityCount === 0}
+          onClick={toggleAllActivities}
+        >
+          {allExpandableExpanded ? "Collapse all" : "Expand all"}
+        </button>
+        <select className={`input-field text-xs ${sideLayout ? "w-36 shrink-0" : ""}`} value={exportFormat} onChange={(event) => setExportFormat(event.target.value as AgentExportFormat)}>
+          <option value="markdown">Markdown</option>
+          <option value="text">Plain text</option>
+          <option value="yaml">YAML</option>
+          <option value="xml">XML</option>
+          <option value="json">JSON</option>
+          <option value="pdf">PDF</option>
+          <option value="asciidoc">Asciidoctor</option>
+        </select>
+        <button className={`btn-secondary flex items-center justify-center gap-2 text-xs ${sideLayout ? "shrink-0" : "w-full"}`} onClick={() => void exportRuns("current")}>
+          <Download className="w-3.5 h-3.5" /> Current run
+        </button>
+        <button className={`btn-secondary flex items-center justify-center gap-2 text-xs ${sideLayout ? "shrink-0" : "w-full"}`} onClick={() => void exportRuns("all")}>
+          <Download className="w-3.5 h-3.5" /> All runs
+        </button>
+        {exportStatus && (
+          <div className={`rounded border border-kortty-border bg-kortty-bg/60 px-2 py-1 text-[10px] text-kortty-text-dim ${sideLayout ? "min-w-0 flex-1 truncate" : ""}`}>
+            {exportStatus}
+          </div>
+        )}
+        <div className={`font-mono text-[10px] text-kortty-text-dim truncate ${sideLayout ? "min-w-[120px] max-w-full" : ""}`}>{sessionId}</div>
+      </div>
+    </div>
+  );
+
+  return (
+    <div
+      className={panelClassName}
+      style={{ height: visibleHeight }}
+    >
+      {hasSideTitle && (
+        <div className="flex h-7 min-w-0 items-center gap-2 border-b border-kortty-border bg-kortty-bg/60 px-2 text-[11px]">
+          <span className="truncate font-medium text-kortty-text">{connectionLabel}</span>
+          <span className="ml-auto shrink-0 text-kortty-text-dim">AI Agent</span>
+        </div>
+      )}
+      <div className="h-1 cursor-row-resize bg-kortty-border/60 hover:bg-kortty-accent" onMouseDown={startResize} />
+      <div className="flex h-9 min-w-0 items-center gap-2 overflow-hidden px-2 text-[11px] border-b border-kortty-border">
+        <button className="icon-button cursor-grab active:cursor-grabbing" title="Move AI Agent panel" onMouseDown={startDockDrag}>
+          <GripVertical className="w-3.5 h-3.5" />
+        </button>
+        <span className="font-medium text-kortty-accent whitespace-nowrap">AI Agent</span>
+        {active && <span className="font-mono text-kortty-accent">{spinnerFrame}</span>}
+        <span className="font-mono text-kortty-text-dim">{formatAgentElapsed(elapsedMs)}</span>
+        <span className="text-kortty-text-dim whitespace-nowrap">{agentState.phase}</span>
+        <span className="min-w-0 flex-1 truncate text-kortty-text">{agentState.userMessage || agentState.summary}</span>
+        <span className="shrink-0 whitespace-nowrap text-kortty-text-dim">
+          {tokenUsage > 0 ? `${tokenUsage} tokens` : "tokens unknown"}
+        </span>
+        <button className="icon-button" title="Previous run" disabled={selectedIndex <= 0} onClick={() => onSelectRun(runIds[selectedIndex - 1])}>
+          <ChevronUp className="w-3.5 h-3.5" />
+        </button>
+        <button className="icon-button" title="Next run" disabled={selectedIndex >= runIds.length - 1} onClick={() => onSelectRun(runIds[selectedIndex + 1])}>
+          <ChevronDown className="w-3.5 h-3.5" />
+        </button>
+        <button className="icon-button" title="Rerun" onClick={onRerun}>
+          <RotateCcw className="w-3.5 h-3.5" />
+        </button>
+        {active && (
+          <button className="icon-button text-kortty-error" title="Cancel" onClick={onCancel}>
+            <Square className="w-3.5 h-3.5" />
+          </button>
+        )}
+        <button className="icon-button" title={collapsed ? "Expand panel" : "Collapse panel"} onClick={onToggleCollapsed}>
+          {collapsed ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+        </button>
+        <button className="icon-button" title="Close panel" onClick={onClose}>
+          <X className="w-3.5 h-3.5" />
+        </button>
+      </div>
+      {!collapsed && (
+        <div className={sideLayout ? "flex min-h-0 flex-col" : "flex min-h-0"} style={{ height: `calc(100% - ${contentChromeHeight}px)` }}>
+          {sideLayout && controlsPanel}
+          <div
+            ref={activityViewportRef}
+            className="flex-1 min-w-0 overflow-y-auto px-2 py-2"
+            style={{ fontSize }}
+          >
+            {activities.length === 0 ? (
+              <div className="text-kortty-text-dim">Waiting for agent activity.</div>
+            ) : (
+              activities.map((activity) => {
+                const expanded = isActivityExpanded(activity);
+                return (
+                  <div key={activity.id} className="mb-1 rounded border border-kortty-border bg-kortty-bg/70">
+                    <button
+                      className="flex w-full items-start gap-2 px-2 py-1.5 text-left"
+                      onClick={() => activity.collapsible && toggleActivity(activity)}
+                    >
+                      <span className={`mt-1 h-2 w-2 rounded-full ${activityDotClass(activity)}`} />
+                      <span className="min-w-0 flex-1">
+                        <span className="block truncate text-kortty-text">{activityTitle(activity)}</span>
+                        <span className="block truncate text-kortty-text-dim">{activity.summary}</span>
+                      </span>
+                      <span className="font-mono text-kortty-text-dim whitespace-nowrap">
+                        {activity.elapsedSeconds}s
+                      </span>
+                      <span className="font-mono text-kortty-text-dim whitespace-nowrap">
+                        {formatTokenUsage(activity)}
+                      </span>
+                    </button>
+                    {expanded && activity.detail.trim() && (
+                      <pre className="max-h-48 overflow-auto whitespace-pre-wrap border-t border-kortty-border px-2 py-1.5 font-mono text-kortty-text-dim">
+                        {activity.detail}
+                      </pre>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+          {!sideLayout && controlsPanel}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function extractAgentPrompt(state: TerminalAgentRunState, activities: AgentActivity[]) {
+  const startDetail = activities.find((activity) => activity.id.endsWith(":message:start"))?.detail;
+  return (startDetail || state.userMessage || state.summary || "").trim();
+}
+
+function activityTitle(activity: AgentActivity) {
+  return `${activity.activityType} · ${activity.status} · ${activity.title}`;
+}
+
+function activityDotClass(activity: AgentActivity) {
+  if (activity.status === "Running") return "bg-kortty-accent animate-pulse";
+  if (activity.status === "Completed") return "bg-kortty-success";
+  if (activity.status === "Cancelled") return "bg-kortty-warning";
+  return "bg-kortty-error";
+}
+
+function formatTokenUsage(activity: AgentActivity) {
+  const usage = activity.tokenUsage;
+  if (!usage?.known) return "-";
+  return `${usage.totalTokens}`;
+}
+
+function exportExtension(format: AgentExportFormat) {
+  switch (format) {
+    case "markdown": return "md";
+    case "text": return "txt";
+    case "yaml": return "yaml";
+    case "xml": return "xml";
+    case "json": return "json";
+    case "pdf": return "pdf";
+    case "asciidoc": return "adoc";
+  }
+}
+
+function buildAgentExportContent(format: AgentExportFormat, runs: AgentExportRun[]) {
+  switch (format) {
+    case "json":
+      return JSON.stringify({ exportedAt: new Date().toISOString(), runs }, null, 2);
+    case "yaml":
+      return buildYamlExport(runs);
+    case "xml":
+      return buildXmlExport(runs);
+    case "text":
+      return buildTextExport(runs);
+    case "asciidoc":
+      return buildAsciiDocExport(runs);
+    case "pdf":
+      return buildTextExport(runs);
+    case "markdown":
+      return buildMarkdownExport(runs);
+  }
+}
+
+function buildMarkdownExport(runs: AgentExportRun[]) {
+  return runs.map((run) => [
+    `# Terminal Agent Run ${run.runId}`,
+    ...run.activities.map((activity) =>
+      `## ${activityTitle(activity)}\n\n${activity.summary}\n\n${activity.detail ? "```text\n" + activity.detail + "\n```" : ""}`,
+    ),
+  ].join("\n\n")).join("\n\n");
+}
+
+function buildTextExport(runs: AgentExportRun[]) {
+  return runs.map((run) => [
+    `Terminal Agent Run ${run.runId}`,
+    ...run.activities.map((activity) =>
+      `${activityTitle(activity)}\n${activity.summary}${activity.detail ? "\n" + activity.detail : ""}`,
+    ),
+  ].join("\n\n")).join("\n\n");
+}
+
+function buildAsciiDocExport(runs: AgentExportRun[]) {
+  return runs.map((run) => [
+    `= Terminal Agent Run ${run.runId}`,
+    ...run.activities.map((activity) =>
+      `== ${activityTitle(activity)}\n\n${activity.summary}${activity.detail ? "\n\n----\n" + activity.detail + "\n----" : ""}`,
+    ),
+  ].join("\n\n")).join("\n\n");
+}
+
+function buildYamlExport(runs: AgentExportRun[]) {
+  const lines = [`exportedAt: ${JSON.stringify(new Date().toISOString())}`, "runs:"];
+  for (const run of runs) {
+    lines.push(`  - runId: ${JSON.stringify(run.runId)}`, "    activities:");
+    for (const activity of run.activities) {
+      lines.push(
+        `      - id: ${JSON.stringify(activity.id)}`,
+        `        type: ${JSON.stringify(activity.activityType)}`,
+        `        status: ${JSON.stringify(activity.status)}`,
+        `        title: ${JSON.stringify(activity.title)}`,
+        `        summary: ${JSON.stringify(activity.summary)}`,
+        `        detail: ${JSON.stringify(activity.detail)}`,
+        `        elapsedSeconds: ${activity.elapsedSeconds}`,
+        `        totalTokens: ${activity.tokenUsage?.known ? activity.tokenUsage.totalTokens : 0}`,
+      );
+    }
+  }
+  return lines.join("\n");
+}
+
+function buildXmlExport(runs: AgentExportRun[]) {
+  return [
+    `<?xml version="1.0" encoding="UTF-8"?>`,
+    `<terminalAgentExport exportedAt="${escapeXml(new Date().toISOString())}">`,
+    ...runs.map((run) =>
+      `  <run id="${escapeXml(run.runId)}">\n${run.activities.map((activity) =>
+        `    <activity id="${escapeXml(activity.id)}" type="${escapeXml(activity.activityType)}" status="${escapeXml(activity.status)}" elapsedSeconds="${activity.elapsedSeconds}">\n      <title>${escapeXml(activity.title)}</title>\n      <summary>${escapeXml(activity.summary)}</summary>\n      <detail>${escapeXml(activity.detail)}</detail>\n    </activity>`,
+      ).join("\n")}\n  </run>`,
+    ),
+    `</terminalAgentExport>`,
+  ].join("\n");
+}
+
+function escapeXml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 function CtxItem({
   label,
   shortcut,
@@ -1094,7 +1897,9 @@ interface TerminalPortalProps {
   sessionId: string;
   connected: boolean;
   agentCommandName?: string;
+  agentCommandNameCaseInsensitive?: boolean;
   readOnly?: boolean;
+  forceAutoScroll?: boolean;
   promptHookEnabled?: boolean;
   showTimestamps: boolean;
   fontSize: number;
@@ -1111,7 +1916,9 @@ function TerminalPortal({
   sessionId,
   connected,
   agentCommandName,
+  agentCommandNameCaseInsensitive = false,
   readOnly = false,
+  forceAutoScroll = false,
   promptHookEnabled = true,
   showTimestamps,
   fontSize,
@@ -1127,7 +1934,9 @@ function TerminalPortal({
       sessionId={sessionId}
       connected={connected}
       agentCommandName={agentCommandName}
+      agentCommandNameCaseInsensitive={agentCommandNameCaseInsensitive}
       readOnly={readOnly}
+      forceAutoScroll={forceAutoScroll}
       promptHookEnabled={promptHookEnabled}
       showTimestamps={showTimestamps}
       fontSize={fontSize}

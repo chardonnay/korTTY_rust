@@ -64,6 +64,7 @@ pub fn run() {
             commands::terminal_agent_commands::approve_terminal_agent_always,
             commands::terminal_agent_commands::cancel_terminal_agent,
             commands::terminal_agent_commands::submit_terminal_agent_sudo_password,
+            commands::terminal_agent_commands::export_terminal_agent_activity_pdf,
             commands::connection_commands::get_connections,
             commands::connection_commands::save_connection,
             commands::connection_commands::delete_connection,
