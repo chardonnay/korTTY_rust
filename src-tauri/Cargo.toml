@@ -17,6 +17,8 @@ tauri-build = { version = "2", features = [] }
 [patch.crates-io]
 # Keep russh's forked ssh-key crate RSA-free until upstream ships a non-vulnerable RSA path.
 internal-russh-forked-ssh-key = { path = "vendor/internal-russh-forked-ssh-key" }
+# Backport GHSA-wrw7-89jp-8q8g fix while Tauri 2.11.1 still pulls gtk 0.18/glib 0.18.
+glib = { path = "vendor/glib-0.18.5-kortty" }
 
 [dependencies]
 tauri = { version = "2", features = ["tray-icon"] }
