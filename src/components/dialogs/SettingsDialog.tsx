@@ -1,8 +1,9 @@
 import { useState, useEffect } from "react";
 import { X, Settings } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { useSettingsStore, GlobalSettings } from "../../store/settingsStore";
-import type { AiProfile } from "../../types/ai";
+import type { AiProfile, AiSkill } from "../../types/ai";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 import {
   DEFAULT_TERMINAL_AGENT_COMMAND_NAME,
@@ -63,6 +64,8 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
   const [translationTargetLang, setTranslationTargetLang] = useState("en");
   const [generating, setGenerating] = useState(false);
   const [aiProfiles, setAiProfiles] = useState<AiProfile[]>([]);
+  const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
+  const [skillDraft, setSkillDraft] = useState<AiSkill | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -73,12 +76,22 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
           console.error("Failed to load AI profiles for settings:", error);
           setAiProfiles([]);
         });
+      invoke<AiSkill[]>("get_ai_skills")
+        .then((skills) => update({ aiSkills: skills }))
+        .catch((error) => {
+          console.error("Failed to load AI skills:", error);
+        });
     }
   }, [open, loadSettings]);
 
   useEffect(() => {
     setLocal(settings);
   }, [settings]);
+
+  useEffect(() => {
+    const selected = local.aiSkills.find((skill) => skill.id === selectedSkillId) ?? null;
+    setSkillDraft(selected ? { ...selected, tags: [...selected.tags] } : null);
+  }, [local.aiSkills, selectedSkillId]);
 
   if (!open) return null;
 
@@ -102,6 +115,7 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
         terminalAgentPanelSideWidth: clampOptionalNumber(local.terminalAgentPanelSideWidth, 360, 720),
         terminalAgentPanelFontSize: clampOptionalNumber(local.terminalAgentPanelFontSize, 9, 20),
       };
+      await invoke("save_ai_skills", { skills: nextSettings.aiSkills });
       await saveSettings(nextSettings);
       onSaved?.(nextSettings);
       onClose();
@@ -144,6 +158,48 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
     } finally {
       setGenerating(false);
     }
+  }
+
+  function updateSkillDraft(partial: Partial<AiSkill>) {
+    setSkillDraft((current) => current ? { ...current, ...partial } : current);
+  }
+
+  function upsertSkill(skill: AiSkill) {
+    const normalized = {
+      ...skill,
+      name: skill.name.trim() || "AI Skill",
+      tags: skill.tags.map((tag) => tag.trim()).filter(Boolean),
+    };
+    update({
+      aiSkills: local.aiSkills.some((candidate) => candidate.id === normalized.id)
+        ? local.aiSkills.map((candidate) => candidate.id === normalized.id ? normalized : candidate)
+        : [...local.aiSkills, normalized],
+    });
+    setSelectedSkillId(normalized.id);
+  }
+
+  async function importAiSkill() {
+    const path = await openDialog({
+      multiple: false,
+      filters: [{ name: "Markdown", extensions: ["md", "markdown"] }],
+    });
+    if (typeof path !== "string") return;
+    try {
+      const imported = await invoke<AiSkill>("import_ai_skill_markdown", { path });
+      upsertSkill(imported);
+    } catch (error) {
+      console.error("AI Skill import failed:", error);
+    }
+  }
+
+  async function exportAiSkill() {
+    if (!skillDraft) return;
+    const path = await saveDialog({
+      defaultPath: `${skillDraft.name || "kortty-ai-skill"}.md`,
+      filters: [{ name: "Markdown", extensions: ["md"] }],
+    });
+    if (typeof path !== "string") return;
+    await invoke("export_ai_skill_markdown", { path, skill: skillDraft });
   }
 
   const tabs: { id: TabId; label: string }[] = [
@@ -310,6 +366,75 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
                   </p>
                 )}
               </div>
+              <div className="grid grid-cols-2 gap-3 rounded border border-kortty-border bg-kortty-panel/30 p-3">
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Tavily API key</label>
+                  <input
+                    className="input-field"
+                    type="password"
+                    value={local.aiTavilyApiKey || ""}
+                    onChange={(e) => update({ aiTavilyApiKey: e.target.value || undefined })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Bright Data token</label>
+                  <input
+                    className="input-field"
+                    type="password"
+                    value={local.aiBrightDataApiToken || ""}
+                    onChange={(e) => update({ aiBrightDataApiToken: e.target.value || undefined })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Brave Search API key</label>
+                  <input
+                    className="input-field"
+                    type="password"
+                    value={local.aiBraveSearchApiKey || ""}
+                    onChange={(e) => update({ aiBraveSearchApiKey: e.target.value || undefined })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">SearXNG URL</label>
+                  <input
+                    className="input-field"
+                    value={local.aiSearxngUrl || ""}
+                    onChange={(e) => update({ aiSearxngUrl: e.target.value || undefined })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Tavily MCP label</label>
+                  <input
+                    className="input-field"
+                    value={local.aiTavilyMcpServerLabel}
+                    onChange={(e) => update({ aiTavilyMcpServerLabel: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Bright Data MCP label</label>
+                  <input
+                    className="input-field"
+                    value={local.aiBrightDataMcpServerLabel}
+                    onChange={(e) => update({ aiBrightDataMcpServerLabel: e.target.value })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Brave plugin ID</label>
+                  <input
+                    className="input-field"
+                    value={local.aiBraveSearchMcpPluginId || ""}
+                    onChange={(e) => update({ aiBraveSearchMcpPluginId: e.target.value || undefined })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">LM Studio toolpack plugin ID</label>
+                  <input
+                    className="input-field"
+                    value={local.aiLmStudioToolpackMcpPluginId || ""}
+                    onChange={(e) => update({ aiLmStudioToolpackMcpPluginId: e.target.value || undefined })}
+                  />
+                </div>
+              </div>
               <div>
                 <label className="block text-xs text-kortty-text-dim mb-1">Agent command name</label>
                 <input
@@ -446,6 +571,84 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
                   />
                 </div>
               </div>
+              <div className="rounded border border-kortty-border bg-kortty-panel/30 p-3">
+                <div className="mb-3 flex items-center gap-2">
+                  <span className="font-medium text-xs">AI Skills</span>
+                  <button
+                    className="btn-primary text-xs"
+                    onClick={() => {
+                      const skill: AiSkill = {
+                        id: crypto.randomUUID(),
+                        name: "AI Skill",
+                        description: "",
+                        tags: [],
+                        enabled: true,
+                        target: "Both",
+                        content: "",
+                      };
+                      upsertSkill(skill);
+                    }}
+                  >
+                    Add
+                  </button>
+                  <button className="btn-secondary text-xs" onClick={() => void importAiSkill()}>Import Markdown</button>
+                  <button className="btn-secondary text-xs" disabled={!skillDraft} onClick={() => void exportAiSkill()}>Export</button>
+                  <button
+                    className="btn-secondary text-xs text-kortty-error"
+                    disabled={!skillDraft}
+                    onClick={() => {
+                      if (!skillDraft) return;
+                      update({ aiSkills: local.aiSkills.filter((skill) => skill.id !== skillDraft.id) });
+                      setSelectedSkillId(null);
+                    }}
+                  >
+                    Delete
+                  </button>
+                </div>
+                <div className="grid grid-cols-[220px_minmax(0,1fr)] gap-3">
+                  <div className="max-h-72 overflow-y-auto rounded border border-kortty-border bg-kortty-bg/40 p-1">
+                    {local.aiSkills.map((skill) => (
+                      <button
+                        key={skill.id}
+                        className={`mb-1 w-full rounded px-2 py-1.5 text-left text-xs ${selectedSkillId === skill.id ? "bg-kortty-accent/10 text-kortty-accent" : "hover:bg-kortty-panel"}`}
+                        onClick={() => setSelectedSkillId(skill.id)}
+                      >
+                        <div className="truncate font-medium">{skill.name || "AI Skill"}</div>
+                        <div className="truncate text-[10px] text-kortty-text-dim">{skill.target} · {skill.enabled ? "enabled" : "disabled"}</div>
+                      </button>
+                    ))}
+                    {local.aiSkills.length === 0 && <div className="p-2 text-xs text-kortty-text-dim">No AI Skills configured.</div>}
+                  </div>
+                  {skillDraft ? (
+                    <div className="space-y-2">
+                      <div className="grid grid-cols-2 gap-2">
+                        <div>
+                          <label className="block text-xs text-kortty-text-dim mb-1">Name</label>
+                          <input className="input-field" value={skillDraft.name} onChange={(e) => updateSkillDraft({ name: e.target.value })} />
+                        </div>
+                        <div>
+                          <label className="block text-xs text-kortty-text-dim mb-1">Target</label>
+                          <select className="input-field" value={skillDraft.target} onChange={(e) => updateSkillDraft({ target: e.target.value as AiSkill["target"] })}>
+                            <option value="Chat">Chat</option>
+                            <option value="Agent">Agent</option>
+                            <option value="Both">Both</option>
+                          </select>
+                        </div>
+                      </div>
+                      <label className="flex items-center gap-2 text-xs">
+                        <input type="checkbox" checked={skillDraft.enabled} onChange={(e) => updateSkillDraft({ enabled: e.target.checked })} />
+                        Enabled
+                      </label>
+                      <input className="input-field" placeholder="Description" value={skillDraft.description || ""} onChange={(e) => updateSkillDraft({ description: e.target.value || undefined })} />
+                      <input className="input-field" placeholder="Tags, comma separated" value={skillDraft.tags.join(", ")} onChange={(e) => updateSkillDraft({ tags: e.target.value.split(",").map((tag) => tag.trim()).filter(Boolean) })} />
+                      <textarea className="input-field min-h-36 font-mono" value={skillDraft.content} onChange={(e) => updateSkillDraft({ content: e.target.value })} />
+                      <button className="btn-primary text-xs" onClick={() => upsertSkill(skillDraft)}>Apply Skill</button>
+                    </div>
+                  ) : (
+                    <div className="flex items-center justify-center text-xs text-kortty-text-dim">Select a skill.</div>
+                  )}
+                </div>
+              </div>
             </>
           )}
 
@@ -531,6 +734,15 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
                 />
                 Store dashboard state
               </label>
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={local.jobSchedulerShowMenuBarStatus}
+                  onChange={(e) => update({ jobSchedulerShowMenuBarStatus: e.target.checked })}
+                  className="rounded border-kortty-border"
+                />
+                Show JobScheduler status in the menu bar when available
+              </label>
             </>
           )}
 
@@ -583,6 +795,47 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
                     update({ defaultScrollbackLines: parseInt(e.target.value) || 10000 })
                   }
                 />
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Default terminal effect ID</label>
+                  <input
+                    className="input-field"
+                    value={local.defaultTerminalEffectPluginId || ""}
+                    onChange={(e) => update({ defaultTerminalEffectPluginId: e.target.value || undefined })}
+                    placeholder="mother"
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Default effect speed</label>
+                  <input
+                    className="input-field"
+                    type="number"
+                    min={1}
+                    max={99}
+                    value={local.defaultTerminalEffectAnimationSpeed}
+                    onChange={(e) => update({ defaultTerminalEffectAnimationSpeed: Math.min(99, Math.max(1, Number(e.target.value) || 1)) })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">Job journal retention days</label>
+                  <input
+                    className="input-field"
+                    type="number"
+                    min={1}
+                    value={local.jobSchedulerJournalRetentionDays}
+                    onChange={(e) => update({ jobSchedulerJournalRetentionDays: Math.max(1, Number(e.target.value) || 14) })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">rsync path</label>
+                  <input
+                    className="input-field"
+                    value={local.jobSchedulerRsyncPath || ""}
+                    onChange={(e) => update({ jobSchedulerRsyncPath: e.target.value || undefined })}
+                    placeholder="rsync"
+                  />
+                </div>
               </div>
               <label className="flex items-center gap-2 text-xs">
                 <input

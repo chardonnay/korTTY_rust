@@ -29,3 +29,137 @@
 .xterm-viewport::-webkit-scrollbar-thumb:hover {
   background: #4a4a5c;
 }
+
+.kortty-terminal-effect-mother {
+  position: relative;
+  background: #000;
+  filter: contrast(1.18) saturate(1.22);
+}
+
+.kortty-terminal-effect-mother .xterm {
+  background: #000 !important;
+  text-shadow:
+    0 0 2px rgba(25, 255, 76, 0.8),
+    0 0 8px rgba(25, 255, 76, 0.28);
+}
+
+.kortty-terminal-effect-mother .xterm-screen,
+.kortty-terminal-effect-mother .xterm-viewport {
+  background: #000 !important;
+}
+
+.kortty-terminal-effect-mother .xterm-cursor-block {
+  box-shadow: 0 0 10px rgba(242, 242, 242, 0.78);
+}
+
+.kortty-mother-terminal-host {
+  background:
+    radial-gradient(circle at 50% 42%, rgba(25, 255, 76, 0.10), transparent 58%),
+    #000;
+}
+
+.kortty-mother-line-flash-layer,
+.kortty-mother-crt-overlay {
+  pointer-events: none;
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+}
+
+.kortty-mother-line-flash-layer {
+  z-index: 18;
+}
+
+.kortty-mother-crt-overlay {
+  z-index: 20;
+}
+
+.kortty-mother-crt-overlay::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    repeating-linear-gradient(
+      0deg,
+      rgba(0, 0, 0, 0.30) 0,
+      rgba(0, 0, 0, 0.30) 1px,
+      transparent 1px,
+      transparent 4px
+    ),
+    repeating-linear-gradient(
+      0deg,
+      transparent 0,
+      transparent 7px,
+      rgba(40, 255, 80, 0.055) 7px,
+      rgba(40, 255, 80, 0.055) 8px
+    ),
+    linear-gradient(
+      90deg,
+      rgba(255, 0, 0, 0.05),
+      rgba(0, 255, 0, 0.018),
+      rgba(0, 0, 255, 0.05)
+    );
+  background-size: 100% 4px, 100% 8px, 4px 100%;
+  mix-blend-mode: screen;
+}
+
+.kortty-mother-crt-overlay::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background:
+    linear-gradient(90deg, rgba(0, 0, 0, 0.25), transparent 4%, transparent 96%, rgba(0, 0, 0, 0.25)),
+    linear-gradient(0deg, rgba(0, 0, 0, 0.26), transparent 7%, transparent 93%, rgba(0, 0, 0, 0.28)),
+    radial-gradient(ellipse at center, transparent 56%, rgba(0, 0, 0, 0.18) 100%);
+}
+
+.kortty-mother-noise {
+  position: absolute;
+  inset: 0;
+  opacity: 0.20;
+  background-image:
+    radial-gradient(circle at 13% 17%, rgba(180, 255, 190, 0.24) 0 1px, transparent 1px),
+    radial-gradient(circle at 47% 53%, rgba(180, 255, 190, 0.16) 0 1px, transparent 1px),
+    radial-gradient(circle at 79% 31%, rgba(180, 255, 190, 0.18) 0 1px, transparent 1px);
+  background-size: 91px 77px, 137px 113px, 173px 149px;
+  animation: kortty-mother-noise 140ms steps(2, end) infinite;
+}
+
+.kortty-mother-line-flash {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-radius: 2px;
+  background:
+    linear-gradient(
+      180deg,
+      rgba(245, 255, 210, 0.12),
+      rgba(150, 255, 175, 0.24) 45%,
+      rgba(25, 255, 76, 0.08)
+    );
+  box-shadow:
+    0 0 12px rgba(25, 255, 76, 0.55),
+    inset 0 1px 0 rgba(245, 255, 210, 0.18);
+  mix-blend-mode: screen;
+  animation: kortty-mother-line-flash 260ms ease-out forwards;
+}
+
+@keyframes kortty-mother-line-flash {
+  from {
+    opacity: 1;
+    transform: scaleY(1.06);
+  }
+  to {
+    opacity: 0;
+    transform: scaleY(1);
+  }
+}
+
+@keyframes kortty-mother-noise {
+  from {
+    transform: translate3d(0, 0, 0);
+  }
+  to {
+    transform: translate3d(3px, -2px, 0);
+  }
+}

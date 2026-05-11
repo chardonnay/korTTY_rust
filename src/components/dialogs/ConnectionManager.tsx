@@ -4,6 +4,13 @@ import { invoke } from "@tauri-apps/api/core";
 import { useConnectionStore, ConnectionSettings } from "../../store/connectionStore";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 import type { ThemeData } from "../../store/themeStore";
+import type { TerminalEffectPluginEntry } from "../../types/terminalEffects";
+import {
+  TERMINAL_EFFECT_SPEED_MAXIMUM,
+  TERMINAL_EFFECT_SPEED_MINIMUM,
+  TERMINAL_EFFECT_SPEED_SLIDER_MAXIMUM,
+  normalizeTerminalEffectSpeed,
+} from "../../types/terminalEffects";
 import { RestoreTeamworkDialog } from "./RestoreTeamworkDialog";
 
 interface ConnectionManagerProps {
@@ -19,12 +26,14 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [themes, setThemes] = useState<ThemeData[]>([]);
+  const [terminalEffects, setTerminalEffects] = useState<TerminalEffectPluginEntry[]>([]);
   const [showRestoreDialog, setShowRestoreDialog] = useState(false);
 
   useEffect(() => {
     if (open) {
       loadConnections();
       invoke<ThemeData[]>("get_themes").then(setThemes).catch(console.error);
+      invoke<TerminalEffectPluginEntry[]>("list_terminal_effect_plugins").then(setTerminalEffects).catch(console.error);
     }
   }, [open, loadConnections]);
 
@@ -50,6 +59,9 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
 
   const selected = connections.find((c) => c.id === selectedId);
   const selectedTheme = selected?.themeId ? themes.find((theme) => theme.id === selected.themeId) : undefined;
+  const selectedTerminalEffect = selected?.terminalEffectPluginId
+    ? terminalEffects.find((effect) => effect.id === selected.terminalEffectPluginId)
+    : undefined;
 
   function handleConnectSelected(connectionId: string) {
     const latestConnection =
@@ -77,6 +89,20 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
           themeId: undefined,
         };
     await saveConnection(nextConnection);
+  }
+
+  async function handleTerminalEffectChange(connection: ConnectionSettings, pluginId: string) {
+    await saveConnection({
+      ...connection,
+      terminalEffectPluginId: pluginId || undefined,
+    });
+  }
+
+  async function handleTerminalEffectSpeedChange(connection: ConnectionSettings, value: number) {
+    await saveConnection({
+      ...connection,
+      terminalEffectAnimationSpeed: normalizeTerminalEffectSpeed(value),
+    });
   }
 
   return (
@@ -185,6 +211,13 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
                     </div>
                   </div>
                   <div>
+                    <label className="text-kortty-text-dim">Terminal Effect</label>
+                    <p>
+                      {selectedTerminalEffect?.name ??
+                        (selected.terminalEffectPluginId ? selected.terminalEffectPluginId : "None")}
+                    </p>
+                  </div>
+                  <div>
                     <label className="text-kortty-text-dim">Last Used</label>
                     <p>{selected.lastUsed || "Never"}</p>
                   </div>
@@ -235,6 +268,58 @@ export function ConnectionManager({ open, onClose, onConnect, onEdit }: Connecti
                     <span className="truncate">
                       {selectedTheme?.name ?? "Custom terminal colors"} · {selected.fontFamily}, {selected.fontSize}px
                     </span>
+                  </div>
+                  <div className="border-t border-kortty-border/70 pt-3">
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
+                        <label className="block text-kortty-text-dim mb-1">Terminal Effect</label>
+                        <select
+                          className="input-field"
+                          value={selected.terminalEffectPluginId || ""}
+                          onChange={(event) => {
+                            void handleTerminalEffectChange(selected, event.target.value);
+                          }}
+                        >
+                          <option value="">None</option>
+                          {terminalEffects
+                            .filter((effect) => effect.enabled || effect.id === selected.terminalEffectPluginId)
+                            .map((effect) => (
+                              <option key={effect.id} value={effect.id}>
+                                {effect.name}{effect.enabled ? "" : " (disabled)"}
+                              </option>
+                            ))}
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-kortty-text-dim mb-1">Effect Speed</label>
+                        <div className="flex items-center gap-2">
+                          <input
+                            className="flex-1 accent-kortty-accent"
+                            type="range"
+                            min={TERMINAL_EFFECT_SPEED_MINIMUM}
+                            max={TERMINAL_EFFECT_SPEED_SLIDER_MAXIMUM}
+                            step={1}
+                            value={Math.min(
+                              TERMINAL_EFFECT_SPEED_SLIDER_MAXIMUM,
+                              selected.terminalEffectAnimationSpeed || 1,
+                            )}
+                            onChange={(event) => {
+                              void handleTerminalEffectSpeedChange(selected, Number(event.target.value));
+                            }}
+                          />
+                          <input
+                            className="input-field w-20"
+                            type="number"
+                            min={TERMINAL_EFFECT_SPEED_MINIMUM}
+                            max={TERMINAL_EFFECT_SPEED_MAXIMUM}
+                            value={selected.terminalEffectAnimationSpeed || 1}
+                            onChange={(event) => {
+                              void handleTerminalEffectSpeedChange(selected, Number(event.target.value));
+                            }}
+                          />
+                        </div>
+                      </div>
+                    </div>
                   </div>
                 </div>
               </div>

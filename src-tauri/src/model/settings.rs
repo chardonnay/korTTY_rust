@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::ai::AiSkill;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BackupEncryptionType {
     Password,
@@ -118,6 +120,40 @@ pub struct GlobalSettings {
     pub terminal_agent_panel_font_size: Option<f64>,
     #[serde(default)]
     pub default_ai_profile_id: Option<String>,
+    #[serde(default)]
+    pub ai_tavily_api_key: Option<String>,
+    #[serde(default)]
+    pub ai_bright_data_api_token: Option<String>,
+    #[serde(default)]
+    pub ai_brave_search_api_key: Option<String>,
+    #[serde(default)]
+    pub ai_searxng_url: Option<String>,
+    #[serde(default = "default_tavily_mcp_server_label")]
+    pub ai_tavily_mcp_server_label: String,
+    #[serde(default = "default_bright_data_mcp_server_label")]
+    pub ai_bright_data_mcp_server_label: String,
+    #[serde(default)]
+    pub ai_brave_search_mcp_plugin_id: Option<String>,
+    #[serde(default)]
+    pub ai_searxng_mcp_plugin_id: Option<String>,
+    #[serde(default)]
+    pub ai_lm_studio_toolpack_mcp_plugin_id: Option<String>,
+    #[serde(default)]
+    pub ai_skills: Vec<AiSkill>,
+    #[serde(default = "default_job_scheduler_retention_days")]
+    pub job_scheduler_journal_retention_days: u32,
+    #[serde(default)]
+    pub job_scheduler_show_menu_bar_status: bool,
+    #[serde(default)]
+    pub job_scheduler_rsync_path: Option<String>,
+    #[serde(default)]
+    pub default_terminal_effect_plugin_id: Option<String>,
+    #[serde(default = "default_terminal_effect_animation_speed")]
+    pub default_terminal_effect_animation_speed: f64,
+    #[serde(default)]
+    pub last_quick_connect_terminal_effect_plugin_id: Option<String>,
+    #[serde(default)]
+    pub last_quick_connect_terminal_effect_animation_speed: Option<f64>,
 }
 
 impl Default for GlobalSettings {
@@ -164,6 +200,23 @@ impl Default for GlobalSettings {
             terminal_agent_panel_side_width: None,
             terminal_agent_panel_font_size: None,
             default_ai_profile_id: None,
+            ai_tavily_api_key: None,
+            ai_bright_data_api_token: None,
+            ai_brave_search_api_key: None,
+            ai_searxng_url: None,
+            ai_tavily_mcp_server_label: default_tavily_mcp_server_label(),
+            ai_bright_data_mcp_server_label: default_bright_data_mcp_server_label(),
+            ai_brave_search_mcp_plugin_id: None,
+            ai_searxng_mcp_plugin_id: None,
+            ai_lm_studio_toolpack_mcp_plugin_id: None,
+            ai_skills: Vec::new(),
+            job_scheduler_journal_retention_days: default_job_scheduler_retention_days(),
+            job_scheduler_show_menu_bar_status: false,
+            job_scheduler_rsync_path: None,
+            default_terminal_effect_plugin_id: None,
+            default_terminal_effect_animation_speed: default_terminal_effect_animation_speed(),
+            last_quick_connect_terminal_effect_plugin_id: None,
+            last_quick_connect_terminal_effect_animation_speed: None,
         }
     }
 }
@@ -182,6 +235,22 @@ fn default_terminal_agent_execution_target() -> TerminalAgentExecutionTarget {
 
 fn default_terminal_agent_panel_dock() -> TerminalAgentPanelDock {
     TerminalAgentPanelDock::Bottom
+}
+
+fn default_tavily_mcp_server_label() -> String {
+    "tavily".into()
+}
+
+fn default_bright_data_mcp_server_label() -> String {
+    "bright-data".into()
+}
+
+fn default_job_scheduler_retention_days() -> u32 {
+    14
+}
+
+fn default_terminal_effect_animation_speed() -> f64 {
+    1.0
 }
 
 #[cfg(test)]

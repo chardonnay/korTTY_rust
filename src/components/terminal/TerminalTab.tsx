@@ -40,6 +40,8 @@ interface TerminalTabProps {
   fontFamily?: string;
   fontSize?: number;
   scrollbackLines?: number;
+  terminalEffectPluginId?: string;
+  terminalEffectAnimationSpeed?: number;
   onCloseRequest?: () => void;
   broadcastTargets?: string[];
   onContextMenu?: (e: MouseEvent<HTMLDivElement>, selectedText: string) => void;
@@ -55,6 +57,69 @@ type TimestampEntry = {
   durationLabel?: string;
 };
 
+type MotherLineFlash = {
+  id: string;
+  top: number;
+  height: number;
+};
+
+const DEFAULT_ANSI_COLORS = [
+  "#45475a", "#f38ba8", "#a6e3a1", "#f9e2af",
+  "#89b4fa", "#f5c2e7", "#94e2d5", "#bac2de",
+  "#585b70", "#f38ba8", "#a6e3a1", "#f9e2af",
+  "#89b4fa", "#f5c2e7", "#94e2d5", "#a6adc8",
+];
+
+const MOTHER_ANSI_COLORS = [
+  "#031007", "#19ff4c", "#19ff4c", "#c8ff7a",
+  "#48d46f", "#7dff9d", "#70ff9a", "#d7ffe0",
+  "#0b2b14", "#5dff80", "#72ff8f", "#e4ff9c",
+  "#81ff9a", "#a6ffba", "#b8ffc8", "#f2fff4",
+];
+
+function buildTerminalTheme(
+  theme: TerminalTabProps["theme"] | undefined,
+  motherActive: boolean,
+) {
+  const ansiColors = motherActive ? MOTHER_ANSI_COLORS : theme?.ansiColors ?? DEFAULT_ANSI_COLORS;
+  return {
+    foreground: motherActive ? "#19ff4c" : theme?.foreground ?? "#cdd6f4",
+    background: motherActive ? "#000000" : theme?.background ?? "#11111b",
+    cursor: motherActive ? "#f2f2f2" : theme?.cursor ?? "#89b4fa",
+    selectionBackground: motherActive ? "#19ff4c40" : theme?.selectionBackground ?? "#45475a80",
+    black: ansiColors[0],
+    red: ansiColors[1],
+    green: ansiColors[2],
+    yellow: ansiColors[3],
+    blue: ansiColors[4],
+    magenta: ansiColors[5],
+    cyan: ansiColors[6],
+    white: ansiColors[7],
+    brightBlack: ansiColors[8],
+    brightRed: ansiColors[9],
+    brightGreen: ansiColors[10],
+    brightYellow: ansiColors[11],
+    brightBlue: ansiColors[12],
+    brightMagenta: ansiColors[13],
+    brightCyan: ansiColors[14],
+    brightWhite: ansiColors[15],
+  };
+}
+
+function containsVisibleMotherOutput(text: string): boolean {
+  const withoutControlSequences = text.replace(
+    /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][\s\S]*?(?:\x07|\x1b\\)|P[\s\S]*?\x1b\\|[@-Z\\-_])/g,
+    "",
+  );
+  for (const char of withoutControlSequences) {
+    const codePoint = char.codePointAt(0);
+    if (codePoint != null && codePoint >= 0x20 && codePoint !== 0x7f) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // These shims match the private @xterm/xterm 5.5.0 internals currently pinned in package.json.
 // We only touch them to guard a syncScrollArea/renderer race that has no public workaround here.
 // Prefer public APIs such as onScroll/scrollLines/scrollToLine for feature work, and re-verify
@@ -68,8 +133,17 @@ type XtermRendererContainerLike = {
   value?: unknown;
 };
 
+type XtermRenderDimensionsLike = {
+  css?: {
+    cell?: {
+      height?: number;
+    };
+  };
+};
+
 type XtermRenderServiceLike = {
   _renderer?: XtermRendererContainerLike;
+  dimensions?: XtermRenderDimensionsLike;
 };
 
 type XtermCoreLike = {
@@ -94,6 +168,8 @@ export function TerminalTab({
   fontFamily = "JetBrains Mono, Cascadia Code, Fira Code, Menlo, monospace",
   fontSize = 14,
   scrollbackLines = 10000,
+  terminalEffectPluginId,
+  terminalEffectAnimationSpeed = 1,
   onCloseRequest,
   broadcastTargets,
   onContextMenu,
@@ -102,6 +178,7 @@ export function TerminalTab({
   const [timestampsCollapsed, setTimestampsCollapsed] = useState(false);
   const [hoveredMarkerId, setHoveredMarkerId] = useState<string | null>(null);
   const [timestampEntries, setTimestampEntries] = useState<TimestampEntry[]>([]);
+  const [motherLineFlashes, setMotherLineFlashes] = useState<MotherLineFlash[]>([]);
   const [viewportScrollTop, setViewportScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
   const [rowHeight, setRowHeight] = useState(18);
@@ -124,6 +201,13 @@ export function TerminalTab({
   const onCloseRequestRef = useRef(onCloseRequest);
   const onAgentCommandRef = useRef(onAgentCommand);
   const broadcastTargetsRef = useRef<string[]>([]);
+  const terminalEffectPluginIdRef = useRef<string | undefined>(terminalEffectPluginId);
+  const terminalEffectAnimationSpeedRef = useRef(terminalEffectAnimationSpeed);
+  const motherOutputQueueRef = useRef<string[]>([]);
+  const motherOutputTimerRef = useRef<number | null>(null);
+  const motherLineFlashCounterRef = useRef(0);
+  const motherLineFlashTimeoutsRef = useRef<Set<number>>(new Set());
+  const motherLastLineFlashRef = useRef<{ row: number; at: number } | null>(null);
   const agentShortcutBufferRef = useRef("");
   const agentShortcutPromptReadyRef = useRef(false);
   const agentShortcutStartedAtPromptRef = useRef(false);
@@ -466,6 +550,165 @@ export function TerminalTab({
   onCloseRequestRef.current = onCloseRequest;
   onAgentCommandRef.current = onAgentCommand;
   broadcastTargetsRef.current = broadcastTargets || [];
+  terminalEffectPluginIdRef.current = terminalEffectPluginId;
+  terminalEffectAnimationSpeedRef.current = terminalEffectAnimationSpeed;
+
+  function isMotherEffectActive(): boolean {
+    return terminalEffectPluginIdRef.current === "mother";
+  }
+
+  function motherWriteDelayMs(): number {
+    const speed = Math.min(99, Math.max(1, terminalEffectAnimationSpeedRef.current || 1));
+    return Math.max(1, Math.round(18 / speed));
+  }
+
+  function clearMotherOutputQueue() {
+    motherOutputQueueRef.current = [];
+    if (motherOutputTimerRef.current != null) {
+      window.clearTimeout(motherOutputTimerRef.current);
+      motherOutputTimerRef.current = null;
+    }
+  }
+
+  function clearMotherLineFlashes() {
+    for (const timeoutId of motherLineFlashTimeoutsRef.current) {
+      window.clearTimeout(timeoutId);
+    }
+    motherLineFlashTimeoutsRef.current.clear();
+    motherLastLineFlashRef.current = null;
+    if (isMountedRef.current) {
+      setMotherLineFlashes([]);
+    }
+  }
+
+  function getTerminalCellHeight(term: Terminal): number {
+    const terminalWithCore = term as XtermTerminalWithCore;
+    const renderCellHeight = terminalWithCore._core?._renderService?.dimensions?.css?.cell?.height;
+    if (typeof renderCellHeight === "number" && Number.isFinite(renderCellHeight) && renderCellHeight > 0) {
+      return renderCellHeight;
+    }
+
+    const screenEl = term.element?.querySelector(".xterm-screen") as HTMLElement | null;
+    const screenHeight = screenEl?.getBoundingClientRect().height;
+    if (typeof screenHeight === "number" && Number.isFinite(screenHeight) && screenHeight > 0 && term.rows > 0) {
+      return screenHeight / term.rows;
+    }
+
+    return rowHeight;
+  }
+
+  function getMotherLineFlashGeometry(term: Terminal): { row: number; top: number; height: number } | null {
+    const buffer = term.buffer.active;
+    const visibleRow = buffer.baseY + buffer.cursorY - buffer.viewportY;
+    if (!Number.isFinite(visibleRow) || visibleRow < 0 || visibleRow >= term.rows) {
+      return null;
+    }
+
+    const cellHeight = getTerminalCellHeight(term);
+    const fallbackTop = Math.max(0, visibleRow * cellHeight);
+    const hostEl = termRef.current?.parentElement;
+    const screenEl = term.element?.querySelector(".xterm-screen") as HTMLElement | null;
+    if (!hostEl || !screenEl) {
+      return {
+        row: visibleRow,
+        top: fallbackTop,
+        height: Math.max(2, cellHeight + 2),
+      };
+    }
+
+    const hostRect = hostEl.getBoundingClientRect();
+    const screenRect = screenEl.getBoundingClientRect();
+    const screenTop = screenRect.top - hostRect.top;
+    return {
+      row: visibleRow,
+      top: Math.max(0, screenTop + visibleRow * cellHeight),
+      height: Math.max(2, cellHeight + 2),
+    };
+  }
+
+  function triggerMotherLineFlash(term: Terminal) {
+    if (!isMotherEffectActive() || !isMountedRef.current || xtermRef.current !== term) {
+      return;
+    }
+    const geometry = getMotherLineFlashGeometry(term);
+    if (!geometry) {
+      return;
+    }
+    const row = geometry.row;
+    const now = Date.now();
+    const last = motherLastLineFlashRef.current;
+    if (last && last.row === row && now - last.at < 35) {
+      return;
+    }
+    motherLastLineFlashRef.current = { row, at: now };
+
+    const id = `${now}-${motherLineFlashCounterRef.current++}`;
+    const flash: MotherLineFlash = {
+      id,
+      top: geometry.top,
+      height: geometry.height,
+    };
+    setMotherLineFlashes((current) => [...current.slice(-7), flash]);
+    const timeoutId = window.setTimeout(() => {
+      motherLineFlashTimeoutsRef.current.delete(timeoutId);
+      if (isMountedRef.current) {
+        setMotherLineFlashes((current) => current.filter((entry) => entry.id !== id));
+      }
+    }, 300);
+    motherLineFlashTimeoutsRef.current.add(timeoutId);
+  }
+
+  function writeTerminalOutput(term: Terminal, data: string | Uint8Array, visibleSource?: string) {
+    const source = typeof data === "string" ? data : visibleSource;
+    const shouldFlash = isMotherEffectActive() && !!source && containsVisibleMotherOutput(source);
+    term.write(data, () => {
+      if (shouldFlash) {
+        triggerMotherLineFlash(term);
+      }
+    });
+  }
+
+  function flushMotherOutputQueue(term: Terminal) {
+    if (motherOutputTimerRef.current != null || motherOutputQueueRef.current.length === 0) {
+      return;
+    }
+    motherOutputTimerRef.current = window.setTimeout(() => {
+      motherOutputTimerRef.current = null;
+      if (!isMountedRef.current || xtermRef.current !== term || !isMotherEffectActive()) {
+        motherOutputQueueRef.current = [];
+        return;
+      }
+      const next = motherOutputQueueRef.current.shift();
+      if (next) {
+        writeTerminalOutput(term, next);
+        if (forceAutoScrollRef.current) {
+          requestAnimationFrame(() => {
+            if (xtermRef.current === term && isMountedRef.current) {
+              term.scrollToBottom();
+            }
+          });
+        }
+      }
+      flushMotherOutputQueue(term);
+    }, motherWriteDelayMs());
+  }
+
+  function enqueueMotherOutput(term: Terminal, text: string) {
+    const controlPattern = /\x1b(?:\[[0-?]*[ -/]*[@-~]|\][\s\S]*?(?:\x07|\x1b\\)|P[\s\S]*?\x1b\\|[@-Z\\-_])|[\r\n\t\b\f]/g;
+    let cursor = 0;
+    let match: RegExpExecArray | null;
+    while ((match = controlPattern.exec(text)) != null) {
+      if (match.index > cursor) {
+        motherOutputQueueRef.current.push(...Array.from(text.slice(cursor, match.index)));
+      }
+      motherOutputQueueRef.current.push(match[0]);
+      cursor = controlPattern.lastIndex;
+    }
+    if (cursor < text.length) {
+      motherOutputQueueRef.current.push(...Array.from(text.slice(cursor)));
+    }
+    flushMotherOutputQueue(term);
+  }
 
   function sendResizeIfNeeded(term: Terminal, force = false) {
     if (!connectedRef.current) return;
@@ -575,43 +818,13 @@ export function TerminalTab({
       }
     }
 
-    const defaultColors = [
-      "#45475a", "#f38ba8", "#a6e3a1", "#f9e2af",
-      "#89b4fa", "#f5c2e7", "#94e2d5", "#bac2de",
-      "#585b70", "#f38ba8", "#a6e3a1", "#f9e2af",
-      "#89b4fa", "#f5c2e7", "#94e2d5", "#a6adc8",
-    ];
-
-    const ansiColors = theme?.ansiColors ?? defaultColors;
-
     const term = new Terminal({
       cursorBlink: true,
       cursorStyle: "block",
       fontFamily,
       fontSize,
       scrollback: scrollbackLines,
-      theme: {
-        foreground: theme?.foreground ?? "#cdd6f4",
-        background: theme?.background ?? "#11111b",
-        cursor: theme?.cursor ?? "#89b4fa",
-        selectionBackground: theme?.selectionBackground ?? "#45475a80",
-        black: ansiColors[0],
-        red: ansiColors[1],
-        green: ansiColors[2],
-        yellow: ansiColors[3],
-        blue: ansiColors[4],
-        magenta: ansiColors[5],
-        cyan: ansiColors[6],
-        white: ansiColors[7],
-        brightBlack: ansiColors[8],
-        brightRed: ansiColors[9],
-        brightGreen: ansiColors[10],
-        brightYellow: ansiColors[11],
-        brightBlue: ansiColors[12],
-        brightMagenta: ansiColors[13],
-        brightCyan: ansiColors[14],
-        brightWhite: ansiColors[15],
-      },
+      theme: buildTerminalTheme(theme, terminalEffectPluginId === "mother"),
       allowProposedApi: true,
     });
 
@@ -839,6 +1052,8 @@ export function TerminalTab({
       window.removeEventListener("kortty-refit", handleRefit);
       window.removeEventListener("kortty-terminal-reattach", handleReattach as EventListener);
       clearPendingFitTimers();
+      clearMotherOutputQueue();
+      clearMotherLineFlashes();
       stopPromptProbe();
       syncViewportMetricsRef.current = null;
       scrollDisposable.dispose();
@@ -877,8 +1092,14 @@ export function TerminalTab({
           return;
         }
         const bytes = new Uint8Array(event.payload);
+        const text = new TextDecoder().decode(bytes);
         try {
-          term.write(bytes);
+          if (isMotherEffectActive() && bytes.length <= 4096) {
+            enqueueMotherOutput(term, text);
+          } else {
+            clearMotherOutputQueue();
+            writeTerminalOutput(term, bytes, text);
+          }
           if (forceAutoScrollRef.current) {
             requestAnimationFrame(() => {
               if (xtermRef.current === term && isMountedRef.current) {
@@ -890,7 +1111,6 @@ export function TerminalTab({
           console.warn("[TerminalTab] Ignored terminal-output write on inactive terminal", error);
           return;
         }
-        const text = new TextDecoder().decode(bytes);
         handleTerminalAgentOscMarkers(text);
         if (containsClearScreenSignal(text)) {
           setTimestampEntries([]);
@@ -924,6 +1144,8 @@ export function TerminalTab({
   useEffect(() => {
     waitingForNextPromptRef.current = false;
     outputTailRef.current = "";
+    clearMotherOutputQueue();
+    clearMotherLineFlashes();
     stopPromptProbe();
     pendingCommandStartedAtRef.current = null;
     lastPushRef.current = null;
@@ -939,31 +1161,7 @@ export function TerminalTab({
 
     term.options.fontSize = fontSize;
     if (fontFamily) term.options.fontFamily = fontFamily;
-    if (theme) {
-      const ansi = theme.ansiColors ?? [];
-      term.options.theme = {
-        foreground: theme.foreground,
-        background: theme.background,
-        cursor: theme.cursor,
-        selectionBackground: theme.selectionBackground,
-        black: ansi[0],
-        red: ansi[1],
-        green: ansi[2],
-        yellow: ansi[3],
-        blue: ansi[4],
-        magenta: ansi[5],
-        cyan: ansi[6],
-        white: ansi[7],
-        brightBlack: ansi[8],
-        brightRed: ansi[9],
-        brightGreen: ansi[10],
-        brightYellow: ansi[11],
-        brightBlue: ansi[12],
-        brightMagenta: ansi[13],
-        brightCyan: ansi[14],
-        brightWhite: ansi[15],
-      };
-    }
+    term.options.theme = buildTerminalTheme(theme, terminalEffectPluginId === "mother");
 
     clearPendingFitTimers();
 
@@ -980,7 +1178,14 @@ export function TerminalTab({
     return () => {
       clearPendingFitTimers();
     };
-  }, [fontSize, fontFamily, theme]);
+  }, [fontSize, fontFamily, theme, terminalEffectPluginId]);
+
+  useEffect(() => {
+    if (terminalEffectPluginId !== "mother") {
+      clearMotherOutputQueue();
+      clearMotherLineFlashes();
+    }
+  }, [terminalEffectPluginId]);
 
   useEffect(() => {
     syncViewportMetricsRef.current?.();
@@ -991,9 +1196,14 @@ export function TerminalTab({
   const visibleTimestampEntries = timestampEntries.filter(
     (entry) => entry.row >= visibleStartRow && entry.row <= visibleEndRow,
   );
+  const motherActive = terminalEffectPluginId === "mother";
 
   return (
-    <div className="w-full h-full min-h-0 min-w-0 bg-kortty-terminal overflow-hidden flex">
+    <div
+      className={`w-full h-full min-h-0 min-w-0 bg-kortty-terminal overflow-hidden flex ${
+        motherActive ? "kortty-terminal-effect-mother" : ""
+      }`}
+    >
       {showTimestamps && (
         <div
           className={`border-r border-kortty-border bg-kortty-surface/30 text-[10px] text-kortty-text-dim relative transition-[width] duration-150 ${
@@ -1058,10 +1268,29 @@ export function TerminalTab({
         </div>
       )}
       <div
-        ref={termRef}
-        className="flex-1 min-h-0 min-w-0 overflow-hidden"
+        className={`relative flex-1 min-h-0 min-w-0 overflow-hidden ${
+          motherActive ? "kortty-mother-terminal-host" : ""
+        }`}
         onContextMenu={(event) => onContextMenu?.(event, xtermRef.current?.getSelection() ?? "")}
-      />
+      >
+        <div ref={termRef} className="absolute inset-0 min-h-0 min-w-0 overflow-hidden" />
+        {motherActive && (
+          <>
+            <div className="kortty-mother-line-flash-layer" aria-hidden="true">
+              {motherLineFlashes.map((flash) => (
+                <div
+                  key={flash.id}
+                  className="kortty-mother-line-flash"
+                  style={{ top: flash.top, height: flash.height }}
+                />
+              ))}
+            </div>
+            <div className="kortty-mother-crt-overlay" aria-hidden="true">
+              <div className="kortty-mother-noise" />
+            </div>
+          </>
+        )}
+      </div>
     </div>
   );
 }

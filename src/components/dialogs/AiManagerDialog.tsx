@@ -285,6 +285,49 @@ export function AiManagerDialog({ open, onClose, onOpenChat }: AiManagerDialogPr
 
                     <div className="grid grid-cols-2 gap-3">
                       <div>
+                        <label className="block text-xs text-kortty-text-dim mb-1">Reasoning Effort</label>
+                        <select
+                          className="input-field"
+                          value={editingProfile.reasoningEffort}
+                          onChange={(event) =>
+                            setEditingProfile((current) => (
+                              current ? { ...current, reasoningEffort: event.target.value as AiProfile["reasoningEffort"] } : null
+                            ))
+                          }
+                        >
+                          <option value="Disabled">Disabled</option>
+                          <option value="None">None</option>
+                          <option value="Minimal">Minimal</option>
+                          <option value="Low">Low</option>
+                          <option value="Medium">Medium</option>
+                          <option value="High">High</option>
+                          <option value="Xhigh">XHigh</option>
+                        </select>
+                      </div>
+                      <div>
+                        <label className="block text-xs text-kortty-text-dim mb-1">Internet Access Mode</label>
+                        <select
+                          className="input-field"
+                          value={editingProfile.internetAccessMode}
+                          onChange={(event) =>
+                            setEditingProfile((current) => (
+                              current ? { ...current, internetAccessMode: event.target.value as AiProfile["internetAccessMode"] } : null
+                            ))
+                          }
+                        >
+                          <option value="Disabled">Disabled</option>
+                          <option value="KorttyTavilyTool">KorTTY Tavily tool</option>
+                          <option value="LmStudioTavilyMcp">LM Studio Tavily MCP</option>
+                          <option value="BrightDataWebMcp">Bright Data Web MCP</option>
+                          <option value="BraveSearchMcp">Brave Search MCP</option>
+                          <option value="SearxngMcp">SearXNG MCP</option>
+                          <option value="LmStudioToolpack">LM Studio Toolpack</option>
+                        </select>
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div>
                         <label className="block text-xs text-kortty-text-dim mb-1">Max Selection Chars</label>
                         <input
                           className="input-field"

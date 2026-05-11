@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { ConnectionSettings, useConnectionStore } from "../../store/connectionStore";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 import type { ThemeData } from "../../store/themeStore";
+import type { TerminalEffectPluginEntry } from "../../types/terminalEffects";
 
 interface ConnectionEditorProps {
   open: boolean;
@@ -33,6 +34,7 @@ export function ConnectionEditor({ open, connection, onClose, onSave }: Connecti
   const [activeEditorTab, setActiveEditorTab] = useState<TabName>("general");
   const { saveConnection } = useConnectionStore();
   const [themes, setThemes] = useState<ThemeData[]>([]);
+  const [terminalEffects, setTerminalEffects] = useState<TerminalEffectPluginEntry[]>([]);
   const [sshKeys, setSshKeys] = useState<SimpleSshKey[]>([]);
   const [credentials, setCredentials] = useState<SimpleCredential[]>([]);
   const [authChoice, setAuthChoice] = useState<"Password" | "PrivateKey" | "TemporaryKey">("Password");
@@ -40,6 +42,7 @@ export function ConnectionEditor({ open, connection, onClose, onSave }: Connecti
   useEffect(() => {
     if (open) {
       invoke<ThemeData[]>("get_themes").then(setThemes).catch(console.error);
+      invoke<TerminalEffectPluginEntry[]>("list_terminal_effect_plugins").then(setTerminalEffects).catch(console.error);
       invoke<SimpleSshKey[]>("get_ssh_keys").then(setSshKeys).catch(console.error);
       invoke<SimpleCredential[]>("get_credentials").then(setCredentials).catch(console.error);
       if (connection.authMethod === "Password") {
@@ -417,6 +420,43 @@ export function ConnectionEditor({ open, connection, onClose, onSave }: Connecti
                   <option value="Bar">Bar</option>
                 </select>
               </Field>
+              <div className="grid grid-cols-2 gap-2">
+                <Field label="Terminal Effect">
+                  <select
+                    className="input-field"
+                    value={conn.terminalEffectPluginId || ""}
+                    onChange={(e) => update({ terminalEffectPluginId: e.target.value || undefined })}
+                  >
+                    <option value="">None</option>
+                    {terminalEffects.filter((effect) => effect.enabled).map((effect) => (
+                      <option key={effect.id} value={effect.id}>
+                        {effect.name}
+                      </option>
+                    ))}
+                  </select>
+                </Field>
+                <Field label="Effect Speed">
+                  <div className="flex gap-2">
+                    <input
+                      className="flex-1"
+                      type="range"
+                      min={1}
+                      max={10}
+                      step={1}
+                      value={Math.min(10, conn.terminalEffectAnimationSpeed || 1)}
+                      onChange={(e) => update({ terminalEffectAnimationSpeed: Number(e.target.value) || 1 })}
+                    />
+                    <input
+                      className="input-field w-20"
+                      type="number"
+                      min={1}
+                      max={99}
+                      value={conn.terminalEffectAnimationSpeed || 1}
+                      onChange={(e) => update({ terminalEffectAnimationSpeed: Math.min(99, Math.max(1, Number(e.target.value) || 1)) })}
+                    />
+                  </div>
+                </Field>
+              </div>
               <div className="grid grid-cols-3 gap-2">
                 <Field label="Foreground">
                   <input

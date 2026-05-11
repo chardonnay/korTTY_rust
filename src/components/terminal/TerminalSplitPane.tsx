@@ -6,7 +6,21 @@ import { save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { writeTextFile } from "@tauri-apps/plugin-fs";
 import { Panel, PanelGroup, PanelResizeHandle, type ImperativePanelGroupHandle } from "react-resizable-panels";
 import { TerminalTab } from "./TerminalTab";
-import { Radio, X, ChevronRight, GripVertical, ChevronDown, ChevronUp, Download, Square, RotateCcw, Minus, Plus } from "lucide-react";
+import {
+  Clipboard,
+  FileCode,
+  Radio,
+  X,
+  ChevronRight,
+  GripVertical,
+  ChevronDown,
+  ChevronUp,
+  Download,
+  Square,
+  RotateCcw,
+  Minus,
+  Plus,
+} from "lucide-react";
 import type {
   AgentActivity,
   AiAction,
@@ -246,6 +260,8 @@ interface TerminalSplitPaneProps {
   }) => void;
   fontSize: number;
   getFontSizeForSession?: (sessionId: string) => number;
+  getTerminalEffectPluginIdForSession?: (sessionId: string) => string | undefined;
+  getTerminalEffectAnimationSpeedForSession?: (sessionId: string) => number | undefined;
   theme?: TerminalTheme;
   fontFamily?: string;
   onZoomIn: (sessionId: string) => void;
@@ -258,6 +274,7 @@ interface TerminalSplitPaneProps {
   onAiAction?: (sessionId: string, action: AiAction, selectedText: string) => void;
   onStartAgent?: (sessionId: string) => void;
   onStartAgentPlan?: (sessionId: string) => void;
+  onOpenSnippetManager?: () => void;
   onAgentCommand?: (sessionId: string, rawCommand: string) => void;
   onApproveAgent?: (approval: TerminalAgentApproval) => void;
   onApproveAgentAlways?: (approval: TerminalAgentApproval) => void;
@@ -291,6 +308,8 @@ export function TerminalSplitPane({
   onAgentPanelLayoutChange,
   fontSize,
   getFontSizeForSession,
+  getTerminalEffectPluginIdForSession,
+  getTerminalEffectAnimationSpeedForSession,
   theme,
   fontFamily,
   onZoomIn,
@@ -303,6 +322,7 @@ export function TerminalSplitPane({
   onAiAction,
   onStartAgent,
   onStartAgentPlan,
+  onOpenSnippetManager,
   onAgentCommand,
   onApproveAgent,
   onApproveAgentAlways,
@@ -960,6 +980,7 @@ export function TerminalSplitPane({
             activities: agentActivitiesByRun[runId] ?? [],
           }));
         }}
+        onOpenSnippetManager={onOpenSnippetManager}
       />
     );
   }
@@ -1154,6 +1175,8 @@ export function TerminalSplitPane({
         const host = hostElementsRef.current.get(sessionId);
         if (!host) return null;
         const paneFontSize = getFontSizeForSession?.(sessionId) ?? fontSize;
+        const terminalEffectPluginId = getTerminalEffectPluginIdForSession?.(sessionId);
+        const terminalEffectAnimationSpeed = getTerminalEffectAnimationSpeedForSession?.(sessionId) ?? 1;
         return (
           <TerminalPortal
             key={sessionId}
@@ -1167,6 +1190,8 @@ export function TerminalSplitPane({
             promptHookEnabled={promptHookEnabled}
             showTimestamps={showTimestamps}
             fontSize={paneFontSize}
+            terminalEffectPluginId={terminalEffectPluginId}
+            terminalEffectAnimationSpeed={terminalEffectAnimationSpeed}
             theme={theme}
             fontFamily={fontFamily}
             broadcastTargets={broadcast ? broadcastTargetsBySessionId[sessionId] : undefined}
@@ -1318,6 +1343,7 @@ interface AgentActivityPanelProps {
   onFontSizeChange: (fontSize: number) => void;
   onDockDragEnd: (clientX: number, clientY: number) => void;
   buildAllRuns: () => AgentExportRun[];
+  onOpenSnippetManager?: () => void;
 }
 
 function AgentActivityPanel({
@@ -1350,6 +1376,7 @@ function AgentActivityPanel({
   onFontSizeChange,
   onDockDragEnd,
   buildAllRuns,
+  onOpenSnippetManager,
 }: AgentActivityPanelProps) {
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const [collapsedIds, setCollapsedIds] = useState<Set<string>>(new Set());
@@ -1535,6 +1562,32 @@ function AgentActivityPanel({
     }
   }
 
+  async function copyActivity(activity: AgentActivity) {
+    const text = [activityTitle(activity), activity.summary, activity.detail]
+      .filter((value) => value.trim())
+      .join("\n\n");
+    await navigator.clipboard.writeText(text);
+  }
+
+  async function openActivityInSnippet(activity: AgentActivity) {
+    const content = (activity.detail || activity.summary).trim();
+    if (!content) {
+      return;
+    }
+    await invoke("save_snippet", {
+      snippet: {
+        id: crypto.randomUUID(),
+        name: activity.title || "AI Agent activity",
+        content,
+        category: "AI Agent",
+        language: "bash",
+        favorite: false,
+        variables: [],
+      },
+    });
+    onOpenSnippetManager?.();
+  }
+
   const hasSideTitle = dock !== "bottom" && !!connectionLabel;
   const sideTitleHeight = hasSideTitle ? AGENT_PANEL_SIDE_TITLE_HEIGHT : 0;
   const visibleHeight = collapsed
@@ -1686,22 +1739,39 @@ function AgentActivityPanel({
                 const expanded = isActivityExpanded(activity);
                 return (
                   <div key={activity.id} className="mb-1 rounded border border-kortty-border bg-kortty-bg/70">
-                    <button
-                      className="flex w-full items-start gap-2 px-2 py-1.5 text-left"
-                      onClick={() => activity.collapsible && toggleActivity(activity)}
-                    >
-                      <span className={`mt-1 h-2 w-2 rounded-full ${activityDotClass(activity)}`} />
-                      <span className="min-w-0 flex-1">
-                        <span className="block truncate text-kortty-text">{activityTitle(activity)}</span>
-                        <span className="block truncate text-kortty-text-dim">{activity.summary}</span>
-                      </span>
-                      <span className="font-mono text-kortty-text-dim whitespace-nowrap">
-                        {activity.elapsedSeconds}s
-                      </span>
-                      <span className="font-mono text-kortty-text-dim whitespace-nowrap">
-                        {formatTokenUsage(activity)}
-                      </span>
-                    </button>
+                    <div className="flex w-full items-start gap-2 px-2 py-1.5 text-left">
+                      <button
+                        className="flex min-w-0 flex-1 items-start gap-2 text-left"
+                        onClick={() => activity.collapsible && toggleActivity(activity)}
+                      >
+                        <span className={`mt-1 h-2 w-2 rounded-full ${activityDotClass(activity)}`} />
+                        <span className="min-w-0 flex-1">
+                          <span className="block truncate text-kortty-text">{activityTitle(activity)}</span>
+                          <span className="block truncate text-kortty-text-dim">{activity.summary}</span>
+                        </span>
+                        <span className="font-mono text-kortty-text-dim whitespace-nowrap">
+                          {activity.elapsedSeconds}s
+                        </span>
+                        <span className="font-mono text-kortty-text-dim whitespace-nowrap">
+                          {formatTokenUsage(activity)}
+                        </span>
+                      </button>
+                      <button
+                        className="icon-button shrink-0"
+                        title="Copy activity"
+                        onClick={() => void copyActivity(activity)}
+                      >
+                        <Clipboard className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        className="icon-button shrink-0"
+                        title="Open activity in snippets"
+                        disabled={!(activity.detail || activity.summary).trim()}
+                        onClick={() => void openActivityInSnippet(activity)}
+                      >
+                        <FileCode className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
                     {expanded && activity.detail.trim() && (
                       <pre className="max-h-48 overflow-auto whitespace-pre-wrap border-t border-kortty-border px-2 py-1.5 font-mono text-kortty-text-dim">
                         {activity.detail}
@@ -1903,6 +1973,8 @@ interface TerminalPortalProps {
   promptHookEnabled?: boolean;
   showTimestamps: boolean;
   fontSize: number;
+  terminalEffectPluginId?: string;
+  terminalEffectAnimationSpeed?: number;
   theme?: TerminalTheme;
   fontFamily?: string;
   broadcastTargets?: string[];
@@ -1922,6 +1994,8 @@ function TerminalPortal({
   promptHookEnabled = true,
   showTimestamps,
   fontSize,
+  terminalEffectPluginId,
+  terminalEffectAnimationSpeed,
   theme,
   fontFamily,
   broadcastTargets,
@@ -1940,6 +2014,8 @@ function TerminalPortal({
       promptHookEnabled={promptHookEnabled}
       showTimestamps={showTimestamps}
       fontSize={fontSize}
+      terminalEffectPluginId={terminalEffectPluginId}
+      terminalEffectAnimationSpeed={terminalEffectAnimationSpeed}
       theme={theme}
       fontFamily={fontFamily}
       onContextMenu={onContextMenu}

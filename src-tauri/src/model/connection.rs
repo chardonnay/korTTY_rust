@@ -53,6 +53,10 @@ pub struct ConnectionSettings {
     pub prompt_hook_enabled: bool,
     #[serde(default)]
     pub terminal_agent_command_name: Option<String>,
+    #[serde(default)]
+    pub terminal_effect_plugin_id: Option<String>,
+    #[serde(default = "default_terminal_effect_animation_speed")]
+    pub terminal_effect_animation_speed: f64,
     pub theme_id: Option<String>,
     pub jump_server: Option<JumpServerConfig>,
     pub tunnels: Vec<super::tunnel::TunnelConfig>,
@@ -135,6 +139,8 @@ impl Default for ConnectionSettings {
             command_timestamps: false,
             prompt_hook_enabled: true,
             terminal_agent_command_name: None,
+            terminal_effect_plugin_id: None,
+            terminal_effect_animation_speed: default_terminal_effect_animation_speed(),
             theme_id: None,
             jump_server: None,
             tunnels: Vec::new(),
@@ -176,4 +182,8 @@ fn default_connection_protocol() -> ConnectionProtocol {
 
 fn default_true() -> bool {
     true
+}
+
+fn default_terminal_effect_animation_speed() -> f64 {
+    1.0
 }

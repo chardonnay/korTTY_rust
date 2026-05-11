@@ -1,6 +1,6 @@
 import { create } from "zustand";
 import { invoke } from "@tauri-apps/api/core";
-import type { TerminalAgentExecutionTarget } from "../types/ai";
+import type { AiSkill, TerminalAgentExecutionTarget } from "../types/ai";
 
 export type TeamworkSourceType = "Git" | "SharedFile";
 export type TerminalAgentPanelDock = "bottom" | "left" | "right";
@@ -56,6 +56,23 @@ export interface GlobalSettings {
   terminalAgentPanelSideWidth?: number;
   terminalAgentPanelFontSize?: number;
   defaultAiProfileId?: string;
+  aiTavilyApiKey?: string;
+  aiBrightDataApiToken?: string;
+  aiBraveSearchApiKey?: string;
+  aiSearxngUrl?: string;
+  aiTavilyMcpServerLabel: string;
+  aiBrightDataMcpServerLabel: string;
+  aiBraveSearchMcpPluginId?: string;
+  aiSearxngMcpPluginId?: string;
+  aiLmStudioToolpackMcpPluginId?: string;
+  aiSkills: AiSkill[];
+  jobSchedulerJournalRetentionDays: number;
+  jobSchedulerShowMenuBarStatus: boolean;
+  jobSchedulerRsyncPath?: string;
+  defaultTerminalEffectPluginId?: string;
+  defaultTerminalEffectAnimationSpeed: number;
+  lastQuickConnectTerminalEffectPluginId?: string;
+  lastQuickConnectTerminalEffectAnimationSpeed?: number;
 }
 
 interface SettingsStore {
@@ -100,6 +117,23 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
     terminalAgentPanelSideWidth: undefined,
     terminalAgentPanelFontSize: undefined,
     defaultAiProfileId: undefined,
+    aiTavilyApiKey: undefined,
+    aiBrightDataApiToken: undefined,
+    aiBraveSearchApiKey: undefined,
+    aiSearxngUrl: undefined,
+    aiTavilyMcpServerLabel: "tavily",
+    aiBrightDataMcpServerLabel: "bright-data",
+    aiBraveSearchMcpPluginId: undefined,
+    aiSearxngMcpPluginId: undefined,
+    aiLmStudioToolpackMcpPluginId: undefined,
+    aiSkills: [],
+    jobSchedulerJournalRetentionDays: 14,
+    jobSchedulerShowMenuBarStatus: false,
+    jobSchedulerRsyncPath: undefined,
+    defaultTerminalEffectPluginId: undefined,
+    defaultTerminalEffectAnimationSpeed: 1,
+    lastQuickConnectTerminalEffectPluginId: undefined,
+    lastQuickConnectTerminalEffectAnimationSpeed: undefined,
   },
   loading: false,
 

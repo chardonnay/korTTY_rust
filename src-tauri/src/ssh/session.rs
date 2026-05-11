@@ -56,6 +56,7 @@ struct TerminalRuntimeState {
     input_line_buffer: String,
     osc7_buffer: String,
     agent_osc_buffer: String,
+    startup_echo_filter: Option<StartupEchoFilter>,
 }
 
 impl Default for TerminalRuntimeState {
@@ -68,7 +69,121 @@ impl Default for TerminalRuntimeState {
             input_line_buffer: String::new(),
             osc7_buffer: String::new(),
             agent_osc_buffer: String::new(),
+            startup_echo_filter: None,
         }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct StartupEchoFilter {
+    candidates: Vec<Vec<u8>>,
+    positions: Vec<usize>,
+    buffered: Vec<u8>,
+    marker: Vec<u8>,
+    max_suppressed_len: usize,
+    active: bool,
+}
+
+impl StartupEchoFilter {
+    fn new(command: &[u8]) -> Option<Self> {
+        if command.is_empty() {
+            return None;
+        }
+
+        let mut crlf_command = Vec::with_capacity(command.len() + 1);
+        for byte in command {
+            if *byte == b'\n' {
+                crlf_command.extend_from_slice(b"\r\n");
+            } else {
+                crlf_command.push(*byte);
+            }
+        }
+
+        let mut candidates = vec![command.to_vec()];
+        if crlf_command != command {
+            candidates.push(crlf_command);
+        }
+        let positions = vec![0; candidates.len()];
+
+        Some(Self {
+            candidates,
+            positions,
+            buffered: Vec::new(),
+            marker: b"__kortty_agent_b64(){".to_vec(),
+            max_suppressed_len: command.len().saturating_add(1024),
+            active: false,
+        })
+    }
+
+    fn filter(&mut self, data: &[u8]) -> (Vec<u8>, bool) {
+        let mut output = Vec::with_capacity(data.len());
+
+        for (index, byte) in data.iter().copied().enumerate() {
+            if !self.active {
+                if self.starts_candidate(byte) {
+                    self.active = true;
+                    self.positions = vec![0; self.candidates.len()];
+                    self.buffered.clear();
+                } else {
+                    output.push(byte);
+                    continue;
+                }
+            }
+
+            self.buffered.push(byte);
+            let mut matched_any = false;
+            let mut completed = false;
+            for (candidate_index, candidate) in self.candidates.iter().enumerate() {
+                let position = self.positions[candidate_index];
+                if position < candidate.len() && candidate[position] == byte {
+                    self.positions[candidate_index] += 1;
+                    matched_any = true;
+                    if self.positions[candidate_index] == candidate.len() {
+                        completed = true;
+                    }
+                } else {
+                    self.positions[candidate_index] = usize::MAX;
+                }
+            }
+
+            if completed {
+                output.extend_from_slice(&data[index + 1..]);
+                return (output, true);
+            }
+
+            if !matched_any {
+                if self.should_keep_suppressing_disrupted_startup_echo(byte) {
+                    if byte == b'\n' {
+                        output.extend_from_slice(&data[index + 1..]);
+                        return (output, true);
+                    }
+                    continue;
+                }
+
+                output.extend_from_slice(&self.buffered);
+                self.buffered.clear();
+                self.active = false;
+                self.positions = vec![0; self.candidates.len()];
+            }
+        }
+
+        (output, false)
+    }
+
+    fn starts_candidate(&self, byte: u8) -> bool {
+        self.candidates
+            .iter()
+            .any(|candidate| candidate.first().copied() == Some(byte))
+    }
+
+    fn should_keep_suppressing_disrupted_startup_echo(&self, byte: u8) -> bool {
+        if self.buffered.len() > self.max_suppressed_len {
+            return false;
+        }
+        if byte == b'\n' && self.buffered.starts_with(&self.marker) {
+            return true;
+        }
+        self.marker.starts_with(&self.buffered) || self.buffered.starts_with(&self.marker)
     }
 }
 
@@ -127,8 +242,11 @@ impl client::Handler for SSHHandler {
         if let Some(output) = exec_outputs.get(&channel) {
             let _ = output.stdout_tx.send(data.to_vec());
         } else {
-            update_current_directory_from_output(&self.runtime_state, data);
-            let _ = self.output_tx.send(data.to_vec());
+            let filtered = filter_startup_echo_from_output(&self.runtime_state, data);
+            if !filtered.is_empty() {
+                update_current_directory_from_output(&self.runtime_state, &filtered);
+                let _ = self.output_tx.send(filtered);
+            }
         }
         Ok(())
     }
@@ -152,8 +270,11 @@ impl client::Handler for SSHHandler {
                 let _ = output.stdout_tx.send(data.to_vec());
             }
         } else {
-            update_current_directory_from_output(&self.runtime_state, data);
-            let _ = self.output_tx.send(data.to_vec());
+            let filtered = filter_startup_echo_from_output(&self.runtime_state, data);
+            if !filtered.is_empty() {
+                update_current_directory_from_output(&self.runtime_state, &filtered);
+                let _ = self.output_tx.send(filtered);
+            }
         }
         Ok(())
     }
@@ -261,22 +382,27 @@ impl SSHSession {
             }
         }
 
+        let startup_command = if self.settings.prompt_hook_enabled {
+            build_terminal_agent_shell_startup_command(
+                self.settings.terminal_agent_command_name.as_deref(),
+            )
+        } else {
+            None
+        };
+
         let channel = handle.channel_open_session().await?;
 
         let term = "xterm-256color";
         let cols = self.settings.columns as u32;
         let rows = self.settings.rows as u32;
-        let terminal_modes = Vec::new();
+        let terminal_modes = terminal_modes_for_shell(startup_command.is_some());
         channel
             .request_pty(false, term, cols, rows, 0, 0, &terminal_modes)
             .await?;
         channel.request_shell(false).await?;
-        if self.settings.prompt_hook_enabled {
-            if let Some(startup_command) = build_terminal_agent_shell_startup_command(
-                self.settings.terminal_agent_command_name.as_deref(),
-            ) {
-                channel.data(startup_command.as_bytes()).await?;
-            }
+        if let Some(startup_command) = startup_command {
+            register_startup_echo_filter(&self.runtime_state, startup_command.as_bytes());
+            channel.data(startup_command.as_bytes()).await?;
         }
 
         *handle_ref = Some(handle);
@@ -754,6 +880,14 @@ impl SSHSession {
     }
 }
 
+fn terminal_modes_for_shell(disable_echo_for_startup: bool) -> Vec<(Pty, u32)> {
+    if disable_echo_for_startup {
+        vec![(Pty::ECHO, 0)]
+    } else {
+        Vec::new()
+    }
+}
+
 fn build_terminal_agent_shell_startup_command(command_name: Option<&str>) -> Option<String> {
     let command_names = terminal_agent_shell_alias_names(command_name);
     if command_names.is_empty() {
@@ -799,6 +933,35 @@ __kortty_agent_clean_history; unset -f __kortty_agent_clean_history; \
 printf '\\033[1A\\r\\033[K'; \
 stty echo\n"
     ))
+}
+
+fn register_startup_echo_filter(
+    runtime_state: &Arc<std::sync::Mutex<TerminalRuntimeState>>,
+    startup_command: &[u8],
+) {
+    let Some(filter) = StartupEchoFilter::new(startup_command) else {
+        return;
+    };
+    if let Ok(mut state) = runtime_state.lock() {
+        state.startup_echo_filter = Some(filter);
+    }
+}
+
+fn filter_startup_echo_from_output(
+    runtime_state: &Arc<std::sync::Mutex<TerminalRuntimeState>>,
+    data: &[u8],
+) -> Vec<u8> {
+    let Ok(mut state) = runtime_state.lock() else {
+        return data.to_vec();
+    };
+    let Some(filter) = state.startup_echo_filter.as_mut() else {
+        return data.to_vec();
+    };
+    let (filtered, completed) = filter.filter(data);
+    if completed {
+        state.startup_echo_filter = None;
+    }
+    filtered
 }
 
 fn terminal_agent_shell_alias_names(command_name: Option<&str>) -> Vec<String> {
@@ -1244,6 +1407,76 @@ mod tests {
         assert_eq!(
             terminal_agent_shell_alias_names(Some("agent")),
             vec!["agent".to_string()]
+        );
+    }
+
+    #[test]
+    fn terminal_modes_disable_echo_only_for_startup_bootstrap() {
+        assert_eq!(terminal_modes_for_shell(true), vec![(Pty::ECHO, 0)]);
+        assert!(terminal_modes_for_shell(false).is_empty());
+    }
+
+    #[test]
+    fn startup_echo_filter_removes_bootstrap_after_prompt() {
+        let startup = build_terminal_agent_shell_startup_command(None)
+            .expect("default agent aliases should be generated");
+        let mut filter = StartupEchoFilter::new(startup.as_bytes())
+            .expect("startup command should create an echo filter");
+        let echoed = format!("daniel@fedora:~$ {startup}");
+
+        let (filtered, completed) = filter.filter(echoed.as_bytes());
+
+        assert!(completed);
+        assert_eq!(String::from_utf8(filtered).unwrap(), "daniel@fedora:~$ ");
+    }
+
+    #[test]
+    fn startup_echo_filter_accepts_crlf_echo() {
+        let startup = build_terminal_agent_shell_startup_command(None)
+            .expect("default agent aliases should be generated");
+        let echoed = startup.replace('\n', "\r\n");
+        let mut filter = StartupEchoFilter::new(startup.as_bytes())
+            .expect("startup command should create an echo filter");
+
+        let (filtered, completed) = filter.filter(format!("{echoed}ready").as_bytes());
+
+        assert!(completed);
+        assert_eq!(String::from_utf8(filtered).unwrap(), "ready");
+    }
+
+    #[test]
+    fn startup_echo_filter_handles_chunked_echo() {
+        let startup = build_terminal_agent_shell_startup_command(Some("Max"))
+            .expect("custom and default agent aliases should be generated");
+        let split = startup.len() / 2;
+        let mut filter = StartupEchoFilter::new(startup.as_bytes())
+            .expect("startup command should create an echo filter");
+
+        let (first, first_completed) = filter.filter(&startup.as_bytes()[..split]);
+        let (second, second_completed) =
+            filter.filter(format!("{}{}", &startup[split..], "after").as_bytes());
+
+        assert!(!first_completed);
+        assert!(first.is_empty());
+        assert!(second_completed);
+        assert_eq!(String::from_utf8(second).unwrap(), "after");
+    }
+
+    #[test]
+    fn startup_echo_filter_suppresses_disrupted_bootstrap_line() {
+        let startup = build_terminal_agent_shell_startup_command(None)
+            .expect("default agent aliases should be generated");
+        let mut filter = StartupEchoFilter::new(startup.as_bytes())
+            .expect("startup command should create an echo filter");
+        let disrupted = startup.replacen("if command", "if\rcommand", 1);
+        let echoed = format!("daniel@fedora:~$ {disrupted}ready");
+
+        let (filtered, completed) = filter.filter(echoed.as_bytes());
+
+        assert!(completed);
+        assert_eq!(
+            String::from_utf8(filtered).unwrap(),
+            "daniel@fedora:~$ ready"
         );
     }
 

@@ -36,6 +36,8 @@ import { AiActionDialog } from "./dialogs/AiActionDialog";
 import { AiAgentDialog } from "./dialogs/AiAgentDialog";
 import { AiAgentPlanDialog } from "./dialogs/AiAgentPlanDialog";
 import { AiManagerDialog } from "./dialogs/AiManagerDialog";
+import { JobSchedulerDialog } from "./dialogs/JobSchedulerDialog";
+import { TerminalEffectManagerDialog } from "./dialogs/TerminalEffectManagerDialog";
 import { AiChatTab } from "./ai/AiChatTab";
 import { AiAgentRunTab } from "./ai/AiAgentRunTab";
 import { AiAgentPlanTab } from "./ai/AiAgentPlanTab";
@@ -49,6 +51,8 @@ import {
   buildTerminalAgentAskPattern,
   buildTerminalAgentAskPrefixPattern,
   buildTerminalAgentCommandPattern,
+  buildTerminalAgentInlinePlanPattern,
+  buildTerminalAgentInlinePlanPrefixPattern,
   buildTerminalAgentPlanPattern,
   buildTerminalAgentPlanPrefixPattern,
   buildTerminalAgentUsageText,
@@ -57,6 +61,7 @@ import {
   normalizeTerminalAgentCommandName,
 } from "../utils/terminalAgentCommand";
 import { resolvePreferredAiProfileId } from "../utils/aiProfiles";
+import { normalizeTerminalEffectSpeed, type TerminalEffectPluginEntry } from "../types/terminalEffects";
 import type {
   AiAction,
   AiExecutionResult,
@@ -96,6 +101,8 @@ type DialogId =
   | "aiAgent"
   | "aiAgentPlan"
   | "aiManager"
+  | "jobScheduler"
+  | "terminalEffects"
   | "terminalThemeEditor"
   | "guiThemeEditor"
   | "sftpManager"
@@ -121,6 +128,8 @@ type SessionConnectInfo = {
   temporaryKeyExpirationMinutes?: number;
   temporaryKeyPermanent?: boolean;
   connectionProtocol: "TcpIp" | "Mosh";
+  terminalEffectPluginId?: string;
+  terminalEffectAnimationSpeed?: number;
 };
 
 type DashboardConnectionEntry = {
@@ -137,6 +146,8 @@ type DashboardConnectionEntry = {
   backgroundColor?: string;
   cursorColor?: string;
   ansiColors?: string[];
+  terminalEffectPluginId?: string;
+  terminalEffectAnimationSpeed?: number;
 };
 
 type WindowStateSnapshot = {
@@ -370,7 +381,9 @@ function parseTerminalAgentShortcut(
       error: `Invalid ${askCommandName} command. Use \`${askCommandName} <question>\` or \`${askCommandName}: <question>\`.`,
     };
   }
-  const planMatch = trimmed.match(buildTerminalAgentPlanPattern(normalizedAgentCommandName, caseInsensitive));
+  const planMatch =
+    trimmed.match(buildTerminalAgentPlanPattern(normalizedAgentCommandName, caseInsensitive)) ??
+    trimmed.match(buildTerminalAgentInlinePlanPattern(normalizedAgentCommandName, caseInsensitive));
   if (planMatch) {
     const [, rawOptions = "", rawPrompt = ""] = planMatch;
     const userPrompt = rawPrompt.trim();
@@ -432,7 +445,10 @@ function parseTerminalAgentShortcut(
       },
     };
   }
-  if (buildTerminalAgentPlanPrefixPattern(normalizedAgentCommandName, caseInsensitive).test(trimmed)) {
+  if (
+    buildTerminalAgentPlanPrefixPattern(normalizedAgentCommandName, caseInsensitive).test(trimmed) ||
+    buildTerminalAgentInlinePlanPrefixPattern(normalizedAgentCommandName, caseInsensitive).test(trimmed)
+  ) {
     return {
       ok: false,
       error: `Invalid ${planCommandName} command. Use \`${planCommandName} <prompt>\`, \`${planCommandName}: <prompt>\`, or \`${planCommandName}(profile=name) <prompt>\`.`,
@@ -676,6 +692,7 @@ export function MainWindow() {
   const { theme: activeTheme, loadActiveTheme } = useThemeStore();
   const { loadActiveGuiTheme } = useGuiThemeStore();
   const [allThemes, setAllThemes] = useState<import("../store/themeStore").ThemeData[]>([]);
+  const [terminalEffects, setTerminalEffects] = useState<TerminalEffectPluginEntry[]>([]);
   const [tabSplitSessions, setTabSplitSessions] = useState<Record<string, string[]>>({});
   const [splitSessionConfigs, setSplitSessionConfigs] = useState<Record<string, SessionConnectInfo>>({});
   /** Stored split tree per tab (for transfer). Updated by TerminalSplitPane onTreeChange. */
@@ -772,6 +789,9 @@ export function MainWindow() {
     invoke<import("../store/themeStore").ThemeData[]>("get_themes")
       .then(setAllThemes)
       .catch(console.error);
+    invoke<TerminalEffectPluginEntry[]>("list_terminal_effect_plugins")
+      .then(setTerminalEffects)
+      .catch(console.error);
     invoke<GlobalSettingsView>("get_settings")
       .then((settings) => {
         applyGlobalSettingsView(settings);
@@ -783,6 +803,14 @@ export function MainWindow() {
       .then(setRecentProjects)
       .catch(console.error);
   }, [applyGlobalSettingsView, loadAiProfileAvailability, loadConnections, loadActiveTheme, loadActiveGuiTheme, setRecentProjects]);
+
+  const reloadTerminalEffects = useCallback(async () => {
+    try {
+      setTerminalEffects(await invoke<TerminalEffectPluginEntry[]>("list_terminal_effect_plugins"));
+    } catch (error) {
+      console.error("Failed to load terminal effect plugins:", error);
+    }
+  }, []);
 
   useEffect(() => {
     let offSettingsUpdated: (() => void) | null = null;
@@ -947,6 +975,8 @@ export function MainWindow() {
             sk: tab.sshKeyId,
             pk: tab.privateKeyPath,
             cp: tab.connectionProtocol,
+            ep: tab.terminalEffectPluginId,
+            es: tab.terminalEffectAnimationSpeed,
             th: tab.themeId,
             ff: tab.fontFamily,
             fs: tab.fontSize,
@@ -984,6 +1014,8 @@ export function MainWindow() {
               temporaryKeyExpirationMinutes: tab.temporaryKeyExpirationMinutes,
               temporaryKeyPermanent: tab.temporaryKeyPermanent,
               connectionProtocol: tab.connectionProtocol || "TcpIp",
+              terminalEffectPluginId: tab.terminalEffectPluginId,
+              terminalEffectAnimationSpeed: tab.terminalEffectAnimationSpeed,
             }
           : undefined;
       connections.push({
@@ -994,6 +1026,8 @@ export function MainWindow() {
         status: tab.status,
         config: tabConfig,
         ...buildTerminalAppearanceFromTab(tab),
+        terminalEffectPluginId: tab.terminalEffectPluginId,
+        terminalEffectAnimationSpeed: tab.terminalEffectAnimationSpeed,
       });
 
       const splitIds = tabSplitSessions[tab.id] || [];
@@ -1319,6 +1353,8 @@ export function MainWindow() {
             commandTimestamps: false,
             promptHookEnabled,
             terminalAgentCommandName,
+            terminalEffectPluginId: info.terminalEffectPluginId,
+            terminalEffectAnimationSpeed: info.terminalEffectAnimationSpeed ?? 1,
             tunnels: [],
             usageCount: 0,
           },
@@ -1384,6 +1420,8 @@ export function MainWindow() {
         temporaryKeyExpirationMinutes: cfg.temporaryKeyExpirationMinutes,
         temporaryKeyPermanent: cfg.temporaryKeyPermanent,
         connectionProtocol: cfg.connectionProtocol,
+        terminalEffectPluginId: cfg.terminalEffectPluginId ?? payload.entry.terminalEffectPluginId,
+        terminalEffectAnimationSpeed: cfg.terminalEffectAnimationSpeed ?? payload.entry.terminalEffectAnimationSpeed,
         themeId: payload.entry.themeId,
         fontFamily: payload.entry.fontFamily,
         fontSize: payload.entry.fontSize,
@@ -1437,6 +1475,8 @@ export function MainWindow() {
       username: string,
       password: string,
       connectionProtocol: "TcpIp" | "Mosh" = "TcpIp",
+      terminalEffectPluginId?: string,
+      terminalEffectAnimationSpeed?: number,
     ) => {
       setTabs((prev) =>
         prev.map((t) =>
@@ -1450,6 +1490,8 @@ export function MainWindow() {
                 password,
                 credentialId: t.credentialId,
                 connectionProtocol,
+                terminalEffectPluginId: terminalEffectPluginId ?? t.terminalEffectPluginId,
+                terminalEffectAnimationSpeed: terminalEffectAnimationSpeed ?? t.terminalEffectAnimationSpeed,
                 status: "connecting" as const,
               }
             : t,
@@ -1463,6 +1505,8 @@ export function MainWindow() {
         password,
         credentialId: undefined,
         connectionProtocol,
+        terminalEffectPluginId,
+        terminalEffectAnimationSpeed,
       });
       if (ok) {
         setTabs((prev) =>
@@ -1504,6 +1548,8 @@ export function MainWindow() {
           temporaryKeyExpirationMinutes: latestConnection.temporaryKeyExpirationMinutes,
           temporaryKeyPermanent: latestConnection.temporaryKeyPermanent,
           connectionProtocol: latestConnection.connectionProtocol || "TcpIp",
+          terminalEffectPluginId: latestConnection.terminalEffectPluginId,
+          terminalEffectAnimationSpeed: latestConnection.terminalEffectAnimationSpeed,
         });
         if (ok) {
           setTabSplitSessions((prev) => ({
@@ -1526,6 +1572,8 @@ export function MainWindow() {
               temporaryKeyExpirationMinutes: latestConnection.temporaryKeyExpirationMinutes,
               temporaryKeyPermanent: latestConnection.temporaryKeyPermanent,
               connectionProtocol: latestConnection.connectionProtocol || "TcpIp",
+              terminalEffectPluginId: latestConnection.terminalEffectPluginId,
+              terminalEffectAnimationSpeed: latestConnection.terminalEffectAnimationSpeed,
             },
           }));
           splitResolveRef.current(splitSessionId);
@@ -1557,6 +1605,8 @@ export function MainWindow() {
         temporaryKeyExpirationMinutes: latestConnection.temporaryKeyExpirationMinutes,
         temporaryKeyPermanent: latestConnection.temporaryKeyPermanent,
         connectionProtocol: latestConnection.connectionProtocol || "TcpIp",
+        terminalEffectPluginId: latestConnection.terminalEffectPluginId,
+        terminalEffectAnimationSpeed: latestConnection.terminalEffectAnimationSpeed,
         ...buildTerminalAppearanceSnapshot(latestConnection),
       };
       setTabs((prev) => [...prev, newTab]);
@@ -1570,6 +1620,8 @@ export function MainWindow() {
           latestConnection.username,
           latestConnection.password || "",
           latestConnection.connectionProtocol || "TcpIp",
+          latestConnection.terminalEffectPluginId,
+          latestConnection.terminalEffectAnimationSpeed,
         );
       } else {
         createSshSession(id, {
@@ -1586,6 +1638,8 @@ export function MainWindow() {
           temporaryKeyExpirationMinutes: latestConnection.temporaryKeyExpirationMinutes,
           temporaryKeyPermanent: latestConnection.temporaryKeyPermanent,
           connectionProtocol: latestConnection.connectionProtocol || "TcpIp",
+          terminalEffectPluginId: latestConnection.terminalEffectPluginId,
+          terminalEffectAnimationSpeed: latestConnection.terminalEffectAnimationSpeed,
         }).then((ok) => {
           setTabs((prev) =>
             prev.map((t) =>
@@ -1707,6 +1761,8 @@ export function MainWindow() {
         temporaryKeyExpirationMinutes: connection.temporaryKeyExpirationMinutes,
         temporaryKeyPermanent: connection.temporaryKeyPermanent,
         connectionProtocol: connection.connectionProtocol || "TcpIp",
+        terminalEffectPluginId: connection.terminalEffectPluginId,
+        terminalEffectAnimationSpeed: connection.terminalEffectAnimationSpeed,
         ...buildTerminalAppearanceSnapshot(connection),
       }));
 
@@ -1741,6 +1797,8 @@ export function MainWindow() {
             connection.username,
             connection.password || "",
             connection.connectionProtocol || "TcpIp",
+            connection.terminalEffectPluginId,
+            connection.terminalEffectAnimationSpeed,
           );
           continue;
         }
@@ -1759,6 +1817,8 @@ export function MainWindow() {
           temporaryKeyExpirationMinutes: connection.temporaryKeyExpirationMinutes,
           temporaryKeyPermanent: connection.temporaryKeyPermanent,
           connectionProtocol: connection.connectionProtocol || "TcpIp",
+          terminalEffectPluginId: connection.terminalEffectPluginId,
+          terminalEffectAnimationSpeed: connection.terminalEffectAnimationSpeed,
         });
         setTabs((previous) =>
           previous.map((tab) =>
@@ -1815,6 +1875,8 @@ export function MainWindow() {
           temporaryKeyExpirationMinutes: primaryTab.temporaryKeyExpirationMinutes,
           temporaryKeyPermanent: primaryTab.temporaryKeyPermanent,
           connectionProtocol: primaryTab.connectionProtocol || "TcpIp",
+          terminalEffectPluginId: primaryTab.terminalEffectPluginId,
+          terminalEffectAnimationSpeed: primaryTab.terminalEffectAnimationSpeed,
         };
       } else {
         info = splitSessionConfigs[sessionId] || null;
@@ -1880,6 +1942,8 @@ export function MainWindow() {
         temporaryKeyExpirationMinutes: source.temporaryKeyExpirationMinutes,
         temporaryKeyPermanent: source.temporaryKeyPermanent,
         connectionProtocol: source.connectionProtocol,
+        terminalEffectPluginId: source.terminalEffectPluginId,
+        terminalEffectAnimationSpeed: source.terminalEffectAnimationSpeed,
         ...buildTerminalAppearanceFromTab(source),
       };
       setTabs((prev) => [...prev, newTab]);
@@ -1893,6 +1957,8 @@ export function MainWindow() {
             source.username,
             source.password || "",
             source.connectionProtocol || "TcpIp",
+            source.terminalEffectPluginId,
+            source.terminalEffectAnimationSpeed,
           );
         } else {
           createSshSession(id, {
@@ -1909,6 +1975,8 @@ export function MainWindow() {
             temporaryKeyExpirationMinutes: source.temporaryKeyExpirationMinutes,
             temporaryKeyPermanent: source.temporaryKeyPermanent,
             connectionProtocol: source.connectionProtocol || "TcpIp",
+            terminalEffectPluginId: source.terminalEffectPluginId,
+            terminalEffectAnimationSpeed: source.terminalEffectAnimationSpeed,
           }).then((ok) => {
             setTabs((prev) =>
               prev.map((t) =>
@@ -1941,6 +2009,8 @@ export function MainWindow() {
       const temporaryKeyExpirationMinutes = tab.temporaryKeyExpirationMinutes;
       const temporaryKeyPermanent = tab.temporaryKeyPermanent;
       const connectionProtocol = tab.connectionProtocol || "TcpIp";
+      const terminalEffectPluginId = tab.terminalEffectPluginId;
+      const terminalEffectAnimationSpeed = tab.terminalEffectAnimationSpeed;
       const splitSessionId = crypto.randomUUID();
       const ok = await createSshSession(splitSessionId, {
         host,
@@ -1956,6 +2026,8 @@ export function MainWindow() {
         temporaryKeyExpirationMinutes,
         temporaryKeyPermanent,
         connectionProtocol,
+        terminalEffectPluginId,
+        terminalEffectAnimationSpeed,
       });
       if (ok) {
         setTabSplitSessions((prev) => ({
@@ -1978,6 +2050,8 @@ export function MainWindow() {
               temporaryKeyExpirationMinutes,
               temporaryKeyPermanent,
             connectionProtocol,
+            terminalEffectPluginId,
+            terminalEffectAnimationSpeed,
           },
         }));
         return splitSessionId;
@@ -2233,6 +2307,8 @@ export function MainWindow() {
         temporaryKeyExpirationMinutes: info.temporaryKeyExpirationMinutes,
         temporaryKeyPermanent: info.temporaryKeyPermanent,
         connectionProtocol: info.connectionProtocol,
+        terminalEffectPluginId: info.terminalEffectPluginId,
+        terminalEffectAnimationSpeed: info.terminalEffectAnimationSpeed,
       };
       setTabs((prev) => [...prev, newTab]);
       setActiveTab(id);
@@ -2244,6 +2320,8 @@ export function MainWindow() {
           info.username,
           info.password || "",
           info.connectionProtocol,
+          info.terminalEffectPluginId,
+          info.terminalEffectAnimationSpeed,
         );
       } else {
         createSshSession(id, info).then((ok) => {
@@ -2841,6 +2919,26 @@ export function MainWindow() {
       .then((settings) => invoke("save_settings", { settings: { ...settings, showMenuBar: visible } }))
       .catch(console.error);
   }, [showMenuBar]);
+
+  const setTabTerminalEffect = useCallback((tabId: string, pluginId: string | undefined) => {
+    setTabs((prev) =>
+      prev.map((tab) =>
+        tab.id === tabId && (tab.kind ?? "terminal") === "terminal"
+          ? { ...tab, terminalEffectPluginId: pluginId }
+          : tab,
+      ),
+    );
+  }, []);
+
+  const setTabTerminalEffectSpeed = useCallback((tabId: string, speed: number) => {
+    setTabs((prev) =>
+      prev.map((tab) =>
+        tab.id === tabId && (tab.kind ?? "terminal") === "terminal"
+          ? { ...tab, terminalEffectAnimationSpeed: normalizeTerminalEffectSpeed(speed) }
+          : tab,
+      ),
+    );
+  }, []);
 
   const handleOpenProjectDialog = useCallback(async () => {
     const path = await openFileDialog({
@@ -3657,6 +3755,8 @@ export function MainWindow() {
     onAiManager: () => setOpenDialog("aiManager"),
     onAiAgent: handleOpenAiAgentForFocusedSession,
     onSnippets: () => setOpenDialog("snippetManager"),
+    onJobScheduler: () => setOpenDialog("jobScheduler"),
+    onTerminalEffects: () => setOpenDialog("terminalEffects"),
     onSFTPManager: () => setOpenDialog("sftpManager"),
     onAsciiArt: () => setOpenDialog("asciiArt"),
     onCreateBackup: () => setOpenDialog("backupCreate"),
@@ -3790,6 +3890,9 @@ export function MainWindow() {
             otherWindows={otherWorkspaceWindows}
             onMoveTabToWindow={handleMoveTabToWindow}
             onCopyTabToWindow={handleCopyTabToWindow}
+            terminalEffects={terminalEffects}
+            onSetTabTerminalEffect={setTabTerminalEffect}
+            onSetTabTerminalEffectSpeed={setTabTerminalEffectSpeed}
           />
           <div
             className="flex-1 min-h-0 bg-kortty-terminal relative overflow-hidden"
@@ -3892,6 +3995,16 @@ export function MainWindow() {
                         terminalAppearance.fontSize ??
                         globalFontSize
                       }
+                      getTerminalEffectPluginIdForSession={(sessionId) =>
+                        sessionId === tab.id
+                          ? tab.terminalEffectPluginId
+                          : splitSessionConfigs[sessionId]?.terminalEffectPluginId
+                      }
+                      getTerminalEffectAnimationSpeedForSession={(sessionId) =>
+                        sessionId === tab.id
+                          ? tab.terminalEffectAnimationSpeed
+                          : splitSessionConfigs[sessionId]?.terminalEffectAnimationSpeed
+                      }
                       onFocusSession={(sessionId) => {
                         focusedPaneSessionRef.current = sessionId;
                       }}
@@ -3958,6 +4071,7 @@ export function MainWindow() {
                           connectionDisplayName: resolveConnectionDisplayName(sessionId),
                         });
                       }) : undefined}
+                      onOpenSnippetManager={() => setOpenDialog("snippetManager")}
                       onAgentCommand={(sessionId, rawCommand) => {
                         void handleTerminalAgentShortcut(sessionId, rawCommand);
                       }}
@@ -4131,6 +4245,17 @@ export function MainWindow() {
           void handleCloseAiManager();
         }}
         onOpenChat={handleOpenSavedAiChat}
+      />
+      <JobSchedulerDialog
+        open={openDialog === "jobScheduler"}
+        onClose={() => setOpenDialog(null)}
+      />
+      <TerminalEffectManagerDialog
+        open={openDialog === "terminalEffects"}
+        onClose={() => {
+          void reloadTerminalEffects();
+          setOpenDialog(null);
+        }}
       />
       <CredentialManager
         open={openDialog === "credentialManager"}

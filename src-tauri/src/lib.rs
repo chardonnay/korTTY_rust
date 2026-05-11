@@ -1,16 +1,20 @@
 pub mod ai;
+pub mod ai_skills;
 pub mod backup;
 pub mod commands;
 pub mod figlet;
 pub mod i18n;
+pub mod jobscheduler;
 pub mod logging;
 pub mod model;
 pub mod persistence;
 pub mod security;
 pub mod sftp;
+pub mod snippet_tools;
 pub mod ssh;
 pub mod teamwork;
 pub mod terminal_agent;
+pub mod terminal_effects;
 
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -26,6 +30,7 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .manage(ssh::SSHManager::new())
+        .manage(jobscheduler::JobSchedulerManager::new())
         .manage(terminal_agent::TerminalAgentStore::new())
         .manage(terminal_agent::TerminalAgentPlanStore::new())
         .manage(security::vault::Vault::new())
@@ -65,6 +70,28 @@ pub fn run() {
             commands::terminal_agent_commands::cancel_terminal_agent,
             commands::terminal_agent_commands::submit_terminal_agent_sudo_password,
             commands::terminal_agent_commands::export_terminal_agent_activity_pdf,
+            commands::jobscheduler_commands::get_scheduled_jobs,
+            commands::jobscheduler_commands::save_scheduled_job,
+            commands::jobscheduler_commands::delete_scheduled_job,
+            commands::jobscheduler_commands::run_scheduled_job_now,
+            commands::jobscheduler_commands::cancel_scheduled_job_run,
+            commands::jobscheduler_commands::get_job_scheduler_status,
+            commands::jobscheduler_commands::get_job_journal,
+            commands::jobscheduler_commands::clear_job_journal,
+            commands::jobscheduler_commands::probe_job_host_key,
+            commands::jobscheduler_commands::pin_job_host_key,
+            commands::jobscheduler_commands::get_pinned_host_keys,
+            commands::jobscheduler_commands::delete_pinned_host_key,
+            commands::jobscheduler_commands::encrypt_job_secret,
+            commands::jobscheduler_commands::save_job_sudo_credential,
+            commands::jobscheduler_commands::delete_job_sudo_credential,
+            commands::jobscheduler_commands::drain_job_scheduler_on_shutdown,
+            commands::terminal_effect_commands::list_terminal_effect_plugins,
+            commands::terminal_effect_commands::load_terminal_effect_plugin,
+            commands::terminal_effect_commands::set_terminal_effect_plugin_enabled,
+            commands::terminal_effect_commands::import_terminal_effect_plugin,
+            commands::terminal_effect_commands::export_terminal_effect_plugin,
+            commands::terminal_effect_commands::normalize_terminal_effect_speed,
             commands::connection_commands::get_connections,
             commands::connection_commands::save_connection,
             commands::connection_commands::delete_connection,
@@ -113,6 +140,13 @@ pub fn run() {
             commands::snippet_commands::get_snippets,
             commands::snippet_commands::save_snippet,
             commands::snippet_commands::delete_snippet,
+            commands::snippet_commands::get_snippet_global_variables,
+            commands::snippet_commands::save_snippet_global_variables,
+            commands::snippet_commands::build_snippet_one_liner,
+            commands::ai_commands::get_ai_skills,
+            commands::ai_commands::save_ai_skills,
+            commands::ai_commands::import_ai_skill_markdown,
+            commands::ai_commands::export_ai_skill_markdown,
             commands::translation_commands::translate_text,
             commands::translation_commands::generate_language_file,
             commands::translation_commands::test_api_connection,

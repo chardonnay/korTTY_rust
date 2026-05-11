@@ -1,8 +1,11 @@
 use crate::ai;
-use crate::model::ai::{AiExecutionResult, AiProfile, AiRequestPayload, SavedAiChat};
+use crate::ai_skills;
+use crate::model::ai::{AiExecutionResult, AiProfile, AiRequestPayload, AiSkill, SavedAiChat};
 use crate::model::settings::GlobalSettings;
 use crate::persistence::xml_repository;
 use std::collections::HashMap;
+use std::fs;
+use std::path::Path;
 use std::sync::Mutex;
 use tauri::{AppHandle, Manager};
 use tokio::sync::oneshot;
@@ -237,4 +240,46 @@ pub async fn delete_ai_chat(id: String) -> Result<(), String> {
         .unwrap_or_default();
     chats.retain(|chat| chat.id != id);
     xml_repository::save_json(AI_CHATS_FILE, &chats).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn get_ai_skills() -> Result<Vec<AiSkill>, String> {
+    let mut settings: GlobalSettings = xml_repository::load_json(GLOBAL_SETTINGS_FILE)
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    for skill in &mut settings.ai_skills {
+        ai_skills::normalize_skill(skill);
+    }
+    settings
+        .ai_skills
+        .sort_by_key(|skill| skill.name.to_lowercase());
+    Ok(settings.ai_skills)
+}
+
+#[tauri::command]
+pub async fn save_ai_skills(skills: Vec<AiSkill>) -> Result<Vec<AiSkill>, String> {
+    let mut settings: GlobalSettings = xml_repository::load_json(GLOBAL_SETTINGS_FILE)
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    let mut normalized = skills;
+    for skill in &mut normalized {
+        ai_skills::normalize_skill(skill);
+    }
+    settings.ai_skills = normalized.clone();
+    xml_repository::save_json(GLOBAL_SETTINGS_FILE, &settings)
+        .map_err(|error| error.to_string())?;
+    Ok(normalized)
+}
+
+#[tauri::command]
+pub async fn import_ai_skill_markdown(path: String) -> Result<AiSkill, String> {
+    let path_ref = Path::new(&path);
+    let text = fs::read_to_string(path_ref).map_err(|error| error.to_string())?;
+    ai_skills::import_skill_from_markdown(Some(path_ref), &text).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn export_ai_skill_markdown(path: String, skill: AiSkill) -> Result<(), String> {
+    let markdown = ai_skills::export_skill_to_markdown(&skill);
+    fs::write(path, markdown).map_err(|error| error.to_string())
 }

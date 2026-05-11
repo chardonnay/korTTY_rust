@@ -1,9 +1,28 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
-import { X, Plus, Trash2, Edit, FileCode, Star, StarOff, Upload, Download } from "lucide-react";
+import {
+  X,
+  Plus,
+  Trash2,
+  Edit,
+  FileCode,
+  Star,
+  StarOff,
+  Upload,
+  Download,
+  Bot,
+  ChevronDown,
+  ChevronRight,
+  PanelLeftClose,
+  PanelLeftOpen,
+} from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
+import type { GlobalSettings } from "../../store/settingsStore";
+import type { AiExecutionResult, AiProfile, AiRequestPayload } from "../../types/ai";
+import { resolvePreferredAiProfileId } from "../../utils/aiProfiles";
+import { DEFAULT_AI_LANGUAGE_CODE, resolveGuiLanguageCode } from "../../utils/aiLanguage";
 import CodeMirror from "@uiw/react-codemirror";
 import { oneDark } from "@codemirror/theme-one-dark";
 import { StreamLanguage } from "@codemirror/language";
@@ -57,6 +76,7 @@ export interface Snippet {
   name: string;
   content: string;
   category?: string;
+  description?: string;
   language?: string;
   favorite: boolean;
   variables: SnippetVariable[];
@@ -68,6 +88,84 @@ interface SnippetManagerProps {
 }
 
 const EXPORT_FORMATS = ["JSON", "XML", "YAML"] as const;
+const SNIPPET_CATEGORY_MAX_LENGTH = 30;
+
+interface SnippetMetadataSuggestion {
+  name?: string;
+  category?: string;
+  description?: string;
+}
+
+function normalizeSnippetCategory(value?: string | null): string | undefined {
+  const trimmed = value?.trim();
+  if (!trimmed) return undefined;
+  return trimmed.slice(0, SNIPPET_CATEGORY_MAX_LENGTH);
+}
+
+function normalizeSnippetDescription(value?: string | null): string | undefined {
+  const normalized = value?.replace(/\r\n?/g, "\n").trim();
+  return normalized || undefined;
+}
+
+function normalizeSnippetForSave(snippet: Snippet): Snippet {
+  return {
+    ...snippet,
+    category: normalizeSnippetCategory(snippet.category),
+    description: normalizeSnippetDescription(snippet.description),
+    variables: snippet.variables ?? [],
+  };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function readStringField(source: Record<string, unknown>, key: string): string | undefined {
+  const value = source[key];
+  return typeof value === "string" ? value : undefined;
+}
+
+function tryParseJson(value: string): unknown | null {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function parseSnippetMetadataSuggestion(raw: string): SnippetMetadataSuggestion {
+  const candidates = [
+    raw.trim(),
+    raw.match(/```(?:json)?\s*([\s\S]*?)```/i)?.[1]?.trim(),
+    raw.slice(raw.indexOf("{"), raw.lastIndexOf("}") + 1).trim(),
+  ].filter((candidate): candidate is string => !!candidate);
+
+  for (const candidate of candidates) {
+    const parsed = tryParseJson(candidate);
+    if (!isRecord(parsed)) {
+      continue;
+    }
+    return {
+      name: readStringField(parsed, "name"),
+      category: readStringField(parsed, "category"),
+      description: readStringField(parsed, "description"),
+    };
+  }
+
+  throw new Error("AI response did not contain a valid JSON object");
+}
+
+function buildSnippetMetadataPrompt(responseLanguageCode: string): string {
+  return [
+    "Analyze this script snippet and infer suitable metadata for a snippet library.",
+    "Return exactly one JSON object and no Markdown.",
+    'Schema: {"name":"...","category":"...","description":"..."}',
+    `Use language code ${responseLanguageCode} for human-readable values.`,
+    `category must be at most ${SNIPPET_CATEGORY_MAX_LENGTH} characters.`,
+    "description must contain at least two concise lines separated by \\n.",
+    "Do not invent external facts; use only what is visible in the script.",
+  ].join("\n");
+}
 
 function normalizeSnippetContent(rawContent: string): string {
   const lines = rawContent.replace(/\r\n?/g, "\n").split("\n");
@@ -116,7 +214,10 @@ function parseSnippetsXml(content: string): Snippet[] {
   return Array.from(document.querySelectorAll("snippet")).map((element) => ({
     id: element.getAttribute("id") || crypto.randomUUID(),
     name: element.getAttribute("name") || "",
-    category: element.getAttribute("category") || undefined,
+    category: normalizeSnippetCategory(element.getAttribute("category")),
+    description: normalizeSnippetDescription(
+      element.querySelector("description")?.textContent ?? element.getAttribute("description"),
+    ),
     language: element.getAttribute("language") || "bash",
     favorite: element.getAttribute("favorite") === "true",
     content: normalizeSnippetContent(element.querySelector("content")?.textContent ?? ""),
@@ -149,6 +250,7 @@ function snippetsToXml(snippets: Snippet[]): string {
       `  <snippet id="${escapeXml(snippet.id)}" name="${escapeXml(snippet.name)}"${
         snippet.category ? ` category="${escapeXml(snippet.category)}"` : ""
       }${snippet.language ? ` language="${escapeXml(snippet.language)}"` : ""} favorite="${snippet.favorite}">`,
+      snippet.description ? `    <description>${escapeXml(snippet.description)}</description>` : "",
       `    <content>${escapeXml(snippet.content)}</content>`,
       "    <variables>",
       variables,
@@ -166,6 +268,7 @@ function newSnippet(): Snippet {
     name: "",
     content: "",
     category: undefined,
+    description: undefined,
     language: "bash",
     favorite: false,
     variables: [],
@@ -223,7 +326,11 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
   const [search, setSearch] = useState("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [aiMetadataLoading, setAiMetadataLoading] = useState(false);
+  const [aiMetadataStatus, setAiMetadataStatus] = useState<string | null>(null);
   const [importExportStatus, setImportExportStatus] = useState<string | null>(null);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [metadataCollapsed, setMetadataCollapsed] = useState(false);
 
   useEffect(() => {
     if (open) loadSnippets();
@@ -242,9 +349,10 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
     setLoading(true);
     try {
       const s = await invoke<Snippet[]>("get_snippets");
-      setSnippets(s);
-      if (!selectedId && s.length > 0) setSelectedId(s[0].id);
-      if (selectedId && !s.find((x) => x.id === selectedId)) setSelectedId(s[0]?.id ?? null);
+      const normalized = s.map(normalizeSnippetForSave);
+      setSnippets(normalized);
+      if (!selectedId && normalized.length > 0) setSelectedId(normalized[0].id);
+      if (selectedId && !normalized.find((x) => x.id === selectedId)) setSelectedId(normalized[0]?.id ?? null);
     } catch (err) {
       console.error("Failed to load snippets:", err);
     } finally {
@@ -256,7 +364,7 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
     if (!editing) return;
     setSaving(true);
     try {
-      await invoke("save_snippet", { snippet: editing });
+      await invoke("save_snippet", { snippet: normalizeSnippetForSave(editing) });
       await loadSnippets();
     } catch (err) {
       console.error("Failed to save snippet:", err);
@@ -280,10 +388,60 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
     if (!s) return;
     const updated = { ...s, favorite: !s.favorite };
     try {
-      await invoke("save_snippet", { snippet: updated });
+      await invoke("save_snippet", { snippet: normalizeSnippetForSave(updated) });
       await loadSnippets();
     } catch (err) {
       console.error("Failed to toggle favorite:", err);
+    }
+  }
+
+  async function handleGenerateMetadata() {
+    if (!editing?.content.trim()) {
+      setAiMetadataStatus("Snippet content is required for AI metadata analysis.");
+      return;
+    }
+
+    setAiMetadataLoading(true);
+    setAiMetadataStatus("Analyzing snippet with AI...");
+    try {
+      const [profiles, settings] = await Promise.all([
+        invoke<AiProfile[]>("get_ai_profiles"),
+        invoke<GlobalSettings>("get_settings").catch(() => null),
+      ]);
+      const profileId = resolvePreferredAiProfileId(profiles, settings?.defaultAiProfileId);
+      if (!profileId) {
+        setAiMetadataStatus("No AI profile configured.");
+        return;
+      }
+
+      const responseLanguageCode = resolveGuiLanguageCode(settings) || DEFAULT_AI_LANGUAGE_CODE;
+      const request: AiRequestPayload = {
+        action: "Ask",
+        profileId,
+        selectedText: editing.content,
+        responseLanguageCode,
+        userPrompt: buildSnippetMetadataPrompt(responseLanguageCode),
+      };
+      const result = await invoke<AiExecutionResult>("execute_ai_action", {
+        request,
+        requestId: crypto.randomUUID(),
+      });
+      const suggestion = parseSnippetMetadataSuggestion(result.content);
+
+      setEditing((current) => {
+        if (!current) return current;
+        return {
+          ...current,
+          name: suggestion.name?.trim() || current.name,
+          category: normalizeSnippetCategory(suggestion.category) ?? current.category,
+          description: normalizeSnippetDescription(suggestion.description) ?? current.description,
+        };
+      });
+      setAiMetadataStatus("AI metadata applied. Review and save the snippet.");
+    } catch (error) {
+      setAiMetadataStatus(`AI metadata failed: ${String(error)}`);
+    } finally {
+      setAiMetadataLoading(false);
     }
   }
 
@@ -319,7 +477,9 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
         return;
       }
       for (const s of imported) {
-        if (s.id && s.name) await invoke("save_snippet", { snippet: s });
+        if (s.id && s.name) {
+          await invoke("save_snippet", { snippet: normalizeSnippetForSave(s) });
+        }
       }
       setImportExportStatus(`Imported ${imported.length} snippets`);
       await loadSnippets();
@@ -373,6 +533,7 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
     const matchSearch =
       !search ||
       s.name.toLowerCase().includes(search.toLowerCase()) ||
+      (s.description || "").toLowerCase().includes(search.toLowerCase()) ||
       (s.content || "").toLowerCase().includes(search.toLowerCase());
     return matchCat && matchSearch;
   });
@@ -396,88 +557,179 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
         </div>
 
         <div className="flex flex-1 min-h-0">
-          <div className="w-[220px] border-r border-kortty-border flex flex-col overflow-hidden">
-            <div className="p-2 space-y-2 border-b border-kortty-border">
-              <select
-                className="input-field text-xs"
-                value={categoryFilter}
-                onChange={(e) => setCategoryFilter(e.target.value)}
+          <div
+            className={`border-r border-kortty-border flex flex-col overflow-hidden transition-[width] duration-150 ${
+              sidebarCollapsed ? "w-10" : "w-[220px]"
+            }`}
+          >
+            <div className="flex items-center justify-between gap-1 p-2 border-b border-kortty-border">
+              {!sidebarCollapsed && (
+                <div className="min-w-0 text-xs font-medium text-kortty-text truncate">
+                  Snippets
+                </div>
+              )}
+              <button
+                className="ml-auto flex h-6 w-6 items-center justify-center rounded text-kortty-text-dim hover:bg-kortty-panel hover:text-kortty-text"
+                onClick={() => setSidebarCollapsed((collapsed) => !collapsed)}
+                title={sidebarCollapsed ? "Show snippet list" : "Hide snippet list"}
               >
-                <option value="">All categories</option>
-                {categories.map((c) => (
-                  <option key={c} value={c}>
-                    {c}
-                  </option>
-                ))}
-              </select>
-              <input
-                className="input-field text-xs"
-                placeholder="Search…"
-                value={search}
-                onChange={(e) => setSearch(e.target.value)}
-              />
+                {sidebarCollapsed ? (
+                  <PanelLeftOpen className="h-3.5 w-3.5" />
+                ) : (
+                  <PanelLeftClose className="h-3.5 w-3.5" />
+                )}
+              </button>
             </div>
-            <div className="flex-1 overflow-y-auto p-2">
-              {loading ? (
-                <div className="text-xs text-kortty-text-dim p-3">Loading…</div>
-              ) : (
-                filtered.map((s) => (
-                  <button
-                    key={s.id}
-                    className={`w-full text-left px-2 py-1.5 text-xs rounded truncate flex items-center gap-1 ${
-                      selectedId === s.id
-                        ? "bg-kortty-accent/10 text-kortty-accent"
-                        : "text-kortty-text hover:bg-kortty-panel"
-                    }`}
-                    onClick={() => setSelectedId(s.id)}
+            {!sidebarCollapsed && (
+              <>
+                <div className="p-2 space-y-2 border-b border-kortty-border">
+                  <select
+                    className="input-field text-xs"
+                    value={categoryFilter}
+                    onChange={(e) => setCategoryFilter(e.target.value)}
                   >
-                    <button
-                      className="shrink-0 p-0.5 hover:text-kortty-accent"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        handleToggleFavorite(s.id);
-                      }}
-                    >
-                      {s.favorite ? (
-                        <Star className="w-3 h-3 fill-kortty-accent text-kortty-accent" />
-                      ) : (
-                        <StarOff className="w-3 h-3 text-kortty-text-dim" />
-                      )}
-                    </button>
-                    <span className="truncate">{s.name || "Unnamed"}</span>
-                  </button>
-                ))
-              )}
-              {!loading && filtered.length === 0 && (
-                <div className="text-xs text-kortty-text-dim p-3">No snippets</div>
-              )}
-            </div>
+                    <option value="">All categories</option>
+                    {categories.map((c) => (
+                      <option key={c} value={c}>
+                        {c}
+                      </option>
+                    ))}
+                  </select>
+                  <input
+                    className="input-field text-xs"
+                    placeholder="Search…"
+                    value={search}
+                    onChange={(e) => setSearch(e.target.value)}
+                  />
+                </div>
+                <div className="flex-1 overflow-y-auto p-2">
+                  {loading ? (
+                    <div className="text-xs text-kortty-text-dim p-3">Loading…</div>
+                  ) : (
+                    filtered.map((s) => (
+                      <button
+                        key={s.id}
+                        className={`w-full text-left px-2 py-1.5 text-xs rounded truncate flex items-center gap-1 ${
+                          selectedId === s.id
+                            ? "bg-kortty-accent/10 text-kortty-accent"
+                            : "text-kortty-text hover:bg-kortty-panel"
+                        }`}
+                        onClick={() => setSelectedId(s.id)}
+                      >
+                        <button
+                          className="shrink-0 p-0.5 hover:text-kortty-accent"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleToggleFavorite(s.id);
+                          }}
+                        >
+                          {s.favorite ? (
+                            <Star className="w-3 h-3 fill-kortty-accent text-kortty-accent" />
+                          ) : (
+                            <StarOff className="w-3 h-3 text-kortty-text-dim" />
+                          )}
+                        </button>
+                        <span className="truncate">{s.name || "Unnamed"}</span>
+                      </button>
+                    ))
+                  )}
+                  {!loading && filtered.length === 0 && (
+                    <div className="text-xs text-kortty-text-dim p-3">No snippets</div>
+                  )}
+                </div>
+              </>
+            )}
           </div>
 
           <div className="flex-1 p-4 overflow-hidden flex flex-col min-h-0">
             {editing ? (
               <div className="flex-1 flex flex-col space-y-3 min-h-0">
-                <div>
-                  <label className="block text-xs text-kortty-text-dim mb-1">Name</label>
-                  <input
-                    className="input-field"
-                    value={editing.name}
-                    onChange={(e) =>
-                      setEditing((p) => (p ? { ...p, name: e.target.value } : null))
-                    }
-                    placeholder="Snippet name"
-                  />
-                </div>
-                <div>
-                  <label className="block text-xs text-kortty-text-dim mb-1">Category</label>
-                  <input
-                    className="input-field"
-                    value={editing.category || ""}
-                    onChange={(e) =>
-                      setEditing((p) => (p ? { ...p, category: e.target.value || undefined } : null))
-                    }
-                    placeholder="Optional category"
-                  />
+                <div className="rounded border border-kortty-border bg-kortty-panel/30">
+                  <div className="flex items-center justify-between gap-3 px-3 py-2">
+                    <button
+                      className="flex min-w-0 items-center gap-2 text-left text-xs font-medium text-kortty-text"
+                      onClick={() => setMetadataCollapsed((collapsed) => !collapsed)}
+                      title={metadataCollapsed ? "Show metadata" : "Hide metadata"}
+                    >
+                      {metadataCollapsed ? (
+                        <ChevronRight className="h-3.5 w-3.5 shrink-0 text-kortty-text-dim" />
+                      ) : (
+                        <ChevronDown className="h-3.5 w-3.5 shrink-0 text-kortty-text-dim" />
+                      )}
+                      <span className="truncate">Metadata</span>
+                    </button>
+                    <div className="flex items-center gap-2">
+                      <button
+                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors disabled:opacity-50"
+                        disabled={aiMetadataLoading || !editing.content.trim()}
+                        onClick={() => {
+                          void handleGenerateMetadata();
+                        }}
+                        title="Analyze script content and fill snippet metadata"
+                      >
+                        <Bot className="w-3.5 h-3.5" />
+                        AI
+                      </button>
+                      <button
+                        className="flex h-7 w-7 items-center justify-center rounded text-kortty-text-dim hover:bg-kortty-border hover:text-kortty-text"
+                        onClick={() => setMetadataCollapsed((collapsed) => !collapsed)}
+                        title={metadataCollapsed ? "Show metadata" : "Hide metadata"}
+                      >
+                        {metadataCollapsed ? (
+                          <ChevronRight className="h-3.5 w-3.5" />
+                        ) : (
+                          <ChevronDown className="h-3.5 w-3.5" />
+                        )}
+                      </button>
+                    </div>
+                  </div>
+                  {!metadataCollapsed && (
+                    <div className="space-y-3 border-t border-kortty-border px-3 py-3">
+                      <div>
+                        <label className="block text-xs text-kortty-text-dim mb-1">Name</label>
+                        <input
+                          className="input-field"
+                          value={editing.name}
+                          onChange={(e) =>
+                            setEditing((p) => (p ? { ...p, name: e.target.value } : null))
+                          }
+                          placeholder="Snippet name"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-kortty-text-dim mb-1">Category</label>
+                        <input
+                          className="input-field"
+                          value={editing.category || ""}
+                          maxLength={SNIPPET_CATEGORY_MAX_LENGTH}
+                          onChange={(e) =>
+                            setEditing((p) => (p ? { ...p, category: normalizeSnippetCategory(e.target.value) } : null))
+                          }
+                          placeholder="Optional category"
+                        />
+                        <div className="mt-1 text-[10px] text-kortty-text-dim text-right">
+                          {(editing.category || "").length}/{SNIPPET_CATEGORY_MAX_LENGTH}
+                        </div>
+                      </div>
+                      <div>
+                        <label className="block text-xs text-kortty-text-dim mb-1">Description</label>
+                        <textarea
+                          className="input-field min-h-12 resize-y"
+                          rows={2}
+                          value={editing.description || ""}
+                          onChange={(e) =>
+                            setEditing((p) => (p ? { ...p, description: e.target.value || undefined } : null))
+                          }
+                          placeholder="Optional two-line description"
+                        />
+                      </div>
+                      {aiMetadataStatus && (
+                        <div className="rounded border border-kortty-border bg-kortty-panel/50 px-3 py-2 text-xs text-kortty-text-dim">
+                          {aiMetadataStatus}
+                        </div>
+                      )}
+                    </div>
+                  )}
                 </div>
                 <div className="flex-1 flex flex-col min-h-0">
                   <div className="flex items-center justify-between mb-1">

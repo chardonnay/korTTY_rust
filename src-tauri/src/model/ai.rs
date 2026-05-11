@@ -41,6 +41,112 @@ pub enum AiTokenWarningLevel {
     Red,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AiReasoningEffort {
+    #[default]
+    Disabled,
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+impl AiReasoningEffort {
+    pub fn api_value(&self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => None,
+            Self::None => Some("none"),
+            Self::Minimal => Some("minimal"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High => Some("high"),
+            Self::Xhigh => Some("xhigh"),
+        }
+    }
+
+    pub fn lm_studio_reasoning_value(&self) -> Option<&'static str> {
+        match self {
+            Self::Disabled => None,
+            Self::None | Self::Minimal => Some("off"),
+            Self::Low => Some("low"),
+            Self::Medium => Some("medium"),
+            Self::High | Self::Xhigh => Some("high"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AiInternetAccessMode {
+    #[default]
+    Disabled,
+    KorttyTavilyTool,
+    LmStudioTavilyMcp,
+    BrightDataWebMcp,
+    BraveSearchMcp,
+    SearxngMcp,
+    LmStudioToolpack,
+}
+
+impl AiInternetAccessMode {
+    pub fn is_enabled(&self) -> bool {
+        !matches!(self, Self::Disabled)
+    }
+
+    pub fn uses_kortty_tool(&self) -> bool {
+        matches!(self, Self::KorttyTavilyTool)
+    }
+
+    pub fn uses_lm_studio_mcp(&self) -> bool {
+        matches!(
+            self,
+            Self::LmStudioTavilyMcp
+                | Self::BrightDataWebMcp
+                | Self::BraveSearchMcp
+                | Self::SearxngMcp
+                | Self::LmStudioToolpack
+        )
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AiSkillTarget {
+    Chat,
+    Agent,
+    #[default]
+    Both,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AiSkill {
+    pub id: String,
+    pub name: String,
+    pub description: Option<String>,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub target: AiSkillTarget,
+    pub content: String,
+}
+
+impl Default for AiSkill {
+    fn default() -> Self {
+        Self {
+            id: uuid::Uuid::new_v4().to_string(),
+            name: String::new(),
+            description: None,
+            tags: Vec::new(),
+            enabled: true,
+            target: AiSkillTarget::Both,
+            content: String::new(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AiProfile {
@@ -50,6 +156,10 @@ pub struct AiProfile {
     pub model: String,
     #[serde(default)]
     pub api_key: String,
+    #[serde(default)]
+    pub reasoning_effort: AiReasoningEffort,
+    #[serde(default)]
+    pub internet_access_mode: AiInternetAccessMode,
     #[serde(default = "default_max_selection_chars")]
     pub max_selection_chars: usize,
     #[serde(default)]
@@ -81,6 +191,8 @@ impl Default for AiProfile {
             api_url: String::new(),
             model: String::new(),
             api_key: String::new(),
+            reasoning_effort: AiReasoningEffort::Disabled,
+            internet_access_mode: AiInternetAccessMode::Disabled,
             max_selection_chars: default_max_selection_chars(),
             tokenizer_type: AiTokenizerType::Estimate,
             token_limit_amount: None,
@@ -205,4 +317,8 @@ fn default_red_percent() -> u8 {
 
 fn default_reset_days() -> u16 {
     30
+}
+
+fn default_true() -> bool {
+    true
 }

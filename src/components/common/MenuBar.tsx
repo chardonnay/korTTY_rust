@@ -22,6 +22,8 @@ interface MenuBarProps {
   onAiManager: () => void;
   onAiAgent?: () => void;
   onSnippets: () => void;
+  onJobScheduler: () => void;
+  onTerminalEffects: () => void;
   onSFTPManager: () => void;
   onAsciiArt: () => void;
   onCreateBackup: () => void;
@@ -112,10 +114,18 @@ export function MenuBar(props: MenuBarProps) {
         { label: "AI Manager...", shortcut: "Ctrl+Shift+Y", action: props.onAiManager },
         { label: "AI Agent...", action: props.onAiAgent },
         { separator: true, label: "" },
+        { label: "JobScheduler...", action: props.onJobScheduler },
+        { separator: true, label: "" },
         { label: "Open SFTP Manager...", action: props.onSFTPManager },
         { label: "ASCII Art Banner...", action: props.onAsciiArt },
         { separator: true, label: "" },
         { label: "Snippets...", action: props.onSnippets },
+      ],
+    },
+    {
+      label: "Plugins",
+      items: [
+        { label: "Terminal Effects...", action: props.onTerminalEffects },
       ],
     },
     {

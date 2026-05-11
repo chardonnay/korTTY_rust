@@ -63,9 +63,22 @@ export function buildTerminalAgentPlanPattern(commandName: string, caseInsensiti
   );
 }
 
+export function buildTerminalAgentInlinePlanPattern(commandName: string, caseInsensitive = false): RegExp {
+  const escapedName = escapeRegExp(normalizeTerminalAgentCommandName(commandName));
+  return new RegExp(
+    `^${escapedName}\\s+-plan(?:\\s*\\((.*)\\))?(?:(?:\\s*:\\s*)|\\s+)(.+)$`,
+    commandFlags(caseInsensitive),
+  );
+}
+
 export function buildTerminalAgentPlanPrefixPattern(commandName: string, caseInsensitive = false): RegExp {
   const escapedPlanName = escapeRegExp(getTerminalAgentPlanCommandName(commandName));
   return new RegExp(`^${escapedPlanName}\\b`, commandFlags(caseInsensitive));
+}
+
+export function buildTerminalAgentInlinePlanPrefixPattern(commandName: string, caseInsensitive = false): RegExp {
+  const escapedName = escapeRegExp(normalizeTerminalAgentCommandName(commandName));
+  return new RegExp(`^${escapedName}\\s+-plan\\b`, commandFlags(caseInsensitive));
 }
 
 export function buildTerminalAgentShortcutCommandPattern(commandName: string, caseInsensitive = false): RegExp {
@@ -73,7 +86,7 @@ export function buildTerminalAgentShortcutCommandPattern(commandName: string, ca
   const escapedAskName = escapeRegExp(getTerminalAgentAskCommandName(commandName));
   const escapedPlanName = escapeRegExp(getTerminalAgentPlanCommandName(commandName));
   return new RegExp(
-    `^(?:${escapedName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+|${escapedAskName}(?:(?:\\s*:\\s*)|\\s+).+|${escapedPlanName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+)$`,
+    `^(?:${escapedName}\\s+-plan(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+|${escapedName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+|${escapedAskName}(?:(?:\\s*:\\s*)|\\s+).+|${escapedPlanName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+)$`,
     commandFlags(caseInsensitive),
   );
 }
@@ -83,7 +96,7 @@ export function buildTerminalAgentPromptLineExtractPattern(commandName: string, 
   const escapedAskName = escapeRegExp(getTerminalAgentAskCommandName(commandName));
   const escapedPlanName = escapeRegExp(getTerminalAgentPlanCommandName(commandName));
   return new RegExp(
-    `^(?:.+?(?:[$#%>❯➜]\\s+)|PS [^>]*>\\s+)?((?:${escapedName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+|${escapedAskName}(?:(?:\\s*:\\s*)|\\s+).+|${escapedPlanName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+))$`,
+    `^(?:.+?(?:[$#%>❯➜]\\s+)|PS [^>]*>\\s+)?((?:${escapedName}\\s+-plan(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+|${escapedName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+|${escapedAskName}(?:(?:\\s*:\\s*)|\\s+).+|${escapedPlanName}(?:\\s*\\([^)]*\\))?(?:(?:\\s*:\\s*)|\\s+).+))$`,
     commandFlags(caseInsensitive),
   );
 }
@@ -92,5 +105,5 @@ export function buildTerminalAgentUsageText(commandName: string): string {
   const normalizedName = normalizeTerminalAgentCommandName(commandName);
   const askName = getTerminalAgentAskCommandName(commandName);
   const planName = getTerminalAgentPlanCommandName(commandName);
-  return `Use \`${normalizedName} <prompt>\`, \`${normalizedName}: <prompt>\`, \`${normalizedName}(profile=name,root=true,ask=true) <prompt>\`, \`${askName} <question>\`, \`${askName}: <question>\`, \`${planName} <prompt>\`, \`${planName}: <prompt>\`, or \`${planName}(profile=name) <prompt>\`.`;
+  return `Use \`${normalizedName} <prompt>\`, \`${normalizedName}: <prompt>\`, \`${normalizedName}(profile=name,root=true,ask=true) <prompt>\`, \`${askName} <question>\`, \`${askName}: <question>\`, \`${planName} <prompt>\`, \`${planName}: <prompt>\`, \`${planName}(profile=name) <prompt>\`, or \`${normalizedName} -plan <prompt>\`.`;
 }

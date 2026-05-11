@@ -42,6 +42,23 @@ export type AiTokenizerType =
 export type AiTokenLimitUnit = "Thousands" | "Millions";
 export type AiTokenWarningLevel = "None" | "Yellow" | "Red";
 export type AiChatRole = "User" | "Assistant";
+export type AiReasoningEffort =
+  | "Disabled"
+  | "None"
+  | "Minimal"
+  | "Low"
+  | "Medium"
+  | "High"
+  | "Xhigh";
+export type AiInternetAccessMode =
+  | "Disabled"
+  | "KorttyTavilyTool"
+  | "LmStudioTavilyMcp"
+  | "BrightDataWebMcp"
+  | "BraveSearchMcp"
+  | "SearxngMcp"
+  | "LmStudioToolpack";
+export type AiSkillTarget = "Chat" | "Agent" | "Both";
 
 export interface AiProfile {
   id: string;
@@ -49,6 +66,8 @@ export interface AiProfile {
   apiUrl: string;
   model: string;
   apiKey: string;
+  reasoningEffort: AiReasoningEffort;
+  internetAccessMode: AiInternetAccessMode;
   maxSelectionChars: number;
   tokenizerType: AiTokenizerType;
   tokenLimitAmount?: number;
@@ -61,6 +80,16 @@ export interface AiProfile {
   usedPromptTokens: number;
   usedCompletionTokens: number;
   usedTotalTokens: number;
+}
+
+export interface AiSkill {
+  id: string;
+  name: string;
+  description?: string;
+  tags: string[];
+  enabled: boolean;
+  target: AiSkillTarget;
+  content: string;
 }
 
 export interface AiTokenUsage {
@@ -309,6 +338,8 @@ export function createEmptyAiProfile(): AiProfile {
     apiUrl: "",
     model: "",
     apiKey: "",
+    reasoningEffort: "Disabled",
+    internetAccessMode: "Disabled",
     maxSelectionChars: 1_000_000,
     tokenizerType: "Estimate",
     tokenLimitUnit: "Thousands",

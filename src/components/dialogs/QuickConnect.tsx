@@ -2,6 +2,8 @@ import { useEffect, useState } from "react";
 import { X, Zap } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { ConnectionSettings, useConnectionStore } from "../../store/connectionStore";
+import type { GlobalSettings } from "../../store/settingsStore";
+import type { TerminalEffectPluginEntry } from "../../types/terminalEffects";
 
 interface QuickConnectProps {
   open: boolean;
@@ -20,6 +22,8 @@ interface QuickConnectProps {
     temporaryKeyExpirationMinutes?: number;
     temporaryKeyPermanent?: boolean;
     connectionProtocol: "TcpIp" | "Mosh";
+    terminalEffectPluginId?: string;
+    terminalEffectAnimationSpeed?: number;
   }) => void;
 }
 
@@ -50,16 +54,26 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
   const [temporaryKeyExpirationMinutes, setTemporaryKeyExpirationMinutes] = useState(15);
   const [temporaryKeyPermanent, setTemporaryKeyPermanent] = useState(false);
   const [connectionProtocol, setConnectionProtocol] = useState<"TcpIp" | "Mosh">("TcpIp");
+  const [terminalEffectPluginId, setTerminalEffectPluginId] = useState("");
+  const [terminalEffectAnimationSpeed, setTerminalEffectAnimationSpeed] = useState(1);
   const [saveAsConnection, setSaveAsConnection] = useState(false);
   const [connectionName, setConnectionName] = useState("");
   const [sshKeys, setSshKeys] = useState<SimpleSshKey[]>([]);
   const [credentials, setCredentials] = useState<SimpleCredential[]>([]);
   const [credentialId, setCredentialId] = useState("");
+  const [terminalEffects, setTerminalEffects] = useState<TerminalEffectPluginEntry[]>([]);
 
   useEffect(() => {
     if (!open) return;
     invoke<SimpleSshKey[]>("get_ssh_keys").then(setSshKeys).catch(console.error);
     invoke<SimpleCredential[]>("get_credentials").then(setCredentials).catch(console.error);
+    invoke<TerminalEffectPluginEntry[]>("list_terminal_effect_plugins").then(setTerminalEffects).catch(console.error);
+    invoke<GlobalSettings>("get_settings")
+      .then((settings) => {
+        setTerminalEffectPluginId(settings.lastQuickConnectTerminalEffectPluginId || settings.defaultTerminalEffectPluginId || "");
+        setTerminalEffectAnimationSpeed(settings.lastQuickConnectTerminalEffectAnimationSpeed || settings.defaultTerminalEffectAnimationSpeed || 1);
+      })
+      .catch(console.error);
   }, [open]);
 
   if (!open) return null;
@@ -68,7 +82,7 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
     .sort((a, b) => b.usageCount - a.usageCount)
     .slice(0, 10);
 
-  function handleSubmit(e: React.FormEvent) {
+  async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     if (host && username) {
       const effectiveAuthMethod: "Password" | "PrivateKey" =
@@ -93,8 +107,21 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
           temporaryKeyExpirationMinutes: usingTemporaryKey ? temporaryKeyExpirationMinutes : undefined,
           temporaryKeyPermanent: usingTemporaryKey ? temporaryKeyPermanent : false,
           connectionProtocol,
+          terminalEffectPluginId: terminalEffectPluginId || undefined,
+          terminalEffectAnimationSpeed,
         });
       }
+      invoke<GlobalSettings>("get_settings")
+        .then((settings) =>
+          invoke("save_settings", {
+            settings: {
+              ...settings,
+              lastQuickConnectTerminalEffectPluginId: terminalEffectPluginId || undefined,
+              lastQuickConnectTerminalEffectAnimationSpeed: terminalEffectAnimationSpeed,
+            },
+          }),
+        )
+        .catch(console.error);
       onConnect({
         host,
         port,
@@ -109,6 +136,8 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
         temporaryKeyExpirationMinutes: usingTemporaryKey ? temporaryKeyExpirationMinutes : undefined,
         temporaryKeyPermanent: usingTemporaryKey ? temporaryKeyPermanent : undefined,
         connectionProtocol,
+        terminalEffectPluginId: terminalEffectPluginId || undefined,
+        terminalEffectAnimationSpeed,
       });
       onClose();
     }
@@ -129,6 +158,8 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
       temporaryKeyExpirationMinutes: conn.temporaryKeyExpirationMinutes,
       temporaryKeyPermanent: conn.temporaryKeyPermanent,
       connectionProtocol: conn.connectionProtocol || "TcpIp",
+      terminalEffectPluginId: conn.terminalEffectPluginId,
+      terminalEffectAnimationSpeed: conn.terminalEffectAnimationSpeed,
     });
     onClose();
   }
@@ -329,6 +360,34 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
               <option value="TcpIp">SSH (TCP/IP)</option>
               <option value="Mosh">MOSH</option>
             </select>
+          </div>
+          <div className="grid grid-cols-2 gap-2">
+            <div>
+              <label className="block text-[10px] text-kortty-text-dim mb-1">Terminal Effect</label>
+              <select
+                className="input-field"
+                value={terminalEffectPluginId}
+                onChange={(e) => setTerminalEffectPluginId(e.target.value)}
+              >
+                <option value="">None</option>
+                {terminalEffects.filter((effect) => effect.enabled).map((effect) => (
+                  <option key={effect.id} value={effect.id}>
+                    {effect.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <div>
+              <label className="block text-[10px] text-kortty-text-dim mb-1">Effect Speed</label>
+              <input
+                className="input-field"
+                type="number"
+                min={1}
+                max={99}
+                value={terminalEffectAnimationSpeed}
+                onChange={(e) => setTerminalEffectAnimationSpeed(Math.min(99, Math.max(1, Number(e.target.value) || 1)))}
+              />
+            </div>
           </div>
           <label className="flex items-center gap-2 text-xs">
             <input

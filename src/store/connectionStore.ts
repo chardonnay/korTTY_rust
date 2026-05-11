@@ -36,6 +36,8 @@ export interface ConnectionSettings {
   commandTimestamps: boolean;
   promptHookEnabled?: boolean;
   terminalAgentCommandName?: string;
+  terminalEffectPluginId?: string;
+  terminalEffectAnimationSpeed: number;
   themeId?: string;
   jumpServer?: JumpServerConfig;
   tunnels: TunnelConfig[];
@@ -166,6 +168,8 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
     commandTimestamps: false,
     promptHookEnabled: true,
     terminalAgentCommandName: "agent",
+    terminalEffectPluginId: undefined,
+    terminalEffectAnimationSpeed: 1,
     tunnels: [],
     usageCount: 0,
     connectionSource: "Local",

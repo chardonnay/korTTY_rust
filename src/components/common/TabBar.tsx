@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Bot, X, Plus, Terminal } from "lucide-react";
+import { Bot, X, Plus, Sparkles, Terminal } from "lucide-react";
 import type {
   AiRequestPayload,
   SavedAiChat,
@@ -7,6 +7,13 @@ import type {
   TerminalAgentPlanRunState,
   TerminalAgentRequest,
 } from "../../types/ai";
+import type { TerminalEffectPluginEntry } from "../../types/terminalEffects";
+import {
+  TERMINAL_EFFECT_SPEED_MAXIMUM,
+  TERMINAL_EFFECT_SPEED_MINIMUM,
+  TERMINAL_EFFECT_SPEED_SLIDER_MAXIMUM,
+  normalizeTerminalEffectSpeed,
+} from "../../types/terminalEffects";
 
 const TAB_REORDER_MIME = "application/x-kortty-tab-reorder-id";
 
@@ -30,6 +37,8 @@ export interface Tab {
   temporaryKeyExpirationMinutes?: number;
   temporaryKeyPermanent?: boolean;
   connectionProtocol?: "TcpIp" | "Mosh";
+  terminalEffectPluginId?: string;
+  terminalEffectAnimationSpeed?: number;
   themeId?: string;
   fontFamily?: string;
   fontSize?: number;
@@ -62,6 +71,9 @@ interface TabBarProps {
   otherWindows?: { label: string; name: string }[];
   onMoveTabToWindow?: (tabId: string, targetWindowLabel: string) => void;
   onCopyTabToWindow?: (tabId: string, targetWindowLabel: string) => void;
+  terminalEffects?: TerminalEffectPluginEntry[];
+  onSetTabTerminalEffect?: (tabId: string, pluginId: string | undefined) => void;
+  onSetTabTerminalEffectSpeed?: (tabId: string, speed: number) => void;
 }
 
 interface CtxMenu {
@@ -75,6 +87,7 @@ export function TabBar({
   onDuplicateTab, onReconnectTab, onReorderTabs,
   onTabTransferDragStart, onTabTransferDragEnd,
   otherWindows, onMoveTabToWindow, onCopyTabToWindow,
+  terminalEffects = [], onSetTabTerminalEffect, onSetTabTerminalEffectSpeed,
 }: TabBarProps) {
   const [ctxMenu, setCtxMenu] = useState<CtxMenu | null>(null);
   const [draggedId, setDraggedId] = useState<string | null>(null);
@@ -215,6 +228,75 @@ export function TabBar({
               </button>
             ) : null;
           })()}
+          {!isAiContextTab && onSetTabTerminalEffect && (
+            <>
+              <div className="my-1 border-t border-kortty-border" />
+              <div className="px-2 py-1 text-[10px] text-kortty-text-dim uppercase">Terminal effect</div>
+              <button
+                className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors text-left ${
+                  !contextTab?.terminalEffectPluginId
+                    ? "text-kortty-accent bg-kortty-accent/10"
+                    : "text-kortty-text hover:bg-kortty-accent/10 hover:text-kortty-accent"
+                }`}
+                onClick={() => handleCtxAction(() => onSetTabTerminalEffect(ctxMenu.tabId, undefined))}
+              >
+                <Sparkles className="w-3 h-3" />
+                <span>None</span>
+              </button>
+              {terminalEffects
+                .filter((effect) => effect.enabled || effect.id === contextTab?.terminalEffectPluginId)
+                .map((effect) => (
+                  <button
+                    key={effect.id}
+                    className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs transition-colors text-left ${
+                      contextTab?.terminalEffectPluginId === effect.id
+                        ? "text-kortty-accent bg-kortty-accent/10"
+                        : "text-kortty-text hover:bg-kortty-accent/10 hover:text-kortty-accent"
+                    }`}
+                    onClick={() => handleCtxAction(() => onSetTabTerminalEffect(ctxMenu.tabId, effect.id))}
+                  >
+                    <Sparkles className="w-3 h-3" />
+                    <span className="truncate">{effect.name}{effect.enabled ? "" : " (disabled)"}</span>
+                  </button>
+                ))}
+              {onSetTabTerminalEffectSpeed && (
+                <div className="px-3 py-2">
+                  <div className="mb-1 flex items-center justify-between gap-2 text-[10px] text-kortty-text-dim">
+                    <span>Speed</span>
+                    <span>{normalizeTerminalEffectSpeed(contextTab?.terminalEffectAnimationSpeed ?? 1)}x</span>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <input
+                      className="w-28 accent-kortty-accent"
+                      type="range"
+                      min={TERMINAL_EFFECT_SPEED_MINIMUM}
+                      max={TERMINAL_EFFECT_SPEED_SLIDER_MAXIMUM}
+                      step={1}
+                      value={Math.min(
+                        TERMINAL_EFFECT_SPEED_SLIDER_MAXIMUM,
+                        normalizeTerminalEffectSpeed(contextTab?.terminalEffectAnimationSpeed ?? 1),
+                      )}
+                      onClick={(event) => event.stopPropagation()}
+                      onChange={(event) =>
+                        onSetTabTerminalEffectSpeed(ctxMenu.tabId, Number(event.currentTarget.value))
+                      }
+                    />
+                    <input
+                      className="input-field h-7 w-16 text-xs"
+                      type="number"
+                      min={TERMINAL_EFFECT_SPEED_MINIMUM}
+                      max={TERMINAL_EFFECT_SPEED_MAXIMUM}
+                      value={normalizeTerminalEffectSpeed(contextTab?.terminalEffectAnimationSpeed ?? 1)}
+                      onClick={(event) => event.stopPropagation()}
+                      onChange={(event) =>
+                        onSetTabTerminalEffectSpeed(ctxMenu.tabId, Number(event.currentTarget.value))
+                      }
+                    />
+                  </div>
+                </div>
+              )}
+            </>
+          )}
           {!isAiContextTab && otherWindows && otherWindows.length > 0 && (onMoveTabToWindow || onCopyTabToWindow) && (
             <>
               <div className="my-1 border-t border-kortty-border" />

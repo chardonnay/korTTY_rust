@@ -1,5 +1,10 @@
 use crate::model::snippet::Snippet;
 use crate::persistence::xml_repository;
+use crate::snippet_tools::{
+    build_embedded_one_liner, SnippetGlobalVariable, SnippetOneLinerRequest, SnippetOneLinerResult,
+};
+
+const SNIPPET_GLOBAL_VARIABLES_FILE: &str = "snippet-variables.json";
 
 #[tauri::command]
 pub async fn get_snippets() -> Result<Vec<Snippet>, String> {
@@ -32,4 +37,51 @@ pub async fn delete_snippet(id: String) -> Result<(), String> {
 
     snippets.retain(|s| s.id != id);
     xml_repository::save_json("snippets.json", &snippets).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn get_snippet_global_variables() -> Result<Vec<SnippetGlobalVariable>, String> {
+    let mut variables: Vec<SnippetGlobalVariable> =
+        xml_repository::load_json(SNIPPET_GLOBAL_VARIABLES_FILE)
+            .map_err(|error| error.to_string())?
+            .unwrap_or_default();
+    variables.sort_by_key(|variable| variable.name.to_lowercase());
+    Ok(variables)
+}
+
+#[tauri::command]
+pub async fn save_snippet_global_variables(
+    variables: Vec<SnippetGlobalVariable>,
+) -> Result<(), String> {
+    let mut normalized = Vec::<SnippetGlobalVariable>::new();
+    for variable in variables {
+        let name = variable.name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        if normalized
+            .iter()
+            .any(|existing| existing.name.eq_ignore_ascii_case(name))
+        {
+            continue;
+        }
+        normalized.push(SnippetGlobalVariable {
+            name: name.to_string(),
+            value: variable.value,
+            description: variable
+                .description
+                .map(|description| description.trim().to_string())
+                .filter(|description| !description.is_empty()),
+        });
+    }
+    normalized.sort_by_key(|variable| variable.name.to_lowercase());
+    xml_repository::save_json(SNIPPET_GLOBAL_VARIABLES_FILE, &normalized)
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn build_snippet_one_liner(
+    request: SnippetOneLinerRequest,
+) -> Result<SnippetOneLinerResult, String> {
+    build_embedded_one_liner(&request).map_err(|error| error.to_string())
 }
