@@ -29,6 +29,7 @@ import type {
   TerminalAgentRunState,
 } from "../../types/ai";
 import type { TerminalAgentPanelDock } from "../../store/settingsStore";
+import type { TerminalRecordingStartResponse } from "../../types/terminalRecording";
 
 // --- Split tree data model ---
 
@@ -270,6 +271,8 @@ interface TerminalSplitPaneProps {
   onFocusSession?: (sessionId: string) => void;
   onToggleTimestamps: () => void;
   showTimestamps: boolean;
+  recordings?: Record<string, TerminalRecordingStartResponse | undefined>;
+  onToggleRecording?: (sessionId: string) => void;
   onReconnect: (sessionId: string) => void;
   onAiAction?: (sessionId: string, action: AiAction, selectedText: string) => void;
   onStartAgent?: (sessionId: string) => void;
@@ -318,6 +321,8 @@ export function TerminalSplitPane({
   onFocusSession,
   onToggleTimestamps,
   showTimestamps,
+  recordings = {},
+  onToggleRecording,
   onReconnect,
   onAiAction,
   onStartAgent,
@@ -1194,6 +1199,7 @@ export function TerminalSplitPane({
             terminalEffectAnimationSpeed={terminalEffectAnimationSpeed}
             theme={theme}
             fontFamily={fontFamily}
+            recordingSessionId={recordings[sessionId]?.sessionId}
             broadcastTargets={broadcast ? broadcastTargetsBySessionId[sessionId] : undefined}
             onContextMenu={(e, selectedText) => openContextMenu(e, leaf.id, sessionId, selectedText)}
             onAgentCommand={onAgentCommand}
@@ -1289,6 +1295,12 @@ export function TerminalSplitPane({
             label={showTimestamps ? "✓ Command Timestamps" : "  Command Timestamps"}
             onClick={() => menuAction(onToggleTimestamps)}
           />
+          {onToggleRecording && (
+            <CtxItem
+              label={recordings[contextMenu.sessionId] ? "Stop Recording" : "Start Recording"}
+              onClick={() => menuAction(() => onToggleRecording(contextMenu.sessionId))}
+            />
+          )}
           <CtxSep />
           <CtxItem
             label="Reconnect"
@@ -1977,6 +1989,7 @@ interface TerminalPortalProps {
   terminalEffectAnimationSpeed?: number;
   theme?: TerminalTheme;
   fontFamily?: string;
+  recordingSessionId?: string;
   broadcastTargets?: string[];
   onContextMenu: (e: React.MouseEvent<HTMLDivElement>, selectedText: string) => void;
   onAgentCommand?: (sessionId: string, rawCommand: string) => void;
@@ -1998,6 +2011,7 @@ function TerminalPortal({
   terminalEffectAnimationSpeed,
   theme,
   fontFamily,
+  recordingSessionId,
   broadcastTargets,
   onContextMenu,
   onAgentCommand,
@@ -2018,6 +2032,7 @@ function TerminalPortal({
       terminalEffectAnimationSpeed={terminalEffectAnimationSpeed}
       theme={theme}
       fontFamily={fontFamily}
+      recordingSessionId={recordingSessionId}
       onContextMenu={onContextMenu}
       onAgentCommand={onAgentCommand}
       onCloseRequest={onCloseRequest}

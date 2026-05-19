@@ -79,15 +79,63 @@ export interface Snippet {
   description?: string;
   language?: string;
   favorite: boolean;
+  diagrams: SnippetDiagram[];
+  editorProfileId?: string;
   variables: SnippetVariable[];
+}
+
+export interface SnippetDiagram {
+  id: string;
+  name: string;
+  diagramType: "PlantUml";
+  source: string;
+  renderedPath?: string;
+  contentHash?: string;
 }
 
 interface SnippetManagerProps {
   open: boolean;
   onClose: () => void;
+  fileDraft?: SnippetFileDraft | null;
+  onFileDraftSave?: (content: string) => Promise<void> | void;
 }
 
-const EXPORT_FORMATS = ["JSON", "XML", "YAML"] as const;
+export interface SnippetFileDraft {
+  id: string;
+  source: "local" | "remote";
+  path: string;
+  sessionId?: string;
+  content: string;
+}
+
+const PACKAGE_FORMATS = ["JSON", "XML", "YAML"] as const;
+const IMPORT_FORMATS = [...PACKAGE_FORMATS, "Plaintext"] as const;
+const RUNTIME_EXPORT_FORMATS = ["ScriptFiles", "Zip", "AesZip", "GpgZip"] as const;
+const FILE_RUNTIME_EXPORT_FORMATS = ["Zip", "AesZip", "GpgZip"] as const;
+type SnippetPackageFormat = (typeof PACKAGE_FORMATS)[number];
+type SnippetImportFormat = (typeof IMPORT_FORMATS)[number];
+type RuntimeExportFormat = (typeof RUNTIME_EXPORT_FORMATS)[number];
+type FileRuntimeExportFormat = (typeof FILE_RUNTIME_EXPORT_FORMATS)[number];
+type SnippetExportFormat = SnippetPackageFormat | RuntimeExportFormat;
+type SnippetFileExportFormat = SnippetPackageFormat | FileRuntimeExportFormat;
+type TransferDialogMode = "import" | "export";
+
+const SNIPPET_IMPORT_OPTIONS: { value: SnippetImportFormat; label: string }[] = [
+  { value: "JSON", label: "JSON (.json)" },
+  { value: "XML", label: "XML (.xml)" },
+  { value: "YAML", label: "YAML (.yaml, .yml)" },
+  { value: "Plaintext", label: "Plaintext" },
+];
+
+const SNIPPET_EXPORT_OPTIONS: { value: SnippetExportFormat; label: string }[] = [
+  { value: "JSON", label: "JSON (.json)" },
+  { value: "XML", label: "XML (.xml)" },
+  { value: "YAML", label: "YAML (.yaml, .yml)" },
+  { value: "ScriptFiles", label: "Script files (folder)" },
+  { value: "Zip", label: "ZIP (.zip)" },
+  { value: "AesZip", label: "AES ZIP (.aes.zip)" },
+  { value: "GpgZip", label: "GPG ZIP (.zip.gpg)" },
+];
 const SNIPPET_CATEGORY_MAX_LENGTH = 30;
 
 interface SnippetMetadataSuggestion {
@@ -112,8 +160,113 @@ function normalizeSnippetForSave(snippet: Snippet): Snippet {
     ...snippet,
     category: normalizeSnippetCategory(snippet.category),
     description: normalizeSnippetDescription(snippet.description),
+    diagrams: snippet.diagrams ?? [],
+    editorProfileId: snippet.editorProfileId,
     variables: snippet.variables ?? [],
   };
+}
+
+function isFileRuntimeExportFormat(format: SnippetFileExportFormat): format is FileRuntimeExportFormat {
+  return (FILE_RUNTIME_EXPORT_FORMATS as readonly string[]).includes(format);
+}
+
+function isRuntimeExportFormat(format: SnippetExportFormat): format is RuntimeExportFormat {
+  return (RUNTIME_EXPORT_FORMATS as readonly string[]).includes(format);
+}
+
+function importDialogFilter(format: SnippetImportFormat) {
+  switch (format) {
+    case "JSON":
+      return { name: "JSON snippets", extensions: ["json"] };
+    case "XML":
+      return { name: "XML snippets", extensions: ["xml"] };
+    case "YAML":
+      return { name: "YAML snippets", extensions: ["yaml", "yml"] };
+    case "Plaintext":
+      return {
+        name: "Plaintext",
+        extensions: [
+          "txt",
+          "text",
+          "log",
+          "md",
+          "sh",
+          "bash",
+          "zsh",
+          "py",
+          "js",
+          "ts",
+          "rs",
+          "java",
+          "json",
+          "xml",
+          "yaml",
+          "yml",
+          "sql",
+          "css",
+          "html",
+          "php",
+          "c",
+          "cpp",
+        ],
+      };
+  }
+}
+
+function exportDialogFilter(format: SnippetFileExportFormat) {
+  switch (format) {
+    case "JSON":
+      return { name: "JSON snippets", extensions: ["json"] };
+    case "XML":
+      return { name: "XML snippets", extensions: ["xml"] };
+    case "YAML":
+      return { name: "YAML snippets", extensions: ["yaml", "yml"] };
+    case "Zip":
+      return { name: "Snippet scripts ZIP", extensions: ["zip"] };
+    case "AesZip":
+      return { name: "AES encrypted ZIP", extensions: ["zip"] };
+    case "GpgZip":
+      return { name: "GPG encrypted ZIP", extensions: ["gpg"] };
+  }
+}
+
+function exportDefaultPath(format: SnippetFileExportFormat): string {
+  switch (format) {
+    case "JSON":
+      return "snippets.json";
+    case "XML":
+      return "snippets.xml";
+    case "YAML":
+      return "snippets.yaml";
+    case "Zip":
+      return "snippets.zip";
+    case "AesZip":
+      return "snippets.aes.zip";
+    case "GpgZip":
+      return "snippets.zip.gpg";
+  }
+}
+
+function ensureExportPathExtension(path: string, format: SnippetFileExportFormat): string {
+  const lowerPath = path.toLowerCase();
+  switch (format) {
+    case "JSON":
+      return lowerPath.endsWith(".json") ? path : `${path}.json`;
+    case "XML":
+      return lowerPath.endsWith(".xml") ? path : `${path}.xml`;
+    case "YAML":
+      return lowerPath.endsWith(".yaml") || lowerPath.endsWith(".yml") ? path : `${path}.yaml`;
+    case "Zip":
+      return lowerPath.endsWith(".zip") ? path : `${path}.zip`;
+    case "AesZip":
+      if (lowerPath.endsWith(".aes.zip")) return path;
+      if (lowerPath.endsWith(".zip")) return path.replace(/\.zip$/i, ".aes.zip");
+      return `${path}.aes.zip`;
+    case "GpgZip":
+      if (lowerPath.endsWith(".zip.gpg") || lowerPath.endsWith(".gpg")) return path;
+      if (lowerPath.endsWith(".zip")) return `${path}.gpg`;
+      return `${path}.zip.gpg`;
+  }
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -221,6 +374,8 @@ function parseSnippetsXml(content: string): Snippet[] {
     language: element.getAttribute("language") || "bash",
     favorite: element.getAttribute("favorite") === "true",
     content: normalizeSnippetContent(element.querySelector("content")?.textContent ?? ""),
+    diagrams: [],
+    editorProfileId: undefined,
     variables: Array.from(element.querySelectorAll("variables > variable")).map((variable) => ({
       name: variable.getAttribute("name") || "",
       defaultValue: variable.getAttribute("defaultValue") || "",
@@ -271,8 +426,49 @@ function newSnippet(): Snippet {
     description: undefined,
     language: "bash",
     favorite: false,
+    diagrams: [],
+    editorProfileId: undefined,
     variables: [],
   };
+}
+
+function languageFromPath(path: string): string {
+  const extension = path.split(".").pop()?.toLowerCase();
+  switch (extension) {
+    case "sh":
+    case "bash":
+    case "zsh":
+      return "bash";
+    case "py":
+      return "python";
+    case "js":
+      return "javascript";
+    case "ts":
+      return "typescript";
+    case "rs":
+      return "rust";
+    case "java":
+      return "java";
+    case "json":
+      return "json";
+    case "xml":
+      return "xml";
+    case "yaml":
+    case "yml":
+      return "yaml";
+    case "sql":
+      return "sql";
+    case "md":
+      return "markdown";
+    default:
+      return "plain";
+  }
+}
+
+function snippetNameFromPath(path: string): string {
+  const fileName = path.split(/[\\/]/).filter(Boolean).pop()?.trim();
+  if (!fileName) return "Imported plaintext";
+  return fileName.replace(/\.[^.]+$/, "") || fileName;
 }
 
 function SnippetCodeEditor({
@@ -317,7 +513,7 @@ function SnippetCodeEditor({
   );
 }
 
-export function SnippetManager({ open, onClose }: SnippetManagerProps) {
+export function SnippetManager({ open, onClose, fileDraft, onFileDraftSave }: SnippetManagerProps) {
   const { width, height, onResizeStart } = useDialogGeometry("snippet-manager", 720, 520, 480, 360);
   const [snippets, setSnippets] = useState<Snippet[]>([]);
   const [selectedId, setSelectedId] = useState<string | null>(null);
@@ -329,12 +525,37 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
   const [aiMetadataLoading, setAiMetadataLoading] = useState(false);
   const [aiMetadataStatus, setAiMetadataStatus] = useState<string | null>(null);
   const [importExportStatus, setImportExportStatus] = useState<string | null>(null);
+  const [transferDialogMode, setTransferDialogMode] = useState<TransferDialogMode | null>(null);
+  const [importFormat, setImportFormat] = useState<SnippetImportFormat>("JSON");
+  const [exportFormat, setExportFormat] = useState<SnippetExportFormat>("JSON");
+  const [markedSnippetIds, setMarkedSnippetIds] = useState<Set<string>>(() => new Set());
+  const [runtimeToolStatus, setRuntimeToolStatus] = useState<string | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [metadataCollapsed, setMetadataCollapsed] = useState(false);
 
   useEffect(() => {
     if (open) loadSnippets();
   }, [open]);
+
+  useEffect(() => {
+    if (!open || !fileDraft) return;
+    const fileName = fileDraft.path.split("/").filter(Boolean).pop() || "file";
+    const draftSnippet: Snippet = {
+      id: `file-${fileDraft.id}`,
+      name: fileName,
+      content: fileDraft.content,
+      category: fileDraft.source === "remote" ? "Remote file" : "Local file",
+      description: fileDraft.path,
+      language: languageFromPath(fileDraft.path),
+      favorite: false,
+      diagrams: [],
+      editorProfileId: undefined,
+      variables: [],
+    };
+    setSelectedId(draftSnippet.id);
+    setEditing(draftSnippet);
+    setRuntimeToolStatus(`Editing ${fileDraft.source} file: ${fileDraft.path}`);
+  }, [open, fileDraft]);
 
   useEffect(() => {
     if (selectedId && !editing) {
@@ -344,6 +565,15 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
       setEditing(null);
     }
   }, [selectedId, snippets, editing]);
+
+  useEffect(() => {
+    setMarkedSnippetIds((current) => {
+      if (current.size === 0) return current;
+      const existingIds = new Set(snippets.map((snippet) => snippet.id));
+      const retained = new Set([...current].filter((id) => existingIds.has(id)));
+      return retained.size === current.size ? current : retained;
+    });
+  }, [snippets]);
 
   async function loadSnippets() {
     setLoading(true);
@@ -364,10 +594,16 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
     if (!editing) return;
     setSaving(true);
     try {
-      await invoke("save_snippet", { snippet: normalizeSnippetForSave(editing) });
-      await loadSnippets();
+      if (fileDraft && onFileDraftSave) {
+        await onFileDraftSave(editing.content);
+        setRuntimeToolStatus(`Saved ${fileDraft.source} file: ${fileDraft.path}`);
+      } else {
+        await invoke("save_snippet", { snippet: normalizeSnippetForSave(editing) });
+        await loadSnippets();
+      }
     } catch (err) {
       console.error("Failed to save snippet:", err);
+      setRuntimeToolStatus(`Save failed: ${String(err)}`);
     } finally {
       setSaving(false);
     }
@@ -376,11 +612,29 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
   async function handleDelete(id: string) {
     try {
       await invoke("delete_snippet", { id });
+      setMarkedSnippetIds((current) => {
+        if (!current.has(id)) return current;
+        const next = new Set(current);
+        next.delete(id);
+        return next;
+      });
       await loadSnippets();
       if (selectedId === id) setSelectedId(snippets[0]?.id ?? null);
     } catch (err) {
       console.error("Failed to delete snippet:", err);
     }
+  }
+
+  function setSnippetMarked(id: string, marked: boolean) {
+    setMarkedSnippetIds((current) => {
+      const next = new Set(current);
+      if (marked) {
+        next.add(id);
+      } else {
+        next.delete(id);
+      }
+      return next;
+    });
   }
 
   async function handleToggleFavorite(id: string) {
@@ -445,21 +699,34 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
     }
   }
 
-  async function handleImport(format: string) {
+  async function handleImport(format: SnippetImportFormat) {
     setImportExportStatus(null);
     try {
       const path = await openDialog({
+        title: "Import snippets",
         multiple: false,
         directory: false,
-        filters: [
-          { name: format, extensions: [format.toLowerCase()] },
-          { name: "All files", extensions: ["*"] },
-        ],
+        filters: [importDialogFilter(format)],
       });
       if (!path || typeof path !== "string") return;
       const content = await readTextFile(path);
       let imported: Snippet[] = [];
-      if (format === "JSON") {
+      if (format === "Plaintext") {
+        imported = [
+          {
+            id: crypto.randomUUID(),
+            name: snippetNameFromPath(path),
+            content,
+            category: undefined,
+            description: undefined,
+            language: languageFromPath(path),
+            favorite: false,
+            diagrams: [],
+            editorProfileId: undefined,
+            variables: [],
+          },
+        ];
+      } else if (format === "JSON") {
         imported = JSON.parse(content);
       } else if (format === "YAML") {
         try {
@@ -488,35 +755,176 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
     }
   }
 
-  async function handleExport(format: string) {
+  async function handleExport(format: SnippetExportFormat) {
     setImportExportStatus(null);
     try {
+      const snippetsToExport = snippetsForExport(isRuntimeExportFormat(format) ? "active" : "all");
+      if (snippetsToExport.length === 0) {
+        setImportExportStatus("No snippets selected for export");
+        return;
+      }
+      if (format === "ScriptFiles") {
+        await handleExportRuntime(format, undefined, snippetsToExport);
+        return;
+      }
       const path = await saveDialog({
-        defaultPath: "snippets",
-        filters: [
-          { name: format, extensions: [format.toLowerCase()] },
-          { name: "All files", extensions: ["*"] },
-        ],
+        title: "Export snippets",
+        defaultPath: exportDefaultPath(format),
+        filters: [exportDialogFilter(format)],
       });
       if (!path) return;
+      const targetPath = ensureExportPathExtension(path, format);
+      if (isFileRuntimeExportFormat(format)) {
+        await handleExportRuntime(format, targetPath, snippetsToExport);
+        return;
+      }
       let content = "";
       if (format === "JSON") {
-        content = JSON.stringify(snippets, null, 2);
+        content = JSON.stringify(snippetsToExport, null, 2);
       } else if (format === "YAML") {
         try {
           const yaml = await import("yaml");
-          content = yaml.stringify(snippets);
+          content = yaml.stringify(snippetsToExport);
         } catch {
           setImportExportStatus("YAML package not installed");
           return;
         }
       } else {
-        content = snippetsToXml(snippets);
+        content = snippetsToXml(snippetsToExport);
       }
-      await writeTextFile(path, content);
-      setImportExportStatus(`Exported to ${path}`);
+      await writeTextFile(targetPath, content);
+      setImportExportStatus(`Exported to ${targetPath}`);
     } catch (err) {
       setImportExportStatus(`Export failed: ${String(err)}`);
+    }
+  }
+
+  async function handleFormatSnippet() {
+    if (!editing) return;
+    setRuntimeToolStatus(null);
+    try {
+      const result = await invoke<{
+        content: string;
+        formatterName: string;
+        usedExternalFormatter: boolean;
+      }>("format_snippet", {
+        request: {
+          content: editing.content,
+          language: editing.language,
+        },
+      });
+      setEditing((current) => (current ? { ...current, content: result.content } : null));
+      setRuntimeToolStatus(`Formatted with ${result.formatterName}.`);
+    } catch (error) {
+      setRuntimeToolStatus(`Format failed: ${String(error)}`);
+    }
+  }
+
+  function snippetsForExport(fallback: "active" | "all"): Snippet[] {
+    const markedSnippets = snippets.filter((snippet) => markedSnippetIds.has(snippet.id));
+    if (markedSnippets.length > 0) {
+      return markedSnippets.map(normalizeSnippetForSave);
+    }
+    if (fallback === "all") {
+      return snippets.map(normalizeSnippetForSave);
+    }
+    return selected ? [normalizeSnippetForSave(selected)] : [];
+  }
+
+  async function handleExportRuntime(format: RuntimeExportFormat, requestedTargetPath?: string, snippetsToExport?: Snippet[]) {
+    setImportExportStatus(null);
+    try {
+      const selectedSnippets = snippetsToExport ?? snippetsForExport("active");
+      if (selectedSnippets.length === 0) {
+        setImportExportStatus("No snippets selected for export");
+        return;
+      }
+      let targetPath: string | null = null;
+      if (requestedTargetPath) {
+        targetPath = requestedTargetPath;
+      } else if (format === "ScriptFiles") {
+        const directory = await openDialog({ directory: true, multiple: false });
+        targetPath = typeof directory === "string" ? directory : null;
+      } else {
+        const extension = format === "GpgZip" ? "zip.gpg" : "zip";
+        targetPath = await saveDialog({
+          defaultPath: `snippets.${extension}`,
+          filters: [
+            { name: extension.toUpperCase(), extensions: [extension] },
+            { name: "All files", extensions: ["*"] },
+          ],
+        });
+      }
+      if (!targetPath) return;
+      const password = format === "AesZip" ? window.prompt("AES ZIP password") || undefined : undefined;
+      if (format === "AesZip" && !password) return;
+      const gpgRecipient = format === "GpgZip" ? window.prompt("GPG recipient") || undefined : undefined;
+      if (format === "GpgZip" && !gpgRecipient) return;
+      const result = await invoke<{ targetPath: string; exportedCount: number }>("export_snippet_scripts", {
+        request: {
+          snippets: selectedSnippets,
+          targetPath,
+          format,
+          password,
+          gpgRecipient,
+        },
+      });
+      setImportExportStatus(`Exported ${result.exportedCount} snippet(s) to ${result.targetPath}`);
+    } catch (error) {
+      setImportExportStatus(`Export failed: ${String(error)}`);
+    }
+  }
+
+  function confirmTransferDialog() {
+    const mode = transferDialogMode;
+    setTransferDialogMode(null);
+    if (mode === "import") {
+      void handleImport(importFormat);
+    } else if (mode === "export") {
+      void handleExport(exportFormat);
+    }
+  }
+
+  async function handleRenderPlantUml() {
+    if (!editing) return;
+    setRuntimeToolStatus(null);
+    try {
+      const source = await invoke<string>("build_snippet_plantuml_preview", {
+        snippet: normalizeSnippetForSave(editing),
+      });
+      const targetPath = await saveDialog({
+        defaultPath: `${editing.name || "snippet-diagram"}.png`,
+        filters: [
+          { name: "PNG", extensions: ["png"] },
+          { name: "SVG", extensions: ["svg"] },
+        ],
+      });
+      if (!targetPath) return;
+      const result = await invoke<{ outputPath: string; contentHash: string; tool: string }>(
+        "render_snippet_plantuml",
+        {
+          request: {
+            source,
+            outputPath: targetPath,
+            outputFormat: targetPath.toLowerCase().endsWith(".svg") ? "svg" : "png",
+          },
+        },
+      );
+      setEditing((current) => {
+        if (!current) return current;
+        const diagram: SnippetDiagram = {
+          id: crypto.randomUUID(),
+          name: current.name || "Snippet diagram",
+          diagramType: "PlantUml",
+          source,
+          renderedPath: result.outputPath,
+          contentHash: result.contentHash,
+        };
+        return { ...current, diagrams: [...(current.diagrams || []), diagram] };
+      });
+      setRuntimeToolStatus(`Rendered PlantUML with ${result.tool}.`);
+    } catch (error) {
+      setRuntimeToolStatus(`PlantUML failed: ${String(error)}`);
     }
   }
 
@@ -606,32 +1014,47 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
                   {loading ? (
                     <div className="text-xs text-kortty-text-dim p-3">Loading…</div>
                   ) : (
-                    filtered.map((s) => (
-                      <button
-                        key={s.id}
-                        className={`w-full text-left px-2 py-1.5 text-xs rounded truncate flex items-center gap-1 ${
-                          selectedId === s.id
-                            ? "bg-kortty-accent/10 text-kortty-accent"
-                            : "text-kortty-text hover:bg-kortty-panel"
-                        }`}
-                        onClick={() => setSelectedId(s.id)}
-                      >
-                        <button
-                          className="shrink-0 p-0.5 hover:text-kortty-accent"
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            handleToggleFavorite(s.id);
-                          }}
+                    filtered.map((s) => {
+                      const marked = markedSnippetIds.has(s.id);
+                      return (
+                        <div
+                          key={s.id}
+                          className={`w-full px-2 py-1.5 text-xs rounded flex items-center gap-1 ${
+                            selectedId === s.id
+                              ? "bg-kortty-accent/10 text-kortty-accent"
+                              : "text-kortty-text hover:bg-kortty-panel"
+                          }`}
                         >
-                          {s.favorite ? (
-                            <Star className="w-3 h-3 fill-kortty-accent text-kortty-accent" />
-                          ) : (
-                            <StarOff className="w-3 h-3 text-kortty-text-dim" />
-                          )}
-                        </button>
-                        <span className="truncate">{s.name || "Unnamed"}</span>
-                      </button>
-                    ))
+                          <input
+                            type="checkbox"
+                            className="h-3 w-3 shrink-0 accent-kortty-accent"
+                            checked={marked}
+                            onChange={(event) => setSnippetMarked(s.id, event.currentTarget.checked)}
+                            title="Mark for export"
+                          />
+                          <button
+                            type="button"
+                            className="shrink-0 p-0.5 hover:text-kortty-accent"
+                            onClick={() => {
+                              void handleToggleFavorite(s.id);
+                            }}
+                          >
+                            {s.favorite ? (
+                              <Star className="w-3 h-3 fill-kortty-accent text-kortty-accent" />
+                            ) : (
+                              <StarOff className="w-3 h-3 text-kortty-text-dim" />
+                            )}
+                          </button>
+                          <button
+                            type="button"
+                            className="min-w-0 flex-1 truncate text-left"
+                            onClick={() => setSelectedId(s.id)}
+                          >
+                            {s.name || "Unnamed"}
+                          </button>
+                        </div>
+                      );
+                    })
                   )}
                   {!loading && filtered.length === 0 && (
                     <div className="text-xs text-kortty-text-dim p-3">No snippets</div>
@@ -734,19 +1157,35 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
                 <div className="flex-1 flex flex-col min-h-0">
                   <div className="flex items-center justify-between mb-1">
                     <label className="text-xs text-kortty-text-dim">Content</label>
-                    <select
-                      className="input-field text-xs w-40 py-0.5"
-                      value={editing.language || "bash"}
-                      onChange={(e) =>
-                        setEditing((p) => (p ? { ...p, language: e.target.value } : null))
-                      }
-                    >
-                      {LANGUAGES.map((l) => (
-                        <option key={l.value} value={l.value}>
-                          {l.label}
-                        </option>
-                      ))}
-                    </select>
+                    <div className="flex items-center gap-2">
+                      <button
+                        className="px-2 py-1 text-xs rounded bg-kortty-panel hover:bg-kortty-border transition-colors"
+                        onClick={() => void handleFormatSnippet()}
+                        title="Format snippet content"
+                      >
+                        Format
+                      </button>
+                      <button
+                        className="px-2 py-1 text-xs rounded bg-kortty-panel hover:bg-kortty-border transition-colors"
+                        onClick={() => void handleRenderPlantUml()}
+                        title="Render a PlantUML preview for this snippet"
+                      >
+                        PlantUML
+                      </button>
+                      <select
+                        className="input-field text-xs w-40 py-0.5"
+                        value={editing.language || "bash"}
+                        onChange={(e) =>
+                          setEditing((p) => (p ? { ...p, language: e.target.value } : null))
+                        }
+                      >
+                        {LANGUAGES.map((l) => (
+                          <option key={l.value} value={l.value}>
+                            {l.label}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
                   </div>
                   <SnippetCodeEditor
                     value={editing.content}
@@ -755,6 +1194,11 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
                       setEditing((p) => (p ? { ...p, content: val } : null))
                     }
                   />
+                  {runtimeToolStatus && (
+                    <div className="mt-2 rounded border border-kortty-border bg-kortty-panel/50 px-3 py-2 text-xs text-kortty-text-dim">
+                      {runtimeToolStatus}
+                    </div>
+                  )}
                 </div>
                 <div>
                   <label className="block text-xs text-kortty-text-dim mb-1">
@@ -812,28 +1256,20 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
             >
               <Trash2 className="w-3 h-3" /> Delete
             </button>
-            <div className="flex gap-1">
-              {EXPORT_FORMATS.map((fmt) => (
-                <button
-                  key={fmt}
-                  className="flex items-center gap-1 px-2 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors"
-                  onClick={() => handleImport(fmt)}
-                >
-                  <Upload className="w-3 h-3" /> {fmt}
-                </button>
-              ))}
-            </div>
-            <div className="flex gap-1">
-              {EXPORT_FORMATS.map((fmt) => (
-                <button
-                  key={fmt}
-                  className="flex items-center gap-1 px-2 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors"
-                  onClick={() => handleExport(fmt)}
-                >
-                  <Download className="w-3 h-3" /> {fmt}
-                </button>
-              ))}
-            </div>
+            <button
+              className="flex items-center gap-1 px-3 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors"
+              onClick={() => setTransferDialogMode("import")}
+              title="Import snippets"
+            >
+              <Upload className="w-3 h-3" /> Import
+            </button>
+            <button
+              className="flex items-center gap-1 px-3 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors"
+              onClick={() => setTransferDialogMode("export")}
+              title="Export snippets"
+            >
+              <Download className="w-3 h-3" /> Export
+            </button>
           </div>
           <div className="flex gap-2 items-center">
             {importExportStatus && (
@@ -854,6 +1290,73 @@ export function SnippetManager({ open, onClose }: SnippetManagerProps) {
             </button>
           </div>
         </div>
+        {transferDialogMode && (
+          <div className="fixed inset-0 z-[70] flex items-center justify-center bg-black/50">
+            <div className="w-[360px] rounded-lg border border-kortty-border bg-kortty-bg shadow-2xl">
+              <div className="flex items-center justify-between border-b border-kortty-border px-4 py-3">
+                <h3 className="text-sm font-semibold text-kortty-text">
+                  {transferDialogMode === "import" ? "Import snippets" : "Export snippets"}
+                </h3>
+                <button
+                  className="text-kortty-text-dim hover:text-kortty-text"
+                  onClick={() => setTransferDialogMode(null)}
+                  type="button"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+              <div className="space-y-2 p-4">
+                <label className="block text-xs text-kortty-text-dim" htmlFor="snippet-transfer-format">
+                  Format
+                </label>
+                {transferDialogMode === "import" ? (
+                  <select
+                    id="snippet-transfer-format"
+                    className="w-full rounded border border-kortty-border bg-kortty-panel px-2 py-1.5 text-xs text-kortty-text"
+                    value={importFormat}
+                    onChange={(event) => setImportFormat(event.target.value as SnippetImportFormat)}
+                  >
+                    {SNIPPET_IMPORT_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <select
+                    id="snippet-transfer-format"
+                    className="w-full rounded border border-kortty-border bg-kortty-panel px-2 py-1.5 text-xs text-kortty-text"
+                    value={exportFormat}
+                    onChange={(event) => setExportFormat(event.target.value as SnippetExportFormat)}
+                  >
+                    {SNIPPET_EXPORT_OPTIONS.map((option) => (
+                      <option key={option.value} value={option.value}>
+                        {option.label}
+                      </option>
+                    ))}
+                  </select>
+                )}
+              </div>
+              <div className="flex justify-end gap-2 border-t border-kortty-border px-4 py-3">
+                <button
+                  className="px-3 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors"
+                  onClick={() => setTransferDialogMode(null)}
+                  type="button"
+                >
+                  Cancel
+                </button>
+                <button
+                  className="flex items-center gap-1 px-3 py-1.5 text-xs bg-kortty-accent text-kortty-bg rounded hover:bg-kortty-accent-hover transition-colors"
+                  onClick={confirmTransferDialog}
+                  type="button"
+                >
+                  {transferDialogMode === "import" ? <Upload className="h-3 w-3" /> : <Download className="h-3 w-3" />}
+                  {transferDialogMode === "import" ? "Import" : "Export"}
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
         <div
           className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize opacity-40 hover:opacity-100 transition-opacity"
           onMouseDown={onResizeStart}

@@ -42,6 +42,7 @@ interface TerminalTabProps {
   scrollbackLines?: number;
   terminalEffectPluginId?: string;
   terminalEffectAnimationSpeed?: number;
+  recordingSessionId?: string;
   onCloseRequest?: () => void;
   broadcastTargets?: string[];
   onContextMenu?: (e: MouseEvent<HTMLDivElement>, selectedText: string) => void;
@@ -76,6 +77,8 @@ const MOTHER_ANSI_COLORS = [
   "#0b2b14", "#5dff80", "#72ff8f", "#e4ff9c",
   "#81ff9a", "#a6ffba", "#b8ffc8", "#f2fff4",
 ];
+
+const ACTIVE_TERMINAL_SESSION_DATA_KEY = "korttyActiveTerminalSessionId";
 
 function buildTerminalTheme(
   theme: TerminalTabProps["theme"] | undefined,
@@ -170,6 +173,7 @@ export function TerminalTab({
   scrollbackLines = 10000,
   terminalEffectPluginId,
   terminalEffectAnimationSpeed = 1,
+  recordingSessionId,
   onCloseRequest,
   broadcastTargets,
   onContextMenu,
@@ -203,6 +207,9 @@ export function TerminalTab({
   const broadcastTargetsRef = useRef<string[]>([]);
   const terminalEffectPluginIdRef = useRef<string | undefined>(terminalEffectPluginId);
   const terminalEffectAnimationSpeedRef = useRef(terminalEffectAnimationSpeed);
+  const recordingSessionIdRef = useRef<string | undefined>(recordingSessionId);
+  const recordingSnapshotTimerRef = useRef<number | null>(null);
+  const lastRecordingSnapshotRef = useRef("");
   const motherOutputQueueRef = useRef<string[]>([]);
   const motherOutputTimerRef = useRef<number | null>(null);
   const motherLineFlashCounterRef = useRef(0);
@@ -245,6 +252,7 @@ export function TerminalTab({
   agentShortcutCommandPatternRef.current = agentShortcutCommandPattern;
   exactAgentShortcutCommandPatternRef.current = exactAgentShortcutCommandPattern;
   agentPromptLineExtractPatternRef.current = agentPromptLineExtractPattern;
+  recordingSessionIdRef.current = recordingSessionId;
 
   function formatTimestamp(date: Date): string {
     const yyyy = date.getFullYear();
@@ -338,6 +346,203 @@ export function TerminalTab({
 
   function containsPromptReadyMarker(chunk: string): boolean {
     return /\x1b\]133;D;[0-9]+\x07/.test(chunk);
+  }
+
+  function captureTerminalSnapshot(term: Terminal): string {
+    const buffer = term.buffer.active;
+    const start = Math.max(0, buffer.baseY);
+    const lines: string[] = [];
+    for (let row = 0; row < term.rows; row += 1) {
+      const line = buffer.getLine(start + row);
+      lines.push(line?.translateToString(true) ?? "");
+    }
+    return lines.join("\n").trimEnd();
+  }
+
+  function appendRecordingSnapshot(term: Terminal, force = false) {
+    const recordingSession = recordingSessionIdRef.current;
+    if (!recordingSession) return;
+    const text = captureTerminalSnapshot(term);
+    if (!force && text === lastRecordingSnapshotRef.current) return;
+    lastRecordingSnapshotRef.current = text;
+    invoke("append_terminal_recording_snapshot", {
+      request: {
+        sessionId: recordingSession,
+        atMillis: Date.now(),
+        text,
+        columns: term.cols,
+        rows: term.rows,
+      },
+    }).catch(console.error);
+  }
+
+  function scheduleRecordingSnapshot(term: Terminal) {
+    if (!recordingSessionIdRef.current || recordingSnapshotTimerRef.current != null) return;
+    recordingSnapshotTimerRef.current = window.setTimeout(() => {
+      recordingSnapshotTimerRef.current = null;
+      if (xtermRef.current === term && isMountedRef.current) {
+        appendRecordingSnapshot(term);
+      }
+    }, 500);
+  }
+
+  function appendRecordingInput(text: string) {
+    const recordingSession = recordingSessionIdRef.current;
+    if (!recordingSession || !text) return;
+    invoke("append_terminal_recording_input", {
+      request: {
+        sessionId: recordingSession,
+        atMillis: Date.now(),
+        text,
+      },
+    }).catch(console.error);
+  }
+
+  function markTerminalKeyboardOwner() {
+    document.documentElement.dataset[ACTIVE_TERMINAL_SESSION_DATA_KEY] = sessionIdRef.current;
+  }
+
+  function sendTerminalInput(data: string) {
+    if (!connectedRef.current || readOnlyRef.current || !data) {
+      return;
+    }
+    const encoded = Array.from(new TextEncoder().encode(data));
+    invoke("ssh_send_input", {
+      sessionId: sessionIdRef.current,
+      data: encoded,
+    }).catch(console.error);
+    for (const targetId of broadcastTargetsRef.current) {
+      invoke("ssh_send_input", {
+        sessionId: targetId,
+        data: encoded,
+      }).catch(console.error);
+    }
+  }
+
+  function elementConsumesKeyboard(target: EventTarget | Element | null): boolean {
+    if (!(target instanceof Element)) {
+      return false;
+    }
+    if (target === document.body || target === document.documentElement) {
+      return false;
+    }
+    if (target instanceof HTMLElement && target.isContentEditable) {
+      return true;
+    }
+    return Boolean(
+      target.closest(
+        "input, textarea, select, button, a[href], [role='button'], [role='menuitem'], [role='textbox'], [tabindex]:not([tabindex='-1'])",
+      ),
+    );
+  }
+
+  function isTerminalHostVisible(): boolean {
+    const host = termRef.current;
+    if (!host?.isConnected) {
+      return false;
+    }
+    const rect = host.getBoundingClientRect();
+    if (rect.width < 1 || rect.height < 1) {
+      return false;
+    }
+    const style = window.getComputedStyle(host);
+    return style.display !== "none" && style.visibility !== "hidden";
+  }
+
+  function keyEventToTerminalInput(event: KeyboardEvent): string | null {
+    if (event.defaultPrevented || event.isComposing || event.ctrlKey || event.metaKey) {
+      return null;
+    }
+    if (event.altKey && event.shiftKey) {
+      return null;
+    }
+    if (event.altKey && event.key.length === 1) {
+      return `\x1b${event.key}`;
+    }
+    if (event.altKey) {
+      return null;
+    }
+    if (event.key.length === 1) {
+      return event.key;
+    }
+    if (event.shiftKey && event.key === "Tab") {
+      return "\x1b[Z";
+    }
+    switch (event.key) {
+      case "Enter":
+        return "\r";
+      case "Tab":
+        return "\t";
+      case "Backspace":
+        return "\x7f";
+      case "Escape":
+        return "\x1b";
+      case "ArrowUp":
+        return "\x1b[A";
+      case "ArrowDown":
+        return "\x1b[B";
+      case "ArrowRight":
+        return "\x1b[C";
+      case "ArrowLeft":
+        return "\x1b[D";
+      case "Home":
+        return "\x1b[H";
+      case "End":
+        return "\x1b[F";
+      case "Insert":
+        return "\x1b[2~";
+      case "Delete":
+        return "\x1b[3~";
+      case "PageUp":
+        return "\x1b[5~";
+      case "PageDown":
+        return "\x1b[6~";
+      case "F1":
+        return "\x1bOP";
+      case "F2":
+        return "\x1bOQ";
+      case "F3":
+        return "\x1bOR";
+      case "F4":
+        return "\x1bOS";
+      case "F5":
+        return "\x1b[15~";
+      case "F6":
+        return "\x1b[17~";
+      case "F7":
+        return "\x1b[18~";
+      case "F8":
+        return "\x1b[19~";
+      case "F9":
+        return "\x1b[20~";
+      case "F10":
+        return "\x1b[21~";
+      default:
+        return null;
+    }
+  }
+
+  function shouldRecoverTerminalKeyEvent(event: KeyboardEvent, term: Terminal): boolean {
+    if (!connectedRef.current || readOnlyRef.current) {
+      return false;
+    }
+    if (document.documentElement.dataset[ACTIVE_TERMINAL_SESSION_DATA_KEY] !== sessionIdRef.current) {
+      return false;
+    }
+    if (!isTerminalHostVisible()) {
+      return false;
+    }
+    const activeElement = document.activeElement;
+    if (
+      activeElement instanceof Element &&
+      (termRef.current?.contains(activeElement) || term.element?.contains(activeElement))
+    ) {
+      return false;
+    }
+    if (elementConsumesKeyboard(event.target) || elementConsumesKeyboard(activeElement)) {
+      return false;
+    }
+    return true;
   }
 
   function looksLikeAgentShortcutCommand(command: string): boolean {
@@ -863,6 +1068,11 @@ export function TerminalTab({
     const scrollDisposable = term.onScroll(() => {
       syncViewportMetrics();
     });
+    const terminalElement = term.element;
+    function handleTerminalFocusIn() {
+      markTerminalKeyboardOwner();
+    }
+    terminalElement?.addEventListener("focusin", handleTerminalFocusIn);
 
     initialFitRafRef.current = window.requestAnimationFrame(() => {
       initialFitRafRef.current = null;
@@ -888,6 +1098,7 @@ export function TerminalTab({
         return;
       }
       if (connectedRef.current && !readOnlyRef.current) {
+        appendRecordingInput(data);
         if (data !== "\r") {
           noteAgentShortcutInput(data);
         }
@@ -911,22 +1122,22 @@ export function TerminalTab({
             ) {
               // Let the shell alias emit OSC 777 so the backend can also learn the exact remote cwd.
             } else {
-            const cancelLinePayload = [21, 13];
-            const targetSessionIds = [sessionIdRef.current, ...broadcastTargetsRef.current];
-            try {
-              await Promise.all(
-                targetSessionIds.map((targetId) =>
-                  invoke("ssh_send_input", {
-                    sessionId: targetId,
-                    data: cancelLinePayload,
-                  }),
-                ),
-              );
-            } catch (error) {
-              console.error(error);
-            }
-            onAgentCommandRef.current?.(sessionIdRef.current, currentInput);
-            return;
+              const cancelLinePayload = [21, 13];
+              const targetSessionIds = [sessionIdRef.current, ...broadcastTargetsRef.current];
+              try {
+                await Promise.all(
+                  targetSessionIds.map((targetId) =>
+                    invoke("ssh_send_input", {
+                      sessionId: targetId,
+                      data: cancelLinePayload,
+                    }),
+                  ),
+                );
+              } catch (error) {
+                console.error(error);
+              }
+              onAgentCommandRef.current?.(sessionIdRef.current, currentInput);
+              return;
             }
           }
         }
@@ -953,18 +1164,7 @@ export function TerminalTab({
         if (data.includes("\r")) {
           agentShortcutPromptTailRef.current = "";
         }
-        const encoder = new TextEncoder();
-        const encoded = Array.from(encoder.encode(data));
-        invoke("ssh_send_input", {
-          sessionId: sessionIdRef.current,
-          data: encoded,
-        }).catch(console.error);
-        for (const targetId of broadcastTargetsRef.current) {
-          invoke("ssh_send_input", {
-            sessionId: targetId,
-            data: encoded,
-          }).catch(console.error);
-        }
+        sendTerminalInput(data);
       }
     });
 
@@ -1006,8 +1206,23 @@ export function TerminalTab({
       }
     }
 
+    function handleRecoveredKeyDown(event: KeyboardEvent) {
+      const data = keyEventToTerminalInput(event);
+      if (!data || !shouldRecoverTerminalKeyEvent(event, term)) {
+        return;
+      }
+      event.preventDefault();
+      event.stopPropagation();
+      appendRecordingInput(data);
+      if (data !== "\r") {
+        noteAgentShortcutInput(data);
+      }
+      sendTerminalInput(data);
+    }
+
     window.addEventListener("kortty-terminal-copy", handleCopy as EventListener);
     window.addEventListener("kortty-terminal-paste", handlePaste as EventListener);
+    window.addEventListener("keydown", handleRecoveredKeyDown, true);
 
     const resizeObserver = new ResizeObserver(() => {
       safeFitAndResize(term, fitAddon);
@@ -1049,6 +1264,7 @@ export function TerminalTab({
       isMountedRef.current = false;
       window.removeEventListener("kortty-terminal-copy", handleCopy as EventListener);
       window.removeEventListener("kortty-terminal-paste", handlePaste as EventListener);
+      window.removeEventListener("keydown", handleRecoveredKeyDown, true);
       window.removeEventListener("kortty-refit", handleRefit);
       window.removeEventListener("kortty-terminal-reattach", handleReattach as EventListener);
       clearPendingFitTimers();
@@ -1057,6 +1273,7 @@ export function TerminalTab({
       stopPromptProbe();
       syncViewportMetricsRef.current = null;
       scrollDisposable.dispose();
+      terminalElement?.removeEventListener("focusin", handleTerminalFocusIn);
       // Always disconnect ResizeObserver on every unmount to prevent leaks
       if (observerTokenRef.current) {
         observerTokenRef.current.disconnected = true;
@@ -1066,6 +1283,10 @@ export function TerminalTab({
         resizeObserverRef.current.disconnect();
         console.log("[TerminalTab] ResizeObserver disconnected", sessionId);
         resizeObserverRef.current = null;
+      }
+      if (recordingSnapshotTimerRef.current != null) {
+        window.clearTimeout(recordingSnapshotTimerRef.current);
+        recordingSnapshotTimerRef.current = null;
       }
       xtermRef.current = null;
       fitAddonRef.current = null;
@@ -1100,6 +1321,7 @@ export function TerminalTab({
             clearMotherOutputQueue();
             writeTerminalOutput(term, bytes, text);
           }
+          scheduleRecordingSnapshot(term);
           if (forceAutoScrollRef.current) {
             requestAnimationFrame(() => {
               if (xtermRef.current === term && isMountedRef.current) {
@@ -1188,6 +1410,12 @@ export function TerminalTab({
   }, [terminalEffectPluginId]);
 
   useEffect(() => {
+    const term = xtermRef.current;
+    if (!term || !recordingSessionId) return;
+    appendRecordingSnapshot(term, true);
+  }, [recordingSessionId]);
+
+  useEffect(() => {
     syncViewportMetricsRef.current?.();
   }, [showTimestamps, timestampsCollapsed, fontSize, fontFamily]);
 
@@ -1271,6 +1499,10 @@ export function TerminalTab({
         className={`relative flex-1 min-h-0 min-w-0 overflow-hidden ${
           motherActive ? "kortty-mother-terminal-host" : ""
         }`}
+        onMouseDown={() => {
+          markTerminalKeyboardOwner();
+          xtermRef.current?.focus();
+        }}
         onContextMenu={(event) => onContextMenu?.(event, xtermRef.current?.getSelection() ?? "")}
       >
         <div ref={termRef} className="absolute inset-0 min-h-0 min-w-0 overflow-hidden" />

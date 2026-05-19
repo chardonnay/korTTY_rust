@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useMemo, useRef } from "react";
+import { lazy, Suspense, useState, useCallback, useEffect, useMemo, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emit, emitTo, listen } from "@tauri-apps/api/event";
@@ -22,7 +22,7 @@ import { SettingsDialog } from "./dialogs/SettingsDialog";
 import { CredentialManager } from "./dialogs/CredentialManager";
 import { SSHKeyManager } from "./dialogs/SSHKeyManager";
 import { GPGKeyManager } from "./dialogs/GPGKeyManager";
-import { SnippetManager } from "./dialogs/SnippetManager";
+import type { SnippetFileDraft } from "./dialogs/SnippetManager";
 import { AsciiArtBanner } from "./dialogs/AsciiArtBanner";
 import { BackupDialog } from "./dialogs/BackupDialog";
 import { ImportDialog } from "./dialogs/ImportDialog";
@@ -36,15 +36,13 @@ import { AiActionDialog } from "./dialogs/AiActionDialog";
 import { AiAgentDialog } from "./dialogs/AiAgentDialog";
 import { AiAgentPlanDialog } from "./dialogs/AiAgentPlanDialog";
 import { AiManagerDialog } from "./dialogs/AiManagerDialog";
-import { JobSchedulerDialog } from "./dialogs/JobSchedulerDialog";
-import { TerminalEffectManagerDialog } from "./dialogs/TerminalEffectManagerDialog";
 import { AiChatTab } from "./ai/AiChatTab";
 import { AiAgentRunTab } from "./ai/AiAgentRunTab";
 import { AiAgentPlanTab } from "./ai/AiAgentPlanTab";
-import { SFTPManager } from "./sftp/SFTPManager";
+import { LocalFileBrowser } from "./files/LocalFileBrowser";
 import { useConnectionStore, ConnectionSettings } from "../store/connectionStore";
 import { useProjectStore, type Project } from "../store/projectStore";
-import type { GlobalSettings, TerminalAgentPanelDock } from "../store/settingsStore";
+import type { GlobalSettings, LocalFileBrowserDock, TerminalAgentPanelDock } from "../store/settingsStore";
 import { useThemeStore } from "../store/themeStore";
 import { useGuiThemeStore } from "../store/guiThemeStore";
 import {
@@ -62,6 +60,23 @@ import {
 } from "../utils/terminalAgentCommand";
 import { resolvePreferredAiProfileId } from "../utils/aiProfiles";
 import { normalizeTerminalEffectSpeed, type TerminalEffectPluginEntry } from "../types/terminalEffects";
+import type { TerminalRecordingStartResponse } from "../types/terminalRecording";
+
+const JobSchedulerDialog = lazy(() =>
+  import("./dialogs/JobSchedulerDialog").then((module) => ({ default: module.JobSchedulerDialog })),
+);
+const TerminalEffectManagerDialog = lazy(() =>
+  import("./dialogs/TerminalEffectManagerDialog").then((module) => ({ default: module.TerminalEffectManagerDialog })),
+);
+const TerminalRecordingManagerDialog = lazy(() =>
+  import("./dialogs/TerminalRecordingManagerDialog").then((module) => ({ default: module.TerminalRecordingManagerDialog })),
+);
+const SnippetManager = lazy(() =>
+  import("./dialogs/SnippetManager").then((module) => ({ default: module.SnippetManager })),
+);
+const SFTPManager = lazy(() =>
+  import("./sftp/SFTPManager").then((module) => ({ default: module.SFTPManager })),
+);
 import type {
   AiAction,
   AiExecutionResult,
@@ -103,6 +118,7 @@ type DialogId =
   | "aiManager"
   | "jobScheduler"
   | "terminalEffects"
+  | "terminalRecordings"
   | "terminalThemeEditor"
   | "guiThemeEditor"
   | "sftpManager"
@@ -186,6 +202,8 @@ type GlobalSettingsView = {
   terminalAgentPanelSideWidth?: number;
   terminalAgentPanelFontSize?: number;
   defaultAiProfileId?: string;
+  localFileBrowserDock?: LocalFileBrowserDock;
+  localFileBrowserVisible?: boolean;
 };
 
 type TerminalAgentPanelLayoutSnapshot = {
@@ -654,6 +672,9 @@ export function MainWindow() {
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeTab, setActiveTab] = useState<string | null>(null);
   const [showDashboard, setShowDashboard] = useState(false);
+  const [terminalOnlyFullscreen, setTerminalOnlyFullscreen] = useState(false);
+  const [localFileBrowserVisible, setLocalFileBrowserVisible] = useState(false);
+  const [localFileBrowserDock, setLocalFileBrowserDock] = useState<LocalFileBrowserDock>("left");
   const [connectionCount, setConnectionCount] = useState(0);
   const [openDialog, setOpenDialog] = useState<DialogId>(null);
   const [editingConnection, setEditingConnection] = useState<ConnectionSettings | null>(null);
@@ -661,12 +682,14 @@ export function MainWindow() {
   const [projectSettingsDraft, setProjectSettingsDraft] = useState<Project | null>(null);
   const [pendingAiAction, setPendingAiAction] = useState<PendingAiAction | null>(null);
   const [pendingTerminalAgentAction, setPendingTerminalAgentAction] = useState<PendingTerminalAgentAction | null>(null);
+  const [snippetFileDraft, setSnippetFileDraft] = useState<SnippetFileDraft | null>(null);
   const [pendingTerminalAgentMode, setPendingTerminalAgentMode] = useState<"run" | "plan" | null>(null);
   const [terminalAgentStates, setTerminalAgentStates] = useState<Record<string, TerminalAgentRunState>>({});
   const [globalFontSize, setGlobalFontSize] = useState(DEFAULT_FONT_SIZE);
   const [tabFontSizes, setTabFontSizes] = useState<Record<string, number>>({});
   const [paneFontSizes, setPaneFontSizes] = useState<Record<string, number>>({});
   const [showTimestamps, setShowTimestamps] = useState(false);
+  const [recordingSessions, setRecordingSessions] = useState<Record<string, TerminalRecordingStartResponse | undefined>>({});
   const [promptHookEnabled, setPromptHookEnabled] = useState(true);
   const [showMenuBar, setShowMenuBar] = useState(true);
   const [terminalAgentCommandName, setTerminalAgentCommandName] = useState("agent");
@@ -768,6 +791,8 @@ export function MainWindow() {
     setTerminalAgentPanelFontSize(nextAgentPanelLayout.terminalAgentPanelFontSize);
     setTerminalAgentExecutionTarget(settings.terminalAgentExecutionTarget ?? "TerminalWindow");
     setDefaultAiProfileId(settings.defaultAiProfileId ?? "");
+    setLocalFileBrowserDock(settings.localFileBrowserDock ?? "left");
+    setLocalFileBrowserVisible(!!settings.localFileBrowserVisible);
   }, []);
 
   const loadAiProfileAvailability = useCallback(async () => {
@@ -2903,6 +2928,27 @@ export function MainWindow() {
     await win.setFullscreen(!isFull);
   }, []);
 
+  const toggleTerminalOnlyFullscreen = useCallback(() => {
+    setTerminalOnlyFullscreen((current) => !current);
+    window.setTimeout(() => window.dispatchEvent(new Event("kortty-refit")), 0);
+    window.setTimeout(() => window.dispatchEvent(new Event("kortty-refit")), 120);
+  }, []);
+
+  const saveSnippetFileDraft = useCallback(async (content: string) => {
+    const draft = snippetFileDraft;
+    if (!draft) return;
+    if (draft.source === "local") {
+      await invoke("write_local_text_file", { path: draft.path, content });
+    } else {
+      await invoke("write_remote_text_file", {
+        sessionId: draft.sessionId,
+        remotePath: draft.path,
+        content,
+      });
+    }
+    setSnippetFileDraft((current) => (current?.id === draft.id ? { ...current, content } : current));
+  }, [snippetFileDraft]);
+
   const handleQuit = useCallback(async () => {
     for (const tab of tabs) {
       if ((tab.kind ?? "terminal") === "terminal" && tab.status === "connected") {
@@ -3001,6 +3047,37 @@ export function MainWindow() {
     const parentTabId = Object.entries(tabSplitSessions).find(([, sessionIds]) => sessionIds.includes(sessionId))?.[0];
     return parentTabId ? tabs.find((tab) => tab.id === parentTabId)?.label : undefined;
   }, [splitSessionConfigs, tabSplitSessions, tabs]);
+
+  const toggleTerminalRecording = useCallback(async (sessionId: string) => {
+    const current = recordingSessions[sessionId];
+    if (current) {
+      try {
+        await invoke("stop_terminal_recording", { sessionId: current.sessionId });
+      } finally {
+        setRecordingSessions((prev) => {
+          const next = { ...prev };
+          delete next[sessionId];
+          return next;
+        });
+      }
+      return;
+    }
+
+    const parentTabId = tabs.some((tab) => tab.id === sessionId)
+      ? sessionId
+      : Object.entries(tabSplitSessions).find(([, sessionIds]) => sessionIds.includes(sessionId))?.[0] ?? sessionId;
+    const response = await invoke<TerminalRecordingStartResponse>("start_terminal_recording", {
+      request: {
+        tabId: parentTabId,
+        splitId: sessionId === parentTabId ? undefined : sessionId,
+        connectionName: resolveConnectionDisplayName(sessionId),
+        scope: "ActiveSplit",
+        columns: 80,
+        rows: 24,
+      },
+    });
+    setRecordingSessions((prev) => ({ ...prev, [sessionId]: response }));
+  }, [recordingSessions, resolveConnectionDisplayName, tabSplitSessions, tabs]);
 
   const handleRequestAiAction = useCallback(async (nextAction: PendingAiAction) => {
     if (!nextAction.selectedText.trim()) {
@@ -3662,6 +3739,9 @@ export function MainWindow() {
       } else if (e.key === "F11") {
         e.preventDefault();
         handleFullscreen();
+      } else if (e.key === "F12") {
+        e.preventDefault();
+        toggleTerminalOnlyFullscreen();
       } else if (
         ctrl &&
         shift &&
@@ -3717,6 +3797,7 @@ export function MainWindow() {
     setOpenDialog,
     handleQuit,
     handleFullscreen,
+    toggleTerminalOnlyFullscreen,
     zoomIn,
     zoomOut,
     resetZoom,
@@ -3744,6 +3825,7 @@ export function MainWindow() {
     onProjectSettings: handleEditProjectSettings,
     onToggleMenuBar: () => toggleMenuBarPreference(!showMenuBar),
     onToggleDashboard: () => setShowDashboard((prev) => !prev),
+    onToggleLocalFileBrowser: () => setLocalFileBrowserVisible((prev) => !prev),
     onQuickConnect: () => setOpenDialog("quickConnect"),
     onManageConnections: () => setOpenDialog("connectionManager"),
     onImportConnections: () => setOpenDialog("importDialog"),
@@ -3754,9 +3836,13 @@ export function MainWindow() {
     onManageGPGKeys: () => setOpenDialog("gpgKeyManager"),
     onAiManager: () => setOpenDialog("aiManager"),
     onAiAgent: handleOpenAiAgentForFocusedSession,
-    onSnippets: () => setOpenDialog("snippetManager"),
+    onSnippets: () => {
+      setSnippetFileDraft(null);
+      setOpenDialog("snippetManager");
+    },
     onJobScheduler: () => setOpenDialog("jobScheduler"),
     onTerminalEffects: () => setOpenDialog("terminalEffects"),
+    onTerminalRecordings: () => setOpenDialog("terminalRecordings"),
     onSFTPManager: () => setOpenDialog("sftpManager"),
     onAsciiArt: () => setOpenDialog("asciiArt"),
     onCreateBackup: () => setOpenDialog("backupCreate"),
@@ -3765,6 +3851,7 @@ export function MainWindow() {
     onTerminalThemeEditor: () => setOpenDialog("terminalThemeEditor"),
     onGuiThemeEditor: () => setOpenDialog("guiThemeEditor"),
     onFullscreen: handleFullscreen,
+    onTerminalOnlyFullscreen: toggleTerminalOnlyFullscreen,
     onQuit: handleQuit,
     onAbout: () => setOpenDialog("about"),
   };
@@ -3781,9 +3868,9 @@ export function MainWindow() {
 
   return (
     <div className="flex flex-col h-screen w-screen bg-kortty-bg">
-      {showMenuBar && <MenuBar {...menuActions} />}
+      {showMenuBar && !terminalOnlyFullscreen && <MenuBar {...menuActions} />}
       <div className="flex flex-1 min-h-0">
-        {showDashboard && (
+        {showDashboard && !terminalOnlyFullscreen && (
           <div className="w-[300px] border-r border-kortty-border bg-kortty-surface flex-shrink-0 flex flex-col">
             <div className="px-3 py-2 text-xs font-semibold text-kortty-text-dim uppercase tracking-wider border-b border-kortty-border">
               Dashboard
@@ -3874,26 +3961,37 @@ export function MainWindow() {
             </div>
           </div>
         )}
-        <div className="flex-1 flex flex-col min-w-0 min-h-0">
-          <TabBar
-            tabs={tabs}
-            activeTab={activeTab}
-            onTabChange={setActiveTab}
-            onAddTab={addTab}
-            onQuickConnect={() => setOpenDialog("quickConnect")}
-            onCloseTab={closeTab}
-            onDuplicateTab={duplicateTab}
-            onReconnectTab={(tabId) => handleReconnectTabAll(tabId)}
-            onReorderTabs={reorderTabs}
-            onTabTransferDragStart={handleTabTransferDragStart}
-            onTabTransferDragEnd={handleTabTransferDragEnd}
-            otherWindows={otherWorkspaceWindows}
-            onMoveTabToWindow={handleMoveTabToWindow}
-            onCopyTabToWindow={handleCopyTabToWindow}
-            terminalEffects={terminalEffects}
-            onSetTabTerminalEffect={setTabTerminalEffect}
-            onSetTabTerminalEffectSpeed={setTabTerminalEffectSpeed}
+        {localFileBrowserVisible && !terminalOnlyFullscreen && localFileBrowserDock === "left" && (
+          <LocalFileBrowser
+            dock="left"
+            onClose={() => setLocalFileBrowserVisible(false)}
+            onEditFile={(draft) => {
+              setSnippetFileDraft(draft);
+              setOpenDialog("snippetManager");
+            }}
           />
+        )}
+        <div className="flex-1 flex flex-col min-w-0 min-h-0">
+          {!terminalOnlyFullscreen && (
+            <TabBar
+              tabs={tabs}
+              activeTab={activeTab}
+              onTabChange={setActiveTab}
+              onAddTab={addTab}
+              onCloseTab={closeTab}
+              onDuplicateTab={duplicateTab}
+              onReconnectTab={(tabId) => handleReconnectTabAll(tabId)}
+              onReorderTabs={reorderTabs}
+              onTabTransferDragStart={handleTabTransferDragStart}
+              onTabTransferDragEnd={handleTabTransferDragEnd}
+              otherWindows={otherWorkspaceWindows}
+              onMoveTabToWindow={handleMoveTabToWindow}
+              onCopyTabToWindow={handleCopyTabToWindow}
+              terminalEffects={terminalEffects}
+              onSetTabTerminalEffect={setTabTerminalEffect}
+              onSetTabTerminalEffectSpeed={setTabTerminalEffectSpeed}
+            />
+          )}
           <div
             className="flex-1 min-h-0 bg-kortty-terminal relative overflow-hidden"
             onDragOver={handleWindowRootDragOver}
@@ -4033,6 +4131,10 @@ export function MainWindow() {
                       }}
                       onToggleTimestamps={() => setShowTimestamps((s) => !s)}
                       showTimestamps={showTimestamps}
+                      recordings={recordingSessions}
+                      onToggleRecording={(sessionId) => {
+                        void toggleTerminalRecording(sessionId);
+                      }}
                       onReconnect={(sessionId) => handleReconnect(sessionId)}
                       agentRunStates={terminalAgentStates}
                       onClosePrimarySplit={() => {
@@ -4071,7 +4173,10 @@ export function MainWindow() {
                           connectionDisplayName: resolveConnectionDisplayName(sessionId),
                         });
                       }) : undefined}
-                      onOpenSnippetManager={() => setOpenDialog("snippetManager")}
+                      onOpenSnippetManager={() => {
+                        setSnippetFileDraft(null);
+                        setOpenDialog("snippetManager");
+                      }}
                       onAgentCommand={(sessionId, rawCommand) => {
                         void handleTerminalAgentShortcut(sessionId, rawCommand);
                       }}
@@ -4130,7 +4235,27 @@ export function MainWindow() {
               </div>
             )}
           </div>
+          {localFileBrowserVisible && !terminalOnlyFullscreen && localFileBrowserDock === "bottom" && (
+            <LocalFileBrowser
+              dock="bottom"
+              onClose={() => setLocalFileBrowserVisible(false)}
+              onEditFile={(draft) => {
+                setSnippetFileDraft(draft);
+                setOpenDialog("snippetManager");
+              }}
+            />
+          )}
         </div>
+        {localFileBrowserVisible && !terminalOnlyFullscreen && localFileBrowserDock === "right" && (
+          <LocalFileBrowser
+            dock="right"
+            onClose={() => setLocalFileBrowserVisible(false)}
+            onEditFile={(draft) => {
+              setSnippetFileDraft(draft);
+              setOpenDialog("snippetManager");
+            }}
+          />
+        )}
       </div>
       <StatusBar connectionCount={connectionCount} />
 
@@ -4187,6 +4312,8 @@ export function MainWindow() {
           setTerminalAgentPanelHeight(settings.terminalAgentPanelHeight);
           setTerminalAgentPanelSideWidth(settings.terminalAgentPanelSideWidth);
           setTerminalAgentPanelFontSize(settings.terminalAgentPanelFontSize);
+          setLocalFileBrowserDock(settings.localFileBrowserDock ?? "left");
+          setLocalFileBrowserVisible(!!settings.localFileBrowserVisible);
           terminalAgentPanelLayoutRef.current = {
             terminalAgentPanelDock: settings.terminalAgentPanelDock ?? "bottom",
             terminalAgentPanelHeight: settings.terminalAgentPanelHeight,
@@ -4246,17 +4373,23 @@ export function MainWindow() {
         }}
         onOpenChat={handleOpenSavedAiChat}
       />
-      <JobSchedulerDialog
-        open={openDialog === "jobScheduler"}
-        onClose={() => setOpenDialog(null)}
-      />
-      <TerminalEffectManagerDialog
-        open={openDialog === "terminalEffects"}
-        onClose={() => {
-          void reloadTerminalEffects();
-          setOpenDialog(null);
-        }}
-      />
+      <Suspense fallback={null}>
+        <JobSchedulerDialog
+          open={openDialog === "jobScheduler"}
+          onClose={() => setOpenDialog(null)}
+        />
+        <TerminalEffectManagerDialog
+          open={openDialog === "terminalEffects"}
+          onClose={() => {
+            void reloadTerminalEffects();
+            setOpenDialog(null);
+          }}
+        />
+        <TerminalRecordingManagerDialog
+          open={openDialog === "terminalRecordings"}
+          onClose={() => setOpenDialog(null)}
+        />
+      </Suspense>
       <CredentialManager
         open={openDialog === "credentialManager"}
         onClose={() => setOpenDialog(null)}
@@ -4269,10 +4402,17 @@ export function MainWindow() {
         open={openDialog === "gpgKeyManager"}
         onClose={() => setOpenDialog(null)}
       />
-      <SnippetManager
-        open={openDialog === "snippetManager"}
-        onClose={() => setOpenDialog(null)}
-      />
+      <Suspense fallback={null}>
+        <SnippetManager
+          open={openDialog === "snippetManager"}
+          fileDraft={snippetFileDraft}
+          onFileDraftSave={saveSnippetFileDraft}
+          onClose={() => {
+            setOpenDialog(null);
+            setSnippetFileDraft(null);
+          }}
+        />
+      </Suspense>
       <AsciiArtBanner
         open={openDialog === "asciiArt"}
         onClose={() => setOpenDialog(null)}
@@ -4310,11 +4450,17 @@ export function MainWindow() {
         open={openDialog === "guiThemeEditor"}
         onClose={() => setOpenDialog(null)}
       />
-      <SFTPManager
-        open={openDialog === "sftpManager"}
-        onClose={() => setOpenDialog(null)}
-        sessionId={activeTerminalSessionId}
-      />
+      <Suspense fallback={null}>
+        <SFTPManager
+          open={openDialog === "sftpManager"}
+          onClose={() => setOpenDialog(null)}
+          sessionId={activeTerminalSessionId}
+          onEditFile={(draft) => {
+            setSnippetFileDraft(draft);
+            setOpenDialog("snippetManager");
+          }}
+        />
+      </Suspense>
       <ProjectPreviewDialog
         open={openDialog === "projectPreview"}
         project={projectPreview}
@@ -4381,7 +4527,7 @@ export function MainWindow() {
               <div className="text-4xl font-mono font-bold text-kortty-accent mb-2">KorTTY</div>
               <div className="text-xs text-kortty-text-dim mb-6">SSH Terminal Client</div>
               <div className="space-y-1 text-center text-xs text-kortty-text">
-                <p>Version 2.0.0</p>
+                <p>Version 2.2.0</p>
                 <p className="text-kortty-text-dim">Built with Tauri + React + Rust</p>
               </div>
               <div className="mt-6 text-center text-[11px] text-kortty-text-dim space-y-0.5">

@@ -3,7 +3,7 @@ import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import {
   X, Upload, Download, Trash2, FolderPlus, FileArchive,
-  RefreshCw, Folder, File, ChevronRight, Shield, UserCog,
+  RefreshCw, Folder, File, ChevronRight, Shield, UserCog, Edit,
 } from "lucide-react";
 
 interface FileEntry {
@@ -20,6 +20,13 @@ interface SFTPManagerProps {
   open: boolean;
   onClose: () => void;
   sessionId: string;
+  onEditFile?: (draft: {
+    id: string;
+    source: "local" | "remote";
+    path: string;
+    sessionId?: string;
+    content: string;
+  }) => void;
 }
 
 type SortKey = "name" | "type" | "size" | "date" | "owner" | "group" | "permissions";
@@ -316,9 +323,10 @@ function PermissionsDialog({ open, side, entry, sessionId, basePath, onClose, on
 function ContextMenu({ x, y, side, entry, hasSelection, onAction, onClose }: {
   x: number; y: number; side: "local" | "remote"; entry: FileEntry | null;
   hasSelection: boolean;
-  onAction: (action: string) => void; onClose: () => void;
+  onAction: (action: string, menu: CtxMenuState) => void; onClose: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
+  const menu = { x, y, side, entry };
 
   useEffect(() => {
     const handler = (e: MouseEvent) => {
@@ -328,10 +336,32 @@ function ContextMenu({ x, y, side, entry, hasSelection, onAction, onClose }: {
     return () => document.removeEventListener("mousedown", handler);
   }, [onClose]);
 
+  const runAction = (action: string) => {
+    onAction(action, menu);
+    onClose();
+  };
+
   const Itm = ({ label, icon, action, disabled }: { label: string; icon?: React.ReactNode; action: string; disabled?: boolean }) => (
-    <button disabled={disabled}
+    <button type="button" disabled={disabled}
       className="w-full flex items-center gap-2 px-3 py-1.5 text-xs text-kortty-text hover:bg-kortty-accent/10 hover:text-kortty-accent transition-colors disabled:opacity-30 disabled:cursor-not-allowed"
-      onClick={() => { onAction(action); onClose(); }}>
+      onPointerDown={(event) => {
+        if (disabled || event.button !== 0) return;
+        event.preventDefault();
+        event.stopPropagation();
+        runAction(action);
+      }}
+      onClick={(event) => event.preventDefault()}
+      onContextMenu={(event) => {
+        event.preventDefault();
+        event.stopPropagation();
+        if (!disabled) runAction(action);
+      }}
+      onKeyDown={(event) => {
+        if (disabled || (event.key !== "Enter" && event.key !== " ")) return;
+        event.preventDefault();
+        event.stopPropagation();
+        runAction(action);
+      }}>
       {icon}{label}
     </button>
   );
@@ -339,7 +369,11 @@ function ContextMenu({ x, y, side, entry, hasSelection, onAction, onClose }: {
 
   return (
     <div ref={ref} className="fixed z-[70] bg-kortty-panel border border-kortty-border rounded-lg shadow-2xl py-1 min-w-[180px]"
+      onMouseDown={(event) => event.stopPropagation()}
+      onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); }}
       style={{ left: x, top: y }}>
+      <Itm label="Edit in Snippet Editor" icon={<Edit className="w-3.5 h-3.5" />} action="edit" disabled={!entry || entry.fileType !== "File"} />
+      <Sep />
       <Itm label="Rename" action="rename" disabled={!entry || entry.name === ".."} />
       <Itm label="Delete" icon={<Trash2 className="w-3.5 h-3.5" />} action="delete" disabled={!entry || entry.name === ".."} />
       <Sep />
@@ -435,7 +469,7 @@ function FilePanel({ title, path, onPathChange, entries, loading, error, selecte
 
 /* ====== Main SFTP Manager ====== */
 
-export function SFTPManager({ open, onClose, sessionId }: SFTPManagerProps) {
+export function SFTPManager({ open, onClose, sessionId, onEditFile }: SFTPManagerProps) {
   const { t } = useTranslation();
   const [localPath, setLocalPath] = useState("");
   const [remotePath, setRemotePath] = useState("/");
@@ -554,7 +588,7 @@ export function SFTPManager({ open, onClose, sessionId }: SFTPManagerProps) {
       const fullPath = basePath.replace(/\/$/, "") + "/" + name;
       try {
         if (side === "remote") await invoke("sftp_delete", { sessionId, path: fullPath });
-        // Local delete not implemented yet
+        else await invoke("local_delete", { path: fullPath });
       } catch (e) { console.error("Delete failed:", e); }
     }
     setStatus("Delete complete");
@@ -568,7 +602,8 @@ export function SFTPManager({ open, onClose, sessionId }: SFTPManagerProps) {
     const oldPath = basePath.replace(/\/$/, "") + "/" + oldName;
     const newPath = basePath.replace(/\/$/, "") + "/" + newName;
     try {
-      await invoke("sftp_rename", { sessionId, oldPath, newPath });
+      if (side === "local") await invoke("local_rename", { oldPath, newPath });
+      else await invoke("sftp_rename", { sessionId, oldPath, newPath });
       if (side === "local") loadLocal(localPath); else loadRemote(remotePath);
     } catch (e) { console.error("Rename failed:", e); }
     setRenaming(null);
@@ -580,17 +615,42 @@ export function SFTPManager({ open, onClose, sessionId }: SFTPManagerProps) {
     const basePath = side === "local" ? localPath : remotePath;
     const fullPath = basePath.replace(/\/$/, "") + "/" + name;
     try {
-      await invoke("sftp_mkdir", { sessionId, path: fullPath });
+      if (side === "local") await invoke("local_mkdir", { path: fullPath });
+      else await invoke("sftp_mkdir", { sessionId, path: fullPath });
       if (side === "local") loadLocal(localPath); else loadRemote(remotePath);
     } catch (e) { console.error("Mkdir failed:", e); }
   };
 
-  const handleContextAction = (action: string) => {
-    if (!ctxMenu) return;
-    const { side, entry } = ctxMenu;
+  const handleEditFile = async (side: "local" | "remote", entry: FileEntry | null) => {
+    if (!entry || entry.fileType !== "File") return;
+    const basePath = side === "local" ? localPath : remotePath;
+    const fullPath = basePath.replace(/\/$/, "") + "/" + entry.name;
+    setStatus("Opening file in snippet editor...");
+    try {
+      const content = side === "local"
+        ? await invoke<string>("read_local_text_file", { path: fullPath })
+        : await invoke<string>("read_remote_text_file", { sessionId, remotePath: fullPath });
+      onEditFile?.({
+        id: crypto.randomUUID(),
+        source: side,
+        path: fullPath,
+        sessionId: side === "remote" ? sessionId : undefined,
+        content,
+      });
+      setStatus("");
+    } catch (error) {
+      setStatus(`Open failed: ${String(error)}`);
+    }
+  };
+
+  const handleContextAction = (action: string, menu: CtxMenuState) => {
+    const { side, entry } = menu;
     const sel = side === "local" ? localSelected : remoteSelected;
     const basePath = side === "local" ? localPath : remotePath;
     switch (action) {
+      case "edit":
+        void handleEditFile(side, entry);
+        break;
       case "delete":
         if (entry) handleDelete(side, sel.size > 0 ? sel : new Set([entry.name]));
         break;

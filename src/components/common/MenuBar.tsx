@@ -11,6 +11,7 @@ interface MenuBarProps {
   onProjectSettings: () => void;
   onToggleMenuBar: () => void;
   onToggleDashboard: () => void;
+  onToggleLocalFileBrowser: () => void;
   onQuickConnect: () => void;
   onManageConnections: () => void;
   onImportConnections: () => void;
@@ -24,6 +25,7 @@ interface MenuBarProps {
   onSnippets: () => void;
   onJobScheduler: () => void;
   onTerminalEffects: () => void;
+  onTerminalRecordings: () => void;
   onSFTPManager: () => void;
   onAsciiArt: () => void;
   onCreateBackup: () => void;
@@ -32,6 +34,7 @@ interface MenuBarProps {
   onTerminalThemeEditor: () => void;
   onGuiThemeEditor: () => void;
   onFullscreen: () => void;
+  onTerminalOnlyFullscreen: () => void;
   onQuit: () => void;
   onAbout: () => void;
 }
@@ -116,6 +119,8 @@ export function MenuBar(props: MenuBarProps) {
         { separator: true, label: "" },
         { label: "JobScheduler...", action: props.onJobScheduler },
         { separator: true, label: "" },
+        { label: "Terminal Recordings...", action: props.onTerminalRecordings },
+        { separator: true, label: "" },
         { label: "Open SFTP Manager...", action: props.onSFTPManager },
         { label: "ASCII Art Banner...", action: props.onAsciiArt },
         { separator: true, label: "" },
@@ -132,9 +137,11 @@ export function MenuBar(props: MenuBarProps) {
       label: "View",
       items: [
         { label: "Toggle Dashboard", shortcut: "Ctrl+Shift+D", action: props.onToggleDashboard },
+        { label: "Toggle Local File Browser", action: props.onToggleLocalFileBrowser },
         { label: "Toggle Menu Bar", shortcut: "Ctrl+Shift+L", action: props.onToggleMenuBar },
         { separator: true, label: "" },
         { label: "Fullscreen", shortcut: "F11", action: props.onFullscreen },
+        { label: "Terminal-only Fullscreen", shortcut: "F12", action: props.onTerminalOnlyFullscreen },
       ],
     },
     {

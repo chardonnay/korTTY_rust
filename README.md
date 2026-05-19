@@ -3,6 +3,8 @@
 A modern SSH terminal client built with Rust (Tauri v2) and React/TypeScript.
 This repository tracks the feature migration from [KorTTY JavaFX](https://github.com/chardonnay/korTTY) to the Rust/Tauri desktop app.
 
+Current version: v2.2.0
+
 ## Highlights
 
 - Multiple SSH tabs, split terminals, broadcast input, zoom control, dashboard and multi-window workflows

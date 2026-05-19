@@ -2697,7 +2697,7 @@ dependencies = [
 
 [[package]]
 name = "kortty"
-version = "2.0.0"
+version = "2.2.0"
 dependencies = [
  "aes-gcm 0.10.3",
  "anyhow",

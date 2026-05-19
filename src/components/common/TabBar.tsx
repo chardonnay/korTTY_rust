@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from "react";
-import { Bot, X, Plus, Sparkles, Terminal } from "lucide-react";
+import { Bot, X, Sparkles, Terminal } from "lucide-react";
 import type {
   AiRequestPayload,
   SavedAiChat,
@@ -61,7 +61,6 @@ interface TabBarProps {
   activeTab: string | null;
   onTabChange: (tabId: string) => void;
   onAddTab: () => void;
-  onQuickConnect: () => void;
   onCloseTab: (tabId: string) => void;
   onDuplicateTab?: (tabId: string) => void;
   onReconnectTab?: (tabId: string) => void;
@@ -83,7 +82,7 @@ interface CtxMenu {
 }
 
 export function TabBar({
-  tabs, activeTab, onTabChange, onQuickConnect, onCloseTab,
+  tabs, activeTab, onTabChange, onCloseTab,
   onDuplicateTab, onReconnectTab, onReorderTabs,
   onTabTransferDragStart, onTabTransferDragEnd,
   otherWindows, onMoveTabToWindow, onCopyTabToWindow,
@@ -195,14 +194,6 @@ export function TabBar({
           </div>
         ))}
       </div>
-      <button
-        className="flex items-center justify-center w-8 h-8 text-kortty-text-dim hover:text-kortty-accent hover:bg-kortty-panel rounded transition-colors flex-shrink-0"
-        onClick={onQuickConnect}
-        title="Quick Connect (Ctrl+K)"
-      >
-        <Plus className="w-4 h-4" />
-      </button>
-
       {ctxMenu && (
         <div
           ref={menuRef}

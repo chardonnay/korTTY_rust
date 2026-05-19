@@ -111,6 +111,13 @@ impl AiInternetAccessMode {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AiModelSelectionMode {
+    Auto,
+    #[default]
+    Manual,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AiSkillTarget {
     Chat,
     Agent,
@@ -155,6 +162,8 @@ pub struct AiProfile {
     pub api_url: String,
     pub model: String,
     #[serde(default)]
+    pub model_selection_mode: AiModelSelectionMode,
+    #[serde(default)]
     pub api_key: String,
     #[serde(default)]
     pub reasoning_effort: AiReasoningEffort,
@@ -190,6 +199,7 @@ impl Default for AiProfile {
             name: String::new(),
             api_url: String::new(),
             model: String::new(),
+            model_selection_mode: AiModelSelectionMode::Manual,
             api_key: String::new(),
             reasoning_effort: AiReasoningEffort::Disabled,
             internet_access_mode: AiInternetAccessMode::Disabled,

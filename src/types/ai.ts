@@ -58,6 +58,7 @@ export type AiInternetAccessMode =
   | "BraveSearchMcp"
   | "SearxngMcp"
   | "LmStudioToolpack";
+export type AiModelSelectionMode = "Auto" | "Manual";
 export type AiSkillTarget = "Chat" | "Agent" | "Both";
 
 export interface AiProfile {
@@ -65,6 +66,7 @@ export interface AiProfile {
   name: string;
   apiUrl: string;
   model: string;
+  modelSelectionMode: AiModelSelectionMode;
   apiKey: string;
   reasoningEffort: AiReasoningEffort;
   internetAccessMode: AiInternetAccessMode;
@@ -337,6 +339,7 @@ export function createEmptyAiProfile(): AiProfile {
     name: "",
     apiUrl: "",
     model: "",
+    modelSelectionMode: "Manual",
     apiKey: "",
     reasoningEffort: "Disabled",
     internetAccessMode: "Disabled",

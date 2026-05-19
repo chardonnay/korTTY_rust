@@ -11,5 +11,6 @@ pub mod snippet;
 pub mod ssh_key;
 pub mod terminal_agent;
 pub mod terminal_effect;
+pub mod terminal_recording;
 pub mod theme;
 pub mod tunnel;

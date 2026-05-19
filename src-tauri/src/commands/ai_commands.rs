@@ -115,6 +115,16 @@ pub async fn test_ai_profile(profile: AiProfile) -> Result<bool, String> {
 }
 
 #[tauri::command]
+pub async fn list_lm_studio_models(
+    api_url: String,
+    api_key: Option<String>,
+) -> Result<Vec<String>, String> {
+    ai::list_local_lm_models(&api_url, api_key.as_deref())
+        .await
+        .map_err(|error| error.to_string())
+}
+
+#[tauri::command]
 pub async fn execute_ai_action(
     app: AppHandle,
     mut request: AiRequestPayload,

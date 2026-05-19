@@ -2,6 +2,8 @@
 
 This document summarizes the currently implemented desktop workflows in the Rust/Tauri version of KorTTY.
 
+Version: v2.2.0
+
 ## Terminal workflows
 
 - Open SSH sessions in multiple tabs.

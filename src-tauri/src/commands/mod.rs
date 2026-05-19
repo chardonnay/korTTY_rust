@@ -15,6 +15,7 @@ pub mod ssh_commands;
 pub mod teamwork_commands;
 pub mod terminal_agent_commands;
 pub mod terminal_effect_commands;
+pub mod terminal_recording_commands;
 pub mod theme_commands;
 pub mod translation_commands;
 pub mod window_commands;

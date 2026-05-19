@@ -1,7 +1,7 @@
 use crate::ai_skills;
 use crate::model::ai::{
-    AiAction, AiExecutionResult, AiInternetAccessMode, AiProfile, AiRequestPayload, AiSkillTarget,
-    AiTokenUsage, AiTokenUsageSnapshot, AiTokenWarningLevel,
+    AiAction, AiExecutionResult, AiInternetAccessMode, AiModelSelectionMode, AiProfile,
+    AiRequestPayload, AiSkillTarget, AiTokenUsage, AiTokenUsageSnapshot, AiTokenWarningLevel,
 };
 use crate::model::settings::GlobalSettings;
 use crate::persistence::xml_repository;
@@ -132,11 +132,23 @@ pub async fn test_connection(profile: &AiProfile) -> bool {
     let Ok(client) = build_http_client(TEST_CONNECT_TIMEOUT_SECS, TEST_REQUEST_TIMEOUT_SECS) else {
         return false;
     };
-    let request_body = build_connection_test_request_body(profile);
-    send_request_body(profile, &client, &request_body)
-        .await
-        .map(|result| !result.content.trim().is_empty())
-        .unwrap_or(false)
+    let settings = load_global_settings();
+    let internet_config = internet_config_from_settings(profile, &settings);
+    send_prompt_for_profile(
+        profile,
+        PromptDispatch {
+            client: &client,
+            system_prompt: CONNECTION_TEST_SYSTEM_PROMPT,
+            user_prompt: CONNECTION_TEST_USER_PROMPT,
+            temperature: 0.0,
+            json_response_format: false,
+            internet_config: &internet_config,
+            internet_eligible: false,
+        },
+    )
+    .await
+    .map(|result| !result.content.trim().is_empty())
+    .unwrap_or(false)
 }
 
 pub async fn execute_custom_prompt(
@@ -491,16 +503,6 @@ fn build_http_client(
         .map_err(AiError::from)
 }
 
-fn build_connection_test_request_body(profile: &AiProfile) -> Value {
-    build_message_request_body(
-        profile,
-        CONNECTION_TEST_SYSTEM_PROMPT,
-        CONNECTION_TEST_USER_PROMPT,
-        0.0,
-        false,
-    )
-}
-
 fn build_message_request_body(
     profile: &AiProfile,
     system_prompt: &str,
@@ -544,6 +546,10 @@ async fn send_prompt_for_profile(
         internet_config,
         internet_eligible,
     } = dispatch;
+    let effective_profile =
+        prepare_profile_for_dispatch(profile, client, internet_config.mode.uses_lm_studio_mcp())
+            .await?;
+    let profile = &effective_profile;
     if internet_config.mode.uses_lm_studio_mcp() {
         validate_lm_studio_config(profile, internet_config, internet_eligible)?;
         let body = build_lm_studio_request_body(
@@ -573,6 +579,187 @@ async fn send_prompt_for_profile(
         return execute_tool_aware_messages(profile, client, body, internet_config).await;
     }
     send_request_body(profile, client, &body).await
+}
+
+async fn prepare_profile_for_dispatch(
+    profile: &AiProfile,
+    client: &reqwest::Client,
+    native_lm_studio_chat: bool,
+) -> Result<AiProfile, AiError> {
+    let mut effective = profile.clone();
+    effective.api_url = if native_lm_studio_chat {
+        normalize_lm_studio_chat_url(&effective.api_url)?
+    } else {
+        normalize_openai_chat_completions_url(&effective.api_url)?
+    };
+    effective.model = resolve_effective_model(&effective, client).await?;
+    Ok(effective)
+}
+
+async fn resolve_effective_model(
+    profile: &AiProfile,
+    client: &reqwest::Client,
+) -> Result<String, AiError> {
+    let configured_model = profile.model.trim();
+    match profile.model_selection_mode {
+        AiModelSelectionMode::Manual => {
+            if configured_model.is_empty() {
+                return Err(AiError::Configuration(
+                    "AI model must be configured in Manual model selection mode.".into(),
+                ));
+            }
+            Ok(configured_model.to_string())
+        }
+        AiModelSelectionMode::Auto => {
+            let models =
+                list_local_lm_models_with_client(client, &profile.api_url, Some(&profile.api_key))
+                    .await?;
+            if models.is_empty() {
+                return Err(AiError::Configuration(
+                    "LM Studio Auto model selection found no loaded local models.".into(),
+                ));
+            }
+            if models.len() == 1 {
+                return Ok(models[0].clone());
+            }
+            if !configured_model.is_empty() && models.iter().any(|model| model == configured_model)
+            {
+                return Ok(configured_model.to_string());
+            }
+            Err(AiError::Configuration(format!(
+                "LM Studio Auto model selection is ambiguous; loaded models: {}. Select one model manually.",
+                models.join(", ")
+            )))
+        }
+    }
+}
+
+pub async fn list_local_lm_models(
+    api_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<String>, AiError> {
+    let client = build_http_client(TEST_CONNECT_TIMEOUT_SECS, TEST_REQUEST_TIMEOUT_SECS)?;
+    list_local_lm_models_with_client(&client, api_url, api_key).await
+}
+
+async fn list_local_lm_models_with_client(
+    client: &reqwest::Client,
+    api_url: &str,
+    api_key: Option<&str>,
+) -> Result<Vec<String>, AiError> {
+    let models_url = normalize_lm_studio_models_url(api_url)?;
+    let mut builder = client.get(models_url);
+    if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
+        builder = builder.bearer_auth(api_key.trim());
+    }
+    let response = builder.send().await?;
+    let status = response.status();
+    let body = response.text().await?;
+    if !status.is_success() {
+        return Err(AiError::ApiStatus {
+            status: status.as_u16(),
+            message: extract_error_message(&body),
+        });
+    }
+    parse_lm_studio_models_response(&body)
+}
+
+fn normalize_openai_chat_completions_url(api_url: &str) -> Result<String, AiError> {
+    let trimmed = api_url.trim();
+    if trimmed.is_empty() {
+        return Err(AiError::MissingApiUrl);
+    }
+    let mut url =
+        reqwest::Url::parse(trimmed).map_err(|error| AiError::Configuration(error.to_string()))?;
+    let path = url.path().trim_end_matches('/');
+    if path == "/v1" {
+        url.set_path("/v1/chat/completions");
+    }
+    Ok(url.to_string())
+}
+
+fn normalize_lm_studio_chat_url(api_url: &str) -> Result<String, AiError> {
+    let trimmed = api_url.trim();
+    if trimmed.is_empty() {
+        return Err(AiError::MissingApiUrl);
+    }
+    let mut url =
+        reqwest::Url::parse(trimmed).map_err(|error| AiError::Configuration(error.to_string()))?;
+    let path = url.path().trim_end_matches('/');
+    match path {
+        "" | "/" | "/v1" | "/v1/chat/completions" | "/api/v1" | "/api/v1/models" => {
+            url.set_path("/api/v1/chat")
+        }
+        _ => {}
+    }
+    Ok(url.to_string())
+}
+
+fn normalize_lm_studio_models_url(api_url: &str) -> Result<String, AiError> {
+    let trimmed = api_url.trim();
+    if trimmed.is_empty() {
+        return Err(AiError::MissingApiUrl);
+    }
+    let mut url =
+        reqwest::Url::parse(trimmed).map_err(|error| AiError::Configuration(error.to_string()))?;
+    let Some(host) = url.host_str() else {
+        return Err(AiError::Configuration(
+            "LM Studio Auto model selection requires a local HTTP endpoint.".into(),
+        ));
+    };
+    if !matches!(host, "localhost" | "127.0.0.1" | "::1") {
+        return Err(AiError::Configuration(
+            "LM Studio Auto model selection is restricted to localhost endpoints.".into(),
+        ));
+    }
+    let path = url.path().trim_end_matches('/');
+    match path {
+        ""
+        | "/"
+        | "/v1"
+        | "/v1/chat/completions"
+        | "/api/v1"
+        | "/api/v1/chat"
+        | "/api/v1/models" => {
+            url.set_path("/api/v1/models");
+            Ok(url.to_string())
+        }
+        _ => Err(AiError::Configuration(
+            "LM Studio Auto model selection requires /v1 or /api/v1 endpoints.".into(),
+        )),
+    }
+}
+
+fn parse_lm_studio_models_response(body: &str) -> Result<Vec<String>, AiError> {
+    let root: Value =
+        serde_json::from_str(body).map_err(|error| AiError::InvalidResponse(error.to_string()))?;
+    let mut models = if let Some(items) = root.get("data").and_then(Value::as_array) {
+        collect_model_ids(items)
+    } else if let Some(items) = root.get("models").and_then(Value::as_array) {
+        collect_model_ids(items)
+    } else if let Some(items) = root.as_array() {
+        collect_model_ids(items)
+    } else {
+        Vec::new()
+    };
+    models.sort();
+    models.dedup();
+    Ok(models)
+}
+
+fn collect_model_ids(items: &[Value]) -> Vec<String> {
+    items
+        .iter()
+        .filter_map(|item| {
+            item.as_str()
+                .or_else(|| item.get("id").and_then(Value::as_str))
+                .or_else(|| item.get("model").and_then(Value::as_str))
+                .or_else(|| item.get("name").and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
 }
 
 fn validate_openai_tool_config(
@@ -1669,7 +1856,13 @@ mod tests {
             ..AiProfile::default()
         };
 
-        let body = build_connection_test_request_body(&profile);
+        let body = build_message_request_body(
+            &profile,
+            CONNECTION_TEST_SYSTEM_PROMPT,
+            CONNECTION_TEST_USER_PROMPT,
+            0.0,
+            false,
+        );
         assert_eq!(
             body.get("model").and_then(Value::as_str),
             Some("gpt-4.1-mini")
@@ -1770,6 +1963,7 @@ mod tests {
             name: "Profile".into(),
             api_url: "http://localhost".into(),
             model: "gpt".into(),
+            model_selection_mode: AiModelSelectionMode::Manual,
             api_key: String::new(),
             reasoning_effort: crate::model::ai::AiReasoningEffort::Disabled,
             internet_access_mode: crate::model::ai::AiInternetAccessMode::Disabled,

@@ -4,6 +4,7 @@ import type { AiSkill, TerminalAgentExecutionTarget } from "../types/ai";
 
 export type TeamworkSourceType = "Git" | "SharedFile";
 export type TerminalAgentPanelDock = "bottom" | "left" | "right";
+export type LocalFileBrowserDock = "left" | "right" | "bottom";
 
 export interface TeamworkSourceConfig {
   id: string;
@@ -73,6 +74,11 @@ export interface GlobalSettings {
   defaultTerminalEffectAnimationSpeed: number;
   lastQuickConnectTerminalEffectPluginId?: string;
   lastQuickConnectTerminalEffectAnimationSpeed?: number;
+  terminalRecordingEnabled: boolean;
+  terminalRecordingIdleAutoPause: boolean;
+  terminalRecordingDirectory?: string;
+  localFileBrowserDock: LocalFileBrowserDock;
+  localFileBrowserVisible: boolean;
 }
 
 interface SettingsStore {
@@ -134,6 +140,11 @@ export const useSettingsStore = create<SettingsStore>((set) => ({
     defaultTerminalEffectAnimationSpeed: 1,
     lastQuickConnectTerminalEffectPluginId: undefined,
     lastQuickConnectTerminalEffectAnimationSpeed: undefined,
+    terminalRecordingEnabled: false,
+    terminalRecordingIdleAutoPause: true,
+    terminalRecordingDirectory: undefined,
+    localFileBrowserDock: "left",
+    localFileBrowserVisible: false,
   },
   loading: false,
 

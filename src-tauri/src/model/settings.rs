@@ -37,6 +37,14 @@ pub enum TeamworkSourceType {
     SharedFile,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum LocalFileBrowserDock {
+    Left,
+    Right,
+    Bottom,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TeamworkSourceConfig {
@@ -154,6 +162,16 @@ pub struct GlobalSettings {
     pub last_quick_connect_terminal_effect_plugin_id: Option<String>,
     #[serde(default)]
     pub last_quick_connect_terminal_effect_animation_speed: Option<f64>,
+    #[serde(default)]
+    pub terminal_recording_enabled: bool,
+    #[serde(default = "default_true")]
+    pub terminal_recording_idle_auto_pause: bool,
+    #[serde(default)]
+    pub terminal_recording_directory: Option<String>,
+    #[serde(default = "default_local_file_browser_dock")]
+    pub local_file_browser_dock: LocalFileBrowserDock,
+    #[serde(default)]
+    pub local_file_browser_visible: bool,
 }
 
 impl Default for GlobalSettings {
@@ -217,6 +235,11 @@ impl Default for GlobalSettings {
             default_terminal_effect_animation_speed: default_terminal_effect_animation_speed(),
             last_quick_connect_terminal_effect_plugin_id: None,
             last_quick_connect_terminal_effect_animation_speed: None,
+            terminal_recording_enabled: false,
+            terminal_recording_idle_auto_pause: true,
+            terminal_recording_directory: None,
+            local_file_browser_dock: default_local_file_browser_dock(),
+            local_file_browser_visible: false,
         }
     }
 }
@@ -251,6 +274,10 @@ fn default_job_scheduler_retention_days() -> u32 {
 
 fn default_terminal_effect_animation_speed() -> f64 {
     1.0
+}
+
+fn default_local_file_browser_dock() -> LocalFileBrowserDock {
+    LocalFileBrowserDock::Left
 }
 
 #[cfg(test)]

@@ -143,6 +143,53 @@ fn shell_escape(s: &str) -> String {
 }
 
 const UPLOAD_CHUNK_SIZE: usize = 32 * 1024;
+const MAX_TEXT_EDITOR_BYTES: u64 = 5 * 1024 * 1024;
+
+#[tauri::command]
+pub async fn read_local_text_file(path: String) -> Result<String, String> {
+    let metadata = fs::metadata(&path).map_err(|e| e.to_string())?;
+    if !metadata.is_file() {
+        return Err("Local path is not a file".into());
+    }
+    if metadata.len() > MAX_TEXT_EDITOR_BYTES {
+        return Err(format!(
+            "Local file is too large for the snippet editor ({} bytes)",
+            metadata.len()
+        ));
+    }
+    fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn write_local_text_file(path: String, content: String) -> Result<(), String> {
+    if content.len() as u64 > MAX_TEXT_EDITOR_BYTES {
+        return Err("Content is too large for the snippet editor handoff".into());
+    }
+    if let Some(parent) = Path::new(&path).parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(&path, content).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn local_mkdir(path: String) -> Result<(), String> {
+    fs::create_dir_all(path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn local_rename(old_path: String, new_path: String) -> Result<(), String> {
+    fs::rename(old_path, new_path).map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn local_delete(path: String) -> Result<(), String> {
+    let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+    if metadata.is_dir() {
+        fs::remove_dir(path).map_err(|e| e.to_string())
+    } else {
+        fs::remove_file(path).map_err(|e| e.to_string())
+    }
+}
 
 #[tauri::command]
 pub async fn sftp_upload(
@@ -170,6 +217,80 @@ pub async fn sftp_upload(
             .exec_command(&cmd)
             .await
             .map_err(|e| format!("Upload chunk {} failed: {}", i, e))?;
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn read_remote_text_file(
+    state: State<'_, SSHManager>,
+    session_id: String,
+    remote_path: String,
+) -> Result<String, String> {
+    let session_arc = state
+        .get_session(&session_id)
+        .await
+        .ok_or_else(|| "Session not found".to_string())?;
+    let session = session_arc.lock().await;
+    let size_cmd = format!("wc -c < {} 2>/dev/null", shell_escape(&remote_path));
+    let size_output = session
+        .exec_command(&size_cmd)
+        .await
+        .map_err(|e| e.to_string())?;
+    let size = size_output.trim().parse::<u64>().unwrap_or(0);
+    if size > MAX_TEXT_EDITOR_BYTES {
+        return Err(format!(
+            "Remote file is too large for the snippet editor ({size} bytes)"
+        ));
+    }
+    let cmd = format!("cat {} | base64", shell_escape(&remote_path));
+    let output = session
+        .exec_command(&cmd)
+        .await
+        .map_err(|e| e.to_string())?;
+    let cleaned: String = output.chars().filter(|c| !c.is_whitespace()).collect();
+    if cleaned.is_empty() {
+        return Ok(String::new());
+    }
+    let data = base64::engine::general_purpose::STANDARD
+        .decode(&cleaned)
+        .map_err(|e| format!("Base64 decode error: {}", e))?;
+    String::from_utf8(data).map_err(|e| format!("Remote file is not valid UTF-8: {}", e))
+}
+
+#[tauri::command]
+pub async fn write_remote_text_file(
+    state: State<'_, SSHManager>,
+    session_id: String,
+    remote_path: String,
+    content: String,
+) -> Result<(), String> {
+    if content.len() as u64 > MAX_TEXT_EDITOR_BYTES {
+        return Err("Content is too large for the snippet editor handoff".into());
+    }
+    let session_arc = state
+        .get_session(&session_id)
+        .await
+        .ok_or_else(|| "Session not found".to_string())?;
+    let session = session_arc.lock().await;
+    let escaped = shell_escape(&remote_path);
+    for (i, chunk) in content.as_bytes().chunks(UPLOAD_CHUNK_SIZE).enumerate() {
+        let b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
+        let redirect = if i == 0 { ">" } else { ">>" };
+        let cmd = format!(
+            "printf '%s' '{}' | {{ base64 -d 2>/dev/null || base64 -D; }} {} {}",
+            b64, redirect, escaped
+        );
+        session
+            .exec_command(&cmd)
+            .await
+            .map_err(|e| format!("Remote write chunk {} failed: {}", i, e))?;
+    }
+    if content.is_empty() {
+        session
+            .exec_command(&format!(": > {}", escaped))
+            .await
+            .map_err(|e| e.to_string())?;
     }
     Ok(())
 }

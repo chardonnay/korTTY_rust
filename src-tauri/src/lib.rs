@@ -15,6 +15,7 @@ pub mod ssh;
 pub mod teamwork;
 pub mod terminal_agent;
 pub mod terminal_effects;
+pub mod terminal_recording;
 
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -33,6 +34,7 @@ pub fn run() {
         .manage(jobscheduler::JobSchedulerManager::new())
         .manage(terminal_agent::TerminalAgentStore::new())
         .manage(terminal_agent::TerminalAgentPlanStore::new())
+        .manage(terminal_recording::TerminalRecordingStore::new())
         .manage(security::vault::Vault::new())
         .manage(commands::ai_commands::AiRequestCancelStore(
             std::sync::Mutex::new(std::collections::HashMap::new()),
@@ -53,6 +55,7 @@ pub fn run() {
             commands::ai_commands::save_ai_profile,
             commands::ai_commands::delete_ai_profile,
             commands::ai_commands::test_ai_profile,
+            commands::ai_commands::list_lm_studio_models,
             commands::ai_commands::execute_ai_action,
             commands::ai_commands::cancel_ai_request,
             commands::ai_commands::get_ai_chats,
@@ -92,6 +95,18 @@ pub fn run() {
             commands::terminal_effect_commands::import_terminal_effect_plugin,
             commands::terminal_effect_commands::export_terminal_effect_plugin,
             commands::terminal_effect_commands::normalize_terminal_effect_speed,
+            commands::terminal_recording_commands::start_terminal_recording,
+            commands::terminal_recording_commands::append_terminal_recording_snapshot,
+            commands::terminal_recording_commands::append_terminal_recording_input,
+            commands::terminal_recording_commands::pause_terminal_recording,
+            commands::terminal_recording_commands::resume_terminal_recording,
+            commands::terminal_recording_commands::stop_terminal_recording,
+            commands::terminal_recording_commands::list_terminal_recordings,
+            commands::terminal_recording_commands::load_terminal_recording,
+            commands::terminal_recording_commands::delete_terminal_recording,
+            commands::terminal_recording_commands::rename_terminal_recording,
+            commands::terminal_recording_commands::check_terminal_recording_ffmpeg,
+            commands::terminal_recording_commands::export_terminal_recording_video,
             commands::connection_commands::get_connections,
             commands::connection_commands::save_connection,
             commands::connection_commands::delete_connection,
@@ -120,8 +135,15 @@ pub fn run() {
             commands::key_commands::delete_gpg_key,
             commands::sftp_commands::get_home_dir,
             commands::sftp_commands::list_local_dir,
+            commands::sftp_commands::read_local_text_file,
+            commands::sftp_commands::write_local_text_file,
+            commands::sftp_commands::local_mkdir,
+            commands::sftp_commands::local_rename,
+            commands::sftp_commands::local_delete,
             commands::sftp_commands::sftp_list_dir,
             commands::sftp_commands::sftp_upload,
+            commands::sftp_commands::read_remote_text_file,
+            commands::sftp_commands::write_remote_text_file,
             commands::sftp_commands::sftp_download,
             commands::sftp_commands::sftp_delete,
             commands::sftp_commands::sftp_rename,
@@ -143,6 +165,11 @@ pub fn run() {
             commands::snippet_commands::get_snippet_global_variables,
             commands::snippet_commands::save_snippet_global_variables,
             commands::snippet_commands::build_snippet_one_liner,
+            commands::snippet_commands::format_snippet,
+            commands::snippet_commands::export_snippet_scripts,
+            commands::snippet_commands::render_snippet_plantuml,
+            commands::snippet_commands::build_snippet_plantuml_preview,
+            commands::snippet_commands::check_snippet_tools_available,
             commands::ai_commands::get_ai_skills,
             commands::ai_commands::save_ai_skills,
             commands::ai_commands::import_ai_skill_markdown,

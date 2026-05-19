@@ -51,6 +51,7 @@ export function AiManagerDialog({ open, onClose, onOpenChat }: AiManagerDialogPr
   const [status, setStatus] = useState<string | null>(null);
   const [testing, setTesting] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [loadingModels, setLoadingModels] = useState(false);
 
   useEffect(() => {
     if (!open) return;
@@ -131,6 +132,32 @@ export function AiManagerDialog({ open, onClose, onOpenChat }: AiManagerDialogPr
       setStatus(`Connection test failed: ${String(error)}`);
     } finally {
       setTesting(false);
+    }
+  }
+
+  async function handleLoadLmStudioModels() {
+    if (!editingProfile) return;
+    setLoadingModels(true);
+    setStatus(null);
+    try {
+      const models = await invoke<string[]>("list_lm_studio_models", {
+        apiUrl: editingProfile.apiUrl,
+        apiKey: editingProfile.apiKey || undefined,
+      });
+      if (models.length === 0) {
+        setStatus("LM Studio returned no loaded models.");
+      } else if (models.length === 1) {
+        setEditingProfile((current) => (
+          current ? { ...current, model: models[0], modelSelectionMode: "Auto" } : null
+        ));
+        setStatus(`Loaded LM Studio model "${models[0]}".`);
+      } else {
+        setStatus(`LM Studio has multiple loaded models: ${models.join(", ")}. Select one manually.`);
+      }
+    } catch (error) {
+      setStatus(`LM Studio model lookup failed: ${String(error)}`);
+    } finally {
+      setLoadingModels(false);
     }
   }
 
@@ -242,30 +269,59 @@ export function AiManagerDialog({ open, onClose, onOpenChat }: AiManagerDialogPr
                       </div>
                       <div>
                         <label className="block text-xs text-kortty-text-dim mb-1">Model</label>
-                        <input
-                          className="input-field"
-                          value={editingProfile.model}
-                          onChange={(event) =>
-                            setEditingProfile((current) => (
-                              current ? { ...current, model: event.target.value } : null
-                            ))
-                          }
-                        />
+                        <div className="flex gap-2">
+                          <input
+                            className="input-field"
+                            value={editingProfile.model}
+                            onChange={(event) =>
+                              setEditingProfile((current) => (
+                                current ? { ...current, model: event.target.value } : null
+                              ))
+                            }
+                          />
+                          <button
+                            className="px-2 py-1.5 text-xs rounded bg-kortty-panel hover:bg-kortty-border transition-colors flex items-center justify-center"
+                            onClick={() => void handleLoadLmStudioModels()}
+                            disabled={loadingModels}
+                            title="Load LM Studio models"
+                          >
+                            <RefreshCw className={`w-3.5 h-3.5 ${loadingModels ? "animate-spin" : ""}`} />
+                          </button>
+                        </div>
                       </div>
                     </div>
 
-                    <div>
-                      <label className="block text-xs text-kortty-text-dim mb-1">API URL</label>
-                      <input
-                        className="input-field"
-                        value={editingProfile.apiUrl}
-                        onChange={(event) =>
-                          setEditingProfile((current) => (
-                            current ? { ...current, apiUrl: event.target.value } : null
-                          ))
-                        }
-                        placeholder="https://api.openai.com/v1/chat/completions"
-                      />
+                    <div className="grid grid-cols-[1fr_180px] gap-3">
+                      <div>
+                        <label className="block text-xs text-kortty-text-dim mb-1">API URL</label>
+                        <input
+                          className="input-field"
+                          value={editingProfile.apiUrl}
+                          onChange={(event) =>
+                            setEditingProfile((current) => (
+                              current ? { ...current, apiUrl: event.target.value } : null
+                            ))
+                          }
+                          placeholder="https://api.openai.com/v1/chat/completions"
+                        />
+                      </div>
+                      <div>
+                        <label className="block text-xs text-kortty-text-dim mb-1">Model Mode</label>
+                        <select
+                          className="input-field"
+                          value={editingProfile.modelSelectionMode}
+                          onChange={(event) =>
+                            setEditingProfile((current) => (
+                              current
+                                ? { ...current, modelSelectionMode: event.target.value as AiProfile["modelSelectionMode"] }
+                                : null
+                            ))
+                          }
+                        >
+                          <option value="Manual">Manual</option>
+                          <option value="Auto">Auto</option>
+                        </select>
+                      </div>
                     </div>
 
                     <div>

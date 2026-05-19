@@ -1,7 +1,11 @@
 use crate::model::snippet::Snippet;
 use crate::persistence::xml_repository;
 use crate::snippet_tools::{
-    build_embedded_one_liner, SnippetGlobalVariable, SnippetOneLinerRequest, SnippetOneLinerResult,
+    build_embedded_one_liner, build_plantuml_preview_source, check_snippet_tools, export_snippets,
+    format_snippet_code, render_plantuml, SnippetExportRequest, SnippetExportResult,
+    SnippetFormatRequest, SnippetFormatResult, SnippetGlobalVariable, SnippetOneLinerRequest,
+    SnippetOneLinerResult, SnippetPlantUmlRenderRequest, SnippetPlantUmlRenderResult,
+    SnippetToolAvailability,
 };
 
 const SNIPPET_GLOBAL_VARIABLES_FILE: &str = "snippet-variables.json";
@@ -84,4 +88,33 @@ pub async fn build_snippet_one_liner(
     request: SnippetOneLinerRequest,
 ) -> Result<SnippetOneLinerResult, String> {
     build_embedded_one_liner(&request).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn format_snippet(request: SnippetFormatRequest) -> Result<SnippetFormatResult, String> {
+    format_snippet_code(&request).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn export_snippet_scripts(
+    request: SnippetExportRequest,
+) -> Result<SnippetExportResult, String> {
+    export_snippets(&request).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn render_snippet_plantuml(
+    request: SnippetPlantUmlRenderRequest,
+) -> Result<SnippetPlantUmlRenderResult, String> {
+    render_plantuml(&request).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn build_snippet_plantuml_preview(snippet: Snippet) -> Result<String, String> {
+    Ok(build_plantuml_preview_source(&snippet))
+}
+
+#[tauri::command]
+pub async fn check_snippet_tools_available() -> Result<SnippetToolAvailability, String> {
+    Ok(check_snippet_tools())
 }
