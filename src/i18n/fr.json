@@ -42,7 +42,11 @@
     "fullscreen": "Plein écran",
     "userGuide": "Guide utilisateur",
     "shortcuts": "Raccourcis clavier",
-    "about": "À propos de KorTTY"
+    "about": "À propos de KorTTY",
+    "toggleRecording": "Démarrer/arrêter l'enregistrement du terminal",
+    "aiPlanning": "Planification IA...",
+    "terminalOnlyFullscreen": "Terminal seul en plein écran",
+    "hideTerminalScrollbarsFullscreen": "Masquer les barres de défilement du terminal en plein écran"
   },
   "connection": {
     "manager": "Gestionnaire de connexions",
@@ -85,7 +89,52 @@
     "background": "Arrière-plan",
     "cursor": "Curseur",
     "timestamps": "Afficher les horodatages des commandes",
-    "logging": "Activer l'enregistrement du terminal"
+    "logging": "Activer l'enregistrement du terminal",
+    "recording": {
+      "start": "Démarrer l'enregistrement",
+      "stop": "Arrêter l'enregistrement",
+      "indicator": {
+        "recording": "Enregistrement",
+        "autoPaused": "Enregistrement en pause automatique"
+      },
+      "scope": {
+        "title": "Enregistrement du terminal",
+        "header": "Choisir le périmètre d'enregistrement",
+        "content": "Périmètre :",
+        "activeSplit": "Division active",
+        "wholeTab": "Onglet entier"
+      },
+      "error": {
+        "title": "Enregistrement du terminal",
+        "header": "Échec de l'enregistrement",
+        "notConnected": "Connectez le terminal avant de démarrer un enregistrement.",
+        "noTerminal": "Aucun onglet de terminal actif pour l'enregistrement.",
+        "disabled": "Activez l'enregistrement du terminal dans Outils > Gestionnaire vidéo avant de démarrer un enregistrement.",
+        "start": "Impossible de démarrer l'enregistrement : {{message}}",
+        "stop": "Impossible d'arrêter l'enregistrement : {{message}}"
+      }
+    },
+    "dragDrop": {
+      "title": "Copier vers le serveur",
+      "count": "{{done}} sur {{total}} éléments copiés",
+      "abort": "Abandonner",
+      "done": "Copie terminée.",
+      "cancelled": "Copie abandonnée.",
+      "target": "Cible : {{target}}",
+      "error": "Échec de la copie : {{message}}",
+      "dropHint": "Déposez des fichiers pour les téléverser"
+    },
+    "context": {
+      "openSelectionInSnippetEditor": "Ouvrir la sélection dans l'éditeur d'extraits"
+    },
+    "loadTextFile": {
+      "invalidSelection": "Veuillez sélectionner exactement un nom de fichier dans le répertoire actuel.",
+      "notConnected": "Aucune connexion SSH active n'est disponible.",
+      "loading": "Chargement de {{name}} comme fichier texte...",
+      "loaded": "Fichier texte chargé : {{path}}",
+      "binary": "Le fichier sélectionné est binaire ou n'est pas un texte UTF-8 valide et n'a pas été chargé : {{path}}",
+      "failed": "Impossible de charger {{name}} : {{error}}"
+    }
   },
   "settings": {
     "title": "Paramètres",
@@ -110,7 +159,69 @@
     "keepalive": "SSH Keep-Alive",
     "keepaliveInterval": "Intervalle Keep-Alive (secondes)",
     "connectionTimeout": "Délai de connexion (secondes)",
-    "retryCount": "Nombre de tentatives"
+    "retryCount": "Nombre de tentatives",
+    "tab": {
+      "appearance": "Apparence",
+      "recording": "Vidéo",
+      "logging": "Journaux",
+      "updates": "Mises à jour"
+    },
+    "appearance": {
+      "appDesign": "Design de l'application :",
+      "appDesignInfo": "S'applique aux fenêtres et boîtes de dialogue de l'application. Les sessions de terminal et le contenu de l'éditeur conservent leurs propres paramètres de couleurs.",
+      "preview": "Aperçu :",
+      "design": {
+        "normal": "Normal",
+        "matrixTerminal": "Terminal Matrix",
+        "holographicInterface": "Interface holographique",
+        "klingonTactical": "Tactique klingon",
+        "elegantDark": "Sombre élégant"
+      }
+    },
+    "updates": {
+      "header": "Vérifications de mise à jour",
+      "automatic": "Rechercher automatiquement les mises à jour de KorTTY",
+      "automaticTooltip": "Si activé, KorTTY vérifie les releases GitHub en arrière-plan.",
+      "interval": "Intervalle de vérification :",
+      "intervalDays": "Tous les {{days}} jour(s)",
+      "info": "Les vérifications automatiques n'affichent une boîte de dialogue que lorsqu'une version compatible plus récente est disponible. Les vérifications manuelles sont disponibles dans la boîte de dialogue À propos."
+    },
+    "logging": {
+      "header": "Fichiers journaux",
+      "directory": "Répertoire des journaux :",
+      "directoryInfo": "Par défaut : {{path}}",
+      "directoryChoose": "Choisir le répertoire des journaux",
+      "retention": "Conserver les journaux :",
+      "retentionInfo": "0 = illimité. Les plus anciennes archives de journaux sont supprimées automatiquement.",
+      "compressionInfo": "Les archives de journaux de plus de 24 heures sont compressées automatiquement.",
+      "restartRequired": "Les modifications du répertoire des journaux prennent effet après le redémarrage de KorTTY.",
+      "days": "jour(s)"
+    },
+    "ai": {
+      "terminalAgentExecutionEnabled": "Activer l'exécution de l'agent IA",
+      "terminalAgentExecutionEnabledHint": "Quand cette option est désactivée, les exécutions de l'agent IA et la mise en œuvre des plans ne sont pas disponibles. La planification IA et Demander à l'agent IA restent disponibles.",
+      "terminalAgentConfirmMutatingCommandSets": "Demander confirmation avant que l'agent IA modifie le système cible",
+      "terminalAgentConfirmMutatingCommandSetsHint": "Quand cette option est activée, les ensembles de commandes qui créent, suppriment ou modifient des fichiers, ou changent autrement le système cible, nécessitent une confirmation. Les actions en lecture seule ne demandent pas de confirmation."
+    },
+    "snippetEditor": {
+      "title": "Éditeur d'extraits",
+      "info": "Ces paramètres remplacent les valeurs par défaut du terminal/éditeur pour le gestionnaire d'extraits et la boîte de dialogue de modification d'extraits. Laissez vide ou 0 pour hériter des paramètres généraux.",
+      "fontFamily": "Police de caractères",
+      "fontSize": "Taille de police",
+      "fontSizeInfo": "(0 = hériter du terminal)",
+      "foreground": "Couleur de premier plan",
+      "background": "Couleur d'arrière-plan",
+      "cursorStyle": "Style du curseur",
+      "cursorColor": "Couleur du curseur",
+      "wordWrap": "Retour à la ligne",
+      "lineNumbers": "Numéros de ligne",
+      "historyMax": "Entrées d'historique (max)",
+      "diagramBackground": "Couleur d'arrière-plan des diagrammes",
+      "aiInstructionsEnabled": "Afficher des instructions IA supplémentaires facultatives dans l'éditeur d'extraits",
+      "alternativeSolutionCount": "Nombre maximal de solutions alternatives",
+      "profile": "Profil",
+      "manageProfiles": "Gérer les profils..."
+    }
   },
   "credential": {
     "manager": "Gestionnaire d'identifiants",
@@ -141,16 +252,268 @@
   },
   "snippet": {
     "manager": "Gestionnaire d'extraits",
+    "diagram": {
+      "button": "Diagramme",
+      "title": "Diagrammes d'extraits",
+      "script": "Script : {{name}}",
+      "unnamed": "(extrait sans nom)",
+      "empty": "Aucun diagramme n'est encore enregistré pour cet extrait.",
+      "current": "Le diagramme est à jour.",
+      "stale": "Le diagramme est peut-être obsolète car l'extrait a été modifié.",
+      "rendering": "Rendu local en cours...",
+      "renderFailed": "Rendu local indisponible : {{error}}",
+      "regenerate": "Régénérer",
+      "generate": "Générer le diagramme",
+      "generating": "Génération du diagramme PlantUML...",
+      "ready": "Diagramme prêt. Enregistrez l'extrait pour le conserver.",
+      "failed": "Impossible de générer le diagramme PlantUML.",
+      "instructions": "Instruction :",
+      "instructionsHint": "Paramètres facultatifs pour le diagramme",
+      "copyPlantUml": "Copier le PlantUML",
+      "copied": "Code PlantUML copié dans le presse-papiers.",
+      "backgroundColor": "Arrière-plan :",
+      "readableColors": "Appliquer des couleurs lisibles",
+      "readableColorsApplied": "Couleurs lisibles appliquées.",
+      "saveSvg": "Enregistrer le SVG",
+      "exportSaved": "Enregistré : {{path}}",
+      "exportFailed": "Échec de l'export : {{error}}",
+      "delete": "Supprimer",
+      "typeLogicalStructure": "Structure logique",
+      "codeReference": {
+        "line": "Ligne {{line}}",
+        "lines": "Lignes {{start}}-{{end}}"
+      }
+    },
     "name": "Nom",
     "category": "Catégorie",
     "content": "Contenu",
     "favorite": "Favori",
     "variables": "Variables",
     "search": "Rechercher des extraits...",
-    "importExport": "Importer/Exporter"
+    "importExport": "Importer/Exporter",
+    "unnamed": "(sans nom)",
+    "saveAsNew": "Enregistrer comme nouvel extrait",
+    "copySuffix": " (Copie)",
+    "formatter": {
+      "builtIn": "Intégré",
+      "bundled": "Embarqué",
+      "external": "Externe",
+      "unavailable": "Indisponible"
+    },
+    "ai": {
+      "copy": "Copier dans le presse-papiers",
+      "copied": "Copié dans le presse-papiers.",
+      "noProfile": "Aucun profil IA configuré.",
+      "noTextSegments": "La sélection actuelle ne contient ni commentaires modifiables ni segments de texte destinés à l'utilisateur.",
+      "context": {
+        "assistant": "Assistant IA...",
+        "complete": "Complétion IA",
+        "autoComplete": "Complétion IA automatique",
+        "review": "Examiner les erreurs et les améliorations",
+        "improveReadability": "Améliorer la lisibilité",
+        "improveRobustness": "Améliorer la robustesse",
+        "improvePerformance": "Améliorer les performances",
+        "improveCustom": "Amélioration personnalisée...",
+        "alternatives": "Solutions alternatives",
+        "security": "Vérification de sécurité",
+        "describe": "Description technique",
+        "correctSelection": "Corriger l'orthographe de la sélection",
+        "translateSelection": "Traduire la sélection..."
+      },
+      "assistant": {
+        "title": "Assistant IA",
+        "header": "Décrivez ce que KorTTY doit modifier à la position actuelle du curseur.",
+        "instruction": "Instruction :",
+        "prompt": "Exemple : ajouter de nouveaux paramètres pour les noms de répertoires",
+        "cursor": "Curseur : décalage {{offset}}, ligne {{line}}, colonne {{column}}",
+        "skills": "Prendre en compte les skills IA",
+        "skillsTooltip": "Les skills IA Chat/Fonctions activés peuvent être ajoutés à cette requête lorsqu'ils sont pertinents.",
+        "skillsUnavailable": "Aucun skill IA Chat/Fonctions activé n'est disponible dans les paramètres globaux.",
+        "running": "L'assistant IA met à jour l'extrait...",
+        "empty": "Aucun résultat exploitable de l'assistant IA n'a été renvoyé.",
+        "failed": "L'assistant IA a échoué.",
+        "applied": "Modification de l'assistant IA appliquée.",
+        "diffTitle": "Vérifier la modification de l'assistant IA"
+      },
+      "complete": {
+        "running": "Génération de la suggestion de complétion...",
+        "empty": "Aucune suggestion de complétion exploitable n'a été renvoyée.",
+        "discarded": "Complétion abandonnée car l'éditeur a été modifié.",
+        "ready": "Suggestion de complétion prête. Appuyez sur Tab pour l'insérer.",
+        "failed": "La suggestion de complétion a échoué."
+      },
+      "autocomplete": {
+        "warningTitle": "Activer la complétion IA automatique",
+        "warningHeader": "La complétion automatique peut envoyer le contenu de l'extrait de manière répétée tant qu'elle est activée.",
+        "warningContent": "KorTTY demandera des suggestions après une pause à une position du curseur. Laissez cette option désactivée pour les extraits sensibles, sauf si vous faites confiance au point de terminaison IA configuré.",
+        "enabled": "Complétion IA automatique activée.",
+        "disabled": "Complétion IA automatique désactivée."
+      },
+      "review": {
+        "title": "Revue de code IA",
+        "info": "Le rapport est informatif. Le contenu de l'éditeur n'est pas modifié. Cliquez sur un constat avec un numéro de ligne pour le sélectionner dans l'éditeur.",
+        "empty": "Aucun constat n'a été renvoyé.",
+        "recommendation": "Recommandation :",
+        "running": "Revue du code en cours...",
+        "ready": "Revue de code prête.",
+        "failed": "La revue de code a échoué.",
+        "theme": "Trouver les erreurs probables et les possibilités d'amélioration concrètes.",
+        "colSeverity": "Sévérité",
+        "colTitle": "Titre",
+        "colLine": "Ligne"
+      },
+      "improve": {
+        "running": "Génération du code amélioré...",
+        "empty": "Aucun remplacement exploitable n'a été renvoyé.",
+        "failed": "L'amélioration du code a échoué.",
+        "applied": "Code amélioré appliqué.",
+        "selectFirst": "Sélectionnez une région de code avant de demander une réécriture par l'IA.",
+        "readabilityTheme": "Améliorer la lisibilité sans changer le comportement.",
+        "robustnessTheme": "Améliorer la robustesse, la gestion des erreurs et le comportement dans les cas limites, sans modifications non liées.",
+        "performanceTheme": "Améliorer les performances sans changer le comportement visible de l'extérieur.",
+        "customTitle": "Amélioration IA personnalisée",
+        "customHeader": "Décrivez comment le code sélectionné doit être amélioré.",
+        "customPrompt": "Instruction :"
+      },
+      "diff": {
+        "title": "Vérifier la modification IA",
+        "summaryEmpty": "Vérifiez le remplacement avant de l'appliquer.",
+        "original": "Original",
+        "replacement": "Remplacement IA",
+        "apply": "Appliquer la modification"
+      },
+      "security": {
+        "title": "Vérification de sécurité",
+        "info": "Sélectionnez uniquement les constats que l'IA doit corriger. Les constats non sélectionnés ne sont pas appliqués.",
+        "empty": "Aucun constat de sécurité n'a été renvoyé.",
+        "applySelected": "Appliquer les corrections sélectionnées",
+        "running": "Vérification de sécurité en cours...",
+        "ready": "Rapport de sécurité prêt.",
+        "failed": "La vérification de sécurité a échoué.",
+        "fixRunning": "Génération des corrections de sécurité sélectionnées...",
+        "fixEmpty": "Aucune correction de sécurité exploitable n'a été renvoyée.",
+        "fixFailed": "La génération des corrections de sécurité a échoué.",
+        "fixApplied": "Corrections de sécurité sélectionnées appliquées.",
+        "diffTitle": "Vérifier les corrections de sécurité"
+      },
+      "alternatives": {
+        "title": "Solutions alternatives",
+        "instructionsPrompt": "Instructions facultatives pour l'IA, par exemple « utiliser uniquement les builtins Bash »",
+        "reload": "Générer de nouvelles alternatives",
+        "loading": "Génération de solutions alternatives...",
+        "empty": "Aucune solution alternative exploitable n'a été renvoyée.",
+        "loaded": "{{count}} solutions alternatives prêtes.",
+        "failed": "Les solutions alternatives n'ont pas pu être générées.",
+        "apply": "Appliquer",
+        "applied": "La solution alternative a été appliquée au code sélectionné.",
+        "scopeSelection": "Portée cible : région de code sélectionnée",
+        "scopeWhole": "Portée cible : extrait complet"
+      },
+      "describe": {
+        "dialogTitle": "Description technique",
+        "commentSyntax": "Utiliser la syntaxe de commentaire du langage actuel de l'extrait",
+        "lineWidth": "Largeur de ligne :",
+        "copy": "Copier dans le presse-papiers",
+        "insert": "Insérer dans l'extrait",
+        "info": "La description générée est affichée ci-dessous. Vous pouvez la copier ou l'insérer dans l'extrait.",
+        "generating": "Génération de la description technique...",
+        "generated": "Description technique prête.",
+        "generateFailed": "La description technique n'a pas pu être générée.",
+        "inserted": "Description technique insérée dans l'extrait."
+      },
+      "selection": {
+        "correcting": "Correction du texte sélectionné...",
+        "corrected": "Texte sélectionné corrigé.",
+        "correctFailed": "Le texte sélectionné n'a pas pu être corrigé.",
+        "translating": "Traduction du texte sélectionné...",
+        "translated": "Texte sélectionné traduit.",
+        "translateFailed": "Le texte sélectionné n'a pas pu être traduit.",
+        "translateTitle": "Traduire le texte de l'extrait",
+        "translatePrompt": "Sélectionnez la langue cible pour le texte sélectionné destiné à l'utilisateur :"
+      },
+      "format": {
+        "fallbackTitle": "Utiliser le formatage IA ?",
+        "fallbackHeader": "Le formatage local n'est pas disponible pour cette action.",
+        "fallbackContent": "{{reason}}\n\nVoulez-vous que KorTTY demande à la place un formatage du code assisté par IA ? Le résultat de l'IA sera affiché en aperçu avant d'être appliqué.",
+        "unavailable": "{{reason}}\n\nAucun fournisseur d'amélioration de code par IA n'est configuré.",
+        "notSupported": "Aucun formateur disponible pour {{language}}",
+        "providerUnavailable": "Formateur indisponible : {{name}}",
+        "widthNotSupported": "Le formatage par largeur de ligne n'est pas pris en charge pour {{language}}.",
+        "theme": "Formater ce code. Préserver exactement le comportement, conserver le même langage de programmation, ne pas ajouter d'explications et ne pas effectuer de modifications non liées.",
+        "widthTheme": "Formater ce code avec une largeur de ligne maximale de {{width}} caractères lorsque cela est possible sans casser la syntaxe. Préserver exactement le comportement, conserver le même langage de programmation, ne pas ajouter d'explications et ne pas effectuer de modifications non liées.",
+        "running": "Formatage IA en cours...",
+        "empty": "Aucun résultat de formatage IA exploitable n'a été renvoyé.",
+        "failed": "Le formatage IA a échoué.",
+        "applied": "Formatage IA appliqué.",
+        "diffTitle": "Vérifier le formatage IA"
+      }
+    },
+    "ruler": {
+      "tooltip": "Cliquez sur la règle pour définir le marqueur de longueur de ligne maximale. Faites un clic droit sur le marqueur pour formater à cette largeur ou le supprimer.",
+      "position": "Colonne {{column}}",
+      "caretTooltip": "Position {{column}}",
+      "limit": "Limite {{limit}}",
+      "formatToLimit": "Formater à {{limit}} caractères par ligne",
+      "clearLimit": "Supprimer le marqueur de longueur de ligne",
+      "formatSuccess": "Formaté à {{limit}} caractères maximum par ligne."
+    },
+    "history": {
+      "label": "Historique",
+      "position": "Historique : {{index}} / {{total}}",
+      "restore": "Restaurer"
+    },
+    "diff": {
+      "compare": "Comparer",
+      "title": "Diff d'extraits",
+      "left": "Gauche : {{name}} ({{language}})",
+      "right": "Droite : {{name}} ({{language}})",
+      "hint": "Sélectionnez exactement deux extraits."
+    },
+    "profile": {
+      "title": "Profils de l'éditeur d'extraits",
+      "newTitle": "Nouveau profil d'éditeur d'extraits",
+      "editTitle": "Modifier le profil d'éditeur d'extraits",
+      "namePrompt": "Nom du profil",
+      "presets": "Préréglages",
+      "custom": "Profils personnalisés",
+      "new": "Nouveau profil personnalisé...",
+      "current": "Couleurs personnalisées",
+      "builtInHint": "Les profils intégrés sont en lecture seule. Créez un profil personnalisé pour modifier les couleurs.",
+      "preview": "Aperçu",
+      "label": "Profil",
+      "manage": "Gérer les profils...",
+      "comment": "Commentaire",
+      "string": "Chaîne",
+      "number": "Nombre",
+      "boolean": "Booléen/null",
+      "key": "Clé",
+      "keyword": "Mot-clé",
+      "section": "Section",
+      "variable": "Variable",
+      "brace": "Accolade"
+    }
   },
   "sftp": {
     "title": "Gestionnaire SFTP",
+    "saveAs": {
+      "menu": "Enregistrer sous…",
+      "overwriteRemote": "Écraser le fichier distant",
+      "overwriteLocal": "Écraser le fichier local",
+      "saveSnippet": "Enregistrer comme extrait",
+      "remoteTitle": "Enregistrer le fichier distant sous",
+      "remoteHeader": "Nouveau nom de fichier dans le même dossier distant",
+      "remoteLabel": "Nom de fichier :",
+      "invalidFileName": "Nom de fichier invalide : {{name}}",
+      "confirmOverwrite": "Le fichier cible existe déjà. Écraser {{path}} ?",
+      "savedFile": "Fichier enregistré : {{path}}",
+      "savedSnippet": "Extrait enregistré : {{name}}",
+      "saveFailed": "Impossible d'enregistrer le fichier : {{error}}",
+      "error": {
+        "empty": "Le nom de fichier ne doit pas être vide.",
+        "dots": "Le nom de fichier ne doit pas être '.' ou '..'.",
+        "separators": "Le nom de fichier ne doit pas contenir de séparateurs de chemin."
+      }
+    },
     "local": "Local",
     "remote": "Distant",
     "name": "Nom",
@@ -166,7 +529,14 @@
     "rename": "Renommer",
     "newFolder": "Nouveau dossier",
     "refresh": "Actualiser",
-    "search": "Rechercher..."
+    "search": "Rechercher...",
+    "fallback": {
+      "notice": "Sous-système SFTP indisponible — utilisation du repli en ligne de commande"
+    },
+    "error": {
+      "subsystemRejected": "Le sous-système SFTP a été rejeté ou fermé par le serveur après une authentification SSH réussie ; aucune version SFTP n'a été négociée. Vérifiez si SFTP est activé pour cette cible ou pour le proxy SSH.",
+      "startFailed": "Le sous-système SFTP n'a pas pu être démarré après une authentification SSH réussie."
+    }
   },
   "backup": {
     "createTitle": "Créer une sauvegarde",
@@ -186,11 +556,102 @@
   },
   "quickConnect": {
     "title": "Connexion rapide",
-    "frequentlyUsed": "Utilisés fréquemment"
+    "frequentlyUsed": "Utilisés fréquemment",
+    "terminalEmulation": "Émulation de terminal",
+    "terminalColors": "Activer les couleurs du terminal"
   },
   "dashboard": {
     "title": "Tableau de bord",
     "noConnections": "Aucune connexion active"
+  },
+  "recording": {
+    "manager": {
+      "title": "Gestionnaire vidéo",
+      "header": "Gérer les enregistrements replay du terminal et l'export vidéo optionnel.",
+      "enabled": "Activer l'enregistrement du terminal pour cette session de l'application",
+      "storagePath": "Chemin de stockage",
+      "format": "Format par défaut",
+      "formatKorttyReplay": "KorTTY Replay",
+      "formatWebm": "WebM",
+      "defaultScope": "Périmètre par défaut",
+      "scopeActiveSplit": "Division active",
+      "scopeWholeTab": "Onglet entier",
+      "captureColors": "Capturer les couleurs du terminal dans les nouveaux enregistrements",
+      "autoPause": "Mettre en pause automatiquement quand le terminal est inactif",
+      "idleSeconds": "Seuil d'inactivité (secondes)",
+      "ffmpegPath": "Chemin ffmpeg",
+      "browse": "Parcourir...",
+      "checkFfmpeg": "Vérifier",
+      "ffmpegAvailable": "ffmpeg disponible ; export vidéo activé.",
+      "ffmpegMissing": "ffmpeg indisponible ; export vidéo désactivé.",
+      "recordings": "Enregistrements replay",
+      "refresh": "Actualiser",
+      "save": "Enregistrer",
+      "chooseDirectory": "Choisir le dossier d'enregistrement",
+      "done": "Terminé",
+      "saveFailed": "Impossible d'enregistrer les paramètres : {{error}}",
+      "refreshFailed": "Impossible de charger les enregistrements : {{error}}",
+      "view": "Afficher",
+      "rename": "Renommer...",
+      "delete": "Supprimer",
+      "export": "Exporter...",
+      "viewFailed": "Impossible d'ouvrir le replay : {{error}}",
+      "renameTitle": "Renommer le replay",
+      "renameHeader": "Choisir un nouveau nom de replay",
+      "renameContent": "Nom :",
+      "renameSuccess": "Replay renommé : {{name}}",
+      "renameFailed": "Impossible de renommer le replay : {{error}}",
+      "deleteTitle": "Supprimer le replay",
+      "deleteContent": "Cela supprime {{name}}. Cette action est irréversible.",
+      "deleteSuccess": "Replay supprimé : {{name}}",
+      "deleteFailed": "Impossible de supprimer le replay : {{error}}",
+      "exportSuccess": "Vidéo exportée : {{path}}",
+      "exportFailed": "Échec de l'export vidéo : {{error}}",
+      "noRecordings": "Aucun enregistrement trouvé.",
+      "selectRecording": "Sélectionnez un enregistrement.",
+      "duration": "Durée",
+      "eventCount": "{{count}} événements",
+      "exportOptions": {
+        "title": "Options d'export",
+        "header": "Choisir la plage, la couleur et le format",
+        "format": "Format",
+        "formatWebm": "WebM (VP9)",
+        "formatMkv": "MKV (FFV1)",
+        "duration": "Durée enregistrée : {{duration}}",
+        "all": "Exporter tout l'enregistrement",
+        "start": "Début",
+        "end": "Fin",
+        "includeColor": "Inclure les couleurs du terminal",
+        "invalidRange": "Saisissez une plage de temps valide entre 0:00 et {{max}}."
+      },
+      "exportProgress": {
+        "title": "Exporter la vidéo",
+        "header": "Export du replay en vidéo",
+        "preparing": "Préparation de l'export...",
+        "rendering": "Rendu des images...",
+        "encoding": "Encodage de la vidéo...",
+        "finalizing": "Finalisation de l'export...",
+        "message": "{{phase}} Temps restant estimé : {{remaining}}",
+        "remainingCalculating": "calcul..."
+      }
+    },
+    "viewer": {
+      "title": "Visionneuse de replay",
+      "play": "Lire",
+      "pause": "Pause",
+      "stop": "Arrêter",
+      "empty": "Aucune image de replay enregistrée.",
+      "status": "Image {{current}} / {{total}}",
+      "timeline": "Chronologie",
+      "time": "{{position}} / {{total}}",
+      "timeJump": "Saut dans le temps :",
+      "seek": "Aller",
+      "seekInvalid": "Saisissez un temps entre 0:00 et {{max}}.",
+      "speed": "Vitesse :",
+      "speedSuffix": "x",
+      "loading": "Chargement du replay...",
+      "loadFailed": "Impossible d'ouvrir le replay : {{error}}"
+    }
   },
   "common": {
     "ready": "Prêt",
@@ -204,5 +665,183 @@
     "add": "Ajouter",
     "edit": "Modifier",
     "search": "Rechercher..."
+  },
+  "updates": {
+    "checkNow": "Rechercher les mises à jour",
+    "checking": "Recherche de mises à jour...",
+    "manual": {
+      "current": "Vous disposez déjà de la dernière version de KorTTY."
+    },
+    "available": {
+      "short": "KorTTY {{version}} est disponible."
+    },
+    "noCompatibleAsset": "Une version plus récente de KorTTY est disponible, mais aucun téléchargement compatible n'a été trouvé pour cette plateforme.",
+    "checkFailed": "Échec de la vérification de mise à jour.",
+    "checkFailedDetail": "Échec de la vérification de mise à jour : {{message}}",
+    "dialog": {
+      "title": "Mise à jour KorTTY disponible",
+      "header": "KorTTY {{version}} est disponible",
+      "installedVersion": "Version installée :",
+      "availableVersion": "Version disponible :",
+      "downloadAsset": "Téléchargement :",
+      "downloadTargetInfo": "Le fichier sera téléchargé vers :"
+    },
+    "downloadAction": "Télécharger",
+    "remindTomorrow": "Rappeler demain",
+    "skipVersion": "Ignorer cette version",
+    "download": {
+      "title": "Téléchargement de la mise à jour KorTTY",
+      "header": "Téléchargement de {{version}}",
+      "running": "Téléchargement de {{asset}}...",
+      "complete": {
+        "title": "Téléchargement terminé"
+      },
+      "completeInfo": "La mise à jour a été téléchargée vers :",
+      "failed": {
+        "title": "Échec du téléchargement"
+      },
+      "failedInfo": "La mise à jour n'a pas pu être téléchargée.",
+      "openFolder": "Ouvrir le dossier"
+    }
+  },
+  "connEdit": {
+    "terminalEmulation": "Émulation de terminal",
+    "terminalColors": "Activer les couleurs du terminal",
+    "aiTab": "IA",
+    "aiProfile": "Profil IA :",
+    "aiProfileDefault": "Utiliser le profil par défaut",
+    "aiProfileMissing": "Profil enregistré (actuellement indisponible)",
+    "aiProfileHint": "Si le profil sélectionné n'est pas disponible, le profil IA par défaut est utilisé jusqu'à ce qu'il soit de nouveau disponible.",
+    "aiSkills": "Skills de connexion :",
+    "aiSkillsHint": "Les skills assignés sont toujours inclus dans les requêtes IA de cette connexion. Les skills avec la cible « Connexion » ne sont utilisés que pour les connexions auxquelles ils sont assignés.",
+    "aiSkillsNone": "Aucun skill IA enregistré pour le moment."
+  },
+  "filebrowser": {
+    "title": "Navigateur de fichiers local",
+    "showHidden": "Afficher les fichiers cachés",
+    "selected": "sélectionné(s)",
+    "copied": "{{count}} élément(s) copié(s)",
+    "confirmDelete": "Supprimer {{count}} élément(s) ?",
+    "context": {
+      "open": "Ouvrir",
+      "loadAsTextFile": "Charger comme fichier texte",
+      "copy": "Copier",
+      "cut": "Couper",
+      "paste": "Coller",
+      "delete": "Supprimer",
+      "selectAll": "Tout sélectionner",
+      "details": "Détails",
+      "archive": "Archiver",
+      "newFolder": "Nouveau dossier",
+      "newFile": "Nouveau fichier"
+    },
+    "newFolder": {
+      "title": "Nouveau dossier",
+      "header": "Entrez le nom du dossier"
+    },
+    "newFile": {
+      "title": "Nouveau fichier",
+      "header": "Entrez le nom du fichier"
+    },
+    "rename": {
+      "title": "Renommer",
+      "header": "Entrez le nouveau nom"
+    },
+    "archive": {
+      "title": "Archiver",
+      "header": "Entrez le nom du fichier d'archive",
+      "created": "Archive créée"
+    },
+    "folder": {
+      "created": "Dossier créé"
+    },
+    "file": {
+      "created": "Fichier créé"
+    },
+    "error": {
+      "accessDenied": "Accès refusé",
+      "paste": "Erreur de collage",
+      "delete": "Erreur de suppression",
+      "archive": "Erreur d'archivage",
+      "createFolder": "Erreur de création de dossier",
+      "createFile": "Erreur de création de fichier",
+      "cannotOpen": "Impossible d'ouvrir le fichier",
+      "rename": "Erreur de renommage"
+    },
+    "details": {
+      "type": "Type",
+      "folder": "Dossier",
+      "file": "Fichier",
+      "size": "Taille",
+      "path": "Chemin",
+      "modified": "Modifié",
+      "permissions": "Permissions",
+      "owner": "Propriétaire",
+      "group": "Groupe"
+    },
+    "setOwner": {
+      "title": "Définir le propriétaire/les permissions",
+      "header": "Définir le propriétaire et les permissions pour {{count}} élément(s)",
+      "ownerUser": "Utilisateur :",
+      "ownerGroup": "Groupe :",
+      "permissions": "Permissions :",
+      "recursive": "Appliquer de manière récursive aux répertoires",
+      "infoSeparate": "Laisser vide pour conserver la valeur actuelle.\nLes listes propriétaire/groupe sont indicatives ; vous pouvez saisir un autre nom valide.\nPermissions : format octal comme 755 ou 644",
+      "success": "{{count}} élément(s) modifié(s)",
+      "errorCount": "Échec de la modification de {{failed}} sur {{total}} éléments.",
+      "notSupported": "Le propriétaire ou les permissions POSIX ne sont pas pris en charge par ce système de fichiers.",
+      "invalid": "Saisie invalide"
+    }
+  },
+  "ai": {
+    "manager": {
+      "title": "Gestionnaire IA",
+      "tabProfiles": "Profils",
+      "tabChats": "Chats enregistrés",
+      "defaultProfile": "Profil par défaut :",
+      "defaultProfileNone": "Premier profil disponible",
+      "defaultProfileHint": "Le profil par défaut est également utilisé par les actions IA du terminal et par l'agent IA du terminal lorsqu'aucun autre profil n'est sélectionné.",
+      "defaultProfileSaved": "Profil par défaut enregistré.",
+      "defaultMarker": "Par défaut",
+      "profileUnnamed": "Profil sans nom",
+      "connectionMode": "Connexion",
+      "connectionModeHttp": "API HTTP",
+      "connectionModeCli": "CLI locale",
+      "model": "Modèle",
+      "modelRefresh": "Actualiser les modèles disponibles",
+      "cli": {
+        "provider": "Fournisseur CLI",
+        "executable": "Exécutable CLI",
+        "executablePrompt": "Laisser vide pour utiliser un candidat de commande de fournisseur vérifié",
+        "statusInstalled": "Trouvé : {{path}}",
+        "statusNotInstalled": "Aucune CLI de fournisseur vérifiée trouvée dans le PATH. Configurez un exécutable et un modèle d'arguments.",
+        "statusCustom": "Exécutable personnalisé : {{path}}",
+        "statusCustomUnverified": "Exécutable personnalisé configuré mais non vérifié comme exécutable : {{path}}",
+        "arguments": "Arguments CLI",
+        "argumentsPrompt": "Un argument par ligne ou un modèle en ligne entre guillemets. Utilisez {promptFile}, {systemPromptFile}, {userPromptFile}, {model}, {reasoning}, {stdinPrompt}.",
+        "insertPreset": "Insérer un préréglage",
+        "presetInserted": "Préréglage d'arguments « {{label}} » inséré.",
+        "presetMissing": "Ce fournisseur n'a pas de préréglage d'arguments vérifié.",
+        "model": "Modèle",
+        "modelPrompt": "Saisissez un nom de modèle spécifique au fournisseur"
+      },
+      "reasoning": {
+        "label": "Effort de raisonnement",
+        "refresh": "Actualiser les options de raisonnement",
+        "refreshSuccess": "Options de raisonnement actualisées : {{options}}",
+        "refreshNone": "Ce profil n'a accepté aucun paramètre de raisonnement supplémentaire.",
+        "refreshFailed": "Échec de l'actualisation du raisonnement",
+        "rediscover": "La configuration du profil a changé depuis la dernière découverte. Actualisez les options de raisonnement.",
+        "option": {
+          "disabled": "Désactivé",
+          "none": "Aucun",
+          "minimal": "Minimal",
+          "low": "Faible",
+          "medium": "Moyen",
+          "high": "Élevé",
+          "xhigh": "Très élevé"
+        }
+      }
+    }
   }
 }

@@ -4,7 +4,9 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { emit, emitTo, listen } from "@tauri-apps/api/event";
 import { WebviewWindow, getAllWebviewWindows, getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { open as openFileDialog, save as saveFileDialog } from "@tauri-apps/plugin-dialog";
+import { useTranslation } from "react-i18next";
 import { MenuBar } from "./common/MenuBar";
+import { ResizableDivider } from "./common/ResizableDivider";
 import { TabBar, Tab } from "./common/TabBar";
 import { StatusBar } from "./common/StatusBar";
 import {
@@ -23,6 +25,7 @@ import { CredentialManager } from "./dialogs/CredentialManager";
 import { SSHKeyManager } from "./dialogs/SSHKeyManager";
 import { GPGKeyManager } from "./dialogs/GPGKeyManager";
 import type { SnippetFileDraft } from "./dialogs/SnippetManager";
+import { normalizeSelectedFileName, resolveRemoteFilePath } from "../utils/remoteTextFileSelection";
 import { AsciiArtBanner } from "./dialogs/AsciiArtBanner";
 import { BackupDialog } from "./dialogs/BackupDialog";
 import { ImportDialog } from "./dialogs/ImportDialog";
@@ -60,7 +63,19 @@ import {
 } from "../utils/terminalAgentCommand";
 import { resolvePreferredAiProfileId } from "../utils/aiProfiles";
 import { normalizeTerminalEffectSpeed, type TerminalEffectPluginEntry } from "../types/terminalEffects";
-import type { TerminalRecordingStartResponse } from "../types/terminalRecording";
+import type {
+  TerminalRecordingScope,
+  TerminalRecordingStartResponse,
+} from "../types/terminalRecording";
+import {
+  UPDATE_AVAILABLE_EVENT,
+  type AvailableUpdate,
+  type UpdateCheckResult,
+} from "../types/update";
+import { UpdateAvailableDialog } from "./dialogs/UpdateAvailableDialog";
+import { UpdateDownloadDialog } from "./dialogs/UpdateDownloadDialog";
+import { TerminalRecordingScopeDialog } from "./dialogs/TerminalRecordingScopeDialog";
+import korttyLogo from "../assets/kortty_logo.png";
 
 const JobSchedulerDialog = lazy(() =>
   import("./dialogs/JobSchedulerDialog").then((module) => ({ default: module.JobSchedulerDialog })),
@@ -130,6 +145,50 @@ const MIN_FONT_SIZE = 8;
 const MAX_FONT_SIZE = 36;
 const DEFAULT_FONT_SIZE = 14;
 
+const FILE_BROWSER_PANEL_WIDTH_KEY = "kortty.localFileBrowser.panelWidth";
+const FILE_BROWSER_PANEL_HEIGHT_KEY = "kortty.localFileBrowser.panelHeight";
+const FILE_BROWSER_MIN_WIDTH = 180;
+const FILE_BROWSER_MAX_WIDTH = 640;
+const FILE_BROWSER_MIN_HEIGHT = 120;
+const FILE_BROWSER_MAX_HEIGHT = 560;
+
+function readStoredPanelSize(key: string, fallback: number): number {
+  try {
+    const raw = window.localStorage.getItem(key);
+    const parsed = raw != null ? Number.parseInt(raw, 10) : Number.NaN;
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function storePanelSize(key: string, value: number) {
+  try {
+    window.localStorage.setItem(key, String(Math.round(value)));
+  } catch {
+    // localStorage unavailable
+  }
+}
+
+function clampPanelSize(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+/**
+ * Queries the real geometry (cols/rows + pixel size) of a mounted terminal
+ * via a synchronous DOM event answered by TerminalTab (WP3.8).
+ */
+function getTerminalGeometry(
+  sessionId: string,
+): { columns: number; rows: number; pixelWidth: number; pixelHeight: number } | null {
+  const detail: {
+    sessionId: string;
+    geometry: { columns: number; rows: number; pixelWidth: number; pixelHeight: number } | null;
+  } = { sessionId, geometry: null };
+  window.dispatchEvent(new CustomEvent("kortty-terminal-geometry-request", { detail }));
+  return detail.geometry;
+}
+
 type SessionConnectInfo = {
   host: string;
   port: number;
@@ -146,6 +205,12 @@ type SessionConnectInfo = {
   connectionProtocol: "TcpIp" | "Mosh";
   terminalEffectPluginId?: string;
   terminalEffectAnimationSpeed?: number;
+  terminalEmulationType?: string;
+  terminalColorsEnabled?: boolean;
+  /** Fixed AI profile for this session's connection ("" / undefined = default). */
+  aiProfileId?: string;
+  /** AI skills assigned to this session's connection (always pinned). */
+  aiSkillIds?: string[];
 };
 
 type DashboardConnectionEntry = {
@@ -204,6 +269,9 @@ type GlobalSettingsView = {
   defaultAiProfileId?: string;
   localFileBrowserDock?: LocalFileBrowserDock;
   localFileBrowserVisible?: boolean;
+  hideTerminalScrollbarsInFullscreen?: boolean;
+  terminalRecordingEnabled?: boolean;
+  terminalRecordingDefaultScope?: TerminalRecordingScope;
 };
 
 type TerminalAgentPanelLayoutSnapshot = {
@@ -218,6 +286,8 @@ type PendingAiAction = {
   sessionId: string;
   selectedText: string;
   connectionDisplayName?: string;
+  connectionAiProfileId?: string;
+  connectionAiSkillIds?: string[];
 };
 
 type PendingTerminalAgentAction = {
@@ -228,6 +298,8 @@ type PendingTerminalAgentAction = {
   initialExecutionTarget?: TerminalAgentExecutionTarget;
   initialAskConfirmationBeforeEveryCommand?: boolean;
   initialAutoApproveRootCommands?: boolean;
+  connectionAiProfileId?: string;
+  connectionAiSkillIds?: string[];
 };
 
 type ActiveTabTransfer = {
@@ -631,6 +703,26 @@ function buildFontFamilyStack(fontFamily?: string): string {
   return fontFamily ? `${fontFamily}, ${TERMINAL_FONT_FAMILY_FALLBACK}` : TERMINAL_FONT_FAMILY_FALLBACK;
 }
 
+/**
+ * True when a key event originates from a terminal/xterm view or an editable
+ * element, i.e. a target that owns paste handling itself. Used to avoid
+ * hijacking Ctrl/Cmd+Shift+V (the terminal paste binding) with global
+ * shortcuts.
+ */
+function eventTargetConsumesPaste(target: EventTarget | null): boolean {
+  if (!(target instanceof Element)) {
+    return false;
+  }
+  if (target.closest(".xterm, .xterm-helper-textarea")) {
+    return true;
+  }
+  if (target instanceof HTMLElement && target.isContentEditable) {
+    return true;
+  }
+  const tagName = target.tagName;
+  return tagName === "INPUT" || tagName === "TEXTAREA" || tagName === "SELECT";
+}
+
 function copyAnsiColors(ansiColors?: string[]): string[] | undefined {
   if (!ansiColors || ansiColors.length === 0) {
     return undefined;
@@ -668,13 +760,40 @@ function buildTerminalAppearanceFromTab(tab: Tab): TerminalAppearanceSnapshot {
 }
 
 export function MainWindow() {
+  const { t } = useTranslation();
   const currentWindowLabel = getCurrentWebviewWindow().label;
   const [tabs, setTabs] = useState<Tab[]>([]);
   const [activeTab, setActiveTab] = useState<string | null>(null);
   const [showDashboard, setShowDashboard] = useState(false);
   const [terminalOnlyFullscreen, setTerminalOnlyFullscreen] = useState(false);
+  const [hideTerminalScrollbarsInFullscreen, setHideTerminalScrollbarsInFullscreen] = useState(false);
   const [localFileBrowserVisible, setLocalFileBrowserVisible] = useState(false);
   const [localFileBrowserDock, setLocalFileBrowserDock] = useState<LocalFileBrowserDock>("left");
+  const [fileBrowserPanelWidth, setFileBrowserPanelWidth] = useState(() =>
+    clampPanelSize(
+      readStoredPanelSize(FILE_BROWSER_PANEL_WIDTH_KEY, 280),
+      FILE_BROWSER_MIN_WIDTH,
+      FILE_BROWSER_MAX_WIDTH,
+    ),
+  );
+  const [fileBrowserPanelHeight, setFileBrowserPanelHeight] = useState(() =>
+    clampPanelSize(
+      readStoredPanelSize(FILE_BROWSER_PANEL_HEIGHT_KEY, 224),
+      FILE_BROWSER_MIN_HEIGHT,
+      FILE_BROWSER_MAX_HEIGHT,
+    ),
+  );
+  const [recordingErrorMessage, setRecordingErrorMessage] = useState<string | null>(null);
+  const [recordingScopeRequest, setRecordingScopeRequest] = useState<{
+    tabId: string;
+    targetSessionId: string;
+    defaultScope: TerminalRecordingScope;
+  } | null>(null);
+  const [availableUpdate, setAvailableUpdate] = useState<AvailableUpdate | null>(null);
+  const [updateDialogManual, setUpdateDialogManual] = useState(false);
+  const [updateDownload, setUpdateDownload] = useState<AvailableUpdate | null>(null);
+  const [updateCheckBusy, setUpdateCheckBusy] = useState(false);
+  const [updateCheckStatus, setUpdateCheckStatus] = useState("");
   const [connectionCount, setConnectionCount] = useState(0);
   const [openDialog, setOpenDialog] = useState<DialogId>(null);
   const [editingConnection, setEditingConnection] = useState<ConnectionSettings | null>(null);
@@ -683,6 +802,9 @@ export function MainWindow() {
   const [pendingAiAction, setPendingAiAction] = useState<PendingAiAction | null>(null);
   const [pendingTerminalAgentAction, setPendingTerminalAgentAction] = useState<PendingTerminalAgentAction | null>(null);
   const [snippetFileDraft, setSnippetFileDraft] = useState<SnippetFileDraft | null>(null);
+  /** WP1.3c: transient toast for the terminal "open selection in snippet editor" flow. */
+  const [terminalFileLoadNotice, setTerminalFileLoadNotice] = useState<string | null>(null);
+  const terminalFileLoadNoticeTimerRef = useRef<number | null>(null);
   const [pendingTerminalAgentMode, setPendingTerminalAgentMode] = useState<"run" | "plan" | null>(null);
   const [terminalAgentStates, setTerminalAgentStates] = useState<Record<string, TerminalAgentRunState>>({});
   const [globalFontSize, setGlobalFontSize] = useState(DEFAULT_FONT_SIZE);
@@ -793,6 +915,7 @@ export function MainWindow() {
     setDefaultAiProfileId(settings.defaultAiProfileId ?? "");
     setLocalFileBrowserDock(settings.localFileBrowserDock ?? "left");
     setLocalFileBrowserVisible(!!settings.localFileBrowserVisible);
+    setHideTerminalScrollbarsInFullscreen(!!settings.hideTerminalScrollbarsInFullscreen);
   }, []);
 
   const loadAiProfileAvailability = useCallback(async () => {
@@ -1380,6 +1503,8 @@ export function MainWindow() {
             terminalAgentCommandName,
             terminalEffectPluginId: info.terminalEffectPluginId,
             terminalEffectAnimationSpeed: info.terminalEffectAnimationSpeed ?? 1,
+            terminalEmulationType: info.terminalEmulationType,
+            terminalColorsEnabled: info.terminalColorsEnabled ?? true,
             tunnels: [],
             usageCount: 0,
           },
@@ -1502,6 +1627,8 @@ export function MainWindow() {
       connectionProtocol: "TcpIp" | "Mosh" = "TcpIp",
       terminalEffectPluginId?: string,
       terminalEffectAnimationSpeed?: number,
+      terminalEmulationType?: string,
+      terminalColorsEnabled?: boolean,
     ) => {
       setTabs((prev) =>
         prev.map((t) =>
@@ -1532,6 +1659,8 @@ export function MainWindow() {
         connectionProtocol,
         terminalEffectPluginId,
         terminalEffectAnimationSpeed,
+        terminalEmulationType,
+        terminalColorsEnabled,
       });
       if (ok) {
         setTabs((prev) =>
@@ -1575,6 +1704,8 @@ export function MainWindow() {
           connectionProtocol: latestConnection.connectionProtocol || "TcpIp",
           terminalEffectPluginId: latestConnection.terminalEffectPluginId,
           terminalEffectAnimationSpeed: latestConnection.terminalEffectAnimationSpeed,
+          terminalEmulationType: latestConnection.terminalEmulationType,
+          terminalColorsEnabled: latestConnection.terminalColorsEnabled ?? true,
         });
         if (ok) {
           setTabSplitSessions((prev) => ({
@@ -1599,6 +1730,10 @@ export function MainWindow() {
               connectionProtocol: latestConnection.connectionProtocol || "TcpIp",
               terminalEffectPluginId: latestConnection.terminalEffectPluginId,
               terminalEffectAnimationSpeed: latestConnection.terminalEffectAnimationSpeed,
+              terminalEmulationType: latestConnection.terminalEmulationType,
+              terminalColorsEnabled: latestConnection.terminalColorsEnabled ?? true,
+              aiProfileId: latestConnection.aiProfileId,
+              aiSkillIds: latestConnection.aiSkillIds,
             },
           }));
           splitResolveRef.current(splitSessionId);
@@ -1647,6 +1782,8 @@ export function MainWindow() {
           latestConnection.connectionProtocol || "TcpIp",
           latestConnection.terminalEffectPluginId,
           latestConnection.terminalEffectAnimationSpeed,
+          latestConnection.terminalEmulationType,
+          latestConnection.terminalColorsEnabled ?? true,
         );
       } else {
         createSshSession(id, {
@@ -1665,6 +1802,8 @@ export function MainWindow() {
           connectionProtocol: latestConnection.connectionProtocol || "TcpIp",
           terminalEffectPluginId: latestConnection.terminalEffectPluginId,
           terminalEffectAnimationSpeed: latestConnection.terminalEffectAnimationSpeed,
+          terminalEmulationType: latestConnection.terminalEmulationType,
+          terminalColorsEnabled: latestConnection.terminalColorsEnabled ?? true,
         }).then((ok) => {
           setTabs((prev) =>
             prev.map((t) =>
@@ -2334,6 +2473,8 @@ export function MainWindow() {
         connectionProtocol: info.connectionProtocol,
         terminalEffectPluginId: info.terminalEffectPluginId,
         terminalEffectAnimationSpeed: info.terminalEffectAnimationSpeed,
+        aiProfileId: info.aiProfileId,
+        aiSkillIds: info.aiSkillIds,
       };
       setTabs((prev) => [...prev, newTab]);
       setActiveTab(id);
@@ -2347,6 +2488,8 @@ export function MainWindow() {
           info.connectionProtocol,
           info.terminalEffectPluginId,
           info.terminalEffectAnimationSpeed,
+          info.terminalEmulationType,
+          info.terminalColorsEnabled,
         );
       } else {
         createSshSession(id, info).then((ok) => {
@@ -2928,10 +3071,49 @@ export function MainWindow() {
     await win.setFullscreen(!isFull);
   }, []);
 
+  const terminalOnlyPreviousFullscreenRef = useRef(false);
+
   const toggleTerminalOnlyFullscreen = useCallback(() => {
     setTerminalOnlyFullscreen((current) => !current);
     window.setTimeout(() => window.dispatchEvent(new Event("kortty-refit")), 0);
     window.setTimeout(() => window.dispatchEvent(new Event("kortty-refit")), 120);
+  }, []);
+
+  // Java setTerminalOnlyFullscreen also enters/leaves native fullscreen.
+  const terminalOnlyFullscreenInitializedRef = useRef(false);
+  useEffect(() => {
+    if (!terminalOnlyFullscreenInitializedRef.current) {
+      terminalOnlyFullscreenInitializedRef.current = true;
+      return;
+    }
+    const win = getCurrentWindow();
+    if (terminalOnlyFullscreen) {
+      win
+        .isFullscreen()
+        .then((isFull) => {
+          terminalOnlyPreviousFullscreenRef.current = isFull;
+          if (!isFull) {
+            return win.setFullscreen(true);
+          }
+        })
+        .catch(console.error);
+    } else {
+      win.setFullscreen(terminalOnlyPreviousFullscreenRef.current).catch(console.error);
+    }
+  }, [terminalOnlyFullscreen]);
+
+  const toggleHideTerminalScrollbarsInFullscreen = useCallback(() => {
+    setHideTerminalScrollbarsInFullscreen((current) => {
+      const next = !current;
+      invoke<GlobalSettings>("get_settings")
+        .then((settings) =>
+          invoke("save_settings", {
+            settings: { ...settings, hideTerminalScrollbarsInFullscreen: next },
+          }),
+        )
+        .catch(console.error);
+      return next;
+    });
   }, []);
 
   const saveSnippetFileDraft = useCallback(async (content: string) => {
@@ -2949,6 +3131,68 @@ export function MainWindow() {
     setSnippetFileDraft((current) => (current?.id === draft.id ? { ...current, content } : current));
   }, [snippetFileDraft]);
 
+  const showTerminalFileLoadNotice = useCallback((message: string | null) => {
+    if (terminalFileLoadNoticeTimerRef.current !== null) {
+      window.clearTimeout(terminalFileLoadNoticeTimerRef.current);
+      terminalFileLoadNoticeTimerRef.current = null;
+    }
+    setTerminalFileLoadNotice(message);
+    if (message) {
+      terminalFileLoadNoticeTimerRef.current = window.setTimeout(() => {
+        terminalFileLoadNoticeTimerRef.current = null;
+        setTerminalFileLoadNotice(null);
+      }, 6000);
+    }
+  }, []);
+
+  /**
+   * WP1.3c: opens a terminal selection as a remote text file in the snippet
+   * editor (port of MainWindow.loadTerminalSelectionAsTextFile): the selection
+   * is validated as a single file name, resolved against the tracked remote
+   * working directory (home hint as "~" fallback) and loaded via
+   * read_remote_text_file. Binary/non-UTF-8 files are rejected with a
+   * localized message.
+   */
+  const handleOpenTerminalSelectionInSnippetEditor = useCallback(
+    async (sessionId: string, selectedText: string) => {
+      let fileName: string;
+      try {
+        fileName = normalizeSelectedFileName(selectedText);
+      } catch {
+        showTerminalFileLoadNotice(t("terminal.loadTextFile.invalidSelection"));
+        return;
+      }
+      showTerminalFileLoadNotice(t("terminal.loadTextFile.loading", { name: fileName }));
+      try {
+        const hints = await invoke<{ current?: string; home?: string }>(
+          "get_remote_directory_hints",
+          { sessionId },
+        );
+        const remotePath = resolveRemoteFilePath(hints.current, fileName, hints.home);
+        const content = await invoke<string>("read_remote_text_file", { sessionId, remotePath });
+        setSnippetFileDraft({
+          id: crypto.randomUUID(),
+          source: "remote",
+          path: remotePath,
+          sessionId,
+          content,
+        });
+        setOpenDialog("snippetManager");
+        showTerminalFileLoadNotice(t("terminal.loadTextFile.loaded", { path: remotePath }));
+      } catch (error) {
+        const message = String(error);
+        if (message.includes("BINARY_OR_NON_TEXT")) {
+          showTerminalFileLoadNotice(t("terminal.loadTextFile.binary", { path: fileName }));
+        } else if (message.includes("Session not found")) {
+          showTerminalFileLoadNotice(t("terminal.loadTextFile.notConnected"));
+        } else {
+          showTerminalFileLoadNotice(t("terminal.loadTextFile.failed", { name: fileName, error: message }));
+        }
+      }
+    },
+    [showTerminalFileLoadNotice, t],
+  );
+
   const handleQuit = useCallback(async () => {
     for (const tab of tabs) {
       if ((tab.kind ?? "terminal") === "terminal" && tab.status === "connected") {
@@ -2965,6 +3209,27 @@ export function MainWindow() {
       .then((settings) => invoke("save_settings", { settings: { ...settings, showMenuBar: visible } }))
       .catch(console.error);
   }, [showMenuBar]);
+
+  const setLocalFileBrowserVisiblePreference = useCallback((visible: boolean) => {
+    setLocalFileBrowserVisible(visible);
+    invoke<GlobalSettings>("get_settings")
+      .then((settings) =>
+        invoke("save_settings", { settings: { ...settings, localFileBrowserVisible: visible } }),
+      )
+      .catch(console.error);
+  }, []);
+
+  const toggleLocalFileBrowserPreference = useCallback(() => {
+    setLocalFileBrowserVisible((prev) => {
+      const next = !prev;
+      invoke<GlobalSettings>("get_settings")
+        .then((settings) =>
+          invoke("save_settings", { settings: { ...settings, localFileBrowserVisible: next } }),
+        )
+        .catch(console.error);
+      return next;
+    });
+  }, []);
 
   const setTabTerminalEffect = useCallback((tabId: string, pluginId: string | undefined) => {
     setTabs((prev) =>
@@ -3048,41 +3313,198 @@ export function MainWindow() {
     return parentTabId ? tabs.find((tab) => tab.id === parentTabId)?.label : undefined;
   }, [splitSessionConfigs, tabSplitSessions, tabs]);
 
-  const toggleTerminalRecording = useCallback(async (sessionId: string) => {
-    const current = recordingSessions[sessionId];
-    if (current) {
+  /**
+   * Resolves the connection-scoped AI settings (fixed profile + pinned skills)
+   * for a session so chat/agent requests can carry them (WP4.6).
+   */
+  const resolveConnectionAiSettings = useCallback((sessionId: string): {
+    connectionAiProfileId?: string;
+    connectionAiSkillIds?: string[];
+  } => {
+    const splitConfig = splitSessionConfigs[sessionId];
+    const parentTabId = Object.entries(tabSplitSessions)
+      .find(([, sessionIds]) => sessionIds.includes(sessionId))?.[0];
+    const tab =
+      tabs.find((candidate) => candidate.id === sessionId) ??
+      (parentTabId ? tabs.find((candidate) => candidate.id === parentTabId) : undefined);
+
+    // Split sessions opened for a different server carry their own AI settings.
+    if (splitConfig && (splitConfig.aiProfileId || splitConfig.aiSkillIds?.length)) {
+      return {
+        connectionAiProfileId: splitConfig.aiProfileId || undefined,
+        connectionAiSkillIds: splitConfig.aiSkillIds?.length ? splitConfig.aiSkillIds : undefined,
+      };
+    }
+
+    if (tab?.connectionId) {
+      const connection = useConnectionStore
+        .getState()
+        .connections.find((candidate) => candidate.id === tab.connectionId);
+      if (connection) {
+        return {
+          connectionAiProfileId: connection.aiProfileId || undefined,
+          connectionAiSkillIds: connection.aiSkillIds?.length ? connection.aiSkillIds : undefined,
+        };
+      }
+    }
+
+    // Ad-hoc sessions (quick connect) keep their AI selection on the tab itself.
+    if (tab && (tab.aiProfileId || tab.aiSkillIds?.length)) {
+      return {
+        connectionAiProfileId: tab.aiProfileId || undefined,
+        connectionAiSkillIds: tab.aiSkillIds?.length ? tab.aiSkillIds : undefined,
+      };
+    }
+    return {};
+  }, [splitSessionConfigs, tabSplitSessions, tabs]);
+
+  /** Starts a recording for one split or the whole tab with real geometry (WP3.8). */
+  const startTerminalRecordingWithScope = useCallback(
+    async (tabId: string, targetSessionId: string, scope: TerminalRecordingScope) => {
+      const splitIds = tabSplitSessions[tabId] ?? [];
+      const geometrySessionId = scope === "WholeTab" ? tabId : targetSessionId;
+      const geometry =
+        getTerminalGeometry(geometrySessionId) ??
+        getTerminalGeometry(tabId) ?? {
+          columns: 80,
+          rows: 24,
+          pixelWidth: 0,
+          pixelHeight: 0,
+        };
       try {
-        await invoke("stop_terminal_recording", { sessionId: current.sessionId });
-      } finally {
+        const response = await invoke<TerminalRecordingStartResponse>("start_terminal_recording", {
+          request: {
+            tabId,
+            splitId: scope === "ActiveSplit" && targetSessionId !== tabId ? targetSessionId : undefined,
+            connectionName: resolveConnectionDisplayName(
+              scope === "ActiveSplit" ? targetSessionId : tabId,
+            ),
+            scope,
+            columns: geometry.columns,
+            rows: geometry.rows,
+          },
+        });
         setRecordingSessions((prev) => {
           const next = { ...prev };
-          delete next[sessionId];
+          const sessionIds = scope === "WholeTab" ? [tabId, ...splitIds] : [targetSessionId];
+          for (const id of sessionIds) {
+            next[id] = response;
+          }
+          return next;
+        });
+      } catch (error) {
+        setRecordingErrorMessage(t("terminal.recording.error.start", { message: String(error) }));
+      }
+    },
+    [resolveConnectionDisplayName, t, tabSplitSessions],
+  );
+
+  /** Stops a recording and removes all session mappings sharing it (WholeTab). */
+  const stopTerminalRecordingSession = useCallback(
+    async (recording: TerminalRecordingStartResponse) => {
+      try {
+        await invoke("stop_terminal_recording", { sessionId: recording.sessionId });
+      } catch (error) {
+        setRecordingErrorMessage(t("terminal.recording.error.stop", { message: String(error) }));
+      } finally {
+        setRecordingSessions((prev) => {
+          const next: typeof prev = {};
+          for (const [key, value] of Object.entries(prev)) {
+            if (value?.sessionId !== recording.sessionId) {
+              next[key] = value;
+            }
+          }
           return next;
         });
       }
+    },
+    [t],
+  );
+
+  const toggleTerminalRecording = useCallback(async (sessionId: string) => {
+    const current = recordingSessions[sessionId];
+    if (current) {
+      await stopTerminalRecordingSession(current);
       return;
     }
 
     const parentTabId = tabs.some((tab) => tab.id === sessionId)
       ? sessionId
       : Object.entries(tabSplitSessions).find(([, sessionIds]) => sessionIds.includes(sessionId))?.[0] ?? sessionId;
-    const response = await invoke<TerminalRecordingStartResponse>("start_terminal_recording", {
-      request: {
-        tabId: parentTabId,
-        splitId: sessionId === parentTabId ? undefined : sessionId,
-        connectionName: resolveConnectionDisplayName(sessionId),
-        scope: "ActiveSplit",
-        columns: 80,
-        rows: 24,
-      },
-    });
-    setRecordingSessions((prev) => ({ ...prev, [sessionId]: response }));
-  }, [recordingSessions, resolveConnectionDisplayName, tabSplitSessions, tabs]);
-
-  const handleRequestAiAction = useCallback(async (nextAction: PendingAiAction) => {
-    if (!nextAction.selectedText.trim()) {
+    const tab = tabs.find((entry) => entry.id === parentTabId);
+    if (!tab || (tab.kind ?? "terminal") !== "terminal") {
+      setRecordingErrorMessage(t("terminal.recording.error.noTerminal"));
       return;
     }
+    if (tab.status !== "connected") {
+      setRecordingErrorMessage(t("terminal.recording.error.notConnected"));
+      return;
+    }
+
+    let settings: GlobalSettingsView | null = null;
+    try {
+      settings = await invoke<GlobalSettingsView>("get_settings");
+    } catch (error) {
+      console.error("Failed to load settings for recording:", error);
+    }
+    if (!settings?.terminalRecordingEnabled) {
+      setRecordingErrorMessage(t("terminal.recording.error.disabled"));
+      return;
+    }
+    const defaultScope: TerminalRecordingScope =
+      settings.terminalRecordingDefaultScope ?? "ActiveSplit";
+    const splitIds = tabSplitSessions[parentTabId] ?? [];
+    if (splitIds.length > 0) {
+      // Only ask for the scope when the tab actually has split terminals
+      // (Java TerminalTab.chooseRecordingScope).
+      setRecordingScopeRequest({ tabId: parentTabId, targetSessionId: sessionId, defaultScope });
+      return;
+    }
+    await startTerminalRecordingWithScope(parentTabId, sessionId, defaultScope);
+  }, [
+    recordingSessions,
+    startTerminalRecordingWithScope,
+    stopTerminalRecordingSession,
+    t,
+    tabSplitSessions,
+    tabs,
+  ]);
+
+  /** Ctrl/Cmd+Shift+E and Tools menu entry (Java MainWindow.toggleTerminalRecording). */
+  const toggleRecordingForActiveTab = useCallback(() => {
+    const tab = activeTabEntry;
+    if (!tab || (tab.kind ?? "terminal") !== "terminal") {
+      setRecordingErrorMessage(t("terminal.recording.error.noTerminal"));
+      return;
+    }
+    const sessionIds = [tab.id, ...(tabSplitSessions[tab.id] ?? [])];
+    const activeRecording = sessionIds
+      .map((id) => recordingSessions[id])
+      .find((entry) => entry != null);
+    if (activeRecording) {
+      void stopTerminalRecordingSession(activeRecording);
+      return;
+    }
+    const focused = focusedPaneSessionRef.current;
+    const targetSessionId = focused && sessionIds.includes(focused) ? focused : tab.id;
+    void toggleTerminalRecording(targetSessionId);
+  }, [
+    activeTabEntry,
+    recordingSessions,
+    stopTerminalRecordingSession,
+    t,
+    tabSplitSessions,
+    toggleTerminalRecording,
+  ]);
+
+  const handleRequestAiAction = useCallback(async (pendingAction: PendingAiAction) => {
+    if (!pendingAction.selectedText.trim()) {
+      return;
+    }
+    const nextAction: PendingAiAction = {
+      ...pendingAction,
+      ...resolveConnectionAiSettings(pendingAction.sessionId),
+    };
     try {
       const profiles = await invoke<AiProfile[]>("get_ai_profiles");
       setHasConfiguredAiProfiles(profiles.length > 0);
@@ -3098,9 +3520,13 @@ export function MainWindow() {
       setPendingAiAction(nextAction);
       setOpenDialog("aiManager");
     }
-  }, []);
+  }, [resolveConnectionAiSettings]);
 
-  const handleRequestTerminalAgent = useCallback(async (nextAction: PendingTerminalAgentAction) => {
+  const handleRequestTerminalAgent = useCallback(async (pendingAction: PendingTerminalAgentAction) => {
+    const nextAction: PendingTerminalAgentAction = {
+      ...pendingAction,
+      ...resolveConnectionAiSettings(pendingAction.sessionId),
+    };
     try {
       const profiles = await invoke<AiProfile[]>("get_ai_profiles");
       setHasConfiguredAiProfiles(profiles.length > 0);
@@ -3119,9 +3545,13 @@ export function MainWindow() {
       setPendingTerminalAgentMode("run");
       setOpenDialog("aiManager");
     }
-  }, []);
+  }, [resolveConnectionAiSettings]);
 
-  const handleRequestTerminalAgentPlan = useCallback(async (nextAction: PendingTerminalAgentAction) => {
+  const handleRequestTerminalAgentPlan = useCallback(async (pendingAction: PendingTerminalAgentAction) => {
+    const nextAction: PendingTerminalAgentAction = {
+      ...pendingAction,
+      ...resolveConnectionAiSettings(pendingAction.sessionId),
+    };
     try {
       const profiles = await invoke<AiProfile[]>("get_ai_profiles");
       setHasConfiguredAiProfiles(profiles.length > 0);
@@ -3140,7 +3570,7 @@ export function MainWindow() {
       setPendingTerminalAgentMode("plan");
       setOpenDialog("aiManager");
     }
-  }, []);
+  }, [resolveConnectionAiSettings]);
 
   const isReadOnlyMirrorSession = useCallback((sessionId: string) => {
     const directTab = tabs.find((tab) => tab.id === sessionId);
@@ -3169,7 +3599,17 @@ export function MainWindow() {
   }, []);
 
   const handleStartTerminalAgent = useCallback(async (request: TerminalAgentRequest) => {
-    const response = await invoke<TerminalAgentStartResponse>("start_terminal_agent", { request });
+    let effectiveRequest = request;
+    if (request.confirmMutatingCommandSets === undefined) {
+      const settings = await invoke<GlobalSettings>("get_settings").catch(() => null);
+      effectiveRequest = {
+        ...request,
+        confirmMutatingCommandSets: settings?.terminalAgentConfirmMutatingCommandSets ?? false,
+      };
+    }
+    const response = await invoke<TerminalAgentStartResponse>("start_terminal_agent", {
+      request: effectiveRequest,
+    });
     if (request.executionTarget === "TerminalWindow") {
       setTerminalAgentStates((prev) => ({
         ...prev,
@@ -3391,7 +3831,12 @@ export function MainWindow() {
       ? parsed.invocation.profileLookup?.trim()
       : undefined;
     const normalizedLookup = profileLookup?.toLowerCase();
-    const preferredProfileId = resolvePreferredAiProfileId(profiles, defaultAiProfileId);
+    const connectionAi = resolveConnectionAiSettings(sessionId);
+    // The connection-fixed profile wins over the default profile (WP4.6).
+    const preferredProfileId = resolvePreferredAiProfileId(
+      profiles,
+      connectionAi.connectionAiProfileId || defaultAiProfileId,
+    );
     const profile = profileLookup
       ? profiles.find((candidate) => {
           const candidateName = candidate.name.trim();
@@ -3428,6 +3873,8 @@ export function MainWindow() {
             selectedText: parsed.invocation.userPrompt,
             connectionDisplayName: resolveConnectionDisplayName(sessionId),
             userPrompt: parsed.invocation.userPrompt,
+            connectionAiProfileId: connectionAi.connectionAiProfileId,
+            connectionAiSkillIds: connectionAi.connectionAiSkillIds,
           },
           requestId,
         });
@@ -3450,6 +3897,9 @@ export function MainWindow() {
           profileId: profile.id,
           userPrompt: parsed.invocation.userPrompt,
           connectionDisplayName: resolveConnectionDisplayName(sessionId),
+          // An explicit profile lookup overrides the connection profile.
+          connectionAiProfileId: profileLookup ? undefined : connectionAi.connectionAiProfileId,
+          connectionAiSkillIds: connectionAi.connectionAiSkillIds,
         });
       } catch (error) {
         await emitTerminalAgentNote(sessionId, `Agent planning start failed: ${String(error)}`);
@@ -3470,6 +3920,8 @@ export function MainWindow() {
           initialAskConfirmationBeforeEveryCommand:
             parsed.invocation.askConfirmationBeforeEveryCommand,
           initialAutoApproveRootCommands: parsed.invocation.autoApproveRootCommands,
+          connectionAiProfileId: profileLookup ? undefined : connectionAi.connectionAiProfileId,
+          connectionAiSkillIds: connectionAi.connectionAiSkillIds,
         });
         setPendingTerminalAgentMode("run");
         setOpenDialog("aiAgent");
@@ -3486,6 +3938,9 @@ export function MainWindow() {
         showRuntimeMessages: visibility.showRuntimeMessages,
         askConfirmationBeforeEveryCommand: parsed.invocation.askConfirmationBeforeEveryCommand,
         autoApproveRootCommands: parsed.invocation.autoApproveRootCommands,
+        // An explicit profile lookup overrides the connection profile.
+        connectionAiProfileId: profileLookup ? undefined : connectionAi.connectionAiProfileId,
+        connectionAiSkillIds: connectionAi.connectionAiSkillIds,
       });
     } catch (error) {
       await emitTerminalAgentNote(sessionId, `Agent start failed: ${String(error)}`);
@@ -3496,6 +3951,7 @@ export function MainWindow() {
     handleLaunchTerminalAgentPlanTask,
     loadTerminalAgentVisibilitySettings,
     redrawTerminalPrompt,
+    resolveConnectionAiSettings,
     resolveConnectionDisplayName,
     terminalAgentCommandName,
     terminalAgentCommandNameCaseInsensitive,
@@ -3606,6 +4062,92 @@ export function MainWindow() {
       connectionDisplayName: resolveConnectionDisplayName(targetSessionId),
     });
   }, [activeTabEntry, handleRequestTerminalAgent, isReadOnlyMirrorSession, resolveConnectionDisplayName, tabSplitSessions]);
+
+  /** Ctrl/Cmd+Alt+P and Tools menu entry (Java MainWindow.showAiPlanning). */
+  const handleOpenAiAgentPlanForFocusedSession = useCallback(() => {
+    if ((activeTabEntry?.kind ?? "terminal") !== "terminal" || activeTabEntry?.status !== "connected") {
+      return;
+    }
+
+    const activeSessionIds = new Set([
+      activeTabEntry.id,
+      ...(tabSplitSessions[activeTabEntry.id] ?? []),
+    ]);
+    const focusedSessionId = focusedPaneSessionRef.current;
+    const targetSessionId =
+      focusedSessionId && activeSessionIds.has(focusedSessionId)
+        ? focusedSessionId
+        : activeTabEntry.id;
+    if (!targetSessionId || isReadOnlyMirrorSession(targetSessionId)) {
+      return;
+    }
+
+    void handleRequestTerminalAgentPlan({
+      sessionId: targetSessionId,
+      connectionDisplayName: resolveConnectionDisplayName(targetSessionId),
+    });
+  }, [activeTabEntry, handleRequestTerminalAgentPlan, isReadOnlyMirrorSession, resolveConnectionDisplayName, tabSplitSessions]);
+
+  // Automatic update notifications from the background checker (WP7.2).
+  useEffect(() => {
+    if (currentWindowLabel !== "main") {
+      return;
+    }
+    let disposed = false;
+    const unlisten = listen<AvailableUpdate>(UPDATE_AVAILABLE_EVENT, (event) => {
+      if (disposed || !event.payload) {
+        return;
+      }
+      setAvailableUpdate(event.payload);
+      setUpdateDialogManual(false);
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((fn) => fn());
+    };
+  }, [currentWindowLabel]);
+
+  /** Manual update check from the About dialog (Java runManualUpdateCheck). */
+  const runManualUpdateCheck = useCallback(async () => {
+    setUpdateCheckBusy(true);
+    setUpdateCheckStatus(t("updates.checking"));
+    try {
+      const result = await invoke<UpdateCheckResult>("check_for_updates_manually");
+      switch (result?.status) {
+        case "UpdateAvailable":
+          if (result.update) {
+            setUpdateCheckStatus(t("updates.available.short", { version: result.update.latestVersion }));
+            setAvailableUpdate(result.update);
+            setUpdateDialogManual(true);
+          } else {
+            setAvailableUpdate(null);
+            setUpdateCheckStatus(t("updates.checkFailed"));
+          }
+          break;
+        case "NoUpdate":
+          setAvailableUpdate(null);
+          setUpdateCheckStatus(t("updates.manual.current"));
+          break;
+        case "NoCompatibleAsset":
+          setAvailableUpdate(null);
+          setUpdateCheckStatus(t("updates.noCompatibleAsset"));
+          break;
+        default:
+          setAvailableUpdate(null);
+          setUpdateCheckStatus(
+            result?.message
+              ? t("updates.checkFailedDetail", { message: result.message })
+              : t("updates.checkFailed"),
+          );
+          break;
+      }
+    } catch (error) {
+      setAvailableUpdate(null);
+      setUpdateCheckStatus(t("updates.checkFailedDetail", { message: String(error) }));
+    } finally {
+      setUpdateCheckBusy(false);
+    }
+  }, [t]);
 
   useEffect(() => {
     const unlistenStatus = listen<TerminalAgentRunState>("terminal-agent-status", (event) => {
@@ -3727,9 +4269,38 @@ export function MainWindow() {
       } else if (ctrl && shift && (e.key === "Y" || e.key === "y")) {
         e.preventDefault();
         setOpenDialog("aiManager");
-      } else if (ctrl && !shift && e.key === "q") {
+      } else if (ctrl && shift && (e.key === "E" || e.key === "e")) {
         e.preventDefault();
-        handleQuit();
+        toggleRecordingForActiveTab();
+      } else if (ctrl && shift && (e.key === "J" || e.key === "j")) {
+        e.preventDefault();
+        setOpenDialog("jobScheduler");
+      } else if (ctrl && shift && (e.key === "V" || e.key === "v")) {
+        // Ctrl/Cmd+Shift+V is the terminal's paste binding. Don't hijack it
+        // when focus is inside a terminal/xterm view or any editable element,
+        // otherwise the user's paste is swallowed by the recordings dialog.
+        if (eventTargetConsumesPaste(e.target)) {
+          return;
+        }
+        e.preventDefault();
+        setOpenDialog("terminalRecordings");
+      } else if (ctrl && shift && (e.key === "S" || e.key === "s")) {
+        e.preventDefault();
+        setSnippetFileDraft(null);
+        setOpenDialog("snippetManager");
+      } else if (ctrl && e.altKey && !shift && e.code === "KeyA") {
+        e.preventDefault();
+        handleOpenAiAgentForFocusedSession();
+      } else if (ctrl && e.altKey && !shift && e.code === "KeyP") {
+        e.preventDefault();
+        handleOpenAiAgentPlanForFocusedSession();
+      } else if (ctrl && !shift && e.key === "q") {
+        // Port of WindowCloseShortcutSupport: Ctrl+Q closes only secondary
+        // windows; the primary main window ignores the shortcut.
+        e.preventDefault();
+        if (currentWindowLabel !== "main") {
+          handleQuit();
+        }
       } else if (ctrl && !shift && e.key === "Tab") {
         e.preventDefault();
         nextTab();
@@ -3788,12 +4359,16 @@ export function MainWindow() {
     createAdditionalWindow,
     closeTab,
     activeTab,
+    currentWindowLabel,
     nextTab,
     prevTab,
     handleOpenProjectDialog,
+    handleOpenAiAgentForFocusedSession,
+    handleOpenAiAgentPlanForFocusedSession,
     handleSaveProject,
     showMenuBar,
     toggleMenuBarPreference,
+    toggleRecordingForActiveTab,
     setOpenDialog,
     handleQuit,
     handleFullscreen,
@@ -3825,7 +4400,7 @@ export function MainWindow() {
     onProjectSettings: handleEditProjectSettings,
     onToggleMenuBar: () => toggleMenuBarPreference(!showMenuBar),
     onToggleDashboard: () => setShowDashboard((prev) => !prev),
-    onToggleLocalFileBrowser: () => setLocalFileBrowserVisible((prev) => !prev),
+    onToggleLocalFileBrowser: toggleLocalFileBrowserPreference,
     onQuickConnect: () => setOpenDialog("quickConnect"),
     onManageConnections: () => setOpenDialog("connectionManager"),
     onImportConnections: () => setOpenDialog("importDialog"),
@@ -3836,6 +4411,7 @@ export function MainWindow() {
     onManageGPGKeys: () => setOpenDialog("gpgKeyManager"),
     onAiManager: () => setOpenDialog("aiManager"),
     onAiAgent: handleOpenAiAgentForFocusedSession,
+    onAiAgentPlan: handleOpenAiAgentPlanForFocusedSession,
     onSnippets: () => {
       setSnippetFileDraft(null);
       setOpenDialog("snippetManager");
@@ -3843,6 +4419,7 @@ export function MainWindow() {
     onJobScheduler: () => setOpenDialog("jobScheduler"),
     onTerminalEffects: () => setOpenDialog("terminalEffects"),
     onTerminalRecordings: () => setOpenDialog("terminalRecordings"),
+    onToggleRecording: toggleRecordingForActiveTab,
     onSFTPManager: () => setOpenDialog("sftpManager"),
     onAsciiArt: () => setOpenDialog("asciiArt"),
     onCreateBackup: () => setOpenDialog("backupCreate"),
@@ -3852,6 +4429,8 @@ export function MainWindow() {
     onGuiThemeEditor: () => setOpenDialog("guiThemeEditor"),
     onFullscreen: handleFullscreen,
     onTerminalOnlyFullscreen: toggleTerminalOnlyFullscreen,
+    hideTerminalScrollbarsInFullscreen,
+    onToggleHideTerminalScrollbarsInFullscreen: toggleHideTerminalScrollbarsInFullscreen,
     onQuit: handleQuit,
     onAbout: () => setOpenDialog("about"),
   };
@@ -3867,7 +4446,13 @@ export function MainWindow() {
   }
 
   return (
-    <div className="flex flex-col h-screen w-screen bg-kortty-bg">
+    <div
+      className={`flex flex-col h-screen w-screen bg-kortty-bg ${
+        terminalOnlyFullscreen && hideTerminalScrollbarsInFullscreen
+          ? "kortty-hide-terminal-scrollbars"
+          : ""
+      }`}
+    >
       {showMenuBar && !terminalOnlyFullscreen && <MenuBar {...menuActions} />}
       <div className="flex flex-1 min-h-0">
         {showDashboard && !terminalOnlyFullscreen && (
@@ -3962,14 +4547,30 @@ export function MainWindow() {
           </div>
         )}
         {localFileBrowserVisible && !terminalOnlyFullscreen && localFileBrowserDock === "left" && (
-          <LocalFileBrowser
-            dock="left"
-            onClose={() => setLocalFileBrowserVisible(false)}
-            onEditFile={(draft) => {
-              setSnippetFileDraft(draft);
-              setOpenDialog("snippetManager");
-            }}
-          />
+          <>
+            <div
+              className="kortty-resizable-filebrowser flex shrink-0 min-h-0"
+              style={{ width: fileBrowserPanelWidth }}
+            >
+              <LocalFileBrowser
+                dock="left"
+                onClose={() => setLocalFileBrowserVisiblePreference(false)}
+                onEditFile={(draft) => {
+                  setSnippetFileDraft(draft);
+                  setOpenDialog("snippetManager");
+                }}
+              />
+            </div>
+            <ResizableDivider
+              orientation="vertical"
+              onResize={(delta) =>
+                setFileBrowserPanelWidth((width) =>
+                  clampPanelSize(width + delta, FILE_BROWSER_MIN_WIDTH, FILE_BROWSER_MAX_WIDTH),
+                )
+              }
+              onResizeEnd={() => storePanelSize(FILE_BROWSER_PANEL_WIDTH_KEY, fileBrowserPanelWidth)}
+            />
+          </>
         )}
         <div className="flex-1 flex flex-col min-w-0 min-h-0">
           {!terminalOnlyFullscreen && (
@@ -4155,6 +4756,9 @@ export function MainWindow() {
                           connectionDisplayName,
                         });
                       }) : undefined}
+                      onOpenSelectionInSnippetEditor={(sessionId, selectedText) => {
+                        void handleOpenTerminalSelectionInSnippetEditor(sessionId, selectedText);
+                      }}
                       onStartAgent={hasConfiguredAiProfiles ? ((sessionId) => {
                         if (isReadOnlyMirrorSession(sessionId)) {
                           return;
@@ -4236,28 +4840,68 @@ export function MainWindow() {
             )}
           </div>
           {localFileBrowserVisible && !terminalOnlyFullscreen && localFileBrowserDock === "bottom" && (
-            <LocalFileBrowser
-              dock="bottom"
-              onClose={() => setLocalFileBrowserVisible(false)}
-              onEditFile={(draft) => {
-                setSnippetFileDraft(draft);
-                setOpenDialog("snippetManager");
-              }}
-            />
+            <>
+              <ResizableDivider
+                orientation="horizontal"
+                onResize={(delta) =>
+                  setFileBrowserPanelHeight((height) =>
+                    clampPanelSize(height - delta, FILE_BROWSER_MIN_HEIGHT, FILE_BROWSER_MAX_HEIGHT),
+                  )
+                }
+                onResizeEnd={() =>
+                  storePanelSize(FILE_BROWSER_PANEL_HEIGHT_KEY, fileBrowserPanelHeight)
+                }
+              />
+              <div
+                className="kortty-resizable-filebrowser flex shrink-0 min-w-0"
+                style={{ height: fileBrowserPanelHeight }}
+              >
+                <LocalFileBrowser
+                  dock="bottom"
+                  onClose={() => setLocalFileBrowserVisiblePreference(false)}
+                  onEditFile={(draft) => {
+                    setSnippetFileDraft(draft);
+                    setOpenDialog("snippetManager");
+                  }}
+                />
+              </div>
+            </>
           )}
         </div>
         {localFileBrowserVisible && !terminalOnlyFullscreen && localFileBrowserDock === "right" && (
-          <LocalFileBrowser
-            dock="right"
-            onClose={() => setLocalFileBrowserVisible(false)}
-            onEditFile={(draft) => {
-              setSnippetFileDraft(draft);
-              setOpenDialog("snippetManager");
-            }}
-          />
+          <>
+            <ResizableDivider
+              orientation="vertical"
+              onResize={(delta) =>
+                setFileBrowserPanelWidth((width) =>
+                  clampPanelSize(width - delta, FILE_BROWSER_MIN_WIDTH, FILE_BROWSER_MAX_WIDTH),
+                )
+              }
+              onResizeEnd={() => storePanelSize(FILE_BROWSER_PANEL_WIDTH_KEY, fileBrowserPanelWidth)}
+            />
+            <div
+              className="kortty-resizable-filebrowser flex shrink-0 min-h-0"
+              style={{ width: fileBrowserPanelWidth }}
+            >
+              <LocalFileBrowser
+                dock="right"
+                onClose={() => setLocalFileBrowserVisiblePreference(false)}
+                onEditFile={(draft) => {
+                  setSnippetFileDraft(draft);
+                  setOpenDialog("snippetManager");
+                }}
+              />
+            </div>
+          </>
         )}
       </div>
-      <StatusBar connectionCount={connectionCount} />
+      {!terminalOnlyFullscreen && <StatusBar connectionCount={connectionCount} />}
+      {/* WP1.3c: transient notice for the terminal text-file load flow. */}
+      {terminalFileLoadNotice && (
+        <div className="fixed bottom-10 right-4 z-[120] max-w-[420px] rounded border border-kortty-border bg-kortty-surface px-3 py-2 text-xs text-kortty-text shadow-2xl">
+          {terminalFileLoadNotice}
+        </div>
+      )}
 
       <QuickConnect
         open={openDialog === "quickConnect"}
@@ -4314,6 +4958,7 @@ export function MainWindow() {
           setTerminalAgentPanelFontSize(settings.terminalAgentPanelFontSize);
           setLocalFileBrowserDock(settings.localFileBrowserDock ?? "left");
           setLocalFileBrowserVisible(!!settings.localFileBrowserVisible);
+          setHideTerminalScrollbarsInFullscreen(!!settings.hideTerminalScrollbarsInFullscreen);
           terminalAgentPanelLayoutRef.current = {
             terminalAgentPanelDock: settings.terminalAgentPanelDock ?? "bottom",
             terminalAgentPanelHeight: settings.terminalAgentPanelHeight,
@@ -4333,19 +4978,30 @@ export function MainWindow() {
           setPendingAiAction(null);
         }}
         onManageProfiles={() => setOpenDialog("aiManager")}
-        onRun={createAiTab}
+        onRun={(request) =>
+          createAiTab({
+            ...request,
+            connectionAiProfileId: pendingAiAction?.connectionAiProfileId,
+            connectionAiSkillIds: pendingAiAction?.connectionAiSkillIds,
+          })
+        }
       />
       <AiAgentDialog
         open={openDialog === "aiAgent"}
         sessionId={pendingTerminalAgentAction?.sessionId}
         connectionDisplayName={pendingTerminalAgentAction?.connectionDisplayName}
         initialPrompt={pendingTerminalAgentAction?.initialPrompt}
-        initialProfileId={pendingTerminalAgentAction?.initialProfileId}
+        initialProfileId={
+          pendingTerminalAgentAction?.connectionAiProfileId
+          || pendingTerminalAgentAction?.initialProfileId
+        }
         initialExecutionTarget={pendingTerminalAgentAction?.initialExecutionTarget}
         initialAskConfirmationBeforeEveryCommand={
           pendingTerminalAgentAction?.initialAskConfirmationBeforeEveryCommand
         }
         initialAutoApproveRootCommands={pendingTerminalAgentAction?.initialAutoApproveRootCommands}
+        connectionAiProfileId={pendingTerminalAgentAction?.connectionAiProfileId}
+        connectionAiSkillIds={pendingTerminalAgentAction?.connectionAiSkillIds}
         onClose={() => {
           setOpenDialog(null);
           setPendingTerminalAgentAction(null);
@@ -4364,7 +5020,13 @@ export function MainWindow() {
           setPendingTerminalAgentMode(null);
         }}
         onManageProfiles={() => setOpenDialog("aiManager")}
-        onRun={handleLaunchTerminalAgentPlanTask}
+        onRun={(request) =>
+          handleLaunchTerminalAgentPlanTask({
+            ...request,
+            connectionAiProfileId: pendingTerminalAgentAction?.connectionAiProfileId,
+            connectionAiSkillIds: pendingTerminalAgentAction?.connectionAiSkillIds,
+          })
+        }
       />
       <AiManagerDialog
         open={openDialog === "aiManager"}
@@ -4522,9 +5184,14 @@ export function MainWindow() {
 
       {openDialog === "about" && (
         <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-50">
-          <div className="bg-kortty-bg border border-kortty-border rounded-lg shadow-2xl w-[420px] overflow-hidden">
-            <div className="flex flex-col items-center px-8 py-10">
-              <div className="text-4xl font-mono font-bold text-kortty-accent mb-2">KorTTY</div>
+          <div className="bg-kortty-bg border border-kortty-border rounded-lg shadow-2xl w-[480px] overflow-hidden">
+            <div className="flex flex-col items-center px-8 py-8">
+              <img
+                src={korttyLogo}
+                alt="KorTTY"
+                className="mb-4 w-full max-w-[360px] select-none"
+                draggable={false}
+              />
               <div className="text-xs text-kortty-text-dim mb-6">SSH Terminal Client</div>
               <div className="space-y-1 text-center text-xs text-kortty-text">
                 <p>Version 2.2.0</p>
@@ -4541,6 +5208,27 @@ export function MainWindow() {
                   github.com/chardonnay/korTTY_rust
                 </a>
               </div>
+              <div className="mt-6 w-full border-t border-kortty-border pt-4">
+                <div className="flex items-center gap-3">
+                  <button
+                    className="px-3 py-1.5 text-xs rounded border border-kortty-border text-kortty-text hover:bg-kortty-panel transition-colors disabled:opacity-50"
+                    disabled={updateCheckBusy}
+                    onClick={() => {
+                      void runManualUpdateCheck();
+                    }}
+                  >
+                    {t("updates.checkNow")}
+                  </button>
+                  {updateCheckBusy && (
+                    <div className="animate-spin w-4 h-4 border-2 border-kortty-accent border-t-transparent rounded-full" />
+                  )}
+                </div>
+                {updateCheckStatus && (
+                  <p className="mt-2 text-[11px] text-kortty-text-dim break-words">
+                    {updateCheckStatus}
+                  </p>
+                )}
+              </div>
             </div>
             <div className="border-t border-kortty-border px-4 py-3 flex justify-center">
               <button
@@ -4553,6 +5241,58 @@ export function MainWindow() {
           </div>
         </div>
       )}
+
+      <TerminalRecordingScopeDialog
+        open={recordingScopeRequest != null}
+        defaultScope={recordingScopeRequest?.defaultScope ?? "ActiveSplit"}
+        onCancel={() => setRecordingScopeRequest(null)}
+        onConfirm={(scope) => {
+          const request = recordingScopeRequest;
+          setRecordingScopeRequest(null);
+          if (request) {
+            void startTerminalRecordingWithScope(request.tabId, request.targetSessionId, scope);
+          }
+        }}
+      />
+
+      {recordingErrorMessage != null && (
+        <div className="fixed inset-0 bg-black/60 flex items-center justify-center z-[120]">
+          <div className="bg-kortty-bg border border-kortty-border rounded-lg shadow-2xl w-[400px] overflow-hidden">
+            <div className="px-4 py-3 border-b border-kortty-border">
+              <div className="text-sm font-semibold text-kortty-text">
+                {t("terminal.recording.error.title")}
+              </div>
+              <div className="text-xs text-kortty-text-dim mt-0.5">
+                {t("terminal.recording.error.header")}
+              </div>
+            </div>
+            <div className="px-4 py-4 text-xs text-kortty-text break-words">
+              {recordingErrorMessage}
+            </div>
+            <div className="border-t border-kortty-border px-4 py-3 flex justify-end">
+              <button
+                className="px-5 py-1.5 text-xs bg-kortty-accent text-kortty-bg rounded hover:bg-kortty-accent-hover transition-colors"
+                onClick={() => setRecordingErrorMessage(null)}
+              >
+                {t("common.ok")}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <UpdateAvailableDialog
+        open={availableUpdate != null}
+        update={availableUpdate}
+        manual={updateDialogManual}
+        onClose={() => setAvailableUpdate(null)}
+        onDownload={(update) => setUpdateDownload(update)}
+      />
+      <UpdateDownloadDialog
+        open={updateDownload != null}
+        update={updateDownload}
+        onClose={() => setUpdateDownload(null)}
+      />
     </div>
   );
 }

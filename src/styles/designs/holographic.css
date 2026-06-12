@@ -1,0 +1,74 @@
+/*
+ * Holographic Interface app design (port of Java styles/holographic.css).
+ * Cyan-on-black holo projection look with glow effects.
+ * Terminal sessions (.xterm) and Monaco editors keep their own styling —
+ * selectors below must never target .xterm or [class*="monaco"] content.
+ */
+
+[data-app-design="holographic-interface"] body,
+[data-app-design="holographic-interface"] button:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="holographic-interface"] input:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="holographic-interface"] select:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="holographic-interface"] textarea:not(.xterm *):not([class*="monaco"] *) {
+  font-family: "JetBrains Mono", "Menlo", "Consolas", "Courier New", monospace;
+}
+
+/* Soft holographic glow projected from the bottom of the window. */
+[data-app-design="holographic-interface"] body::before {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 2147483645;
+  pointer-events: none;
+  background: linear-gradient(to bottom, transparent 55%, rgba(0, 212, 255, 0.06));
+}
+
+/* Fine horizontal interference lines, like a hologram projection. */
+[data-app-design="holographic-interface"] body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 212, 255, 0.025) 0px,
+    rgba(0, 212, 255, 0.025) 1px,
+    transparent 1px,
+    transparent 6px
+  );
+}
+
+/* Angular, sharp-edged controls in app chrome. */
+[data-app-design="holographic-interface"] button:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="holographic-interface"] input:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="holographic-interface"] select:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="holographic-interface"] textarea:not(.xterm *):not([class*="monaco"] *) {
+  border-radius: 0 !important;
+}
+
+/* Glowing focus outline, like the JavaFX dropshadow on focused fields. */
+[data-app-design="holographic-interface"] input:not(.xterm *):not([class*="monaco"] *):focus,
+[data-app-design="holographic-interface"] select:not(.xterm *):not([class*="monaco"] *):focus,
+[data-app-design="holographic-interface"] textarea:not(.xterm *):not([class*="monaco"] *):focus {
+  box-shadow: 0 0 12px rgba(0, 212, 255, 0.3) !important;
+}
+
+/* Buttons project a cyan glow on hover. */
+[data-app-design="holographic-interface"] button:not(.xterm *):not([class*="monaco"] *):hover {
+  box-shadow: 0 0 12px rgba(0, 212, 255, 0.25);
+  text-shadow: 0 0 8px rgba(0, 212, 255, 0.55);
+}
+
+/* Headings and labels shimmer slightly. */
+[data-app-design="holographic-interface"] h1:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="holographic-interface"] h2:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="holographic-interface"] h3:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="holographic-interface"] label:not(.xterm *):not([class*="monaco"] *) {
+  text-shadow: 0 0 8px rgba(0, 212, 255, 0.4);
+}
+
+/* Square scrollbars in app chrome. */
+[data-app-design="holographic-interface"] ::-webkit-scrollbar-thumb {
+  border-radius: 0;
+}

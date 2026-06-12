@@ -42,7 +42,11 @@
     "fullscreen": "Volledig scherm",
     "userGuide": "Gebruikershandleiding",
     "shortcuts": "Sneltoetsen",
-    "about": "Over KorTTY"
+    "about": "Over KorTTY",
+    "toggleRecording": "Terminalopname starten/stoppen",
+    "aiPlanning": "AI-planning...",
+    "terminalOnlyFullscreen": "Alleen terminal in volledig scherm",
+    "hideTerminalScrollbarsFullscreen": "Terminal-schuifbalken verbergen in volledig scherm"
   },
   "connection": {
     "manager": "Verbindingsbeheer",
@@ -85,7 +89,52 @@
     "background": "Achtergrond",
     "cursor": "Cursor",
     "timestamps": "Tijdstempels van opdrachten tonen",
-    "logging": "Terminallogging inschakelen"
+    "logging": "Terminallogging inschakelen",
+    "recording": {
+      "start": "Opname starten",
+      "stop": "Opname stoppen",
+      "indicator": {
+        "recording": "Opname",
+        "autoPaused": "Opname automatisch gepauzeerd"
+      },
+      "scope": {
+        "title": "Terminalopname",
+        "header": "Opnamebereik kiezen",
+        "content": "Bereik:",
+        "activeSplit": "Actieve split",
+        "wholeTab": "Heel tabblad"
+      },
+      "error": {
+        "title": "Terminalopname",
+        "header": "Opname mislukt",
+        "notConnected": "Verbind de terminal voordat u een opname start.",
+        "noTerminal": "Geen actief terminaltabblad voor opname.",
+        "disabled": "Schakel terminalopname in via Hulpmiddelen > Videobeheer voordat u een opname start.",
+        "start": "Opname kon niet worden gestart: {{message}}",
+        "stop": "Opname kon niet worden gestopt: {{message}}"
+      }
+    },
+    "dragDrop": {
+      "title": "Kopiëren naar server",
+      "count": "{{done}} van {{total}} items gekopieerd",
+      "abort": "Afbreken",
+      "done": "Kopiëren voltooid.",
+      "cancelled": "Kopiëren afgebroken.",
+      "target": "Doel: {{target}}",
+      "error": "Kopiëren mislukt: {{message}}",
+      "dropHint": "Sleep bestanden hierheen om te uploaden"
+    },
+    "context": {
+      "openSelectionInSnippetEditor": "Selectie openen in snippet-editor"
+    },
+    "loadTextFile": {
+      "invalidSelection": "Selecteer exact één bestandsnaam in de huidige map.",
+      "notConnected": "Er is geen actieve SSH-verbinding beschikbaar.",
+      "loading": "{{name}} laden als tekstbestand...",
+      "loaded": "Tekstbestand geladen: {{path}}",
+      "binary": "Het geselecteerde bestand is binair of geen geldige UTF-8-tekst en is niet geladen: {{path}}",
+      "failed": "{{name}} kon niet worden geladen: {{error}}"
+    }
   },
   "settings": {
     "title": "Instellingen",
@@ -110,7 +159,69 @@
     "keepalive": "SSH Keep-Alive",
     "keepaliveInterval": "Keep-Alive-interval (seconden)",
     "connectionTimeout": "Verbindingstimeout (seconden)",
-    "retryCount": "Aantal pogingen"
+    "retryCount": "Aantal pogingen",
+    "tab": {
+      "appearance": "Vormgeving",
+      "recording": "Video",
+      "logging": "Logs",
+      "updates": "Updates"
+    },
+    "appearance": {
+      "appDesign": "App-design:",
+      "appDesignInfo": "Geldt voor app-vensters en dialoogvensters. Terminalsessies en editorinhoud behouden hun eigen kleurinstellingen.",
+      "preview": "Voorvertoning:",
+      "design": {
+        "normal": "Normaal",
+        "matrixTerminal": "Matrix-terminal",
+        "holographicInterface": "Holografische interface",
+        "klingonTactical": "Klingon-tactisch",
+        "elegantDark": "Elegant donker"
+      }
+    },
+    "updates": {
+      "header": "Updatecontroles",
+      "automatic": "Automatisch controleren op KorTTY-updates",
+      "automaticTooltip": "Indien ingeschakeld controleert KorTTY GitHub-releases op de achtergrond.",
+      "interval": "Controle-interval:",
+      "intervalDays": "Elke {{days}} dag(en)",
+      "info": "Automatische controles tonen alleen een dialoogvenster wanneer een nieuwere compatibele versie beschikbaar is. Handmatige controles zijn beschikbaar in het dialoogvenster Over."
+    },
+    "logging": {
+      "header": "Logbestanden",
+      "directory": "Logmap:",
+      "directoryInfo": "Standaard: {{path}}",
+      "directoryChoose": "Logmap kiezen",
+      "retention": "Logs bewaren:",
+      "retentionInfo": "0 = onbeperkt. Oudste logarchieven worden automatisch verwijderd.",
+      "compressionInfo": "Logarchieven ouder dan 24 uur worden automatisch gecomprimeerd.",
+      "restartRequired": "Wijzigingen aan de logmap worden actief na het herstarten van KorTTY.",
+      "days": "dag(en)"
+    },
+    "ai": {
+      "terminalAgentExecutionEnabled": "AI-agentuitvoering inschakelen",
+      "terminalAgentExecutionEnabledHint": "Wanneer uitgeschakeld zijn uitvoerbare AI-agentruns en planimplementatie niet beschikbaar. AI-planning en AI-agent vragen blijven beschikbaar.",
+      "terminalAgentConfirmMutatingCommandSets": "Vragen voordat de AI-agent het doelsysteem wijzigt",
+      "terminalAgentConfirmMutatingCommandSetsHint": "Wanneer ingeschakeld vereisen commandosets die bestanden aanmaken, verwijderen of wijzigen, of het doelsysteem anderszins veranderen, bevestiging. Alleen-lezenacties vragen niet om bevestiging."
+    },
+    "snippetEditor": {
+      "title": "Snippet-editor",
+      "info": "Deze instellingen overschrijven de terminal-/editorstandaarden voor Snippetbeheer en het snippetbewerkingsvenster. Laat leeg of 0 om over te nemen van de algemene instellingen.",
+      "fontFamily": "Lettertype",
+      "fontSize": "Lettergrootte",
+      "fontSizeInfo": "(0 = overnemen van terminal)",
+      "foreground": "Voorgrondkleur",
+      "background": "Achtergrondkleur",
+      "cursorStyle": "Cursorstijl",
+      "cursorColor": "Cursorkleur",
+      "wordWrap": "Automatische regelafbreking",
+      "lineNumbers": "Regelnummers",
+      "historyMax": "Geschiedenisitems (max)",
+      "diagramBackground": "Achtergrondkleur diagram",
+      "aiInstructionsEnabled": "Optionele aanvullende AI-instructies tonen in de snippet-editor",
+      "alternativeSolutionCount": "Maximaal aantal alternatieve oplossingen",
+      "profile": "Profiel",
+      "manageProfiles": "Profielen beheren..."
+    }
   },
   "credential": {
     "manager": "Inloggegevensbeheer",
@@ -141,16 +252,268 @@
   },
   "snippet": {
     "manager": "Snippetbeheer",
+    "diagram": {
+      "button": "Diagram",
+      "title": "Snippetdiagrammen",
+      "script": "Script: {{name}}",
+      "unnamed": "(snippet zonder naam)",
+      "empty": "Er zijn nog geen diagrammen opgeslagen voor deze snippet.",
+      "current": "Diagram is actueel.",
+      "stale": "Het diagram is mogelijk verouderd omdat de snippet is gewijzigd.",
+      "rendering": "Lokaal renderen...",
+      "renderFailed": "Lokaal renderen niet beschikbaar: {{error}}",
+      "regenerate": "Opnieuw genereren",
+      "generate": "Diagram genereren",
+      "generating": "PlantUML-diagram wordt gegenereerd...",
+      "ready": "Diagram gereed. Sla de snippet op om het te bewaren.",
+      "failed": "Het PlantUML-diagram kon niet worden gegenereerd.",
+      "instructions": "Instructie:",
+      "instructionsHint": "Optionele parameters voor het diagram",
+      "copyPlantUml": "PlantUML kopiëren",
+      "copied": "PlantUML-code naar klembord gekopieerd.",
+      "backgroundColor": "Achtergrond:",
+      "readableColors": "Leesbare kleuren toepassen",
+      "readableColorsApplied": "Leesbare kleuren toegepast.",
+      "saveSvg": "SVG opslaan",
+      "exportSaved": "Opgeslagen: {{path}}",
+      "exportFailed": "Export mislukt: {{error}}",
+      "delete": "Verwijderen",
+      "typeLogicalStructure": "Logische structuur",
+      "codeReference": {
+        "line": "Regel {{line}}",
+        "lines": "Regels {{start}}-{{end}}"
+      }
+    },
     "name": "Naam",
     "category": "Categorie",
     "content": "Inhoud",
     "favorite": "Favoriet",
     "variables": "Variabelen",
     "search": "Snippets zoeken...",
-    "importExport": "Importeren/Exporteren"
+    "importExport": "Importeren/Exporteren",
+    "unnamed": "(zonder naam)",
+    "saveAsNew": "Opslaan als nieuwe snippet",
+    "copySuffix": " (Kopie)",
+    "formatter": {
+      "builtIn": "Ingebouwd",
+      "bundled": "Meegeleverd",
+      "external": "Extern",
+      "unavailable": "Niet beschikbaar"
+    },
+    "ai": {
+      "copy": "Naar klembord kopiëren",
+      "copied": "Naar klembord gekopieerd.",
+      "noProfile": "Geen AI-profiel geconfigureerd.",
+      "noTextSegments": "De huidige selectie bevat geen bewerkbare opmerkingen of gebruikerstekstsegmenten.",
+      "context": {
+        "assistant": "AI-assistent...",
+        "complete": "AI-aanvullen",
+        "autoComplete": "Automatisch AI-aanvullen",
+        "review": "Fouten en verbeteringen controleren",
+        "improveReadability": "Leesbaarheid verbeteren",
+        "improveRobustness": "Robuustheid verbeteren",
+        "improvePerformance": "Prestaties verbeteren",
+        "improveCustom": "Aangepaste verbetering...",
+        "alternatives": "Alternatieve oplossingen",
+        "security": "Beveiligingscontrole",
+        "describe": "Technische beschrijving",
+        "correctSelection": "Spelling in selectie corrigeren",
+        "translateSelection": "Selectie vertalen..."
+      },
+      "assistant": {
+        "title": "AI-assistent",
+        "header": "Beschrijf wat KorTTY moet wijzigen op de huidige cursorpositie.",
+        "instruction": "Instructie:",
+        "prompt": "Voorbeeld: nieuwe parameters voor mapnamen toevoegen",
+        "cursor": "Cursor: offset {{offset}}, regel {{line}}, kolom {{column}}",
+        "skills": "AI-skills meenemen",
+        "skillsTooltip": "Ingeschakelde AI-skills voor chat/functies kunnen aan dit verzoek worden toegevoegd wanneer relevant.",
+        "skillsUnavailable": "Er zijn geen ingeschakelde AI-skills voor chat/functies beschikbaar in de algemene instellingen.",
+        "running": "AI-assistent werkt de snippet bij...",
+        "empty": "Er is geen bruikbaar resultaat van de AI-assistent teruggegeven.",
+        "failed": "AI-assistent mislukt.",
+        "applied": "Wijziging van AI-assistent toegepast.",
+        "diffTitle": "Wijziging van AI-assistent beoordelen"
+      },
+      "complete": {
+        "running": "Aanvullingssuggestie wordt gegenereerd...",
+        "empty": "Er is geen bruikbare aanvullingssuggestie teruggegeven.",
+        "discarded": "Aanvulling verworpen omdat de editor is gewijzigd.",
+        "ready": "Aanvullingssuggestie gereed. Druk op Tab om in te voegen.",
+        "failed": "Aanvullingssuggestie mislukt."
+      },
+      "autocomplete": {
+        "warningTitle": "Automatische AI-aanvulling inschakelen",
+        "warningHeader": "Automatische aanvulling kan snippetinhoud herhaaldelijk versturen zolang deze is ingeschakeld.",
+        "warningContent": "KorTTY vraagt suggesties op nadat u pauzeert op een cursorpositie. Houd dit uitgeschakeld voor gevoelige snippets, tenzij u het geconfigureerde AI-eindpunt vertrouwt.",
+        "enabled": "Automatische AI-aanvulling ingeschakeld.",
+        "disabled": "Automatische AI-aanvulling uitgeschakeld."
+      },
+      "review": {
+        "title": "AI-codereview",
+        "info": "Het rapport is informatief. De editorinhoud wordt niet gewijzigd. Klik op een bevinding met regelnummer om deze in de editor te selecteren.",
+        "empty": "Er zijn geen bevindingen teruggegeven.",
+        "recommendation": "Aanbeveling:",
+        "running": "Code wordt beoordeeld...",
+        "ready": "Codereview gereed.",
+        "failed": "Codereview mislukt.",
+        "theme": "Vind waarschijnlijke fouten en praktische verbetermogelijkheden.",
+        "colSeverity": "Ernst",
+        "colTitle": "Titel",
+        "colLine": "Regel"
+      },
+      "improve": {
+        "running": "Verbeterde code wordt gegenereerd...",
+        "empty": "Er is geen bruikbare vervanging teruggegeven.",
+        "failed": "Codeverbetering mislukt.",
+        "applied": "Verbeterde code toegepast.",
+        "selectFirst": "Selecteer een codegebied voordat u een AI-herschrijving aanvraagt.",
+        "readabilityTheme": "Verbeter de leesbaarheid zonder het gedrag te wijzigen.",
+        "robustnessTheme": "Verbeter robuustheid, foutafhandeling en randgevalgedrag zonder niet-gerelateerde wijzigingen.",
+        "performanceTheme": "Verbeter de prestaties zonder extern zichtbaar gedrag te wijzigen.",
+        "customTitle": "Aangepaste AI-verbetering",
+        "customHeader": "Beschrijf hoe de geselecteerde code moet worden verbeterd.",
+        "customPrompt": "Instructie:"
+      },
+      "diff": {
+        "title": "AI-wijziging beoordelen",
+        "summaryEmpty": "Beoordeel de vervanging voordat u deze toepast.",
+        "original": "Origineel",
+        "replacement": "AI-vervanging",
+        "apply": "Wijziging toepassen"
+      },
+      "security": {
+        "title": "Beveiligingscontrole",
+        "info": "Selecteer alleen de bevindingen die de AI moet oplossen. Niet-geselecteerde bevindingen worden niet toegepast.",
+        "empty": "Er zijn geen beveiligingsbevindingen teruggegeven.",
+        "applySelected": "Geselecteerde oplossingen toepassen",
+        "running": "Beveiligingscontrole wordt uitgevoerd...",
+        "ready": "Beveiligingsrapport gereed.",
+        "failed": "Beveiligingscontrole mislukt.",
+        "fixRunning": "Geselecteerde beveiligingsoplossingen worden gegenereerd...",
+        "fixEmpty": "Er is geen bruikbare beveiligingsoplossing teruggegeven.",
+        "fixFailed": "Genereren van beveiligingsoplossingen mislukt.",
+        "fixApplied": "Geselecteerde beveiligingsoplossingen toegepast.",
+        "diffTitle": "Beveiligingsoplossingen beoordelen"
+      },
+      "alternatives": {
+        "title": "Alternatieve oplossingen",
+        "instructionsPrompt": "Optionele instructies voor de AI, bijvoorbeeld \"gebruik alleen Bash-builtins\"",
+        "reload": "Nieuwe alternatieven genereren",
+        "loading": "Alternatieve oplossingen worden gegenereerd...",
+        "empty": "Er zijn geen bruikbare alternatieve oplossingen teruggegeven.",
+        "loaded": "{{count}} alternatieve oplossingen klaar.",
+        "failed": "Alternatieve oplossingen konden niet worden gegenereerd.",
+        "apply": "Toepassen",
+        "applied": "Alternatieve oplossing toegepast op de geselecteerde code.",
+        "scopeSelection": "Doelbereik: geselecteerd codegebied",
+        "scopeWhole": "Doelbereik: volledige snippet"
+      },
+      "describe": {
+        "dialogTitle": "Technische beschrijving",
+        "commentSyntax": "Commentaarsyntaxis van de huidige snippettaal gebruiken",
+        "lineWidth": "Regelbreedte:",
+        "copy": "Naar klembord kopiëren",
+        "insert": "In snippet invoegen",
+        "info": "De gegenereerde beschrijving wordt hieronder weergegeven. U kunt deze kopiëren of in de snippet invoegen.",
+        "generating": "Technische beschrijving wordt gegenereerd...",
+        "generated": "Technische beschrijving gereed.",
+        "generateFailed": "Technische beschrijving kon niet worden gegenereerd.",
+        "inserted": "Technische beschrijving in de snippet ingevoegd."
+      },
+      "selection": {
+        "correcting": "Geselecteerde tekst wordt gecorrigeerd...",
+        "corrected": "Geselecteerde tekst gecorrigeerd.",
+        "correctFailed": "Geselecteerde tekst kon niet worden gecorrigeerd.",
+        "translating": "Geselecteerde tekst wordt vertaald...",
+        "translated": "Geselecteerde tekst vertaald.",
+        "translateFailed": "Geselecteerde tekst kon niet worden vertaald.",
+        "translateTitle": "Snippettekst vertalen",
+        "translatePrompt": "Selecteer de doeltaal voor de geselecteerde gebruikerstekst:"
+      },
+      "format": {
+        "fallbackTitle": "AI-opmaak gebruiken?",
+        "fallbackHeader": "Lokale opmaak is niet beschikbaar voor deze actie.",
+        "fallbackContent": "{{reason}}\n\nWilt u dat KorTTY in plaats daarvan een AI-ondersteunde code-opmaak aanvraagt? Het AI-resultaat wordt als voorbeeld getoond voordat het wordt toegepast.",
+        "unavailable": "{{reason}}\n\nEr is geen AI-provider voor codeverbetering geconfigureerd.",
+        "notSupported": "Geen formatter beschikbaar voor {{language}}",
+        "providerUnavailable": "Formatter niet beschikbaar: {{name}}",
+        "widthNotSupported": "Opmaak op regelbreedte wordt niet ondersteund voor {{language}}.",
+        "theme": "Formatteer deze code. Behoud het gedrag exact, gebruik dezelfde programmeertaal, voeg geen uitleg toe en maak geen niet-gerelateerde wijzigingen.",
+        "widthTheme": "Formatteer deze code tot een maximale regelbreedte van {{width}} tekens waar dit syntactisch veilig mogelijk is. Behoud het gedrag exact, gebruik dezelfde programmeertaal, voeg geen uitleg toe en maak geen niet-gerelateerde wijzigingen.",
+        "running": "AI-opmaak wordt uitgevoerd...",
+        "empty": "Er is geen bruikbaar AI-opmaakresultaat teruggegeven.",
+        "failed": "AI-opmaak mislukt.",
+        "applied": "AI-opmaak toegepast.",
+        "diffTitle": "AI-opmaak beoordelen"
+      }
+    },
+    "ruler": {
+      "tooltip": "Klik op de liniaal om de markering voor maximale regellengte in te stellen. Klik met de rechtermuisknop op de markering om naar deze breedte te formatteren of deze te verwijderen.",
+      "position": "Kolom {{column}}",
+      "caretTooltip": "Positie {{column}}",
+      "limit": "Limiet {{limit}}",
+      "formatToLimit": "Formatteren naar {{limit}} tekens per regel",
+      "clearLimit": "Regellengtemarkering verwijderen",
+      "formatSuccess": "Geformatteerd naar max. {{limit}} tekens per regel."
+    },
+    "history": {
+      "label": "Geschiedenis",
+      "position": "Geschiedenis: {{index}} / {{total}}",
+      "restore": "Herstellen"
+    },
+    "diff": {
+      "compare": "Vergelijken",
+      "title": "Snippet-diff",
+      "left": "Links: {{name}} ({{language}})",
+      "right": "Rechts: {{name}} ({{language}})",
+      "hint": "Selecteer precies twee snippets."
+    },
+    "profile": {
+      "title": "Snippet-editorprofielen",
+      "newTitle": "Nieuw snippet-editorprofiel",
+      "editTitle": "Snippet-editorprofiel bewerken",
+      "namePrompt": "Profielnaam",
+      "presets": "Voorinstellingen",
+      "custom": "Aangepaste profielen",
+      "new": "Nieuw aangepast profiel...",
+      "current": "Aangepaste kleuren",
+      "builtInHint": "Ingebouwde profielen zijn alleen-lezen. Maak een aangepast profiel om kleuren te wijzigen.",
+      "preview": "Voorvertoning",
+      "label": "Profiel",
+      "manage": "Profielen beheren...",
+      "comment": "Commentaar",
+      "string": "String",
+      "number": "Getal",
+      "boolean": "Boolean/null",
+      "key": "Sleutel",
+      "keyword": "Sleutelwoord",
+      "section": "Sectie",
+      "variable": "Variabele",
+      "brace": "Accolade"
+    }
   },
   "sftp": {
     "title": "SFTP-beheer",
+    "saveAs": {
+      "menu": "Opslaan als…",
+      "overwriteRemote": "Extern bestand overschrijven",
+      "overwriteLocal": "Lokaal bestand overschrijven",
+      "saveSnippet": "Opslaan als snippet",
+      "remoteTitle": "Extern bestand opslaan als",
+      "remoteHeader": "Nieuwe bestandsnaam in dezelfde externe map",
+      "remoteLabel": "Bestandsnaam:",
+      "invalidFileName": "Ongeldige bestandsnaam: {{name}}",
+      "confirmOverwrite": "Het doelbestand bestaat al. {{path}} overschrijven?",
+      "savedFile": "Bestand opgeslagen: {{path}}",
+      "savedSnippet": "Snippet opgeslagen: {{name}}",
+      "saveFailed": "Bestand kon niet worden opgeslagen: {{error}}",
+      "error": {
+        "empty": "De bestandsnaam mag niet leeg zijn.",
+        "dots": "De bestandsnaam mag niet '.' of '..' zijn.",
+        "separators": "De bestandsnaam mag geen padscheidingstekens bevatten."
+      }
+    },
     "local": "Lokaal",
     "remote": "Extern",
     "name": "Naam",
@@ -166,7 +529,14 @@
     "rename": "Hernoemen",
     "newFolder": "Nieuwe map",
     "refresh": "Vernieuwen",
-    "search": "Zoeken..."
+    "search": "Zoeken...",
+    "fallback": {
+      "notice": "SFTP-subsysteem niet beschikbaar — terugval op opdrachtregel wordt gebruikt"
+    },
+    "error": {
+      "subsystemRejected": "Het SFTP-subsysteem is door de server geweigerd of gesloten na succesvolle SSH-authenticatie; er is geen SFTP-versie onderhandeld. Controleer of SFTP is ingeschakeld voor dit doel of de SSH-proxy.",
+      "startFailed": "Het SFTP-subsysteem kon niet worden gestart na succesvolle SSH-authenticatie."
+    }
   },
   "backup": {
     "createTitle": "Back-up maken",
@@ -186,11 +556,102 @@
   },
   "quickConnect": {
     "title": "Snelle verbinding",
-    "frequentlyUsed": "Vaak gebruikt"
+    "frequentlyUsed": "Vaak gebruikt",
+    "terminalEmulation": "Terminalemulatie",
+    "terminalColors": "Terminalkleuren inschakelen"
   },
   "dashboard": {
     "title": "Dashboard",
     "noConnections": "Geen actieve verbindingen"
+  },
+  "recording": {
+    "manager": {
+      "title": "Videobeheer",
+      "header": "Terminalreplay-opnamen en optionele video-export beheren.",
+      "enabled": "Terminalopname inschakelen voor deze app-sessie",
+      "storagePath": "Opslagpad",
+      "format": "Standaardformaat",
+      "formatKorttyReplay": "KorTTY Replay",
+      "formatWebm": "WebM",
+      "defaultScope": "Standaardbereik",
+      "scopeActiveSplit": "Actieve split",
+      "scopeWholeTab": "Heel tabblad",
+      "captureColors": "Terminalkleuren in nieuwe opnamen vastleggen",
+      "autoPause": "Automatisch pauzeren wanneer de terminal inactief is",
+      "idleSeconds": "Inactiviteitsdrempel (seconden)",
+      "ffmpegPath": "ffmpeg-pad",
+      "browse": "Bladeren...",
+      "checkFfmpeg": "Controleren",
+      "ffmpegAvailable": "ffmpeg beschikbaar; video-export ingeschakeld.",
+      "ffmpegMissing": "ffmpeg niet beschikbaar; video-export uitgeschakeld.",
+      "recordings": "Replay-opnamen",
+      "refresh": "Vernieuwen",
+      "save": "Opslaan",
+      "chooseDirectory": "Opnamemap kiezen",
+      "done": "Gereed",
+      "saveFailed": "Instellingen konden niet worden opgeslagen: {{error}}",
+      "refreshFailed": "Opnamen konden niet worden geladen: {{error}}",
+      "view": "Bekijken",
+      "rename": "Naam wijzigen...",
+      "delete": "Verwijderen",
+      "export": "Exporteren...",
+      "viewFailed": "Replay kon niet worden geopend: {{error}}",
+      "renameTitle": "Replaynaam wijzigen",
+      "renameHeader": "Nieuwe replaynaam kiezen",
+      "renameContent": "Naam:",
+      "renameSuccess": "Replay hernoemd: {{name}}",
+      "renameFailed": "Replay kon niet worden hernoemd: {{error}}",
+      "deleteTitle": "Replay verwijderen",
+      "deleteContent": "Hiermee wordt {{name}} verwijderd. Dit kan niet ongedaan worden gemaakt.",
+      "deleteSuccess": "Replay verwijderd: {{name}}",
+      "deleteFailed": "Replay kon niet worden verwijderd: {{error}}",
+      "exportSuccess": "Video geëxporteerd: {{path}}",
+      "exportFailed": "Video-export mislukt: {{error}}",
+      "noRecordings": "Geen opnamen gevonden.",
+      "selectRecording": "Selecteer een opname.",
+      "duration": "Duur",
+      "eventCount": "{{count}} gebeurtenissen",
+      "exportOptions": {
+        "title": "Exportopties",
+        "header": "Kies bereik, kleur en formaat",
+        "format": "Formaat",
+        "formatWebm": "WebM (VP9)",
+        "formatMkv": "MKV (FFV1)",
+        "duration": "Opnameduur: {{duration}}",
+        "all": "Hele opname exporteren",
+        "start": "Start",
+        "end": "Einde",
+        "includeColor": "Terminalkleuren opnemen",
+        "invalidRange": "Voer een geldig tijdsbereik in tussen 0:00 en {{max}}."
+      },
+      "exportProgress": {
+        "title": "Video exporteren",
+        "header": "Replay naar video exporteren",
+        "preparing": "Export voorbereiden...",
+        "rendering": "Frames renderen...",
+        "encoding": "Video coderen...",
+        "finalizing": "Export afronden...",
+        "message": "{{phase}} Geschatte resterende tijd: {{remaining}}",
+        "remainingCalculating": "berekenen..."
+      }
+    },
+    "viewer": {
+      "title": "Replayviewer",
+      "play": "Afspelen",
+      "pause": "Pauzeren",
+      "stop": "Stoppen",
+      "empty": "Er zijn geen replaybeelden opgenomen.",
+      "status": "Frame {{current}} / {{total}}",
+      "timeline": "Tijdlijn",
+      "time": "{{position}} / {{total}}",
+      "timeJump": "Tijdsprong:",
+      "seek": "Ga",
+      "seekInvalid": "Voer een tijd tussen 0:00 en {{max}} in.",
+      "speed": "Snelheid:",
+      "speedSuffix": "x",
+      "loading": "Replay laden...",
+      "loadFailed": "Replay kon niet worden geopend: {{error}}"
+    }
   },
   "common": {
     "ready": "Gereed",
@@ -204,5 +665,183 @@
     "add": "Toevoegen",
     "edit": "Bewerken",
     "search": "Zoeken..."
+  },
+  "updates": {
+    "checkNow": "Controleren op updates",
+    "checking": "Controleren op updates...",
+    "manual": {
+      "current": "U hebt al de nieuwste versie van KorTTY."
+    },
+    "available": {
+      "short": "KorTTY {{version}} is beschikbaar."
+    },
+    "noCompatibleAsset": "Er is een nieuwere KorTTY-versie beschikbaar, maar er is geen compatibele download gevonden voor dit platform.",
+    "checkFailed": "Updatecontrole mislukt.",
+    "checkFailedDetail": "Updatecontrole mislukt: {{message}}",
+    "dialog": {
+      "title": "KorTTY-update beschikbaar",
+      "header": "KorTTY {{version}} is beschikbaar",
+      "installedVersion": "Geïnstalleerde versie:",
+      "availableVersion": "Beschikbare versie:",
+      "downloadAsset": "Download:",
+      "downloadTargetInfo": "Het bestand wordt gedownload naar:"
+    },
+    "downloadAction": "Downloaden",
+    "remindTomorrow": "Morgen herinneren",
+    "skipVersion": "Deze versie overslaan",
+    "download": {
+      "title": "KorTTY-update downloaden",
+      "header": "{{version}} wordt gedownload",
+      "running": "{{asset}} wordt gedownload...",
+      "complete": {
+        "title": "Download voltooid"
+      },
+      "completeInfo": "De update is gedownload naar:",
+      "failed": {
+        "title": "Download mislukt"
+      },
+      "failedInfo": "De update kon niet worden gedownload.",
+      "openFolder": "Map openen"
+    }
+  },
+  "connEdit": {
+    "terminalEmulation": "Terminalemulatie",
+    "terminalColors": "Terminalkleuren inschakelen",
+    "aiTab": "AI",
+    "aiProfile": "AI-profiel:",
+    "aiProfileDefault": "Standaardprofiel gebruiken",
+    "aiProfileMissing": "Opgeslagen profiel (momenteel niet beschikbaar)",
+    "aiProfileHint": "Als het geselecteerde profiel niet beschikbaar is, wordt het standaard-AI-profiel gebruikt totdat het weer beschikbaar is.",
+    "aiSkills": "Verbindingsskills:",
+    "aiSkillsHint": "Toegewezen skills worden altijd meegestuurd bij AI-verzoeken van deze verbinding. AI-skills met doel \"Verbinding\" worden alleen gebruikt voor verbindingen waaraan ze zijn toegewezen.",
+    "aiSkillsNone": "Nog geen AI-skills opgeslagen."
+  },
+  "filebrowser": {
+    "title": "Lokale bestandsbrowser",
+    "showHidden": "Verborgen bestanden tonen",
+    "selected": "geselecteerd",
+    "copied": "{{count}} item(s) gekopieerd",
+    "confirmDelete": "{{count}} item(s) verwijderen?",
+    "context": {
+      "open": "Openen",
+      "loadAsTextFile": "Laden als tekstbestand",
+      "copy": "Kopiëren",
+      "cut": "Knippen",
+      "paste": "Plakken",
+      "delete": "Verwijderen",
+      "selectAll": "Alles selecteren",
+      "details": "Details",
+      "archive": "Archiveren",
+      "newFolder": "Nieuwe map",
+      "newFile": "Nieuw bestand"
+    },
+    "newFolder": {
+      "title": "Nieuwe map",
+      "header": "Voer mapnaam in"
+    },
+    "newFile": {
+      "title": "Nieuw bestand",
+      "header": "Voer bestandsnaam in"
+    },
+    "rename": {
+      "title": "Hernoemen",
+      "header": "Voer nieuwe naam in"
+    },
+    "archive": {
+      "title": "Archiveren",
+      "header": "Voer archiefbestandsnaam in",
+      "created": "Archief gemaakt"
+    },
+    "folder": {
+      "created": "Map gemaakt"
+    },
+    "file": {
+      "created": "Bestand gemaakt"
+    },
+    "error": {
+      "accessDenied": "Toegang geweigerd",
+      "paste": "Plakfout",
+      "delete": "Verwijderfout",
+      "archive": "Archieffout",
+      "createFolder": "Fout bij maken map",
+      "createFile": "Fout bij maken bestand",
+      "cannotOpen": "Kan bestand niet openen",
+      "rename": "Hernoemfout"
+    },
+    "details": {
+      "type": "Type",
+      "folder": "Map",
+      "file": "Bestand",
+      "size": "Grootte",
+      "path": "Pad",
+      "modified": "Gewijzigd",
+      "permissions": "Rechten",
+      "owner": "Eigenaar",
+      "group": "Groep"
+    },
+    "setOwner": {
+      "title": "Eigenaar/rechten instellen",
+      "header": "Eigenaar en rechten instellen voor {{count}} item(s)",
+      "ownerUser": "Gebruiker:",
+      "ownerGroup": "Groep:",
+      "permissions": "Rechten:",
+      "recursive": "Recursief toepassen op mappen",
+      "infoSeparate": "Leeg laten om de huidige waarde te behouden.\nEigenaar-/groepslijsten zijn niet volledig; u kunt een andere geldige naam typen.\nRechten: octaal formaat zoals 755 of 644",
+      "success": "{{count}} item(s) gewijzigd",
+      "errorCount": "Kon {{failed}} van {{total}} items niet wijzigen.",
+      "notSupported": "Eigenaar of POSIX-rechten worden niet ondersteund door dit bestandssysteem.",
+      "invalid": "Ongeldige invoer"
+    }
+  },
+  "ai": {
+    "manager": {
+      "title": "AI-beheer",
+      "tabProfiles": "Profielen",
+      "tabChats": "Opgeslagen chats",
+      "defaultProfile": "Standaardprofiel:",
+      "defaultProfileNone": "Eerste beschikbare profiel",
+      "defaultProfileHint": "Het standaardprofiel wordt ook gebruikt door terminal-AI-acties en door de terminal-AI-agent wanneer geen ander profiel is geselecteerd.",
+      "defaultProfileSaved": "Standaardprofiel opgeslagen.",
+      "defaultMarker": "Standaard",
+      "profileUnnamed": "Naamloos profiel",
+      "connectionMode": "Verbinding",
+      "connectionModeHttp": "HTTP-API",
+      "connectionModeCli": "Lokale CLI",
+      "model": "Model",
+      "modelRefresh": "Beschikbare modellen vernieuwen",
+      "cli": {
+        "provider": "CLI-provider",
+        "executable": "CLI-programma",
+        "executablePrompt": "Laat leeg om een geverifieerd providercommando te gebruiken",
+        "statusInstalled": "Gevonden: {{path}}",
+        "statusNotInstalled": "Geen geverifieerde provider-CLI gevonden in PATH. Configureer een programma en argumentsjabloon.",
+        "statusCustom": "Aangepast programma: {{path}}",
+        "statusCustomUnverified": "Aangepast programma geconfigureerd maar niet geverifieerd als uitvoerbaar: {{path}}",
+        "arguments": "CLI-argumenten",
+        "argumentsPrompt": "Eén argument per regel of een inline sjabloon tussen aanhalingstekens. Gebruik {promptFile}, {systemPromptFile}, {userPromptFile}, {model}, {reasoning}, {stdinPrompt}.",
+        "insertPreset": "Voorinstelling invoegen",
+        "presetInserted": "Argumentvoorinstelling \"{{label}}\" ingevoegd.",
+        "presetMissing": "Deze provider heeft geen geverifieerde argumentvoorinstelling.",
+        "model": "Model",
+        "modelPrompt": "Voer een providerspecifieke modelnaam in"
+      },
+      "reasoning": {
+        "label": "Redeneerinspanning",
+        "refresh": "Redeneeropties vernieuwen",
+        "refreshSuccess": "Redeneeropties vernieuwd: {{options}}",
+        "refreshNone": "Dit profiel accepteerde geen extra redeneerparameter.",
+        "refreshFailed": "Redeneervernieuwing mislukt",
+        "rediscover": "De profielconfiguratie is gewijzigd sinds de laatste detectie. Vernieuw de redeneeropties.",
+        "option": {
+          "disabled": "Uitgeschakeld",
+          "none": "Geen",
+          "minimal": "Minimaal",
+          "low": "Laag",
+          "medium": "Gemiddeld",
+          "high": "Hoog",
+          "xhigh": "Extra hoog"
+        }
+      }
+    }
   }
 }

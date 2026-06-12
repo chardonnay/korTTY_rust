@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import i18n from "./i18n";
 import { MainWindow } from "./components/MainWindow";
 import { MasterPasswordDialog } from "./components/dialogs/MasterPasswordDialog";
 import type { GlobalSettings } from "./store/settingsStore";
+import { applyAppDesign, normalizeAppDesign } from "./store/appDesignStore";
 import { resolveGuiLanguageCode } from "./utils/aiLanguage";
 
 type AuthPhase = "checking" | "setup" | "unlock" | "error" | "ready";
@@ -21,10 +23,21 @@ export default function App() {
   const syncGuiLanguage = useCallback(async () => {
     try {
       const settings = await invoke<GlobalSettings>("get_settings");
+      applyAppDesign(normalizeAppDesign(settings.appDesign));
       await i18n.changeLanguage(resolveGuiLanguageCode(settings));
     } catch {
       await i18n.changeLanguage(resolveGuiLanguageCode(null));
     }
+  }, []);
+
+  useEffect(() => {
+    // Keep the app design in sync when settings are saved in any window.
+    const unlistenPromise = listen<GlobalSettings>("kortty-settings-updated", (event) => {
+      applyAppDesign(normalizeAppDesign(event.payload?.appDesign));
+    });
+    return () => {
+      void unlistenPromise.then((unlisten) => unlisten());
+    };
   }, []);
 
   const isAuthRequiredError = useCallback((error: unknown) => {

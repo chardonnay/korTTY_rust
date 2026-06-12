@@ -39,6 +39,10 @@ export interface Tab {
   connectionProtocol?: "TcpIp" | "Mosh";
   terminalEffectPluginId?: string;
   terminalEffectAnimationSpeed?: number;
+  /** Fixed AI profile for ad-hoc (quick connect) sessions without a stored connection. */
+  aiProfileId?: string;
+  /** AI skills pinned for ad-hoc (quick connect) sessions without a stored connection. */
+  aiSkillIds?: string[];
   themeId?: string;
   fontFamily?: string;
   fontSize?: number;

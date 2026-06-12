@@ -1,0 +1,71 @@
+/*
+ * Klingon Tactical app design (port of Java styles/tactical.css).
+ * Dark red/amber/gold military console look.
+ * Terminal sessions (.xterm) and Monaco editors keep their own styling —
+ * selectors below must never target .xterm or [class*="monaco"] content.
+ */
+
+[data-app-design="klingon-tactical"] body,
+[data-app-design="klingon-tactical"] button:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="klingon-tactical"] input:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="klingon-tactical"] select:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="klingon-tactical"] textarea:not(.xterm *):not([class*="monaco"] *) {
+  font-family: "JetBrains Mono", "Menlo", "Consolas", "Courier New", monospace;
+}
+
+/* Red tactical accent bar across the top of the window (Java .accent-bar). */
+[data-app-design="klingon-tactical"] body::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  z-index: 2147483646;
+  pointer-events: none;
+  background: linear-gradient(to right, #ff3c5a, rgba(255, 210, 0, 0.35));
+  box-shadow: 0 0 12px rgba(255, 60, 90, 0.6);
+}
+
+/* Faint red ambient glow at the window edges. */
+[data-app-design="klingon-tactical"] body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 2147483645;
+  pointer-events: none;
+  background: linear-gradient(to bottom, rgba(255, 60, 90, 0.05), transparent 30%);
+}
+
+/* Hard-edged tactical controls in app chrome. */
+[data-app-design="klingon-tactical"] button:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="klingon-tactical"] input:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="klingon-tactical"] select:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="klingon-tactical"] textarea:not(.xterm *):not([class*="monaco"] *) {
+  border-radius: 0 !important;
+}
+
+/* Focused fields flash a red targeting glow. */
+[data-app-design="klingon-tactical"] input:not(.xterm *):not([class*="monaco"] *):focus,
+[data-app-design="klingon-tactical"] select:not(.xterm *):not([class*="monaco"] *):focus,
+[data-app-design="klingon-tactical"] textarea:not(.xterm *):not([class*="monaco"] *):focus {
+  box-shadow: 0 0 10px rgba(255, 60, 90, 0.35) !important;
+}
+
+/* Buttons glow red on hover and shout in uppercase like the Java design. */
+[data-app-design="klingon-tactical"] button:not(.xterm *):not([class*="monaco"] *):hover {
+  box-shadow: 0 0 10px rgba(255, 60, 90, 0.3);
+}
+
+[data-app-design="klingon-tactical"] h1:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="klingon-tactical"] h2:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="klingon-tactical"] h3:not(.xterm *):not([class*="monaco"] *) {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  text-shadow: 0 0 6px rgba(255, 60, 90, 0.35);
+}
+
+/* Square scrollbars in app chrome. */
+[data-app-design="klingon-tactical"] ::-webkit-scrollbar-thumb {
+  border-radius: 0;
+}

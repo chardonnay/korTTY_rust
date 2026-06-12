@@ -1,4 +1,5 @@
 import { useState, useRef, useEffect } from "react";
+import { useTranslation } from "react-i18next";
 
 interface MenuBarProps {
   onNewWindow: () => void;
@@ -22,10 +23,12 @@ interface MenuBarProps {
   onManageGPGKeys: () => void;
   onAiManager: () => void;
   onAiAgent?: () => void;
+  onAiAgentPlan?: () => void;
   onSnippets: () => void;
   onJobScheduler: () => void;
   onTerminalEffects: () => void;
   onTerminalRecordings: () => void;
+  onToggleRecording?: () => void;
   onSFTPManager: () => void;
   onAsciiArt: () => void;
   onCreateBackup: () => void;
@@ -35,6 +38,8 @@ interface MenuBarProps {
   onGuiThemeEditor: () => void;
   onFullscreen: () => void;
   onTerminalOnlyFullscreen: () => void;
+  hideTerminalScrollbarsInFullscreen?: boolean;
+  onToggleHideTerminalScrollbarsInFullscreen?: () => void;
   onQuit: () => void;
   onAbout: () => void;
 }
@@ -45,6 +50,8 @@ interface MenuItem {
   separator?: boolean;
   action?: () => void;
   disabled?: boolean;
+  /** Renders a check-menu-item style prefix (undefined = plain item). */
+  checked?: boolean;
 }
 
 interface MenuDef {
@@ -53,6 +60,7 @@ interface MenuDef {
 }
 
 export function MenuBar(props: MenuBarProps) {
+  const { t } = useTranslation();
   const [openMenu, setOpenMenu] = useState<string | null>(null);
   const menuRef = useRef<HTMLDivElement>(null);
 
@@ -115,16 +123,18 @@ export function MenuBar(props: MenuBarProps) {
       label: "Tools",
       items: [
         { label: "AI Manager...", shortcut: "Ctrl+Shift+Y", action: props.onAiManager },
-        { label: "AI Agent...", action: props.onAiAgent },
+        { label: "AI Agent...", shortcut: "Ctrl+Alt+A", action: props.onAiAgent },
+        { label: t("menu.aiPlanning"), shortcut: "Ctrl+Alt+P", action: props.onAiAgentPlan },
         { separator: true, label: "" },
-        { label: "JobScheduler...", action: props.onJobScheduler },
+        { label: "JobScheduler...", shortcut: "Ctrl+Shift+J", action: props.onJobScheduler },
         { separator: true, label: "" },
-        { label: "Terminal Recordings...", action: props.onTerminalRecordings },
+        { label: "Terminal Recordings...", shortcut: "Ctrl+Shift+V", action: props.onTerminalRecordings },
+        { label: t("menu.toggleRecording"), shortcut: "Ctrl+Shift+E", action: props.onToggleRecording },
         { separator: true, label: "" },
         { label: "Open SFTP Manager...", action: props.onSFTPManager },
         { label: "ASCII Art Banner...", action: props.onAsciiArt },
         { separator: true, label: "" },
-        { label: "Snippets...", action: props.onSnippets },
+        { label: "Snippets...", shortcut: "Ctrl+Shift+S", action: props.onSnippets },
       ],
     },
     {
@@ -142,6 +152,11 @@ export function MenuBar(props: MenuBarProps) {
         { separator: true, label: "" },
         { label: "Fullscreen", shortcut: "F11", action: props.onFullscreen },
         { label: "Terminal-only Fullscreen", shortcut: "F12", action: props.onTerminalOnlyFullscreen },
+        {
+          label: t("menu.hideTerminalScrollbarsFullscreen"),
+          action: props.onToggleHideTerminalScrollbarsInFullscreen,
+          checked: !!props.hideTerminalScrollbarsInFullscreen,
+        },
       ],
     },
     {
@@ -201,7 +216,12 @@ export function MenuBar(props: MenuBarProps) {
                         }
                       }}
                     >
-                      <span>{item.label}</span>
+                      <span>
+                        {item.checked !== undefined && (
+                          <span className="inline-block w-4">{item.checked ? "✓" : ""}</span>
+                        )}
+                        {item.label}
+                      </span>
                       {item.shortcut && (
                         <span className="text-kortty-text-dim ml-6 text-[10px]">{item.shortcut}</span>
                       )}

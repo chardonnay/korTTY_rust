@@ -1,6 +1,9 @@
 use crate::model::connection::{AuthMethod, ConnectionProtocol, ConnectionSettings};
 use crate::model::ssh_key::SSHKey;
 use crate::persistence::xml_repository;
+use crate::sftp::diagnostics::SftpStartupError;
+use crate::ssh::color_filter::TerminalColorFilter;
+use crate::ssh::terminal_emulation;
 use anyhow::Result;
 use base64::Engine;
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
@@ -17,6 +20,13 @@ pub struct SSHSession {
     output_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     exec_outputs: Arc<std::sync::Mutex<HashMap<ChannelId, ExecChannelOutput>>>,
     runtime_state: Arc<std::sync::Mutex<TerminalRuntimeState>>,
+    sftp_state: tokio::sync::Mutex<SftpRuntimeState>,
+}
+
+#[derive(Default)]
+struct SftpRuntimeState {
+    outcome: Option<Result<Arc<russh_sftp::client::SftpSession>, SftpStartupError>>,
+    channel_id: Option<ChannelId>,
 }
 
 #[derive(Clone)]
@@ -57,6 +67,8 @@ struct TerminalRuntimeState {
     osc7_buffer: String,
     agent_osc_buffer: String,
     startup_echo_filter: Option<StartupEchoFilter>,
+    /// Strips SGR color sequences when terminal colors are disabled for the session.
+    color_filter: Option<TerminalColorFilter>,
 }
 
 impl Default for TerminalRuntimeState {
@@ -70,6 +82,7 @@ impl Default for TerminalRuntimeState {
             osc7_buffer: String::new(),
             agent_osc_buffer: String::new(),
             startup_echo_filter: None,
+            color_filter: None,
         }
     }
 }
@@ -245,7 +258,10 @@ impl client::Handler for SSHHandler {
             let filtered = filter_startup_echo_from_output(&self.runtime_state, data);
             if !filtered.is_empty() {
                 update_current_directory_from_output(&self.runtime_state, &filtered);
-                let _ = self.output_tx.send(filtered);
+                let emitted = apply_terminal_color_filter(&self.runtime_state, filtered);
+                if !emitted.is_empty() {
+                    let _ = self.output_tx.send(emitted);
+                }
             }
         }
         Ok(())
@@ -273,7 +289,10 @@ impl client::Handler for SSHHandler {
             let filtered = filter_startup_echo_from_output(&self.runtime_state, data);
             if !filtered.is_empty() {
                 update_current_directory_from_output(&self.runtime_state, &filtered);
-                let _ = self.output_tx.send(filtered);
+                let emitted = apply_terminal_color_filter(&self.runtime_state, filtered);
+                if !emitted.is_empty() {
+                    let _ = self.output_tx.send(emitted);
+                }
             }
         }
         Ok(())
@@ -320,11 +339,14 @@ impl SSHSession {
             output_tx: None,
             exec_outputs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             runtime_state: Arc::new(std::sync::Mutex::new(TerminalRuntimeState::default())),
+            sftp_state: tokio::sync::Mutex::new(SftpRuntimeState::default()),
         }
     }
 
     pub async fn connect(&mut self, output_tx: mpsc::UnboundedSender<Vec<u8>>) -> Result<()> {
+        self.reset_sftp_state().await;
         self.output_tx = Some(output_tx.clone());
+        configure_terminal_color_filter(&self.runtime_state, self.settings.terminal_colors_enabled);
 
         match self.settings.connection_protocol {
             ConnectionProtocol::TcpIp => self.connect_ssh(output_tx).await,
@@ -392,7 +414,9 @@ impl SSHSession {
 
         let channel = handle.channel_open_session().await?;
 
-        let term = "xterm-256color";
+        let term = terminal_emulation::term_name_for_stored(
+            self.settings.terminal_emulation_type.as_deref(),
+        );
         let cols = self.settings.columns as u32;
         let rows = self.settings.rows as u32;
         let terminal_modes = terminal_modes_for_shell(startup_command.is_some());
@@ -428,6 +452,12 @@ impl SSHSession {
         })?;
 
         let mut cmd = CommandBuilder::new("mosh");
+        cmd.env(
+            "TERM",
+            terminal_emulation::term_name_for_stored(
+                self.settings.terminal_emulation_type.as_deref(),
+            ),
+        );
         match self.settings.auth_method {
             AuthMethod::Password => {
                 let password = self.settings.password.clone().unwrap_or_default();
@@ -471,7 +501,11 @@ impl SSHSession {
                     Ok(0) => break,
                     Ok(n) => {
                         update_current_directory_from_output(&runtime_state, &buf[..n]);
-                        let _ = tx.send(buf[..n].to_vec());
+                        let emitted =
+                            apply_terminal_color_filter(&runtime_state, buf[..n].to_vec());
+                        if !emitted.is_empty() {
+                            let _ = tx.send(emitted);
+                        }
                     }
                     Err(_) => break,
                 }
@@ -707,6 +741,81 @@ impl SSHSession {
             .map_err(|error| anyhow::anyhow!("command output is not valid UTF-8: {error}"))
     }
 
+    /// Opens the SFTP subsystem for this session, caching the outcome for reuse.
+    ///
+    /// russh delivers CHANNEL_DATA for every channel both to the channel's own message
+    /// queue (consumed by `into_stream()`) and to `SSHHandler::data()`, which forwards
+    /// data of unregistered channels to the terminal output. The SFTP channel is
+    /// therefore registered as an exec-output sink before the subsystem request, and a
+    /// drain task discards the duplicated packets so binary SFTP traffic neither leaks
+    /// into the terminal nor accumulates in the unbounded sink queue.
+    pub async fn open_sftp(
+        &self,
+    ) -> Result<Arc<russh_sftp::client::SftpSession>, SftpStartupError> {
+        let mut state = self.sftp_state.lock().await;
+        if let Some(outcome) = state.outcome.as_ref() {
+            return outcome.clone();
+        }
+        let outcome = match self.start_sftp_subsystem().await {
+            Ok((sftp, channel_id)) => {
+                state.channel_id = Some(channel_id);
+                Ok(sftp)
+            }
+            Err(error) => Err(error),
+        };
+        state.outcome = Some(outcome.clone());
+        outcome
+    }
+
+    async fn start_sftp_subsystem(
+        &self,
+    ) -> Result<(Arc<russh_sftp::client::SftpSession>, ChannelId), SftpStartupError> {
+        let handle = match &self.mode {
+            SessionMode::Russh { handle, .. } => handle
+                .as_ref()
+                .ok_or_else(|| SftpStartupError::start_failed("SSH session is not connected"))?,
+            SessionMode::Mosh { .. } => {
+                return Err(SftpStartupError::start_failed(
+                    "SFTP is not available for this session type",
+                ));
+            }
+        };
+
+        let channel = handle.channel_open_session().await.map_err(|error| {
+            SftpStartupError::classified(format!("channel open failure: {error}"))
+        })?;
+        let channel_id = channel.id();
+
+        // Register the sink before any subsystem traffic can arrive on the channel.
+        let (sink_tx, mut sink_rx) = mpsc::unbounded_channel();
+        self.register_exec_output(channel_id, sink_tx, None)
+            .map_err(|error| SftpStartupError::start_failed(error.to_string()))?;
+        tokio::spawn(async move { while sink_rx.recv().await.is_some() {} });
+
+        if let Err(error) = channel.request_subsystem(true, "sftp").await {
+            self.remove_exec_output(channel_id);
+            return Err(SftpStartupError::classified(format!(
+                "subsystem request failed: {error}"
+            )));
+        }
+
+        match russh_sftp::client::SftpSession::new(channel.into_stream()).await {
+            Ok(sftp) => Ok((Arc::new(sftp), channel_id)),
+            Err(error) => {
+                self.remove_exec_output(channel_id);
+                Err(SftpStartupError::classified(error.to_string()))
+            }
+        }
+    }
+
+    async fn reset_sftp_state(&self) {
+        let mut state = self.sftp_state.lock().await;
+        if let Some(channel_id) = state.channel_id.take() {
+            self.remove_exec_output(channel_id);
+        }
+        state.outcome = None;
+    }
+
     pub async fn send_data(&mut self, data: &[u8]) -> Result<()> {
         track_potential_directory_change(&self.runtime_state, data);
         match &mut self.mode {
@@ -733,6 +842,67 @@ impl SSHSession {
             .unwrap_or_else(|_| "~".into())
     }
 
+    pub fn home_remote_directory(&self) -> String {
+        self.runtime_state
+            .lock()
+            .map(|state| state.home_remote_directory.clone())
+            .unwrap_or_else(|_| "~".into())
+    }
+
+    /// Updates the tracked working directory from an external hint
+    /// (Java `SshTtyConnector.updateCurrentRemoteDirectoryHint`).
+    pub fn update_current_remote_directory_hint(&self, directory: &str) {
+        let home = self.home_remote_directory();
+        let resolved = resolve_remote_directory_hint(directory, Some(&home));
+        if let Some(resolved) = resolved {
+            if let Ok(mut state) = self.runtime_state.lock() {
+                set_current_remote_directory(&mut state, &resolved);
+            }
+        }
+    }
+
+    /// Sets the remote home directory from an explicit hint and seeds the current
+    /// and previous directories while they are still unresolved
+    /// (Java `SshTtyConnector.updateHomeRemoteDirectoryHint`).
+    pub fn update_home_remote_directory_hint(&self, directory: &str) {
+        let Some(resolved) = resolve_remote_directory_hint(directory, None) else {
+            return;
+        };
+        let Ok(mut state) = self.runtime_state.lock() else {
+            return;
+        };
+        state.home_remote_directory = resolved.clone();
+        if state.current_remote_directory.trim().is_empty() || state.current_remote_directory == "~"
+        {
+            state.current_remote_directory = resolved.clone();
+        }
+        if state.previous_remote_directory.trim().is_empty()
+            || state.previous_remote_directory == "~"
+        {
+            state.previous_remote_directory = resolved;
+        }
+    }
+
+    /// Best-known absolute current and home directories for this session.
+    /// Values are `None` until an absolute path was observed (OSC 7, terminal
+    /// agent hook, typed `cd` commands) or set via an explicit hint.
+    pub fn remote_directory_hints(&self) -> (Option<String>, Option<String>) {
+        let Ok(state) = self.runtime_state.lock() else {
+            return (None, None);
+        };
+        let absolute_only = |value: &str| {
+            if value.starts_with('/') {
+                Some(value.to_string())
+            } else {
+                None
+            }
+        };
+        (
+            absolute_only(&state.current_remote_directory),
+            absolute_only(&state.home_remote_directory),
+        )
+    }
+
     pub async fn resize(&mut self, cols: u32, rows: u32) -> Result<()> {
         match &mut self.mode {
             SessionMode::Russh { channel, .. } => {
@@ -756,6 +926,7 @@ impl SSHSession {
     }
 
     pub async fn disconnect(&mut self) -> Result<()> {
+        self.reset_sftp_state().await;
         match &mut self.mode {
             SessionMode::Russh { handle, channel } => {
                 if let Some(h) = handle.take() {
@@ -944,6 +1115,34 @@ fn register_startup_echo_filter(
     };
     if let Ok(mut state) = runtime_state.lock() {
         state.startup_echo_filter = Some(filter);
+    }
+}
+
+fn configure_terminal_color_filter(
+    runtime_state: &Arc<std::sync::Mutex<TerminalRuntimeState>>,
+    terminal_colors_enabled: bool,
+) {
+    if let Ok(mut state) = runtime_state.lock() {
+        state.color_filter = if terminal_colors_enabled {
+            None
+        } else {
+            Some(TerminalColorFilter::new())
+        };
+    }
+}
+
+/// Applies the session color filter to terminal output when colors are disabled.
+/// Without an active filter the data is passed through unchanged.
+fn apply_terminal_color_filter(
+    runtime_state: &Arc<std::sync::Mutex<TerminalRuntimeState>>,
+    data: Vec<u8>,
+) -> Vec<u8> {
+    let Ok(mut state) = runtime_state.lock() else {
+        return data;
+    };
+    match state.color_filter.as_mut() {
+        Some(filter) => filter.filter(&data),
+        None => data,
     }
 }
 
@@ -1226,6 +1425,62 @@ fn resolve_remote_path(state: &TerminalRuntimeState, path: &str) -> String {
         );
     }
     normalize_remote_path(&value)
+}
+
+/// Resolves an externally supplied directory hint to an absolute, normalized path
+/// (Java `SshTtyConnector.resolveRemoteDirectoryHint`).
+///
+/// Absolute hints are normalized directly. Tilde hints (`~`, `~/sub`) are resolved
+/// against `home_directory` when it is an absolute path; named-home hints
+/// (`~other`) and relative hints are rejected with `None`.
+pub fn resolve_remote_directory_hint(
+    directory: &str,
+    home_directory: Option<&str>,
+) -> Option<String> {
+    let trimmed = directory.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if trimmed.starts_with('/') {
+        return normalize_absolute_remote_path(trimmed);
+    }
+    if is_tilde_remote_directory_hint(trimmed) {
+        let home = home_directory?;
+        if !home.starts_with('/') {
+            return None;
+        }
+        if trimmed == "~" {
+            return normalize_absolute_remote_path(home);
+        }
+        if let Some(rest) = trimmed.strip_prefix("~/") {
+            return normalize_absolute_remote_path(&format!("{home}/{rest}"));
+        }
+    }
+    None
+}
+
+/// True when the hint references the home directory via a leading tilde
+/// (Java `SshTtyConnector.isTildeRemoteDirectoryHint`).
+pub fn is_tilde_remote_directory_hint(directory: &str) -> bool {
+    directory.trim().starts_with('~')
+}
+
+fn normalize_absolute_remote_path(path: &str) -> Option<String> {
+    if !path.starts_with('/') {
+        return None;
+    }
+    let mut parts: Vec<&str> = Vec::new();
+    for part in path.split('/') {
+        if part.is_empty() || part == "." {
+            continue;
+        }
+        if part == ".." {
+            parts.pop();
+        } else {
+            parts.push(part);
+        }
+    }
+    Some(format!("/{}", parts.join("/")))
 }
 
 fn normalize_remote_path(path: &str) -> String {
@@ -1513,6 +1768,125 @@ mod tests {
 
         let state = runtime_state.lock().expect("state should lock");
         assert_eq!(state.current_remote_directory, "/tmp");
+    }
+
+    #[test]
+    fn resolves_home_relative_directory_hint_with_absolute_home() {
+        assert_eq!(
+            resolve_remote_directory_hint("~/Dokumente", Some("/home/daniel")),
+            Some("/home/daniel/Dokumente".to_string())
+        );
+    }
+
+    #[test]
+    fn resolves_home_directory_hint_with_absolute_home() {
+        assert_eq!(
+            resolve_remote_directory_hint("~", Some("/home/daniel")),
+            Some("/home/daniel".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_home_relative_directory_hint_without_absolute_home() {
+        assert_eq!(
+            resolve_remote_directory_hint("~/Dokumente", Some("~")),
+            None
+        );
+    }
+
+    #[test]
+    fn ignores_home_relative_directory_hint_without_home() {
+        assert_eq!(resolve_remote_directory_hint("~/Dokumente", None), None);
+        assert_eq!(resolve_remote_directory_hint("~", None), None);
+    }
+
+    #[test]
+    fn ignores_named_home_directory_hint() {
+        assert_eq!(
+            resolve_remote_directory_hint("~other", Some("/home/daniel")),
+            None
+        );
+    }
+
+    #[test]
+    fn normalizes_absolute_directory_hint() {
+        assert_eq!(
+            resolve_remote_directory_hint("/home/daniel/../daniel/Dokumente", None),
+            Some("/home/daniel/Dokumente".to_string())
+        );
+    }
+
+    #[test]
+    fn ignores_blank_directory_hint() {
+        assert_eq!(
+            resolve_remote_directory_hint("", Some("/home/daniel")),
+            None
+        );
+        assert_eq!(resolve_remote_directory_hint("   ", None), None);
+    }
+
+    #[test]
+    fn detects_tilde_remote_directory_hints() {
+        assert!(is_tilde_remote_directory_hint("~"));
+        assert!(is_tilde_remote_directory_hint(" ~/Dokumente"));
+        assert!(is_tilde_remote_directory_hint("~other"));
+        assert!(!is_tilde_remote_directory_hint("/home/daniel"));
+        assert!(!is_tilde_remote_directory_hint("Dokumente"));
+    }
+
+    #[test]
+    fn home_hint_seeds_unresolved_current_and_previous_directories() {
+        let session = SSHSession::new(ConnectionSettings::default());
+
+        session.update_home_remote_directory_hint("~/invalid");
+        assert_eq!(session.home_remote_directory(), "~");
+
+        session.update_home_remote_directory_hint("/home/daniel/");
+        assert_eq!(session.home_remote_directory(), "/home/daniel");
+        assert_eq!(session.current_remote_directory(), "/home/daniel");
+    }
+
+    #[test]
+    fn home_hint_keeps_already_resolved_current_directory() {
+        let session = SSHSession::new(ConnectionSettings::default());
+        update_current_directory_from_output(
+            &session.runtime_state,
+            "\u{1b}]7;file://server/tmp/project\u{7}".as_bytes(),
+        );
+
+        session.update_home_remote_directory_hint("/home/daniel");
+
+        assert_eq!(session.current_remote_directory(), "/tmp/project");
+        assert_eq!(session.home_remote_directory(), "/home/daniel");
+    }
+
+    #[test]
+    fn remote_directory_hints_expose_only_absolute_paths() {
+        let session = SSHSession::new(ConnectionSettings::default());
+        assert_eq!(session.remote_directory_hints(), (None, None));
+
+        update_current_directory_from_output(
+            &session.runtime_state,
+            "\u{1b}]7;file://server/home/daniel\u{7}".as_bytes(),
+        );
+
+        assert_eq!(
+            session.remote_directory_hints(),
+            (
+                Some("/home/daniel".to_string()),
+                Some("/home/daniel".to_string())
+            )
+        );
+    }
+
+    #[test]
+    fn current_directory_hint_resolves_against_tracked_home() {
+        let session = SSHSession::new(ConnectionSettings::default());
+        session.update_home_remote_directory_hint("/home/daniel");
+
+        session.update_current_remote_directory_hint("~/Dokumente");
+
+        assert_eq!(session.current_remote_directory(), "/home/daniel/Dokumente");
     }
 
     fn assert_startup_has_alias_trio(startup: &str, command: &str) {

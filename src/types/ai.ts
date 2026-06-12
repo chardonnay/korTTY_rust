@@ -59,16 +59,23 @@ export type AiInternetAccessMode =
   | "SearxngMcp"
   | "LmStudioToolpack";
 export type AiModelSelectionMode = "Auto" | "Manual";
-export type AiSkillTarget = "Chat" | "Agent" | "Both";
+export type AiConnectionMode = "HttpApi" | "LocalCli";
+export type AiSkillTarget = "Chat" | "Agent" | "Both" | "Connection";
 
 export interface AiProfile {
   id: string;
   name: string;
   apiUrl: string;
+  connectionMode?: AiConnectionMode;
   model: string;
   modelSelectionMode: AiModelSelectionMode;
   apiKey: string;
+  cliProviderId?: string;
+  cliExecutablePath?: string;
+  cliArgumentsTemplate?: string;
   reasoningEffort: AiReasoningEffort;
+  discoveredReasoningEfforts?: AiReasoningEffort[];
+  reasoningDiscoveryKey?: string;
   internetAccessMode: AiInternetAccessMode;
   maxSelectionChars: number;
   tokenizerType: AiTokenizerType;
@@ -82,6 +89,25 @@ export interface AiProfile {
   usedPromptTokens: number;
   usedCompletionTokens: number;
   usedTotalTokens: number;
+}
+
+export interface AiCliModelPreset {
+  model: string;
+  reasoningEfforts: AiReasoningEffort[];
+}
+
+export interface AiCliArgumentPreset {
+  label: string;
+  template: string;
+}
+
+export interface AiCliProviderDescriptor {
+  id: string;
+  displayName: string;
+  commandCandidates: string[];
+  modelPresets: AiCliModelPreset[];
+  argumentPresets: AiCliArgumentPreset[];
+  supportsRateLimitProbe: boolean;
 }
 
 export interface AiSkill {
@@ -131,7 +157,12 @@ export interface TerminalAgentRequest {
   showRuntimeMessages: boolean;
   askConfirmationBeforeEveryCommand: boolean;
   autoApproveRootCommands: boolean;
+  confirmMutatingCommandSets?: boolean;
   queryOnly?: boolean;
+  /** Fixed AI profile of the originating connection (overrides the default profile). */
+  connectionAiProfileId?: string;
+  /** Skills assigned to the originating connection; always pinned into the prompt. */
+  connectionAiSkillIds?: string[];
 }
 
 export interface TerminalAgentPlanRequest {
@@ -139,6 +170,10 @@ export interface TerminalAgentPlanRequest {
   profileId: string;
   userPrompt: string;
   connectionDisplayName?: string;
+  /** Fixed AI profile of the originating connection (overrides the default profile). */
+  connectionAiProfileId?: string;
+  /** Skills assigned to the originating connection; always pinned into the prompt. */
+  connectionAiSkillIds?: string[];
 }
 
 export interface TerminalAgentPlanStartResponse {
@@ -310,6 +345,11 @@ export interface AiRequestPayload {
   responseLanguageCode?: string;
   userPrompt?: string;
   conversationContext?: string;
+  includeAiSkills?: boolean;
+  /** Fixed AI profile of the originating connection (overrides the default profile). */
+  connectionAiProfileId?: string;
+  /** Skills assigned to the originating connection; always pinned into the prompt. */
+  connectionAiSkillIds?: string[];
 }
 
 export interface SavedAiChatMessage {
@@ -338,10 +378,12 @@ export function createEmptyAiProfile(): AiProfile {
     id: crypto.randomUUID(),
     name: "",
     apiUrl: "",
+    connectionMode: "HttpApi",
     model: "",
     modelSelectionMode: "Manual",
     apiKey: "",
     reasoningEffort: "Disabled",
+    discoveredReasoningEfforts: [],
     internetAccessMode: "Disabled",
     maxSelectionChars: 1_000_000,
     tokenizerType: "Estimate",

@@ -15,6 +15,10 @@ interface AiAgentDialogProps {
   initialExecutionTarget?: TerminalAgentExecutionTarget;
   initialAskConfirmationBeforeEveryCommand?: boolean;
   initialAutoApproveRootCommands?: boolean;
+  /** Fixed AI profile of the session's connection; injected into the request (WP4.6). */
+  connectionAiProfileId?: string;
+  /** Skills assigned to the session's connection; injected into the request (WP4.6). */
+  connectionAiSkillIds?: string[];
   onClose: () => void;
   onManageProfiles: () => void;
   onRun: (request: TerminalAgentRequest) => Promise<void>;
@@ -29,6 +33,8 @@ export function AiAgentDialog({
   initialExecutionTarget,
   initialAskConfirmationBeforeEveryCommand = false,
   initialAutoApproveRootCommands = false,
+  connectionAiProfileId,
+  connectionAiSkillIds,
   onClose,
   onManageProfiles,
   onRun,
@@ -146,6 +152,14 @@ export function AiAgentDialog({
         autoApproveRootCommands: initialAskConfirmationBeforeEveryCommand
           ? false
           : initialAutoApproveRootCommands,
+        confirmMutatingCommandSets:
+          loadedSettings?.terminalAgentConfirmMutatingCommandSets ?? undefined,
+        // Only force the connection profile when the user kept the preselection.
+        connectionAiProfileId:
+          connectionAiProfileId && profileId === connectionAiProfileId
+            ? connectionAiProfileId
+            : undefined,
+        connectionAiSkillIds,
       });
     } catch (error) {
       setStatus(`Start failed: ${String(error)}`);

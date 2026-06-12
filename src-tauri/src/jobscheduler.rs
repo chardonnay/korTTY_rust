@@ -1,5 +1,5 @@
 use crate::ai;
-use crate::model::ai::{AiProfile, AiRequestPayload};
+use crate::model::ai::AiProfile;
 use crate::model::connection::{ConnectionProtocol, ConnectionSettings};
 use crate::model::jobscheduler::{
     ActiveJobSummary, JobAction, JobActionType, JobArchiveFormat, JobRunStatus, JobSchedule,
@@ -13,6 +13,7 @@ use crate::security::vault::Vault;
 use crate::snippet_tools::{build_embedded_one_liner, SnippetOneLinerRequest};
 use crate::ssh::session::SSHSession;
 use crate::teamwork::sync::SyncService;
+use crate::terminal_agent;
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
 use chrono::{DateTime, Datelike, Days, Local, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
@@ -32,6 +33,17 @@ const SNIPPETS_FILE: &str = "snippets.json";
 const SEARCH_DAYS: i64 = 370;
 const COMMAND_TIMEOUT_SECS: u64 = 6 * 60 * 60;
 const JOB_STATUS_EVENT: &str = "job-scheduler-status";
+/// Safety limit for unattended AI agent decision turns; matches the Java
+/// `TerminalAgentService.MAX_AGENT_TURNS` value.
+const JOB_AI_AGENT_MAX_TURNS: usize = 8;
+const JOB_AI_AGENT_OUTPUT_TAIL_CHARS: usize = 4_000;
+/// System prompt for unattended AI agent jobs; 1:1 port of the Java
+/// `JobSchedulerAiSupport` prompt.
+const JOB_AI_AGENT_SYSTEM_PROMPT: &str = "You are KorTTY JobScheduler's unattended SSH agent.\n\
+Return JSON only with this shape:\n\
+{\"status\":\"done|run_commands|blocked\",\"summary\":\"short\",\"commands\":[{\"command\":\"non-interactive shell command\",\"purpose\":\"why\",\"risk\":\"LOW|REQUIRES_CONFIRMATION|ROOT\"}]}\n\
+Use only non-interactive commands. Do not ask questions. Do not invent server facts.\n\
+Use sudo only when clearly needed. Prefer read-only inspection unless the job prompt requests changes.\n";
 
 #[derive(Clone)]
 pub struct JobSchedulerManager {
@@ -193,6 +205,7 @@ impl JobSchedulerManager {
         let mut inner = self.lock()?;
         let key = PinnedHostKey {
             id: uuid::Uuid::new_v4().to_string(),
+            connection_id: None,
             host: probe.host,
             port: probe.port,
             algorithm: probe.algorithm,
@@ -274,10 +287,21 @@ impl JobSchedulerManager {
             .as_ref()
             .map(|vault| vault.is_unlocked().unwrap_or(false))
             .unwrap_or(false);
+        let sudo_passwords = match vault.as_ref() {
+            Some(vault) if vault_unlocked => self.decrypt_job_sudo_passwords(&job, vault)?,
+            _ => HashMap::new(),
+        };
         let spawned_run_id = run_id.clone();
         tokio::spawn(async move {
             let result = manager
-                .execute_job_run(&app, spawned_run_id.clone(), job, cancel_rx, vault_unlocked)
+                .execute_job_run(
+                    &app,
+                    spawned_run_id.clone(),
+                    job,
+                    cancel_rx,
+                    vault_unlocked,
+                    sudo_passwords,
+                )
                 .await;
             if let Err(error) = result {
                 tracing::warn!(error = %error, "Job scheduler run failed");
@@ -303,6 +327,45 @@ impl JobSchedulerManager {
             let _ = run.cancel_tx.send(true);
         }
         Ok(inner.active_runs.len())
+    }
+
+    /// Decrypts the stored sudo passwords for a job, keyed by target
+    /// connection id (`None` is the job-wide fallback credential).
+    fn decrypt_job_sudo_passwords(
+        &self,
+        job: &ScheduledJob,
+        vault: &Vault,
+    ) -> Result<HashMap<Option<String>, String>> {
+        if !job.action.use_sudo || job.action.action_type == JobActionType::RsyncSync {
+            return Ok(HashMap::new());
+        }
+        let credentials = {
+            let inner = self.lock()?;
+            inner
+                .state
+                .sudo_credentials
+                .iter()
+                .filter(|credential| credential.job_id == job.id)
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        let mut passwords = HashMap::new();
+        for credential in credentials {
+            match vault.decrypt_value(&credential.encrypted_password) {
+                Ok(password) if !password.trim().is_empty() => {
+                    passwords.insert(credential.target_connection_id.clone(), password);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        error = %error,
+                        job_id = %job.id,
+                        "Failed to decrypt a stored sudo password for the job"
+                    );
+                }
+            }
+        }
+        Ok(passwords)
     }
 
     fn register_active_run(
@@ -337,6 +400,7 @@ impl JobSchedulerManager {
         job: ScheduledJob,
         cancel_rx: watch::Receiver<bool>,
         vault_unlocked: bool,
+        sudo_passwords: HashMap<Option<String>, String>,
     ) -> Result<()> {
         let targets = resolve_job_targets(&job)?;
         if targets.is_empty() {
@@ -376,6 +440,7 @@ impl JobSchedulerManager {
                     target_count,
                     cancel_rx.clone(),
                     vault_unlocked,
+                    &sudo_passwords,
                 )
                 .await;
             let (status, summary, detail) = match outcome {
@@ -422,6 +487,7 @@ impl JobSchedulerManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn execute_job_for_connection(
         &self,
         job: &ScheduledJob,
@@ -429,6 +495,7 @@ impl JobSchedulerManager {
         target_count: usize,
         cancel_rx: watch::Receiver<bool>,
         vault_unlocked: bool,
+        sudo_passwords: &HashMap<Option<String>, String>,
     ) -> Result<String, JobRunError> {
         if matches!(connection.connection_protocol, ConnectionProtocol::Mosh) {
             return Err(JobRunError::Blocked(
@@ -452,13 +519,26 @@ impl JobSchedulerManager {
             ));
         }
 
+        let sudo_password = sudo_passwords
+            .get(&Some(connection.id.clone()))
+            .or_else(|| sudo_passwords.get(&None))
+            .map(String::as_str);
+
         let (tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let mut session = SSHSession::new(connection.clone());
         session
             .connect(tx)
             .await
             .map_err(|error| JobRunError::Failed(format!("SSH connect failed: {error}")))?;
-        let detail = execute_action(job, connection, target_count, &session, cancel_rx).await;
+        let detail = execute_action(
+            job,
+            connection,
+            target_count,
+            &session,
+            sudo_password,
+            cancel_rx,
+        )
+        .await;
         let _ = session.disconnect().await;
         detail
     }
@@ -565,18 +645,21 @@ async fn execute_action(
     connection: &ConnectionSettings,
     target_count: usize,
     session: &SSHSession,
+    sudo_password: Option<&str>,
     cancel_rx: watch::Receiver<bool>,
 ) -> Result<String, JobRunError> {
     match job.action.action_type {
         JobActionType::Command => {
             let command = require_non_blank(job.action.command.as_deref(), "Command is required")?;
-            run_remote_command(job, session, command, cancel_rx).await
+            run_remote_command(job, session, command, sudo_password, cancel_rx).await
         }
         JobActionType::SnippetScript => {
             let command = build_snippet_script_command(job)?;
-            run_remote_command(job, session, &command, cancel_rx).await
+            run_remote_command(job, session, &command, sudo_password, cancel_rx).await
         }
-        JobActionType::AiAgent => run_ai_agent_job(job).await,
+        JobActionType::AiAgent => {
+            run_ai_agent_job(job, connection, session, sudo_password, cancel_rx).await
+        }
         JobActionType::SftpUpload => {
             upload_file(
                 session,
@@ -605,6 +688,7 @@ async fn execute_action(
                         "Remote path is required"
                     )?)
                 ),
+                sudo_password,
                 cancel_rx,
             )
             .await
@@ -633,6 +717,7 @@ async fn execute_action(
                 job,
                 session,
                 &format!("mv {} {}", shell_quote(source), shell_quote(&destination)),
+                sudo_password,
                 cancel_rx,
             )
             .await
@@ -648,6 +733,7 @@ async fn execute_action(
                         "Remote path is required"
                     )?)
                 ),
+                sudo_password,
                 cancel_rx,
             )
             .await
@@ -667,6 +753,7 @@ async fn execute_action(
                         "Remote path is required"
                     )?)
                 ),
+                sudo_password,
                 cancel_rx,
             )
             .await
@@ -694,6 +781,7 @@ async fn execute_action(
                         "Remote path is required"
                     )?)
                 ),
+                sudo_password,
                 cancel_rx,
             )
             .await
@@ -713,13 +801,14 @@ async fn execute_action(
                         "Destination path is required"
                     )?)
                 ),
+                sudo_password,
                 cancel_rx,
             )
             .await
         }
         JobActionType::SftpArchive => {
             let command = build_archive_command(&job.action)?;
-            run_remote_command(job, session, &command, cancel_rx).await
+            run_remote_command(job, session, &command, sudo_password, cancel_rx).await
         }
         JobActionType::RsyncSync => run_rsync_sync(job, connection, target_count).await,
     }
@@ -729,6 +818,7 @@ async fn run_remote_command(
     job: &ScheduledJob,
     session: &SSHSession,
     command: &str,
+    sudo_password: Option<&str>,
     cancel_rx: watch::Receiver<bool>,
 ) -> Result<String, JobRunError> {
     let mut command = command.trim().to_string();
@@ -740,10 +830,22 @@ async fn run_remote_command(
     {
         command = format!("cd {} && {command}", shell_quote(working_directory));
     }
-    let command = if job.action.use_sudo {
-        format!("sudo -n sh -lc {}", shell_quote(&command))
+    // Port of Java `JobSchedulerArchiveCommandBuilder.sudoWrap`: when a stored
+    // sudo password is available wrap with `sudo -S -p ''` and feed the password
+    // on stdin; otherwise fall back to non-interactive `sudo -n`.
+    let sudo_password = sudo_password
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let (command, stdin) = if job.action.use_sudo {
+        match sudo_password {
+            Some(password) => (
+                format!("sudo -S -p '' sh -lc {}", shell_quote(&command)),
+                Some(format!("{password}\n").into_bytes()),
+            ),
+            None => (format!("sudo -n sh -lc {}", shell_quote(&command)), None),
+        }
     } else {
-        command
+        (command, None)
     };
     let (tx, mut rx) = mpsc::unbounded_channel();
     let command_display = command.clone();
@@ -753,7 +855,7 @@ async fn run_remote_command(
             tx,
             cancel_rx,
             Duration::from_secs(COMMAND_TIMEOUT_SECS),
-            None,
+            stdin,
             false,
         )
         .await
@@ -859,32 +961,314 @@ async fn run_sftp_sync(session: &SSHSession, action: &JobAction) -> Result<Strin
     }
 }
 
-async fn run_ai_agent_job(job: &ScheduledJob) -> Result<String, JobRunError> {
-    let profile_id = require_non_blank(
-        job.action.ai_profile_id.as_deref(),
-        "AI profile id is required",
-    )?;
-    let prompt = require_non_blank(job.action.ai_prompt.as_deref(), "AI prompt is required")?;
+#[derive(Debug, Clone, Deserialize)]
+struct JobAgentDecision {
+    status: Option<String>,
+    summary: Option<String>,
+    #[serde(default)]
+    commands: Vec<JobAgentCommand>,
+}
+
+impl JobAgentDecision {
+    fn blocked(summary: &str) -> Self {
+        Self {
+            status: Some("blocked".into()),
+            summary: Some(summary.to_string()),
+            commands: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct JobAgentCommand {
+    command: Option<String>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    purpose: Option<String>,
+    risk: Option<String>,
+}
+
+/// Parses an unattended AI agent decision leniently: invalid JSON or shapes
+/// degrade to a blocked decision instead of failing the run with a raw error.
+fn parse_job_agent_decision(content: &str) -> JobAgentDecision {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(content.trim()) else {
+        return JobAgentDecision::blocked("AI agent returned invalid JSON.");
+    };
+    let normalized = terminal_agent::normalize_agent_decision_value(value);
+    match serde_json::from_value::<JobAgentDecision>(normalized) {
+        Ok(decision) => decision,
+        Err(_) => JobAgentDecision::blocked("AI agent returned no decision."),
+    }
+}
+
+fn normalize_risk(risk: Option<&str>) -> String {
+    risk.map(|value| value.trim().to_lowercase().replace(['-', ' '], "_"))
+        .unwrap_or_default()
+}
+
+/// Only server-changing commands require the job-level auto-approval flag:
+/// risky by declared risk level, or risky by command shape. Port of Java
+/// `JobSchedulerAiSupport.requiresAutoApprovalForServerChange`.
+fn requires_auto_approval_for_server_change(risk: Option<&str>, normalized_command: &str) -> bool {
+    let risk = normalize_risk(risk);
+    risk == "requires_confirmation"
+        || risk == "root"
+        || terminal_agent::requires_confirmation_by_command_shape(normalized_command)
+}
+
+fn redact_job_agent_secret(text: &str, sudo_password: Option<&str>) -> String {
+    match sudo_password
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(password) => text.replace(password, "[redacted]"),
+        None => text.to_string(),
+    }
+}
+
+fn tail_chars(text: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    if chars.len() <= max_chars {
+        return text.to_string();
+    }
+    chars[chars.len() - max_chars..].iter().collect()
+}
+
+fn find_job_ai_profile(profile_id: Option<&str>) -> Result<AiProfile, JobRunError> {
     let profiles: Vec<AiProfile> = xml_repository::load_json(AI_PROFILES_FILE)
         .map_err(|error| JobRunError::Failed(error.to_string()))?
         .unwrap_or_default();
-    let profile = profiles
+    let settings: GlobalSettings = xml_repository::load_json(GLOBAL_SETTINGS_FILE)
+        .map_err(|error| JobRunError::Failed(error.to_string()))?
+        .unwrap_or_default();
+    let effective_id = profile_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            settings
+                .default_ai_profile_id
+                .clone()
+                .filter(|id| !id.trim().is_empty())
+        });
+    if let Some(id) = effective_id {
+        if let Some(profile) = profiles.iter().find(|profile| profile.id == id) {
+            return Ok(profile.clone());
+        }
+    }
+    profiles
         .into_iter()
-        .find(|profile| profile.id == profile_id)
-        .ok_or_else(|| JobRunError::Blocked("AI profile not found.".into()))?;
-    let payload = AiRequestPayload {
-        action: crate::model::ai::AiAction::Ask,
-        profile_id: profile.id.clone(),
-        selected_text: String::new(),
-        connection_display_name: job.connection_display_name.clone(),
-        response_language_code: None,
-        user_prompt: Some(prompt.to_string()),
-        conversation_context: None,
-    };
-    let result = ai::execute_request(&profile, &payload)
+        .next()
+        .ok_or_else(|| JobRunError::Blocked("AI profile is not available.".into()))
+}
+
+async fn run_job_agent_command(
+    session: &SSHSession,
+    command: &str,
+    stdin: Option<Vec<u8>>,
+    cancel_rx: watch::Receiver<bool>,
+) -> Result<crate::ssh::session::TerminalExecResult, JobRunError> {
+    let shell_command = format!("sh -lc {}", shell_quote(command));
+    let (tx, mut rx) = mpsc::unbounded_channel();
+    let exec = session
+        .exec_command_streaming(
+            &shell_command,
+            tx,
+            cancel_rx,
+            Duration::from_secs(COMMAND_TIMEOUT_SECS),
+            stdin,
+            false,
+        )
+        .await
+        .map_err(|error| {
+            if error.to_string().contains("cancelled") {
+                JobRunError::Cancelled
+            } else {
+                JobRunError::Failed(format!("AI agent command failed: {error}"))
+            }
+        })?;
+    while rx.try_recv().is_ok() {}
+    if exec.cancelled {
+        return Err(JobRunError::Cancelled);
+    }
+    if exec.timed_out {
+        return Err(JobRunError::Failed("AI agent command timed out.".into()));
+    }
+    Ok(exec)
+}
+
+/// Unattended AI agent job: decision loop over the job's SSH session. Port of
+/// Java `JobSchedulerAiSupport.runAiAgent` with a bounded multi-turn loop that
+/// feeds command outputs back into the next AI decision.
+async fn run_ai_agent_job(
+    job: &ScheduledJob,
+    connection: &ConnectionSettings,
+    session: &SSHSession,
+    sudo_password: Option<&str>,
+    cancel_rx: watch::Receiver<bool>,
+) -> Result<String, JobRunError> {
+    let prompt = require_non_blank(job.action.ai_prompt.as_deref(), "AI prompt is required")?;
+    let profile = find_job_ai_profile(job.action.ai_profile_id.as_deref())?;
+    let working_directory = job
+        .working_directory
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("~");
+    let base_user_prompt = format!(
+        "Server: {}\nWorking directory: {}\nJob prompt:\n{}",
+        connection_display_name(connection),
+        working_directory,
+        prompt
+    );
+
+    let mut detail = String::new();
+    let mut executed_results: Vec<serde_json::Value> = Vec::new();
+
+    for _turn in 1..=JOB_AI_AGENT_MAX_TURNS {
+        if *cancel_rx.borrow() {
+            return Err(JobRunError::Cancelled);
+        }
+
+        let user_prompt = if executed_results.is_empty() {
+            base_user_prompt.clone()
+        } else {
+            format!(
+                "{base_user_prompt}\n\nPrevious command results:\n```json\n{}\n```\nDecide the next step from these results only. Return status \"done\" with a short summary when the job is complete.",
+                serde_json::to_string_pretty(&executed_results).unwrap_or_else(|_| "[]".into())
+            )
+        };
+        let mut ai_cancel_rx = cancel_rx.clone();
+        let response = ai::execute_custom_json_prompt(
+            &profile,
+            JOB_AI_AGENT_SYSTEM_PROMPT,
+            &user_prompt,
+            0.1,
+            Some(&mut ai_cancel_rx),
+        )
         .await
         .map_err(|error| JobRunError::Failed(format!("AI agent job failed: {error}")))?;
-    Ok(result.content)
+
+        let decision = parse_job_agent_decision(&response.content);
+        detail.push_str(response.content.trim());
+        detail.push_str("\n\n");
+
+        let status = decision.status.as_deref().unwrap_or("blocked");
+        if status.eq_ignore_ascii_case("blocked") {
+            return Err(JobRunError::Blocked(redact_job_agent_secret(
+                decision
+                    .summary
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .unwrap_or("AI agent blocked the job."),
+                sudo_password,
+            )));
+        }
+        if !status.eq_ignore_ascii_case("run_commands") {
+            let summary = decision
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("AI agent completed without commands.");
+            detail.push_str(&format!("Summary: {summary}\n"));
+            return Ok(redact_job_agent_secret(&detail, sudo_password));
+        }
+
+        let mut executed_in_turn = 0usize;
+        for command in &decision.commands {
+            if *cancel_rx.borrow() {
+                return Err(JobRunError::Cancelled);
+            }
+            let Some(raw_command) = command
+                .command
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            if terminal_agent::is_interactive_command(raw_command) {
+                return Err(JobRunError::Blocked(format!(
+                    "AI agent planned an interactive command: {raw_command}"
+                )));
+            }
+            let mut normalized_command =
+                terminal_agent::normalize_sudo_for_agent_execution(raw_command)
+                    .map_err(JobRunError::Failed)?;
+            if !job.action.ai_auto_approve_commands
+                && requires_auto_approval_for_server_change(
+                    command.risk.as_deref(),
+                    &normalized_command,
+                )
+            {
+                return Err(JobRunError::Blocked(format!(
+                    "AI agent planned a server-changing command without job auto-approval: {normalized_command}"
+                )));
+            }
+            let mut stdin: Option<Vec<u8>> = None;
+            if let Some(password) = sudo_password
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                normalized_command =
+                    terminal_agent::rewrite_sudo_for_stored_password(&normalized_command);
+                stdin = Some(format!("{password}\n").into_bytes());
+            }
+
+            let exec =
+                run_job_agent_command(session, &normalized_command, stdin, cancel_rx.clone())
+                    .await?;
+            executed_in_turn += 1;
+            let exit_status = exec.exit_status;
+            let stdout_tail = tail_chars(&exec.stdout, JOB_AI_AGENT_OUTPUT_TAIL_CHARS);
+            let stderr_tail = tail_chars(&exec.stderr, JOB_AI_AGENT_OUTPUT_TAIL_CHARS);
+            detail.push_str(&format!(
+                "$ {}\nexit={}\nStdout:\n{}\nStderr:\n{}\n\n",
+                normalized_command,
+                exit_status
+                    .map(|status| status.to_string())
+                    .unwrap_or_else(|| "unknown".into()),
+                stdout_tail,
+                stderr_tail
+            ));
+            executed_results.push(serde_json::json!({
+                "command": normalized_command,
+                "exitStatus": exit_status,
+                "stdoutTail": stdout_tail,
+                "stderrTail": stderr_tail,
+            }));
+            if exit_status.unwrap_or(0) != 0 {
+                return Err(JobRunError::Failed(redact_job_agent_secret(
+                    &format!(
+                        "AI agent command failed with exit status {}: {}",
+                        exit_status
+                            .map(|status| status.to_string())
+                            .unwrap_or_else(|| "unknown".into()),
+                        normalized_command
+                    ),
+                    sudo_password,
+                )));
+            }
+        }
+
+        if executed_in_turn == 0 {
+            let summary = decision
+                .summary
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .unwrap_or("AI agent commands completed.");
+            detail.push_str(&format!("Summary: {summary}\n"));
+            return Ok(redact_job_agent_secret(&detail, sudo_password));
+        }
+    }
+
+    Err(JobRunError::Failed(format!(
+        "AI agent reached the safety limit of {JOB_AI_AGENT_MAX_TURNS} AI turns."
+    )))
 }
 
 fn build_snippet_script_command(job: &ScheduledJob) -> Result<String, JobRunError> {
@@ -1447,15 +1831,114 @@ fn non_blank<'a>(value: &'a str, fallback: &'a str) -> &'a str {
     }
 }
 
+fn state_file_path() -> Result<PathBuf> {
+    Ok(xml_repository::config_dir()?.join(JOB_SCHEDULER_FILE))
+}
+
 fn load_state() -> Result<JobSchedulerStateFile> {
-    let mut state: JobSchedulerStateFile =
-        xml_repository::load_xml(JOB_SCHEDULER_FILE)?.unwrap_or_default();
+    load_state_from(&state_file_path()?)
+}
+
+fn load_state_from(path: &Path) -> Result<JobSchedulerStateFile> {
+    let loaded = read_state_file(path)?;
+    let state_existed = loaded.is_some();
+    let mut state = loaded.unwrap_or_default();
+    if migrate_ai_agent_auto_approve_default(&mut state) && state_existed {
+        if let Err(error) = save_state_to(path, &state) {
+            tracing::warn!(
+                error = %error,
+                "Failed to persist the AI agent auto-approve default migration"
+            );
+        }
+    }
     recompute_next_runs(&mut state.jobs);
     Ok(state)
 }
 
+/// Reads and parses the state file. The file is shared with the Java app and
+/// parsed via `jobscheduler_xml` (Java JAXB format with a fallback for the
+/// legacy quick-xml Rust format). An unparseable file is moved to a
+/// `job-scheduler.xml.broken-<timestamp>` backup instead of being silently
+/// replaced (a later `save_state` would otherwise overwrite the only copy).
+fn read_state_file(path: &Path) -> Result<Option<JobSchedulerStateFile>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content =
+        fs::read_to_string(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    match crate::jobscheduler_xml::parse_state(&content) {
+        Ok(state) => Ok(Some(state)),
+        Err(error) => {
+            match backup_broken_state_file(path) {
+                Some(backup) => tracing::error!(
+                    error = %error,
+                    backup = %backup.display(),
+                    "The job scheduler state file could not be parsed; it was moved to a backup and KorTTY starts with an empty job scheduler state"
+                ),
+                None => tracing::error!(
+                    error = %error,
+                    path = %path.display(),
+                    "The job scheduler state file could not be parsed and could not be backed up; KorTTY starts with an empty job scheduler state"
+                ),
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn backup_broken_state_file(path: &Path) -> Option<PathBuf> {
+    let file_name = path
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| JOB_SCHEDULER_FILE.to_string());
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let mut backup = path.with_file_name(format!("{file_name}.broken-{timestamp}"));
+    if backup.exists() {
+        backup = path.with_file_name(format!(
+            "{file_name}.broken-{timestamp}-{}",
+            uuid::Uuid::new_v4()
+        ));
+    }
+    match fs::rename(path, &backup) {
+        Ok(()) => Some(backup),
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                path = %path.display(),
+                "Failed to back up the broken job scheduler state file"
+            );
+            None
+        }
+    }
+}
+
+/// One-time migration: AI agent jobs created before the risk-based approval
+/// gate keep their previous blanket behaviour by defaulting to auto-approved
+/// commands. Port of Java
+/// `JobSchedulerRepository.migrateAiAgentAutoApproveDefault`.
+fn migrate_ai_agent_auto_approve_default(state: &mut JobSchedulerStateFile) -> bool {
+    if state.ai_agent_auto_approve_default_migrated {
+        return false;
+    }
+    for job in &mut state.jobs {
+        if job.action.action_type == JobActionType::AiAgent {
+            job.action.ai_auto_approve_commands = true;
+        }
+    }
+    state.ai_agent_auto_approve_default_migrated = true;
+    true
+}
+
 fn save_state(state: &JobSchedulerStateFile) -> Result<()> {
-    xml_repository::save_xml(JOB_SCHEDULER_FILE, state)
+    save_state_to(&state_file_path()?, state)
+}
+
+/// Persists the state in the Java-compatible JAXB layout so the Java app can
+/// keep using the same `~/.kortty/job-scheduler.xml`.
+fn save_state_to(path: &Path, state: &JobSchedulerStateFile) -> Result<()> {
+    let xml = crate::jobscheduler_xml::serialize_state(state)?;
+    fs::write(path, xml).with_context(|| format!("Failed to write {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1508,6 +1991,138 @@ mod tests {
     }
 
     #[test]
+    fn auto_approval_is_only_required_for_server_changing_commands() {
+        assert!(!requires_auto_approval_for_server_change(
+            Some("LOW"),
+            "find /var/log -type f | head"
+        ));
+        assert!(requires_auto_approval_for_server_change(
+            Some("LOW"),
+            "touch /tmp/kortty-test"
+        ));
+        assert!(requires_auto_approval_for_server_change(
+            Some("REQUIRES_CONFIRMATION"),
+            "dnf install -y tmux"
+        ));
+    }
+
+    #[test]
+    fn risk_normalization_handles_aliases_and_missing_values() {
+        assert_eq!(normalize_risk(Some("LOW")), "low");
+        assert_eq!(
+            normalize_risk(Some(" REQUIRES CONFIRMATION ")),
+            "requires_confirmation"
+        );
+        assert_eq!(normalize_risk(Some("Root")), "root");
+        assert_eq!(
+            normalize_risk(Some("requires-confirmation")),
+            "requires_confirmation"
+        );
+        assert_eq!(normalize_risk(None), "");
+    }
+
+    #[test]
+    fn root_risk_requires_auto_approval() {
+        assert!(requires_auto_approval_for_server_change(Some("ROOT"), "id"));
+        assert!(requires_auto_approval_for_server_change(
+            Some("requires confirmation"),
+            "id"
+        ));
+        assert!(!requires_auto_approval_for_server_change(Some("LOW"), "id"));
+        // Missing risk falls back to the command-shape check only.
+        assert!(!requires_auto_approval_for_server_change(
+            None,
+            "cat /etc/os-release"
+        ));
+        assert!(requires_auto_approval_for_server_change(
+            None,
+            "echo data > /tmp/file"
+        ));
+    }
+
+    #[test]
+    fn migrates_ai_agent_auto_approve_default_once() {
+        let mut state = JobSchedulerStateFile {
+            jobs: vec![
+                ScheduledJob {
+                    action: JobAction {
+                        action_type: JobActionType::AiAgent,
+                        ai_auto_approve_commands: false,
+                        ..JobAction::default()
+                    },
+                    ..ScheduledJob::default()
+                },
+                ScheduledJob {
+                    action: JobAction {
+                        action_type: JobActionType::Command,
+                        ai_auto_approve_commands: false,
+                        ..JobAction::default()
+                    },
+                    ..ScheduledJob::default()
+                },
+            ],
+            ..JobSchedulerStateFile::default()
+        };
+
+        assert!(migrate_ai_agent_auto_approve_default(&mut state));
+        assert!(state.ai_agent_auto_approve_default_migrated);
+        assert!(state.jobs[0].action.ai_auto_approve_commands);
+        assert!(!state.jobs[1].action.ai_auto_approve_commands);
+
+        // Jobs added after the migration keep their explicit setting.
+        state.jobs.push(ScheduledJob {
+            action: JobAction {
+                action_type: JobActionType::AiAgent,
+                ai_auto_approve_commands: false,
+                ..JobAction::default()
+            },
+            ..ScheduledJob::default()
+        });
+        assert!(!migrate_ai_agent_auto_approve_default(&mut state));
+        assert!(!state.jobs[2].action.ai_auto_approve_commands);
+    }
+
+    #[test]
+    fn parses_job_agent_decision_with_normalization() {
+        let decision = parse_job_agent_decision(
+            r#"{
+                "status": "RUN",
+                "summary": "Inspect the host",
+                "command": "uname -a",
+                "purpose": "Identify the kernel",
+                "risk": "LOW"
+            }"#,
+        );
+
+        assert_eq!(decision.status.as_deref(), Some("run_commands"));
+        assert_eq!(decision.commands.len(), 1);
+        assert_eq!(decision.commands[0].command.as_deref(), Some("uname -a"));
+    }
+
+    #[test]
+    fn invalid_job_agent_decision_json_degrades_to_blocked() {
+        let decision = parse_job_agent_decision("not json at all");
+
+        assert_eq!(decision.status.as_deref(), Some("blocked"));
+        assert_eq!(
+            decision.summary.as_deref(),
+            Some("AI agent returned invalid JSON.")
+        );
+        assert!(decision.commands.is_empty());
+    }
+
+    #[test]
+    fn redacts_job_agent_sudo_password_from_detail() {
+        let detail = "stdout shows s3cret here";
+        assert_eq!(
+            redact_job_agent_secret(detail, Some("s3cret")),
+            "stdout shows [redacted] here"
+        );
+        assert_eq!(redact_job_agent_secret(detail, None), detail);
+        assert_eq!(redact_job_agent_secret(detail, Some("  ")), detail);
+    }
+
+    #[test]
     fn archive_command_quotes_paths_and_excludes() {
         let action = JobAction {
             action_type: JobActionType::SftpArchive,
@@ -1524,5 +2139,101 @@ mod tests {
         assert!(command.contains("zip -r -7 '/tmp/a b.zip'"));
         assert!(command.contains("-x '*.gz'"));
         assert!(command.contains("'/var/log'"));
+    }
+
+    fn temp_state_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("kortty-jobscheduler-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    #[test]
+    fn loads_empty_java_state_file_without_error() {
+        let dir = temp_state_dir();
+        let path = dir.join(JOB_SCHEDULER_FILE);
+        // Exact content the Java app writes for an empty scheduler state.
+        fs::write(
+            &path,
+            "<?xml version=\"1.0\" encoding=\"UTF-8\" standalone=\"yes\"?>\n<jobScheduler>\n    <jobs/>\n    <sudoCredentials/>\n    <pinnedHostKeys/>\n    <journal/>\n</jobScheduler>\n",
+        )
+        .unwrap();
+
+        let state = load_state_from(&path).expect("Java file must load");
+
+        assert!(state.jobs.is_empty());
+        assert!(state.journal_entries.is_empty());
+        // The one-time migration ran against the existing file and was
+        // persisted back in the Java-compatible layout.
+        assert!(state.ai_agent_auto_approve_default_migrated);
+        let rewritten = fs::read_to_string(&path).unwrap();
+        assert!(rewritten.contains("standalone=\"yes\""));
+        assert!(rewritten.contains(
+            "<aiAgentAutoApproveDefaultMigrated>true</aiAgentAutoApproveDefaultMigrated>"
+        ));
+        assert!(rewritten.contains("<journal/>"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unreadable_state_file_is_backed_up_and_replaced_with_default() {
+        let dir = temp_state_dir();
+        let path = dir.join(JOB_SCHEDULER_FILE);
+        let broken_content = "<jobScheduler><jobs><job><id>x</id></job>";
+        fs::write(&path, broken_content).unwrap();
+
+        let state = load_state_from(&path).expect("broken file must fall back to default");
+
+        assert!(state.jobs.is_empty());
+        // The broken file was moved aside, not overwritten.
+        assert!(!path.exists());
+        let backups: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("job-scheduler.xml.broken-")
+            })
+            .collect();
+        assert_eq!(backups.len(), 1);
+        assert_eq!(
+            fs::read_to_string(backups[0].path()).unwrap(),
+            broken_content
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn save_state_writes_java_format_that_loads_again() {
+        let dir = temp_state_dir();
+        let path = dir.join(JOB_SCHEDULER_FILE);
+        let state = JobSchedulerStateFile {
+            jobs: vec![ScheduledJob {
+                id: "job-1".into(),
+                name: "Check disk".into(),
+                action: JobAction {
+                    action_type: JobActionType::Command,
+                    command: Some("df -h".into()),
+                    ..JobAction::default()
+                },
+                ..ScheduledJob::default()
+            }],
+            ai_agent_auto_approve_default_migrated: true,
+            ..JobSchedulerStateFile::default()
+        };
+
+        save_state_to(&path, &state).unwrap();
+        let loaded = load_state_from(&path).unwrap();
+
+        assert_eq!(loaded.jobs.len(), 1);
+        assert_eq!(loaded.jobs[0].id, "job-1");
+        assert_eq!(loaded.jobs[0].action.command.as_deref(), Some("df -h"));
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("<jobs>"));
+        assert!(content.contains("<job>"));
+        assert!(content.contains("<type>COMMAND</type>"));
+        fs::remove_dir_all(&dir).ok();
     }
 }

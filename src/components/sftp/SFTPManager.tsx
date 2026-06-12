@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from "react";
 import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import {
   X, Upload, Download, Trash2, FolderPlus, FileArchive,
   RefreshCw, Folder, File, ChevronRight, Shield, UserCog, Edit,
@@ -31,6 +32,13 @@ interface SFTPManagerProps {
 
 type SortKey = "name" | "type" | "size" | "date" | "owner" | "group" | "permissions";
 type SortDir = "asc" | "desc";
+
+interface SftpModeReason { code: string; message: string }
+interface SftpModeStatus {
+  sessionId: string;
+  mode: "sftp" | "execFallback";
+  reason?: SftpModeReason;
+}
 
 interface CtxMenuState { x: number; y: number; side: "local" | "remote"; entry: FileEntry | null }
 interface ArchiveDialogState { open: boolean; side: "local" | "remote"; files: string[] }
@@ -320,9 +328,9 @@ function PermissionsDialog({ open, side, entry, sessionId, basePath, onClose, on
 
 /* ====== Context Menu ====== */
 
-function ContextMenu({ x, y, side, entry, hasSelection, onAction, onClose }: {
+function ContextMenu({ x, y, side, entry, hasSelection, canEdit, onAction, onClose }: {
   x: number; y: number; side: "local" | "remote"; entry: FileEntry | null;
-  hasSelection: boolean;
+  hasSelection: boolean; canEdit: boolean;
   onAction: (action: string, menu: CtxMenuState) => void; onClose: () => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
@@ -372,8 +380,12 @@ function ContextMenu({ x, y, side, entry, hasSelection, onAction, onClose }: {
       onMouseDown={(event) => event.stopPropagation()}
       onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); }}
       style={{ left: x, top: y }}>
-      <Itm label="Edit in Snippet Editor" icon={<Edit className="w-3.5 h-3.5" />} action="edit" disabled={!entry || entry.fileType !== "File"} />
-      <Sep />
+      {canEdit && (
+        <>
+          <Itm label="Edit in Snippet Editor" icon={<Edit className="w-3.5 h-3.5" />} action="edit" disabled={!entry || entry.fileType !== "File"} />
+          <Sep />
+        </>
+      )}
       <Itm label="Rename" action="rename" disabled={!entry || entry.name === ".."} />
       <Itm label="Delete" icon={<Trash2 className="w-3.5 h-3.5" />} action="delete" disabled={!entry || entry.name === ".."} />
       <Sep />
@@ -390,12 +402,13 @@ function ContextMenu({ x, y, side, entry, hasSelection, onAction, onClose }: {
 
 function FilePanel({ title, path, onPathChange, entries, loading, error, selected, onSelect,
   onDoubleClick, sortKey, sortDir, onSort, searchQuery, onSearchChange,
-  onContextMenu, t }: {
+  onContextMenu, t, notice }: {
   title: string; path: string; onPathChange: (p: string) => void; entries: FileEntry[];
   loading: boolean; error: string | null; selected: Set<string>; onSelect: (e: FileEntry, multi: boolean) => void;
   onDoubleClick: (e: FileEntry) => void; sortKey: SortKey; sortDir: SortDir;
   onSort: (key: SortKey) => void; searchQuery: string; onSearchChange: (q: string) => void;
   onContextMenu: (e: React.MouseEvent, entry: FileEntry | null) => void; t: (key: string) => string;
+  notice?: { text: string; detail?: string } | null;
 }) {
   const filtered = searchQuery
     ? entries.filter((e) => e.name.toLowerCase().includes(searchQuery.toLowerCase()))
@@ -422,6 +435,12 @@ function FilePanel({ title, path, onPathChange, entries, loading, error, selecte
           placeholder={t("sftp.search")}
           className="w-32 px-2 py-1 text-xs bg-kortty-bg border border-kortty-border rounded text-kortty-text placeholder-kortty-text-dim" />
       </div>
+      {notice && (
+        <div className="px-3 py-1.5 border-b border-kortty-border bg-kortty-warning/10 text-kortty-warning text-[11px]"
+          title={notice.detail}>
+          {notice.text}
+        </div>
+      )}
       <div className="flex-1 overflow-auto min-h-0">
         {loading ? (
           <div className="flex items-center justify-center h-32 text-kortty-text-dim text-xs">
@@ -492,6 +511,7 @@ export function SFTPManager({ open, onClose, sessionId, onEditFile }: SFTPManage
   const [permDialog, setPermDialog] = useState<PermDialogState>({ open: false, side: "remote", entry: null });
   const [renaming, setRenaming] = useState<{ side: "local" | "remote"; oldName: string; newName: string } | null>(null);
   const [status, setStatus] = useState("");
+  const [transferMode, setTransferMode] = useState<SftpModeStatus | null>(null);
 
   const loadLocal = useCallback(async (path: string) => {
     setLocalLoading(true); setLocalError(null);
@@ -515,6 +535,38 @@ export function SFTPManager({ open, onClose, sessionId, onEditFile }: SFTPManage
     if (!open) return;
     invoke<string>("get_home_dir").then((h) => setLocalPath(h || "/")).catch(() => setLocalPath("/"));
   }, [open]);
+
+  // Track whether the remote side runs over the SFTP subsystem or the
+  // exec command-line fallback ("kortty-sftp-mode" event from the backend).
+  useEffect(() => {
+    if (!open || !sessionId) return;
+    let active = true;
+    const unlisten = listen<SftpModeStatus>("kortty-sftp-mode", (event) => {
+      if (!active || event.payload.sessionId !== sessionId) return;
+      setTransferMode(event.payload);
+    });
+    // The mode may already have been determined before this dialog mounted —
+    // query the cached state (this also triggers determination on first open).
+    invoke<SftpModeStatus>("sftp_transfer_mode", { sessionId })
+      .then((mode) => { if (active) setTransferMode(mode); })
+      .catch(() => {});
+    return () => {
+      active = false;
+      unlisten.then((fn) => fn()).catch(() => {});
+    };
+  }, [open, sessionId]);
+
+  const fallbackNotice = transferMode?.mode === "execFallback"
+    ? {
+        text: t("sftp.fallback.notice"),
+        detail: [
+          transferMode.reason?.code === "SFTP_SUBSYSTEM_REJECTED"
+            ? t("sftp.error.subsystemRejected")
+            : t("sftp.error.startFailed"),
+          transferMode.reason?.message,
+        ].filter(Boolean).join("\n"),
+      }
+    : null;
 
   useEffect(() => { if (open && localPath) loadLocal(localPath); }, [open, localPath, loadLocal]);
   useEffect(() => { if (open && sessionId) loadRemote(remotePath); }, [open, sessionId, remotePath, loadRemote]);
@@ -622,7 +674,7 @@ export function SFTPManager({ open, onClose, sessionId, onEditFile }: SFTPManage
   };
 
   const handleEditFile = async (side: "local" | "remote", entry: FileEntry | null) => {
-    if (!entry || entry.fileType !== "File") return;
+    if (!onEditFile || !entry || entry.fileType !== "File") return;
     const basePath = side === "local" ? localPath : remotePath;
     const fullPath = basePath.replace(/\/$/, "") + "/" + entry.name;
     setStatus("Opening file in snippet editor...");
@@ -740,7 +792,7 @@ export function SFTPManager({ open, onClose, sessionId, onEditFile }: SFTPManage
             onSort={(k) => { setRemoteSortDir(toggleSort(k, remoteSortKey, remoteSortDir)); setRemoteSortKey(k); }}
             searchQuery={remoteSearch} onSearchChange={setRemoteSearch}
             onContextMenu={(e, entry) => setCtxMenu({ x: e.clientX, y: e.clientY, side: "remote", entry })}
-            t={t} />
+            t={t} notice={fallbackNotice} />
         </div>
 
         {/* Status */}
@@ -753,6 +805,7 @@ export function SFTPManager({ open, onClose, sessionId, onEditFile }: SFTPManage
       {ctxMenu && (
         <ContextMenu x={ctxMenu.x} y={ctxMenu.y} side={ctxMenu.side} entry={ctxMenu.entry}
           hasSelection={(ctxMenu.side === "local" ? localSelected : remoteSelected).size > 0}
+          canEdit={!!onEditFile}
           onAction={handleContextAction} onClose={() => setCtxMenu(null)} />
       )}
 

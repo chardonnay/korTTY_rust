@@ -1,8 +1,11 @@
+pub mod color_filter;
 pub mod jump;
 pub mod keepalive;
 pub mod session;
+pub mod terminal_emulation;
 pub mod tunnel;
 
+use serde::Serialize;
 use session::SSHSession;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -67,4 +70,29 @@ impl Default for SSHManager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Best-known remote directories of a session for drag&drop and path hints.
+#[derive(Debug, Clone, Default, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteDirectoryHints {
+    pub current: Option<String>,
+    pub home: Option<String>,
+}
+
+/// Returns the tracked current and home remote directories of a session.
+/// Both values are absent until an absolute path was observed for them.
+#[tauri::command]
+pub async fn get_remote_directory_hints(
+    state: tauri::State<'_, SSHManager>,
+    session_id: String,
+) -> Result<RemoteDirectoryHints, String> {
+    let Some(session_arc) = state.get_session(&session_id).await else {
+        return Ok(RemoteDirectoryHints::default());
+    };
+    let session = tokio::time::timeout(SESSION_LOCK_TIMEOUT, session_arc.lock())
+        .await
+        .map_err(|_| "Session busy or unavailable".to_string())?;
+    let (current, home) = session.remote_directory_hints();
+    Ok(RemoteDirectoryHints { current, home })
 }

@@ -44,6 +44,8 @@ pub struct SnippetFormatRequest {
     pub formatter_command: Option<String>,
     #[serde(default)]
     pub formatter_args: Vec<String>,
+    #[serde(default)]
+    pub max_line_length: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -100,6 +102,27 @@ pub struct SnippetPlantUmlRenderResult {
     pub tool: String,
 }
 
+/// WP2.10: in-memory SVG render request used by the snippet diagram dialog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnippetPlantUmlSvgRequest {
+    pub source: String,
+    #[serde(default)]
+    pub background_color: Option<String>,
+    #[serde(default)]
+    pub plantuml_jar_path: Option<String>,
+}
+
+/// WP2.10: in-memory SVG render result. `content_hash` is the SHA-256 of the
+/// normalized PlantUML source (without the injected background color line).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnippetPlantUmlSvgResult {
+    pub svg: String,
+    pub content_hash: String,
+    pub tool: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SnippetToolAvailability {
@@ -135,18 +158,28 @@ pub fn build_embedded_one_liner(request: &SnippetOneLinerRequest) -> Result<Snip
     Ok(SnippetOneLinerResult { line })
 }
 
-pub fn format_snippet_code(request: &SnippetFormatRequest) -> Result<SnippetFormatResult> {
+pub async fn format_snippet_code(request: &SnippetFormatRequest) -> Result<SnippetFormatResult> {
+    // Editor-profile formatter overrides always take precedence.
     if let Some(command) = request
         .formatter_command
         .as_deref()
         .map(str::trim)
         .filter(|value| !value.is_empty())
     {
-        let content = run_external_formatter(command, &request.formatter_args, &request.content)?;
+        let content =
+            run_external_formatter(command, &request.formatter_args, &request.content).await?;
         return Ok(SnippetFormatResult {
             content,
             formatter_name: command.to_string(),
             used_external_formatter: true,
+        });
+    }
+
+    if request.content.trim().is_empty() {
+        return Ok(SnippetFormatResult {
+            content: request.content.clone(),
+            formatter_name: "integrated".into(),
+            used_external_formatter: false,
         });
     }
 
@@ -156,17 +189,22 @@ pub fn format_snippet_code(request: &SnippetFormatRequest) -> Result<SnippetForm
         .unwrap_or_default()
         .trim()
         .to_lowercase();
-    let (content, formatter_name) = match language.as_str() {
-        "json" => (format_json(&request.content)?, "built-in JSON".into()),
-        "xml" | "html" => (format_xml_like(&request.content), "built-in XML".into()),
-        _ => (
-            trim_trailing_whitespace(&request.content),
-            "built-in whitespace".into(),
-        ),
-    };
+    if let Some(info) = crate::code_formatter::get_formatter_info(&language) {
+        let content =
+            crate::code_formatter::format(&language, &request.content, request.max_line_length)
+                .await?;
+        let used_external_formatter =
+            info.provider_type != crate::code_formatter::FormatterProviderType::BuiltIn;
+        return Ok(SnippetFormatResult {
+            content,
+            formatter_name: info.display_name,
+            used_external_formatter,
+        });
+    }
+
     Ok(SnippetFormatResult {
-        content,
-        formatter_name,
+        content: trim_trailing_whitespace(&request.content),
+        formatter_name: "built-in whitespace".into(),
         used_external_formatter: false,
     })
 }
@@ -243,6 +281,112 @@ pub fn render_plantuml(
         content_hash: content_hash(&source),
         tool,
     })
+}
+
+/// Renders PlantUML to an in-memory SVG string for the snippet diagram dialog
+/// (WP2.10, variant of `render_plantuml` that never touches a user-chosen
+/// output path). The optional background color is injected as a
+/// `skinparam backgroundColor` line before rendering; the returned content
+/// hash is computed over the normalized source *without* that line so the
+/// hash stays stable across background changes.
+pub fn render_plantuml_svg_string(
+    request: &SnippetPlantUmlSvgRequest,
+) -> Result<SnippetPlantUmlSvgResult> {
+    let source = normalize_plantuml_source(&request.source);
+    let render_source = match request
+        .background_color
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(color) => apply_plantuml_background_color(&source, color),
+        None => source.clone(),
+    };
+    let temp_dir = std::env::temp_dir().join(format!(
+        "kortty-plantuml-svg-{}",
+        uuid::Uuid::new_v4().simple()
+    ));
+    fs::create_dir_all(&temp_dir)?;
+    let source_path = temp_dir.join("snippet-diagram.puml");
+    fs::write(&source_path, &render_source)?;
+    let render_result = (|| -> Result<(String, String)> {
+        let tool = if let Some(jar_path) = request
+            .plantuml_jar_path
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            run_plantuml_jar(jar_path, &source_path, &temp_dir, "svg")?
+        } else {
+            run_plantuml_binary(&source_path, &temp_dir, "svg")?
+        };
+        let generated = temp_dir.join("snippet-diagram.svg");
+        if !generated.exists() {
+            bail!("PlantUML did not create the expected svg output");
+        }
+        Ok((fs::read_to_string(&generated)?, tool))
+    })();
+    let _ = fs::remove_dir_all(&temp_dir);
+    let (svg, tool) = render_result?;
+    Ok(SnippetPlantUmlSvgResult {
+        svg,
+        content_hash: content_hash(&source),
+        tool,
+    })
+}
+
+/// Inserts (or replaces) a `skinparam backgroundColor` line after `@startuml`.
+/// Port of the background half of Java `SnippetDiagramSupport.applyBackgroundColor`.
+fn apply_plantuml_background_color(normalized_source: &str, color: &str) -> String {
+    let color = normalize_hex_color(color, "#FFFFFF");
+    let background_line = format!("skinparam backgroundColor {color}");
+    let mut lines: Vec<String> = Vec::new();
+    let mut replaced = false;
+    for line in normalized_source.lines() {
+        let trimmed = line.trim();
+        if !replaced
+            && trimmed.len() > "skinparam backgroundColor".len()
+            && trimmed
+                .to_lowercase()
+                .starts_with("skinparam backgroundcolor")
+        {
+            lines.push(background_line.clone());
+            replaced = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        let insert_at = lines
+            .iter()
+            .position(|line| line.trim_start().starts_with("@start"))
+            .map(|index| index + 1)
+            .unwrap_or(0);
+        lines.insert(insert_at, background_line);
+    }
+    let mut result = lines.join("\n");
+    if normalized_source.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// Port of Java `SnippetDiagramSupport.normalizeHexColor`.
+fn normalize_hex_color(color: &str, fallback: &str) -> String {
+    fn is_hex_color(value: &str) -> bool {
+        value.len() == 7
+            && value.starts_with('#')
+            && value[1..].chars().all(|ch| ch.is_ascii_hexdigit())
+    }
+    let value = color.trim();
+    if is_hex_color(value) {
+        return value.to_uppercase();
+    }
+    let fallback_value = fallback.trim();
+    if is_hex_color(fallback_value) {
+        return fallback_value.to_uppercase();
+    }
+    "#FFFFFF".to_string()
 }
 
 pub fn check_snippet_tools() -> SnippetToolAvailability {
@@ -325,55 +469,80 @@ pub fn shell_escape_single_quoted(value: &str) -> String {
     value.replace('\'', "'\\''")
 }
 
-fn run_external_formatter(command: &str, args: &[String], content: &str) -> Result<String> {
-    let mut child = Command::new(command)
+/// Maximum wall-clock time an editor-profile formatter override may run before
+/// it is killed. Matches the shared code-formatter timeout.
+const EXTERNAL_FORMATTER_TIMEOUT_SECONDS: u64 = 15;
+
+/// Runs an editor-profile formatter override, feeding `content` on stdin and
+/// returning its stdout. stdin is written concurrently with stdout/stderr
+/// draining (so a formatter that emits output before consuming all of its
+/// input cannot deadlock), and the whole process is bounded by a timeout so a
+/// hung formatter cannot block indefinitely.
+async fn run_external_formatter(command: &str, args: &[String], content: &str) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut child = tokio::process::Command::new(command)
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
+        .kill_on_drop(true)
         .spawn()?;
-    if let Some(stdin) = child.stdin.as_mut() {
-        stdin.write_all(content.as_bytes())?;
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
+
+    let mut stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Could not open formatter stdin"))?;
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Could not open formatter stdout"))?;
+    let mut stderr_pipe = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Could not open formatter stderr"))?;
+
+    let stdout_task = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        stdout_pipe.read_to_end(&mut buffer).await.map(|_| buffer)
+    });
+    let stderr_task = tokio::spawn(async move {
+        let mut buffer = Vec::new();
+        stderr_pipe.read_to_end(&mut buffer).await.map(|_| buffer)
+    });
+    let payload = content.as_bytes().to_vec();
+    let stdin_task = tokio::spawn(async move {
+        let _ = stdin.write_all(&payload).await;
+        let _ = stdin.shutdown().await;
+    });
+
+    let status = match tokio::time::timeout(
+        std::time::Duration::from_secs(EXTERNAL_FORMATTER_TIMEOUT_SECONDS),
+        child.wait(),
+    )
+    .await
+    {
+        Ok(result) => result?,
+        Err(_) => {
+            let _ = child.kill().await;
+            bail!("Formatter timed out after {EXTERNAL_FORMATTER_TIMEOUT_SECONDS} seconds");
+        }
+    };
+    let _ = stdin_task.await;
+    let stdout = stdout_task
+        .await
+        .map_err(|error| anyhow::anyhow!("Could not read formatter output: {error}"))??;
+    let stderr = stderr_task
+        .await
+        .unwrap_or(Ok(Vec::new()))
+        .unwrap_or_default();
+    if !status.success() {
         bail!(
             "Formatter failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
+            String::from_utf8_lossy(&stderr).trim()
         );
     }
-    Ok(String::from_utf8(output.stdout)?)
-}
-
-fn format_json(content: &str) -> Result<String> {
-    let value: serde_json::Value = serde_json::from_str(content)?;
-    Ok(serde_json::to_string_pretty(&value)?)
-}
-
-fn format_xml_like(content: &str) -> String {
-    let mut formatted = String::new();
-    let mut indent = 0usize;
-    for token in content.replace("><", ">\n<").lines().map(str::trim) {
-        if token.is_empty() {
-            continue;
-        }
-        if token.starts_with("</") {
-            indent = indent.saturating_sub(1);
-        }
-        formatted.push_str(&"  ".repeat(indent));
-        formatted.push_str(token);
-        formatted.push('\n');
-        if token.starts_with('<')
-            && !token.starts_with("</")
-            && !token.ends_with("/>")
-            && !token.starts_with("<?")
-            && !token.starts_with("<!")
-            && !token.contains("</")
-        {
-            indent = indent.saturating_add(1);
-        }
-    }
-    formatted.trim_end().to_string()
+    Ok(String::from_utf8(stdout)?)
 }
 
 fn trim_trailing_whitespace(content: &str) -> String {
@@ -569,10 +738,9 @@ fn run_plantuml_jar(
 }
 
 fn find_tool(name: &str) -> Option<PathBuf> {
-    let path_var = std::env::var_os("PATH")?;
-    std::env::split_paths(&path_var)
-        .map(|dir| dir.join(name))
-        .find(|candidate| candidate.is_file())
+    // Reuse the PATHEXT-aware lookup from the code formatter so Windows tools
+    // such as `plantuml.exe`/`java.exe`/`gpg.exe` are discovered as well.
+    crate::code_formatter::find_command_on_path(name)
 }
 
 fn default_plantuml_format() -> String {
@@ -634,6 +802,104 @@ mod tests {
         );
 
         assert_eq!(expanded, "echo example.test 22");
+    }
+
+    #[tokio::test]
+    async fn format_snippet_code_delegates_json_to_code_formatter() {
+        let result = format_snippet_code(&SnippetFormatRequest {
+            content: "{\"name\":\"demo\",\"items\":[1,2]}".into(),
+            language: Some("json".into()),
+            formatter_command: None,
+            formatter_args: Vec::new(),
+            max_line_length: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            result.content,
+            "{\n  \"name\": \"demo\",\n  \"items\": [\n    1,\n    2\n  ]\n}"
+        );
+        assert_eq!(result.formatter_name, "integrated");
+        assert!(!result.used_external_formatter);
+    }
+
+    #[tokio::test]
+    async fn format_snippet_code_keeps_whitespace_fallback_for_unsupported_languages() {
+        let result = format_snippet_code(&SnippetFormatRequest {
+            content: "line one   \nline two\t\n".into(),
+            language: Some("markdown".into()),
+            formatter_command: None,
+            formatter_args: Vec::new(),
+            max_line_length: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.content, "line one\nline two");
+        assert_eq!(result.formatter_name, "built-in whitespace");
+        assert!(!result.used_external_formatter);
+    }
+
+    #[tokio::test]
+    async fn format_snippet_code_returns_blank_content_unchanged() {
+        let result = format_snippet_code(&SnippetFormatRequest {
+            content: "   ".into(),
+            language: Some("json".into()),
+            formatter_command: None,
+            formatter_args: Vec::new(),
+            max_line_length: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(result.content, "   ");
+        assert!(!result.used_external_formatter);
+    }
+
+    #[test]
+    fn apply_plantuml_background_color_inserts_skinparam_after_start() {
+        let source = "@startuml\nstart\nstop\n@enduml\n";
+        let result = apply_plantuml_background_color(source, "#f4f8ff");
+        assert!(result.contains("@startuml\nskinparam backgroundColor #F4F8FF\nstart"));
+        assert!(result.trim_end().ends_with("@enduml"));
+    }
+
+    #[test]
+    fn apply_plantuml_background_color_replaces_existing_skinparam() {
+        let source = "@startuml\nskinparam backgroundColor #FFFFFF\nstart\nstop\n@enduml\n";
+        let result = apply_plantuml_background_color(source, "#202020");
+        assert!(result.contains("skinparam backgroundColor #202020"));
+        assert!(!result.contains("skinparam backgroundColor #FFFFFF"));
+    }
+
+    #[test]
+    fn normalize_hex_color_uppercases_and_falls_back() {
+        assert_eq!(normalize_hex_color("#a1b2c3", "#FFFFFF"), "#A1B2C3");
+        assert_eq!(normalize_hex_color("not-a-color", "#102030"), "#102030");
+        assert_eq!(normalize_hex_color("", "also-bad"), "#FFFFFF");
+    }
+
+    #[test]
+    fn svg_render_request_accepts_camel_case_payload() {
+        let request: SnippetPlantUmlSvgRequest = serde_json::from_str(
+            "{\"source\":\"@startuml\\nstart\\nstop\\n@enduml\",\"backgroundColor\":\"#FFFFFF\"}",
+        )
+        .unwrap();
+        assert_eq!(request.background_color.as_deref(), Some("#FFFFFF"));
+        assert!(request.plantuml_jar_path.is_none());
+    }
+
+    #[test]
+    fn svg_render_result_serializes_camel_case() {
+        let json = serde_json::to_string(&SnippetPlantUmlSvgResult {
+            svg: "<svg/>".into(),
+            content_hash: "abc".into(),
+            tool: "plantuml".into(),
+        })
+        .unwrap();
+        assert!(json.contains("\"contentHash\":\"abc\""));
+        assert!(json.contains("\"svg\":\"<svg/>\""));
     }
 
     #[test]

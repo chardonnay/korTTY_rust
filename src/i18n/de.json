@@ -42,7 +42,11 @@
     "fullscreen": "Vollbild",
     "userGuide": "Benutzerhandbuch",
     "shortcuts": "Tastenkürzel",
-    "about": "Über KorTTY"
+    "about": "Über KorTTY",
+    "toggleRecording": "Terminal-Aufnahme starten/stoppen",
+    "aiPlanning": "KI-Planung...",
+    "terminalOnlyFullscreen": "Nur Terminal im Vollbild",
+    "hideTerminalScrollbarsFullscreen": "Terminal-Scroll-Leisten im Vollbild ausblenden"
   },
   "connection": {
     "manager": "Verbindungsmanager",
@@ -85,7 +89,52 @@
     "background": "Hintergrund",
     "cursor": "Cursor",
     "timestamps": "Befehlszeitstempel anzeigen",
-    "logging": "Terminal-Protokollierung aktivieren"
+    "logging": "Terminal-Protokollierung aktivieren",
+    "recording": {
+      "start": "Aufnahme starten",
+      "stop": "Aufnahme stoppen",
+      "indicator": {
+        "recording": "Aufnahme läuft",
+        "autoPaused": "Aufnahme automatisch pausiert"
+      },
+      "scope": {
+        "title": "Terminal-Aufnahme",
+        "header": "Aufnahmebereich wählen",
+        "content": "Bereich:",
+        "activeSplit": "Aktiver Split",
+        "wholeTab": "Ganzer Tab"
+      },
+      "error": {
+        "title": "Terminal-Aufnahme",
+        "header": "Aufnahme fehlgeschlagen",
+        "notConnected": "Verbinden Sie das Terminal, bevor Sie eine Aufnahme starten.",
+        "noTerminal": "Kein aktiver Terminal-Tab für die Aufnahme.",
+        "disabled": "Aktivieren Sie Terminal-Aufnahmen unter Werkzeuge > Videoverwaltung, bevor Sie eine Aufnahme starten.",
+        "start": "Aufnahme konnte nicht gestartet werden: {{message}}",
+        "stop": "Aufnahme konnte nicht gestoppt werden: {{message}}"
+      }
+    },
+    "dragDrop": {
+      "title": "Auf Server kopieren",
+      "count": "{{done}} von {{total}} Objekten kopiert",
+      "abort": "Abbrechen",
+      "done": "Kopieren abgeschlossen.",
+      "cancelled": "Kopieren abgebrochen.",
+      "target": "Ziel: {{target}}",
+      "error": "Kopieren fehlgeschlagen: {{message}}",
+      "dropHint": "Dateien zum Hochladen ablegen"
+    },
+    "context": {
+      "openSelectionInSnippetEditor": "Auswahl im Snippet-Editor öffnen"
+    },
+    "loadTextFile": {
+      "invalidSelection": "Bitte genau einen Dateinamen im aktuellen Verzeichnis markieren.",
+      "notConnected": "Es ist keine aktive SSH-Verbindung verfügbar.",
+      "loading": "Lade {{name}} als Textdatei...",
+      "loaded": "Textdatei geladen: {{path}}",
+      "binary": "Die markierte Datei ist binär oder kein gültiger UTF-8-Text und wurde nicht geladen: {{path}}",
+      "failed": "{{name}} konnte nicht geladen werden: {{error}}"
+    }
   },
   "settings": {
     "title": "Einstellungen",
@@ -110,7 +159,69 @@
     "keepalive": "SSH Keep-Alive",
     "keepaliveInterval": "Keep-Alive-Intervall (Sekunden)",
     "connectionTimeout": "Verbindungs-Timeout (Sekunden)",
-    "retryCount": "Wiederholungsanzahl"
+    "retryCount": "Wiederholungsanzahl",
+    "tab": {
+      "appearance": "Darstellung",
+      "recording": "Video",
+      "logging": "Logs",
+      "updates": "Updates"
+    },
+    "appearance": {
+      "appDesign": "App-Design:",
+      "appDesignInfo": "Wirkt auf App-Fenster und Dialoge. Terminal-Sessions und Editor-Inhalte behalten ihre eigenen Farbeinstellungen.",
+      "preview": "Vorschau:",
+      "design": {
+        "normal": "Normal",
+        "matrixTerminal": "Matrix Terminal",
+        "holographicInterface": "Holographic Interface",
+        "klingonTactical": "Klingon Tactical",
+        "elegantDark": "Elegant Dark"
+      }
+    },
+    "updates": {
+      "header": "Update-Prüfungen",
+      "automatic": "Automatisch nach KorTTY-Updates suchen",
+      "automaticTooltip": "Wenn aktiviert, prüft KorTTY GitHub-Releases im Hintergrund.",
+      "interval": "Prüfintervall:",
+      "intervalDays": "Alle {{days}} Tag(e)",
+      "info": "Automatische Prüfungen zeigen nur dann einen Dialog, wenn eine neuere kompatible Version verfügbar ist. Manuelle Prüfungen sind im Über-Dialog verfügbar."
+    },
+    "logging": {
+      "header": "Logdateien",
+      "directory": "Log-Verzeichnis:",
+      "directoryInfo": "Standard: {{path}}",
+      "directoryChoose": "Log-Verzeichnis auswählen",
+      "retention": "Logs aufbewahren:",
+      "retentionInfo": "0 = unbegrenzt. Älteste Logarchive werden automatisch gelöscht.",
+      "compressionInfo": "Logarchive, die älter als 24 Stunden sind, werden automatisch komprimiert.",
+      "restartRequired": "Änderungen am Log-Verzeichnis werden nach einem Neustart von KorTTY wirksam.",
+      "days": "Tag(e)"
+    },
+    "ai": {
+      "terminalAgentExecutionEnabled": "KI-Agent-Ausführung aktivieren",
+      "terminalAgentExecutionEnabledHint": "Wenn deaktiviert, sind ausführende KI-Agent-Läufe und Plan-Umsetzung nicht verfügbar. KI-Planung und KI-Agent fragen bleiben verfügbar.",
+      "terminalAgentConfirmMutatingCommandSets": "Vor Änderungen durch den KI-Agent am Zielsystem fragen",
+      "terminalAgentConfirmMutatingCommandSetsHint": "Wenn aktiviert, benötigen Command-Sets, die Dateien anlegen, löschen, ändern oder das Zielsystem anderweitig verändern, eine Bestätigung. Rein lesende Aktionen fragen nicht nach."
+    },
+    "snippetEditor": {
+      "title": "Snippet-Editor",
+      "info": "Diese Einstellungen überschreiben die Terminal/Editor-Vorgaben für den Snippet-Manager und den Snippet-Bearbeitungsdialog. Leer bzw. 0 = von allgemeinen Einstellungen erben.",
+      "fontFamily": "Schriftart",
+      "fontSize": "Schriftgröße",
+      "fontSizeInfo": "(0 = von Terminal erben)",
+      "foreground": "Vordergrundfarbe",
+      "background": "Hintergrundfarbe",
+      "cursorStyle": "Cursor-Stil",
+      "cursorColor": "Cursor-Farbe",
+      "wordWrap": "Zeilenumbruch",
+      "lineNumbers": "Zeilennummern",
+      "historyMax": "Maximale Verlaufseinträge",
+      "diagramBackground": "Diagramm-Hintergrundfarbe",
+      "aiInstructionsEnabled": "Optionale Zusatzhinweise für KI-Aktionen im Snippet-Editor anzeigen",
+      "alternativeSolutionCount": "Maximale Anzahl alternativer Lösungen",
+      "profile": "Profil",
+      "manageProfiles": "Profile verwalten..."
+    }
   },
   "credential": {
     "manager": "Anmeldedaten-Manager",
@@ -141,16 +252,268 @@
   },
   "snippet": {
     "manager": "Snippet-Manager",
+    "diagram": {
+      "button": "Diagramm",
+      "title": "Snippet-Diagramme",
+      "script": "Skript: {{name}}",
+      "unnamed": "(unbenanntes Snippet)",
+      "empty": "Für dieses Snippet sind noch keine Diagramme gespeichert.",
+      "current": "Diagramm ist aktuell.",
+      "stale": "Diagramm ist möglicherweise veraltet, weil sich das Snippet geändert hat.",
+      "rendering": "Wird lokal gerendert...",
+      "renderFailed": "Lokales Rendering nicht verfügbar: {{error}}",
+      "regenerate": "Neu erzeugen",
+      "generate": "Diagramm erzeugen",
+      "generating": "PlantUML-Diagramm wird erzeugt...",
+      "ready": "Diagramm bereit. Speichern Sie das Snippet, um es dauerhaft abzulegen.",
+      "failed": "PlantUML-Diagramm konnte nicht erzeugt werden.",
+      "instructions": "Anweisung:",
+      "instructionsHint": "Optionale Parameter für das Diagramm",
+      "copyPlantUml": "PlantUML kopieren",
+      "copied": "PlantUML-Code in die Zwischenablage kopiert.",
+      "backgroundColor": "Hintergrund:",
+      "readableColors": "Lesbare Farben anwenden",
+      "readableColorsApplied": "Lesbare Farben angewendet.",
+      "saveSvg": "SVG speichern",
+      "exportSaved": "Gespeichert: {{path}}",
+      "exportFailed": "Export fehlgeschlagen: {{error}}",
+      "delete": "Löschen",
+      "typeLogicalStructure": "Logische Struktur",
+      "codeReference": {
+        "line": "Zeile {{line}}",
+        "lines": "Zeilen {{start}}-{{end}}"
+      }
+    },
     "name": "Name",
     "category": "Kategorie",
     "content": "Inhalt",
     "favorite": "Favorit",
     "variables": "Variablen",
     "search": "Snippets suchen...",
-    "importExport": "Import/Export"
+    "importExport": "Import/Export",
+    "unnamed": "(ohne Namen)",
+    "saveAsNew": "Als neues Snippet speichern",
+    "copySuffix": " (Kopie)",
+    "formatter": {
+      "builtIn": "Integriert",
+      "bundled": "Gebündelt",
+      "external": "Extern",
+      "unavailable": "Nicht verfügbar"
+    },
+    "ai": {
+      "copy": "In Zwischenablage kopieren",
+      "copied": "In die Zwischenablage kopiert.",
+      "noProfile": "Kein KI-Profil konfiguriert.",
+      "noTextSegments": "Die aktuelle Auswahl enthält keine bearbeitbaren Kommentare oder ausgabebezogenen Textsegmente.",
+      "context": {
+        "assistant": "KI-Assistenz...",
+        "complete": "KI vervollständigen",
+        "autoComplete": "Auto-KI-Vervollständigung",
+        "review": "Fehler und Verbesserungen prüfen",
+        "improveReadability": "Lesbarkeit verbessern",
+        "improveRobustness": "Robustheit verbessern",
+        "improvePerformance": "Performance verbessern",
+        "improveCustom": "Eigene Verbesserung...",
+        "alternatives": "Alternative Lösungen",
+        "security": "Security-Check",
+        "describe": "Fachliche Beschreibung",
+        "correctSelection": "Rechtschreibung in Auswahl korrigieren",
+        "translateSelection": "Auswahl übersetzen..."
+      },
+      "assistant": {
+        "title": "KI-Assistenz",
+        "header": "Beschreiben Sie, was KorTTY an der aktuellen Cursorposition ändern soll.",
+        "instruction": "Anweisung:",
+        "prompt": "Beispiel: füge neue Parameter für Verzeichnisnamen ein",
+        "cursor": "Cursor: Offset {{offset}}, Zeile {{line}}, Spalte {{column}}",
+        "skills": "KI-Skills berücksichtigen",
+        "skillsTooltip": "Aktivierte KI-Skills für Chat/Funktionen können bei Relevanz in diese Anfrage übernommen werden.",
+        "skillsUnavailable": "In den globalen Einstellungen sind keine aktivierten KI-Skills für Chat/Funktionen verfügbar.",
+        "running": "KI-Assistenz aktualisiert das Snippet...",
+        "empty": "Es wurde kein verwendbares KI-Assistenz-Ergebnis zurückgegeben.",
+        "failed": "KI-Assistenz fehlgeschlagen.",
+        "applied": "KI-Assistenz-Änderung angewendet.",
+        "diffTitle": "KI-Assistenz-Änderung prüfen"
+      },
+      "complete": {
+        "running": "Vervollständigungsvorschlag wird erzeugt...",
+        "empty": "Es wurde kein verwendbarer Vervollständigungsvorschlag zurückgegeben.",
+        "discarded": "Vervollständigung verworfen, weil sich der Editor geändert hat.",
+        "ready": "Vervollständigungsvorschlag bereit. Mit Tab einfügen.",
+        "failed": "Vervollständigungsvorschlag fehlgeschlagen."
+      },
+      "autocomplete": {
+        "warningTitle": "Automatische KI-Vervollständigung aktivieren",
+        "warningHeader": "Die automatische Vervollständigung kann Snippet-Inhalte wiederholt senden, solange sie aktiv ist.",
+        "warningContent": "KorTTY fragt Vorschläge ab, nachdem Sie kurz an einer Cursorposition verweilen. Lassen Sie dies für sensible Snippets deaktiviert, außer Sie vertrauen dem konfigurierten KI-Endpunkt.",
+        "enabled": "Automatische KI-Vervollständigung aktiviert.",
+        "disabled": "Automatische KI-Vervollständigung deaktiviert."
+      },
+      "review": {
+        "title": "KI-Codeprüfung",
+        "info": "Der Bericht ist informativ. Der Editorinhalt wird nicht geändert. Klicken Sie auf einen Befund mit Zeilennummer, um ihn im Editor zu markieren.",
+        "empty": "Es wurden keine Befunde zurückgegeben.",
+        "recommendation": "Empfehlung:",
+        "running": "Code wird geprüft...",
+        "ready": "Codeprüfung bereit.",
+        "failed": "Codeprüfung fehlgeschlagen.",
+        "theme": "Finde wahrscheinliche Fehler und praktische Verbesserungsmöglichkeiten.",
+        "colSeverity": "Schweregrad",
+        "colTitle": "Titel",
+        "colLine": "Zeile"
+      },
+      "improve": {
+        "running": "Verbesserter Code wird erzeugt...",
+        "empty": "Es wurde kein verwendbarer Ersatz zurückgegeben.",
+        "failed": "Codeverbesserung fehlgeschlagen.",
+        "applied": "Verbesserter Code angewendet.",
+        "selectFirst": "Wählen Sie zuerst einen Codebereich aus, bevor Sie eine KI-Überarbeitung anfordern.",
+        "readabilityTheme": "Verbessere die Lesbarkeit, ohne das Verhalten zu ändern.",
+        "robustnessTheme": "Verbessere Robustheit, Fehlerbehandlung und Randfälle ohne unzusammenhängende Änderungen.",
+        "performanceTheme": "Verbessere die Performance, ohne nach außen sichtbares Verhalten zu ändern.",
+        "customTitle": "Eigene KI-Verbesserung",
+        "customHeader": "Beschreiben Sie, wie der ausgewählte Code verbessert werden soll.",
+        "customPrompt": "Anweisung:"
+      },
+      "diff": {
+        "title": "KI-Änderung prüfen",
+        "summaryEmpty": "Prüfen Sie den Ersatz vor dem Anwenden.",
+        "original": "Original",
+        "replacement": "KI-Ersatz",
+        "apply": "Änderung anwenden"
+      },
+      "security": {
+        "title": "Security-Check",
+        "info": "Wählen Sie nur die Befunde aus, die die KI beheben soll. Nicht ausgewählte Befunde werden nicht umgesetzt.",
+        "empty": "Es wurden keine Sicherheitsbefunde zurückgegeben.",
+        "applySelected": "Ausgewählte Fixes anwenden",
+        "running": "Security-Check läuft...",
+        "ready": "Sicherheitsbericht bereit.",
+        "failed": "Security-Check fehlgeschlagen.",
+        "fixRunning": "Ausgewählte Sicherheitsfixes werden erzeugt...",
+        "fixEmpty": "Es wurde kein verwendbarer Sicherheitsfix zurückgegeben.",
+        "fixFailed": "Erzeugung der Sicherheitsfixes fehlgeschlagen.",
+        "fixApplied": "Ausgewählte Sicherheitsfixes angewendet.",
+        "diffTitle": "Sicherheitsfixes prüfen"
+      },
+      "alternatives": {
+        "title": "Alternative Lösungen",
+        "instructionsPrompt": "Optionale Hinweise für die KI, zum Beispiel „nutze nur Bash builtins“",
+        "reload": "Neue Alternativen erzeugen",
+        "loading": "Alternative Lösungen werden erzeugt...",
+        "empty": "Es wurden keine verwendbaren alternativen Lösungen zurückgegeben.",
+        "loaded": "{{count}} alternative Lösungen bereit.",
+        "failed": "Alternative Lösungen konnten nicht erzeugt werden.",
+        "apply": "Übernehmen",
+        "applied": "Alternative Lösung auf den ausgewählten Code angewendet.",
+        "scopeSelection": "Zielbereich: ausgewählter Codebereich",
+        "scopeWhole": "Zielbereich: ganzes Snippet"
+      },
+      "describe": {
+        "dialogTitle": "Fachliche Beschreibung",
+        "commentSyntax": "Kommentarzeichen der aktuellen Snippet-Sprache verwenden",
+        "lineWidth": "Zeilenbreite:",
+        "copy": "In Zwischenablage kopieren",
+        "insert": "In Snippet einfügen",
+        "info": "Die erzeugte Beschreibung wird unten angezeigt. Sie können sie kopieren oder direkt in das Snippet einfügen.",
+        "generating": "Fachliche Beschreibung wird erzeugt...",
+        "generated": "Fachliche Beschreibung bereit.",
+        "generateFailed": "Fachliche Beschreibung konnte nicht erzeugt werden.",
+        "inserted": "Fachliche Beschreibung in das Snippet eingefügt."
+      },
+      "selection": {
+        "correcting": "Ausgewählter Text wird korrigiert...",
+        "corrected": "Ausgewählter Text korrigiert.",
+        "correctFailed": "Ausgewählter Text konnte nicht korrigiert werden.",
+        "translating": "Ausgewählter Text wird übersetzt...",
+        "translated": "Ausgewählter Text übersetzt.",
+        "translateFailed": "Ausgewählter Text konnte nicht übersetzt werden.",
+        "translateTitle": "Snippet-Text übersetzen",
+        "translatePrompt": "Wählen Sie die Zielsprache für den ausgewählten ausgabebezogenen Text:"
+      },
+      "format": {
+        "fallbackTitle": "KI-Formatierung verwenden?",
+        "fallbackHeader": "Lokale Formatierung ist für diese Aktion nicht verfügbar.",
+        "fallbackContent": "{{reason}}\n\nSoll KorTTY stattdessen eine KI-gestützte Codeformatierung anfordern? Das KI-Ergebnis wird vor dem Anwenden als Vorschau angezeigt.",
+        "unavailable": "{{reason}}\n\nEs ist kein KI-Codeverbesserungs-Provider konfiguriert.",
+        "notSupported": "Kein Formatierer für {{language}} verfügbar",
+        "providerUnavailable": "Formatierer nicht verfügbar: {{name}}",
+        "widthNotSupported": "Formatierung auf Zeilenbreite wird für {{language}} nicht unterstützt.",
+        "theme": "Formatiere diesen Code. Erhalte das Verhalten exakt, behalte dieselbe Programmiersprache bei, füge keine Erklärungen hinzu und mache keine unzusammenhängenden Änderungen.",
+        "widthTheme": "Formatiere diesen Code, soweit syntaktisch sicher möglich, auf maximal {{width}} Zeichen pro Zeile. Erhalte das Verhalten exakt, behalte dieselbe Programmiersprache bei, füge keine Erklärungen hinzu und mache keine unzusammenhängenden Änderungen.",
+        "running": "KI-Formatierung läuft...",
+        "empty": "Es wurde kein verwendbares KI-Formatierungsergebnis zurückgegeben.",
+        "failed": "KI-Formatierung fehlgeschlagen.",
+        "applied": "KI-Formatierung angewendet.",
+        "diffTitle": "KI-Formatierung prüfen"
+      }
+    },
+    "ruler": {
+      "tooltip": "Klicken Sie ins Lineal, um die Markierung für die maximale Zeilenlänge zu setzen. Rechtsklick auf die Markierung formatiert auf diese Breite oder entfernt sie.",
+      "position": "Spalte {{column}}",
+      "caretTooltip": "Position {{column}}",
+      "limit": "Limit {{limit}}",
+      "formatToLimit": "Auf {{limit}} Zeichen pro Zeile formatieren",
+      "clearLimit": "Zeilenlängen-Markierung entfernen",
+      "formatSuccess": "Auf maximal {{limit}} Zeichen pro Zeile formatiert."
+    },
+    "history": {
+      "label": "Verlauf",
+      "position": "Verlauf: {{index}} / {{total}}",
+      "restore": "Wiederherstellen"
+    },
+    "diff": {
+      "compare": "Vergleichen",
+      "title": "Snippet-Diff",
+      "left": "Links: {{name}} ({{language}})",
+      "right": "Rechts: {{name}} ({{language}})",
+      "hint": "Bitte genau zwei Snippets markieren."
+    },
+    "profile": {
+      "title": "Snippet-Editor-Profile",
+      "newTitle": "Neues Snippet-Editor-Profil",
+      "editTitle": "Snippet-Editor-Profil bearbeiten",
+      "namePrompt": "Profilname",
+      "presets": "Vorgefertigte Profile",
+      "custom": "Eigene Profile",
+      "new": "Neues eigenes Profil...",
+      "current": "Eigene Farben",
+      "builtInHint": "Vorgefertigte Profile sind schreibgeschützt. Erstellen Sie ein eigenes Profil, um Farben zu ändern.",
+      "preview": "Vorschau",
+      "label": "Profil",
+      "manage": "Profile verwalten...",
+      "comment": "Kommentar",
+      "string": "String",
+      "number": "Zahl",
+      "boolean": "Boolean/null",
+      "key": "Schlüssel",
+      "keyword": "Keyword",
+      "section": "Section",
+      "variable": "Variable",
+      "brace": "Klammer"
+    }
   },
   "sftp": {
     "title": "SFTP-Manager",
+    "saveAs": {
+      "menu": "Speichern unter...",
+      "overwriteRemote": "Remote-Datei überschreiben",
+      "overwriteLocal": "Lokale Datei überschreiben",
+      "saveSnippet": "Als Snippet speichern",
+      "remoteTitle": "Remote-Datei speichern unter",
+      "remoteHeader": "Neuer Dateiname im selben Remote-Ordner",
+      "remoteLabel": "Dateiname:",
+      "invalidFileName": "Ungültiger Dateiname: {{name}}",
+      "confirmOverwrite": "Die Zieldatei existiert bereits. {{path}} überschreiben?",
+      "savedFile": "Datei gespeichert: {{path}}",
+      "savedSnippet": "Snippet gespeichert: {{name}}",
+      "saveFailed": "Datei konnte nicht gespeichert werden: {{error}}",
+      "error": {
+        "empty": "Der Dateiname darf nicht leer sein.",
+        "dots": "Der Dateiname darf nicht '.' oder '..' sein.",
+        "separators": "Der Dateiname darf keine Pfadtrenner enthalten."
+      }
+    },
     "local": "Lokal",
     "remote": "Remote",
     "name": "Name",
@@ -166,7 +529,14 @@
     "rename": "Umbenennen",
     "newFolder": "Neuer Ordner",
     "refresh": "Aktualisieren",
-    "search": "Suchen..."
+    "search": "Suchen...",
+    "fallback": {
+      "notice": "SFTP-Subsystem wurde nach erfolgreicher SSH-Authentifizierung vom Server abgelehnt oder geschlossen — Befehlszeilen-Fallback aktiv"
+    },
+    "error": {
+      "subsystemRejected": "SFTP-Subsystem wurde nach erfolgreicher SSH-Authentifizierung vom Server abgelehnt oder geschlossen. Es wurde keine SFTP-Version ausgehandelt. Prüfe, ob SFTP für dieses Ziel bzw. den SSH-Proxy freigegeben ist.",
+      "startFailed": "SFTP-Subsystem konnte nach erfolgreicher SSH-Authentifizierung nicht gestartet werden."
+    }
   },
   "backup": {
     "createTitle": "Backup erstellen",
@@ -186,11 +556,102 @@
   },
   "quickConnect": {
     "title": "Schnellverbindung",
-    "frequentlyUsed": "Häufig verwendet"
+    "frequentlyUsed": "Häufig verwendet",
+    "terminalEmulation": "Terminal-Emulation",
+    "terminalColors": "Terminalfarben aktivieren"
   },
   "dashboard": {
     "title": "Dashboard",
     "noConnections": "Keine aktiven Verbindungen"
+  },
+  "recording": {
+    "manager": {
+      "title": "Videoverwaltung",
+      "header": "Terminal-Replay-Aufnahmen und optionalen Videoexport verwalten.",
+      "enabled": "Terminal-Aufnahmen für diese App-Sitzung aktivieren",
+      "storagePath": "Speicherpfad",
+      "format": "Standardformat",
+      "formatKorttyReplay": "KorTTY Replay",
+      "formatWebm": "WebM",
+      "defaultScope": "Standardbereich",
+      "scopeActiveSplit": "Aktiver Split",
+      "scopeWholeTab": "Gesamter Tab",
+      "captureColors": "Terminalfarben in neuen Aufnahmen erfassen",
+      "autoPause": "Bei inaktivem Terminal automatisch pausieren",
+      "idleSeconds": "Inaktivitätsschwelle (Sekunden)",
+      "ffmpegPath": "ffmpeg-Pfad",
+      "browse": "Durchsuchen...",
+      "checkFfmpeg": "Prüfen",
+      "ffmpegAvailable": "ffmpeg verfügbar; Videoexport aktiviert.",
+      "ffmpegMissing": "ffmpeg nicht verfügbar; Videoexport deaktiviert.",
+      "recordings": "Replay-Aufnahmen",
+      "refresh": "Aktualisieren",
+      "save": "Speichern",
+      "chooseDirectory": "Aufnahmeordner auswählen",
+      "done": "Fertig",
+      "saveFailed": "Einstellungen konnten nicht gespeichert werden: {{error}}",
+      "refreshFailed": "Aufnahmen konnten nicht geladen werden: {{error}}",
+      "view": "Ansehen",
+      "rename": "Umbenennen...",
+      "delete": "Löschen",
+      "export": "Exportieren...",
+      "viewFailed": "Replay konnte nicht geöffnet werden: {{error}}",
+      "renameTitle": "Replay umbenennen",
+      "renameHeader": "Neuen Replay-Namen festlegen",
+      "renameContent": "Name:",
+      "renameSuccess": "Replay umbenannt: {{name}}",
+      "renameFailed": "Replay konnte nicht umbenannt werden: {{error}}",
+      "deleteTitle": "Replay löschen",
+      "deleteContent": "{{name}} wird gelöscht. Das kann nicht rückgängig gemacht werden.",
+      "deleteSuccess": "Replay gelöscht: {{name}}",
+      "deleteFailed": "Replay konnte nicht gelöscht werden: {{error}}",
+      "exportSuccess": "Video exportiert: {{path}}",
+      "exportFailed": "Videoexport fehlgeschlagen: {{error}}",
+      "noRecordings": "Keine Aufnahmen gefunden.",
+      "selectRecording": "Wählen Sie eine Aufnahme aus.",
+      "duration": "Dauer",
+      "eventCount": "{{count}} Ereignisse",
+      "exportOptions": {
+        "title": "Exportoptionen",
+        "header": "Zeitraum, Farbe und Format auswählen",
+        "format": "Format",
+        "formatWebm": "WebM (VP9)",
+        "formatMkv": "MKV (FFV1)",
+        "duration": "Aufnahmedauer: {{duration}}",
+        "all": "Gesamte Aufnahme exportieren",
+        "start": "Start",
+        "end": "Ende",
+        "includeColor": "Terminalfarben berücksichtigen",
+        "invalidRange": "Geben Sie einen gültigen Zeitraum zwischen 0:00 und {{max}} ein."
+      },
+      "exportProgress": {
+        "title": "Video exportieren",
+        "header": "Replay wird als Video exportiert",
+        "preparing": "Export wird vorbereitet...",
+        "rendering": "Frames rendern...",
+        "encoding": "Video kodieren...",
+        "finalizing": "Export wird abgeschlossen...",
+        "message": "{{phase}} Verbleibend: {{remaining}}",
+        "remainingCalculating": "wird berechnet..."
+      }
+    },
+    "viewer": {
+      "title": "Replay-Anzeige",
+      "play": "Abspielen",
+      "pause": "Pause",
+      "stop": "Stopp",
+      "empty": "Keine Replay-Frames aufgezeichnet.",
+      "status": "Frame {{current}} / {{total}}",
+      "timeline": "Zeitleiste",
+      "time": "{{position}} / {{total}}",
+      "timeJump": "Time jump:",
+      "seek": "Springen",
+      "seekInvalid": "Geben Sie eine Zeit zwischen 0:00 und {{max}} ein.",
+      "speed": "Geschwindigkeit:",
+      "speedSuffix": "x",
+      "loading": "Replay wird geladen...",
+      "loadFailed": "Replay konnte nicht geöffnet werden: {{error}}"
+    }
   },
   "common": {
     "ready": "Bereit",
@@ -204,5 +665,183 @@
     "add": "Hinzufügen",
     "edit": "Bearbeiten",
     "search": "Suchen..."
+  },
+  "updates": {
+    "checkNow": "Nach Updates suchen",
+    "checking": "Updates werden geprüft...",
+    "manual": {
+      "current": "Sie verwenden bereits die neueste KorTTY-Version."
+    },
+    "available": {
+      "short": "KorTTY {{version}} ist verfügbar."
+    },
+    "noCompatibleAsset": "Eine neuere KorTTY-Version ist verfügbar, aber für diese Plattform wurde kein kompatibler Download gefunden.",
+    "checkFailed": "Update-Prüfung fehlgeschlagen.",
+    "checkFailedDetail": "Update-Prüfung fehlgeschlagen: {{message}}",
+    "dialog": {
+      "title": "KorTTY-Update verfügbar",
+      "header": "KorTTY {{version}} ist verfügbar",
+      "installedVersion": "Installierte Version:",
+      "availableVersion": "Verfügbare Version:",
+      "downloadAsset": "Download:",
+      "downloadTargetInfo": "Die Datei wird hierhin heruntergeladen:"
+    },
+    "downloadAction": "Herunterladen",
+    "remindTomorrow": "Morgen erinnern",
+    "skipVersion": "Diese Version überspringen",
+    "download": {
+      "title": "KorTTY-Update wird heruntergeladen",
+      "header": "{{version}} wird heruntergeladen",
+      "running": "{{asset}} wird heruntergeladen...",
+      "complete": {
+        "title": "Download abgeschlossen"
+      },
+      "completeInfo": "Das Update wurde heruntergeladen nach:",
+      "failed": {
+        "title": "Download fehlgeschlagen"
+      },
+      "failedInfo": "Das Update konnte nicht heruntergeladen werden.",
+      "openFolder": "Ordner öffnen"
+    }
+  },
+  "connEdit": {
+    "terminalEmulation": "Terminal-Emulation",
+    "terminalColors": "Terminalfarben aktivieren",
+    "aiTab": "KI",
+    "aiProfile": "KI-Profil:",
+    "aiProfileDefault": "Standardprofil verwenden",
+    "aiProfileMissing": "Gespeichertes Profil (derzeit nicht verfügbar)",
+    "aiProfileHint": "Ist das gewählte Profil nicht verfügbar, wird das Standard-KI-Profil verwendet, bis es wieder verfügbar ist.",
+    "aiSkills": "Verbindungs-Skills:",
+    "aiSkillsHint": "Zugeordnete Skills werden bei KI-Anfragen dieser Verbindung immer mitgesendet. Skills mit Ziel \"Verbindung\" werden nur für Verbindungen verwendet, denen sie zugeordnet sind.",
+    "aiSkillsNone": "Noch keine KI-Skills gespeichert."
+  },
+  "filebrowser": {
+    "title": "Lokaler Dateibrowser",
+    "showHidden": "Versteckte Dateien anzeigen",
+    "selected": "ausgewählt",
+    "copied": "{{count}} Element(e) kopiert",
+    "confirmDelete": "{{count}} Element(e) löschen?",
+    "context": {
+      "open": "Öffnen",
+      "loadAsTextFile": "Als Textdatei laden",
+      "copy": "Kopieren",
+      "cut": "Ausschneiden",
+      "paste": "Einfügen",
+      "delete": "Löschen",
+      "selectAll": "Alles auswählen",
+      "details": "Details",
+      "archive": "Archivieren",
+      "newFolder": "Neuer Ordner",
+      "newFile": "Neue Datei"
+    },
+    "newFolder": {
+      "title": "Neuer Ordner",
+      "header": "Ordnername eingeben"
+    },
+    "newFile": {
+      "title": "Neue Datei",
+      "header": "Dateiname eingeben"
+    },
+    "rename": {
+      "title": "Umbenennen",
+      "header": "Neuen Namen eingeben"
+    },
+    "archive": {
+      "title": "Archivieren",
+      "header": "Archivdateinamen eingeben",
+      "created": "Archiv erstellt"
+    },
+    "folder": {
+      "created": "Ordner erstellt"
+    },
+    "file": {
+      "created": "Datei erstellt"
+    },
+    "error": {
+      "accessDenied": "Zugriff verweigert",
+      "paste": "Einfügen fehlgeschlagen",
+      "delete": "Löschen fehlgeschlagen",
+      "archive": "Archivieren fehlgeschlagen",
+      "createFolder": "Ordner erstellen fehlgeschlagen",
+      "createFile": "Datei erstellen fehlgeschlagen",
+      "cannotOpen": "Datei kann nicht geöffnet werden",
+      "rename": "Umbenennen fehlgeschlagen"
+    },
+    "details": {
+      "type": "Typ",
+      "folder": "Ordner",
+      "file": "Datei",
+      "size": "Größe",
+      "path": "Pfad",
+      "modified": "Geändert",
+      "permissions": "Berechtigungen",
+      "owner": "Besitzer",
+      "group": "Gruppe"
+    },
+    "setOwner": {
+      "title": "Besitzer/Berechtigungen setzen",
+      "header": "Besitzer und Berechtigungen für {{count}} Element(e) setzen",
+      "ownerUser": "Benutzer:",
+      "ownerGroup": "Gruppe:",
+      "permissions": "Berechtigungen:",
+      "recursive": "Rekursiv auf Verzeichnisse anwenden",
+      "infoSeparate": "Leer lassen um aktuellen Wert zu behalten.\nBenutzer-/Gruppenlisten sind Best-Effort; andere gültige Namen können eingegeben werden.\nBerechtigungen: Oktalformat wie 755 oder 644",
+      "success": "{{count}} Element(e) geändert",
+      "errorCount": "{{failed}} von {{total}} Elementen konnten nicht geändert werden.",
+      "notSupported": "Besitzer oder POSIX-Berechtigungen werden von diesem Dateisystem nicht unterstützt.",
+      "invalid": "Ungültige Eingabe"
+    }
+  },
+  "ai": {
+    "manager": {
+      "title": "KI-Manager",
+      "tabProfiles": "Profile",
+      "tabChats": "Gespeicherte Chats",
+      "defaultProfile": "Standardprofil:",
+      "defaultProfileNone": "Erstes verfügbares Profil",
+      "defaultProfileHint": "Das Standardprofil wird auch für KI-Aktionen im Terminal und für den KI-Agenten im Terminal verwendet, wenn kein anderes Profil ausgewählt wird.",
+      "defaultProfileSaved": "Standardprofil gespeichert.",
+      "defaultMarker": "Standard",
+      "profileUnnamed": "Unbenanntes Profil",
+      "connectionMode": "Verbindung",
+      "connectionModeHttp": "HTTP-API",
+      "connectionModeCli": "Lokale CLI",
+      "model": "Modell",
+      "modelRefresh": "Verfügbare Modelle aktualisieren",
+      "cli": {
+        "provider": "CLI-Anbieter",
+        "executable": "CLI-Executable",
+        "executablePrompt": "Leer lassen, um einen verifizierten Anbieter-Befehl zu verwenden",
+        "statusInstalled": "Gefunden: {{path}}",
+        "statusNotInstalled": "Keine verifizierte Anbieter-CLI im PATH gefunden. Bitte Executable und Argument-Template konfigurieren.",
+        "statusCustom": "Eigenes Executable: {{path}}",
+        "statusCustomUnverified": "Eigenes Executable konfiguriert, aber nicht als ausführbar verifiziert: {{path}}",
+        "arguments": "CLI-Argumente",
+        "argumentsPrompt": "Ein Argument pro Zeile oder ein gequotetes Inline-Template. Verwende {promptFile}, {systemPromptFile}, {userPromptFile}, {model}, {reasoning}, {stdinPrompt}.",
+        "insertPreset": "Preset einfügen",
+        "presetInserted": "Argument-Preset \"{{label}}\" eingefügt.",
+        "presetMissing": "Für diesen Anbieter ist kein verifiziertes Argument-Preset vorhanden.",
+        "model": "Modell",
+        "modelPrompt": "Anbieterspezifischen Modellnamen eingeben"
+      },
+      "reasoning": {
+        "label": "Reasoning",
+        "refresh": "Reasoning-Optionen aktualisieren",
+        "refreshSuccess": "Reasoning-Optionen aktualisiert: {{options}}",
+        "refreshNone": "Dieses Profil hat keine zusätzlichen Reasoning-Parameter akzeptiert.",
+        "refreshFailed": "Reasoning-Aktualisierung fehlgeschlagen",
+        "rediscover": "Die Profilkonfiguration hat sich seit der letzten Erkennung geändert. Bitte Reasoning-Optionen aktualisieren.",
+        "option": {
+          "disabled": "Deaktiviert",
+          "none": "Keine",
+          "minimal": "Minimal",
+          "low": "Niedrig",
+          "medium": "Mittel",
+          "high": "Hoch",
+          "xhigh": "Extra hoch"
+        }
+      }
+    }
   }
 }

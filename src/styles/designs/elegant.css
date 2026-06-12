@@ -1,0 +1,47 @@
+/*
+ * Elegant Dark app design (port of Java styles/elegant.css).
+ * Calm graphite surfaces with warm gold accents and the Inter typeface.
+ * Terminal sessions (.xterm) and Monaco editors keep their own styling —
+ * selectors below must never target .xterm or [class*="monaco"] content.
+ */
+
+[data-app-design="elegant-dark"] body,
+[data-app-design="elegant-dark"] button:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="elegant-dark"] input:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="elegant-dark"] select:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="elegant-dark"] textarea:not(.xterm *):not([class*="monaco"] *) {
+  font-family: "Inter", "SF Pro Text", "Segoe UI", "Helvetica Neue", sans-serif;
+}
+
+/* Slightly larger radii for a softer, premium feel. */
+[data-app-design="elegant-dark"] button:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="elegant-dark"] input:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="elegant-dark"] select:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="elegant-dark"] textarea:not(.xterm *):not([class*="monaco"] *) {
+  border-radius: 6px !important;
+}
+
+/* Gentle gold focus glow. */
+[data-app-design="elegant-dark"] input:not(.xterm *):not([class*="monaco"] *):focus,
+[data-app-design="elegant-dark"] select:not(.xterm *):not([class*="monaco"] *):focus,
+[data-app-design="elegant-dark"] textarea:not(.xterm *):not([class*="monaco"] *):focus {
+  box-shadow: 0 0 0 2px rgba(200, 169, 110, 0.25) !important;
+}
+
+/* Soft elevation on hovered buttons. */
+[data-app-design="elegant-dark"] button:not(.xterm *):not([class*="monaco"] *):hover {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
+}
+
+/* Restrained heading treatment matching the Java Inter design. */
+[data-app-design="elegant-dark"] h1:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="elegant-dark"] h2:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="elegant-dark"] h3:not(.xterm *):not([class*="monaco"] *) {
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
+/* Rounded scrollbars in app chrome. */
+[data-app-design="elegant-dark"] ::-webkit-scrollbar-thumb {
+  border-radius: 4px;
+}

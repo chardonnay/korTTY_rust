@@ -1,9 +1,16 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useMemo } from "react";
 import { X, Settings } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
-import { useSettingsStore, GlobalSettings } from "../../store/settingsStore";
+import { useTranslation } from "react-i18next";
+import { useSettingsStore, GlobalSettings, AppDesign } from "../../store/settingsStore";
+import { applyAppDesign, normalizeAppDesign } from "../../store/appDesignStore";
+import matrixTerminalPreview from "../../assets/previews/matrix-terminal-preview.png";
+import holographicPreview from "../../assets/previews/holographic-preview.png";
+import klingonTacticalPreview from "../../assets/previews/klingon-tactical-preview.png";
+import elegantDarkPreview from "../../assets/previews/elegant-dark-preview.png";
 import type { AiProfile, AiSkill } from "../../types/ai";
+import type { SnippetEditorProfile } from "../../types/snippet";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
 import {
   DEFAULT_TERMINAL_AGENT_COMMAND_NAME,
@@ -12,6 +19,13 @@ import {
   getTerminalAgentCommandNameValidationMessage,
   normalizeTerminalAgentCommandName,
 } from "../../utils/terminalAgentCommand";
+import {
+  CURRENT_SETTINGS_PROFILE_ID,
+  builtInProfiles,
+  customProfiles,
+  hexColor,
+} from "../../utils/snippetEditorProfiles";
+import { SnippetEditorProfileDialog } from "./SnippetEditorProfileDialog";
 
 interface SettingsDialogProps {
   open: boolean;
@@ -19,7 +33,48 @@ interface SettingsDialogProps {
   onSaved?: (settings: GlobalSettings) => void;
 }
 
-type TabId = "language" | "translation" | "ai" | "backup" | "window" | "terminal";
+type TabId =
+  | "language"
+  | "appearance"
+  | "translation"
+  | "ai"
+  | "backup"
+  | "window"
+  | "terminal"
+  | "recording"
+  | "logging"
+  | "updates"
+  | "snippetEditor";
+
+const SNIPPET_CURSOR_STYLES = ["BLOCK", "LINE", "UNDERSCORE"] as const;
+
+const APP_DESIGN_OPTIONS: {
+  id: AppDesign;
+  labelKey: string;
+  preview?: string;
+}[] = [
+  { id: "normal", labelKey: "settings.appearance.design.normal" },
+  {
+    id: "matrix-terminal",
+    labelKey: "settings.appearance.design.matrixTerminal",
+    preview: matrixTerminalPreview,
+  },
+  {
+    id: "holographic-interface",
+    labelKey: "settings.appearance.design.holographicInterface",
+    preview: holographicPreview,
+  },
+  {
+    id: "klingon-tactical",
+    labelKey: "settings.appearance.design.klingonTactical",
+    preview: klingonTacticalPreview,
+  },
+  {
+    id: "elegant-dark",
+    labelKey: "settings.appearance.design.elegantDark",
+    preview: elegantDarkPreview,
+  },
+];
 
 const LANGUAGES = [
   { value: "en", label: "English" },
@@ -55,6 +110,7 @@ function clampOptionalNumber(value: number | undefined, min: number, max: number
 }
 
 export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) {
+  const { t } = useTranslation();
   const { width, height, onResizeStart } = useDialogGeometry("settings", 600, 500, 400, 300);
   const { settings, loadSettings, saveSettings } = useSettingsStore();
   const [activeTab, setActiveTab] = useState<TabId>("language");
@@ -66,6 +122,10 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
   const [aiProfiles, setAiProfiles] = useState<AiProfile[]>([]);
   const [selectedSkillId, setSelectedSkillId] = useState<string | null>(null);
   const [skillDraft, setSkillDraft] = useState<AiSkill | null>(null);
+  const [snippetProfileDialogOpen, setSnippetProfileDialogOpen] = useState(false);
+  const [defaultLogDirectory, setDefaultLogDirectory] = useState<string>("");
+  const snippetBuiltInProfiles = useMemo(() => builtInProfiles(), []);
+  const snippetCustomProfiles = useMemo(() => customProfiles(local), [local]);
 
   useEffect(() => {
     if (open) {
@@ -80,6 +140,12 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
         .then((skills) => update({ aiSkills: skills }))
         .catch((error) => {
           console.error("Failed to load AI skills:", error);
+        });
+      invoke<string>("get_default_log_directory")
+        .then(setDefaultLogDirectory)
+        .catch((error) => {
+          console.error("Failed to resolve default log directory:", error);
+          setDefaultLogDirectory("");
         });
     }
   }, [open, loadSettings]);
@@ -99,6 +165,20 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
     setLocal((prev) => ({ ...prev, ...partial }));
   }
 
+  function selectAppDesign(id: AppDesign) {
+    update({ appDesign: id });
+    // Live preview: apply the design immediately; reverted on cancel.
+    applyAppDesign(id);
+  }
+
+  function handleClose() {
+    // Revert any unsaved app-design live preview.
+    if (normalizeAppDesign(local.appDesign) !== normalizeAppDesign(settings.appDesign)) {
+      applyAppDesign(normalizeAppDesign(settings.appDesign));
+    }
+    onClose();
+  }
+
   async function handleSave() {
     setSaving(true);
     try {
@@ -114,15 +194,52 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
         terminalAgentPanelHeight: clampOptionalNumber(local.terminalAgentPanelHeight, 140, 520),
         terminalAgentPanelSideWidth: clampOptionalNumber(local.terminalAgentPanelSideWidth, 360, 720),
         terminalAgentPanelFontSize: clampOptionalNumber(local.terminalAgentPanelFontSize, 9, 20),
+        appDesign: normalizeAppDesign(local.appDesign),
+        updateCheckIntervalDays: Math.min(30, Math.max(1, Math.round(local.updateCheckIntervalDays) || 1)),
+        logRetentionDays: Math.min(3650, Math.max(0, Math.round(local.logRetentionDays) || 0)),
+        logDirectoryPath: local.logDirectoryPath?.trim() || undefined,
       };
       await invoke("save_ai_skills", { skills: nextSettings.aiSkills });
       await saveSettings(nextSettings);
+      applyAppDesign(nextSettings.appDesign);
+      const updateSettingsChanged =
+        nextSettings.updateChecksEnabled !== settings.updateChecksEnabled ||
+        nextSettings.updateCheckIntervalDays !== settings.updateCheckIntervalDays;
+      if (updateSettingsChanged) {
+        invoke("restart_update_check_service").catch((error) => {
+          console.error("Failed to restart update check service:", error);
+        });
+      }
       onSaved?.(nextSettings);
       onClose();
     } catch (err) {
       console.error(err);
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function chooseLogDirectory() {
+    const path = await openDialog({
+      directory: true,
+      multiple: false,
+      title: t("settings.logging.directoryChoose"),
+      defaultPath: local.logDirectoryPath || defaultLogDirectory || undefined,
+    });
+    if (typeof path === "string" && path) {
+      update({ logDirectoryPath: path });
+    }
+  }
+
+  async function chooseRecordingDirectory() {
+    const path = await openDialog({
+      directory: true,
+      multiple: false,
+      title: t("recording.manager.chooseDirectory"),
+      defaultPath: local.terminalRecordingDirectory || undefined,
+    });
+    if (typeof path === "string" && path) {
+      update({ terminalRecordingDirectory: path });
     }
   }
 
@@ -204,12 +321,44 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
 
   const tabs: { id: TabId; label: string }[] = [
     { id: "language", label: "Language" },
+    { id: "appearance", label: t("settings.tab.appearance") },
     { id: "translation", label: "Translation" },
     { id: "ai", label: "AI" },
     { id: "backup", label: "Backup" },
     { id: "window", label: "Window" },
     { id: "terminal", label: "Terminal" },
+    { id: "recording", label: t("settings.tab.recording") },
+    { id: "logging", label: t("settings.tab.logging") },
+    { id: "updates", label: t("settings.tab.updates") },
+    { id: "snippetEditor", label: t("settings.snippetEditor.title") },
   ];
+
+  function colorField(
+    label: string,
+    value: string | undefined,
+    fallback: string,
+    onChange: (value: string | undefined) => void,
+  ) {
+    return (
+      <div>
+        <label className="block text-xs text-kortty-text-dim mb-1">{label}</label>
+        <div className="flex items-center gap-2">
+          <input
+            type="color"
+            className="h-7 w-12 cursor-pointer rounded border border-kortty-border bg-transparent"
+            value={hexColor(value, fallback).toLowerCase()}
+            onChange={(e) => onChange(hexColor(e.target.value, fallback))}
+          />
+          <input
+            className="input-field flex-1"
+            value={value || ""}
+            placeholder={fallback}
+            onChange={(e) => onChange(e.target.value || undefined)}
+          />
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -220,7 +369,7 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
             <Settings className="w-4 h-4 text-kortty-accent" />
             Settings
           </h2>
-          <button onClick={onClose} className="text-kortty-text-dim hover:text-kortty-text">
+          <button onClick={handleClose} className="text-kortty-text-dim hover:text-kortty-text">
             <X className="w-4 h-4" />
           </button>
         </div>
@@ -264,6 +413,71 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
               </div>
               <p className="text-xs text-kortty-text-dim">
                 Restart the application for language changes to take effect.
+              </p>
+            </>
+          )}
+
+          {activeTab === "appearance" && (
+            <>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">
+                  {t("settings.appearance.appDesign")}
+                </label>
+                <p className="text-xs text-kortty-text-dim mb-2">
+                  {t("settings.appearance.appDesignInfo")}
+                </p>
+              </div>
+              <div className="grid grid-cols-2 gap-3 lg:grid-cols-3">
+                {APP_DESIGN_OPTIONS.map((option) => {
+                  const selected = normalizeAppDesign(local.appDesign) === option.id;
+                  return (
+                    <label
+                      key={option.id}
+                      className={`flex cursor-pointer select-none flex-col gap-2 rounded border p-2 transition-colors ${
+                        selected
+                          ? "border-kortty-accent bg-kortty-accent/10"
+                          : "border-kortty-border bg-kortty-panel/30 hover:border-kortty-text-dim"
+                      }`}
+                    >
+                      <span className="flex items-center gap-2 text-xs">
+                        <input
+                          type="radio"
+                          name="appDesign"
+                          value={option.id}
+                          checked={selected}
+                          onChange={() => selectAppDesign(option.id)}
+                        />
+                        <span className={selected ? "text-kortty-accent font-medium" : ""}>
+                          {t(option.labelKey)}
+                        </span>
+                      </span>
+                      {option.preview ? (
+                        <img
+                          src={option.preview}
+                          alt={t(option.labelKey)}
+                          draggable={false}
+                          className="h-24 w-full rounded-sm border border-kortty-border object-cover"
+                        />
+                      ) : (
+                        <div
+                          className="h-24 w-full rounded-sm border border-kortty-border"
+                          aria-label={t(option.labelKey)}
+                          style={{
+                            background:
+                              "linear-gradient(135deg, rgb(var(--kortty-bg)) 0%, rgb(var(--kortty-surface)) 45%, rgb(var(--kortty-panel)) 70%, rgb(var(--kortty-accent)) 140%)",
+                          }}
+                        />
+                      )}
+                    </label>
+                  );
+                })}
+              </div>
+              <p className="text-xs text-kortty-text-dim">
+                {t("settings.appearance.preview")} {t(
+                  APP_DESIGN_OPTIONS.find(
+                    (option) => option.id === normalizeAppDesign(local.appDesign),
+                  )?.labelKey ?? "settings.appearance.design.normal",
+                )}
               </p>
             </>
           )}
@@ -471,6 +685,34 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
                 </select>
                 <p className="mt-1 text-xs text-kortty-text-dim">
                   Choose whether AI Agent tasks run directly in the current terminal session or open as a new AI chat.
+                </p>
+              </div>
+              <div className="space-y-1">
+                <label className="flex items-center gap-2 text-xs text-kortty-text cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={local.terminalAgentExecutionEnabled}
+                    onChange={(e) => update({ terminalAgentExecutionEnabled: e.target.checked })}
+                  />
+                  <span>{t("settings.ai.terminalAgentExecutionEnabled")}</span>
+                </label>
+                <p className="pl-6 text-xs text-kortty-text-dim">
+                  {t("settings.ai.terminalAgentExecutionEnabledHint")}
+                </p>
+              </div>
+              <div className="space-y-1">
+                <label className="flex items-center gap-2 text-xs text-kortty-text cursor-pointer select-none">
+                  <input
+                    type="checkbox"
+                    checked={local.terminalAgentConfirmMutatingCommandSets}
+                    onChange={(e) =>
+                      update({ terminalAgentConfirmMutatingCommandSets: e.target.checked })
+                    }
+                  />
+                  <span>{t("settings.ai.terminalAgentConfirmMutatingCommandSets")}</span>
+                </label>
+                <p className="pl-6 text-xs text-kortty-text-dim">
+                  {t("settings.ai.terminalAgentConfirmMutatingCommandSetsHint")}
                 </p>
               </div>
               <label className="flex items-center gap-2 text-xs text-kortty-text cursor-pointer select-none">
@@ -883,12 +1125,433 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
               </label>
             </>
           )}
+
+          {activeTab === "recording" && (
+            <>
+              <h3 className="text-xs font-semibold">{t("recording.manager.header")}</h3>
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={local.terminalRecordingEnabled}
+                  onChange={(e) => update({ terminalRecordingEnabled: e.target.checked })}
+                />
+                {t("recording.manager.enabled")}
+              </label>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">
+                  {t("recording.manager.storagePath")}
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    className="input-field flex-1"
+                    value={local.terminalRecordingDirectory || ""}
+                    onChange={(e) =>
+                      update({ terminalRecordingDirectory: e.target.value || undefined })
+                    }
+                  />
+                  <button
+                    className="px-3 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors whitespace-nowrap"
+                    onClick={() => void chooseRecordingDirectory()}
+                  >
+                    {t("recording.manager.browse")}
+                  </button>
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">
+                    {t("recording.manager.format")}
+                  </label>
+                  <select
+                    className="input-field w-full"
+                    value={local.terminalRecordingFormat}
+                    onChange={(e) =>
+                      update({
+                        terminalRecordingFormat: e.target.value as GlobalSettings["terminalRecordingFormat"],
+                      })
+                    }
+                  >
+                    <option value="KorttyReplay">{t("recording.manager.formatKorttyReplay")}</option>
+                    <option value="Webm">{t("recording.manager.formatWebm")}</option>
+                  </select>
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">
+                    {t("recording.manager.defaultScope")}
+                  </label>
+                  <select
+                    className="input-field w-full"
+                    value={local.terminalRecordingDefaultScope}
+                    onChange={(e) =>
+                      update({
+                        terminalRecordingDefaultScope: e.target
+                          .value as GlobalSettings["terminalRecordingDefaultScope"],
+                      })
+                    }
+                  >
+                    <option value="ActiveSplit">{t("recording.manager.scopeActiveSplit")}</option>
+                    <option value="WholeTab">{t("recording.manager.scopeWholeTab")}</option>
+                  </select>
+                </div>
+              </div>
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={local.terminalRecordingCaptureColorsEnabled}
+                  onChange={(e) =>
+                    update({ terminalRecordingCaptureColorsEnabled: e.target.checked })
+                  }
+                />
+                {t("recording.manager.captureColors")}
+              </label>
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={local.terminalRecordingIdleAutoPause}
+                  onChange={(e) => update({ terminalRecordingIdleAutoPause: e.target.checked })}
+                />
+                {t("recording.manager.autoPause")}
+              </label>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">
+                  {t("recording.manager.idleSeconds")}
+                </label>
+                <input
+                  className="input-field w-28"
+                  type="number"
+                  min={1}
+                  max={3600}
+                  value={local.terminalRecordingIdlePauseSeconds}
+                  onChange={(e) => {
+                    const value = parseInt(e.target.value, 10);
+                    update({
+                      terminalRecordingIdlePauseSeconds: Number.isFinite(value)
+                        ? Math.min(3600, Math.max(1, value))
+                        : 20,
+                    });
+                  }}
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">
+                  {t("recording.manager.ffmpegPath")}
+                </label>
+                <input
+                  className="input-field w-full"
+                  value={local.terminalRecordingFfmpegPath || ""}
+                  placeholder="ffmpeg"
+                  onChange={(e) =>
+                    update({ terminalRecordingFfmpegPath: e.target.value || undefined })
+                  }
+                />
+              </div>
+            </>
+          )}
+
+          {activeTab === "logging" && (
+            <>
+              <h3 className="text-xs font-semibold">{t("settings.logging.header")}</h3>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">
+                  {t("settings.logging.directory")}
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    className="input-field flex-1"
+                    value={local.logDirectoryPath || ""}
+                    placeholder={defaultLogDirectory}
+                    onChange={(e) => update({ logDirectoryPath: e.target.value || undefined })}
+                  />
+                  <button
+                    className="px-3 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors whitespace-nowrap"
+                    onClick={() => void chooseLogDirectory()}
+                  >
+                    {t("settings.logging.directoryChoose")}
+                  </button>
+                </div>
+                {defaultLogDirectory && (
+                  <p className="mt-1 text-xs text-kortty-text-dim">
+                    {t("settings.logging.directoryInfo", { path: defaultLogDirectory })}
+                  </p>
+                )}
+                {(local.logDirectoryPath?.trim() || undefined) !==
+                  (settings.logDirectoryPath?.trim() || undefined) && (
+                  <p className="mt-1 text-xs text-amber-300">
+                    {t("settings.logging.restartRequired")}
+                  </p>
+                )}
+              </div>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">
+                  {t("settings.logging.retention")}
+                </label>
+                <div className="flex items-center gap-2">
+                  <input
+                    className="input-field w-28"
+                    type="number"
+                    min={0}
+                    max={3650}
+                    value={local.logRetentionDays}
+                    title={t("settings.logging.retentionInfo")}
+                    onChange={(e) => {
+                      const value = parseInt(e.target.value, 10);
+                      update({
+                        logRetentionDays: Number.isFinite(value)
+                          ? Math.min(3650, Math.max(0, value))
+                          : 0,
+                      });
+                    }}
+                  />
+                  <span className="text-xs text-kortty-text-dim">{t("settings.logging.days")}</span>
+                </div>
+                <p className="mt-1 text-xs text-kortty-text-dim">
+                  {t("settings.logging.retentionInfo")}
+                </p>
+                <p className="mt-1 text-xs text-kortty-text-dim">
+                  {t("settings.logging.compressionInfo")}
+                </p>
+              </div>
+            </>
+          )}
+
+          {activeTab === "updates" && (
+            <>
+              <h3 className="text-xs font-semibold">{t("settings.updates.header")}</h3>
+              <label
+                className="flex items-center gap-2 text-xs cursor-pointer select-none"
+                title={t("settings.updates.automaticTooltip")}
+              >
+                <input
+                  type="checkbox"
+                  checked={local.updateChecksEnabled}
+                  onChange={(e) => update({ updateChecksEnabled: e.target.checked })}
+                  className="rounded border-kortty-border"
+                />
+                {t("settings.updates.automatic")}
+              </label>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">
+                  {t("settings.updates.interval")}
+                </label>
+                <div className="flex items-center gap-3">
+                  <input
+                    type="range"
+                    min={1}
+                    max={30}
+                    step={1}
+                    value={Math.min(30, Math.max(1, local.updateCheckIntervalDays || 1))}
+                    disabled={!local.updateChecksEnabled}
+                    onChange={(e) =>
+                      update({ updateCheckIntervalDays: parseInt(e.target.value, 10) || 1 })
+                    }
+                    className="flex-1"
+                  />
+                  <span className="w-32 text-xs text-kortty-text whitespace-nowrap">
+                    {t("settings.updates.intervalDays", {
+                      days: Math.min(30, Math.max(1, local.updateCheckIntervalDays || 1)),
+                    })}
+                  </span>
+                </div>
+              </div>
+              <p className="text-xs text-kortty-text-dim">{t("settings.updates.info")}</p>
+            </>
+          )}
+
+          {activeTab === "snippetEditor" && (
+            <>
+              <p className="text-xs text-kortty-text-dim">{t("settings.snippetEditor.info")}</p>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">
+                    {t("settings.snippetEditor.fontFamily")}
+                  </label>
+                  <input
+                    className="input-field"
+                    value={local.snippetFontFamily || ""}
+                    placeholder={local.defaultFontFamily}
+                    onChange={(e) => update({ snippetFontFamily: e.target.value || undefined })}
+                  />
+                </div>
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">
+                    {t("settings.snippetEditor.fontSize")} {t("settings.snippetEditor.fontSizeInfo")}
+                  </label>
+                  <input
+                    className="input-field"
+                    type="number"
+                    min={0}
+                    max={72}
+                    value={local.snippetFontSize ?? 0}
+                    onChange={(e) => {
+                      const value = parseInt(e.target.value, 10);
+                      update({
+                        snippetFontSize: Number.isFinite(value) && value > 0 ? Math.min(72, value) : undefined,
+                      });
+                    }}
+                  />
+                </div>
+                {colorField(
+                  t("settings.snippetEditor.foreground"),
+                  local.snippetForegroundColor,
+                  "#D4D4D4",
+                  (value) => update({ snippetForegroundColor: value }),
+                )}
+                {colorField(
+                  t("settings.snippetEditor.background"),
+                  local.snippetBackgroundColor,
+                  "#1E1E1E",
+                  (value) => update({ snippetBackgroundColor: value }),
+                )}
+                {colorField(
+                  t("settings.snippetEditor.cursorColor"),
+                  local.snippetCursorColor,
+                  "#D4D4D4",
+                  (value) => update({ snippetCursorColor: value }),
+                )}
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">
+                    {t("settings.snippetEditor.cursorStyle")}
+                  </label>
+                  <select
+                    className="input-field"
+                    value={local.snippetCursorStyle || "BLOCK"}
+                    onChange={(e) => update({ snippetCursorStyle: e.target.value })}
+                  >
+                    {SNIPPET_CURSOR_STYLES.map((style) => (
+                      <option key={style} value={style}>
+                        {style}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={local.snippetWordWrap}
+                  onChange={(e) => update({ snippetWordWrap: e.target.checked })}
+                  className="rounded border-kortty-border"
+                />
+                {t("settings.snippetEditor.wordWrap")}
+              </label>
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={local.snippetLineNumbers}
+                  onChange={(e) => update({ snippetLineNumbers: e.target.checked })}
+                  className="rounded border-kortty-border"
+                />
+                {t("settings.snippetEditor.lineNumbers")}
+              </label>
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs text-kortty-text-dim mb-1">
+                    {t("settings.snippetEditor.historyMax")}
+                  </label>
+                  <input
+                    className="input-field"
+                    type="number"
+                    min={1}
+                    max={99}
+                    value={local.snippetHistoryMaxSize}
+                    onChange={(e) => {
+                      const value = parseInt(e.target.value, 10);
+                      update({
+                        snippetHistoryMaxSize: Number.isFinite(value)
+                          ? Math.min(99, Math.max(1, value))
+                          : 30,
+                      });
+                    }}
+                  />
+                </div>
+                {colorField(
+                  t("settings.snippetEditor.diagramBackground"),
+                  local.snippetDiagramBackgroundColor,
+                  "#FFFFFF",
+                  (value) => update({ snippetDiagramBackgroundColor: value }),
+                )}
+              </div>
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={local.aiSnippetEditorAdditionalInstructionsEnabled}
+                  onChange={(e) =>
+                    update({ aiSnippetEditorAdditionalInstructionsEnabled: e.target.checked })
+                  }
+                  className="rounded border-kortty-border"
+                />
+                {t("settings.snippetEditor.aiInstructionsEnabled")}
+              </label>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">
+                  {t("settings.snippetEditor.alternativeSolutionCount")}
+                </label>
+                <input
+                  className="input-field"
+                  type="number"
+                  min={1}
+                  max={10}
+                  value={local.aiSnippetAlternativeSolutionCount}
+                  onChange={(e) => {
+                    const value = parseInt(e.target.value, 10);
+                    update({
+                      aiSnippetAlternativeSolutionCount: Number.isFinite(value)
+                        ? Math.min(10, Math.max(1, value))
+                        : 3,
+                    });
+                  }}
+                />
+              </div>
+              <div>
+                <label className="block text-xs text-kortty-text-dim mb-1">
+                  {t("settings.snippetEditor.profile")}
+                </label>
+                <div className="flex items-center gap-2">
+                  <select
+                    className="input-field flex-1"
+                    value={
+                      local.selectedSnippetEditorProfileId === CURRENT_SETTINGS_PROFILE_ID
+                        ? ""
+                        : local.selectedSnippetEditorProfileId || ""
+                    }
+                    onChange={(e) =>
+                      update({ selectedSnippetEditorProfileId: e.target.value || undefined })
+                    }
+                  >
+                    <option value="">{t("snippet.profile.current")}</option>
+                    {snippetCustomProfiles.length > 0 && (
+                      <optgroup label={t("snippet.profile.custom")}>
+                        {snippetCustomProfiles.map((profile) => (
+                          <option key={profile.id} value={profile.id}>
+                            {profile.name}
+                          </option>
+                        ))}
+                      </optgroup>
+                    )}
+                    <optgroup label={t("snippet.profile.presets")}>
+                      {snippetBuiltInProfiles.map((profile) => (
+                        <option key={profile.id} value={profile.id}>
+                          {profile.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  </select>
+                  <button
+                    className="px-3 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors"
+                    onClick={() => setSnippetProfileDialogOpen(true)}
+                  >
+                    {t("settings.snippetEditor.manageProfiles")}
+                  </button>
+                </div>
+              </div>
+            </>
+          )}
         </div>
 
         <div className="flex justify-end gap-2 px-4 py-3 border-t border-kortty-border">
           <button
             className="px-4 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors"
-            onClick={onClose}
+            onClick={handleClose}
           >
             Cancel
           </button>
@@ -900,6 +1563,16 @@ export function SettingsDialog({ open, onClose, onSaved }: SettingsDialogProps) 
             Save
           </button>
         </div>
+        <SnippetEditorProfileDialog
+          open={snippetProfileDialogOpen}
+          onClose={() => setSnippetProfileDialogOpen(false)}
+          customProfiles={snippetCustomProfiles}
+          onSaveProfiles={(profiles: SnippetEditorProfile[]) =>
+            update({ snippetEditorProfiles: profiles })
+          }
+          selectedProfileId={local.selectedSnippetEditorProfileId}
+          onSelectProfile={(id) => update({ selectedSnippetEditorProfileId: id })}
+        />
         <div
           className="absolute bottom-0 right-0 w-4 h-4 cursor-nwse-resize opacity-40 hover:opacity-100 transition-opacity"
           onMouseDown={onResizeStart}

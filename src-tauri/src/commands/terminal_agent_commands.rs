@@ -27,7 +27,19 @@ pub async fn start_terminal_agent(
         return Err("A terminal agent prompt is required".into());
     }
 
-    let profile = terminal_agent::load_ai_profile(&profile_id)?;
+    // Safety gate: executable agent runs can be disabled in Global Settings.
+    // Ask (query-only) and planning flows stay available.
+    let settings = terminal_agent::load_global_settings_or_default();
+    if !request.query_only && !settings.terminal_agent_execution_enabled {
+        return Err("AI Agent execution is disabled in Global Settings.".into());
+    }
+
+    // Connection-fixed profile > explicitly requested profile > default profile.
+    let profile = terminal_agent::resolve_ai_profile(
+        &profile_id,
+        request.connection_ai_profile_id.as_deref(),
+    )?;
+    let profile_id = profile.id.clone();
     let session_arc = state
         .get_session(&session_id)
         .await
@@ -55,8 +67,22 @@ pub async fn start_terminal_agent(
         show_runtime_messages: request.show_runtime_messages,
         ask_confirmation_before_every_command: request.ask_confirmation_before_every_command,
         auto_approve_root_commands: request.auto_approve_root_commands,
+        confirm_mutating_command_sets: request.confirm_mutating_command_sets
+            || settings.terminal_agent_confirm_mutating_command_sets,
         accepted_plan_context: request.accepted_plan_context,
         query_only: request.query_only,
+        connection_ai_profile_id: request
+            .connection_ai_profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        connection_ai_skill_ids: request
+            .connection_ai_skill_ids
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect(),
     };
     let app_clone = app.clone();
     let run_id_clone = run_id.clone();

@@ -163,3 +163,23 @@
     transform: translate3d(3px, -2px, 0);
   }
 }
+
+/* WP5.4: hide terminal scrollbars in terminal-only fullscreen when
+   settings.hideTerminalScrollbarsInFullscreen is active (class is set on the
+   MainWindow root). */
+.kortty-hide-terminal-scrollbars .xterm-viewport {
+  scrollbar-width: none;
+}
+
+.kortty-hide-terminal-scrollbars .xterm-viewport::-webkit-scrollbar {
+  width: 0 !important;
+  display: none;
+}
+
+/* WP5.5: the resizable LocalFileBrowser wrapper controls the panel size, so
+   the browser's own fixed Tailwind frame size (w-[280px]/h-56) is overridden
+   to fill the wrapper. */
+.kortty-resizable-filebrowser > div {
+  width: 100% !important;
+  height: 100% !important;
+}

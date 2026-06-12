@@ -1,5 +1,6 @@
 import { useState, useCallback, useEffect, useLayoutEffect, useRef, useMemo, Fragment } from "react";
 import { createPortal } from "react-dom";
+import { useTranslation } from "react-i18next";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -275,6 +276,8 @@ interface TerminalSplitPaneProps {
   onToggleRecording?: (sessionId: string) => void;
   onReconnect: (sessionId: string) => void;
   onAiAction?: (sessionId: string, action: AiAction, selectedText: string) => void;
+  /** WP1.3c: opens the selected file name from the terminal in the snippet editor. */
+  onOpenSelectionInSnippetEditor?: (sessionId: string, selectedText: string) => void;
   onStartAgent?: (sessionId: string) => void;
   onStartAgentPlan?: (sessionId: string) => void;
   onOpenSnippetManager?: () => void;
@@ -325,6 +328,7 @@ export function TerminalSplitPane({
   onToggleRecording,
   onReconnect,
   onAiAction,
+  onOpenSelectionInSnippetEditor,
   onStartAgent,
   onStartAgentPlan,
   onOpenSnippetManager,
@@ -343,6 +347,7 @@ export function TerminalSplitPane({
   initialTree,
   onTreeChange,
 }: TerminalSplitPaneProps) {
+  const { t } = useTranslation();
   const [tree, setTree] = useState<SplitNode>(() => {
     if (initialTree) {
       return initialTree;
@@ -1224,6 +1229,21 @@ export function TerminalSplitPane({
         >
           <CtxItem label="Copy" shortcut="Ctrl+C" onClick={() => menuAction(() => triggerTerminalAction("copy"))} />
           <CtxItem label="Paste" shortcut="Ctrl+V" onClick={() => menuAction(() => triggerTerminalAction("paste"))} />
+          {/* WP1.3c: open a selected file name in the snippet editor (only for
+              a non-blank selection, mirroring TerminalView.shouldShowLoadAsTextFileContextItem). */}
+          {onOpenSelectionInSnippetEditor && contextMenu.selectedText.trim() !== "" && (
+            <>
+              <CtxSep />
+              <CtxItem
+                label={t("terminal.context.openSelectionInSnippetEditor")}
+                onClick={() =>
+                  menuAction(() =>
+                    onOpenSelectionInSnippetEditor(contextMenu.sessionId, contextMenu.selectedText),
+                  )
+                }
+              />
+            </>
+          )}
           {onAiAction && (
             <>
               <CtxSep />

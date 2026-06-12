@@ -57,6 +57,10 @@ pub struct ConnectionSettings {
     pub terminal_effect_plugin_id: Option<String>,
     #[serde(default = "default_terminal_effect_animation_speed")]
     pub terminal_effect_animation_speed: f64,
+    #[serde(default)]
+    pub terminal_emulation_type: Option<String>,
+    #[serde(default = "default_true")]
+    pub terminal_colors_enabled: bool,
     pub theme_id: Option<String>,
     pub jump_server: Option<JumpServerConfig>,
     pub tunnels: Vec<super::tunnel::TunnelConfig>,
@@ -67,6 +71,10 @@ pub struct ConnectionSettings {
     pub teamwork_source_id: Option<String>,
     pub teamwork_version_token: Option<String>,
     pub teamwork_role: Option<String>,
+    #[serde(default)]
+    pub ai_profile_id: Option<String>,
+    #[serde(default)]
+    pub ai_skill_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -141,6 +149,8 @@ impl Default for ConnectionSettings {
             terminal_agent_command_name: None,
             terminal_effect_plugin_id: None,
             terminal_effect_animation_speed: default_terminal_effect_animation_speed(),
+            terminal_emulation_type: None,
+            terminal_colors_enabled: true,
             theme_id: None,
             jump_server: None,
             tunnels: Vec::new(),
@@ -151,6 +161,8 @@ impl Default for ConnectionSettings {
             teamwork_source_id: None,
             teamwork_version_token: None,
             teamwork_role: None,
+            ai_profile_id: None,
+            ai_skill_ids: Vec::new(),
         }
     }
 }

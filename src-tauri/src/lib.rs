@@ -1,10 +1,12 @@
 pub mod ai;
 pub mod ai_skills;
 pub mod backup;
+pub mod code_formatter;
 pub mod commands;
 pub mod figlet;
 pub mod i18n;
 pub mod jobscheduler;
+pub mod jobscheduler_xml;
 pub mod logging;
 pub mod model;
 pub mod persistence;
@@ -16,21 +18,67 @@ pub mod teamwork;
 pub mod terminal_agent;
 pub mod terminal_effects;
 pub mod terminal_recording;
+pub mod update;
 
-use tracing_subscriber::{fmt, EnvFilter};
+use tauri::Manager;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+
+/// Builds the optional daily-rolling file layer writing `kortty.YYYY-MM-DD.log`
+/// into the configured log directory. Any failure is swallowed — logging must
+/// never prevent application startup (mirrors Java LoggingConfiguration).
+fn build_log_file_appender() -> Option<tracing_appender::rolling::RollingFileAppender> {
+    let config_dir = persistence::xml_repository::config_dir().ok()?;
+    let log_dir = logging::prepare_log_directory_from_persisted_settings(&config_dir)?;
+    tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("kortty")
+        .filename_suffix("log")
+        .build(&log_dir)
+        .ok()
+}
+
+/// Periodically maintains the log directory (compression + retention) once
+/// per day, re-reading the persisted settings on every tick.
+fn spawn_log_maintenance_task() {
+    tauri::async_runtime::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(24 * 60 * 60)).await;
+            let _ = tokio::task::spawn_blocking(|| {
+                if let Ok(config_dir) = persistence::xml_repository::config_dir() {
+                    let settings = logging::read_persisted_log_settings(&config_dir);
+                    let log_dir = logging::resolve_log_directory(
+                        settings.log_directory_path.as_deref(),
+                        &config_dir,
+                    );
+                    if let Err(error) =
+                        logging::maintain_log_directory(&log_dir, settings.log_retention_days)
+                    {
+                        tracing::warn!(error = %error, "log directory maintenance failed");
+                    }
+                }
+            })
+            .await;
+        }
+    });
+}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    fmt()
-        .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
-        )
+    // Resolve the log directory from persisted settings BEFORE the tracing
+    // subscriber is initialized so the daily rolling file appender lands in
+    // the user-configured directory. Errors never prevent startup.
+    let file_appender = build_log_file_appender();
+    tracing_subscriber::registry()
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        .with(fmt::layer())
+        .with(file_appender.map(|appender| fmt::layer().with_ansi(false).with_writer(appender)))
         .init();
 
     let _ = persistence::xml_repository::ensure_subdirs();
 
     let app = tauri::Builder::default()
         .manage(ssh::SSHManager::new())
+        .manage(sftp::SftpModeStore::default())
         .manage(jobscheduler::JobSchedulerManager::new())
         .manage(terminal_agent::TerminalAgentStore::new())
         .manage(terminal_agent::TerminalAgentPlanStore::new())
@@ -42,6 +90,20 @@ pub fn run() {
         .manage(commands::window_commands::PendingTransferStore(
             std::sync::Mutex::new(std::collections::HashMap::new()),
         ))
+        .manage(update::service::UpdateCheckService::new())
+        .manage(commands::upload_commands::DroppedUploadCancelStore::default())
+        .setup(|app| {
+            // Start the automatic update checker (no-op when disabled in settings).
+            let app_handle = app.handle().clone();
+            tauri::async_runtime::spawn(async move {
+                let service_handle = app_handle.clone();
+                let service = service_handle.state::<update::service::UpdateCheckService>();
+                service.start(app_handle).await;
+            });
+            // Daily log directory maintenance (compression + retention).
+            spawn_log_maintenance_task();
+            Ok(())
+        })
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_shell::init())
@@ -51,6 +113,8 @@ pub fn run() {
             commands::ssh_commands::ssh_disconnect,
             commands::ssh_commands::ssh_send_input,
             commands::ssh_commands::ssh_resize,
+            ssh::terminal_emulation::get_terminal_emulations,
+            ssh::get_remote_directory_hints,
             commands::ai_commands::get_ai_profiles,
             commands::ai_commands::save_ai_profile,
             commands::ai_commands::delete_ai_profile,
@@ -103,6 +167,7 @@ pub fn run() {
             commands::terminal_recording_commands::stop_terminal_recording,
             commands::terminal_recording_commands::list_terminal_recordings,
             commands::terminal_recording_commands::load_terminal_recording,
+            commands::terminal_recording_commands::load_terminal_recording_frames,
             commands::terminal_recording_commands::delete_terminal_recording,
             commands::terminal_recording_commands::rename_terminal_recording,
             commands::terminal_recording_commands::check_terminal_recording_ffmpeg,
@@ -118,6 +183,8 @@ pub fn run() {
             commands::teamwork_commands::get_deleted_teamwork_connections,
             commands::settings_commands::get_settings,
             commands::settings_commands::save_settings,
+            commands::settings_commands::reload_settings_if_changed,
+            commands::settings_commands::get_default_log_directory,
             commands::security_commands::get_master_password_status,
             commands::security_commands::set_master_password,
             commands::security_commands::unlock_master_password,
@@ -140,10 +207,20 @@ pub fn run() {
             commands::sftp_commands::local_mkdir,
             commands::sftp_commands::local_rename,
             commands::sftp_commands::local_delete,
+            commands::local_fs_commands::local_copy_paths,
+            commands::local_fs_commands::local_create_file,
+            commands::local_fs_commands::local_stat,
+            commands::local_fs_commands::local_set_owner_permissions,
+            commands::local_fs_commands::local_list_principals,
+            commands::local_fs_commands::local_create_archive,
+            commands::local_fs_commands::local_delete_recursive,
+            commands::local_fs_commands::local_open_path,
+            commands::sftp_commands::sftp_transfer_mode,
             commands::sftp_commands::sftp_list_dir,
             commands::sftp_commands::sftp_upload,
             commands::sftp_commands::read_remote_text_file,
             commands::sftp_commands::write_remote_text_file,
+            commands::sftp_commands::write_remote_text_file_as,
             commands::sftp_commands::sftp_download,
             commands::sftp_commands::sftp_delete,
             commands::sftp_commands::sftp_rename,
@@ -168,12 +245,19 @@ pub fn run() {
             commands::snippet_commands::format_snippet,
             commands::snippet_commands::export_snippet_scripts,
             commands::snippet_commands::render_snippet_plantuml,
+            commands::snippet_commands::render_snippet_plantuml_svg,
             commands::snippet_commands::build_snippet_plantuml_preview,
             commands::snippet_commands::check_snippet_tools_available,
+            commands::snippet_commands::get_snippet_formatter_info,
+            commands::snippet_commands::get_formatter_manifest,
             commands::ai_commands::get_ai_skills,
             commands::ai_commands::save_ai_skills,
             commands::ai_commands::import_ai_skill_markdown,
             commands::ai_commands::export_ai_skill_markdown,
+            commands::ai_commands::list_ai_cli_providers,
+            commands::ai_commands::resolve_ai_cli_executable,
+            commands::ai_commands::get_ai_cli_argument_preset,
+            commands::ai_commands::discover_ai_reasoning_efforts,
             commands::translation_commands::translate_text,
             commands::translation_commands::generate_language_file,
             commands::translation_commands::test_api_connection,
@@ -192,6 +276,15 @@ pub fn run() {
             commands::window_commands::create_workspace_window,
             commands::window_commands::store_pending_transfer,
             commands::window_commands::take_pending_transfer,
+            commands::update_commands::check_for_updates_manually,
+            commands::update_commands::download_update_asset,
+            commands::update_commands::snooze_update_version,
+            commands::update_commands::ignore_update_version,
+            commands::update_commands::restart_update_check_service,
+            commands::update_commands::get_update_download_directory,
+            commands::upload_commands::ssh_upload_dropped_paths,
+            commands::upload_commands::cancel_dropped_upload,
+            commands::upload_commands::ssh_update_remote_directory_hint,
         ])
         .run(tauri::generate_context!());
 

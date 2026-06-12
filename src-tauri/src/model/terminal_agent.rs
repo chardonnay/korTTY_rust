@@ -35,7 +35,15 @@ pub struct TerminalAgentRequest {
     pub ask_confirmation_before_every_command: bool,
     pub auto_approve_root_commands: bool,
     #[serde(default)]
+    pub confirm_mutating_command_sets: bool,
+    #[serde(default)]
     pub query_only: bool,
+    /// Fixed AI profile of the originating connection (overrides the default profile).
+    #[serde(default)]
+    pub connection_ai_profile_id: Option<String>,
+    /// Skills assigned to the originating connection; they are always pinned into the prompt.
+    #[serde(default)]
+    pub connection_ai_skill_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -51,6 +59,12 @@ pub struct TerminalAgentPlanRequest {
     pub profile_id: String,
     pub user_prompt: String,
     pub connection_display_name: Option<String>,
+    /// Fixed AI profile of the originating connection (overrides the default profile).
+    #[serde(default)]
+    pub connection_ai_profile_id: Option<String>,
+    /// Skills assigned to the originating connection; they are always pinned into the prompt.
+    #[serde(default)]
+    pub connection_ai_skill_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

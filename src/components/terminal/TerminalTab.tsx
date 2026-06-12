@@ -1,16 +1,24 @@
 import { useEffect, useMemo, useRef, useState, type MouseEvent } from "react";
-import { Terminal } from "@xterm/xterm";
+import { Terminal, type IBufferCell } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { useTranslation } from "react-i18next";
 import "@xterm/xterm/css/xterm.css";
 import {
   buildTerminalAgentPromptLineExtractPattern,
   buildTerminalAgentShortcutCommandPattern,
   normalizeTerminalAgentCommandName,
 } from "../../utils/terminalAgentCommand";
+import { extractWorkingDirectoryFromVisibleScreen } from "../../utils/promptDirectory";
+import { UploadProgressDialog, type UploadDialogStatus } from "../dialogs/UploadProgressDialog";
+import type {
+  TerminalRecordingStateEvent,
+  TerminalRecordingStyleRun,
+} from "../../types/terminalRecording";
 
 /** Tracks ResizeObserver instances; finalizer runs when observer is GC'd. Logs if it was never disconnected (leak). */
 const resizeObserverRegistry = new FinalizationRegistry<{ sessionId: string; disconnected: boolean }>(
@@ -179,10 +187,20 @@ export function TerminalTab({
   onContextMenu,
   onAgentCommand,
 }: TerminalTabProps) {
+  const { t } = useTranslation();
   const [timestampsCollapsed, setTimestampsCollapsed] = useState(false);
   const [hoveredMarkerId, setHoveredMarkerId] = useState<string | null>(null);
   const [timestampEntries, setTimestampEntries] = useState<TimestampEntry[]>([]);
   const [motherLineFlashes, setMotherLineFlashes] = useState<MotherLineFlash[]>([]);
+  const [recordingIndicatorState, setRecordingIndicatorState] = useState<
+    "Recording" | "AutoPaused" | null
+  >(null);
+  const [uploadDragOver, setUploadDragOver] = useState(false);
+  const [uploadState, setUploadState] = useState<{
+    uploadId: string;
+    status: UploadDialogStatus;
+    errorMessage?: string;
+  } | null>(null);
   const [viewportScrollTop, setViewportScrollTop] = useState(0);
   const [viewportHeight, setViewportHeight] = useState(0);
   const [rowHeight, setRowHeight] = useState(18);
@@ -210,6 +228,11 @@ export function TerminalTab({
   const recordingSessionIdRef = useRef<string | undefined>(recordingSessionId);
   const recordingSnapshotTimerRef = useRef<number | null>(null);
   const lastRecordingSnapshotRef = useRef("");
+  const recordingCaptureColorsRef = useRef(false);
+  const recordingAnsiColorsRef = useRef<string[]>(DEFAULT_ANSI_COLORS);
+  const promptCwdTimerRef = useRef<number | null>(null);
+  const lastReportedPromptCwdRef = useRef<string | null>(null);
+  const uploadStateRef = useRef<typeof uploadState>(null);
   const motherOutputQueueRef = useRef<string[]>([]);
   const motherOutputTimerRef = useRef<number | null>(null);
   const motherLineFlashCounterRef = useRef(0);
@@ -359,6 +382,127 @@ export function TerminalTab({
     return lines.join("\n").trimEnd();
   }
 
+  function rgbNumberToHex(value: number): string {
+    return `#${(value & 0xffffff).toString(16).padStart(6, "0").toUpperCase()}`;
+  }
+
+  function normalizeHexColor(value: string | undefined): string | null {
+    if (!value) return null;
+    const trimmed = value.trim();
+    if (!/^#[0-9a-fA-F]{6}$/.test(trimmed)) return null;
+    return trimmed.toUpperCase();
+  }
+
+  /** xterm 256-color cube component value (matches the standard palette). */
+  function xtermColorCubeValue(component: number): number {
+    return component === 0 ? 0 : 55 + component * 40;
+  }
+
+  /**
+   * Maps an xterm palette index to a hex color: 0-15 via the active theme's
+   * ANSI colors, 16-231 via the 6x6x6 color cube, 232-255 via the gray ramp
+   * (port of TerminalView.indexedTerminalColorToHex).
+   */
+  function paletteIndexToHex(index: number): string | null {
+    if (index < 0) return null;
+    if (index < 16) {
+      return normalizeHexColor(recordingAnsiColorsRef.current[index]);
+    }
+    if (index < 232) {
+      const value = index - 16;
+      const red = xtermColorCubeValue(Math.floor(value / 36) % 6);
+      const green = xtermColorCubeValue(Math.floor(value / 6) % 6);
+      const blue = xtermColorCubeValue(value % 6);
+      return rgbNumberToHex((red << 16) | (green << 8) | blue);
+    }
+    if (index < 256) {
+      const level = 8 + (index - 232) * 10;
+      return rgbNumberToHex((level << 16) | (level << 8) | level);
+    }
+    return null;
+  }
+
+  function resolveCellColor(cell: IBufferCell, foreground: boolean): string | null {
+    if (foreground ? cell.isFgDefault() : cell.isBgDefault()) {
+      return null;
+    }
+    const color = foreground ? cell.getFgColor() : cell.getBgColor();
+    if (foreground ? cell.isFgRGB() : cell.isBgRGB()) {
+      return rgbNumberToHex(color);
+    }
+    if (foreground ? cell.isFgPalette() : cell.isBgPalette()) {
+      return paletteIndexToHex(color);
+    }
+    return null;
+  }
+
+  /** Java TextStyle.Option names used by the recording format. */
+  function resolveCellOptions(cell: IBufferCell): string[] {
+    const options: string[] = [];
+    if (cell.isBold()) options.push("BOLD");
+    if (cell.isItalic()) options.push("ITALIC");
+    if (cell.isDim()) options.push("DIM");
+    if (cell.isUnderline()) options.push("UNDERLINED");
+    if (cell.isInverse()) options.push("INVERSE");
+    if (cell.isInvisible()) options.push("HIDDEN");
+    return options;
+  }
+
+  /**
+   * Captures per-cell colors/styles of the visible screen as merged style
+   * runs (port of TerminalView.captureTerminalStyleRuns, WP3.9). Cells with
+   * identical attributes are merged into one run; fully default-styled
+   * whitespace runs are dropped because they render identically to plain text.
+   */
+  function captureStyleRuns(term: Terminal): TerminalRecordingStyleRun[] {
+    const buffer = term.buffer.active;
+    const start = Math.max(0, buffer.baseY);
+    const runs: TerminalRecordingStyleRun[] = [];
+    const cell = buffer.getNullCell();
+    for (let row = 0; row < term.rows; row += 1) {
+      const line = buffer.getLine(start + row);
+      if (!line) continue;
+      if (!line.translateToString(true)) continue;
+      let current: (TerminalRecordingStyleRun & { key: string }) | null = null;
+      const flush = () => {
+        if (current && !(current.text.trim() === "" && current.key === "||")) {
+          const { key: _key, ...run } = current;
+          runs.push(run);
+        }
+        current = null;
+      };
+      for (let column = 0; column < line.length; column += 1) {
+        const resolved = line.getCell(column, cell);
+        if (!resolved) continue;
+        if (resolved.getWidth() === 0) {
+          // Continuation cell of a wide character; glyph already captured.
+          continue;
+        }
+        const text = resolved.getChars() || " ";
+        const foreground = resolveCellColor(resolved, true);
+        const background = resolveCellColor(resolved, false);
+        const options = resolveCellOptions(resolved);
+        const key = `${foreground ?? ""}|${background ?? ""}|${options.join(",")}`;
+        if (current && current.key === key) {
+          current.text += text;
+        } else {
+          flush();
+          current = {
+            row,
+            column,
+            text,
+            foreground: foreground ?? undefined,
+            background: background ?? undefined,
+            options,
+            key,
+          };
+        }
+      }
+      flush();
+    }
+    return runs;
+  }
+
   function appendRecordingSnapshot(term: Terminal, force = false) {
     const recordingSession = recordingSessionIdRef.current;
     if (!recordingSession) return;
@@ -372,6 +516,10 @@ export function TerminalTab({
         text,
         columns: term.cols,
         rows: term.rows,
+        widget: sessionIdRef.current,
+        pixelWidth: Math.max(0, Math.round(term.element?.clientWidth ?? 0)),
+        pixelHeight: Math.max(0, Math.round(term.element?.clientHeight ?? 0)),
+        styleRuns: recordingCaptureColorsRef.current ? captureStyleRuns(term) : [],
       },
     }).catch(console.error);
   }
@@ -384,6 +532,50 @@ export function TerminalTab({
         appendRecordingSnapshot(term);
       }
     }, 500);
+  }
+
+  /**
+   * Fallback of the cwd tracking chain (after OSC-7/cd tracking in the
+   * backend): extracts the working directory from the visible prompt line
+   * (Java TerminalView.extractWorkingDirectoryFromVisibleScreen) and reports
+   * it to the session as remote-directory hint. `~` candidates are expanded
+   * against the home hint from get_remote_directory_hints.
+   */
+  async function extractAndReportPromptCwd(term: Terminal) {
+    if (!connectedRef.current || readOnlyRef.current) return;
+    if (!isPromptReadyInBuffer(term)) return;
+    try {
+      const hints = await invoke<{ current?: string | null; home?: string | null }>(
+        "get_remote_directory_hints",
+        { sessionId: sessionIdRef.current },
+      );
+      if (xtermRef.current !== term || !isMountedRef.current) return;
+      const directory = extractWorkingDirectoryFromVisibleScreen(
+        captureTerminalSnapshot(term),
+        hints?.home ?? null,
+      );
+      if (!directory || directory === lastReportedPromptCwdRef.current) return;
+      lastReportedPromptCwdRef.current = directory;
+      await invoke("ssh_update_remote_directory_hint", {
+        sessionId: sessionIdRef.current,
+        directory,
+      });
+    } catch {
+      // best-effort heuristic; tracking falls back to OSC-7/cd data
+    }
+  }
+
+  function schedulePromptCwdExtraction(term: Terminal) {
+    if (!connectedRef.current || readOnlyRef.current) return;
+    if (promptCwdTimerRef.current != null) {
+      window.clearTimeout(promptCwdTimerRef.current);
+    }
+    promptCwdTimerRef.current = window.setTimeout(() => {
+      promptCwdTimerRef.current = null;
+      if (xtermRef.current === term && isMountedRef.current) {
+        void extractAndReportPromptCwd(term);
+      }
+    }, 400);
   }
 
   function appendRecordingInput(text: string) {
@@ -402,11 +594,16 @@ export function TerminalTab({
     document.documentElement.dataset[ACTIVE_TERMINAL_SESSION_DATA_KEY] = sessionIdRef.current;
   }
 
-  function sendTerminalInput(data: string) {
-    if (!connectedRef.current || readOnlyRef.current || !data) {
+  /**
+   * Sends pre-encoded bytes to the active session and all broadcast targets.
+   * Use this for byte-accurate input (binary, paste) so it cannot be mangled
+   * by UTF-8 re-encoding while still fanning out to broadcast sessions.
+   * Recording of the input must be appended by the caller (see onData/paste).
+   */
+  function sendTerminalInputBytes(encoded: number[]) {
+    if (!connectedRef.current || readOnlyRef.current || encoded.length === 0) {
       return;
     }
-    const encoded = Array.from(new TextEncoder().encode(data));
     invoke("ssh_send_input", {
       sessionId: sessionIdRef.current,
       data: encoded,
@@ -417,6 +614,13 @@ export function TerminalTab({
         data: encoded,
       }).catch(console.error);
     }
+  }
+
+  function sendTerminalInput(data: string) {
+    if (!connectedRef.current || readOnlyRef.current || !data) {
+      return;
+    }
+    sendTerminalInputBytes(Array.from(new TextEncoder().encode(data)));
   }
 
   function elementConsumesKeyboard(target: EventTarget | Element | null): boolean {
@@ -1174,10 +1378,8 @@ export function TerminalTab({
         for (let i = 0; i < data.length; i++) {
           bytes[i] = data.charCodeAt(i);
         }
-        invoke("ssh_send_input", {
-          sessionId: sessionIdRef.current,
-          data: Array.from(bytes),
-        }).catch(console.error);
+        appendRecordingInput(data);
+        sendTerminalInputBytes(Array.from(bytes));
       }
     });
 
@@ -1196,11 +1398,8 @@ export function TerminalTab({
       try {
         const text = await navigator.clipboard.readText();
         if (!text) return;
-        const encoded = Array.from(new TextEncoder().encode(text));
-        await invoke("ssh_send_input", {
-          sessionId: sessionIdRef.current,
-          data: encoded,
-        });
+        appendRecordingInput(text);
+        sendTerminalInput(text);
       } catch (err) {
         console.error(err);
       }
@@ -1257,8 +1456,28 @@ export function TerminalTab({
       }
     }
 
+    /**
+     * Synchronous geometry query used by the recording trigger in MainWindow
+     * (real cols/rows + pixel size instead of hardcoded 80x24, WP3.8).
+     */
+    function handleGeometryRequest(event: Event) {
+      const custom = event as CustomEvent<{
+        sessionId: string;
+        geometry: { columns: number; rows: number; pixelWidth: number; pixelHeight: number } | null;
+      }>;
+      if (!custom.detail || custom.detail.sessionId !== sessionIdRef.current) return;
+      if (xtermRef.current !== term) return;
+      custom.detail.geometry = {
+        columns: term.cols,
+        rows: term.rows,
+        pixelWidth: Math.max(0, Math.round(term.element?.clientWidth ?? 0)),
+        pixelHeight: Math.max(0, Math.round(term.element?.clientHeight ?? 0)),
+      };
+    }
+
     window.addEventListener("kortty-refit", handleRefit);
     window.addEventListener("kortty-terminal-reattach", handleReattach as EventListener);
+    window.addEventListener("kortty-terminal-geometry-request", handleGeometryRequest as EventListener);
 
     return () => {
       isMountedRef.current = false;
@@ -1267,6 +1486,7 @@ export function TerminalTab({
       window.removeEventListener("keydown", handleRecoveredKeyDown, true);
       window.removeEventListener("kortty-refit", handleRefit);
       window.removeEventListener("kortty-terminal-reattach", handleReattach as EventListener);
+      window.removeEventListener("kortty-terminal-geometry-request", handleGeometryRequest as EventListener);
       clearPendingFitTimers();
       clearMotherOutputQueue();
       clearMotherLineFlashes();
@@ -1287,6 +1507,10 @@ export function TerminalTab({
       if (recordingSnapshotTimerRef.current != null) {
         window.clearTimeout(recordingSnapshotTimerRef.current);
         recordingSnapshotTimerRef.current = null;
+      }
+      if (promptCwdTimerRef.current != null) {
+        window.clearTimeout(promptCwdTimerRef.current);
+        promptCwdTimerRef.current = null;
       }
       xtermRef.current = null;
       fitAddonRef.current = null;
@@ -1344,6 +1568,7 @@ export function TerminalTab({
           return;
         }
         recordAgentShortcutPromptSignal(term, text);
+        schedulePromptCwdExtraction(term);
         if (showTimestampsRef.current && waitingForNextPromptRef.current) {
           if (promptHookEnabledRef.current && containsPromptReadyMarker(text)) {
             markPromptReadyNow();
@@ -1374,6 +1599,11 @@ export function TerminalTab({
     resetAgentShortcutTracking();
     setTimestampEntries([]);
     setViewportScrollTop(0);
+    lastReportedPromptCwdRef.current = null;
+    if (promptCwdTimerRef.current != null) {
+      window.clearTimeout(promptCwdTimerRef.current);
+      promptCwdTimerRef.current = null;
+    }
   }, [sessionId]);
 
   useEffect(() => {
@@ -1410,10 +1640,136 @@ export function TerminalTab({
   }, [terminalEffectPluginId]);
 
   useEffect(() => {
-    const term = xtermRef.current;
-    if (!term || !recordingSessionId) return;
-    appendRecordingSnapshot(term, true);
+    if (!recordingSessionId) {
+      setRecordingIndicatorState(null);
+      recordingCaptureColorsRef.current = false;
+      return;
+    }
+    setRecordingIndicatorState("Recording");
+    let cancelled = false;
+    // Color capture follows the global setting at recording start (WP3.9).
+    invoke<{ terminalRecordingCaptureColorsEnabled?: boolean }>("get_settings")
+      .then((settings) => {
+        if (!cancelled) {
+          recordingCaptureColorsRef.current = !!settings?.terminalRecordingCaptureColorsEnabled;
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          recordingCaptureColorsRef.current = false;
+        }
+      })
+      .finally(() => {
+        if (cancelled) return;
+        const term = xtermRef.current;
+        if (term) {
+          appendRecordingSnapshot(term, true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recordingSessionId]);
+
+  // REC indicator badge state from backend recording state changes (WP3.8).
+  useEffect(() => {
+    if (!recordingSessionId) return;
+    let disposed = false;
+    const unlisten = listen<TerminalRecordingStateEvent>("kortty-recording-state", (event) => {
+      if (disposed || event.payload.sessionId !== recordingSessionId) return;
+      const state = event.payload.state;
+      setRecordingIndicatorState(
+        state === "Recording"
+          ? "Recording"
+          : state === "AutoPaused" || state === "Paused"
+            ? "AutoPaused"
+            : null,
+      );
+    });
+    return () => {
+      disposed = true;
+      void unlisten.then((fn) => fn());
+    };
+  }, [recordingSessionId]);
+
+  // Tauri drag&drop of local files onto this terminal pane (WP6.4).
+  useEffect(() => {
+    let disposed = false;
+
+    function isPointerInsideTerminal(physicalX: number, physicalY: number): boolean {
+      const host = termRef.current;
+      if (!host || !isTerminalHostVisible()) return false;
+      const scale = window.devicePixelRatio || 1;
+      const x = physicalX / scale;
+      const y = physicalY / scale;
+      const rect = host.getBoundingClientRect();
+      return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+    }
+
+    function startDroppedUpload(paths: string[]) {
+      if (uploadStateRef.current?.status === "running") return;
+      const uploadId =
+        typeof crypto !== "undefined" && typeof crypto.randomUUID === "function"
+          ? crypto.randomUUID()
+          : `upload-${Date.now()}-${Math.floor(Math.random() * 1_000_000)}`;
+      const next = { uploadId, status: "running" as UploadDialogStatus };
+      uploadStateRef.current = next;
+      setUploadState(next);
+      invoke<{ cancelled: boolean }>("ssh_upload_dropped_paths", {
+        sessionId: sessionIdRef.current,
+        paths,
+        uploadId,
+      })
+        .then((result) => {
+          if (disposed || uploadStateRef.current?.uploadId !== uploadId) return;
+          const finished = {
+            uploadId,
+            status: (result?.cancelled ? "cancelled" : "done") as UploadDialogStatus,
+          };
+          uploadStateRef.current = finished;
+          setUploadState(finished);
+        })
+        .catch((error) => {
+          if (disposed || uploadStateRef.current?.uploadId !== uploadId) return;
+          const failed = {
+            uploadId,
+            status: "error" as UploadDialogStatus,
+            errorMessage: String(error),
+          };
+          uploadStateRef.current = failed;
+          setUploadState(failed);
+        });
+    }
+
+    const unlisten = getCurrentWebviewWindow().onDragDropEvent((event) => {
+      if (disposed) return;
+      const payload = event.payload;
+      if (payload.type === "leave") {
+        setUploadDragOver(false);
+        return;
+      }
+      const inside = isPointerInsideTerminal(payload.position.x, payload.position.y);
+      if (payload.type === "enter" || payload.type === "over") {
+        setUploadDragOver(inside && connectedRef.current && !readOnlyRef.current);
+        return;
+      }
+      if (payload.type === "drop") {
+        setUploadDragOver(false);
+        if (!inside || !connectedRef.current || readOnlyRef.current) return;
+        const paths = payload.paths ?? [];
+        if (paths.length > 0) {
+          startDroppedUpload(paths);
+        }
+      }
+    });
+
+    return () => {
+      disposed = true;
+      void unlisten.then((fn) => fn());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     syncViewportMetricsRef.current?.();
@@ -1425,6 +1781,9 @@ export function TerminalTab({
     (entry) => entry.row >= visibleStartRow && entry.row <= visibleEndRow,
   );
   const motherActive = terminalEffectPluginId === "mother";
+  recordingAnsiColorsRef.current = motherActive
+    ? MOTHER_ANSI_COLORS
+    : theme?.ansiColors ?? DEFAULT_ANSI_COLORS;
 
   return (
     <div
@@ -1506,6 +1865,46 @@ export function TerminalTab({
         onContextMenu={(event) => onContextMenu?.(event, xtermRef.current?.getSelection() ?? "")}
       >
         <div ref={termRef} className="absolute inset-0 min-h-0 min-w-0 overflow-hidden" />
+        {recordingIndicatorState != null && (
+          <div
+            className="pointer-events-none absolute top-1 right-8 z-30 flex items-center gap-1 rounded bg-kortty-bg/80 px-1.5 py-0.5 text-[10px] font-semibold"
+            title={
+              recordingIndicatorState === "AutoPaused"
+                ? t("terminal.recording.indicator.autoPaused")
+                : t("terminal.recording.indicator.recording")
+            }
+          >
+            {recordingIndicatorState === "AutoPaused" ? (
+              <span className="text-kortty-warning">⏸ REC</span>
+            ) : (
+              <span className="text-kortty-error animate-pulse">● REC</span>
+            )}
+          </div>
+        )}
+        {uploadDragOver && (
+          <div className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center border-2 border-dashed border-kortty-accent bg-kortty-accent/10">
+            <span className="rounded bg-kortty-bg/80 px-3 py-1.5 text-xs font-medium text-kortty-accent">
+              {t("terminal.dragDrop.dropHint")}
+            </span>
+          </div>
+        )}
+        {uploadState != null && (
+          <UploadProgressDialog
+            open
+            uploadId={uploadState.uploadId}
+            status={uploadState.status}
+            errorMessage={uploadState.errorMessage}
+            onAbort={() => {
+              invoke("cancel_dropped_upload", { uploadId: uploadState.uploadId }).catch(
+                console.error,
+              );
+            }}
+            onClose={() => {
+              uploadStateRef.current = null;
+              setUploadState(null);
+            }}
+          />
+        )}
         {motherActive && (
           <>
             <div className="kortty-mother-line-flash-layer" aria-hidden="true">

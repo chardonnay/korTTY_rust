@@ -1,6 +1,7 @@
 use crate::ai::{self, AiError};
 use crate::model::ai::{AiProfile, AiTokenUsage};
 use crate::model::connection::ConnectionProtocol;
+use crate::model::settings::GlobalSettings;
 use crate::model::terminal_agent::{
     AgentActivity, AgentActivityStatus, AgentActivityTokenUsage, AgentActivityType,
     TerminalAgentApproval, TerminalAgentCommandResult, TerminalAgentEvent, TerminalAgentEventKind,
@@ -22,6 +23,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::timeout;
 
 const AI_PROFILES_FILE: &str = "ai-profiles.json";
+const GLOBAL_SETTINGS_FILE: &str = "global-settings.json";
 const MAX_AGENT_TURNS: u8 = 8;
 const MAX_COMMANDS_PER_TURN: usize = 3;
 const COMMAND_TIMEOUT_SECS: u64 = 15 * 60;
@@ -101,7 +103,9 @@ struct AgentDecision {
     status: AgentDecisionStatus,
     summary: String,
     user_message: String,
+    #[serde(default)]
     commands: Vec<TerminalAgentPlannedCommand>,
+    #[serde(default)]
     needs_reprobe: bool,
 }
 
@@ -484,6 +488,13 @@ impl TerminalAgentControl {
     }
 }
 
+pub fn load_global_settings_or_default() -> GlobalSettings {
+    xml_repository::load_json(GLOBAL_SETTINGS_FILE)
+        .ok()
+        .flatten()
+        .unwrap_or_default()
+}
+
 pub fn load_ai_profile(profile_id: &str) -> Result<AiProfile, String> {
     let mut profiles: Vec<AiProfile> = xml_repository::load_json(AI_PROFILES_FILE)
         .map_err(|error| error.to_string())?
@@ -491,6 +502,44 @@ pub fn load_ai_profile(profile_id: &str) -> Result<AiProfile, String> {
     let Some(profile) = profiles.iter_mut().find(|profile| profile.id == profile_id) else {
         return Err("AI profile not found".into());
     };
+    ai::normalize_profile(profile);
+    let _ = ai::refresh_usage(profile);
+    Ok(profile.clone())
+}
+
+/// Resolves the effective AI profile for an agent request: the fixed profile of
+/// the originating connection wins when it is available, then the explicitly
+/// requested profile, then the configured default profile (Port of the Java
+/// `resolveAiProfileForConnection`).
+pub fn resolve_ai_profile(
+    requested_profile_id: &str,
+    connection_ai_profile_id: Option<&str>,
+) -> Result<AiProfile, String> {
+    let mut profiles: Vec<AiProfile> = xml_repository::load_json(AI_PROFILES_FILE)
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    let selected_id = {
+        let connection_profile = connection_ai_profile_id
+            .and_then(|profile_id| crate::ai::profile_selection::find_by_id(&profiles, profile_id));
+        let selected = if let Some(connection_profile) = connection_profile {
+            Some(connection_profile)
+        } else if requested_profile_id.trim().is_empty() {
+            let settings = load_global_settings_or_default();
+            crate::ai::profile_selection::default_profile(
+                &profiles,
+                settings.default_ai_profile_id.as_deref(),
+            )
+        } else {
+            crate::ai::profile_selection::find_by_lookup(&profiles, requested_profile_id)
+        };
+        selected
+            .map(|profile| profile.id.clone())
+            .ok_or_else(|| "AI profile not found".to_string())?
+    };
+    let profile = profiles
+        .iter_mut()
+        .find(|profile| profile.id == selected_id)
+        .ok_or_else(|| "AI profile not found".to_string())?;
     ai::normalize_profile(profile);
     let _ = ai::refresh_usage(profile);
     Ok(profile.clone())
@@ -524,8 +573,13 @@ pub async fn start_terminal_agent_plan(
     store: &TerminalAgentPlanStore,
     request: TerminalAgentPlanRequest,
 ) -> Result<TerminalAgentPlanStartResponse, String> {
-    let request = normalize_plan_request(request)?;
-    let mut profile = load_ai_profile(&request.profile_id)?;
+    let mut request = normalize_plan_request(request)?;
+    let mut profile = resolve_ai_profile(
+        &request.profile_id,
+        request.connection_ai_profile_id.as_deref(),
+    )?;
+    // Later plan steps reload the profile by id, so keep the resolved id.
+    request.profile_id = profile.id.clone();
     ensure_terminal_agent_session_available(ssh_manager, &request.session_id).await?;
 
     let run_id = uuid::Uuid::new_v4().to_string();
@@ -864,6 +918,11 @@ pub async fn start_terminal_agent_from_plan(
         return Err("Run id is required".into());
     }
 
+    let settings = load_global_settings_or_default();
+    if !settings.terminal_agent_execution_enabled {
+        return Err("AI Agent execution is disabled in Global Settings.".into());
+    }
+
     let context = plan_store.context(run_id)?;
     let accepted_option = context
         .accepted_option_id
@@ -891,7 +950,10 @@ pub async fn start_terminal_agent_from_plan(
         show_runtime_messages,
         ask_confirmation_before_every_command: false,
         auto_approve_root_commands: false,
+        confirm_mutating_command_sets: settings.terminal_agent_confirm_mutating_command_sets,
         query_only: false,
+        connection_ai_profile_id: context.request.connection_ai_profile_id.clone(),
+        connection_ai_skill_ids: context.request.connection_ai_skill_ids.clone(),
     };
 
     let (updated, ()) = plan_store.update_context(run_id, |plan| {
@@ -1695,12 +1757,13 @@ async fn request_agent_decision(
         control.cached_sudo_password()?.is_some(),
     )?;
     let mut cancel_rx = control.cancel_receiver();
-    let response = ai::execute_custom_json_prompt(
+    let response = ai::execute_custom_json_prompt_with_pinned_skills(
         profile,
         &system_prompt,
         &user_prompt,
         0.1,
         Some(&mut cancel_rx),
+        &request.connection_ai_skill_ids,
     )
     .await
     .map_err(map_ai_error)?;
@@ -1711,12 +1774,13 @@ async fn request_agent_decision(
         if let Some(reason) = decision_requires_repair(&decision, probe) {
             let repair_prompt = build_agent_semantic_repair_prompt(&response.content, &reason);
             let mut cancel_rx = control.cancel_receiver();
-            let repaired = ai::execute_custom_json_prompt(
+            let repaired = ai::execute_custom_json_prompt_with_pinned_skills(
                 profile,
                 &system_prompt,
                 &repair_prompt,
                 0.0,
                 Some(&mut cancel_rx),
+                &request.connection_ai_skill_ids,
             )
             .await
             .map_err(map_ai_error)?;
@@ -1759,12 +1823,13 @@ async fn request_agent_decision(
 
     let repair_prompt = build_agent_repair_prompt(&response.content);
     let mut cancel_rx = control.cancel_receiver();
-    let repaired = ai::execute_custom_json_prompt(
+    let repaired = ai::execute_custom_json_prompt_with_pinned_skills(
         profile,
         &system_prompt,
         &repair_prompt,
         0.0,
         Some(&mut cancel_rx),
+        &request.connection_ai_skill_ids,
     )
     .await
     .map_err(map_ai_error)?;
@@ -1821,12 +1886,13 @@ async fn try_request_turn_limit_final_decision(
     let system_prompt = build_agent_turn_limit_final_system_prompt();
     let user_prompt = build_agent_turn_limit_final_user_prompt(request, probe, command_history)?;
     let mut cancel_rx = control.cancel_receiver();
-    let response = ai::execute_custom_json_prompt(
+    let response = ai::execute_custom_json_prompt_with_pinned_skills(
         profile,
         &system_prompt,
         &user_prompt,
         0.0,
         Some(&mut cancel_rx),
+        &request.connection_ai_skill_ids,
     )
     .await
     .map_err(map_ai_error)?;
@@ -1883,7 +1949,9 @@ async fn wait_for_approval(
     approval: TerminalAgentApproval,
     turn: u8,
 ) -> Result<(), TerminalAgentError> {
-    if control.approval_bypass_enabled()? {
+    // "Approve always" must not bypass future approvals when the user asked
+    // for confirmation of every mutating command set (Java: Approval.allowAlways()).
+    if !request.confirm_mutating_command_sets && control.approval_bypass_enabled()? {
         return Ok(());
     }
 
@@ -2768,7 +2836,10 @@ fn build_agent_semantic_repair_prompt(previous_response: &str, reason: &str) -> 
 }
 
 fn parse_agent_decision(raw_content: &str) -> Result<AgentDecision, String> {
-    let decision: AgentDecision = serde_json::from_str(raw_content.trim())
+    let value: serde_json::Value = serde_json::from_str(raw_content.trim())
+        .map_err(|error| format!("Invalid JSON from AI planner: {error}"))?;
+    let normalized = normalize_agent_decision_value(value);
+    let decision: AgentDecision = serde_json::from_value(normalized)
         .map_err(|error| format!("Invalid JSON from AI planner: {error}"))?;
     if decision.summary.trim().is_empty() {
         return Err("The AI planner returned an empty `summary`.".into());
@@ -2798,6 +2869,208 @@ fn parse_agent_decision(raw_content: &str) -> Result<AgentDecision, String> {
             Ok(decision)
         }
     }
+}
+
+/// Normalizes a raw AI agent decision JSON object so that alternative field
+/// names and status values produced by different models still parse into the
+/// strict typed decision model. Port of Java
+/// `TerminalAgentService.normalizeAgentDecisionObject`.
+pub fn normalize_agent_decision_value(value: serde_json::Value) -> serde_json::Value {
+    let mut normalized = value;
+    if let serde_json::Value::Object(object) = &mut normalized {
+        normalize_agent_decision_status(object);
+        normalize_agent_decision_commands(object);
+    }
+    normalized
+}
+
+fn normalize_agent_decision_status(object: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(status) = object.get("status").and_then(|value| value.as_str()) else {
+        return;
+    };
+    if status.trim().is_empty() {
+        return;
+    }
+    let normalized = status.trim().to_lowercase().replace(['-', ' '], "_");
+    let mapped = match normalized.as_str() {
+        "run" | "commands" | "run_command" | "execute" | "execute_commands" => {
+            "run_commands".to_string()
+        }
+        "confirm" | "confirmation" | "requires_confirmation" | "need_confirmation" => {
+            "needs_confirmation".to_string()
+        }
+        "complete" | "completed" | "success" => "done".to_string(),
+        "cannot" | "failed" | "failure" => "blocked".to_string(),
+        _ => normalized,
+    };
+    object.insert("status".into(), serde_json::Value::String(mapped));
+}
+
+fn normalize_agent_decision_commands(object: &mut serde_json::Map<String, serde_json::Value>) {
+    let mut commands_element = object.get("commands").cloned();
+    if commands_element.is_none() || matches!(commands_element, Some(serde_json::Value::Null)) {
+        commands_element = first_existing_element(
+            object,
+            &["command", "cmd", "shellCommand", "terminalCommand"],
+        );
+    }
+    let Some(commands_element) = commands_element else {
+        return;
+    };
+    if commands_element.is_null() {
+        return;
+    }
+    let decision_snapshot = object.clone();
+    let mut commands = Vec::new();
+    if let serde_json::Value::Array(items) = &commands_element {
+        for item in items {
+            if let Some(command) = normalize_agent_command_value(item, &decision_snapshot) {
+                commands.push(serde_json::Value::Object(command));
+            }
+        }
+    } else if let Some(command) =
+        normalize_agent_command_value(&commands_element, &decision_snapshot)
+    {
+        commands.push(serde_json::Value::Object(command));
+    }
+    object.insert("commands".into(), serde_json::Value::Array(commands));
+}
+
+fn normalize_agent_command_value(
+    element: &serde_json::Value,
+    decision_object: &serde_json::Map<String, serde_json::Value>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    if element.is_null() {
+        return None;
+    }
+    let mut command_object = match element {
+        serde_json::Value::Object(object) => object.clone(),
+        _ => serde_json::Map::new(),
+    };
+    if let serde_json::Value::String(text) = element {
+        command_object.insert("command".into(), serde_json::Value::String(text.clone()));
+    }
+    copy_first_string(
+        &mut command_object,
+        "command",
+        &["cmd", "shellCommand", "terminalCommand"],
+    );
+    copy_first_string(
+        &mut command_object,
+        "purpose",
+        &["reason", "description", "summary"],
+    );
+    if !has_non_blank_string(&command_object, "purpose") {
+        copy_first_string_from_decision(
+            &mut command_object,
+            decision_object,
+            "purpose",
+            &["purpose", "reason", "description", "summary", "userMessage"],
+        );
+    }
+    copy_first_string(
+        &mut command_object,
+        "risk",
+        &["riskLevel", "confirmation", "safety"],
+    );
+    if !has_non_blank_string(&command_object, "risk") {
+        copy_first_string_from_decision(
+            &mut command_object,
+            decision_object,
+            "risk",
+            &["risk", "riskLevel", "confirmation", "safety"],
+        );
+    }
+    normalize_agent_command_risk(&mut command_object);
+    if has_non_blank_string(&command_object, "command") {
+        Some(command_object)
+    } else {
+        None
+    }
+}
+
+fn normalize_agent_command_risk(command_object: &mut serde_json::Map<String, serde_json::Value>) {
+    let Some(risk) = command_object.get("risk").and_then(|value| value.as_str()) else {
+        // The strict decision model requires a risk; default missing values to
+        // the safe side like the Java validator does.
+        command_object.insert(
+            "risk".into(),
+            serde_json::Value::String("requires_confirmation".into()),
+        );
+        return;
+    };
+    if risk.trim().is_empty() {
+        command_object.insert(
+            "risk".into(),
+            serde_json::Value::String("requires_confirmation".into()),
+        );
+        return;
+    }
+    let normalized = risk.trim().to_lowercase().replace(['-', ' '], "_");
+    let mapped = if matches!(
+        normalized.as_str(),
+        "read_only" | "readonly" | "read" | "safe" | "low"
+    ) {
+        "read_only"
+    } else {
+        "requires_confirmation"
+    };
+    command_object.insert("risk".into(), serde_json::Value::String(mapped.into()));
+}
+
+fn first_existing_element(
+    object: &serde_json::Map<String, serde_json::Value>,
+    names: &[&str],
+) -> Option<serde_json::Value> {
+    names.iter().find_map(|name| object.get(*name).cloned())
+}
+
+fn copy_first_string(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    target_name: &str,
+    source_names: &[&str],
+) {
+    if has_non_blank_string(object, target_name) {
+        return;
+    }
+    for source_name in source_names {
+        let Some(text) = object.get(*source_name).and_then(|value| value.as_str()) else {
+            continue;
+        };
+        if !text.trim().is_empty() {
+            let trimmed = text.trim().to_string();
+            object.insert(target_name.into(), serde_json::Value::String(trimmed));
+            return;
+        }
+    }
+}
+
+fn copy_first_string_from_decision(
+    command_object: &mut serde_json::Map<String, serde_json::Value>,
+    decision_object: &serde_json::Map<String, serde_json::Value>,
+    target_name: &str,
+    source_names: &[&str],
+) {
+    for source_name in source_names {
+        let Some(text) = decision_object
+            .get(*source_name)
+            .and_then(|value| value.as_str())
+        else {
+            continue;
+        };
+        if !text.trim().is_empty() {
+            let trimmed = text.trim().to_string();
+            command_object.insert(target_name.into(), serde_json::Value::String(trimmed));
+            return;
+        }
+    }
+}
+
+fn has_non_blank_string(object: &serde_json::Map<String, serde_json::Value>, name: &str) -> bool {
+    object
+        .get(name)
+        .and_then(|value| value.as_str())
+        .is_some_and(|text| !text.trim().is_empty())
 }
 
 fn decision_requires_repair(
@@ -2908,7 +3181,7 @@ fn validate_planned_commands(
 }
 
 fn classify_command_risk(command: &str) -> TerminalAgentRisk {
-    if is_clearly_read_only_command(command) {
+    if is_clearly_read_only_command(command) && !requires_confirmation_by_command_shape(command) {
         TerminalAgentRisk::ReadOnly
     } else {
         TerminalAgentRisk::RequiresConfirmation
@@ -2975,7 +3248,7 @@ fn is_clearly_read_only_command(command: &str) -> bool {
         .any(|prefix| lowered == *prefix || lowered.starts_with(prefix))
 }
 
-fn is_interactive_command(command: &str) -> bool {
+pub fn is_interactive_command(command: &str) -> bool {
     let lowered = normalize_shell_whitespace(command);
     let blocked_phrases = [
         "sudo su", "su -", "sudo -s", "sudo -i", "passwd", "visudo", "nano", "vi", "vim", "less",
@@ -2985,6 +3258,388 @@ fn is_interactive_command(command: &str) -> bool {
     blocked_phrases
         .iter()
         .any(|phrase| contains_shell_phrase(&lowered, phrase))
+}
+
+const MUTATING_COMMAND_TOKENS: [&str; 14] = [
+    "chmod", "chown", "chgrp", "rm", "rmdir", "mv", "cp", "mkdir", "touch", "ln", "tee", "dd",
+    "truncate", "install",
+];
+
+/// Returns true when the command shape clearly mutates the target system
+/// (mutating binaries at a command position, or unquoted write redirections).
+/// Port of Java `TerminalAgentService.requiresConfirmationByCommandShape`.
+pub fn requires_confirmation_by_command_shape(command: &str) -> bool {
+    let checked = strip_here_document_bodies_for_command_check(command);
+    mutating_command_pattern_matches(&checked) || contains_write_redirection(&checked)
+}
+
+fn mutating_command_pattern_matches(command: &str) -> bool {
+    let chars: Vec<char> = command.to_lowercase().chars().collect();
+    for index in 0..chars.len() {
+        if !command_position_prefix_at(&chars, index) {
+            continue;
+        }
+        for token in MUTATING_COMMAND_TOKENS {
+            let token_chars: Vec<char> = token.chars().collect();
+            if index + token_chars.len() > chars.len() {
+                continue;
+            }
+            if chars[index..index + token_chars.len()] != token_chars[..] {
+                continue;
+            }
+            let right_index = index + token_chars.len();
+            let right_boundary =
+                right_index >= chars.len() || !is_shell_word_char(chars[right_index]);
+            if right_boundary {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// True when `index` is a valid command position: the start of the string or
+/// preceded by a shell separator (`;&|()`), optionally followed by whitespace.
+fn command_position_prefix_at(chars: &[char], index: usize) -> bool {
+    if index == 0 {
+        return true;
+    }
+    let mut cursor = index;
+    while cursor > 0 && chars[cursor - 1].is_whitespace() {
+        cursor -= 1;
+    }
+    if cursor == 0 {
+        // Leading whitespace before the first token does not match the Java
+        // pattern, which anchors the empty alternative at the string start.
+        return false;
+    }
+    matches!(chars[cursor - 1], ';' | '&' | '|' | '(' | ')')
+}
+
+fn contains_write_redirection(command: &str) -> bool {
+    if command.trim().is_empty() {
+        return false;
+    }
+    let chars: Vec<char> = command.chars().collect();
+    let mut in_single_quote = false;
+    let mut in_double_quote = false;
+    let mut escaped = false;
+    for index in 0..chars.len() {
+        let ch = chars[index];
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' && !in_single_quote {
+            escaped = true;
+            continue;
+        }
+        if ch == '\'' && !in_double_quote {
+            in_single_quote = !in_single_quote;
+            continue;
+        }
+        if ch == '"' && !in_single_quote {
+            in_double_quote = !in_double_quote;
+            continue;
+        }
+        if ch != '>' || in_single_quote || in_double_quote {
+            continue;
+        }
+        let previous = if index > 0 { chars[index - 1] } else { '\0' };
+        let next = if index + 1 < chars.len() {
+            chars[index + 1]
+        } else {
+            '\0'
+        };
+        if previous == '<' || previous == '=' || previous == '-' || next == '=' || next == '&' {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn strip_here_document_bodies_for_command_check(command: &str) -> String {
+    if command.trim().is_empty() || !command.contains("<<") {
+        return command.to_string();
+    }
+
+    let mut sanitized = String::with_capacity(command.len());
+    let mut pending_delimiters: Vec<String> = Vec::new();
+    for line in command.split(['\n', '\r']) {
+        if let Some(first_delimiter) = pending_delimiters.first() {
+            if matches_here_document_delimiter(line, first_delimiter) {
+                pending_delimiters.remove(0);
+            }
+            continue;
+        }
+        sanitized.push_str(line);
+        sanitized.push('\n');
+        pending_delimiters.extend(find_here_document_delimiters(line));
+    }
+    sanitized
+}
+
+fn matches_here_document_delimiter(line: &str, delimiter: &str) -> bool {
+    line == delimiter || line.trim_start_matches('\t') == delimiter
+}
+
+fn find_here_document_delimiters(line: &str) -> Vec<String> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut delimiters = Vec::new();
+    let mut index = 0usize;
+    while index + 1 < chars.len() {
+        if chars[index] != '<' || chars[index + 1] != '<' {
+            index += 1;
+            continue;
+        }
+        if index > 0 && chars[index - 1] == '<' {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 2;
+        if cursor < chars.len() && chars[cursor] == '-' {
+            cursor += 1;
+        }
+        if cursor < chars.len() && chars[cursor] == '<' {
+            // Here-strings (`<<<`) are not here-documents.
+            index = cursor + 1;
+            continue;
+        }
+        while cursor < chars.len() && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        let mut delimiter = String::new();
+        if cursor < chars.len() && (chars[cursor] == '\'' || chars[cursor] == '"') {
+            let quote = chars[cursor];
+            cursor += 1;
+            while cursor < chars.len() && chars[cursor] != quote {
+                delimiter.push(chars[cursor]);
+                cursor += 1;
+            }
+            cursor += 1;
+        } else {
+            while cursor < chars.len()
+                && !chars[cursor].is_whitespace()
+                && !matches!(chars[cursor], ';' | '|' | '&' | '<' | '>')
+            {
+                delimiter.push(chars[cursor]);
+                cursor += 1;
+            }
+        }
+        if !delimiter.trim().is_empty() {
+            delimiters.push(delimiter);
+        }
+        index = cursor.max(index + 1);
+    }
+    delimiters
+}
+
+struct SudoInvocation {
+    /// Index of the `s` of `sudo` in the character vector.
+    start: usize,
+    /// Index of the first character after the whitespace run following `sudo`.
+    rest_start: usize,
+}
+
+fn find_sudo_invocations(chars: &[char], case_insensitive: bool) -> Vec<SudoInvocation> {
+    let token: Vec<char> = "sudo".chars().collect();
+    let mut invocations = Vec::new();
+    let mut index = 0usize;
+    while index + token.len() < chars.len() + 1 {
+        let matches_token = (0..token.len()).all(|offset| {
+            let ch = chars[index + offset];
+            if case_insensitive {
+                ch.to_ascii_lowercase() == token[offset]
+            } else {
+                ch == token[offset]
+            }
+        });
+        if !matches_token || !command_position_prefix_at(chars, index) {
+            index += 1;
+            continue;
+        }
+        let after = index + token.len();
+        if after >= chars.len() || !chars[after].is_whitespace() {
+            index += 1;
+            continue;
+        }
+        let mut rest_start = after;
+        while rest_start < chars.len() && chars[rest_start].is_whitespace() {
+            rest_start += 1;
+        }
+        invocations.push(SudoInvocation {
+            start: index,
+            rest_start,
+        });
+        index = rest_start.max(index + 1);
+    }
+    invocations
+}
+
+fn starts_with_non_interactive_sudo_flag(rest: &str) -> bool {
+    let stripped = rest.trim_start();
+    if !stripped.starts_with("-n") {
+        return false;
+    }
+    stripped.len() == 2
+        || stripped
+            .chars()
+            .nth(2)
+            .is_some_and(|character| character.is_whitespace())
+}
+
+fn contains_forbidden_sudo_mode(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    for invocation in find_sudo_invocations(&chars, true) {
+        let rest: String = chars[invocation.rest_start..].iter().collect();
+        for token in rest.split_whitespace().take(8) {
+            if token == "--" {
+                break;
+            }
+            if token.starts_with('-') {
+                if is_forbidden_sudo_option(token) {
+                    return true;
+                }
+                continue;
+            }
+            return token.eq_ignore_ascii_case("su");
+        }
+    }
+    false
+}
+
+fn is_forbidden_sudo_option(token: &str) -> bool {
+    let lower_token = token.to_lowercase();
+    if lower_token == "--shell" || lower_token == "--login" {
+        return true;
+    }
+    if lower_token.starts_with("--") {
+        return false;
+    }
+    token.contains('s') || token.contains('i')
+}
+
+/// Rewrites every sudo invocation to the non-interactive `sudo -n ...` form
+/// and strips planner-provided stdin options. Errors on unsupported sudo
+/// modes such as `sudo -s`, `sudo -i`, or `sudo su`. Port of Java
+/// `TerminalAgentService.normalizeSudoForAgentExecution`.
+pub fn normalize_sudo_for_agent_execution(command: &str) -> Result<String, String> {
+    if command.trim().is_empty() {
+        return Ok(command.to_string());
+    }
+    if contains_forbidden_sudo_mode(command) {
+        return Err(format!("Unsupported sudo mode: {command}"));
+    }
+
+    let chars: Vec<char> = command.chars().collect();
+    let invocations = find_sudo_invocations(&chars, true);
+    let mut normalized = String::with_capacity(command.len() + 8);
+    let mut cursor = 0usize;
+    for invocation in &invocations {
+        normalized.extend(chars[cursor..invocation.start].iter());
+        let rest: String = chars[invocation.rest_start..].iter().collect();
+        if starts_with_non_interactive_sudo_flag(&rest) {
+            normalized.extend(chars[invocation.start..invocation.rest_start].iter());
+        } else {
+            normalized.push_str("sudo -n ");
+        }
+        cursor = invocation.rest_start;
+    }
+    normalized.extend(chars[cursor..].iter());
+    Ok(strip_planner_sudo_stdin_options(&normalized))
+}
+
+fn strip_planner_sudo_stdin_options(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let mut stripped = String::with_capacity(command.len());
+    let mut cursor = 0usize;
+    for invocation in find_sudo_invocations(&chars, false) {
+        if invocation.start < cursor {
+            continue;
+        }
+        let Some(after_flag) = consume_sudo_flag(&chars, invocation.rest_start, &["-n"]) else {
+            continue;
+        };
+        let mut end = after_flag;
+        let mut consumed_stdin_option = false;
+        while let Some(after_stdin) = consume_sudo_flag(&chars, end, &["-S", "--stdin"]) {
+            end = after_stdin;
+            consumed_stdin_option = true;
+        }
+        if !consumed_stdin_option {
+            continue;
+        }
+        stripped.extend(chars[cursor..invocation.start].iter());
+        stripped.push_str("sudo -n ");
+        cursor = end;
+    }
+    stripped.extend(chars[cursor..].iter());
+    stripped
+}
+
+/// Consumes one of the given flags at `index` if it is followed by at least
+/// one whitespace character, returning the index after the whitespace run.
+fn consume_sudo_flag(chars: &[char], index: usize, flags: &[&str]) -> Option<usize> {
+    for flag in flags {
+        let flag_chars: Vec<char> = flag.chars().collect();
+        if index + flag_chars.len() >= chars.len() {
+            continue;
+        }
+        if chars[index..index + flag_chars.len()] != flag_chars[..] {
+            continue;
+        }
+        let mut cursor = index + flag_chars.len();
+        if !chars[cursor].is_whitespace() {
+            continue;
+        }
+        while cursor < chars.len() && chars[cursor].is_whitespace() {
+            cursor += 1;
+        }
+        return Some(cursor);
+    }
+    None
+}
+
+/// Rewrites `sudo -n ...` invocations to `sudo -S -p '' ...` so that a stored
+/// sudo password can be supplied via stdin. Port of Java
+/// `JobSchedulerAiSupport.rewriteSudoForStoredPassword`.
+pub fn rewrite_sudo_for_stored_password(command: &str) -> String {
+    let chars: Vec<char> = command.chars().collect();
+    let mut rewritten = String::with_capacity(command.len() + 16);
+    let mut cursor = 0usize;
+    for invocation in find_sudo_invocations(&chars, true) {
+        if invocation.start < cursor {
+            continue;
+        }
+        let Some(after_flag) = consume_sudo_flag_case_insensitive(&chars, invocation.rest_start)
+        else {
+            continue;
+        };
+        rewritten.extend(chars[cursor..invocation.start].iter());
+        rewritten.push_str("sudo -S -p '' ");
+        cursor = after_flag;
+    }
+    rewritten.extend(chars[cursor..].iter());
+    rewritten
+}
+
+/// Consumes a case-insensitive `-n` flag followed by whitespace at `index`.
+fn consume_sudo_flag_case_insensitive(chars: &[char], index: usize) -> Option<usize> {
+    if index + 2 >= chars.len() {
+        return None;
+    }
+    if chars[index] != '-' || !chars[index + 1].eq_ignore_ascii_case(&'n') {
+        return None;
+    }
+    let mut cursor = index + 2;
+    if !chars[cursor].is_whitespace() {
+        return None;
+    }
+    while cursor < chars.len() && chars[cursor].is_whitespace() {
+        cursor += 1;
+    }
+    Some(cursor)
 }
 
 fn contains_sudo_without_noninteractive_flag(command: &str) -> bool {
@@ -3052,7 +3707,10 @@ fn should_request_approval_for_command(
     if command.risk != TerminalAgentRisk::RequiresConfirmation {
         return false;
     }
-    if request.auto_approve_root_commands && command_uses_root_privileges(probe, &command.command) {
+    if !request.confirm_mutating_command_sets
+        && request.auto_approve_root_commands
+        && command_uses_root_privileges(probe, &command.command)
+    {
         return false;
     }
     true
@@ -3482,6 +4140,18 @@ fn normalize_plan_request(
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(ToString::to_string),
+        connection_ai_profile_id: request
+            .connection_ai_profile_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string),
+        connection_ai_skill_ids: request
+            .connection_ai_skill_ids
+            .iter()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .collect(),
     })
 }
 
@@ -3604,10 +4274,17 @@ async fn request_plan_questions(
     let system_prompt = build_plan_question_system_prompt();
     let user_prompt =
         build_plan_question_user_prompt(request, probe).map_err(plan_error_to_string)?;
-    let response = ai::execute_custom_json_prompt(profile, &system_prompt, &user_prompt, 0.1, None)
-        .await
-        .map_err(map_ai_error)
-        .map_err(plan_error_to_string)?;
+    let response = ai::execute_custom_json_prompt_with_pinned_skills(
+        profile,
+        &system_prompt,
+        &user_prompt,
+        0.1,
+        None,
+        &request.connection_ai_skill_ids,
+    )
+    .await
+    .map_err(map_ai_error)
+    .map_err(plan_error_to_string)?;
     record_profile_usage(profile, response.usage.as_ref());
 
     if let Ok(decision) = parse_plan_question_decision(&response.content) {
@@ -3615,11 +4292,17 @@ async fn request_plan_questions(
     }
 
     let repair_prompt = build_plan_repair_prompt(&response.content, "questions");
-    let repaired =
-        ai::execute_custom_json_prompt(profile, &system_prompt, &repair_prompt, 0.0, None)
-            .await
-            .map_err(map_ai_error)
-            .map_err(plan_error_to_string)?;
+    let repaired = ai::execute_custom_json_prompt_with_pinned_skills(
+        profile,
+        &system_prompt,
+        &repair_prompt,
+        0.0,
+        None,
+        &request.connection_ai_skill_ids,
+    )
+    .await
+    .map_err(map_ai_error)
+    .map_err(plan_error_to_string)?;
     record_profile_usage(profile, repaired.usage.as_ref());
     decision_to_plan_questions(parse_plan_question_decision(&repaired.content)?)
 }
@@ -3636,10 +4319,17 @@ async fn request_plan_options(
     let user_prompt =
         build_plan_option_user_prompt(request, probe, questions, answers, custom_approach)
             .map_err(plan_error_to_string)?;
-    let response = ai::execute_custom_json_prompt(profile, &system_prompt, &user_prompt, 0.1, None)
-        .await
-        .map_err(map_ai_error)
-        .map_err(plan_error_to_string)?;
+    let response = ai::execute_custom_json_prompt_with_pinned_skills(
+        profile,
+        &system_prompt,
+        &user_prompt,
+        0.1,
+        None,
+        &request.connection_ai_skill_ids,
+    )
+    .await
+    .map_err(map_ai_error)
+    .map_err(plan_error_to_string)?;
     record_profile_usage(profile, response.usage.as_ref());
 
     if let Ok(decision) = parse_plan_option_decision(&response.content) {
@@ -3647,11 +4337,17 @@ async fn request_plan_options(
     }
 
     let repair_prompt = build_plan_repair_prompt(&response.content, "options");
-    let repaired =
-        ai::execute_custom_json_prompt(profile, &system_prompt, &repair_prompt, 0.0, None)
-            .await
-            .map_err(map_ai_error)
-            .map_err(plan_error_to_string)?;
+    let repaired = ai::execute_custom_json_prompt_with_pinned_skills(
+        profile,
+        &system_prompt,
+        &repair_prompt,
+        0.0,
+        None,
+        &request.connection_ai_skill_ids,
+    )
+    .await
+    .map_err(map_ai_error)
+    .map_err(plan_error_to_string)?;
     record_profile_usage(profile, repaired.usage.as_ref());
     decision_to_plan_options(parse_plan_option_decision(&repaired.content)?)
 }
@@ -4516,7 +5212,10 @@ mod tests {
             show_runtime_messages: false,
             ask_confirmation_before_every_command: false,
             auto_approve_root_commands: false,
+            confirm_mutating_command_sets: false,
             query_only: false,
+            connection_ai_profile_id: None,
+            connection_ai_skill_ids: Vec::new(),
         }
     }
 
@@ -5138,6 +5837,337 @@ __KORTTY_SUDO_L_END__"#;
 
         assert_eq!(decision.status, AgentDecisionStatus::NeedsConfirmation);
         assert_eq!(decision.commands.len(), 1);
+    }
+
+    // Ports of Java TerminalAgentDecisionRepairTest cases that exercise the
+    // decision-normalization layer.
+
+    #[test]
+    fn accepts_single_top_level_command_field_from_json_strict_models() {
+        let decision = parse_agent_decision(
+            r#"{
+                "status": "needs_confirmation",
+                "summary": "Install the package",
+                "userMessage": "I will install gpg-pubkey with dnf.",
+                "command": "sudo -n dnf install -y gpg-pubkey",
+                "purpose": "Install the requested gpg-pubkey package",
+                "risk": "requires confirmation",
+                "needsReprobe": false
+            }"#,
+        )
+        .expect("single top-level command field should normalize");
+
+        assert_eq!(decision.status, AgentDecisionStatus::NeedsConfirmation);
+        assert_eq!(decision.commands.len(), 1);
+        assert_eq!(
+            decision.commands[0].command,
+            "sudo -n dnf install -y gpg-pubkey"
+        );
+        assert_eq!(
+            decision.commands[0].purpose,
+            "Install the requested gpg-pubkey package"
+        );
+        assert_eq!(
+            decision.commands[0].risk,
+            TerminalAgentRisk::RequiresConfirmation
+        );
+    }
+
+    #[test]
+    fn accepts_command_object_instead_of_command_array() {
+        let decision = parse_agent_decision(
+            r#"{
+                "status": "run_commands",
+                "summary": "Inspect package availability",
+                "userMessage": "I will check the package name first.",
+                "commands": {
+                    "cmd": "dnf info gpg-pubkey",
+                    "description": "Check whether the package is available",
+                    "risk": "low"
+                },
+                "needsReprobe": false
+            }"#,
+        )
+        .expect("command object should normalize to a command array");
+
+        assert_eq!(decision.status, AgentDecisionStatus::RunCommands);
+        assert_eq!(decision.commands.len(), 1);
+        assert_eq!(decision.commands[0].command, "dnf info gpg-pubkey");
+        assert_eq!(
+            decision.commands[0].purpose,
+            "Check whether the package is available"
+        );
+        assert_eq!(decision.commands[0].risk, TerminalAgentRisk::ReadOnly);
+    }
+
+    #[test]
+    fn normalizes_status_aliases() {
+        for (alias, expected) in [
+            ("run", AgentDecisionStatus::RunCommands),
+            ("commands", AgentDecisionStatus::RunCommands),
+            ("run_command", AgentDecisionStatus::RunCommands),
+            ("execute", AgentDecisionStatus::RunCommands),
+            ("Execute Commands", AgentDecisionStatus::RunCommands),
+            ("confirm", AgentDecisionStatus::NeedsConfirmation),
+            ("confirmation", AgentDecisionStatus::NeedsConfirmation),
+            (
+                "requires-confirmation",
+                AgentDecisionStatus::NeedsConfirmation,
+            ),
+            ("need_confirmation", AgentDecisionStatus::NeedsConfirmation),
+            ("complete", AgentDecisionStatus::Done),
+            ("completed", AgentDecisionStatus::Done),
+            ("SUCCESS", AgentDecisionStatus::Done),
+            ("cannot", AgentDecisionStatus::Blocked),
+            ("failed", AgentDecisionStatus::Blocked),
+            ("failure", AgentDecisionStatus::Blocked),
+        ] {
+            let payload = format!(
+                r#"{{
+                    "status": "{alias}",
+                    "summary": "Summary text",
+                    "userMessage": "User message text",
+                    "commands": [
+                        {{"command": "echo one", "purpose": "Step one", "risk": "read_only"}}
+                    ]
+                }}"#
+            );
+            let decision = parse_agent_decision(&payload)
+                .unwrap_or_else(|error| panic!("alias `{alias}` should parse: {error}"));
+            assert_eq!(decision.status, expected, "alias `{alias}`");
+        }
+    }
+
+    #[test]
+    fn normalizes_string_command_entries_with_decision_level_purpose() {
+        let decision = parse_agent_decision(
+            r#"{
+                "status": "run",
+                "summary": "Check the kernel",
+                "userMessage": "Inspecting the kernel version.",
+                "commands": ["uname -a"]
+            }"#,
+        )
+        .expect("string command entries should normalize");
+
+        assert_eq!(decision.status, AgentDecisionStatus::RunCommands);
+        assert_eq!(decision.commands.len(), 1);
+        assert_eq!(decision.commands[0].command, "uname -a");
+        assert_eq!(decision.commands[0].purpose, "Check the kernel");
+        assert_eq!(
+            decision.commands[0].risk,
+            TerminalAgentRisk::RequiresConfirmation
+        );
+    }
+
+    #[test]
+    fn normalizes_command_field_aliases_and_risk_values() {
+        let decision = parse_agent_decision(
+            r#"{
+                "status": "run_commands",
+                "summary": "Run the script",
+                "userMessage": "Running.",
+                "commands": [
+                    {
+                        "shellCommand": "ls -la",
+                        "reason": "List files",
+                        "riskLevel": "SAFE"
+                    },
+                    {
+                        "terminalCommand": "cat /etc/os-release",
+                        "summary": "Identify the OS",
+                        "safety": "READ-ONLY"
+                    }
+                ]
+            }"#,
+        )
+        .expect("command field aliases should normalize");
+
+        assert_eq!(decision.commands.len(), 2);
+        assert_eq!(decision.commands[0].command, "ls -la");
+        assert_eq!(decision.commands[0].purpose, "List files");
+        assert_eq!(decision.commands[0].risk, TerminalAgentRisk::ReadOnly);
+        assert_eq!(decision.commands[1].command, "cat /etc/os-release");
+        assert_eq!(decision.commands[1].purpose, "Identify the OS");
+        assert_eq!(decision.commands[1].risk, TerminalAgentRisk::ReadOnly);
+    }
+
+    #[test]
+    fn missing_risk_defaults_to_requires_confirmation() {
+        let decision = parse_agent_decision(
+            r#"{
+                "status": "run_commands",
+                "summary": "Run the command",
+                "userMessage": "Running.",
+                "commands": [
+                    {"command": "systemctl restart nginx", "purpose": "Restart the web server"}
+                ]
+            }"#,
+        )
+        .expect("missing risk should default safely");
+
+        assert_eq!(
+            decision.commands[0].risk,
+            TerminalAgentRisk::RequiresConfirmation
+        );
+    }
+
+    #[test]
+    fn tolerates_missing_needs_reprobe_and_commands_for_final_statuses() {
+        let decision = parse_agent_decision(
+            r#"{
+                "status": "done",
+                "summary": "Created script guidance",
+                "userMessage": "Use find and sort to list the largest XML files."
+            }"#,
+        )
+        .expect("final decisions without commands or needsReprobe should parse");
+
+        assert_eq!(decision.status, AgentDecisionStatus::Done);
+        assert!(decision.commands.is_empty());
+        assert!(!decision.needs_reprobe);
+    }
+
+    #[test]
+    fn rejects_too_many_commands_with_repairable_error() {
+        let error = parse_agent_decision(
+            r#"{
+                "status": "run_commands",
+                "summary": "Need several steps",
+                "userMessage": "Running checks.",
+                "commands": [
+                    {"command": "echo one", "purpose": "Step one", "risk": "read_only"},
+                    {"command": "echo two", "purpose": "Step two", "risk": "read_only"},
+                    {"command": "echo three", "purpose": "Step three", "risk": "read_only"},
+                    {"command": "echo four", "purpose": "Step four", "risk": "read_only"}
+                ],
+                "needsReprobe": false
+            }"#,
+        )
+        .expect_err("too many commands should be rejected for the repair turn");
+
+        assert!(error.contains("too many commands"));
+    }
+
+    #[test]
+    fn detects_mutating_command_shapes() {
+        assert!(requires_confirmation_by_command_shape(
+            "touch /tmp/kortty-test"
+        ));
+        assert!(requires_confirmation_by_command_shape(
+            "rm -rf /tmp/scratch"
+        ));
+        assert!(requires_confirmation_by_command_shape("ls; rm file"));
+        assert!(requires_confirmation_by_command_shape(
+            "systemctl status nginx && cp a b"
+        ));
+        assert!(requires_confirmation_by_command_shape(
+            "echo data > /tmp/file"
+        ));
+        assert!(!requires_confirmation_by_command_shape(
+            "find /var/log -type f | head"
+        ));
+        assert!(!requires_confirmation_by_command_shape(
+            "cat /etc/os-release"
+        ));
+        assert!(!requires_confirmation_by_command_shape(
+            "echo 'rm this text'"
+        ));
+        assert!(!requires_confirmation_by_command_shape("echo \"a > b\""));
+        assert!(!requires_confirmation_by_command_shape(
+            "grep -r pattern 2>&1"
+        ));
+        assert!(!requires_confirmation_by_command_shape("awk '$1 >= 10'"));
+    }
+
+    #[test]
+    fn here_document_bodies_are_ignored_for_shape_checks() {
+        assert!(!requires_confirmation_by_command_shape(
+            "cat << 'EOF'\nrm -rf /\nEOF"
+        ));
+        assert!(requires_confirmation_by_command_shape(
+            "tee /etc/demo.conf << EOF\nhello\nEOF"
+        ));
+    }
+
+    #[test]
+    fn normalizes_sudo_invocations_for_agent_execution() {
+        assert_eq!(
+            normalize_sudo_for_agent_execution("sudo systemctl restart nginx")
+                .expect("plain sudo should normalize"),
+            "sudo -n systemctl restart nginx"
+        );
+        assert_eq!(
+            normalize_sudo_for_agent_execution("sudo -n whoami")
+                .expect("non-interactive sudo should stay unchanged"),
+            "sudo -n whoami"
+        );
+        assert_eq!(
+            normalize_sudo_for_agent_execution("echo hi && sudo reboot")
+                .expect("chained sudo should normalize"),
+            "echo hi && sudo -n reboot"
+        );
+        assert_eq!(
+            normalize_sudo_for_agent_execution("sudo -n -S apt-get update")
+                .expect("stdin options should be stripped"),
+            "sudo -n apt-get update"
+        );
+        assert_eq!(
+            normalize_sudo_for_agent_execution("sudo -n --stdin -S id")
+                .expect("repeated stdin options should be stripped"),
+            "sudo -n id"
+        );
+        assert!(normalize_sudo_for_agent_execution("sudo -i").is_err());
+        assert!(normalize_sudo_for_agent_execution("sudo -s bash").is_err());
+        assert!(normalize_sudo_for_agent_execution("sudo su ").is_err());
+        assert_eq!(
+            normalize_sudo_for_agent_execution("ls -la").expect("non-sudo passes through"),
+            "ls -la"
+        );
+    }
+
+    #[test]
+    fn rewrites_stored_password_sudo_invocations() {
+        assert_eq!(
+            rewrite_sudo_for_stored_password("sudo -n systemctl restart nginx"),
+            "sudo -S -p '' systemctl restart nginx"
+        );
+        assert_eq!(
+            rewrite_sudo_for_stored_password("ls; sudo -n id"),
+            "ls; sudo -S -p '' id"
+        );
+        assert_eq!(rewrite_sudo_for_stored_password("ls -la"), "ls -la");
+    }
+
+    #[test]
+    fn confirm_mutating_command_sets_disables_root_auto_approval() {
+        let mut request = build_agent_request();
+        request.auto_approve_root_commands = true;
+        request.confirm_mutating_command_sets = true;
+        let mut probe = build_probe_snapshot();
+        probe.passwordless_sudo = false;
+
+        let command = TerminalAgentPlannedCommand {
+            command: "sudo -n apt-get install -y postgresql".into(),
+            purpose: "Install PostgreSQL".into(),
+            risk: TerminalAgentRisk::RequiresConfirmation,
+        };
+
+        assert!(should_request_approval_for_command(
+            &request, &probe, &command
+        ));
+    }
+
+    #[test]
+    fn read_only_risk_is_upgraded_for_mutating_command_shapes() {
+        assert_eq!(
+            classify_command_risk("echo data > /tmp/file"),
+            TerminalAgentRisk::RequiresConfirmation
+        );
+        assert_eq!(
+            classify_command_risk("echo hello"),
+            TerminalAgentRisk::ReadOnly
+        );
     }
 
     #[test]

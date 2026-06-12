@@ -112,8 +112,9 @@ pub fn append_skills_to_prompt(
     user_prompt: &str,
     skills: &[AiSkill],
     target: AiSkillTarget,
+    pinned_skill_ids: &[String],
 ) -> (String, Vec<String>) {
-    let selected = select_relevant_skills(user_prompt, skills, target);
+    let selected = select_relevant_skills(user_prompt, skills, target, pinned_skill_ids);
     if selected.is_empty() {
         return (system_prompt.trim().to_string(), Vec::new());
     }
@@ -143,16 +144,25 @@ pub fn append_skills_to_prompt(
     )
 }
 
+/// Selects skills for the prompt: candidates pass the relevance auto-detection,
+/// while pinned skills (e.g. assigned to the active connection) always survive
+/// it. Port of the Java `AiSkillRelevanceSelector.withPinnedSkills` behavior.
 pub fn select_relevant_skills<'a>(
     user_prompt: &str,
     skills: &'a [AiSkill],
     target: AiSkillTarget,
+    pinned_skill_ids: &[String],
 ) -> Vec<&'a AiSkill> {
     let query = user_prompt.to_lowercase();
-    skills
+    let candidates: Vec<&AiSkill> = skills
         .iter()
         .filter(|skill| skill.enabled)
-        .filter(|skill| target_applies(&skill.target, &target))
+        .filter(|skill| skill_applicable(skill, &target, pinned_skill_ids))
+        .collect();
+
+    let mut selected: Vec<&AiSkill> = candidates
+        .iter()
+        .copied()
         .filter(|skill| {
             let name_match =
                 !skill.name.trim().is_empty() && query.contains(&skill.name.to_lowercase());
@@ -167,7 +177,37 @@ pub fn select_relevant_skills<'a>(
             name_match || tag_match || desc_match
         })
         .take(5)
-        .collect()
+        .collect();
+
+    // Pinned skills always survive the relevance auto-detection.
+    for candidate in &candidates {
+        if is_pinned(candidate, pinned_skill_ids)
+            && !selected.iter().any(|skill| skill.id == candidate.id)
+        {
+            selected.push(candidate);
+        }
+    }
+    selected
+}
+
+fn is_pinned(skill: &AiSkill, pinned_skill_ids: &[String]) -> bool {
+    !skill.id.trim().is_empty()
+        && pinned_skill_ids
+            .iter()
+            .any(|pinned| pinned.trim() == skill.id.trim())
+}
+
+fn skill_applicable(
+    skill: &AiSkill,
+    requested: &AiSkillTarget,
+    pinned_skill_ids: &[String],
+) -> bool {
+    // Connection-scoped skills are only sent for connections they are explicitly
+    // assigned to (= pinned); the generic auto-detection never picks them up.
+    if matches!(skill.target, AiSkillTarget::Connection) {
+        return is_pinned(skill, pinned_skill_ids);
+    }
+    target_applies(&skill.target, requested)
 }
 
 fn target_applies(skill_target: &AiSkillTarget, requested: &AiSkillTarget) -> bool {
@@ -286,6 +326,7 @@ fn parse_target(value: Option<&str>) -> Result<AiSkillTarget> {
         "CHAT" => Ok(AiSkillTarget::Chat),
         "AGENT" => Ok(AiSkillTarget::Agent),
         "BOTH" => Ok(AiSkillTarget::Both),
+        "CONNECTION" => Ok(AiSkillTarget::Connection),
         other => bail!("Invalid AI skill target: {other}"),
     }
 }
@@ -385,5 +426,124 @@ mod tests {
         assert!(!imported.enabled);
         assert_eq!(imported.target, AiSkillTarget::Both);
         assert_eq!(imported.content, "# Foreign skill\nBody");
+    }
+
+    fn skill(id: &str, name: &str, target: AiSkillTarget) -> AiSkill {
+        AiSkill {
+            id: id.into(),
+            name: name.into(),
+            description: None,
+            tags: vec![],
+            enabled: true,
+            target,
+            content: format!("Content of {name}."),
+        }
+    }
+
+    #[test]
+    fn pinned_skill_survives_relevance_auto_detection() {
+        let skills = vec![
+            skill("relevant", "journalctl", AiSkillTarget::Chat),
+            skill("pinned", "backup ritual", AiSkillTarget::Both),
+            skill("irrelevant", "kubernetes", AiSkillTarget::Chat),
+        ];
+
+        let selected = select_relevant_skills(
+            "how do I read journalctl output?",
+            &skills,
+            AiSkillTarget::Chat,
+            &["pinned".to_string()],
+        );
+
+        let ids: Vec<&str> = selected.iter().map(|skill| skill.id.as_str()).collect();
+        assert!(
+            ids.contains(&"relevant"),
+            "relevance match must stay selected"
+        );
+        assert!(
+            ids.contains(&"pinned"),
+            "pinned skill must bypass relevance"
+        );
+        assert!(!ids.contains(&"irrelevant"));
+    }
+
+    #[test]
+    fn connection_skills_require_pinning_and_never_auto_detect() {
+        let skills = vec![skill("conn-skill", "journalctl", AiSkillTarget::Connection)];
+
+        // Even a perfect keyword match must not select an unpinned connection skill.
+        let unpinned = select_relevant_skills(
+            "how do I read journalctl output?",
+            &skills,
+            AiSkillTarget::Chat,
+            &[],
+        );
+        assert!(unpinned.is_empty());
+
+        // Pinned connection skills are included for chat and agent targets.
+        for target in [AiSkillTarget::Chat, AiSkillTarget::Agent] {
+            let pinned = select_relevant_skills(
+                "unrelated prompt",
+                &skills,
+                target,
+                &["conn-skill".to_string()],
+            );
+            assert_eq!(pinned.len(), 1);
+            assert_eq!(pinned[0].id, "conn-skill");
+        }
+    }
+
+    #[test]
+    fn disabled_pinned_skills_stay_excluded() {
+        let mut disabled = skill("conn-skill", "journalctl", AiSkillTarget::Connection);
+        disabled.enabled = false;
+        let skills = vec![disabled];
+
+        let selected = select_relevant_skills(
+            "journalctl",
+            &skills,
+            AiSkillTarget::Chat,
+            &["conn-skill".to_string()],
+        );
+        assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn pinned_skills_are_not_duplicated_when_already_relevant() {
+        let skills = vec![skill("pinned", "journalctl", AiSkillTarget::Both)];
+
+        let selected = select_relevant_skills(
+            "how do I read journalctl output?",
+            &skills,
+            AiSkillTarget::Chat,
+            &["pinned".to_string()],
+        );
+        assert_eq!(selected.len(), 1);
+    }
+
+    #[test]
+    fn append_skills_to_prompt_includes_pinned_connection_skills() {
+        let skills = vec![skill("conn-skill", "Backup", AiSkillTarget::Connection)];
+
+        let (prompt, used) = append_skills_to_prompt(
+            "Base prompt.",
+            "unrelated question",
+            &skills,
+            AiSkillTarget::Chat,
+            &["conn-skill".to_string()],
+        );
+
+        assert!(prompt.contains("Content of Backup."));
+        assert_eq!(used, vec!["Backup".to_string()]);
+
+        let (prompt_without_pin, used_without_pin) = append_skills_to_prompt(
+            "Base prompt.",
+            "unrelated question",
+            &skills,
+            AiSkillTarget::Chat,
+            &[],
+        );
+        assert_eq!(prompt_without_pin, "Base prompt.");
+        assert!(used_without_pin.is_empty());
     }
 }

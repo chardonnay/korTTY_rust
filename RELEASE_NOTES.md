@@ -2,6 +2,27 @@
 
 ## v2.2.0
 
+### Added — Java v2.2 feature parity port
+
+- Terminal recording: lightweight replay capture per tab or active split (`.korttyrec.jsonl.gz`, Java-compatible format), idle auto-pause with input-activity tracking, snapshot deduplication, optional per-cell color capture, in-app replay viewer with timeline slider, time-jump (`MM:SS`) and 1x–20x playback speed, plus WebM/VP9 and MKV/FFV1 video export with glyph rendering, custom time ranges and live progress/ETA; Video Manager dialog and `Settings -> Video`; `Ctrl/Cmd+Shift+E` toggle
+- Monaco-based snippet editor (locally bundled, no CDN) with column ruler and line-length limit (20–240), format-to-width, ten built-in IntelliJ-inspired editor profiles plus custom profiles, snippet history with restore, side-by-side snippet diff, and save-as-new
+- Snippet AI workflows: cursor-aware assistant, ghost-text completions with optional session-local auto-completion, error review, improvement themes, alternative solutions (selection-aware), security review with selectable fixes, technical description generator in comment syntax, and AI formatting fallback — all with before/after diff previews and hardened prompts (no hidden reasoning, no invented files/URLs)
+- Local PlantUML snippet diagrams stored with the snippet: stale detection by content hash, regeneration with custom instructions, readable activity colors, SVG export and clickable code-reference hotspots
+- Shared code formatter service with provider states (built-in, bundled, external fallback, unavailable), ~16 languages, pinned formatter manifest and line-width support for Prettier, Black and Perl::Tidy
+- Real SFTP subsystem via `russh-sftp` for all remote file operations (listing, transfers, text editing, delete/rename/mkdir/chmod) with Java-equivalent subsystem failure diagnostics and automatic exec fallback when the server rejects the SFTP subsystem
+- SFTP file editing through the snippet editor with overwrite, validated remote "Save As" and save-as-snippet; terminal selection can be opened as a remote file in the snippet editor with binary detection
+- Application update checker: GitHub release polling on startup and hourly, semantic version comparison, platform/architecture-aware asset selection (including Linux distro detection), SHA256-verified downloads to the Downloads folder, snooze/skip handling and `Settings -> Updates`
+- App-wide designs with previews in `Settings -> Appearance`: Normal, Matrix Terminal, Holographic Interface, Klingon Tactical and Elegant Dark (terminal and editor content colors stay untouched); refreshed master-password login with logo
+- Dockable local file browser full feature set: context menu with copy/cut/paste, rename, new file/folder, ZIP/TAR/TAR.GZ archives, owner/permission editor with octal validation and principal lookup, file details, hidden-file toggle and resizable dividers
+- Per-connection terminal emulation (TERM value) with searchable selector in Quick Connect and Connection Edit; per-connection and global terminal color disabling via a stateful SGR color-sequence filter
+- Drag-and-drop file upload to SSH terminals with `~`-path resolution through the SFTP start directory, progress dialog (target, elapsed time, current file) and cancellation; prompt-heuristic working-directory extraction as cwd-tracking fallback
+- AI CLI providers: profiles can run through 17 known local CLI tools (Claude Code, Codex, Gemini, OpenCode, …) with argument templates, placeholder expansion and timeouts; LM Studio auto model selection; reasoning-effort discovery with caching; default AI profile selection
+- Per-connection AI profile and connection-scoped AI skills with pinning (assigned skills bypass relevance auto-detection)
+- Terminal agent robustness: decision normalization for LLM output variations, mutating-command confirmation gate and a global agent-execution kill switch in `Settings -> AI`
+- JobScheduler AI agent jobs now run a full decision loop with command execution, risk-based auto-approval (instead of blanket blocking), sudo handling and journaling; one-time auto-approve default migration for existing jobs
+- Configurable log directory with retention (0–3650 days) and automatic gzip compression of old logs in `Settings -> Logging`; settings hot-reload on external file changes
+- Tools menu shortcuts (`Ctrl+Shift+J/V`, `Ctrl+Alt+A/P`), `Ctrl+Q` closes secondary windows only, terminal-only fullscreen scrollbar hiding, and complete translations for all eight UI languages (680 keys each)
+
 ### Added
 
 - AI Manager with profile management, saved chats, usage/quota preview and AI result tabs

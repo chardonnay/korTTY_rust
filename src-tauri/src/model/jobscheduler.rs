@@ -223,6 +223,11 @@ pub struct JournalEntry {
 #[serde(rename_all = "camelCase")]
 pub struct PinnedHostKey {
     pub id: String,
+    /// Java-interop pass-through: the Java app keys pinned host keys by the
+    /// connection id (`PinnedHostKey.connectionId`). Preserved on load/save
+    /// so a Rust save does not break the Java host-key lookups.
+    #[serde(default)]
+    pub connection_id: Option<String>,
     pub host: String,
     pub port: u16,
     pub algorithm: String,
@@ -241,6 +246,14 @@ pub struct SudoCredential {
     pub encrypted_password: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Java-interop pass-through: the Java app scopes sudo credentials as
+    /// `SERVER` or `GROUP` (`SudoCredential.scope`); preserved so credentials
+    /// written by the Java app survive a Rust save.
+    #[serde(default)]
+    pub scope: Option<String>,
+    /// Java-interop pass-through for `SudoCredential.groupName`.
+    #[serde(default)]
+    pub group_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -276,6 +289,10 @@ pub struct JobSchedulerStateFile {
     pub pinned_host_keys: Vec<PinnedHostKey>,
     #[serde(default)]
     pub sudo_credentials: Vec<SudoCredential>,
+    /// One-time migration marker: existing AI agent jobs created before the
+    /// risk-based approval gate default to auto-approved commands.
+    #[serde(default)]
+    pub ai_agent_auto_approve_default_migrated: bool,
 }
 
 fn default_true() -> bool {

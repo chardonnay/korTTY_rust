@@ -1,6 +1,10 @@
 use crate::ai;
+use crate::ai::cli_registry::{self, AiCliArgumentPreset, AiCliProviderDescriptor};
+use crate::ai::{profile_selection, reasoning_discovery};
 use crate::ai_skills;
-use crate::model::ai::{AiExecutionResult, AiProfile, AiRequestPayload, AiSkill, SavedAiChat};
+use crate::model::ai::{
+    AiExecutionResult, AiProfile, AiReasoningEffort, AiRequestPayload, AiSkill, SavedAiChat,
+};
 use crate::model::settings::GlobalSettings;
 use crate::persistence::xml_repository;
 use std::collections::HashMap;
@@ -104,7 +108,22 @@ pub async fn delete_ai_profile(id: String) -> Result<(), String> {
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
     profiles.retain(|profile| profile.id != id);
-    xml_repository::save_json(AI_PROFILES_FILE, &profiles).map_err(|error| error.to_string())
+    xml_repository::save_json(AI_PROFILES_FILE, &profiles).map_err(|error| error.to_string())?;
+
+    // Keep the configured default profile id valid after deletions.
+    let mut settings: GlobalSettings = xml_repository::load_json(GLOBAL_SETTINGS_FILE)
+        .map_err(|error| error.to_string())?
+        .unwrap_or_default();
+    let normalized = profile_selection::normalize_default_profile_id(
+        settings.default_ai_profile_id.as_deref(),
+        &profiles,
+    );
+    if normalized != settings.default_ai_profile_id {
+        settings.default_ai_profile_id = normalized;
+        xml_repository::save_json(GLOBAL_SETTINGS_FILE, &settings)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -139,12 +158,38 @@ pub async fn execute_ai_action(
     let mut profiles: Vec<AiProfile> = xml_repository::load_json(AI_PROFILES_FILE)
         .map_err(|error| error.to_string())?
         .unwrap_or_default();
+    // Resolve the profile: the fixed profile of the originating connection wins
+    // when it is available, then the explicitly requested profile (id/name
+    // lookup), then the configured default profile (Port of the Java
+    // `resolveAiProfileForConnection` + `AiProfileSelectionSupport`).
+    let selected_profile_id = {
+        let requested = request.profile_id.trim();
+        let connection_profile = request
+            .connection_ai_profile_id
+            .as_deref()
+            .and_then(|profile_id| profile_selection::find_by_id(&profiles, profile_id));
+        let selected = if let Some(connection_profile) = connection_profile {
+            Some(connection_profile)
+        } else if requested.is_empty() {
+            let settings: GlobalSettings = xml_repository::load_json(GLOBAL_SETTINGS_FILE)
+                .map_err(|error| error.to_string())?
+                .unwrap_or_default();
+            profile_selection::default_profile(&profiles, settings.default_ai_profile_id.as_deref())
+        } else {
+            profile_selection::find_by_lookup(&profiles, requested)
+        };
+        selected.map(|profile| profile.id.clone())
+    };
+    let Some(selected_profile_id) = selected_profile_id else {
+        return Err("AI profile not found".into());
+    };
     let Some(profile) = profiles
         .iter_mut()
-        .find(|profile| profile.id == request.profile_id)
+        .find(|profile| profile.id == selected_profile_id)
     else {
         return Err("AI profile not found".into());
     };
+    request.profile_id = selected_profile_id;
 
     ai::normalize_profile(profile);
     let selection_limit = profile.max_selection_chars.max(1);
@@ -292,4 +337,40 @@ pub async fn import_ai_skill_markdown(path: String) -> Result<AiSkill, String> {
 pub async fn export_ai_skill_markdown(path: String, skill: AiSkill) -> Result<(), String> {
     let markdown = ai_skills::export_skill_to_markdown(&skill);
     fs::write(path, markdown).map_err(|error| error.to_string())
+}
+
+#[tauri::command]
+pub async fn list_ai_cli_providers() -> Result<Vec<AiCliProviderDescriptor>, String> {
+    Ok(cli_registry::providers().to_vec())
+}
+
+#[tauri::command]
+pub async fn resolve_ai_cli_executable(
+    provider_id: Option<String>,
+    executable_path: Option<String>,
+) -> Result<Option<String>, String> {
+    if let Some(path) = executable_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return Ok(cli_registry::find_executable(path));
+    }
+    Ok(cli_registry::find_provider_executable(
+        provider_id.as_deref().unwrap_or(""),
+    ))
+}
+
+#[tauri::command]
+pub async fn get_ai_cli_argument_preset(
+    provider_id: String,
+) -> Result<Option<AiCliArgumentPreset>, String> {
+    Ok(cli_registry::default_argument_preset(&provider_id))
+}
+
+#[tauri::command]
+pub async fn discover_ai_reasoning_efforts(
+    profile: AiProfile,
+) -> Result<Vec<AiReasoningEffort>, String> {
+    reasoning_discovery::discover(&profile).await
 }

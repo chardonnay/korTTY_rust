@@ -1,9 +1,103 @@
-use crate::sftp::manager::{FileEntry, FileType};
+use crate::sftp::exec_fallback::{self, shell_escape};
+use crate::sftp::manager::{self, FileEntry, FileType};
+use crate::sftp::paths;
+use crate::sftp::{
+    SftpModeReason, SftpModeStatus, SftpModeStore, SftpTransferMode, MAX_TEXT_EDITOR_BYTES,
+};
+use crate::ssh::session::SSHSession;
 use crate::ssh::SSHManager;
-use base64::Engine as _;
 use std::fs;
 use std::path::Path;
-use tauri::State;
+use std::sync::Arc;
+use tauri::{AppHandle, Emitter, State};
+use tokio::sync::Mutex;
+
+/// Tauri event emitted when the transfer mode of a session is first determined
+/// (and again only when it changes, e.g. after a reconnect).
+const SFTP_MODE_EVENT: &str = "kortty-sftp-mode";
+
+/// Transfer backend resolved for one remote file operation.
+enum TransferBackend {
+    /// Native SFTP subsystem; the Arc is independent of the session lock.
+    Sftp(Arc<russh_sftp::client::SftpSession>),
+    /// Exec + base64 command-line fallback.
+    ExecFallback,
+}
+
+async fn get_session(
+    state: &State<'_, SSHManager>,
+    session_id: &str,
+) -> Result<Arc<Mutex<SSHSession>>, String> {
+    state
+        .get_session(session_id)
+        .await
+        .ok_or_else(|| "Session not found".to_string())
+}
+
+/// Resolves the transfer backend for a session: tries the SFTP subsystem first
+/// and falls back to the exec transport on startup errors. The open_sftp()
+/// outcome is cached inside the session, so a rejected subsystem is not retried
+/// on every operation. Reports the determined mode via the
+/// "kortty-sftp-mode" event when it is first established or changes.
+async fn resolve_transfer_backend(
+    app: &AppHandle,
+    mode_store: &SftpModeStore,
+    session: &SSHSession,
+    session_id: &str,
+) -> TransferBackend {
+    let outcome = session.open_sftp().await;
+    let status = match &outcome {
+        Ok(_) => SftpModeStatus {
+            session_id: session_id.to_string(),
+            mode: SftpTransferMode::Sftp,
+            reason: None,
+        },
+        Err(error) => SftpModeStatus {
+            session_id: session_id.to_string(),
+            mode: SftpTransferMode::ExecFallback,
+            reason: Some(SftpModeReason::from_startup_error(error)),
+        },
+    };
+    report_transfer_mode(app, mode_store, status).await;
+    match outcome {
+        Ok(sftp) => TransferBackend::Sftp(sftp),
+        Err(_) => TransferBackend::ExecFallback,
+    }
+}
+
+async fn report_transfer_mode(app: &AppHandle, mode_store: &SftpModeStore, status: SftpModeStatus) {
+    let mut modes = mode_store.0.lock().await;
+    let unchanged = modes
+        .get(&status.session_id)
+        .map(|previous| previous.mode == status.mode)
+        .unwrap_or(false);
+    if unchanged {
+        return;
+    }
+    modes.insert(status.session_id.clone(), status.clone());
+    drop(modes);
+    let _ = app.emit(SFTP_MODE_EVENT, &status);
+}
+
+/// Determines (and caches) the transfer mode of a session so the frontend can
+/// show the fallback diagnosis even when it missed the "kortty-sftp-mode" event.
+#[tauri::command]
+pub async fn sftp_transfer_mode(
+    app: AppHandle,
+    state: State<'_, SSHManager>,
+    mode_store: State<'_, SftpModeStore>,
+    session_id: String,
+) -> Result<SftpModeStatus, String> {
+    let session_arc = get_session(&state, &session_id).await?;
+    let session = session_arc.lock().await;
+    resolve_transfer_backend(&app, &mode_store, &session, &session_id).await;
+    drop(session);
+    let modes = mode_store.0.lock().await;
+    modes
+        .get(&session_id)
+        .cloned()
+        .ok_or_else(|| "Transfer mode not determined".to_string())
+}
 
 #[tauri::command]
 pub async fn get_home_dir() -> Result<String, String> {
@@ -62,88 +156,24 @@ pub async fn list_local_dir(path: String) -> Result<Vec<FileEntry>, String> {
     Ok(entries)
 }
 
-fn parse_ls_output(output: &str) -> Vec<FileEntry> {
-    let mut entries = Vec::new();
-    for line in output.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with("total") {
-            continue;
-        }
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() < 9 {
-            continue;
-        }
-        let perms = parts[0];
-        let owner = parts[2].to_string();
-        let group = parts[3].to_string();
-        let size: u64 = parts[4].parse().unwrap_or(0);
-        let date = format!("{} {} {}", parts[5], parts[6], parts[7]);
-        let name_raw = parts[8..].join(" ");
-
-        let name = if perms.starts_with('l') {
-            name_raw
-                .split(" -> ")
-                .next()
-                .unwrap_or(&name_raw)
-                .to_string()
-        } else {
-            name_raw
-        };
-
-        if name == "." || name == ".." {
-            continue;
-        }
-
-        let file_type = if perms.starts_with('d') {
-            FileType::Directory
-        } else if perms.starts_with('l') {
-            FileType::Symlink
-        } else {
-            FileType::File
-        };
-
-        entries.push(FileEntry {
-            name,
-            file_type,
-            size,
-            modified: Some(date),
-            owner: Some(owner),
-            group: Some(group),
-            permissions: Some(perms.to_string()),
-        });
-    }
-    entries
-}
-
 #[tauri::command]
 pub async fn sftp_list_dir(
+    app: AppHandle,
     state: State<'_, SSHManager>,
+    mode_store: State<'_, SftpModeStore>,
     session_id: String,
     path: String,
 ) -> Result<Vec<FileEntry>, String> {
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
-    let command = format!(
-        "LC_ALL=C ls -la --time-style=long-iso {} 2>/dev/null || LC_ALL=C ls -la {}",
-        shell_escape(&path),
-        shell_escape(&path)
-    );
-    let output = session
-        .exec_command(&command)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(parse_ls_output(&output))
+    match resolve_transfer_backend(&app, &mode_store, &session, &session_id).await {
+        TransferBackend::Sftp(sftp) => {
+            drop(session);
+            manager::list_dir(&sftp, &path).await
+        }
+        TransferBackend::ExecFallback => exec_fallback::list_dir(&session, &path).await,
+    }
 }
-
-fn shell_escape(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
-const UPLOAD_CHUNK_SIZE: usize = 32 * 1024;
-const MAX_TEXT_EDITOR_BYTES: u64 = 5 * 1024 * 1024;
 
 #[tauri::command]
 pub async fn read_local_text_file(path: String) -> Result<String, String> {
@@ -193,74 +223,52 @@ pub async fn local_delete(path: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn sftp_upload(
+    app: AppHandle,
     state: State<'_, SSHManager>,
+    mode_store: State<'_, SftpModeStore>,
     session_id: String,
     local_path: String,
     remote_path: String,
 ) -> Result<(), String> {
-    let data = fs::read(&local_path).map_err(|e| format!("Failed to read local file: {}", e))?;
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
-
-    let escaped = shell_escape(&remote_path);
-    for (i, chunk) in data.chunks(UPLOAD_CHUNK_SIZE).enumerate() {
-        let b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
-        let redirect = if i == 0 { ">" } else { ">>" };
-        let cmd = format!(
-            "printf '%s' '{}' | {{ base64 -d 2>/dev/null || base64 -D; }} {} {}",
-            b64, redirect, escaped
-        );
-        session
-            .exec_command(&cmd)
-            .await
-            .map_err(|e| format!("Upload chunk {} failed: {}", i, e))?;
+    match resolve_transfer_backend(&app, &mode_store, &session, &session_id).await {
+        TransferBackend::Sftp(sftp) => {
+            drop(session);
+            manager::upload(&sftp, &local_path, &remote_path).await
+        }
+        TransferBackend::ExecFallback => {
+            exec_fallback::upload(&session, &local_path, &remote_path).await
+        }
     }
-    Ok(())
 }
 
 #[tauri::command]
 pub async fn read_remote_text_file(
+    app: AppHandle,
     state: State<'_, SSHManager>,
+    mode_store: State<'_, SftpModeStore>,
     session_id: String,
     remote_path: String,
 ) -> Result<String, String> {
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
-    let size_cmd = format!("wc -c < {} 2>/dev/null", shell_escape(&remote_path));
-    let size_output = session
-        .exec_command(&size_cmd)
-        .await
-        .map_err(|e| e.to_string())?;
-    let size = size_output.trim().parse::<u64>().unwrap_or(0);
-    if size > MAX_TEXT_EDITOR_BYTES {
-        return Err(format!(
-            "Remote file is too large for the snippet editor ({size} bytes)"
-        ));
+    match resolve_transfer_backend(&app, &mode_store, &session, &session_id).await {
+        TransferBackend::Sftp(sftp) => {
+            drop(session);
+            manager::read_text_file(&sftp, &remote_path).await
+        }
+        TransferBackend::ExecFallback => {
+            exec_fallback::read_remote_text_file(&session, &remote_path).await
+        }
     }
-    let cmd = format!("cat {} | base64", shell_escape(&remote_path));
-    let output = session
-        .exec_command(&cmd)
-        .await
-        .map_err(|e| e.to_string())?;
-    let cleaned: String = output.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.is_empty() {
-        return Ok(String::new());
-    }
-    let data = base64::engine::general_purpose::STANDARD
-        .decode(&cleaned)
-        .map_err(|e| format!("Base64 decode error: {}", e))?;
-    String::from_utf8(data).map_err(|e| format!("Remote file is not valid UTF-8: {}", e))
 }
 
 #[tauri::command]
 pub async fn write_remote_text_file(
+    app: AppHandle,
     state: State<'_, SSHManager>,
+    mode_store: State<'_, SftpModeStore>,
     session_id: String,
     remote_path: String,
     content: String,
@@ -268,142 +276,156 @@ pub async fn write_remote_text_file(
     if content.len() as u64 > MAX_TEXT_EDITOR_BYTES {
         return Err("Content is too large for the snippet editor handoff".into());
     }
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
-    let escaped = shell_escape(&remote_path);
-    for (i, chunk) in content.as_bytes().chunks(UPLOAD_CHUNK_SIZE).enumerate() {
-        let b64 = base64::engine::general_purpose::STANDARD.encode(chunk);
-        let redirect = if i == 0 { ">" } else { ">>" };
-        let cmd = format!(
-            "printf '%s' '{}' | {{ base64 -d 2>/dev/null || base64 -D; }} {} {}",
-            b64, redirect, escaped
-        );
-        session
-            .exec_command(&cmd)
-            .await
-            .map_err(|e| format!("Remote write chunk {} failed: {}", i, e))?;
+    match resolve_transfer_backend(&app, &mode_store, &session, &session_id).await {
+        TransferBackend::Sftp(sftp) => {
+            drop(session);
+            manager::write_text_file(&sftp, &remote_path, &content).await
+        }
+        TransferBackend::ExecFallback => {
+            exec_fallback::write_remote_text_file(&session, &remote_path, &content).await
+        }
     }
-    if content.is_empty() {
-        session
-            .exec_command(&format!(": > {}", escaped))
-            .await
-            .map_err(|e| e.to_string())?;
+}
+
+/// Writes the snippet-editor content as a sibling of an existing remote file
+/// ("Save as…" flow). The new file name is validated against the same rules as
+/// the Java `SftpFileTransferService.validateRemoteSiblingFileName` and the
+/// target path is resolved next to `original_path`. Returns the new path.
+#[tauri::command]
+pub async fn write_remote_text_file_as(
+    app: AppHandle,
+    state: State<'_, SSHManager>,
+    mode_store: State<'_, SftpModeStore>,
+    session_id: String,
+    original_path: String,
+    new_file_name: String,
+    content: String,
+) -> Result<String, String> {
+    if content.len() as u64 > MAX_TEXT_EDITOR_BYTES {
+        return Err("Content is too large for the snippet editor handoff".into());
     }
-    Ok(())
+    let target_path = paths::resolve_sibling_remote_file_path(&original_path, &new_file_name)?;
+    let session_arc = get_session(&state, &session_id).await?;
+    let session = session_arc.lock().await;
+    match resolve_transfer_backend(&app, &mode_store, &session, &session_id).await {
+        TransferBackend::Sftp(sftp) => {
+            drop(session);
+            manager::write_text_file(&sftp, &target_path, &content).await?;
+        }
+        TransferBackend::ExecFallback => {
+            exec_fallback::write_remote_text_file(&session, &target_path, &content).await?;
+        }
+    }
+    Ok(target_path)
 }
 
 #[tauri::command]
 pub async fn sftp_download(
+    app: AppHandle,
     state: State<'_, SSHManager>,
+    mode_store: State<'_, SftpModeStore>,
     session_id: String,
     remote_path: String,
     local_path: String,
 ) -> Result<(), String> {
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
-    let cmd = format!("cat {} | base64", shell_escape(&remote_path));
-    let output = session
-        .exec_command(&cmd)
-        .await
-        .map_err(|e| e.to_string())?;
-    let cleaned: String = output.chars().filter(|c| !c.is_whitespace()).collect();
-    if cleaned.is_empty() {
-        return Err("Download failed: empty response (file may not exist or is empty)".to_string());
+    match resolve_transfer_backend(&app, &mode_store, &session, &session_id).await {
+        TransferBackend::Sftp(sftp) => {
+            drop(session);
+            manager::download(&sftp, &remote_path, &local_path).await
+        }
+        TransferBackend::ExecFallback => {
+            exec_fallback::download(&session, &remote_path, &local_path).await
+        }
     }
-    let data = base64::engine::general_purpose::STANDARD
-        .decode(&cleaned)
-        .map_err(|e| format!("Base64 decode error: {}", e))?;
-    if let Some(parent) = Path::new(&local_path).parent() {
-        fs::create_dir_all(parent).ok();
-    }
-    fs::write(&local_path, &data).map_err(|e| format!("Failed to write local file: {}", e))?;
-    Ok(())
 }
 
 #[tauri::command]
 pub async fn sftp_delete(
+    app: AppHandle,
     state: State<'_, SSHManager>,
+    mode_store: State<'_, SftpModeStore>,
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
-    let cmd = format!("rm -rf {}", shell_escape(&path));
-    session
-        .exec_command(&cmd)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    match resolve_transfer_backend(&app, &mode_store, &session, &session_id).await {
+        TransferBackend::Sftp(sftp) => {
+            drop(session);
+            manager::delete(&sftp, &path).await
+        }
+        TransferBackend::ExecFallback => exec_fallback::delete(&session, &path).await,
+    }
 }
 
 #[tauri::command]
 pub async fn sftp_rename(
+    app: AppHandle,
     state: State<'_, SSHManager>,
+    mode_store: State<'_, SftpModeStore>,
     session_id: String,
     old_path: String,
     new_path: String,
 ) -> Result<(), String> {
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
-    let cmd = format!("mv {} {}", shell_escape(&old_path), shell_escape(&new_path));
-    session
-        .exec_command(&cmd)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    match resolve_transfer_backend(&app, &mode_store, &session, &session_id).await {
+        TransferBackend::Sftp(sftp) => {
+            drop(session);
+            manager::rename(&sftp, &old_path, &new_path).await
+        }
+        TransferBackend::ExecFallback => {
+            exec_fallback::rename(&session, &old_path, &new_path).await
+        }
+    }
 }
 
 #[tauri::command]
 pub async fn sftp_chmod(
+    app: AppHandle,
     state: State<'_, SSHManager>,
+    mode_store: State<'_, SftpModeStore>,
     session_id: String,
     path: String,
     mode: u32,
 ) -> Result<(), String> {
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
-    let cmd = format!("chmod {:o} {}", mode, shell_escape(&path));
-    session
-        .exec_command(&cmd)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    match resolve_transfer_backend(&app, &mode_store, &session, &session_id).await {
+        TransferBackend::Sftp(sftp) => {
+            drop(session);
+            manager::chmod(&sftp, &path, mode).await
+        }
+        TransferBackend::ExecFallback => exec_fallback::chmod(&session, &path, mode).await,
+    }
 }
 
 #[tauri::command]
 pub async fn sftp_mkdir(
+    app: AppHandle,
     state: State<'_, SSHManager>,
+    mode_store: State<'_, SftpModeStore>,
     session_id: String,
     path: String,
 ) -> Result<(), String> {
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
-    let cmd = format!("mkdir -p {}", shell_escape(&path));
-    session
-        .exec_command(&cmd)
-        .await
-        .map_err(|e| e.to_string())?;
-    Ok(())
+    match resolve_transfer_backend(&app, &mode_store, &session, &session_id).await {
+        TransferBackend::Sftp(sftp) => {
+            drop(session);
+            manager::mkdir(&sftp, &path).await
+        }
+        TransferBackend::ExecFallback => exec_fallback::mkdir(&session, &path).await,
+    }
 }
 
+/// Intentionally exec-only: chown by user/group *names* (with recursion) has no
+/// SFTP-protocol equivalent — SETSTAT only accepts numeric uid/gid and is not
+/// recursive. The remote `chown` binary resolves names and handles -R.
 #[tauri::command]
 pub async fn sftp_chown(
     state: State<'_, SSHManager>,
@@ -413,10 +435,7 @@ pub async fn sftp_chown(
     group: String,
     recursive: bool,
 ) -> Result<(), String> {
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
     let flag = if recursive { "-R " } else { "" };
     let owner_group = if group.is_empty() {
@@ -432,6 +451,8 @@ pub async fn sftp_chown(
     Ok(())
 }
 
+/// Intentionally exec-only: symbolic modes ("u+x", "a-w") and recursive
+/// application are features of the `chmod` binary, not of the SFTP protocol.
 #[tauri::command]
 pub async fn sftp_chmod_str(
     state: State<'_, SSHManager>,
@@ -440,10 +461,7 @@ pub async fn sftp_chmod_str(
     mode: String,
     recursive: bool,
 ) -> Result<(), String> {
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
     let flag = if recursive { "-R " } else { "" };
     let cmd = format!("chmod {}{} {}", flag, mode, shell_escape(&path));
@@ -475,15 +493,13 @@ pub struct CreateArchiveRequest {
     pub permissions: Option<String>,
 }
 
+/// Intentionally exec-only: probes for archive binaries on the remote host.
 #[tauri::command]
 pub async fn sftp_check_archive_tools(
     state: State<'_, SSHManager>,
     session_id: String,
 ) -> Result<ArchiveToolsAvailable, String> {
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
     let cmd = "echo ZIP=$(which zip 2>/dev/null && echo ok || echo no) TAR=$(which tar 2>/dev/null && echo ok || echo no) 7Z=$(which 7z 2>/dev/null || which 7za 2>/dev/null && echo ok || echo no)";
     let output = session.exec_command(cmd).await.map_err(|e| e.to_string())?;
@@ -494,16 +510,15 @@ pub async fn sftp_check_archive_tools(
     })
 }
 
+/// Intentionally exec-only: archives are created by zip/tar/7z on the remote
+/// host; there is no SFTP equivalent.
 #[tauri::command]
 pub async fn sftp_create_archive(
     state: State<'_, SSHManager>,
     session_id: String,
     request: CreateArchiveRequest,
 ) -> Result<String, String> {
-    let session_arc = state
-        .get_session(&session_id)
-        .await
-        .ok_or_else(|| "Session not found".to_string())?;
+    let session_arc = get_session(&state, &session_id).await?;
     let session = session_arc.lock().await;
 
     let file_args = request

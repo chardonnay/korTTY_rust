@@ -1,0 +1,78 @@
+/*
+ * Matrix Terminal app design (port of Java styles/matrix-terminal.css).
+ * Palette is intentionally limited to the green-on-black scheme.
+ * Terminal sessions (.xterm) and Monaco editors keep their own styling —
+ * selectors below must never target .xterm or [class*="monaco"] content.
+ */
+
+[data-app-design="matrix-terminal"] body,
+[data-app-design="matrix-terminal"] button:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="matrix-terminal"] input:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="matrix-terminal"] select:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="matrix-terminal"] textarea:not(.xterm *):not([class*="monaco"] *) {
+  font-family: "JetBrains Mono", "Menlo", "Consolas", "Courier New", monospace;
+}
+
+/* Subtle CRT scanline overlay across app chrome. */
+[data-app-design="matrix-terminal"] body::after {
+  content: "";
+  position: fixed;
+  inset: 0;
+  z-index: 2147483646;
+  pointer-events: none;
+  background: repeating-linear-gradient(
+    to bottom,
+    rgba(0, 255, 136, 0.035) 0px,
+    rgba(0, 255, 136, 0.035) 1px,
+    transparent 1px,
+    transparent 4px
+  );
+  mix-blend-mode: screen;
+}
+
+/* Faint phosphor glow falling in from the top of the window. */
+[data-app-design="matrix-terminal"] body::before {
+  content: "";
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 120px;
+  z-index: 2147483645;
+  pointer-events: none;
+  background: linear-gradient(to bottom, rgba(0, 255, 136, 0.08), transparent);
+}
+
+/* Square corners everywhere in app chrome. */
+[data-app-design="matrix-terminal"] button:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="matrix-terminal"] input:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="matrix-terminal"] select:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="matrix-terminal"] textarea:not(.xterm *):not([class*="monaco"] *) {
+  border-radius: 0 !important;
+}
+
+/* Terminal-style glow when fields receive focus. */
+[data-app-design="matrix-terminal"] input:not(.xterm *):not([class*="monaco"] *):focus,
+[data-app-design="matrix-terminal"] select:not(.xterm *):not([class*="monaco"] *):focus,
+[data-app-design="matrix-terminal"] textarea:not(.xterm *):not([class*="monaco"] *):focus {
+  box-shadow: 0 0 8px rgba(0, 255, 136, 0.4) !important;
+}
+
+/* Buttons glow softly on hover, like the JavaFX dropshadow effect. */
+[data-app-design="matrix-terminal"] button:not(.xterm *):not([class*="monaco"] *):hover {
+  box-shadow: 0 0 10px rgba(0, 255, 136, 0.25);
+  text-shadow: 0 0 6px rgba(0, 255, 136, 0.5);
+}
+
+/* Headings and labels carry a faint phosphor glow. */
+[data-app-design="matrix-terminal"] h1:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="matrix-terminal"] h2:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="matrix-terminal"] h3:not(.xterm *):not([class*="monaco"] *),
+[data-app-design="matrix-terminal"] label:not(.xterm *):not([class*="monaco"] *) {
+  text-shadow: 0 0 6px rgba(0, 255, 136, 0.35);
+}
+
+/* Square scrollbars in app chrome. */
+[data-app-design="matrix-terminal"] ::-webkit-scrollbar-thumb {
+  border-radius: 0;
+}

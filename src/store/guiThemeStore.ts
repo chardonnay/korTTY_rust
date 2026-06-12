@@ -50,7 +50,7 @@ function hexToRgbChannels(hex: string): string {
   return `${r} ${g} ${b}`;
 }
 
-function applyGuiThemeToCss(theme: GuiThemeData) {
+export function applyGuiThemeToCss(theme: GuiThemeData) {
   const root = document.documentElement;
   root.style.setProperty("--kortty-bg", hexToRgbChannels(theme.bg));
   root.style.setProperty("--kortty-surface", hexToRgbChannels(theme.surface));
@@ -66,6 +66,29 @@ function applyGuiThemeToCss(theme: GuiThemeData) {
   root.style.setProperty("--kortty-terminal", hexToRgbChannels(theme.terminal));
 }
 
+/**
+ * App designs (matrix-terminal, holographic-interface, ...) override the
+ * regular GUI theme palette. While an override is active, theme loads still
+ * update the store state, but the CSS variables stay on the design palette.
+ * The terminal background variable is intentionally kept from the active GUI
+ * theme so terminal sessions keep their own colors (matches Java behavior).
+ */
+let designOverride: GuiThemeData | null = null;
+
+export function setGuiThemeDesignOverride(override: GuiThemeData | null) {
+  designOverride = override;
+  const activeTheme = useGuiThemeStore.getState().theme;
+  if (override) {
+    applyGuiThemeToCss({ ...override, terminal: activeTheme.terminal });
+  } else {
+    applyGuiThemeToCss(activeTheme);
+  }
+}
+
+export function getGuiThemeDesignOverride(): GuiThemeData | null {
+  return designOverride;
+}
+
 export const useGuiThemeStore = create<GuiThemeStore>((set) => ({
   theme: DEFAULT_GUI_THEME,
   loading: false,
@@ -76,7 +99,13 @@ export const useGuiThemeStore = create<GuiThemeStore>((set) => ({
       const activeId = await invoke<string>("get_active_gui_theme_id");
       const all = await invoke<GuiThemeData[]>("get_gui_themes");
       const active = all.find((t) => t.id === activeId) ?? all[0] ?? DEFAULT_GUI_THEME;
-      applyGuiThemeToCss(active);
+      // An active app design wins over the GUI theme palette, but the
+      // terminal background always follows the GUI theme.
+      if (designOverride) {
+        applyGuiThemeToCss({ ...designOverride, terminal: active.terminal });
+      } else {
+        applyGuiThemeToCss(active);
+      }
       set({ theme: active, loading: false });
     } catch (err) {
       console.error("Failed to load GUI theme:", err);

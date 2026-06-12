@@ -1,3 +1,8 @@
+@import "./designs/matrix-terminal.css";
+@import "./designs/holographic.css";
+@import "./designs/tactical.css";
+@import "./designs/elegant.css";
+
 @tailwind base;
 @tailwind components;
 @tailwind utilities;

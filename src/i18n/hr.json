@@ -1,1 +1,847 @@
-{"app":{"title":"KorTTY","version":"v2.2.0"},"menu":{"file":"Datoteka","edit":"Uredi","connections":"Veze","management":"Upravljanje","tools":"Alati","view":"Prikaz","help":"Pomoć","newTab":"Nova kartica","newWindow":"Novi prozor","closeTab":"Zatvori karticu","quickConnect":"Brza veza...","openProject":"Otvori projekt...","saveProject":"Spremi projekt","saveProjectAs":"Spremi projekt kao...","quit":"Izlaz","copy":"Kopiraj","paste":"Zalijepi","find":"Traži...","createBackup":"Stvori sigurnosnu kopiju...","importBackup":"Uvezi sigurnosnu kopiju...","settings":"Postavke...","manageConnections":"Upravljaj vezama...","import":"Uvezi...","export":"Izvezi...","manageCredentials":"Upravljaj vjerodajnicama...","manageSSHKeys":"Upravljaj SSH ključevima...","manageGPGKeys":"Upravljaj GPG ključevima...","snippets":"Isječci...","openSFTP":"Otvori SFTP upravitelj...","asciiArt":"ASCII Art banner...","teamwork":"Postavke timskog rada...","toggleDashboard":"Prebaci nadzornu ploču","zoomIn":"Povećaj","zoomOut":"Smanji","resetZoom":"Resetiraj zum","fullscreen":"Cijeli zaslon","userGuide":"Korisnički vodič","shortcuts":"Prečaci na tipkovnici","about":"O KorTTY"},"connection":{"manager":"Upravitelj veza","editor":"Uređivač veza","newConnection":"Nova veza","name":"Naziv","host":"Poslužitelj","port":"Port","username":"Korisničko ime","password":"Lozinka","authMethod":"Autentifikacija","passwordAuth":"Lozinka","privateKeyAuth":"Privatni ključ","group":"Grupa","connect":"Spoji","disconnect":"Odspoji","save":"Spremi","cancel":"Odustani","delete":"Obriši","edit":"Uredi","add":"Dodaj","close":"Zatvori","noConnections":"Nema spremljenih veza.","selectToView":"Odaberi vezu za pregled pojedinosti","lastUsed":"Zadnja upotreba","never":"Nikad","connecting":"Spajanje...","connected":"Spojeno","disconnected":"Odspojeno","connectionFailed":"Spajanje nije uspjelo"},"terminal":{"fontFamily":"Obitelj fonta","fontSize":"Veličina fonta","columns":"Stupci","rows":"Redovi","scrollbackLines":"Broj linija povijesti","cursorStyle":"Stil kursora","foreground":"Prednji plan","background":"Pozadina","cursor":"Kursor","timestamps":"Prikaži vremenske oznake naredbi","logging":"Omogući bilježenje terminala"},"settings":{"title":"Postavke","language":"Jezik","translation":"Prijevod","backup":"Sigurnosna kopija","window":"Prozor","terminal":"Terminal","autoDetect":"Automatsko otkrivanje (jezik sustava)","restartRequired":"Promjena jezika stupa na snagu nakon ponovnog pokretanja.","translationProvider":"Pružatelj prijevoda","apiKey":"API ključ","customUrl":"Prilagođeni API URL","testConnection":"Testiraj vezu","targetLanguage":"Ciljni jezik","generateFile":"Generiraj datoteku jezika","regenerateOutdated":"Regeneriraj zastarjele","encryptionType":"Vrsta šifriranja","maxBackups":"Maksimalan broj sigurnosnih kopija","storeGeometry":"Spremi geometriju prozora","storeDashboard":"Spremi stanje nadzorne ploče","keepalive":"SSH Keep-Alive","keepaliveInterval":"Interval Keep-Alive (sekunde)","connectionTimeout":"Vremensko ograničenje veze (sekunde)","retryCount":"Broj ponovnih pokušaja"},"credential":{"manager":"Upravitelj vjerodajnica","name":"Naziv","username":"Korisničko ime","password":"Lozinka","environment":"Okruženje","serverPattern":"Uzorak poslužitelja","production":"Produkcija","development":"Razvoj","test":"Test","staging":"Staging"},"sshKey":{"manager":"Upravitelj SSH ključeva","name":"Naziv","path":"Put","keyType":"Vrsta ključa","passphrase":"Frazna lozinka","copyToUserDir":"Kopiraj u korisnički direktorij"},"gpgKey":{"manager":"Upravitelj GPG ključeva","keyId":"ID ključa","name":"Naziv","email":"Email","importFromGPG":"Uvezi iz GPG"},"snippet":{"manager":"Upravitelj isječaka","name":"Naziv","category":"Kategorija","content":"Sadržaj","favorite":"Omiljeno","variables":"Varijable","search":"Traži isječke...","importExport":"Uvoz/Izvoz"},"sftp":{"title":"SFTP upravitelj","local":"Lokalno","remote":"Udaljeno","name":"Naziv","type":"Vrsta","size":"Veličina","date":"Datum","owner":"Vlasnik","group":"Grupa","permissions":"Dozvole","upload":"Učitaj","download":"Preuzmi","delete":"Obriši","rename":"Preimenuj","newFolder":"Nova mapa","refresh":"Osvježi","search":"Traži..."},"backup":{"createTitle":"Stvori sigurnosnu kopiju","importTitle":"Uvezi sigurnosnu kopiju","destination":"Odredište","password":"Lozinka","overwrite":"Prepiši postojeće datoteke","create":"Stvori","import":"Uvezi"},"theme":{"editor":"Uređivač tema","preview":"Pregled","ansiColors":"ANSI boje","normal":"Normalno","bright":"Svijetlo"},"quickConnect":{"title":"Brza veza","frequentlyUsed":"Često korišteno"},"dashboard":{"title":"Nadzorna ploča","noConnections":"Nema aktivnih veza"},"common":{"ready":"Spremno","connections":"veza","connection":"veza","ok":"U redu","cancel":"Odustani","save":"Spremi","delete":"Obriši","close":"Zatvori","add":"Dodaj","edit":"Uredi","search":"Traži..."}}
+{
+  "app": {
+    "title": "KorTTY",
+    "version": "v2.2.0"
+  },
+  "menu": {
+    "file": "Datoteka",
+    "edit": "Uredi",
+    "connections": "Veze",
+    "management": "Upravljanje",
+    "tools": "Alati",
+    "view": "Prikaz",
+    "help": "Pomoć",
+    "newTab": "Nova kartica",
+    "newWindow": "Novi prozor",
+    "closeTab": "Zatvori karticu",
+    "quickConnect": "Brza veza...",
+    "openProject": "Otvori projekt...",
+    "saveProject": "Spremi projekt",
+    "saveProjectAs": "Spremi projekt kao...",
+    "quit": "Izlaz",
+    "copy": "Kopiraj",
+    "paste": "Zalijepi",
+    "find": "Traži...",
+    "createBackup": "Stvori sigurnosnu kopiju...",
+    "importBackup": "Uvezi sigurnosnu kopiju...",
+    "settings": "Postavke...",
+    "manageConnections": "Upravljaj vezama...",
+    "import": "Uvezi...",
+    "export": "Izvezi...",
+    "manageCredentials": "Upravljaj vjerodajnicama...",
+    "manageSSHKeys": "Upravljaj SSH ključevima...",
+    "manageGPGKeys": "Upravljaj GPG ključevima...",
+    "snippets": "Isječci...",
+    "openSFTP": "Otvori SFTP upravitelj...",
+    "asciiArt": "ASCII Art banner...",
+    "teamwork": "Postavke timskog rada...",
+    "toggleDashboard": "Prebaci nadzornu ploču",
+    "zoomIn": "Povećaj",
+    "zoomOut": "Smanji",
+    "resetZoom": "Resetiraj zum",
+    "fullscreen": "Cijeli zaslon",
+    "userGuide": "Korisnički vodič",
+    "shortcuts": "Prečaci na tipkovnici",
+    "about": "O KorTTY",
+    "toggleRecording": "Pokreni/zaustavi snimanje terminala",
+    "aiPlanning": "AI planiranje...",
+    "terminalOnlyFullscreen": "Samo terminal na cijelom zaslonu",
+    "hideTerminalScrollbarsFullscreen": "Sakrij klizače terminala u cijelom zaslonu"
+  },
+  "connection": {
+    "manager": "Upravitelj veza",
+    "editor": "Uređivač veza",
+    "newConnection": "Nova veza",
+    "name": "Naziv",
+    "host": "Poslužitelj",
+    "port": "Port",
+    "username": "Korisničko ime",
+    "password": "Lozinka",
+    "authMethod": "Autentifikacija",
+    "passwordAuth": "Lozinka",
+    "privateKeyAuth": "Privatni ključ",
+    "group": "Grupa",
+    "connect": "Spoji",
+    "disconnect": "Odspoji",
+    "save": "Spremi",
+    "cancel": "Odustani",
+    "delete": "Obriši",
+    "edit": "Uredi",
+    "add": "Dodaj",
+    "close": "Zatvori",
+    "noConnections": "Nema spremljenih veza.",
+    "selectToView": "Odaberi vezu za pregled pojedinosti",
+    "lastUsed": "Zadnja upotreba",
+    "never": "Nikad",
+    "connecting": "Spajanje...",
+    "connected": "Spojeno",
+    "disconnected": "Odspojeno",
+    "connectionFailed": "Spajanje nije uspjelo"
+  },
+  "terminal": {
+    "fontFamily": "Obitelj fonta",
+    "fontSize": "Veličina fonta",
+    "columns": "Stupci",
+    "rows": "Redovi",
+    "scrollbackLines": "Broj linija povijesti",
+    "cursorStyle": "Stil kursora",
+    "foreground": "Prednji plan",
+    "background": "Pozadina",
+    "cursor": "Kursor",
+    "timestamps": "Prikaži vremenske oznake naredbi",
+    "logging": "Omogući bilježenje terminala",
+    "recording": {
+      "start": "Pokreni snimanje",
+      "stop": "Zaustavi snimanje",
+      "indicator": {
+        "recording": "Snimanje",
+        "autoPaused": "Snimanje automatski pauzirano"
+      },
+      "scope": {
+        "title": "Snimanje terminala",
+        "header": "Odaberite opseg snimanja",
+        "content": "Opseg:",
+        "activeSplit": "Aktivna podjela",
+        "wholeTab": "Cijela kartica"
+      },
+      "error": {
+        "title": "Snimanje terminala",
+        "header": "Snimanje nije uspjelo",
+        "notConnected": "Spojite terminal prije pokretanja snimanja.",
+        "noTerminal": "Nema aktivne kartice terminala za snimanje.",
+        "disabled": "Omogućite snimanje terminala u Alati > Video upravitelj prije pokretanja snimanja.",
+        "start": "Snimanje nije moguće pokrenuti: {{message}}",
+        "stop": "Snimanje nije moguće zaustaviti: {{message}}"
+      }
+    },
+    "dragDrop": {
+      "title": "Kopiraj na poslužitelj",
+      "count": "Kopirano {{done}} od {{total}} stavki",
+      "abort": "Prekini",
+      "done": "Kopiranje dovršeno.",
+      "cancelled": "Kopiranje prekinuto.",
+      "target": "Odredište: {{target}}",
+      "error": "Kopiranje nije uspjelo: {{message}}",
+      "dropHint": "Ispustite datoteke za prijenos"
+    },
+    "context": {
+      "openSelectionInSnippetEditor": "Otvori odabir u uređivaču isječaka"
+    },
+    "loadTextFile": {
+      "invalidSelection": "Odaberite točno jedan naziv datoteke u trenutnom direktoriju.",
+      "notConnected": "Nema aktivne SSH veze.",
+      "loading": "Učitavam {{name}} kao tekstualnu datoteku...",
+      "loaded": "Tekstualna datoteka učitana: {{path}}",
+      "binary": "Odabrana datoteka je binarna ili nije valjan UTF-8 tekst i nije učitana: {{path}}",
+      "failed": "Nije moguće učitati {{name}}: {{error}}"
+    }
+  },
+  "settings": {
+    "title": "Postavke",
+    "language": "Jezik",
+    "translation": "Prijevod",
+    "backup": "Sigurnosna kopija",
+    "window": "Prozor",
+    "terminal": "Terminal",
+    "autoDetect": "Automatsko otkrivanje (jezik sustava)",
+    "restartRequired": "Promjena jezika stupa na snagu nakon ponovnog pokretanja.",
+    "translationProvider": "Pružatelj prijevoda",
+    "apiKey": "API ključ",
+    "customUrl": "Prilagođeni API URL",
+    "testConnection": "Testiraj vezu",
+    "targetLanguage": "Ciljni jezik",
+    "generateFile": "Generiraj datoteku jezika",
+    "regenerateOutdated": "Regeneriraj zastarjele",
+    "encryptionType": "Vrsta šifriranja",
+    "maxBackups": "Maksimalan broj sigurnosnih kopija",
+    "storeGeometry": "Spremi geometriju prozora",
+    "storeDashboard": "Spremi stanje nadzorne ploče",
+    "keepalive": "SSH Keep-Alive",
+    "keepaliveInterval": "Interval Keep-Alive (sekunde)",
+    "connectionTimeout": "Vremensko ograničenje veze (sekunde)",
+    "retryCount": "Broj ponovnih pokušaja",
+    "tab": {
+      "appearance": "Izgled",
+      "recording": "Video",
+      "logging": "Zapisnici",
+      "updates": "Ažuriranja"
+    },
+    "appearance": {
+      "appDesign": "Dizajn aplikacije:",
+      "appDesignInfo": "Primjenjuje se na prozore aplikacije i dijaloge. Terminalske sesije i sadržaj uređivača zadržavaju vlastite postavke boja.",
+      "preview": "Pregled:",
+      "design": {
+        "normal": "Normalno",
+        "matrixTerminal": "Matrix terminal",
+        "holographicInterface": "Holografsko sučelje",
+        "klingonTactical": "Klingonski taktički",
+        "elegantDark": "Elegantno tamno"
+      }
+    },
+    "updates": {
+      "header": "Provjere ažuriranja",
+      "automatic": "Automatski provjeravaj KorTTY ažuriranja",
+      "automaticTooltip": "Kada je omogućeno, KorTTY u pozadini provjerava GitHub izdanja.",
+      "interval": "Interval provjere:",
+      "intervalDays": "Svakih {{days}} dan(a)",
+      "info": "Automatske provjere prikazuju dijalog samo kada je dostupna novija kompatibilna verzija. Ručne provjere dostupne su u dijalogu O aplikaciji."
+    },
+    "logging": {
+      "header": "Datoteke zapisnika",
+      "directory": "Direktorij zapisnika:",
+      "directoryInfo": "Zadano: {{path}}",
+      "directoryChoose": "Odaberite direktorij zapisnika",
+      "retention": "Čuvaj zapisnike:",
+      "retentionInfo": "0 = neograničeno. Najstarije arhive zapisnika brišu se automatski.",
+      "compressionInfo": "Arhive zapisnika starije od 24 sata komprimiraju se automatski.",
+      "restartRequired": "Promjene direktorija zapisnika stupaju na snagu nakon ponovnog pokretanja KorTTY-a.",
+      "days": "dan(a)"
+    },
+    "ai": {
+      "terminalAgentExecutionEnabled": "Omogući izvršavanje AI agenta",
+      "terminalAgentExecutionEnabledHint": "Kada je onemogućeno, izvršavanja AI agenta i provedba planova nisu dostupni. AI planiranje i upit AI agentu ostaju dostupni.",
+      "terminalAgentConfirmMutatingCommandSets": "Zatraži potvrdu prije nego AI agent promijeni ciljni sustav",
+      "terminalAgentConfirmMutatingCommandSetsHint": "Kada je omogućeno, skupovi naredbi koji stvaraju, brišu ili mijenjaju datoteke ili na drugi način mijenjaju ciljni sustav zahtijevaju potvrdu. Radnje samo za čitanje ne traže potvrdu."
+    },
+    "snippetEditor": {
+      "title": "Uređivač isječaka",
+      "info": "Ove postavke poništavaju zadane postavke terminala/uređivača za Upravitelj isječaka i dijalog uređivanja isječaka. Ostavite prazno ili 0 za nasljeđivanje općih postavki.",
+      "fontFamily": "Obitelj fonta",
+      "fontSize": "Veličina fonta",
+      "fontSizeInfo": "(0 = naslijedi od terminala)",
+      "foreground": "Boja prednjeg plana",
+      "background": "Boja pozadine",
+      "cursorStyle": "Stil kursora",
+      "cursorColor": "Boja kursora",
+      "wordWrap": "Prijelom retka",
+      "lineNumbers": "Brojevi redaka",
+      "historyMax": "Stavke povijesti (maks.)",
+      "diagramBackground": "Boja pozadine dijagrama",
+      "aiInstructionsEnabled": "Prikaži opcionalne dodatne AI upute u uređivaču isječaka",
+      "alternativeSolutionCount": "Maksimalan broj alternativnih rješenja",
+      "profile": "Profil",
+      "manageProfiles": "Upravljaj profilima..."
+    }
+  },
+  "credential": {
+    "manager": "Upravitelj vjerodajnica",
+    "name": "Naziv",
+    "username": "Korisničko ime",
+    "password": "Lozinka",
+    "environment": "Okruženje",
+    "serverPattern": "Uzorak poslužitelja",
+    "production": "Produkcija",
+    "development": "Razvoj",
+    "test": "Test",
+    "staging": "Staging"
+  },
+  "sshKey": {
+    "manager": "Upravitelj SSH ključeva",
+    "name": "Naziv",
+    "path": "Put",
+    "keyType": "Vrsta ključa",
+    "passphrase": "Frazna lozinka",
+    "copyToUserDir": "Kopiraj u korisnički direktorij"
+  },
+  "gpgKey": {
+    "manager": "Upravitelj GPG ključeva",
+    "keyId": "ID ključa",
+    "name": "Naziv",
+    "email": "Email",
+    "importFromGPG": "Uvezi iz GPG"
+  },
+  "snippet": {
+    "manager": "Upravitelj isječaka",
+    "diagram": {
+      "button": "Dijagram",
+      "title": "Dijagrami isječaka",
+      "script": "Skripta: {{name}}",
+      "unnamed": "(isječak bez naziva)",
+      "empty": "Za ovaj isječak još nema spremljenih dijagrama.",
+      "current": "Dijagram je ažuran.",
+      "stale": "Dijagram je možda zastario jer je isječak promijenjen.",
+      "rendering": "Lokalno iscrtavanje...",
+      "renderFailed": "Lokalno iscrtavanje nije dostupno: {{error}}",
+      "regenerate": "Regeneriraj",
+      "generate": "Generiraj dijagram",
+      "generating": "Generiranje PlantUML dijagrama...",
+      "ready": "Dijagram je spreman. Spremite isječak da biste ga trajno sačuvali.",
+      "failed": "PlantUML dijagram nije moguće generirati.",
+      "instructions": "Uputa:",
+      "instructionsHint": "Opcionalni parametri za dijagram",
+      "copyPlantUml": "Kopiraj PlantUML",
+      "copied": "PlantUML kod kopiran u međuspremnik.",
+      "backgroundColor": "Pozadina:",
+      "readableColors": "Primijeni čitljive boje",
+      "readableColorsApplied": "Čitljive boje primijenjene.",
+      "saveSvg": "Spremi SVG",
+      "exportSaved": "Spremljeno: {{path}}",
+      "exportFailed": "Izvoz nije uspio: {{error}}",
+      "delete": "Obriši",
+      "typeLogicalStructure": "Logička struktura",
+      "codeReference": {
+        "line": "Redak {{line}}",
+        "lines": "Redci {{start}}-{{end}}"
+      }
+    },
+    "name": "Naziv",
+    "category": "Kategorija",
+    "content": "Sadržaj",
+    "favorite": "Omiljeno",
+    "variables": "Varijable",
+    "search": "Traži isječke...",
+    "importExport": "Uvoz/Izvoz",
+    "unnamed": "(bez naziva)",
+    "saveAsNew": "Spremi kao novi isječak",
+    "copySuffix": " (kopija)",
+    "formatter": {
+      "builtIn": "Ugrađeno",
+      "bundled": "Priloženo",
+      "external": "Vanjsko",
+      "unavailable": "Nedostupno"
+    },
+    "ai": {
+      "copy": "Kopiraj u međuspremnik",
+      "copied": "Kopirano u međuspremnik.",
+      "noProfile": "Nije konfiguriran nijedan AI profil.",
+      "noTextSegments": "Trenutni odabir ne sadrži komentare niti korisnički vidljive tekstualne segmente koji se mogu uređivati.",
+      "context": {
+        "assistant": "AI asistent...",
+        "complete": "AI dovršavanje",
+        "autoComplete": "Automatsko AI dovršavanje",
+        "review": "Pregled grešaka i poboljšanja",
+        "improveReadability": "Poboljšaj čitljivost",
+        "improveRobustness": "Poboljšaj robusnost",
+        "improvePerformance": "Poboljšaj performanse",
+        "improveCustom": "Prilagođeno poboljšanje...",
+        "alternatives": "Alternativna rješenja",
+        "security": "Sigurnosna provjera",
+        "describe": "Tehnički opis",
+        "correctSelection": "Ispravi pravopis u odabiru",
+        "translateSelection": "Prevedi odabir..."
+      },
+      "assistant": {
+        "title": "AI asistent",
+        "header": "Opišite što bi KorTTY trebao promijeniti na trenutnoj poziciji kursora.",
+        "instruction": "Uputa:",
+        "prompt": "Primjer: dodaj nove parametre za nazive direktorija",
+        "cursor": "Kursor: pomak {{offset}}, redak {{line}}, stupac {{column}}",
+        "skills": "Uzmi u obzir AI skillove",
+        "skillsTooltip": "Omogućeni Chat/Functions AI skillovi mogu se dodati ovom zahtjevu kada su relevantni.",
+        "skillsUnavailable": "U globalnim postavkama nije dostupan nijedan omogućeni Chat/Functions AI skill.",
+        "running": "AI asistent ažurira isječak...",
+        "empty": "Nije vraćen upotrebljiv rezultat AI asistenta.",
+        "failed": "AI asistent nije uspio.",
+        "applied": "Promjena AI asistenta primijenjena.",
+        "diffTitle": "Pregledajte promjenu AI asistenta"
+      },
+      "complete": {
+        "running": "Generiranje prijedloga dovršavanja...",
+        "empty": "Nije vraćen upotrebljiv prijedlog dovršavanja.",
+        "discarded": "Dovršavanje odbačeno jer je uređivač promijenjen.",
+        "ready": "Prijedlog dovršavanja spreman. Pritisnite Tab za umetanje.",
+        "failed": "Prijedlog dovršavanja nije uspio."
+      },
+      "autocomplete": {
+        "warningTitle": "Omogući automatsko AI dovršavanje",
+        "warningHeader": "Automatsko dovršavanje može opetovano slati sadržaj isječka dok je omogućeno.",
+        "warningContent": "KorTTY će zatražiti prijedloge nakon što zastanete na poziciji kursora. Za osjetljive isječke ostavite ovo onemogućeno osim ako vjerujete konfiguriranoj AI krajnjoj točki.",
+        "enabled": "Automatsko AI dovršavanje omogućeno.",
+        "disabled": "Automatsko AI dovršavanje onemogućeno."
+      },
+      "review": {
+        "title": "AI pregled koda",
+        "info": "Izvještaj je informativan. Sadržaj uređivača se ne mijenja. Kliknite nalaz s brojem retka da biste ga odabrali u uređivaču.",
+        "empty": "Nisu vraćeni nalazi.",
+        "recommendation": "Preporuka:",
+        "running": "Pregled koda u tijeku...",
+        "ready": "Pregled koda spreman.",
+        "failed": "Pregled koda nije uspio.",
+        "theme": "Pronađi vjerojatne greške i praktične prilike za poboljšanje.",
+        "colSeverity": "Ozbiljnost",
+        "colTitle": "Naslov",
+        "colLine": "Redak"
+      },
+      "improve": {
+        "running": "Generiranje poboljšanog koda...",
+        "empty": "Nije vraćena upotrebljiva zamjena.",
+        "failed": "Poboljšanje koda nije uspjelo.",
+        "applied": "Poboljšani kod primijenjen.",
+        "selectFirst": "Odaberite područje koda prije zahtjeva za AI preradu.",
+        "readabilityTheme": "Poboljšaj čitljivost bez promjene ponašanja.",
+        "robustnessTheme": "Poboljšaj robusnost, rukovanje greškama i ponašanje u rubnim slučajevima bez nepovezanih promjena.",
+        "performanceTheme": "Poboljšaj performanse bez promjene izvana vidljivog ponašanja.",
+        "customTitle": "Prilagođeno AI poboljšanje",
+        "customHeader": "Opišite kako bi odabrani kod trebalo poboljšati.",
+        "customPrompt": "Uputa:"
+      },
+      "diff": {
+        "title": "Pregledajte AI promjenu",
+        "summaryEmpty": "Pregledajte zamjenu prije primjene.",
+        "original": "Izvornik",
+        "replacement": "AI zamjena",
+        "apply": "Primijeni promjenu"
+      },
+      "security": {
+        "title": "Sigurnosna provjera",
+        "info": "Odaberite samo nalaze koje AI treba ispraviti. Neodabrani nalazi se ne primjenjuju.",
+        "empty": "Nisu vraćeni sigurnosni nalazi.",
+        "applySelected": "Primijeni odabrane ispravke",
+        "running": "Sigurnosna provjera u tijeku...",
+        "ready": "Sigurnosni izvještaj spreman.",
+        "failed": "Sigurnosna provjera nije uspjela.",
+        "fixRunning": "Generiranje odabranih sigurnosnih ispravaka...",
+        "fixEmpty": "Nije vraćen upotrebljiv sigurnosni ispravak.",
+        "fixFailed": "Generiranje sigurnosnih ispravaka nije uspjelo.",
+        "fixApplied": "Odabrani sigurnosni ispravci primijenjeni.",
+        "diffTitle": "Pregledajte sigurnosne ispravke"
+      },
+      "alternatives": {
+        "title": "Alternativna rješenja",
+        "instructionsPrompt": "Opcionalne upute za AI, na primjer \"koristi samo Bash ugrađene naredbe\"",
+        "reload": "Generiraj nove alternative",
+        "loading": "Generiranje alternativnih rješenja...",
+        "empty": "Nisu vraćena upotrebljiva alternativna rješenja.",
+        "loaded": "{{count}} alternativnih rješenja spremno.",
+        "failed": "Alternativna rješenja nije moguće generirati.",
+        "apply": "Primijeni",
+        "applied": "Alternativno rješenje primijenjeno na odabrani kod.",
+        "scopeSelection": "Ciljni opseg: odabrano područje koda",
+        "scopeWhole": "Ciljni opseg: cijeli isječak"
+      },
+      "describe": {
+        "dialogTitle": "Tehnički opis",
+        "commentSyntax": "Koristi sintaksu komentara trenutnog jezika isječka",
+        "lineWidth": "Širina retka:",
+        "copy": "Kopiraj u međuspremnik",
+        "insert": "Umetni u isječak",
+        "info": "Generirani opis prikazan je u nastavku. Možete ga kopirati ili umetnuti u isječak.",
+        "generating": "Generiranje tehničkog opisa...",
+        "generated": "Tehnički opis spreman.",
+        "generateFailed": "Tehnički opis nije moguće generirati.",
+        "inserted": "Tehnički opis umetnut u isječak."
+      },
+      "selection": {
+        "correcting": "Ispravljanje odabranog teksta...",
+        "corrected": "Odabrani tekst ispravljen.",
+        "correctFailed": "Odabrani tekst nije moguće ispraviti.",
+        "translating": "Prevođenje odabranog teksta...",
+        "translated": "Odabrani tekst preveden.",
+        "translateFailed": "Odabrani tekst nije moguće prevesti.",
+        "translateTitle": "Prevedi tekst isječka",
+        "translatePrompt": "Odaberite ciljni jezik za odabrani korisnički vidljivi tekst:"
+      },
+      "format": {
+        "fallbackTitle": "Koristiti AI formatiranje?",
+        "fallbackHeader": "Lokalno formatiranje nije dostupno za ovu radnju.",
+        "fallbackContent": "{{reason}}\n\nŽelite li da KorTTY umjesto toga zatraži AI formatiranje koda? AI rezultat bit će prikazan kao pregled prije primjene.",
+        "unavailable": "{{reason}}\n\nNije konfiguriran nijedan AI pružatelj za poboljšanje koda.",
+        "notSupported": "Nema dostupnog formatera za {{language}}",
+        "providerUnavailable": "Formater nije dostupan: {{name}}",
+        "widthNotSupported": "Formatiranje prema širini retka nije podržano za {{language}}.",
+        "theme": "Formatiraj ovaj kod. Točno očuvaj ponašanje, zadrži isti programski jezik, ne dodaji objašnjenja i ne radi nepovezane promjene.",
+        "widthTheme": "Formatiraj ovaj kod na maksimalnu širinu retka od {{width}} znakova gdje je to sintaktički sigurno moguće. Točno očuvaj ponašanje, zadrži isti programski jezik, ne dodaji objašnjenja i ne radi nepovezane promjene.",
+        "running": "AI formatiranje u tijeku...",
+        "empty": "Nije vraćen upotrebljiv rezultat AI formatiranja.",
+        "failed": "AI formatiranje nije uspjelo.",
+        "applied": "AI formatiranje primijenjeno.",
+        "diffTitle": "Pregledajte AI formatiranje"
+      }
+    },
+    "ruler": {
+      "tooltip": "Kliknite ravnalo za postavljanje oznake maksimalne duljine retka. Desnim klikom na oznaku formatirajte na ovu širinu ili je uklonite.",
+      "position": "Stupac {{column}}",
+      "caretTooltip": "Pozicija {{column}}",
+      "limit": "Ograničenje {{limit}}",
+      "formatToLimit": "Formatiraj na {{limit}} znakova po retku",
+      "clearLimit": "Ukloni oznaku duljine retka",
+      "formatSuccess": "Formatirano na maks. {{limit}} znakova po retku."
+    },
+    "history": {
+      "label": "Povijest",
+      "position": "Povijest: {{index}} / {{total}}",
+      "restore": "Vrati"
+    },
+    "diff": {
+      "compare": "Usporedi",
+      "title": "Usporedba isječaka",
+      "left": "Lijevo: {{name}} ({{language}})",
+      "right": "Desno: {{name}} ({{language}})",
+      "hint": "Odaberite točno dva isječka."
+    },
+    "profile": {
+      "title": "Profili uređivača isječaka",
+      "newTitle": "Novi profil uređivača isječaka",
+      "editTitle": "Uredi profil uređivača isječaka",
+      "namePrompt": "Naziv profila",
+      "presets": "Unaprijed definirani profili",
+      "custom": "Prilagođeni profili",
+      "new": "Novi prilagođeni profil...",
+      "current": "Prilagođene boje",
+      "builtInHint": "Ugrađeni profili su samo za čitanje. Stvorite prilagođeni profil za promjenu boja.",
+      "preview": "Pregled",
+      "label": "Profil",
+      "manage": "Upravljaj profilima...",
+      "comment": "Komentar",
+      "string": "String",
+      "number": "Broj",
+      "boolean": "Boolean/null",
+      "key": "Ključ",
+      "keyword": "Ključna riječ",
+      "section": "Sekcija",
+      "variable": "Varijabla",
+      "brace": "Zagrada"
+    }
+  },
+  "sftp": {
+    "title": "SFTP upravitelj",
+    "saveAs": {
+      "menu": "Spremi kao…",
+      "overwriteRemote": "Prepiši udaljenu datoteku",
+      "overwriteLocal": "Prepiši lokalnu datoteku",
+      "saveSnippet": "Spremi kao isječak",
+      "remoteTitle": "Spremi udaljenu datoteku kao",
+      "remoteHeader": "Novi naziv datoteke u istoj udaljenoj mapi",
+      "remoteLabel": "Naziv datoteke:",
+      "invalidFileName": "Nevažeći naziv datoteke: {{name}}",
+      "confirmOverwrite": "Ciljna datoteka već postoji. Prepisati {{path}}?",
+      "savedFile": "Datoteka spremljena: {{path}}",
+      "savedSnippet": "Isječak spremljen: {{name}}",
+      "saveFailed": "Datoteku nije moguće spremiti: {{error}}",
+      "error": {
+        "empty": "Naziv datoteke ne smije biti prazan.",
+        "dots": "Naziv datoteke ne smije biti '.' ni '..'.",
+        "separators": "Naziv datoteke ne smije sadržavati razdjelnike putanje."
+      }
+    },
+    "local": "Lokalno",
+    "remote": "Udaljeno",
+    "name": "Naziv",
+    "type": "Vrsta",
+    "size": "Veličina",
+    "date": "Datum",
+    "owner": "Vlasnik",
+    "group": "Grupa",
+    "permissions": "Dozvole",
+    "upload": "Učitaj",
+    "download": "Preuzmi",
+    "delete": "Obriši",
+    "rename": "Preimenuj",
+    "newFolder": "Nova mapa",
+    "refresh": "Osvježi",
+    "search": "Traži...",
+    "fallback": {
+      "notice": "SFTP podsustav nije dostupan — koristi se zamjenski način putem naredbenog retka"
+    },
+    "error": {
+      "subsystemRejected": "Poslužitelj je odbio ili zatvorio SFTP podsustav nakon uspješne SSH autentifikacije; SFTP verzija nije dogovorena. Provjerite je li SFTP omogućen za ovaj cilj ili SSH proxy.",
+      "startFailed": "SFTP podsustav nije moguće pokrenuti nakon uspješne SSH autentifikacije."
+    }
+  },
+  "backup": {
+    "createTitle": "Stvori sigurnosnu kopiju",
+    "importTitle": "Uvezi sigurnosnu kopiju",
+    "destination": "Odredište",
+    "password": "Lozinka",
+    "overwrite": "Prepiši postojeće datoteke",
+    "create": "Stvori",
+    "import": "Uvezi"
+  },
+  "theme": {
+    "editor": "Uređivač tema",
+    "preview": "Pregled",
+    "ansiColors": "ANSI boje",
+    "normal": "Normalno",
+    "bright": "Svijetlo"
+  },
+  "quickConnect": {
+    "title": "Brza veza",
+    "frequentlyUsed": "Često korišteno",
+    "terminalEmulation": "Emulacija terminala",
+    "terminalColors": "Omogući boje terminala"
+  },
+  "dashboard": {
+    "title": "Nadzorna ploča",
+    "noConnections": "Nema aktivnih veza"
+  },
+  "recording": {
+    "manager": {
+      "title": "Video upravitelj",
+      "header": "Upravljanje replay snimkama terminala i opcionalnim izvozom videa.",
+      "enabled": "Omogući snimanje terminala za ovu sesiju aplikacije",
+      "storagePath": "Putanja pohrane",
+      "format": "Zadani format",
+      "formatKorttyReplay": "KorTTY Replay",
+      "formatWebm": "WebM",
+      "defaultScope": "Zadani opseg",
+      "scopeActiveSplit": "Aktivna podjela",
+      "scopeWholeTab": "Cijela kartica",
+      "captureColors": "Snimi boje terminala u novim snimkama",
+      "autoPause": "Automatski pauziraj kada je terminal neaktivan",
+      "idleSeconds": "Prag neaktivnosti (sekunde)",
+      "ffmpegPath": "ffmpeg putanja",
+      "browse": "Pregledaj...",
+      "checkFfmpeg": "Provjeri",
+      "ffmpegAvailable": "ffmpeg je dostupan; izvoz videa je omogućen.",
+      "ffmpegMissing": "ffmpeg nije dostupan; izvoz videa je onemogućen.",
+      "recordings": "Replay snimke",
+      "refresh": "Osvježi",
+      "save": "Spremi",
+      "chooseDirectory": "Odaberite mapu za snimke",
+      "done": "Gotovo",
+      "saveFailed": "Postavke nije moguće spremiti: {{error}}",
+      "refreshFailed": "Snimke nije moguće učitati: {{error}}",
+      "view": "Prikaži",
+      "rename": "Preimenuj...",
+      "delete": "Obriši",
+      "export": "Izvezi...",
+      "viewFailed": "Replay nije moguće otvoriti: {{error}}",
+      "renameTitle": "Preimenuj replay",
+      "renameHeader": "Odaberite novi naziv replaya",
+      "renameContent": "Naziv:",
+      "renameSuccess": "Replay preimenovan: {{name}}",
+      "renameFailed": "Replay nije moguće preimenovati: {{error}}",
+      "deleteTitle": "Obriši replay",
+      "deleteContent": "Ovo briše {{name}}. Radnju nije moguće poništiti.",
+      "deleteSuccess": "Replay obrisan: {{name}}",
+      "deleteFailed": "Replay nije moguće obrisati: {{error}}",
+      "exportSuccess": "Video izvezen: {{path}}",
+      "exportFailed": "Izvoz videa nije uspio: {{error}}",
+      "noRecordings": "Nema pronađenih snimki.",
+      "selectRecording": "Odaberite snimku.",
+      "duration": "Trajanje",
+      "eventCount": "{{count}} događaja",
+      "exportOptions": {
+        "title": "Opcije izvoza",
+        "header": "Odaberite raspon, boju i format",
+        "format": "Format",
+        "formatWebm": "WebM (VP9)",
+        "formatMkv": "MKV (FFV1)",
+        "duration": "Trajanje snimke: {{duration}}",
+        "all": "Izvezi cijelu snimku",
+        "start": "Početak",
+        "end": "Kraj",
+        "includeColor": "Uključi boje terminala",
+        "invalidRange": "Unesite valjan vremenski raspon između 0:00 i {{max}}."
+      },
+      "exportProgress": {
+        "title": "Izvoz videa",
+        "header": "Izvoz replaya u video",
+        "preparing": "Priprema izvoza...",
+        "rendering": "Iscrtavanje kadrova...",
+        "encoding": "Kodiranje videa...",
+        "finalizing": "Dovršavanje izvoza...",
+        "message": "{{phase}} Procijenjeno preostalo: {{remaining}}",
+        "remainingCalculating": "izračunavanje..."
+      }
+    },
+    "viewer": {
+      "title": "Preglednik replaya",
+      "play": "Reproduciraj",
+      "pause": "Pauziraj",
+      "stop": "Zaustavi",
+      "empty": "Nije snimljen nijedan replay kadar.",
+      "status": "Kadar {{current}} / {{total}}",
+      "timeline": "Vremenska crta",
+      "time": "{{position}} / {{total}}",
+      "timeJump": "Vremenski skok:",
+      "seek": "Idi",
+      "seekInvalid": "Unesite vrijeme između 0:00 i {{max}}.",
+      "speed": "Brzina:",
+      "speedSuffix": "x",
+      "loading": "Učitavanje replaya...",
+      "loadFailed": "Replay nije moguće otvoriti: {{error}}"
+    }
+  },
+  "common": {
+    "ready": "Spremno",
+    "connections": "veza",
+    "connection": "veza",
+    "ok": "U redu",
+    "cancel": "Odustani",
+    "save": "Spremi",
+    "delete": "Obriši",
+    "close": "Zatvori",
+    "add": "Dodaj",
+    "edit": "Uredi",
+    "search": "Traži..."
+  },
+  "updates": {
+    "checkNow": "Provjeri ažuriranja",
+    "checking": "Provjera ažuriranja...",
+    "manual": {
+      "current": "Već imate najnoviju verziju KorTTY-a."
+    },
+    "available": {
+      "short": "KorTTY {{version}} je dostupan."
+    },
+    "noCompatibleAsset": "Dostupna je novija verzija KorTTY-a, ali za ovu platformu nije pronađeno kompatibilno preuzimanje.",
+    "checkFailed": "Provjera ažuriranja nije uspjela.",
+    "checkFailedDetail": "Provjera ažuriranja nije uspjela: {{message}}",
+    "dialog": {
+      "title": "Dostupno KorTTY ažuriranje",
+      "header": "KorTTY {{version}} je dostupan",
+      "installedVersion": "Instalirana verzija:",
+      "availableVersion": "Dostupna verzija:",
+      "downloadAsset": "Preuzimanje:",
+      "downloadTargetInfo": "Datoteka će biti preuzeta u:"
+    },
+    "downloadAction": "Preuzmi",
+    "remindTomorrow": "Podsjeti sutra",
+    "skipVersion": "Preskoči ovu verziju",
+    "download": {
+      "title": "Preuzimanje KorTTY ažuriranja",
+      "header": "Preuzimanje {{version}}",
+      "running": "Preuzimanje {{asset}}...",
+      "complete": {
+        "title": "Preuzimanje dovršeno"
+      },
+      "completeInfo": "Ažuriranje je preuzeto u:",
+      "failed": {
+        "title": "Preuzimanje nije uspjelo"
+      },
+      "failedInfo": "Ažuriranje nije moguće preuzeti.",
+      "openFolder": "Otvori mapu"
+    }
+  },
+  "connEdit": {
+    "terminalEmulation": "Emulacija terminala",
+    "terminalColors": "Omogući boje terminala",
+    "aiTab": "AI",
+    "aiProfile": "AI profil:",
+    "aiProfileDefault": "Koristi zadani profil",
+    "aiProfileMissing": "Spremljeni profil (trenutno nedostupan)",
+    "aiProfileHint": "Ako odabrani profil nije dostupan, koristi se zadani AI profil dok ponovno ne postane dostupan.",
+    "aiSkills": "Skillovi veze:",
+    "aiSkillsHint": "Dodijeljeni skillovi uvijek se uključuju u AI zahtjeve ove veze. Skillovi s ciljem \"Veza\" koriste se samo za veze kojima su dodijeljeni.",
+    "aiSkillsNone": "Još nema spremljenih AI skillova."
+  },
+  "filebrowser": {
+    "title": "Lokalni preglednik datoteka",
+    "showHidden": "Prikaži skrivene datoteke",
+    "selected": "odabrano",
+    "copied": "{{count}} stavka(i) kopirano",
+    "confirmDelete": "Obrisati {{count}} stavku(i)?",
+    "context": {
+      "open": "Otvori",
+      "loadAsTextFile": "Učitaj kao tekstualnu datoteku",
+      "copy": "Kopiraj",
+      "cut": "Izreži",
+      "paste": "Zalijepi",
+      "delete": "Obriši",
+      "selectAll": "Odaberi sve",
+      "details": "Detalji",
+      "archive": "Arhiviraj",
+      "newFolder": "Nova mapa",
+      "newFile": "Nova datoteka"
+    },
+    "newFolder": {
+      "title": "Nova mapa",
+      "header": "Unesite naziv mape"
+    },
+    "newFile": {
+      "title": "Nova datoteka",
+      "header": "Unesite naziv datoteke"
+    },
+    "rename": {
+      "title": "Preimenuj",
+      "header": "Unesite novi naziv"
+    },
+    "archive": {
+      "title": "Arhiviraj",
+      "header": "Unesite naziv arhivske datoteke",
+      "created": "Arhiva stvorena"
+    },
+    "folder": {
+      "created": "Mapa stvorena"
+    },
+    "file": {
+      "created": "Datoteka stvorena"
+    },
+    "error": {
+      "accessDenied": "Pristup odbijen",
+      "paste": "Greška lijepljenja",
+      "delete": "Greška brisanja",
+      "archive": "Greška arhiviranja",
+      "createFolder": "Greška stvaranja mape",
+      "createFile": "Greška stvaranja datoteke",
+      "cannotOpen": "Datoteku nije moguće otvoriti",
+      "rename": "Greška preimenovanja"
+    },
+    "details": {
+      "type": "Vrsta",
+      "folder": "Mapa",
+      "file": "Datoteka",
+      "size": "Veličina",
+      "path": "Putanja",
+      "modified": "Promijenjeno",
+      "permissions": "Dozvole",
+      "owner": "Vlasnik",
+      "group": "Grupa"
+    },
+    "setOwner": {
+      "title": "Postavi vlasnika/dozvole",
+      "header": "Postavi vlasnika i dozvole za {{count}} stavku(i)",
+      "ownerUser": "Korisnik:",
+      "ownerGroup": "Grupa:",
+      "permissions": "Dozvole:",
+      "recursive": "Primijeni rekurzivno na direktorije",
+      "infoSeparate": "Ostavite prazno za zadržavanje trenutne vrijednosti.\nPopisi vlasnika/grupa su orijentacijski; možete upisati drugi valjani naziv.\nDozvole: oktalni format poput 755 ili 644",
+      "success": "Promijenjeno {{count}} stavki",
+      "errorCount": "Promjena nije uspjela za {{failed}} od {{total}} stavki.",
+      "notSupported": "Ovaj datotečni sustav ne podržava vlasnika ili POSIX dozvole.",
+      "invalid": "Nevažeći unos"
+    }
+  },
+  "ai": {
+    "manager": {
+      "title": "Upravitelj AI",
+      "tabProfiles": "Profili",
+      "tabChats": "Spremljeni razgovori",
+      "defaultProfile": "Zadani profil:",
+      "defaultProfileNone": "Prvi dostupni profil",
+      "defaultProfileHint": "Zadani profil se također koristi za AI akcije u terminalu i za terminalskog AI agenta kada nije odabran nijedan drugi profil.",
+      "defaultProfileSaved": "Zadani profil je spremljen.",
+      "defaultMarker": "Zadano",
+      "profileUnnamed": "Profil bez naziva",
+      "connectionMode": "Veza",
+      "connectionModeHttp": "HTTP API",
+      "connectionModeCli": "Lokalni CLI",
+      "model": "Model",
+      "modelRefresh": "Osvježi dostupne modele",
+      "cli": {
+        "provider": "CLI pružatelj",
+        "executable": "CLI izvršna datoteka",
+        "executablePrompt": "Ostavite prazno za korištenje provjerenog kandidata naredbe pružatelja",
+        "statusInstalled": "Pronađeno: {{path}}",
+        "statusNotInstalled": "Na PATH-u nije pronađen provjereni CLI pružatelja. Konfigurirajte izvršnu datoteku i predložak argumenata.",
+        "statusCustom": "Prilagođena izvršna datoteka: {{path}}",
+        "statusCustomUnverified": "Prilagođena izvršna datoteka je konfigurirana, ali nije potvrđena kao izvršna: {{path}}",
+        "arguments": "CLI argumenti",
+        "argumentsPrompt": "Jedan argument po retku ili predložak u navodnicima. Koristite {promptFile}, {systemPromptFile}, {userPromptFile}, {model}, {reasoning}, {stdinPrompt}.",
+        "insertPreset": "Umetni predložak",
+        "presetInserted": "Umetnut predložak argumenata \"{{label}}\".",
+        "presetMissing": "Ovaj pružatelj nema provjereni predložak argumenata.",
+        "model": "Model",
+        "modelPrompt": "Unesite naziv modela specifičan za pružatelja"
+      },
+      "reasoning": {
+        "label": "Razina zaključivanja",
+        "refresh": "Osvježi opcije zaključivanja",
+        "refreshSuccess": "Opcije zaključivanja osvježene: {{options}}",
+        "refreshNone": "Ovaj profil nije prihvatio dodatni parametar zaključivanja.",
+        "refreshFailed": "Osvježavanje zaključivanja nije uspjelo",
+        "rediscover": "Konfiguracija profila promijenjena je od zadnjeg otkrivanja. Osvježite opcije zaključivanja.",
+        "option": {
+          "disabled": "Onemogućeno",
+          "none": "Bez",
+          "minimal": "Minimalno",
+          "low": "Nisko",
+          "medium": "Srednje",
+          "high": "Visoko",
+          "xhigh": "Ekstra visoko"
+        }
+      }
+    }
+  }
+}

@@ -1,10 +1,13 @@
 import { useState, useEffect } from "react";
 import { X } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { useTranslation } from "react-i18next";
 import { ConnectionSettings, useConnectionStore } from "../../store/connectionStore";
 import { useDialogGeometry } from "../../hooks/useDialogGeometry";
+import { TerminalEmulationSelect } from "../common/TerminalEmulationSelect";
 import type { ThemeData } from "../../store/themeStore";
 import type { TerminalEffectPluginEntry } from "../../types/terminalEffects";
+import type { AiProfile, AiSkill } from "../../types/ai";
 
 interface ConnectionEditorProps {
   open: boolean;
@@ -26,9 +29,10 @@ interface SimpleCredential {
   encryptedPassword?: string;
 }
 
-type TabName = "general" | "terminal" | "tunnels" | "advanced";
+type TabName = "general" | "terminal" | "tunnels" | "ai" | "advanced";
 
 export function ConnectionEditor({ open, connection, onClose, onSave }: ConnectionEditorProps) {
+  const { t } = useTranslation();
   const { width, height, onResizeStart } = useDialogGeometry("connection-editor", 600, 700, 400, 400);
   const [conn, setConn] = useState<ConnectionSettings>(connection);
   const [activeEditorTab, setActiveEditorTab] = useState<TabName>("general");
@@ -38,6 +42,8 @@ export function ConnectionEditor({ open, connection, onClose, onSave }: Connecti
   const [sshKeys, setSshKeys] = useState<SimpleSshKey[]>([]);
   const [credentials, setCredentials] = useState<SimpleCredential[]>([]);
   const [authChoice, setAuthChoice] = useState<"Password" | "PrivateKey" | "TemporaryKey">("Password");
+  const [aiProfiles, setAiProfiles] = useState<AiProfile[]>([]);
+  const [aiSkills, setAiSkills] = useState<AiSkill[]>([]);
 
   useEffect(() => {
     if (open) {
@@ -45,6 +51,8 @@ export function ConnectionEditor({ open, connection, onClose, onSave }: Connecti
       invoke<TerminalEffectPluginEntry[]>("list_terminal_effect_plugins").then(setTerminalEffects).catch(console.error);
       invoke<SimpleSshKey[]>("get_ssh_keys").then(setSshKeys).catch(console.error);
       invoke<SimpleCredential[]>("get_credentials").then(setCredentials).catch(console.error);
+      invoke<AiProfile[]>("get_ai_profiles").then(setAiProfiles).catch(console.error);
+      invoke<AiSkill[]>("get_ai_skills").then(setAiSkills).catch(console.error);
       if (connection.authMethod === "Password") {
         setAuthChoice("Password");
       } else if (connection.temporaryKeyContent?.trim()) {
@@ -121,8 +129,27 @@ export function ConnectionEditor({ open, connection, onClose, onSave }: Connecti
     { id: "general", label: "General" },
     { id: "terminal", label: "Terminal" },
     { id: "tunnels", label: "Tunnels" },
+    { id: "ai", label: t("connEdit.aiTab") },
     { id: "advanced", label: "Advanced" },
   ];
+
+  // Only skills with target "Connection" are offered for assignment; assignments
+  // to currently unavailable skills are preserved instead of silently dropped
+  // (Port of the Java ConnectionEditDialog behavior).
+  const connectionTargetSkills = aiSkills.filter((skill) => skill.target === "Connection");
+  const assignedSkillIds = conn.aiSkillIds ?? [];
+  const storedAiProfileMissing =
+    !!conn.aiProfileId && !aiProfiles.some((profile) => profile.id === conn.aiProfileId);
+
+  function toggleConnectionSkill(skillId: string, checked: boolean) {
+    const current = conn.aiSkillIds ?? [];
+    const next = checked
+      ? current.includes(skillId)
+        ? current
+        : [...current, skillId]
+      : current.filter((id) => id !== skillId);
+    update({ aiSkillIds: next });
+  }
 
   return (
     <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -420,6 +447,21 @@ export function ConnectionEditor({ open, connection, onClose, onSave }: Connecti
                   <option value="Bar">Bar</option>
                 </select>
               </Field>
+              <Field label={t("connEdit.terminalEmulation")}>
+                <TerminalEmulationSelect
+                  value={conn.terminalEmulationType}
+                  onChange={(name) => update({ terminalEmulationType: name })}
+                />
+              </Field>
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={conn.terminalColorsEnabled ?? true}
+                  onChange={(e) => update({ terminalColorsEnabled: e.target.checked })}
+                  className="rounded"
+                />
+                {t("connEdit.terminalColors")}
+              </label>
               <div className="grid grid-cols-2 gap-2">
                 <Field label="Terminal Effect">
                   <select
@@ -499,6 +541,68 @@ export function ConnectionEditor({ open, connection, onClose, onSave }: Connecti
             <div className="text-xs text-kortty-text-dim text-center py-8">
               Tunnel configuration will be available in a future update.
             </div>
+          )}
+
+          {activeEditorTab === "ai" && (
+            <>
+              <Field label={t("connEdit.aiProfile")}>
+                <select
+                  className="input-field"
+                  value={conn.aiProfileId || ""}
+                  onChange={(e) => update({ aiProfileId: e.target.value || undefined })}
+                >
+                  <option value="">{t("connEdit.aiProfileDefault")}</option>
+                  {[...aiProfiles]
+                    .sort((left, right) =>
+                      (left.name || left.id).localeCompare(right.name || right.id, undefined, {
+                        sensitivity: "base",
+                      }),
+                    )
+                    .map((profile) => (
+                      <option key={profile.id} value={profile.id}>
+                        {profile.name || profile.id}
+                      </option>
+                    ))}
+                  {storedAiProfileMissing && (
+                    <option value={conn.aiProfileId}>{t("connEdit.aiProfileMissing")}</option>
+                  )}
+                </select>
+              </Field>
+              <p className="text-[11px] text-kortty-text-dim">{t("connEdit.aiProfileHint")}</p>
+
+              {connectionTargetSkills.length > 0 && (
+                <>
+                  <Field label={t("connEdit.aiSkills")}>
+                    <div className="rounded border border-kortty-border bg-kortty-panel/30 max-h-52 overflow-y-auto p-2 space-y-1">
+                      {[...connectionTargetSkills]
+                        .sort((left, right) =>
+                          (left.name || "").localeCompare(right.name || "", undefined, {
+                            sensitivity: "base",
+                          }),
+                        )
+                        .map((skill) => (
+                          <label
+                            key={skill.id}
+                            className="flex items-center gap-2 text-xs cursor-pointer select-none"
+                          >
+                            <input
+                              type="checkbox"
+                              className="rounded"
+                              checked={assignedSkillIds.includes(skill.id)}
+                              onChange={(e) => toggleConnectionSkill(skill.id, e.target.checked)}
+                            />
+                            <span className="truncate">{skill.name || skill.id}</span>
+                          </label>
+                        ))}
+                    </div>
+                  </Field>
+                  <p className="text-[11px] text-kortty-text-dim">{t("connEdit.aiSkillsHint")}</p>
+                </>
+              )}
+              {connectionTargetSkills.length === 0 && (
+                <p className="text-[11px] text-kortty-text-dim">{t("connEdit.aiSkillsNone")}</p>
+              )}
+            </>
           )}
 
           {activeEditorTab === "advanced" && (

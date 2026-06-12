@@ -6,6 +6,34 @@ pub enum AiAction {
     SolveProblem,
     Ask,
     GenerateChatTitle,
+    // Snippet-editor AI actions (port of the Java AiAction snippet values).
+    GenerateSnippetMetadata,
+    CorrectSnippetDescription,
+    CorrectSnippetSelectionText,
+    TranslateSnippetSelectionText,
+    DescribeSnippetSelection,
+    DescribeSnippetFull,
+    GenerateSnippetAlternatives,
+    CompleteSnippetCode,
+    ReviewSnippetCode,
+    ImproveSnippetCode,
+    AssistSnippetCode,
+    SecurityReviewSnippetCode,
+    ApplySnippetSecurityFixes,
+    GenerateSnippetOneLiner,
+    GenerateSnippetPlantUml,
+}
+
+impl AiAction {
+    /// Snippet AI privacy boundary (port of `AiInternetPromptSupport.isInternetEligible`):
+    /// snippet-editor actions never use internet tooling, regardless of the
+    /// profile's internet access mode.
+    pub fn is_snippet_action(&self) -> bool {
+        !matches!(
+            self,
+            Self::Summarize | Self::SolveProblem | Self::Ask | Self::GenerateChatTitle
+        )
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -118,11 +146,20 @@ pub enum AiModelSelectionMode {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AiConnectionMode {
+    #[default]
+    HttpApi,
+    LocalCli,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AiSkillTarget {
     Chat,
     Agent,
     #[default]
     Both,
+    /// Only sent for connections the skill has been assigned to; applies to chat and agent there.
+    Connection,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -160,13 +197,25 @@ pub struct AiProfile {
     pub id: String,
     pub name: String,
     pub api_url: String,
+    #[serde(default)]
+    pub connection_mode: AiConnectionMode,
     pub model: String,
     #[serde(default)]
     pub model_selection_mode: AiModelSelectionMode,
     #[serde(default)]
     pub api_key: String,
     #[serde(default)]
+    pub cli_provider_id: Option<String>,
+    #[serde(default)]
+    pub cli_executable_path: Option<String>,
+    #[serde(default)]
+    pub cli_arguments_template: Option<String>,
+    #[serde(default)]
     pub reasoning_effort: AiReasoningEffort,
+    #[serde(default)]
+    pub discovered_reasoning_efforts: Vec<AiReasoningEffort>,
+    #[serde(default)]
+    pub reasoning_discovery_key: Option<String>,
     #[serde(default)]
     pub internet_access_mode: AiInternetAccessMode,
     #[serde(default = "default_max_selection_chars")]
@@ -198,10 +247,16 @@ impl Default for AiProfile {
             id: uuid::Uuid::new_v4().to_string(),
             name: String::new(),
             api_url: String::new(),
+            connection_mode: AiConnectionMode::HttpApi,
             model: String::new(),
             model_selection_mode: AiModelSelectionMode::Manual,
             api_key: String::new(),
+            cli_provider_id: None,
+            cli_executable_path: None,
+            cli_arguments_template: None,
             reasoning_effort: AiReasoningEffort::Disabled,
+            discovered_reasoning_efforts: Vec::new(),
+            reasoning_discovery_key: None,
             internet_access_mode: AiInternetAccessMode::Disabled,
             max_selection_chars: default_max_selection_chars(),
             tokenizer_type: AiTokenizerType::Estimate,
@@ -261,6 +316,14 @@ pub struct AiRequestPayload {
     pub response_language_code: Option<String>,
     pub user_prompt: Option<String>,
     pub conversation_context: Option<String>,
+    #[serde(default)]
+    pub include_ai_skills: Option<bool>,
+    /// Fixed AI profile of the originating connection (overrides the default profile).
+    #[serde(default)]
+    pub connection_ai_profile_id: Option<String>,
+    /// Skills assigned to the originating connection; they are always pinned into the prompt.
+    #[serde(default)]
+    pub connection_ai_skill_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

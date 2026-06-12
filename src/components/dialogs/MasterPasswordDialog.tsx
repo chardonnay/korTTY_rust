@@ -1,5 +1,5 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
-import { KeyRound, LockKeyhole } from "lucide-react";
+import { CSSProperties, FormEvent, useEffect, useRef, useState } from "react";
+import korttyLogo from "../../assets/kortty_logo.png";
 
 interface MasterPasswordDialogProps {
   mode: "setup" | "unlock";
@@ -7,6 +7,28 @@ interface MasterPasswordDialogProps {
   error: string | null;
   onSubmit: (password: string) => Promise<void> | void;
 }
+
+/**
+ * Master password screen, ported from the Java v2.2 login refresh:
+ * hardcoded black background (independent of the active app design),
+ * large KorTTY logo, light text and a blue password field with dark
+ * input text (see Java MasterPasswordDialog.stylePasswordField()).
+ */
+
+const PASSWORD_FIELD_STYLE: CSSProperties = {
+  backgroundColor: "#2f9cff",
+  color: "#000000",
+  border: "1.5px solid #79c4ff",
+  borderRadius: "6px",
+  caretColor: "#000000",
+};
+
+const PRIMARY_BUTTON_STYLE: CSSProperties = {
+  backgroundColor: "#16324a",
+  border: "1px solid #2f9cff",
+  borderRadius: "6px",
+  color: "#ffffff",
+};
 
 export function MasterPasswordDialog({
   mode,
@@ -55,28 +77,32 @@ export function MasterPasswordDialog({
   }
 
   return (
-    <div className="min-h-screen bg-kortty-bg text-kortty-text flex items-center justify-center px-4">
-      <div className="w-full max-w-md bg-kortty-surface border border-kortty-border rounded-xl shadow-2xl overflow-hidden">
-        <div className="px-5 py-4 border-b border-kortty-border flex items-center gap-3">
-          <div className="w-10 h-10 rounded-full bg-kortty-accent/10 text-kortty-accent flex items-center justify-center">
-            {isSetup ? <KeyRound className="w-5 h-5" /> : <LockKeyhole className="w-5 h-5" />}
-          </div>
+    <div
+      className="min-h-screen flex items-center justify-center px-8"
+      style={{ backgroundColor: "#000000", color: "#f1f5fb" }}
+    >
+      <div className="flex w-full max-w-5xl items-center justify-center gap-12">
+        <form onSubmit={handleSubmit} className="w-full max-w-sm space-y-5">
           <div>
-            <h1 className="text-sm font-semibold">{title}</h1>
-            <p className="text-xs text-kortty-text-dim">Secure startup required</p>
+            <h1 className="text-lg font-bold" style={{ color: "#f1f5fb" }}>
+              {title}
+            </h1>
+            <p className="mt-2 text-sm leading-6" style={{ color: "#d8e3f0" }}>
+              {description}
+            </p>
           </div>
-        </div>
-
-        <form onSubmit={handleSubmit} className="px-5 py-4 space-y-4">
-          <p className="text-sm text-kortty-text-dim leading-6">{description}</p>
 
           <div>
-            <label className="block text-[11px] uppercase tracking-wide text-kortty-text-dim mb-1.5">
+            <label
+              className="block text-[11px] uppercase tracking-wide font-bold mb-1.5"
+              style={{ color: "#f1f5fb" }}
+            >
               {isSetup ? "New Master Password" : "Master Password"}
             </label>
             <input
               ref={passwordRef}
-              className="input-field"
+              className="w-full px-3 py-2 text-sm focus:outline-none placeholder-black/60"
+              style={PASSWORD_FIELD_STYLE}
               type="password"
               autoComplete={isSetup ? "new-password" : "current-password"}
               value={password}
@@ -87,25 +113,36 @@ export function MasterPasswordDialog({
 
           {isSetup && (
             <div>
-              <label className="block text-[11px] uppercase tracking-wide text-kortty-text-dim mb-1.5">
+              <label
+                className="block text-[11px] uppercase tracking-wide font-bold mb-1.5"
+                style={{ color: "#f1f5fb" }}
+              >
                 Confirm Password
               </label>
               <input
-                className="input-field"
+                className="w-full px-3 py-2 text-sm focus:outline-none placeholder-black/60"
+                style={PASSWORD_FIELD_STYLE}
                 type="password"
                 autoComplete="new-password"
                 value={confirmPassword}
                 onChange={(event) => setConfirmPassword(event.target.value)}
                 disabled={busy}
               />
-              <p className="mt-2 text-xs text-kortty-text-dim">
+              <p className="mt-2 text-xs" style={{ color: "#d8e3f0" }}>
                 Use at least 8 characters. KorTTY will ask for this password on every startup.
               </p>
             </div>
           )}
 
           {displayedError && (
-            <div className="rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-200">
+            <div
+              className="rounded-md px-3 py-2 text-xs font-bold"
+              style={{
+                color: "#ff6b6b",
+                border: "1px solid rgba(255,107,107,0.4)",
+                backgroundColor: "rgba(255,107,107,0.08)",
+              }}
+            >
               {displayedError}
             </div>
           )}
@@ -113,11 +150,25 @@ export function MasterPasswordDialog({
           <button
             type="submit"
             disabled={busy}
-            className="w-full px-3 py-2 rounded-md bg-kortty-accent text-black text-sm font-medium hover:opacity-90 disabled:opacity-60 disabled:cursor-not-allowed transition-opacity"
+            className="w-full px-3 py-2 text-sm font-bold cursor-pointer hover:opacity-90 disabled:opacity-60 disabled:cursor-not-allowed transition-opacity"
+            style={PRIMARY_BUTTON_STYLE}
           >
             {busy ? "Please wait..." : submitLabel}
           </button>
         </form>
+
+        <div className="hidden md:flex flex-col items-center justify-center select-none">
+          <img
+            src={korttyLogo}
+            alt="KorTTY"
+            draggable={false}
+            style={{
+              width: isSetup ? 220 : 420,
+              maxWidth: "40vw",
+              height: "auto",
+            }}
+          />
+        </div>
       </div>
     </div>
   );

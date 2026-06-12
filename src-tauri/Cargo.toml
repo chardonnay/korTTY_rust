@@ -39,6 +39,7 @@ rand = "0.8"
 base64 = "0.22"
 flate2 = "1"
 zip = "2"
+tar = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 tracing = "0.1"
 fs2 = "0.4"
@@ -54,3 +55,8 @@ figlet-rs = "0.1"
 zxcvbn = "3"
 portable-pty = "0.9"
 printpdf = { version = "0.9.1", default-features = false }
+ab_glyph = "0.2"
+png = "0.17"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

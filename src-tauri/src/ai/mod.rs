@@ -1,7 +1,14 @@
+pub mod cli_registry;
+pub mod cli_template;
+pub mod local_cli;
+pub mod profile_selection;
+pub mod reasoning_discovery;
+
 use crate::ai_skills;
 use crate::model::ai::{
-    AiAction, AiExecutionResult, AiInternetAccessMode, AiModelSelectionMode, AiProfile,
-    AiRequestPayload, AiSkillTarget, AiTokenUsage, AiTokenUsageSnapshot, AiTokenWarningLevel,
+    AiAction, AiConnectionMode, AiExecutionResult, AiInternetAccessMode, AiModelSelectionMode,
+    AiProfile, AiReasoningEffort, AiRequestPayload, AiSkillTarget, AiTokenUsage,
+    AiTokenUsageSnapshot, AiTokenWarningLevel,
 };
 use crate::model::settings::GlobalSettings;
 use crate::persistence::xml_repository;
@@ -77,44 +84,67 @@ async fn execute_request_internal(
     request: &AiRequestPayload,
     cancel_rx: Option<&mut oneshot::Receiver<()>>,
 ) -> Result<AiExecutionResult, AiError> {
-    if profile.api_url.trim().is_empty() {
-        return Err(AiError::MissingApiUrl);
-    }
-
     let settings = load_global_settings();
-    let client = build_http_client(DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)?;
     let mut system_prompt = build_system_prompt(request);
     let user_prompt = build_user_prompt(request);
-    let (skill_system_prompt, _) = ai_skills::append_skills_to_prompt(
-        &system_prompt,
-        &user_prompt,
-        &settings.ai_skills,
-        AiSkillTarget::Chat,
-    );
-    system_prompt = skill_system_prompt;
-    let internet_config = internet_config_from_settings(profile, &settings);
-    let request_future = send_prompt_for_profile(
-        profile,
-        PromptDispatch {
-            client: &client,
-            system_prompt: &system_prompt,
-            user_prompt: &user_prompt,
-            temperature: 0.2,
-            json_response_format: false,
-            internet_config: &internet_config,
-            internet_eligible: is_request_internet_eligible(request),
-        },
-    );
-    tokio::pin!(request_future);
-    let mut result = if let Some(cancel_rx) = cancel_rx {
-        tokio::select! {
-            response = &mut request_future => response?,
-            _ = cancel_rx => {
-                return Err(AiError::Cancelled);
+    if request.include_ai_skills != Some(false) {
+        let (skill_system_prompt, _) = ai_skills::append_skills_to_prompt(
+            &system_prompt,
+            &user_prompt,
+            &settings.ai_skills,
+            AiSkillTarget::Chat,
+            &request.connection_ai_skill_ids,
+        );
+        system_prompt = skill_system_prompt;
+    }
+
+    let mut result = if profile.connection_mode == AiConnectionMode::LocalCli {
+        let request_future = local_cli::execute(
+            profile,
+            &system_prompt,
+            &user_prompt,
+            local_cli::DEFAULT_TIMEOUT,
+        );
+        tokio::pin!(request_future);
+        if let Some(cancel_rx) = cancel_rx {
+            tokio::select! {
+                response = &mut request_future => response?,
+                _ = cancel_rx => {
+                    return Err(AiError::Cancelled);
+                }
             }
+        } else {
+            request_future.await?
         }
     } else {
-        request_future.await?
+        if profile.api_url.trim().is_empty() {
+            return Err(AiError::MissingApiUrl);
+        }
+        let client = build_http_client(DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)?;
+        let internet_config = internet_config_from_settings(profile, &settings);
+        let request_future = send_prompt_for_profile(
+            profile,
+            PromptDispatch {
+                client: &client,
+                system_prompt: &system_prompt,
+                user_prompt: &user_prompt,
+                temperature: 0.2,
+                json_response_format: false,
+                internet_config: &internet_config,
+                internet_eligible: is_request_internet_eligible(request),
+            },
+        );
+        tokio::pin!(request_future);
+        if let Some(cancel_rx) = cancel_rx {
+            tokio::select! {
+                response = &mut request_future => response?,
+                _ = cancel_rx => {
+                    return Err(AiError::Cancelled);
+                }
+            }
+        } else {
+            request_future.await?
+        }
     };
     if result.content.trim().is_empty() {
         return Err(AiError::EmptyResponse);
@@ -125,6 +155,9 @@ async fn execute_request_internal(
 }
 
 pub async fn test_connection(profile: &AiProfile) -> bool {
+    if profile.connection_mode == AiConnectionMode::LocalCli {
+        return matches!(local_cli::test_connection(profile).await, Ok(true));
+    }
     if profile.api_url.trim().is_empty() {
         return false;
     }
@@ -165,6 +198,29 @@ pub async fn execute_custom_prompt(
         temperature,
         false,
         cancel_rx,
+        &[],
+    )
+    .await
+}
+
+/// Like [`execute_custom_prompt`], but pins the given skill ids (e.g. skills
+/// assigned to the active connection) into the prompt regardless of relevance.
+pub async fn execute_custom_prompt_with_pinned_skills(
+    profile: &AiProfile,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+    cancel_rx: Option<&mut watch::Receiver<bool>>,
+    pinned_skill_ids: &[String],
+) -> Result<AiExecutionResult, AiError> {
+    execute_custom_prompt_internal(
+        profile,
+        system_prompt,
+        user_prompt,
+        temperature,
+        false,
+        cancel_rx,
+        pinned_skill_ids,
     )
     .await
 }
@@ -183,6 +239,30 @@ pub async fn execute_custom_json_prompt(
         temperature,
         true,
         cancel_rx,
+        &[],
+    )
+    .await
+}
+
+/// Like [`execute_custom_json_prompt`], but pins the given skill ids (e.g.
+/// skills assigned to the active connection) into the prompt regardless of
+/// relevance.
+pub async fn execute_custom_json_prompt_with_pinned_skills(
+    profile: &AiProfile,
+    system_prompt: &str,
+    user_prompt: &str,
+    temperature: f64,
+    cancel_rx: Option<&mut watch::Receiver<bool>>,
+    pinned_skill_ids: &[String],
+) -> Result<AiExecutionResult, AiError> {
+    execute_custom_prompt_internal(
+        profile,
+        system_prompt,
+        user_prompt,
+        temperature,
+        true,
+        cancel_rx,
+        pinned_skill_ids,
     )
     .await
 }
@@ -194,19 +274,43 @@ async fn execute_custom_prompt_internal(
     temperature: f64,
     json_response_format: bool,
     cancel_rx: Option<&mut watch::Receiver<bool>>,
+    pinned_skill_ids: &[String],
 ) -> Result<AiExecutionResult, AiError> {
-    if profile.api_url.trim().is_empty() {
-        return Err(AiError::MissingApiUrl);
-    }
-
     let settings = load_global_settings();
-    let client = build_http_client(DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)?;
     let (system_prompt, _) = ai_skills::append_skills_to_prompt(
         system_prompt,
         user_prompt,
         &settings.ai_skills,
         AiSkillTarget::Agent,
+        pinned_skill_ids,
     );
+
+    if profile.connection_mode == AiConnectionMode::LocalCli {
+        // JSON response-format requests degrade to a plain prompt for CLI providers.
+        let execution = local_cli::execute(
+            profile,
+            &system_prompt,
+            user_prompt,
+            local_cli::DEFAULT_TIMEOUT,
+        );
+        let mut result = if let Some(cancel_rx) = cancel_rx {
+            with_watch_cancel(execution, cancel_rx).await?
+        } else {
+            execution.await?
+        };
+        if result.content.trim().is_empty() {
+            return Err(AiError::EmptyResponse);
+        }
+        result.active_profile_id = Some(profile.id.clone());
+        result.active_profile_name = Some(profile.name.clone());
+        return Ok(result);
+    }
+
+    if profile.api_url.trim().is_empty() {
+        return Err(AiError::MissingApiUrl);
+    }
+
+    let client = build_http_client(DEFAULT_CONNECT_TIMEOUT_SECS, DEFAULT_REQUEST_TIMEOUT_SECS)?;
     let internet_config = internet_config_from_settings(profile, &settings);
     let internet_eligible = is_prompt_internet_eligible(user_prompt);
     let dispatch = PromptDispatch {
@@ -275,7 +379,16 @@ async fn send_prompt_with_watch_cancel(
     dispatch: PromptDispatch<'_>,
     cancel_rx: &mut watch::Receiver<bool>,
 ) -> Result<AiExecutionResult, AiError> {
-    let request_future = send_prompt_for_profile(profile, dispatch);
+    with_watch_cancel(send_prompt_for_profile(profile, dispatch), cancel_rx).await
+}
+
+async fn with_watch_cancel<F>(
+    request_future: F,
+    cancel_rx: &mut watch::Receiver<bool>,
+) -> Result<AiExecutionResult, AiError>
+where
+    F: std::future::Future<Output = Result<AiExecutionResult, AiError>>,
+{
     tokio::pin!(request_future);
 
     loop {
@@ -313,6 +426,10 @@ pub fn normalize_profile(profile: &mut AiProfile) {
     profile.name = profile.name.trim().to_string();
     profile.api_url = profile.api_url.trim().to_string();
     profile.model = profile.model.trim().to_string();
+    profile.cli_provider_id = normalize_optional_field(profile.cli_provider_id.take());
+    profile.cli_executable_path = normalize_optional_field(profile.cli_executable_path.take());
+    profile.cli_arguments_template =
+        normalize_optional_field(profile.cli_arguments_template.take());
     profile.max_selection_chars = profile.max_selection_chars.max(1);
     profile.token_warning_yellow_percent = profile.token_warning_yellow_percent.min(100);
     profile.token_warning_red_percent = profile
@@ -415,14 +532,141 @@ fn build_system_prompt(request: &AiRequestPayload) -> String {
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .unwrap_or("en");
-    format!(
-        "You are an assistant that analyzes terminal output. \
+    // Snippet-action system prompts are a 1:1 port of AiPromptBuilder.buildSystemPrompt.
+    match request.action {
+        AiAction::GenerateSnippetMetadata => format!(
+            "You generate metadata for reusable code snippets. \
+Return exactly one JSON object with the keys fileName, description, and language. \
+The description must be written in language code {language_code}. \
+Do not include hidden reasoning, analysis, or <think> tags. \
+Do not invent files, URLs, or external facts. \
+Do not use Markdown or add explanations outside the JSON object."
+        ),
+        AiAction::CorrectSnippetDescription => format!(
+            "You correct spelling and grammar for snippet descriptions. \
+Return only the corrected plain text in language code {language_code}. \
+Do not include hidden reasoning, analysis, or <think> tags. \
+Do not use Markdown, quotes, bullets, or explanations."
+        ),
+        AiAction::CorrectSnippetSelectionText => format!(
+            "You correct spelling and grammar only inside user-facing text segments extracted from source code. \
+Never modify code, identifiers, operators, keywords, syntax, delimiters, or control flow. \
+Return exactly one JSON object with an array field named segments. \
+Each array entry must contain only the corrected text for one segment in the same order as provided. \
+Use language code {language_code} unless the provided snippet context clearly shows a different natural language for existing comments or user-facing strings. \
+Do not include hidden reasoning, analysis, <think> tags, explanations, or Markdown."
+        ),
+        AiAction::TranslateSnippetSelectionText => format!(
+            "You translate only user-facing text segments extracted from source code. \
+Never modify code, identifiers, operators, keywords, syntax, delimiters, or control flow. \
+Return exactly one JSON object with an array field named segments. \
+Each array entry must contain only the translated text for one segment in the same order as provided. \
+Translate into language code {language_code}. \
+Do not include hidden reasoning, analysis, <think> tags, explanations, or Markdown."
+        ),
+        AiAction::DescribeSnippetSelection => format!(
+            "You write a concise technical description for a marked code selection. \
+Write in language code {language_code} unless the provided full snippet clearly shows another dominant natural language in comments or user-facing strings. \
+Summarize only relevant responsibilities, inputs, outputs, side effects, conditions, and risks. \
+Do not explain every single line. \
+Do not include hidden reasoning, analysis, or <think> tags. \
+Return plain text only without Markdown or bullet lists unless short plain-text paragraphs truly need them."
+        ),
+        AiAction::DescribeSnippetFull => format!(
+            "You write a concise technical description for a full code snippet. \
+Write in language code {language_code} unless the provided full snippet clearly shows another dominant natural language in comments or user-facing strings. \
+Summarize only relevant blocks, flow, inputs, outputs, side effects, conditions, and risks. \
+Do not explain every single line. \
+Do not include hidden reasoning, analysis, or <think> tags. \
+Return plain text only without Markdown or bullet lists unless short plain-text paragraphs truly need them."
+        ),
+        AiAction::GenerateSnippetAlternatives => format!(
+            "You generate alternative implementations for a selected code block. \
+Return exactly one JSON object with a solutions array. \
+Each solution entry must contain title, code, and optionally summary. \
+Keep the program code in the same programming language as the provided snippet. \
+If you include comments or user-facing strings, use language code {language_code} unless the provided full snippet clearly shows another dominant natural language in comments or user-facing strings. \
+Do not include explanations outside the JSON object."
+        ),
+        AiAction::CompleteSnippetCode => "You generate a short code completion at the current cursor position in a snippet editor. \
+Return exactly one JSON object with keys insertText and summary. \
+insertText must contain only the code that should be inserted at the cursor, not the full file. \
+Keep the code in the snippet language. Do not include Markdown or explanations outside the JSON object."
+            .to_string(),
+        AiAction::ReviewSnippetCode => format!(
+            "You review a code snippet or selected code region for likely errors and concrete improvements. \
+Return exactly one JSON object with a findings array. \
+Each finding must contain id, severity, title, detail, recommendation, and optionally line. \
+Write human-readable text in language code {language_code}. \
+Do not rewrite code and do not include Markdown outside the JSON object."
+        ),
+        AiAction::ImproveSnippetCode => format!(
+            "You improve a selected code region in a snippet editor according to the requested theme. \
+Return exactly one JSON object with keys replacement and summary. \
+replacement must contain only the replacement code for the selected region. \
+Preserve behavior unless the user explicitly requests a behavior change. \
+Write summary in language code {language_code}. \
+Do not nest this JSON object inside another JSON string. \
+Do not include Markdown outside the JSON object."
+        ),
+        AiAction::AssistSnippetCode => format!(
+            "You edit a complete code snippet according to the user's instruction and cursor context. \
+Return exactly one JSON object with keys replacement and summary. \
+replacement must contain the full updated snippet content, not a patch, not Markdown, and not only a selected region. \
+Use the cursor as the user's focal point, but update other locations when the instruction requires it. \
+Preserve existing behavior unless the user explicitly requests a behavior change. \
+Do not invent files, endpoints, configuration keys, schemas, secrets, versions, or external facts. \
+Write summary in language code {language_code}. \
+Do not nest this JSON object inside another JSON string. \
+Do not include Markdown outside the JSON object."
+        ),
+        AiAction::SecurityReviewSnippetCode => format!(
+            "You perform a security review of the provided snippet. \
+Return exactly one JSON object with a findings array. \
+Each finding must contain id, severity, title, impact, and recommendation. \
+Only report issues supported by the provided code. If there are no findings, return an empty findings array. \
+Write human-readable text in language code {language_code}. \
+Do not include Markdown outside the JSON object."
+        ),
+        AiAction::ApplySnippetSecurityFixes => format!(
+            "You apply only the selected security findings to the provided snippet. \
+Return exactly one JSON object with keys replacement and summary. \
+replacement must contain the full updated snippet content. \
+Do not apply findings that were not selected. Preserve unrelated behavior and formatting where possible. \
+Write summary in language code {language_code}. \
+Do not include Markdown outside the JSON object."
+        ),
+        AiAction::GenerateSnippetOneLiner => "You convert a code snippet into a compact, pasteable one-line shell command. \
+Return exactly one JSON object with key command. \
+command must be a single line with no newline characters. \
+Use only the provided snippet content. \
+Do not use curl, wget, temporary downloads, external URLs, invented files, base64, heredocs, Markdown, or explanations. \
+Preserve the snippet behavior as closely as possible for the declared snippet language."
+            .to_string(),
+        AiAction::GenerateSnippetPlantUml => "You generate a compact PlantUML diagram for the logical structure of a code snippet. \
+Return exactly one JSON object with keys title, plantUml, and codeReferences. \
+plantUml must start with @startuml and end with @enduml. \
+codeReferences must be an array of objects with label, startLine, and endLine. \
+Each codeReferences label must exactly match one visible PlantUML activity or decision label. \
+Create one codeReferences entry for every activity and decision in plantUml; exclude only start, stop, arrows, and merge nodes. \
+Line numbers must be 1-based and must refer only to lines visible in the provided line-numbered snippet. \
+For scripts and imperative snippets, use only a PlantUML activity diagram. \
+Use a small semantic HEX color palette to improve readability. \
+Allowed activity syntax is limited to start, :Action;, :Action; <<#RRGGBB>>, if (...) then (...) else (...) endif, and stop. \
+Do not use gradients or large style blocks. \
+Do not use component, package, class, object, actor, or usecase blocks for scripts. \
+Do not place raw variable names or shell commands as free text inside PlantUML blocks. \
+Do not include Markdown or explanations outside the JSON object."
+            .to_string(),
+        _ => format!(
+            "You are an assistant that analyzes terminal output. \
 Answer in language code {language_code}. \
 Use Markdown with short headings and concise, practical content. \
 If you need to present tabular data, use Markdown tables and never ASCII-art grid tables. \
 Do not invent facts that are not supported by the provided selection. \
 If something is uncertain, say so explicitly."
-    )
+        ),
+    }
 }
 
 fn build_user_prompt(request: &AiRequestPayload) -> String {
@@ -440,8 +684,122 @@ fn build_user_prompt(request: &AiRequestPayload) -> String {
         AiAction::GenerateChatTitle => prompt.push_str(
             "Generate a short, precise title for this AI chat.\nReturn exactly one plain-text line.\nDo not use Markdown, bullets, numbering, or quotation marks.\nKeep it under 80 characters and describe the topic clearly.\n",
         ),
+        // Snippet-action user prompts are a 1:1 port of AiPromptBuilder.buildUserPrompt.
+        AiAction::GenerateSnippetMetadata => prompt.push_str(
+            "Generate metadata for a reusable script snippet.\n\
+Return exactly one JSON object with these keys:\n\
+- fileName: an ASCII file name with a suitable extension for the script language\n\
+- description: one short, precise sentence for the snippet manager\n\
+- language: the best matching snippet language identifier such as bash, python, perl, ruby, javascript, groovy, powershell, java, sql, json, yaml, xml, markdown, properties, html, dockerfile, or plain\n\
+Use only letters, digits, dash, underscore, and dot in fileName.\n",
+        ),
+        AiAction::CorrectSnippetDescription => prompt.push_str(
+            "Correct spelling and grammar in the snippet description.\n\
+Return only the corrected plain text.\n\
+Do not include hidden reasoning, analysis, or <think> tags.\n\
+Preserve the original meaning, commands, file names, code terms, and technical wording.\n",
+        ),
+        AiAction::CorrectSnippetSelectionText => prompt.push_str(
+            "Correct spelling and grammar only in the provided editable text segments.\n\
+Return exactly one JSON object with this shape:\n\
+{ \"segments\": [ { \"text\": \"...\" } ] }\n\
+Keep the same segment order.\n\
+Do not include hidden reasoning, analysis, or <think> tags.\n\
+Never rewrite or explain code.\n",
+        ),
+        AiAction::TranslateSnippetSelectionText => prompt.push_str(
+            "Translate only the provided editable text segments.\n\
+Return exactly one JSON object with this shape:\n\
+{ \"segments\": [ { \"text\": \"...\" } ] }\n\
+Keep the same segment order.\n\
+Do not include hidden reasoning, analysis, or <think> tags.\n\
+Never rewrite or explain code.\n",
+        ),
+        AiAction::DescribeSnippetSelection => prompt.push_str(
+            "Describe the selected code region technically.\n\
+Focus on the relevant responsibilities and behavior.\n\
+Do not describe every line.\n",
+        ),
+        AiAction::DescribeSnippetFull => prompt.push_str(
+            "Describe the full snippet technically.\n\
+Focus on central blocks, behavior, inputs, outputs, side effects, conditions, and risks.\n\
+Do not describe every line.\n",
+        ),
+        AiAction::GenerateSnippetAlternatives => prompt.push_str(
+            "Generate alternative solutions for the requested target scope. The target scope can be either a selected code region or the full snippet.\n\
+Return exactly one JSON object with this shape:\n\
+{ \"solutions\": [ { \"title\": \"...\", \"code\": \"...\", \"summary\": \"...\" } ] }\n\
+Each solution code must replace exactly the target scope.\n\
+Do not include explanations outside the JSON object.\n",
+        ),
+        AiAction::CompleteSnippetCode => prompt.push_str(
+            "Generate a concise completion at the cursor position.\n\
+Return exactly one JSON object with this shape:\n\
+{ \"insertText\": \"...\", \"summary\": \"...\" }\n\
+Return only text that should be inserted at the cursor.\n",
+        ),
+        AiAction::ReviewSnippetCode => prompt.push_str(
+            "Review the provided snippet context for likely errors and useful improvements.\n\
+Return exactly one JSON object with this shape:\n\
+{ \"findings\": [ { \"id\": \"R1\", \"severity\": \"medium\", \"title\": \"...\", \"detail\": \"...\", \"recommendation\": \"...\", \"line\": 1 } ] }\n\
+If there are no findings, return { \"findings\": [] }.\n",
+        ),
+        AiAction::ImproveSnippetCode => prompt.push_str(
+            "Improve the selected code region according to the requested theme.\n\
+Return exactly one JSON object with this shape:\n\
+{ \"replacement\": \"...\", \"summary\": \"...\" }\n\
+The replacement must replace only the selected region.\n",
+        ),
+        AiAction::AssistSnippetCode => prompt.push_str(
+            "Apply the user's instruction to the complete snippet.\n\
+Return exactly one JSON object with this shape:\n\
+{ \"replacement\": \"...\", \"summary\": \"...\" }\n\
+replacement must be the full updated snippet content.\n\
+Use the cursor metadata as the user's focal point and make wider changes only when required by the instruction.\n\
+Do not invent files, endpoints, configuration keys, schemas, secrets, versions, or external facts.\n",
+        ),
+        AiAction::SecurityReviewSnippetCode => prompt.push_str(
+            "Review the snippet for security issues.\n\
+Return exactly one JSON object with this shape:\n\
+{ \"findings\": [ { \"id\": \"S1\", \"severity\": \"high\", \"title\": \"...\", \"impact\": \"...\", \"recommendation\": \"...\" } ] }\n\
+Only report issues supported by the provided code.\n",
+        ),
+        AiAction::ApplySnippetSecurityFixes => prompt.push_str(
+            "Apply only the selected security findings to the full snippet.\n\
+Return exactly one JSON object with this shape:\n\
+{ \"replacement\": \"...\", \"summary\": \"...\" }\n\
+The replacement must be the full updated snippet content.\n",
+        ),
+        AiAction::GenerateSnippetOneLiner => prompt.push_str(
+            "Convert the snippet into a compact one-liner command.\n\
+Return exactly one JSON object with this shape:\n\
+{ \"command\": \"...\" }\n\
+The command must be a single line that can be pasted into a shell.\n\
+Do not use base64, heredocs, curl, wget, temporary downloads, or external URLs.\n\
+Do not invent files, endpoints, placeholders, or network locations.\n\
+Prefer readable shell separators, interpreter -e/-c flags, and safe quoting.\n",
+        ),
+        AiAction::GenerateSnippetPlantUml => prompt.push_str(
+            "Generate a compact PlantUML logical-structure diagram for the snippet.\n\
+For bash/shell or other imperative snippets, use a simple activity diagram only. Valid example syntax:\n\
+@startuml\\nstart\\n:Read configuration; <<#EAF7EF>>\\n:Run main command; <<#EAF4FF>>\\nif (command succeeds?) then (yes)\\n  :Handle success; <<#EAF7EF>>\\nelse (no)\\n  :Handle failure; <<#FDECEC>>\\nendif\\nstop\\n@enduml\n\
+Use HEX colors sparingly to distinguish setup, main work, success, and failure paths. Action lines may use :Action label; <<#RRGGBB>> syntax.\n\
+Do not use gradients or large style blocks.\n\
+Do not use component/package/class/object/actor/usecase blocks for script variables or commands.\n\
+Do not put raw variable declarations or shell commands as standalone PlantUML lines.\n\
+Each executable step must be an activity line like :Create backup archive;.\n\
+Return exactly one JSON object with this shape:\n\
+{ \"title\": \"...\", \"plantUml\": \"@startuml\\n...\\n@enduml\", \"codeReferences\": [ { \"label\": \"Create backup archive\", \"startLine\": 12, \"endLine\": 14 } ] }\n\
+Each codeReferences label must exactly match a visible activity label or decision text in plantUml.\n\
+Create a codeReferences entry for every visible activity and decision; exclude only start, stop, arrows, and merge nodes.\n\
+Use only 1-based line numbers from the line-numbered snippet context.\n",
+        ),
     }
-    prompt.push_str("Treat the selected text as the primary source of truth.\n");
+    if matches!(request.action, AiAction::AssistSnippetCode) {
+        prompt.push_str("Treat the provided full snippet as the editable source of truth.\n");
+    } else {
+        prompt.push_str("Treat the selected text as the primary source of truth.\n");
+    }
 
     if let Some(connection_name) = request
         .connection_display_name
@@ -483,13 +841,97 @@ fn build_user_prompt(request: &AiRequestPayload) -> String {
         }
     }
 
+    if matches!(request.action, AiAction::GenerateSnippetMetadata) {
+        if let Some(user_prompt) = request
+            .user_prompt
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            prompt.push_str("Detected script language: ");
+            prompt.push_str(user_prompt.trim());
+            prompt.push('\n');
+        }
+    }
+
+    if matches!(request.action, AiAction::CorrectSnippetDescription) {
+        if let Some(context) = request
+            .conversation_context
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            prompt.push_str("Detected script language: ");
+            prompt.push_str(context.trim());
+            prompt.push('\n');
+        }
+        if let Some(user_prompt) = request
+            .user_prompt
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            prompt.push_str("Description to correct:\n");
+            prompt.push_str(user_prompt.trim());
+            prompt.push('\n');
+        }
+    }
+
+    let uses_script_context = uses_snippet_script_context(&request.action);
+    if uses_script_context {
+        if let Some(user_prompt) = request
+            .user_prompt
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            prompt.push_str("Additional user instructions:\n");
+            prompt.push_str(user_prompt.trim());
+            prompt.push('\n');
+        }
+        if let Some(context) = request
+            .conversation_context
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            prompt.push_str("Snippet context:\n");
+            prompt.push_str(context.trim());
+            prompt.push('\n');
+        }
+    }
+
     if matches!(request.action, AiAction::GenerateChatTitle) {
         prompt.push_str("Focus on what the user and AI discussed, not on generic phrasing.\n");
     }
 
-    prompt.push_str("Selected terminal text:\n");
+    let uses_script_content =
+        uses_script_context || matches!(request.action, AiAction::CorrectSnippetDescription);
+    prompt.push_str(if matches!(request.action, AiAction::AssistSnippetCode) {
+        "Full script content to update:\n"
+    } else if uses_script_content {
+        "Script content for context only:\n"
+    } else {
+        "Selected terminal text:\n"
+    });
     prompt.push_str(&to_safe_text_code_block(&request.selected_text));
     prompt
+}
+
+/// Snippet actions that pass extra instructions and a snippet context block
+/// (port of the action list in `AiPromptBuilder.buildUserPrompt`).
+fn uses_snippet_script_context(action: &AiAction) -> bool {
+    matches!(
+        action,
+        AiAction::CorrectSnippetSelectionText
+            | AiAction::TranslateSnippetSelectionText
+            | AiAction::DescribeSnippetSelection
+            | AiAction::DescribeSnippetFull
+            | AiAction::GenerateSnippetAlternatives
+            | AiAction::CompleteSnippetCode
+            | AiAction::ReviewSnippetCode
+            | AiAction::ImproveSnippetCode
+            | AiAction::AssistSnippetCode
+            | AiAction::SecurityReviewSnippetCode
+            | AiAction::ApplySnippetSecurityFixes
+            | AiAction::GenerateSnippetOneLiner
+            | AiAction::GenerateSnippetPlantUml
+    )
 }
 
 fn build_http_client(
@@ -614,24 +1056,35 @@ async fn resolve_effective_model(
             let models =
                 list_local_lm_models_with_client(client, &profile.api_url, Some(&profile.api_key))
                     .await?;
-            if models.is_empty() {
-                return Err(AiError::Configuration(
-                    "LM Studio Auto model selection found no loaded local models.".into(),
-                ));
-            }
-            if models.len() == 1 {
-                return Ok(models[0].clone());
-            }
-            if !configured_model.is_empty() && models.iter().any(|model| model == configured_model)
-            {
-                return Ok(configured_model.to_string());
-            }
-            Err(AiError::Configuration(format!(
-                "LM Studio Auto model selection is ambiguous; loaded models: {}. Select one model manually.",
-                models.join(", ")
-            )))
+            select_auto_model(&models, configured_model)
         }
     }
+}
+
+/// Port of `LocalLmModelResolver.selectAutoModel`: with exactly one loaded
+/// model that model wins; with several the configured preference must be one
+/// of them, otherwise the loaded models are listed in the error.
+fn select_auto_model(
+    loaded_llm_model_keys: &[String],
+    preferred_model: &str,
+) -> Result<String, AiError> {
+    if loaded_llm_model_keys.is_empty() {
+        return Err(AiError::Configuration(
+            "No loaded local LM Studio LLM was found. Load one LLM or select a specific model."
+                .into(),
+        ));
+    }
+    if loaded_llm_model_keys.len() == 1 {
+        return Ok(loaded_llm_model_keys[0].clone());
+    }
+    let preferred = preferred_model.trim();
+    if !preferred.is_empty() && loaded_llm_model_keys.iter().any(|model| model == preferred) {
+        return Ok(preferred.to_string());
+    }
+    Err(AiError::Configuration(format!(
+        "Multiple loaded local LM Studio LLMs were found ({}). Select one model or keep the Auto preference loaded.",
+        loaded_llm_model_keys.join(", ")
+    )))
 }
 
 pub async fn list_local_lm_models(
@@ -1646,13 +2099,63 @@ fn internet_config_from_settings(
     }
 }
 
-fn normalize_reasoning_for_profile(profile: &AiProfile) -> crate::model::ai::AiReasoningEffort {
-    use crate::model::ai::AiReasoningEffort;
-    let model = profile.model.trim().to_lowercase();
-    if model.is_empty() {
-        return AiReasoningEffort::Disabled;
+fn normalize_optional_field(value: Option<String>) -> Option<String> {
+    value
+        .map(|inner| inner.trim().to_string())
+        .filter(|inner| !inner.is_empty())
+}
+
+fn normalize_reasoning_for_profile(profile: &AiProfile) -> AiReasoningEffort {
+    let allowed = available_reasoning_efforts_for_profile(profile);
+    if allowed.contains(&profile.reasoning_effort) {
+        profile.reasoning_effort.clone()
+    } else {
+        AiReasoningEffort::Disabled
     }
-    let allowed = if model.starts_with("gpt-5.1-codex-max")
+}
+
+/// Reasoning efforts KorTTY can safely expose for the profile: discovered
+/// efforts win while the discovery key still matches, CLI profiles fall back
+/// to the provider registry, HTTP profiles to the model heuristics.
+pub fn available_reasoning_efforts_for_profile(profile: &AiProfile) -> Vec<AiReasoningEffort> {
+    let discovered = discovered_reasoning_efforts(profile);
+    if !discovered.is_empty() {
+        return discovered;
+    }
+    if profile.connection_mode == AiConnectionMode::LocalCli {
+        return cli_registry::available_reasoning_efforts(
+            profile.cli_provider_id.as_deref().unwrap_or(""),
+            &profile.model,
+        );
+    }
+    available_reasoning_efforts_for_model(&profile.model)
+}
+
+fn discovered_reasoning_efforts(profile: &AiProfile) -> Vec<AiReasoningEffort> {
+    let current_key = reasoning_discovery::discovery_key(profile);
+    if profile.reasoning_discovery_key.as_deref() != Some(current_key.as_str()) {
+        return Vec::new();
+    }
+    normalize_reasoning_options(&profile.discovered_reasoning_efforts)
+}
+
+/// Deduplicates discovered efforts and guarantees `Disabled` as first option.
+pub fn normalize_reasoning_options(efforts: &[AiReasoningEffort]) -> Vec<AiReasoningEffort> {
+    let mut normalized = vec![AiReasoningEffort::Disabled];
+    for effort in efforts {
+        if !normalized.contains(effort) {
+            normalized.push(effort.clone());
+        }
+    }
+    normalized
+}
+
+fn available_reasoning_efforts_for_model(model: &str) -> Vec<AiReasoningEffort> {
+    let model = model.trim().to_lowercase();
+    if model.is_empty() {
+        return vec![AiReasoningEffort::Disabled];
+    }
+    if model.starts_with("gpt-5.1-codex-max")
         || model.starts_with("gpt-5.2")
         || model.starts_with("gpt-5.3")
         || model.starts_with("gpt-5.4")
@@ -1697,19 +2200,18 @@ fn normalize_reasoning_for_profile(profile: &AiProfile) -> crate::model::ai::AiR
         ]
     } else {
         vec![AiReasoningEffort::Disabled]
-    };
-    if allowed.contains(&profile.reasoning_effort) {
-        profile.reasoning_effort.clone()
-    } else {
-        AiReasoningEffort::Disabled
     }
 }
 
+/// Port of `AiInternetPromptSupport.isInternetEligible`. Snippet-editor AI
+/// actions form a privacy boundary: they never use internet tooling, even
+/// when the profile has an internet access mode configured.
 fn is_request_internet_eligible(request: &AiRequestPayload) -> bool {
-    matches!(
-        request.action,
-        AiAction::Summarize | AiAction::SolveProblem | AiAction::Ask
-    )
+    !request.action.is_snippet_action()
+        && matches!(
+            request.action,
+            AiAction::Summarize | AiAction::SolveProblem | AiAction::Ask
+        )
 }
 
 fn is_prompt_internet_eligible(user_prompt: &str) -> bool {
@@ -1938,6 +2440,9 @@ mod tests {
             response_language_code: Some("de".into()),
             user_prompt: Some("Explain step 2 in more detail.".into()),
             conversation_context: Some("Assistant: Summary text".into()),
+            include_ai_skills: None,
+            connection_ai_profile_id: None,
+            connection_ai_skill_ids: Vec::new(),
         };
 
         let prompt = build_user_prompt(&request);
@@ -1954,6 +2459,186 @@ mod tests {
             .expect("conversation context should be included");
         assert!(request_position < context_position);
         assert!(!prompt.contains("Summarize the selected terminal text."));
+    }
+
+    fn snippet_request(action: AiAction) -> AiRequestPayload {
+        AiRequestPayload {
+            action,
+            profile_id: "profile".into(),
+            selected_text: "echo hello".into(),
+            connection_display_name: None,
+            response_language_code: Some("de".into()),
+            user_prompt: Some("Additional theme".into()),
+            conversation_context: Some("Snippet language: bash".into()),
+            include_ai_skills: None,
+            connection_ai_profile_id: None,
+            connection_ai_skill_ids: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn assist_snippet_prompt_uses_full_snippet_as_source_of_truth() {
+        let prompt = build_user_prompt(&snippet_request(AiAction::AssistSnippetCode));
+        assert!(prompt.contains("Apply the user's instruction to the complete snippet."));
+        assert!(prompt.contains("Treat the provided full snippet as the editable source of truth."));
+        assert!(prompt.contains("Additional user instructions:\nAdditional theme"));
+        assert!(prompt.contains("Snippet context:\nSnippet language: bash"));
+        assert!(prompt.contains("Full script content to update:"));
+        assert!(!prompt.contains("Selected terminal text:"));
+    }
+
+    #[test]
+    fn snippet_actions_use_script_context_label() {
+        for action in [
+            AiAction::CompleteSnippetCode,
+            AiAction::ReviewSnippetCode,
+            AiAction::ImproveSnippetCode,
+            AiAction::SecurityReviewSnippetCode,
+            AiAction::ApplySnippetSecurityFixes,
+            AiAction::GenerateSnippetAlternatives,
+            AiAction::GenerateSnippetOneLiner,
+            AiAction::GenerateSnippetPlantUml,
+            AiAction::DescribeSnippetSelection,
+            AiAction::DescribeSnippetFull,
+            AiAction::CorrectSnippetSelectionText,
+            AiAction::TranslateSnippetSelectionText,
+        ] {
+            let prompt = build_user_prompt(&snippet_request(action.clone()));
+            assert!(
+                prompt.contains("Script content for context only:"),
+                "action {action:?} should use script context label"
+            );
+        }
+    }
+
+    #[test]
+    fn correct_snippet_description_prompt_includes_language_and_description() {
+        let prompt = build_user_prompt(&snippet_request(AiAction::CorrectSnippetDescription));
+        assert!(prompt.contains("Detected script language: Snippet language: bash"));
+        assert!(prompt.contains("Description to correct:\nAdditional theme"));
+        assert!(prompt.contains("Script content for context only:"));
+    }
+
+    #[test]
+    fn snippet_metadata_system_prompt_is_hardened() {
+        let prompt = build_system_prompt(&snippet_request(AiAction::GenerateSnippetMetadata));
+        assert!(prompt.contains("fileName, description, and language"));
+        assert!(prompt.contains("Do not include hidden reasoning, analysis, or <think> tags."));
+        assert!(prompt.contains("Do not invent files, URLs, or external facts."));
+    }
+
+    #[test]
+    fn one_liner_system_prompt_forbids_downloads() {
+        let prompt = build_system_prompt(&snippet_request(AiAction::GenerateSnippetOneLiner));
+        assert!(prompt.contains("Do not use curl, wget, temporary downloads, external URLs"));
+    }
+
+    #[test]
+    fn snippet_actions_are_never_internet_eligible() {
+        for action in [
+            AiAction::GenerateSnippetMetadata,
+            AiAction::CorrectSnippetDescription,
+            AiAction::CorrectSnippetSelectionText,
+            AiAction::TranslateSnippetSelectionText,
+            AiAction::DescribeSnippetSelection,
+            AiAction::DescribeSnippetFull,
+            AiAction::GenerateSnippetAlternatives,
+            AiAction::CompleteSnippetCode,
+            AiAction::ReviewSnippetCode,
+            AiAction::ImproveSnippetCode,
+            AiAction::AssistSnippetCode,
+            AiAction::SecurityReviewSnippetCode,
+            AiAction::ApplySnippetSecurityFixes,
+            AiAction::GenerateSnippetOneLiner,
+            AiAction::GenerateSnippetPlantUml,
+        ] {
+            assert!(
+                !is_request_internet_eligible(&snippet_request(action.clone())),
+                "action {action:?} must not be internet eligible"
+            );
+        }
+        assert!(is_request_internet_eligible(&snippet_request(
+            AiAction::Ask
+        )));
+    }
+
+    #[test]
+    fn select_auto_model_uses_single_loaded_model() {
+        let models = vec!["only-model".to_string()];
+        assert_eq!(
+            select_auto_model(&models, "").expect("single model"),
+            "only-model"
+        );
+    }
+
+    #[test]
+    fn select_auto_model_prefers_configured_model_among_multiple() {
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        assert_eq!(
+            select_auto_model(&models, "model-b").expect("preferred model"),
+            "model-b"
+        );
+    }
+
+    #[test]
+    fn select_auto_model_lists_loaded_models_when_ambiguous() {
+        let models = vec!["model-a".to_string(), "model-b".to_string()];
+        let error = select_auto_model(&models, "missing").expect_err("ambiguous selection");
+        let message = error.to_string();
+        assert!(message.contains("Multiple loaded local LM Studio LLMs were found"));
+        assert!(message.contains("model-a, model-b"));
+    }
+
+    #[test]
+    fn select_auto_model_requires_loaded_models() {
+        let error = select_auto_model(&[], "any").expect_err("no models");
+        assert!(error
+            .to_string()
+            .contains("No loaded local LM Studio LLM was found"));
+    }
+
+    #[test]
+    fn cli_profiles_keep_reasoning_effort_for_custom_models() {
+        let mut profile = AiProfile {
+            connection_mode: crate::model::ai::AiConnectionMode::LocalCli,
+            cli_provider_id: Some("claude-code".into()),
+            cli_executable_path: Some("/usr/local/bin/claude".into()),
+            cli_arguments_template: Some("{promptFile}".into()),
+            model: "custom-model".into(),
+            reasoning_effort: AiReasoningEffort::Xhigh,
+            ..AiProfile::default()
+        };
+
+        normalize_profile(&mut profile);
+
+        assert_eq!(profile.reasoning_effort, AiReasoningEffort::Xhigh);
+    }
+
+    #[test]
+    fn discovered_efforts_apply_only_while_discovery_key_matches() {
+        let mut profile = AiProfile {
+            api_url: "http://localhost:1234/v1/chat/completions".into(),
+            model: "some-model".into(),
+            reasoning_effort: AiReasoningEffort::Medium,
+            discovered_reasoning_efforts: vec![AiReasoningEffort::Medium],
+            ..AiProfile::default()
+        };
+        profile.reasoning_discovery_key = Some(reasoning_discovery::discovery_key(&profile));
+
+        assert_eq!(
+            available_reasoning_efforts_for_profile(&profile),
+            vec![AiReasoningEffort::Disabled, AiReasoningEffort::Medium]
+        );
+        normalize_profile(&mut profile);
+        assert_eq!(profile.reasoning_effort, AiReasoningEffort::Medium);
+
+        profile.model = "other-model".into();
+        assert_eq!(
+            available_reasoning_efforts_for_profile(&profile),
+            vec![AiReasoningEffort::Disabled]
+        );
+        normalize_profile(&mut profile);
+        assert_eq!(profile.reasoning_effort, AiReasoningEffort::Disabled);
     }
 
     #[test]
@@ -1979,6 +2664,7 @@ mod tests {
             used_prompt_tokens: 10,
             used_completion_tokens: 20,
             used_total_tokens: 30,
+            ..AiProfile::default()
         };
 
         let snapshot = refresh_usage(&mut profile);

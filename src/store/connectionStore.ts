@@ -38,6 +38,8 @@ export interface ConnectionSettings {
   terminalAgentCommandName?: string;
   terminalEffectPluginId?: string;
   terminalEffectAnimationSpeed: number;
+  terminalEmulationType?: string;
+  terminalColorsEnabled?: boolean;
   themeId?: string;
   jumpServer?: JumpServerConfig;
   tunnels: TunnelConfig[];
@@ -48,6 +50,10 @@ export interface ConnectionSettings {
   teamworkSourceId?: string;
   teamworkVersionToken?: string;
   teamworkRole?: string;
+  /** Fixed AI profile for this connection; empty means "use default profile". */
+  aiProfileId?: string;
+  /** AI skills assigned to this connection; always pinned into its AI prompts. */
+  aiSkillIds?: string[];
 }
 
 export interface JumpServerConfig {
@@ -170,6 +176,8 @@ export const useConnectionStore = create<ConnectionStore>((set, get) => ({
     terminalAgentCommandName: "agent",
     terminalEffectPluginId: undefined,
     terminalEffectAnimationSpeed: 1,
+    terminalEmulationType: "XTERM",
+    terminalColorsEnabled: true,
     tunnels: [],
     usageCount: 0,
     connectionSource: "Local",

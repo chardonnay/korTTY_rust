@@ -1,6 +1,7 @@
 export type TerminalRecordingScope = "ActiveSplit" | "WholeTab";
-export type TerminalRecordingState = "Recording" | "Paused" | "Stopped";
+export type TerminalRecordingState = "Idle" | "Recording" | "Paused" | "AutoPaused" | "Stopped";
 export type TerminalRecordingExportFormat = "Webm" | "Mkv";
+export type TerminalRecordingFormat = "KorttyReplay" | "Webm";
 
 export interface TerminalRecordingStartRequest {
   tabId: string;
@@ -18,6 +19,15 @@ export interface TerminalRecordingStartResponse {
   startedAtMillis: number;
 }
 
+export interface TerminalRecordingStyleRun {
+  row: number;
+  column: number;
+  text: string;
+  foreground?: string;
+  background?: string;
+  options?: string[];
+}
+
 export interface TerminalRecordingReplayEvent {
   eventType: string;
   atMillis: number;
@@ -26,6 +36,10 @@ export interface TerminalRecordingReplayEvent {
   rows?: number;
   cursorColumn?: number;
   cursorRow?: number;
+  widget?: string;
+  pixelWidth?: number;
+  pixelHeight?: number;
+  styleRuns?: TerminalRecordingStyleRun[];
 }
 
 export interface TerminalRecordingReplaySummary {
@@ -43,4 +57,27 @@ export interface TerminalRecordingReplaySummary {
 export interface TerminalRecordingReplayFile {
   summary: TerminalRecordingReplaySummary;
   events: TerminalRecordingReplayEvent[];
+}
+
+export interface TerminalRecordingReplayFrame {
+  content: string;
+  columns: number;
+  rows: number;
+  pixelWidth: number;
+  pixelHeight: number;
+  styleRuns: TerminalRecordingStyleRun[];
+  durationSeconds: number;
+}
+
+export interface TerminalRecordingReplayFrames {
+  frames: TerminalRecordingReplayFrame[];
+  totalDurationSeconds: number;
+}
+
+/** Payload of the "kortty-recording-state" backend event. */
+export interface TerminalRecordingStateEvent {
+  sessionId: string;
+  tabId: string;
+  splitId?: string;
+  state: TerminalRecordingState;
 }

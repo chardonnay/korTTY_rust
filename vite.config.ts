@@ -4,8 +4,27 @@ import path from "path";
 
 const host = process.env.TAURI_DEV_HOST;
 
+// Monaco is bundled locally and wired up through loader.config({ monaco }) in
+// src/utils/monacoSetup.ts, so the CDN fallback URL baked into
+// @monaco-editor/loader is dead code. Strip it so the build output never
+// references an external CDN.
+function stripMonacoCdnUrls() {
+  return {
+    name: "strip-monaco-cdn-urls",
+    transform(code: string, id: string) {
+      if (!id.includes("node_modules") || !code.includes("cdn.jsdelivr.net")) {
+        return null;
+      }
+      return {
+        code: code.replace(/https:\/\/cdn\.jsdelivr\.net[^"'`]*/g, ""),
+        map: null,
+      };
+    },
+  };
+}
+
 export default defineConfig(async () => ({
-  plugins: [react()],
+  plugins: [react(), stripMonacoCdnUrls()],
   resolve: {
     alias: {
       "@": path.resolve(__dirname, "./src"),
@@ -37,6 +56,9 @@ export default defineConfig(async () => ({
           }
           if (!id.includes("node_modules")) {
             return undefined;
+          }
+          if (id.includes("monaco-editor")) {
+            return "vendor-monaco";
           }
           if (id.includes("@uiw/react-codemirror")) {
             return "vendor-codemirror-core";

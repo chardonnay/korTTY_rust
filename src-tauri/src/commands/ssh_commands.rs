@@ -1,6 +1,7 @@
 use crate::model::connection::ConnectionSettings;
 use crate::ssh::session::SSHSession;
 use crate::ssh::{SSHManager, DISCONNECT_TIMEOUT, SESSION_LOCK_TIMEOUT};
+use crate::terminal_recording::TerminalRecordingStore;
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -70,6 +71,7 @@ pub async fn ssh_disconnect(
 #[tauri::command]
 pub async fn ssh_send_input(
     state: State<'_, SSHManager>,
+    recordings: State<'_, TerminalRecordingStore>,
     session_id: String,
     data: Vec<u8>,
 ) -> Result<(), String> {
@@ -80,6 +82,10 @@ pub async fn ssh_send_input(
         .await
         .map_err(|_| "Session busy or unavailable".to_string())?;
     session.send_data(&data).await.map_err(|e| e.to_string())?;
+    drop(session);
+    // Pure activity signal for the terminal recording auto-pause logic.
+    // The input itself is never recorded (privacy, Java parity).
+    recordings.record_input_activity_for_terminal(&session_id);
     Ok(())
 }
 

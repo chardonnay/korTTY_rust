@@ -42,7 +42,11 @@
     "fullscreen": "Fullscreen",
     "userGuide": "User Guide",
     "shortcuts": "Keyboard Shortcuts",
-    "about": "About KorTTY"
+    "about": "About KorTTY",
+    "toggleRecording": "Start/Stop Terminal Recording",
+    "aiPlanning": "AI Planning...",
+    "terminalOnlyFullscreen": "Terminal-only Fullscreen",
+    "hideTerminalScrollbarsFullscreen": "Hide terminal scrollbars in fullscreen"
   },
   "connection": {
     "manager": "Connection Manager",
@@ -85,7 +89,52 @@
     "background": "Background",
     "cursor": "Cursor",
     "timestamps": "Show command timestamps",
-    "logging": "Enable Terminal Logging"
+    "logging": "Enable Terminal Logging",
+    "recording": {
+      "start": "Start recording",
+      "stop": "Stop recording",
+      "indicator": {
+        "recording": "Recording",
+        "autoPaused": "Recording auto-paused"
+      },
+      "scope": {
+        "title": "Terminal recording",
+        "header": "Choose recording scope",
+        "content": "Scope:",
+        "activeSplit": "Active split",
+        "wholeTab": "Whole tab"
+      },
+      "error": {
+        "title": "Terminal recording",
+        "header": "Recording failed",
+        "notConnected": "Connect the terminal before starting a recording.",
+        "noTerminal": "No active terminal tab for recording.",
+        "disabled": "Enable terminal recording in Tools > Video Manager before starting a recording.",
+        "start": "Recording could not be started: {{message}}",
+        "stop": "Recording could not be stopped: {{message}}"
+      }
+    },
+    "dragDrop": {
+      "title": "Copy to server",
+      "count": "Copied {{done}} of {{total}} items",
+      "abort": "Abort",
+      "done": "Copy complete.",
+      "cancelled": "Copy aborted.",
+      "target": "Target: {{target}}",
+      "error": "Copy failed: {{message}}",
+      "dropHint": "Drop files to upload"
+    },
+    "context": {
+      "openSelectionInSnippetEditor": "Open selection in snippet editor"
+    },
+    "loadTextFile": {
+      "invalidSelection": "Please select exactly one file name in the current directory.",
+      "notConnected": "No active SSH connection available.",
+      "loading": "Loading {{name}} as text file...",
+      "loaded": "Text file loaded: {{path}}",
+      "binary": "The selected file is binary or not valid UTF-8 text and was not loaded: {{path}}",
+      "failed": "{{name}} could not be loaded: {{error}}"
+    }
   },
   "settings": {
     "title": "Settings",
@@ -110,7 +159,69 @@
     "keepalive": "SSH Keep-Alive",
     "keepaliveInterval": "Keep-Alive Interval (seconds)",
     "connectionTimeout": "Connection Timeout (seconds)",
-    "retryCount": "Retry Count"
+    "retryCount": "Retry Count",
+    "tab": {
+      "appearance": "Appearance",
+      "recording": "Video",
+      "logging": "Logging",
+      "updates": "Updates"
+    },
+    "appearance": {
+      "appDesign": "App Design:",
+      "appDesignInfo": "Applies to app windows and dialogs. Terminal sessions and editor content keep their own color settings.",
+      "preview": "Preview:",
+      "design": {
+        "normal": "Normal",
+        "matrixTerminal": "Matrix Terminal",
+        "holographicInterface": "Holographic Interface",
+        "klingonTactical": "Klingon Tactical",
+        "elegantDark": "Elegant Dark"
+      }
+    },
+    "updates": {
+      "header": "Update checks",
+      "automatic": "Check automatically for KorTTY updates",
+      "automaticTooltip": "When enabled, KorTTY checks GitHub releases in the background.",
+      "interval": "Check interval:",
+      "intervalDays": "Every {{days}} day(s)",
+      "info": "Automatic checks only show a dialog when a newer compatible version is available. Manual checks are available in the About dialog."
+    },
+    "logging": {
+      "header": "Log files",
+      "directory": "Log directory:",
+      "directoryInfo": "Default: {{path}}",
+      "directoryChoose": "Choose log directory",
+      "retention": "Keep logs:",
+      "retentionInfo": "0 = unlimited. Oldest log archives are deleted automatically.",
+      "compressionInfo": "Log archives older than 24 hours are compressed automatically.",
+      "restartRequired": "Log directory changes take effect after restarting KorTTY.",
+      "days": "day(s)"
+    },
+    "ai": {
+      "terminalAgentExecutionEnabled": "Enable AI Agent execution",
+      "terminalAgentExecutionEnabledHint": "When disabled, executable AI Agent runs and plan implementation are unavailable. AI Planning and Ask AI Agent remain available.",
+      "terminalAgentConfirmMutatingCommandSets": "Ask before AI Agent changes the target system",
+      "terminalAgentConfirmMutatingCommandSetsHint": "When enabled, command sets that create, delete, modify files, or otherwise change the target system require confirmation. Read-only actions do not ask."
+    },
+    "snippetEditor": {
+      "title": "Snippet Editor",
+      "info": "These settings override the terminal/editor defaults for the Snippet Manager and Snippet Edit dialog. Leave empty or 0 to inherit from the general settings.",
+      "fontFamily": "Font Family",
+      "fontSize": "Font Size",
+      "fontSizeInfo": "(0 = inherit from terminal)",
+      "foreground": "Foreground Color",
+      "background": "Background Color",
+      "cursorStyle": "Cursor Style",
+      "cursorColor": "Cursor Color",
+      "wordWrap": "Word Wrap",
+      "lineNumbers": "Line numbers",
+      "historyMax": "History entries (max)",
+      "diagramBackground": "Diagram background color",
+      "aiInstructionsEnabled": "Show optional additional AI instructions in the snippet editor",
+      "alternativeSolutionCount": "Maximum number of alternative solutions",
+      "profile": "Profile",
+      "manageProfiles": "Manage profiles..."
+    }
   },
   "credential": {
     "manager": "Credential Manager",
@@ -141,16 +252,268 @@
   },
   "snippet": {
     "manager": "Snippet Manager",
+    "diagram": {
+      "button": "Diagram",
+      "title": "Snippet diagrams",
+      "script": "Script: {{name}}",
+      "unnamed": "(unnamed snippet)",
+      "empty": "No diagrams are saved for this snippet yet.",
+      "current": "Diagram is up to date.",
+      "stale": "Diagram may be outdated because the snippet changed.",
+      "rendering": "Rendering locally...",
+      "renderFailed": "Local rendering unavailable: {{error}}",
+      "regenerate": "Regenerate",
+      "generate": "Generate diagram",
+      "generating": "Generating PlantUML diagram...",
+      "ready": "Diagram ready. Save the snippet to persist it.",
+      "failed": "Could not generate the PlantUML diagram.",
+      "instructions": "Instruction:",
+      "instructionsHint": "Optional parameters for the diagram",
+      "copyPlantUml": "Copy PlantUML",
+      "copied": "PlantUML code copied to clipboard.",
+      "backgroundColor": "Background:",
+      "readableColors": "Apply readable colors",
+      "readableColorsApplied": "Readable colors applied.",
+      "saveSvg": "Save SVG",
+      "exportSaved": "Saved: {{path}}",
+      "exportFailed": "Export failed: {{error}}",
+      "delete": "Delete",
+      "typeLogicalStructure": "Logical structure",
+      "codeReference": {
+        "line": "Line {{line}}",
+        "lines": "Lines {{start}}-{{end}}"
+      }
+    },
     "name": "Name",
     "category": "Category",
     "content": "Content",
     "favorite": "Favorite",
     "variables": "Variables",
     "search": "Search snippets...",
-    "importExport": "Import/Export"
+    "importExport": "Import/Export",
+    "unnamed": "(unnamed)",
+    "saveAsNew": "Save as new snippet",
+    "copySuffix": " (Copy)",
+    "formatter": {
+      "builtIn": "Built-in",
+      "bundled": "Bundled",
+      "external": "External",
+      "unavailable": "Unavailable"
+    },
+    "ai": {
+      "copy": "Copy to clipboard",
+      "copied": "Copied to clipboard.",
+      "noProfile": "No AI profile configured.",
+      "noTextSegments": "The current selection does not contain any editable comments or user-facing text segments.",
+      "context": {
+        "assistant": "AI Assistant...",
+        "complete": "AI Complete",
+        "autoComplete": "Auto AI Complete",
+        "review": "Review errors and improvements",
+        "improveReadability": "Improve readability",
+        "improveRobustness": "Improve robustness",
+        "improvePerformance": "Improve performance",
+        "improveCustom": "Custom improvement...",
+        "alternatives": "Alternative solutions",
+        "security": "Security Check",
+        "describe": "Technical description",
+        "correctSelection": "Correct spelling in selection",
+        "translateSelection": "Translate selection..."
+      },
+      "assistant": {
+        "title": "AI Assistant",
+        "header": "Describe what KorTTY should change at the current cursor position.",
+        "instruction": "Instruction:",
+        "prompt": "Example: add new parameters for directory names",
+        "cursor": "Cursor: offset {{offset}}, line {{line}}, column {{column}}",
+        "skills": "Consider AI Skills",
+        "skillsTooltip": "Enabled Chat/Functions AI Skills can be added to this request when relevant.",
+        "skillsUnavailable": "No enabled Chat/Functions AI Skills are available in global settings.",
+        "running": "AI assistant is updating the snippet...",
+        "empty": "No usable AI assistant result was returned.",
+        "failed": "AI assistant failed.",
+        "applied": "AI assistant change applied.",
+        "diffTitle": "Review AI assistant change"
+      },
+      "complete": {
+        "running": "Generating completion suggestion...",
+        "empty": "No usable completion suggestion was returned.",
+        "discarded": "Completion discarded because the editor changed.",
+        "ready": "Completion suggestion ready. Press Tab to insert.",
+        "failed": "Completion suggestion failed."
+      },
+      "autocomplete": {
+        "warningTitle": "Enable automatic AI completion",
+        "warningHeader": "Auto completion can send snippet content repeatedly while it is enabled.",
+        "warningContent": "KorTTY will request suggestions after you pause at a cursor position. Keep this disabled for sensitive snippets unless you trust the configured AI endpoint.",
+        "enabled": "Automatic AI completion enabled.",
+        "disabled": "Automatic AI completion disabled."
+      },
+      "review": {
+        "title": "AI code review",
+        "info": "The report is informational. The editor content is not changed. Click a finding with a line number to select it in the editor.",
+        "empty": "No findings were returned.",
+        "recommendation": "Recommendation:",
+        "running": "Reviewing code...",
+        "ready": "Code review ready.",
+        "failed": "Code review failed.",
+        "theme": "Find likely errors and practical improvement opportunities.",
+        "colSeverity": "Severity",
+        "colTitle": "Title",
+        "colLine": "Line"
+      },
+      "improve": {
+        "running": "Generating improved code...",
+        "empty": "No usable replacement was returned.",
+        "failed": "Code improvement failed.",
+        "applied": "Improved code applied.",
+        "selectFirst": "Select a code region before requesting an AI rewrite.",
+        "readabilityTheme": "Improve readability without changing behavior.",
+        "robustnessTheme": "Improve robustness, error handling, and edge-case behavior without unrelated changes.",
+        "performanceTheme": "Improve performance without changing externally visible behavior.",
+        "customTitle": "Custom AI improvement",
+        "customHeader": "Describe how the selected code should be improved.",
+        "customPrompt": "Instruction:"
+      },
+      "diff": {
+        "title": "Review AI change",
+        "summaryEmpty": "Review the replacement before applying it.",
+        "original": "Original",
+        "replacement": "AI replacement",
+        "apply": "Apply change"
+      },
+      "security": {
+        "title": "Security Check",
+        "info": "Select only the findings you want the AI to fix. Unselected findings are not applied.",
+        "empty": "No security findings were returned.",
+        "applySelected": "Apply selected fixes",
+        "running": "Running security check...",
+        "ready": "Security report ready.",
+        "failed": "Security check failed.",
+        "fixRunning": "Generating selected security fixes...",
+        "fixEmpty": "No usable security fix was returned.",
+        "fixFailed": "Security fix generation failed.",
+        "fixApplied": "Selected security fixes applied.",
+        "diffTitle": "Review security fixes"
+      },
+      "alternatives": {
+        "title": "Alternative solutions",
+        "instructionsPrompt": "Optional instructions for the AI, for example \"use only Bash builtins\"",
+        "reload": "Generate new alternatives",
+        "loading": "Generating alternative solutions...",
+        "empty": "No usable alternative solutions were returned.",
+        "loaded": "{{count}} alternative solutions ready.",
+        "failed": "Alternative solutions could not be generated.",
+        "apply": "Apply",
+        "applied": "Alternative solution applied to the selected code.",
+        "scopeSelection": "Target scope: selected code region",
+        "scopeWhole": "Target scope: full snippet"
+      },
+      "describe": {
+        "dialogTitle": "Technical description",
+        "commentSyntax": "Use comment syntax of the current snippet language",
+        "lineWidth": "Line width:",
+        "copy": "Copy to clipboard",
+        "insert": "Insert into snippet",
+        "info": "The generated description is shown below. You can copy it or insert it into the snippet.",
+        "generating": "Generating technical description...",
+        "generated": "Technical description ready.",
+        "generateFailed": "Technical description could not be generated.",
+        "inserted": "Technical description inserted into the snippet."
+      },
+      "selection": {
+        "correcting": "Correcting selected text...",
+        "corrected": "Selected text corrected.",
+        "correctFailed": "Selected text could not be corrected.",
+        "translating": "Translating selected text...",
+        "translated": "Selected text translated.",
+        "translateFailed": "Selected text could not be translated.",
+        "translateTitle": "Translate snippet text",
+        "translatePrompt": "Select the target language for the selected user-facing text:"
+      },
+      "format": {
+        "fallbackTitle": "Use AI formatting?",
+        "fallbackHeader": "Local formatting is not available for this action.",
+        "fallbackContent": "{{reason}}\n\nDo you want KorTTY to request an AI-assisted code format instead? The AI result will be shown as a preview before it is applied.",
+        "unavailable": "{{reason}}\n\nNo AI code-improvement provider is configured.",
+        "notSupported": "No formatter available for {{language}}",
+        "providerUnavailable": "Formatter unavailable: {{name}}",
+        "widthNotSupported": "Line-width formatting is not supported for {{language}}.",
+        "theme": "Format this code. Preserve behavior exactly, keep the same programming language, do not add explanations, and do not make unrelated changes.",
+        "widthTheme": "Format this code to a maximum line width of {{width}} characters where syntax-safely possible. Preserve behavior exactly, keep the same programming language, do not add explanations, and do not make unrelated changes.",
+        "running": "AI formatting is running...",
+        "empty": "No usable AI formatting result was returned.",
+        "failed": "AI formatting failed.",
+        "applied": "AI formatting applied.",
+        "diffTitle": "Review AI formatting"
+      }
+    },
+    "ruler": {
+      "tooltip": "Click the ruler to set the maximum line-length marker. Right-click the marker to format to this width or remove it.",
+      "position": "Column {{column}}",
+      "caretTooltip": "Position {{column}}",
+      "limit": "Limit {{limit}}",
+      "formatToLimit": "Format to {{limit}} characters per line",
+      "clearLimit": "Remove line-length marker",
+      "formatSuccess": "Formatted to max {{limit}} characters per line."
+    },
+    "history": {
+      "label": "History",
+      "position": "History: {{index}} / {{total}}",
+      "restore": "Restore"
+    },
+    "diff": {
+      "compare": "Compare",
+      "title": "Snippet Diff",
+      "left": "Left: {{name}} ({{language}})",
+      "right": "Right: {{name}} ({{language}})",
+      "hint": "Select exactly two snippets."
+    },
+    "profile": {
+      "title": "Snippet Editor Profiles",
+      "newTitle": "New Snippet Editor Profile",
+      "editTitle": "Edit Snippet Editor Profile",
+      "namePrompt": "Profile name",
+      "presets": "Presets",
+      "custom": "Custom profiles",
+      "new": "New custom profile...",
+      "current": "Custom colors",
+      "builtInHint": "Built-in profiles are read-only. Create a custom profile to change colors.",
+      "preview": "Preview",
+      "label": "Profile",
+      "manage": "Manage profiles...",
+      "comment": "Comment",
+      "string": "String",
+      "number": "Number",
+      "boolean": "Boolean/null",
+      "key": "Key",
+      "keyword": "Keyword",
+      "section": "Section",
+      "variable": "Variable",
+      "brace": "Brace"
+    }
   },
   "sftp": {
     "title": "SFTP Manager",
+    "saveAs": {
+      "menu": "Save as…",
+      "overwriteRemote": "Overwrite remote file",
+      "overwriteLocal": "Overwrite local file",
+      "saveSnippet": "Save as snippet",
+      "remoteTitle": "Save remote file as",
+      "remoteHeader": "New file name in the same remote folder",
+      "remoteLabel": "File name:",
+      "invalidFileName": "Invalid file name: {{name}}",
+      "confirmOverwrite": "The target file already exists. Overwrite {{path}}?",
+      "savedFile": "File saved: {{path}}",
+      "savedSnippet": "Snippet saved: {{name}}",
+      "saveFailed": "Could not save file: {{error}}",
+      "error": {
+        "empty": "The file name must not be empty.",
+        "dots": "The file name must not be '.' or '..'.",
+        "separators": "The file name must not contain path separators."
+      }
+    },
     "local": "Local",
     "remote": "Remote",
     "name": "Name",
@@ -166,7 +529,14 @@
     "rename": "Rename",
     "newFolder": "New Folder",
     "refresh": "Refresh",
-    "search": "Search..."
+    "search": "Search...",
+    "fallback": {
+      "notice": "SFTP subsystem unavailable — using command-line fallback"
+    },
+    "error": {
+      "subsystemRejected": "The SFTP subsystem was rejected or closed by the server after successful SSH authentication; no SFTP version was negotiated. Check whether SFTP is enabled for this target or the SSH proxy.",
+      "startFailed": "The SFTP subsystem could not be started after successful SSH authentication."
+    }
   },
   "backup": {
     "createTitle": "Create Backup",
@@ -186,11 +556,102 @@
   },
   "quickConnect": {
     "title": "Quick Connect",
-    "frequentlyUsed": "Frequently Used"
+    "frequentlyUsed": "Frequently Used",
+    "terminalEmulation": "Terminal emulation",
+    "terminalColors": "Enable terminal colors"
   },
   "dashboard": {
     "title": "Dashboard",
     "noConnections": "No active connections"
+  },
+  "recording": {
+    "manager": {
+      "title": "Video Manager",
+      "header": "Manage terminal replay recordings and optional video export.",
+      "enabled": "Enable terminal recording for this app session",
+      "storagePath": "Storage path",
+      "format": "Default format",
+      "formatKorttyReplay": "KorTTY Replay",
+      "formatWebm": "WebM",
+      "defaultScope": "Default scope",
+      "scopeActiveSplit": "Active split",
+      "scopeWholeTab": "Whole tab",
+      "captureColors": "Capture terminal colors in new recordings",
+      "autoPause": "Auto-pause when the terminal is idle",
+      "idleSeconds": "Idle threshold (seconds)",
+      "ffmpegPath": "ffmpeg path",
+      "browse": "Browse...",
+      "checkFfmpeg": "Check",
+      "ffmpegAvailable": "ffmpeg available; video export enabled.",
+      "ffmpegMissing": "ffmpeg not available; video export disabled.",
+      "recordings": "Replay recordings",
+      "refresh": "Refresh",
+      "save": "Save",
+      "chooseDirectory": "Choose recording folder",
+      "done": "Done",
+      "saveFailed": "Settings could not be saved: {{error}}",
+      "refreshFailed": "Recordings could not be loaded: {{error}}",
+      "view": "View",
+      "rename": "Rename...",
+      "delete": "Delete",
+      "export": "Export...",
+      "viewFailed": "Replay could not be opened: {{error}}",
+      "renameTitle": "Rename replay",
+      "renameHeader": "Choose a new replay name",
+      "renameContent": "Name:",
+      "renameSuccess": "Replay renamed: {{name}}",
+      "renameFailed": "Replay could not be renamed: {{error}}",
+      "deleteTitle": "Delete replay",
+      "deleteContent": "This deletes {{name}}. This cannot be undone.",
+      "deleteSuccess": "Replay deleted: {{name}}",
+      "deleteFailed": "Replay could not be deleted: {{error}}",
+      "exportSuccess": "Video exported: {{path}}",
+      "exportFailed": "Video export failed: {{error}}",
+      "noRecordings": "No recordings found.",
+      "selectRecording": "Select a recording.",
+      "duration": "Duration",
+      "eventCount": "{{count}} events",
+      "exportOptions": {
+        "title": "Export options",
+        "header": "Choose range, color, and format",
+        "format": "Format",
+        "formatWebm": "WebM (VP9)",
+        "formatMkv": "MKV (FFV1)",
+        "duration": "Recorded duration: {{duration}}",
+        "all": "Export entire recording",
+        "start": "Start",
+        "end": "End",
+        "includeColor": "Include terminal colors",
+        "invalidRange": "Enter a valid time range between 0:00 and {{max}}."
+      },
+      "exportProgress": {
+        "title": "Export video",
+        "header": "Exporting replay to video",
+        "preparing": "Preparing export...",
+        "rendering": "Rendering frames...",
+        "encoding": "Encoding video...",
+        "finalizing": "Finalizing export...",
+        "message": "{{phase}} Estimated remaining: {{remaining}}",
+        "remainingCalculating": "calculating..."
+      }
+    },
+    "viewer": {
+      "title": "Replay viewer",
+      "play": "Play",
+      "pause": "Pause",
+      "stop": "Stop",
+      "empty": "No replay frames were recorded.",
+      "status": "Frame {{current}} / {{total}}",
+      "timeline": "Timeline",
+      "time": "{{position}} / {{total}}",
+      "timeJump": "Time jump:",
+      "seek": "Go",
+      "seekInvalid": "Enter a time between 0:00 and {{max}}.",
+      "speed": "Speed:",
+      "speedSuffix": "x",
+      "loading": "Loading replay...",
+      "loadFailed": "Replay could not be opened: {{error}}"
+    }
   },
   "common": {
     "ready": "Ready",
@@ -204,5 +665,183 @@
     "add": "Add",
     "edit": "Edit",
     "search": "Search..."
+  },
+  "updates": {
+    "checkNow": "Check for updates",
+    "checking": "Checking for updates...",
+    "manual": {
+      "current": "You already have the latest KorTTY version."
+    },
+    "available": {
+      "short": "KorTTY {{version}} is available."
+    },
+    "noCompatibleAsset": "A newer KorTTY version is available, but no compatible download was found for this platform.",
+    "checkFailed": "Update check failed.",
+    "checkFailedDetail": "Update check failed: {{message}}",
+    "dialog": {
+      "title": "KorTTY update available",
+      "header": "KorTTY {{version}} is available",
+      "installedVersion": "Installed version:",
+      "availableVersion": "Available version:",
+      "downloadAsset": "Download:",
+      "downloadTargetInfo": "The file will be downloaded to:"
+    },
+    "downloadAction": "Download",
+    "remindTomorrow": "Remind tomorrow",
+    "skipVersion": "Skip this version",
+    "download": {
+      "title": "Downloading KorTTY update",
+      "header": "Downloading {{version}}",
+      "running": "Downloading {{asset}}...",
+      "complete": {
+        "title": "Download complete"
+      },
+      "completeInfo": "The update was downloaded to:",
+      "failed": {
+        "title": "Download failed"
+      },
+      "failedInfo": "The update could not be downloaded.",
+      "openFolder": "Open folder"
+    }
+  },
+  "connEdit": {
+    "terminalEmulation": "Terminal emulation",
+    "terminalColors": "Enable terminal colors",
+    "aiTab": "AI",
+    "aiProfile": "AI profile:",
+    "aiProfileDefault": "Use default profile",
+    "aiProfileMissing": "Stored profile (currently unavailable)",
+    "aiProfileHint": "If the selected profile is not available, the default AI profile is used until it is available again.",
+    "aiSkills": "Connection skills:",
+    "aiSkillsHint": "Assigned skills are always included for AI requests in this connection. Skills with target \"Connection\" are only used for connections they are assigned to.",
+    "aiSkillsNone": "No AI skills saved yet."
+  },
+  "filebrowser": {
+    "title": "Local File Browser",
+    "showHidden": "Show Hidden Files",
+    "selected": "selected",
+    "copied": "{{count}} item(s) copied",
+    "confirmDelete": "Delete {{count}} item(s)?",
+    "context": {
+      "open": "Open",
+      "loadAsTextFile": "Load as text file",
+      "copy": "Copy",
+      "cut": "Cut",
+      "paste": "Paste",
+      "delete": "Delete",
+      "selectAll": "Select All",
+      "details": "Details",
+      "archive": "Archive",
+      "newFolder": "New Folder",
+      "newFile": "New File"
+    },
+    "newFolder": {
+      "title": "New Folder",
+      "header": "Enter folder name"
+    },
+    "newFile": {
+      "title": "New File",
+      "header": "Enter file name"
+    },
+    "rename": {
+      "title": "Rename",
+      "header": "Enter new name"
+    },
+    "archive": {
+      "title": "Archive",
+      "header": "Enter archive file name",
+      "created": "Archive created"
+    },
+    "folder": {
+      "created": "Folder created"
+    },
+    "file": {
+      "created": "File created"
+    },
+    "error": {
+      "accessDenied": "Access denied",
+      "paste": "Paste error",
+      "delete": "Delete error",
+      "archive": "Archive error",
+      "createFolder": "Create folder error",
+      "createFile": "Create file error",
+      "cannotOpen": "Cannot open file",
+      "rename": "Rename error"
+    },
+    "details": {
+      "type": "Type",
+      "folder": "Folder",
+      "file": "File",
+      "size": "Size",
+      "path": "Path",
+      "modified": "Modified",
+      "permissions": "Permissions",
+      "owner": "Owner",
+      "group": "Group"
+    },
+    "setOwner": {
+      "title": "Set Owner/Permissions",
+      "header": "Set owner and permissions for {{count}} item(s)",
+      "ownerUser": "User:",
+      "ownerGroup": "Group:",
+      "permissions": "Permissions:",
+      "recursive": "Apply recursively to directories",
+      "infoSeparate": "Leave empty to keep current value.\nOwner/group lists are best-effort; you can type another valid name.\nPermissions: octal format like 755 or 644",
+      "success": "Changed {{count}} item(s)",
+      "errorCount": "Failed to change {{failed}} of {{total}} items.",
+      "notSupported": "Owner or POSIX permissions are not supported by this file system.",
+      "invalid": "Invalid input"
+    }
+  },
+  "ai": {
+    "manager": {
+      "title": "AI Manager",
+      "tabProfiles": "Profiles",
+      "tabChats": "Saved Chats",
+      "defaultProfile": "Default profile:",
+      "defaultProfileNone": "First available profile",
+      "defaultProfileHint": "The default profile is also used by terminal AI actions and by the terminal AI Agent when no other profile is selected.",
+      "defaultProfileSaved": "Default profile saved.",
+      "defaultMarker": "Default",
+      "profileUnnamed": "Unnamed profile",
+      "connectionMode": "Connection",
+      "connectionModeHttp": "HTTP API",
+      "connectionModeCli": "Local CLI",
+      "model": "Model",
+      "modelRefresh": "Refresh available models",
+      "cli": {
+        "provider": "CLI provider",
+        "executable": "CLI executable",
+        "executablePrompt": "Leave empty to use a verified provider command candidate",
+        "statusInstalled": "Found: {{path}}",
+        "statusNotInstalled": "No verified provider CLI found on PATH. Configure an executable and argument template.",
+        "statusCustom": "Custom executable: {{path}}",
+        "statusCustomUnverified": "Custom executable configured but not verified as executable: {{path}}",
+        "arguments": "CLI arguments",
+        "argumentsPrompt": "One argument per line or a quoted inline template. Use {promptFile}, {systemPromptFile}, {userPromptFile}, {model}, {reasoning}, {stdinPrompt}.",
+        "insertPreset": "Insert preset",
+        "presetInserted": "Inserted argument preset \"{{label}}\".",
+        "presetMissing": "This provider has no verified argument preset.",
+        "model": "Model",
+        "modelPrompt": "Enter a provider-specific model name"
+      },
+      "reasoning": {
+        "label": "Reasoning Effort",
+        "refresh": "Refresh reasoning options",
+        "refreshSuccess": "Reasoning options refreshed: {{options}}",
+        "refreshNone": "This profile accepted no additional reasoning parameter.",
+        "refreshFailed": "Reasoning refresh failed",
+        "rediscover": "The profile configuration changed since the last discovery. Refresh the reasoning options.",
+        "option": {
+          "disabled": "Disabled",
+          "none": "None",
+          "minimal": "Minimal",
+          "low": "Low",
+          "medium": "Medium",
+          "high": "High",
+          "xhigh": "Extra high"
+        }
+      }
+    }
   }
 }

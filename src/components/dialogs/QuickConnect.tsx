@@ -1,9 +1,12 @@
 import { useEffect, useState } from "react";
 import { X, Zap } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
+import { useTranslation } from "react-i18next";
 import { ConnectionSettings, useConnectionStore } from "../../store/connectionStore";
+import { TerminalEmulationSelect } from "../common/TerminalEmulationSelect";
 import type { GlobalSettings } from "../../store/settingsStore";
 import type { TerminalEffectPluginEntry } from "../../types/terminalEffects";
+import type { AiProfile, AiSkill } from "../../types/ai";
 
 interface QuickConnectProps {
   open: boolean;
@@ -24,6 +27,10 @@ interface QuickConnectProps {
     connectionProtocol: "TcpIp" | "Mosh";
     terminalEffectPluginId?: string;
     terminalEffectAnimationSpeed?: number;
+    terminalEmulationType?: string;
+    terminalColorsEnabled?: boolean;
+    aiProfileId?: string;
+    aiSkillIds?: string[];
   }) => void;
 }
 
@@ -41,6 +48,7 @@ interface SimpleCredential {
 }
 
 export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
+  const { t } = useTranslation();
   const { connections, saveConnection, getDefaultConnection } = useConnectionStore();
   const [host, setHost] = useState("");
   const [port, setPort] = useState(22);
@@ -56,18 +64,26 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
   const [connectionProtocol, setConnectionProtocol] = useState<"TcpIp" | "Mosh">("TcpIp");
   const [terminalEffectPluginId, setTerminalEffectPluginId] = useState("");
   const [terminalEffectAnimationSpeed, setTerminalEffectAnimationSpeed] = useState(1);
+  const [terminalEmulationType, setTerminalEmulationType] = useState("XTERM");
+  const [terminalColorsEnabled, setTerminalColorsEnabled] = useState(true);
   const [saveAsConnection, setSaveAsConnection] = useState(false);
   const [connectionName, setConnectionName] = useState("");
   const [sshKeys, setSshKeys] = useState<SimpleSshKey[]>([]);
   const [credentials, setCredentials] = useState<SimpleCredential[]>([]);
   const [credentialId, setCredentialId] = useState("");
   const [terminalEffects, setTerminalEffects] = useState<TerminalEffectPluginEntry[]>([]);
+  const [aiProfiles, setAiProfiles] = useState<AiProfile[]>([]);
+  const [aiSkills, setAiSkills] = useState<AiSkill[]>([]);
+  const [aiProfileId, setAiProfileId] = useState("");
+  const [aiSkillIds, setAiSkillIds] = useState<string[]>([]);
 
   useEffect(() => {
     if (!open) return;
     invoke<SimpleSshKey[]>("get_ssh_keys").then(setSshKeys).catch(console.error);
     invoke<SimpleCredential[]>("get_credentials").then(setCredentials).catch(console.error);
     invoke<TerminalEffectPluginEntry[]>("list_terminal_effect_plugins").then(setTerminalEffects).catch(console.error);
+    invoke<AiProfile[]>("get_ai_profiles").then(setAiProfiles).catch(console.error);
+    invoke<AiSkill[]>("get_ai_skills").then(setAiSkills).catch(console.error);
     invoke<GlobalSettings>("get_settings")
       .then((settings) => {
         setTerminalEffectPluginId(settings.lastQuickConnectTerminalEffectPluginId || settings.defaultTerminalEffectPluginId || "");
@@ -109,6 +125,10 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
           connectionProtocol,
           terminalEffectPluginId: terminalEffectPluginId || undefined,
           terminalEffectAnimationSpeed,
+          terminalEmulationType: terminalEmulationType || undefined,
+          terminalColorsEnabled,
+          aiProfileId: aiProfileId || undefined,
+          aiSkillIds,
         });
       }
       invoke<GlobalSettings>("get_settings")
@@ -138,6 +158,10 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
         connectionProtocol,
         terminalEffectPluginId: terminalEffectPluginId || undefined,
         terminalEffectAnimationSpeed,
+        terminalEmulationType: terminalEmulationType || undefined,
+        terminalColorsEnabled,
+        aiProfileId: aiProfileId || undefined,
+        aiSkillIds,
       });
       onClose();
     }
@@ -160,6 +184,10 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
       connectionProtocol: conn.connectionProtocol || "TcpIp",
       terminalEffectPluginId: conn.terminalEffectPluginId,
       terminalEffectAnimationSpeed: conn.terminalEffectAnimationSpeed,
+      terminalEmulationType: conn.terminalEmulationType,
+      terminalColorsEnabled: conn.terminalColorsEnabled ?? true,
+      aiProfileId: conn.aiProfileId,
+      aiSkillIds: conn.aiSkillIds,
     });
     onClose();
   }
@@ -361,6 +389,24 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
               <option value="Mosh">MOSH</option>
             </select>
           </div>
+          <div>
+            <label className="block text-[10px] text-kortty-text-dim mb-1">
+              {t("quickConnect.terminalEmulation")}
+            </label>
+            <TerminalEmulationSelect
+              value={terminalEmulationType}
+              onChange={setTerminalEmulationType}
+            />
+          </div>
+          <label className="flex items-center gap-2 text-xs">
+            <input
+              type="checkbox"
+              checked={terminalColorsEnabled}
+              onChange={(e) => setTerminalColorsEnabled(e.target.checked)}
+              className="rounded"
+            />
+            {t("quickConnect.terminalColors")}
+          </label>
           <div className="grid grid-cols-2 gap-2">
             <div>
               <label className="block text-[10px] text-kortty-text-dim mb-1">Terminal Effect</label>
@@ -389,6 +435,68 @@ export function QuickConnect({ open, onClose, onConnect }: QuickConnectProps) {
               />
             </div>
           </div>
+          <div>
+            <label className="block text-[10px] text-kortty-text-dim mb-1">
+              {t("connEdit.aiProfile")}
+            </label>
+            <select
+              className="input-field"
+              value={aiProfileId}
+              onChange={(e) => setAiProfileId(e.target.value)}
+            >
+              <option value="">{t("connEdit.aiProfileDefault")}</option>
+              {[...aiProfiles]
+                .sort((left, right) =>
+                  (left.name || left.id).localeCompare(right.name || right.id, undefined, {
+                    sensitivity: "base",
+                  }),
+                )
+                .map((profile) => (
+                  <option key={profile.id} value={profile.id}>
+                    {profile.name || profile.id}
+                  </option>
+                ))}
+            </select>
+          </div>
+          {aiSkills.some((skill) => skill.target === "Connection") && (
+            <div>
+              <label className="block text-[10px] text-kortty-text-dim mb-1">
+                {t("connEdit.aiSkills")}
+              </label>
+              <div className="rounded border border-kortty-border bg-kortty-panel/30 max-h-32 overflow-y-auto p-2 space-y-1">
+                {aiSkills
+                  .filter((skill) => skill.target === "Connection")
+                  .sort((left, right) =>
+                    (left.name || "").localeCompare(right.name || "", undefined, {
+                      sensitivity: "base",
+                    }),
+                  )
+                  .map((skill) => (
+                    <label
+                      key={skill.id}
+                      className="flex items-center gap-2 text-xs cursor-pointer select-none"
+                    >
+                      <input
+                        type="checkbox"
+                        className="rounded"
+                        checked={aiSkillIds.includes(skill.id)}
+                        onChange={(e) =>
+                          setAiSkillIds((current) =>
+                            e.target.checked
+                              ? current.includes(skill.id)
+                                ? current
+                                : [...current, skill.id]
+                              : current.filter((id) => id !== skill.id),
+                          )
+                        }
+                      />
+                      <span className="truncate">{skill.name || skill.id}</span>
+                    </label>
+                  ))}
+              </div>
+              <p className="mt-1 text-[10px] text-kortty-text-dim">{t("connEdit.aiSkillsHint")}</p>
+            </div>
+          )}
           <label className="flex items-center gap-2 text-xs">
             <input
               type="checkbox"
