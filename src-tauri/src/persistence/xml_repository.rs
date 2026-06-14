@@ -1,8 +1,20 @@
 use anyhow::Result;
 use serde::{de::DeserializeOwned, Serialize};
 use std::path::PathBuf;
+use std::sync::OnceLock;
+
+static CONFIG_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Override the config directory for test mode. Must be called before the
+/// first `config_dir()` invocation (i.e. at the start of `run()`).
+pub fn set_config_dir_override(path: PathBuf) {
+    let _ = CONFIG_DIR_OVERRIDE.set(path);
+}
 
 pub fn config_dir() -> Result<PathBuf> {
+    if let Some(path) = CONFIG_DIR_OVERRIDE.get() {
+        return Ok(path.clone());
+    }
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Cannot find home directory"))?;
     let dir = home.join(".kortty");
     if !dir.exists() {

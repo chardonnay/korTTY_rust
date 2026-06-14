@@ -491,6 +491,12 @@
       "section": "Section",
       "variable": "Variable",
       "brace": "Klammer"
+    },
+    "fullscreen": {
+      "open": "Im Vollbild-Editor öffnen",
+      "save": "Speichern",
+      "format": "Formatieren",
+      "exit": "Vollbild schließen (Esc)"
     }
   },
   "sftp": {
@@ -841,6 +847,11 @@
           "high": "Hoch",
           "xhigh": "Extra hoch"
         }
+      }
+    },
+    "agent": {
+      "error": {
+        "noTerminal": "Kein verbundenes Terminal ist aktiv."
       }
     }
   }

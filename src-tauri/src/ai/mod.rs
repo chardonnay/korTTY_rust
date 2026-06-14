@@ -1053,12 +1053,34 @@ async fn resolve_effective_model(
             Ok(configured_model.to_string())
         }
         AiModelSelectionMode::Auto => {
+            // Auto resolution only works against a local LM Studio endpoint
+            // (Java LocalLmModelResolver.canResolve). For any other endpoint
+            // (e.g. a cloud OpenAI-compatible API) discovery is meaningless, so
+            // reuse the configured model if there is one and otherwise fail with
+            // an actionable message instead of probing a non-LM-Studio /models URL.
+            if !is_lm_studio_auto_url(&profile.api_url) {
+                if !configured_model.is_empty() {
+                    return Ok(configured_model.to_string());
+                }
+                return Err(AiError::Configuration(
+                    "Auto model selection only works with a local LM Studio endpoint. \
+                     Switch to Manual model selection and configure an explicit model for this endpoint."
+                        .into(),
+                ));
+            }
             let models =
                 list_local_lm_models_with_client(client, &profile.api_url, Some(&profile.api_key))
                     .await?;
             select_auto_model(&models, configured_model)
         }
     }
+}
+
+/// True when `api_url` is a localhost LM Studio endpoint that supports Auto
+/// model discovery (loopback host + a recognised `/v1` or `/api/v1` path).
+/// Mirrors the gate enforced by [`normalize_lm_studio_models_url`].
+fn is_lm_studio_auto_url(api_url: &str) -> bool {
+    normalize_lm_studio_models_url(api_url).is_ok()
 }
 
 /// Port of `LocalLmModelResolver.selectAutoModel`: with exactly one loaded

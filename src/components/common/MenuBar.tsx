@@ -196,7 +196,7 @@ export function MenuBar(props: MenuBarProps) {
               {menu.label}
             </button>
             {openMenu === menu.label && (
-              <div className="absolute left-0 top-full mt-0.5 bg-kortty-panel border border-kortty-border rounded-md shadow-xl min-w-[220px] py-1 z-50">
+              <div className="absolute left-0 top-full mt-0.5 bg-kortty-panel border border-kortty-border rounded-md shadow-xl w-max min-w-[220px] py-1 z-50">
                 {menu.items.map((item, idx) =>
                   item.separator ? (
                     <div key={idx} className="my-1 border-t border-kortty-border" />
@@ -216,14 +216,16 @@ export function MenuBar(props: MenuBarProps) {
                         }
                       }}
                     >
-                      <span>
+                      <span className="whitespace-nowrap">
                         {item.checked !== undefined && (
                           <span className="inline-block w-4">{item.checked ? "✓" : ""}</span>
                         )}
                         {item.label}
                       </span>
                       {item.shortcut && (
-                        <span className="text-kortty-text-dim ml-6 text-[10px]">{item.shortcut}</span>
+                        <span className="text-kortty-text-dim ml-6 text-[10px] whitespace-nowrap">
+                          {item.shortcut}
+                        </span>
                       )}
                     </button>
                   ),

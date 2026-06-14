@@ -241,6 +241,16 @@ pub fn export_snippets(request: &SnippetExportRequest) -> Result<SnippetExportRe
     })
 }
 
+/// Removes a temporary directory on drop so PlantUML scratch directories are
+/// cleaned up even when rendering fails on an early `?` return.
+struct TempDirGuard(PathBuf);
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
 pub fn render_plantuml(
     request: &SnippetPlantUmlRenderRequest,
 ) -> Result<SnippetPlantUmlRenderResult> {
@@ -258,6 +268,7 @@ pub fn render_plantuml(
     let temp_dir =
         std::env::temp_dir().join(format!("kortty-plantuml-{}", uuid::Uuid::new_v4().simple()));
     fs::create_dir_all(&temp_dir)?;
+    let _temp_guard = TempDirGuard(temp_dir.clone());
     let source_path = temp_dir.join(format!("{stem}.puml"));
     fs::write(&source_path, &source)?;
     let tool = if let Some(jar_path) = request
@@ -275,7 +286,6 @@ pub fn render_plantuml(
         bail!("PlantUML did not create the expected {} output", format);
     }
     fs::copy(&generated, &output_path)?;
-    let _ = fs::remove_dir_all(&temp_dir);
     Ok(SnippetPlantUmlRenderResult {
         output_path: output_path.to_string_lossy().to_string(),
         content_hash: content_hash(&source),
@@ -307,27 +317,24 @@ pub fn render_plantuml_svg_string(
         uuid::Uuid::new_v4().simple()
     ));
     fs::create_dir_all(&temp_dir)?;
+    let _temp_guard = TempDirGuard(temp_dir.clone());
     let source_path = temp_dir.join("snippet-diagram.puml");
     fs::write(&source_path, &render_source)?;
-    let render_result = (|| -> Result<(String, String)> {
-        let tool = if let Some(jar_path) = request
-            .plantuml_jar_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            run_plantuml_jar(jar_path, &source_path, &temp_dir, "svg")?
-        } else {
-            run_plantuml_binary(&source_path, &temp_dir, "svg")?
-        };
-        let generated = temp_dir.join("snippet-diagram.svg");
-        if !generated.exists() {
-            bail!("PlantUML did not create the expected svg output");
-        }
-        Ok((fs::read_to_string(&generated)?, tool))
-    })();
-    let _ = fs::remove_dir_all(&temp_dir);
-    let (svg, tool) = render_result?;
+    let tool = if let Some(jar_path) = request
+        .plantuml_jar_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        run_plantuml_jar(jar_path, &source_path, &temp_dir, "svg")?
+    } else {
+        run_plantuml_binary(&source_path, &temp_dir, "svg")?
+    };
+    let generated = temp_dir.join("snippet-diagram.svg");
+    if !generated.exists() {
+        bail!("PlantUML did not create the expected svg output");
+    }
+    let svg = fs::read_to_string(&generated)?;
     Ok(SnippetPlantUmlSvgResult {
         svg,
         content_hash: content_hash(&source),

@@ -864,7 +864,7 @@ fn action_to_xml(action: &JobAction) -> ActionXml {
             )
             .into(),
         ),
-        archive_compression_level: Some(action.archive_compression_level.unwrap_or(6).min(9)),
+        archive_compression_level: Some(action.archive_compression_level.unwrap_or(6).clamp(0, 9)),
         archive_download_after_create: Some(action.archive_download_after_create),
         archive_download_local_path: to_xml_opt(&action.archive_download_local_path),
         encrypted_archive_password: to_xml_opt(&action.encrypted_archive_password),

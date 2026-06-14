@@ -4038,34 +4038,9 @@ export function MainWindow() {
 
   const handleOpenAiAgentForFocusedSession = useCallback(() => {
     if ((activeTabEntry?.kind ?? "terminal") !== "terminal" || activeTabEntry?.status !== "connected") {
-      return;
-    }
-
-    const activeSessionIds = new Set([
-      activeTabEntry.id,
-      ...(tabSplitSessions[activeTabEntry.id] ?? []),
-    ]);
-    const focusedSessionId = focusedPaneSessionRef.current;
-    const targetSessionId =
-      focusedSessionId && activeSessionIds.has(focusedSessionId)
-        ? focusedSessionId
-        : activeTabEntry.id;
-    if (!targetSessionId) {
-      return;
-    }
-    if (isReadOnlyMirrorSession(targetSessionId)) {
-      return;
-    }
-
-    void handleRequestTerminalAgent({
-      sessionId: targetSessionId,
-      connectionDisplayName: resolveConnectionDisplayName(targetSessionId),
-    });
-  }, [activeTabEntry, handleRequestTerminalAgent, isReadOnlyMirrorSession, resolveConnectionDisplayName, tabSplitSessions]);
-
-  /** Ctrl/Cmd+Alt+P and Tools menu entry (Java MainWindow.showAiPlanning). */
-  const handleOpenAiAgentPlanForFocusedSession = useCallback(() => {
-    if ((activeTabEntry?.kind ?? "terminal") !== "terminal" || activeTabEntry?.status !== "connected") {
+      // Java MainWindow.showAiAgent surfaces an error instead of silently
+      // doing nothing when no connected terminal is active.
+      showTerminalFileLoadNotice(t("ai.agent.error.noTerminal"));
       return;
     }
 
@@ -4079,6 +4054,34 @@ export function MainWindow() {
         ? focusedSessionId
         : activeTabEntry.id;
     if (!targetSessionId || isReadOnlyMirrorSession(targetSessionId)) {
+      showTerminalFileLoadNotice(t("ai.agent.error.noTerminal"));
+      return;
+    }
+
+    void handleRequestTerminalAgent({
+      sessionId: targetSessionId,
+      connectionDisplayName: resolveConnectionDisplayName(targetSessionId),
+    });
+  }, [activeTabEntry, handleRequestTerminalAgent, isReadOnlyMirrorSession, resolveConnectionDisplayName, showTerminalFileLoadNotice, t, tabSplitSessions]);
+
+  /** Ctrl/Cmd+Alt+P and Tools menu entry (Java MainWindow.showAiPlanning). */
+  const handleOpenAiAgentPlanForFocusedSession = useCallback(() => {
+    if ((activeTabEntry?.kind ?? "terminal") !== "terminal" || activeTabEntry?.status !== "connected") {
+      showTerminalFileLoadNotice(t("ai.agent.error.noTerminal"));
+      return;
+    }
+
+    const activeSessionIds = new Set([
+      activeTabEntry.id,
+      ...(tabSplitSessions[activeTabEntry.id] ?? []),
+    ]);
+    const focusedSessionId = focusedPaneSessionRef.current;
+    const targetSessionId =
+      focusedSessionId && activeSessionIds.has(focusedSessionId)
+        ? focusedSessionId
+        : activeTabEntry.id;
+    if (!targetSessionId || isReadOnlyMirrorSession(targetSessionId)) {
+      showTerminalFileLoadNotice(t("ai.agent.error.noTerminal"));
       return;
     }
 
@@ -4086,7 +4089,7 @@ export function MainWindow() {
       sessionId: targetSessionId,
       connectionDisplayName: resolveConnectionDisplayName(targetSessionId),
     });
-  }, [activeTabEntry, handleRequestTerminalAgentPlan, isReadOnlyMirrorSession, resolveConnectionDisplayName, tabSplitSessions]);
+  }, [activeTabEntry, handleRequestTerminalAgentPlan, isReadOnlyMirrorSession, resolveConnectionDisplayName, showTerminalFileLoadNotice, t, tabSplitSessions]);
 
   // Automatic update notifications from the background checker (WP7.2).
   useEffect(() => {

@@ -13,12 +13,14 @@ type AuthPhase = "checking" | "setup" | "unlock" | "error" | "ready";
 type MasterPasswordStatus = {
   hasPassword: boolean;
   unlocked: boolean;
+  testMode: boolean;
 };
 
 export default function App() {
   const [authPhase, setAuthPhase] = useState<AuthPhase>("checking");
   const [authError, setAuthError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
+  const [testMode, setTestMode] = useState(false);
 
   const syncGuiLanguage = useCallback(async () => {
     try {
@@ -52,6 +54,7 @@ export default function App() {
   const loadAuthStatus = useCallback(async () => {
     setAuthError(null);
     const status = await invoke<MasterPasswordStatus>("get_master_password_status");
+    if (status.testMode) setTestMode(true);
     if (status.unlocked) {
       setAuthPhase("ready");
       return;
@@ -150,5 +153,14 @@ export default function App() {
     );
   }
 
-  return <MainWindow />;
+  return (
+    <>
+      {testMode && (
+        <div className="fixed top-0 left-1/2 -translate-x-1/2 z-[300] bg-orange-500 text-black text-[10px] font-bold px-3 py-0.5 rounded-b select-none pointer-events-none tracking-widest uppercase">
+          Test Mode
+        </div>
+      )}
+      <MainWindow />
+    </>
+  );
 }

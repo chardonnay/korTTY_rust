@@ -6,17 +6,30 @@ use tauri::State;
 
 const MIN_MASTER_PASSWORD_LENGTH: usize = 8;
 
+/// Managed state that signals whether the app was started with KORTTY_TEST_MODE=1.
+pub struct TestModeStore(pub bool);
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct MasterPasswordStatus {
     pub has_password: bool,
     pub unlocked: bool,
+    pub test_mode: bool,
 }
 
 #[tauri::command]
 pub async fn get_master_password_status(
     vault: State<'_, Vault>,
+    test_mode: State<'_, TestModeStore>,
 ) -> Result<MasterPasswordStatus, String> {
+    if test_mode.0 {
+        return Ok(MasterPasswordStatus {
+            has_password: false,
+            unlocked: true,
+            test_mode: true,
+        });
+    }
+
     let has_password = MasterPassword::load_hash()
         .map_err(|e| e.to_string())?
         .is_some();
@@ -25,6 +38,7 @@ pub async fn get_master_password_status(
     Ok(MasterPasswordStatus {
         has_password,
         unlocked,
+        test_mode: false,
     })
 }
 

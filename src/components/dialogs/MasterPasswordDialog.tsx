@@ -1,5 +1,6 @@
 import { CSSProperties, FormEvent, useEffect, useRef, useState } from "react";
 import korttyLogo from "../../assets/kortty_logo.png";
+import korttyLogoVideo from "../../assets/kortty_logo_ai_pingpong.mp4";
 
 interface MasterPasswordDialogProps {
   mode: "setup" | "unlock";
@@ -158,11 +159,32 @@ export function MasterPasswordDialog({
         </form>
 
         <div className="hidden md:flex flex-col items-center justify-center select-none">
+          <video
+            autoPlay
+            loop
+            muted
+            playsInline
+            draggable={false}
+            style={{
+              width: isSetup ? 220 : 420,
+              maxWidth: "40vw",
+              height: "auto",
+            }}
+            onError={(e) => {
+              const video = e.currentTarget;
+              const fallback = video.nextElementSibling as HTMLImageElement | null;
+              if (fallback) fallback.style.display = "block";
+              video.style.display = "none";
+            }}
+          >
+            <source src={korttyLogoVideo} type="video/mp4" />
+          </video>
           <img
             src={korttyLogo}
             alt="KorTTY"
             draggable={false}
             style={{
+              display: "none",
               width: isSetup ? 220 : 420,
               maxWidth: "40vw",
               height: "auto",

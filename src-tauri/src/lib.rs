@@ -64,6 +64,20 @@ fn spawn_log_maintenance_task() {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Test mode: KORTTY_TEST_MODE=1 bypasses the master password and uses a
+    // fresh isolated temp directory — no access to the real ~/.kortty data.
+    let test_mode = std::env::var("KORTTY_TEST_MODE")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
+    if test_mode {
+        let tmp = std::env::temp_dir().join("kortty-testmode");
+        // Always start with a clean slate in test mode.
+        let _ = std::fs::remove_dir_all(&tmp);
+        let _ = std::fs::create_dir_all(&tmp);
+        persistence::xml_repository::set_config_dir_override(tmp);
+    }
+
     // Resolve the log directory from persisted settings BEFORE the tracing
     // subscriber is initialized so the daily rolling file appender lands in
     // the user-configured directory. Errors never prevent startup.
@@ -84,6 +98,7 @@ pub fn run() {
         .manage(terminal_agent::TerminalAgentPlanStore::new())
         .manage(terminal_recording::TerminalRecordingStore::new())
         .manage(security::vault::Vault::new())
+        .manage(commands::security_commands::TestModeStore(test_mode))
         .manage(commands::ai_commands::AiRequestCancelStore(
             std::sync::Mutex::new(std::collections::HashMap::new()),
         ))
@@ -92,7 +107,19 @@ pub fn run() {
         ))
         .manage(update::service::UpdateCheckService::new())
         .manage(commands::upload_commands::DroppedUploadCancelStore::default())
-        .setup(|app| {
+        .setup(move |app| {
+            // In test mode the vault is unlocked with an ephemeral random key
+            // so the encryption subsystem works but no real secrets are loaded.
+            if test_mode {
+                use rand::RngCore;
+                let mut key = vec![0u8; 32];
+                rand::thread_rng().fill_bytes(&mut key);
+                app.state::<security::vault::Vault>()
+                    .unlock(key)
+                    .map_err(|e| e.to_string())?;
+                tracing::warn!("KorTTY running in TEST MODE — isolated temp config, no saved data");
+            }
+
             // Start the automatic update checker (no-op when disabled in settings).
             let app_handle = app.handle().clone();
             tauri::async_runtime::spawn(async move {

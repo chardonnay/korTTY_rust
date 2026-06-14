@@ -17,6 +17,7 @@ import {
   Palette,
   PanelLeftClose,
   PanelLeftOpen,
+  Maximize2,
 } from "lucide-react";
 import { invoke } from "@tauri-apps/api/core";
 import { open as openDialog, save as saveDialog } from "@tauri-apps/plugin-dialog";
@@ -616,6 +617,9 @@ export function SnippetManager({ open, onClose, fileDraft, onFileDraftSave }: Sn
   // WP1.3: file-draft split save menu and remote "save as" dialog.
   const [fileSaveMenuOpen, setFileSaveMenuOpen] = useState(false);
   const [remoteSaveAsName, setRemoteSaveAsName] = useState<string | null>(null);
+  // Distraction-free fullscreen editor for the currently edited snippet.
+  const [fullscreenOpen, setFullscreenOpen] = useState(false);
+  const fullscreenEditorRef = useRef<MonacoSnippetEditorHandle | null>(null);
   // WP2.6-2.9: snippet AI workflows.
   const editorRef = useRef<MonacoSnippetEditorHandle | null>(null);
   const selectionRef = useRef<MonacoSelectionInfo>({
@@ -701,6 +705,24 @@ export function SnippetManager({ open, onClose, fileDraft, onFileDraftSave }: Sn
       setEditing(null);
     }
   }, [selectedId, snippets, editing]);
+
+  // Close the fullscreen editor when the manager closes or nothing is being
+  // edited, and let Escape exit it from anywhere.
+  useEffect(() => {
+    if (!fullscreenOpen) return;
+    if (!open || !editing) {
+      setFullscreenOpen(false);
+      return;
+    }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setFullscreenOpen(false);
+      }
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [fullscreenOpen, open, editing]);
 
   useEffect(() => {
     setMarkedSnippetIds((current) => {
@@ -2446,10 +2468,14 @@ export function SnippetManager({ open, onClose, fileDraft, onFileDraftSave }: Sn
             </button>
             <button
               className="flex items-center gap-1 px-3 py-1.5 text-xs bg-kortty-panel text-kortty-text rounded hover:bg-kortty-border transition-colors disabled:opacity-40"
-              disabled={!selected}
-              onClick={() => selected && setEditing({ ...selected })}
+              disabled={!selected && !editing}
+              title={t("snippet.fullscreen.open")}
+              onClick={() => {
+                if (selected) setEditing({ ...selected });
+                if (selected || editing) setFullscreenOpen(true);
+              }}
             >
-              <Edit className="w-3 h-3" /> Edit
+              <Maximize2 className="w-3 h-3" /> {t("snippet.fullscreen.open")}
             </button>
             <button
               className="flex items-center gap-1 px-3 py-1.5 text-xs bg-kortty-panel text-kortty-error rounded hover:bg-kortty-border transition-colors disabled:opacity-40"
@@ -2666,6 +2692,69 @@ export function SnippetManager({ open, onClose, fileDraft, onFileDraftSave }: Sn
             onDeleteDiagram={deleteEditingDiagram}
             onNavigateToCode={navigateToDiagramCodeReference}
           />
+        )}
+        {/* Distraction-free fullscreen code editor for the current snippet,
+            bound to the same `editing` state so edits and Save stay in sync. */}
+        {fullscreenOpen && editing && (
+          <div className="fixed inset-0 z-[140] flex flex-col bg-kortty-bg">
+            <div className="flex items-center justify-between gap-3 border-b border-kortty-border px-4 py-2">
+              <div className="flex min-w-0 items-center gap-2">
+                <Maximize2 className="h-4 w-4 shrink-0 text-kortty-text-dim" />
+                <span className="truncate text-sm font-medium text-kortty-text">
+                  {editing.name || t("snippet.unnamed")}
+                </span>
+                <select
+                  className="input-field ml-2 h-7 py-0 text-xs"
+                  value={editing.language || ""}
+                  onChange={(e) =>
+                    setEditing((p) => (p ? { ...p, language: e.target.value } : null))
+                  }
+                >
+                  {LANGUAGES.map((l) => (
+                    <option key={l.value} value={l.value}>
+                      {l.label}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="flex items-center gap-2">
+                <button
+                  className="rounded bg-kortty-panel px-3 py-1.5 text-xs text-kortty-text transition-colors hover:bg-kortty-border"
+                  onClick={() => void handleFormatSnippet()}
+                >
+                  {t("snippet.fullscreen.format")}
+                </button>
+                <button
+                  className="rounded bg-kortty-accent px-3 py-1.5 text-xs text-kortty-bg transition-colors hover:bg-kortty-accent-hover disabled:opacity-40"
+                  disabled={saving}
+                  onClick={() => void handleSave()}
+                >
+                  {t("snippet.fullscreen.save")}
+                </button>
+                <button
+                  className="rounded p-1 text-kortty-text-dim transition-colors hover:text-kortty-text"
+                  title={t("snippet.fullscreen.exit")}
+                  onClick={() => setFullscreenOpen(false)}
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+            <MonacoSnippetEditor
+              ref={fullscreenEditorRef}
+              value={editing.content}
+              language={editing.language || "bash"}
+              onChange={(val) => setEditing((p) => (p ? { ...p, content: val } : null))}
+              wordWrap={settings.snippetWordWrap}
+              lineNumbers={settings.snippetLineNumbers}
+              rulerColumn={limitColumn > 0 ? limitColumn : null}
+              fontFamily={editorFontFamily}
+              fontSize={editorFontSize}
+              theme={editorTheme}
+              cursorStyle={activeProfile.cursorStyle}
+              className="min-h-0 flex-1"
+            />
+          </div>
         )}
         {/* WP1.3b: remote "save as" file-name dialog with live validation. */}
         {remoteSaveAsName !== null && fileDraft && (

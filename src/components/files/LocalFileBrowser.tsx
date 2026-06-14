@@ -266,6 +266,10 @@ function BrowserContextMenu({ menu, hasSelection, singleFile, canPaste, showHidd
 export function LocalFileBrowser({ dock, onClose, onEditFile }: LocalFileBrowserProps) {
   const { t } = useTranslation();
   const [path, setPath] = useState("");
+  // Uncommitted address-bar text; only promoted to `path` once list_local_dir
+  // succeeds, so a typo or failed navigation cannot affect file actions that
+  // derive their targets from the committed `path`.
+  const [pathInput, setPathInput] = useState("");
   const [entries, setEntries] = useState<FileEntry[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [anchorIndex, setAnchorIndex] = useState<number | null>(null);
@@ -286,6 +290,7 @@ export function LocalFileBrowser({ dock, onClose, onEditFile }: LocalFileBrowser
       const loaded = await invoke<FileEntry[]>("list_local_dir", { path: nextPath });
       setEntries(loaded);
       setPath(nextPath);
+      setPathInput(nextPath);
       setSelected(new Set());
       setAnchorIndex(null);
     } catch (error) {
@@ -594,10 +599,10 @@ export function LocalFileBrowser({ dock, onClose, onEditFile }: LocalFileBrowser
       <div className="border-b border-kortty-border px-2 py-2">
         <input
           className="input-field font-mono text-xs"
-          value={path}
-          onChange={(event) => setPath(event.target.value)}
+          value={pathInput}
+          onChange={(event) => setPathInput(event.target.value)}
           onKeyDown={(event) => {
-            if (event.key === "Enter") void load(path);
+            if (event.key === "Enter") void load(pathInput);
           }}
         />
       </div>

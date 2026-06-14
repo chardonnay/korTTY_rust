@@ -491,6 +491,12 @@
       "section": "Sectie",
       "variable": "Variabele",
       "brace": "Accolade"
+    },
+    "fullscreen": {
+      "open": "Openen in volledig scherm-editor",
+      "save": "Opslaan",
+      "format": "Opmaken",
+      "exit": "Volledig scherm sluiten (Esc)"
     }
   },
   "sftp": {
@@ -841,6 +847,11 @@
           "high": "Hoog",
           "xhigh": "Extra hoog"
         }
+      }
+    },
+    "agent": {
+      "error": {
+        "noTerminal": "Er is geen verbonden terminal actief."
       }
     }
   }

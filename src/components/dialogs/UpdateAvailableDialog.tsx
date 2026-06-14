@@ -104,8 +104,10 @@ export function UpdateAvailableDialog({
           <button
             className="px-4 py-1.5 text-xs bg-kortty-accent text-kortty-bg rounded hover:bg-kortty-accent-hover transition-colors"
             onClick={() => {
-              onClose();
+              // Start the download (capturing `update`) before closing, so a
+              // close handler that clears update state cannot race the download.
               onDownload(update);
+              onClose();
             }}
           >
             {t("updates.downloadAction")}

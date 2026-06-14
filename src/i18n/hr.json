@@ -491,6 +491,12 @@
       "section": "Sekcija",
       "variable": "Varijabla",
       "brace": "Zagrada"
+    },
+    "fullscreen": {
+      "open": "Otvori u uređivaču preko cijelog zaslona",
+      "save": "Spremi",
+      "format": "Oblikuj",
+      "exit": "Zatvori cijeli zaslon (Esc)"
     }
   },
   "sftp": {
@@ -841,6 +847,11 @@
           "high": "Visoko",
           "xhigh": "Ekstra visoko"
         }
+      }
+    },
+    "agent": {
+      "error": {
+        "noTerminal": "Nema aktivnog povezanog terminala."
       }
     }
   }

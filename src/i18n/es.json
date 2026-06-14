@@ -491,6 +491,12 @@
       "section": "Sección",
       "variable": "Variable",
       "brace": "Llave"
+    },
+    "fullscreen": {
+      "open": "Abrir en editor de pantalla completa",
+      "save": "Guardar",
+      "format": "Formatear",
+      "exit": "Cerrar pantalla completa (Esc)"
     }
   },
   "sftp": {
@@ -841,6 +847,11 @@
           "high": "Alto",
           "xhigh": "Extra alto"
         }
+      }
+    },
+    "agent": {
+      "error": {
+        "noTerminal": "No hay ningún terminal conectado activo."
       }
     }
   }

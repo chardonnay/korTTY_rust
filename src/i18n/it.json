@@ -491,6 +491,12 @@
       "section": "Sezione",
       "variable": "Variabile",
       "brace": "Parentesi graffa"
+    },
+    "fullscreen": {
+      "open": "Apri nell'editor a schermo intero",
+      "save": "Salva",
+      "format": "Formatta",
+      "exit": "Chiudi schermo intero (Esc)"
     }
   },
   "sftp": {
@@ -841,6 +847,11 @@
           "high": "Alto",
           "xhigh": "Extra alto"
         }
+      }
+    },
+    "agent": {
+      "error": {
+        "noTerminal": "Nessun terminale connesso è attivo."
       }
     }
   }
