@@ -453,7 +453,7 @@ mod tests {
         assert_eq!(MANUAL.first().unwrap().title, "kortty");
         let startup = MANUAL
             .iter()
-            .find(|chapter| chapter.title == "Starten")
+            .find(|chapter| chapter.title == "Getting started")
             .unwrap();
         assert!(startup.matches(&needle("  quick CONNECT ")));
         assert!(startup.blocks.iter().any(|block| {
@@ -464,12 +464,15 @@ mod tests {
                 .iter()
                 .any(|chapter| chapter.matches("missing-manual-probe-82c2"))
         );
-        let text = "Öffne **Quick Connect** oder `ssh`.";
+        let text = "Choose a connection – open **Quick Connect** or run `ssh`.";
         let rendered: String = inline_format(text)
             .into_iter()
             .map(|(range, _)| &text[range])
             .collect();
-        assert_eq!(rendered, "Öffne Quick Connect oder ssh.");
+        assert_eq!(
+            rendered,
+            "Choose a connection – open Quick Connect or run ssh."
+        );
     }
 
     #[test]
