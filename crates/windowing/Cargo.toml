@@ -1,0 +1,25 @@
+[package]
+name = "kortty-windowing"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Platform pointer hit testing for native kortty windows"
+
+[dependencies]
+raw-window-handle = "0.6.2"
+url = "2.5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+kortty-macos = { path = "../macos" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Dwm", "Win32_Graphics_Gdi", "Win32_System_DataExchange", "Win32_System_Diagnostics_Debug", "Win32_System_Com", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Power", "Win32_System_SystemServices", "Win32_System_Threading", "Win32_UI_ColorSystem", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell", "Win32_UI_Shell_Common"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libloading = "0.8.9"
+rustix = { version = "1", features = ["event"] }
+smithay-clipboard = "=0.7.3"
+wayland-client = "0.31"
+wayland-protocols = { version = "0.32", features = ["client", "staging"] }
+x11rb = { version = "0.13", features = ["randr", "render"] }

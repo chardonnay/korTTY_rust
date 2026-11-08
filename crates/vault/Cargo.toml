@@ -1,0 +1,20 @@
+[package]
+name = "kortty-vault"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native encrypted credential storage for kortty"
+
+[dependencies]
+# These branches use RustCrypto's subtle implementation without cmov's inline assembly.
+argon2 = { version = "0.5.3", default-features = false, features = ["zeroize"] }
+chacha20poly1305 = { version = "0.10.1", default-features = false }
+getrandom = "0.4"
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", default-features = false, features = ["fs", "std", "use-libc"] }
+
+[target.'cfg(windows)'.dependencies]
+kortty-files = { path = "../files" }
+windows-sys = { version = "0.61", default-features = false, features = ["Win32_Storage_FileSystem"] }

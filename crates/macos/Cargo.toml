@@ -1,0 +1,15 @@
+[package]
+name = "kortty-macos"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "AppKit lifecycle adapter for the kortty desktop"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+async-channel = "2.5"
+block2 = "0.5.1"
+core-foundation-sys = "0.8.7"
+objc2 = "0.5.3"
+raw-window-handle = "0.6.2"
+objc2-app-kit = { version = "0.2.2", default-features = false, features = ["std", "block2", "NSAppearance", "NSApplication", "NSCell", "NSEvent", "NSGraphics", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSScreen", "NSView", "NSWindow", "NSWorkspace"] }
+objc2-foundation = { version = "0.2.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSEnumerator", "NSGeometry", "NSString", "NSThread", "NSURL"] }

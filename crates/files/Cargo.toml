@@ -1,0 +1,9 @@
+[package]
+name = "kortty-files"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Windows file operations for the kortty desktop"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemServices", "Win32_System_Threading"] }

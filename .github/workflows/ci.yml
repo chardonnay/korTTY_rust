@@ -1,0 +1,57 @@
+name: Native Rust CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  native:
+    name: Native checks (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, ubuntu-24.04, windows-2025]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install stable Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+
+      - name: Check formatting
+        run: cargo +stable fmt --all --check
+
+      - name: Check lints
+        run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run macOS tests with zsh
+        if: runner.os == 'macOS'
+        run: bash scripts/with-scratch.sh --zsh-tests cargo +stable test --locked --workspace --all-targets
+
+      - name: Run Linux tests
+        if: runner.os == 'Linux'
+        env:
+          SHELL: /bin/sh
+        run: bash scripts/with-scratch.sh cargo +stable test --locked --workspace --all-targets
+
+      - name: Run Windows tests
+        if: runner.os == 'Windows'
+        env:
+          SHELL: /bin/sh
+        run: cargo +stable test --locked --workspace --all-targets
+
+      - name: Remove development build before release build
+        run: cargo +stable clean --profile dev
+
+      - name: Build native release
+        run: cargo +stable build --locked --workspace --release
+
+      - name: Stage native release package
+        run: cargo +stable run --locked --release -p kortty-package

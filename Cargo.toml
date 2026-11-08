@@ -1,0 +1,91 @@
+[workspace]
+members = ["crates/control", "crates/diagram", "crates/files", "crates/ibm", "crates/jobs", "crates/macos", "crates/pty", "crates/recording", "crates/serial", "crates/ssh", "crates/terminal", "crates/windowing", "crates/vault", "packaging"]
+exclude = ["vendor/iced-tiny-skia", "vendor/smithay-clipboard", "vendor/softbuffer", "vendor/ssh-key", "vendor/sunset"]
+resolver = "3"
+
+[package]
+name = "kortty"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native desktop terminal workspace"
+default-run = "kortty"
+
+[dependencies]
+base64 = "0.22.1"
+async-channel = "2.5"
+bzip2 = "0.6.1"
+flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
+getrandom = "0.4"
+globset = { version = "0.4.20", default-features = false }
+iced = { version = "0.14", default-features = false, features = ["advanced", "advanced-shaping", "canvas", "image-without-codecs", "svg", "thread-pool", "tiny-skia", "wayland", "x11"] }
+iced_runtime = "0.14"
+iced_tiny_skia = { version = "0.14", default-features = false }
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "jpeg", "png"] }
+jiff = { version = "0.2.39", default-features = false, features = ["std", "tz-system"] }
+kortty-control = { path = "crates/control" }
+kortty-diagram = { path = "crates/diagram" }
+kortty-ibm = { path = "crates/ibm" }
+kortty-jobs = { path = "crates/jobs" }
+kortty-pty = { path = "crates/pty" }
+kortty-recording = { path = "crates/recording" }
+kortty-serial = { path = "crates/serial", features = ["serde"] }
+kortty-ssh = { path = "crates/ssh" }
+kortty-terminal = { path = "crates/terminal" }
+kortty-windowing = { path = "crates/windowing" }
+kortty-vault = { path = "crates/vault" }
+percent-encoding = "2.3"
+pgp = { version = "0.21.0", default-features = false }
+rand = { version = "0.8.8", default-features = false, features = ["std_rng"] }
+regex = "1"
+resvg = { version = "0.49", default-features = false }
+roxmltree = "0.21.2"
+rsa = { version = "0.9.10", default-features = false }
+ruzstd = "=0.9.1"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["raw_value"] }
+softbuffer = { version = "=0.4.8", default-features = false, features = ["premultiplied-argb"] }
+svgtypes = "0.16"
+tar = { version = "0.4.46", default-features = false }
+tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
+url = "2.5"
+ureq = { version = "3.5.1", default-features = false }
+unicode-normalization = "0.1"
+vte = { version = "0.15", default-features = false }
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
+zip = { version = "9.4.1", default-features = false, features = ["aes-crypto", "deflate-flate2"] }
+pdf-writer = { version = "=0.15.0", default-features = false }
+subsetter = { version = "=0.2.6", default-features = false }
+ttf-parser = { version = "=0.25.1", default-features = false }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Use the system's libc interface for Linux desktop dependencies.
+rustix = { version = "1", default-features = false, features = ["fs", "use-libc"] }
+rustix-legacy = { package = "rustix", version = "0.38", default-features = false, features = ["use-libc"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+kortty-files = { path = "crates/files" }
+kortty-macos = { path = "crates/macos" }
+rustix = { version = "1", default-features = false, features = ["fs", "std", "use-libc"] }
+
+[target.'cfg(windows)'.dependencies]
+kortty-files = { path = "crates/files" }
+
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "use-libc", "event", "pty"] }
+
+[profile.dev]
+debug = "line-tables-only"
+split-debuginfo = "off"
+incremental = false
+
+[profile.release]
+lto = "thin"
+
+[patch.crates-io]
+iced_tiny_skia = { path = "vendor/iced-tiny-skia" }
+smithay-clipboard = { path = "vendor/smithay-clipboard" }
+softbuffer = { path = "vendor/softbuffer" }
+ssh-key = { path = "vendor/ssh-key" }
+sunset = { path = "vendor/sunset" }

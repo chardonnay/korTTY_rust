@@ -1,0 +1,10 @@
+cursor=5,1
+title=Mode ready
+reply=1b3d2125
+screen:
+AxCDE
+   ZR
+
+here
+
+

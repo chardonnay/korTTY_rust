@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<snippetVariables>
+    <variable>
+        <name>host</name>
+        <value>東京 &amp; &lt;db&gt;</value>
+    </variable>
+    <variable>
+        <name>motd</name>
+        <value>one&#13;
+two: "quoted" # café \</value>
+    </variable>
+    <variable>
+        <name>empty</name>
+        <value></value>
+    </variable>
+</snippetVariables>

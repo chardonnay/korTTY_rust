@@ -1,0 +1,7 @@
+variables:
+  - name: "host"
+    value: "東京 & <db>"
+  - name: "motd"
+    value: "one\r\ntwo: \"quoted\" # café \\"
+  - name: "empty"
+    value: ""

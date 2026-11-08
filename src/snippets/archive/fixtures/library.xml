@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<snippetExport version="1" exportDate="2026-11-06T09:08:56.504409">
+  <snippet>
+    <name>Deploy α</name>
+    <content>#!/bin/bash
+printf &apos;%s&apos; &apos;東京 &amp; &lt;db&gt;&apos;
+
+</content>
+    <language>bash</language>
+    <category>Ops</category>
+    <description>Release # one
+second line &amp; details</description>
+    <folderPath>Automation/Production</folderPath>
+    <fileName>deploy.sh</fileName>
+    <executable>false</executable>
+    <tags>
+      <tag>prod</tag>
+      <tag>tag: nested</tag>
+    </tags>
+  </snippet>
+</snippetExport>

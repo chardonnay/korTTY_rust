@@ -1,0 +1,21 @@
+[package]
+name = "kortty-ssh"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native SSH terminal transport and host key trust for kortty"
+
+[dependencies]
+ed25519 = { version = "=2.2.3", default-features = false, features = ["pem", "zeroize"] }
+getrandom = "0.4"
+mio = { version = "1", default-features = false, features = ["net", "os-poll"] }
+ssh-key = { version = "=0.6.7", default-features = false, features = ["std", "ecdsa", "ed25519", "encryption"] }
+sunset = { version = "=0.6.0", default-features = false, features = ["std", "ecdsa-userkeys"] }
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
+
+[target.'cfg(windows)'.dependencies]
+mio = { version = "1", default-features = false, features = ["os-ext"] }
+
+[dev-dependencies]
+sha2 = { version = "0.10", default-features = false }
+ssh-encoding = { version = "=0.2.0", default-features = false }

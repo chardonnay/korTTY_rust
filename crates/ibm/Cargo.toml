@@ -1,0 +1,10 @@
+[package]
+name = "kortty-ibm"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Bounded IBM block-terminal Telnet transport for kortty"
+
+[dependencies]
+getrandom = "0.4"
+zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }

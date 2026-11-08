@@ -1,0 +1,8 @@
+row0=HP
+row1=
+row2= ANSI
+row3=
+cursor=2,5
+modes=-
+replies=1b5b333b3652
+keys=0d,09,08,1b70

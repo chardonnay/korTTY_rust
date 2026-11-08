@@ -1,0 +1,17 @@
+{
+  "version": 1,
+  "exportDate": "2026-11-06T09:08:56.503446",
+  "snippets": [
+    {
+      "name": "Deploy α",
+      "content": "#!/bin/bash\nprintf '%s' '東京 & <db>'\n\n",
+      "language": "bash",
+      "category": "Ops",
+      "description": "Release # one\nsecond line & details",
+      "folderPath": "Automation/Production",
+      "fileName": "deploy.sh",
+      "executable": false,
+      "tags": ["prod", "tag: nested"]
+    }
+  ]
+}

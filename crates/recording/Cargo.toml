@@ -1,0 +1,9 @@
+[package]
+name = "kortty-recording"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Native terminal capture and replay for kortty"
+
+[dependencies]
+kortty-terminal = { path = "../terminal" }
