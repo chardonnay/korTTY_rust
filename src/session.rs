@@ -5207,26 +5207,47 @@ mod search_tests {
         let executable = scratch.0.join("gemini");
         let script_path = scratch.0.join("monitor.sh");
         let answer_gate = scratch.0.join("answer");
-        // Darwin's /bin/sh can exec a different shell image. Use an actual
-        // shell binary so the foreground process keeps the test executable name.
+        // Keep a native Gemini process in the foreground group while the
+        // system shell runs the fixture script.
         let shell = if cfg!(target_os = "macos") {
             "/bin/bash"
         } else {
             "/bin/sh"
         };
+        #[cfg(not(target_os = "macos"))]
         std::fs::copy(shell, &executable).unwrap();
         #[cfg(target_os = "macos")]
         {
-            // The copied system image needs a signature for its new location.
-            let signature = std::process::Command::new("/usr/bin/codesign")
-                .args(["--force", "--sign", "-", "--timestamp=none"])
+            let source = scratch.0.join("gemini.c");
+            std::fs::write(
+                &source,
+                r#"#include <sys/wait.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    if (argc != 3) return 2;
+    pid_t child = fork();
+    if (child < 0) return 3;
+    if (child == 0) {
+        execl("/bin/bash", "bash", argv[1], argv[2], (char *)0);
+        _exit(127);
+    }
+    int status;
+    if (waitpid(child, &status, 0) != child) return 4;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 5;
+}
+"#,
+            )
+            .unwrap();
+            let build = std::process::Command::new("/usr/bin/cc")
+                .arg(&source)
+                .arg("-o")
                 .arg(&executable)
                 .output()
                 .unwrap();
             assert!(
-                signature.status.success(),
-                "could not sign the coding agent fixture: {}",
-                String::from_utf8_lossy(&signature.stderr)
+                build.status.success(),
+                "could not build the coding agent fixture: {}",
+                String::from_utf8_lossy(&build.stderr)
             );
         }
         let script = concat!(
@@ -5257,7 +5278,30 @@ mod search_tests {
         session.set_coding_agent_detection(true);
         let send = |line: &str| session.send(format!("{line}\r").into_bytes()).unwrap();
         send("./gemini ./monitor.sh ./answer");
-        let ready = wait_for_frame(&session, |frame| visible_text(frame, "monitor-ready"));
+        let deadline = Instant::now() + TIMEOUT;
+        let ready = loop {
+            let frame = session.frame();
+            if visible_text(&frame, "monitor-ready") {
+                break frame;
+            }
+            if Instant::now() >= deadline {
+                let screen = (0..frame.screen.rows)
+                    .filter_map(|row| frame.screen.row(row))
+                    .map(|cells| {
+                        cells
+                            .iter()
+                            .map(|cell| cell.text.as_str())
+                            .collect::<String>()
+                    })
+                    .collect::<Vec<_>>();
+                panic!(
+                    "coding agent fixture did not start: {:?}\n{}",
+                    frame.status,
+                    screen.join("\n")
+                );
+            }
+            thread::sleep(FRAME_INTERVAL);
+        };
         assert!(ready.coding_agent().is_none());
         send("block");
         #[track_caller]
