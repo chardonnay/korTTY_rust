@@ -11,7 +11,9 @@ jobs:
   native:
     name: Native checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    # Windows can spend more than 25 minutes on a cold workspace test build
+    # and test run before the separate static-CRT release build starts.
+    timeout-minutes: ${{ matrix.os == 'windows-2025' && 60 || 35 }}
     strategy:
       fail-fast: false
       matrix:
