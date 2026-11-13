@@ -35,6 +35,8 @@ pub mod password;
 pub mod password_file;
 #[path = "server.rs"]
 mod server;
+#[path = "sudo_pty.rs"]
+pub mod sudo_pty;
 #[path = "wire.rs"]
 pub mod wire;
 

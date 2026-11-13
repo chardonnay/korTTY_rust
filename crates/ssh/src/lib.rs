@@ -12,8 +12,8 @@ pub const MAX_SESSION_CHANNELS: usize = sunset::config::MAX_CHANNELS;
 /// One browser and up to eight transfer leases on a terminal connection.
 pub const MAX_SFTP_LEASES: usize = 9;
 
-/// Forwarding shares the connection while reserving the primary, SFTP and exec channels.
-pub const MAX_FORWARD_STREAMS: usize = MAX_SESSION_CHANNELS - MAX_SFTP_LEASES - 2;
+/// Forwarding shares the connection with the terminal, SFTP, exec and dedicated exec PTY.
+pub const MAX_FORWARD_STREAMS: usize = MAX_SESSION_CHANNELS - MAX_SFTP_LEASES - 3;
 
 /// Remote forwarding registrations use no SSH channel until a client connects.
 pub const MAX_REMOTE_FORWARD_LISTENERS: usize = 4;

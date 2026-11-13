@@ -1174,6 +1174,11 @@ impl<'a> Runner<'a, client::Client> {
         self.client_tracked_request(chan, channel::Req::Subsystem(name))
     }
 
+    /// Sends a confirmed PTY request on a newly opened tracked session.
+    pub fn client_tracked_pty(&mut self, chan: &ChanHandle, pty: channel::Pty) -> Result<bool> {
+        self.client_tracked_request(chan, channel::Req::Pty(pty))
+    }
+
     /// Sends a confirmed exec request on a newly opened tracked session.
     pub fn client_tracked_exec(&mut self, chan: &ChanHandle, command: &str) -> Result<bool> {
         self.client_tracked_request(chan, channel::Req::Exec(command))

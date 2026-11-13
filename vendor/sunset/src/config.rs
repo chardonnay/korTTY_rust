@@ -19,9 +19,9 @@ pub(crate) const SSH_MAX_PACKET: usize = 35000;
 #[cfg(not(feature = "larger"))]
 pub const MAX_CHANNELS: usize = 4;
 
-// Reserve room for independent desktop SFTP sessions alongside forwarding.
+// Reserve room for independent desktop SFTP sessions and a dedicated exec PTY.
 #[cfg(feature = "larger")]
-pub const MAX_CHANNELS: usize = 24;
+pub const MAX_CHANNELS: usize = 25;
 
 // Enough for longest 23 of "screen.konsole-256color" on my system
 // Unsure if this is specified somewhere

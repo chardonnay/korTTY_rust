@@ -1,9 +1,17 @@
-//! A single password submission to a reviewed, authenticated SSH exec lease.
+//! Password sudo on a private terminal bound to the original SSH connection.
 
-use std::time::{Duration, Instant};
+use std::fmt::Write as _;
+use std::io;
+use std::thread;
+use std::time::Instant;
 
-use kortty::ssh_runtime::{mux::PasswordEvent, password};
-use kortty_ssh::SensitiveLine;
+use kortty::ssh_runtime::{
+    mux::PasswordFileEvent,
+    password::{Answer, Status as AuthStatus},
+    sudo_pty,
+};
+use kortty_ssh::{ExecLease, SensitiveLine, SshReader, SshWriter};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::{ssh_connection::ExecOpener, ssh_worker};
 
@@ -12,211 +20,312 @@ use super::{quote, validate_remote_command};
 
 pub(crate) struct Command {
     wire: String,
-    nonce: [u8; 16],
 }
 
 impl Command {
     pub(crate) fn new(directory: &str, command: &str) -> Result<Self, String> {
         validate_remote_command(directory, command)?;
-        let mut random = [0; 16];
-        getrandom::fill(&mut random).map_err(|_| "Could not create a sudo challenge.")?;
-        let marker = password::marker(random);
         let payload = format!(
             "exec </dev/null\ncd {} || exit\n{command}",
             quote(directory)
         );
         let wire = format!(
-            "exec /usr/bin/sudo -k -S -p {} -u root -- /bin/sh -c {}",
-            quote(&marker),
+            "exec /usr/bin/sudo -n -u root -- /bin/sh -c {}",
             quote(&payload)
         );
         if wire.len() > kortty_ssh::MAX_EXEC_COMMAND_BYTES {
             return Err("The effective sudo command exceeds the SSH execution limit.".into());
         }
-        Ok(Self {
-            wire,
-            nonce: random,
-        })
+        Ok(Self { wire })
     }
 
     pub(crate) fn wire(&self) -> &str {
         &self.wire
     }
 
-    pub(crate) fn run(
+    pub(crate) fn run_with_terminal(
         self,
         opener: ExecOpener,
+        terminal: Option<Terminal>,
         cancel: Cancel,
         authorized: impl Fn() -> bool + Clone + Send + Sync + 'static,
         answers: async_channel::Receiver<SensitiveLine>,
         challenge: impl FnOnce() -> bool,
-    ) -> Result<Status, &'static str> {
+    ) -> Result<(Status, Option<Terminal>), &'static str> {
         let permitted = move || !cancel.requested() && authorized();
-        let status = match opener {
-            ExecOpener::Direct(opener) => {
-                let opening = permitted.clone();
-                let lease = opener
-                    .open_sensitive_cancellable(&self.wire, move || !opening())
-                    .map_err(|_| "Could not open the reviewed sudo SSH channel.")?;
-                password::supervise(
-                    lease,
-                    &password::marker(self.nonce),
-                    permitted,
-                    || match answers.try_recv() {
-                        Ok(line) => password::Answer::Line(line),
-                        Err(async_channel::TryRecvError::Closed) => password::Answer::Closed,
-                        Err(async_channel::TryRecvError::Empty) => password::Answer::Pending,
-                    },
-                    challenge,
-                )?
-            }
-            ExecOpener::Worker(opener) => self.run_worker(opener, permitted, answers, challenge)?,
+        if !permitted() {
+            return Ok((Status::Cancelled, None));
+        }
+        let mut terminal = match terminal {
+            Some(terminal) if opener.same_connection(&terminal.opener) => terminal,
+            Some(_) => return Err("The sudo terminal belongs to a different SSH connection."),
+            None => match Terminal::open(opener, permitted.clone(), answers, challenge) {
+                Ok(terminal) => terminal,
+                Err(Status::Cancelled) => return Ok((Status::Cancelled, None)),
+                Err(Status::TimedOut) => {
+                    return Err("Timed out while validating sudo in the SSH terminal.");
+                }
+                Err(Status::Exited(124)) => {
+                    return Err("The SSH server did not allocate a sudo pseudoterminal.");
+                }
+                Err(Status::Exited(125)) => {
+                    return Err("Could not disable echo on the SSH sudo pseudoterminal.");
+                }
+                Err(Status::Exited(_)) => {
+                    return Err("Sudo authentication failed. No approved command was run.");
+                }
+                Err(_) => return Err("Could not validate sudo in the SSH terminal."),
+            },
         };
-        Ok(match status {
-            password::Status::Exited(code) => Status::Exited(code),
-            password::Status::Cancelled => Status::Cancelled,
-            password::Status::TimedOut => Status::TimedOut,
-            password::Status::TransportFailed => Status::TransportFailed,
-            password::Status::MissingExitCode => Status::MissingExitCode,
-        })
+        let request = new_token()?;
+        let status = terminal.execute(&request, &self.wire, &permitted);
+        // Stop on a failed or expired ticket. Never reopen or reauthenticate in this run.
+        Ok((status, (status == Status::Exited(0)).then_some(terminal)))
     }
+}
 
-    fn run_worker(
-        self,
-        opener: ssh_worker::Opener,
+pub(crate) struct Terminal {
+    opener: ExecOpener,
+    streams: Streams,
+}
+
+enum Streams {
+    Direct {
+        _lease: ExecLease,
+        reader: SshReader,
+        writer: SshWriter,
+    },
+    Worker {
+        _channel: ssh_worker::Channel,
+        reader: ssh_worker::Reader,
+        writer: ssh_worker::Writer,
+    },
+}
+
+impl Terminal {
+    fn open(
+        opener: ExecOpener,
         permitted: impl Fn() -> bool + Clone + Send + Sync + 'static,
         answers: async_channel::Receiver<SensitiveLine>,
         challenge: impl FnOnce() -> bool,
-    ) -> Result<password::Status, &'static str> {
-        let channel = opener
-            .open_password_exec(&self.wire, self.nonce, || !permitted())
-            .map_err(|_| "Could not open the reviewed isolated SSH sudo channel.")?;
-        let deadline = Instant::now() + COMMAND_LIMIT + Duration::from_secs(10);
-        let mut challenge = Some(challenge);
-        let mut submitted = false;
+    ) -> Result<Self, Status> {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|_| Status::TransportFailed)?;
+        let streams = match &opener {
+            ExecOpener::Direct(direct) => {
+                let opening = permitted.clone();
+                let mut lease = direct
+                    .open_pty_cancellable(&sudo_pty::command(nonce), move || !opening())
+                    .map_err(|_| stopped_or_failed(&permitted))?;
+                let sudo_pty::Authenticated { reader, writer } = sudo_pty::authenticate(
+                    &mut lease,
+                    nonce,
+                    permitted,
+                    || match answers.try_recv() {
+                        Ok(line) => Answer::Line(line),
+                        Err(async_channel::TryRecvError::Closed) => Answer::Closed,
+                        Err(async_channel::TryRecvError::Empty) => Answer::Pending,
+                    },
+                    challenge,
+                )
+                .map_err(auth_status)?;
+                Streams::Direct {
+                    _lease: lease,
+                    reader,
+                    writer,
+                }
+            }
+            ExecOpener::Worker(worker) => {
+                let mut channel = open_worker(worker, nonce, permitted, answers, challenge)?;
+                let reader = channel.take_reader().ok_or(Status::TransportFailed)?;
+                let writer = channel.take_writer().ok_or(Status::TransportFailed)?;
+                Streams::Worker {
+                    _channel: channel,
+                    reader,
+                    writer,
+                }
+            }
+        };
+        Ok(Self { opener, streams })
+    }
+
+    fn execute(&mut self, token: &str, wire: &str, permitted: &impl Fn() -> bool) -> Status {
+        let mut reply = sudo_pty::Reply::new(token);
+        let frame = command_frame(token, wire);
+        let mut remaining = frame.as_bytes();
+        let mut buffer = Zeroizing::new([0; 8192]);
+        let deadline = Instant::now() + COMMAND_LIMIT;
         loop {
             if !permitted() {
-                return Ok(password::Status::Cancelled);
+                return Status::Cancelled;
             }
             if Instant::now() >= deadline {
-                return Ok(password::Status::TimedOut);
+                return Status::TimedOut;
             }
-            match channel
-                .next(POLL)
-                .map_err(|_| "The isolated SSH sudo channel closed.")?
-            {
-                Some(PasswordEvent::Challenge) => {
-                    if !challenge.take().is_some_and(|notify| notify()) {
-                        return Ok(password::Status::Cancelled);
-                    }
+            if !remaining.is_empty() {
+                match self.streams.write(remaining) {
+                    Ok(0) => return Status::TransportFailed,
+                    Ok(count) => remaining = &remaining[count..],
+                    Err(error) if retry(&error) => {}
+                    Err(_) => return stopped_or_failed(permitted),
                 }
-                Some(PasswordEvent::Staged) => {
-                    channel
-                        .commit(permitted.clone())
-                        .map_err(|_| "The isolated SSH sudo approval expired.")?;
+                if !remaining.is_empty() {
+                    continue;
                 }
-                Some(PasswordEvent::Finished(status)) => return Ok(status),
-                None => {}
             }
-            if !submitted {
-                match answers.try_recv() {
-                    Ok(line) if challenge.is_none() && permitted() => {
-                        channel
-                            .stage(line, permitted.clone())
-                            .map_err(|_| "The isolated SSH sudo approval expired.")?;
-                        submitted = true;
+            match self.streams.read(&mut buffer[..]) {
+                Ok(0) => return Status::MissingExitCode,
+                Ok(count) => {
+                    let result = reply.observe(&buffer[..count]);
+                    buffer[..count].zeroize();
+                    match result {
+                        Ok(Some(code)) => return Status::Exited(code),
+                        Ok(None) => {}
+                        Err(_) => return Status::TransportFailed,
                     }
-                    Ok(_) => {
-                        return Err("The isolated SSH sudo password request is no longer valid.");
-                    }
-                    Err(async_channel::TryRecvError::Closed) => {
-                        return Ok(password::Status::Cancelled);
-                    }
-                    Err(async_channel::TryRecvError::Empty) => {}
                 }
+                Err(error) if retry(&error) => {}
+                Err(_) => return stopped_or_failed(permitted),
             }
         }
     }
 }
+
+impl Streams {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct { writer, .. } => {
+                let result = writer.write_nonblocking(bytes);
+                if matches!(&result, Err(error) if error.kind() == io::ErrorKind::WouldBlock) {
+                    thread::sleep(POLL);
+                }
+                result
+            }
+            Self::Worker { writer, .. } => writer.write_timeout(bytes, POLL),
+        }
+    }
+
+    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::Direct { reader, .. } => reader.read_timeout(bytes, POLL),
+            Self::Worker { reader, .. } => reader.read_timeout(bytes, POLL),
+        }
+    }
+}
+
+fn open_worker(
+    opener: &ssh_worker::Opener,
+    nonce: [u8; 16],
+    permitted: impl Fn() -> bool + Clone + Send + Sync + 'static,
+    answers: async_channel::Receiver<SensitiveLine>,
+    challenge: impl FnOnce() -> bool,
+) -> Result<ssh_worker::Channel, Status> {
+    let channel = opener
+        .open_sudo_pty(nonce, || !permitted())
+        .map_err(|_| stopped_or_failed(&permitted))?;
+    let mut challenge = Some(challenge);
+    let mut submitted = false;
+    loop {
+        if !permitted() {
+            return Err(Status::Cancelled);
+        }
+        match channel
+            .next(POLL)
+            .map_err(|_| stopped_or_failed(&permitted))?
+        {
+            Some(PasswordFileEvent::Challenge) => {
+                if !challenge.take().is_some_and(|notify| notify()) {
+                    return Err(Status::Cancelled);
+                }
+            }
+            Some(PasswordFileEvent::Staged) => {
+                channel
+                    .commit(permitted.clone())
+                    .map_err(|_| stopped_or_failed(&permitted))?;
+            }
+            Some(PasswordFileEvent::Ready) => {
+                return channel.into_channel().map_err(|_| Status::TransportFailed);
+            }
+            Some(PasswordFileEvent::Finished(status)) => return Err(auth_status(status)),
+            None => {}
+        }
+        if !submitted {
+            match answers.try_recv() {
+                Ok(line) if challenge.is_none() => {
+                    channel
+                        .stage(line, permitted.clone())
+                        .map_err(|_| stopped_or_failed(&permitted))?;
+                    submitted = true;
+                }
+                Ok(_) | Err(async_channel::TryRecvError::Closed) => return Err(Status::Cancelled),
+                Err(async_channel::TryRecvError::Empty) => {}
+            }
+        }
+    }
+}
+
+fn auth_status(status: AuthStatus) -> Status {
+    match status {
+        AuthStatus::Exited(0) | AuthStatus::MissingExitCode => Status::MissingExitCode,
+        AuthStatus::Exited(code) => Status::Exited(code),
+        AuthStatus::Cancelled => Status::Cancelled,
+        AuthStatus::TimedOut => Status::TimedOut,
+        AuthStatus::TransportFailed => Status::TransportFailed,
+    }
+}
+
+fn stopped_or_failed(permitted: &impl Fn() -> bool) -> Status {
+    if permitted() {
+        Status::TransportFailed
+    } else {
+        Status::Cancelled
+    }
+}
+
+fn retry(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::TimedOut | io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
+    )
+}
+
+fn new_token() -> Result<String, &'static str> {
+    let mut nonce = [0; 16];
+    getrandom::fill(&mut nonce).map_err(|_| "Could not create a sudo terminal request.")?;
+    Ok(sudo_pty::token(nonce))
+}
+
+fn command_frame(token: &str, command: &str) -> String {
+    let mut frame = String::with_capacity(token.len() + 2 + command.len() * 5);
+    frame.push_str(token);
+    frame.push(' ');
+    for byte in command.bytes() {
+        write!(frame, "\\0{byte:03o}").expect("writing to a String cannot fail");
+    }
+    frame.push('\n');
+    frame
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn password_sudo_wrapper_binds_unique_prompt_and_quoted_working_directory() {
-        let first = Command::new("/tmp/it's here", "printf '%s' '$literal'").unwrap();
-        let second = Command::new("/tmp/it's here", "printf '%s' '$literal'").unwrap();
-        assert_ne!(first.nonce, second.nonce);
-        assert!(first.wire.starts_with("exec /usr/bin/sudo -k -S -p '"));
+    fn password_sudo_reviews_only_the_noninteractive_command_and_quoted_directory() {
+        let command = Command::new("/tmp/it's here", "printf '%s' '$literal'").unwrap();
         assert!(
-            first
-                .wire
-                .contains(" -u root -- /bin/sh -c 'exec </dev/null\ncd ")
+            command
+                .wire()
+                .starts_with("exec /usr/bin/sudo -n -u root -- /bin/sh -c 'exec </dev/null\ncd ")
         );
-        assert!(first.wire.contains(&password::marker(first.nonce)));
+        assert!(!command.wire().contains("-k"));
+        assert!(!command.wire().contains("-S"));
         assert!(Command::new("relative", "id").is_err());
         assert!(Command::new("/tmp", "echo ***").is_err());
     }
 
     #[test]
-    #[ignore = "requires explicit KORTTY_SSH_EXEC_* host fixtures"]
-    fn live_password_sudo_lane_sends_one_fixture_line_and_preserves_shell() {
-        use kortty_ssh::{
-            Authentication, Connect, Endpoint, HostKey, SshSession, TrustStore, WindowSize,
-        };
-
-        let fixture = |suffix| std::env::var(format!("KORTTY_SSH_EXEC_{suffix}")).unwrap();
-        let address: std::net::SocketAddr = fixture("ADDRESS").parse().unwrap();
-        let endpoint = Endpoint::new(&address.ip().to_string(), address.port()).unwrap();
-        let key = HostKey::from_openssh(&fixture("HOST_KEY")).unwrap();
-        let trust = TrustStore::from_pins(vec![(endpoint.clone(), key)]).unwrap();
-        let mut shell = SshSession::connect(
-            Connect {
-                address,
-                endpoint,
-                username: fixture("USER"),
-                authentication: Authentication::private_key(
-                    std::fs::read(fixture("PRIVATE_KEY")).unwrap(),
-                ),
-                term: "xterm".into(),
-                size: WindowSize {
-                    columns: 80,
-                    rows: 24,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                },
-            },
-            trust,
-        )
-        .unwrap();
-        let opener = shell.exec_opener().unwrap();
-        let nonce = [21; 16];
-        let marker = password::marker(nonce);
-        // A finite fake challenge exercises the actual lease without invoking sudo.
-        let script = format!(
-            "printf '%s' {} >&2; IFS= read -r value || exit 70; test \"${{#value}}\" -eq 14 || exit 71; IFS= read -r extra && exit 72; printf '%s' \"$value\"; exit 29",
-            quote(&marker),
-        );
-        let command = Command {
-            wire: format!("exec /usr/bin/timeout 8 /bin/sh -c {}", quote(&script)),
-            nonce,
-        };
-        let (sender, answers) = async_channel::bounded(1);
-        let status = command
-            .run(
-                ExecOpener::Direct(opener.clone()),
-                Cancel::default(),
-                || true,
-                answers,
-                move || {
-                    sender
-                        .try_send(SensitiveLine::new("synthetic-only").unwrap())
-                        .is_ok()
-                },
-            )
-            .unwrap();
-        assert_eq!(status, Status::Exited(29));
-        assert!(!opener.is_closed());
-        shell.close().unwrap();
+    fn sudo_terminal_command_frame_encodes_every_byte() {
+        assert_eq!(command_frame("token", "a\n'"), "token \\0141\\0012\\0047\n");
     }
 }

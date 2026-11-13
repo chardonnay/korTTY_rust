@@ -464,6 +464,7 @@ pub enum Open {
     Exec(String),
     PasswordExec { command: String, nonce: [u8; 16] },
     PasswordFileExec { nonce: [u8; 16] },
+    SudoPty { nonce: [u8; 16] },
     FileExec,
     AccountLookup { kind: Kind, name: String },
     ArchiveExtract,
@@ -481,6 +482,7 @@ impl std::fmt::Debug for Open {
             Self::Exec(..) => "Exec",
             Self::PasswordExec { .. } => "PasswordExec",
             Self::PasswordFileExec { .. } => "PasswordFileExec",
+            Self::SudoPty { .. } => "SudoPty",
             Self::FileExec => "FileExec",
             Self::AccountLookup { .. } => "AccountLookup",
             Self::ArchiveExtract => "ArchiveExtract",
@@ -674,6 +676,10 @@ impl Frame {
                         }
                     }
                     Open::DraftReplace => out.write_all(&[11])?,
+                    Open::SudoPty { nonce } => {
+                        out.write_all(&[12])?;
+                        out.write_all(&nonce)?;
+                    }
                 }
             }
             Self::Opened(id, address) => {
@@ -754,6 +760,11 @@ impl Frame {
                     9 => Open::FolderUsage(recv_folder_usage(input)?),
                     10 => Open::AccountNames(recv_account_names(input)?),
                     11 => Open::DraftReplace,
+                    12 => {
+                        let mut nonce = [0; 16];
+                        input.read_exact(&mut nonce)?;
+                        Open::SudoPty { nonce }
+                    }
                     _ => return Err(invalid()),
                 },
             ),
@@ -820,6 +831,23 @@ mod tests {
         assert!(matches!(
             Frame::recv(&mut input),
             Ok(Frame::Password(5, PasswordFrame::Ready))
+        ));
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn sudo_pty_open_carries_only_the_validation_nonce() {
+        let nonce = [42; 16];
+        let mut bytes = Vec::new();
+        Frame::Open(3, Open::SudoPty { nonce })
+            .send(&mut bytes)
+            .unwrap();
+        assert_eq!(&bytes[..6], &[5, 0, 0, 0, 3, 12]);
+        assert_eq!(&bytes[6..], &nonce);
+        let mut input = bytes.as_slice();
+        assert!(matches!(
+            Frame::recv(&mut input),
+            Ok(Frame::Open(3, Open::SudoPty { nonce: decoded })) if decoded == nonce
         ));
         assert!(input.is_empty());
     }

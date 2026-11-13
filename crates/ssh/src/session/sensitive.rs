@@ -1,4 +1,4 @@
-//! A one-use input stream for credentials on a dedicated non-PTY exec channel.
+//! One-use input for credentials on a dedicated SSH exec channel.
 
 use std::fmt;
 use std::io;

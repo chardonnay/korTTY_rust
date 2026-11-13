@@ -13,7 +13,9 @@ use super::wire::{Frame, Open, invalid};
 use super::{Abort, NO_EXIT, closed, lock};
 use kortty::ssh_runtime::account_lookup::{self, DisplayQuery, Kind};
 use kortty::ssh_runtime::folder_usage;
-use kortty::ssh_runtime::mux::{PasswordEvent, PasswordFileEvent, PasswordSide};
+#[cfg(test)]
+use kortty::ssh_runtime::mux::PasswordEvent;
+use kortty::ssh_runtime::mux::{PasswordFileEvent, PasswordSide};
 use kortty_ssh::SensitiveLine;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(9);
@@ -81,8 +83,10 @@ impl Drop for Channel {
     }
 }
 
+#[cfg(test)]
 pub(crate) struct PasswordChannel(Flow);
 
+#[cfg(test)]
 impl PasswordChannel {
     pub(crate) fn next(&self, timeout: Duration) -> io::Result<Option<PasswordEvent>> {
         self.0.password_event(timeout)
@@ -104,6 +108,7 @@ impl PasswordChannel {
     }
 }
 
+#[cfg(test)]
 impl Drop for PasswordChannel {
     fn drop(&mut self) {
         self.0.close(None);
@@ -348,6 +353,7 @@ impl Opener {
         self.open_channel(Open::DraftReplace, cancelled)
     }
 
+    #[cfg(test)]
     pub(crate) fn open_password_exec(
         &self,
         command: &str,
@@ -372,6 +378,19 @@ impl Opener {
         cancelled: impl Fn() -> bool,
     ) -> Result<PasswordFileChannel, ConnectError> {
         let (flow, address) = self.open(Open::PasswordFileExec { nonce }, None, cancelled)?;
+        if address.is_some() {
+            flow.close(None);
+            return Err(invalid().into());
+        }
+        Ok(PasswordFileChannel(Some(flow)))
+    }
+
+    pub(crate) fn open_sudo_pty(
+        &self,
+        nonce: [u8; 16],
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PasswordFileChannel, ConnectError> {
+        let (flow, address) = self.open(Open::SudoPty { nonce }, None, cancelled)?;
         if address.is_some() {
             flow.close(None);
             return Err(invalid().into());
@@ -437,7 +456,7 @@ impl Opener {
             .map_err(|_| io::Error::other("SSH worker stream IDs exhausted"))?;
         let flow = match &request {
             Open::PasswordExec { .. } => self.0.mux.add_password(id, PasswordSide::Desktop)?,
-            Open::PasswordFileExec { .. } => {
+            Open::PasswordFileExec { .. } | Open::SudoPty { .. } => {
                 self.0.mux.add_password_file(id, PasswordSide::Desktop)?
             }
             _ => self.0.mux.add(id)?,
@@ -460,6 +479,7 @@ impl Opener {
             Open::Exec(_)
                 | Open::PasswordExec { .. }
                 | Open::PasswordFileExec { .. }
+                | Open::SudoPty { .. }
                 | Open::FileExec
                 | Open::ArchiveExtract
                 | Open::DraftReplace

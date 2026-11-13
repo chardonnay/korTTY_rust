@@ -685,6 +685,7 @@ enum ChannelMode {
     Terminal,
     Exec,
     SensitiveExec,
+    SensitiveExecPty,
     ExecPty,
     ExecOnly,
     Subsystem,
@@ -2385,9 +2386,10 @@ impl Outputs {
     fn send(&self, kind: ChanData, data: &[u8]) -> io::Result<usize> {
         let stream = match (kind, self.mode) {
             (ChanData::Normal, _)
-            | (ChanData::Stderr, ChannelMode::Terminal | ChannelMode::ExecPty) => {
-                self.stdout.as_ref()
-            }
+            | (
+                ChanData::Stderr,
+                ChannelMode::Terminal | ChannelMode::ExecPty | ChannelMode::SensitiveExecPty,
+            ) => self.stdout.as_ref(),
             (ChanData::Stderr, ChannelMode::Exec | ChannelMode::SensitiveExec) => {
                 self.stderr.as_ref()
             }
@@ -2516,7 +2518,10 @@ impl ChannelPump {
             .read_channel_ready()
             .is_some_and(|(channel, _, _)| channel == self.channel.num())
         {
-            let sensitive = self.output.mode == ChannelMode::SensitiveExec;
+            let sensitive = matches!(
+                self.output.mode,
+                ChannelMode::SensitiveExec | ChannelMode::SensitiveExecPty
+            );
             let (count, kind) = if sensitive {
                 runner.read_sensitive_channel_either_deferred(&self.channel, buffer)
             } else {
