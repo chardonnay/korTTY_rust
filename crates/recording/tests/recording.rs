@@ -178,6 +178,63 @@ fn changed_screen_resumes_idle_and_equal_timestamps_use_the_last_frame() {
 }
 
 #[test]
+fn interleaved_panes_seek_independently_and_keep_their_initial_state_in_an_export() {
+    let mut writer = Recorder::new(Vec::new(), CaptureOptions::default()).unwrap();
+    writer.start(Duration::ZERO).unwrap();
+    for (at, pane, letter) in [
+        (0, 9, b'A'),
+        (0, 4, b'B'),
+        (2, 9, b'C'),
+        (2, 9, b'D'),
+        (3, 20, b'E'),
+        (5, 4, b'F'),
+    ] {
+        let mut terminal = Terminal::new(3, 1);
+        terminal.advance(&[letter]);
+        writer
+            .record_screen(seconds(at), pane, &terminal.snapshot(), (0, 0))
+            .unwrap();
+    }
+    let mut replay = Replay::from_reader(Cursor::new(writer.finish(seconds(6)).unwrap())).unwrap();
+    assert_eq!(replay.pane_count(), 3);
+    assert_eq!(
+        replay
+            .pane_frame_indices_at(Duration::ZERO, 0..3)
+            .collect::<Vec<_>>(),
+        [Some(1), Some(0), None]
+    );
+    assert_eq!(
+        replay
+            .pane_frame_indices_at(seconds(2), 0..3)
+            .collect::<Vec<_>>(),
+        [Some(1), Some(3), None]
+    );
+    assert_eq!(
+        replay
+            .pane_frame_indices_at(seconds(3), 1..usize::MAX)
+            .collect::<Vec<_>>(),
+        [Some(3), Some(4)]
+    );
+
+    let directory = TestDirectory::new();
+    let destination = directory.0.join("tiled-clip.korttyrec");
+    replay
+        .export_range(&destination, seconds(2)..seconds(6))
+        .unwrap();
+    let mut clip = Replay::open(&destination).unwrap();
+    assert_eq!(clip.frame_count(), 4);
+    for (index, (pane, at, letter)) in [(4, 0, "B"), (9, 0, "D"), (20, 1, "E"), (4, 3, "F")]
+        .into_iter()
+        .enumerate()
+    {
+        let frame = clip.frame(index).unwrap().unwrap();
+        assert_eq!(frame.pane, pane);
+        assert_eq!(frame.playback_at, seconds(at));
+        assert_eq!(frame.screen.cells[0].text, letter);
+    }
+}
+
+#[test]
 fn opens_private_files_and_exports_a_range_without_overwriting() {
     let directory = TestDirectory::new();
     let source = directory.0.join("source.korttyrec");

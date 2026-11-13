@@ -9,6 +9,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use kortty_terminal::TerminalProfile;
 use serde::{Deserialize, Serialize};
 
+use crate::connection_store::{
+    MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS,
+};
 use crate::session::{IbmKind, SerialConnection};
 use crate::session_security::LocalSettings;
 use crate::terminal_effects::Selection as TerminalEffect;
@@ -17,6 +20,7 @@ use crate::workspace::SshTarget;
 pub(crate) mod dialog_geometry;
 pub(crate) mod projects;
 pub(crate) mod session;
+pub(crate) use projects::java::appearance::ProjectTerminalAppearance;
 
 const VERSION: u32 = 1;
 const MAX_BYTES: u64 = 256 * 1024;
@@ -59,6 +63,8 @@ pub struct WindowLayout {
     pub tab_primary_panes: BTreeMap<usize, usize>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub(crate) tab_terminal_effects: BTreeMap<usize, PaneEffects>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) tab_terminal_appearance: BTreeMap<usize, ProjectTerminalAppearance>,
 }
 
 pub(crate) type PaneEffects = BTreeMap<usize, TerminalEffect>;
@@ -172,6 +178,14 @@ impl WindowLayout {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum PaneLayout {
+    LocalFile {
+        path: PathBuf,
+        tool: LocalFileTool,
+    },
+    RemoteTool {
+        target: SshTarget,
+        tool: RemoteProjectTool,
+    },
     Terminal {
         font: u8,
         focused: bool,
@@ -181,6 +195,8 @@ pub enum PaneLayout {
         term: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         security: Option<LocalSettings>,
+        #[serde(default, skip_serializing_if = "InitialTerminalSize::is_default")]
+        initial_size: InitialTerminalSize,
     },
     Ibm {
         font: u8,
@@ -198,6 +214,8 @@ pub enum PaneLayout {
         focused: bool,
         term: String,
         target: SshTarget,
+        #[serde(default, skip_serializing_if = "InitialTerminalSize::is_default")]
+        initial_size: InitialTerminalSize,
     },
     Split {
         vertical: bool,
@@ -205,6 +223,145 @@ pub enum PaneLayout {
         first: Box<PaneLayout>,
         second: Box<PaneLayout>,
     },
+}
+
+/// Optional launch dimensions carried by a project terminal pane.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct InitialTerminalSize {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) columns: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) rows: Option<u16>,
+}
+
+impl InitialTerminalSize {
+    pub(crate) fn is_default(&self) -> bool {
+        self.columns.is_none() && self.rows.is_none()
+    }
+
+    pub(crate) fn validate(self) -> io::Result<()> {
+        if self.columns.is_some_and(|columns| {
+            !(MIN_TERMINAL_COLUMNS..=MAX_TERMINAL_COLUMNS).contains(&columns)
+        }) || self
+            .rows
+            .is_some_and(|rows| !(MIN_TERMINAL_ROWS..=MAX_TERMINAL_ROWS).contains(&rows))
+        {
+            return Err(invalid(
+                "Initial terminal size requires 40 to 500 columns and 10 to 200 rows.",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum LocalFileTool {
+    Editor,
+    Image { zoom: f32 },
+}
+
+impl LocalFileTool {
+    pub(crate) const MIN_ZOOM: f32 = 0.1;
+    pub(crate) const MAX_ZOOM: f32 = 10.0;
+
+    pub(crate) fn valid_path(path: &Path) -> bool {
+        path.file_name().is_some() && Self::valid_directory(path)
+    }
+
+    pub(crate) fn valid_directory(path: &Path) -> bool {
+        use std::path::Component;
+
+        if !path.is_absolute() {
+            return false;
+        }
+        let Some(text) = path.to_str() else {
+            return false;
+        };
+        if text.len() > 4096 || crate::ssh_dialog::unsafe_text(text) {
+            return false;
+        }
+        #[cfg(windows)]
+        if !matches!(
+            path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), std::path::Prefix::Disk(_))
+        ) {
+            return false;
+        }
+        path.components().all(|component| match component {
+            Component::Normal(name) => {
+                #[cfg(windows)]
+                {
+                    let name = name.to_string_lossy();
+                    !name.contains(':') && !name.ends_with([' ', '.'])
+                }
+                #[cfg(not(windows))]
+                {
+                    let _ = name;
+                    true
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => true,
+            Component::CurDir | Component::ParentDir => false,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) enum RemoteProjectTool {
+    Sftp {
+        local: Option<PathBuf>,
+        remote: Option<String>,
+        idle_minutes: Option<u16>,
+    },
+    File {
+        path: String,
+        tool: LocalFileTool,
+    },
+}
+
+impl RemoteProjectTool {
+    pub(crate) const MAX_IDLE_MINUTES: u16 = 120;
+
+    pub(crate) fn valid_remote_path(path: &str, directory: bool) -> bool {
+        if path.len() > 4096 || crate::ssh_dialog::unsafe_text(path) {
+            return false;
+        }
+        let Some(rest) = path.strip_prefix('/') else {
+            return false;
+        };
+        if directory && rest.is_empty() {
+            return true;
+        }
+        let rest = if directory {
+            rest.strip_suffix('/').unwrap_or(rest)
+        } else {
+            rest
+        };
+        rest.split('/').all(|part| !matches!(part, "" | "." | ".."))
+    }
+
+    pub(crate) fn valid(&self) -> bool {
+        match self {
+            Self::Sftp {
+                local,
+                remote,
+                idle_minutes,
+            } => {
+                local.as_deref().is_none_or(LocalFileTool::valid_directory)
+                    && remote
+                        .as_deref()
+                        .is_none_or(|path| Self::valid_remote_path(path, true))
+                    && idle_minutes
+                        .is_none_or(|minutes| (1..=Self::MAX_IDLE_MINUTES).contains(&minutes))
+            }
+            Self::File { path, tool } => {
+                Self::valid_remote_path(path, false)
+                    && !matches!(tool, LocalFileTool::Image { zoom } if !(LocalFileTool::MIN_ZOOM..=LocalFileTool::MAX_ZOOM).contains(zoom))
+            }
+        }
+    }
 }
 
 impl WorkspaceLayout {
@@ -242,13 +399,9 @@ impl WorkspaceLayout {
                 if window
                     .tab_terminal_effects
                     .get(&index)
-                    .is_some_and(|effects| {
-                        effects.iter().any(|(&pane, effect)| {
-                            pane >= panes - before || effect.speed != effect.speed()
-                        })
-                    })
+                    .is_some_and(|effects| effects.keys().any(|&pane| pane >= panes - before))
                 {
-                    return Err(invalid("invalid terminal effect speed or pane index"));
+                    return Err(invalid("invalid terminal effect pane index"));
                 }
             }
             if window
@@ -264,6 +417,16 @@ impl WorkspaceLayout {
                 .any(|&index| index >= window.tabs.len())
             {
                 return Err(invalid("invalid terminal effect tab index"));
+            }
+            for (&index, appearance) in &window.tab_terminal_appearance {
+                if window
+                    .tabs
+                    .get(index)
+                    .is_none_or(PaneLayout::is_project_tool)
+                {
+                    return Err(invalid("invalid terminal appearance tab index"));
+                }
+                appearance.validate()?;
             }
             if window.tab_titles.iter().any(|(&index, title)| {
                 index >= window.tabs.len()
@@ -333,9 +496,16 @@ fn clean_tab_text(value: &str, normalize_unicode_line_breaks: bool) -> String {
 }
 
 impl PaneLayout {
+    pub(crate) fn is_project_tool(&self) -> bool {
+        matches!(self, Self::LocalFile { .. } | Self::RemoteTool { .. })
+    }
+
     fn validate(&self, depth: usize, panes: &mut usize) -> io::Result<usize> {
         if depth > MAX_SPLIT_DEPTH {
             return Err(invalid("too many nested splits"));
+        }
+        if let Self::Terminal { initial_size, .. } | Self::Ssh { initial_size, .. } = self {
+            initial_size.validate()?;
         }
         if let Self::Terminal { vt100, term, .. } = self
             && local_profile(term.as_deref(), *vt100).is_none()
@@ -365,6 +535,22 @@ impl PaneLayout {
             target.validate().map_err(invalid)?;
         }
         match self {
+            Self::RemoteTool { target, tool } => {
+                target.validate()?;
+                if depth != 0 || !tool.valid() {
+                    return Err(invalid("invalid SFTP or remote file tab state"));
+                }
+                Ok(1)
+            }
+            Self::LocalFile { path, tool } => {
+                if depth != 0
+                    || !LocalFileTool::valid_path(path)
+                    || matches!(tool, LocalFileTool::Image { zoom } if !(LocalFileTool::MIN_ZOOM..=LocalFileTool::MAX_ZOOM).contains(zoom))
+                {
+                    return Err(invalid("invalid local file tab path, zoom or placement"));
+                }
+                Ok(1)
+            }
             Self::Terminal { font, focused, .. }
             | Self::Ibm { font, focused, .. }
             | Self::Serial { font, focused, .. }
@@ -447,7 +633,11 @@ pub fn jobs_path() -> io::Result<PathBuf> {
 }
 
 pub fn connections_path() -> io::Result<PathBuf> {
-    Ok(path()?.with_file_name("connections.json"))
+    Ok(connections_path_at(&root()?))
+}
+
+pub(crate) fn connections_path_at(root: &Path) -> PathBuf {
+    root.join("connections.json")
 }
 
 pub(crate) fn local_dock_path() -> io::Result<PathBuf> {
@@ -476,7 +666,11 @@ pub(crate) fn open_preference(path: &Path) -> io::Result<File> {
 }
 
 pub fn vault_path() -> io::Result<PathBuf> {
-    Ok(path()?.with_file_name("vault").join("vault.bin"))
+    Ok(vault_path_at(&root()?))
+}
+
+pub(crate) fn vault_path_at(root: &Path) -> PathBuf {
+    root.join("vault").join("vault.bin")
 }
 
 pub fn ssh_known_hosts() -> io::Result<PathBuf> {
@@ -659,6 +853,7 @@ mod tests {
             tab_groups: Default::default(),
             tab_primary_panes: Default::default(),
             tab_terminal_effects: Default::default(),
+            tab_terminal_appearance: Default::default(),
             width: 920.0,
             height: 620.0,
             position: SavedPosition::new(-90.0, 45.0),
@@ -674,6 +869,7 @@ mod tests {
                     vt100: false,
                     term: Some("dtterm".into()),
                     security: None,
+                    initial_size: InitialTerminalSize::default(),
                 }),
                 second: Box::new(PaneLayout::Terminal {
                     font: 17,
@@ -681,9 +877,43 @@ mod tests {
                     vt100: true,
                     term: None,
                     security: None,
+                    initial_size: InitialTerminalSize::default(),
                 }),
             }],
         }])
+    }
+
+    #[test]
+    fn workspace_layout_initial_terminal_size_is_optional_and_validated() {
+        let legacy = example();
+        let document = serde_json::to_string(&legacy).unwrap();
+        assert!(!document.contains("initial_size"));
+        assert_eq!(
+            serde_json::from_str::<WorkspaceLayout>(&document).unwrap(),
+            legacy
+        );
+
+        let mut layout = legacy;
+        let PaneLayout::Split { first, .. } = &mut layout.windows[0].tabs[0] else {
+            panic!("expected the example split");
+        };
+        let PaneLayout::Terminal { initial_size, .. } = first.as_mut() else {
+            panic!("expected the example terminal pane");
+        };
+        *initial_size = InitialTerminalSize {
+            columns: Some(500),
+            rows: None,
+        };
+        let mut document = serde_json::to_value(&layout).unwrap();
+        let restored: WorkspaceLayout = serde_json::from_value(document.clone()).unwrap();
+        restored.validate().unwrap();
+        assert_eq!(restored, layout);
+
+        let size =
+            &mut document["windows"][0]["tabs"][0]["Split"]["first"]["Terminal"]["initial_size"];
+        size["rows"] = serde_json::json!(201);
+        let invalid: WorkspaceLayout = serde_json::from_value(document).unwrap();
+        assert!(invalid.validate().is_err());
     }
 
     #[test]
@@ -707,7 +937,7 @@ mod tests {
 
     #[test]
     fn workspace_layout_effects_are_additive_and_reject_invalid_coordinates_or_speed() {
-        use crate::terminal_effects::Effect;
+        use crate::terminal_effects::{Effect, Speed};
 
         let mut layout = example();
         let value = serde_json::to_value(&layout).unwrap();
@@ -719,7 +949,7 @@ mod tests {
 
         let selection = TerminalEffect {
             effect: Effect::NeonCity,
-            speed: 7,
+            speed: Speed::try_from(7.5).unwrap(),
         };
         layout.windows[0]
             .tab_terminal_effects
@@ -731,11 +961,15 @@ mod tests {
             layout
         );
 
-        for (tab, pane, speed) in [(1, 1, 7), (0, 2, 7), (0, 1, 0), (0, 1, 100)] {
-            layout.windows[0].tab_terminal_effects = BTreeMap::from([(
-                tab,
-                BTreeMap::from([(pane, TerminalEffect { speed, ..selection })]),
-            )]);
+        for speed in [0, 100] {
+            let mut invalid = serde_json::to_value(&layout).unwrap();
+            invalid["windows"][0]["tab_terminal_effects"]["0"]["1"]["speed"] =
+                serde_json::json!(speed);
+            assert!(serde_json::from_value::<WorkspaceLayout>(invalid).is_err());
+        }
+        for (tab, pane) in [(1, 1), (0, 2)] {
+            layout.windows[0].tab_terminal_effects =
+                BTreeMap::from([(tab, BTreeMap::from([(pane, selection)]))]);
             assert!(layout.validate().is_err());
         }
     }

@@ -104,11 +104,23 @@ impl ClipboardBridge {
         replies
     }
 
-    pub(super) fn has_commands(&self) -> bool {
+    pub(super) fn has_commands(&self, batch_continuation: bool) -> bool {
         self.strict_dirty
-            || self.revoke_paste
-            || self.paste.is_some()
-            || !self.completions.is_empty()
+            || !batch_continuation
+                && (self.revoke_paste || self.paste.is_some() || !self.completions.is_empty())
+    }
+
+    pub(super) fn request_strict(&mut self, strict: bool) -> bool {
+        if strict == self.strict {
+            return false;
+        }
+        self.strict = strict;
+        self.strict_dirty = true;
+        if strict {
+            self.revoke_protocol = true;
+            self.revoke();
+        }
+        true
     }
 
     pub(super) fn apply(&mut self, terminal: &mut Terminal) -> Applied {
@@ -225,6 +237,9 @@ impl Session {
     }
 
     pub fn try_clipboard_paste(&self, text: &str, fallback: &[u8]) -> bool {
+        if self.is_pacing_paste() {
+            return false;
+        }
         let Backend::Stream { events, actor, .. } = &self.backend else {
             return false;
         };
@@ -254,17 +269,10 @@ impl Session {
     }
 
     pub fn set_strict_escapes(&self, strict: bool) {
-        if let Backend::Stream { actor, .. } = &self.backend {
-            let mut bridge = lock(&self.shared.clipboard);
-            if strict != bridge.strict {
-                bridge.strict = strict;
-                bridge.strict_dirty = true;
-                if strict {
-                    bridge.revoke_protocol = true;
-                    bridge.revoke();
-                }
-                actor.unpark();
-            }
+        if let Backend::Stream { actor, .. } = &self.backend
+            && lock(&self.shared.clipboard).request_strict(strict)
+        {
+            actor.unpark();
         }
     }
 

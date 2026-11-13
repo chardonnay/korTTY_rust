@@ -37,6 +37,7 @@ impl Workspace {
                     Some("Unlock the vault before saving the new SSH key passphrase.".into());
                 return Task::none();
             };
+            self.vault_change_revision = std::sync::Arc::new(());
             Some(vault)
         } else {
             None
@@ -102,6 +103,7 @@ impl Workspace {
                     && let Some(window) = &mut self.vault
                 {
                     window.restore_after_ssh_keys(vault);
+                    self.vault_change_revision = std::sync::Arc::new(());
                 }
                 let Some(manager) = self
                     .ssh_keys

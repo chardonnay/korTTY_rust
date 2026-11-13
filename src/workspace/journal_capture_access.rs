@@ -1,4 +1,4 @@
-//! Owns manual journal capture for the lifetime of a terminal tab.
+//! Owns manual and automatic journal captures for terminal tabs.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -107,6 +107,8 @@ pub(super) struct Entry {
     screenshot: Option<Receiver<()>>,
     automatic_screenshot_ai: Option<u64>,
     automatic_screenshot_ai_disabled: bool,
+    automatic: Option<(SessionId, u64)>,
+    capture_input: bool,
 }
 
 enum Phase {
@@ -122,7 +124,9 @@ enum Phase {
 
 struct Binding {
     id: SessionId,
+    generation: u64,
     attachment: JournalAttachment,
+    note_authority: Arc<()>,
     ready: bool,
 }
 
@@ -149,7 +153,7 @@ impl Startup {
         thread::Builder::new()
             .name("kortty-journal-start".into())
             .spawn(move || {
-                let started = Capture::start_with_marker_rules(root, metadata, markers)
+                let started = Capture::start_configured(root, metadata, markers)
                     .map(Arc::new)
                     .map_err(|error| error.to_string());
                 let mut slot = worker_result
@@ -326,6 +330,37 @@ impl Workspace {
         })
     }
 
+    pub(super) fn live_journal_note_authority(
+        &self,
+        capture: &Arc<Capture>,
+    ) -> Option<impl Fn() -> bool + use<>> {
+        let binding = self.journal_captures.values().find_map(|entry| {
+            let Phase::Active {
+                capture: active,
+                source: Some(binding),
+                retiring: None,
+            } = &entry.phase
+            else {
+                return None;
+            };
+            (Arc::ptr_eq(capture, active) && binding.ready).then_some(binding)
+        })?;
+        let pane = self.sessions.get(&binding.id)?;
+        if pane.stream_generation != binding.generation {
+            return None;
+        }
+        let terminal = pane.session.journal_note_authority()?;
+        let binding = Arc::downgrade(&binding.note_authority);
+        let capture = Arc::downgrade(capture);
+        Some(move || {
+            binding.strong_count() != 0
+                && capture
+                    .upgrade()
+                    .is_some_and(|capture| capture.status() == Status::Recording)
+                && terminal()
+        })
+    }
+
     pub(super) fn prune_retired_journal_captures(&mut self) {
         self.retired_journal_captures
             .retain(|capture| !capture.done().is_closed());
@@ -392,6 +427,35 @@ impl Workspace {
             title: entry.title.clone(),
             capture,
         })
+    }
+
+    pub(in crate::workspace) fn journal_agent_capture(
+        &self,
+        session: SessionId,
+        stream: u64,
+    ) -> Option<Arc<Capture>> {
+        if self.exiting
+            || self.scheduler_draining
+            || self.sessions.get(&session)?.stream_generation != stream
+        {
+            return None;
+        }
+        let tab = self
+            .windows
+            .values()
+            .flat_map(Window::terminal_tabs)
+            .find(|tab| tab.grid.get(tab.primary) == Some(&session))?;
+        let entry = self.dock_journal_entry(tab)?;
+        match &entry.phase {
+            Phase::Active {
+                source: Some(source),
+                retiring: None,
+                ..
+            } if source.ready && source.id == session && source.generation == stream => {
+                entry.recording().cloned()
+            }
+            _ => None,
+        }
     }
 
     pub(super) fn dock_journal_live(&self, owner: window::Id, tab: u64, run: u64) -> bool {
@@ -495,7 +559,6 @@ impl Workspace {
         else {
             return Task::none();
         };
-        let journal_pane = tab.primary;
         if self
             .journal_captures
             .get(&tab_id)
@@ -504,11 +567,36 @@ impl Workspace {
             self.stop_journal(tab_id);
             return Task::none();
         }
+        self.start_journal_for(owner, tab.id, false)
+    }
+
+    fn start_journal_for(
+        &mut self,
+        owner: window::Id,
+        tab_id: u64,
+        automatic: bool,
+    ) -> Task<Desktop> {
+        let Some(tab) = self.journal_tab_in(owner, tab_id) else {
+            return Task::none();
+        };
+        let journal_pane = tab.primary;
         let Some((source, pane)) = self.journal_source(tab) else {
             return Task::none();
         };
+        let generation = pane.stream_generation;
+        let mut config = pane.journal_config;
+        if let Some(cap) = self
+            .clipboard
+            .policy
+            .terminal_logging
+            .journal_max_log_parts()
+        {
+            config.max_log_parts = config.max_log_parts.min(cap);
+        }
         let connection_name = if let Some(ssh) = &pane.ssh {
             ssh.label()
+        } else if let Some(local) = &pane.saved_local {
+            local.display_name()
         } else if let Some(serial) = &pane.frame.serial {
             serial.device.display().to_string()
         } else {
@@ -520,8 +608,10 @@ impl Workspace {
             .unwrap_or_else(|| connection_name.clone());
         let mut metadata = Metadata {
             title: title.clone(),
+            title_manually_set: tab.custom_title.is_some(),
             connection_name,
-            seeded: true,
+            seeded: !automatic,
+            connection_config: Some(config),
             log_format: self
                 .clipboard
                 .policy
@@ -572,6 +662,8 @@ impl Workspace {
                 screenshot: None,
                 automatic_screenshot_ai,
                 automatic_screenshot_ai_disabled: false,
+                automatic: automatic.then_some((source, generation)),
+                capture_input: config.capture_input,
             },
         );
         task
@@ -603,11 +695,26 @@ impl Workspace {
         };
         capture.set_marker_rules(markers);
         let done = capture.done();
+        let summary_config = capture.summary_config();
+        let summary_capture = Arc::clone(&capture);
+        let summary_title = entry.title.clone();
         entry.phase = Phase::Active {
             capture,
             source: None,
             retiring: None,
         };
+        if let Some(config) = summary_config
+            && let Some(secrets) = self
+                .sessions
+                .get(&source)
+                .and_then(|pane| pane.session.journal_redaction_secrets())
+        {
+            let redactor = Arc::new(crate::terminal_logging::Redactor::for_journal(
+                secrets,
+                self.clipboard.policy.terminal_logging.clone(),
+            ));
+            self.register_journal_summaries(summary_capture, config, redactor, summary_title);
+        }
         Task::batch([
             when_closed(done, Message::Ended(tab_id, run)),
             self.attach_journal_source(tab_id, Some(source)),
@@ -624,7 +731,12 @@ impl Workspace {
         let Some((id, pane)) = self
             .journal_tab(tab_id)
             .and_then(|tab| self.journal_source(tab))
-            .filter(|(id, _)| original.is_none_or(|original| original == *id))
+            .filter(|(id, pane)| {
+                original.is_none_or(|original| original == *id)
+                    && entry.automatic.is_none_or(|(source, generation)| {
+                        source == *id && generation == pane.stream_generation
+                    })
+            })
         else {
             if original.is_some() {
                 self.fail_journal(
@@ -635,10 +747,12 @@ impl Workspace {
             return Task::none();
         };
         let sink = capture.sink();
-        let result = pane.session.attach_journal(
+        let generation = pane.stream_generation;
+        let result = pane.session.attach_journal_configured(
             sink,
             self.clipboard.policy.terminal_logging.clone(),
-            original.is_some(),
+            original.is_some() && entry.automatic.is_none(),
+            entry.capture_input,
         );
         let (attachment, reply) = match result {
             Ok(result) => result,
@@ -659,7 +773,9 @@ impl Workspace {
         if let Phase::Active { source, .. } = &mut entry.phase {
             *source = Some(Binding {
                 id,
+                generation,
                 attachment,
+                note_authority: Arc::new(()),
                 ready: false,
             });
         }
@@ -679,12 +795,29 @@ impl Workspace {
         let mut retire = Vec::new();
         let mut stop = Vec::new();
         for (&id, entry) in &self.journal_captures {
-            let Some(tab) = self.journal_tab(id).filter(|tab| tab.primary == entry.pane) else {
+            let Some(tab) = self.journal_tab(id).filter(|tab| {
+                tab.primary == entry.pane && !tab.incognito && self.journal_allowed()
+            }) else {
                 if entry.capturing() {
                     stop.push(id);
                 }
                 continue;
             };
+            let primary = tab.grid.get(entry.pane).copied().and_then(|id| {
+                self.sessions
+                    .get(&id)
+                    .map(|pane| (id, pane.stream_generation, &pane.frame.status))
+            });
+            if entry.automatic.is_some_and(|(id, generation)| {
+                !primary.is_some_and(|(pane, stream, status)| {
+                    id == pane && generation == stream && *status == crate::session::Status::Running
+                })
+            }) {
+                if entry.capturing() {
+                    stop.push(id);
+                }
+                continue;
+            }
             let Phase::Active {
                 source,
                 retiring: None,
@@ -693,9 +826,10 @@ impl Workspace {
             else {
                 continue;
             };
-            let primary = tab.grid.get(entry.pane).copied();
-            match (source, primary) {
-                (Some(bound), current) if Some(bound.id) != current => retire.push(id),
+            match (source, primary.map(|(id, generation, _)| (id, generation))) {
+                (Some(bound), current) if Some((bound.id, bound.generation)) != current => {
+                    retire.push(id)
+                }
                 (None, Some(_)) => attach.push(id),
                 _ => {}
             }
@@ -703,7 +837,7 @@ impl Workspace {
         for id in stop {
             self.stop_journal(id);
         }
-        let mut tasks = Vec::new();
+        let mut tasks = self.reconcile_automatic_journals();
         for id in retire {
             let Some(Entry {
                 run,
@@ -716,7 +850,13 @@ impl Workspace {
             else {
                 continue;
             };
-            if let Some(source) = source.take() {
+            if let Some(Binding {
+                attachment,
+                note_authority,
+                ..
+            }) = source.take()
+            {
+                drop(note_authority);
                 if let Some(note) = note {
                     note.translation.cancel();
                 }
@@ -724,7 +864,7 @@ impl Workspace {
                 let worker = thread::Builder::new()
                     .name("kortty-journal-detach".into())
                     .spawn(move || {
-                        block_on(source.attachment.detach());
+                        block_on(attachment.detach());
                         drop(signal);
                     });
                 if let Err(error) = worker {
@@ -741,6 +881,40 @@ impl Workspace {
                 .map(|id| self.attach_journal_source(id, None)),
         );
         Task::batch(tasks)
+    }
+
+    fn reconcile_automatic_journals(&mut self) -> Vec<Task<Desktop>> {
+        if !self.journal_allowed() {
+            return Vec::new();
+        }
+        let mut candidates = Vec::new();
+        for (&owner, window) in &self.windows {
+            for tab in window.terminal_tabs() {
+                let Some((session, pane)) = self.journal_source(tab) else {
+                    continue;
+                };
+                if pane.journal_config.auto_start
+                    && pane.frame.status == crate::session::Status::Running
+                    && pane.journal_attempted != Some(pane.stream_generation)
+                {
+                    candidates.push((owner, tab.id, session, pane.stream_generation));
+                }
+            }
+        }
+        let mut tasks = Vec::new();
+        for (owner, tab, session, generation) in candidates {
+            let existing = self.journal_captures.get(&tab);
+            if existing.is_some_and(|entry| matches!(entry.phase, Phase::Finishing(..))) {
+                continue;
+            }
+            if let Some(pane) = self.sessions.get_mut(&session) {
+                pane.journal_attempted = Some(generation);
+            }
+            if existing.is_none_or(|entry| !entry.capturing()) {
+                tasks.push(self.start_journal_for(owner, tab, true));
+            }
+        }
+        tasks
     }
 
     fn fail_journal(&mut self, tab: u64, message: String) {
@@ -878,11 +1052,17 @@ impl Workspace {
         };
         let sink = capture.sink();
         let setup = match &action {
-            Note::Translate(event) => Some(self.journal_note_translation_setup(
-                event,
-                entry.recording(),
-                MAX_RECORD_BYTES,
-            )),
+            Note::Translate(event) => {
+                let recording = entry.recording();
+                let source = ViewerSource::capture(capture);
+                let source = self.journal_note_entry_source(recording, move || {
+                    source.require_current_location()
+                });
+                Some(
+                    self.journal_note_translation_setup(event, recording, MAX_RECORD_BYTES)
+                        .with_outbound_source(source),
+                )
+            }
             _ => None,
         };
         let Some(entry) = self.journal_captures.get_mut(&id) else {
@@ -1057,6 +1237,9 @@ impl Workspace {
                 {
                     entry.phase = Phase::Finished(Some(Arc::clone(capture)));
                 }
+                return self.update_journal_summary_worker(
+                    super::journal_access::summaries::Worker::Pulse,
+                );
             }
             Message::SourceRetired(tab, run) => {
                 if let Some(Entry {
@@ -1333,6 +1516,7 @@ mod tests {
         }
     }
 
+    #[track_caller]
     fn wait(mut finished: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(8);
         while !finished() {
@@ -1394,6 +1578,8 @@ mod tests {
                 screenshot: None,
                 automatic_screenshot_ai: Some(19),
                 automatic_screenshot_ai_disabled: false,
+                automatic: None,
+                capture_input: false,
             },
         );
         let obsolete = PublishedScreenshot {
@@ -1469,6 +1655,8 @@ mod tests {
 
     #[test]
     fn journal_metadata_retains_a_closing_capture_after_its_tab_is_removed() {
+        use iced::futures::{FutureExt as _, StreamExt as _};
+
         use crate::workspace::journal_access::{Message as JournalMessage, metadata};
 
         let scratch = Scratch::new();
@@ -1498,6 +1686,8 @@ mod tests {
                 screenshot: None,
                 automatic_screenshot_ai: None,
                 automatic_screenshot_ai_disabled: false,
+                automatic: None,
+                capture_input: false,
             },
         );
         workspace.remove_tab_journal(tab_id);
@@ -1522,14 +1712,33 @@ mod tests {
             dialog,
             JournalMessage::Metadata(metadata::Message::Title("Saved after tab close".into())),
         );
-        let _ = workspace.update_session_journal(
+        let save = workspace.update_session_journal(
             dialog,
             JournalMessage::Metadata(metadata::Message::SaveTitle),
         );
-        wait(|| {
-            crate::session_journal::read(capture.directory())
-                .is_ok_and(|journal| journal.summary.title == "Saved after tab close")
+        let mut save = iced_runtime::task::into_stream(save).expect("scheduled journal rename");
+        let mut completion = None;
+        wait(|| match save.next().now_or_never() {
+            Some(Some(iced_runtime::Action::Output(message))) => {
+                completion = Some(message);
+                true
+            }
+            Some(_) => panic!("Journal rename ended without a completion message"),
+            None => false,
         });
+        let completion = completion.unwrap();
+        let Desktop::SessionJournal(
+            saved_viewer,
+            JournalMessage::Metadata(metadata::Message::Saved(_, result)),
+        ) = &completion
+        else {
+            panic!("Expected journal rename completion");
+        };
+        assert_eq!(*saved_viewer, viewer);
+        result
+            .as_ref()
+            .expect("saved title while capture was retiring");
+        let _ = workspace.update(completion);
         drop(retiring);
         wait(|| capture.done().is_closed());
         wait(|| {
@@ -1583,6 +1792,8 @@ mod tests {
                 screenshot: None,
                 automatic_screenshot_ai: None,
                 automatic_screenshot_ai_disabled: false,
+                automatic: None,
+                capture_input: false,
             },
         );
         let _ = workspace.open_journal_viewer(owner, replacement, "Replacement".into());
@@ -1672,6 +1883,111 @@ mod tests {
         );
         let done = workspace.sessions[&session].session.stop();
         wait(|| done.is_closed());
+    }
+
+    #[test]
+    fn configured_journal_starts_once_per_stream_without_retroactive_seed() {
+        let scratch = Scratch::new();
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        workspace.window_settings.session_journal.directory =
+            scratch.0.join("journals").to_str().unwrap().into();
+        let grid = crate::session::GridSize::default();
+        let shell =
+            crate::session::Session::start(grid, kortty_terminal::TerminalProfile::Xterm).unwrap();
+        let session = workspace.store_session(shell, grid, 14);
+        workspace.add_tab(owner, session);
+        let pane = workspace.sessions.get_mut(&session).unwrap();
+        wait(|| {
+            pane.session.journal_available()
+                && pane.session.frame().status == crate::session::Status::Running
+        });
+        pane.frame = pane.session.frame();
+        pane.journal_config.auto_start = true;
+        let generation = pane.stream_generation;
+        let tab = workspace.windows[&owner].active_tab_id().unwrap();
+        let _ = workspace.reconcile_journal_sources();
+        let entry = &workspace.journal_captures[&tab];
+        assert_eq!(entry.automatic, Some((session, generation)));
+        assert!(!entry.capture_input);
+        let run = entry.run;
+        let Phase::Starting(_, startup) = &entry.phase else {
+            panic!("automatic capture did not start");
+        };
+        wait(|| startup.done.is_closed());
+        let attach = workspace.update_journal_capture(Message::Started(tab, run));
+        assert!(matches!(
+            &workspace.journal_captures[&tab].phase,
+            Phase::Active {
+                source: Some(_),
+                ..
+            }
+        ));
+        assert!(
+            workspace
+                .journal_agent_capture(session, generation)
+                .is_none()
+        );
+        {
+            use iced::futures::StreamExt as _;
+
+            let mut events = iced_runtime::task::into_stream(attach).unwrap();
+            loop {
+                if let iced_runtime::Action::Output(Desktop::JournalCapture(
+                    message @ Message::Attached(..),
+                )) = block_on(events.next()).expect("the journal attachment must finish")
+                {
+                    let _ = workspace.update_journal_capture(message);
+                    break;
+                }
+            }
+        }
+        let capture = workspace.journal_captures[&tab].metadata_capture().unwrap();
+        let note_authority = workspace.live_journal_note_authority(&capture).unwrap();
+        assert!(note_authority());
+        assert!(
+            workspace
+                .journal_agent_capture(session, generation)
+                .is_some_and(|current| { Arc::ptr_eq(&current, &capture) })
+        );
+        assert!(
+            workspace
+                .journal_agent_capture(session, generation.wrapping_add(1))
+                .is_none()
+        );
+        workspace.active_tab_mut(owner).unwrap().incognito = true;
+        assert!(
+            workspace
+                .journal_agent_capture(session, generation)
+                .is_none()
+        );
+        workspace.active_tab_mut(owner).unwrap().incognito = false;
+        let data = std::fs::read_to_string(capture.directory().join("journal.xml")).unwrap();
+        assert!(data.contains("<seeded>false</seeded>"));
+        let _ = workspace.reconcile_journal_sources();
+        assert_eq!(workspace.journal_captures[&tab].run, run);
+        workspace.sessions[&session]
+            .session
+            .send(b"exit\r".to_vec())
+            .unwrap();
+        wait(|| {
+            workspace.sessions[&session].session.frame().status != crate::session::Status::Running
+        });
+        assert!(!note_authority());
+        let _ = workspace.update(Desktop::SessionUpdate(session));
+        let Phase::Finishing(_, done) = &workspace.journal_captures[&tab].phase else {
+            panic!("automatic capture did not stop after the shell exited");
+        };
+        wait(|| done.is_closed());
+        let _ = workspace.update_journal_capture(Message::Finalized(tab, run));
+        assert!(
+            workspace
+                .journal_agent_capture(session, generation)
+                .is_none()
+        );
+        let _ = workspace.reconcile_journal_sources();
+        assert_eq!(workspace.journal_captures[&tab].run, run);
+        let _ = workspace.sessions[&session].session.stop().recv_blocking();
     }
 
     #[test]
@@ -1795,6 +2111,8 @@ mod tests {
                 screenshot: None,
                 automatic_screenshot_ai: None,
                 automatic_screenshot_ai_disabled: false,
+                automatic: None,
+                capture_input: false,
             },
         );
 

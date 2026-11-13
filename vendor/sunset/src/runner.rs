@@ -13,7 +13,7 @@ use encrypt::KeyState;
 use event::{CliEvent, CliEventId, Event, ServEvent, ServEventId};
 use traffic::{TrafIn, TrafOut};
 
-use conn::{CliServ, Conn, DispatchEvent, Dispatched};
+use conn::{CliServ, Conn, DispatchEvent, Dispatched, GlobalOwner};
 
 pub(crate) type ServRunner<'a> = Runner<'a, server::Server>;
 pub(crate) type CliRunner<'a> = Runner<'a, client::Client>;
@@ -71,6 +71,33 @@ impl<CS: CliServ> core::fmt::Debug for Runner<'_, CS> {
 }
 
 impl<'a> Runner<'a, client::Client> {
+    /// Queues one transport keepalive only when the authenticated wire is idle.
+    /// It never enters the deferred queue or reserves a global-request reply.
+    pub fn try_send_keepalive(&mut self) -> Result<bool> {
+        if !self.conn.is_authenticated()
+            || !self.conn.is_kex_idle()
+            || self.closed_input
+            || self.traf_out.closed()
+            || self.traf_out.is_draining()
+            || self.traf_out.is_output_pending()
+            || self.traf_out.have_deferred_packets()
+        {
+            return Ok(false);
+        }
+        let packet = packets::Ignore {
+            data: sshwire::BinString(&[]),
+        }
+        .into();
+        match self.traf_out.send_packet_inner(&packet, &mut self.keys) {
+            Ok(()) => {
+                self.wake();
+                Ok(true)
+            }
+            Err(Error::NoRoom { .. } | Error::BusySend { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Prioritizes a supported host-key algorithm before the initial exchange.
     /// The application's host-key verification still applies to the selected key.
     pub fn prefer_host_key(&mut self, algorithm: &str) -> Result<()> {
@@ -87,7 +114,7 @@ impl<'a> Runner<'a, client::Client> {
         if !self.conn.is_authenticated() {
             return error::BadUsage.fail();
         }
-        if self.conn.global_pending
+        if self.conn.global_pending.is_some()
             || self.conn.global_reply.is_some()
             || self.conn.is_kex_sending()
             || self.traf_out.is_draining()
@@ -96,16 +123,22 @@ impl<'a> Runner<'a, client::Client> {
             return Ok(false);
         }
         use packets::{GlobalRequest, GlobalRequestMethod, TcpipForward};
-        let bind = TcpipForward { address: address.into(), port: u32::from(port) };
+        let bind = TcpipForward {
+            address: address.into(),
+            port: u32::from(port),
+        };
         let req = if cancel {
             GlobalRequestMethod::CancelTcpipForward(bind)
         } else {
             GlobalRequestMethod::TcpipForward(bind)
         };
-        let packet = GlobalRequest { want_reply: true, req };
+        let packet = GlobalRequest {
+            want_reply: true,
+            req,
+        };
         match self.traf_out.send_packet(packet.into(), &mut self.keys) {
             Ok(()) => {
-                self.conn.global_pending = true;
+                self.conn.global_pending = Some(GlobalOwner::Forward);
                 self.wake();
                 Ok(true)
             }
@@ -115,7 +148,55 @@ impl<'a> Runner<'a, client::Client> {
     }
 
     pub fn take_global_reply(&mut self) -> Option<GlobalReply> {
-        self.conn.global_reply.take()
+        self.take_global_reply_for(GlobalOwner::Forward)
+    }
+
+    /// Starts a `keepalive@kortty.de` liveness probe in the exclusive global request slot.
+    /// A timeout does not release this slot: only a matched reply or connection close does.
+    pub fn try_send_liveness(&mut self) -> Result<bool> {
+        if !self.conn.is_authenticated()
+            || !self.conn.is_kex_idle()
+            || self.closed_input
+            || self.traf_out.closed()
+            || self.traf_out.is_draining()
+            || self.traf_out.have_deferred_packets()
+            || self.conn.global_pending.is_some()
+            || self.conn.global_reply.is_some()
+        {
+            return Ok(false);
+        }
+        let packet = packets::GlobalRequest {
+            want_reply: true,
+            req: packets::GlobalRequestMethod::Liveness,
+        }
+        .into();
+        match self.traf_out.send_packet_inner(&packet, &mut self.keys) {
+            Ok(()) => {
+                self.conn.global_pending = Some(GlobalOwner::Liveness);
+                self.wake();
+                Ok(true)
+            }
+            Err(Error::NoRoom { .. } | Error::BusySend { .. }) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Either a success or a failure acknowledges the exact pending liveness probe.
+    pub fn take_liveness_reply(&mut self) -> bool {
+        self.take_global_reply_for(GlobalOwner::Liveness).is_some()
+    }
+
+    fn take_global_reply_for(&mut self, owner: GlobalOwner) -> Option<GlobalReply> {
+        if self
+            .conn
+            .global_reply
+            .as_ref()
+            .is_some_and(|(matched, _)| *matched == owner)
+        {
+            self.conn.global_reply.take().map(|(_, reply)| reply)
+        } else {
+            None
+        }
     }
 
     pub(crate) fn resume_forwarded_open(
@@ -142,14 +223,17 @@ impl<'a> Runner<'a, client::Client> {
         {
             return Ok(None);
         }
-        let (num, packet) = self.conn.channels.open(packets::ChannelOpenType::DirectTcpip(
-            packets::DirectTcpip {
-                address: target.into(),
-                port: u32::from(port),
-                origin: origin.into(),
-                origin_port: u32::from(origin_port),
-            },
-        ))?;
+        let (num, packet) = self
+            .conn
+            .channels
+            .open(packets::ChannelOpenType::DirectTcpip(
+                packets::DirectTcpip {
+                    address: target.into(),
+                    port: u32::from(port),
+                    origin: origin.into(),
+                    origin_port: u32::from(origin_port),
+                },
+            ))?;
         if let Err(error) = self.traf_out.send_packet(packet, &mut self.keys) {
             self.conn.channels.discard_unopened_tracked(num)?;
             return match error {
@@ -180,10 +264,7 @@ impl<'a> Runner<'a, client::Client> {
     }
 
     /// `inbuf` and `outbuf` must be sized to fit the largest SSH packet allowed.
-    pub fn new_client(
-        inbuf: &'a mut [u8],
-        outbuf: &'a mut [u8],
-    ) -> Runner<'a, client::Client> {
+    pub fn new_client(inbuf: &'a mut [u8], outbuf: &'a mut [u8]) -> Runner<'a, client::Client> {
         Self::new(inbuf, outbuf)
     }
 
@@ -208,10 +289,7 @@ impl<'a> Runner<'a, client::Client> {
         self.conn.fetch_cli_banner(payload)
     }
 
-    pub(crate) fn cli_session_opener(
-        &mut self,
-        ch: ChanNum,
-    ) -> Result<CliSessionOpener<'_, 'a>> {
+    pub(crate) fn cli_session_opener(&mut self, ch: ChanNum) -> Result<CliSessionOpener<'_, 'a>> {
         let ch = self.conn.channels.get_mut(ch)?;
         let s = self.traf_out.sender(&mut self.keys);
 
@@ -227,15 +305,17 @@ impl<'a> Runner<'a, client::Client> {
     }
 
     /// Selects the authentication methods available for this client before polling it.
-    pub fn client_auth_methods(&mut self, public_key: bool, password: bool, keyboard_interactive: bool) -> Result<()> {
+    pub fn client_auth_methods(
+        &mut self,
+        public_key: bool,
+        password: bool,
+        keyboard_interactive: bool,
+    ) -> Result<()> {
         let (auth, _) = self.conn.mut_cliauth()?;
         auth.configure(public_key, password, keyboard_interactive)
     }
 
-    pub(crate) fn resume_clipassword(
-        &mut self,
-        password: Option<&str>,
-    ) -> Result<()> {
+    pub(crate) fn resume_clipassword(&mut self, password: Option<&str>) -> Result<()> {
         let mut s = self.traf_out.sender(&mut self.keys);
         let (cliauth, ctx) = self.conn.mut_cliauth()?;
         let event = cliauth.resume_password(&mut s, password, ctx)?;
@@ -247,7 +327,9 @@ impl<'a> Runner<'a, client::Client> {
     pub(crate) fn fetch_keyboard_challenge(&self) -> Result<packets::UserauthInfoRequest<'_>> {
         self.check_resume(&DispatchEvent::CliEvent(CliEventId::KeyboardChallenge));
         match self.packet()? {
-            Some(packets::Packet::Userauth60(packets::Userauth60::InfoRequest(request))) => Ok(request),
+            Some(packets::Packet::Userauth60(packets::Userauth60::InfoRequest(request))) => {
+                Ok(request)
+            }
             _ => Error::bug(),
         }
     }
@@ -260,10 +342,14 @@ impl<'a> Runner<'a, client::Client> {
         Ok(())
     }
 
-    pub(crate) fn resume_clipubkey(&mut self, key: Option<SignKey>) -> Result<()> {
+    pub(crate) fn resume_clipubkey(
+        &mut self,
+        key: Option<SignKey>,
+        defer_signature: bool,
+    ) -> Result<()> {
         let mut s = self.traf_out.sender(&mut self.keys);
         let (cliauth, ctx) = self.conn.mut_cliauth()?;
-        let ev = cliauth.resume_pubkey(&mut s, key, ctx)?;
+        let ev = cliauth.resume_pubkey(&mut s, key, defer_signature, ctx)?;
         self.set_extra_resume(ev);
         self.resume(&DispatchEvent::CliEvent(CliEventId::Pubkey));
         Ok(())
@@ -278,6 +364,11 @@ impl<'a> Runner<'a, client::Client> {
     pub(crate) fn fetch_agentsign_msg(&self) -> Result<AuthSigMsg<'_>> {
         self.check_resume(&DispatchEvent::CliEvent(CliEventId::AgentSign));
         self.conn.fetch_agentsign_msg()
+    }
+
+    pub(crate) fn sign_deferred_private_key(&self) -> Result<OwnedSig> {
+        self.check_resume(&DispatchEvent::CliEvent(CliEventId::AgentSign));
+        self.conn.sign_deferred_private_key()
     }
 
     pub(crate) fn resume_agentsign(&mut self, sig: Option<&OwnedSig>) -> Result<()> {
@@ -319,10 +410,7 @@ impl Runner<'static, client::Client> {
 
 impl<'a> Runner<'a, server::Server> {
     /// `inbuf` and `outbuf` must be sized to fit the largest SSH packet allowed.
-    pub fn new_server(
-        inbuf: &'a mut [u8],
-        outbuf: &'a mut [u8],
-    ) -> Runner<'a, server::Server> {
+    pub fn new_server(inbuf: &'a mut [u8], outbuf: &'a mut [u8]) -> Runner<'a, server::Server> {
         Self::new(inbuf, outbuf)
     }
 
@@ -357,9 +445,7 @@ impl<'a> Runner<'a, server::Server> {
         debug_assert!(matches!(
             self.resume_event,
             DispatchEvent::ServEvent(
-                ServEventId::PasswordAuth
-                    | ServEventId::PubkeyAuth { .. }
-                    | ServEventId::FirstAuth
+                ServEventId::PasswordAuth | ServEventId::PubkeyAuth { .. } | ServEventId::FirstAuth
             )
         ));
 
@@ -389,11 +475,7 @@ impl<'a> Runner<'a, server::Server> {
         r
     }
 
-    pub(crate) fn set_auth_methods(
-        &mut self,
-        password: bool,
-        pubkey: bool,
-    ) -> Result<()> {
+    pub(crate) fn set_auth_methods(&mut self, password: bool, pubkey: bool) -> Result<()> {
         self.conn.set_auth_methods(password, pubkey)
     }
 
@@ -556,7 +638,8 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         if !self.is_input_ready() {
             return Ok(0);
         }
-        self.traf_in.input(&mut self.keys, &mut self.conn.remote_version, buf)
+        self.traf_in
+            .input(&mut self.keys, &mut self.conn.remote_version, buf)
     }
 
     // Whether [`input()`](input) is ready
@@ -642,12 +725,7 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
     ///
     /// Returns `Ok(len)` consumed, `Err(Error::ChannelEof)` on EOF,
     /// or other errors.
-    pub fn write_channel(
-        &mut self,
-        chan: &ChanHandle,
-        dt: ChanData,
-        buf: &[u8],
-    ) -> Result<usize> {
+    pub fn write_channel(&mut self, chan: &ChanHandle, dt: ChanData, buf: &[u8]) -> Result<usize> {
         if self.traf_out.closed() {
             // TODO: unsure if we need this
             return error::ChannelEOF.fail();
@@ -717,7 +795,25 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         chan: &ChanHandle,
         buf: &mut [u8],
     ) -> (usize, ChanData) {
-        let result = self.traf_in.read_channel_either(chan.0, buf);
+        self.read_channel_either_with_wipe(chan, buf, false)
+    }
+
+    /// Drains and wipes decrypted bytes from a sensitive exec channel.
+    pub fn read_sensitive_channel_either_deferred(
+        &mut self,
+        chan: &ChanHandle,
+        buf: &mut [u8],
+    ) -> (usize, ChanData) {
+        self.read_channel_either_with_wipe(chan, buf, true)
+    }
+
+    fn read_channel_either_with_wipe(
+        &mut self,
+        chan: &ChanHandle,
+        buf: &mut [u8],
+        wipe: bool,
+    ) -> (usize, ChanData) {
+        let result = self.traf_in.read_channel_either(chan.0, buf, wipe);
         if result.0 != 0 {
             self.wake();
         }
@@ -733,11 +829,7 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
     }
 
     /// Returns credit for bytes consumed after a deferred channel read.
-    pub fn release_channel_window(
-        &mut self,
-        chan: &ChanHandle,
-        len: usize,
-    ) -> Result<()> {
+    pub fn release_channel_window(&mut self, chan: &ChanHandle, len: usize) -> Result<()> {
         if len == 0 {
             return Ok(());
         }
@@ -789,11 +881,7 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
     /// Returns `Ok(None)` on channel closed.
     ///
     /// May fail with `BadChannelData` if dt is invalid for this session.
-    pub fn write_channel_ready(
-        &self,
-        chan: &ChanHandle,
-        dt: ChanData,
-    ) -> Result<Option<usize>> {
+    pub fn write_channel_ready(&self, chan: &ChanHandle, dt: ChanData) -> Result<Option<usize>> {
         if self.traf_out.closed() {
             return Ok(None);
         }
@@ -858,30 +946,18 @@ impl<'a, CS: CliServ> Runner<'a, CS> {
         Ok(())
     }
 
-    pub fn set_channel_read_waker(
-        &mut self,
-        ch: &ChanHandle,
-        dt: ChanData,
-        waker: &Waker,
-    ) {
-        self.conn.channels.by_handle_mut(ch).set_read_waker(
-            dt,
-            CS::is_client(),
-            waker,
-        )
+    pub fn set_channel_read_waker(&mut self, ch: &ChanHandle, dt: ChanData, waker: &Waker) {
+        self.conn
+            .channels
+            .by_handle_mut(ch)
+            .set_read_waker(dt, CS::is_client(), waker)
     }
 
-    pub fn set_channel_write_waker(
-        &mut self,
-        ch: &ChanHandle,
-        dt: ChanData,
-        waker: &Waker,
-    ) {
-        self.conn.channels.by_handle_mut(ch).set_write_waker(
-            dt,
-            CS::is_client(),
-            waker,
-        )
+    pub fn set_channel_write_waker(&mut self, ch: &ChanHandle, dt: ChanData, waker: &Waker) {
+        self.conn
+            .channels
+            .by_handle_mut(ch)
+            .set_write_waker(dt, CS::is_client(), waker)
     }
 
     fn channel_wake_read(&mut self, num: ChanNum, dt: ChanData) {
@@ -1061,7 +1137,9 @@ impl<'a> Runner<'a, client::Client> {
             return Ok(false);
         }
         let mut send = self.traf_out.sender(&mut self.keys);
-        self.conn.channels.client_exec_after_confirmation(chan.0, command, &mut send)?;
+        self.conn
+            .channels
+            .client_exec_after_confirmation(chan.0, command, &mut send)?;
         self.wake();
         Ok(true)
     }
@@ -1093,6 +1171,19 @@ impl<'a> Runner<'a, client::Client> {
 
     /// Sends a confirmed subsystem request on a newly opened tracked session.
     pub fn client_tracked_subsystem(&mut self, chan: &ChanHandle, name: &str) -> Result<bool> {
+        self.client_tracked_request(chan, channel::Req::Subsystem(name))
+    }
+
+    /// Sends a confirmed exec request on a newly opened tracked session.
+    pub fn client_tracked_exec(&mut self, chan: &ChanHandle, command: &str) -> Result<bool> {
+        self.client_tracked_request(chan, channel::Req::Exec(command))
+    }
+
+    fn client_tracked_request(
+        &mut self,
+        chan: &ChanHandle,
+        request: channel::Req<'_>,
+    ) -> Result<bool> {
         if self.conn.is_kex_sending()
             || self.traf_out.is_draining()
             || self.traf_out.have_deferred_packets()
@@ -1100,7 +1191,11 @@ impl<'a> Runner<'a, client::Client> {
             return Ok(false);
         }
         let mut send = self.traf_out.sender(&mut self.keys);
-        match self.conn.channels.client_tracked_subsystem(chan.0, name, &mut send) {
+        match self
+            .conn
+            .channels
+            .client_tracked_request(chan.0, request, &mut send)
+        {
             Ok(()) => {
                 self.wake();
                 Ok(true)
@@ -1113,8 +1208,7 @@ impl<'a> Runner<'a, client::Client> {
     pub fn open_client_session(&mut self) -> Result<ChanHandle> {
         trace!("open_client_session");
 
-        let (chan, p) =
-            self.conn.channels.open(packets::ChannelOpenType::Session)?;
+        let (chan, p) = self.conn.channels.open(packets::ChannelOpenType::Session)?;
         self.traf_out.send_packet(p, &mut self.keys)?;
         self.wake();
         Ok(ChanHandle(chan))

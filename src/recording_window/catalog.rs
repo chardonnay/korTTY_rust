@@ -242,7 +242,7 @@ fn recording_path(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case(FILE_EXTENSION))
 }
 
-fn checked_name(input: &str) -> io::Result<String> {
+pub(super) fn checked_name(input: &str) -> io::Result<String> {
     let input = input.trim();
     let name = match input.rsplit_once('.') {
         Some((base, extension)) if extension.eq_ignore_ascii_case(FILE_EXTENSION) => base,

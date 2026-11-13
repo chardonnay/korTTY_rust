@@ -238,7 +238,15 @@ impl Forms {
                 }
             }
         } else {
-            let cursor = model.cursor();
+            let cursor = if self.block {
+                model.cursor()
+            } else {
+                form_cursor(model)
+            };
+            if !display && cursor.column == model.columns {
+                model.screen_mut().lines[cursor.row].wrap_length = None;
+                return;
+            }
             let end = if display { model.rows } else { cursor.row + 1 };
             for row in cursor.row..end {
                 let start = if row == cursor.row { cursor.column } else { 0 };

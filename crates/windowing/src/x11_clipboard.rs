@@ -93,13 +93,13 @@ impl Drop for Request {
 }
 
 #[derive(Eq, PartialEq)]
-struct Server {
-    name: String,
-    screen: usize,
+pub(super) struct Server {
+    pub(super) name: String,
+    pub(super) screen: usize,
 }
 
 impl Server {
-    fn from_display(display: DisplayHandle<'_>) -> io::Result<Self> {
+    pub(super) fn from_display(display: DisplayHandle<'_>) -> io::Result<Self> {
         // Winit supplies a live Xlib handle. An XCB address cannot be inferred from its
         // connection pointer or the process environment without risking another X server.
         let RawDisplayHandle::Xlib(display) = display.as_raw() else {

@@ -11,6 +11,7 @@ use iced::{Color, Element, Font, Length, Pixels, Point, Rectangle, Renderer, Siz
 use kortty_terminal::{Cell, ScreenSnapshot};
 use regex::{Captures, Regex};
 
+use crate::session::Frame;
 use crate::terminal_links::{self, Hit as Link};
 use crate::terminal_theme::Appearance;
 use crate::workspace::Message;
@@ -32,6 +33,12 @@ static PATH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(&format!(
         r"(?P<root>[A-Za-z]:[\\/]|~/|\.\.?/|/)?(?P<body>[{PATH_BODY}]+)(?P<suffix>:[0-9]{{1,9}}(?::[0-9]{{1,9}})?|\([0-9]{{1,9}},[0-9]{{1,9}}\))?"
     )).unwrap()
+});
+static WINDOWS_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?P<root>/?[A-Za-z]:[\\/]|~[\\/]|\.\.?[\\/]|/)?(?P<body>[{PATH_BODY}]+)(?P<suffix>:[0-9]{{1,9}}(?::[0-9]{{1,9}})?|\([0-9]{{1,9}},[0-9]{{1,9}}\))?"
+    ))
+    .unwrap()
 });
 static PATH_CHARACTER: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(&format!(r"^[{PATH_BODY}]$")).unwrap());
@@ -92,6 +99,7 @@ pub(crate) struct Target {
     pub(crate) text: String,
     label: String,
     occurrences: Vec<Span>,
+    windows_paths: bool,
 }
 
 pub(crate) struct FileTarget {
@@ -113,7 +121,7 @@ impl Target {
         if self.kind != Kind::Path {
             return None;
         }
-        let captures = PATH.captures(&self.text)?;
+        let captures = path_pattern(self.windows_paths).captures(&self.text)?;
         let full = captures.get(0)?;
         if full.as_str() != self.text {
             return None;
@@ -154,8 +162,8 @@ pub(crate) struct Labels {
 }
 
 impl Labels {
-    pub(crate) fn capture(screen: &ScreenSnapshot, settings: &Compiled) -> Option<Self> {
-        let mut hits = capture(screen, settings);
+    pub(crate) fn capture(frame: &Frame, settings: &Compiled, windows_paths: bool) -> Option<Self> {
+        let mut hits = capture(frame, settings, windows_paths);
         if hits.is_empty() {
             return None;
         }
@@ -173,6 +181,7 @@ impl Labels {
                     text: hit.text,
                     label: String::new(),
                     occurrences: vec![hit.span],
+                    windows_paths,
                 });
             }
         }
@@ -197,6 +206,14 @@ impl Labels {
         self.prefix.pop();
     }
 
+    #[cfg(all(test, windows))]
+    pub(crate) fn label_for_text(&self, text: &str) -> Option<&str> {
+        self.targets
+            .iter()
+            .find(|target| target.text == text)
+            .map(|target| target.label.as_str())
+    }
+
     pub(crate) fn letter(&mut self, letter: char) -> Option<&Target> {
         self.prefix.push(letter);
         if let Some(index) = self
@@ -216,11 +233,11 @@ impl Labels {
         None
     }
 
-    pub(crate) fn retain_visible(&mut self, screen: &ScreenSnapshot) -> bool {
+    pub(crate) fn retain_visible(&mut self, frame: &Frame) -> bool {
         self.targets.retain_mut(|target| {
-            target
-                .occurrences
-                .retain(|span| span.still_shows(screen, &target.text));
+            target.occurrences.retain(|span| {
+                span.visible_in(frame) && span.still_shows(&frame.screen, &target.text)
+            });
             !target.occurrences.is_empty()
         });
         if !self
@@ -235,6 +252,10 @@ impl Labels {
 }
 
 impl Span {
+    fn visible_in(self, frame: &Frame) -> bool {
+        (self.start.row..=self.end.row).all(|row| frame.raw_display_row(row).is_some())
+    }
+
     fn rows(self, screen: &ScreenSnapshot) -> impl Iterator<Item = (u16, Range<u16>)> + '_ {
         (self.start.row..=self.end.row).map(move |row| {
             let start = if row == self.start.row {
@@ -281,15 +302,20 @@ fn cell_text(cell: &Cell) -> &str {
     }
 }
 
-fn capture(screen: &ScreenSnapshot, settings: &Compiled) -> Vec<Match> {
-    let mut end = screen.rows;
+fn capture(frame: &Frame, settings: &Compiled, windows_paths: bool) -> Vec<Match> {
+    let screen = &frame.screen;
+    let mut visible_rows = (0..screen.rows).filter(|row| frame.raw_display_row(*row).is_some());
+    let Some(first) = visible_rows.next() else {
+        return Vec::new();
+    };
+    let mut end = visible_rows.next_back().unwrap_or(first) + 1;
     let mut scanned = 0;
     let mut hits = Vec::new();
     let mut matching = settings.matching();
     let max_rows = (MAX_LINE_BYTES / usize::from(screen.columns.max(1))).max(1);
-    while end > 0 && scanned < MAX_VIEWPORT_BYTES && hits.len() < MAX_OCCURRENCES {
+    while end > first && scanned < MAX_VIEWPORT_BYTES && hits.len() < MAX_OCCURRENCES {
         let mut start = end - 1;
-        while start > 0
+        while start > first
             && usize::from(end - start) < max_rows
             && screen.wrapped_columns(start - 1).is_some()
         {
@@ -335,10 +361,13 @@ fn capture(screen: &ScreenSnapshot, settings: &Compiled) -> Vec<Match> {
                 .as_mut()
                 .map_or_else(Vec::new, |matching| matching.spans(scan));
             custom.retain(|(bytes, _)| aligned(bytes).is_some());
-            let mut visible: Vec<_> = matches(scan, custom)
+            let mut visible: Vec<_> = matches(scan, custom, windows_paths)
                 .into_iter()
                 .filter_map(|(bytes, kind)| {
                     let span = aligned(&bytes)?;
+                    if !span.visible_in(frame) {
+                        return None;
+                    }
                     Some(Match {
                         kind,
                         text: scan[bytes].to_owned(),
@@ -388,7 +417,11 @@ fn line_text(screen: &ScreenSnapshot, rows: Range<u16>) -> (String, Vec<CellText
 
 type Spans = BTreeMap<usize, (usize, Kind)>;
 
-fn matches(line: &str, custom: Vec<(Range<usize>, usize)>) -> Vec<(Range<usize>, Kind)> {
+fn matches(
+    line: &str,
+    custom: Vec<(Range<usize>, usize)>,
+    windows_paths: bool,
+) -> Vec<(Range<usize>, Kind)> {
     let mut candidates = Vec::<(Range<usize>, Kind)>::new();
     candidates.extend(
         terminal_links::address_candidates(line).filter_map(|(text, start)| {
@@ -398,8 +431,9 @@ fn matches(line: &str, custom: Vec<(Range<usize>, usize)>) -> Vec<(Range<usize>,
     );
     if line.contains(['/', '\\']) {
         candidates.extend(
-            PATH.captures_iter(line)
-                .filter_map(|hit| path(line, &hit).map(|range| (range, Kind::Path))),
+            path_pattern(windows_paths)
+                .captures_iter(line)
+                .filter_map(|hit| path(line, &hit, windows_paths).map(|range| (range, Kind::Path))),
         );
     }
     candidates.extend(
@@ -482,16 +516,30 @@ fn valid_email(text: &str) -> bool {
         })
 }
 
-fn path(line: &str, hit: &Captures<'_>) -> Option<Range<usize>> {
+fn path_pattern(windows_paths: bool) -> &'static Regex {
+    if windows_paths { &WINDOWS_PATH } else { &PATH }
+}
+
+fn path(line: &str, hit: &Captures<'_>, windows_paths: bool) -> Option<Range<usize>> {
     let range = hit.get(0)?.range();
     if line[..range.start]
         .chars()
         .next_back()
-        .is_some_and(|value| PATH_CHARACTER.is_match(value.encode_utf8(&mut [0; 4])))
+        .is_some_and(|value| {
+            (windows_paths && value == ':')
+                || PATH_CHARACTER.is_match(value.encode_utf8(&mut [0; 4]))
+        })
     {
         return None;
     }
     let suffix = hit.name("suffix");
+    if windows_paths
+        && line[range.end..]
+            .strip_prefix(':')
+            .is_some_and(|tail| tail.starts_with(|ch: char| !ch.is_whitespace()))
+    {
+        return None;
+    }
     if suffix.is_some() && line[range.end..].starts_with(|value: char| value.is_ascii_digit()) {
         return None;
     }
@@ -510,7 +558,7 @@ fn path(line: &str, hit: &Captures<'_>) -> Option<Range<usize>> {
             return None;
         }
     } else {
-        let (_, tail) = value.rsplit_once('/')?;
+        let (_, tail) = value.rsplit_once(|ch| ch == '/' || (windows_paths && ch == '\\'))?;
         if value.starts_with(['/', '\\'])
             || suffix.is_none()
                 && !tail
@@ -578,7 +626,7 @@ fn token_end(kind: Kind, line: &str, range: Range<usize>) -> Option<usize> {
 pub(crate) fn view<'a>(
     base: Element<'a, Message>,
     labels: Option<&'a Labels>,
-    screen: &'a ScreenSnapshot,
+    frame: &'a Frame,
     font_size: u8,
     font: Font,
     appearance: Appearance,
@@ -588,7 +636,7 @@ pub(crate) fn view<'a>(
         base,
         Canvas::new(Overlay {
             labels,
-            screen,
+            frame,
             font_size,
             font,
             appearance
@@ -601,7 +649,7 @@ pub(crate) fn view<'a>(
 
 struct Overlay<'a> {
     labels: &'a Labels,
-    screen: &'a ScreenSnapshot,
+    frame: &'a Frame,
     font_size: u8,
     font: Font,
     appearance: Appearance,
@@ -630,7 +678,10 @@ impl canvas::Program<Message> for Overlay<'_> {
             .filter(|target| target.label.starts_with(&self.labels.prefix));
         for target in visible.clone() {
             for span in &target.occurrences {
-                for (row, columns) in span.rows(self.screen) {
+                for (raw, columns) in span.rows(&self.frame.screen) {
+                    let Some(row) = self.frame.raw_display_row(raw) else {
+                        continue;
+                    };
                     let origin = metrics.point(row, columns.start);
                     let size = Size::new(
                         metrics.width * f32::from(columns.end - columns.start),
@@ -649,7 +700,10 @@ impl canvas::Program<Message> for Overlay<'_> {
         }
         for target in visible {
             for span in &target.occurrences {
-                let origin = metrics.point(span.start.row, span.start.column);
+                let Some(row) = self.frame.raw_display_row(span.start.row) else {
+                    continue;
+                };
+                let origin = metrics.point(row, span.start.column);
                 let width = metrics.width * (target.label.len() as f32 + 1.0);
                 let origin = Point::new(origin.x.min((bounds.width - width).max(0.0)), origin.y);
                 frame.fill_rectangle(origin, Size::new(width, metrics.height), foreground);
@@ -674,10 +728,52 @@ impl canvas::Program<Message> for Overlay<'_> {
 mod tests {
     use kortty_terminal::Terminal;
 
+    use super::super::selection_test_frame;
     use super::*;
 
     fn default_labels(screen: &ScreenSnapshot) -> Option<Labels> {
-        Labels::capture(screen, &Preferences::default().compile())
+        Labels::capture(
+            &selection_test_frame(screen.clone()),
+            &Preferences::default().compile(),
+            false,
+        )
+    }
+
+    #[test]
+    fn quick_select_filters_hidden_raw_rows_and_excludes_agent_annotations() {
+        use std::sync::Arc;
+
+        use crate::session::inline_history;
+        use crate::terminal_agent::design::inline::{Line, Role, Segment};
+
+        let mut terminal = Terminal::new(40, 5);
+        terminal.advance(b"\x1b[2;1Hhttps://visible.example/\x1b[5;1Hhttps://hidden.example/");
+        let mut frame = selection_test_frame(terminal.snapshot());
+        let settings = Preferences::default().compile();
+        let mut retained = Labels::capture(&frame, &settings, false).unwrap();
+        assert_eq!(retained.targets.len(), 2);
+        inline_history::fixture(
+            Arc::get_mut(&mut frame).unwrap(),
+            1,
+            vec![Line {
+                segments: vec![Segment {
+                    text: "https://agent.example/".into(),
+                    role: Role::Text,
+                }],
+            }],
+            false,
+        );
+        assert!(retained.retain_visible(&frame));
+        let fresh = Labels::capture(&frame, &settings, false).unwrap();
+        for targets in [&retained.targets, &fresh.targets] {
+            assert_eq!(targets.len(), 1);
+            let target = &targets[0];
+            assert_eq!(target.text, "https://visible.example/");
+            assert_eq!(
+                frame.raw_display_row(target.occurrences[0].start.row),
+                Some(2)
+            );
+        }
     }
 
     #[test]
@@ -699,6 +795,42 @@ mod tests {
                 ("../two.py(3,9)", "../two.py".into(), Some(3), Some(9)),
                 ("./one.rs:4:6", "./one.rs".into(), Some(4), Some(6)),
             ]
+        );
+    }
+
+    #[test]
+    fn quick_select_windows_paths_keep_the_label_and_reject_ambiguous_prefixes() {
+        let mut terminal = Terminal::new(80, 12);
+        terminal.advance(
+            b"~/one.rs:4:6\r\n..\\two.py(3,9)\r\nC:\\src\\three.c:0\r\n/ D:/four.txt\r\nfolder\\five.rs\r\n/C:/six.txt\r\n\\\\host\\share\\file.txt\r\nC:folder\\file.txt\r\nC:\\file.txt:stream\r\n",
+        );
+        let frame = selection_test_frame(terminal.snapshot());
+        let labels = Labels::capture(&frame, &Preferences::default().compile(), true).unwrap();
+        assert_eq!(
+            labels
+                .targets
+                .iter()
+                .filter_map(|target| {
+                    let file = target.file()?;
+                    Some((target.text.as_str(), file.path, file.line, file.column))
+                })
+                .collect::<Vec<_>>(),
+            [
+                ("/C:/six.txt", "/C:/six.txt".into(), None, None),
+                (r"folder\five.rs", r"folder\five.rs".into(), None, None),
+                ("D:/four.txt", "D:/four.txt".into(), None, None),
+                (r"C:\src\three.c:0", r"C:\src\three.c".into(), None, None),
+                (r"..\two.py(3,9)", r"..\two.py".into(), Some(3), Some(9)),
+                ("~/one.rs:4:6", "~/one.rs".into(), Some(4), Some(6)),
+            ]
+        );
+        let unix_labels =
+            Labels::capture(&frame, &Preferences::default().compile(), false).unwrap();
+        assert!(
+            !unix_labels
+                .targets
+                .iter()
+                .any(|target| target.text == r"folder\five.rs")
         );
     }
 
@@ -750,7 +882,7 @@ mod tests {
         assert_eq!(labels.targets[0].label, "aa");
         assert!(labels.letter('a').is_none());
         terminal.advance(b"\x1b[4;1H98765\x1b[K");
-        assert!(labels.retain_visible(&terminal.snapshot()));
+        assert!(labels.retain_visible(&selection_test_frame(terminal.snapshot())));
         assert!(labels.letter('a').is_none());
         labels.backspace();
         assert_eq!(labels.targets[0].label, "az");
@@ -769,7 +901,8 @@ mod tests {
         terminal.advance(
             "  TICKET-12345 https://example.test/TICKET-67890 abc def ghi 文界\r\n".as_bytes(),
         );
-        let mut labels = Labels::capture(&terminal.snapshot(), &preferences.compile()).unwrap();
+        let frame = selection_test_frame(terminal.snapshot());
+        let mut labels = Labels::capture(&frame, &preferences.compile(), false).unwrap();
         let actual: Vec<_> = labels
             .targets
             .iter()
@@ -812,7 +945,8 @@ mod tests {
         assert!(preferences.validate().is_err());
         let mut terminal = Terminal::new(40, 3);
         terminal.advance(b"TICKET-12345\r\n");
-        let labels = Labels::capture(&terminal.snapshot(), &preferences.compile()).unwrap();
+        let frame = selection_test_frame(terminal.snapshot());
+        let labels = Labels::capture(&frame, &preferences.compile(), false).unwrap();
         assert_eq!(labels.targets[0].label, "a");
         assert_eq!(labels.targets[0].text, "TICKET-12345");
 

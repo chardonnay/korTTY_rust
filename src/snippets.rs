@@ -10,10 +10,16 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::clipboard_policy::ClipboardPolicy;
+use crate::private_files::Directory;
 use crate::profile;
+use crate::snippet_analysis::model::hardening::HEADER_CATEGORY;
+
+pub(crate) mod one_liner;
 
 const VERSION: u8 = 1;
 pub(crate) const FILE_NAME: &str = "snippets.json";
+const STORE_BUSY: &str = "The snippet library is being saved by another instance";
 const MAX_SNIPPETS: usize = 1024;
 const MAX_TAGS: usize = 128;
 const MAX_VARIABLES: usize = 256;
@@ -25,15 +31,22 @@ pub(crate) const MAX_CONTENT_BYTES: usize = 10 * 1024 * 1024;
 pub(crate) const MAX_NAME_BYTES: usize = 160;
 pub(crate) const MAX_CATEGORY_BYTES: usize = 96;
 pub(crate) const MAX_LANGUAGE_BYTES: usize = 64;
+pub(crate) const MAX_OPERATING_SYSTEM_BYTES: usize = 128;
 
 pub(crate) mod archive;
+pub(crate) mod diagrams;
 pub(crate) mod exchange;
 pub(crate) mod folders;
+pub(crate) mod modularization;
 pub(crate) mod recipients;
 pub(crate) mod resolve;
 
 pub(crate) fn profile_path() -> io::Result<PathBuf> {
     Ok(profile::root()?.join(FILE_NAME))
+}
+
+pub(crate) fn is_script_header_category(category: &str) -> bool {
+    category.trim().eq_ignore_ascii_case(HEADER_CATEGORY)
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -45,6 +58,19 @@ impl SnippetId {
         let mut bytes = [0; 16];
         getrandom::fill(&mut bytes).map_err(io::Error::other)?;
         Ok(Self(bytes))
+    }
+
+    pub(super) fn from_java_uuid(text: &str) -> io::Result<Self> {
+        let bytes = text.as_bytes();
+        if bytes.len() != 36
+            || ![8, 13, 18, 23]
+                .into_iter()
+                .all(|index| bytes[index] == b'-')
+        {
+            return Err(invalid("Invalid Java snippet library UUID"));
+        }
+        Self::try_from(text.replace('-', ""))
+            .map_err(|_| invalid("Invalid Java snippet library UUID"))
     }
 }
 
@@ -100,6 +126,11 @@ impl Snippet {
     pub(crate) fn category(&self) -> &str {
         &self.category
     }
+
+    fn is_script_header(&self) -> bool {
+        is_script_header_category(&self.category)
+    }
+
     pub(crate) fn content(&self) -> &str {
         &self.content
     }
@@ -174,6 +205,8 @@ pub(crate) struct Input {
 pub(crate) struct Metadata {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) operating_system: Option<String>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub(crate) folder_path: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -182,20 +215,31 @@ pub(crate) struct Metadata {
     pub(crate) executable: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) tags: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) diagrams: Vec<diagrams::Saved>,
 }
 
 impl Metadata {
     fn is_empty(&self) -> bool {
         self.description.is_empty()
+            && self.operating_system.is_none()
             && self.folder_path.is_empty()
             && self.file_name.is_none()
             && self.executable.is_none()
             && self.tags.is_empty()
+            && self.diagrams.is_empty()
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
         if self.description.len() > 16 * 1024
             || self.description.contains('\0')
+            || self.operating_system.as_deref().is_some_and(|system| {
+                system.is_empty()
+                    || !valid_field(system, MAX_OPERATING_SYSTEM_BYTES)
+                    || !system
+                        .chars()
+                        .all(crate::session_journal::is_display_character)
+            })
             || !valid_field(&self.folder_path, 1024)
             || self
                 .file_name
@@ -205,10 +249,11 @@ impl Metadata {
             || self.tags.iter().any(|tag| !valid_field(tag, 128))
         {
             return Err(invalid(
-                "Snippet description, folder, filename or tags exceed the metadata limits",
+                "Snippet description, operating system, folder, filename or tags exceed the metadata limits",
             ));
         }
-        Ok(())
+        diagrams::validate_collection(&self.diagrams)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 }
 
@@ -283,6 +328,24 @@ impl Default for Document {
 }
 
 impl Document {
+    fn adds_script_headers(&self, previous: &Self) -> bool {
+        let mut headers = self
+            .snippets
+            .iter()
+            .filter(|entry| entry.is_script_header())
+            .peekable();
+        if headers.peek().is_none() {
+            return false;
+        }
+        let existing: HashSet<_> = previous
+            .snippets
+            .iter()
+            .filter(|entry| entry.is_script_header())
+            .map(Snippet::id)
+            .collect();
+        headers.any(|entry| !existing.contains(&entry.id()))
+    }
+
     fn validate(&self) -> io::Result<()> {
         if self.version != VERSION || self.snippets.len() > MAX_SNIPPETS {
             return Err(invalid(
@@ -315,6 +378,8 @@ impl Document {
 pub(crate) struct Library {
     path: PathBuf,
     document: Arc<Document>,
+    #[cfg(test)]
+    allow_custom_script_headers: Option<bool>,
 }
 
 impl Library {
@@ -324,11 +389,21 @@ impl Library {
 
     pub(crate) fn open(path: PathBuf) -> io::Result<Self> {
         let document = Arc::new(read_document(&path)?);
-        Ok(Self { path, document })
+        Ok(Self {
+            path,
+            document,
+            #[cfg(test)]
+            allow_custom_script_headers: None,
+        })
     }
 
     pub(crate) fn shares_store(&self, other: &Self) -> bool {
         self.path == other.path
+    }
+
+    pub(crate) fn same_revision(&self, other: &Self) -> bool {
+        self.shares_store(other)
+            && (Arc::ptr_eq(&self.document, &other.document) || self.document == other.document)
     }
 
     pub(crate) fn entries(&self) -> &[Snippet] {
@@ -444,6 +519,33 @@ impl Library {
         self.save_with_metadata(editing, input, None)
     }
 
+    pub(crate) fn replace_contents<'a>(
+        &mut self,
+        changes: impl IntoIterator<Item = (SnippetId, &'a str, &'a str)>,
+    ) -> io::Result<()> {
+        let mut candidate = self.document.as_ref().clone();
+        let mut replaced = HashSet::new();
+        for (id, before, after) in changes {
+            if !replaced.insert(id) {
+                return Err(invalid("A reviewed snippet was selected more than once"));
+            }
+            let snippet = candidate
+                .snippets
+                .iter_mut()
+                .find(|snippet| snippet.id == id && snippet.content() == before)
+                .ok_or_else(|| invalid("A reviewed snippet changed before saving"))?;
+            if after.trim().is_empty() {
+                return Err(invalid("Enter snippet text"));
+            }
+            diagrams::rebase(&mut snippet.metadata.diagrams, before, after);
+            snippet.content = after.into();
+        }
+        if replaced.is_empty() {
+            return Ok(());
+        }
+        self.commit(candidate)
+    }
+
     pub(crate) fn save_with_metadata(
         &mut self,
         editing: Option<SnippetId>,
@@ -488,7 +590,15 @@ impl Library {
             if input.content.trim().is_empty() && !previous.content.trim().is_empty() {
                 return Err(invalid("Enter snippet text"));
             }
-            let metadata = metadata.unwrap_or_else(|| previous.metadata.clone());
+            let mut metadata = match metadata {
+                Some(mut metadata) => {
+                    // Editor details and recovered drafts do not own diagram changes.
+                    metadata.diagrams.clone_from(&previous.metadata.diagrams);
+                    metadata
+                }
+                None => previous.metadata.clone(),
+            };
+            diagrams::rebase(&mut metadata.diagrams, &previous.content, &input.content);
             *previous = Snippet::from_input(id, input, metadata);
         } else {
             if input.content.trim().is_empty() {
@@ -507,19 +617,29 @@ impl Library {
         imports: archive::Imports,
     ) -> io::Result<Option<SnippetId>> {
         let mut candidate = self.document.as_ref().clone();
+        let folders = candidate.import_java_folders(imports.folders)?;
         let mut names: HashSet<_> = candidate
             .snippets
             .iter()
             .map(|entry| entry.name.to_lowercase())
             .collect();
         let start = candidate.snippets.len();
-        for (input, metadata) in imports.structured {
+        for archive::ImportedSnippet {
+            id,
+            input,
+            metadata,
+        } in imports.structured
+        {
             if !names.insert(input.name.trim().to_lowercase()) {
                 return Err(invalid("An imported snippet name is already in use"));
             }
+            let id = match id {
+                Some(id) => id,
+                None => SnippetId::new()?,
+            };
             candidate
                 .snippets
-                .push(Snippet::from_input(SnippetId::new()?, input, metadata));
+                .push(Snippet::from_input(id, input, metadata));
         }
         for mut input in imports.text {
             let base = input.name.trim();
@@ -546,7 +666,7 @@ impl Library {
             ));
         }
         let first = candidate.snippets.get(start).map(Snippet::id);
-        if first.is_some() {
+        if first.is_some() || folders {
             self.commit(candidate)?;
         }
         Ok(first)
@@ -574,10 +694,22 @@ impl Library {
             return Err(invalid("The snippet library exceeds 64 MiB"));
         }
         let _lock = StoreLock::acquire(&self.path)?;
-        if read_document(&self.path)? != *self.document {
+        let previous = read_document(&self.path)?;
+        if previous != *self.document {
             return Err(io::Error::other(
                 "The snippet library changed. Reload before saving again.",
             ));
+        }
+        if candidate.adds_script_headers(&previous) {
+            #[cfg(not(test))]
+            let allowed = custom_script_headers_allowed();
+            #[cfg(test)]
+            let allowed = self
+                .allow_custom_script_headers
+                .unwrap_or_else(custom_script_headers_allowed);
+            if !allowed {
+                return Err(header_creation_denied());
+            }
         }
         profile::save_atomic(&self.path, &bytes)?;
         self.document = Arc::new(candidate);
@@ -591,6 +723,10 @@ fn read_document(path: &Path) -> io::Result<Document> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Document::default()),
         Err(error) => return Err(error),
     };
+    read_document_file(file)
+}
+
+fn read_document_file(file: File) -> io::Result<Document> {
     let metadata = file.metadata()?;
     if !metadata.is_file() || metadata.len() > MAX_LIBRARY_BYTES {
         return Err(invalid(
@@ -612,8 +748,194 @@ fn read_document(path: &Path) -> io::Result<Document> {
     decode_document(&bytes)
 }
 
+pub(crate) fn custom_script_headers_allowed() -> bool {
+    let policy = ClipboardPolicy::load();
+    policy.problem.is_none() && policy.snippets.allow_custom_script_headers
+}
+
+pub(crate) fn check_restore_headers(
+    previous: Option<&Directory>,
+    incoming: &[u8],
+) -> io::Result<()> {
+    let candidate = decode_document(incoming)?;
+    if !candidate.snippets.iter().any(Snippet::is_script_header) {
+        return Ok(());
+    }
+    let previous = if let Some(directory) = previous {
+        match directory.open_file(FILE_NAME).and_then(read_document_file) {
+            Ok(document) => document,
+            // A missing or corrupt library cannot establish an existing header identity.
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+                ) =>
+            {
+                Document::default()
+            }
+            Err(error) => return Err(error),
+        }
+    } else {
+        Document::default()
+    };
+    if candidate.adds_script_headers(&previous) {
+        Err(header_creation_denied())
+    } else {
+        Ok(())
+    }
+}
+
+fn header_creation_denied() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "Managed policy blocks creating custom script headers.",
+    )
+}
+
 pub(crate) fn validate_backup(bytes: &[u8]) -> io::Result<()> {
     decode_document(bytes).map(|_| ())
+}
+
+/// Identifies executable Java snippet links that survived an additive merge.
+pub(crate) fn java_scheduler_snippets(
+    incoming: &[u8],
+    merged: &[u8],
+) -> io::Result<HashSet<SnippetId>> {
+    use crate::scheduler_window::script::{Language, MAX_COMMAND_BYTES};
+
+    let incoming = decode_document(incoming)?;
+    let merged = decode_document(merged)?;
+    let by_id: std::collections::HashMap<_, _> = merged
+        .snippets
+        .iter()
+        .map(|entry| (entry.id, entry))
+        .collect();
+    Ok(incoming
+        .snippets
+        .iter()
+        .filter(|source| {
+            let Some(saved) = by_id.get(&source.id) else {
+                return false;
+            };
+            !source.is_script_header()
+                && !saved.is_script_header()
+                && saved.content == source.content
+                && saved.language == source.language
+                && Language::from_snippet(&source.language).is_some()
+                && source.content.len() <= MAX_COMMAND_BYTES
+                && resolve::referenced_variables(&source.content, &incoming.variables)
+                    == resolve::referenced_variables(&saved.content, &merged.variables)
+                && resolve::headless(&saved.content, &merged.variables, MAX_COMMAND_BYTES).is_ok()
+        })
+        .map(Snippet::id)
+        .collect())
+}
+
+pub(crate) fn portable_java_backup(
+    snippets: Option<&[u8]>,
+    variables: Option<&[u8]>,
+) -> io::Result<(Vec<u8>, usize, usize, usize, usize)> {
+    let imports = snippets
+        .map(archive::read_java_backup)
+        .transpose()?
+        .unwrap_or_default();
+    let skipped_diagrams = imports.skipped_diagrams;
+    let skipped_references = imports.skipped_references;
+    let mut document = Document::default();
+    document.import_java_folders(imports.folders)?;
+    let mut skipped_headers = 0;
+    for archive::ImportedSnippet {
+        id,
+        input,
+        metadata,
+    } in imports.structured
+    {
+        let id = id.map(Ok).unwrap_or_else(SnippetId::new)?;
+        let snippet = Snippet::from_input(id, input, metadata);
+        if snippet.is_script_header() && !custom_script_headers_allowed() {
+            skipped_headers += 1;
+        } else {
+            document.snippets.push(snippet);
+        }
+    }
+    document.variables = variables
+        .map(exchange::read_java_backup)
+        .transpose()?
+        .unwrap_or_default();
+    let count = document.snippets.len() + document.folders.len() + document.variables.len();
+    Ok((
+        encode_java_backup(document)?,
+        count,
+        skipped_headers,
+        skipped_diagrams,
+        skipped_references,
+    ))
+}
+
+pub(crate) fn merge_java_backup(
+    local: Option<&[u8]>,
+    incoming: &[u8],
+    allow_headers: bool,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut target = local.map(decode_document).transpose()?.unwrap_or_default();
+    let incoming = decode_document(incoming)?;
+    let mut names: HashSet<_> = target
+        .snippets
+        .iter()
+        .map(|entry| entry.name.to_lowercase())
+        .collect();
+    let mut ids: HashSet<_> = target.snippets.iter().map(Snippet::id).collect();
+    let before = (
+        target.snippets.len(),
+        target.variables.len(),
+        target.folders.len(),
+    );
+    target.merge_java_backup_folders(incoming.folders);
+    for snippet in incoming.snippets {
+        if snippet.is_script_header() && !allow_headers {
+            continue;
+        }
+        let name = snippet.name.to_lowercase();
+        if !names.contains(&name) && !ids.contains(&snippet.id) {
+            names.insert(name);
+            ids.insert(snippet.id);
+            target.snippets.push(snippet);
+        }
+    }
+    for variable in incoming.variables {
+        if !target
+            .variables
+            .iter()
+            .any(|entry| entry.matches(&variable.name))
+        {
+            target.variables.push(variable);
+        }
+    }
+    if before
+        == (
+            target.snippets.len(),
+            target.variables.len(),
+            target.folders.len(),
+        )
+    {
+        return Ok(None);
+    }
+    target
+        .variables
+        .sort_by_cached_key(|entry| entry.name.to_lowercase());
+    encode_java_backup(target).map(Some)
+}
+
+fn encode_java_backup(mut document: Document) -> io::Result<Vec<u8>> {
+    document.validate()?;
+    document.materialize_folders()?;
+    document.preserve_displaced_folders()?;
+    let bytes =
+        serde_json::to_vec(&document).map_err(|_| invalid("Could not encode snippet library"))?;
+    if bytes.len() as u64 > MAX_LIBRARY_BYTES {
+        return Err(invalid("The snippet library exceeds 64 MiB"));
+    }
+    Ok(bytes)
 }
 
 fn decode_document(bytes: &[u8]) -> io::Result<Document> {
@@ -627,14 +949,15 @@ fn decode_document(bytes: &[u8]) -> io::Result<Document> {
     Ok(document)
 }
 
-struct StoreLock(File);
+pub(crate) struct StoreLock(File);
 
 impl StoreLock {
     fn acquire(path: &Path) -> io::Result<Self> {
-        Self::acquire_for(
-            path,
-            "The snippet library is being saved by another instance",
-        )
+        Self::acquire_for(path, STORE_BUSY)
+    }
+
+    pub(crate) fn acquire_for_restore(root: &Path) -> io::Result<Self> {
+        Self::acquire(&root.join(FILE_NAME))
     }
 
     fn acquire_for(path: &Path, busy: &'static str) -> io::Result<Self> {

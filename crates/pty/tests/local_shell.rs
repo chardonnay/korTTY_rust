@@ -78,6 +78,36 @@ fn windows_presets_run_distinct_system_shells() {
     }
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_custom_command_prompt_accepts_forward_slash_path() {
+    let root = PathBuf::from(std::env::var_os("SystemRoot").unwrap());
+    let directory = TestDirectory::new();
+    for path in [
+        root.join(r"System32\cmd.exe"),
+        root.join("System32/cmd.exe"),
+    ] {
+        let mut command = vec![path.to_str().unwrap().to_owned()];
+        command.extend(["/d", "/q", "/c", "echo", "kortty-custom-cmd"].map(str::to_owned));
+        let mut pty = Pty::spawn_with_options(
+            80,
+            24,
+            "xterm-256color",
+            &LaunchOptions {
+                command: Some(command),
+                working_directory: Some(directory.0.clone()),
+                ..LaunchOptions::default()
+            },
+        )
+        .unwrap();
+        let (status, output) = run_shell(&mut pty, &[]);
+        assert!(
+            status.success() && output.contains("kortty-custom-cmd"),
+            "{path:?}: {status} {output:?}"
+        );
+    }
+}
+
 #[cfg(not(windows))]
 #[test]
 fn an_explicit_windows_shell_is_unavailable_on_other_hosts() {
@@ -91,6 +121,56 @@ fn an_explicit_windows_shell_is_unavailable_on_other_hosts() {
         },
     );
     assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Unsupported);
+}
+
+#[test]
+fn job_process_evidence_is_local_to_the_pane_and_clears_on_exit() {
+    #[cfg(unix)]
+    let (name, command) = ("sleep", b"/bin/sleep 3\n".as_slice());
+    #[cfg(windows)]
+    let (name, command) = (
+        "powershell.exe",
+        b"\"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe\" -NoProfile -Command \"Start-Sleep -Seconds 3\"\r".as_slice(),
+    );
+    let options = LaunchOptions {
+        shell: if cfg!(windows) {
+            LocalShell::CommandPrompt
+        } else {
+            LocalShell::Default
+        },
+        ..LaunchOptions::default()
+    };
+    let mut target = Pty::spawn_with_options(80, 24, "xterm-256color", &options).unwrap();
+    let mut other = Pty::spawn_with_options(80, 24, "xterm-256color", &options).unwrap();
+    let mut reader = target.take_reader().unwrap();
+    let drain = thread::spawn(move || io::copy(&mut reader, &mut io::sink()));
+    let mut writer = target.take_writer().unwrap();
+    let matches = |image: &str, _: &[&str]| {
+        image
+            .rsplit(['/', '\\'])
+            .next()
+            .is_some_and(|base| base.eq_ignore_ascii_case(name))
+    };
+    assert!(!target.any_job_process(matches));
+    writer.write_all(command).unwrap();
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while !target.any_job_process(matches) {
+        assert!(
+            Instant::now() < deadline,
+            "the pane's process was not found"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!other.any_job_process(matches));
+    let deadline = Instant::now() + TEST_TIMEOUT;
+    while target.any_job_process(matches) {
+        assert!(Instant::now() < deadline, "the exited process was reported");
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(target.try_wait().unwrap().is_none());
+    target.shutdown().unwrap();
+    other.shutdown().unwrap();
+    drain.join().unwrap().unwrap();
 }
 
 #[test]
@@ -126,6 +206,55 @@ fn working_directory_starts_a_separate_real_process() {
         fs::read(directory.0.join("cwd-proof.txt")).unwrap(),
         b"directory-test"
     );
+}
+
+const CUSTOM_ARGV: &[&str] = &[
+    "kortty-custom-local-argv",
+    "two words",
+    "",
+    "  surrounded by spaces  ",
+    r#"say "hello" from C:\dir\"#,
+    "日本語 $PATH; & |",
+];
+
+#[test]
+fn custom_local_shell_keeps_arguments_and_working_directory() {
+    let root = TestDirectory::new();
+    let directory = root.0.join("start with spaces");
+    fs::create_dir(&directory).unwrap();
+    let program = std::env::current_exe().unwrap().into_os_string();
+    let mut command = vec![program.into_string().unwrap()];
+    command.extend(
+        ["--exact", "custom_local_shell_fixture", "--ignored", "--"]
+            .into_iter()
+            .chain(CUSTOM_ARGV.iter().copied())
+            .map(str::to_owned),
+    );
+    let mut pty = Pty::spawn_with_options(
+        80,
+        24,
+        "xterm-256color",
+        &LaunchOptions {
+            command: Some(command),
+            working_directory: Some(directory.clone()),
+            ..LaunchOptions::default()
+        },
+    )
+    .unwrap();
+    let (status, output) = run_shell(&mut pty, &[]);
+    assert!(status.success(), "{status}: {output}");
+    assert_eq!(fs::read(directory.join("argv-proof.txt")).unwrap(), b"ok");
+}
+
+#[test]
+#[ignore = "launched in a PTY by custom_local_shell_keeps_arguments_and_working_directory"]
+fn custom_local_shell_fixture() {
+    let arguments = std::env::args().collect::<Vec<_>>();
+    let Some(start) = arguments.iter().position(|word| word == CUSTOM_ARGV[0]) else {
+        return;
+    };
+    assert_eq!(arguments[start..], *CUSTOM_ARGV);
+    fs::write("argv-proof.txt", "ok").unwrap();
 }
 
 #[cfg(unix)]
@@ -202,25 +331,28 @@ fn sandbox_requires_an_explicit_workspace() {
     assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
 }
 
-#[cfg(any(target_os = "macos", windows))]
+#[cfg(target_os = "macos")]
 #[test]
-fn unavailable_required_sandbox_is_refused_without_an_unrestricted_shell() {
+fn sandbox_workspace_cannot_contain_the_private_profile() {
     let directory = TestDirectory::new();
+    let profile_root = directory.0.join("profile");
+    std::fs::create_dir(&profile_root).unwrap();
     let error = Pty::spawn_with_options(
         80,
         24,
         "xterm-256color",
         &LaunchOptions {
             working_directory: Some(directory.0.clone()),
-            sandbox: Some(Sandbox {
-                profile_root: directory.0.join("profile"),
-            }),
+            sandbox: Some(Sandbox { profile_root }),
             ..LaunchOptions::default()
         },
     )
     .err()
     .unwrap();
-    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(matches!(
+        error.kind(),
+        io::ErrorKind::InvalidInput | io::ErrorKind::PermissionDenied
+    ));
 }
 
 #[cfg(all(
@@ -401,6 +533,149 @@ fn linux_sandbox_restricts_real_profile_keys_ipc_and_writes() {
         "xterm-256color",
         &LaunchOptions {
             working_directory: Some(directory.0.clone()),
+            ..options
+        },
+    )
+    .err()
+    .unwrap();
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires native macOS Seatbelt and the system sandbox-exec tool"]
+fn macos_seatbelt_restricts_local_shell_and_descendants() {
+    use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener, TcpStream};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::fs::symlink;
+    use std::os::unix::net::{UnixListener, UnixStream};
+    use std::process::Command;
+
+    const HOST: &str = "KORTTY_PTY_SEATBELT_HOST_FIXTURE";
+    const PROBE: &str = "KORTTY_PTY_SEATBELT_FIXTURE";
+    if let Some(arguments) = std::env::var_os(PROBE) {
+        let arguments = arguments.to_str().unwrap();
+        let mut fields = arguments.split_whitespace();
+        let fd = fields.next().unwrap().parse().unwrap();
+        // SAFETY: this operation only checks the child descriptor table.
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
+        assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+        assert_eq!(
+            UnixStream::connect("s").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        assert_eq!(
+            UnixListener::bind("child.sock").unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        for address in fields {
+            let address: SocketAddr = address.parse().unwrap();
+            TcpStream::connect_timeout(&address, Duration::from_secs(2)).unwrap();
+        }
+        return;
+    }
+
+    let Some(root) = std::env::var_os(HOST) else {
+        // An isolated harness binds its Unix socket relative to its work area,
+        // so a long TMPDIR does not exceed Darwin's Unix socket address size.
+        let directory = TestDirectory::new();
+        let root = directory.0.canonicalize().unwrap();
+        let workspace = root.join("w");
+        fs::create_dir(&workspace).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .current_dir(workspace)
+            .env(HOST, root)
+            .args([
+                "--ignored",
+                "--exact",
+                "macos_seatbelt_restricts_local_shell_and_descendants",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    };
+    let root = PathBuf::from(root);
+    let workspace = root.join("w");
+    let profile = root.join("profile");
+    fs::create_dir(&profile).unwrap();
+    let secret = profile.join("private");
+    fs::write(&secret, b"profile unchanged").unwrap();
+    symlink(&secret, workspace.join("profile-link")).unwrap();
+    let _unix = UnixListener::bind("s").unwrap();
+    let ipv4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let ipv6 = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+    let secret_handle = fs::File::open(&secret).unwrap();
+    // SAFETY: F_DUPFD duplicates this file descriptor without close-on-exec.
+    let descriptor = unsafe { libc::fcntl(secret_handle.as_raw_fd(), libc::F_DUPFD, 128) };
+    assert!(descriptor >= 128);
+    // SAFETY: F_DUPFD returned a new owned file descriptor.
+    let inherited = unsafe { OwnedFd::from_raw_fd(descriptor) };
+    let target = workspace.join("runtime-probe");
+    fs::copy(std::env::current_exe().unwrap(), &target).unwrap();
+
+    let script = r#"
+        set -eu
+        [ "$KORTTY_SANDBOX" = seatbelt ] && [ -t 0 ] && [ -t 1 ] && [ -t 2 ] || exit 10
+        [ "$(pwd -P)" = "$1" ] && [ "$HOME" = "$TMPDIR" ] || exit 11
+        if /bin/cat "$2" >/dev/null 2>&1; then exit 12; fi
+        if ( : >> "$2" ) 2>/dev/null; then exit 13; fi
+        if /bin/cat profile-link >/dev/null 2>&1; then exit 14; fi
+        if /bin/sh -c '/bin/cat "$1"' descendant "$2" >/dev/null 2>&1; then exit 15; fi
+        KORTTY_PTY_SEATBELT_FIXTURE="$3" ./runtime-probe --ignored --exact \
+            macos_seatbelt_restricts_local_shell_and_descendants
+        printf '%s' workspace-ok > proof
+        printf '%s' scratch-ok > "$TMPDIR/proof"
+        printf '%s' "$TMPDIR" > scratch-path
+    "#;
+    let options = LaunchOptions {
+        command: Some(vec![
+            "/bin/sh".to_owned(),
+            "-c".to_owned(),
+            script.to_owned(),
+            "seatbelt-fixture".to_owned(),
+            workspace.to_str().unwrap().to_owned(),
+            secret.to_str().unwrap().to_owned(),
+            format!(
+                "{} {} {}",
+                inherited.as_raw_fd(),
+                ipv4.local_addr().unwrap(),
+                ipv6.local_addr().unwrap()
+            ),
+        ]),
+        working_directory: Some(workspace.clone()),
+        sandbox: Some(Sandbox {
+            profile_root: profile,
+        }),
+        ..LaunchOptions::default()
+    };
+    let mut pty = Pty::spawn_with_options(80, 24, "xterm-256color", &options).unwrap();
+    assert_eq!(pty.sandbox_backend(), Some("seatbelt"));
+    let (status, output) = run_shell(&mut pty, &[]);
+    assert!(
+        status.success(),
+        "sandbox probe failed: {status:?}, {output:?}"
+    );
+    assert_eq!(fs::read(workspace.join("proof")).unwrap(), b"workspace-ok");
+    assert_eq!(fs::read(&secret).unwrap(), b"profile unchanged");
+    let scratch = PathBuf::from(fs::read_to_string(workspace.join("scratch-path")).unwrap());
+    assert!(scratch.is_absolute());
+    assert!(!scratch.exists());
+    assert!(!scratch.parent().unwrap().exists());
+
+    let outside = root.join("outside-probe");
+    fs::copy(target, &outside).unwrap();
+    let error = Pty::spawn_with_options(
+        80,
+        24,
+        "xterm-256color",
+        &LaunchOptions {
+            command: Some(vec![outside.into_os_string().into_string().unwrap()]),
             ..options
         },
     )

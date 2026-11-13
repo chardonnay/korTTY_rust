@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=kortty
+Comment=Terminal emulator and SSH client
+Exec=kortty
+Icon=kortty
+Terminal=false
+Categories=System;TerminalEmulator;
+StartupWMClass=kortty

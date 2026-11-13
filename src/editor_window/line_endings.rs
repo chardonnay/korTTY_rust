@@ -102,6 +102,16 @@ impl State {
             .map_or(Ok(None), |preferred| convert(source, preferred))
     }
 
+    pub(super) fn convert_formatted(
+        self,
+        source: &str,
+        line_count: usize,
+    ) -> Result<Option<String>, &'static str> {
+        self.preferred
+            .or_else(|| self.selected(line_count))
+            .map_or(Ok(None), |ending| convert(source, ending))
+    }
+
     pub(super) fn observe_edit(
         &mut self,
         content: &text_editor::Content,

@@ -72,6 +72,37 @@ impl Fixture {
         request(&self.listener, self.user.clone(), key)
     }
 
+    fn generate_key(&self, name: &str, kind: &str, bits: &str, passphrase: &str) {
+        let generated = Command::new("ssh-keygen")
+            .args(["-q", "-t", kind, "-b", bits, "-N", passphrase, "-f"])
+            .arg(self.directory.0.join(name))
+            .output()
+            .unwrap();
+        assert!(
+            generated.status.success(),
+            "{}",
+            String::from_utf8_lossy(&generated.stderr)
+        );
+    }
+
+    fn encrypted_key_request(&self, kind: &str, bits: &str) -> Request {
+        const PASSPHRASE: &str = "test-only worker key passphrase";
+        let name = format!("client-{kind}");
+        self.generate_key(&name, kind, bits, PASSPHRASE);
+        let key = self.directory.0.join(name);
+        fs::copy(
+            key.with_extension("pub"),
+            self.directory.0.join("client.pub"),
+        )
+        .unwrap();
+        let mut request = self.request(key.clone());
+        request.target.auth = Authentication::KeyWithPassphrase(
+            key,
+            crate::ssh_dialog::Password::new(PASSPHRASE.into()),
+        );
+        request
+    }
+
     fn serve(&self, host: &str) -> JoinHandle<ProcessOutput> {
         self.serve_with_extra(host, "")
     }
@@ -449,36 +480,17 @@ fn worker_pins_and_shell(isolation: IsolationLevel) {
 #[test]
 #[ignore = "requires OpenSSH and KORTTY_SSH_TEST_EXE pointing to the built app"]
 fn openssh_worker_authenticates_with_an_encrypted_ecdsa_key() {
-    const PASSPHRASE: &str = "test-only worker key passphrase";
     let fixture = Fixture::new();
-    let key = fixture.directory.0.join("client-ecdsa");
-    let generated = Command::new("ssh-keygen")
-        .args(["-q", "-t", "ecdsa", "-b", "384", "-N", PASSPHRASE, "-f"])
-        .arg(&key)
-        .output()
-        .unwrap();
-    assert!(
-        generated.status.success(),
-        "{}",
-        String::from_utf8_lossy(&generated.stderr)
-    );
-    fs::copy(
-        key.with_extension("pub"),
-        fixture.directory.0.join("client.pub"),
-    )
-    .unwrap();
+    let request = fixture.encrypted_key_request("ecdsa", "384");
     let trust = fixture.trust();
     trust
         .remember(&fixture.endpoint(), &fixture.key("host"))
         .unwrap();
-    let mut request = fixture.request(key.clone());
-    request.target.auth =
-        Authentication::KeyWithPassphrase(key, crate::ssh_dialog::Password::new(PASSPHRASE.into()));
     let server = fixture.serve("host");
     let mut session = dial(request, false, &executable(), &trust).unwrap();
     let mut writer = session.take_writer().unwrap();
     writer
-        .write_all(b"printf '%s%s\\n' 'worker-ecdsa-' 'ok'; exit 21\n")
+        .write_all(b"HISTFILE=/dev/null; printf '\\n%s%s\\n' 'worker-ecdsa-' 'ok'; exit 21\n")
         .unwrap();
     let mut reader = session.take_reader().unwrap();
     let output = bounded_io(&mut session, move || {
@@ -486,9 +498,56 @@ fn openssh_worker_authenticates_with_an_encrypted_ecdsa_key() {
         reader.read_to_string(&mut output).unwrap();
         output
     });
-    assert!(output.lines().any(|line| line.trim() == "worker-ecdsa-ok"));
+    assert!(
+        output.lines().any(|line| line.trim() == "worker-ecdsa-ok"),
+        "{output:?}"
+    );
     assert_eq!(session.exit_code(), Some(21));
     session.close().unwrap();
+    assert!(server_log(server).contains("Accepted publickey"));
+}
+
+#[test]
+#[ignore = "requires OpenSSH and KORTTY_SSH_TEST_EXE pointing to the built app"]
+fn openssh_worker_authenticates_with_an_encrypted_rsa_key() {
+    let fixture = Fixture::new();
+    fixture.generate_key("host-rsa", "rsa", "2048", "");
+    let request = fixture.encrypted_key_request("rsa", "2048");
+    let trust = fixture.trust();
+    assert_eq!(
+        trust
+            .remember(&fixture.endpoint(), &fixture.key("host-rsa"))
+            .unwrap(),
+        HostKeyStatus::Known
+    );
+    let server = fixture.serve_with_extra(
+        "host-rsa",
+        "HostKeyAlgorithms rsa-sha2-512\nPubkeyAcceptedAlgorithms rsa-sha2-256\n",
+    );
+    let mut worker = dial(request, true, &executable(), &trust).unwrap();
+    let pid = lock(&worker.abort.0.child).as_ref().unwrap().id();
+    assert_ne!(pid, std::process::id());
+
+    // Exercise the authenticated channel through internal-sftp without a user shell.
+    let remote = fixture.directory().join("rsa-test.bin");
+    let path = remote.to_str().unwrap().as_bytes().to_vec();
+    let input = worker.take_reader().unwrap();
+    let output = worker.take_writer().unwrap();
+    let bytes = b"\0worker RSA/SHA-2 authenticated SFTP fixture\xff";
+    bounded_io(&mut worker, move || {
+        let mut sftp = Sftp::new(input, output).unwrap();
+        assert_eq!(
+            sftp.upload_new(&path, &bytes[..]).unwrap(),
+            bytes.len() as u64
+        );
+        let mut received = Vec::new();
+        sftp.download(&path, &mut received).unwrap();
+        assert_eq!(received, bytes);
+    });
+    assert_eq!(fs::read(remote).unwrap(), bytes);
+    worker.close().unwrap();
+    assert!(lock(&worker.abort.0.child).is_none());
+    assert_reaped(pid);
     assert!(server_log(server).contains("Accepted publickey"));
 }
 
@@ -509,6 +568,12 @@ fn worker_standalone_sftp(isolation: IsolationLevel) {
     let mut request = fixture.request(fixture.directory.0.join("client"));
     request.isolation = isolation;
     let mut worker = dial(request, true, &executable, &trust).unwrap();
+    let opener = worker.exec_opener().expect("verified worker opener");
+    assert!(opener.open_exec("true", || false).is_err());
+    // SSH can accept the fixed command even on a host without the helper installed.
+    // Close its separate lane before sending any archive request.
+    let extraction = opener.open_archive_extract(|| false).unwrap();
+    drop(extraction);
     let remote = fixture.directory.0.join("test.bin");
     let path = remote.to_str().unwrap().as_bytes().to_vec();
     let input = worker.take_reader().unwrap();

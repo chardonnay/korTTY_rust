@@ -3,8 +3,8 @@
 The pinned Java reference (`1ebbe724ee84`) records changed screen snapshots,
 input activity, and recording state transitions. Replay removes paused and
 stopped gaps and starts at the first screen. The native crate keeps these
-behaviors in an indexed, little-endian `.korttyrec` format. Java JSONL/GZIP
-files and video export are outside this format.
+behaviors in an indexed, little-endian `.korttyrec` format. The desktop Video
+Manager converts Java JSONL/GZIP recordings to this format for replay.
 
 The recorder stores visible cells, terminal geometry, cursor and optional
 style. It discards concealed glyph text, OSC 8 targets, title, scrollback and

@@ -54,6 +54,10 @@ fn send_target(out: &mut impl Write, login: LoginRequest) -> io::Result<()> {
             let key = Zeroizing::new(ssh_connection::read_key(&path)?);
             send(Credential::KeyWithPassphrase(&key, password.as_str()))
         }
+        Authentication::TemporaryKey(key) => {
+            let bytes = key.copy_for_attempt()?;
+            send(Credential::PrivateKey(&bytes))
+        }
         Authentication::ResolvedKey(record, password) => {
             let key = ssh_connection::read_registered_key(&record)?;
             match password {

@@ -230,7 +230,7 @@ impl Workspace {
         Some(Context { target, host })
     }
 
-    fn valid_remote_transfer(&self, owner: window::Id, target: &Target) -> bool {
+    pub(super) fn valid_remote_transfer(&self, owner: window::Id, target: &Target) -> bool {
         self.clipboard.policy.file_transfer_allowed
             && !self
                 .remote_dialogs

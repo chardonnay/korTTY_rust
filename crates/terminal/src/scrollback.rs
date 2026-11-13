@@ -55,9 +55,16 @@ impl Coordinates {
 impl ScrollbackSnapshot {
     /// Selects an offset in this snapshot. Zero means following live output.
     pub fn anchor(&self, offset: usize) -> Option<ScrollbackAnchor> {
-        (offset != 0 && self.0.history != 0).then(|| ScrollbackAnchor {
+        (offset != 0 && self.0.history != 0)
+            .then(|| self.row_anchor(self.0.history.saturating_sub(offset)))
+            .flatten()
+    }
+
+    /// Anchors any retained physical row, including the live grid.
+    pub fn row_anchor(&self, row: usize) -> Option<ScrollbackAnchor> {
+        (row < self.0.rows).then(|| ScrollbackAnchor {
             snapshot: self.clone(),
-            row: self.0.history.saturating_sub(offset),
+            row,
         })
     }
 
@@ -66,11 +73,15 @@ impl ScrollbackSnapshot {
     /// This is used for successive wheel and keyboard operations before the UI
     /// has received its next frame. Invalidated or unrelated anchors follow live.
     pub fn offset(&self, anchor: Option<&ScrollbackAnchor>) -> usize {
-        let Some(anchor) = anchor else {
-            return 0;
-        };
+        anchor
+            .and_then(|anchor| self.row(anchor))
+            .map_or(0, |index| self.0.history.saturating_sub(index))
+    }
+
+    /// Resolves a physical anchor in the layout this snapshot showed.
+    pub fn row(&self, anchor: &ScrollbackAnchor) -> Option<usize> {
         if !Arc::ptr_eq(&self.0.identity, &anchor.snapshot.0.identity) {
-            return 0;
+            return None;
         }
         let _layout = self.0.identity.read().unwrap_or_else(|e| e.into_inner());
         if Arc::ptr_eq(&self.0, &anchor.snapshot.0) {
@@ -81,29 +92,25 @@ impl ScrollbackSnapshot {
                 .unwrap_or_else(|e| e.into_inner())
                 .is_some()
             {
-                self.0.history.saturating_sub(anchor.row)
+                Some(anchor.row)
             } else {
-                0
+                None
             };
         }
-        let Some(position) = anchor.position() else {
-            return 0;
-        };
+        let position = anchor.position()?;
         let coordinates = self.0.coordinates.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(coordinates) = coordinates.as_ref() else {
-            return 0;
-        };
+        let coordinates = coordinates.as_ref()?;
         let index = if let Some(positions) = &coordinates.mapped {
-            positions[..=self.0.history]
+            positions
                 .partition_point(|candidate| {
                     candidate.row < position.row
                         || (candidate.row == position.row && candidate.column <= position.column)
                 })
                 .saturating_sub(1)
         } else {
-            retained_index(position.row, coordinates.origin, self.0.history)
+            retained_index(position.row, coordinates.origin, self.0.rows - 1)
         };
-        self.0.history.saturating_sub(index)
+        Some(index)
     }
 }
 

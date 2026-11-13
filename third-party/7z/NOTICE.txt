@@ -1,0 +1,8 @@
+The native 7z writer uses a korTTY-modified sevenz-rust2 0.25.0 and
+lzma-rust2 0.25.0. korTTY changes the AES credential and header handling
+and the LZMA dependency features. See vendor/sevenz-rust2/KORTTY-PATCH.md.
+Both crates are licensed under the Apache License, Version 2.0. The included
+license text is identical to the LICENSE file in both crates.io archives.
+
+https://github.com/hasenbanck/sevenz-rust2
+https://github.com/hasenbanck/lzma-rust2

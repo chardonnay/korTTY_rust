@@ -326,7 +326,7 @@ struct Viewer {
 }
 
 enum Mode {
-    Manager(Manager),
+    Manager(Box<Manager>),
     Viewer(Box<Viewer>),
 }
 
@@ -383,7 +383,7 @@ pub struct Window {
 impl Window {
     pub fn manager() -> Self {
         Self {
-            mode: Mode::Manager(Manager::default()),
+            mode: Mode::Manager(Box::default()),
             prompt: None,
             badge_close: None,
             pending: None,

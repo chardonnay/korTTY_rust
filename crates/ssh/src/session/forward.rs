@@ -1,5 +1,7 @@
 use std::sync::mpsc::RecvTimeoutError;
 
+use crate::MAX_FORWARD_STREAMS;
+
 use super::*;
 
 /// A direct-tcpip opener tied to an already verified SSH connection.
@@ -145,14 +147,16 @@ pub(super) struct Forwards {
     incoming: Receiver<OpenForward>,
     pending: Option<OpenForward>,
     channels: Vec<Forward>,
+    limit: usize,
 }
 
 impl Forwards {
-    pub(super) fn new(incoming: Receiver<OpenForward>) -> Self {
+    pub(super) fn new(incoming: Receiver<OpenForward>, transfer_helper: bool) -> Self {
         Self {
             incoming,
             pending: None,
             channels: Vec::new(),
+            limit: MAX_FORWARD_STREAMS - usize::from(transfer_helper),
         }
     }
 
@@ -178,6 +182,10 @@ impl Forwards {
         stream
     }
 
+    pub(super) fn has_capacity(&self) -> bool {
+        self.channels.len() < self.limit
+    }
+
     pub(super) fn step(
         &mut self,
         runner: &mut Runner<'_, Client>,
@@ -201,7 +209,12 @@ impl Forwards {
                 request.fail(forward_timeout());
                 return Ok(true);
             }
-            match open_direct_channel(runner, &request.destination, request.origin) {
+            let open = if self.has_capacity() {
+                open_direct_channel(runner, &request.destination, request.origin)
+            } else {
+                Err(sunset::Error::NoChannels)
+            };
+            match open {
                 Ok(Some(channel)) => {
                     self.channels.push(Forward::Opening(channel, request));
                     progressed = true;
@@ -214,6 +227,13 @@ impl Forwards {
                         .any(|channel| matches!(channel, Forward::Closing(_))) =>
                 {
                     self.pending = Some(request);
+                }
+                Err(sunset::Error::NoChannels) => {
+                    request.fail(
+                        io::Error::new(io::ErrorKind::WouldBlock, "SSH forwarding slots are full")
+                            .into(),
+                    );
+                    progressed = true;
                 }
                 Err(error) => {
                     request.fail(error.into());

@@ -3,6 +3,8 @@ use std::fs::File;
 use std::io::{self, BufWriter, Write as _};
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::mpsc::RecvTimeoutError;
+use std::time::Duration;
 
 use async_channel::{Receiver, Sender};
 use jiff::Timestamp;
@@ -22,24 +24,29 @@ use super::super::screenshot_analysis_store;
 use super::super::screenshot_edit::{self, XmlWrite};
 use super::super::viewer::Source;
 use super::super::{
-    LogFormat, MAX_DOCUMENT_BYTES, MAX_PNG_BYTES, MAX_PNG_PIXELS, MetadataEdit, display_text,
-    invalid,
+    CaptureKind, LogFormat, MAX_DOCUMENT_BYTES, MAX_PNG_BYTES, MAX_PNG_PIXELS, MetadataEdit,
+    command_count, display_text, invalid,
 };
 use super::storage::{DirectoryIdentity, MetadataError, Storage, file_identity};
 use super::{Item, Metadata, PublishedScreenshot, RecordKind, Shared, uuid};
 
+mod agent_chat;
 mod compression;
 mod log_encoding;
 mod markers;
 mod screenshot_analysis;
+mod summaries;
 use log_encoding::Record;
 use markers::{Assignment, Snapshots, first_match};
+pub(super) use summaries::Publish as SummaryPublish;
 
 const BATCH: usize = 64;
 const MAX_TIMELINE: usize = 1024;
 const MAX_TIMELINE_TEXT_BYTES: usize = 1024 * 1024;
 const SCREENSHOTS: &str = "screenshots";
 const LOG_LIMIT: &str = "the capture log reached its storage limit";
+const RETAINED_TAIL_BYTES: u64 = 1024 * 1024;
+const INPUT_CONFIRM_TIMEOUT: Duration = Duration::from_secs(5);
 const TIMELINE_LIMIT: &str = "the journal timeline reached its storage limit";
 
 #[derive(Clone, Copy)]
@@ -67,8 +74,10 @@ pub(super) struct Writer {
     archives: Arc<LiveArchives>,
     document: Document,
     sequence: u64,
+    command_count: command_count::Counter,
     timeline_text_bytes: usize,
     timeline_revision: usize,
+    output_stopped: bool,
 }
 
 impl Writer {
@@ -78,6 +87,7 @@ impl Writer {
         mut metadata: Metadata,
         limits: Limits,
         archives: Arc<LiveArchives>,
+        automation: Option<super::super::automation::TargetMetadata>,
     ) -> io::Result<Self> {
         for value in [
             &mut metadata.title,
@@ -110,6 +120,9 @@ impl Writer {
             entries: Vec::new(),
             markers: Snapshots::default(),
             screenshot_count: 0,
+            command_count: None,
+            summary: summaries::Checkpoint::default(),
+            automation,
         };
         let initialized = directory.lock_metadata().and_then(|()| {
             let directory_identity = directory.identity()?;
@@ -128,6 +141,8 @@ impl Writer {
                 archives,
                 document,
                 sequence: 0,
+                command_count: command_count::Counter::default(),
+                output_stopped: false,
                 timeline_text_bytes: 0,
                 timeline_revision: 0,
             }),
@@ -157,13 +172,18 @@ impl Writer {
             self.document.entries.push(entry);
         }
         self.sealed_parts.push(self.log.finish()?);
+        self.document.command_count = Some(std::mem::take(&mut self.command_count).finish());
+        let frozen = self.freeze_agent_chats();
+        if let Some(automation) = &self.document.automation {
+            automation.complete(truncation.is_none());
+        }
         self.document.save(
             &mut self.directory,
             self.log.number,
             self.sequence,
             Some(Timestamp::now().max(self.document.started)),
         )?;
-        if truncation.is_some() {
+        if truncation.is_some() || frozen {
             self.advance_timeline();
         }
         self.publish(shared);
@@ -185,7 +205,13 @@ impl Writer {
         while let Ok(first) = input.recv_blocking() {
             let more = std::iter::from_fn(|| input.try_recv().ok());
             for item in std::iter::once(first).chain(more).take(BATCH) {
-                if let Some(reason) = self.write(item, shared)? {
+                let result = self.write(item, shared)?;
+                if self.output_stopped {
+                    shared
+                        .output_paused
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                if let Some(reason) = result {
                     shared.finish(Some(reason));
                     return Ok(Some(reason));
                 }
@@ -193,7 +219,10 @@ impl Writer {
             self.log.output.flush()?;
             self.publish(shared);
         }
-        Ok(shared.lock().truncation)
+        Ok(shared
+            .lock()
+            .truncation
+            .or(self.output_stopped.then_some(LOG_LIMIT)))
     }
 
     fn publish(&self, shared: &Shared) {
@@ -212,6 +241,38 @@ impl Writer {
                 let result = self
                     .edit_metadata(edit)
                     .map_err(|error| format!("Could not save session journal metadata ({error})."));
+                let _ = reply.try_send(result);
+            }
+            Item::Summary { update, reply } => {
+                let result = self
+                    .publish_summary(*update)
+                    .map_err(|error| error.to_string());
+                shared.lock().entry_mutation_pending = false;
+                self.publish(shared);
+                let _ = reply.try_send(result);
+            }
+            Item::AgentCard {
+                card,
+                permit,
+                reply,
+            } => {
+                let result = self
+                    .ensure_agent_card(*card, shared, permit.as_deref())
+                    .map_err(agent_chat::save_error);
+                self.publish(shared);
+                let _ = reply.try_send(result);
+            }
+            Item::AgentChat {
+                entry,
+                snapshot,
+                permit,
+                reply,
+            } => {
+                let result = self
+                    .link_agent_chat(&entry, *snapshot, &permit)
+                    .map_err(agent_chat::save_error);
+                shared.lock().entry_mutation_pending = false;
+                self.publish(shared);
                 let _ = reply.try_send(result);
             }
             Item::Entry { edit, reply } => {
@@ -264,6 +325,24 @@ impl Writer {
                 shared.lock().entry_mutation_pending = false;
                 let _ = reply.try_send(result);
             }
+            Item::ConfirmedInput {
+                text,
+                time,
+                receipt,
+            } => match receipt.recv_timeout(INPUT_CONFIRM_TIMEOUT) {
+                Ok(()) => {
+                    let text = Zeroizing::new(display_text(&text));
+                    if !self.write_log(time, RecordKind::Input.key(), &text, false, None)? {
+                        return Ok(Some(LOG_LIMIT));
+                    }
+                }
+                Err(RecvTimeoutError::Disconnected) => {}
+                Err(RecvTimeoutError::Timeout) => {
+                    return Ok(Some(
+                        "a terminal input write could not be confirmed in time",
+                    ));
+                }
+            },
             Item::Text {
                 kind,
                 text,
@@ -271,16 +350,24 @@ impl Writer {
                 time,
             } => {
                 let text = Zeroizing::new(display_text(&text));
-                let timeline = if kind == RecordKind::Note && !text.trim().is_empty() {
-                    if self.document.entries.len() >= MAX_TIMELINE
-                        || self.timeline_text_bytes + text.len() > MAX_TIMELINE_TEXT_BYTES
-                    {
-                        return Ok(Some(TIMELINE_LIMIT));
-                    }
-                    Some(Entry::new("USER_NOTE", time)?)
-                } else {
-                    None
+                let timeline_kind = match kind {
+                    RecordKind::Note => Some("USER_NOTE"),
+                    RecordKind::SystemNote => Some("SYSTEM"),
+                    _ => None,
                 };
+                let timeline =
+                    if let Some(entry_kind) = timeline_kind.filter(|_| !text.trim().is_empty()) {
+                        if self.document.entries.len() >= MAX_TIMELINE
+                            || self.timeline_text_bytes + text.len() > MAX_TIMELINE_TEXT_BYTES
+                        {
+                            return Ok(Some(TIMELINE_LIMIT));
+                        }
+                        let mut entry = Entry::new(entry_kind, time)?;
+                        entry.raw = kind == RecordKind::SystemNote;
+                        Some(entry)
+                    } else {
+                        None
+                    };
                 if !self.write_log(time, kind.key(), &text, partial, None)? {
                     return Ok(Some(LOG_LIMIT));
                 }
@@ -367,7 +454,7 @@ impl Writer {
         let filename = format!("shot-{:06}.png", self.sequence + 1);
         let reference = format!("{SCREENSHOTS}/{filename}");
         let bytes = self.encode_log(time, "screenshot", "", false, Some(&reference))?;
-        if !self.reserve(bytes.len() as u64)? {
+        if !self.reserve(bytes.len() as u64)? && !self.reserve_retained(bytes.len() as u64) {
             return Ok(Some(LOG_LIMIT));
         }
         if self.screenshots.is_none() {
@@ -378,6 +465,8 @@ impl Writer {
             .expect("screenshot directory prepared")
             .save_new(&filename, png)?;
         self.append_log(&bytes)?;
+        self.command_count
+            .push(CaptureKind::Screenshot, "", false, false);
         entry.screenshot = Some(reference);
         self.document.screenshot_count += 1;
         self.commit_entry(entry, shared)?;
@@ -389,9 +478,11 @@ impl Writer {
             return self.directory.require_metadata();
         }
         self.log.sync()?;
+        let title_manually_set = self.document.metadata.title_manually_set;
         match &mut edit {
             MetadataEdit::Title(value) => {
                 std::mem::swap(&mut self.document.metadata.title, value);
+                self.document.metadata.title_manually_set = true;
             }
             MetadataEdit::Description(value) => {
                 std::mem::swap(&mut self.document.metadata.description, value);
@@ -404,6 +495,7 @@ impl Writer {
             .document
             .save(&mut self.directory, self.log.number, self.sequence, None);
         if result.as_ref().is_err_and(|error| !error.published) {
+            self.document.metadata.title_manually_set = title_manually_set;
             match edit {
                 MetadataEdit::Title(previous) => self.document.metadata.title = previous,
                 MetadataEdit::Description(previous) => {
@@ -724,11 +816,33 @@ impl Writer {
         partial: bool,
         file: Option<&str>,
     ) -> io::Result<bool> {
+        let output = matches!(kind, "out" | "seed");
+        if output && self.output_stopped {
+            return Ok(true);
+        }
         let bytes = self.encode_log(time, kind, text, partial, file)?;
         if !self.reserve(bytes.len() as u64)? {
-            return Ok(false);
+            if output && self.document.metadata.connection_config.is_some() {
+                self.output_stopped = true;
+                let warning = format!(
+                    "output capture stopped: size limit reached after {} log parts",
+                    self.log.number
+                );
+                let notice = self.encode_log(time, "note", &warning, false, None)?;
+                if self.reserve_retained(notice.len() as u64) {
+                    self.append_log(&notice)?;
+                    self.command_count
+                        .push(CaptureKind::Note, &warning, false, false);
+                }
+                return Ok(true);
+            }
+            if !self.reserve_retained(bytes.len() as u64) {
+                return Ok(false);
+            }
         }
         self.append_log(&bytes)?;
+        self.command_count
+            .push(CaptureKind::parse(kind)?, text, partial, false);
         Ok(true)
     }
 
@@ -771,6 +885,13 @@ impl Writer {
             self.sealed_parts.push(sealed);
         }
         Ok(self.log.bytes + bytes + self.log.footer.len() as u64 <= self.limits.part_bytes)
+    }
+
+    fn reserve_retained(&self, bytes: u64) -> bool {
+        self.document.metadata.connection_config.is_some()
+            && self.log.number >= self.limits.parts
+            && self.log.bytes + bytes + self.log.footer.len() as u64
+                <= self.limits.part_bytes + RETAINED_TAIL_BYTES
     }
 
     fn append_log(&mut self, bytes: &[u8]) -> io::Result<()> {
@@ -830,12 +951,16 @@ struct Document {
     entries: Vec<Entry>,
     markers: Snapshots,
     screenshot_count: u32,
+    command_count: Option<u64>,
+    summary: summaries::Checkpoint,
+    automation: Option<super::super::automation::TargetMetadata>,
 }
 
 struct Entry {
     id: String,
     kind: &'static str,
     time: Timestamp,
+    raw: bool,
     fields: EntryFields,
     marker: Option<Assignment>,
     edited_at: Option<Timestamp>,
@@ -843,6 +968,8 @@ struct Entry {
     annotations: Vec<Annotation>,
     analysis: Option<Arc<Analysis>>,
     anchor: Option<(u32, u64)>,
+    summary: Option<summaries::SummaryEntry>,
+    agent: Option<agent_chat::Agent>,
 }
 
 impl Entry {
@@ -851,6 +978,7 @@ impl Entry {
             id: uuid()?,
             kind,
             time,
+            raw: false,
             fields: EntryFields::default(),
             marker: None,
             edited_at: None,
@@ -858,6 +986,8 @@ impl Entry {
             annotations: Vec::new(),
             analysis: None,
             anchor: None,
+            summary: None,
+            agent: None,
         })
     }
 
@@ -889,6 +1019,9 @@ impl Entry {
         xml.push_str("<entry>\n");
         element(xml, "id", &self.id);
         element(xml, "kind", self.kind);
+        if self.raw {
+            element(xml, "state", "RAW");
+        }
         element(xml, "marker", self.legacy_marker().xml());
         if let Some(marker) = &self.marker {
             if let Some(id) = &marker.id {
@@ -916,7 +1049,12 @@ impl Entry {
         if let Some(analysis) = &self.analysis {
             screenshot_analysis_store::write_xml(xml, analysis);
         }
-        if let Some((part, seq)) = self.anchor {
+        if let Some(agent) = &self.agent {
+            agent.write_xml(xml);
+        }
+        if let Some(summary) = &self.summary {
+            summary.write(xml);
+        } else if let Some((part, seq)) = self.anchor {
             element(xml, "logPart", &part.to_string());
             element(xml, "logStartSeq", &seq.to_string());
             element(xml, "logEndSeq", &seq.to_string());
@@ -1000,6 +1138,9 @@ impl Document {
         if let Some(ended) = ended {
             element(&mut xml, "endedAt", &ended.to_string());
         }
+        if let Some(automation) = &self.automation {
+            automation.write(ended, |name, value| element(&mut xml, name, value))?;
+        }
         element(
             &mut xml,
             "seeded",
@@ -1012,6 +1153,9 @@ impl Document {
         element(&mut xml, "logFormat", self.metadata.log_format.name());
         element(&mut xml, "logEntryCount", &records.to_string());
         element(&mut xml, "logParts", &parts.to_string());
+        if let Some(commands) = self.command_count {
+            element(&mut xml, "commandCount", &commands.to_string());
+        }
         let errors = self
             .entries
             .iter()
@@ -1028,7 +1172,19 @@ impl Document {
             "pinned",
             if self.pinned { "true" } else { "false" },
         );
-        element(&mut xml, "aiSummariesOff", "true");
+        let summaries = self
+            .metadata
+            .connection_config
+            .is_some_and(|config| config.ai_summaries);
+        element(
+            &mut xml,
+            "aiSummariesOff",
+            if summaries { "false" } else { "true" },
+        );
+        self.summary.write(&mut xml);
+        if self.metadata.title_manually_set {
+            element(&mut xml, super::super::summary_store::MANUAL_TITLE, "true");
+        }
         xml.push_str("</meta>\n<entries>\n");
         for entry in &self.entries {
             entry.write_xml(&mut xml)?;

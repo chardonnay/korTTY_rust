@@ -51,6 +51,7 @@ pub(super) struct TabWatch {
     enabled: Watch,
     panes: HashMap<SessionId, PaneWatch>,
     attention: Option<Attention>,
+    notification: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -88,12 +89,16 @@ impl TabWatch {
 
     pub(super) fn seen(&mut self) {
         self.attention = None;
+        self.notification = None;
         for pane in self.panes.values_mut() {
             pane.activity_armed = true;
         }
     }
 
     pub(super) fn attention_text(&self) -> Option<String> {
+        if let Some(text) = &self.notification {
+            return Some(text.clone());
+        }
         Some(match self.attention? {
             Attention::Activity => {
                 "New output arrived while you were not looking at this tab.".into()
@@ -102,6 +107,10 @@ impl TabWatch {
                 format!("No output in this tab for {} seconds.", duration.as_secs())
             }
         })
+    }
+
+    pub(super) fn mark_notification(&mut self, text: &str) {
+        self.notification = Some(text.chars().take(200).collect());
     }
 }
 
@@ -243,6 +252,7 @@ impl Workspace {
             .retain(|_, at| now.saturating_duration_since(*at) < ATTENTION_INTERVAL);
         let silence = Duration::from_secs(u64::from(self.window_settings.terminal_silence_seconds));
         let mut requests = Vec::new();
+        let mut notifications = Vec::new();
         let system_attention = self.clipboard.policy.desktop_notifications_allowed
             && self.clipboard.policy.problem.is_none();
         for (&owner, window) in &mut self.windows {
@@ -278,6 +288,19 @@ impl Workspace {
                         {
                             entry.insert(now);
                             request = true;
+                            notifications.push((
+                                session,
+                                attention.kind(),
+                                match attention {
+                                    Attention::Activity => {
+                                        "New terminal output is available.".to_owned()
+                                    }
+                                    Attention::Silence(duration) => format!(
+                                        "No terminal output for {} seconds.",
+                                        duration.as_secs()
+                                    ),
+                                },
+                            ));
                         }
                     }
                 }
@@ -289,6 +312,17 @@ impl Workspace {
                 ));
             }
         }
+        requests.extend(notifications.into_iter().map(|(session, kind, body)| {
+            self.notify_terminal_kind(
+                session,
+                match kind {
+                    Kind::Activity => super::terminal_notifications::Kind::Activity,
+                    Kind::Silence => super::terminal_notifications::Kind::Silence,
+                },
+                "kortty · Terminal monitor",
+                &body,
+            )
+        }));
         Task::batch(requests)
     }
 }

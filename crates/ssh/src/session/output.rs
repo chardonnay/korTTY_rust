@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 use std::io;
 use std::sync::{Arc, Condvar, Mutex};
 
+use zeroize::Zeroize;
+
 use super::{ReadWait, closed, lock};
 
 pub(super) struct OutputSender(Arc<OutputQueue>);
@@ -14,20 +16,48 @@ struct OutputQueue {
 
 struct OutputState {
     bytes: VecDeque<u8>,
+    sensitive: bool,
     sender_closed: bool,
     receiver_closed: bool,
 }
 
 pub(super) fn queue() -> (OutputSender, OutputReceiver) {
+    queue_with_wipe(false)
+}
+
+pub(super) fn queue_with_wipe(sensitive: bool) -> (OutputSender, OutputReceiver) {
     let queue = Arc::new(OutputQueue {
         state: Mutex::new(OutputState {
-            bytes: VecDeque::new(),
+            bytes: if sensitive {
+                // The receive window bounds the queue and avoids reallocating live bytes.
+                VecDeque::with_capacity(sunset::config::DEFAULT_WINDOW)
+            } else {
+                VecDeque::new()
+            },
+            sensitive,
             sender_closed: false,
             receiver_closed: false,
         }),
         ready: Condvar::new(),
     });
     (OutputSender(Arc::clone(&queue)), OutputReceiver(queue))
+}
+
+impl OutputState {
+    fn wipe_prefix(&mut self, count: usize) {
+        if self.sensitive {
+            let (first, second) = self.bytes.as_mut_slices();
+            let split = first.len().min(count);
+            first[..split].zeroize();
+            second[..count - split].zeroize();
+        }
+    }
+}
+
+impl Drop for OutputState {
+    fn drop(&mut self) {
+        self.wipe_prefix(self.bytes.len());
+    }
 }
 
 impl OutputSender {
@@ -90,6 +120,7 @@ impl OutputReceiver {
         let split = first.len().min(count);
         bytes[..split].copy_from_slice(&first[..split]);
         bytes[split..count].copy_from_slice(&second[..count - split]);
+        state.wipe_prefix(count);
         state.bytes.drain(..count);
         Ok(count)
     }
@@ -98,6 +129,7 @@ impl OutputReceiver {
         let mut state = lock(&self.0.state);
         state.receiver_closed = true;
         let count = state.bytes.len();
+        state.wipe_prefix(count);
         state.bytes.clear();
         count
     }

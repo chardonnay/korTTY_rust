@@ -1,5 +1,5 @@
 use iced::keyboard::{Key, Location, Modifiers, key::Named};
-use kortty_terminal::{KeyModifiers, ScreenSnapshot, TerminalKey, TerminalProfile};
+use kortty_terminal::{KeyModifiers, ScreenSnapshot, TerminalKey, TerminalProfile, TextEncoding};
 
 use crate::session::{IbmAid, IbmEdit, IbmInput, IbmKind};
 
@@ -135,7 +135,7 @@ pub fn encode_stream_key(
         return Some(bytes);
     }
     let encoded = encode_key(key, modifiers, text, application_cursor_keys)?;
-    if screen.profile == TerminalProfile::Xterm {
+    if screen.profile == TerminalProfile::Xterm && screen.text_encoding() == TextEncoding::Utf8 {
         return Some(encoded);
     }
     if matches!(key, Key::Named(named) if *named != Named::Space) {
@@ -349,7 +349,7 @@ pub fn encode_paste(text: &str, bracketed: bool) -> Vec<u8> {
 }
 
 pub fn encode_stream_paste(screen: &ScreenSnapshot, text: &str, bracketed: bool) -> Vec<u8> {
-    if screen.profile == TerminalProfile::Xterm {
+    if screen.profile == TerminalProfile::Xterm && screen.text_encoding() == TextEncoding::Utf8 {
         return encode_paste(text, bracketed);
     }
     if !bracketed {
@@ -364,6 +364,44 @@ pub fn encode_stream_paste(screen: &ScreenSnapshot, text: &str, bracketed: bool)
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn serial_xterm_encodes_keyboard_and_paste_with_ascii_control_bytes() {
+        let terminal = kortty_terminal::Terminal::with_profile_and_encoding(
+            80,
+            24,
+            TerminalProfile::Xterm,
+            TextEncoding::Windows1252,
+        );
+        let screen = terminal.snapshot();
+        assert_eq!(
+            encode_stream_key(
+                &screen,
+                &Key::Character("€".into()),
+                Location::Standard,
+                Modifiers::empty(),
+                Some("€"),
+                false
+            ),
+            Some(vec![0x80]),
+        );
+        assert_eq!(
+            encode_stream_key(
+                &screen,
+                &Key::Named(Named::ArrowUp),
+                Location::Standard,
+                Modifiers::empty(),
+                None,
+                false
+            ),
+            Some(b"\x1b[A".to_vec()),
+        );
+        assert_eq!(encode_stream_paste(&screen, "é\n€", false), b"\xe9\r\x80");
+        assert_eq!(
+            encode_stream_paste(&screen, "€", true),
+            b"\x1b[200~\x80\x1b[201~"
+        );
+    }
 
     #[test]
     fn ibm_functions_and_editing_remain_typed() {

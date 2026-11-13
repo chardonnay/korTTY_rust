@@ -23,13 +23,14 @@ pub(crate) fn attachment_dir(recording: &Path) -> PathBuf {
 
 /// Saves the recorded frames in an immutable, private directory beside the replay.
 pub(crate) fn attach(recording: &Path, cancelled: impl Fn() -> bool) -> Result<Summary, String> {
-    let mut replay = Replay::open(recording).map_err(|error| error.to_string())?;
+    let mut replay = Replay::open(recording)
+        .map_err(|error| format!("Could not open the terminal recording ({error})."))?;
     if !replay.is_complete() || replay.frame_count() == 0 {
         return Err("A complete terminal recording is required.".into());
     }
     let destination = attachment_dir(recording);
     let stage = StagedDirectory::new(recording.with_extension(&STAGE_SUFFIX[1..]))
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("Could not create the screenshot staging directory ({error})."))?;
     let mut count = 0;
     let mut bytes = 0;
     for index in 0..replay.frame_count() {
@@ -39,20 +40,21 @@ pub(crate) fn attach(recording: &Path, cancelled: impl Fn() -> bool) -> Result<S
         }
         let frame = replay
             .frame(index)
-            .map_err(|error| error.to_string())?
+            .map_err(|error| format!("Could not read the recorded terminal frame ({error})."))?
             .ok_or("The recording lost a terminal frame.")?;
         let png = render::png(&frame.screen)?;
         let size = png.len() as u64;
         if index != replay.frame_count() - 1 && bytes + size > ATTACHMENT_BUDGET {
             continue;
         }
-        write_new(&image_path(&stage.path, index), &png).map_err(|error| error.to_string())?;
+        write_new(&image_path(&stage.path, index), &png)
+            .map_err(|error| format!("Could not write the terminal screenshot ({error})."))?;
         bytes += size;
         count += 1;
     }
     stage
         .publish(&destination)
-        .map_err(|error| error.to_string())?;
+        .map_err(|error| format!("Could not publish the terminal screenshots ({error})."))?;
     Ok(Summary {
         count,
         limited: count != replay.frame_count(),
@@ -170,7 +172,10 @@ impl StagedDirectory {
 
     fn publish(mut self, destination: &Path) -> io::Result<()> {
         sync_directory(&self.path)?;
+        #[cfg(unix)]
         rename_no_replace(&self.path, destination)?;
+        #[cfg(windows)]
+        publish_directory(&self.path, destination)?;
         self.published = true;
         if let Some(parent) = destination.parent() {
             sync_directory(parent)?;
@@ -206,6 +211,22 @@ fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
 #[cfg(windows)]
 fn rename_no_replace(from: &Path, to: &Path) -> io::Result<()> {
     kortty_files::rename_no_replace(from, to)
+}
+
+#[cfg(windows)]
+fn publish_directory(stage: &Path, destination: &Path) -> io::Result<()> {
+    use kortty_files::tree::Directory;
+
+    let invalid_path = || io::Error::new(io::ErrorKind::InvalidInput, "invalid screenshot path");
+    let parent = stage
+        .parent()
+        .filter(|parent| Some(*parent) == destination.parent())
+        .ok_or_else(invalid_path)?;
+    let name = stage.file_name().ok_or_else(invalid_path)?;
+    let destination = destination.file_name().ok_or_else(invalid_path)?;
+    let parent = Directory::open_publish_parent(parent)?;
+    let stage = Directory::from_file(parent.child_for_removal(name)?)?;
+    parent.publish(&stage, destination)
 }
 
 pub(crate) fn remove(directory: &Path) -> io::Result<()> {

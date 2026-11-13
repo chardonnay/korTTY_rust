@@ -8,6 +8,7 @@ use iced::widget::{
 use iced::{Alignment, Element, Event, Length, Rectangle, Renderer, Size, Theme, mouse, window};
 use jiff::{Timestamp, tz::TimeZone};
 
+use crate::session::SessionId;
 use crate::sftp_window::{ConflictChoice, Entry, EntryKind, Location};
 
 use super::{
@@ -19,49 +20,81 @@ const TERMINAL_RESERVE: f32 = 260.0;
 const MAX_CRUMBS: usize = 12;
 
 impl Workspace {
+    fn remote_dock_source(
+        &self,
+        owner: window::Id,
+        tab: &Tab,
+    ) -> Option<(local_dock::Side, SessionId, bool)> {
+        let side = match self.window_settings.remote_sidebar_position {
+            RemoteSidebarPosition::Left => local_dock::Side::Left,
+            RemoteSidebarPosition::Right => local_dock::Side::Right,
+            RemoteSidebarPosition::Hidden => return None,
+        };
+        if self.terminal_only_fullscreen_active(owner) {
+            return None;
+        }
+        let binding = tab.remote_files.binding.as_ref();
+        let session = binding
+            .map(|binding| binding.browser.session())
+            .or_else(|| self.preferred_remote_pane(tab))?;
+        let manager = binding.is_some_and(|binding| binding.manager_loan.is_some())
+            || self.remote_manager_owns(session);
+        (binding.is_some() || manager).then_some((side, session, manager))
+    }
+
+    pub(in crate::workspace) fn visible_remote_dock_width(
+        &self,
+        owner: window::Id,
+        tab: &Tab,
+    ) -> f32 {
+        self.remote_dock_source(owner, tab).map_or(0.0, |_| {
+            f32::from(self.window_settings.remote_sidebar_width)
+        })
+    }
+
     pub(in crate::workspace) fn remote_dock_view<'a>(
         &'a self,
         owner: window::Id,
         window: &'a Window,
         tab: &'a Tab,
         panes: Element<'a, Desktop>,
+        fitted_width: Option<f32>,
     ) -> Element<'a, Desktop> {
         let position = self.window_settings.remote_sidebar_position;
-        let side = match position {
-            RemoteSidebarPosition::Left => local_dock::Side::Left,
-            RemoteSidebarPosition::Right => local_dock::Side::Right,
-            RemoteSidebarPosition::Hidden => return panes,
-        };
-        if self.terminal_only_fullscreen_active(owner) {
+        let Some((side, session, manager)) = self.remote_dock_source(owner, tab) else {
             return panes;
-        }
+        };
         let binding = tab.remote_files.binding.as_ref();
-        let Some(session) = binding
-            .map(|binding| binding.browser.session())
-            .or_else(|| self.preferred_remote_pane(tab))
-        else {
-            return panes;
-        };
-        let manager = binding.is_some_and(|binding| binding.manager_loan.is_some())
-            || self.remote_manager_owns(session);
-        if binding.is_none() && !manager {
-            return panes;
-        }
         let eligible = self.remote_pane(session).is_some();
         let transfer_allowed = self.clipboard.policy.file_transfer_allowed;
         let available = window.content_bounds().width;
         let (_, remaining) =
             self.local_dock
                 .tab_drop_coordinates(available, 0.0, f64::from(available));
-        let width = f32::from(self.window_settings.remote_sidebar_width)
-            .min((remaining as f32 - TERMINAL_RESERVE).max(f32::from(REMOTE_SIDEBAR_MIN_WIDTH)));
+        let preferred = f32::from(self.window_settings.remote_sidebar_width);
+        let width = fitted_width.unwrap_or_else(|| {
+            preferred
+                .min((remaining as f32 - TERMINAL_RESERVE).max(f32::from(REMOTE_SIDEBAR_MIN_WIDTH)))
+        });
         let tab_id = tab.id;
         let sidebar = binding
             .map_or_else(
                 || manager_placeholder(width),
                 |binding| {
-                    tab.remote_files
-                        .sidebar(binding, width, eligible, transfer_allowed, manager)
+                    #[cfg(any(target_os = "linux", target_os = "windows"))]
+                    let desktop_drag = self
+                        .sidebar_drag_available(owner, tab_id, binding)
+                        .then(|| tab.remote_files.desktop_drag_controls(tab_id, binding))
+                        .flatten();
+                    tab.remote_files.sidebar(
+                        binding,
+                        width,
+                        eligible,
+                        transfer_allowed,
+                        manager,
+                        #[cfg(any(target_os = "linux", target_os = "windows"))]
+                        desktop_drag,
+                    )
                 },
             )
             .map(move |action| Desktop::RemoteDock(owner, Message::Action(tab_id, action)));
@@ -80,15 +113,17 @@ impl Workspace {
                 })
                 .map(|binding| (binding.generation, binding.listing)),
         });
-        let divider = local_dock::dock_divider(side, width).map(move |message| match message {
-            local_dock::Message::Resize(_, width) => {
-                Desktop::RemoteDock(owner, Message::Resize(position, width))
-            }
-            local_dock::Message::FinishResize(_) => {
-                Desktop::RemoteDock(owner, Message::FinishResize(position))
-            }
-            _ => unreachable!("the dock divider emits resize messages only"),
-        });
+        let resize_from = fitted_width.map_or(width, |_| preferred);
+        let divider =
+            local_dock::dock_divider(side, resize_from).map(move |message| match message {
+                local_dock::Message::Resize(_, width) => {
+                    Desktop::RemoteDock(owner, Message::Resize(position, width))
+                }
+                local_dock::Message::FinishResize(_) => {
+                    Desktop::RemoteDock(owner, Message::FinishResize(position))
+                }
+                _ => unreachable!("the dock divider emits resize messages only"),
+            });
         let empty = || -> Element<'a, Desktop> { space::Space::new().into() };
         let (left, right) = match side {
             local_dock::Side::Left => (
@@ -134,6 +169,10 @@ impl Dock {
         eligible: bool,
         transfer_allowed: bool,
         manager: bool,
+        #[cfg(any(target_os = "linux", target_os = "windows"))] desktop_drag: Option<(
+            Element<'a, Action>,
+            Option<&'a str>,
+        )>,
     ) -> Element<'a, Action> {
         let browser = &binding.browser;
         let connected = eligible && browser.connected() && !manager;
@@ -204,6 +243,13 @@ impl Dock {
             format!("Following the SSH pane · {path}")
         };
         let mut panel = column![header, text(banner).size(12)].spacing(5);
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        if let Some((control, error)) = desktop_drag {
+            panel = panel.push(control);
+            if let Some(error) = error {
+                panel = panel.push(text(error).size(12));
+            }
+        }
         if let Some(path) = browser.path() {
             panel = panel.push(breadcrumbs(path, binding, connected));
         }

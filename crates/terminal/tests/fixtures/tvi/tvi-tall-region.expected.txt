@@ -1,0 +1,8 @@
+size=12x132
+cursor=1,97
+history=0
+reply=1b3d20201b3dc28121
+row95=header
+row96=keep
+row97=X
+row98=footer

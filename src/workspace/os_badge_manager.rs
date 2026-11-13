@@ -1,5 +1,6 @@
 //! Native editor for custom OS symbols assigned to saved connections.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -10,7 +11,7 @@ use crate::profile;
 use crate::sftp_window::{Directory, EntryKind, Location, list_local};
 use crate::ssh_dialog::unsafe_text;
 
-use super::{Message, Workspace, dialog_placement::Kind};
+use super::{Message, Workspace, chrome::focus_dialog_field, dialog_placement::Kind};
 
 mod view;
 
@@ -51,12 +52,13 @@ pub struct Saved {
 
 #[derive(Default)]
 pub(super) struct State {
-    dialog: Option<Dialog>,
+    dialogs: BTreeMap<window::Id, Dialog>,
 }
 
 struct Dialog {
     id: window::Id,
     owner: window::Id,
+    focus_scope: iced::widget::Id,
     catalog: Arc<Catalog>,
     catalog_state: CatalogState,
     selected: Option<String>,
@@ -104,6 +106,7 @@ impl Dialog {
         Self {
             id,
             owner,
+            focus_scope: iced::widget::Id::unique(),
             catalog,
             catalog_state: CatalogState::Loading,
             selected: None,
@@ -167,7 +170,7 @@ impl Dialog {
             target: Target::Add(path),
             value,
         };
-        iced::widget::operation::focus(NAME_INPUT)
+        focus_dialog_field(self.focus_scope.clone(), NAME_INPUT)
     }
 
     fn save(&mut self, change: Change) -> Task<Message> {
@@ -267,7 +270,7 @@ impl Dialog {
                         value: badge.name().into(),
                     };
                     self.problem = None;
-                    return iced::widget::operation::focus(NAME_INPUT);
+                    return focus_dialog_field(self.focus_scope.clone(), NAME_INPUT);
                 }
             }
             Event::Delete if matches!(self.mode, Mode::List) => {
@@ -432,17 +435,15 @@ pub(super) fn message(id: window::Id, event: Event) -> Message {
 
 impl Workspace {
     pub(super) fn show_os_badge_manager(&mut self, owner: window::Id) -> Task<Message> {
-        if self.connections_id != Some(owner) {
-            return Task::none();
+        if let Some((id, focus)) = self.owner_dialog(owner) {
+            return window::gain_focus(id).chain(Task::done(focus));
         }
-        if let Some(dialog) = &self.os_badge_manager.dialog {
-            return window::gain_focus(dialog.id);
-        }
-        let Some(connections) = self.connections.as_ref() else {
+        let Some(manager) = self.connection_managers.get(&owner) else {
             return Task::none();
         };
-        let catalog = connections.custom_badges();
-        let (id, opened) = self.open_placed_dialog(
+        let catalog = manager.window.custom_badges();
+        let (id, opened) = self.open_owned_placed_dialog(
+            owner,
             Kind::OsBadgeManager,
             window::Settings {
                 size: Size::new(540.0, 470.0),
@@ -451,10 +452,13 @@ impl Workspace {
                 exit_on_close_request: false,
                 ..window::Settings::default()
             },
+            Some(|id| message(id, Event::Focus)),
         );
-        self.os_badge_manager.dialog = Some(Dialog::new(id, owner, Arc::clone(&catalog)));
+        self.os_badge_manager
+            .dialogs
+            .insert(id, Dialog::new(id, owner, Arc::clone(&catalog)));
         Task::batch([
-            opened.discard(),
+            opened,
             Task::perform(async move { read_catalog(catalog) }, move |result| {
                 message(id, Event::Loaded(result))
             }),
@@ -463,47 +467,38 @@ impl Workspace {
 
     pub(super) fn os_badge_manager_title(&self, id: window::Id) -> Option<&'static str> {
         self.os_badge_manager
-            .dialog
-            .as_ref()
-            .filter(|dialog| dialog.id == id)
-            .map(|_| TITLE)
+            .dialogs
+            .contains_key(&id)
+            .then_some(TITLE)
     }
 
     pub(super) fn os_badge_manager_view(&self, id: window::Id) -> Option<Element<'_, Message>> {
-        let dialog = self
-            .os_badge_manager
-            .dialog
-            .as_ref()
-            .filter(|dialog| dialog.id == id)?;
+        let dialog = self.os_badge_manager.dialogs.get(&id)?;
         Some(dialog.view().map(move |event| message(id, event)))
     }
 
     pub(super) fn os_badge_manager_for_owner(&self, owner: window::Id) -> Option<window::Id> {
         self.os_badge_manager
-            .dialog
-            .as_ref()
-            .filter(|dialog| dialog.owner == owner)
+            .dialogs
+            .values()
+            .find(|dialog| dialog.owner == owner)
             .map(|dialog| dialog.id)
     }
 
     pub(super) fn os_badge_manager_saving(&self) -> Option<window::Id> {
         self.os_badge_manager
-            .dialog
-            .as_ref()
-            .filter(|dialog| dialog.writing)
+            .dialogs
+            .values()
+            .find(|dialog| dialog.writing)
             .map(|dialog| dialog.id)
     }
 
     pub(super) fn close_os_badge_manager(&mut self, id: window::Id) -> Option<Task<Message>> {
-        self.os_badge_manager_title(id)?;
-        if self.os_badge_manager_saving() == Some(id) {
+        if self.os_badge_manager.dialogs.get(&id)?.writing {
             return Some(Task::none());
         }
-        let dialog = self.os_badge_manager.dialog.take()?;
-        Some(Task::batch([
-            self.close_placed_dialog(id),
-            window::gain_focus(dialog.owner),
-        ]))
+        let dialog = self.os_badge_manager.dialogs.remove(&id)?;
+        Some(self.close_placed_dialog_and_focus(id, dialog.owner))
     }
 
     pub(super) fn update_os_badge_manager(
@@ -511,35 +506,60 @@ impl Workspace {
         id: window::Id,
         event: Event,
     ) -> Task<Message> {
-        let Some(dialog) = self
-            .os_badge_manager
-            .dialog
-            .as_mut()
-            .filter(|dialog| dialog.id == id)
-        else {
+        let another_save = matches!(event, Event::SaveName | Event::ConfirmDelete)
+            && self
+                .os_badge_manager_saving()
+                .is_some_and(|saving| saving != id);
+        let Some(dialog) = self.os_badge_manager.dialogs.get_mut(&id) else {
             return Task::none();
         };
-        let refreshed = match event {
+        match event {
             Event::Focus => return window::gain_focus(id),
             Event::Close => return self.close_os_badge_manager(id).unwrap_or_else(Task::none),
             Event::Dismiss if matches!(dialog.mode, Mode::List) => {
                 return self.close_os_badge_manager(id).unwrap_or_else(Task::none);
             }
             Event::Loaded(result) if dialog.catalog_state == CatalogState::Loading => {
-                dialog.finish_load(result)
+                if let Some(manager) = self.connection_managers.get_mut(&dialog.owner) {
+                    let latest = manager.window.custom_badges();
+                    let result = if Arc::ptr_eq(&dialog.catalog, &latest) {
+                        result
+                    } else {
+                        // A peer saved after this read started.
+                        Ok(latest)
+                    };
+                    if let Some(catalog) = dialog.finish_load(result) {
+                        manager.window.replace_custom_badges(catalog);
+                    }
+                } else {
+                    dialog.finish_load(result);
+                }
             }
             Event::Saved(generation, result)
                 if dialog.writing && generation == dialog.generation =>
             {
-                dialog.finish_save(result)
+                if let Some(catalog) = dialog.finish_save(result) {
+                    for manager in self.connection_managers.values_mut() {
+                        manager.window.replace_custom_badges(Arc::clone(&catalog));
+                    }
+                    for (&peer, dialog) in &mut self.os_badge_manager.dialogs {
+                        if peer != id
+                            && dialog.catalog_state == CatalogState::Ready
+                            && matches!(dialog.mode, Mode::List)
+                        {
+                            dialog.catalog = Arc::clone(&catalog);
+                            if dialog.selected().is_none() {
+                                dialog.selected = None;
+                            }
+                        }
+                    }
+                }
+            }
+            Event::SaveName | Event::ConfirmDelete if another_save => {
+                dialog.problem =
+                    Some("Another OS symbols window is saving. Try again shortly.".into());
             }
             event => return dialog.handle(event),
-        };
-        if let Some(catalog) = refreshed
-            && self.connections_id == Some(dialog.owner)
-            && let Some(connections) = &mut self.connections
-        {
-            connections.replace_custom_badges(catalog);
         }
         Task::none()
     }
@@ -552,6 +572,7 @@ mod tests {
     #[test]
     fn manager_close_respects_its_symbols_dialog_and_the_native_menu_targets_the_dialog() {
         use crate::connection_window::ConnectionWindow;
+        use crate::workspace::profile_tools::ConnectionManager;
 
         let mut workspace = Workspace::default();
         let (main, _) = workspace.open_window(false);
@@ -564,15 +585,18 @@ mod tests {
                 u64::from_ne_bytes(nonce)
             ))
             .join("connections.json");
-        workspace.connections = Some(ConnectionWindow::open(path).unwrap());
-        workspace.connections_id = Some(owner);
+        workspace.connection_managers.insert(
+            owner,
+            ConnectionManager::new(main, ConnectionWindow::open(path).unwrap()),
+        );
         let _ = workspace.show_os_badge_manager(owner);
         let id = workspace.os_badge_manager_for_owner(owner).unwrap();
         assert_eq!(workspace.owner_dialog(owner).map(|(id, _)| id), Some(id));
-        assert!(workspace.owner_dialog(main).is_none());
+        assert_eq!(workspace.placed_dialog_owner(id), Some(owner));
+        assert_eq!(workspace.owner_dialog(main).map(|(id, _)| id), Some(id));
 
         let _ = workspace.close_window(owner);
-        assert_eq!(workspace.connections_id, Some(owner));
+        assert!(workspace.connection_managers.contains_key(&owner));
         assert_eq!(workspace.os_badge_manager_for_owner(owner), Some(id));
 
         #[cfg(target_os = "macos")]
@@ -584,7 +608,7 @@ mod tests {
         let _ = workspace.close_window(id);
 
         assert!(workspace.os_badge_manager_for_owner(owner).is_none());
-        assert_eq!(workspace.connections_id, Some(owner));
+        assert!(workspace.connection_managers.contains_key(&owner));
         assert!(workspace.windows.contains_key(&main));
     }
 

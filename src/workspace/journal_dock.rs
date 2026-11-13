@@ -55,6 +55,9 @@ pub enum Action {
     Note(Note),
     Screenshot,
     Open,
+    OpenAgentChat {
+        entry: String,
+    },
     OpenLink {
         entry: String,
         field: LinkField,
@@ -397,14 +400,18 @@ impl ReadRequest {
 }
 
 impl Workspace {
-    fn dock_journal_links_enabled(&self, owner: window::Id, dock: &Dock) -> bool {
+    fn dock_journal_entry_actions_enabled(&self, owner: window::Id, dock: &Dock) -> bool {
         dock.placement() != Placement::Hidden
             && !self.exiting
             && !self.scheduler_draining
             && !self.terminal_only_fullscreen_active(owner)
-            && self.journal_links_allowed()
+            && self.journal_allowed()
             && self.palette_can_open(owner)
             && !self.palette.is_open(owner)
+    }
+
+    fn dock_journal_links_enabled(&self, owner: window::Id, dock: &Dock) -> bool {
+        self.journal_links_allowed() && self.dock_journal_entry_actions_enabled(owner, dock)
     }
 
     pub(super) fn journal_dock_placement(&self, owner: window::Id) -> Placement {
@@ -704,6 +711,10 @@ impl Workspace {
                 .windows
                 .get(&owner)
                 .is_some_and(|window| self.dock_journal_links_enabled(owner, &window.journal_dock));
+        let chat_enabled = matches!(&action, Action::OpenAgentChat { .. })
+            && self.windows.get(&owner).is_some_and(|window| {
+                self.dock_journal_entry_actions_enabled(owner, &window.journal_dock)
+            });
         let Some(dock) = self
             .windows
             .get_mut(&owner)
@@ -725,6 +736,18 @@ impl Workspace {
                 let source = viewer::Source::capture(&bound.source.capture);
                 let name = bound.source.title.clone();
                 return self.open_journal_viewer(owner, source, name);
+            }
+            Action::OpenAgentChat { entry } => {
+                if chat_enabled
+                    && bound
+                        .timeline
+                        .entries
+                        .iter()
+                        .any(|candidate| candidate.id == entry && candidate.has_agent_chat())
+                {
+                    let source = viewer::Source::capture(&bound.source.capture);
+                    return self.start_journal_agent_chat(owner, source, entry, None);
+                }
             }
             Action::OpenLink {
                 entry,
@@ -812,6 +835,7 @@ impl Workspace {
         owner: window::Id,
         window: &'a Window,
         panes: Element<'a, Desktop>,
+        fitted_width: Option<f32>,
     ) -> Element<'a, Desktop> {
         let dock = &window.journal_dock;
         let position = if self.journal_allowed() && !self.terminal_only_fullscreen_active(owner) {
@@ -823,8 +847,10 @@ impl Workspace {
         let (_, remaining) =
             self.local_dock
                 .tab_drop_coordinates(available, 0.0, f64::from(available));
-        let width = f32::from(dock.preferences.width)
-            .min((remaining as f32 - TERMINAL_RESERVE).max(MIN_VISIBLE_WIDTH));
+        let width = fitted_width.unwrap_or_else(|| {
+            f32::from(dock.preferences.width)
+                .min((remaining as f32 - TERMINAL_RESERVE).max(MIN_VISIBLE_WIDTH))
+        });
         let dispatch = move |message| Desktop::JournalDock(owner, message);
         let panel = if position == Placement::Hidden {
             space::Space::new().into()
@@ -859,6 +885,9 @@ impl Workspace {
                     note_editor: editor,
                     links: self
                         .dock_journal_links_enabled(owner, dock)
+                        .then_some(LinkContext { owner, tab, run }),
+                    chat: self
+                        .dock_journal_entry_actions_enabled(owner, dock)
                         .then_some(LinkContext { owner, tab, run }),
                     images: images::widget::Context {
                         owner,
@@ -902,14 +931,26 @@ impl Workspace {
                 appearance.map(|(_, appearance)| appearance.content),
             )
         };
-        view::dock(
-            position,
+        super::local_dock::dock_terminal(
+            view::side(position),
             width,
+            fitted_width.map_or(width, |_| f32::from(dock.preferences.width)),
             panel,
             panes,
             move |width| dispatch(Message::Resize(position, width)),
             dispatch(Message::FinishResize(position)),
         )
+    }
+
+    pub(super) fn visible_journal_dock_width(&self, owner: window::Id, window: &Window) -> f32 {
+        if self.journal_allowed()
+            && !self.terminal_only_fullscreen_active(owner)
+            && window.journal_dock.placement() != Placement::Hidden
+        {
+            f32::from(window.journal_dock.preferences.width)
+        } else {
+            0.0
+        }
     }
 }
 

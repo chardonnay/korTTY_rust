@@ -8,7 +8,7 @@ use crate::session_journal::markers::{Compiled, Definition, match_text};
 
 use super::{Entry, MAX_TIMELINE, element, invalid};
 
-#[derive(Eq, PartialEq)]
+#[derive(Clone, Eq, PartialEq)]
 pub(super) struct Assignment {
     pub(super) id: Option<String>,
     pub(super) legacy: LegacyMarker,

@@ -3,12 +3,15 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use kortty_ssh::{
-    Authentication, ConnectError, ConnectOptions, Endpoint, HostKey, KeyboardChallenge,
+    Authentication, ConnectError, ConnectOptions, Endpoint, HostKey, KeepAlive, KeyboardChallenge,
     KeyboardPrompt, KeyboardResponse, SshTarget, TrustStore, WindowSize,
 };
 use zeroize::Zeroizing;
 
-const MAGIC: &[u8; 8] = b"kortssh4";
+use super::account_lookup::{self, DisplayQuery, Kind};
+use super::folder_usage;
+
+const MAGIC: &[u8; 8] = b"kortssh5";
 const TEXT: usize = 4096;
 const KEY: usize = 1024 * 1024;
 const MAX_PROMPTS: usize = 16;
@@ -60,6 +63,11 @@ pub fn send_login_header(
     out.write_all(&[u8::from(sftp)])?;
     out.write_all(&options.seconds().to_be_bytes())?;
     out.write_all(&[options.attempts()])?;
+    let keepalive = options.keepalive();
+    out.write_all(&[keepalive.map_or(0, |value| if value.enabled() { 2 } else { 1 })])?;
+    if let Some(keepalive) = keepalive {
+        out.write_all(&keepalive.seconds().to_be_bytes())?;
+    }
     blob(out, term.as_bytes(), TEXT)?;
     send_size(out, size)?;
     out.write_all(&[pins.len().try_into().map_err(|_| invalid())?])?;
@@ -81,6 +89,15 @@ pub(super) fn recv_login(input: &mut impl Read) -> io::Result<Login> {
     input.read_exact(&mut seconds)?;
     let options =
         ConnectOptions::new(u16::from_be_bytes(seconds), byte(input)?).map_err(|_| invalid())?;
+    let keepalive = match byte(input)? {
+        0 => None,
+        kind @ (1 | 2) => {
+            input.read_exact(&mut seconds)?;
+            Some(KeepAlive::new(kind == 2, u16::from_be_bytes(seconds)).map_err(|_| invalid())?)
+        }
+        _ => return Err(invalid()),
+    };
+    let options = options.with_keepalive(keepalive);
     let term = text(input, TEXT)?;
     let size = recv_size(input)?;
     let pins = byte(input)?;
@@ -380,6 +397,37 @@ fn recv_blob(input: &mut impl Read, limit: usize) -> io::Result<Zeroizing<Vec<u8
     Ok(bytes)
 }
 
+fn recv_folder_usage(input: &mut impl Read) -> io::Result<Vec<Vec<u8>>> {
+    let count = number(input)? as usize;
+    if !(1..=folder_usage::MAX_PATHS).contains(&count) {
+        return Err(invalid());
+    }
+    let mut paths = Vec::with_capacity(count);
+    let mut remaining = kortty_ssh::MAX_EXEC_COMMAND_BYTES;
+    for _ in 0..count {
+        let mut path = recv_blob(input, remaining)?;
+        remaining -= path.len();
+        paths.push(std::mem::take(&mut *path));
+    }
+    folder_usage::command(&paths).map_err(|_| invalid())?;
+    Ok(paths)
+}
+
+fn recv_account_names(input: &mut impl Read) -> io::Result<DisplayQuery> {
+    let users = usize::from(byte(input)?);
+    let groups = usize::from(byte(input)?);
+    if !(1..=account_lookup::DISPLAY_ID_LIMIT).contains(&(users + groups)) {
+        return Err(invalid());
+    }
+    let users = (0..users)
+        .map(|_| number(input))
+        .collect::<io::Result<_>>()?;
+    let groups = (0..groups)
+        .map(|_| number(input))
+        .collect::<io::Result<_>>()?;
+    DisplayQuery::new(users, groups).map_err(|_| invalid())
+}
+
 fn text(input: &mut impl Read, limit: usize) -> io::Result<String> {
     String::from_utf8(std::mem::take(&mut *recv_blob(input, limit)?)).map_err(|_| invalid())
 }
@@ -408,11 +456,39 @@ pub fn invalid() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, "Invalid SSH worker message")
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub enum Open {
     Sftp,
     Direct(Endpoint, SocketAddr),
     Listen(SocketAddr),
+    Exec(String),
+    PasswordExec { command: String, nonce: [u8; 16] },
+    PasswordFileExec { nonce: [u8; 16] },
+    FileExec,
+    AccountLookup { kind: Kind, name: String },
+    ArchiveExtract,
+    FolderUsage(Vec<Vec<u8>>),
+    AccountNames(DisplayQuery),
+    DraftReplace,
+}
+
+impl std::fmt::Debug for Open {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Sftp => "Sftp",
+            Self::Direct(..) => "Direct",
+            Self::Listen(..) => "Listen",
+            Self::Exec(..) => "Exec",
+            Self::PasswordExec { .. } => "PasswordExec",
+            Self::PasswordFileExec { .. } => "PasswordFileExec",
+            Self::FileExec => "FileExec",
+            Self::AccountLookup { .. } => "AccountLookup",
+            Self::ArchiveExtract => "ArchiveExtract",
+            Self::FolderUsage(..) => "FolderUsage",
+            Self::AccountNames(..) => "AccountNames",
+            Self::DraftReplace => "DraftReplace",
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -428,6 +504,86 @@ pub enum Frame {
     Closed(u32, Option<String>),
     EndAck(u32),
     Finished(u32, Option<String>),
+    Password(u32, PasswordFrame),
+}
+
+#[derive(Debug)]
+pub enum PasswordFrame {
+    Challenge,
+    Input(kortty_ssh::SensitiveLine, Option<PasswordWriteGuard>),
+    Staged,
+    Commit(Option<PasswordWriteGuard>),
+    Result(super::password::Status),
+    Ready,
+}
+
+pub struct PasswordWriteGuard {
+    pub(super) lane: std::sync::Weak<()>,
+    pub(super) permitted: std::sync::Arc<dyn Fn() -> bool + Send + Sync>,
+}
+
+impl std::fmt::Debug for PasswordWriteGuard {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("SSH password write guard")
+    }
+}
+
+impl PasswordFrame {
+    fn send(self, id: u32, out: &mut impl Write) -> io::Result<()> {
+        let guard = match &self {
+            Self::Input(_, guard) | Self::Commit(guard) => guard.as_ref(),
+            _ => None,
+        };
+        if guard.is_some_and(|guard| guard.lane.strong_count() == 0 || !(guard.permitted)()) {
+            return Ok(());
+        }
+        header(out, 11, id)?;
+        match self {
+            Self::Challenge => out.write_all(&[0]),
+            Self::Input(line, _) => {
+                out.write_all(&[1])?;
+                line.write_wire(out)
+            }
+            Self::Staged => out.write_all(&[2]),
+            Self::Commit(_) => out.write_all(&[3]),
+            Self::Result(status) => {
+                use super::password::Status;
+                let tag = match status {
+                    Status::Exited(_) => 0,
+                    Status::Cancelled => 1,
+                    Status::TimedOut => 2,
+                    Status::TransportFailed => 3,
+                    Status::MissingExitCode => 4,
+                };
+                out.write_all(&[4, tag])?;
+                if let Status::Exited(code) = status {
+                    out.write_all(&code.to_be_bytes())?;
+                }
+                Ok(())
+            }
+            Self::Ready => out.write_all(&[5]),
+        }
+    }
+
+    fn recv(input: &mut impl Read) -> io::Result<Self> {
+        use super::password::Status;
+        Ok(match byte(input)? {
+            0 => Self::Challenge,
+            1 => Self::Input(kortty_ssh::SensitiveLine::read_wire(input)?, None),
+            2 => Self::Staged,
+            3 => Self::Commit(None),
+            4 => Self::Result(match byte(input)? {
+                0 => Status::Exited(number(input)?),
+                1 => Status::Cancelled,
+                2 => Status::TimedOut,
+                3 => Status::TransportFailed,
+                4 => Status::MissingExitCode,
+                _ => return Err(invalid()),
+            }),
+            5 => Self::Ready,
+            _ => return Err(invalid()),
+        })
+    }
 }
 
 impl Frame {
@@ -457,6 +613,14 @@ impl Frame {
                 error_text(out, error)?;
             }
             Self::Open(id, request) => {
+                if let Open::AccountLookup { name, .. } = &request
+                    && !account_lookup::valid_name(name)
+                {
+                    return Err(invalid());
+                }
+                if let Open::FolderUsage(paths) = &request {
+                    folder_usage::command(paths).map_err(|_| invalid())?;
+                }
                 header(out, 5, id)?;
                 match request {
                     Open::Sftp => out.write_all(&[0])?,
@@ -469,6 +633,47 @@ impl Frame {
                         out.write_all(&[2])?;
                         send_address(out, bind)?;
                     }
+                    Open::Exec(command) => {
+                        out.write_all(&[3])?;
+                        blob(out, command.as_bytes(), kortty_ssh::MAX_EXEC_COMMAND_BYTES)?;
+                    }
+                    Open::PasswordExec { command, nonce } => {
+                        out.write_all(&[4])?;
+                        blob(out, command.as_bytes(), kortty_ssh::MAX_EXEC_COMMAND_BYTES)?;
+                        out.write_all(&nonce)?;
+                    }
+                    Open::PasswordFileExec { nonce } => {
+                        out.write_all(&[5])?;
+                        out.write_all(&nonce)?;
+                    }
+                    Open::FileExec => out.write_all(&[6])?,
+                    Open::AccountLookup { kind, name } => {
+                        let kind = match kind {
+                            Kind::User => 0,
+                            Kind::Group => 1,
+                        };
+                        out.write_all(&[7, kind])?;
+                        blob(out, name.as_bytes(), account_lookup::INPUT_LIMIT)?;
+                    }
+                    Open::ArchiveExtract => out.write_all(&[8])?,
+                    Open::FolderUsage(paths) => {
+                        out.write_all(&[9])?;
+                        out.write_all(&(paths.len() as u32).to_be_bytes())?;
+                        for path in paths {
+                            blob(out, &path, kortty_ssh::MAX_EXEC_COMMAND_BYTES)?;
+                        }
+                    }
+                    Open::AccountNames(query) => {
+                        out.write_all(&[
+                            10,
+                            query.users().len() as u8,
+                            query.groups().len() as u8,
+                        ])?;
+                        for id in query.users().iter().chain(query.groups()) {
+                            out.write_all(&id.to_be_bytes())?;
+                        }
+                    }
+                    Open::DraftReplace => out.write_all(&[11])?,
                 }
             }
             Self::Opened(id, address) => {
@@ -492,6 +697,7 @@ impl Frame {
                 header(out, 10, id)?;
                 error_text(out, error)?;
             }
+            Self::Password(id, frame) => frame.send(id, out)?,
         }
         out.flush()
     }
@@ -519,6 +725,35 @@ impl Frame {
                     0 => Open::Sftp,
                     1 => Open::Direct(recv_endpoint(input)?, recv_address(input)?),
                     2 => Open::Listen(recv_address(input)?),
+                    3 => Open::Exec(text(input, kortty_ssh::MAX_EXEC_COMMAND_BYTES)?),
+                    4 => {
+                        let command = text(input, kortty_ssh::MAX_EXEC_COMMAND_BYTES)?;
+                        let mut nonce = [0; 16];
+                        input.read_exact(&mut nonce)?;
+                        Open::PasswordExec { command, nonce }
+                    }
+                    5 => {
+                        let mut nonce = [0; 16];
+                        input.read_exact(&mut nonce)?;
+                        Open::PasswordFileExec { nonce }
+                    }
+                    6 => Open::FileExec,
+                    7 => {
+                        let kind = match byte(input)? {
+                            0 => Kind::User,
+                            1 => Kind::Group,
+                            _ => return Err(invalid()),
+                        };
+                        let name = text(input, account_lookup::INPUT_LIMIT)?;
+                        if !account_lookup::valid_name(&name) {
+                            return Err(invalid());
+                        }
+                        Open::AccountLookup { kind, name }
+                    }
+                    8 => Open::ArchiveExtract,
+                    9 => Open::FolderUsage(recv_folder_usage(input)?),
+                    10 => Open::AccountNames(recv_account_names(input)?),
+                    11 => Open::DraftReplace,
                     _ => return Err(invalid()),
                 },
             ),
@@ -527,6 +762,7 @@ impl Frame {
             8 => Self::Closed(id, flag(input)?.then(|| text(input, TEXT)).transpose()?),
             9 => Self::EndAck(id),
             10 => Self::Finished(id, flag(input)?.then(|| text(input, TEXT)).transpose()?),
+            11 => Self::Password(id, PasswordFrame::recv(input)?),
             _ => return Err(invalid()),
         })
     }
@@ -561,8 +797,186 @@ mod tests {
     use super::*;
 
     #[test]
+    fn fixed_file_open_frames_have_no_command_or_body() {
+        let nonce = [37; 16];
+        let mut bytes = Vec::new();
+        Frame::Open(3, Open::FileExec).send(&mut bytes).unwrap();
+        Frame::Open(5, Open::PasswordFileExec { nonce })
+            .send(&mut bytes)
+            .unwrap();
+        Frame::Password(5, PasswordFrame::Ready)
+            .send(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes.len(), 6 + 22 + 6);
+        let mut input = bytes.as_slice();
+        assert!(matches!(
+            Frame::recv(&mut input),
+            Ok(Frame::Open(3, Open::FileExec))
+        ));
+        assert!(matches!(
+            Frame::recv(&mut input),
+            Ok(Frame::Open(5, Open::PasswordFileExec { nonce: decoded })) if decoded == nonce
+        ));
+        assert!(matches!(
+            Frame::recv(&mut input),
+            Ok(Frame::Password(5, PasswordFrame::Ready))
+        ));
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn archive_extract_open_has_only_its_fixed_tag() {
+        let mut bytes = Vec::new();
+        Frame::Open(3, Open::ArchiveExtract)
+            .send(&mut bytes)
+            .unwrap();
+        assert_eq!(bytes, [5, 0, 0, 0, 3, 8]);
+        let mut input = bytes.as_slice();
+        assert!(matches!(
+            Frame::recv(&mut input),
+            Ok(Frame::Open(3, Open::ArchiveExtract))
+        ));
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn draft_replace_open_has_only_its_fixed_tag() {
+        let mut bytes = Vec::new();
+        Frame::Open(3, Open::DraftReplace).send(&mut bytes).unwrap();
+        assert_eq!(bytes, [5, 0, 0, 0, 3, 11]);
+        let mut input = bytes.as_slice();
+        assert!(matches!(
+            Frame::recv(&mut input),
+            Ok(Frame::Open(3, Open::DraftReplace))
+        ));
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn folder_usage_open_carries_only_ordered_paths() {
+        let paths = vec![b"/one/quoted' path".to_vec(), "/two/ü".as_bytes().to_vec()];
+        let mut bytes = Vec::new();
+        Frame::Open(3, Open::FolderUsage(paths.clone()))
+            .send(&mut bytes)
+            .unwrap();
+        assert_eq!(&bytes[..10], [5, 0, 0, 0, 3, 9, 0, 0, 0, 2]);
+        assert!(!bytes.windows(2).any(|bytes| bytes == b"du"));
+        let mut input = bytes.as_slice();
+        assert!(matches!(
+            Frame::recv(&mut input),
+            Ok(Frame::Open(3, Open::FolderUsage(decoded))) if decoded == paths
+        ));
+        assert!(input.is_empty());
+    }
+
+    #[test]
+    fn folder_usage_open_rejects_unrepresentable_or_oversized_paths() {
+        let limit = kortty_ssh::MAX_EXEC_COMMAND_BYTES;
+        for paths in [
+            Vec::new(),
+            vec![b"/valid".to_vec(); folder_usage::MAX_PATHS + 1],
+            vec![b"du -sk /".to_vec()],
+            vec![b"/one\n/two".to_vec()],
+            vec![b"/invalid/\xff".to_vec()],
+            vec![format!("/{}", "'".repeat(limit / 4)).into_bytes()],
+            vec![format!("/{}", "a".repeat(limit / 2)).into_bytes(); 2],
+        ] {
+            let mut encoded = Vec::new();
+            assert!(
+                Frame::Open(3, Open::FolderUsage(paths.clone()))
+                    .send(&mut encoded)
+                    .is_err()
+            );
+            assert!(encoded.is_empty());
+
+            // Simulate a peer bypassing the sender's validation.
+            let mut bytes = vec![5, 0, 0, 0, 3, 9];
+            bytes.extend_from_slice(&(paths.len() as u32).to_be_bytes());
+            for path in paths {
+                blob(&mut bytes, &path, limit).unwrap();
+            }
+            assert!(Frame::recv(&mut bytes.as_slice()).is_err());
+        }
+    }
+
+    #[test]
+    fn account_display_lookup_wire_round_trips_numeric_ids_and_rejects_unbounded_input() {
+        let query = DisplayQuery::new(vec![0, 1000], vec![2000]).unwrap();
+        let mut bytes = Vec::new();
+        Frame::Open(3, Open::AccountNames(query.clone()))
+            .send(&mut bytes)
+            .unwrap();
+        assert_eq!(
+            bytes,
+            [
+                5, 0, 0, 0, 3, 10, 2, 1, 0, 0, 0, 0, 0, 0, 3, 232, 0, 0, 7, 208
+            ]
+        );
+        let mut input = bytes.as_slice();
+        assert!(matches!(
+            Frame::recv(&mut input),
+            Ok(Frame::Open(3, Open::AccountNames(decoded))) if decoded == query
+        ));
+        assert!(input.is_empty());
+        for invalid in [
+            vec![5, 0, 0, 0, 3, 10, 0, 0],
+            vec![5, 0, 0, 0, 3, 10, 64, 1],
+            vec![5, 0, 0, 0, 3, 10, 1, 0, 255, 255, 255, 255],
+            vec![5, 0, 0, 0, 3, 10, 2, 0, 0, 0, 0, 2, 0, 0, 0, 1],
+        ] {
+            assert!(Frame::recv(&mut invalid.as_slice()).is_err());
+        }
+    }
+
+    #[test]
+    fn account_lookup_open_carries_only_the_database_and_name() {
+        for (kind, name) in [(Kind::User, "service$"), (Kind::Group, "work-team@example")] {
+            let mut bytes = Vec::new();
+            Frame::Open(
+                3,
+                Open::AccountLookup {
+                    kind,
+                    name: name.to_owned(),
+                },
+            )
+            .send(&mut bytes)
+            .unwrap();
+            assert_eq!(bytes.len(), 11 + name.len());
+            let mut input = bytes.as_slice();
+            assert!(matches!(
+                Frame::recv(&mut input),
+                Ok(Frame::Open(3, Open::AccountLookup { kind: decoded, name: received }))
+                    if decoded == kind && received == name
+            ));
+            assert!(input.is_empty());
+        }
+    }
+
+    #[test]
+    fn account_lookup_open_rejects_invalid_names_and_database_tags() {
+        for name in ["", "123", "-option", "account'command", "é"] {
+            let mut encoded = Vec::new();
+            let request = Open::AccountLookup {
+                kind: Kind::User,
+                name: name.to_owned(),
+            };
+            assert!(Frame::Open(3, request).send(&mut encoded).is_err());
+            assert!(encoded.is_empty());
+
+            // Simulate an untrusted sender that bypasses Frame::send validation.
+            let mut bytes = vec![5, 0, 0, 0, 3, 7, 0];
+            blob(&mut bytes, name.as_bytes(), account_lookup::INPUT_LIMIT).unwrap();
+            assert!(Frame::recv(&mut bytes.as_slice()).is_err());
+        }
+        assert!(Frame::recv(&mut [5, 0, 0, 0, 3, 7, 2].as_slice()).is_err());
+        assert!(Frame::recv(&mut [5, 0, 0, 0, 3, 7, 0, 0, 0, 0, 65].as_slice()).is_err());
+    }
+
+    #[test]
     fn worker_login_round_trips_and_rejects_out_of_range_startup_options() {
-        let options = ConnectOptions::new(300, 20).unwrap();
+        let options = ConnectOptions::new(300, 20)
+            .unwrap()
+            .with_keepalive(Some(KeepAlive::new(false, 600).unwrap()));
         let mut bytes = Vec::new();
         let size = WindowSize {
             columns: 80,
@@ -582,7 +996,7 @@ mod tests {
         .unwrap();
         bytes.push(0);
         assert_eq!(recv_login(&mut bytes.as_slice()).unwrap().options, options);
-        for (index, value) in [(9, 0xff), (11, 21)] {
+        for (index, value) in [(9, 0xff), (11, 21), (12, 3), (13, 0xff)] {
             let mut invalid = bytes.clone();
             invalid[index] = value;
             assert!(

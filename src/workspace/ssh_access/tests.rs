@@ -2,6 +2,8 @@ use serde_json::json;
 
 use super::*;
 use crate::ssh_dialog::LoginMessage;
+#[cfg(unix)]
+use crate::workspace::initial_grid;
 
 #[cfg(unix)]
 mod native_registered_key;
@@ -9,6 +11,157 @@ mod native_registered_key;
 const PROFILE: TerminalProfile = TerminalProfile::Vt220;
 const FONT: u8 = 17;
 const TEST_PASSWORD: &str = "workspace-test-password";
+
+#[test]
+fn mcp_masking_uses_ssh_secrets_when_journaling_and_logging_are_off() {
+    let mut workspace = Workspace::default();
+    workspace.set_test_ai_configuration(
+        serde_json::from_value(json!({"general": {"features_enabled": false}})).unwrap(),
+    );
+    workspace.clipboard.policy.session_journal_allowed = false;
+    assert!(workspace.ssh_needs_terminal_secrets(false, false, false));
+    assert!(!workspace.ssh_needs_terminal_secrets(true, false, false));
+    assert!(!workspace.ssh_needs_terminal_secrets(false, true, false));
+    workspace.clipboard.policy.mcp_server_allowed = false;
+    assert!(!workspace.ssh_needs_terminal_secrets(false, false, false));
+}
+
+#[test]
+fn terminal_ai_masking_is_independent_of_journal_mcp_and_private_persistence() {
+    let mut workspace = Workspace::default();
+    workspace.set_test_ai_configuration(crate::ai_manager::Configuration::default());
+    workspace.clipboard.policy.session_journal_allowed = false;
+    workspace.clipboard.policy.mcp_server_allowed = false;
+    for private in [false, true] {
+        assert!(workspace.ssh_needs_terminal_secrets(private, false, false));
+        assert!(!workspace.ssh_needs_terminal_secrets(private, true, false));
+    }
+    let target = SshTarget::from_imported_route(
+        LoginTarget {
+            host: "fixture.invalid".into(),
+            port: 22,
+            username: "fixture".into(),
+        },
+        None,
+        IsolationLevel::None,
+    )
+    .unwrap();
+    let logging: crate::terminal_logging::Config =
+        serde_json::from_value(json!({"enabled": true})).unwrap();
+    let public = workspace.ssh_terminal_capture(false, logging.clone(), "Fixture".into(), &target);
+    assert!(public.enabled());
+    let private = workspace.ssh_terminal_capture(true, logging, "Fixture".into(), &target);
+    assert!(!private.enabled());
+    private.secrets().add("fixture-private-password");
+    let redactor = crate::terminal_logging::Redactor::for_journal(
+        private.secrets().seal().unwrap(),
+        Default::default(),
+    );
+    assert_eq!(
+        redactor
+            .journal_text(
+                "fixture-private-password",
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+            )
+            .unwrap()
+            .as_str(),
+        "***",
+    );
+
+    workspace.clipboard.policy.ai_chat_allowed = false;
+    workspace.clipboard.policy.ai_agent_feature_allowed = false;
+    workspace.clipboard.policy.ai_swarm_feature_allowed = false;
+    workspace.clipboard.policy.ai_planning_feature_allowed = false;
+    assert!(!workspace.ssh_needs_terminal_secrets(false, false, false));
+    assert!(!workspace.ssh_needs_terminal_secrets(true, false, false));
+    workspace.clipboard.policy.ai_planning_feature_allowed = true;
+    assert!(workspace.ssh_needs_terminal_secrets(false, false, false));
+    assert!(workspace.ssh_needs_terminal_secrets(true, false, false));
+    workspace.clipboard.policy.ai_allowed = false;
+    assert!(!workspace.ssh_needs_terminal_secrets(false, false, false));
+    assert!(!workspace.ssh_needs_terminal_secrets(true, false, false));
+    workspace.clipboard.policy.ai_allowed = true;
+    workspace.set_test_ai_configuration(
+        serde_json::from_value(json!({"general": {"features_enabled": false}})).unwrap(),
+    );
+    assert!(!workspace.ssh_needs_terminal_secrets(false, false, false));
+    assert!(!workspace.ssh_needs_terminal_secrets(true, false, false));
+}
+
+#[test]
+fn managed_servers_check_the_submitted_route_and_the_in_flight_attempt() {
+    let mut workspace = Workspace::default();
+    workspace.clipboard.policy = crate::clipboard_policy::parse(
+        "[meta]\nschema-version = 1\n[[rule]]\n[rule.servers]\nmode = 'allow'\nhosts = ['gateway.example:22']",
+    ).unwrap();
+    let (owner, _) = workspace.open_window(false);
+    let _ = workspace.update_ssh(Message::Show(owner, None));
+    let password = || LoginMessage::Password(ssh_dialog::Password::new(TEST_PASSWORD.into()));
+    for message in [
+        ssh_dialog::Message::Target(LoginMessage::Host("blocked.example".into())),
+        ssh_dialog::Message::Target(LoginMessage::Username("fixture".into())),
+        ssh_dialog::Message::Target(password()),
+        ssh_dialog::Message::UseJump(true),
+        ssh_dialog::Message::Jump(LoginMessage::Host("gateway.example".into())),
+        ssh_dialog::Message::Jump(LoginMessage::Username("gateway".into())),
+        ssh_dialog::Message::Jump(password()),
+        ssh_dialog::Message::Connect,
+    ] {
+        let _ = workspace.update_ssh(Message::Form(owner, message));
+    }
+    let state = &workspace.windows[&owner];
+    assert!(
+        state
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("blocked.example:22")
+    );
+    assert!(
+        matches!(&state.pending_ssh.as_ref().unwrap().stage, Stage::Form(form) if form.can_connect())
+    );
+
+    let _ = workspace.update_ssh(Message::Form(
+        owner,
+        ssh_dialog::Message::Jump(LoginMessage::Port("2222".into())),
+    ));
+    let _ = workspace.connect_ssh(owner);
+    assert!(
+        workspace.windows[&owner]
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("gateway.example:2222")
+    );
+
+    let _ = workspace.update_ssh(Message::Form(owner, ssh_dialog::Message::UseJump(false)));
+    let _ = workspace.update_ssh(Message::Form(
+        owner,
+        ssh_dialog::Message::Target(LoginMessage::Host("gateway.example".into())),
+    ));
+    let dial = workspace.connect_ssh(owner);
+    let Some(PendingSsh {
+        stage: Stage::Dialing { id, .. },
+        ..
+    }) = workspace.pending_ssh(owner)
+    else {
+        panic!("the allowed direct route should be ready to dial");
+    };
+    let id = *id;
+    drop(dial);
+    workspace.clipboard.policy = crate::clipboard_policy::parse(
+        "[meta]\nschema-version = 1\n[[rule]]\n[rule.servers]\nmode = 'deny'\nhosts = ['gateway.example']",
+    ).unwrap();
+    let _ = workspace.ssh_dialed(owner, id, DialResponse(Arc::new(Mutex::new(None))));
+    assert!(workspace.windows[&owner].pending_ssh.is_none());
+    assert!(
+        workspace.windows[&owner]
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("gateway.example:22")
+    );
+}
 
 #[test]
 fn managed_process_floor_cannot_be_lowered_in_the_ssh_form() {
@@ -33,6 +186,628 @@ fn managed_process_floor_cannot_be_lowered_in_the_ssh_form() {
         form.take_request().unwrap().isolation,
         IsolationLevel::Process
     );
+}
+
+#[test]
+fn teamwork_ssh_requires_fresh_authentication_and_keeps_the_source_route_through_retry() {
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    let login = LoginTarget {
+        host: "shared.example".into(),
+        port: 2222,
+        username: "operator".into(),
+    };
+    let jump = LoginTarget {
+        host: "gateway.example".into(),
+        port: 22,
+        username: "gateway".into(),
+    };
+    let fixture = TeamworkFixture::new();
+    let catalog = fixture.catalog(&login.host);
+    let selected = fixture.selection(&catalog);
+    workspace.set_teamwork_catalog_for_test(catalog);
+    let _ = workspace.show_teamwork_ssh(owner, selected, false);
+    let key = workspace.guarded_ssh_form_key(owner);
+    assert!(matches!(key, Some(FormKey::Teamwork(_))));
+    let password = || LoginMessage::Password(ssh_dialog::Password::new(TEST_PASSWORD.into()));
+    let _ = workspace.update_ssh(Message::Form(
+        owner,
+        ssh_dialog::Message::Target(password()),
+    ));
+    let pending = workspace.pending_ssh_mut(owner).unwrap();
+    let Stage::Form(form) = &pending.stage else {
+        panic!("expected a Teamwork login form")
+    };
+    assert!(!form.can_connect());
+    assert!(form.vault_password().is_none());
+    assert_eq!(form.profile(), PROFILE);
+    assert_eq!(pending.saved, None);
+
+    for message in [
+        ssh_dialog::Message::Target(LoginMessage::Host("unrelated.example".into())),
+        ssh_dialog::Message::Target(LoginMessage::Username("unrelated".into())),
+        ssh_dialog::Message::Jump(LoginMessage::Port("2223".into())),
+        ssh_dialog::Message::UseJump(false),
+        ssh_dialog::Message::Isolation(IsolationLevel::None),
+        ssh_dialog::Message::Target(password()),
+        ssh_dialog::Message::Jump(password()),
+        ssh_dialog::Message::Connect,
+    ] {
+        let _ = workspace.update_ssh(form_message(owner, key, message));
+    }
+    let pending = workspace.pending_ssh_mut(owner).unwrap();
+    let Stage::Dialing {
+        target,
+        command_timestamps,
+        connection_group,
+        ..
+    } = &pending.stage
+    else {
+        panic!("expected an authenticated Teamwork dial request")
+    };
+    assert!(target.matches_endpoints(&login, Some(&jump)));
+    assert_eq!(target.saved_id(), None);
+    assert_eq!(target.isolation, IsolationLevel::Process);
+    assert_eq!(*command_timestamps, Some(true));
+    assert_eq!(*connection_group, None);
+    assert_eq!(
+        pending.retry.as_ref().unwrap().startup,
+        ConnectOptions::new(9, 2).unwrap()
+    );
+    let target = target.clone();
+    let _ = workspace.reopen_ssh_form(owner, target, PROFILE, "Test retry.".into());
+    let retry_key = workspace.guarded_ssh_form_key(owner);
+    assert_ne!(retry_key, key);
+    let _ = workspace.update_ssh(form_message(
+        owner,
+        key,
+        ssh_dialog::Message::Target(password()),
+    ));
+    let _ = workspace.update_ssh(form_message(
+        owner,
+        retry_key,
+        ssh_dialog::Message::Target(LoginMessage::Host("unrelated.example".into())),
+    ));
+    let Stage::Form(form) = &workspace.pending_ssh_mut(owner).unwrap().stage else {
+        panic!("expected a Teamwork retry form")
+    };
+    assert!(!form.can_connect());
+    assert_eq!(form.target_endpoint(), Some(login));
+}
+
+#[test]
+fn teamwork_ssh_rejects_changed_or_removed_selections_before_open_and_submit() {
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    let fixture = TeamworkFixture::new();
+    let original = fixture.catalog("shared.example");
+    let selected = fixture.selection(&original);
+    let changed = fixture.catalog("replacement.example");
+    assert_eq!(
+        changed.entries().next().unwrap().identity(),
+        &selected.identity
+    );
+
+    for (current, sftp) in [(changed, false), (teamwork::Catalog::default(), true)] {
+        workspace.set_teamwork_catalog_for_test(current.clone());
+        let _ = workspace.show_teamwork_ssh(owner, selected.clone(), sftp);
+        assert!(workspace.pending_ssh_mut(owner).is_none());
+        assert_eq!(
+            workspace.windows[&owner].notice.as_deref(),
+            Some(TEAMWORK_RESELECT)
+        );
+
+        workspace.set_teamwork_catalog_for_test(original.clone());
+        let _ = workspace.show_teamwork_ssh(owner, selected.clone(), sftp);
+        let key = workspace.guarded_ssh_form_key(owner);
+        assert!(matches!(key, Some(FormKey::Teamwork(_))));
+        let password = || LoginMessage::Password(ssh_dialog::Password::new(TEST_PASSWORD.into()));
+        for message in [
+            ssh_dialog::Message::Target(password()),
+            ssh_dialog::Message::Jump(password()),
+        ] {
+            let _ = workspace.update_ssh(form_message(owner, key, message));
+        }
+        let pending = workspace.pending_ssh_mut(owner).unwrap();
+        assert!(matches!(&pending.stage, Stage::Form(form) if form.can_connect()));
+
+        workspace.set_teamwork_catalog_for_test(current);
+        let _ = workspace.update_ssh(form_message(owner, key, ssh_dialog::Message::Connect));
+        assert!(workspace.pending_ssh_mut(owner).is_none());
+        assert_eq!(
+            workspace.windows[&owner].notice.as_deref(),
+            Some(TEAMWORK_RESELECT)
+        );
+    }
+}
+
+#[test]
+fn teamwork_hide_on_disk_cancels_a_stale_ssh_launch_and_blocks_sftp_until_restored() {
+    let fixture = TeamworkFixture::new();
+    let catalog = fixture.catalog("shared.example");
+    let selected = fixture.selection(&catalog);
+    let hidden = teamwork::HiddenEntry::from(catalog.entries().next().unwrap());
+    let mut store = Store::open(selected.store_path.clone()).unwrap();
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    workspace.set_teamwork_catalog_for_test(catalog);
+    let _ = workspace.show_teamwork_ssh(owner, selected.clone(), false);
+    let key = workspace.guarded_ssh_form_key(owner);
+    assert!(matches!(key, Some(FormKey::Teamwork(_))));
+
+    store.hide_teamwork(std::slice::from_ref(&hidden)).unwrap();
+    let _ = workspace.update_ssh(form_message(owner, key, ssh_dialog::Message::Connect));
+    assert!(workspace.pending_ssh_mut(owner).is_none());
+    assert_eq!(
+        workspace.windows[&owner].notice.as_deref(),
+        Some(TEAMWORK_RESELECT)
+    );
+    let _ = workspace.show_teamwork_ssh(owner, selected.clone(), true);
+    assert!(workspace.pending_ssh_mut(owner).is_none());
+
+    store.restore_teamwork(hidden.identity()).unwrap();
+    let _ = workspace.show_teamwork_ssh(owner, selected, true);
+    assert!(
+        workspace
+            .pending_ssh_mut(owner)
+            .is_some_and(|pending| pending.sftp)
+    );
+}
+
+#[test]
+fn teamwork_default_vault_password_is_bound_to_the_effective_target_and_scope() {
+    use kortty_vault::{CredentialInput, Secret, Vault};
+
+    let fixture = TeamworkFixture::new();
+    let vault_path = fixture.0.join("vault.bin");
+    let mut vault = Vault::create(&vault_path, b"teamwork-auth-test-master").unwrap();
+    let credential = vault
+        .save(
+            CredentialInput {
+                label: "Teamwork fixture".into(),
+                username: "vault-user".into(),
+                server_pattern: "shared.example".into(),
+                ..CredentialInput::default()
+            },
+            Secret::new(TEST_PASSWORD.into()),
+        )
+        .unwrap();
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    workspace.vault = Some(crate::vault_window::VaultWindow::with_unlocked_fixture(
+        vault_path, vault,
+    ));
+    workspace.set_teamwork_auth_for_test(teamwork::DefaultAuth::Password {
+        credential: credential.clone(),
+    });
+
+    let eligible = fixture.catalog_with_auth("shared.example", "", "");
+    let selected = fixture.selection(&eligible);
+    assert!(selected.default_auth_eligible);
+    workspace.set_teamwork_catalog_for_test(eligible);
+    let _ = workspace.show_teamwork_ssh(owner, selected, false);
+    let key = workspace.guarded_ssh_form_key(owner);
+    let _ = workspace.update_ssh(form_message(
+        owner,
+        key,
+        ssh_dialog::Message::Jump(LoginMessage::Password(ssh_dialog::Password::new(
+            "separate-jump-password".into(),
+        ))),
+    ));
+    let Stage::Form(form) = &mut workspace.pending_ssh_mut(owner).unwrap().stage else {
+        panic!("expected the shared login form");
+    };
+    assert_eq!(form.target_endpoint().unwrap().username, "vault-user");
+    let chosen = form.explicit_vault();
+    let mut request = form.take_request().unwrap();
+    assert!(
+        matches!(&request.target.auth, ssh_dialog::Authentication::VaultPassword(id) if id == &credential)
+    );
+    assert_eq!(request.jump.as_ref().unwrap().endpoint.username, "gateway");
+    assert!(
+        matches!(&request.jump.as_ref().unwrap().auth, ssh_dialog::Authentication::Password(password) if password.as_str() == "separate-jump-password")
+    );
+    assert!(saved_credentials_match(&request, None, chosen.as_ref()));
+    request.target.endpoint.host = "different.example".into();
+    assert!(!saved_credentials_match(&request, None, chosen.as_ref()));
+
+    for (host, reference) in [
+        ("different.example", String::new()),
+        (
+            "shared.example",
+            format!("<credentialId>{credential}</credentialId>"),
+        ),
+    ] {
+        let catalog = fixture.catalog_with_auth(host, "operator", &reference);
+        let selection = fixture.selection(&catalog);
+        workspace.set_teamwork_catalog_for_test(catalog);
+        let _ = workspace.show_teamwork_ssh(owner, selection, false);
+        let Stage::Form(form) = &workspace.pending_ssh_mut(owner).unwrap().stage else {
+            panic!("expected a manual shared login form");
+        };
+        assert_eq!(form.target_endpoint().unwrap().username, "operator");
+        assert!(form.vault_password().is_none());
+    }
+}
+
+#[test]
+fn teamwork_vault_unlock_resumes_the_same_target_after_the_prompt_closes() {
+    use crate::vault_window::{Completion, Message as VaultMessage, VaultWindow};
+    use kortty_vault::{CredentialInput, Secret, Vault};
+
+    const MASTER: &[u8] = b"teamwork-unlock-test-master";
+    let fixture = TeamworkFixture::new();
+    let path = fixture.0.join("vault.bin");
+    let mut vault = Vault::create(&path, MASTER).unwrap();
+    let credential = vault
+        .save(
+            CredentialInput {
+                label: "Teamwork unlock fixture".into(),
+                username: "vault-operator".into(),
+                server_pattern: "shared.example".into(),
+                ..CredentialInput::default()
+            },
+            Secret::new(TEST_PASSWORD.into()),
+        )
+        .unwrap();
+    drop(vault);
+    let catalog = fixture.catalog_with_auth("shared.example", "", "");
+    let selection = fixture.selection(&catalog);
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    workspace.vault = Some(VaultWindow::open(path.clone()).unwrap());
+    workspace.set_teamwork_auth_for_test(teamwork::DefaultAuth::Password {
+        credential: credential.clone(),
+    });
+    workspace.set_teamwork_catalog_for_test(catalog);
+
+    let _ = workspace.show_teamwork_ssh(owner, selection, true);
+    let unlock = workspace.vault_unlock_for_owner(owner).unwrap();
+    assert!(workspace.pending_ssh_mut(owner).is_none());
+    let _ = workspace.update_vault(
+        unlock,
+        VaultMessage::Completed(Completion::unlock_fixture(&path, MASTER, true)),
+    );
+    assert!(workspace.vault_id.is_none());
+    assert!(workspace.pending_ssh_mut(owner).is_none());
+    let _ = workspace.update(WorkspaceMessage::Window(unlock, window::Event::Closed));
+
+    let pending = workspace.pending_ssh_mut(owner).unwrap();
+    assert!(pending.sftp);
+    let Stage::Form(form) = &pending.stage else {
+        panic!("expected the deferred SFTP login form");
+    };
+    let (endpoint, selected_credential) = form.explicit_vault().unwrap();
+    assert_eq!(endpoint.username, "vault-operator");
+    assert_eq!(endpoint.host, "shared.example");
+    assert_eq!(selected_credential, credential);
+}
+
+#[test]
+fn cancelling_teamwork_vault_unlock_preserves_the_source_and_rejects_a_changed_preference() {
+    use crate::vault_window::VaultWindow;
+    use kortty_vault::Vault;
+
+    let fixture = TeamworkFixture::new();
+    let path = fixture.0.join("vault.bin");
+    drop(Vault::create(&path, b"teamwork-cancel-test-master").unwrap());
+    let catalog = fixture.catalog_with_auth("shared.example", "operator", "");
+    let selection = fixture.selection(&catalog);
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    workspace.vault = Some(VaultWindow::open(path).unwrap());
+    workspace.set_teamwork_auth_for_test(teamwork::DefaultAuth::Password {
+        credential: "fixture-credential".into(),
+    });
+    workspace.set_teamwork_catalog_for_test(catalog);
+
+    let _ = workspace.show_teamwork_ssh(owner, selection.clone(), false);
+    let unlock = workspace.vault_unlock_for_owner(owner).unwrap();
+    let _ = workspace.close_profile_tool(unlock, false);
+    let _ = workspace.update(WorkspaceMessage::Window(unlock, window::Event::Closed));
+    let Stage::Form(form) = &workspace.pending_ssh_mut(owner).unwrap().stage else {
+        panic!("expected the manual Teamwork login form");
+    };
+    assert_eq!(form.target_endpoint().unwrap().username, "operator");
+    assert!(form.explicit_vault().is_none());
+
+    let _ = workspace.cancel_ssh_login(owner);
+    let _ = workspace.show_teamwork_ssh(owner, selection, false);
+    let unlock = workspace.vault_unlock_for_owner(owner).unwrap();
+    workspace.set_teamwork_auth_for_test(teamwork::DefaultAuth::Prompt);
+    let _ = workspace.close_profile_tool(unlock, false);
+    let _ = workspace.update(WorkspaceMessage::Window(unlock, window::Event::Closed));
+    assert!(workspace.pending_ssh_mut(owner).is_none());
+    assert!(
+        workspace.windows[&owner]
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("authentication changed")
+    );
+}
+
+#[test]
+fn teamwork_temporary_key_ignores_osc_permission_and_rejects_stale_paste_requests() {
+    let fixture = TeamworkFixture::new();
+    let catalog = fixture.catalog_with_auth("shared.example", "operator", "");
+    let selection = fixture.selection(&catalog);
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    workspace.set_teamwork_catalog_for_test(catalog);
+    workspace.set_teamwork_auth_for_test(teamwork::DefaultAuth::TemporaryKey {
+        username: " key-user ".into(),
+    });
+    assert!(!workspace.clipboard.read_allowed());
+    let _ = workspace.show_teamwork_ssh(owner, selection.clone(), true);
+    let initial = workspace.guarded_ssh_form_key(owner);
+    let stale_form = system_temporary_key_paste(
+        request_temporary_key_paste(&mut workspace, owner, initial),
+        TEAMWORK_TEST_KEY,
+    );
+    let _ = workspace.show_teamwork_ssh(owner, selection, true);
+    let Some(FormKey::Teamwork(revision)) = workspace.guarded_ssh_form_key(owner) else {
+        panic!("expected a revision-bound shared form");
+    };
+    assert_ne!(initial, Some(FormKey::Teamwork(revision)));
+    let _ = workspace.update_ssh(stale_form);
+    let paste = |workspace: &mut Workspace, contents| {
+        system_temporary_key_paste(
+            request_temporary_key_paste(workspace, owner, Some(FormKey::Teamwork(revision))),
+            contents,
+        )
+    };
+    let jump_password = || {
+        ssh_dialog::Message::Jump(LoginMessage::Password(ssh_dialog::Password::new(
+            TEST_PASSWORD.into(),
+        )))
+    };
+    let _ = workspace.update_ssh(Message::TeamworkForm(owner, revision, jump_password()));
+    assert!(!teamwork_form_can_connect(&mut workspace, owner));
+
+    let stale_lifetime = paste(&mut workspace, TEAMWORK_TEST_KEY);
+    for minutes in ["15", "60"] {
+        let _ = workspace.update_ssh(Message::TeamworkForm(
+            owner,
+            revision,
+            ssh_dialog::Message::Target(LoginMessage::TemporaryLifetime(minutes.into())),
+        ));
+    }
+    let _ = workspace.update_ssh(stale_lifetime);
+    assert!(!teamwork_form_can_connect(&mut workspace, owner));
+
+    let stale_method = paste(&mut workspace, TEAMWORK_TEST_KEY);
+    for method in [
+        ssh_dialog::Method::Password,
+        ssh_dialog::Method::TemporaryKey,
+    ] {
+        let _ = workspace.update_ssh(Message::TeamworkForm(
+            owner,
+            revision,
+            ssh_dialog::Message::Target(LoginMessage::Authentication(method)),
+        ));
+    }
+    let _ = workspace.update_ssh(stale_method);
+    assert!(!teamwork_form_can_connect(&mut workspace, owner));
+
+    let superseded = paste(&mut workspace, "obsolete clipboard contents");
+    let latest = paste(&mut workspace, TEAMWORK_TEST_KEY);
+    assert!(!format!("{latest:?}").contains("fixture-only"));
+    let Message::TemporaryKeyPasted(_, ticket, _) = latest.clone() else {
+        panic!("expected a temporary key paste result");
+    };
+    let _ = workspace.update_ssh(latest);
+    let _ = workspace.update_ssh(superseded);
+    let _ = workspace.update_ssh(Message::TemporaryKeyPasted(
+        owner,
+        ticket,
+        ssh_dialog::Password::new("duplicate clipboard delivery".into()),
+    ));
+    let _ = workspace.update_ssh(Message::TeamworkForm(
+        owner,
+        revision,
+        ssh_dialog::Message::Connect,
+    ));
+    let Stage::Dialing { target, .. } = &workspace.pending_ssh_mut(owner).unwrap().stage else {
+        panic!("expected a dial attempt with a live temporary key");
+    };
+    let target = target.clone();
+    assert_eq!(target.username(), "key-user");
+    assert_eq!(target.jump.as_ref().unwrap().username, "gateway");
+    assert_eq!(target.saved_id(), None);
+
+    let _ = workspace.reopen_ssh_form(owner, target.clone(), PROFILE, "Review the key.".into());
+    let retry = workspace.guarded_ssh_form_key(owner);
+    assert_ne!(retry, Some(FormKey::Teamwork(revision)));
+    let _ = workspace.update_ssh(form_message(owner, retry, jump_password()));
+    let Stage::Form(form) = &mut workspace.pending_ssh_mut(owner).unwrap().stage else {
+        panic!("expected the retry form")
+    };
+    let request = form.take_request().unwrap();
+    assert!(!format!("{request:?}").contains("fixture-only"));
+    let ssh_dialog::Authentication::TemporaryKey(key) = request.target.auth else {
+        panic!("the checked retry should retain its temporary key");
+    };
+    assert_eq!(
+        &**key.copy_for_attempt().unwrap(),
+        format!("{TEAMWORK_TEST_KEY}\n").as_bytes()
+    );
+
+    workspace.set_teamwork_auth_for_test(teamwork::DefaultAuth::Prompt);
+    let _ = workspace.reopen_ssh_form(owner, target, PROFILE, "Review the key again.".into());
+    assert!(workspace.pending_ssh_mut(owner).is_none());
+    assert!(
+        workspace.windows[&owner]
+            .notice
+            .as_deref()
+            .unwrap()
+            .contains("authentication changed")
+    );
+}
+
+#[test]
+fn teamwork_temporary_key_uses_managed_clipboard_mode_and_rechecks_teamwork_policy() {
+    use iced::futures::executor::block_on;
+    use iced_runtime::{Action, task};
+
+    let fixture = TeamworkFixture::new();
+    let catalog = fixture.catalog_with_auth("shared.example", "operator", "");
+    let selection = fixture.selection(&catalog);
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    workspace.set_teamwork_catalog_for_test(catalog);
+    workspace.set_teamwork_auth_for_test(teamwork::DefaultAuth::TemporaryKey {
+        username: String::new(),
+    });
+    workspace.clipboard.policy.read_allowed = false;
+    workspace.clipboard.policy.paste_events_allowed = false;
+    let _ = workspace.show_teamwork_ssh(owner, selection, false);
+    let revision = workspace.guarded_ssh_form_key(owner);
+    let _ = workspace.update_ssh(form_message(
+        owner,
+        revision,
+        ssh_dialog::Message::Jump(LoginMessage::Password(ssh_dialog::Password::new(
+            TEST_PASSWORD.into(),
+        ))),
+    ));
+    let old_mode = system_temporary_key_paste(
+        request_temporary_key_paste(&mut workspace, owner, revision),
+        TEAMWORK_TEST_KEY,
+    );
+    workspace.clipboard.policy.internal = true;
+    let _ = workspace.update_ssh(old_mode);
+    assert!(!teamwork_form_can_connect(&mut workspace, owner));
+    workspace.clipboard.buffer.set(TEAMWORK_TEST_KEY.into());
+    let internal_paste = |workspace: &mut Workspace| {
+        let task = request_temporary_key_paste(workspace, owner, revision);
+        let mut actions = task::into_stream(task).unwrap();
+        let Some(Action::Output(WorkspaceMessage::Ssh(message))) = block_on(actions.next()) else {
+            panic!("the internal clipboard must produce a result without a system read");
+        };
+        message
+    };
+    let allowed = internal_paste(&mut workspace);
+    let _ = workspace.update_ssh(allowed);
+    assert!(teamwork_form_can_connect(&mut workspace, owner));
+
+    let denied = internal_paste(&mut workspace);
+    workspace.clipboard.policy.teamwork_allowed = false;
+    let _ = workspace.update_ssh(denied);
+    assert!(workspace.pending_ssh_mut(owner).is_none());
+    assert_eq!(
+        workspace.windows[&owner].notice.as_deref(),
+        Some("Managed policy blocks Teamwork connections.")
+    );
+    assert_eq!(
+        request_temporary_key_paste(&mut workspace, owner, revision).units(),
+        0
+    );
+}
+
+const TEAMWORK_TEST_KEY: &str =
+    "-----BEGIN OPENSSH PRIVATE KEY-----\nfixture-only\n-----END OPENSSH PRIVATE KEY-----";
+
+fn request_temporary_key_paste(
+    workspace: &mut Workspace,
+    owner: window::Id,
+    key: Option<FormKey>,
+) -> Task<WorkspaceMessage> {
+    workspace.update_ssh(form_message(
+        owner,
+        key,
+        ssh_dialog::Message::PasteTemporaryKey,
+    ))
+}
+
+fn system_temporary_key_paste(task: Task<WorkspaceMessage>, contents: &str) -> Message {
+    use iced::futures::executor::block_on;
+    use iced_runtime::{Action, clipboard, task};
+
+    let mut actions = task::into_stream(task).unwrap();
+    let Some(Action::Clipboard(clipboard::Action::Read { channel, .. })) = block_on(actions.next())
+    else {
+        panic!("the explicit paste should request the system clipboard");
+    };
+    assert!(channel.send(Some(contents.into())).is_ok());
+    let Some(Action::Output(WorkspaceMessage::Ssh(message))) = block_on(actions.next()) else {
+        panic!("expected a revision-bound paste result");
+    };
+    message
+}
+
+fn teamwork_form_can_connect(workspace: &mut Workspace, owner: window::Id) -> bool {
+    let Stage::Form(form) = &workspace.pending_ssh_mut(owner).unwrap().stage else {
+        panic!("expected the key form");
+    };
+    assert!(form.temporary_key_selected());
+    form.can_connect()
+}
+
+struct TeamworkFixture(PathBuf);
+
+impl TeamworkFixture {
+    fn new() -> Self {
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "kortty-teamwork-ssh-{}",
+            crate::private_files::nonce().unwrap()
+        ));
+        crate::private_files::Directory::open(&root, true).unwrap();
+        Self(root)
+    }
+
+    fn selection(&self, catalog: &teamwork::Catalog) -> TeamworkSelection {
+        TeamworkSelection::new(
+            catalog.entries().next().unwrap(),
+            self.0.join("connections.json"),
+        )
+    }
+
+    fn catalog(&self, host: &str) -> teamwork::Catalog {
+        self.catalog_with_auth(
+            host,
+            "operator",
+            "<credentialId>foreign-password-id</credentialId>",
+        )
+    }
+
+    fn catalog_with_auth(&self, host: &str, username: &str, reference: &str) -> teamwork::Catalog {
+        let path = self.0.join("shared.xml");
+        std::fs::write(
+            &path,
+            format!(
+                r#"<connections schemaVersion="2"><connection id="shared-fixture">
+                <name>Shared fixture</name><host>{host}</host><port>2222</port><username>{username}</username>
+                {reference}
+                <jumpServer><enabled>true</enabled><host>gateway.example</host><username>gateway</username>
+                    <authMethod>PUBLIC_KEY</authMethod><sshKeyId>23</sshKeyId>
+                </jumpServer>
+                <terminalEmulationType>{}</terminalEmulationType><isolationMode>process</isolationMode>
+                <connectionTimeoutSeconds>9</connectionTimeoutSeconds><retryCount>2</retryCount>
+                <settings><useGlobalSettings>false</useGlobalSettings>
+                    <commandTimestampsEnabled>true</commandTimestampsEnabled>
+                </settings>
+                </connection></connections>"#,
+                PROFILE.term_name()
+            ),
+        )
+        .unwrap();
+        let settings = teamwork::Settings {
+            sources: vec![teamwork::Source {
+                location: path.to_str().unwrap().into(),
+                enabled: true,
+                kind: teamwork::SourceKind::File,
+                check_interval_minutes: teamwork::DEFAULT_CHECK_INTERVAL_MINUTES,
+            }],
+            ..teamwork::Settings::default()
+        };
+        teamwork::Catalog::default().refreshed(&settings.active_sources(true, &[]).unwrap())
+    }
+}
+
+impl Drop for TeamworkFixture {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 #[test]
@@ -91,7 +866,7 @@ fn offline_tab(workspace: &mut Workspace, window: window::Id, host: &str) -> Ses
         isolation: IsolationLevel::None,
     };
     let session = workspace
-        .store_disconnected_ssh(target, PROFILE, FONT)
+        .store_disconnected_ssh(target, PROFILE, FONT, Default::default())
         .unwrap();
     workspace.add_tab(window, session);
     session
@@ -176,6 +951,91 @@ fn ssh_layout_contains_target_metadata_and_restores_disconnected() {
 }
 
 #[test]
+fn restored_project_ssh_sign_in_uses_project_size_after_layout_measurement() {
+    use crate::profile::PaneLayout;
+    use crate::workspace::reconnect::ReconnectTarget;
+
+    let mut workspace = Workspace::default();
+    workspace.window_settings.terminal_columns = Some(99);
+    workspace.window_settings.terminal_rows = Some(31);
+    let initial_size = InitialTerminalSize {
+        columns: Some(132),
+        rows: None,
+    };
+    let pane = PaneLayout::Ssh {
+        font: FONT,
+        focused: true,
+        term: PROFILE.term_name().into(),
+        target: SshTarget {
+            login: LoginTarget {
+                host: "project-terminal-size.invalid".into(),
+                port: 2222,
+                username: "operator".into(),
+            },
+            jump: None,
+            saved: None,
+            isolation: IsolationLevel::None,
+        },
+        initial_size,
+    };
+    let (owner, _) = workspace.open_window(false);
+    let mut active = None;
+    let _ = workspace
+        .restore_pane(&pane, &mut Vec::new(), &mut active, None)
+        .unwrap();
+    let source = active.unwrap();
+    let grid = workspace.sessions[&source].grid;
+    assert_eq!((grid.columns, grid.rows), (132, 31));
+    workspace.add_tab(owner, source);
+    let tab = workspace.windows[&owner].tab().unwrap().id;
+    let measured = GridSize {
+        columns: 105,
+        rows: 39,
+        pixel_width: 840,
+        pixel_height: 624,
+        ..GridSize::default()
+    };
+    let _ = workspace.update(WorkspaceMessage::PaneResized(source, measured));
+    assert_eq!(workspace.capture_layout().unwrap().windows[0].tabs[0], pane);
+
+    for review in [false, true] {
+        if review {
+            let target = ReconnectTarget { tab, source };
+            let _ = workspace.review_project_ssh_reconnect(owner, target);
+        } else {
+            let _ = workspace.update_ssh(Message::Show(owner, Some(source)));
+        }
+        let key = workspace.guarded_ssh_form_key(owner);
+        let _ = workspace.update_ssh(form_message(
+            owner,
+            key,
+            ssh_dialog::Message::Target(LoginMessage::Password(ssh_dialog::Password::new(
+                TEST_PASSWORD.into(),
+            ))),
+        ));
+        // Prepare the actual dial task without polling it or opening a network connection.
+        let dial = workspace.connect_ssh(owner);
+        let Stage::Dialing { grid, .. } = &workspace.pending_ssh(owner).unwrap().stage else {
+            panic!("expected a prepared project SSH dial");
+        };
+        assert_eq!(
+            (*grid, workspace.live_ssh_grid(owner)),
+            (
+                GridSize {
+                    columns: 132,
+                    rows: 31,
+                    ..GridSize::default()
+                },
+                Some((measured, false)),
+            )
+        );
+        drop(dial);
+        let _ = workspace.update_ssh(Message::Cancel(owner));
+        assert!(workspace.sessions[&source].project_initial_ssh_pending);
+    }
+}
+
+#[test]
 fn layout_roundtrips_jump_host_metadata_without_credentials() {
     let mut workspace = Workspace::default();
     let (window, _) = workspace.open_window(false);
@@ -245,6 +1105,8 @@ fn profile_changes_invalidate_an_open_vault_login() {
         command_timestamps: None,
         tab_color: None,
         paste_warning: None,
+        window_geometry: None,
+        terminal: Default::default(),
     };
     let request = ssh_dialog::Request {
         target: LoginRequest {
@@ -303,6 +1165,8 @@ fn registered_keys_from_saved_logins_cannot_be_reused_after_reassignment() {
         command_timestamps: None,
         tab_color: None,
         paste_warning: None,
+        window_geometry: None,
+        terminal: Default::default(),
     };
     let mut form = SshDialog::from_saved(PROFILE, &connection);
     let mut request = form.take_request().unwrap();
@@ -336,6 +1200,29 @@ fn incognito_ssh_form_honors_managed_privacy_policy() {
     workspace.clipboard.policy.incognito_allowed = false;
     let _ = workspace.update_ssh(Message::ShowIncognito(window));
     assert!(workspace.windows[&window].pending_ssh.is_none());
+}
+
+#[test]
+fn saved_incognito_sftp_retains_privacy_before_authentication() {
+    let connection: Connection = serde_json::from_value(serde_json::json!({
+        "id": 3,
+        "name": "Private SFTP fixture",
+        "tag": "",
+        "login": {"endpoint": {"host": "private.example", "port": 22, "username": "operator"}, "auth": "prompt"},
+        "jump": null,
+        "emulation": PROFILE.term_name(),
+        "tunnels": [],
+        "incognito": true
+    })).unwrap();
+    let mut workspace = Workspace::default();
+    let (window, _) = workspace.open_window(false);
+    let _ = workspace.show_saved_ssh(window, connection.clone(), true);
+    let pending = workspace.pending_ssh_mut(window).unwrap();
+    assert!(pending.sftp && pending.incognito);
+    let _ = workspace.update_ssh(Message::Cancel(window));
+    workspace.clipboard.policy.incognito_allowed = false;
+    let _ = workspace.show_saved_ssh(window, connection, true);
+    assert!(workspace.pending_ssh_mut(window).is_none());
 }
 
 #[test]
@@ -995,6 +1882,8 @@ fn reopen_closed_ssh_refreshes_edited_saved_route_without_reusing_typed_password
         command_timestamps: None,
         tab_color: None,
         paste_warning: None,
+        window_geometry: None,
+        terminal: Default::default(),
     };
     profile.id = store.save(profile.clone()).unwrap();
 

@@ -345,6 +345,8 @@ fn journal_metadata_lock_excludes_other_edits_and_allows_retry_after_drop() {
         fs::read_to_string(directory.join(DOCUMENT)).unwrap(),
         IMPORT
     );
+    #[cfg(unix)]
+    let inherited = lock.file.try_clone().unwrap();
     drop(lock);
     assert_eq!(
         edit_metadata(&directory, ID, &MetadataEdit::Description("retry".into()))
@@ -353,6 +355,8 @@ fn journal_metadata_lock_excludes_other_edits_and_allows_retry_after_drop() {
             .description,
         "retry"
     );
+    #[cfg(unix)]
+    drop(inherited);
     assert!(directory.join(LOCK).is_file());
 }
 

@@ -1,11 +1,24 @@
 use std::process::Child;
 use std::time::Duration;
 
-/// Resident memory and cumulative CPU time of a child process.
+/// Resident memory and cumulative CPU time of a process.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ProcessUsage {
     pub resident_bytes: Option<u64>,
     pub cpu_time: Option<Duration>,
+}
+
+/// Measures the calling process without opening a process by a reusable ID on Windows.
+pub fn current_process_usage() -> ProcessUsage {
+    #[cfg(unix)]
+    return pid_usage(std::process::id());
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+        // SAFETY: the process pseudo-handle is valid in the calling process.
+        handle_usage(unsafe { GetCurrentProcess() })
+    }
 }
 
 /// Measures a child before another caller can wait on or release it.
@@ -196,10 +209,9 @@ pub(crate) fn handle_usage(handle: std::os::windows::io::RawHandle) -> ProcessUs
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
     fn native_process_usage_measures_memory_and_cpu() {
-        let usage = pid_usage(std::process::id());
+        let usage = current_process_usage();
         assert!(usage.resident_bytes.is_some_and(|bytes| bytes > 0));
         assert!(usage.cpu_time.is_some());
     }
@@ -245,15 +257,5 @@ mod tests {
         let tolerance = Duration::from_millis(2);
         assert!(measured + tolerance >= after_low - before_high);
         assert!(measured <= after_high - before_low + tolerance);
-    }
-
-    #[cfg(windows)]
-    #[test]
-    fn native_process_usage_measures_memory_and_cpu() {
-        use windows_sys::Win32::System::Threading::GetCurrentProcess;
-        // SAFETY: GetCurrentProcess returns a pseudo-handle valid in this process.
-        let usage = handle_usage(unsafe { GetCurrentProcess() });
-        assert!(usage.resident_bytes.is_some_and(|bytes| bytes > 0));
-        assert!(usage.cpu_time.is_some());
     }
 }

@@ -26,7 +26,7 @@ const UNICODE: SystemInfo<'_> = SystemInfo {
 };
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(in crate::session_journal::export::pdf) enum Font {
+pub(crate) enum Font {
     Regular,
     Bold,
     Mono,

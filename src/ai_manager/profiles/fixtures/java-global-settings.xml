@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<globalSettings>
+    <defaultAiProfileId>45d49b0d-764e-4fc8-9108-b831ba701f88</defaultAiProfileId>
+    <aiProfiles>
+        <profile>
+            <id>45d49b0d-764e-4fc8-9108-b831ba701f88</id>
+            <name>Café HTTPS</name>
+            <apiUrl>https://example.test/openai/v1/</apiUrl>
+            <trustedLocalEndpoint>true</trustedLocalEndpoint>
+            <connectionMode>HTTP_API</connectionMode>
+            <model>family/model</model>
+            <promptPreset>GPT_OSS</promptPreset>
+            <ragStoreIds><storeId>fixture-store</storeId></ragStoreIds>
+            <modelSelectionMode>MANUAL</modelSelectionMode>
+            <reasoningEffort>XHIGH</reasoningEffort>
+            <visionSupport>ENABLED</visionSupport>
+            <internetAccessMode>KORTTY_TAVILY_TOOL</internetAccessMode>
+            <encryptedApiKey>synthetic-source-api-key</encryptedApiKey>
+            <maxSelectionChars>12000</maxSelectionChars>
+            <requestTimeoutMinutes>0</requestTimeoutMinutes>
+            <maxOutputTokens>4096</maxOutputTokens>
+            <tokenizerType>O200K_BASE</tokenizerType>
+        </profile>
+        <profile>
+            <id>7635b481-6d93-4100-9d22-47ab1c491143</id>
+            <name>Anthropic-compatible</name>
+            <apiUrl>https://example.test/v1/messages</apiUrl>
+            <model>claude-fixture</model>
+        </profile>
+        <profile>
+            <id>7f87d66d-5ad2-4ff0-9b07-4b91604626bd</id>
+            <name>Local CLI</name>
+            <connectionMode>LOCAL_CLI</connectionMode>
+            <cliExecutablePath>/fixture/untrusted-command</cliExecutablePath>
+        </profile>
+        <profile>
+            <id>73fdfc18-3c53-42e3-9e34-5759dd5c4e11</id>
+            <name>Ambiguous path</name>
+            <apiUrl>https://example.test/v1/../v1/chat/completions</apiUrl>
+            <model>other-model</model>
+        </profile>
+    </aiProfiles>
+</globalSettings>

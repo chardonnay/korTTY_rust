@@ -13,6 +13,7 @@ use zip::{AesMode, CompressionMethod, System, ZipArchive, ZipWriter};
 
 use super::Snapshot;
 
+pub(super) mod java;
 #[cfg(test)]
 mod tests;
 
@@ -126,6 +127,23 @@ pub(super) fn encode_snapshot(snapshot: &Snapshot) -> io::Result<Zeroizing<Vec<u
 pub(super) fn decode_snapshot(bytes: &[u8]) -> io::Result<Snapshot> {
     let mut input = bytes;
     read_payload(&mut input, bytes.len())
+}
+
+/// Reserves encoded space for validated members appended to a converted archive.
+pub(super) fn remaining_capacity(
+    snapshot: &Snapshot,
+) -> io::Result<impl FnMut(&str, usize) -> bool> {
+    let mut entries = MAX_ENTRIES - snapshot.len().min(MAX_ENTRIES);
+    let mut remaining = MAX_PAYLOAD_BYTES - payload_size(snapshot)?;
+    Ok(move |path: &str, bytes: usize| {
+        let size = ENTRY_HEADER_SIZE + path.len() + bytes;
+        if entries == 0 || size > remaining {
+            return false;
+        }
+        entries -= 1;
+        remaining -= size;
+        true
+    })
 }
 
 fn payload_size(snapshot: &Snapshot) -> io::Result<usize> {
@@ -266,7 +284,7 @@ impl Paths {
     }
 }
 
-fn invalid_component(component: &str) -> bool {
+pub(super) fn invalid_component(component: &str) -> bool {
     if component.is_empty()
         || component.ends_with([' ', '.'])
         || component.len() > 255

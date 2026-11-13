@@ -1,4 +1,4 @@
-//! Bounded interchange with the Java snippet library's portable export formats.
+//! Bounded snippet interchange and optional native diagram records.
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
@@ -13,12 +13,16 @@ use serde::{Deserialize, Serialize};
 use super::exchange::{escape_xml, xml_elements, xml_is};
 use super::folders;
 use super::{
-    Input, Library, MAX_LIBRARY_BYTES, MAX_SNIPPETS, MAX_TAGS, Metadata, Snippet, invalid, profile,
+    Input, Library, MAX_LIBRARY_BYTES, MAX_SNIPPETS, MAX_TAGS, Metadata, Snippet, SnippetId,
+    invalid, profile,
 };
 
 mod files;
+mod java_library;
 mod text_file;
 mod yaml;
+
+use super::diagrams;
 
 pub(crate) use files::{
     AnalysisFile, CertificateInfo, OpenPgpSettings, ZipSettings, analysis_files,
@@ -35,9 +39,25 @@ const MAX_PATHS: usize = 256;
 
 #[derive(Clone, Default)]
 pub(crate) struct Imports {
-    pub(super) structured: Vec<(Input, Metadata)>,
+    pub(super) structured: Vec<ImportedSnippet>,
+    pub(super) folders: Vec<folders::Folder>,
     pub(super) text: Vec<Input>,
     pub(crate) rejected_text: usize,
+    pub(crate) skipped_diagrams: usize,
+    pub(crate) skipped_references: usize,
+}
+
+#[derive(Clone)]
+pub(super) struct ImportedSnippet {
+    pub(super) id: Option<SnippetId>,
+    pub(super) input: Input,
+    pub(super) metadata: Metadata,
+}
+
+impl Imports {
+    pub(crate) fn java_folder_count(&self) -> usize {
+        self.folders.len()
+    }
 }
 
 /// A fixed library subtree and its layout relative to the selected folder's parent.
@@ -220,19 +240,23 @@ impl Format {
         }
     }
 
-    fn read(self, source: &str) -> io::Result<Vec<Portable>> {
-        match self {
+    fn import(self, source: &str, imports: &mut Imports) -> io::Result<()> {
+        let entries = match self {
             Self::Json => {
                 let archive: JsonArchive = serde_json::from_str(source)
                     .map_err(|_| invalid("Invalid snippet JSON export"))?;
                 if archive.version.is_some_and(|version| version != VERSION) {
                     return Err(invalid("Unsupported snippet JSON export version"));
                 }
-                Ok(archive.snippets)
+                archive.snippets
             }
-            Self::Xml => read_xml(source),
-            Self::Yaml => yaml::read(source),
+            Self::Xml => return read_xml(source, imports),
+            Self::Yaml => yaml::read(source)?,
+        };
+        for entry in entries {
+            imports.structured.push(entry.into_input(None)?);
         }
+        Ok(())
     }
 
     fn write(self, entries: &[Snippet]) -> io::Result<String> {
@@ -273,6 +297,8 @@ struct Portable {
     category: Option<String>,
     description: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    operating_system: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     folder_path: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     file_name: Option<String>,
@@ -280,6 +306,11 @@ struct Portable {
     executable: Option<bool>,
     #[serde(deserialize_with = "deserialize_tags")]
     tags: Vec<String>,
+    #[serde(
+        deserialize_with = "deserialize_diagrams",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    diagrams: Vec<diagrams::Saved>,
 }
 
 fn deserialize_entries<'de, D: serde::Deserializer<'de>>(
@@ -290,6 +321,26 @@ fn deserialize_entries<'de, D: serde::Deserializer<'de>>(
 
 fn deserialize_tags<'de, D: serde::Deserializer<'de>>(decoder: D) -> Result<Vec<String>, D::Error> {
     deserialize_list::<_, _, MAX_TAGS>(decoder)
+}
+
+fn deserialize_diagrams<'de, D: serde::Deserializer<'de>>(
+    decoder: D,
+) -> Result<Vec<diagrams::Saved>, D::Error> {
+    deserialize_list::<_, _, { diagrams::MAX_DIAGRAMS }>(decoder)
+}
+
+fn read_diagrams(value: &str) -> io::Result<Vec<diagrams::Saved>> {
+    let mut decoder = serde_json::Deserializer::from_str(value);
+    let records = deserialize_diagrams(&mut decoder)
+        .map_err(|_| invalid("Could not decode saved snippet diagrams"))?;
+    decoder
+        .end()
+        .map_err(|_| invalid("Invalid saved snippet diagram data"))?;
+    Ok(records)
+}
+
+fn write_diagrams(entries: &[diagrams::Saved]) -> io::Result<String> {
+    serde_json::to_string(entries).map_err(|_| invalid("Could not encode saved snippet diagrams"))
 }
 
 fn deserialize_list<'de, D, T, const LIMIT: usize>(decoder: D) -> Result<Vec<T>, D::Error>
@@ -333,7 +384,7 @@ impl Portable {
         Ok(())
     }
 
-    fn into_input(self) -> io::Result<(Input, Metadata)> {
+    fn into_input(self, id: Option<SnippetId>) -> io::Result<ImportedSnippet> {
         let content = self
             .content
             .ok_or_else(|| invalid("A snippet is missing its content"))?;
@@ -350,12 +401,20 @@ impl Portable {
         };
         let metadata = Metadata {
             description: self.description.unwrap_or_default(),
+            operating_system: self
+                .operating_system
+                .filter(|value| !value.trim().is_empty()),
             folder_path: self.folder_path.unwrap_or_default(),
             file_name: self.file_name.filter(|value| !value.trim().is_empty()),
             executable: self.executable,
             tags: self.tags,
+            diagrams: self.diagrams,
         };
-        Ok((input, metadata))
+        Ok(ImportedSnippet {
+            id,
+            input,
+            metadata,
+        })
     }
 }
 
@@ -368,10 +427,12 @@ impl From<&Snippet> for Portable {
             language: Some(entry.language().into()),
             category: Some(entry.category().into()),
             description: Some(metadata.description.clone()),
+            operating_system: metadata.operating_system.clone(),
             folder_path: (!metadata.folder_path.is_empty()).then(|| metadata.folder_path.clone()),
             file_name: metadata.file_name.clone(),
             executable: metadata.executable,
             tags: metadata.tags.clone(),
+            diagrams: metadata.diagrams.clone(),
         }
     }
 }
@@ -417,9 +478,7 @@ fn import_files(paths: Vec<PathBuf>) -> io::Result<Imports> {
         if let (Some(format), Ok(source)) = (format, std::str::from_utf8(&bytes)) {
             let source = source.strip_prefix('\u{feff}').unwrap_or(source);
             if format.looks_like_archive(source) {
-                for entry in format.read(source)? {
-                    imports.structured.push(entry.into_input()?);
-                }
+                format.import(source, &mut imports)?;
                 check_count(imports.structured.len() + imports.text.len())?;
                 continue;
             }
@@ -440,7 +499,7 @@ fn check_count(count: usize) -> io::Result<()> {
     Ok(())
 }
 
-fn read_xml(source: &str) -> io::Result<Vec<Portable>> {
+fn read_xml(source: &str, imports: &mut Imports) -> io::Result<()> {
     let document = Document::parse_with_options(
         source,
         ParsingOptions {
@@ -451,6 +510,9 @@ fn read_xml(source: &str) -> io::Result<Vec<Portable>> {
     )
     .map_err(|_| invalid("Invalid snippet XML export"))?;
     let root = document.root_element();
+    if xml_is(root, "snippets") {
+        return java_library::read(root, imports);
+    }
     if root.tag_name().namespace().is_some()
         || !root.has_tag_name("snippetExport")
         || root
@@ -459,15 +521,23 @@ fn read_xml(source: &str) -> io::Result<Vec<Portable>> {
     {
         return Err(invalid("Expected a version 1 snippetExport element"));
     }
-    let mut entries = Vec::new();
     for child in xml_elements(root)? {
         if !xml_is(child, "snippet") {
             return Err(invalid("Expected an XML snippet element"));
         }
-        check_count(entries.len() + 1)?;
-        entries.push(read_xml_entry(child)?);
+        check_count(imports.structured.len() + imports.text.len() + 1)?;
+        imports
+            .structured
+            .push(read_xml_entry(child)?.into_input(None)?);
     }
-    Ok(entries)
+    Ok(())
+}
+
+pub(super) fn read_java_backup(bytes: &[u8]) -> io::Result<Imports> {
+    let source = std::str::from_utf8(bytes).map_err(|_| invalid("Invalid snippet XML encoding"))?;
+    let mut imports = Imports::default();
+    read_xml(source.trim_start_matches('\u{feff}'), &mut imports)?;
+    Ok(imports)
 }
 
 fn read_xml_entry(child: Node<'_, '_>) -> io::Result<Portable> {
@@ -478,27 +548,36 @@ fn read_xml_entry(child: Node<'_, '_>) -> io::Result<Portable> {
         if !xml_is(field, name) || !seen.insert(name) {
             return Err(invalid("Invalid or duplicate snippet XML field"));
         }
-        match name {
-            "name" => entry.name = Some(xml_text(field)?),
-            "content" => entry.content = Some(xml_text(field)?.into()),
-            "language" => entry.language = Some(xml_text(field)?),
-            "category" => entry.category = Some(xml_text(field)?),
-            "description" => entry.description = Some(xml_text(field)?),
-            "folderPath" => entry.folder_path = Some(xml_text(field)?),
-            "fileName" => entry.file_name = Some(xml_text(field)?),
-            "executable" => entry.executable = Some(boolean(&xml_text(field)?)?),
-            "tags" => {
-                for tag in xml_elements(field)? {
-                    if !xml_is(tag, "tag") {
-                        return Err(invalid("Expected a snippet XML tag"));
-                    }
-                    entry.add_tag(xml_text(tag)?)?;
-                }
-            }
-            _ => return Err(invalid("Unknown snippet XML field")),
+        if !read_xml_field(&mut entry, field)? {
+            return Err(invalid("Unknown snippet XML field"));
         }
     }
     Ok(entry)
+}
+
+fn read_xml_field(entry: &mut Portable, field: Node<'_, '_>) -> io::Result<bool> {
+    match field.tag_name().name() {
+        "name" => entry.name = Some(xml_text(field)?),
+        "content" => entry.content = Some(xml_text(field)?.into()),
+        "language" => entry.language = Some(xml_text(field)?),
+        "category" => entry.category = Some(xml_text(field)?),
+        "description" => entry.description = Some(xml_text(field)?),
+        "operatingSystem" => entry.operating_system = Some(xml_text(field)?),
+        "folderPath" => entry.folder_path = Some(xml_text(field)?),
+        "fileName" => entry.file_name = Some(xml_text(field)?),
+        "executable" => entry.executable = Some(boolean(&xml_text(field)?)?),
+        "savedDiagrams" => entry.diagrams = read_diagrams(&xml_text(field)?)?,
+        "tags" => {
+            for tag in xml_elements(field)? {
+                if !xml_is(tag, "tag") {
+                    return Err(invalid("Expected a snippet XML tag"));
+                }
+                entry.add_tag(xml_text(tag)?)?;
+            }
+        }
+        _ => return Ok(false),
+    }
+    Ok(true)
 }
 
 fn xml_text(node: Node<'_, '_>) -> io::Result<String> {
@@ -540,6 +619,7 @@ fn write_xml(entries: &[Portable], date: &str) -> io::Result<String> {
                 "description",
                 entry.description.as_deref().filter(|text| !text.is_empty()),
             ),
+            ("operatingSystem", entry.operating_system.as_deref()),
             ("folderPath", entry.folder_path.as_deref()),
             ("fileName", entry.file_name.as_deref()),
             (
@@ -559,6 +639,14 @@ fn write_xml(entries: &[Portable], date: &str) -> io::Result<String> {
                 xml_field(&mut output, "      ", "tag", tag)?;
             }
             output.push_str("    </tags>\n");
+        }
+        if !entry.diagrams.is_empty() {
+            xml_field(
+                &mut output,
+                "    ",
+                "savedDiagrams",
+                &write_diagrams(&entry.diagrams)?,
+            )?;
         }
         output.push_str("  </snippet>\n");
     }

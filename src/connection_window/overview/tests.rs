@@ -60,6 +60,8 @@ fn connection(name: &str, auth: Auth) -> Connection {
         command_timestamps: None,
         tab_color: None,
         paste_warning: None,
+        window_geometry: None,
+        terminal: Default::default(),
     }
 }
 
@@ -110,7 +112,7 @@ fn inventory_allowlist_keeps_only_safe_references_in_every_format() {
     ];
     let selected = store.save_in_group(selected, Some(&group)).unwrap();
     store.set_os_badge_id(selected, Some("rocky")).unwrap();
-    store.set_favorite(selected, true).unwrap();
+    assert!(store.toggle_connection_favorites(&[selected], &[]).unwrap());
     store.record_used_at(selected, 1_700_000_000_000).unwrap();
     let vault = store
         .save(connection("Vault", Auth::VaultPassword("entry".into())))

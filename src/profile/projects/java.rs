@@ -1,17 +1,18 @@
 //! Reads projects and the optional route catalogue written by the Java JAXB stores.
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use roxmltree::{Document, Node, ParsingOptions};
 
 use crate::profile::{
-    MAX_SPLIT_DEPTH, MAX_TABS_PER_WINDOW, MAX_TOTAL_PANES, MAX_WINDOWS, PaneLayout, SavedPosition,
-    WindowLayout, WorkspaceLayout, invalid, normalize_tab_group, normalize_tab_title,
-    open_preference,
+    LocalFileTool, MAX_SPLIT_DEPTH, MAX_TABS_PER_WINDOW, MAX_TOTAL_PANES, MAX_WINDOWS, PaneLayout,
+    ProjectTerminalAppearance, RemoteProjectTool, SavedPosition, WindowLayout, WorkspaceLayout,
+    invalid, normalize_tab_group, normalize_tab_title, open_preference,
 };
-use crate::terminal_effects::{Effect, Selection};
+use crate::terminal_effects::{Effect, Selection, Speed};
 
+pub(crate) mod appearance;
 pub(crate) mod export;
 mod routes;
 
@@ -29,6 +30,7 @@ pub(crate) enum Note {
     ToolTab,
     Geometry,
     Appearance,
+    InitialSize,
     SessionData,
 }
 
@@ -43,11 +45,12 @@ impl Note {
             }
             Self::Mosh => "Mosh panes omitted",
             Self::PrivateConnection => "Incognito panes omitted",
-            Self::ToolTab => "Java file, image, SFTP or other tool tabs omitted",
+            Self::ToolTab => "Java tool tabs with unsupported file locations or types omitted",
             Self::Geometry => {
                 "Windows using supported normal bounds instead of the complete Java window state"
             }
             Self::Appearance => "Java-only appearance or encoding settings skipped",
+            Self::InitialSize => "Unsupported initial terminal sizes skipped",
             Self::SessionData => "Saved text, commands, paths or other session-only data skipped",
         }
     }
@@ -75,6 +78,15 @@ pub(super) fn read_project_text(source: &str, connections: Option<&Path>) -> io:
         .map(|path| read_xml(path, CONNECTION_BYTES))
         .transpose()?;
     parse(source, routes.as_deref())
+}
+
+pub(super) fn read_backup(project: &[u8], connections: Option<&[u8]>) -> io::Result<Imported> {
+    let project = std::str::from_utf8(project).map_err(invalid)?;
+    let connections = connections
+        .map(std::str::from_utf8)
+        .transpose()
+        .map_err(invalid)?;
+    parse(project, connections)
 }
 
 fn read_xml(path: &Path, limit: u64) -> io::Result<String> {
@@ -253,6 +265,7 @@ impl Importer<'_, '_> {
         let mut tab_titles = BTreeMap::new();
         let mut tab_groups = BTreeMap::new();
         let mut tab_terminal_effects = BTreeMap::new();
+        let mut tab_terminal_appearance = BTreeMap::new();
         let mut active = None;
         if let Some(list) = child(window, "tabs")? {
             for (index, tab) in list.children().filter(|node| tag(*node, "tab")).enumerate() {
@@ -264,7 +277,8 @@ impl Importer<'_, '_> {
                     || usize::try_from(active_index) == Ok(index),
                     |wanted| id == Some(wanted),
                 );
-                if let Some(pane) = self.tab(tab)? {
+                let (pane, appearance) = self.tab(tab)?;
+                if let Some(pane) = pane {
                     if selected && active.is_none() {
                         active = Some(tabs.len());
                     }
@@ -286,11 +300,16 @@ impl Importer<'_, '_> {
                             tab_groups.insert(tabs.len(), normalized);
                         }
                     }
-                    if let Some(effect) = self.terminal_effect(tab)? {
+                    if !pane.is_project_tool()
+                        && let Some(effect) = self.terminal_effect(tab)?
+                    {
                         // The Java restore path applies its tab effect before
                         // creating splits, which inherit it from their source.
                         let effects = (0..leaf_count(&pane)).map(|pane| (pane, effect)).collect();
                         tab_terminal_effects.insert(tabs.len(), effects);
+                    }
+                    if let Some(appearance) = appearance {
+                        tab_terminal_appearance.insert(tabs.len(), appearance);
                     }
                     tabs.push(pane);
                 }
@@ -301,6 +320,7 @@ impl Importer<'_, '_> {
             tab_groups: Some(tab_groups),
             tab_primary_panes: Default::default(),
             tab_terminal_effects,
+            tab_terminal_appearance,
             width: normal_width,
             height: normal_height,
             position,
@@ -311,10 +331,19 @@ impl Importer<'_, '_> {
         })
     }
 
-    fn tab(&mut self, node: Node<'_, '_>) -> io::Result<Option<PaneLayout>> {
-        if value(node, "tabType")?.is_some_and(|kind| kind != "TERMINAL") {
+    fn tab(
+        &mut self,
+        node: Node<'_, '_>,
+    ) -> io::Result<(Option<PaneLayout>, Option<ProjectTerminalAppearance>)> {
+        if let Some(kind) = value(node, "tabType")?.filter(|&kind| kind != "TERMINAL") {
+            if kind == "SFTP_MANAGER" {
+                return Ok((self.sftp_tab(node)?, None));
+            }
+            if let Some(file) = self.file_tab(node, kind)? {
+                return Ok((Some(file), None));
+            }
             self.note(Note::ToolTab);
-            return Ok(None);
+            return Ok((None, None));
         }
         if has_any(node, &["group", "settings"]) {
             self.note(Note::Appearance);
@@ -342,7 +371,144 @@ impl Importer<'_, '_> {
         if !has_focus && let Some(pane) = pane.as_mut() {
             focus_first(pane);
         }
-        Ok(pane)
+        let appearance = if pane.is_some() {
+            self.tab_appearance(&base)?
+        } else {
+            None
+        };
+        Ok((pane, appearance))
+    }
+
+    fn tab_appearance(
+        &mut self,
+        tab: &routes::Tab<'_>,
+    ) -> io::Result<Option<ProjectTerminalAppearance>> {
+        let style = if tab.local {
+            None
+        } else {
+            let Some(connection) = tab
+                .connection
+                .and_then(|id| self.connections.get(id))
+                .copied()
+            else {
+                return Ok(None);
+            };
+            if flag(connection, "incognito")?
+                || !matches!(
+                    value(connection, "protocol")?,
+                    None | Some("SSH_TCP" | "LOCAL_SHELL")
+                )
+            {
+                return Ok(None);
+            }
+            match appearance::catalogue_style(connection) {
+                Ok(style) => style,
+                Err(_) => {
+                    self.note(Note::Appearance);
+                    None
+                }
+            }
+        };
+        Ok(Some(ProjectTerminalAppearance {
+            style,
+            font_zoom: tab.font,
+        }))
+    }
+
+    fn file_tab(&mut self, node: Node<'_, '_>, kind: &str) -> io::Result<Option<PaneLayout>> {
+        let (path, remote, tool) = match kind {
+            "FILE_EDITOR" => ("editorFilePath", "editorIsRemote", LocalFileTool::Editor),
+            "IMAGE_VIEWER" => {
+                let zoom = number::<f32>(node, "imageZoomLevel")?.unwrap_or(1.0);
+                if !zoom.is_finite() || zoom <= 0.0 {
+                    return Ok(None);
+                }
+                let supported = zoom.clamp(LocalFileTool::MIN_ZOOM, LocalFileTool::MAX_ZOOM);
+                if supported != zoom {
+                    self.note(Note::Appearance);
+                }
+                (
+                    "imageFilePath",
+                    "imageIsRemote",
+                    LocalFileTool::Image { zoom: supported },
+                )
+            }
+            _ => return Ok(None),
+        };
+        let Some(path) = text_value(node, path)? else {
+            return Ok(None);
+        };
+        if flag(node, remote)? {
+            let tool = RemoteProjectTool::File {
+                path: path.to_owned(),
+                tool,
+            };
+            return if tool.valid() {
+                self.remote_tool_tab(node, tool, false)
+            } else {
+                Ok(None)
+            };
+        }
+        let path = PathBuf::from(path);
+        Ok(LocalFileTool::valid_path(&path).then_some(PaneLayout::LocalFile { path, tool }))
+    }
+
+    fn sftp_tab(&mut self, node: Node<'_, '_>) -> io::Result<Option<PaneLayout>> {
+        let local = value(node, "sftpLocalPath")?.map(PathBuf::from);
+        let remote = value(node, "sftpRemotePath")?.filter(|path| *path != "~");
+        let minutes = number::<i32>(node, "sftpAutoCloseTimeout")?.filter(|minutes| *minutes > 0);
+        let tool = RemoteProjectTool::Sftp {
+            local: local
+                .clone()
+                .filter(|path| LocalFileTool::valid_directory(path)),
+            remote: remote
+                .filter(|path| RemoteProjectTool::valid_remote_path(path, true))
+                .map(str::to_owned),
+            idle_minutes: minutes
+                .and_then(|minutes| u16::try_from(minutes).ok())
+                .filter(|minutes| *minutes <= RemoteProjectTool::MAX_IDLE_MINUTES),
+        };
+        if matches!(&tool, RemoteProjectTool::Sftp { local: supported_local, remote: supported_remote, idle_minutes }
+            if local.is_some() != supported_local.is_some() || remote.is_some() != supported_remote.is_some() || minutes.is_some() != idle_minutes.is_some())
+        {
+            self.note(Note::SessionData);
+        }
+        self.remote_tool_tab(node, tool, true)
+    }
+
+    fn remote_tool_tab(
+        &mut self,
+        node: Node<'_, '_>,
+        tool: RemoteProjectTool,
+        legacy_name: bool,
+    ) -> io::Result<Option<PaneLayout>> {
+        let Some(id) = text_value(node, "connectionId")?.filter(|id| !id.trim().is_empty()) else {
+            self.note(Note::MissingConnection);
+            return Ok(None);
+        };
+        let mut connection = self.connections.get(id).copied();
+        if connection.is_none() && legacy_name {
+            for candidate in self.connections.values().copied() {
+                if text_value(candidate, "name")? == Some(id) {
+                    if connection.is_some() {
+                        self.note(Note::MissingConnection);
+                        return Ok(None);
+                    }
+                    connection = Some(candidate);
+                }
+            }
+        }
+        let Some(connection) = connection else {
+            self.note(Note::MissingConnection);
+            return Ok(None);
+        };
+        match routes::remote_tool(connection)? {
+            Ok(target) => Ok(Some(PaneLayout::RemoteTool { target, tool })),
+            Err(note) => {
+                self.note(note);
+                Ok(None)
+            }
+        }
     }
 
     fn terminal_effect(&mut self, node: Node<'_, '_>) -> io::Result<Option<Selection>> {
@@ -353,9 +519,8 @@ impl Importer<'_, '_> {
                 .into_iter()
                 .find(|effect| effect_id(*effect) == id)
         });
-        let speed = raw_speed.map_or(Some(1), |text| {
-            let value = text.parse::<f64>().ok()?;
-            ((1.0..=99.0).contains(&value) && value.fract() == 0.0).then_some(value as u8)
+        let speed = raw_speed.map_or(Some(Speed::DEFAULT), |text| {
+            Speed::try_from(text.parse::<f64>().ok()?).ok()
         });
         let selection = effect
             .zip(speed)
@@ -441,7 +606,15 @@ impl Importer<'_, '_> {
             return Ok(None);
         };
         match routes::convert(tab, connection, focused)? {
-            Ok((pane, appearance_omitted)) => {
+            Ok((mut pane, appearance_omitted)) => {
+                if let PaneLayout::Terminal { initial_size, .. }
+                | PaneLayout::Ssh { initial_size, .. } = &mut pane
+                {
+                    match routes::catalogue_initial_size(connection) {
+                        Ok(size) => *initial_size = size,
+                        Err(_) => self.note(Note::InitialSize),
+                    }
+                }
                 if appearance_omitted {
                     self.note(Note::Appearance);
                 }
@@ -485,6 +658,7 @@ fn focus_first(pane: &mut PaneLayout) {
         | PaneLayout::Ssh { focused, .. }
         | PaneLayout::Serial { focused, .. }
         | PaneLayout::Ibm { focused, .. } => *focused = true,
+        PaneLayout::LocalFile { .. } | PaneLayout::RemoteTool { .. } => {}
     }
 }
 

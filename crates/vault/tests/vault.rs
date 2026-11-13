@@ -4,12 +4,375 @@ use std::sync::Arc;
 use std::sync::Barrier;
 use std::thread;
 
-use kortty_vault::{CredentialInput, CredentialKind, Error, Secret, Vault};
+use kortty_vault::{
+    CredentialAddition, CredentialInput, CredentialKind, Error, MAX_QDRANT_API_KEY_BYTES,
+    MAX_RECOVERY_OUTPUT_BYTES, PreparedState, Secret, Vault, WebhookFormat, WebhookSettings,
+    valid_credential_id,
+};
 
 const MASTER: &[u8] = b"test master password only";
 const CHANGED: &[u8] = b"new test master password only";
 const WRONG: &[u8] = b"wrong test master password only";
 const TEST_SECRET: &str = "test-only ssh secret ä";
+
+#[test]
+fn prepared_additions_are_sealed_without_changing_the_live_vault() {
+    let directory = Directory::new();
+    let path = directory.0.join("vault");
+    let mut vault = Vault::create(&path, MASTER).unwrap();
+    let existing = vault
+        .save(
+            CredentialInput {
+                label: "Existing SSH password".into(),
+                ..Default::default()
+            },
+            Secret::new(TEST_SECRET.into()),
+        )
+        .unwrap();
+    let before = fs::read(&path).unwrap();
+    let webhook = WebhookSettings {
+        enabled: false,
+        format: WebhookFormat::Slack,
+        include_summary: true,
+    };
+    let prepared = vault
+        .prepare_additions(vec![
+            password_addition(),
+            CredentialAddition {
+                input: CredentialInput {
+                    label: "Imported webhook".into(),
+                    kind: CredentialKind::JobWebhookUrl,
+                    ..Default::default()
+                },
+                secret: Secret::new("https://example.test/private-hook".into()),
+                webhook: Some(webhook),
+            },
+        ])
+        .unwrap();
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(vault.entries().count(), 1);
+    let imported = b"imported test password";
+    assert!(
+        !prepared
+            .snapshot
+            .windows(imported.len())
+            .any(|window| window == imported)
+    );
+    let [password_id, webhook_id] = prepared.ids.as_slice() else {
+        panic!("expected two new credential IDs");
+    };
+    assert!(valid_credential_id(password_id));
+    assert!(valid_credential_id(webhook_id));
+    assert_ne!(password_id, webhook_id);
+    assert_ne!(password_id, &existing);
+    assert_ne!(webhook_id, &existing);
+    let verify = || {
+        Vault::verify_prepared_additions(
+            &path,
+            &prepared.before,
+            &prepared.after,
+            &prepared.snapshot,
+        )
+    };
+    let apply = || {
+        Vault::apply_prepared_additions(
+            &path,
+            &prepared.before,
+            &prepared.after,
+            &prepared.snapshot,
+        )
+    };
+    assert!(matches!(verify(), Err(Error::Busy)));
+    assert!(matches!(apply(), Err(Error::Busy)));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    vault.lock();
+    assert_eq!(verify().unwrap(), PreparedState::Before);
+
+    assert_eq!(apply().unwrap(), PreparedState::Before);
+    assert_eq!(fs::read(&path).unwrap(), *prepared.snapshot);
+    assert_eq!(verify().unwrap(), PreparedState::After);
+    assert_eq!(apply().unwrap(), PreparedState::After);
+    assert_eq!(fs::read(&path).unwrap(), *prepared.snapshot);
+    let reopened = Vault::unlock(&path, MASTER).unwrap();
+    assert_eq!(reopened.secret(&existing), Some(TEST_SECRET));
+    assert_eq!(reopened.secret(password_id), Some("imported test password"));
+    assert_eq!(
+        reopened.get(webhook_id).unwrap().webhook_settings(),
+        Some(webhook)
+    );
+    assert_eq!(
+        reopened.job_webhook_url(webhook_id),
+        Some("https://example.test/private-hook")
+    );
+}
+
+#[test]
+fn prepared_additions_reject_invalid_or_stale_input_without_writing() {
+    let directory = Directory::new();
+    let path = directory.0.join("vault");
+    let mut vault = Vault::create(&path, MASTER).unwrap();
+    let before = fs::read(&path).unwrap();
+    assert!(matches!(
+        vault.prepare_additions(Vec::new()),
+        Err(Error::InvalidInput(_))
+    ));
+    let mut update = password_addition();
+    update.input.id = Some("a".repeat(32));
+    assert!(matches!(
+        vault.prepare_additions(vec![password_addition(), update]),
+        Err(Error::InvalidInput(_))
+    ));
+    let mut wrong_kind = password_addition();
+    wrong_kind.webhook = Some(WebhookSettings::default());
+    assert!(matches!(
+        vault.prepare_additions(vec![wrong_kind]),
+        Err(Error::InvalidInput(_))
+    ));
+    assert!(matches!(
+        vault.prepare_additions((0..1025).map(|_| password_addition()).collect()),
+        Err(Error::Limit)
+    ));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert_eq!(vault.entries().count(), 0);
+
+    let prepared = vault.prepare_additions(vec![password_addition()]).unwrap();
+    let added = password_addition();
+    vault.save(added.input, added.secret).unwrap();
+    vault.lock();
+    let current = fs::read(&path).unwrap();
+    assert!(matches!(
+        Vault::verify_prepared_additions(
+            &path,
+            &prepared.before,
+            &prepared.after,
+            &prepared.snapshot
+        ),
+        Err(Error::Changed)
+    ));
+    assert!(matches!(
+        Vault::apply_prepared_additions(
+            &path,
+            &prepared.before,
+            &prepared.after,
+            &prepared.snapshot
+        ),
+        Err(Error::Changed)
+    ));
+    let mut tampered = prepared.snapshot.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        Vault::verify_prepared_additions(&path, &prepared.before, &prepared.after, &tampered),
+        Err(Error::InvalidFormat)
+    ));
+    assert!(matches!(
+        Vault::apply_prepared_additions(&path, &prepared.before, &prepared.after, &tampered),
+        Err(Error::InvalidFormat)
+    ));
+    let missing = directory.0.join("missing");
+    assert!(matches!(
+        Vault::apply_prepared_additions(&missing, &prepared.before, &prepared.after, &tampered),
+        Err(Error::InvalidFormat)
+    ));
+    assert!(matches!(
+        Vault::apply_prepared_additions(
+            &missing,
+            &prepared.before,
+            &prepared.after,
+            &prepared.snapshot
+        ),
+        Err(Error::NotFound)
+    ));
+    assert!(!directory.0.join("missing.lock").exists());
+    assert_eq!(fs::read(&path).unwrap(), current);
+}
+
+fn password_addition() -> CredentialAddition {
+    CredentialAddition {
+        input: CredentialInput {
+            label: "Imported SSH password".into(),
+            ..Default::default()
+        },
+        secret: Secret::new("imported test password".into()),
+        webhook: None,
+    }
+}
+
+#[test]
+fn recovery_output_binds_the_layout_and_vault_key() {
+    let directory = Directory::new();
+    let path = directory.0.join("vault");
+    let vault = Vault::create(&path, MASTER).unwrap();
+    let layout = b"session layout A";
+    let output = b"private terminal output";
+    let sealed = vault.seal_recovery_output(layout, output).unwrap();
+    assert_ne!(sealed, vault.seal_recovery_output(layout, output).unwrap());
+    assert!(!sealed.windows(output.len()).any(|bytes| bytes == output));
+    assert_eq!(
+        vault
+            .open_recovery_output(layout, &sealed)
+            .unwrap()
+            .as_slice(),
+        output
+    );
+    assert!(matches!(
+        vault.open_recovery_output(b"session layout B", &sealed),
+        Err(Error::Authentication)
+    ));
+    let mut tampered = sealed.clone();
+    *tampered.last_mut().unwrap() ^= 1;
+    assert!(matches!(
+        vault.open_recovery_output(layout, &tampered),
+        Err(Error::Authentication)
+    ));
+    assert!(matches!(
+        vault.seal_recovery_output(layout, &vec![0; MAX_RECOVERY_OUTPUT_BYTES + 1]),
+        Err(Error::Limit)
+    ));
+
+    vault.lock();
+    let mut vault = Vault::unlock(&path, MASTER).unwrap();
+    assert_eq!(
+        vault
+            .open_recovery_output(layout, &sealed)
+            .unwrap()
+            .as_slice(),
+        output
+    );
+    vault.change_master_password(MASTER, CHANGED).unwrap();
+    assert!(matches!(
+        vault.open_recovery_output(layout, &sealed),
+        Err(Error::Authentication)
+    ));
+}
+
+#[test]
+fn qdrant_api_key_validates_and_keeps_its_type_after_reopen() {
+    let directory = Directory::new();
+    let path = directory.0.join("vault");
+    let mut vault = Vault::create(&path, MASTER).unwrap();
+    let ssh = vault
+        .save(
+            CredentialInput {
+                label: "Existing SSH password".into(),
+                ..Default::default()
+            },
+            Secret::new(TEST_SECRET.into()),
+        )
+        .unwrap();
+    let input = CredentialInput {
+        label: "Fixture Qdrant key".into(),
+        kind: CredentialKind::QdrantApiKey,
+        ..Default::default()
+    };
+    for invalid in [
+        "",
+        "a b",
+        "a\tb",
+        "a\nb",
+        "a\u{007f}b",
+        "é",
+        &"x".repeat(MAX_QDRANT_API_KEY_BYTES + 1),
+    ] {
+        assert!(matches!(
+            vault.save(input.clone(), Secret::new(invalid.into())),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    for scoped in [
+        CredentialInput {
+            username: "fixture".into(),
+            ..input.clone()
+        },
+        CredentialInput {
+            server_pattern: "fixture.test".into(),
+            ..input.clone()
+        },
+        CredentialInput {
+            environment: "fixture".into(),
+            ..input.clone()
+        },
+    ] {
+        assert!(matches!(
+            vault.save(scoped, Secret::new("fixture-key".into())),
+            Err(Error::InvalidInput(_))
+        ));
+    }
+    let key = "x".repeat(MAX_QDRANT_API_KEY_BYTES);
+    let id = vault.save(input.clone(), Secret::new(key)).unwrap();
+    assert!(valid_credential_id(&id));
+    assert!(vault.qdrant_api_key(&ssh).is_none());
+    assert!(vault.huggingface_token(&id).is_none());
+    assert!(matches!(
+        vault.save(
+            CredentialInput {
+                id: Some(id.clone()),
+                kind: CredentialKind::Password,
+                ..input.clone()
+            },
+            Secret::new("wrong-purpose".into())
+        ),
+        Err(Error::InvalidInput(_))
+    ));
+    let rotated = "fixture-key-JWT.012_=-!";
+    assert_eq!(
+        vault
+            .save(
+                CredentialInput {
+                    id: Some(id.clone()),
+                    ..input
+                },
+                Secret::new(rotated.into())
+            )
+            .unwrap(),
+        id
+    );
+    vault.lock();
+    let reopened = Vault::unlock(&path, MASTER).unwrap();
+    assert_eq!(reopened.qdrant_api_key(&id), Some(rotated));
+    assert_eq!(
+        reopened.get(&id).unwrap().kind,
+        CredentialKind::QdrantApiKey
+    );
+    assert!(!reopened.get(&id).unwrap().kind.is_ssh());
+    assert_eq!(reopened.secret(&ssh), Some(TEST_SECRET));
+    assert!(reopened.qdrant_api_key(&ssh).is_none());
+}
+
+#[test]
+fn huggingface_token_retains_its_dedicated_purpose_after_unlock() {
+    let directory = Directory::new();
+    let path = directory.0.join("vault");
+    let mut vault = Vault::create(&path, MASTER).unwrap();
+    let input = CredentialInput {
+        label: "Test Hub token".into(),
+        kind: CredentialKind::HuggingFaceToken,
+        ..Default::default()
+    };
+    let token = "hf_test_token";
+    assert!(matches!(
+        vault.save(input.clone(), Secret::new("a\nb".into())),
+        Err(Error::InvalidInput(_))
+    ));
+    let id = vault
+        .save(input.clone(), Secret::new(token.into()))
+        .unwrap();
+    assert!(vault.archive_password(&id).is_none());
+    assert!(matches!(
+        vault.save(
+            CredentialInput {
+                id: Some(id.clone()),
+                kind: CredentialKind::Password,
+                ..input
+            },
+            Secret::new(token.into()),
+        ),
+        Err(Error::InvalidInput(_))
+    ));
+    vault.lock();
+    let vault = Vault::unlock(&path, MASTER).unwrap();
+    assert_eq!(vault.huggingface_token(&id), Some(token));
+    assert!(!vault.get(&id).unwrap().kind.is_ssh());
+}
 
 #[test]
 fn archive_password_keeps_its_purpose_and_id_when_the_master_password_changes() {

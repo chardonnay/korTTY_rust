@@ -2,8 +2,8 @@ use std::num::NonZeroU32;
 use std::time::SystemTime;
 
 use kortty_jobs::{
-    Date, DependencyMode, Job, JobGraph, JobId, JobSchedule, RunOutcome, RunTrigger, ScheduleError,
-    Scheduler, Time, TimeZone, Weekday,
+    BlockReason, Date, DependencyMode, Job, JobGraph, JobId, JobSchedule, RunOutcome, RunTrigger,
+    ScheduleError, Scheduler, Time, TimeZone, Weekday,
 };
 
 fn time(value: &str) -> Time {
@@ -249,4 +249,65 @@ fn blocked_timer_rearms_and_enable_recomputes_from_now() {
         .set_chain_enabled(&id("root"), true, at("2026-05-04T11:30", &zone))
         .unwrap();
     assert_eq!(scheduler.next_due(), Some(at("2026-05-05T10:00", &zone)));
+}
+
+#[test]
+fn one_time_calendar_gate_blocks_the_occurrence_and_still_allows_a_manual_start() {
+    let zone = TimeZone::UTC;
+    let date = "2026-05-04".parse().unwrap();
+    let root = Job::new(id("root"), "root", ()).unwrap();
+    let child = Job::new(id("child"), "child", ())
+        .unwrap()
+        .with_schedule(
+            JobSchedule::default()
+                .with_fixed_times([time("10:00")])
+                .with_active_dates(Some(date), Some(date))
+                .unwrap(),
+        )
+        .with_dependencies(DependencyMode::Gate, vec![id("root")], None);
+    let mut scheduler = Scheduler::new(JobGraph::new(vec![root, child]).unwrap());
+    scheduler
+        .initialize_schedules(zone.clone(), at("2026-05-04T09:00", &zone))
+        .unwrap();
+    let due = at("2026-05-04T10:00", &zone);
+    assert_eq!(scheduler.scheduled_at(&id("child")), Some(due));
+
+    let blocked = scheduler.tick(due).unwrap();
+    assert!(blocked.started.is_empty());
+    let [record] = blocked.finished.as_slice() else {
+        panic!("expected one blocked calendar occurrence");
+    };
+    assert_eq!(record.job, id("child"));
+    assert_eq!(record.trigger, RunTrigger::Scheduled);
+    assert_eq!(record.outcome, RunOutcome::Blocked);
+    assert_eq!(record.blockers.len(), 1);
+    assert_eq!(record.blockers[0].predecessor, id("root"));
+    assert_eq!(record.blockers[0].reason, BlockReason::NeverRan);
+    assert_eq!(scheduler.next_due(), None);
+
+    let later = at("2026-05-04T10:01", &zone);
+    assert_eq!(
+        scheduler.blockers(&id("child"), later).unwrap().as_slice(),
+        record.blockers.as_ref()
+    );
+    let manual = scheduler.start_manual(&id("child"), later).unwrap();
+    let [started] = manual.started.as_slice() else {
+        panic!("expected one explicit manual run");
+    };
+    assert_eq!(started.job, id("child"));
+    assert_eq!(started.trigger, RunTrigger::Manual);
+    assert_ne!(started.id, record.id);
+    let _ = scheduler
+        .complete(started.id, RunOutcome::Success, later)
+        .unwrap();
+    let root = scheduler.start_manual(&id("root"), later).unwrap();
+    let completed = scheduler
+        .complete(root.started[0].id, RunOutcome::Success, later)
+        .unwrap();
+    assert!(completed.started.is_empty());
+    assert!(scheduler.blockers(&id("child"), later).unwrap().is_empty());
+
+    let next = scheduler.tick(at("2026-05-05T10:00", &zone)).unwrap();
+    assert!(next.started.is_empty() && next.finished.is_empty());
+    assert_eq!(scheduler.scheduled_at(&id("child")), None);
 }

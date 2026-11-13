@@ -30,6 +30,7 @@ impl KeyboardRoute {
         target == self.source
             || (frame.status == Status::Running
                 && frame.ibm.is_none()
+                && !frame.coding_agent_waiting_for_decision()
                 && (!self.password_prompt || frame.password_prompt))
     }
 }
@@ -186,12 +187,17 @@ impl Workspace {
     }
 
     fn mirror_input_held(&self, id: SessionId) -> bool {
-        self.windows.values().any(|window| {
-            window
-                .pending_paste
-                .as_ref()
-                .is_some_and(|paste| paste.targets.contains(&id))
-        })
+        self.terminal_agents.holds_mirrored_input(id)
+            || self
+                .sessions
+                .get(&id)
+                .is_some_and(|pane| pane.session.frame().coding_agent_waiting_for_decision())
+            || self.windows.values().any(|window| {
+                window
+                    .pending_paste
+                    .as_ref()
+                    .is_some_and(|paste| paste.targets.contains(&id))
+            })
     }
 
     pub(super) fn keyboard_targets(&self, tab: &Tab) -> Option<KeyboardRoute> {
@@ -235,10 +241,21 @@ impl Workspace {
             ));
         }
         if tab.grid.len() > 1 && self.tab_broadcast_active(tab) {
-            marks.push(format!(
-                "Broadcast mode: typing goes to all {} panes of this tab",
-                tab.grid.len()
-            ));
+            let source = tab.focused_session();
+            let held = tab
+                .grid
+                .iter()
+                .filter(|(_, id)| Some(**id) != source && self.mirror_input_held(**id))
+                .count();
+            let available = tab.grid.len() - held;
+            marks.push(if held == 0 {
+                format!("Broadcast mode: typing goes to all {available} panes of this tab")
+            } else {
+                format!(
+                    "Broadcast mode: {available} of {} panes receive keys right now",
+                    tab.grid.len()
+                )
+            });
         }
         (!marks.is_empty()).then(|| marks.join("\n"))
     }
@@ -291,5 +308,96 @@ impl Workspace {
             .align_y(Alignment::Center)
             .into(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iced::widget::pane_grid;
+
+    use crate::session::{CodingAgentState, GridSize, IbmKind, Session};
+
+    use super::*;
+
+    fn pane(workspace: &mut Workspace, state: Option<CodingAgentState>) -> SessionId {
+        // Exercise the real workspace routing without launching a terminal process.
+        let session = Session::disconnected_ibm(IbmKind::Tn3270e);
+        session.set_mirror_test_frame(state);
+        workspace.store_session(session, GridSize::default(), 14)
+    }
+
+    #[test]
+    fn mirror_routes_skip_blocked_agents_and_resume_without_changing_focused_paste_scope() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let (other_owner, _) = workspace.open_window(false);
+        let source = pane(&mut workspace, None);
+        let held = pane(&mut workspace, Some(CodingAgentState::Blocked));
+        let ready = pane(&mut workspace, None);
+        let remote = pane(&mut workspace, None);
+        workspace.add_tab(owner, source);
+        workspace.add_tab(other_owner, remote);
+        let (tab_id, held_slot, source_slot) = {
+            let tab = workspace
+                .windows
+                .get_mut(&owner)
+                .unwrap()
+                .tab_mut()
+                .unwrap();
+            let source_slot = tab.focused;
+            let (held_slot, _) = tab
+                .grid
+                .split(pane_grid::Axis::Vertical, source_slot, held)
+                .unwrap();
+            tab.grid
+                .split(pane_grid::Axis::Horizontal, source_slot, ready)
+                .unwrap();
+            (tab.id, held_slot, source_slot)
+        };
+        let route = |workspace: &Workspace| {
+            workspace
+                .keyboard_targets(workspace.windows[&owner].tab().unwrap())
+                .unwrap()
+        };
+        assert_eq!(route(&workspace).panes, [source]);
+        assert!(route(&workspace).predict);
+
+        let _ = workspace.update(Message::ToggleBroadcast(owner));
+        let broadcast = route(&workspace);
+        assert_eq!(broadcast.panes, [source, ready]);
+        assert!(!broadcast.predict);
+        assert!(!broadcast.accepts(held, &workspace.sessions[&held].session.frame()));
+        assert!(broadcast.accepts(ready, &workspace.sessions[&ready].session.frame()));
+        assert!(
+            workspace
+                .multi_exec_tab_marker(workspace.windows[&owner].tab().unwrap())
+                .is_some_and(|label| label.contains("2 of 3 panes receive keys"))
+        );
+        assert!(workspace.current_targets(owner, tab_id, &[source]));
+        assert!(!workspace.current_targets(owner, tab_id, &[source, ready]));
+
+        let _ = workspace.update(Message::FocusPane(owner, held_slot));
+        let direct = route(&workspace);
+        assert_eq!(direct.source, held);
+        assert!(direct.accepts(held, &workspace.sessions[&held].session.frame()));
+        assert!(workspace.current_targets(owner, tab_id, &[held]));
+        let _ = workspace.update(Message::FocusPane(owner, source_slot));
+        let _ = workspace.update(Message::ToggleBroadcast(owner));
+
+        workspace.update_multi_exec(Some(owner), Action::Tab);
+        workspace.update_multi_exec(Some(other_owner), Action::Pane);
+        let global = route(&workspace);
+        assert_eq!(global.panes, [source, ready, remote]);
+        assert!(!global.accepts(held, &workspace.sessions[&held].session.frame()));
+        assert!(workspace.mirror_input_held(held));
+
+        workspace.sessions[&held]
+            .session
+            .set_mirror_test_frame(Some(CodingAgentState::Idle));
+        let idle = route(&workspace);
+        assert_eq!(idle.panes.len(), 4);
+        assert!(idle.panes.contains(&held));
+        assert!(idle.accepts(held, &workspace.sessions[&held].session.frame()));
+        assert!(!workspace.mirror_input_held(held));
     }
 }

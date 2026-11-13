@@ -1,0 +1,14 @@
+cursor=1,3
+reply=1b5b313b3130521b5b323b37521b5b333b3136521b5b343b3252
+screen:
+A   K   Y
+     Z
+B              Q
+R
+
+attributes:
+IIII.IIIU.......
+.UUUUU..........
+IIIIIIIIIIIIIII.
+................
+................

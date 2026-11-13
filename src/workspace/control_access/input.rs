@@ -5,8 +5,9 @@ use serde_json::{Value, json};
 
 use crate::input::encode_stream_key;
 use crate::session::{Frame, InputError, SessionId, Status};
+use crate::terminal_agent::shortcut::{Aliases, Parsed};
 
-use super::{PaneSession, pane_id};
+use super::{PaneSession, Workspace, pane_id};
 
 const NAMED: &[(&str, Named)] = &[
     ("enter", Named::Enter),
@@ -39,12 +40,81 @@ const NAMED: &[(&str, Named)] = &[
     ("f12", Named::F12),
 ];
 
-struct Payload {
-    bytes: Vec<u8>,
+pub(super) struct Payload {
+    pub(super) bytes: Vec<u8>,
     keys: Vec<String>,
-    bracketed: bool,
-    submit: bool,
+    pub(super) bracketed: bool,
+    pub(super) submit: bool,
     enter: bool,
+    allow_shortcut_conflict: bool,
+}
+
+impl Payload {
+    pub(super) fn result(&self, session: SessionId) -> Value {
+        json!({"pane_id": pane_id(session), "bytes_written": self.bytes.len(), "bracketed": self.bracketed,
+            "submitted": self.submit, "keys": self.keys})
+    }
+
+    pub(super) fn check_shortcut(
+        &self,
+        session: SessionId,
+        method: Method,
+        params: &Params,
+        aliases: Option<&Aliases>,
+    ) -> Result<(), Fault> {
+        if self.bracketed || self.allow_shortcut_conflict || method == Method::SendKeys {
+            return Ok(());
+        }
+        let parameter = if method == Method::Run {
+            "command"
+        } else {
+            "text"
+        };
+        if let Some(aliases) = aliases
+            && let Some(shortcut) = matching_shortcut(aliases, params.required(parameter)?)
+        {
+            return Err(Fault::new(
+                ErrorCode::HostShortcutConflict,
+                "The first line starts with korTTY's own AI shortcut command and would not reach the pane",
+            )
+            .with("pane", json!(pane_id(session)))
+            .with("shortcut", json!(shortcut))
+            .with("hint", json!("pass allow_shortcut_conflict:true to write it anyway")));
+        }
+        Ok(())
+    }
+}
+
+impl Workspace {
+    pub(super) fn control_shortcut_aliases(&self) -> Option<Aliases> {
+        if !self.clipboard.policy.ai_agent_allowed() {
+            return None;
+        }
+        self.ai_configuration()?.agent_shortcut_aliases()
+    }
+}
+
+pub(super) fn matching_shortcut(aliases: &Aliases, text: &str) -> Option<String> {
+    let first_line = text.split(['\r', '\n']).next()?;
+    if matches!(aliases.parse(first_line), Parsed::Ready(_)) {
+        let [shortcut, ..] = aliases.commands();
+        Some(shortcut)
+    } else {
+        None
+    }
+}
+
+pub(super) fn agent_keys(
+    frame: &Frame,
+    params: &Params,
+) -> Result<(Vec<u8>, Vec<String>, bool, bool), Fault> {
+    let payload = key_payload(frame, &params.keys()?)?;
+    let submits = payload.keys.iter().any(|key| key == "enter");
+    let decision = payload
+        .keys
+        .iter()
+        .any(|key| matches!(key.as_str(), "enter" | "esc" | "y" | "n"));
+    Ok((payload.bytes, payload.keys, decision, submits))
 }
 
 pub(super) fn write(
@@ -52,26 +122,12 @@ pub(super) fn write(
     session: SessionId,
     method: Method,
     params: &Params,
+    aliases: Option<&Aliases>,
 ) -> Result<Value, Fault> {
     let frame = pane.session.frame();
-    if frame.status != Status::Running {
-        return Err(Fault::new(
-            ErrorCode::NotConnected,
-            "The pane is disconnected",
-        ));
-    }
-    if frame.ibm.is_some() {
-        return Err(Fault::new(
-            ErrorCode::Unsupported,
-            "Control API input for IBM block terminals is unavailable",
-        ));
-    }
-    let payload = if method == Method::SendKeys {
-        key_payload(&frame, &params.keys()?)?
-    } else {
-        text_payload(&frame, params, method == Method::Run)?
-    };
-    let count = payload.bytes.len();
+    let payload = prepare(&frame, method, params)?;
+    payload.check_shortcut(session, method, params, aliases)?;
+    let written = payload.result(session);
     let result = if frame.screen.profile == TerminalProfile::Hp2392 && method != Method::SendKeys {
         pane.session.send_paste(payload.bytes)
     } else {
@@ -85,12 +141,29 @@ pub(super) fn write(
             "The terminal input exceeds its byte limit",
         ),
     })?;
-    pane.selection = None;
+    pane.clear_selection();
     pane.session.follow_output();
-    Ok(
-        json!({"pane_id": pane_id(session), "bytes_written": count, "bracketed": payload.bracketed,
-        "submitted": payload.submit, "keys": payload.keys}),
-    )
+    Ok(written)
+}
+
+pub(super) fn prepare(frame: &Frame, method: Method, params: &Params) -> Result<Payload, Fault> {
+    if frame.status != Status::Running {
+        return Err(Fault::new(
+            ErrorCode::NotConnected,
+            "The pane is disconnected",
+        ));
+    }
+    if frame.ibm.is_some() {
+        return Err(Fault::new(
+            ErrorCode::Unsupported,
+            "Control API input for IBM block terminals is unavailable",
+        ));
+    }
+    if method == Method::SendKeys {
+        key_payload(frame, &params.keys()?)
+    } else {
+        text_payload(frame, params, method == Method::Run)
+    }
 }
 
 fn text_payload(frame: &Frame, params: &Params, run: bool) -> Result<Payload, Fault> {
@@ -105,10 +178,10 @@ fn text_payload(frame: &Frame, params: &Params, run: bool) -> Result<Payload, Fa
         return Err(Fault::param("command"));
     }
     let submit = run || params.flag("submit", false)?;
+    let allow_shortcut_conflict = !run && params.flag("allow_shortcut_conflict", false)?;
     let bracketed = if run {
         false
     } else {
-        let _ = params.flag("allow_shortcut_conflict", false)?;
         let mode = params
             .string("bracketed")?
             .unwrap_or("auto")
@@ -157,6 +230,7 @@ fn text_payload(frame: &Frame, params: &Params, run: bool) -> Result<Payload, Fa
         bracketed,
         submit,
         enter: false,
+        allow_shortcut_conflict,
     })
 }
 
@@ -218,6 +292,7 @@ fn key_payload(frame: &Frame, keys: &[&str]) -> Result<Payload, Fault> {
         bracketed: false,
         submit: false,
         enter,
+        allow_shortcut_conflict: false,
     })
 }
 
@@ -261,6 +336,26 @@ fn unknown_key() -> Fault {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_conflict_matches_only_complete_configured_first_line_shortcuts() {
+        let aliases = Aliases::new("assist", false).unwrap();
+        for text in [
+            "assist: inspect",
+            "assist-plan inspect\rnext",
+            "assist-ask inspect",
+        ] {
+            assert_eq!(matching_shortcut(&aliases, text).as_deref(), Some("assist"));
+        }
+        for text in [
+            "assist",
+            "assistant inspect",
+            "ASSIST inspect",
+            "echo\r\nassist inspect",
+        ] {
+            assert_eq!(matching_shortcut(&aliases, text), None);
+        }
+    }
 
     #[test]
     fn wrapped_text_cannot_close_bracketed_paste_from_inside_the_payload() {

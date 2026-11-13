@@ -14,10 +14,24 @@ pub(crate) enum SftpOpener {
 }
 
 impl SftpOpener {
+    pub(crate) fn verified_host_key(&self) -> Option<&kortty_ssh::HostKey> {
+        match self {
+            Self::Direct(opener) => opener.verified_host_key(),
+            Self::Worker(opener) => opener.verified_host_key(),
+        }
+    }
+
     pub(crate) fn is_closed(&self) -> bool {
         match self {
             Self::Direct(opener) => opener.is_closed(),
             Self::Worker(opener) => opener.is_closed(),
+        }
+    }
+
+    pub(crate) fn exec_opener(&self) -> super::ExecOpener {
+        match self {
+            Self::Direct(opener) => super::ExecOpener::Direct(opener.exec_opener()),
+            Self::Worker(opener) => super::ExecOpener::Worker(opener.clone()),
         }
     }
 

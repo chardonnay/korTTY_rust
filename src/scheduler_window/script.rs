@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::snippets::{Library, SnippetId, resolve};
 
-pub(super) const MAX_COMMAND_BYTES: usize = 16 * 1024;
+pub(crate) const MAX_COMMAND_BYTES: usize = 16 * 1024;
 pub(super) const MAX_ARGUMENT_TEXT_BYTES: usize = 8 * 1024;
 const MAX_ARGUMENTS: usize = 64;
 const MAX_ARGUMENT_BYTES: usize = 4096;
@@ -24,7 +24,7 @@ pub enum Language {
 impl Language {
     pub(super) const ALL: [Self; 4] = [Self::Bash, Self::Python, Self::Perl, Self::Ruby];
 
-    pub(super) fn from_snippet(language: &str) -> Option<Self> {
+    pub(crate) fn from_snippet(language: &str) -> Option<Self> {
         match language.to_ascii_lowercase().as_str() {
             "bash" | "shell" => Some(Self::Bash),
             "python" => Some(Self::Python),
@@ -96,7 +96,7 @@ impl SnippetLink {
     }
 }
 
-pub(super) fn arguments_from_lines(arguments: &str) -> Vec<String> {
+pub(crate) fn arguments_from_lines(arguments: &str) -> Vec<String> {
     arguments
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -124,8 +124,14 @@ fn validate_arguments(arguments: &[String]) -> Result<(), &'static str> {
     }
 }
 
+pub(crate) fn shell_quote(output: &mut String, value: &str) {
+    output.push('\'');
+    output.push_str(&value.replace('\'', "'\\''"));
+    output.push('\'');
+}
+
 impl Script {
-    pub(super) fn from_lines(language: Language, body: String, arguments: &str) -> Self {
+    pub(crate) fn from_lines(language: Language, body: String, arguments: &str) -> Self {
         Self {
             language,
             body,
@@ -133,7 +139,7 @@ impl Script {
         }
     }
 
-    pub(super) fn command(&self) -> Result<String, &'static str> {
+    pub(crate) fn command(&self) -> Result<String, &'static str> {
         if self.body.trim().is_empty()
             || self.body.len() > MAX_COMMAND_BYTES
             || self.body.contains('\0')
@@ -148,9 +154,8 @@ impl Script {
         }
         let mut command = format!("exec {}", self.language.interpreter());
         for argument in &self.arguments {
-            command.push_str(" '");
-            command.push_str(&argument.replace('\'', "'\\''"));
-            command.push('\'');
+            command.push(' ');
+            shell_quote(&mut command, argument);
         }
         // A quoted heredoc feeds the interpreter verbatim. Only the fixed
         // interpreter selector and shell-quoted argv are parsed by the login shell.

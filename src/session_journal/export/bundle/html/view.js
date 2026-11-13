@@ -344,7 +344,7 @@
         const image = byId("large-image");
         for (const button of document.querySelectorAll("button[data-image]")) {
             button.addEventListener("click", () => {
-                image.src = button.dataset.image;
+                image.src = button.querySelector("img").src;
                 dialog.showModal();
             });
         }

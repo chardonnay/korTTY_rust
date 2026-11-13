@@ -52,6 +52,75 @@ fn snippets_keep_their_ids_and_concurrent_writes_do_not_clobber() {
 }
 
 #[test]
+fn custom_header_policy_checks_new_identities_on_every_store_write() {
+    let profile = Profile::new();
+    let path = profile.path();
+    let mut library = Library::open(path.clone()).unwrap();
+    let header = |name: &str| Input {
+        category: "  sCrIpT-HeAdEr  ".into(),
+        ..input(name)
+    };
+    library.allow_custom_script_headers = Some(true);
+    let existing = library.save(None, header("Existing header")).unwrap();
+    let ordinary = library.save(None, input("Ordinary snippet")).unwrap();
+    let baseline = fs::read(&path).unwrap();
+    library.allow_custom_script_headers = Some(false);
+
+    for attempt in [
+        library.save(None, header("New header")),
+        library.save(Some(ordinary), header("Ordinary snippet")),
+        library.create_with_id(
+            SnippetId::new().unwrap(),
+            header("Duplicate header"),
+            Metadata::default(),
+        ),
+    ] {
+        assert_eq!(attempt.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
+    }
+    let imports = archive::Imports {
+        structured: vec![
+            archive::ImportedSnippet {
+                id: None,
+                input: input("Allowed entry"),
+                metadata: Metadata::default(),
+            },
+            archive::ImportedSnippet {
+                id: None,
+                input: header("Imported header"),
+                metadata: Metadata::default(),
+            },
+        ],
+        ..archive::Imports::default()
+    };
+    assert_eq!(
+        library.import_snippets(imports).unwrap_err().kind(),
+        io::ErrorKind::PermissionDenied
+    );
+    assert_eq!(fs::read(&path).unwrap(), baseline);
+    assert_eq!(library.entries().len(), 2);
+
+    let updated = Input {
+        content: "# edited template".into(),
+        ..header("Renamed header")
+    };
+    assert_eq!(library.save(Some(existing), updated).unwrap(), existing);
+    assert_eq!(
+        library.get(existing).unwrap().content(),
+        "# edited template"
+    );
+    assert!(library.save(None, input("New ordinary snippet")).is_ok());
+    library.remove(existing).unwrap();
+    assert_eq!(
+        library
+            .create_with_id(existing, header("Recreated header"), Metadata::default())
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::PermissionDenied,
+    );
+    assert!(Library::open(path).unwrap().get(existing).is_none());
+}
+
+#[test]
 fn invalid_or_oversized_data_is_never_replaced() {
     let profile = Profile::new();
     let path = profile.path();

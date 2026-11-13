@@ -1,0 +1,957 @@
+[
+{
+  "kind": "AIDER",
+  "version": 1,
+  "comment": "Written against Aider 0.86.2 (Homebrew; prompt_toolkit line UI on the normal screen) from live sessions recorded in a pty against an OpenAI-compatible LM Studio endpoint; must be re-verified when Aider changes its UI. Aider writes everything into the scrollback, so every rule looks only at the last non-empty line or two: an answered question ('Create new file? (Y)es/(N)o [Yes]: n') stays visible above the next prompt. A '(Y)es/(N)o … [Yes]:' question as the last line (file creation, shell commands, URLs, the first-run 'what's new' offer) is BLOCKED; the knight-rider spinner ('░█      Waiting for <model>') is WORKING; the '>' input prompt (or a mode prompt such as 'architect>') as the last line is IDLE. Between the spinner and the next prompt Aider streams its answer and status lines, so the fallback is WORKING, not IDLE. No rule depends on the alternate-screen flag.",
+  "fallbackState": "WORKING",
+  "rules": [
+    {
+      "id": "confirm-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": {
+        "bottomNonEmptyLines": 1
+      },
+      "anyLineRegex": [
+        "\\(Y\\)es/\\(N\\)o\\b.*\\[[^\\]]+\\]:\\s*\\S{0,3}\\s*$"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": {
+        "bottomNonEmptyLines": 2
+      },
+      "anyLineRegex": [
+        "^\\s*[░█]{2,}\\s+\\S"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": {
+        "bottomNonEmptyLines": 1
+      },
+      "anyLineRegex": [
+        "^(?:[a-z-]+)?>(?:\\s|$)"
+      ]
+    }
+  ]
+},
+{
+  "kind": "AMP",
+  "version": 1,
+  "comment": "UNVERIFIED except for the login question: written against Amp CLI 0.0.1791446565-g95411c without an Amp account, so no live agent session could be recorded. Only 'Would you like to log in to Amp? [(y)es, (n)o]:' was seen on screen (BLOCKED). The other patterns are UI strings taken from the string table of the installed binary, whose on-screen layout is unknown: the tool approval dialog ('Approval Required', 'Allow Once', 'Allow All for This Session', 'Allow All for Every Session', 'Always Allow This Path') is BLOCKED; 'Running Tools' and the input placeholder 'Type a prompt to queue it', which Amp shows only while a turn runs, are WORKING. No idle text could be identified, so idle is the fallback; because an agent is reported only after a first rule match, Amp appears from its first working or approval screen on. The fixtures for the approval and working rules are synthesized from those strings, not recorded. Must be re-verified against live authenticated sessions.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "login-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": {
+        "bottomNonEmptyLines": 2
+      },
+      "anyLineRegex": [
+        "^\\s*Would you like to log in to Amp\\? \\[\\(y\\)es, \\(n\\)o\\]:\\s*\\S?\\s*$"
+      ]
+    },
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 990,
+      "region": {
+        "bottomNonEmptyLines": 20
+      },
+      "anyLineRegex": [
+        "(?:^|[\\s│┃|])Approval Required\\b",
+        "\\bAllow All for (?:This|Every) Session\\b",
+        "\\bAlways Allow This Path\\b"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": {
+        "bottomNonEmptyLines": 8
+      },
+      "anyLineRegex": [
+        "\\bType a prompt to queue it\\b",
+        "\\bRunning Tools\\b"
+      ]
+    }
+  ]
+},
+{
+  "kind": "ANTIGRAVITY",
+  "version": 1,
+  "comment": "Written against Antigravity CLI 1.4.8 (Homebrew cask antigravity-cli, linked as agy; full-screen TUI on the alternate screen) from live sessions recorded in a pty with a signed-in Google AI Pro account, the sign-in menu from a signed-out one; must be re-verified when Antigravity CLI changes its TUI. The sign-in menu ('Select login method:', '> 1. Google OAuth'), the workspace-trust question ('Do you trust the contents of this project?', '> Yes, I trust this folder', 'No, exit') and the tool approval ('Requesting permission for:', 'Run this command?' — or 'Allow access to this file?' / 'URL?', 'Allow calling this tool?' — with '> 1. Yes, run command' … '4. No, cancel' and the '↑/↓ Navigate · tab Amend' hint) are BLOCKED; Esc cancels the approval and leaves 'Interrupted · What should Antigravity CLI do instead?'. The Braille spinner line ('⡿  Generating...', '⣽  Running command...') and the footer 'esc to cancel' shown while a turn runs are WORKING; the footer '? for shortcuts' is IDLE. The approval dialog also shows the 'esc to cancel' footer, so the approval rule has the higher priority. The first-run setup (colour scheme, 'Terms of Service & Data Use') intentionally matches no rule. agy can also report its state to the terminal over OSC 7501, which korTTY does not read.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "login-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": { "bottomNonEmptyLines": 6 },
+      "anyLineRegex": ["^\\s*Select login method:\\s*$"],
+      "regex": "^\\s*[>❯›]?\\s*1\\.\\s*Google OAuth\\b"
+    },
+    {
+      "id": "trust-prompt",
+      "state": "BLOCKED",
+      "priority": 995,
+      "region": { "bottomNonEmptyLines": 8 },
+      "anyLineRegex": ["^\\s*Do you trust the contents of this project\\?\\s*$"],
+      "regex": "^\\s*[>❯›]?\\s*Yes, I trust this folder\\b"
+    },
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 990,
+      "region": { "bottomNonEmptyLines": 14 },
+      "anyLineRegex": [
+        "^\\s*(?:Run this command|Allow access to this \\w+|Allow calling this tool|Do you want to proceed)\\?\\s*$"
+      ],
+      "regex": "^\\s*[>❯›]?\\s*\\d+\\.\\s*(?:Yes, (?:run|allow|accept|and always allow)|No, (?:cancel|deny))\\b"
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": { "bottomNonEmptyLines": 8 },
+      "anyLineRegex": [
+        "^\\s*[⠁-⣿]\\s+\\S.*\\.\\.\\.",
+        "^\\s*esc to cancel\\b",
+        "(?i)\\besc to interrupt\\b",
+        "\\bretrying in \\d+s\\b"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": { "bottomNonEmptyLines": 3 },
+      "anyLineRegex": ["^\\s*\\?\\s+for shortcuts\\b"]
+    }
+  ]
+},
+{
+  "kind": "CLAUDE_CODE",
+  "version": 1,
+  "comment": "Written against Claude Code 2.1.x (Ink TUI). Screens were transcribed from documented UI text and from the onboarding screens of an unauthenticated Claude Code 2.1.270 session; re-verified on 2026-10-27 against live Claude Code 2.1.308 sessions (Homebrew cask, driven through LM Studio's Anthropic-compatible endpoint with ANTHROPIC_BASE_URL, no Anthropic login, manual permission mode): idle prompt, spinner (including '✻ Waiting for API response · will retry in …'), the Bash permission dialog ('This command requires approval', 'Do you want to proceed?', '❯ 1. Yes', 'Esc to cancel · Tab to amend') and the idle prompt after a denied call classified correctly without a rule change; must be re-verified when Claude Code changes its TUI. Permission dialogs (Bash, Edit, Write, MCP) and the AskUserQuestion picker are BLOCKED; a tool call showing 'Running…' or the spinner status line ('✻ Thinking… (…)', with 'esc to interrupt') is WORKING — a '*' or '·' bullet ending in an ellipsis is answer text, not a spinner; the empty input prompt with '? for shortcuts' is IDLE. The onboarding menus (theme picker, login method) intentionally match no rule. Claude Code 2.1.308 draws on the alternate screen (earlier 2.1.x builds did not), and no rule depends on that flag.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "permission-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": { "bottomNonEmptyLines": 20 },
+      "anyLineRegex": [
+        "Do you want to (proceed|make this edit|create|run|allow)",
+        "Do you want to allow this connection\\?",
+        "Would you like to proceed\\?"
+      ],
+      "regex": "^\\s*[│┃]?\\s*❯?\\s*1\\.\\s*Yes\\b",
+      "notContains": ["esc to interrupt"]
+    },
+    {
+      "id": "question-picker",
+      "state": "BLOCKED",
+      "priority": 950,
+      "region": { "bottomNonEmptyLines": 20 },
+      "anyLineRegex": ["(?i)\\bEsc to cancel\\b"],
+      "regex": "(?i)Enter to (select|confirm)|Arrow keys to navigate|↑/?↓ to navigate|Review your answers",
+      "notContains": ["esc to interrupt", "Enter to set as default"]
+    },
+    {
+      "id": "working-tool-running",
+      "state": "WORKING",
+      "priority": 910,
+      "region": { "bottomNonEmptyLines": 12 },
+      "anyLineRegex": ["^\\s*⎿\\s+Running…"]
+    },
+    {
+      "id": "working-spinner",
+      "state": "WORKING",
+      "priority": 900,
+      "region": { "bottomNonEmptyLines": 8 },
+      "anyLineRegex": [
+        "(?i)esc to interrupt",
+        "^\\s*[✻✳✶✽✢]\\s+\\S.*…\\s*\\("
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": { "bottomNonEmptyLines": 6 },
+      "anyLineRegex": ["^\\s*[│┃]?\\s*[❯>]\\s*$", "\\?\\s+for shortcuts"],
+      "notContains": ["esc to interrupt"]
+    }
+  ]
+},
+{
+  "kind": "CLINE",
+  "version": 1,
+  "comment": "Written against Cline CLI 3.0.74 (npm cline; full-screen TUI on the alternate screen) from live sessions recorded in a pty against an OpenAI-compatible LM Studio provider, the welcome screen from an unconfigured one; must be re-verified when Cline changes its TUI. The provider choice ('Welcome to Cline', 'Connect a model provider to get started.', 'Sign in with Cline' … 'Bring your own provider'), the device-code sign-in that follows ('Signing in with Cline', 'Visit this URL and enter the code above:', '⠋ Waiting for sign-in...'), the tool approval ('Cline needs permission', 'Approve tool call?', the tool and its input, '[y] Approve   [n] Deny') and the ask_question tool ('Cline is asking a question', the question, 2-5 options, 'Type a response...') are BLOCKED; n denies, Esc dismisses the question. The Braille spinner in front of the running turn's line ('⠋ Thinking... (esc to cancel)', '⠙ run_commands(…)', '⠸ <streamed answer>') is WORKING; a finished line starts with '*' instead. The spinner sits at the top of the answer being streamed, so a reply taller than the screen scrolls it away: the screen then equals the idle one, which korTTY cannot tell apart. The footer '○ Plan ● Act (Tab)' (also '● Plan ○ Act') is IDLE. The ClinePass offer on start ('Press Enter to open, any other key to close') intentionally matches no rule. Cline keeps the auto-approve toggle (Shift+Tab, 'Auto-approve all enabled') across runs and starts with it on, so a run may never show the approval.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "login-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": { "bottomNonEmptyLines": 24 },
+      "anyLineRegex": ["^\\s*Connect a model provider to get started\\.\\s*$"],
+      "regex": "\\bBring your own provider\\b"
+    },
+    {
+      "id": "sign-in-wait",
+      "state": "BLOCKED",
+      "priority": 995,
+      "region": { "bottomNonEmptyLines": 12 },
+      "anyLineRegex": ["^\\s*[⠁-⣿]?\\s*Waiting for sign-in\\.\\.\\.\\s*$"],
+      "regex": "Visit this URL and enter the code above:"
+    },
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 990,
+      "region": { "bottomNonEmptyLines": 5 },
+      "anyLineRegex": ["^\\s*\\[y\\] Approve\\s+\\[n\\] Deny\\s*$"]
+    },
+    {
+      "id": "question-prompt",
+      "state": "BLOCKED",
+      "priority": 985,
+      "region": { "bottomNonEmptyLines": 16 },
+      "anyLineRegex": ["^\\s*Cline is asking a question\\s*$"]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": { "bottomNonEmptyLines": 0 },
+      "anyLineRegex": [
+        "^\\s*[⠁-⣿]\\s+\\S",
+        "\\(esc to cancel\\)\\s*$"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": { "bottomNonEmptyLines": 3 },
+      "anyLineRegex": ["[○●] Plan [○●] Act \\(Tab\\)\\s*$"]
+    }
+  ]
+},
+{
+  "kind": "CODEX",
+  "version": 1,
+  "comment": "Written against Codex CLI 2026 (Rust/ratatui TUI) from documented UI text, then re-verified against live Codex CLI 0.162.0 sessions on 2026-10-09 and checked unchanged against 0.164.0 on 2026-10-27 (Homebrew cask, alternate screen, driven through an OpenAI-compatible LM Studio provider with approval_policy on-request): every recorded screen classified correctly without a rule change. The live approval dialog reads 'Would you like to run the following command?', '› 1. Yes, proceed (y)', '3. No, and tell Codex what to do differently (esc)' and 'Press enter to confirm or esc to cancel'; the working line reads '◦ Working (3s • esc to interrupt)'; the composer reads '› Ask Codex to do anything'. Must be re-verified when Codex changes its TUI. The command/patch approval dialog ('Allow command?', 'Yes (y)', '[y/n]'), the trust-directory prompt and the 'press enter to confirm or esc to cancel' forms are BLOCKED; the '• Working (…s • esc to interrupt)' status line is WORKING; the '›' composer with its '⏎ send' footer is IDLE. The composer stays visible while Codex works, so the idle rule vetoes on 'esc to interrupt' and has the lowest priority; the approval rule vetoes on it too and anchors its patterns, because command output echoed in the transcript ('Continue? [y/n] n') must not read as an approval dialog. No rule depends on the alternate-screen flag.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": { "bottomNonEmptyLines": 20 },
+      "anyLineRegex": [
+        "(?i)^\\s*Allow command\\?",
+        "(?i)^\\s*›?\\s*1\\.\\s*Yes \\(y\\)",
+        "\\[y/n\\]\\s*$",
+        "(?i)press enter to confirm or esc to cancel",
+        "(?i)enter to submit (answer|all)",
+        "(?i)Do you trust the contents of this directory"
+      ],
+      "notContains": ["esc to interrupt"]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": { "bottomNonEmptyLines": 8 },
+      "anyLineRegex": [
+        "^\\s*[•◦]\\s+Working\\b",
+        "(?i)esc to interrupt"
+      ],
+      "notContains": ["■ Conversation interrupted"]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": { "bottomNonEmptyLines": 6 },
+      "anyLineRegex": ["^\\s*›", "⏎ send"],
+      "notContains": ["esc to interrupt"]
+    }
+  ]
+},
+{
+  "kind": "CONTINUE",
+  "version": 1,
+  "comment": "Written against Continue CLI (cn) 1.5.47 (npm @continuedev/cli; Ink UI on the normal screen) from live sessions recorded in a pty against an OpenAI-compatible LM Studio endpoint via a local --config file; must be re-verified when Continue changes its UI. The tool permission box ('Would you like to continue?' with '> Continue (tab)', 'Continue + don't ask again (shift+tab)', 'No, and tell Continue what to do differently (esc)') is BLOCKED. Continue keeps its spinner line ('⣻⣽⣧  ( 40s • esc to interrupt )') running above the open permission box and redraws everything below it on every spinner tick, so a screen read mid-redraw may show only the top of the box; the approval rule therefore also accepts the box's tool header ('│  Bash(curl …)', a capitalised tool name right after the box border, unlike the input box's '│ ● …') and has the highest priority. The spinner line is WORKING; the input box ('│ ● ▋Ask anything, @ for context, …') without a spinner is IDLE.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": {
+        "bottomNonEmptyLines": 20
+      },
+      "anyLineRegex": [
+        "^│\\s+Would you like to continue\\?",
+        "^│\\s+>?\\s*Continue \\(tab\\)",
+        "^│\\s+No, and tell Continue what to do differently \\(esc\\)",
+        "^│\\s{2}⎿ Will run:",
+        "^│\\s{2}[A-Z][A-Za-z]*\\("
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": {
+        "bottomNonEmptyLines": 8
+      },
+      "anyLineRegex": [
+        "\\(\\s*\\d+s • esc to interrupt\\s*\\)"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": {
+        "bottomNonEmptyLines": 6
+      },
+      "anyLineRegex": [
+        "^│ ●"
+      ],
+      "notContains": [
+        "esc to interrupt"
+      ]
+    }
+  ]
+},
+{
+  "kind": "COPILOT",
+  "version": 1,
+  "comment": "Written against GitHub Copilot CLI 1.0.94 and checked unchanged against 1.0.104 (Homebrew cask copilot-cli; full-screen TUI on the alternate screen) from live sessions recorded in a pty in BYOK offline mode (COPILOT_PROVIDER_BASE_URL on an OpenAI-compatible LM Studio endpoint, no GitHub login); must be re-verified when Copilot CLI changes its TUI. Copilot redraws the whole screen, so an answered dialog does not linger and the approval rule may look at the whole screen. A permission or trust dialog ('Do you want to allow this access?', 'Do you trust the files in this folder?', options like '❯ 1. Yes' … 'No, and tell Copilot what to do differently (Esc to stop)', footer '↑/↓ to navigate · enter to select · esc to cancel') is BLOCKED; the status footer '◎ Working · … esc interrupt' (right after a prompt is sent: '○ Working esc edit prompt') is WORKING; the status footer 'Interactive · Manual Approval · …' without 'Working' is IDLE.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": {
+        "bottomNonEmptyLines": 0
+      },
+      "anyLineRegex": [
+        "^│\\s*Do you (?:want to|trust)\\b.*\\?\\s*│?\\s*$",
+        "↑/↓ to navigate · enter to select · esc to cancel",
+        "No, and tell Copilot what to do differently"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": {
+        "bottomNonEmptyLines": 2
+      },
+      "anyLineRegex": [
+        "\\bWorking\\b.*\\besc (?:interrupt|edit prompt)\\b"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": {
+        "bottomNonEmptyLines": 2
+      },
+      "anyLineRegex": [
+        "\\bInteractive · "
+      ],
+      "notContains": [
+        "esc interrupt",
+        "esc edit prompt"
+      ]
+    }
+  ]
+},
+{
+  "kind": "CRUSH",
+  "version": 1,
+  "comment": "Written against Crush 0.97.1 and checked unchanged against 0.98.2 (Charm's Homebrew tap; Bubble Tea full-screen TUI on the alternate screen) from live sessions recorded in a pty against an OpenAI-compatible LM Studio endpoint; must be re-verified when Crush changes its TUI. The permission dialog ('Permission Required' with 'Allow   Allow for Session   Deny' and '←/→ choose • enter confirm • esc exit') is BLOCKED; because Crush redraws the whole alternate screen, an answered dialog does not linger, so this rule looks at the whole screen. The input placeholder changes at random ('Ready!', 'Ready?', 'Brrrrr...', 'Thinking...'), so the state is read from the help footer instead: 'esc cancel • …' while a turn runs is WORKING, 'tab change focus • …' / 'tab focus chat • …' without 'esc cancel' is IDLE.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": {
+        "bottomNonEmptyLines": 0
+      },
+      "anyLineRegex": [
+        "│\\s*Permission Required\\b",
+        "\\bAllow\\s+Allow for Session\\s+Deny\\b",
+        "←/→ choose • enter confirm • esc exit"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": {
+        "bottomNonEmptyLines": 3
+      },
+      "anyLineRegex": [
+        "^\\s*esc cancel •"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": {
+        "bottomNonEmptyLines": 3
+      },
+      "anyLineRegex": [
+        "^\\s*tab (?:change focus|focus chat) •"
+      ],
+      "notContains": [
+        "esc cancel"
+      ]
+    }
+  ]
+},
+{
+  "kind": "CURSOR_AGENT",
+  "version": 1,
+  "comment": "Written against Cursor Agent (cursor-agent) 2026.10.01-e373342 and checked unchanged against 2026.10.22-27dcf5f from live, authenticated sessions recorded in a pty; must be re-verified when Cursor changes its TUI. The command approval ('Run this command?' with '→ Run (once) (y)' … 'Skip & tell the agent what to do instead (esc or n)'), its follow-up input ('→ Tell the agent what to do instead (Enter to send, …)') are BLOCKED, and so is the workspace-trust prompt ('⚠ Workspace Trust Required', '[q] Quit', 'Use arrow keys to navigate, …') — its own rule looks only at the last lines, because Cursor does not use the alternate screen and the answered trust box stays in the scrollback above a working session; the Braille spinner line ('⠘⠣ Working') with the 'ctrl+c to stop' hint is WORKING; the '→ Add a follow-up' / '→ Plan, search, build anything' input line is IDLE. The input line stays visible while the agent works, so the idle rule vetoes on 'ctrl+c to stop' and 'Waiting for approval' and has the lowest priority; the approval rule anchors its patterns to the start of a line, because an answer that quotes the dialog text must not read as a pending approval. Cursor Agent does not use the alternate screen, so no rule depends on that flag.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": { "bottomNonEmptyLines": 20 },
+      "anyLineRegex": [
+        "^\\s*Run this command\\?\\s*$",
+        "^\\s*→?\\s*Run \\(once\\) \\(y\\)",
+        "^\\s*Skip & tell the agent what to do instead \\(esc or n\\)",
+        "^\\s*→\\s*Tell the agent what to do instead \\(Enter to send"
+      ]
+    },
+    {
+      "id": "workspace-trust",
+      "state": "BLOCKED",
+      "priority": 950,
+      "region": { "bottomNonEmptyLines": 6 },
+      "anyLineRegex": [
+        "^\\s*│\\s*Use arrow keys to navigate, Enter to select, or press the key shown",
+        "^\\s*│\\s*\\[q\\] Quit\\b"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": { "bottomNonEmptyLines": 8 },
+      "anyLineRegex": [
+        "^\\s*[⠀-⣿]{1,3}\\s+\\S",
+        "\\bctrl\\+c to stop\\s*$"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": { "bottomNonEmptyLines": 6 },
+      "anyLineRegex": [
+        "^\\s*→\\s+Add a follow-up\\s*$",
+        "^\\s*→\\s+Plan, search, build anything\\s*$",
+        "^\\s*→\\s+\\S"
+      ],
+      "notContains": ["ctrl+c to stop", "Waiting for approval"]
+    }
+  ]
+},
+{
+  "kind": "GEMINI_CLI",
+  "version": 1,
+  "comment": "Written against Gemini CLI 2026 (Ink TUI). Gemini CLI was not available in the sandbox: screens were transcribed from documented UI text and must be re-verified against live sessions; on 2026-10-27 only the start of an unauthenticated Gemini CLI 0.65.0 (Homebrew) could be recorded. Its folder-trust dialog ('Do you trust the files in this folder?' with '● 1. Trust folder (<dir>)' … '3. Don't trust') waits for an answer and is BLOCKED, like the trust prompts of Codex, Copilot and Cursor Agent; the sign-in menu that follows it ('How would you like to authenticate for this project?', '● 1. Sign in with Google', '(Use Enter to select)') is BLOCKED too, like the login prompts of Amp, Kiro and Jules. The tool confirmation dialog ('Allow execution of: …?', 'Apply this change?', '● 1. Yes, allow once') is BLOCKED; the Braille spinner line ending in '(esc to cancel, <n>s)' is WORKING; the rounded input box with the 'Type your message or @path/to/file' placeholder is IDLE. The input box stays visible while Gemini works, so the idle rule vetoes on 'esc to cancel,' and has the lowest priority; the approval rule vetoes on it too and anchors its question patterns, because a tool-result box that echoes 'Do you want to proceed? n' must not read as a confirmation dialog. No rule depends on the alternate-screen flag.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "folder-trust-prompt",
+      "state": "BLOCKED",
+      "priority": 950,
+      "region": { "bottomNonEmptyLines": 16 },
+      "anyLineRegex": ["^\\s*[│┃]\\s*Do you trust the files in this folder\\?\\s*[│┃]?\\s*$"],
+      "regex": "^\\s*[│┃]\\s*[●○]?\\s*1\\.\\s*Trust folder\\b"
+    },
+    {
+      "id": "auth-prompt",
+      "state": "BLOCKED",
+      "priority": 940,
+      "region": { "bottomNonEmptyLines": 20 },
+      "anyLineRegex": ["^\\s*[│┃]\\s*How would you like to authenticate for this project\\?\\s*[│┃]?\\s*$"],
+      "regex": "^\\s*[│┃]\\s*\\(Use Enter to select\\)"
+    },
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": { "bottomNonEmptyLines": 20 },
+      "anyLineRegex": [
+        "(?i)^\\s*[│┃]?\\s*Allow execution of:",
+        "(?i)^\\s*[│┃]?\\s*Apply this change\\?\\s*[│┃]?\\s*$",
+        "(?i)^\\s*[│┃]?\\s*Do you want to proceed\\?\\s*[│┃]?\\s*$",
+        "^\\s*[│┃]?\\s*[●○]?\\s*1\\.\\s*Yes, allow (once|always)"
+      ],
+      "notContains": ["esc to cancel,"]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": { "bottomNonEmptyLines": 8 },
+      "anyLineRegex": [
+        "\\(esc to cancel, \\d+s\\)",
+        "^\\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\\s+\\S"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": { "bottomNonEmptyLines": 6 },
+      "anyLineRegex": ["Type your message or @path/to/file", "^\\s*[│┃]\\s*>\\s*$"],
+      "notContains": ["esc to cancel,"]
+    }
+  ]
+},
+{
+  "kind": "GOOSE",
+  "version": 1,
+  "comment": "Written against goose CLI 1.53.0 and checked unchanged against 1.56.0 (Homebrew block-goose-cli; line UI on the normal screen) from live sessions recorded in a pty against an OpenAI-compatible LM Studio endpoint with GOOSE_MODE=approve; must be re-verified when goose changes its UI. goose writes into the scrollback, and an answered tool question stays visible with a hollow '◇' marker and the chosen option, so every rule looks only at the last lines. The open tool question ('◆  Goose would like to call the above tool, do you allow?' with '│  ● Allow' / '│  ○ Deny' options, filled '◆') is BLOCKED; the spinner line ending in '(Ctrl+C to interrupt)' is WORKING; the '>' input line as the last line ('> Enter to send · Ctrl+J newline' when empty) is IDLE. Between the spinner and the next prompt goose prints tool output and streams its answer, so the fallback is WORKING. pressly's database-migration tool is also named goose; it never shows these screens, so it is never reported. No rule depends on the alternate-screen flag.",
+  "fallbackState": "WORKING",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": {
+        "bottomNonEmptyLines": 8
+      },
+      "anyLineRegex": [
+        "^◆\\s+Goose would like to call the above tool",
+        "^│\\s+[●○]\\s+(?:Allow|Always Allow|Deny|Cancel)\\b"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": {
+        "bottomNonEmptyLines": 2
+      },
+      "anyLineRegex": [
+        "^\\s*[◐◓◑◒]\\s+\\S.*\\(Ctrl\\+C to interrupt\\)\\s*$"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": {
+        "bottomNonEmptyLines": 1
+      },
+      "anyLineRegex": [
+        "^>\\s"
+      ]
+    }
+  ]
+},
+{
+  "kind": "GROK_BUILD",
+  "version": 1,
+  "comment": "Written against xAI's Grok Build 1.0.46 and checked unchanged against 1.0.70 (native binary from x.ai/cli/install.sh; full-screen TUI on the alternate screen) from live sessions recorded in a pty against an OpenAI-compatible LM Studio endpoint (GROK_MODELS_BASE_URL, XAI_API_KEY and a [model.*] base_url in a throwaway ~/.grok/config.toml, no xAI login); must be re-verified when Grok Build changes its TUI. Grok redraws the whole screen and removes an answered dialog, so the approval rule may look at the whole screen. A tool permission dialog (options like '1 (●) Yes, and don't ask again for anything (always-approve mode)' … '3 (○) Yes, proceed', '4 (○) No, reject (type to add feedback)', footer '1/5:select  │  Tab:next option  │ …'; with the focus moved off it by Esc the footer reads 'Tab/Space:permission  │ …') is BLOCKED. The spinner line ending in '[stop]' ('⠙ Waiting for response… 0.1s … [stop]', 'Writing command…') and the footer 'Shift+Tab:mode  │  Ctrl+c:cancel' are WORKING; the input box ('│ ❯ ' above '─ <model> ─╯') without them is IDLE. The default option of the dialog is always-approve, so Enter alone approves everything: reject with ↓ ↓ ↓ Enter (option 4). Superagent's grok-cli is a different program with its own rule file (grok.json).",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": {
+        "bottomNonEmptyLines": 0
+      },
+      "anyLineRegex": [
+        "^\\s*┃\\s+\\d+ \\([●○]\\) No, reject\\b",
+        "^\\s*┃\\s+\\d+ \\([●○]\\) Yes, proceed\\b",
+        "^\\s*\\d+/\\d+:select\\s+│\\s+Tab:next option\\b",
+        "^\\s*Tab/Space:permission\\s+│"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": {
+        "bottomNonEmptyLines": 8
+      },
+      "anyLineRegex": [
+        "…\\s.*\\[stop\\]\\s*$",
+        "^\\s*Shift\\+Tab:mode\\s+│\\s+Ctrl\\+c:cancel\\b"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": {
+        "bottomNonEmptyLines": 6
+      },
+      "anyLineRegex": [
+        "^\\s*│ ❯ "
+      ],
+      "notContains": [
+        "[stop]",
+        "Ctrl+c:cancel"
+      ]
+    }
+  ]
+},
+{
+  "kind": "GROK",
+  "version": 1,
+  "comment": "Written against Superagent's grok-cli 1.0.1 (npm @vibe-kit/grok-cli; Ink UI on the normal screen) from live sessions recorded in a pty against an OpenAI-compatible LM Studio endpoint (GROK_BASE_URL); must be re-verified when grok-cli changes its UI. The confirmation dialog ('Do you want to proceed with this operation?' with '1. Yes' … '4. No, with feedback' and '↑↓ navigate • Enter select • Esc cancel') is BLOCKED; the spinner line ending in '(<n>s · ↑ <n> tokens · esc to interrupt)' is WORKING; the input box ('│ ❯ Ask me anything...') without a spinner is IDLE. xAI's official Grok Build is a different program with its own rule file (grok-build.json; its native 'grok' binary is detected as Grok Build); Homebrew's regex tool 'grok' never shows these screens, so it is never reported.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": {
+        "bottomNonEmptyLines": 12
+      },
+      "anyLineRegex": [
+        "^\\s*Do you want to proceed with this operation\\?",
+        "^\\s*↑↓ navigate • Enter select • Esc cancel"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": {
+        "bottomNonEmptyLines": 8
+      },
+      "anyLineRegex": [
+        "\\(\\d+s\\b[^)]*esc to interrupt\\)\\s*$"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": {
+        "bottomNonEmptyLines": 4
+      },
+      "anyLineRegex": [
+        "^\\s*│ ❯ "
+      ],
+      "notContains": [
+        "esc to interrupt"
+      ]
+    }
+  ]
+},
+{
+  "kind": "JULES",
+  "version": 1,
+  "comment": "PARTLY UNVERIFIED: written against Jules CLI 0.1.42 without a Jules account. Jules runs its sessions in Google's cloud; the local 'jules' process is a dashboard (TUI) that lists those sessions, so the states describe the sessions it shows. Verified on screen: the unauthenticated dashboard with 'Jules authentication is required. Please use the /login command to authenticate.' (BLOCKED, the user has to log in) and the input line '> Search sessions or type / to use command'. The session states come from the Jules API reference (SessionState: AWAITING_PLAN_APPROVAL, AWAITING_USER_FEEDBACK, PLANNING, IN_PROGRESS, QUEUED, …); how the dashboard spells them could not be checked, so the patterns accept both the enum form and the spaced form, case-insensitively. A listed session awaiting plan approval or user feedback is BLOCKED; a queued, planning or in-progress session is WORKING; otherwise the dashboard input line is IDLE (also the fallback). A session title that happens to contain these words could mislead the working rule. The fixtures other than the unauthenticated dashboard are synthesized and named synthetic-*. Must be re-verified against live authenticated sessions.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "login-required",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": {
+        "bottomNonEmptyLines": 6
+      },
+      "anyLineRegex": [
+        "Jules authentication is required\\. Please use the /login command to authenticate\\."
+      ]
+    },
+    {
+      "id": "awaiting-user",
+      "state": "BLOCKED",
+      "priority": 990,
+      "region": {
+        "bottomNonEmptyLines": 0
+      },
+      "anyLineRegex": [
+        "(?i)\\bawaiting[ _](?:plan[ _]approval|user[ _]feedback)\\b"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": {
+        "bottomNonEmptyLines": 0
+      },
+      "anyLineRegex": [
+        "(?i)\\b(?:in[ _]progress|planning|queued)\\b"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": {
+        "bottomNonEmptyLines": 4
+      },
+      "anyLineRegex": [
+        "^\\s*>\\s"
+      ]
+    }
+  ]
+},
+{
+  "kind": "KILO",
+  "version": 1,
+  "comment": "Written against Kilo CLI 7.8.18 (npm @kilocode/cli, a fork of OpenCode; native TUI on the alternate screen) from live sessions recorded in a pty against an OpenAI-compatible LM Studio provider, with edit and shell permissions set to ask; must be re-verified when Kilo changes its TUI. The permission box ('△ Permission required' with the 'Allow once   Allow always   Reject' choices and the '⇆ select  enter confirm' hint) is BLOCKED; Kilo spells the second choice 'Allow always' where OpenCode says 'Always allow'. Reject does not deny at once: it opens a second step ('△ Reject permission', 'Tell Kilo what to do differently', 'enter confirm  esc cancel') that waits for an optional reason, also BLOCKED; Enter on the empty field denies. The progress-bar footer ('■■⬝⬝⬝⬝⬝⬝  esc interrupt') shown while a turn runs is WORKING. The prompt box closed by its '╹▀▀▀' border with the 'tab agents  ctrl+p commands' footer is IDLE; on the start screen a tip and the working directory sit below that footer, so the idle rule looks at the bottom ten lines. The prompt box stays visible while Kilo works, so the idle rule vetoes on 'esc interrupt', 'Permission required' and 'Reject permission' and has the lowest priority; the approval rule anchors its patterns to the start of a line (after the box border), because a transcript that quotes the dialog text must not read as a pending permission. No rule depends on the alternate-screen flag.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": { "bottomNonEmptyLines": 20 },
+      "anyLineRegex": [
+        "^\\s*[┃│]?\\s*△\\s*Permission required\\b",
+        "^\\s*[┃│]?\\s*Allow once\\s+Allow always\\s+Reject\\b",
+        "⇆ select\\s+enter confirm\\s*$"
+      ]
+    },
+    {
+      "id": "reject-feedback",
+      "state": "BLOCKED",
+      "priority": 990,
+      "region": { "bottomNonEmptyLines": 8 },
+      "anyLineRegex": [
+        "^\\s*[┃│]?\\s*△\\s*Reject permission\\b",
+        "^\\s*[┃│]?\\s*Tell Kilo what to do differently\\s*$"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": { "bottomNonEmptyLines": 4 },
+      "anyLineRegex": [
+        "^\\s*[■⬝]{4,}\\s+esc interrupt\\b"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": { "bottomNonEmptyLines": 10 },
+      "anyLineRegex": [
+        "^\\s*╹▀{10,}",
+        "\\bctrl\\+p commands?\\s*$"
+      ],
+      "notContains": ["esc interrupt", "Permission required", "Reject permission"]
+    }
+  ]
+},
+{
+  "kind": "KIRO",
+  "version": 1,
+  "comment": "UNVERIFIED except for the sign-in prompt: written against Kiro CLI 2.28.0 without a Kiro account, so no live chat session could be recorded. Only 'Press enter to continue to the browser or esc to cancel' (the sign-in prompt of an unauthenticated 'kiro-cli chat') was seen on screen (BLOCKED). Kiro 2.x has two UIs, the legacy line UI (--legacy-ui, the former Amazon Q Developer CLI) and a new terminal UI (--tui); which one starts by default could not be checked. The legacy patterns come from the string table of kiro-cli-chat: the tool question 'Allow this action? Use 't' to trust (always allow) the '<tool>' tool for the session. [y/n/t]:' (BLOCKED, last lines only because the legacy UI writes into the scrollback), the 'Thinking...' spinner (WORKING) and the '>' / '!>' (trust-all) prompt (IDLE). The new TUI is described only in Kiro's documentation: a '⏸' status icon on a tool that awaits approval and a notification bar with Yes, Trust and No (BLOCKED). The fallback is IDLE, so an unrecognised TUI screen does not read as working forever. The fixtures other than the sign-in prompt are synthesized and named synthetic-*. Must be re-verified against live authenticated sessions in both UIs.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "sign-in-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": {
+        "bottomNonEmptyLines": 2
+      },
+      "anyLineRegex": [
+        "^\\s*Press enter to continue to the browser or esc to cancel\\s*$"
+      ]
+    },
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 990,
+      "region": {
+        "bottomNonEmptyLines": 3
+      },
+      "anyLineRegex": [
+        "Allow this action\\?",
+        "\\[y/n/t\\]:\\s*\\S?\\s*$",
+        "requires approval, press 'y' to approve and 'n' to deny",
+        "^\\s*⏸\\s+\\S",
+        "^\\s*[│┃]?\\s*(?:[›>▸●○]\\s*)?Yes\\s{2,}(?:[›>▸●○]\\s*)?Trust\\s{2,}(?:[›>▸●○]\\s*)?No\\b"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": {
+        "bottomNonEmptyLines": 2
+      },
+      "anyLineRegex": [
+        "^\\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\\s+Thinking\\.\\.\\."
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": {
+        "bottomNonEmptyLines": 1
+      },
+      "anyLineRegex": [
+        "^(?:\\[[^\\]]+\\]\\s*)?!?>(?:\\s|$)"
+      ]
+    }
+  ]
+},
+{
+  "kind": "MINIMAX_CODE",
+  "version": 1,
+  "comment": "Written against MiniMax Code (mcode) 0.5.9 and checked unchanged against 0.6.3 and 0.7.0, from live sessions recorded in a pty; must be re-verified when MCode changes its TUI. The tool approval dialog ('◆ Approval required' box with 'Run this command?', the numbered '1 Allow for this conversation' options and the '↑/↓ choose · Enter confirm · Esc deny' footer) and its 'Deny this action?' follow-up are BLOCKED; the Braille spinner line ending in '· Esc stop' ('⠋ Loading 2s · … · Esc stop', '⠋ Running 5s · …') is WORKING; the '›  Ask Mcode to do anything' composer with its 'Enter send' / '@ file or Plugin' hint line is IDLE. The composer stays visible while MCode works, so the idle rule vetoes on 'Esc stop' and has the lowest priority; the approval rule vetoes on it too and anchors its patterns to the dialog box border, because a transcript that quotes the dialog text must not read as a pending approval. No rule depends on the alternate-screen flag (the default TUI mode does not switch screens).",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": { "bottomNonEmptyLines": 24 },
+      "anyLineRegex": [
+        "^\\s*╭─\\s*◆\\s*Approval required\\b",
+        "^\\s*│\\s*↑/↓ choose · Enter confirm · Esc deny",
+        "^\\s*│\\s*Deny this action\\?",
+        "^\\s*│\\s*Approve this plan and start implementation\\?"
+      ],
+      "notContains": ["· Esc stop"]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": { "bottomNonEmptyLines": 8 },
+      "anyLineRegex": [
+        "^\\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\\s+\\S.*· Esc stop\\s*$"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": { "bottomNonEmptyLines": 8 },
+      "anyLineRegex": [
+        "^\\s*›\\s+Ask Mcode to do anything\\s*$",
+        "^\\s*(Message|Prompt) · Enter send\\b",
+        "^\\s*Start · @ file or Plugin\\b"
+      ],
+      "notContains": ["· Esc stop"]
+    }
+  ]
+},
+{
+  "kind": "OPENCODE",
+  "version": 1,
+  "comment": "Written against OpenCode 2.0.20 and checked unchanged against 2.0.25 and 2.2.0 (native TUI on the alternate screen) from live sessions recorded in a pty against an OpenAI-compatible LM Studio endpoint, with edit and shell permissions set to ask; must be re-verified when OpenCode changes its TUI. The permission box ('△ Permission required' with the 'Allow once   Always allow   Reject' choices and the '⇆ select  enter confirm' hint) is BLOCKED; the progress-bar footer ('■■⬝⬝⬝⬝⬝⬝ esc interrupt') shown while a turn runs is WORKING; the prompt box closed by its '╹▀▀▀' border with the 'ctrl+p commands' footer is IDLE. The prompt box stays visible while OpenCode works, so the idle rule vetoes on 'esc interrupt' and 'Permission required' and has the lowest priority; the approval rule anchors its patterns to the start of a line (after the box border), because a transcript that quotes the dialog text must not read as a pending permission. No rule depends on the alternate-screen flag.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": { "bottomNonEmptyLines": 20 },
+      "anyLineRegex": [
+        "^\\s*[┃│]?\\s*△\\s*Permission required\\b",
+        "^\\s*[┃│]?\\s*Allow once\\s+Always allow\\s+Reject\\b",
+        "⇆ select\\s+enter confirm\\s*$"
+      ]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": { "bottomNonEmptyLines": 4 },
+      "anyLineRegex": [
+        "^\\s*[■⬝]{4,}\\s+esc interrupt\\b"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": { "bottomNonEmptyLines": 6 },
+      "anyLineRegex": [
+        "^\\s*╹▀{10,}",
+        "\\bctrl\\+p commands?\\s*$"
+      ],
+      "notContains": ["esc interrupt", "Permission required"]
+    }
+  ]
+},
+{
+  "kind": "QWEN_CODE",
+  "version": 1,
+  "comment": "Written against Qwen Code 0.25.0 and checked unchanged against 0.26.1 (Ink TUI, a Gemini CLI fork, alternate screen) from live sessions recorded in a pty against an OpenAI-compatible LM Studio endpoint; must be re-verified when Qwen Code changes its TUI. The tool confirmation dialog ('Allow execution of: 'curl'?', 'Apply this change?', '› 1. Yes, allow once') with its 'Waiting for user confirmation...' spinner line is BLOCKED; the Braille spinner line ending in '(<n>s · … · esc to cancel)' and the 'Enter to steer · Ctrl+Q to queue' footer shown while a turn runs are WORKING; the '>   Type your message or @path/to/file' input box is IDLE. The input box stays visible while Qwen works, so the idle rule vetoes on 'esc to cancel' and 'Enter to steer' and has the lowest priority; the approval rule anchors its patterns to the start of a line, because a transcript that quotes the dialog text must not read as a pending confirmation. The 'Connect a Provider' onboarding menu intentionally matches no rule. No rule depends on the alternate-screen flag.",
+  "fallbackState": "IDLE",
+  "rules": [
+    {
+      "id": "approval-prompt",
+      "state": "BLOCKED",
+      "priority": 1000,
+      "region": { "bottomNonEmptyLines": 20 },
+      "anyLineRegex": [
+        "^\\s*[│┃]?\\s*Allow execution of:",
+        "^\\s*[│┃]?\\s*Apply this change\\?",
+        "^\\s*[│┃]?\\s*Do you want to proceed\\?",
+        "^\\s*[│┃]?\\s*[›●○]?\\s*1\\.\\s*Yes, allow (once|always)",
+        "^\\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\\s+Waiting for user confirmation\\.\\.\\."
+      ],
+      "notContains": ["esc to cancel)"]
+    },
+    {
+      "id": "working",
+      "state": "WORKING",
+      "priority": 900,
+      "region": { "bottomNonEmptyLines": 8 },
+      "anyLineRegex": [
+        "^\\s*[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\\s+\\S.*\\(\\d+s\\b[^)]*esc to cancel\\)",
+        "^\\s*Enter to steer · Ctrl\\+Q to queue\\b"
+      ]
+    },
+    {
+      "id": "idle-prompt",
+      "state": "IDLE",
+      "priority": 100,
+      "region": { "bottomNonEmptyLines": 6 },
+      "anyLineRegex": [
+        "^\\s*>\\s+Type your message or @path/to/file",
+        "^\\s*>\\s+\\S"
+      ],
+      "notContains": ["esc to cancel)", "Enter to steer"]
+    }
+  ]
+}
+]

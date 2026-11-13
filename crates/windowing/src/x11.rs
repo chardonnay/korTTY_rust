@@ -20,6 +20,29 @@ pub(super) fn sample(screen: usize, windows: &[NativeWindow]) -> Option<Sample> 
     result
 }
 
+pub(super) fn file_drop_position(window: u32) -> Option<(f64, f64)> {
+    let mut connection = CONNECTION.lock().ok()?;
+    if connection.is_none() {
+        *connection = Some(x11rb::connect(None).ok()?.0);
+    }
+    let result = client_position(connection.as_ref()?, window);
+    if result.is_none() {
+        *connection = None;
+    }
+    result
+}
+
+fn client_position(connection: &RustConnection, window: u32) -> Option<(f64, f64)> {
+    let pointer = connection.query_pointer(window).ok()?.reply().ok()?;
+    let geometry = connection.get_geometry(window).ok()?.reply().ok()?;
+    let x = f64::from(pointer.win_x);
+    let y = f64::from(pointer.win_y);
+    (pointer.same_screen
+        && (0.0..f64::from(geometry.width)).contains(&x)
+        && (0.0..f64::from(geometry.height)).contains(&y))
+    .then_some((x, y))
+}
+
 fn sample_connection(
     connection: &RustConnection,
     screen: usize,

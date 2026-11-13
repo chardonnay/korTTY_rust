@@ -84,15 +84,70 @@ pub(crate) fn encode_screen(
     pixels: (u16, u16),
     include_style: bool,
 ) -> Result<Vec<u8>, Error> {
+    encode_grid(
+        pane,
+        Grid {
+            columns: screen.columns,
+            rows: screen.rows,
+            pixels,
+            cursor: screen.cursor,
+            cursor_shape: screen.cursor_shape,
+            cursor_blinking: screen.cursor_blinking,
+            reverse_video: include_style && screen.reverse_video,
+        },
+        screen
+            .cells
+            .iter()
+            .map(|cell| VisualCell::new(cell, include_style)),
+    )
+}
+
+pub(crate) fn encode_recorded_screen(
+    pane: u64,
+    screen: &RecordedScreen,
+    include_style: bool,
+) -> Result<Vec<u8>, Error> {
+    encode_grid(
+        pane,
+        Grid {
+            columns: screen.columns,
+            rows: screen.rows,
+            pixels: screen.pixels,
+            cursor: screen.cursor,
+            cursor_shape: screen.cursor_shape,
+            cursor_blinking: screen.cursor_blinking,
+            reverse_video: include_style && screen.reverse_video,
+        },
+        screen
+            .cells
+            .iter()
+            .map(|cell| VisualCell::from_parts(&cell.text, cell.width, cell.style, include_style)),
+    )
+}
+
+struct Grid {
+    columns: u16,
+    rows: u16,
+    pixels: (u16, u16),
+    cursor: Cursor,
+    cursor_shape: CursorShape,
+    cursor_blinking: bool,
+    reverse_video: bool,
+}
+
+fn encode_grid<'a>(
+    pane: u64,
+    screen: Grid,
+    mut cells: impl ExactSizeIterator<Item = VisualCell<'a>> + Clone,
+) -> Result<Vec<u8>, Error> {
     let expected = grid_len(screen.columns, screen.rows)
         .ok_or(Error::Invalid("screen dimensions are out of range"))?;
-    if screen.cells.len() != expected
+    let mut widths = cells.clone().map(|cell| cell.width);
+    if cells.len() != expected
         || screen.cursor.column >= screen.columns
         || screen.cursor.row >= screen.rows
-        || !screen
-            .cells
-            .chunks_exact(usize::from(screen.columns))
-            .all(|row| valid_widths(row.iter().map(|cell| cell.width)))
+        || !(0..screen.rows)
+            .all(|_| valid_widths(widths.by_ref().take(usize::from(screen.columns))))
     {
         return Err(Error::Invalid(
             "screen cells or cursor do not match its dimensions",
@@ -103,8 +158,8 @@ pub(crate) fn encode_screen(
     for value in [
         screen.columns,
         screen.rows,
-        pixels.0,
-        pixels.1,
+        screen.pixels.0,
+        screen.pixels.1,
         screen.cursor.column,
         screen.cursor.row,
     ] {
@@ -119,13 +174,9 @@ pub(crate) fn encode_screen(
         shape
             | u8::from(screen.cursor.visible) << 2
             | u8::from(screen.cursor_blinking) << 3
-            | u8::from(include_style && screen.reverse_video) << 4,
+            | u8::from(screen.reverse_video) << 4,
     );
 
-    let mut cells = screen
-        .cells
-        .iter()
-        .map(|cell| VisualCell::new(cell, include_style));
     let mut current = cells.next().ok_or(Error::Invalid("empty screen grid"))?;
     let mut expanded_text = current.text.len();
     let mut count = 1u32;
@@ -155,15 +206,15 @@ struct VisualCell<'a> {
 
 impl<'a> VisualCell<'a> {
     fn new(cell: &'a Cell, include_style: bool) -> Self {
+        Self::from_parts(&cell.text, cell.width, cell.style, include_style)
+    }
+
+    fn from_parts(text: &'a str, width: u8, style: Style, include_style: bool) -> Self {
         Self {
-            width: cell.width,
-            text: if cell.style.hidden || cell.width == 0 {
-                ""
-            } else {
-                &cell.text
-            },
+            width,
+            text: if style.hidden || width == 0 { "" } else { text },
             style: if include_style {
-                cell.style
+                style
             } else {
                 Style::default()
             },

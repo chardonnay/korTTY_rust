@@ -84,6 +84,20 @@ fn mark(color: [u8; 3]) -> Annotation {
 }
 
 #[test]
+fn screenshot_note_translation_source_rejects_changed_note_or_screenshot_row() {
+    let fixture = Fixture::new(XML);
+    let draft = fixture.draft();
+    draft.require_translation_source().unwrap();
+    let document = fixture.journal.join(DOCUMENT);
+    fs::write(&document, XML.replace("Preserve", "Updated title")).unwrap();
+    draft.require_translation_source().unwrap();
+    fs::write(&document, XML.replace("Original note", "Changed note")).unwrap();
+    assert!(draft.require_translation_source().is_err());
+    fs::write(&document, XML.replace(REFERENCE, "screenshots/other.png")).unwrap();
+    assert!(draft.require_translation_source().is_err());
+}
+
+#[test]
 fn journal_screenshot_edit_bakes_from_private_original_and_restores_exact_bytes() {
     let fixture = Fixture::new(XML);
     let first = fixture.draft();

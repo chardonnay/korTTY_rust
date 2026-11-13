@@ -1,0 +1,4 @@
+before cursor=1,3 reply= screen=[row0|row1|row2|] history=[archived]
+clear cursor=1,3 reply= screen=[|||] history=[]
+pending-wrap cursor=2,1 reply= screen=[||!|] history=[]
+single-row cursor=0,4 reply= screen=[live] history=[]

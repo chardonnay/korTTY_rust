@@ -108,6 +108,7 @@ impl Workspace {
             let form = crate::serial_dialog::SerialDialog::new(self.allocate(), serial, profile);
             if let Some(window) = self.windows.get_mut(&owner) {
                 window.pending_serial = Some(super::PendingSerial {
+                    saved: None,
                     form,
                     replace: None,
                     reconnect: None,
@@ -240,6 +241,7 @@ impl Workspace {
         }
         let failure = match &pane.frame.status {
             Status::Running if valid => None,
+            Status::Exited(_) if valid && pane.saved_local.is_some() => None,
             Status::Error(error) if valid => Some(format!("Could not open the split ({error})")),
             _ if valid => Some("The connection closed before the split was ready.".into()),
             _ => Some("The original pane is no longer available for splitting.".into()),

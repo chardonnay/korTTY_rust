@@ -8,7 +8,7 @@ use pgp::types::{CompressionAlgorithm, KeyDetails, KeyVersion};
 use rand::{SeedableRng, rngs::StdRng};
 
 use super::*;
-use crate::profile_backup::{detect_format, preferences::EncryptionMode};
+use crate::profile_backup::{BackupFormat, detect_format};
 use crate::snippets::{archive::test_openpgp_key, recipients};
 
 struct Fixture(PathBuf);
@@ -95,6 +95,22 @@ fn snapshot() -> Snapshot {
     )])
 }
 
+fn read(source: &Path, private_key: &Path, password: &Secret) -> io::Result<Snapshot> {
+    match read_profile(source, private_key, password)? {
+        ProfileBackup::Native(snapshot) => Ok(snapshot),
+        ProfileBackup::Java(_) => panic!("expected a native OpenPGP backup"),
+    }
+}
+
+fn decrypt(
+    ciphertext: &[u8],
+    key: &SignedSecretKey,
+    password: &Secret,
+    max_payload: usize,
+) -> io::Result<Zeroizing<Vec<u8>>> {
+    decrypt_literal(ciphertext, key, password, max_payload, false).map(|literal| literal.bytes)
+}
+
 #[test]
 fn round_trip_uses_protected_v4_and_v6_keys_and_checks_full_authentication() {
     for version in [KeyVersion::V4, KeyVersion::V6] {
@@ -135,7 +151,7 @@ fn round_trip_uses_protected_v4_and_v6_keys_and_checks_full_authentication() {
         })
         .unwrap();
         fs::write(&binary, &bytes).unwrap();
-        assert_eq!(detect_format(&binary).unwrap(), EncryptionMode::OpenPgp);
+        assert_eq!(detect_format(&binary).unwrap(), BackupFormat::OpenPgp);
         assert_eq!(read(&binary, &key_path, &password).unwrap(), snapshot);
         *bytes.last_mut().unwrap() ^= 0x01;
         fs::write(&binary, &bytes).unwrap();
@@ -154,12 +170,12 @@ fn markerless_import_works_but_rotation_requires_marker_exact_shape_and_eof() {
     let written = fixture.backup(&expected, &recipient);
     let path = fixture.0.join("renamed.zip");
     fs::rename(written, &path).unwrap();
-    assert_eq!(detect_format(&path).unwrap(), EncryptionMode::OpenPgp);
+    assert_eq!(detect_format(&path).unwrap(), BackupFormat::OpenPgp);
     let native = fs::read_to_string(&path).unwrap();
     let password = Secret::default();
     let markerless = native.replace(&format!("Comment: {COMMENT}\n"), "");
     fs::write(&path, &markerless).unwrap();
-    assert_eq!(detect_format(&path).unwrap(), EncryptionMode::OpenPgp);
+    assert_eq!(detect_format(&path).unwrap(), BackupFormat::OpenPgp);
     assert_eq!(read(&path, &key_path, &password).unwrap(), expected);
     let mut file = File::open(&path).unwrap();
     assert!(validate_ciphertext(&mut file).is_err());
@@ -212,6 +228,87 @@ fn compressed_and_non_profile_literal_zip_are_refused() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn java_gnupg_backup_uses_the_additive_preview_and_rejects_tampering() {
+    const DEFAULT: &[u8] = include_bytes!("fixtures/java-default.zip.gpg");
+    const COMPRESSED: &[u8] = include_bytes!("fixtures/java-compressed.zip.gpg");
+    const PRIVATE: &[u8] = include_bytes!("fixtures/java-fixture-secret.asc");
+
+    let fixture = Fixture::new();
+    let path = fixture.0.join("renamed-java-backup.dat");
+    let key_path = fixture.0.join("java-fixture-secret.asc");
+    fs::write(&key_path, PRIVATE).unwrap();
+    let password = Secret::new("fixture-only Java GnuPG".into());
+    for (ciphertext, compressed) in [(DEFAULT, false), (COMPRESSED, true)] {
+        fs::write(&path, ciphertext).unwrap();
+        assert_eq!(detect_format(&path).unwrap(), BackupFormat::OpenPgp);
+        let preview = crate::profile_backup::inspect_openpgp(&path, &key_path, &password).unwrap();
+        let (format, entries, omissions) = preview.java_review().unwrap();
+        assert_eq!(format, "Integrity-checked Java OpenPGP backup");
+        assert_eq!(
+            entries,
+            ["Connection profiles (1)", "Project layout (GnuPG Project)"]
+        );
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| entry.starts_with("credentials.xml:"))
+        );
+        assert!(
+            omissions
+                .iter()
+                .any(|entry| entry.starts_with("memory/empty.md:"))
+        );
+        let literal = decrypt_literal(
+            ciphertext,
+            &read_secret_key(&key_path).unwrap(),
+            &password,
+            4096,
+            true,
+        )
+        .unwrap();
+        assert_eq!(literal.compressed, compressed);
+        assert!(
+            decrypt_literal(
+                ciphertext,
+                &read_secret_key(&key_path).unwrap(),
+                &password,
+                128,
+                true
+            )
+            .is_err()
+        );
+        assert!(
+            crate::profile_backup::inspect_openpgp(&path, &key_path, &Secret::new("wrong".into()))
+                .is_err()
+        );
+
+        let mut tampered = ciphertext.to_vec();
+        *tampered.last_mut().unwrap() ^= 1;
+        fs::write(&path, tampered).unwrap();
+        assert!(crate::profile_backup::inspect_openpgp(&path, &key_path, &password).is_err());
+    }
+}
+
+#[test]
+fn compressed_literal_rejects_nested_packets_and_trailing_data() {
+    let content = b"bounded document";
+    let mut literal = vec![0xcb, (6 + content.len()) as u8, b'b', 0, 0, 0, 0, 0];
+    literal.extend_from_slice(content);
+    assert_eq!(
+        read_literal_packet(literal.as_slice(), content.len())
+            .unwrap()
+            .as_slice(),
+        content
+    );
+    assert!(read_literal_packet(literal.as_slice(), content.len() - 1).is_err());
+    let nested = [literal.as_slice(), literal.as_slice()].concat();
+    assert!(read_literal_packet(nested.as_slice(), nested.len()).is_err());
+    let mut trailing = literal;
+    trailing.push(0);
+    assert!(read_literal_packet(trailing.as_slice(), trailing.len()).is_err());
 }
 
 #[test]

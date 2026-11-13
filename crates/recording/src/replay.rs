@@ -13,16 +13,66 @@ static EXPORT_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Copy)]
 struct IndexedFrame {
+    pane: u64,
     offset: u64,
     length: usize,
     recorded_at: Duration,
     playback_at: Duration,
 }
 
+impl IndexedFrame {
+    fn decode(self, payload: &[u8]) -> Result<ReplayFrame, Error> {
+        let (pane, screen) = codec::decode_screen(payload)?;
+        if pane != self.pane {
+            return Err(Error::Format("screen pane changed after indexing"));
+        }
+        Ok(ReplayFrame {
+            pane,
+            recorded_at: self.recorded_at,
+            playback_at: self.playback_at,
+            screen,
+        })
+    }
+}
+
+struct PaneIndex {
+    frames: Vec<usize>,
+    starts: Vec<usize>,
+}
+
+impl PaneIndex {
+    fn new(frames: &[IndexedFrame]) -> Self {
+        let mut sorted: Vec<_> = (0..frames.len()).collect();
+        sorted.sort_unstable_by_key(|&index| (frames[index].pane, index));
+        let starts = sorted
+            .iter()
+            .enumerate()
+            .filter_map(|(position, &index)| {
+                (position == 0 || frames[sorted[position - 1]].pane != frames[index].pane)
+                    .then_some(position)
+            })
+            .collect();
+        Self {
+            frames: sorted,
+            starts,
+        }
+    }
+
+    fn frames(&self, pane: usize) -> &[usize] {
+        let end = self
+            .starts
+            .get(pane + 1)
+            .copied()
+            .unwrap_or(self.frames.len());
+        &self.frames[self.starts[pane]..end]
+    }
+}
+
 /// A bounded seek index and an open source. Frames are decoded on demand.
 pub struct Replay<R = BufReader<File>> {
     reader: R,
     frames: Vec<IndexedFrame>,
+    panes: Option<PaneIndex>,
     duration: Duration,
     complete: bool,
 }
@@ -93,7 +143,10 @@ impl<R: Read + Seek> Replay<R> {
                 (State::Recording | State::AutoPaused, Kind::Stop) => state = State::Stopped,
                 (State::Recording, Kind::InputActivity) => {}
                 (State::Recording, Kind::Screen) => {
+                    let mut pane = [0; 8];
+                    reader.read_exact(&mut pane)?;
                     frames.push(IndexedFrame {
+                        pane: u64::from_le_bytes(pane),
                         offset: payload,
                         length: event.length,
                         recorded_at: Duration::from_nanos(event.at),
@@ -124,9 +177,14 @@ impl<R: Read + Seek> Replay<R> {
                 duration += FALLBACK_FINAL_FRAME;
             }
         }
+        let panes = frames
+            .windows(2)
+            .any(|pair| pair[0].pane != pair[1].pane)
+            .then(|| PaneIndex::new(&frames));
         Ok(Self {
             reader,
             frames,
+            panes,
             duration,
             complete,
         })
@@ -152,6 +210,34 @@ impl<R: Read + Seek> Replay<R> {
         (!self.frames.is_empty()).then(|| self.index_at(at))
     }
 
+    /// Number of distinct recorded panes.
+    pub fn pane_count(&self) -> usize {
+        self.panes
+            .as_ref()
+            .map_or(usize::from(!self.frames.is_empty()), |panes| {
+                panes.starts.len()
+            })
+    }
+
+    /// Latest frame index for each pane in the given range, in pane ID order.
+    /// A pane has no visible frame before its first event.
+    pub fn pane_frame_indices_at(
+        &self,
+        at: Duration,
+        panes: Range<usize>,
+    ) -> impl Iterator<Item = Option<usize>> + '_ {
+        (panes.start..panes.end.min(self.pane_count())).map(move |pane| {
+            let Some(panes) = &self.panes else {
+                return self.frame_index_at(at);
+            };
+            let indices = panes.frames(pane);
+            indices
+                .partition_point(|&index| self.frames[index].playback_at <= at)
+                .checked_sub(1)
+                .map(|index| indices[index])
+        })
+    }
+
     /// Whether the recorder wrote its closing marker.
     pub fn is_complete(&self) -> bool {
         self.complete
@@ -163,13 +249,7 @@ impl<R: Read + Seek> Replay<R> {
             return Ok(None);
         };
         let payload = self.payload(entry)?;
-        let (pane, screen) = codec::decode_screen(&payload)?;
-        Ok(Some(ReplayFrame {
-            pane,
-            recorded_at: entry.recorded_at,
-            playback_at: entry.playback_at,
-            screen,
-        }))
+        entry.decode(&payload).map(Some)
     }
 
     /// Retrieves the latest screen at or before a playback time. Equal timestamps retain event order.
@@ -179,7 +259,7 @@ impl<R: Read + Seek> Replay<R> {
 
     /// Writes a self-contained native replay of a nonempty playback range to a new file.
     ///
-    /// The export starts with the frame visible at `range.start` and rebases time to zero.
+    /// The export starts with the frames visible at `range.start` and rebases time to zero.
     /// Publication requires same-volume hard-link support and rejects an existing destination.
     pub fn export_range(
         &mut self,
@@ -197,14 +277,21 @@ impl<R: Read + Seek> Replay<R> {
         let stage = ExportStage::new(destination)?;
         let mut recorder = Recorder::create(stage.file(), CaptureOptions::default())?;
         recorder.start(Duration::ZERO)?;
-        let first = self.index_at(range.start);
-        for index in first..self.frames.len() {
+        let mut first: Vec<_> = self
+            .pane_frame_indices_at(range.start, 0..self.pane_count())
+            .flatten()
+            .collect();
+        first.sort_unstable();
+        let following = self
+            .frames
+            .partition_point(|frame| frame.playback_at <= range.start);
+        for index in first.into_iter().chain(following..self.frames.len()) {
             let entry = self.frames[index];
             if entry.playback_at >= range.end {
                 break;
             }
             let payload = self.payload(entry)?;
-            codec::decode_screen(&payload)?;
+            entry.decode(&payload)?;
             recorder.exported_frame(entry.playback_at.saturating_sub(range.start), &payload)?;
         }
         let writer = recorder.finish(duration)?;

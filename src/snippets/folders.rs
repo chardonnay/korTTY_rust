@@ -10,9 +10,9 @@ use unicode_normalization::UnicodeNormalization as _;
 
 use super::{Document, Library, MAX_SNIPPETS, Snippet, SnippetId, invalid, valid_field};
 
-const MAX_DEPTH: usize = 32;
-const MAX_PATH_BYTES: usize = 1024;
-const MAX_FOLDERS: usize = MAX_SNIPPETS * MAX_DEPTH + 1024;
+pub(super) const MAX_DEPTH: usize = 32;
+pub(super) const MAX_PATH_BYTES: usize = 1024;
+pub(super) const MAX_FOLDERS: usize = MAX_SNIPPETS * MAX_DEPTH + 1024;
 
 /// A folder's identity survives renames, moves and restarts.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -20,6 +20,10 @@ const MAX_FOLDERS: usize = MAX_SNIPPETS * MAX_DEPTH + 1024;
 pub(crate) struct Id(SnippetId);
 
 impl Id {
+    pub(super) fn from_java_uuid(text: &str) -> io::Result<Self> {
+        SnippetId::from_java_uuid(text).map(Self)
+    }
+
     fn from_legacy_path(key: &str, attempt: usize) -> io::Result<Self> {
         let input = format!("kortty/snippet-folder/v1\0{attempt}\0{key}");
         let digest = HashAlgorithm::Sha256
@@ -164,6 +168,57 @@ impl Catalog {
 }
 
 impl Document {
+    pub(super) fn merge_java_backup_folders(&mut self, folders: Vec<Folder>) {
+        let mut ids: HashSet<_> = self
+            .folder_catalog
+            .entries
+            .iter()
+            .map(|folder| folder.id)
+            .collect();
+        let mut paths: HashSet<_> = self
+            .folder_catalog
+            .entries
+            .iter()
+            .map(|folder| path_key(&folder.path))
+            .collect();
+        for folder in folders {
+            let path = path_key(&folder.path);
+            if !ids.contains(&folder.id) && !paths.contains(&path) {
+                ids.insert(folder.id);
+                paths.insert(path);
+                self.folders.push(folder);
+            }
+        }
+    }
+
+    pub(super) fn import_java_folders(&mut self, folders: Vec<Folder>) -> io::Result<bool> {
+        let before = self.folders.len();
+        let mut existing_ids: HashSet<_> = self
+            .folder_catalog
+            .entries
+            .iter()
+            .map(|folder| folder.id)
+            .collect();
+        let mut existing_paths: HashSet<_> = self
+            .folder_catalog
+            .entries
+            .iter()
+            .map(|folder| path_key(&folder.path))
+            .collect();
+        for folder in folders {
+            if self.folder_catalog.get(folder.id) == Some(&folder) {
+                continue;
+            }
+            if !existing_ids.insert(folder.id) || !existing_paths.insert(path_key(&folder.path)) {
+                return Err(invalid(
+                    "An imported Java snippet folder conflicts with an existing folder",
+                ));
+            }
+            self.folders.push(folder);
+        }
+        Ok(self.folders.len() != before)
+    }
+
     pub(super) fn materialize_folders(&mut self) -> io::Result<()> {
         self.folder_catalog = Arc::new(Catalog::build(&self.folders, &self.snippets)?);
         Ok(())
@@ -454,7 +509,7 @@ fn sanitize_name(name: &str) -> String {
     clean.trim_end_matches(['.', ' ']).trim().into()
 }
 
-fn folder_name(name: &str) -> io::Result<String> {
+pub(super) fn folder_name(name: &str) -> io::Result<String> {
     let name = sanitize_name(name);
     if name.is_empty() || !valid_field(&name, MAX_PATH_BYTES) {
         return Err(invalid("Enter a valid snippet folder name"));
@@ -481,7 +536,7 @@ fn logical_path(raw: &str) -> Option<String> {
     (path.len() <= MAX_PATH_BYTES).then_some(path)
 }
 
-fn path_key(path: &str) -> String {
+pub(super) fn path_key(path: &str) -> String {
     path.chars().flat_map(char::to_lowercase).nfc().collect()
 }
 

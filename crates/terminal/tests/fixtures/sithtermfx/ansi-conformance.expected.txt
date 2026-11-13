@@ -1,0 +1,10 @@
+size=12x3
+cursor=4,2
+inverse=true
+cursorKey=1b4f41
+keypadKey=1b4f41
+reply=1b5b333b35521b5b383b333b313274
+screen:
+──qÁ
+──qÁ
+──q─

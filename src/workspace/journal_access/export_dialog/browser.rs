@@ -223,6 +223,22 @@ impl Browser {
     }
 
     pub(in crate::workspace) fn view_with_title(&self, title: &'static str) -> Element<'_, Event> {
+        self.view_with_optional_notice(title, None)
+    }
+
+    pub(in crate::workspace::journal_access) fn view_with_notice(
+        &self,
+        title: &'static str,
+        notice: &'static str,
+    ) -> Element<'_, Event> {
+        self.view_with_optional_notice(title, Some(notice))
+    }
+
+    fn view_with_optional_notice(
+        &self,
+        title: &'static str,
+        notice: Option<&'static str>,
+    ) -> Element<'_, Event> {
         let mut folder = text_input("Absolute folder path", &self.folder);
         if !self.loading {
             folder = folder.on_input(Event::Folder).on_submit(Event::List);
@@ -257,6 +273,7 @@ impl Browser {
         container(
             column![
                 text(title).size(19),
+                notice.map(|notice| text(notice).size(14)),
                 row![
                     button("Up").on_press_maybe(
                         self.listing
@@ -289,8 +306,12 @@ impl Browser {
                 row![
                     space::horizontal(),
                     button("Cancel").on_press(Event::Cancel),
-                    button("Save")
-                        .on_press_maybe(self.destination().is_ok().then_some(Event::Save)),
+                    button(if notice.is_some() {
+                        "Save HTML"
+                    } else {
+                        "Save"
+                    })
+                    .on_press_maybe(self.destination().is_ok().then_some(Event::Save)),
                 ]
                 .spacing(8),
             ]

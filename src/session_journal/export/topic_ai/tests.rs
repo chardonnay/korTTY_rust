@@ -4,6 +4,7 @@ use std::thread;
 
 use serde_json::Value;
 
+use crate::local_ai::PromptPreset;
 use crate::local_ai::test_support::{
     accept, exclusive_run, fixture_http_response, fixture_response, listener, request,
     start_test_double,
@@ -79,6 +80,8 @@ fn journal_topic_ai_sends_at_most_eight_redacted_chunks_with_only_allowed_data()
         );
         MAX_PROMPTS
     ]);
+    let profile = profile.with_prompt_preset(PromptPreset::Mistral);
+    let expected_system = profile.render_system_prompt(SYSTEM);
     let (run, _cancel) = begin(profile, FAST_TIMING);
     let entries = candidates(MAX_CANDIDATES + 1);
     let entries: Vec<_> = entries.iter().collect();
@@ -108,6 +111,10 @@ fn journal_topic_ai_sends_at_most_eight_redacted_chunks_with_only_allowed_data()
         }
     );
     for request in requests {
+        assert_eq!(
+            request["messages"][0]["content"].as_str(),
+            Some(expected_system.as_ref())
+        );
         let body = request.to_string();
         for forbidden in [
             "secret-token",
@@ -203,6 +210,7 @@ fn journal_topic_ai_retries_transient_http_statuses_within_the_same_budget() {
     );
     let requests = server.join().unwrap();
     assert_eq!(requests.len(), 3);
+    assert_eq!(requests[0]["messages"][0]["content"], SYSTEM);
     assert!(requests.windows(2).all(|pair| pair[0] == pair[1]));
 }
 

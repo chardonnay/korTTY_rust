@@ -7,14 +7,20 @@ use iced::keyboard::Modifiers;
 use iced::{Point, Task};
 
 use crate::connection_store::custom_os_badges::Catalog;
-use crate::connection_store::{Connection, Search, Store, TabColor};
+use crate::connection_store::teamwork;
+use crate::connection_store::{Connection, LocalProfile, Search, SerialProfile, Store, TabColor};
+use crate::serial_dialog;
 use crate::terminal_effects::Effect;
 
 mod color;
 mod form;
+mod journal_settings;
+mod local;
+pub(crate) mod network_map;
 mod os_badge;
 pub(crate) mod overview;
 mod selection;
+mod terminal_overrides;
 #[cfg(test)]
 mod tests;
 mod tree_context;
@@ -23,13 +29,28 @@ use color::ColorDraft;
 use form::Draft;
 pub use form::Edit;
 use selection::{RowKey, Selection};
-pub(crate) use view::ViewChoices;
+pub(crate) use view::{HighlightChoices, ViewChoices};
+
+const TEAMWORK_USERNAME_DRAFT_BYTES: usize = 259;
 
 #[derive(Clone, Debug)]
 pub enum Message {
     Search(String),
     Scope(Scope),
+    MapView(bool),
+    MapJumpRoutes(bool),
+    MapTunnels(bool),
+    MapZoom(f32),
+    MapFit,
+    MapSelect(RowKey),
+    MapMove(u64, Option<String>),
+    MapUndo,
+    ExportMapPdf,
     Select(u64),
+    SelectShared(teamwork::Identity),
+    TeamworkAuthEdit(teamwork::DefaultAuth),
+    SaveTeamworkAuth,
+    ResetTeamworkAuth,
     SelectGroup(String),
     OpenTreeContext(RowKey, Point),
     TreeContext(tree_context::Message),
@@ -53,6 +74,18 @@ pub enum Message {
     SaveQuick,
     CancelQuick,
     New,
+    NewSerial,
+    NewLocal,
+    SelectLocal(u64),
+    Local(local::Edit),
+    SelectSerial(u64),
+    SerialName(String),
+    SerialTag(String),
+    SerialJournal(journal_settings::Edit),
+    SerialPasteLineDelay(String),
+    SerialStrictTerminalMode(Option<bool>),
+    ToggleSerialPin,
+    Serial(serial_dialog::Message),
     EditSelected,
     Duplicate,
     Edit(Edit),
@@ -60,12 +93,16 @@ pub enum Message {
     CancelEdit,
     Delete,
     ConfirmDelete(bool),
+    ConfirmTeamworkHide(bool),
+    RefreshTeamwork,
+    RestoreTeamwork,
     Reload,
     ImportConnections,
     ExportConnections,
     ExportOverview,
     Completed(Result<Box<Persisted>, String>),
     Connect(bool),
+    ConnectInNewWindow,
     OpenVault,
     Close,
     KeepEditing,
@@ -79,6 +116,7 @@ pub enum Scope {
     Favorites,
     Recent,
     Open,
+    Teamwork,
     Group(String),
     Tag(String),
 }
@@ -160,6 +198,43 @@ struct QuickEdit {
     tag: String,
 }
 
+struct TeamworkAuthDraft {
+    saved: teamwork::DefaultAuth,
+    draft: teamwork::DefaultAuth,
+    conflict: bool,
+}
+
+impl TeamworkAuthDraft {
+    fn new(saved: teamwork::DefaultAuth) -> Self {
+        Self {
+            draft: saved.clone(),
+            saved,
+            conflict: false,
+        }
+    }
+
+    fn dirty(&self) -> bool {
+        self.draft != self.saved
+    }
+
+    fn refresh(&mut self, saved: teamwork::DefaultAuth) {
+        if self.saved == saved {
+            return;
+        }
+        if !self.dirty() || self.draft == saved {
+            *self = Self::new(saved);
+        } else {
+            self.saved = saved;
+            self.conflict = true;
+        }
+    }
+
+    fn change(&self) -> Option<(teamwork::DefaultAuth, teamwork::DefaultAuth)> {
+        (self.dirty() && !self.conflict && self.draft.validate().is_ok())
+            .then(|| (self.saved.clone(), self.draft.clone()))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CredentialChoice {
     pub id: String,
@@ -207,6 +282,11 @@ impl CredentialChoice {
 
 pub struct ConnectionWindow {
     store: Store,
+    server_access: crate::clipboard_policy::ServerAccess,
+    teamwork: teamwork::Catalog,
+    teamwork_available: bool,
+    teamwork_auth: Option<TeamworkAuthDraft>,
+    teamwork_auth_saving: bool,
     custom_badges: Arc<Catalog>,
     path: PathBuf,
     selection: Selection,
@@ -214,19 +294,27 @@ pub struct ConnectionWindow {
     tree_context: tree_context::TreeContext,
     badge_picker: Option<u64>,
     scope: Scope,
+    network_map: network_map::State,
     collapsed: BTreeSet<String>,
     open_counts: Option<BTreeMap<u64, usize>>,
     draft: Option<Draft>,
+    serial_draft: Option<serial::Draft>,
+    local_draft: Option<local::Draft>,
+    serial_generation: u64,
     draft_group: Option<String>,
     draft_conflict: bool,
     quick: Option<QuickEdit>,
     folder: Option<FolderDialog>,
     query: String,
     notice: Option<String>,
+    teamwork_notice: Option<String>,
     confirming_delete: Vec<u64>,
+    confirming_teamwork_hide: Vec<teamwork::HiddenEntry>,
     confirming_close: bool,
     busy: bool,
 }
+
+mod serial;
 
 pub(crate) struct OverviewSources<'a> {
     pub(crate) store: &'a Store,
@@ -254,7 +342,19 @@ impl ConnectionWindow {
             store
                 .connections()
                 .first()
-                .map(|entry| RowKey::Connection(entry.id)),
+                .map(|entry| RowKey::Connection(entry.id))
+                .or_else(|| {
+                    store
+                        .serial_profiles()
+                        .first()
+                        .map(|entry| RowKey::Serial(entry.id))
+                })
+                .or_else(|| {
+                    store
+                        .local_profiles()
+                        .first()
+                        .map(|entry| RowKey::Local(entry.id))
+                }),
         );
         Ok(Self {
             selection,
@@ -262,19 +362,30 @@ impl ConnectionWindow {
             tree_context: tree_context::TreeContext::default(),
             badge_picker: None,
             scope: Scope::All,
+            network_map: network_map::State::default(),
             collapsed: BTreeSet::new(),
             open_counts: None,
             store,
+            server_access: Default::default(),
+            teamwork: teamwork::Catalog::default(),
+            teamwork_available: false,
+            teamwork_auth: None,
+            teamwork_auth_saving: false,
             custom_badges: Arc::new(custom_badges),
             path,
             draft: None,
+            serial_draft: None,
+            local_draft: None,
+            serial_generation: 0,
             draft_group: None,
             draft_conflict: false,
             quick: None,
             folder: None,
             query: String::new(),
             notice,
+            teamwork_notice: None,
             confirming_delete: Vec::new(),
+            confirming_teamwork_hide: Vec::new(),
             confirming_close: false,
             busy: false,
         })
@@ -300,6 +411,125 @@ impl ConnectionWindow {
         os_badge::Badge::resolve(self.store.os_badge_id(id), &self.custom_badges)
     }
 
+    pub(crate) fn set_server_access(&mut self, access: crate::clipboard_policy::ServerAccess) {
+        self.server_access = access;
+    }
+
+    pub(crate) fn set_teamwork(&mut self, catalog: teamwork::Catalog, notice: Option<String>) {
+        let changed = !self.teamwork.same_entries(&catalog);
+        self.teamwork = catalog;
+        self.teamwork_notice = notice;
+        if changed {
+            if self
+                .confirming_teamwork_hide
+                .iter()
+                .any(|entry| self.teamwork.get(entry.identity()).is_none())
+            {
+                self.cancel_changed_teamwork_hide();
+            }
+            self.reconcile_selection();
+        }
+    }
+
+    pub(crate) fn set_teamwork_available(&mut self, available: bool) {
+        self.teamwork_available = available;
+    }
+
+    pub(crate) fn can_restore_teamwork(&self) -> bool {
+        self.teamwork_available && self.can_browse()
+    }
+
+    pub(crate) fn set_teamwork_auth(&mut self, value: Option<teamwork::DefaultAuth>) {
+        match (&mut self.teamwork_auth, value) {
+            (Some(draft), Some(saved)) => draft.refresh(saved),
+            (_, value) => self.teamwork_auth = value.map(TeamworkAuthDraft::new),
+        }
+    }
+
+    pub(crate) fn teamwork_auth_change(
+        &self,
+    ) -> Option<(teamwork::DefaultAuth, teamwork::DefaultAuth)> {
+        if !self.can_edit_teamwork_auth() {
+            return None;
+        }
+        self.teamwork_auth.as_ref()?.change()
+    }
+
+    pub(crate) fn set_teamwork_auth_saving(&mut self, saving: bool) {
+        self.teamwork_auth_saving = saving;
+    }
+
+    fn can_edit_teamwork_auth(&self) -> bool {
+        !self.teamwork_auth_saving && self.scope == Scope::Teamwork && self.can_browse()
+    }
+
+    pub(crate) fn selected_shared(&self) -> Option<&teamwork::Entry> {
+        self.can_browse()
+            .then(|| self.selection.single_shared())
+            .flatten()
+            .and_then(|identity| self.shared_entry(identity))
+    }
+
+    fn shared_entry(&self, identity: &teamwork::Identity) -> Option<&teamwork::Entry> {
+        self.teamwork
+            .get(identity)
+            .filter(|_| !self.store.is_teamwork_hidden(identity))
+    }
+
+    fn shared_entries(&self) -> impl Iterator<Item = &teamwork::Entry> {
+        self.teamwork
+            .entries()
+            .filter(|entry| !self.store.is_teamwork_hidden(entry.identity()))
+    }
+
+    fn selected_shared_entries(&self) -> impl Iterator<Item = &teamwork::Entry> {
+        self.selection
+            .shared()
+            .filter_map(|identity| self.shared_entry(identity))
+    }
+
+    fn favorite_count(&self) -> usize {
+        self.store
+            .connections()
+            .iter()
+            .filter(|entry| self.store.is_favorite(entry.id))
+            .count()
+            + self
+                .store
+                .serial_profiles()
+                .iter()
+                .filter(|entry| self.store.is_favorite(entry.id))
+                .count()
+            + self
+                .shared_entries()
+                .filter(|entry| self.store.is_teamwork_favorite(entry.identity()))
+                .count()
+    }
+
+    fn visible_shared(&self) -> Vec<&teamwork::Entry> {
+        let search = Search::new(&self.query);
+        let mut entries: Vec<_> = self
+            .shared_entries()
+            .filter(|entry| {
+                let in_scope = match &self.scope {
+                    Scope::All | Scope::Teamwork => true,
+                    Scope::Favorites => self.store.is_teamwork_favorite(entry.identity()),
+                    Scope::Tag(tag) => entry.connection.tag.to_lowercase() == *tag,
+                    _ => false,
+                };
+                in_scope && search.manager(&entry.connection)
+            })
+            .collect();
+        entries.sort_by_cached_key(|entry| {
+            (
+                entry.group.to_lowercase(),
+                &entry.group,
+                entry.connection.name.to_lowercase(),
+            )
+        });
+        entries
+    }
+
     pub fn selected(&self) -> Option<&Connection> {
         if !self.can_browse() {
             return None;
@@ -314,7 +544,7 @@ impl ConnectionWindow {
     }
 
     pub(crate) fn connect_selection(&self) -> Option<&Connection> {
-        if !self.can_browse() {
+        if !self.can_browse() || self.selection.serials().next().is_some() {
             return None;
         }
         if let Some(connection) = self.single_connection() {
@@ -322,6 +552,28 @@ impl ConnectionWindow {
         }
         let id = self.selected_connection_ids().into_iter().next()?;
         self.store.get(id)
+    }
+
+    pub(crate) fn selected_serial(&self) -> Option<&SerialProfile> {
+        if !self.can_browse() {
+            return None;
+        }
+        self.single_serial()
+    }
+
+    fn single_serial(&self) -> Option<&SerialProfile> {
+        self.store.serial(self.selection.single_serial()?)
+    }
+
+    pub(crate) fn selected_local(&self) -> Option<&LocalProfile> {
+        if !self.can_browse() {
+            return None;
+        }
+        self.single_local()
+    }
+
+    fn single_local(&self) -> Option<&LocalProfile> {
+        self.store.local(self.selection.single_local()?)
     }
 
     fn selected_connection_ids(&self) -> Vec<u64> {
@@ -334,7 +586,7 @@ impl ConnectionWindow {
         if self.selection.connections().next().is_none() {
             return Vec::new();
         }
-        self.visual_rows(self.visible_connections())
+        self.visible_rows(self.visible_entries())
             .into_iter()
             .filter_map(|row| match row {
                 selection::VisualRow::Connection(entry, _)
@@ -345,6 +597,46 @@ impl ConnectionWindow {
                 _ => None,
             })
             .collect()
+    }
+
+    fn selected_profile_ids(&self) -> Vec<u64> {
+        if !self.can_browse() {
+            return Vec::new();
+        }
+        self.visible_rows(self.visible_entries())
+            .into_iter()
+            .filter(|row| self.selection.contains(&row.key()))
+            .filter_map(|row| match row {
+                selection::VisualRow::Connection(entry, _) => Some(entry.id),
+                selection::VisualRow::Serial(entry, _) => Some(entry.id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn profile_tag(&self, id: u64) -> Option<&str> {
+        self.store
+            .get(id)
+            .map(|entry| entry.tag.as_str())
+            .or_else(|| self.store.serial(id).map(|entry| entry.tag.as_str()))
+    }
+
+    fn library_tags(&self) -> impl Iterator<Item = &str> {
+        self.store
+            .connections()
+            .iter()
+            .map(|entry| entry.tag.as_str())
+            .chain(
+                self.store
+                    .serial_profiles()
+                    .iter()
+                    .map(|entry| entry.tag.as_str()),
+            )
+            .chain(
+                self.shared_entries()
+                    .map(|entry| entry.connection.tag.as_str()),
+            )
+            .filter(|tag| !tag.is_empty())
     }
 
     pub(crate) fn set_modifiers(&mut self, modifiers: Modifiers) {
@@ -371,11 +663,18 @@ impl ConnectionWindow {
         Some(OverviewSources {
             store: &self.store,
             custom_badges: &self.custom_badges,
-            selected: self.selected_export_ids(),
-            shown: self
-                .visible_connections()
+            selected: self
+                .selected_export_ids()
                 .into_iter()
-                .map(|connection| connection.id)
+                .filter(|id| self.store.get(*id).is_some())
+                .collect(),
+            shown: self
+                .visible_entries()
+                .into_iter()
+                .filter_map(|row| match row {
+                    selection::VisualRow::Connection(connection, _) => Some(connection.id),
+                    _ => None,
+                })
                 .collect(),
             all: self
                 .store
@@ -404,33 +703,41 @@ impl ConnectionWindow {
 
     fn can_export_connections(&self) -> bool {
         self.can_browse()
-            && (self.selection.connections().next().is_some()
+            && (self.selection.single_local().is_some()
+                || self.selection.serials().next().is_some()
+                || self.selection.connections().next().is_some()
                 || self
                     .selection
                     .single_group()
-                    .is_some_and(|path| self.store.in_group(path).next().is_some()))
+                    .is_some_and(|path| self.folder_profile_count(path) != 0))
     }
 
     fn selected_export_ids(&self) -> Vec<u64> {
-        let selected = self.selected_connection_ids();
+        if let Some(id) = self.selection.single_local() {
+            return vec![id];
+        }
+        let selected = self.selected_profile_ids();
         if !selected.is_empty() {
             return selected;
         }
         self.selection
             .single_group()
-            .map(|path| self.store.in_group(path).map(|entry| entry.id).collect())
+            .map(|path| {
+                self.store
+                    .in_group(path)
+                    .map(|entry| entry.id)
+                    .chain(self.store.serial_in_group(path).map(|entry| entry.id))
+                    .collect()
+            })
             .unwrap_or_default()
+    }
+
+    fn folder_profile_count(&self, path: &str) -> usize {
+        self.store.in_group(path).count() + self.store.serial_in_group(path).count()
     }
 
     fn visible_connections(&self) -> Vec<&Connection> {
         let search = Search::new(&self.query);
-        if self.scope == Scope::Recent {
-            return self
-                .store
-                .recent()
-                .filter(|entry| search.manager(entry))
-                .collect();
-        }
         let mut rows = self
             .store
             .connections()
@@ -447,12 +754,21 @@ impl ConnectionWindow {
 
     pub fn request_close(&mut self) -> bool {
         self.dismiss_tree_context();
-        if self.busy {
+        if self.busy() {
             self.notice = Some("A profile update is in progress.".into());
             return false;
         }
         self.confirming_close = self.tree_context.has_unsaved_prompt()
+            || self
+                .teamwork_auth
+                .as_ref()
+                .is_some_and(TeamworkAuthDraft::dirty)
             || self.draft.as_ref().is_some_and(|draft| draft.changed)
+            || self
+                .serial_draft
+                .as_ref()
+                .is_some_and(|draft| draft.changed)
+            || self.local_draft.as_ref().is_some_and(|draft| draft.changed)
             || self.quick.is_some()
             || self.folder.as_ref().is_some_and(|action| match action {
                 FolderDialog::Create { name, .. } => !name.is_empty(),
@@ -466,7 +782,25 @@ impl ConnectionWindow {
     }
 
     pub fn busy(&self) -> bool {
+        self.store_busy() || self.teamwork_auth_saving
+    }
+
+    pub(crate) fn store_busy(&self) -> bool {
         self.busy
+    }
+
+    pub(crate) fn discard_editor(&mut self) {
+        if self.busy
+            || (self.draft.is_none() && self.serial_draft.is_none() && self.local_draft.is_none())
+        {
+            return;
+        }
+        self.confirming_close = false;
+        let _ = self.update(Message::CancelEdit);
+    }
+
+    pub(crate) fn store_path(&self) -> &std::path::Path {
+        &self.path
     }
 
     pub fn update_store(&mut self, store: Store) {
@@ -489,16 +823,45 @@ impl ConnectionWindow {
             self.draft_conflict = true;
             self.notice = Some("This connection changed in another window. Discard the draft and reopen it before saving.".into());
         }
+        if self.serial_draft.as_ref().is_some_and(|draft| {
+            self.store.serial(draft.id) != store.serial(draft.id)
+                || self.store.group_of(draft.id) != store.group_of(draft.id)
+                || self
+                    .draft_group
+                    .as_deref()
+                    .is_some_and(|group| !store.has_group(group))
+        }) || self
+            .local_draft
+            .as_ref()
+            .is_some_and(|draft| self.store.local(draft.id) != store.local(draft.id))
+        {
+            self.draft_conflict = true;
+            self.notice = Some("This connection changed in another window. Discard the draft and reopen it before saving.".into());
+        }
         if self.confirming_delete.iter().any(|&id| {
-            self.store.get(id) != store.get(id) || self.store.group_of(id) != store.group_of(id)
+            self.store.get(id) != store.get(id)
+                || self.store.serial(id) != store.serial(id)
+                || self.store.local(id) != store.local(id)
+                || self.store.group_of(id) != store.group_of(id)
         }) {
             self.confirming_delete.clear();
             self.notice =
                 Some("The selection changed. Review the connections before deleting them.".into());
         }
+        if self
+            .confirming_teamwork_hide
+            .iter()
+            .any(|entry| store.is_teamwork_hidden(entry.identity()))
+        {
+            self.cancel_changed_teamwork_hide();
+        }
         if let Some(FolderDialog::Delete { path, .. }) = &self.folder
             && (!self.store.groups().eq(store.groups())
-                || !self.store.in_group(path).eq(store.in_group(path)))
+                || !self.store.in_group(path).eq(store.in_group(path))
+                || !self
+                    .store
+                    .serial_in_group(path)
+                    .eq(store.serial_in_group(path)))
         {
             self.folder = None;
             self.notice =
@@ -516,16 +879,21 @@ impl ConnectionWindow {
     }
 
     pub fn set_open_counts(&mut self, counts: BTreeMap<u64, usize>) {
-        self.open_counts = Some(counts);
-        self.reconcile_selection();
+        if self.open_counts.as_ref() != Some(&counts) {
+            self.open_counts = Some(counts);
+            self.reconcile_selection();
+        }
     }
 
     fn can_browse(&self) -> bool {
         !self.busy
             && !self.confirming_close
             && self.confirming_delete.is_empty()
+            && self.confirming_teamwork_hide.is_empty()
             && !self.tree_context.has_prompt()
             && self.draft.is_none()
+            && self.serial_draft.is_none()
+            && self.local_draft.is_none()
             && self.folder.is_none()
             && self.quick.is_none()
     }
@@ -533,12 +901,19 @@ impl ConnectionWindow {
     fn scope_accepts(&self, connection: &Connection) -> bool {
         match &self.scope {
             Scope::All => true,
+            Scope::Teamwork | Scope::Recent => false,
             Scope::Favorites => self.store.is_favorite(connection.id),
-            Scope::Recent => self.store.recent().any(|entry| entry.id == connection.id),
             Scope::Open => self.open_count(connection.id) > 0,
             Scope::Group(group) => self.store.is_in_group(connection.id, group),
             Scope::Tag(tag) => connection.tag.to_lowercase() == tag.to_lowercase(),
         }
+    }
+
+    fn cancel_changed_teamwork_hide(&mut self) {
+        self.confirming_teamwork_hide.clear();
+        self.notice = Some(
+            "The Teamwork selection changed. Review the connections before hiding them.".into(),
+        );
     }
 
     fn open_count(&self, id: u64) -> usize {
@@ -556,7 +931,11 @@ impl ConnectionWindow {
         {
             self.scope = Scope::All;
         }
-        if self.draft.is_none() && self.quick.is_none() {
+        if self.draft.is_none()
+            && self.serial_draft.is_none()
+            && self.local_draft.is_none()
+            && self.quick.is_none()
+        {
             let visible: BTreeSet<_> = self.visible_row_keys().into_iter().collect();
             self.selection.retain(|row| {
                 visible.contains(row)
@@ -571,8 +950,15 @@ impl ConnectionWindow {
         if let Scope::Group(path) = &scope {
             self.selection.replace(Some(RowKey::Group(path.clone())));
         } else {
-            self.selection
-                .retain(|row| matches!(row, RowKey::Connection(_)));
+            self.selection.retain(|row| {
+                matches!(
+                    row,
+                    RowKey::Connection(_)
+                        | RowKey::Shared(_)
+                        | RowKey::Serial(_)
+                        | RowKey::Local(_)
+                )
+            });
         }
         self.scope = scope;
         self.reconcile_selection();
@@ -586,11 +972,16 @@ impl ConnectionWindow {
     }
 
     fn select_row(&mut self, row: RowKey) {
-        let visible = self.visible_row_keys();
+        let mut visible = self.visible_row_keys();
         if visible.contains(&row) {
             self.badge_picker = None;
             self.dismiss_tree_context();
-            self.selection.press(row, &visible, self.modifiers);
+            if matches!(row, RowKey::Local(_)) || self.selection.single_local().is_some() {
+                self.selection.replace(Some(row));
+            } else {
+                visible.retain(|key| !matches!(key, RowKey::Local(_)));
+                self.selection.press(row, &visible, self.modifiers);
+            }
             self.notice = None;
         }
     }
@@ -598,7 +989,11 @@ impl ConnectionWindow {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         if (self.busy && !matches!(message, Message::Completed(_)))
             || (self.confirming_close && !matches!(message, Message::KeepEditing))
-            || (!self.confirming_delete.is_empty() && !matches!(message, Message::ConfirmDelete(_)))
+            || (!self.confirming_teamwork_hide.is_empty()
+                && !matches!(message, Message::ConfirmTeamworkHide(_)))
+            || (self.confirming_teamwork_hide.is_empty()
+                && !self.confirming_delete.is_empty()
+                && !matches!(message, Message::ConfirmDelete(_) | Message::Completed(_)))
             || (self.tree_context.has_prompt()
                 && !matches!(
                     message,
@@ -635,11 +1030,65 @@ impl ConnectionWindow {
                 self.reconcile_selection();
             }
             Message::Scope(scope) if self.can_browse() => self.set_scope(scope),
+            Message::SelectShared(id) if self.can_browse() => {
+                self.select_row(RowKey::Shared(id));
+            }
+            Message::TeamworkAuthEdit(value) if self.can_edit_teamwork_auth() => {
+                if let Some(auth) = &mut self.teamwork_auth
+                    && !matches!(
+                        &value,
+                        teamwork::DefaultAuth::Key { username, .. }
+                            | teamwork::DefaultAuth::TemporaryKey { username }
+                            if username.len() > TEAMWORK_USERNAME_DRAFT_BYTES
+                    )
+                {
+                    auth.draft = value;
+                    if !auth.dirty() {
+                        auth.conflict = false;
+                    }
+                }
+            }
+            Message::ResetTeamworkAuth if self.can_edit_teamwork_auth() => {
+                if let Some(auth) = &mut self.teamwork_auth {
+                    auth.draft = auth.saved.clone();
+                    auth.conflict = false;
+                }
+            }
+            Message::MapView(enabled) if self.can_browse() => {
+                self.dismiss_tree_context();
+                self.network_map.visible = enabled;
+            }
+            Message::MapJumpRoutes(enabled) if self.network_map.visible => {
+                self.network_map.jumps = enabled;
+            }
+            Message::MapTunnels(enabled) if self.network_map.visible => {
+                self.network_map.tunnels = enabled;
+            }
+            Message::MapZoom(scale) if self.network_map.visible && scale.is_finite() => {
+                self.network_map.zoom = network_map::Zoom::Manual(network_map::clamp_zoom(scale));
+            }
+            Message::MapFit if self.network_map.visible => {
+                self.network_map.zoom = network_map::Zoom::Fit
+            }
+            Message::MapSelect(row) if self.network_map.visible && self.can_browse() => {
+                self.select_map_row(row);
+            }
+            Message::MapMove(id, folder) if self.network_map.visible && self.can_browse() => {
+                return self.move_map_connection(id, folder);
+            }
+            Message::MapUndo if self.network_map.visible && self.can_browse() => {
+                return self.undo_map_move();
+            }
             Message::Select(id) if self.can_browse() => self.select_row(RowKey::Connection(id)),
+            Message::SelectSerial(id) if self.can_browse() => self.select_row(RowKey::Serial(id)),
+            Message::SelectLocal(id) if self.can_browse() => self.select_row(RowKey::Local(id)),
             Message::SelectGroup(path) if self.can_browse() => {
                 self.select_row(RowKey::Group(path));
             }
             Message::OpenTreeContext(row, point) if self.can_browse() => {
+                if row == RowKey::Empty && self.scope == Scope::Teamwork {
+                    return Task::none();
+                }
                 if row != RowKey::Empty && !self.visible_row_keys().contains(&row) {
                     return Task::none();
                 }
@@ -656,14 +1105,31 @@ impl ConnectionWindow {
                 }
                 self.reconcile_selection();
             }
-            Message::New if self.can_browse() => {
+            Message::New if self.can_browse() && self.scope != Scope::Teamwork => {
                 self.badge_picker = None;
                 self.dismiss_tree_context();
                 self.draft_group = self.active_group().map(str::to_owned);
                 self.draft = Some(Draft::new());
                 self.notice = None;
             }
+            Message::NewSerial if self.can_browse() && self.scope != Scope::Teamwork => {
+                return self.begin_serial(None, false);
+            }
+            Message::NewLocal if self.can_browse() && self.scope != Scope::Teamwork => {
+                self.begin_local(None, false);
+            }
             Message::EditSelected | Message::Duplicate => {
+                if let Some(selected) = self.selected_local() {
+                    self.begin_local(
+                        Some(selected.clone()),
+                        matches!(message, Message::Duplicate),
+                    );
+                } else if let Some(selected) = self.selected_serial() {
+                    return self.begin_serial(
+                        Some(selected.clone()),
+                        matches!(message, Message::Duplicate),
+                    );
+                }
                 if let Some(selected) = self.selected() {
                     let draft = Draft::from_profile(
                         selected,
@@ -707,24 +1173,36 @@ impl ConnectionWindow {
                 }
             }
             Message::DraftGroup(group) => {
-                if let Some(draft) = &mut self.draft
-                    && group
-                        .as_deref()
-                        .is_none_or(|path| self.store.has_group(path))
+                if group
+                    .as_deref()
+                    .is_none_or(|path| self.store.has_group(path))
                     && self.draft_group != group
                 {
-                    self.draft_group = group;
-                    draft.changed = true;
+                    if let Some(draft) = &mut self.draft {
+                        self.draft_group = group;
+                        draft.changed = true;
+                    } else if let Some(draft) = &mut self.serial_draft {
+                        self.draft_group = group;
+                        draft.changed = true;
+                    }
                 }
             }
             Message::CancelEdit => {
                 self.draft = None;
+                self.serial_draft = None;
+                self.local_draft = None;
                 self.draft_group = None;
                 self.draft_conflict = false;
                 self.notice = None;
                 self.reconcile_selection();
             }
             Message::Save if !self.draft_conflict => {
+                if self.local_draft.is_some() {
+                    return self.save_local();
+                }
+                if self.serial_draft.is_some() {
+                    return self.save_serial();
+                }
                 let Some(draft) = &self.draft else {
                     return Task::none();
                 };
@@ -747,6 +1225,59 @@ impl ConnectionWindow {
                     }
                     Ok(done)
                 });
+            }
+            Message::SerialName(name) if name.len() <= 160 => {
+                if let Some(draft) = &mut self.serial_draft {
+                    draft.changed |= draft.name != name;
+                    draft.name = name;
+                }
+            }
+            Message::SerialTag(tag) if tag.len() <= 96 => {
+                if let Some(draft) = &mut self.serial_draft {
+                    draft.changed |= draft.tag != tag;
+                    draft.tag = tag;
+                }
+            }
+            Message::ToggleSerialPin if self.can_browse() => {
+                if let Some(mut profile) = self.selected_serial().cloned() {
+                    profile.pinned = !profile.pinned;
+                    return self.persist(move |mut store| {
+                        let status = if profile.pinned {
+                            "Serial profile pinned."
+                        } else {
+                            "Serial profile unpinned."
+                        };
+                        store.save_serial(profile)?;
+                        Ok(Persisted::preserving_selection(store, status))
+                    });
+                }
+            }
+            Message::SerialJournal(edit) => {
+                if let Some(draft) = &mut self.serial_draft {
+                    draft.journal.update(edit);
+                    draft.changed = true;
+                }
+            }
+            Message::SerialPasteLineDelay(value) => {
+                if let Some(draft) = &mut self.serial_draft {
+                    draft.paste_line_delay = value.chars().take(8).collect();
+                    draft.changed = true;
+                }
+            }
+            Message::SerialStrictTerminalMode(value) => {
+                if let Some(draft) = &mut self.serial_draft {
+                    draft.strict_terminal_mode = value;
+                    draft.changed = true;
+                }
+            }
+            Message::Serial(message) => return self.update_serial(message),
+            Message::Local(edit) => {
+                if let Some(draft) = &mut self.local_draft {
+                    draft.update(edit);
+                    if !self.draft_conflict {
+                        self.notice = None;
+                    }
+                }
             }
             Message::QuickName(value) => self.edit_quick(value, true),
             Message::QuickTag(value) => self.edit_quick(value, false),
@@ -772,11 +1303,15 @@ impl ConnectionWindow {
                 self.notice = None;
                 self.reconcile_selection();
             }
-            Message::ToggleFavorite => {
-                let ids = self.selected_connection_ids();
-                if !ids.is_empty() {
+            Message::ToggleFavorite if self.can_browse() => {
+                let local = self.selected_profile_ids();
+                let shared = self
+                    .selected_shared_entries()
+                    .map(|entry| entry.identity().clone())
+                    .collect::<Vec<_>>();
+                if !local.is_empty() || !shared.is_empty() {
                     return self.persist(move |mut store| {
-                        let favorite = store.toggle_favorites(&ids)?;
+                        let favorite = store.toggle_connection_favorites(&local, &shared)?;
                         Ok(Persisted::preserving_selection(
                             store,
                             if favorite {
@@ -788,7 +1323,7 @@ impl ConnectionWindow {
                     });
                 }
             }
-            Message::NewGroup if self.can_browse() => {
+            Message::NewGroup if self.can_browse() && self.scope != Scope::Teamwork => {
                 self.folder = Some(FolderDialog::Create {
                     parent: self.active_group().map(str::to_owned),
                     name: String::new(),
@@ -808,7 +1343,7 @@ impl ConnectionWindow {
                 if let Some(path) = self.selection.single_group() {
                     self.folder = Some(FolderDialog::Delete {
                         path: path.into(),
-                        count: self.store.in_group(path).count(),
+                        count: self.folder_profile_count(path),
                     });
                     self.notice = None;
                 }
@@ -856,7 +1391,33 @@ impl ConnectionWindow {
             }
             Message::Delete if self.can_browse() => {
                 self.dismiss_tree_context();
-                self.confirming_delete = self.selected_connection_ids();
+                let local = self
+                    .selection
+                    .single_local()
+                    .map_or_else(|| self.selected_profile_ids(), |id| vec![id]);
+                self.confirming_teamwork_hide = self
+                    .selected_shared_entries()
+                    .map(teamwork::HiddenEntry::from)
+                    .collect();
+                self.confirming_delete = local;
+            }
+            Message::ConfirmTeamworkHide(confirmed)
+                if !self.confirming_teamwork_hide.is_empty() =>
+            {
+                let entries = std::mem::take(&mut self.confirming_teamwork_hide);
+                if confirmed {
+                    return self.persist(move |mut store| {
+                        store.hide_teamwork(&entries)?;
+                        Ok(Persisted::preserving_selection(
+                            store,
+                            if entries.len() == 1 {
+                                "Teamwork connection hidden."
+                            } else {
+                                "Teamwork connections hidden."
+                            },
+                        ))
+                    });
+                }
             }
             Message::ConfirmDelete(confirmed) if !self.confirming_delete.is_empty() => {
                 let ids = std::mem::take(&mut self.confirming_delete);
@@ -886,10 +1447,13 @@ impl ConnectionWindow {
             }
             Message::Completed(result) => {
                 self.busy = false;
+                self.network_map.finish_move(result.is_ok());
                 match result {
                     Ok(done) => {
                         self.tree_context.clear_prompt();
                         self.draft = None;
+                        self.serial_draft = None;
+                        self.local_draft = None;
                         self.draft_group = None;
                         self.draft_conflict = false;
                         self.quick = None;
@@ -899,7 +1463,15 @@ impl ConnectionWindow {
                             self.set_scope(scope);
                         }
                         if let SelectionChange::Replace(id) = done.selection {
-                            self.selection.replace(id.map(RowKey::Connection));
+                            self.selection.replace(id.map(|id| {
+                                if self.store.serial(id).is_some() {
+                                    RowKey::Serial(id)
+                                } else if self.store.local(id).is_some() {
+                                    RowKey::Local(id)
+                                } else {
+                                    RowKey::Connection(id)
+                                }
+                            }));
                         }
                         self.reconcile_selection();
                         self.notice = Some(done.status.into());
@@ -1018,4 +1590,34 @@ impl ConnectionWindow {
             )
         })
     }
+}
+
+#[cfg(test)]
+#[test]
+fn teamwork_auth_draft_keeps_conflicting_edits_and_accepts_a_matching_commit() {
+    use teamwork::DefaultAuth;
+
+    let key = DefaultAuth::Key {
+        id: 4,
+        username: "operator".into(),
+    };
+    let other = DefaultAuth::TemporaryKey {
+        username: "reviewer".into(),
+    };
+    let mut draft = TeamworkAuthDraft::new(DefaultAuth::Prompt);
+    draft.draft = key.clone();
+    assert_eq!(draft.change(), Some((DefaultAuth::Prompt, key.clone())));
+    draft.refresh(DefaultAuth::Prompt);
+    assert!(draft.change().is_some());
+
+    draft.refresh(other.clone());
+    assert_eq!(draft.saved, other);
+    assert_eq!(draft.draft, key);
+    assert!(draft.conflict);
+    assert!(draft.change().is_none());
+
+    draft.refresh(key.clone());
+    assert_eq!(draft.saved, key);
+    assert!(!draft.dirty());
+    assert!(!draft.conflict);
 }

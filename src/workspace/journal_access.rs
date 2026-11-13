@@ -28,6 +28,7 @@ use super::journal_appearance_access::{
 use super::{Message as Desktop, Workspace, tool_tabs::Kind};
 
 pub(super) mod actions;
+pub(in crate::workspace) mod agent_chat_view;
 mod content_search;
 pub(super) mod dialog_geometry;
 mod entry_edit_access;
@@ -41,11 +42,13 @@ mod link_text;
 mod manager_tree;
 pub(super) mod marker_dialog;
 pub(super) mod metadata;
+pub(super) mod questions;
 pub(super) mod replace_dialog;
 pub(in crate::workspace) mod screenshot_access;
 pub(in crate::workspace) mod screenshot_ai_access;
 pub(super) mod screenshot_editor;
 pub(in crate::workspace) mod screenshot_export;
+pub(super) mod summaries;
 mod timeline_find;
 mod viewer_keys;
 mod viewer_navigation;
@@ -63,6 +66,8 @@ const COMPACT_HEIGHT: f32 = 360.0;
 pub enum Message {
     Metadata(metadata::Message),
     Actions(actions::Message),
+    Summary(summaries::Event),
+    Question(questions::Message),
     ContentSearch(content_search::Message),
     Export(export_dialog::Message),
     ScreenshotExport(screenshot_export::Event),
@@ -103,6 +108,7 @@ pub enum Message {
     ScreenshotAction(screenshot_access::Event),
     ScreenshotAnalysis(screenshot_ai_access::Event),
     HideScreenshot,
+    OpenAgentChat(usize, String),
     OpenLink(usize, String, LinkField, LinkTarget),
     LinkOpened(bool),
     Page(bool),
@@ -238,6 +244,47 @@ impl Workspace {
             && self.palette_can_open(owner)
             && !self.palette.is_open(owner)
             && viewer.has_link(index, entry_id, field, target)
+    }
+
+    fn visible_journal_agent_chat(
+        &self,
+        id: window::Id,
+        index: usize,
+        entry: &str,
+    ) -> Option<(window::Id, ViewerSource)> {
+        let surface = self.journals.get(&id)?;
+        let Mode::Viewer(viewer) = &surface.mode else {
+            return None;
+        };
+        let owner = self.visible_journal_surface_owner(id)?;
+        (self.viewer_navigation_interactive(id)
+            && !self.hosted_close_locks(id)
+            && !self
+                .journal_appearance_page(AppearanceTarget::Viewer(id))
+                .open
+            && viewer.can_navigate_timeline()
+            && !viewer.entry_flow.saving()
+            && viewer.selected_entry == Some(index)
+            && viewer.agent_chat_index(entry) == Some(index))
+        .then(|| (owner, viewer.source.clone()))
+    }
+
+    pub(super) fn journal_agent_chat_request_current(
+        &self,
+        id: window::Id,
+        owner: window::Id,
+        source: &ViewerSource,
+        entry: &str,
+    ) -> bool {
+        let Some(Mode::Viewer(viewer)) = self.journals.get(&id).map(|surface| &surface.mode) else {
+            return false;
+        };
+        viewer.selected_entry.is_some_and(|index| {
+            self.visible_journal_agent_chat(id, index, entry)
+                .is_some_and(|(current_owner, current_source)| {
+                    owner == current_owner && source.same_journal(&current_source)
+                })
+        })
     }
 
     pub(super) fn open_journal_link(
@@ -509,7 +556,8 @@ impl Workspace {
     }
 
     pub(super) fn is_journal_window(&self, id: window::Id) -> bool {
-        self.journal_edits.dialogs.contains_key(&id)
+        self.is_journal_summary_progress(id)
+            || self.journal_edits.dialogs.contains_key(&id)
             || self.journal_actions.dialogs.contains_key(&id)
             || self.journal_entry_deletes.dialogs.contains_key(&id)
             || self.journal_replacements.dialogs.contains_key(&id)
@@ -545,6 +593,9 @@ impl Workspace {
     }
 
     pub(super) fn journal_title(&self, id: window::Id) -> Option<Cow<'static, str>> {
+        if self.is_journal_summary_progress(id) {
+            return Some(Cow::Borrowed(summaries::PROGRESS_TITLE));
+        }
         if let Some(title) = self.journal_screenshot_editors.title(id) {
             return Some(Cow::Borrowed(title));
         }
@@ -573,6 +624,15 @@ impl Workspace {
     }
 
     pub(super) fn journal_view(&self, id: window::Id) -> Option<Element<'_, Desktop>> {
+        if let Some(progress) = self.journal_summary_progress_view(id) {
+            return Some(progress);
+        }
+        if let Some(review) = self.journal_question_view(id) {
+            return Some(review);
+        }
+        if let Some(review) = self.journal_summary_review(id) {
+            return Some(review);
+        }
         if let Some(editor) = self.journal_screenshot_editor_view(id) {
             return Some(editor);
         }
@@ -630,22 +690,33 @@ impl Workspace {
                 .into(),
             );
         }
-        let view = match &surface.mode {
-            Mode::Manager(manager) => manager.view(
-                self.journal_rename_allowed()
-                    && manager.live_aliases.is_some()
-                    && manager
-                        .selected()
-                        .is_some_and(|row| !self.journal_metadata_is_live(manager, row)),
-                self.journal_edit_busy(id),
-                !self
-                    .clipboard
-                    .policy
-                    .terminal_logging
-                    .journal_rename_allowed(),
-                self.journal_delete_available(id),
-                !self.journal_delete_allowed(),
-            ),
+        let view: Element<'_, Message> = match &surface.mode {
+            Mode::Manager(manager) => column![
+                self.journal_summary_controls(manager),
+                self.journal_question_button(id, true),
+                self.automation_journal_status()
+                    .map(|status| text(status).size(13)),
+                manager.view(
+                    self.journal_rename_allowed()
+                        && manager.live_aliases.is_some()
+                        && manager
+                            .selected()
+                            .is_some_and(|row| !self.journal_metadata_is_live(manager, row)),
+                    self.journal_edit_busy(id),
+                    !self
+                        .clipboard
+                        .policy
+                        .terminal_logging
+                        .journal_rename_allowed(),
+                    (
+                        self.journal_delete_available(id),
+                        !self.journal_delete_allowed()
+                    ),
+                    self.journal_summary_row_statuses(manager),
+                )
+            ]
+            .spacing(4)
+            .into(),
             Mode::Viewer(viewer) => {
                 let appearance = self.journal_appearance_page(AppearanceTarget::Viewer(id));
                 let keyboard = self.viewer_navigation_interactive(id) && !appearance.open;
@@ -662,18 +733,23 @@ impl Workspace {
                             && viewer.entry_editor.can_translate(),
                     ),
                 };
-                viewer_keys::wrap(
-                    viewer.view(
-                        self.journal_links_allowed(),
-                        self.journal_rename_allowed() && !self.journal_edit_busy(id),
-                        entry_controls,
-                        screenshot_interactive,
-                        self.journal_screenshot_analysis_available(),
-                        appearance,
+                column![
+                    self.journal_question_button(id, false),
+                    viewer_keys::wrap(
+                        viewer.view(
+                            self.journal_links_allowed(),
+                            self.journal_rename_allowed() && !self.journal_edit_busy(id),
+                            entry_controls,
+                            screenshot_interactive,
+                            self.journal_screenshot_analysis_available(),
+                            appearance,
+                        ),
+                        viewer,
+                        keyboard,
                     ),
-                    viewer,
-                    keyboard,
-                )
+                ]
+                .spacing(4)
+                .into()
             }
         };
         Some(view.map(move |message| Desktop::SessionJournal(id, message)))
@@ -682,6 +758,8 @@ impl Workspace {
     pub(super) fn remove_closed_journal_windows(&mut self, owner: window::Id) -> Task<Desktop> {
         let dialogs = self.remove_journal_edit_owner(owner);
         self.journals.remove(&owner);
+        self.journal_summaries.close_review(owner);
+        self.journal_questions.close(owner);
         let mut closed = Vec::new();
         self.journals.retain(|&id, surface| {
             if surface.native_owner != Some(owner) {
@@ -690,6 +768,10 @@ impl Workspace {
             closed.push(id);
             false
         });
+        for &id in &closed {
+            self.journal_summaries.close_review(id);
+            self.journal_questions.close(id);
+        }
         Task::batch(
             closed
                 .into_iter()
@@ -823,6 +905,15 @@ impl Workspace {
                 .focus_hosted_tool(id)
                 .unwrap_or_else(|| window::gain_focus(id));
         }
+        self.create_journal_viewer(owner, source, name)
+    }
+
+    fn create_journal_viewer(
+        &mut self,
+        owner: window::Id,
+        source: ViewerSource,
+        name: String,
+    ) -> Task<Desktop> {
         let (id, open) = self.open_journal_surface(
             owner,
             Kind::SessionJournalViewer,
@@ -927,6 +1018,8 @@ impl Workspace {
         match message {
             Message::Metadata(message) => return self.update_journal_metadata(id, message),
             Message::Actions(message) => return self.update_journal_actions(id, message),
+            Message::Summary(event) => return self.update_journal_summary_review(id, event),
+            Message::Question(event) => return self.update_journal_question(id, event),
             Message::Export(message) => return self.update_journal_export(id, message),
             Message::ScreenshotExport(event) => {
                 return self.update_journal_screenshot_export(id, event);
@@ -988,6 +1081,14 @@ impl Workspace {
                     self.open_journal_link(id, target)
                 } else {
                     Task::none()
+                };
+            }
+            Message::OpenAgentChat(index, entry) => {
+                return match self.visible_journal_agent_chat(id, index, &entry) {
+                    Some((owner, source)) => {
+                        self.start_journal_agent_chat(owner, source, entry, Some(id))
+                    }
+                    None => Task::none(),
                 };
             }
             Message::LinkOpened(opened) => {
@@ -1125,6 +1226,10 @@ impl Workspace {
             _ => {}
         }
         let thumbnails = self.viewer_navigation_interactive(id);
+        let citation_ready = matches!(
+            &message,
+            Message::DocumentLoaded(_) | Message::CaptureLoaded(..) | Message::ScreenshotLoaded(..)
+        );
         match self.journals.get_mut(&id).map(|surface| &mut surface.mode) {
             Some(Mode::Manager(manager)) => {
                 manager.update(message);
@@ -1142,7 +1247,12 @@ impl Workspace {
                 } else {
                     Task::none()
                 };
-                Task::batch([updated, thumbnails])
+                let citation = if citation_ready {
+                    self.apply_journal_question_citation(id)
+                } else {
+                    Task::none()
+                };
+                Task::batch([updated, thumbnails, citation])
             }
             None => Task::none(),
         }
@@ -1336,8 +1446,8 @@ impl Manager {
         rename_allowed: bool,
         saving: bool,
         rename_managed: bool,
-        delete_available: bool,
-        delete_managed: bool,
+        delete: (bool, bool),
+        summary_statuses: Vec<Option<summaries::RowStatus>>,
     ) -> Element<'_, Message> {
         responsive(move |size| {
             self.catalog_view(
@@ -1345,8 +1455,8 @@ impl Manager {
                 rename_allowed,
                 saving,
                 rename_managed,
-                delete_available,
-                delete_managed,
+                delete,
+                &summary_statuses,
             )
         })
         .into()
@@ -1358,12 +1468,14 @@ impl Manager {
         rename_allowed: bool,
         saving: bool,
         rename_managed: bool,
-        delete_available: bool,
-        delete_managed: bool,
+        (delete_available, delete_managed): (bool, bool),
+        summary_statuses: &[Option<summaries::RowStatus>],
     ) -> Element<'_, Message> {
         let count = self.results().count();
         let rows: Element<'_, Message> = if let Some(catalog) = &self.catalog {
-            self.tree.view(catalog, !self.loading).map(Message::Tree)
+            self.tree
+                .view(catalog, !self.loading, summary_statuses.to_vec())
+                .map(Message::Tree)
         } else {
             container(
                 text(if self.loading {
@@ -1534,6 +1646,30 @@ impl Manager {
 }
 
 impl Viewer {
+    fn agent_chat_index(&self, id: &str) -> Option<usize> {
+        let mut matches = self
+            .document
+            .as_ref()?
+            .timeline
+            .iter()
+            .enumerate()
+            .filter(|(_, entry)| entry.id == id);
+        let (index, entry) = matches.next()?;
+        (entry.has_agent_chat() && matches.next().is_none()).then_some(index)
+    }
+
+    fn reveal_agent_chat_entry(&mut self, id: window::Id, entry: &str) -> Task<Desktop> {
+        let Some(index) = self.agent_chat_index(entry) else {
+            self.error = Some("The recorded Agent entry is no longer available.".into());
+            return Task::none();
+        };
+        self.screenshot = None;
+        self.screenshot_menu = None;
+        let scroll = self.reveal_question_entry(entry);
+        let expand = self.update_navigation(id, Navigation::Chat(index, entry.into()), true);
+        Task::batch([scroll, expand])
+    }
+
     fn can_pick_export_range(&self) -> bool {
         !self.entry_flow.saving()
             && self.document.as_ref().is_some_and(|document| {
@@ -1805,33 +1941,33 @@ impl Viewer {
                     .find(|entry| entry.id == screenshot.entry_id())
                     .and_then(TimelineEntry::screenshot_analysis)
             });
-            let lightbox = container(
-                column![
-                    button("Back to timeline").on_press(Message::HideScreenshot),
-                    self.entry_flow.status_view(),
-                    self.error.as_ref().map(|error| text(error).size(13)),
-                    self.screenshot_analysis_notice
-                        .as_ref()
-                        .map(|notice| text(notice).size(13)),
-                    analysis.map(|rows| scrollable(screenshot_ai_access::analysis_card(
-                        rows,
-                        appearance.content
-                    ))
-                    .height(98)),
-                    screenshot_access::image_view(
-                        screenshot,
-                        self.page_revision,
-                        self.screenshot_menu
-                            .map(|point| (point, self.screenshot_menu_choice)),
-                        screenshot_interactive,
-                        screenshot_analysis,
-                    ),
-                ]
-                .spacing(8)
-                .height(Length::Fill),
-            )
-            .padding(14)
-            .into();
+            let lightbox =
+                container(
+                    column![
+                        button("Back to timeline").on_press(Message::HideScreenshot),
+                        self.entry_flow.status_view(),
+                        self.error.as_ref().map(|error| text(error).size(13)),
+                        self.screenshot_analysis_notice
+                            .as_ref()
+                            .map(|notice| text(notice).size(13)),
+                        analysis.map(|rows| journal_scrollable(
+                            screenshot_ai_access::analysis_card(rows, appearance.content)
+                        )
+                        .height(98)),
+                        screenshot_access::image_view(
+                            screenshot,
+                            self.page_revision,
+                            self.screenshot_menu
+                                .map(|point| (point, self.screenshot_menu_choice)),
+                            screenshot_interactive,
+                            screenshot_analysis,
+                        ),
+                    ]
+                    .spacing(8)
+                    .height(Length::Fill),
+                )
+                .padding(14)
+                .into();
             return if screenshot_interactive && self.screenshot_menu.is_none() {
                 viewer_keys::lightbox(lightbox)
             } else {
@@ -1872,6 +2008,10 @@ impl Viewer {
                 .then_some(Message::ShowCapture(true))
             ),
             export_menu(self.export_range.is_none() && self.export_summary().is_some()),
+            button("Open in Browser…").on_press_maybe(
+                (self.export_range.is_none() && self.export_summary().is_some())
+                    .then_some(Message::Export(export_dialog::Message::OpenBrowser)),
+            ),
             button("Pick an export time range").on_press_maybe(
                 (self.export_range.is_none()
                     && self.export_summary().is_some()
@@ -2110,10 +2250,11 @@ impl Viewer {
                         .screenshot_analysis()
                         .filter(|_| viewport.width >= 540.0)
                     {
-                        let details =
-                            scrollable(screenshot_ai_access::analysis_card(analysis, content))
-                                .height(self.navigation.thumbnail_height())
-                                .width(Length::Fill);
+                        let details = journal_scrollable(screenshot_ai_access::analysis_card(
+                            analysis, content,
+                        ))
+                        .height(self.navigation.thumbnail_height())
+                        .width(Length::Fill);
                         column![header, row![thumbnail, details].spacing(8)].into()
                     } else {
                         column![header, thumbnail].into()
@@ -2158,11 +2299,14 @@ impl Viewer {
             page_text(
                 content,
                 format!(
-                    "{} · Ended {} · {} entries · {} log parts",
+                    "{} · Ended {} · {} entries · {} log parts{}",
                     label(&summary.source, 40),
                     timestamp(summary.ended_at),
                     summary.entry_count,
-                    summary.log_parts
+                    summary.log_parts,
+                    summary
+                        .command_count
+                        .map_or_else(String::new, |count| format!(" · Commands {count}"))
                 ),
                 12.0
             )
@@ -2209,7 +2353,7 @@ impl Viewer {
         body = body
             .push(rule::horizontal(1))
             .push(
-                scrollable(rows)
+                journal_scrollable(rows)
                     .id(self.navigation.scroll_id())
                     .on_scroll(move |viewport| self.navigation.scroll_event(page, viewport))
                     .height(if compact {
@@ -2228,6 +2372,19 @@ impl Viewer {
             let chat = self
                 .navigation
                 .chat_open(index, projection.first_chat_field());
+            if entry.has_agent_chat() {
+                body = body.push(agent_chat_view::action(
+                    (
+                        self.source.directory().to_owned(),
+                        self.source.id().to_owned(),
+                        index,
+                        entry.id.clone(),
+                    ),
+                    (appearance.enabled && !self.loading && !self.entry_flow.saving())
+                        .then(|| Message::OpenAgentChat(index, entry.id.clone())),
+                    content,
+                ));
+            }
             if !entry.chat_details.is_empty() {
                 body = body.push(
                     button(page_text(
@@ -2275,7 +2432,7 @@ impl Viewer {
                 body = if compact {
                     body.push(detail)
                 } else {
-                    body.push(scrollable(detail).height(Length::Fixed(
+                    body.push(journal_scrollable(detail).height(Length::Fixed(
                         content.size(96.0).min(viewport.height * 0.33),
                     )))
                 };
@@ -2417,14 +2574,22 @@ fn journal_rows(rows: Column<'_, Message>, compact: bool) -> Element<'_, Message
     if compact {
         rows.into()
     } else {
-        scrollable(rows).height(Length::Fill).into()
+        journal_scrollable(rows).height(Length::Fill).into()
     }
 }
 
 fn compact_scroll(body: Column<'_, Message>) -> Element<'_, Message> {
-    scrollable(container(body).padding(iced::padding::right(14)))
+    journal_scrollable(container(body).padding(iced::padding::right(14)))
         .height(Length::Fill)
         .into()
+}
+
+fn journal_scrollable<'a, M: 'a>(
+    content: impl Into<Element<'a, M>>,
+) -> scrollable::Scrollable<'a, M> {
+    scrollable(content).direction(scrollable::Direction::Vertical(
+        scrollable::Scrollbar::new().minimum_scroller_length(40),
+    ))
 }
 
 fn catalog_task(id: window::Id, revision: u64, root: PathBuf) -> Task<Desktop> {
@@ -2523,3 +2688,142 @@ mod tests;
 
 #[cfg(test)]
 mod manager_tree_tests;
+
+#[cfg(test)]
+mod agent_chat_route_tests {
+    use iced::futures::{StreamExt as _, executor::block_on};
+    use iced::widget::text_editor;
+
+    use crate::session_journal::agent_chat::{Card, Message as ChatMessage, Role, Snapshot};
+    use crate::workspace::journal_agent_chat::Message as ChatAction;
+
+    use super::*;
+
+    #[test]
+    fn journal_agent_snapshot_opens_a_separate_read_only_chat_without_a_saved_copy() {
+        let profile = crate::snippets::tests::Profile::new();
+        let capture =
+            session_journal::Capture::start(profile.0.join("journals"), Default::default())
+                .unwrap();
+        let entry = "agent-reveal-fixture";
+        capture
+            .ensure_agent_card(Card {
+                id: entry.into(),
+                title: "Reviewed Agent task".into(),
+                answer: "Recorded result".into(),
+                model: "Fixture model".into(),
+                duration_ms: None,
+                tokens: None,
+            })
+            .unwrap()
+            .recv_blocking()
+            .unwrap()
+            .unwrap();
+        capture
+            .link_agent_chat(
+                entry.into(),
+                Snapshot {
+                    chat_id: "recorded-chat-fixture".into(),
+                    title: "Recorded Agent chat".into(),
+                    captured_at: jiff::Timestamp::now(),
+                    frozen: false,
+                    messages: vec![ChatMessage {
+                        role: Role::Assistant,
+                        content: "Recorded result".into(),
+                        profile: "Fixture model".into(),
+                        steps: Vec::new(),
+                    }],
+                },
+            )
+            .unwrap()
+            .recv_blocking()
+            .unwrap()
+            .unwrap();
+        let _ = capture.finish().recv_blocking();
+        let source = ViewerSource::capture(&capture);
+        let document = Arc::new(source.read(None).unwrap().unwrap());
+        let mut workspace = Workspace::default();
+        workspace.window_settings.open_tool_windows_as_tabs = true;
+        workspace.clipboard.policy.internal = true;
+        let (owner, _) = workspace.open_window(false);
+
+        let _ = workspace.open_journal_viewer(owner, source, "Fixture journal".into());
+        let id = *workspace.journals.keys().next().unwrap();
+        let _ = workspace.update_session_journal(id, Message::DocumentLoaded(Ok(document)));
+        let Mode::Viewer(viewer) = &mut workspace.journals.get_mut(&id).unwrap().mode else {
+            panic!("expected an Agent journal viewer");
+        };
+        viewer.selected_entry = Some(0);
+        assert!(workspace.visible_journal_agent_chat(id, 0, entry).is_some());
+        assert!(workspace.visible_journal_agent_chat(id, 1, entry).is_none());
+
+        let open = |workspace: &mut Workspace| {
+            let task =
+                workspace.update_session_journal(id, Message::OpenAgentChat(0, entry.into()));
+            let mut actions = iced_runtime::task::into_stream(task).unwrap();
+            block_on(async {
+                while let Some(action) = actions.next().await {
+                    if let iced_runtime::Action::Output(message) = action {
+                        return message;
+                    }
+                }
+                panic!("expected a loaded chat transcript");
+            })
+        };
+
+        let stale = open(&mut workspace);
+        let Mode::Viewer(viewer) = &mut workspace.journals.get_mut(&id).unwrap().mode else {
+            panic!("expected an Agent journal viewer");
+        };
+        viewer.selected_entry = None;
+        let _ = workspace.update(stale);
+        assert!(workspace.journal_chat_transcripts.is_empty());
+
+        let Mode::Viewer(viewer) = &mut workspace.journals.get_mut(&id).unwrap().mode else {
+            panic!("expected an Agent journal viewer");
+        };
+        viewer.selected_entry = Some(0);
+        let opened = open(&mut workspace);
+        let _ = workspace.update(opened);
+        let transcript = workspace
+            .hosted_tool_in(owner, Kind::JournalChatTranscript)
+            .unwrap();
+        assert_eq!(
+            workspace.journal_chat_transcripts[&transcript].title(),
+            "Recorded Agent chat"
+        );
+        assert!(workspace.journal_transcript_view(transcript).is_some());
+        assert_eq!(workspace.journals.len(), 1);
+        assert!(workspace.terminal_chats.is_empty());
+
+        let update = |workspace: &mut Workspace, message| {
+            let _ = workspace.update(Desktop::JournalAgentChat(message));
+        };
+        update(
+            &mut workspace,
+            ChatAction::Select(transcript, text_editor::Action::SelectAll),
+        );
+        update(
+            &mut workspace,
+            ChatAction::Select(
+                transcript,
+                text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+            ),
+        );
+        update(&mut workspace, ChatAction::Copy(transcript));
+        let selected = workspace.clipboard.buffer.get().unwrap();
+        assert!(selected.contains("Recorded result"));
+        assert!(!selected.contains('!'));
+
+        workspace.clipboard.buffer.set("preserved".into());
+        workspace.clipboard.policy.session_journal_allowed = false;
+        update(&mut workspace, ChatAction::Copy(transcript));
+        assert_eq!(
+            workspace.clipboard.buffer.get().as_deref(),
+            Some("preserved")
+        );
+
+        update(&mut workspace, ChatAction::Close(transcript));
+        assert!(workspace.journal_chat_transcripts.is_empty());
+    }
+}

@@ -142,14 +142,14 @@ impl Workspace {
         }
         let notice = match result {
             Some(TerminalCommandResult::Cleared) => {
-                pane.selection = None;
+                pane.clear_selection();
                 pane.selected_output = None;
                 return Task::none();
             }
             Some(TerminalCommandResult::Selected { revision, range })
                 if revision == pane.session.frame().search_revision =>
             {
-                pane.selection = None;
+                pane.clear_selection();
                 pane.selected_output = Some(SelectedOutput {
                     pending: None,
                     selection: Some((revision, range)),
@@ -171,6 +171,7 @@ impl Workspace {
             Some(TerminalCommandResult::OutputTooLarge) => {
                 "The last command’s output is too large to copy.".into()
             }
+            Some(TerminalCommandResult::AiCodeWritten(_)) => return Task::none(),
             None => "The terminal session is closed.".into(),
         };
         self.notice(owner, notice);

@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::fmt;
 
 use iced::{Size, Task, window};
-use kortty_pty::{LocalShell, ShellIntegrationSnippet};
+use kortty_pty::{LocalShell, validate_shell_integration};
 use kortty_ssh::ConnectOptions;
 use kortty_terminal::TerminalProfile;
 
@@ -78,6 +78,7 @@ pub enum Message {
     #[cfg(windows)]
     LocalShell(LocalShell),
     ShellIntegration(bool),
+    AdHocLocal,
     Ssh(ssh_dialog::Message),
     Serial(serial_dialog::Message),
     IbmAddress(String),
@@ -101,7 +102,9 @@ pub(super) struct Dialog {
     split: Option<SplitTarget>,
     store: Option<Store>,
     query: String,
-    selected: Option<u64>,
+    selected_ssh: Option<(u64, bool)>,
+    selected_serial: Option<u64>,
+    selected_local: Option<u64>,
     group_tab: bool,
     group: Option<String>,
     protocol: Protocol,
@@ -135,7 +138,9 @@ impl Dialog {
             split,
             store: None,
             query: String::new(),
-            selected: None,
+            selected_ssh: None,
+            selected_serial: None,
+            selected_local: None,
             group_tab: false,
             group: None,
             protocol: Protocol::Ssh,
@@ -156,18 +161,28 @@ impl Dialog {
     }
 
     fn choose(&mut self, id: u64) -> bool {
-        let Some((connection, profile)) = self
-            .store
-            .as_ref()
-            .and_then(|store| store.get(id))
-            .and_then(|connection| Some((connection, connection.profile()?)))
-        else {
+        let Some(store) = &self.store else {
             return false;
         };
-        self.ssh = SshDialog::from_saved(profile, connection)
-            .with_isolation(IsolationLevel::None, self.minimum_isolation);
-        self.selected = Some(id);
-        self.protocol = Protocol::Ssh;
+        if let Some(connection) = store.get(id)
+            && let Some(profile) = connection.profile()
+        {
+            self.ssh = SshDialog::from_saved(profile, connection)
+                .with_isolation(IsolationLevel::None, self.minimum_isolation);
+            self.selected_ssh = Some((id, connection.incognito));
+            self.protocol = Protocol::Ssh;
+        } else if let Some(saved) = store.serial(id)
+            && let Some(profile) = saved.profile()
+        {
+            self.serial.load(saved.connection.clone(), profile);
+            self.selected_serial = Some(id);
+            self.protocol = Protocol::Serial;
+        } else if store.local(id).is_some() {
+            self.selected_local = Some(id);
+            self.protocol = Protocol::Local;
+        } else {
+            return false;
+        }
         self.save = false;
         self.name.clear();
         self.status = None;
@@ -175,7 +190,42 @@ impl Dialog {
     }
 
     fn selected(&self) -> Option<&Connection> {
-        self.store.as_ref()?.get(self.selected?)
+        self.store.as_ref()?.get(self.selected_ssh?.0)
+    }
+
+    fn selected_ssh_incognito(&self) -> bool {
+        self.selected_ssh.is_some_and(|(_, incognito)| incognito)
+            || self.selected().is_some_and(|profile| profile.incognito)
+    }
+
+    fn selected_serial(&self) -> Option<&crate::connection_store::SerialProfile> {
+        self.store.as_ref()?.serial(self.selected_serial?)
+    }
+
+    fn selected_local(&self) -> Option<&crate::connection_store::LocalProfile> {
+        self.store.as_ref()?.local(self.selected_local?)
+    }
+
+    fn selected_profile_id(&self) -> Option<u64> {
+        match self.protocol {
+            Protocol::Ssh | Protocol::Sftp => self.selected_ssh.map(|(id, _)| id),
+            Protocol::Serial => self.selected_serial,
+            Protocol::Local => self.selected_local,
+            _ => None,
+        }
+    }
+
+    fn focus_selected(&mut self) -> Task<Desktop> {
+        let id = self.id;
+        if self.protocol == Protocol::Serial {
+            self.serial
+                .refresh()
+                .map(move |message| wrap(id, Message::Serial(message)))
+        } else {
+            self.ssh
+                .focus()
+                .map(move |message| wrap(id, Message::Ssh(message)))
+        }
     }
 
     fn can_connect(&self) -> bool {
@@ -187,7 +237,7 @@ impl Dialog {
         }
         match self.protocol {
             Protocol::Ssh | Protocol::Sftp => self.ssh.can_connect(),
-            Protocol::Local => true,
+            Protocol::Local => self.selected_local.is_none() || self.selected_local().is_some(),
             Protocol::Serial => self.serial.validated().is_ok(),
             Protocol::Tn3270 | Protocol::Tn5250 => self.ibm.connection().is_some(),
         }
@@ -208,10 +258,8 @@ impl Workspace {
     fn quick_shell_integration(
         &self,
         profile: TerminalProfile,
+        shell: LocalShell,
     ) -> Result<LocalSettings, &'static str> {
-        if cfg!(windows) {
-            return Err("Use the shell integration snippets to set up shells on Windows.");
-        }
         if !self.window_settings.prompt_navigation_enabled
             || !super::shell_integration::supports_marks(profile)
         {
@@ -226,9 +274,20 @@ impl Workspace {
         if settings.isolation == IsolationLevel::Sandbox {
             return Err("A sandboxed shell uses its own isolated startup environment.");
         }
-        if ShellIntegrationSnippet::local_default().is_none() {
-            return Err("Automatic setup is available for local bash, zsh and fish.");
+        validate_shell_integration(shell, None)
+            .map_err(|_| "Automatic setup is unavailable for this shell.")?;
+        let supported = kortty_pty::shell_program(shell)
+            .ok()
+            .and_then(|program| {
+                program
+                    .to_str()
+                    .and_then(kortty_pty::ShellIntegrationSnippet::from_program)
+            })
+            .is_some();
+        if !supported {
+            return Err("Automatic setup is unavailable for this shell.");
         }
+        settings.shell = shell;
         settings.shell_integration = true;
         Ok(settings)
     }
@@ -245,6 +304,9 @@ impl Workspace {
         if let Some(dialog) = &self.quick_connect {
             return window::gain_focus(dialog.id);
         }
+        if let Some((_, focus)) = self.owner_dialog(owner) {
+            return self.update(focus);
+        }
         self.refresh_ssh_key_choices();
         let Some(profile) = self.windows.get(&owner).map(|window| window.local_profile) else {
             return Task::none();
@@ -252,7 +314,8 @@ impl Workspace {
         if let Some(window) = self.windows.get_mut(&owner) {
             window.cancel_paste();
         }
-        let (id, open) = self.open_placed_dialog(
+        let (id, open) = self.open_owned_placed_dialog(
+            owner,
             DialogKind::QuickConnect,
             window::Settings {
                 size: Size::new(775.0, 610.0),
@@ -261,6 +324,7 @@ impl Workspace {
                 exit_on_close_request: false,
                 ..window::Settings::default()
             },
+            None,
         );
         let dialog = Dialog::new(
             id,
@@ -281,7 +345,7 @@ impl Workspace {
                 .map_err(|error| format!("Could not load saved connections ({error})"));
             wrap(id, Message::Loaded(result))
         });
-        Task::batch([open.map(|_| Desktop::Noop).chain(focus), load])
+        Task::batch([open.chain(focus), load])
     }
 
     pub(super) fn quick_connect_title(&self, id: window::Id) -> Option<&'static str> {
@@ -308,18 +372,13 @@ impl Workspace {
         }
         let owner = dialog.owner;
         self.quick_connect = None;
-        Some(Task::batch([
-            self.close_placed_dialog(id),
-            window::gain_focus(owner),
-        ]))
+        Some(self.close_placed_dialog_and_focus(id, owner))
     }
 
-    pub(super) fn quick_connect_owner_closed(&mut self, owner: window::Id) -> Task<Desktop> {
-        if let Some(id) = self.quick_connect_for_owner(owner) {
-            self.quick_connect = None;
-            return self.close_placed_dialog(id);
-        }
-        Task::none()
+    pub(super) fn take_quick_connect_for_owner(&mut self, owner: window::Id) -> Option<window::Id> {
+        let id = self.quick_connect_for_owner(owner)?;
+        self.quick_connect = None;
+        Some(id)
     }
 
     pub(super) fn refresh_quick_connect(&mut self, store: &Store) {
@@ -340,7 +399,7 @@ impl Workspace {
             return Vec::new();
         }
         let mut protocols = vec![Protocol::Ssh, Protocol::Local];
-        if !self.isolation_required() && self.clipboard.policy.serial_allowed {
+        if self.serial_profiles_allowed() {
             protocols.push(Protocol::Serial);
         }
         if !split {
@@ -378,7 +437,11 @@ impl Workspace {
             Message::Loaded(Err(error)) => dialog.status = Some(error),
             Message::Saved(Ok((store, id))) => {
                 dialog.saving = false;
-                dialog.selected = Some(id);
+                if let Some(connection) = store.get(id) {
+                    dialog.selected_ssh = Some((id, connection.incognito));
+                } else if store.serial(id).is_some() {
+                    dialog.selected_serial = Some(id);
+                }
                 dialog.save = false;
                 self.update_connection_store(store);
                 return self.quick_submit();
@@ -389,28 +452,22 @@ impl Workspace {
             }
             Message::Query(query) if query.len() <= 240 => dialog.query = query,
             Message::Select(connection) if dialog.choose(connection) => {
-                return dialog
-                    .ssh
-                    .focus()
-                    .map(move |message| wrap(id, Message::Ssh(message)));
+                return dialog.focus_selected();
             }
             Message::Recent(connection) if split => {
                 if dialog.choose(connection) {
                     if dialog.can_connect() {
                         return self.quick_submit();
                     }
-                    return dialog
-                        .ssh
-                        .focus()
-                        .map(move |message| wrap(id, Message::Ssh(message)));
+                    return dialog.focus_selected();
                 }
             }
             Message::Recent(connection) => {
-                if dialog
-                    .store
-                    .as_ref()
-                    .is_some_and(|store| store.get(connection).is_some())
-                {
+                if dialog.store.as_ref().is_some_and(|store| {
+                    store.get(connection).is_some()
+                        || store.serial(connection).is_some()
+                        || store.local(connection).is_some()
+                }) {
                     let close = self.close_quick_connect(id).unwrap_or_else(Task::none);
                     return Task::batch([close, self.open_recent_connection(owner, connection)]);
                 }
@@ -420,6 +477,12 @@ impl Workspace {
                 dialog.group = Some(group)
             }
             Message::Protocol(protocol) if allowed.contains(&protocol) => {
+                if protocol != dialog.protocol
+                    && (protocol == Protocol::Serial || dialog.protocol == Protocol::Serial)
+                {
+                    dialog.save = false;
+                    dialog.name.clear();
+                }
                 dialog.protocol = protocol;
                 if let Some(models) = protocol.ibm_models()
                     && !models.contains(&dialog.ibm.kind)
@@ -453,6 +516,9 @@ impl Workspace {
             }
             Message::ShellIntegration(enabled) if dialog.protocol == Protocol::Local => {
                 dialog.shell_integration = enabled;
+            }
+            Message::AdHocLocal if dialog.protocol == Protocol::Local => {
+                dialog.selected_local = None;
             }
             Message::Ssh(ssh_dialog::Message::Connect) if dialog.protocol.is_ssh() => {
                 return self.quick_submit();
@@ -501,8 +567,9 @@ impl Workspace {
                 ]);
             }
             Message::Manage if !split => {
-                let close = self.close_quick_connect(id).unwrap_or_else(Task::none);
-                return Task::batch([close, self.show_connections(owner)]);
+                self.quick_connect = None;
+                self.connection_manager_open_after_close.insert(id, owner);
+                return self.close_placed_dialog(id);
             }
             Message::Focus => return window::gain_focus(id),
             Message::Cancel => return self.close_quick_connect(id).unwrap_or_else(Task::none),
@@ -521,10 +588,10 @@ impl Workspace {
         };
         let (id, owner) = (dialog.id, dialog.owner);
         if !self.windows.contains_key(&owner) {
-            return self.quick_connect_owner_closed(owner);
+            self.quick_connect = None;
+            return self.close_placed_dialog(id);
         }
-        let incognito = dialog.protocol == Protocol::Ssh
-            && dialog.selected().is_some_and(|profile| profile.incognito);
+        let incognito = dialog.protocol == Protocol::Ssh && dialog.selected_ssh_incognito();
         let incognito = if let Some(target) = dialog.split {
             match self.split_connection_privacy(owner, target, incognito) {
                 Ok(value) => value,
@@ -573,7 +640,7 @@ impl Workspace {
                     draft.jump.as_ref().map(|login| &login.endpoint),
                 )
             }) {
-                draft.incognito = dialog.selected().is_some_and(|profile| profile.incognito);
+                draft.incognito = dialog.selected_ssh_incognito();
                 dialog.saving = true;
                 dialog.status = None;
                 return Task::future(async move {
@@ -588,15 +655,35 @@ impl Workspace {
                 });
             }
         }
+        if dialog.protocol == Protocol::Serial && dialog.save {
+            let Ok((connection, terminal)) = dialog.serial.validated() else {
+                return Task::none();
+            };
+            let draft =
+                crate::connection_store::SerialProfile::new(&dialog.name, connection, terminal);
+            dialog.saving = true;
+            dialog.status = None;
+            return Task::future(async move {
+                let result = profile::connections_path()
+                    .and_then(Store::open)
+                    .and_then(|mut store| {
+                        let id = store.save_serial(draft)?;
+                        Ok((store, id))
+                    })
+                    .map_err(|error| format!("Could not save the connection ({error})"));
+                wrap(id, Message::Saved(result))
+            });
+        }
         let Some(dialog) = self.quick_connect.take() else {
             return Task::none();
         };
+        let saved_ssh = dialog.selected().map(|connection| connection.id);
         let start = match dialog.protocol {
             Protocol::Ssh | Protocol::Sftp => self.start_quick_ssh(
                 owner,
                 dialog.ssh,
                 super::ssh_access::QuickLaunch {
-                    saved: dialog.selected,
+                    saved: saved_ssh,
                     sftp: dialog.protocol == Protocol::Sftp,
                     incognito,
                     font: dialog.font,
@@ -606,34 +693,43 @@ impl Workspace {
             ),
             Protocol::Local => {
                 let profile = dialog.ssh.profile();
-                let settings = if dialog.local_shell.is_default() {
-                    Ok(dialog
-                        .shell_integration
-                        .then(|| self.quick_shell_integration(profile).ok())
-                        .flatten())
+                let started = if let Some(saved) = dialog.selected_local().cloned() {
+                    self.store_saved_local_session(saved, dialog.font)
                 } else {
-                    self.local_settings_for_shell(dialog.local_shell).map(Some)
+                    let settings = if dialog.shell_integration {
+                        self.quick_shell_integration(profile, dialog.local_shell)
+                            .map(Some)
+                            .map_err(std::io::Error::other)
+                    } else if dialog.local_shell.is_default() {
+                        Ok(None)
+                    } else {
+                        self.local_settings_for_shell(dialog.local_shell).map(Some)
+                    };
+                    settings.and_then(|settings| {
+                        self.store_local_session(profile, dialog.font, settings)
+                    })
                 };
-                match settings
-                    .and_then(|settings| self.store_local_session(profile, dialog.font, settings))
-                {
+                match started {
                     Ok(session) => {
                         if let Some(target) = dialog.split {
                             self.start_split_worker(owner, target, session);
                         } else {
                             self.add_tab(owner, session);
                         }
+                        self.record_local_session_used(session)
                     }
                     Err(error) => {
-                        self.notice(owner, format!("Could not start the local shell ({error})"))
+                        self.notice(owner, format!("Could not start the local shell ({error})"));
+                        Task::none()
                     }
                 }
-                Task::none()
             }
             Protocol::Serial => {
+                let saved = dialog.selected_serial().cloned();
                 if let Some(window) = self.windows.get_mut(&owner) {
                     window.pending_serial = Some(PendingSerial {
                         form: dialog.serial,
+                        saved,
                         replace: None,
                         reconnect: None,
                         split: dialog.split,
@@ -652,15 +748,18 @@ impl Workspace {
                 self.connect_ibm(owner)
             }
         };
-        Task::batch([
-            self.close_placed_dialog(id),
-            window::gain_focus(owner),
-            start,
-        ])
+        Task::batch([self.close_placed_dialog_and_focus(id, owner), start])
     }
 
     pub(super) fn open_recent_connection(&mut self, owner: window::Id, id: u64) -> Task<Desktop> {
-        let Some(connection) = self.saved_connection(id) else {
+        let store = profile::connections_path().and_then(Store::open).ok();
+        if let Some(serial) = store.as_ref().and_then(|store| store.serial(id)).cloned() {
+            return self.open_saved_serial(owner, serial);
+        }
+        if let Some(local) = store.as_ref().and_then(|store| store.local(id)).cloned() {
+            return self.open_saved_local(owner, local);
+        }
+        let Some(connection) = store.and_then(|store| store.get(id).cloned()) else {
             self.notice(owner, "The saved connection no longer exists.".into());
             return Task::none();
         };
@@ -683,12 +782,20 @@ impl Workspace {
         };
         let mut members = VecDeque::new();
         let mut skipped = Vec::new();
+        let mut blocked = Vec::new();
         for connection in store
             .connections()
             .iter()
             .filter(|connection| store.group_of(connection.id) == Some(group))
         {
-            if needs_entered_password(connection)
+            if let Some((host, port)) =
+                connection.blocked_server(self.clipboard.policy.server_access())
+            {
+                let endpoint = format!("{host}:{port}");
+                if !blocked.contains(&endpoint) {
+                    blocked.push(endpoint);
+                }
+            } else if needs_entered_password(connection)
                 || (connection.incognito && !self.clipboard.policy.incognito_allowed)
             {
                 skipped.push(connection.name.as_str());
@@ -697,14 +804,21 @@ impl Workspace {
             }
         }
         let task = self.advance_quick_group(owner, members);
+        let mut notices = Vec::new();
         if !skipped.is_empty() {
-            self.notice(
-                owner,
-                format!(
-                    "Skipped connections requiring a password or blocked by policy: {}",
-                    skipped.join(", ")
-                ),
-            );
+            notices.push(format!(
+                "Skipped connections requiring a password or blocked by policy: {}.",
+                skipped.join(", ")
+            ));
+        }
+        if !blocked.is_empty() {
+            notices.push(format!(
+                "Your organization's server policy blocks {}.",
+                blocked.join(", ")
+            ));
+        }
+        if !notices.is_empty() {
+            self.notice(owner, notices.join(" "));
         }
         task
     }
@@ -718,6 +832,7 @@ impl Workspace {
             if let Some(connection) = self.saved_connection(id)
                 && !needs_entered_password(&connection)
                 && (!connection.incognito || self.clipboard.policy.incognito_allowed)
+                && self.blocked_saved_server(&connection).is_none()
             {
                 return self.start_group_member(owner, connection, remaining);
             }
@@ -783,6 +898,129 @@ fn wrap(id: window::Id, message: Message) -> Desktop {
 mod tests {
     use super::*;
     use crate::ssh_dialog::{LoginMessage, Password};
+
+    #[cfg(windows)]
+    #[test]
+    fn quick_local_shell_integration_preserves_windows_shell_and_security_gates() {
+        let mut workspace = Workspace::default();
+        workspace.window_settings.prompt_navigation_enabled = true;
+        for shell in [
+            LocalShell::Default,
+            LocalShell::PowerShell,
+            LocalShell::CommandPrompt,
+        ] {
+            let settings = workspace
+                .quick_shell_integration(TerminalProfile::Xterm, shell)
+                .unwrap();
+            assert_eq!(settings.shell, shell);
+            assert!(settings.shell_integration);
+        }
+        workspace.window_settings.prompt_navigation_enabled = false;
+        assert!(
+            workspace
+                .quick_shell_integration(TerminalProfile::Xterm, LocalShell::PowerShell)
+                .is_err()
+        );
+        workspace.window_settings.prompt_navigation_enabled = true;
+        workspace.clipboard.policy.minimum_isolation = IsolationLevel::Sandbox;
+        assert!(
+            workspace
+                .quick_shell_integration(TerminalProfile::Xterm, LocalShell::CommandPrompt)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn quick_connect_keeps_each_saved_profiles_identity_when_switching_protocols() {
+        use crate::connection_store::SerialProfile;
+        use crate::session::SerialLineEnding;
+        use kortty_terminal::TextEncoding;
+
+        struct Scratch(std::path::PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "kortty-quick-serial-{}",
+            crate::private_files::nonce().unwrap()
+        )));
+        std::fs::create_dir(&scratch.0).unwrap();
+        let mut store = Store::open(scratch.0.join("connections.json")).unwrap();
+        let mut ssh = blank_ssh(TerminalProfile::Xterm, IsolationLevel::None);
+        ssh.update(ssh_dialog::Message::Target(LoginMessage::Host(
+            "private.test".into(),
+        )));
+        ssh.update(ssh_dialog::Message::Target(LoginMessage::Password(
+            Password::new("fixture".into()),
+        )));
+        let mut private = ssh.saved_draft("Private").unwrap();
+        private.incognito = true;
+        let private = store.save(private).unwrap();
+        let connection = SerialConnection {
+            device: if cfg!(windows) {
+                "COM7"
+            } else {
+                "/dev/test-serial"
+            }
+            .into(),
+            line_ending: SerialLineEnding::Lf,
+            local_echo: true,
+            encoding: Some(TextEncoding::Latin1),
+            ..SerialConnection::default()
+        };
+        let saved = store
+            .save_serial(SerialProfile::new(
+                "Router",
+                connection.clone(),
+                TerminalProfile::Vt220,
+            ))
+            .unwrap();
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.show_quick_connect(owner);
+        let id = workspace.quick_connect_for_owner(owner).unwrap();
+        let _ = workspace.update_quick_connect(id, Message::Loaded(Ok(store)));
+        let _ = workspace.update_quick_connect(id, Message::Select(private));
+        let _ = workspace.update_quick_connect(
+            id,
+            Message::Ssh(ssh_dialog::Message::Target(LoginMessage::Password(
+                Password::new("fixture".into()),
+            ))),
+        );
+        let _ = workspace.update_quick_connect(id, Message::Select(saved));
+        let dialog = workspace.quick_connect.as_ref().unwrap();
+        assert_eq!(dialog.protocol, Protocol::Serial);
+        assert_eq!(dialog.selected_profile_id(), Some(saved));
+        assert_eq!(dialog.selected_serial().unwrap().id, saved);
+        assert_eq!(
+            dialog.serial.validated(),
+            Ok((connection.clone(), TerminalProfile::Vt220))
+        );
+        assert!(dialog.can_connect());
+
+        let _ = workspace.update_quick_connect(id, Message::Protocol(Protocol::Ssh));
+        let dialog = workspace.quick_connect.as_ref().unwrap();
+        assert_eq!(dialog.selected_profile_id(), Some(private));
+        assert!(dialog.can_connect());
+        workspace.clipboard.policy.incognito_allowed = false;
+        let _ = workspace.update_quick_connect(id, Message::Connect);
+        assert_eq!(
+            workspace.quick_connect.as_ref().unwrap().status.as_deref(),
+            Some("Managed policy blocks this incognito connection.")
+        );
+
+        let _ = workspace.update_quick_connect(id, Message::Protocol(Protocol::Serial));
+        let dialog = workspace.quick_connect.as_ref().unwrap();
+        assert_eq!(dialog.selected_profile_id(), Some(saved));
+        assert!(
+            dialog
+                .selected_serial()
+                .unwrap()
+                .matches(&connection, TerminalProfile::Vt220)
+        );
+    }
 
     #[test]
     fn quick_connect_appearance_reset_preserves_the_ssh_login() {
@@ -875,6 +1113,94 @@ mod tests {
         assert!(workspace.quick_connect_for_owner(other).is_none());
         let _ = workspace.update_quick_connect(dialog, Message::Cancel);
         assert!(workspace.current_targets(owner, tab, &[session]));
+    }
+
+    #[test]
+    fn quick_connect_escape_cancels_from_focused_host_and_returns_to_owner() {
+        use iced::advanced::clipboard;
+        use iced::futures::{StreamExt, executor::block_on};
+        use iced::keyboard::{self, Key, Location, Modifiers, key, key::Named};
+        use iced::{Event, Font, Renderer, event, mouse};
+        use iced_runtime::user_interface::Cache;
+        use iced_runtime::{Action, UserInterface, task, window::Action as WindowAction};
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let (other, _) = workspace.open_window(false);
+        let _ = workspace.show_quick_connect(owner);
+        let dialog = workspace.quick_connect_for_owner(owner).unwrap();
+        let _ = workspace.finish_owned_dialog_open(dialog, owner, None);
+
+        let key_press = |key: Key, text: Option<&str>| {
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                modified_key: key.clone(),
+                key,
+                physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+                location: Location::Standard,
+                modifiers: Modifiers::empty(),
+                text: text.map(Into::into),
+                repeat: false,
+            })
+        };
+        let cancel_from_view = |workspace: &Workspace| {
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                workspace.view(dialog),
+                Size::new(775.0, 610.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            let focus = workspace.quick_connect.as_ref().unwrap().ssh.focus();
+            let Some(Action::Widget(mut focus)) =
+                block_on(task::into_stream(focus).unwrap().next())
+            else {
+                panic!("the host field needs an initial focus operation");
+            };
+            interface.operate(&renderer, focus.as_mut());
+
+            let mut messages = Vec::new();
+            let (_, statuses) = interface.update(
+                &[
+                    key_press(Key::Character("x".into()), Some("x")),
+                    key_press(Key::Named(Named::Escape), None),
+                ],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(statuses, [event::Status::Captured; 2]);
+            assert!(matches!(
+                messages.as_slice(),
+                [Desktop::QuickConnect(id, Message::Ssh(ssh_dialog::Message::Target(LoginMessage::Host(value)))), Desktop::QuickConnect(cancelled, Message::Cancel)]
+                    if *id == dialog && *cancelled == dialog && value == "x"
+            ));
+            messages.pop().unwrap()
+        };
+
+        workspace.quick_connect.as_mut().unwrap().saving = true;
+        let cancel = cancel_from_view(&workspace);
+        assert!(task::into_stream(workspace.update(cancel)).is_none());
+        assert_eq!(workspace.quick_connect_for_owner(owner), Some(dialog));
+
+        workspace.quick_connect.as_mut().unwrap().saving = false;
+        let cancel = cancel_from_view(&workspace);
+        let mut actions = task::into_stream(workspace.update(cancel)).unwrap();
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        assert!(matches!(
+            block_on(actions.next()),
+            Some(Action::Window(WindowAction::Run(id, _))) if id == dialog
+        ));
+        assert!(matches!(
+            block_on(actions.next()),
+            Some(Action::Window(WindowAction::Close(id))) if id == dialog
+        ));
+        assert!(matches!(
+            block_on(actions.next()),
+            Some(Action::Window(WindowAction::GainFocus(id))) if id == owner
+        ));
+        assert!(workspace.owner_dialog(owner).is_none());
+        assert!(workspace.owner_dialog(other).is_none());
     }
 
     fn split_fixture() -> (Workspace, window::Id, crate::session::SessionId) {

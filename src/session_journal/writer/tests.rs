@@ -7,8 +7,10 @@ use crate::session_journal::{CaptureKind, capture_page, read, read_screenshot};
 
 use super::*;
 
+mod agent_chat;
 mod markers;
 mod screenshots;
+mod summaries;
 
 struct Fixture(PathBuf);
 
@@ -70,6 +72,294 @@ fn wait_timeline(capture: &Capture, revision: usize) {
     }
 }
 
+#[test]
+fn closing_publishes_classified_commands_for_native_header_and_exports() {
+    use crate::session_journal::export::{Options, load_for_bundle};
+
+    let fixture = Fixture::new();
+    for log_format in LogFormat::ALL {
+        let capture = Capture::start(
+            fixture.journals(),
+            Metadata {
+                log_format,
+                ..Metadata::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            read(capture.directory()).unwrap().summary.command_count,
+            None
+        );
+        write_command_count_fixture(&capture);
+        wait(capture.finish());
+
+        let journal = read(capture.directory()).unwrap();
+        let summary = journal.summary;
+        assert_eq!(summary.command_count, Some(2));
+        assert_eq!(summary.log_entry_count, 12);
+        let snapshot = load_for_bundle(
+            &fixture.journals(),
+            capture.directory(),
+            &summary.id,
+            summary.deletion_identity.as_ref().unwrap(),
+        )
+        .unwrap();
+        let options = Options::default();
+        let markdown = snapshot.render(&options, "assets").unwrap();
+        assert!(markdown.text.contains("**Commands:** 2"));
+        let mut metadata = Vec::new();
+        let stats = snapshot
+            .write_html_bundle(
+                &options,
+                true,
+                |name, bytes| {
+                    if name == "journal.xml" {
+                        metadata.extend_from_slice(bytes);
+                    }
+                    Ok(())
+                },
+                &|| false,
+            )
+            .unwrap();
+        assert_eq!(stats.command_count, 2);
+        assert!(
+            String::from_utf8(metadata)
+                .unwrap()
+                .contains("<commandCount>2</commandCount>")
+        );
+    }
+}
+
+#[test]
+fn abandoned_and_legacy_native_journals_rebuild_the_count_from_capture() {
+    use crate::session_journal::{summary_store, viewer::Source};
+    use std::sync::atomic::AtomicBool;
+
+    let fixture = Fixture::new();
+    let capture = Capture::start(fixture.journals(), Metadata::default()).unwrap();
+    write_command_count_fixture(&capture);
+    wait(capture.finish());
+    let path = capture.directory().join("journal.xml");
+    let xml = fs::read_to_string(&path).unwrap();
+    let abandoned = xml
+        .lines()
+        .filter(|line| !line.starts_with("<endedAt>") && !line.starts_with("<commandCount>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, &abandoned).unwrap();
+    let source = Source::capture(&capture);
+
+    let cancelled = AtomicBool::new(true);
+    let error = summary_store::finish_abandoned(&source, &cancelled).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(fs::read_to_string(&path).unwrap(), abandoned);
+
+    let active = AtomicBool::new(false);
+    summary_store::finish_abandoned(&source, &active).unwrap();
+    let recovered = read(capture.directory()).unwrap();
+    assert!(recovered.summary.ended_at.is_some());
+    assert_eq!(recovered.summary.command_count, Some(2));
+
+    let stale = xml.replace(
+        "<commandCount>2</commandCount>",
+        "<commandCount>5</commandCount>",
+    );
+    fs::write(&path, stale).unwrap();
+    assert_eq!(
+        read(capture.directory()).unwrap().summary.command_count,
+        Some(5)
+    );
+    summary_store::refresh_command_count(&source, &active, None).unwrap();
+    assert_eq!(
+        read(capture.directory()).unwrap().summary.command_count,
+        Some(2)
+    );
+}
+
+#[test]
+fn startup_recovers_abandoned_interactive_journals_without_summary_receipts() {
+    use crate::private_files::Directory;
+    use crate::session_journal::{DOCUMENT, metadata::LOCK, summary_store::recover_interactive};
+
+    let fixture = Fixture::new();
+    let root = fixture.journals();
+    let stop = AtomicBool::new(false);
+    assert_eq!(recover_interactive(&root, &stop).unwrap(), 0);
+    assert!(!root.exists());
+
+    let capture = Capture::start(root.clone(), Metadata::default()).unwrap();
+    write_command_count_fixture(&capture);
+    wait(capture.finish());
+    let document = capture.directory().join(DOCUMENT);
+    let closed = fs::read_to_string(&document).unwrap();
+    let abandoned = closed
+        .lines()
+        .filter(|line| !line.starts_with("<endedAt>") && !line.starts_with("<commandCount>"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(abandoned.contains("<aiSummariesOff>true</aiSummariesOff>"));
+    fs::write(&document, &abandoned).unwrap();
+
+    let live = Capture::start(root.clone(), Metadata::default()).unwrap();
+    let live_document = live.directory().join(DOCUMENT);
+    let live_before = fs::read(&live_document).unwrap();
+    let root_handle = Directory::open(&root, false).unwrap();
+    let imported_id = uuid().unwrap();
+    let imported_name = format!("journal-{imported_id}");
+    let imported = root_handle.private_child(&imported_name, true).unwrap();
+    let imported_xml = abandoned.replace(capture.id(), &imported_id);
+    imported
+        .publish_copy(DOCUMENT, imported_xml.as_bytes())
+        .unwrap();
+
+    let automation = Capture::start(root.clone(), Metadata::default()).unwrap();
+    wait(automation.finish());
+    let automation_document = automation.directory().join(DOCUMENT);
+    let automation_xml = abandoned
+        .replace(capture.id(), automation.id())
+        .replace("</meta>", "<sourceKind>JOB</sourceKind>\n</meta>");
+    fs::write(&automation_document, &automation_xml).unwrap();
+
+    let read_only = Capture::start(root.clone(), Metadata::default()).unwrap();
+    wait(read_only.finish());
+    let read_only_document = read_only.directory().join(DOCUMENT);
+    let read_only_xml = abandoned.replace(capture.id(), read_only.id());
+    fs::write(&read_only_document, &read_only_xml).unwrap();
+    let original_permissions = fs::metadata(&read_only_document).unwrap().permissions();
+    let mut read_only_permissions = original_permissions.clone();
+    read_only_permissions.set_readonly(true);
+    fs::set_permissions(&read_only_document, read_only_permissions).unwrap();
+
+    stop.store(true, Ordering::Release);
+    assert_eq!(
+        recover_interactive(&root, &stop).unwrap_err().kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(fs::read_to_string(&document).unwrap(), abandoned);
+    stop.store(false, Ordering::Release);
+    let recovered = recover_interactive(&root, &stop);
+    fs::set_permissions(&read_only_document, original_permissions).unwrap();
+
+    assert_eq!(recovered.unwrap(), 1);
+    let journal = read(capture.directory()).unwrap();
+    assert!(journal.summary.ended_at.is_some());
+    assert_eq!(journal.summary.command_count, Some(2));
+    assert!(
+        !journal
+            .timeline
+            .iter()
+            .any(|entry| entry.kind == "AI_SUMMARY")
+    );
+    assert_eq!(fs::read(&live_document).unwrap(), live_before);
+    let imported_path = root.join(imported_name);
+    assert_eq!(
+        fs::read_to_string(imported_path.join(DOCUMENT)).unwrap(),
+        imported_xml
+    );
+    assert!(!imported_path.join(LOCK).exists());
+    assert_eq!(
+        fs::read_to_string(&automation_document).unwrap(),
+        automation_xml
+    );
+    assert_eq!(
+        fs::read_to_string(&read_only_document).unwrap(),
+        read_only_xml
+    );
+    wait(live.finish());
+}
+
+fn write_command_count_fixture(capture: &Capture) {
+    use RecordKind::{CommandEnd, Input, Output};
+
+    let sink = capture.sink();
+    for (kind, text) in [
+        (Output, "daniel@fedora:~$"),
+        (Input, "sudo id"),
+        (Output, "Continue? [y/N]"),
+        (Input, "y"),
+        (Output, "uid=0(root)"),
+        (CommandEnd, "shell integration: command finished (exit 0)"),
+        (Input, "ls --help"),
+        (CommandEnd, "shell integration: command finished (exit 0)"),
+        (Input, "mistsart"),
+        (Output, "bash: mistsart: command not found"),
+        (CommandEnd, "shell integration: command finished (exit 127)"),
+        (Input, "df -h"),
+    ] {
+        sink.try_write(kind, Zeroizing::new(text.to_owned()), false)
+            .unwrap();
+    }
+}
+
+#[test]
+fn configured_part_limit_stops_output_but_retains_input_and_notes() {
+    let fixture = Fixture::new();
+    let capture = Capture::start_with_limits(
+        fixture.journals(),
+        Metadata {
+            connection_config: Some(Default::default()),
+            ..Metadata::default()
+        },
+        Limits {
+            part_bytes: 1024,
+            parts: 1,
+        },
+    )
+    .unwrap();
+    let sink = capture.sink();
+    sink.try_write(RecordKind::Output, Zeroizing::new("x".repeat(1024)), false)
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    while !sink.output_paused() {
+        assert!(Instant::now() < deadline, "output pause was not published");
+        thread::sleep(Duration::from_millis(5));
+    }
+    for _ in 0..QUEUE * 2 {
+        sink.try_write(
+            RecordKind::Output,
+            Zeroizing::new("suppressed output".into()),
+            false,
+        )
+        .unwrap();
+    }
+    sink.try_write(
+        RecordKind::Input,
+        Zeroizing::new("retained command".into()),
+        false,
+    )
+    .unwrap();
+    sink.try_write(
+        RecordKind::Note,
+        Zeroizing::new("retained note".into()),
+        false,
+    )
+    .unwrap();
+    wait(capture.finish());
+    let page = capture_page(capture.directory(), None, None, None).unwrap();
+    assert!(
+        page.records
+            .iter()
+            .any(|record| record.kind == CaptureKind::Input && record.text == "retained command")
+    );
+    assert!(
+        page.records
+            .iter()
+            .any(|record| record.kind == CaptureKind::Note && record.text == "retained note")
+    );
+    assert!(
+        page.records
+            .iter()
+            .any(|record| record.text.contains("output capture stopped"))
+    );
+    assert!(
+        !page
+            .records
+            .iter()
+            .any(|record| record.text.contains("suppressed output"))
+    );
+    assert_eq!(read(capture.directory()).unwrap().summary.log_parts, 1);
+}
+
 fn archived_part(directory: &Path, name: &str) -> String {
     let file = fs::File::open(directory.join(format!("{name}.zst"))).unwrap();
     assert!(!directory.join(name).exists());
@@ -78,6 +368,62 @@ fn archived_part(directory: &Path, name: &str) -> String {
         .read_to_string(&mut text)
         .unwrap();
     text
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_journal_finishes_with_a_delete_shared_document_reader() {
+    let fixture = Fixture::new();
+    let capture = Capture::start(fixture.journals(), Metadata::default()).unwrap();
+    let path = capture.directory().join("journal.xml");
+    let before = fs::read(&path).unwrap();
+    assert!(
+        read(capture.directory())
+            .unwrap()
+            .summary
+            .ended_at
+            .is_none()
+    );
+    // The live reader retains the original file and shares it for deletion.
+    let mut reader = fs::File::open(&path).unwrap();
+
+    wait(capture.finish());
+
+    assert_eq!(capture.status(), Status::Complete);
+    assert!(
+        read(capture.directory())
+            .unwrap()
+            .summary
+            .ended_at
+            .is_some()
+    );
+    let mut retained = Vec::new();
+    reader.read_to_end(&mut retained).unwrap();
+    assert_eq!(retained, before);
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_journal_preserves_a_document_that_refuses_delete_sharing() {
+    use std::os::windows::fs::OpenOptionsExt as _;
+
+    const SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+    let fixture = Fixture::new();
+    let capture = Capture::start(fixture.journals(), Metadata::default()).unwrap();
+    let path = capture.directory().join("journal.xml");
+    let before = fs::read(&path).unwrap();
+    let reader = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(SHARE_READ_WRITE)
+        .open(&path)
+        .unwrap();
+
+    wait(capture.finish());
+
+    assert!(matches!(capture.status(), Status::Failed(_)));
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(!capture.directory().join(".journal.xml.pending").exists());
+    drop(reader);
 }
 
 #[test]
@@ -797,14 +1143,17 @@ fn busy_metadata_queue_does_not_truncate_capture_or_discard_accepted_records() {
     let (_completion, done) = async_channel::bounded(1);
     let capture = Capture {
         id: "queue-test".into(),
+        started_at: Timestamp::UNIX_EPOCH,
         directory: PathBuf::new(),
         root_identity: Default::default(),
         directory_identity: Default::default(),
         log_format: LogFormat::default(),
+        summary_config: None,
         archives: Default::default(),
         sink: Sink {
             shared: Arc::new(Shared {
                 input,
+                output_paused: AtomicBool::new(false),
                 marker_rules: Mutex::new(Arc::new(super::markers::Compiled::default())),
                 sequence: AtomicU64::default(),
                 timeline: AtomicUsize::default(),
@@ -859,6 +1208,7 @@ fn writes_readable_java_jsonl_timeline_notes_and_private_screenshot() {
             username: "operator".into(),
             seeded: true,
             log_format: LogFormat::Json,
+            ..Metadata::default()
         },
     )
     .unwrap();
@@ -1227,6 +1577,7 @@ fn full_queue_stops_acceptance_without_dropping_its_fifo_prefix() {
     let sink = Sink {
         shared: Arc::new(Shared {
             input,
+            output_paused: AtomicBool::new(false),
             marker_rules: Mutex::new(Arc::new(super::markers::Compiled::default())),
             sequence: AtomicU64::default(),
             timeline: AtomicUsize::default(),

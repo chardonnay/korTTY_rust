@@ -12,6 +12,7 @@ const NEGOTIATED_KEY_TYPES: &[&str] = &[
     "ecdsa-sha2-nistp256",
     "ecdsa-sha2-nistp384",
     "ecdsa-sha2-nistp521",
+    "ssh-rsa",
 ];
 
 /// A bounded snapshot of importable OpenSSH entries and their diagnostics.
@@ -236,14 +237,24 @@ impl KnownHostsFile {
     }
 
     fn classify(&self, pins: &Pins, reviewed: Option<&ImportReport>) -> ImportReport {
+        self.classify_selected(pins, reviewed, None)
+    }
+
+    fn classify_selected(
+        &self,
+        pins: &Pins,
+        reviewed: Option<&ImportReport>,
+        selection: Option<&BTreeSet<usize>>,
+    ) -> ImportReport {
         let mut report = ImportReport {
             skipped: self.skipped.clone(),
             ..ImportReport::default()
         };
-        let approved: BTreeMap<_, _> = reviewed
+        let proposed: BTreeMap<_, _> = reviewed
             .into_iter()
             .flat_map(|report| &report.added)
-            .map(|host| (&host.endpoint, &host.key))
+            .enumerate()
+            .map(|(index, host)| (&host.endpoint, (index, &host.key)))
             .collect();
         for (endpoint, candidates) in &self.candidates {
             let Some(preferred) = candidates
@@ -266,9 +277,20 @@ impl KnownHostsFile {
                         line: preferred.line,
                     });
                 }
-            } else if reviewed.is_some() && approved.get(endpoint) != Some(&&preferred.key) {
-                report.needs_review += 1;
             } else {
+                if reviewed.is_some() {
+                    let Some(&(index, key)) = proposed.get(endpoint) else {
+                        report.needs_review += 1;
+                        continue;
+                    };
+                    if selection.is_some_and(|selected| !selected.contains(&index)) {
+                        continue;
+                    }
+                    if key != &preferred.key {
+                        report.needs_review += 1;
+                        continue;
+                    }
+                }
                 report.added.push(TrustedHost {
                     endpoint: endpoint.clone(),
                     key: preferred.key.clone(),
@@ -306,10 +328,37 @@ impl TrustStore {
     /// Conflicts are reported and never overwrite the current key. If an endpoint becomes
     /// eligible after approval, the new report requests a separate review for that endpoint.
     pub fn import_reviewed(&self, review: &ImportReview) -> io::Result<ImportReport> {
+        self.apply_review(review, None)
+    }
+
+    /// Adds only the explicitly selected positions from the review's `added` list.
+    /// Each position still refers to the exact key and endpoint originally displayed.
+    pub fn import_reviewed_selected(
+        &self,
+        review: &ImportReview,
+        selected: &BTreeSet<usize>,
+    ) -> io::Result<ImportReport> {
+        if selected.is_empty()
+            || selected
+                .last()
+                .is_some_and(|last| *last >= review.report.added.len())
+        {
+            return Err(invalid("invalid SSH host key selection"));
+        }
+        self.apply_review(review, Some(selected))
+    }
+
+    fn apply_review(
+        &self,
+        review: &ImportReview,
+        selection: Option<&BTreeSet<usize>>,
+    ) -> io::Result<ImportReport> {
         let path = self.writable_path()?;
         let _lock = Self::lock(path)?;
         let mut pins = Self::load(path)?;
-        let mut report = review.source.classify(&pins, Some(&review.report));
+        let mut report = review
+            .source
+            .classify_selected(&pins, Some(&review.report), selection);
         if !report.added.is_empty() {
             add_pins(&mut pins, &mut report.added);
             Self::write(path, &pins)?;

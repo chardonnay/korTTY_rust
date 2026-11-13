@@ -7,7 +7,7 @@ use iced::{
     window,
 };
 
-use crate::terminal_effects::{Effect, Preferences, Selection};
+use crate::terminal_effects::{Effect, Preferences, Selection, Speed};
 
 pub(super) const TITLE: &str = "Terminal Effects";
 const ACTIVE_WIDTH: f32 = 76.0;
@@ -112,7 +112,11 @@ impl Manager {
                 canvas(Preview { effect, clock })
                     .width(preview_width)
                     .height(preview_height),
-                Selection { effect, speed: 1 }.overlay(clock),
+                Selection {
+                    effect,
+                    speed: Speed::DEFAULT
+                }
+                .overlay(clock),
             ]
             .clip(true)
             .into(),

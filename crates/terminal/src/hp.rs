@@ -4,7 +4,10 @@ use std::collections::VecDeque;
 
 use unicode_width::UnicodeWidthChar;
 
-use crate::{Color, Input, KeyModifiers, Model, Style, Terminal, TerminalKey, TerminalProfile};
+use crate::{
+    Color, Input, KeyModifiers, Model, Style, Terminal, TerminalKey, TerminalProfile,
+    legacy_modified_key,
+};
 
 mod forms;
 
@@ -13,8 +16,8 @@ pub use forms::Hp2392Input;
 
 const ESC: u8 = 0x1b;
 const MAX_SEQUENCE_BYTES: u16 = 256;
-const MAX_LABEL_BYTES: u16 = 16;
-const MAX_VALUE_BYTES: u16 = 80;
+const MAX_LABEL_UNITS: u16 = 16;
+const MAX_VALUE_UNITS: u16 = 80;
 const MAX_REPLAY_BYTES: usize = 256;
 
 #[derive(Default)]
@@ -66,8 +69,19 @@ impl Parameter {
 struct SoftkeyPayload {
     parameter: Parameter,
     remaining: u16,
-    // Labels occupy bytes on the wire but there is no status-label row here.
+    // Labels are consumed from the wire without installing a status-label row.
     value: Option<Vec<u8>>,
+    character: Utf8,
+}
+
+impl SoftkeyPayload {
+    fn finish_character(&mut self, units: u16) {
+        self.remaining -= units;
+        if let Some(value) = &mut self.value {
+            value.extend_from_slice(&self.character.bytes[..self.character.length]);
+        }
+        self.character.length = 0;
+    }
 }
 
 #[derive(Default)]
@@ -158,9 +172,15 @@ impl Hp {
         self.forms.cancel_transfer();
     }
 
-    fn apply_memory_lock(&self, model: &mut Model) {
+    pub(super) fn apply_memory_lock(&self, model: &mut Model) {
         if let Some(row) = self.memory_lock {
-            model.scroll_top = (row + 1).min(model.rows - 1);
+            // A stream lock at the bottom leaves no rows available to scroll.
+            let limit = if self.stream_mode() {
+                model.rows
+            } else {
+                model.rows - 1
+            };
+            model.scroll_top = (row + 1).min(limit);
             model.scroll_bottom = model.rows - 1;
         }
     }
@@ -176,7 +196,7 @@ impl Hp {
                     self.ground(model, byte);
                 }
             }
-            State::Softkey(payload) => self.softkey_payload(payload, byte),
+            State::Softkey(payload) => return self.softkey_payload(model, payload, byte),
             State::DiscardString(escaped) => {
                 if byte != b'\x07'
                     && byte != b'\x18'
@@ -235,15 +255,16 @@ impl Hp {
                 0x07 => model.ring_bell(),
                 0x08 => {
                     let cursor = model.cursor();
-                    if cursor.column == 0 && cursor.row > 0 {
+                    if cursor.column == 0 && cursor.row > 0 && !self.stream_wrap_pending(model) {
                         model.move_cursor(cursor.row - 1, model.columns - 1);
                     } else {
-                        model.move_columns(-1);
+                        self.move_left(model, 1);
                     }
                 }
                 b'\t' if self.forms.format => self.forms.tab(model, true),
-                b'\t' => model.tab(1, true),
-                b'\n' | 0x0b | 0x0c => model.line_feed(),
+                b'\t' if self.forms.block => model.tab(1, true),
+                b'\t' => model.horizontal_tab(),
+                b'\n' | 0x0b | 0x0c => self.keep_stream_wrap(model, Model::line_feed),
                 b'\r' => model.carriage_return(),
                 0x11 => self.forms.host_trigger(model),
                 0x1e if self.forms.block || self.forms.format => self.forms.host_terminator(model),
@@ -253,6 +274,13 @@ impl Hp {
             return;
         }
 
+        if model.text_encoding().is_single_byte() {
+            let ch = model.text_encoding().decode_byte(byte);
+            if !ch.is_control() {
+                self.print(model, ch);
+            }
+            return;
+        }
         if self.utf8.length != 0 && byte & 0xc0 != 0x80 {
             self.flush_utf8(model);
         }
@@ -281,6 +309,12 @@ impl Hp {
     }
 
     fn print(&mut self, model: &mut Model, character: char) {
+        if !model.auto_wrap
+            && self.stream_wrap_pending(model)
+            && character.width().is_some_and(|width| width > 0)
+        {
+            model.carriage_return();
+        }
         print(model, character);
         if self.profile == TerminalProfile::Hp2392 {
             self.forms.host_character(model, character);
@@ -307,6 +341,7 @@ impl Hp {
             b'c' | b'd' if self.profile == TerminalProfile::Hp2392 => self.protect = byte == b'c',
             b'W' | b'X' if self.forms.block || self.forms.format => {
                 self.forms.set_format(model, byte == b'W');
+                self.apply_memory_lock(model);
             }
             b'E' if self.forms.block || self.forms.format => {
                 self.block = false;
@@ -325,31 +360,31 @@ impl Hp {
                 model.scroll_bottom = model.rows - 1;
                 model.move_cursor(0, 0);
             }
-            b'A' => model.move_rows(-1, cursor.column),
-            b'B' => model.move_rows(1, cursor.column),
+            b'A' => self.move_rows(model, -1),
+            b'B' => self.move_rows(model, 1),
             b'C' | b'G' => model.move_columns(1),
             b'i' if self.forms.format => self.forms.tab(model, false),
-            b'D' | b'i' => model.move_columns(-1),
+            b'D' | b'i' => self.move_left(model, 1),
             b'F' => model.move_cursor(model.rows - 1, 0),
             b'H' => model.move_cursor(0, 0),
-            b'I' => model.reverse_index(),
+            b'I' => self.keep_stream_wrap(model, Model::reverse_index),
             b'J' | b'K' if self.profile == TerminalProfile::Hp2392 => {
                 self.forms.erase(model, byte == b'J');
             }
-            b'J' => model.erase_display(0, false),
-            b'K' => model.erase_in_line(0, false),
+            b'J' => self.erase_display(model, 0),
+            b'K' => self.erase_in_line(model, 0),
             b'L' | b'M' if self.forms.format => {}
-            b'L' | b'M' => lines(model, byte == b'L', 1),
+            b'L' | b'M' => self.lines(model, byte == b'L', 1),
             b'P' if self.forms.format => self.forms.delete(model),
             b'Q' | b'R' if self.forms.block => self.forms.insert = byte == b'Q',
-            b'P' | b'Q' => characters(model, byte == b'Q', 1),
+            b'P' | b'Q' => self.characters(model, byte == b'Q', 1),
             b'S' => model.scroll_up(model.scroll_top, model.scroll_bottom, 1, true),
             b'T' => model.scroll_down(model.scroll_top, model.scroll_bottom, 1),
             b'U' | b'V' => {
                 if self.profile == TerminalProfile::Hp2392 {
                     self.forms.clear_fields(model);
                 }
-                model.erase_display(2, false);
+                self.erase_display(model, 2);
                 model.move_cursor(0, 0);
             }
             b'h' => {
@@ -389,20 +424,22 @@ impl Hp {
                     self.state = State::Parameter(parameter);
                 } else {
                     let cursor = model.cursor();
-                    model.move_cursor(
-                        parameter.row.map_or(cursor.row, usize::from),
-                        parameter.column.map_or(cursor.column, usize::from),
-                    );
+                    let row = parameter.row.map_or(cursor.row, usize::from);
+                    if let Some(column) = parameter.column {
+                        model.move_cursor(row, usize::from(column));
+                    } else {
+                        self.keep_stream_wrap(model, |model| model.move_cursor(row, cursor.column));
+                    }
                 }
             }
             ParameterKind::Relative => {
-                let count = number.unwrap_or(1) as isize;
-                let column = model.cursor().column;
+                let count = usize::from(number.unwrap_or(1));
+                let delta = count as isize;
                 match byte.to_ascii_uppercase() {
-                    b'C' => model.move_columns(count),
-                    b'L' => model.move_columns(-count),
-                    b'R' | b'D' => model.move_rows(count, column),
-                    b'U' => model.move_rows(-count, column),
+                    b'C' => model.move_columns(delta),
+                    b'L' => self.move_left(model, count),
+                    b'R' | b'D' => self.move_rows(model, delta),
+                    b'U' => self.move_rows(model, -delta),
                     _ => {}
                 }
             }
@@ -417,9 +454,9 @@ impl Hp {
                     let length = number.unwrap_or(0);
                     let value = kind == b'L';
                     let limit = if value {
-                        MAX_VALUE_BYTES
+                        MAX_VALUE_UNITS
                     } else {
-                        MAX_LABEL_BYTES
+                        MAX_LABEL_UNITS
                     };
                     if length > limit {
                         return;
@@ -428,6 +465,7 @@ impl Hp {
                         parameter,
                         remaining: length,
                         value: value.then(|| Vec::with_capacity(usize::from(length))),
+                        character: Utf8::default(),
                     };
                     if length == 0 {
                         self.finish_softkey(payload);
@@ -443,6 +481,7 @@ impl Hp {
                 {
                     self.forms
                         .configure(parameter.kind, byte.to_ascii_uppercase(), number == 1);
+                    self.apply_memory_lock(model);
                     if byte.is_ascii_lowercase() {
                         self.state = State::Parameter(parameter);
                     }
@@ -451,16 +490,48 @@ impl Hp {
         }
     }
 
-    fn softkey_payload(&mut self, mut payload: SoftkeyPayload, byte: u8) {
-        if let Some(value) = &mut payload.value {
-            value.push(byte);
+    fn softkey_payload(
+        &mut self,
+        model: &mut Model,
+        mut payload: SoftkeyPayload,
+        byte: u8,
+    ) -> Option<usize> {
+        if payload.character.length != 0 && byte & 0xc0 != 0x80 {
+            payload.finish_character(1);
+            if payload.remaining == 0 {
+                self.finish_softkey(payload);
+                return self.step(model, byte);
+            }
         }
-        payload.remaining -= 1;
+
+        let character = &mut payload.character;
+        character.bytes[character.length] = byte;
+        character.length += 1;
+        // The Java transport counts UTF-16 units. Single-byte serial encodings
+        // still consume one protocol unit per byte.
+        let units = if model.text_encoding().is_single_byte() {
+            1
+        } else {
+            match std::str::from_utf8(&character.bytes[..character.length]) {
+                Ok(text) => text.encode_utf16().count() as u16,
+                Err(error) if error.error_len().is_none() => {
+                    self.state = State::Softkey(payload);
+                    return None;
+                }
+                Err(_) => 1,
+            }
+        };
+        if units > payload.remaining {
+            // The declared length splits a supplementary character.
+            return None;
+        }
+        payload.finish_character(units);
         if payload.remaining == 0 {
             self.finish_softkey(payload);
         } else {
             self.state = State::Softkey(payload);
         }
+        None
     }
 
     fn finish_softkey(&mut self, payload: SoftkeyPayload) {
@@ -533,31 +604,36 @@ impl Hp {
         }
         let count = usize::from(first.max(1));
         let delta = count as isize;
-        let cursor = model.cursor();
         match byte {
-            b'A' => model.move_rows(-delta, cursor.column),
-            b'B' => model.move_rows(delta, cursor.column),
+            b'A' => self.move_rows(model, -delta),
+            b'B' => self.move_rows(model, delta),
             b'C' => model.move_columns(delta),
-            b'D' => model.move_columns(-delta),
+            b'D' => self.move_left(model, count),
             b'H' | b'f' if self.ansi => {
                 model.move_cursor(count - 1, usize::from(csi.values[1].saturating_sub(1)));
             }
-            b'J' => model.erase_display(first, false),
-            b'K' => model.erase_in_line(first, false),
-            b'L' | b'M' => lines(model, byte == b'L', count),
-            b'P' | b'@' => characters(model, byte == b'@', count),
+            b'J' => self.erase_display(model, first),
+            b'K' => self.erase_in_line(model, first),
+            b'L' | b'M' => self.lines(model, byte == b'L', count),
+            b'P' | b'@' => self.characters(model, byte == b'@', count),
             b'm' if self.ansi => ansi_style(model, &csi.values[..csi.count]),
             b'm' => minimal_style(model, first),
             b'r' if self.ansi => {
                 if csi.count >= 2 {
-                    model.set_margins(
-                        usize::from(first.saturating_sub(1)),
-                        if csi.values[1] == 0 {
-                            model.rows - 1
-                        } else {
-                            usize::from(csi.values[1] - 1)
-                        },
-                    );
+                    let top = usize::from(first.saturating_sub(1));
+                    let bottom = if csi.values[1] == 0 {
+                        model.rows - 1
+                    } else {
+                        usize::from(csi.values[1] - 1)
+                    };
+                    if top == bottom && top < model.rows {
+                        // HP 700/92 accepts a scrolling region of one row.
+                        model.scroll_top = top;
+                        model.scroll_bottom = bottom;
+                        model.move_cursor(0, 0);
+                    } else {
+                        model.set_margins(top, bottom);
+                    }
                 } else {
                     model.scroll_top = 0;
                     model.scroll_bottom = model.rows - 1;
@@ -565,9 +641,110 @@ impl Hp {
                 }
             }
             b'n' if self.ansi && first == 5 => model.reply(b"\x1b[0n"),
-            b'n' if self.ansi && first == 6 => model.report_cursor(false),
+            b'n' if self.ansi && first == 6 => {
+                let cursor = model.cursor();
+                let column = cursor.column + usize::from(self.stream_wrap_pending(model));
+                let response = format!("\x1b[{};{}R", cursor.row + 1, column + 1);
+                model.reply(response.as_bytes());
+            }
             _ => {}
         }
+    }
+
+    fn move_rows(&self, model: &mut Model, delta: isize) {
+        let cursor = model.cursor();
+        if self.stream_mode() {
+            self.keep_stream_wrap(model, |model| {
+                model.move_cursor(cursor.row.saturating_add_signed(delta), cursor.column);
+            });
+        } else {
+            model.move_rows(delta, cursor.column);
+        }
+    }
+
+    fn move_left(&self, model: &mut Model, count: usize) {
+        match (self.stream_wrap_pending(model), count) {
+            (true, 0) => {}
+            (true, _) => {
+                let cursor = model.cursor();
+                model.move_cursor(cursor.row, (cursor.column + 1).saturating_sub(count));
+            }
+            (false, _) => model.move_columns(-(count as isize)),
+        }
+    }
+
+    fn keep_stream_wrap(&self, model: &mut Model, motion: impl FnOnce(&mut Model)) {
+        let wrap_pending = self.stream_wrap_pending(model);
+        motion(model);
+        if wrap_pending {
+            model.screen_mut().wrap_pending = true;
+        }
+    }
+
+    fn lines(&self, model: &mut Model, insert: bool, count: usize) {
+        let row = model.cursor().row;
+        // Explicit stream edits may start above the scroll region.
+        if row <= model.scroll_bottom && (self.stream_mode() || row >= model.scroll_top) {
+            if insert {
+                model.scroll_down(row, model.scroll_bottom, count);
+            } else {
+                model.scroll_up(row, model.scroll_bottom, count, false);
+            }
+        }
+    }
+
+    fn erase_display(&self, model: &mut Model, mode: u16) {
+        match mode {
+            0 if self.stream_wrap_pending(model) => {
+                for row in model.cursor().row + 1..model.rows {
+                    model.erase_line(row, 0, model.columns, false);
+                }
+            }
+            2 if self.stream_mode() => {
+                // Both reference HP stream profiles use ED 2 for a page clear.
+                let style = model.style.erase();
+                model.screen_mut().archive_display(style);
+            }
+            3 if self.stream_mode() => {
+                model.erase_display(3, false);
+                // The reference retains visible text on a one-row page.
+                if model.rows > 1 {
+                    model.erase_display(2, false);
+                }
+            }
+            _ => model.erase_display(mode, false),
+        }
+    }
+
+    fn erase_in_line(&self, model: &mut Model, mode: u16) {
+        if mode == 0 && self.stream_wrap_pending(model) {
+            let row = model.cursor().row;
+            model.screen_mut().lines[row].wrap_length = None;
+        } else {
+            model.erase_in_line(mode, false);
+        }
+    }
+
+    fn characters(&self, model: &mut Model, insert: bool, count: usize) {
+        if self.stream_wrap_pending(model) {
+            return;
+        }
+        let style = model.style.erase();
+        let right = model.columns - 1;
+        if insert {
+            model.screen_mut().insert_cells(count, style, right);
+        } else {
+            model.screen_mut().delete_cells(count, style, right);
+        }
+    }
+
+    fn stream_wrap_pending(&self, model: &Model) -> bool {
+        // The stream cursor is one column beyond the row until the next print wraps.
+        self.stream_mode() && model.screen().wrap_pending
+    }
+
+    fn stream_mode(&self) -> bool {
+        !self.forms.block && !self.forms.format
     }
 }
 
@@ -588,28 +765,6 @@ fn print(model: &mut Model, character: char) {
         }
     } else {
         model.put_char(character);
-    }
-}
-
-fn lines(model: &mut Model, insert: bool, count: usize) {
-    let cursor = model.cursor();
-    if (model.scroll_top..=model.scroll_bottom).contains(&cursor.row) {
-        if insert {
-            model.scroll_down(cursor.row, model.scroll_bottom, count);
-        } else {
-            model.scroll_up(cursor.row, model.scroll_bottom, count, false);
-        }
-        model.move_cursor(cursor.row, 0);
-    }
-}
-
-fn characters(model: &mut Model, insert: bool, count: usize) {
-    let style = model.style.erase();
-    let right = model.columns - 1;
-    if insert {
-        model.screen_mut().insert_cells(count, style, right);
-    } else {
-        model.screen_mut().delete_cells(count, style, right);
     }
 }
 
@@ -686,6 +841,9 @@ pub(crate) fn encode_key(
     if !matches!(profile, TerminalProfile::Hp2392 | TerminalProfile::Hp70092) {
         return None;
     }
+    if let Some(sequence) = legacy_modified_key(key, modifiers) {
+        return Some(sequence.to_vec());
+    }
     let sequence: &[u8] = match key {
         TerminalKey::Up => b"\x1bA",
         TerminalKey::Down => b"\x1bB",
@@ -698,7 +856,6 @@ pub(crate) fn encode_key(
         TerminalKey::PageUp => b"\x1bS",
         TerminalKey::PageDown => b"\x1bT",
         TerminalKey::Backspace => b"\x08",
-        TerminalKey::Tab if modifiers.shift && !modifiers.alt && !modifiers.control => b"\x1b[Z",
         TerminalKey::Tab => b"\t",
         TerminalKey::Enter => b"\r",
         TerminalKey::Escape => b"\x1b",

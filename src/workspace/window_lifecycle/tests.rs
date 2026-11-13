@@ -69,6 +69,30 @@ fn standalone_close_remembers_dashboard_without_replacing_bounds_in_fixed_or_ful
     assert_eq!(workspace.lifecycle.last.placement(), Some(prior));
 }
 
+#[test]
+fn saved_window_geometry_does_not_replace_global_last_window_bounds() {
+    let mut workspace = Workspace::default();
+    let (id, _) = workspace.open_window(false);
+    let prior = WindowPlacement {
+        width: 930.0,
+        height: 680.0,
+        position: None,
+    };
+    workspace.lifecycle.last.set_placement(prior, true);
+
+    let window = workspace.windows.get_mut(&id).unwrap();
+    window.geometry.recordable = true;
+    window.geometry.mark_connection_specific();
+    workspace
+        .lifecycle
+        .capture(window, StartupPreferences::default(), false);
+    workspace
+        .lifecycle
+        .capture(window, StartupPreferences::default(), true);
+    assert_eq!(workspace.lifecycle.last.placement(), Some(prior));
+    assert!(workspace.lifecycle.last.maximized);
+}
+
 const PRIMARY: WorkArea = WorkArea {
     origin: Point::new(0.0, 24.0),
     size: Size::new(1440.0, 852.0),

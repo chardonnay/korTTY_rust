@@ -35,6 +35,7 @@ pub enum Message {
     Subject(String),
     Endpoint(String),
     Model(String),
+    UseLocalApi,
     Size(Size),
     Generate(bool),
     Cancel,
@@ -114,13 +115,15 @@ impl State {
             return;
         }
         self.managed = configuration.and_then(|config| config.drawing_profile(false));
-        self.endpoint = self.managed.as_ref().map_or_else(
-            || local_ai::DEFAULT_ENDPOINT.to_owned(),
-            |profile| profile.endpoint.clone(),
-        );
+        self.endpoint = self
+            .managed
+            .as_ref()
+            .and_then(|profile| profile.endpoint.clone())
+            .unwrap_or_else(|| local_ai::DEFAULT_ENDPOINT.to_owned());
         self.model = self
             .managed
             .as_ref()
+            .filter(|profile| profile.endpoint.is_some())
             .map_or_else(String::new, |profile| profile.model.clone());
     }
 
@@ -164,6 +167,10 @@ impl State {
                 self.manual = true;
                 self.managed = None;
                 self.model = value.chars().take(256).collect();
+            }
+            Message::UseLocalApi if !busy => {
+                self.manual = true;
+                self.managed = None;
             }
             Message::Size(size) if !busy => self.size = size,
             Message::Generate(retry) if !busy => return self.start(retry),
@@ -261,14 +268,40 @@ impl State {
         allowed: bool,
     ) -> Element<'a, Parent> {
         let editable = allowed && !self.busy();
-        let generate = editable && !self.subject.trim().is_empty() && !self.model.trim().is_empty();
+        let managed = self
+            .managed
+            .as_ref()
+            .filter(|profile| profile.endpoint.is_none());
+        let generate = editable
+            && !self.subject.trim().is_empty()
+            && (managed.is_some() || !self.model.trim().is_empty());
         let subject = text_input("Subject, e.g. a lighthouse by the sea", &self.subject)
             .on_input_maybe(editable.then_some(|value| Parent::Ai(Message::Subject(value))))
             .on_submit_maybe(generate.then_some(Parent::Ai(Message::Generate(false))))
             .width(Length::Fill);
-        let model = text_input("Installed local model", &self.model)
-            .on_input_maybe(editable.then_some(|value| Parent::Ai(Message::Model(value))))
-            .width(Length::Fill);
+        let route: Element<'_, Parent> = if let Some(profile) = managed {
+            row![
+                text(format!("Managed llama.cpp · {}", profile.model)).width(Length::Fill),
+                button("Use local API")
+                    .style(button::secondary)
+                    .on_press_maybe(editable.then_some(Parent::Ai(Message::UseLocalApi))),
+            ]
+            .spacing(8)
+            .into()
+        } else {
+            row![
+                text_input("127.0.0.1:11434", &self.endpoint)
+                    .on_input_maybe(
+                        editable.then_some(|value| Parent::Ai(Message::Endpoint(value)))
+                    )
+                    .width(156),
+                text_input("Installed local model", &self.model)
+                    .on_input_maybe(editable.then_some(|value| Parent::Ai(Message::Model(value))))
+                    .width(Length::Fill),
+            ]
+            .spacing(8)
+            .into()
+        };
         let size: Element<'_, _> = if editable {
             pick_list(Size::ALL, Some(self.size), |value| {
                 Parent::Ai(Message::Size(value))
@@ -308,12 +341,7 @@ impl State {
             .align_y(Alignment::Center),
             row![
                 text("Local AI"),
-                text_input("127.0.0.1:11434", &self.endpoint)
-                    .on_input_maybe(
-                        editable.then_some(|value| Parent::Ai(Message::Endpoint(value)))
-                    )
-                    .width(156),
-                model,
+                route,
                 button("Retry").on_press_maybe(
                     (generate && self.output.is_some())
                         .then_some(Parent::Ai(Message::Generate(true)))
@@ -340,6 +368,7 @@ fn generate(
     progress: impl Fn(Stage),
 ) -> Result<Output, String> {
     let (columns, rows) = size.dimensions();
+    let svg_prompt = client.render_system_prompt(SVG_PROMPT);
     let input = |correction| {
         json!({
             "subject": subject, "columns": columns, "rows": rows,
@@ -350,7 +379,7 @@ fn generate(
     let mut correction = None;
     for stage in [Stage::Drawing, Stage::Repairing] {
         progress(stage);
-        let drawing = match client.complete(SVG_PROMPT, &input(correction)) {
+        let drawing = match client.complete(&svg_prompt, &input(correction)) {
             Ok(reply) => drawing(&reply, size),
             Err(local_ai::Error::Invalid(reason)) => Err(reason),
             Err(error) => return Err(error.message()),
@@ -367,8 +396,9 @@ fn generate(
         }
     }
     progress(Stage::TextFallback);
+    let text_prompt = client.render_system_prompt(TEXT_PROMPT);
     let reply = client
-        .complete(TEXT_PROMPT, &input(correction))
+        .complete(&text_prompt, &input(correction))
         .map_err(local_ai::Error::message)?;
     let text = text_fallback(&reply, size).ok_or("The model returned no usable ASCII picture.")?;
     if !client.active() {
@@ -473,6 +503,8 @@ mod tests {
         assert!(art.text.lines().all(|line| line.len() <= 40));
         let requests = fixture.join().unwrap();
         assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0]["messages"][0]["content"], SVG_PROMPT);
+        assert_eq!(requests[1]["messages"][0]["content"], SVG_PROMPT);
         let input = |index: usize| {
             serde_json::from_str::<serde_json::Value>(
                 requests[index]["messages"][1]["content"].as_str().unwrap(),
@@ -496,16 +528,20 @@ mod tests {
             fixture_response("200 OK", "", "<svg><rect width=\"0\" height=\"0\"/></svg>"),
             fixture_response("200 OK", "", &json!({"ascii": "  /\\\n /__\\"}).to_string()),
         ]);
+        let profile = profile.with_prompt_preset(local_ai::PromptPreset::Qwen);
+        let expected_svg = profile.render_system_prompt(SVG_PROMPT);
+        let expected_text = profile.render_system_prompt(TEXT_PROMPT);
         let art = generate(&Client::new(profile), "a roof", Size::Small, 0, |_| {}).unwrap();
         assert_eq!(art.source, Stage::TextFallback);
         assert_eq!(art.text, " /\\\n/__\\");
         let requests = fixture.join().unwrap();
         assert_eq!(requests.len(), 3);
-        assert!(
-            requests[2]["messages"][0]["content"]
-                .as_str()
-                .unwrap()
-                .contains("printable ASCII")
+        assert!(expected_text.contains("<kortty_model_preset>"));
+        assert_eq!(requests[0]["messages"][0]["content"], expected_svg.as_ref());
+        assert_eq!(requests[1]["messages"][0]["content"], expected_svg.as_ref());
+        assert_eq!(
+            requests[2]["messages"][0]["content"],
+            expected_text.as_ref()
         );
         assert_eq!(
             text_fallback("```ascii\r\n  /\\\r\n /__\\\r\n```", Size::Small).as_deref(),

@@ -1,0 +1,6 @@
+utf8-label cursor=0,1 reply= screen=[X|||]
+utf8-value cursor=0,3 reply= screen=[é中|||]
+utf8-supplementary-label cursor=0,1 reply= screen=[Y|||]
+utf8-supplementary-value cursor=0,3 reply= screen=[Z🙂|||]
+utf8-control cursor=0,4 reply= screen=[ äYZ|||]
+utf8-redefinition cursor=0,2 reply= screen=[é!|||]

@@ -26,6 +26,9 @@ impl Drop for Fixture {
 fn opted_in_local_shell_reads_its_startup_then_emits_marks_on_the_pty() {
     let mut count = 0;
     for snippet in Snippet::ALL {
+        if matches!(snippet, Snippet::PowerShell | Snippet::CommandPrompt) {
+            continue;
+        }
         let Some(shell) = installed(snippet.name()) else {
             eprintln!("{} is unavailable on this test host", snippet.name());
             continue;
@@ -89,13 +92,32 @@ fn run_case(snippet: Snippet, shell: &Path) {
             fs::create_dir_all(home.join(".config/fish")).unwrap();
             fs::write(home.join(".config/fish/config.fish"), "printf '%s-%s\\n' startup verified\nfunction fish_prompt; echo 'fish test> '; end\n").unwrap();
         }
+        Snippet::PowerShell | Snippet::CommandPrompt => unreachable!(),
     }
-    for integration in [false, true] {
-        let output = run_fixture_pty(home, &directory, shell, snippet, integration);
+    if snippet == Snippet::Bash {
+        fs::write(
+            home.join(".bash_profile"),
+            "printf '%s-%s\\n' login verified\n. ~/.bashrc\n",
+        )
+        .unwrap();
+    }
+    for (integration, custom_flags) in [
+        (false, None),
+        (true, None),
+        (true, Some("-i")),
+        (true, Some("-il")),
+    ] {
+        let output = run_fixture_pty(home, &directory, shell, snippet, integration, custom_flags);
         assert!(
             output.contains("startup-verified"),
             "{case} startup: {output:?}"
         );
+        if snippet == Snippet::Bash && custom_flags == Some("-il") {
+            assert!(
+                output.contains("login-verified"),
+                "login startup: {output:?}"
+            );
+        }
         assert_eq!(
             output.contains("\x1b]133;A\x07"),
             integration && marks_supported,
@@ -124,6 +146,7 @@ fn run_fixture_pty(
     shell: &Path,
     snippet: Snippet,
     integration: bool,
+    custom_flags: Option<&str>,
 ) -> String {
     let exe = env::current_exe().unwrap();
     // The actual PTY spawn inherits fixture variables from an isolated test process.
@@ -131,6 +154,7 @@ fn run_fixture_pty(
         .args(["--exact", "fixture_pty", "--ignored", "--nocapture"])
         .env(CASE, snippet.name())
         .env("KORTTY_SHELL_TEST_CWD", directory)
+        .env("KORTTY_SHELL_TEST_FLAGS", custom_flags.unwrap_or_default())
         .env(
             "KORTTY_SHELL_TEST_ENABLE",
             if integration { "1" } else { "0" },
@@ -166,6 +190,10 @@ fn fixture_pty() {
         24,
         "xterm-256color",
         &LaunchOptions {
+            command: env::var("KORTTY_SHELL_TEST_FLAGS")
+                .ok()
+                .filter(|flags| !flags.is_empty())
+                .map(|flags| vec![env::var("SHELL").unwrap(), flags]),
             working_directory: Some(directory.into()),
             shell_integration: env::var("KORTTY_SHELL_TEST_ENABLE").as_deref() == Ok("1"),
             ..LaunchOptions::default()

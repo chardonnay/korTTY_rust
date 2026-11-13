@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
@@ -11,6 +12,7 @@ const MAX_LOCAL_ENTRIES: usize = 100_000;
 pub(crate) fn list_local(path: &Path) -> io::Result<Directory> {
     let path = fs::canonicalize(path)?;
     let mut entries = Vec::new();
+    let mut local_dates = HashMap::new();
     for result in fs::read_dir(&path)? {
         if entries.len() >= MAX_LOCAL_ENTRIES {
             return Err(io::Error::other("directory has more than 100,000 entries"));
@@ -21,19 +23,39 @@ pub(crate) fn list_local(path: &Path) -> io::Result<Directory> {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error),
         };
-        let name = entry.file_name();
-        let display = display(&name.to_string_lossy());
+        let file_name = entry.file_name();
+        let display = display(&file_name.to_string_lossy());
+        let name = EntryName::Local(file_name);
+        if let Ok(modified) = metadata.modified() {
+            local_dates.insert(name.clone(), modified);
+        }
+        let (owner, group) = local_owner_group(&metadata);
         entries.push(Entry {
-            name: EntryName::Local(name),
+            name,
             hidden: display.starts_with('.') || windows_hidden(&metadata),
             display,
             kind: local_kind(&metadata),
             size: metadata.is_file().then_some(metadata.len()),
             modified: None,
+            owner,
+            group,
             mode: local_mode(&metadata),
         });
     }
-    Ok(Directory::sorted(Location::Local(path), entries))
+    let mut directory = Directory::sorted(Location::Local(path), entries);
+    directory.local_dates = local_dates;
+    Ok(directory)
+}
+
+#[cfg(unix)]
+fn local_owner_group(metadata: &Metadata) -> (Option<u32>, Option<u32>) {
+    use std::os::unix::fs::MetadataExt as _;
+    (Some(metadata.uid()), Some(metadata.gid()))
+}
+
+#[cfg(windows)]
+fn local_owner_group(_: &Metadata) -> (Option<u32>, Option<u32>) {
+    (None, None)
 }
 
 pub(super) fn local_kind(metadata: &Metadata) -> EntryKind {
@@ -209,6 +231,17 @@ pub(crate) fn nonce() -> io::Result<String> {
     Ok(name)
 }
 
+pub(super) fn replacement_stage_id(name: &[u8]) -> Option<&[u8]> {
+    let id = name
+        .strip_prefix(b".kortty-replacement-upload-")?
+        .strip_suffix(b".part")?;
+    (id.len() == 32
+        && id
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)))
+    .then_some(id)
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct LocalStamp {
     pub kind: EntryKind,
@@ -233,6 +266,21 @@ pub(crate) struct LocalStamp {
 }
 
 impl LocalStamp {
+    pub(super) fn review_fields(&self) -> impl serde::Serialize {
+        #[cfg(unix)]
+        let identity = (
+            self.device,
+            self.inode,
+            self.mode,
+            self.uid,
+            self.gid,
+            self.changed,
+        );
+        #[cfg(windows)]
+        let identity = (self.created, self.attributes);
+        (self.size, self.modified, identity)
+    }
+
     pub(crate) fn capture(metadata: &Metadata) -> Self {
         #[cfg(unix)]
         use std::os::unix::fs::MetadataExt as _;

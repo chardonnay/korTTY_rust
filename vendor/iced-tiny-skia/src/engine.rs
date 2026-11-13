@@ -38,12 +38,24 @@ impl Engine {
         clip_bounds: Rectangle,
     ) {
         let physical_bounds = quad.bounds * transformation;
+        let shadow = quad.shadow;
+        let shadow_bounds = Rectangle {
+            x: quad.bounds.x + shadow.offset.x - shadow.blur_radius,
+            y: quad.bounds.y + shadow.offset.y - shadow.blur_radius,
+            width: quad.bounds.width + shadow.blur_radius * 2.0,
+            height: quad.bounds.height + shadow.blur_radius * 2.0,
+        } * transformation;
+        let drawing_bounds = if shadow.color.a > 0.0 {
+            physical_bounds.union(&shadow_bounds)
+        } else {
+            physical_bounds
+        };
 
-        if !clip_bounds.intersects(&physical_bounds) {
+        if !clip_bounds.intersects(&drawing_bounds) {
             return;
         }
 
-        let clip_mask = clip_mask.clip(clip_bounds, physical_bounds);
+        let clip_mask = clip_mask.clip(clip_bounds, drawing_bounds);
 
         let transform = into_transform(transformation);
 
@@ -64,16 +76,7 @@ impl Engine {
 
         let path = rounded_rectangle(quad.bounds, fill_border_radius);
 
-        let shadow = quad.shadow;
-
         if shadow.color.a > 0.0 {
-            let shadow_bounds = Rectangle {
-                x: quad.bounds.x + shadow.offset.x - shadow.blur_radius,
-                y: quad.bounds.y + shadow.offset.y - shadow.blur_radius,
-                width: quad.bounds.width + shadow.blur_radius * 2.0,
-                height: quad.bounds.height + shadow.blur_radius * 2.0,
-            } * transformation;
-
             let radii = fill_border_radius
                 .into_iter()
                 .map(|radius| radius * transformation.scale_factor())
@@ -141,7 +144,7 @@ impl Engine {
                     pixmap.as_ref(),
                     &tiny_skia::PixmapPaint::default(),
                     tiny_skia::Transform::default(),
-                    None,
+                    clip_mask,
                 );
             }
         }
@@ -812,4 +815,74 @@ fn rounded_box_sdf(
     let y = (to_center.y.abs() - size.height() + radius).max(0.0);
 
     (x.powf(2.0) + y.powf(2.0)).sqrt() - radius
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::{Point, Shadow};
+
+    #[test]
+    fn shadow_respects_damage_bounds_and_repaints_shadow_only_regions() {
+        let viewport = Rectangle::with_size(Size::new(80.0, 80.0));
+        let quad = Quad {
+            bounds: Rectangle::new(
+                Point::new(20.0, 20.0),
+                Size::new(40.0, 40.0),
+            ),
+            shadow: Shadow {
+                color: Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+                offset: Vector::new(0.0, 4.0),
+                blur_radius: 8.0,
+            },
+            ..Quad::default()
+        };
+        let background = Background::Color(Color::from_rgb(0.2, 0.3, 0.4));
+        let mut engine = Engine::new();
+        let mut full = tiny_skia::Pixmap::new(80, 80).unwrap();
+        full.fill(tiny_skia::Color::WHITE);
+        let mut full_mask = tiny_skia::Mask::new(80, 80).unwrap();
+        engine.draw_quad(
+            &quad,
+            &background,
+            Transformation::IDENTITY,
+            &mut full.as_mut(),
+            &mut ClipMask::new(&mut full_mask),
+            viewport,
+        );
+
+        for damage in [
+            Rectangle::new(Point::new(30.0, 30.0), Size::new(10.0, 10.0)),
+            Rectangle::new(Point::new(30.0, 61.0), Size::new(10.0, 8.0)),
+        ] {
+            let mut partial = tiny_skia::Pixmap::new(80, 80).unwrap();
+            partial.fill(tiny_skia::Color::WHITE);
+            let untouched = partial.pixels()[0];
+            let mut mask = tiny_skia::Mask::new(80, 80).unwrap();
+            engine.draw_quad(
+                &quad,
+                &background,
+                Transformation::IDENTITY,
+                &mut partial.as_mut(),
+                &mut ClipMask::new(&mut mask),
+                damage,
+            );
+            for y in 0..80 {
+                for x in 0..80 {
+                    let index = y * 80 + x;
+                    let expected =
+                        if damage.contains(Point::new(x as f32, y as f32)) {
+                            full.pixels()[index]
+                        } else {
+                            untouched
+                        };
+                    assert_eq!(
+                        partial.pixels()[index],
+                        expected,
+                        "pixel {x},{y}"
+                    );
+                }
+            }
+        }
+    }
 }

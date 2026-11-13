@@ -1,5 +1,7 @@
+use std::collections::VecDeque;
 use std::fmt;
 use std::io::{self, BufReader, Write};
+use std::net::Shutdown;
 #[cfg(windows)]
 use std::net::{Ipv4Addr, SocketAddr, TcpStream as Stream};
 #[cfg(unix)]
@@ -12,9 +14,10 @@ use serde::Serialize;
 use serde_json::{Value, json};
 use zeroize::Zeroizing;
 
-use crate::endpoint::{self, Endpoint};
+use crate::endpoint::Endpoint;
+use crate::events::DEPTH;
 use crate::protocol::{API, MAX_LINE, PROTOCOL_VERSION};
-use crate::server::read_frame;
+use crate::server::{epoch_millis, read_frame};
 
 #[derive(Debug)]
 pub enum ClientError {
@@ -25,6 +28,7 @@ pub enum ClientError {
         code: String,
         message: String,
         exit: u8,
+        rpc: Value,
     },
 }
 
@@ -56,12 +60,154 @@ impl fmt::Display for ClientError {
 impl std::error::Error for ClientError {}
 
 pub struct Client {
+    events: EventBacklog,
     stream: BufReader<Stream>,
     deadline: Instant,
     next_id: u64,
     instance: String,
     #[cfg(target_os = "linux")]
     endpoint_pid: u32,
+}
+
+#[derive(Default)]
+struct EventBacklog {
+    pending: VecDeque<QueuedEvent>,
+    ordinary_count: usize,
+    overflow_count: usize,
+    loss: Option<ClientLoss>,
+}
+
+enum QueuedEvent {
+    Ordinary(Value),
+    ServerOverflow(ServerOverflow),
+}
+
+struct ServerOverflow {
+    subscription: u64,
+    at_millis: u64,
+    dropped: u64,
+}
+
+#[derive(Default)]
+struct ClientLoss {
+    index: usize,
+    at_millis: u64,
+    dropped: u64,
+    server_markers_dropped: u64,
+}
+
+impl EventBacklog {
+    fn push(&mut self, value: Value) {
+        let event = ServerOverflow::parse(&value)
+            .map_or_else(|| QueuedEvent::Ordinary(value), QueuedEvent::ServerOverflow);
+        let overflow = event.is_server_overflow();
+        let count = if overflow {
+            &mut self.overflow_count
+        } else {
+            &mut self.ordinary_count
+        };
+        // Ordinary traffic cannot displace a server marker. The separate, compact
+        // marker budget also bounds connections that never drain their backlog.
+        if *count == DEPTH {
+            let index = self
+                .pending
+                .iter()
+                .position(|event| event.is_server_overflow() == overflow)
+                .expect("Full event queue contains the evicted event kind");
+            self.pending.remove(index);
+            let loss = self.loss.get_or_insert_with(|| ClientLoss {
+                index,
+                at_millis: epoch_millis(),
+                ..ClientLoss::default()
+            });
+            loss.index = loss.index.min(index);
+            let dropped = if overflow {
+                &mut loss.server_markers_dropped
+            } else {
+                &mut loss.dropped
+            };
+            *dropped = dropped.saturating_add(1);
+        } else {
+            *count += 1;
+        }
+        self.pending.push_back(event);
+    }
+
+    fn pop(&mut self) -> Option<Value> {
+        // Place the local summary at the first missing position, preserving the
+        // wire order of the retained server markers and ordinary events.
+        if self.loss.as_ref().is_some_and(|loss| loss.index == 0) {
+            return self.loss.take().map(ClientLoss::into_event);
+        }
+        let event = self.pending.pop_front()?;
+        if let Some(loss) = self.loss.as_mut() {
+            loss.index -= 1;
+        }
+        match event {
+            QueuedEvent::Ordinary(value) => {
+                self.ordinary_count -= 1;
+                Some(value)
+            }
+            QueuedEvent::ServerOverflow(overflow) => {
+                self.overflow_count -= 1;
+                Some(overflow.into_event())
+            }
+        }
+    }
+}
+
+impl QueuedEvent {
+    fn is_server_overflow(&self) -> bool {
+        matches!(self, Self::ServerOverflow(_))
+    }
+}
+
+impl ServerOverflow {
+    fn parse(value: &Value) -> Option<Self> {
+        let params = value.get("params")?.as_object()?;
+        if value["method"] != "event"
+            || params.get("kind")?.as_str()? != "events.overflow"
+            || value.as_object()?.len() != 3
+            || params.len() != 4
+        {
+            return None;
+        }
+        let id = params.get("subscription_id")?.as_str()?.strip_prefix('s')?;
+        if id.starts_with('0') || !id.bytes().all(|byte| byte.is_ascii_digit()) {
+            return None;
+        }
+        let dropped = params.get("dropped")?.as_u64()?;
+        if dropped == 0 {
+            return None;
+        }
+        Some(Self {
+            subscription: id.parse().ok()?,
+            at_millis: params.get("at_millis")?.as_u64()?,
+            dropped,
+        })
+    }
+
+    fn into_event(self) -> Value {
+        json!({"jsonrpc":"2.0","method":"event","params":{
+            "kind":"events.overflow","at_millis":self.at_millis,
+            "subscription_id":format!("s{}", self.subscription),"dropped":self.dropped
+        }})
+    }
+}
+
+impl ClientLoss {
+    fn into_event(self) -> Value {
+        let mut params = json!({
+            "kind":"events.overflow", "at_millis":self.at_millis,
+            "source":"client", "dropped":self.dropped
+        });
+        // A lost marker is distinct from both its server count and a locally
+        // dropped ordinary event. Never attribute either to a subscription.
+        if self.server_markers_dropped != 0 {
+            params["server_markers_dropped"] = json!(self.server_markers_dropped);
+        }
+        json!({"jsonrpc":"2.0","method":"event","params":params})
+    }
 }
 
 #[derive(Serialize)]
@@ -75,34 +221,70 @@ struct Call<'a, P> {
 #[derive(Serialize)]
 struct Credentials<'a> {
     token: &'a str,
-    client: &'static str,
+    client: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    client_kind: Option<&'static str>,
+}
+
+pub(crate) struct McpSocket(Stream);
+
+impl McpSocket {
+    pub(crate) fn close(self) {
+        let _ = self.0.shutdown(Shutdown::Both);
+    }
 }
 
 impl Client {
     pub fn connect(root: &Path, timeout: Duration) -> Result<Self, ClientError> {
-        let deadline = Instant::now()
-            .checked_add(timeout)
-            .ok_or(ClientError::Protocol("Invalid client deadline"))?;
-        let directory = endpoint::directory(root, false).map_err(ClientError::Connect)?;
-        let endpoint = Endpoint::read(&directory).map_err(ClientError::Connect)?;
+        Self::connect_before(root, deadline_after(timeout)?, "kortty-cli", None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connect_mcp(
+        root: &Path,
+        timeout: Duration,
+        name: &str,
+    ) -> Result<Self, ClientError> {
+        Self::connect_mcp_before(root, deadline_after(timeout)?, name)
+    }
+
+    pub(crate) fn connect_mcp_before(
+        root: &Path,
+        deadline: Instant,
+        name: &str,
+    ) -> Result<Self, ClientError> {
+        Self::connect_before(root, deadline, name, Some("mcp"))
+    }
+
+    fn connect_before(
+        root: &Path,
+        deadline: Instant,
+        name: &str,
+        kind: Option<&'static str>,
+    ) -> Result<Self, ClientError> {
+        let endpoint = Endpoint::read_profile(root).map_err(ClientError::Connect)?;
         #[cfg(unix)]
-        let stream = Stream::connect(
-            endpoint
-                .path
-                .as_ref()
-                .ok_or(ClientError::Protocol("Missing local socket path"))?,
-        )
-        .map_err(ClientError::Connect)?;
+        let stream = {
+            let _ = remaining(deadline)?;
+            Stream::connect(
+                endpoint
+                    .path
+                    .as_ref()
+                    .ok_or(ClientError::Protocol("Missing local socket path"))?,
+            )
+            .map_err(ClientError::Connect)?
+        };
         #[cfg(windows)]
         let stream = Stream::connect_timeout(
             &SocketAddr::from((Ipv4Addr::LOCALHOST, endpoint.port)),
-            timeout,
+            remaining(deadline)?,
         )
         .map_err(ClientError::Connect)?;
         stream
-            .set_read_timeout(Some(Duration::from_millis(100).min(timeout)))
+            .set_read_timeout(Some(Duration::from_millis(100).min(remaining(deadline)?)))
             .map_err(ClientError::Connect)?;
         let mut client = Self {
+            events: EventBacklog::default(),
             stream: BufReader::new(stream),
             deadline,
             next_id: 0,
@@ -114,19 +296,39 @@ impl Client {
             "auth",
             &Credentials {
                 token: &endpoint.token,
-                client: "kortty-cli",
+                client: name,
+                client_kind: kind,
             },
         )?;
         if hello.get("api").and_then(Value::as_str) != Some(API)
             || hello.get("protocol_version").and_then(Value::as_u64)
                 != Some(u64::from(PROTOCOL_VERSION))
             || hello.get("instance_id").and_then(Value::as_str) != Some(client.instance.as_str())
+            || (kind == Some("mcp") && hello["mcp_write_tools"].as_bool().is_none())
         {
             return Err(ClientError::Protocol(
                 "The listener does not match the local control endpoint",
             ));
         }
         Ok(client)
+    }
+
+    pub(crate) fn set_deadline(&mut self, deadline: Instant) -> Result<(), ClientError> {
+        let timeout = remaining(deadline)?;
+        self.stream
+            .get_ref()
+            .set_read_timeout(Some(timeout.min(Duration::from_millis(100))))
+            .map_err(ClientError::Io)?;
+        self.deadline = deadline;
+        Ok(())
+    }
+
+    pub(crate) fn mcp_socket(&self) -> Result<McpSocket, ClientError> {
+        self.stream
+            .get_ref()
+            .try_clone()
+            .map(McpSocket)
+            .map_err(ClientError::Io)
     }
 
     pub fn instance(&self) -> &str {
@@ -177,16 +379,42 @@ impl Client {
         self.call_encoded(method, params)
     }
 
+    /// Reads the next subscription event within the client's configured deadline.
+    pub fn next_event(&mut self) -> Result<Value, ClientError> {
+        if let Some(event) = self.events.pop() {
+            return Ok(event);
+        }
+        let event = self.read_message()?;
+        if event.get("id").is_some() || event.get("method").and_then(Value::as_str).is_none() {
+            return Err(ClientError::Protocol(
+                "Expected a control subscription event",
+            ));
+        }
+        Ok(event)
+    }
+
+    fn read_message(&mut self) -> Result<Value, ClientError> {
+        let bytes = read_frame(
+            &mut self.stream,
+            &AtomicBool::new(true),
+            Some(self.deadline),
+        )
+        .map_err(ClientError::Io)?
+        .ok_or(ClientError::Protocol("Control connection closed"))?;
+        let response: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| ClientError::Protocol("Invalid control response"))?;
+        if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return Err(ClientError::Protocol("Invalid control response version"));
+        }
+        Ok(response)
+    }
+
     fn call_encoded(
         &mut self,
         method: &str,
         params: &impl Serialize,
     ) -> Result<Value, ClientError> {
-        let remaining = self
-            .deadline
-            .checked_duration_since(Instant::now())
-            .filter(|duration| !duration.is_zero())
-            .ok_or_else(|| ClientError::Io(io::ErrorKind::TimedOut.into()))?;
+        let remaining = remaining(self.deadline)?;
         let id = self.next_id;
         self.next_id = self.next_id.wrapping_add(1);
         let mut bytes = Zeroizing::new(
@@ -207,19 +435,20 @@ impl Client {
             .set_write_timeout(Some(remaining))
             .map_err(ClientError::Io)?;
         stream.write_all(&bytes).map_err(ClientError::Io)?;
-        let bytes = read_frame(
-            &mut self.stream,
-            &AtomicBool::new(true),
-            Some(self.deadline),
-        )
-        .map_err(ClientError::Io)?
-        .ok_or(ClientError::Protocol("Control connection closed"))?;
-        let mut response: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| ClientError::Protocol("Invalid control response"))?;
-        if response.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
-            return Err(ClientError::Protocol("Invalid control response version"));
-        }
-        if let Some(error) = response.get("error") {
+        let mut response = loop {
+            let response = self.read_message()?;
+            if response.get("id").is_none()
+                && response.get("method").and_then(Value::as_str).is_some()
+            {
+                self.events.push(response);
+                continue;
+            }
+            break response;
+        };
+        if let Some(error) = response
+            .as_object_mut()
+            .and_then(|object| object.remove("error"))
+        {
             let data = error.get("data");
             let code = data
                 .and_then(|data| data.get("code"))
@@ -245,6 +474,7 @@ impl Client {
                     .and_then(Value::as_str)
                     .unwrap_or("Control request failed")
                     .into(),
+                rpc: error,
             });
         }
         if response.get("id").and_then(Value::as_u64) != Some(id) {
@@ -256,5 +486,54 @@ impl Client {
             .as_object_mut()
             .and_then(|object| object.remove("result"))
             .ok_or(ClientError::Protocol("Missing control result"))
+    }
+}
+
+fn deadline_after(timeout: Duration) -> Result<Instant, ClientError> {
+    Instant::now()
+        .checked_add(timeout)
+        .ok_or(ClientError::Protocol("Invalid client deadline"))
+}
+
+fn remaining(deadline: Instant) -> Result<Duration, ClientError> {
+    deadline
+        .checked_duration_since(Instant::now())
+        .filter(|duration| !duration.is_zero())
+        .ok_or_else(|| ClientError::Io(io::ErrorKind::TimedOut.into()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_backlog_bounds_server_markers_without_merging_subscriptions() {
+        let mut backlog = EventBacklog::default();
+        for index in 0..=DEPTH {
+            backlog.push(
+                ServerOverflow {
+                    subscription: 1 + (index % 2) as u64,
+                    at_millis: index as u64,
+                    dropped: 100 + index as u64,
+                }
+                .into_event(),
+            );
+        }
+
+        let loss = backlog.pop().unwrap();
+        assert_eq!(loss["params"]["source"], "client");
+        assert_eq!(loss["params"]["dropped"], 0);
+        assert_eq!(loss["params"]["server_markers_dropped"], 1);
+        assert!(loss["params"].get("subscription_id").is_none());
+        for index in 1..=DEPTH {
+            let marker = backlog.pop().unwrap();
+            assert_eq!(
+                marker["params"]["subscription_id"],
+                format!("s{}", 1 + index % 2)
+            );
+            assert_eq!(marker["params"]["at_millis"], index);
+            assert_eq!(marker["params"]["dropped"], 100 + index);
+        }
+        assert!(backlog.pop().is_none());
     }
 }

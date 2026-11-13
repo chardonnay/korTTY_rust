@@ -13,11 +13,15 @@ use auth::AuthType;
 use kex::SessId;
 use packets::{AuthMethod, MethodPubKey, ParseContext};
 use packets::{Packet, Userauth60};
-use sign::{OwnedSig, SignKey};
+use sign::{OwnedSig, SigType, SignKey};
 use sshnames::*;
 use traffic::TrafSend;
 
 const MAX_INTERACTIVE_ROUNDS: u8 = 8;
+
+#[cfg(all(test, feature = "rsa"))]
+#[path = "rsa_keys/auth_tests.rs"]
+mod rsa_tests;
 
 #[derive(Debug)]
 enum AuthState {
@@ -26,8 +30,15 @@ enum AuthState {
     MethodQuery,
     // other request types
     Request,
-    RequestKey { key: SignKey },
-    Interactive { rounds: u8, awaiting: Option<usize> },
+    RequestKey {
+        key: SignKey,
+        signature: SigType,
+        defer_signature: bool,
+    },
+    Interactive {
+        rounds: u8,
+        awaiting: Option<usize>,
+    },
     Idle,
 }
 
@@ -56,6 +67,7 @@ pub(crate) struct CliAuth {
 
     /// Set once we are OKed from MSG_EXT_INFO
     allow_rsa_sha2: bool,
+    allow_rsa_sha512: bool,
 }
 
 impl Default for CliAuth {
@@ -68,6 +80,7 @@ impl Default for CliAuth {
             try_interactive: false,
             offers: AuthOffers::default(),
             allow_rsa_sha2: false,
+            allow_rsa_sha512: false,
         }
     }
 }
@@ -94,15 +107,14 @@ impl CliAuth {
         }
     }
 
-    pub fn resume_username(
-        &mut self,
-        s: &mut TrafSend,
-        username: &str,
-    ) -> Result<()> {
+    pub fn resume_username(&mut self, s: &mut TrafSend, username: &str) -> Result<()> {
         // TODO; error handling
-        self.username =
-            username.try_into().map_err(|_| Error::msg("Username too long"))?;
-        s.send(packets::ServiceRequest { name: SSH_SERVICE_USERAUTH })?;
+        self.username = username
+            .try_into()
+            .map_err(|_| Error::msg("Username too long"))?;
+        s.send(packets::ServiceRequest {
+            name: SSH_SERVICE_USERAUTH,
+        })?;
 
         s.send(packets::UserauthRequest {
             username: self.username.as_str().into(),
@@ -144,9 +156,10 @@ impl CliAuth {
     fn auth_sig_msg<'b>(
         &'b self,
         key: &'b SignKey,
+        signature: SigType,
         sess_id: &'b SessId,
     ) -> Result<AuthSigMsg<'b>> {
-        let p = req_packet_pubkey(&self.username, key, None, true)?;
+        let p = req_packet_pubkey(&self.username, key, signature, None, true)?;
         Ok(auth::AuthSigMsg::new(p, sess_id))
     }
 
@@ -157,27 +170,30 @@ impl CliAuth {
         parse_ctx: &mut ParseContext,
         s: &mut TrafSend,
     ) -> Result<DispatchEvent> {
-        let AuthState::RequestKey { key } = &self.state else {
+        let AuthState::RequestKey {
+            key,
+            signature,
+            defer_signature,
+        } = &self.state
+        else {
             trace!("Unexpected userauth60");
             return error::SSHProto.fail();
         };
 
         let public_key = key.pubkey();
-        if public_key != pkok.key.0
-            || packets::Signature::sig_name_for_pubkey(&public_key)? != pkok.algo
-        {
+        if public_key != pkok.key.0 || signature.algorithm_name() != pkok.algo {
             trace!("Received pkok for a different key or algorithm");
             return error::SSHProto.fail();
         }
 
-        if key.is_agent() {
+        if key.is_agent() || *defer_signature {
             return Ok(DispatchEvent::CliEvent(CliEventId::AgentSign));
         }
 
         // Sign the packet without the signature
-        let msg = self.auth_sig_msg(key, sess_id)?;
-        let sig = key.sign(&msg)?;
-        let p = req_packet_pubkey(&self.username, key, Some(&sig), true)?;
+        let msg = self.auth_sig_msg(key, *signature, sess_id)?;
+        let sig = key.sign_with_type(&msg, *signature)?;
+        let p = req_packet_pubkey(&self.username, key, *signature, Some(&sig), true)?;
 
         s.send(p)?;
         parse_ctx.cli_auth_type = None;
@@ -191,7 +207,7 @@ impl CliAuth {
         parse_ctx: &mut ParseContext,
         s: &mut TrafSend,
     ) -> Result<DispatchEvent> {
-        let AuthState::RequestKey { key } = &self.state else {
+        let AuthState::RequestKey { key, signature, .. } = &self.state else {
             return Error::bug();
         };
 
@@ -202,7 +218,7 @@ impl CliAuth {
             return Ok(DispatchEvent::CliEvent(CliEventId::Pubkey));
         };
 
-        let p = req_packet_pubkey(&self.username, key, Some(sig), true)?;
+        let p = req_packet_pubkey(&self.username, key, *signature, Some(sig), true)?;
         s.send(p)?;
         self.state = AuthState::Request;
         Ok(DispatchEvent::None)
@@ -221,6 +237,44 @@ impl CliAuth {
         parse_ctx: &mut ParseContext,
         s: &mut TrafSend,
     ) -> Result<DispatchEvent> {
+        #[cfg(feature = "rsa")]
+        if !failure.partial
+            && self.allow_rsa_sha2
+            && failure.methods.has_algo(SSH_AUTHMETHOD_PUBLICKEY)?
+            && matches!(
+                self.state,
+                AuthState::RequestKey {
+                    signature: SigType::RSA512,
+                    ..
+                }
+            )
+        {
+            // Some servers advertise supported signatures more broadly than their
+            // per-user policy. Retry this unsigned probe once with advertised SHA-256.
+            let AuthState::RequestKey {
+                key,
+                defer_signature,
+                ..
+            } = core::mem::replace(&mut self.state, AuthState::Idle)
+            else {
+                return Error::bug();
+            };
+            let signature = SigType::RSA256;
+            s.send(req_packet_pubkey(
+                &self.username,
+                &key,
+                signature,
+                None,
+                false,
+            )?)?;
+            parse_ctx.cli_auth_type = Some(AuthType::PubKey);
+            self.state = AuthState::RequestKey {
+                key,
+                signature,
+                defer_signature,
+            };
+            return Ok(DispatchEvent::None);
+        }
         match self.state {
             AuthState::MethodQuery | AuthState::RequestKey { .. } if !failure.partial => {}
             AuthState::Request | AuthState::Interactive { awaiting: None, .. } => {}
@@ -236,7 +290,11 @@ impl CliAuth {
         self.select_method(parse_ctx, s)
     }
 
-    fn select_method(&mut self, parse_ctx: &mut ParseContext, s: &mut TrafSend) -> Result<DispatchEvent> {
+    fn select_method(
+        &mut self,
+        parse_ctx: &mut ParseContext,
+        s: &mut TrafSend,
+    ) -> Result<DispatchEvent> {
         if self.try_pubkey && self.offers.public_key {
             return Ok(DispatchEvent::CliEvent(event::CliEventId::Pubkey));
         }
@@ -255,7 +313,10 @@ impl CliAuth {
                 }),
             })?;
             self.try_interactive = false;
-            self.state = AuthState::Interactive { rounds: 0, awaiting: None };
+            self.state = AuthState::Interactive {
+                rounds: 0,
+                awaiting: None,
+            };
             parse_ctx.cli_auth_type = Some(AuthType::KeyboardInteractive);
             return Ok(DispatchEvent::None);
         }
@@ -298,6 +359,7 @@ impl CliAuth {
         &mut self,
         s: &mut TrafSend,
         key: Option<SignKey>,
+        defer_signature: bool,
         parse_ctx: &mut ParseContext,
     ) -> Result<DispatchEvent> {
         let Some(key) = key else {
@@ -305,49 +367,64 @@ impl CliAuth {
             return self.select_method(parse_ctx, s);
         };
 
-        #[cfg(feature = "rsa")]
-        if (matches!(key, SignKey::RSA(_)) || matches!(key, SignKey::AgentRSA(_)))
-            && !self.allow_rsa_sha2
-        {
-            // RSA keys are only used when the server has confirmed that rsa-sha2
-            // signatures are OK by sending ext-info.
-            trace!("Skipping rsa key, no ext-info");
-            // Ask for another public key
+        let Some(signature) = self.signature_for_key(&key)? else {
+            // Never fall back to the SHA-1 ssh-rsa signature algorithm.
+            trace!("Skipping RSA key without a supported SHA-2 server signature offer");
             return Ok(DispatchEvent::CliEvent(CliEventId::Pubkey));
-        }
+        };
 
-        let p = req_packet_pubkey(&self.username, &key, None, false)?;
+        let p = req_packet_pubkey(&self.username, &key, signature, None, false)?;
         s.send(p)?;
         parse_ctx.cli_auth_type = Some(AuthType::PubKey);
         trace!("authtype {:?}", parse_ctx.cli_auth_type);
-        self.state = AuthState::RequestKey { key };
+        self.state = AuthState::RequestKey {
+            key,
+            signature,
+            defer_signature,
+        };
         Ok(DispatchEvent::None)
     }
 
     pub fn fetch_agentsign_key(&self) -> Result<&SignKey> {
-        let AuthState::RequestKey { key } = &self.state else {
+        let AuthState::RequestKey { key, .. } = &self.state else {
             return Error::bug();
         };
-        debug_assert!(key.is_agent());
+        if !key.is_agent() {
+            return error::BadUsage.fail();
+        }
         Ok(key)
     }
 
-    pub fn fetch_agentsign_msg<'b>(
-        &'b self,
-        sess_id: &'b SessId,
-    ) -> Result<AuthSigMsg<'b>> {
-        let AuthState::RequestKey { key } = &self.state else {
+    pub fn fetch_agentsign_msg<'b>(&'b self, sess_id: &'b SessId) -> Result<AuthSigMsg<'b>> {
+        let AuthState::RequestKey { key, signature, .. } = &self.state else {
             return Error::bug();
         };
 
         // Sign the packet without the signature
-        self.auth_sig_msg(key, sess_id)
+        self.auth_sig_msg(key, *signature, sess_id)
+    }
+
+    pub fn sign_deferred_private_key(&self, sess_id: &SessId) -> Result<OwnedSig> {
+        let AuthState::RequestKey {
+            key,
+            signature,
+            defer_signature: true,
+        } = &self.state
+        else {
+            return error::BadUsage.fail();
+        };
+        if key.is_agent() {
+            return error::BadUsage.fail();
+        }
+        let message = self.auth_sig_msg(key, *signature, sess_id)?;
+        key.sign_with_type(&message, *signature)
     }
 
     pub fn success(&mut self) -> Result<DispatchEvent> {
         if !matches!(
             self.state,
-            AuthState::MethodQuery | AuthState::Request
+            AuthState::MethodQuery
+                | AuthState::Request
                 | AuthState::Interactive { awaiting: None, .. }
         ) {
             return error::SSHProto.fail();
@@ -358,12 +435,24 @@ impl CliAuth {
 
     pub fn handle_ext_info(&mut self, p: &packets::ExtInfo) {
         if let Some(ref algs) = p.server_sig_algs {
-            // we only worry about rsa-sha256, assuming other older key types are fine
-
             // OK unwrap: is a remote namelist
             self.allow_rsa_sha2 = algs.has_algo(SSH_NAME_RSA_SHA256).unwrap();
-            trace!("setting allow_rsa_sha2 = {}", self.allow_rsa_sha2);
+            self.allow_rsa_sha512 = algs.has_algo(SSH_NAME_RSA_SHA512).unwrap();
         }
+    }
+
+    fn signature_for_key(&self, key: &SignKey) -> Result<Option<SigType>> {
+        #[cfg(feature = "rsa")]
+        if matches!(key, SignKey::RSA(_) | SignKey::AgentRSA(_)) {
+            return Ok(if self.allow_rsa_sha512 {
+                Some(SigType::RSA512)
+            } else if self.allow_rsa_sha2 {
+                Some(SigType::RSA256)
+            } else {
+                None
+            });
+        }
+        SigType::from_name(packets::Signature::sig_name_for_pubkey(&key.pubkey())?).map(Some)
     }
 }
 
@@ -382,10 +471,11 @@ fn req_packet_password<'b>(username: &'b str, password: &'b str) -> Packet<'b> {
 fn req_packet_pubkey<'b>(
     username: &'b str,
     key: &'b SignKey,
+    signature: SigType,
     sig: Option<&'b OwnedSig>,
     force_sig: bool,
 ) -> Result<packets::UserauthRequest<'b>> {
-    let mut mp = MethodPubKey::new(key.pubkey(), sig)?;
+    let mut mp = MethodPubKey::with_algorithm(key.pubkey(), sig, signature.algorithm_name())?;
     mp.force_sig = force_sig;
     let method = AuthMethod::PubKey(mp);
     Ok(packets::UserauthRequest {

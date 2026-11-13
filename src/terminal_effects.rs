@@ -1,6 +1,7 @@
 //! Built-in terminal effects from the Java reference's effect pack.
 
 use std::collections::BTreeSet;
+use std::fmt;
 
 use iced::widget::canvas::{self, Canvas};
 use iced::{Color, Element, Length, Rectangle, Renderer, Theme, mouse};
@@ -168,14 +169,60 @@ impl Preferences {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub(crate) struct Selection {
     pub(crate) effect: Effect,
-    pub(crate) speed: u8,
+    pub(crate) speed: Speed,
+}
+
+/// A finite multiplier in the supported range, with the same precision as Java.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq)]
+#[serde(try_from = "f64")]
+pub struct Speed(f64);
+
+impl Eq for Speed {}
+
+impl Speed {
+    pub(crate) const DEFAULT: Self = Self(1.0);
+
+    pub(crate) fn normalized(value: f64) -> Self {
+        if !value.is_finite() || value <= 0.0 {
+            Self::DEFAULT
+        } else {
+            Self(value.clamp(1.0, 99.0))
+        }
+    }
+
+    pub(crate) fn multiplier(self) -> f64 {
+        self.0
+    }
+}
+
+impl TryFrom<f64> for Speed {
+    type Error = &'static str;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        (1.0..=99.0)
+            .contains(&value)
+            .then_some(Self(value))
+            .ok_or("terminal effect animation speed must be between 1 and 99")
+    }
+}
+
+impl Serialize for Speed {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.0.fract() == 0.0 {
+            serializer.serialize_u8(self.0 as u8)
+        } else {
+            serializer.serialize_f64(self.0)
+        }
+    }
+}
+
+impl fmt::Display for Speed {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(&self.0, formatter)
+    }
 }
 
 impl Selection {
-    pub(crate) fn speed(self) -> u8 {
-        self.speed.clamp(1, 99)
-    }
-
     pub(crate) fn overlay<'a, Message: 'a>(self, seconds: f32) -> Element<'a, Message> {
         self.overlay_with_flash(seconds, None)
     }

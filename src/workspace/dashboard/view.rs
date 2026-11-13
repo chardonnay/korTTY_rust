@@ -1,10 +1,16 @@
+use std::time::Instant;
+
 use iced::widget::{
     button, column, container, mouse_area, row, rule, scrollable, space, text, tooltip,
 };
 use iced::{Alignment, Element, Length, window};
 
+use crate::session::CodingAgentState;
+
 use super::super::{Message as Desktop, Window, Workspace, chrome::popup, transparency};
-use super::{Action, Branch, ConnectionRow, ConnectionState, Message, Target, Tree, bounded_label};
+use super::{
+    Action, Branch, ConnectionRow, ConnectionState, Message, Target, Tree, agents, bounded_label,
+};
 
 const MIN_WIDTH: f32 = 220.0;
 const MAX_WIDTH: f32 = 480.0;
@@ -20,6 +26,14 @@ impl Workspace {
             .tab_drop_coordinates(width, 0.0, f64::from(width));
         let preferred = tree.preferred_width.clamp(MIN_WIDTH, MAX_WIDTH);
         preferred.min((free as f32 - TERMINAL_RESERVE).max(NARROW_WIDTH))
+    }
+
+    pub(in crate::workspace) fn visible_dashboard_width(&self, window: &Window) -> f32 {
+        if window.dashboard.visible {
+            self.dashboard_width(window, &self.dashboard_tree(window))
+        } else {
+            0.0
+        }
     }
 
     pub(in crate::workspace) fn dashboard_view<'a>(
@@ -43,6 +57,7 @@ impl Workspace {
     fn dashboard_panel(&self, owner: window::Id, window: &Window) -> Element<'_, Desktop> {
         let tree = self.dashboard_tree(window);
         let width = self.dashboard_width(window, &tree);
+        let now = Instant::now();
         let collapsed = !tree
             .branch_ids()
             .any(|branch| window.dashboard.expanded(&branch));
@@ -96,11 +111,14 @@ impl Workspace {
                 0,
                 "▣",
                 "Main Window".into(),
-                &format!("{}/{} active", tree.connected, tree.total),
+                (
+                    &format!("{}/{} active", tree.connected, tree.total),
+                    tree.agent_rollup
+                ),
             )];
             if window.dashboard.expanded(&Branch::Window) {
                 for item in tree.direct {
-                    rows = rows.push(self.dashboard_connection_rows(owner, window, item, 1));
+                    rows = rows.push(self.dashboard_connection_rows(owner, window, item, 1, now));
                 }
                 let mut groups: Vec<_> = tree.groups.into_iter().collect();
                 groups.sort_by_cached_key(|(label, _)| label.to_lowercase());
@@ -119,6 +137,10 @@ impl Workspace {
                         .filter(|row| row.state == ConnectionState::Connected)
                         .count();
                     let expanded = window.dashboard.expanded(&branch);
+                    let mut rollup = agents::Rollup::default();
+                    for item in &items {
+                        rollup.merge(item.rollup);
+                    }
                     rows = rows.push(branch_row(
                         owner,
                         window,
@@ -126,12 +148,12 @@ impl Workspace {
                         1,
                         icon,
                         bounded_label(&label),
-                        &format!("{active}/{} active", items.len()),
+                        (&format!("{active}/{} active", items.len()), rollup),
                     ));
                     if expanded {
                         for item in items {
-                            rows =
-                                rows.push(self.dashboard_connection_rows(owner, window, item, 2));
+                            rows = rows
+                                .push(self.dashboard_connection_rows(owner, window, item, 2, now));
                         }
                     }
                 }
@@ -157,6 +179,7 @@ impl Workspace {
         window: &Window,
         item: ConnectionRow,
         depth: u8,
+        now: Instant,
     ) -> Element<'_, Desktop> {
         let target = Target::tab(item.id);
         let branch = Branch::Tab(item.id);
@@ -166,10 +189,14 @@ impl Workspace {
         } else {
             disclosure(owner, branch, expanded)
         };
-        let hover = item.endpoint.map_or_else(
+        let mut hover = item.endpoint.map_or_else(
             || format!("{}\n{}", item.label, item.state.label()),
             |endpoint| format!("{}\n{endpoint}\n{}", item.label, item.state.label()),
         );
+        if let Some(agent) = &item.agent {
+            hover.push('\n');
+            hover.push_str(&agent.tooltip());
+        }
         let selected = window.tab().is_some_and(|tab| tab.id == item.id);
         let mut content = row![
             disclosure,
@@ -179,6 +206,9 @@ impl Workspace {
             container(text(item.protocol).size(10))
                 .padding([1, 4])
                 .style(container::rounded_box),
+            item.agent
+                .as_ref()
+                .map(|agent| agent_chip(agent.state, agent.chip(now))),
             button("⋯")
                 .padding([2, 4])
                 .style(button::text)
@@ -218,11 +248,19 @@ impl Workspace {
                     session: Some(pane.session),
                 };
                 let label = format!("Pane {}", pane.number);
+                let mut hover = pane.state.label().to_owned();
+                if let Some(agent) = &pane.agent {
+                    hover.push('\n');
+                    hover.push_str(&agent.tooltip());
+                }
                 let row = row![
                     blank_disclosure(),
                     text("▥").size(13),
                     pane.state.indicator(),
-                    clipped(label, 13)
+                    clipped(label, 13),
+                    pane.agent
+                        .as_ref()
+                        .map(|agent| agent_chip(agent.state, agent.chip(now))),
                 ]
                 .spacing(5)
                 .align_y(Alignment::Center)
@@ -234,7 +272,7 @@ impl Workspace {
                 });
                 let trigger = mouse_area(tooltip(
                     row,
-                    text(pane.state.label()),
+                    text(hover).size(12),
                     tooltip::Position::Bottom,
                 ))
                 .interaction(iced::mouse::Interaction::Pointer)
@@ -253,24 +291,31 @@ impl Workspace {
         target: Target,
         row: Element<'a, Desktop>,
     ) -> Element<'a, Desktop> {
-        let Some((_, selected)) = window
+        let Some(context) = window
             .dashboard
             .context
-            .filter(|(active, _)| *active == target)
+            .filter(|active| active.target == target)
         else {
             return row;
         };
-        let actions = self.dashboard_actions(owner, target);
+        let actions = self.dashboard_context_actions(owner, context);
         if actions.is_empty() {
             return row;
         }
         let multi_exec_enabled = actions.contains(&Action::MultiExec);
-        let mut menu = column![].spacing(2);
-        for (index, action) in actions
+        let show_agent = actions
+            .iter()
+            .position(|action| matches!(action, Action::ShowCodingAgent(_)));
+        let mut items: Vec<_> = actions
             .into_iter()
-            .chain((!multi_exec_enabled).then_some(Action::MultiExec))
             .enumerate()
-        {
+            .map(|(index, action)| (Some(index), action))
+            .collect();
+        if !multi_exec_enabled {
+            items.insert(show_agent.unwrap_or(items.len()), (None, Action::MultiExec));
+        }
+        let mut menu = column![].spacing(2);
+        for (index, action) in items {
             let label = text(action.label(target));
             let item = if action == Action::MultiExec {
                 menu = menu.push(rule::horizontal(1));
@@ -285,23 +330,24 @@ impl Workspace {
             } else {
                 button(label)
             };
-            let enabled = action != Action::MultiExec || multi_exec_enabled;
             let item = item
                 .width(Length::Fill)
-                .style(if enabled && index == selected {
+                .style(if index == Some(context.selected) {
                     button::secondary
                 } else {
                     button::text
                 })
                 .on_press_maybe(
-                    enabled.then_some(Desktop::Dashboard(owner, Message::Perform(target, action))),
+                    index
+                        .is_some()
+                        .then_some(Desktop::Dashboard(owner, Message::Perform(target, action))),
                 );
             menu = menu.push(item);
         }
         popup::anchor(
             row,
             container(menu)
-                .width(185)
+                .width(if show_agent.is_some() { 230 } else { 185 })
                 .padding(4)
                 .style(container::rounded_box)
                 .into(),
@@ -318,7 +364,7 @@ fn branch_row(
     depth: u8,
     icon: &'static str,
     label: String,
-    status: &str,
+    (status, rollup): (&str, agents::Rollup),
 ) -> Element<'static, Desktop> {
     let expanded = window.dashboard.expanded(&branch);
     let content = row![
@@ -328,6 +374,7 @@ fn branch_row(
         text(status.to_owned())
             .size(11)
             .wrapping(text::Wrapping::None),
+        rollup.chip().map(|(state, label)| agent_chip(state, label)),
     ]
     .spacing(5)
     .align_y(Alignment::Center)
@@ -340,6 +387,27 @@ fn branch_row(
     mouse_area(content)
         .interaction(iced::mouse::Interaction::Pointer)
         .on_press(Desktop::Dashboard(owner, Message::Disclosure(branch)))
+        .into()
+}
+
+fn agent_chip(state: CodingAgentState, label: String) -> Element<'static, Desktop> {
+    container(text(label).size(11).wrapping(text::Wrapping::None))
+        .padding([2, 5])
+        .max_width(155)
+        .clip(true)
+        .style(move |theme: &iced::Theme| {
+            let palette = theme.extended_palette();
+            let pair = match state {
+                CodingAgentState::Blocked => palette.warning.weak,
+                CodingAgentState::Done => palette.success.weak,
+                CodingAgentState::Working => palette.primary.weak,
+                CodingAgentState::Idle | CodingAgentState::Unknown => palette.secondary.weak,
+            };
+            container::Style::default()
+                .background(pair.color)
+                .color(pair.text)
+                .border(iced::border::rounded(4))
+        })
         .into()
 }
 

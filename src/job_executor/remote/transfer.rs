@@ -7,12 +7,14 @@ use kortty_ssh::sftp::{Attributes, Error, FileKind, Sftp};
 
 use crate::scheduler_window::RemotePath;
 use crate::sftp_window::{
-    FolderError, FolderTransfer, LocalSource, StagedDownload, copy_scheduled_folder, staging_name,
+    FolderError, FolderTransfer, LocalSource, OrdinaryDownload, copy_scheduled_folder, staging_name,
 };
 
 use super::{Failure, before_change, verify_directory, verify_entry};
 
 const MAX_FILE_BYTES: u64 = 1 << 30;
+pub(super) const LOCAL_PUBLICATION_UNCERTAIN: &str =
+    "Local folder publication could not be confirmed. Inspect the destination before retrying.";
 
 mod copy_tree;
 
@@ -20,6 +22,8 @@ pub(super) enum FolderRemains {
     RemotePartial,
     RemoteCopyPartial,
     LocalStage,
+    LocalPublished,
+    LocalPublicationUncertain,
 }
 
 pub(super) fn folder(
@@ -28,14 +32,22 @@ pub(super) fn folder(
     cancellation: &Cancellation,
     remains: &mut Option<FolderRemains>,
 ) -> Result<String, Failure> {
+    let local_download = matches!(transfer, FolderTransfer::Download { .. });
     let result = copy_scheduled_folder(client, transfer, || cancellation.is_requested());
     *remains = match result {
         Err(FolderError::IncompleteUpload) => Some(FolderRemains::RemotePartial),
         Err(FolderError::LocalStageRemains) => Some(FolderRemains::LocalStage),
+        Err(FolderError::LocalPublicationUncertain) => {
+            Some(FolderRemains::LocalPublicationUncertain)
+        }
+        Ok(_) if local_download => Some(FolderRemains::LocalPublished),
         _ => None,
     };
     match result {
         Ok(detail) => Ok(detail),
+        Err(FolderError::LocalPublicationUncertain) => {
+            Err(Failure::failed(LOCAL_PUBLICATION_UNCERTAIN))
+        }
         Err(error) => {
             before_change(cancellation)?;
             Err(match error {
@@ -166,7 +178,7 @@ pub(super) fn published_detail(mut detail: String, cleaned: bool) -> String {
     detail
 }
 
-fn publish_remote<R: Read, W: Write>(
+pub(in crate::job_executor) fn publish_remote<R: Read, W: Write>(
     client: &mut Sftp<R, W>,
     remote: &RemotePath,
     size: u64,
@@ -270,7 +282,7 @@ pub(super) fn download(
         ));
     }
     let size = checked_size(attributes.size)?;
-    let stage = StagedDownload::create(local).map_err(|error| {
+    let stage = OrdinaryDownload::create(local).map_err(|error| {
         if error.kind() == io::ErrorKind::AlreadyExists {
             Failure::failed("The local download destination already exists")
         } else {

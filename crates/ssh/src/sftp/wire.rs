@@ -27,10 +27,10 @@ pub(super) const NAME: u8 = 104;
 pub(super) const ATTRS: u8 = 105;
 pub(super) const EXTENDED: u8 = 200;
 
-const ATTR_SIZE: u32 = 0x0000_0001;
+pub(super) const ATTR_SIZE: u32 = 0x0000_0001;
 pub(super) const ATTR_UID_GID: u32 = 0x0000_0002;
 pub(super) const ATTR_PERMISSIONS: u32 = 0x0000_0004;
-const ATTR_TIMES: u32 = 0x0000_0008;
+pub(super) const ATTR_TIMES: u32 = 0x0000_0008;
 const ATTR_EXTENDED: u32 = 0x8000_0000;
 const ATTR_MASK: u32 = ATTR_SIZE | ATTR_UID_GID | ATTR_PERMISSIONS | ATTR_TIMES | ATTR_EXTENDED;
 

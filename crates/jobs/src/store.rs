@@ -16,10 +16,10 @@ use serde_json::Value;
 
 use crate::graph::validate_name;
 use crate::schedule::timestamp;
-use crate::scheduler::reserve_run_ids_through;
+use crate::scheduler::{DependencyResult, reserve_run_ids_through};
 use crate::{
-    DefinitionError, GraphError, JobDefinition, JobGraph, JobId, MAX_DEPENDENCIES, MAX_JOBS, RunId,
-    RunOutcome, RunRecord, RunTrigger, Scheduler,
+    DefinitionError, GraphError, JobDefinition, JobGraph, JobId, MAX_DEPENDENCIES, MAX_JOBS,
+    ProfileRef, RunId, RunOutcome, RunRecord, RunTrigger, Scheduler,
 };
 
 const VERSION: u32 = 1;
@@ -27,8 +27,8 @@ const MAX_STORED_RUN_ID: u64 = u64::MAX - u32::MAX as u64;
 const MAX_JOURNAL_DETAIL_BYTES: usize = 4096;
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
-/// Maximum number of retained finished records. The oldest appended records
-/// are dropped when this limit is reached.
+/// Maximum number of retained finished records. Older records also expire
+/// when newer records would exceed the scheduler file's byte limit.
 pub const MAX_JOURNAL_RECORDS: usize = 256;
 /// Maximum accepted or written size of the scheduler file.
 pub const MAX_STORE_BYTES: u64 = 16 * 1024 * 1024;
@@ -36,17 +36,188 @@ pub const MAX_STORE_BYTES: u64 = 16 * 1024 * 1024;
 /// Opaque name component for a recording stored beside the scheduler profile.
 pub type JournalRecording = [u8; 16];
 
+/// Maximum number of target journals attached to a single scheduler run.
+pub const MAX_SESSION_JOURNALS_PER_RUN: usize = MAX_SWARM_TARGETS;
+
+/// Maximum selected targets in one scheduled Swarm.
+pub const MAX_SWARM_TARGETS: usize = 32;
+pub const MAX_SWARM_QUESTION_BYTES: usize = 4096;
+pub const MAX_SWARM_TARGET_LABEL_BYTES: usize = 512;
+pub const MAX_SWARM_TARGET_DETAIL_BYTES: usize = 2048;
+pub const MAX_SWARM_COMPARISON_BYTES: usize = 8 * 1024;
+const MAX_PENDING_SWARM_CHAT_SEEDS: usize = 32;
+const MAX_PENDING_SWARM_CHAT_BYTES: usize = 2 * 1024 * 1024;
+
+/// Masked advisory results from one finished Swarm firing, in reviewed target order.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwarmReport {
+    pub question: String,
+    pub targets: Vec<SwarmTargetReport>,
+    /// A masked model comparison of these targets' results.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<String>,
+}
+
+/// One target's outcome and masked, synthesized detail.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwarmTargetReport {
+    pub target: u64,
+    pub label: String,
+    pub outcome: RunOutcome,
+    pub detail: String,
+}
+
+/// A profile-local saved conversation identity for a committed Swarm report.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwarmChatOrigin {
+    pub nonce: String,
+    pub profile: ProfileRef,
+}
+
+impl SwarmChatOrigin {
+    fn valid(&self) -> bool {
+        self.profile.is_nonzero() && valid_nonce(&self.nonce)
+    }
+}
+
+/// A masked conversation awaiting delivery to the private saved-chat store.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SwarmChatSeed {
+    pub run: RunId,
+    pub origin: SwarmChatOrigin,
+    pub report: SwarmReport,
+}
+
+/// Local journal metadata committed with finished runs.
+#[derive(Default)]
+pub struct FinishedRunMetadata<'a> {
+    pub details: &'a [(RunId, String)],
+    pub recordings: &'a [(RunId, JournalRecording)],
+    pub session_journals: &'a [(RunId, &'a [String])],
+    pub swarm_reports: &'a [(RunId, SwarmReport)],
+    pub swarm_chat_origins: &'a [(RunId, SwarmChatOrigin)],
+}
+
+impl SwarmReport {
+    pub fn is_valid_for(&self, record: &RunRecord) -> bool {
+        record.counted_as_run
+            && record.blockers.is_empty()
+            && matches!(record.trigger, RunTrigger::Manual | RunTrigger::Scheduled)
+            && self.outcome() == Some(record.outcome)
+    }
+
+    fn outcome(&self) -> Option<RunOutcome> {
+        if !(1..=MAX_SWARM_TARGETS).contains(&self.targets.len())
+            || !valid_report_text(&self.question, MAX_SWARM_QUESTION_BYTES)
+            || !self
+                .comparison
+                .as_deref()
+                .is_none_or(valid_swarm_comparison)
+        {
+            return None;
+        }
+
+        let mut ids = HashSet::new();
+        let mut aggregate = RunOutcome::Success;
+        for target in &self.targets {
+            if target.target == 0
+                || !ids.insert(target.target)
+                || !valid_report_text(&target.label, MAX_SWARM_TARGET_LABEL_BYTES)
+                || !valid_report_text(&target.detail, MAX_SWARM_TARGET_DETAIL_BYTES)
+            {
+                return None;
+            }
+            match target.outcome {
+                RunOutcome::Cancelled => return None,
+                failed @ RunOutcome::Failed { .. }
+                    if !matches!(aggregate, RunOutcome::Failed { .. }) =>
+                {
+                    aggregate = failed;
+                }
+                RunOutcome::Blocked if aggregate == RunOutcome::Success => {
+                    aggregate = RunOutcome::Blocked;
+                }
+                _ => {}
+            }
+        }
+        Some(aggregate)
+    }
+}
+
+/// Sanitized delivery results attached to a finished scheduler run.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WebhookOutcome {
+    Delivered,
+    PolicyDenied,
+    TargetDisabled,
+    MissingCredential,
+    InvalidDestination,
+    Rejected,
+    Unavailable,
+    Revoked,
+    QueueFull,
+}
+
+pub const MAX_WEBHOOKS_PER_RUN: usize = 8;
+
 /// Exclusive owner of one native scheduler profile. Write operations update
 /// the in-memory data only after replacing the file successfully.
 pub struct SchedulerStore {
     path: PathBuf,
-    _lock: ProfileLock,
+    _lock: StoreLock,
     data: StoreData,
 }
 
-struct ProfileLock(File);
+/// An additive update for a scheduler profile, ready for the caller to publish.
+#[derive(Default)]
+pub struct PreparedJobAdditions {
+    pub bytes: Option<Vec<u8>>,
+    pub added: usize,
+    pub unchanged: usize,
+    pub conflicts: usize,
+    pub missing_dependencies: usize,
+    pub full: usize,
+}
 
-impl Drop for ProfileLock {
+pub struct StoreLock(File);
+
+impl StoreLock {
+    /// Takes the same lock as a live scheduler without opening its database.
+    pub fn acquire(path: &Path) -> Result<Self, StoreError> {
+        let name = path.file_name().ok_or(StoreError::UnsafePath)?;
+        let lock_path = path.with_file_name(lock_name(name));
+        require_regular_if_present(&lock_path)?;
+        let mut options = private_options();
+        options.read(true).create(true).truncate(false);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt as _;
+            const OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+            options.custom_flags(OPEN_REPARSE_POINT);
+        }
+        let lock = options.open(lock_path)?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt as _;
+            const REPARSE_POINT: u32 = 0x400;
+            if lock.metadata()?.file_attributes() & REPARSE_POINT != 0 {
+                return Err(StoreError::UnsafePath);
+            }
+        }
+        match lock.try_lock() {
+            Ok(()) => Ok(Self(lock)),
+            Err(TryLockError::WouldBlock) => Err(StoreError::InUse),
+            Err(TryLockError::Error(error)) => Err(error.into()),
+        }
+    }
+}
+
+impl Drop for StoreLock {
     fn drop(&mut self) {
         // A forked PTY child can still hold a copy of the descriptor until
         // exec. Release the lock explicitly before closing our descriptor.
@@ -62,12 +233,24 @@ struct StoreData {
     journal: Vec<RunRecord>,
     last_runs: BTreeMap<JobId, Timestamp>,
     high_watermark: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    dependency_results: Option<BTreeMap<JobId, DependencyResult>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     actions: BTreeMap<JobId, Value>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     journal_details: BTreeMap<RunId, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     journal_recordings: BTreeMap<RunId, JournalRecording>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    session_journals: BTreeMap<RunId, Vec<String>>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    swarm_reports: BTreeMap<RunId, SwarmReport>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    swarm_chat_origins: BTreeMap<RunId, SwarmChatOrigin>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    swarm_chat_seeds: BTreeMap<RunId, SwarmChatSeed>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    webhook_results: BTreeMap<RunId, BTreeMap<String, WebhookOutcome>>,
 }
 
 impl Default for StoreData {
@@ -78,9 +261,15 @@ impl Default for StoreData {
             journal: Vec::new(),
             last_runs: BTreeMap::new(),
             high_watermark: 0,
+            dependency_results: None,
             actions: BTreeMap::new(),
             journal_details: BTreeMap::new(),
             journal_recordings: BTreeMap::new(),
+            session_journals: BTreeMap::new(),
+            swarm_reports: BTreeMap::new(),
+            swarm_chat_origins: BTreeMap::new(),
+            swarm_chat_seeds: BTreeMap::new(),
+            webhook_results: BTreeMap::new(),
         }
     }
 }
@@ -99,21 +288,10 @@ impl SchedulerStore {
         create_directories(directory)?;
         let directory = fs::canonicalize(directory)?;
         let path = directory.join(name);
-        let lock_path = directory.join(lock_name(name));
-        require_regular_if_present(&lock_path)?;
-        let lock = private_options()
-            .read(true)
-            .create(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        match lock.try_lock() {
-            Ok(()) => {}
-            Err(TryLockError::WouldBlock) => return Err(StoreError::InUse),
-            Err(TryLockError::Error(error)) => return Err(error.into()),
-        }
-        let lock = ProfileLock(lock);
-        let data = read_store(&path)?;
+        let lock = StoreLock::acquire(&path)?;
+        let mut data = read_store(&path)?;
         data.validate()?;
+        data.migrate_dependency_results();
         reserve_run_ids_through(data.high_watermark);
         Ok(Self {
             path,
@@ -127,11 +305,116 @@ impl SchedulerStore {
         &self.data.definitions
     }
 
+    /// Prepares an additive merge of an independently validated graph of disabled jobs.
+    /// A local job can satisfy an incoming dependency only when its definition and
+    /// action exactly match the incoming job. Historical IDs remain reserved.
+    /// The caller must publish against the same local bytes under its profile lock.
+    pub fn prepare_disabled_additions<A: Serialize>(
+        current: Option<&[u8]>,
+        incoming: &JobGraph<A>,
+    ) -> Result<PreparedJobAdditions, StoreError> {
+        let mut data = current.map(decode_store).transpose()?.unwrap_or_default();
+        data.validate()?;
+        if incoming.jobs().iter().any(crate::Job::enabled) {
+            return Err(StoreError::InvalidRecord);
+        }
+
+        let mut result = PreparedJobAdditions::default();
+        let local: HashMap<_, _> = data
+            .definitions
+            .iter()
+            .enumerate()
+            .map(|(index, definition)| (definition.id.clone(), index))
+            .collect();
+        let historical: HashSet<_> = data.journal.iter().map(|record| &record.job).collect();
+        let mut available = HashSet::new();
+        let mut edges: usize = data
+            .definitions
+            .iter()
+            .map(|job| job.dependencies.len())
+            .sum();
+        let mut size = json_size(&data)?;
+
+        for &index in &incoming.topological {
+            let job = &incoming.jobs()[index];
+            if !job.dependencies().iter().all(|id| available.contains(id)) {
+                result.missing_dependencies += 1;
+                continue;
+            }
+
+            let definition = job.definition();
+            let id = &definition.id;
+            let action = serde_json::to_value(job.action())
+                .map_err(|_| StoreError::InvalidAction(id.clone()))?;
+            if let Some(&index) = local.get(id) {
+                if data.definitions[index] == definition && data.actions.get(id) == Some(&action) {
+                    result.unchanged += 1;
+                    available.insert(job.id());
+                } else {
+                    result.conflicts += 1;
+                }
+                continue;
+            }
+            if historical.contains(id) {
+                result.conflicts += 1;
+                continue;
+            }
+
+            let definition_bytes =
+                json_size(&definition)? + usize::from(!data.definitions.is_empty());
+            let action_bytes = json_size(id)? + 1 + json_size(&action)?;
+            // The actions field is omitted when empty. Later entries only add a comma.
+            let action_overhead = if data.actions.is_empty() {
+                br#","actions":{}"#.len()
+            } else {
+                1
+            };
+            let next_size = size
+                .saturating_add(definition_bytes)
+                .saturating_add(action_bytes)
+                .saturating_add(action_overhead);
+            let next_edges = edges + definition.dependencies.len();
+            if data.definitions.len() == MAX_JOBS
+                || next_edges > MAX_DEPENDENCIES
+                || next_size as u64 > MAX_STORE_BYTES
+            {
+                result.full += 1;
+                continue;
+            }
+
+            data.actions.insert(id.clone(), action);
+            data.definitions.push(definition);
+            available.insert(job.id());
+            size = next_size;
+            edges = next_edges;
+            result.added += 1;
+        }
+        if result.added > 0 {
+            data.validate()?;
+            let bytes = serde_json::to_vec(&data).map_err(StoreError::invalid_json)?;
+            debug_assert_eq!(bytes.len(), size);
+            if bytes.len() as u64 > MAX_STORE_BYTES {
+                return Err(StoreError::TooLarge);
+            }
+            result.bytes = Some(bytes);
+        }
+        Ok(result)
+    }
+
     /// Projects the persisted scheduler into portable definitions and actions.
     /// Device-local run history, attachment references, and counters are excluded.
     pub fn portable_backup(bytes: &[u8]) -> Result<Vec<u8>, StoreError> {
-        let data = decode_store(bytes)?;
+        Self::portable_backup_with(bytes, |_| {})
+    }
+
+    /// Projects portable actions after removing caller-owned device authorizations.
+    pub fn portable_backup_with(
+        bytes: &[u8],
+        mut project: impl FnMut(&mut Value),
+    ) -> Result<Vec<u8>, StoreError> {
+        let mut data = decode_store(bytes)?;
         data.validate()?;
+        data.actions.values_mut().for_each(&mut project);
         let portable = StoreData {
             definitions: data.definitions,
             actions: data.actions,
@@ -145,28 +428,41 @@ impl SchedulerStore {
         bytes: &[u8],
         action_valid: impl Fn(A) -> bool,
     ) -> Result<(), StoreError> {
-        let data = decode_store(bytes)?;
-        data.validate()?;
-        if !data.journal.is_empty()
-            || !data.last_runs.is_empty()
-            || data.high_watermark != 0
-            || !data.journal_details.is_empty()
-            || !data.journal_recordings.is_empty()
-        {
-            return Err(StoreError::InvalidRecord);
-        }
+        let data = decode_backup(bytes)?;
         for definition in &data.definitions {
-            let action = data
-                .actions
-                .get(&definition.id)
-                .ok_or_else(|| StoreError::MissingAction(definition.id.clone()))?;
-            let action = A::deserialize(action)
-                .map_err(|_| StoreError::InvalidAction(definition.id.clone()))?;
-            if !action_valid(action) {
+            if !action_valid(data.backup_action(&definition.id)?) {
                 return Err(StoreError::InvalidAction(definition.id.clone()));
             }
         }
         Ok(())
+    }
+
+    /// Serializes a validated graph and its actions without device-local history.
+    pub fn encode_backup<A: Serialize>(graph: &JobGraph<A>) -> Result<Vec<u8>, StoreError> {
+        let data = StoreData {
+            definitions: graph.jobs().iter().map(crate::Job::definition).collect(),
+            actions: encode_actions(graph)?,
+            ..StoreData::default()
+        };
+        let bytes = serde_json::to_vec(&data).map_err(StoreError::invalid_json)?;
+        if bytes.len() as u64 > MAX_STORE_BYTES {
+            return Err(StoreError::TooLarge);
+        }
+        Ok(bytes)
+    }
+
+    /// Reads a portable graph with caller-defined actions and no run history.
+    pub fn decode_backup<A: DeserializeOwned>(bytes: &[u8]) -> Result<JobGraph<A>, StoreError> {
+        let data = decode_backup(bytes)?;
+        let jobs = data
+            .definitions
+            .iter()
+            .map(|definition| {
+                let action = data.backup_action(&definition.id)?;
+                Ok(definition.clone().with_action(action)?)
+            })
+            .collect::<Result<Vec<_>, StoreError>>()?;
+        Ok(JobGraph::new(jobs)?)
     }
 
     /// Retained finished records ordered by most recent start. Equal starts
@@ -182,6 +478,15 @@ impl SchedulerStore {
         self.data.journal.iter().find(|record| record.id == id)
     }
 
+    /// The most recent committed completion, with later appends winning ties.
+    pub fn latest_finished(&self, job: &JobId) -> Option<&RunRecord> {
+        self.data
+            .journal
+            .iter()
+            .filter(|record| &record.job == job)
+            .max_by_key(|record| record.finished_at)
+    }
+
     /// Optional executor-supplied summary attached to a retained run.
     pub fn journal_detail(&self, id: RunId) -> Option<&str> {
         self.data.journal_details.get(&id).map(String::as_str)
@@ -190,6 +495,83 @@ impl SchedulerStore {
     /// Identifies the recording attached to a retained run.
     pub fn journal_recording(&self, id: RunId) -> Option<JournalRecording> {
         self.data.journal_recordings.get(&id).copied()
+    }
+
+    /// Identifies the native per-target Session Journals attached to a retained run.
+    pub fn session_journals(&self, id: RunId) -> Option<&[String]> {
+        self.data.session_journals.get(&id).map(Vec::as_slice)
+    }
+
+    /// Returns the native advisory report for a retained Swarm firing.
+    pub fn journal_swarm_report(&self, id: RunId) -> Option<&SwarmReport> {
+        self.data.swarm_reports.get(&id)
+    }
+
+    pub fn journal_swarm_chat_origin(&self, id: RunId) -> Option<&SwarmChatOrigin> {
+        self.data.swarm_chat_origins.get(&id)
+    }
+
+    pub fn pending_swarm_chat_seed(&self, id: RunId) -> Option<&SwarmChatSeed> {
+        self.data.swarm_chat_seeds.get(&id)
+    }
+
+    pub fn next_swarm_chat_seed(
+        &self,
+        ready: impl Fn(&SwarmChatSeed) -> bool,
+    ) -> Option<&SwarmChatSeed> {
+        self.data.swarm_chat_seeds.values().find(|seed| ready(seed))
+    }
+
+    /// Removes only the exact seed that the saved-chat store has accepted.
+    pub fn acknowledge_swarm_chat_seed(&mut self, nonce: &str) -> Result<bool, StoreError> {
+        let Some(id) = self
+            .data
+            .swarm_chat_seeds
+            .values()
+            .find(|seed| seed.origin.nonce == nonce)
+            .map(|seed| seed.run)
+        else {
+            return Ok(false);
+        };
+        let mut next = self.data.clone();
+        next.swarm_chat_seeds.remove(&id);
+        self.persist(next)?;
+        Ok(true)
+    }
+
+    pub fn profile_root(&self) -> &Path {
+        self.path
+            .parent()
+            .expect("scheduler store has a canonical parent")
+    }
+
+    pub fn webhook_results(&self, id: RunId) -> Option<&BTreeMap<String, WebhookOutcome>> {
+        self.data.webhook_results.get(&id)
+    }
+
+    /// Adds delivery results for retained records, without changing the runs.
+    pub fn record_webhook_results(
+        &mut self,
+        results: &BTreeMap<RunId, BTreeMap<String, WebhookOutcome>>,
+    ) -> Result<(), StoreError> {
+        let mut next = self.data.clone();
+        for (id, additions) in results {
+            if self.journal_record(*id).is_none() {
+                continue;
+            }
+            let entries = next.webhook_results.entry(*id).or_default();
+            for (target, outcome) in additions {
+                if let Some(previous) = entries.insert(target.clone(), *outcome)
+                    && previous != *outcome
+                {
+                    return Err(StoreError::ConflictingRecord(*id));
+                }
+            }
+            if !valid_webhook_results(entries) {
+                return Err(StoreError::InvalidRecord);
+            }
+        }
+        self.persist(next)
     }
 
     /// Lists retained attachments for file cleanup after a journal update.
@@ -236,7 +618,7 @@ impl SchedulerStore {
         Ok(scheduler)
     }
 
-    /// Refreshes live dependency history after journal deletion or retention.
+    /// Refreshes live dependency results and retained journal history.
     /// Commit any outstanding finished records before applying the history.
     pub fn apply_history<A>(&self, scheduler: &mut Scheduler<A>) {
         let last_runs = self
@@ -244,7 +626,13 @@ impl SchedulerStore {
             .last_runs
             .iter()
             .map(|(id, &time)| (id, SystemTime::from(time)));
-        scheduler.restore_history(last_runs, &self.data.journal);
+        let dependency_results = self
+            .data
+            .dependency_results
+            .iter()
+            .flatten()
+            .map(|(id, &result)| (id, result));
+        scheduler.restore_history(last_runs, dependency_results, &self.data.journal);
     }
 
     /// Atomically saves definitions and finished records from a scheduler
@@ -255,7 +643,7 @@ impl SchedulerStore {
         graph: &JobGraph<A>,
         records: &[RunRecord],
     ) -> Result<(), StoreError> {
-        self.commit_inner(graph, records, None, &[], &[])
+        self.commit_inner(graph, records, None, FinishedRunMetadata::default())
     }
 
     /// Commits runtime updates and optional summaries while preserving the
@@ -277,7 +665,62 @@ impl SchedulerStore {
         details: &[(RunId, String)],
         recordings: &[(RunId, JournalRecording)],
     ) -> Result<(), StoreError> {
-        self.commit_inner(graph, records, None, details, recordings)
+        self.commit_records_with_swarm_reports(graph, records, details, recordings, &[])
+    }
+
+    /// Commits finished runs, summaries, recording references and masked Swarm reports
+    /// together. Reports may only accompany their corresponding new completion.
+    /// Retrying the same completion with its identical report is supported.
+    pub fn commit_records_with_swarm_reports<A>(
+        &mut self,
+        graph: &JobGraph<A>,
+        records: &[RunRecord],
+        details: &[(RunId, String)],
+        recordings: &[(RunId, JournalRecording)],
+        swarm_reports: &[(RunId, SwarmReport)],
+    ) -> Result<(), StoreError> {
+        self.commit_records_with_swarm_chat_origins(
+            graph,
+            records,
+            details,
+            recordings,
+            swarm_reports,
+            &[],
+        )
+    }
+
+    /// Commits Swarm chat origins alongside their first completed reports.
+    /// When the delivery queue is full, the retained report can still be opened by origin.
+    pub fn commit_records_with_swarm_chat_origins<A>(
+        &mut self,
+        graph: &JobGraph<A>,
+        records: &[RunRecord],
+        details: &[(RunId, String)],
+        recordings: &[(RunId, JournalRecording)],
+        swarm_reports: &[(RunId, SwarmReport)],
+        chat_origins: &[(RunId, SwarmChatOrigin)],
+    ) -> Result<(), StoreError> {
+        self.commit_finished_runs(
+            graph,
+            records,
+            FinishedRunMetadata {
+                details,
+                recordings,
+                swarm_reports,
+                swarm_chat_origins: chat_origins,
+                ..FinishedRunMetadata::default()
+            },
+        )
+    }
+
+    /// Commits completed runs with their optional native metadata in one replacement.
+    pub fn commit_finished_runs<A>(
+        &mut self,
+        graph: &JobGraph<A>,
+        records: &[RunRecord],
+        metadata: FinishedRunMetadata<'_>,
+    ) -> Result<(), StoreError> {
+        self.commit_inner(graph, records, None, metadata)
     }
 
     /// Saves serializable action metadata, finished records and optional
@@ -289,16 +732,16 @@ impl SchedulerStore {
         records: &[RunRecord],
         details: &[(RunId, String)],
     ) -> Result<(), StoreError> {
-        let actions = graph
-            .jobs()
-            .iter()
-            .map(|job| {
-                serde_json::to_value(job.action())
-                    .map(|action| (job.id().clone(), action))
-                    .map_err(|_| StoreError::InvalidAction(job.id().clone()))
-            })
-            .collect::<Result<_, _>>()?;
-        self.commit_inner(graph, records, Some(actions), details, &[])
+        let actions = encode_actions(graph)?;
+        self.commit_inner(
+            graph,
+            records,
+            Some(actions),
+            FinishedRunMetadata {
+                details,
+                ..FinishedRunMetadata::default()
+            },
+        )
     }
 
     fn commit_inner<A>(
@@ -306,11 +749,16 @@ impl SchedulerStore {
         graph: &JobGraph<A>,
         records: &[RunRecord],
         actions: Option<BTreeMap<JobId, Value>>,
-        details: &[(RunId, String)],
-        recordings: &[(RunId, JournalRecording)],
+        metadata: FinishedRunMetadata<'_>,
     ) -> Result<(), StoreError> {
         if records.len() > MAX_JOURNAL_RECORDS {
             return Err(StoreError::TooManyRecords);
+        }
+        if metadata.swarm_reports.len() > records.len()
+            || metadata.swarm_chat_origins.len() > metadata.swarm_reports.len()
+            || metadata.session_journals.len() > records.len()
+        {
+            return Err(StoreError::InvalidRecord);
         }
         let mut next = self.data.clone();
         next.definitions = graph.jobs().iter().map(crate::Job::definition).collect();
@@ -320,6 +768,8 @@ impl SchedulerStore {
             next.actions.retain(|id, _| graph.job(id).is_some());
         }
         next.last_runs.retain(|id, _| graph.job(id).is_some());
+        let dependency_results = next.dependency_results.get_or_insert_with(BTreeMap::new);
+        dependency_results.retain(|id, _| graph.job(id).is_some());
         let mut indices: HashMap<_, _> = next
             .journal
             .iter()
@@ -334,17 +784,31 @@ impl SchedulerStore {
                 }
                 continue;
             }
-            if record.counted_as_run && graph.job(&record.job).is_some() {
-                let finished =
-                    timestamp(record.finished_at).map_err(|_| StoreError::InvalidRecord)?;
-                let last = next.last_runs.entry(record.job.clone()).or_insert(finished);
-                *last = (*last).max(finished);
+            if let Some((job, result)) = dependency_results
+                .iter()
+                .find(|(_, result)| result.id == record.id)
+                && (job != &record.job || *result != DependencyResult::from(record))
+            {
+                return Err(StoreError::ConflictingRecord(record.id));
+            }
+            if graph.job(&record.job).is_some() {
+                if record.counted_as_run {
+                    let finished =
+                        timestamp(record.finished_at).map_err(|_| StoreError::InvalidRecord)?;
+                    let last = next.last_runs.entry(record.job.clone()).or_insert(finished);
+                    *last = (*last).max(finished);
+                }
+                remember_dependency_result(
+                    dependency_results,
+                    record,
+                    next.last_runs.get(&record.job),
+                );
             }
             next.high_watermark = next.high_watermark.max(record.id.value());
             indices.insert(record.id, next.journal.len());
             next.journal.push(record.clone());
         }
-        for (id, detail) in details {
+        for (id, detail) in metadata.details {
             if !indices.contains_key(id) || !valid_detail(detail) {
                 return Err(StoreError::InvalidRecord);
             }
@@ -354,7 +818,7 @@ impl SchedulerStore {
                 return Err(StoreError::ConflictingRecord(*id));
             }
         }
-        for &(id, recording) in recordings {
+        for &(id, recording) in metadata.recordings {
             if !indices.contains_key(&id) {
                 return Err(StoreError::InvalidRecord);
             }
@@ -364,10 +828,130 @@ impl SchedulerStore {
                 return Err(StoreError::ConflictingRecord(id));
             }
         }
+        self.stage_session_journals(&mut next, records, metadata.session_journals)?;
+        for (id, report) in metadata.swarm_reports {
+            let record = records
+                .iter()
+                .find(|record| record.id == *id)
+                .ok_or(StoreError::InvalidRecord)?;
+            if graph.job(&record.job).is_none() || !report.is_valid_for(record) {
+                return Err(StoreError::InvalidRecord);
+            }
+            if let Some(previous) = next.swarm_reports.get(id) {
+                if previous != report {
+                    return Err(StoreError::ConflictingRecord(*id));
+                }
+            } else if self.journal_record(*id).is_some() {
+                return Err(StoreError::ConflictingRecord(*id));
+            } else {
+                next.swarm_reports.insert(*id, report.clone());
+            }
+        }
+        self.stage_swarm_chat_origins(&mut next, &metadata)?;
+        let appended = next.journal.len() - self.data.journal.len();
         let excess = next.journal.len().saturating_sub(MAX_JOURNAL_RECORDS);
         next.journal.drain(..excess);
         next.retain_journal_metadata();
-        self.persist(next)
+        if !metadata.swarm_chat_origins.is_empty() {
+            next.validate_swarm_chats()?;
+        }
+        let evictable = if appended == 0 {
+            0
+        } else {
+            records
+                .iter()
+                .filter_map(|record| indices.get(&record.id))
+                .min()
+                .map_or(0, |first| first.saturating_sub(excess))
+        };
+        self.persist_with_journal_retention(next, evictable)
+    }
+
+    fn stage_session_journals(
+        &self,
+        next: &mut StoreData,
+        records: &[RunRecord],
+        journals: &[(RunId, &[String])],
+    ) -> Result<(), StoreError> {
+        if journals.is_empty() {
+            return Ok(());
+        }
+        let mut linked: HashSet<_> = self
+            .data
+            .session_journals
+            .values()
+            .flatten()
+            .map(|id| id.to_ascii_lowercase())
+            .collect();
+        let mut runs = HashSet::new();
+        for &(run, ids) in journals {
+            if !valid_session_journal_ids(ids)
+                || !runs.insert(run)
+                || !records.iter().any(|record| {
+                    record.id == run && record.counted_as_run && record.blockers.is_empty()
+                })
+            {
+                return Err(StoreError::InvalidRecord);
+            }
+            if let Some(previous) = next.session_journals.get(&run) {
+                if previous.as_slice() == ids {
+                    continue;
+                }
+                return Err(StoreError::ConflictingRecord(run));
+            }
+            if self.journal_record(run).is_some()
+                || !ids.iter().all(|id| linked.insert(id.to_ascii_lowercase()))
+            {
+                return Err(StoreError::ConflictingRecord(run));
+            }
+            next.session_journals.insert(run, ids.to_vec());
+        }
+        Ok(())
+    }
+
+    fn stage_swarm_chat_origins(
+        &self,
+        next: &mut StoreData,
+        metadata: &FinishedRunMetadata<'_>,
+    ) -> Result<(), StoreError> {
+        if metadata.swarm_chat_origins.is_empty() {
+            return Ok(());
+        }
+        let mut ids = HashSet::new();
+        let mut pending_bytes = pending_seed_bytes(next.swarm_chat_seeds.values())?;
+        for (id, origin) in metadata.swarm_chat_origins {
+            let report = metadata
+                .swarm_reports
+                .iter()
+                .find_map(|(run, report)| (run == id).then_some(report))
+                .ok_or(StoreError::InvalidRecord)?;
+            if !origin.valid() || !ids.insert(*id) {
+                return Err(StoreError::InvalidRecord);
+            }
+            if let Some(previous) = next.swarm_chat_origins.get(id) {
+                if previous != origin {
+                    return Err(StoreError::ConflictingRecord(*id));
+                }
+                continue;
+            }
+            if self.journal_record(*id).is_some() || next.swarm_chat_seeds.contains_key(id) {
+                return Err(StoreError::ConflictingRecord(*id));
+            }
+            next.swarm_chat_origins.insert(*id, origin.clone());
+            if next.swarm_chat_seeds.len() < MAX_PENDING_SWARM_CHAT_SEEDS {
+                let seed = SwarmChatSeed {
+                    run: *id,
+                    origin: origin.clone(),
+                    report: report.clone(),
+                };
+                let size = seed_bytes(&seed)?;
+                if pending_bytes + size <= MAX_PENDING_SWARM_CHAT_BYTES {
+                    next.swarm_chat_seeds.insert(*id, seed);
+                    pending_bytes += size;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Removes selected journal entries without erasing last-run timestamps.
@@ -390,12 +974,33 @@ impl SchedulerStore {
     }
 
     fn persist(&mut self, next: StoreData) -> Result<(), StoreError> {
+        self.persist_with_journal_retention(next, 0)
+    }
+
+    fn persist_with_journal_retention(
+        &mut self,
+        mut next: StoreData,
+        evictable: usize,
+    ) -> Result<(), StoreError> {
+        if next.high_watermark == 0 {
+            // Keep definition-only profiles byte-compatible with portable backups.
+            next.dependency_results = None;
+        }
         if self.data == next {
             return Ok(());
         }
-        let bytes = serde_json::to_vec(&next).map_err(|_| StoreError::InvalidRecord)?;
+        let mut bytes = serde_json::to_vec(&next).map_err(|_| StoreError::InvalidRecord)?;
         if bytes.len() as u64 > MAX_STORE_BYTES {
-            return Err(StoreError::TooLarge);
+            let pending = next.swarm_chat_seeds.len();
+            // Preserve existing delivery obligations and the newly committed report.
+            next.swarm_chat_seeds
+                .retain(|id, _| self.data.swarm_chat_seeds.contains_key(id));
+            if pending != next.swarm_chat_seeds.len() {
+                bytes = serde_json::to_vec(&next).map_err(|_| StoreError::InvalidRecord)?;
+            }
+        }
+        if bytes.len() as u64 > MAX_STORE_BYTES {
+            (next, bytes) = fit_journal(next, evictable)?;
         }
         write_atomically(&self.path, &bytes)?;
         self.data = next;
@@ -403,13 +1008,70 @@ impl SchedulerStore {
     }
 }
 
+/// Retain the longest suffix that fits without dropping a record from the
+/// current commit. Pending chat delivery stays independent of journal retention.
+fn fit_journal(data: StoreData, evictable: usize) -> Result<(StoreData, Vec<u8>), StoreError> {
+    let mut lower = 1;
+    let mut upper = evictable;
+    let mut best = None;
+    while lower <= upper {
+        let remove = lower + (upper - lower) / 2;
+        let mut candidate = data.clone();
+        candidate.journal.drain(..remove);
+        candidate.retain_journal_metadata();
+        let bytes = serde_json::to_vec(&candidate).map_err(|_| StoreError::InvalidRecord)?;
+        if bytes.len() as u64 <= MAX_STORE_BYTES {
+            best = Some((candidate, bytes));
+            upper = remove - 1;
+        } else {
+            lower = remove + 1;
+        }
+    }
+    best.ok_or(StoreError::TooLarge)
+}
+
 impl StoreData {
+    fn backup_action<A: DeserializeOwned>(&self, id: &JobId) -> Result<A, StoreError> {
+        let action = self
+            .actions
+            .get(id)
+            .ok_or_else(|| StoreError::MissingAction(id.clone()))?;
+        A::deserialize(action).map_err(|_| StoreError::InvalidAction(id.clone()))
+    }
+
+    fn migrate_dependency_results(&mut self) {
+        if self.high_watermark == 0 || self.dependency_results.is_some() {
+            return;
+        }
+        let jobs: HashSet<_> = self.definitions.iter().map(|job| &job.id).collect();
+        let mut results = BTreeMap::new();
+        for record in &self.journal {
+            let last_run = self.last_runs.get(&record.job);
+            // Older profiles cannot recover an outcome for a removed last run.
+            if jobs.contains(&record.job) && (last_run.is_some() || !record.counted_as_run) {
+                remember_dependency_result(&mut results, record, last_run);
+            }
+        }
+        self.dependency_results = Some(results);
+    }
+
     fn retain_journal_metadata(&mut self) {
-        if !self.journal_details.is_empty() || !self.journal_recordings.is_empty() {
+        if !self.journal_details.is_empty()
+            || !self.journal_recordings.is_empty()
+            || !self.session_journals.is_empty()
+            || !self.swarm_reports.is_empty()
+            || !self.swarm_chat_origins.is_empty()
+            || !self.webhook_results.is_empty()
+        {
             let retained: HashSet<_> = self.journal.iter().map(|record| record.id).collect();
             self.journal_details.retain(|id, _| retained.contains(id));
             self.journal_recordings
                 .retain(|id, _| retained.contains(id));
+            self.session_journals.retain(|id, _| retained.contains(id));
+            self.swarm_reports.retain(|id, _| retained.contains(id));
+            self.swarm_chat_origins
+                .retain(|id, _| retained.contains(id));
+            self.webhook_results.retain(|id, _| retained.contains(id));
         }
     }
 
@@ -432,23 +1094,168 @@ impl StoreData {
         {
             return Err(StoreError::InvalidRecord);
         }
-        let mut known = HashSet::new();
+        let mut known = HashMap::new();
         for record in &self.journal {
             validate_record(record)?;
-            if record.id.value() > self.high_watermark || !known.insert(record.id) {
+            if record.id.value() > self.high_watermark || known.insert(record.id, record).is_some()
+            {
                 return Err(StoreError::InvalidRecord);
             }
         }
+        let mut result_ids = HashSet::new();
         if self
-            .journal_details
+            .dependency_results
             .iter()
-            .any(|(id, detail)| !known.contains(id) || !valid_detail(detail))
-            || self.journal_recordings.keys().any(|id| !known.contains(id))
+            .flatten()
+            .any(|(job, result)| {
+                graph.job(job).is_none()
+                    || result.id.value() == 0
+                    || result.id.value() > self.high_watermark
+                    || !result_ids.insert(result.id)
+                    || self
+                        .last_runs
+                        .get(job)
+                        .map_or(result.outcome != RunOutcome::Blocked, |&last| {
+                            result.finished_at < SystemTime::from(last)
+                        })
+                    || known.get(&result.id).is_some_and(|&record| {
+                        &record.job != job || DependencyResult::from(record) != *result
+                    })
+            })
         {
             return Err(StoreError::InvalidRecord);
         }
+        let mut linked_journals = HashSet::new();
+        if self
+            .journal_details
+            .iter()
+            .any(|(id, detail)| !known.contains_key(id) || !valid_detail(detail))
+            || self
+                .journal_recordings
+                .keys()
+                .any(|id| !known.contains_key(id))
+            || self.session_journals.iter().any(|(run, ids)| {
+                !known
+                    .get(run)
+                    .is_some_and(|record| record.counted_as_run && record.blockers.is_empty())
+                    || !valid_session_journal_ids(ids)
+                    || !ids
+                        .iter()
+                        .all(|id| linked_journals.insert(id.to_ascii_lowercase()))
+            })
+            || self.swarm_reports.iter().any(|(id, report)| {
+                !known
+                    .get(id)
+                    .is_some_and(|record| report.is_valid_for(record))
+            })
+            || self
+                .webhook_results
+                .iter()
+                .any(|(id, results)| !known.contains_key(id) || !valid_webhook_results(results))
+        {
+            return Err(StoreError::InvalidRecord);
+        }
+        self.validate_swarm_chats()
+    }
+
+    fn validate_swarm_chats(&self) -> Result<(), StoreError> {
+        if self.swarm_chat_seeds.len() > MAX_PENDING_SWARM_CHAT_SEEDS
+            || pending_seed_bytes(self.swarm_chat_seeds.values())? > MAX_PENDING_SWARM_CHAT_BYTES
+        {
+            return Err(StoreError::InvalidRecord);
+        }
+        let mut nonces = HashMap::new();
+        for (id, origin) in &self.swarm_chat_origins {
+            if !self.swarm_reports.contains_key(id)
+                || !origin.valid()
+                || nonces.insert(origin.nonce.as_str(), *id).is_some()
+            {
+                return Err(StoreError::InvalidRecord);
+            }
+        }
+        for (id, seed) in &self.swarm_chat_seeds {
+            if *id != seed.run
+                || id.value() == 0
+                || id.value() > self.high_watermark
+                || !seed.origin.valid()
+                || seed.report.outcome().is_none()
+                || (self.journal.iter().any(|record| record.id == *id)
+                    && (self.swarm_chat_origins.get(id) != Some(&seed.origin)
+                        || self.swarm_reports.get(id) != Some(&seed.report)))
+                || nonces
+                    .insert(seed.origin.nonce.as_str(), *id)
+                    .is_some_and(|previous| previous != *id)
+            {
+                return Err(StoreError::InvalidRecord);
+            }
+        }
         Ok(())
     }
+}
+
+fn remember_dependency_result(
+    results: &mut BTreeMap<JobId, DependencyResult>,
+    record: &RunRecord,
+    last_run: Option<&Timestamp>,
+) {
+    let result = DependencyResult::from(record);
+    if last_run.is_some_and(|&last| result.finished_at < SystemTime::from(last)) {
+        return;
+    }
+    let previous = results.entry(record.job.clone()).or_insert(result);
+    if result.newer_than(*previous) {
+        *previous = result;
+    }
+}
+
+fn pending_seed_bytes<'a>(
+    mut seeds: impl Iterator<Item = &'a SwarmChatSeed>,
+) -> Result<usize, StoreError> {
+    seeds.try_fold(0, |total, seed| Ok(total + seed_bytes(seed)?))
+}
+
+fn seed_bytes(seed: &SwarmChatSeed) -> Result<usize, StoreError> {
+    serde_json::to_vec(seed)
+        // Allow space for the enclosing object's numeric key and separators.
+        .map(|bytes| bytes.len() + 32)
+        .map_err(|_| StoreError::InvalidRecord)
+}
+
+fn valid_webhook_results(results: &BTreeMap<String, WebhookOutcome>) -> bool {
+    !results.is_empty()
+        && results.len() <= MAX_WEBHOOKS_PER_RUN
+        && results.keys().all(|target| valid_nonce(target))
+}
+
+fn valid_nonce(value: &str) -> bool {
+    value.len() == 32
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+/// The exact UUID spelling accepted in a native Session Journal directory name.
+pub fn valid_session_journal_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+/// Validates the bounded ordered set of target journals for one finished run.
+pub fn valid_session_journal_ids(ids: &[String]) -> bool {
+    !ids.is_empty()
+        && ids.len() <= MAX_SESSION_JOURNALS_PER_RUN
+        && ids.iter().enumerate().all(|(index, id)| {
+            valid_session_journal_id(id)
+                && !ids[..index]
+                    .iter()
+                    .any(|other| other.eq_ignore_ascii_case(id))
+        })
 }
 
 fn valid_detail(detail: &str) -> bool {
@@ -456,6 +1263,26 @@ fn valid_detail(detail: &str) -> bool {
         && !detail.chars().any(|ch| {
             ch.is_control()
                 || matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+        })
+}
+
+fn valid_report_text(text: &str, limit: usize) -> bool {
+    text.len() <= limit
+        && !text.trim().is_empty()
+        && !text.contains(['\u{2028}', '\u{2029}'])
+        && valid_detail(text)
+}
+
+/// Checks the storage limits for masked comparison Markdown from one scheduled firing.
+pub fn valid_swarm_comparison(markdown: &str) -> bool {
+    !markdown.is_empty()
+        && markdown.len() <= MAX_SWARM_COMPARISON_BYTES
+        && markdown.trim() == markdown
+        && markdown.chars().all(|ch| {
+            matches!(ch, '\n' | '\t')
+                || (!ch.is_control()
+                    && !matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{2028}' | '\u{2029}'
+                        | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{fffe}' | '\u{ffff}'))
         })
 }
 
@@ -504,6 +1331,47 @@ fn decode_store(bytes: &[u8]) -> Result<StoreData, StoreError> {
         return Err(StoreError::Version(header.version));
     }
     serde_json::from_slice(bytes).map_err(StoreError::invalid_json)
+}
+
+fn decode_backup(bytes: &[u8]) -> Result<StoreData, StoreError> {
+    let data = decode_store(bytes)?;
+    data.validate()?;
+    if !data.journal.is_empty()
+        || !data.last_runs.is_empty()
+        || data.high_watermark != 0
+        || data
+            .dependency_results
+            .as_ref()
+            .is_some_and(|results| !results.is_empty())
+        || !data.journal_details.is_empty()
+        || !data.journal_recordings.is_empty()
+        || !data.session_journals.is_empty()
+        || !data.swarm_reports.is_empty()
+        || !data.swarm_chat_origins.is_empty()
+        || !data.swarm_chat_seeds.is_empty()
+        || !data.webhook_results.is_empty()
+    {
+        return Err(StoreError::InvalidRecord);
+    }
+    Ok(data)
+}
+
+fn encode_actions<A: Serialize>(graph: &JobGraph<A>) -> Result<BTreeMap<JobId, Value>, StoreError> {
+    graph
+        .jobs()
+        .iter()
+        .map(|job| {
+            serde_json::to_value(job.action())
+                .map(|action| (job.id().clone(), action))
+                .map_err(|_| StoreError::InvalidAction(job.id().clone()))
+        })
+        .collect()
+}
+
+fn json_size(value: &impl Serialize) -> Result<usize, StoreError> {
+    serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .map_err(StoreError::invalid_json)
 }
 
 fn require_regular_if_present(path: &Path) -> Result<Option<fs::Metadata>, StoreError> {

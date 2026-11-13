@@ -88,6 +88,13 @@ pub(crate) struct MetadataLock {
     stamp: FileStamp,
 }
 
+impl Drop for MetadataLock {
+    fn drop(&mut self) {
+        // A forked worker can retain the descriptor until it execs.
+        let _ = self.file.unlock();
+    }
+}
+
 impl MetadataLock {
     pub(super) fn directory(&self) -> &Directory {
         &self.directory
@@ -95,19 +102,29 @@ impl MetadataLock {
 
     pub(super) fn read_document(&self) -> io::Result<(FileStamp, String)> {
         let file = self.directory.open_file(DOCUMENT)?;
-        require_single_link(&file)?;
-        let stamp = FileStamp::read(&file)?;
+        Self::read_open_document(&file)
+    }
+
+    pub(super) fn read_writable_private_document(&self) -> io::Result<Option<(FileStamp, String)>> {
+        let file = self.directory.open_private_file(DOCUMENT)?;
+        if file.metadata()?.permissions().readonly() {
+            return Ok(None);
+        }
+        Self::read_open_document(&file).map(Some)
+    }
+
+    fn read_open_document(file: &File) -> io::Result<(FileStamp, String)> {
+        require_single_link(file)?;
+        let stamp = FileStamp::read(file)?;
         if file.metadata()?.len() > MAX_DOCUMENT_BYTES {
             return Err(invalid("Session journal file exceeds the size limit"));
         }
         let mut xml = String::new();
-        (&file)
-            .take(MAX_DOCUMENT_BYTES + 1)
-            .read_to_string(&mut xml)?;
+        file.take(MAX_DOCUMENT_BYTES + 1).read_to_string(&mut xml)?;
         if xml.len() as u64 > MAX_DOCUMENT_BYTES {
             return Err(invalid("Session journal file exceeds the size limit"));
         }
-        stamp.require_unchanged(&file)?;
+        stamp.require_unchanged(file)?;
         Ok((stamp, xml))
     }
 
@@ -184,10 +201,27 @@ pub(crate) fn lock_metadata(directory: &Path) -> io::Result<MetadataLock> {
 
 pub(super) fn lock_metadata_in(directory: &Path, opened: Directory) -> io::Result<MetadataLock> {
     let file = opened.open_lock(LOCK)?;
+    lock_opened_metadata(directory, opened, file)
+}
+
+pub(super) fn lock_existing_metadata_in(
+    directory: &Path,
+    opened: Directory,
+) -> io::Result<MetadataLock> {
+    let file = opened.open_existing_lock(LOCK)?;
+    lock_opened_metadata(directory, opened, file)
+}
+
+fn lock_opened_metadata(
+    directory: &Path,
+    opened: Directory,
+    file: File,
+) -> io::Result<MetadataLock> {
     require_single_link(&file)?;
+    let stamp = FileStamp::read(&file)?;
     file.try_lock().map_err(io::Error::from)?;
     let lock = MetadataLock {
-        stamp: FileStamp::read(&file)?,
+        stamp,
         directory: opened,
         path: directory.into(),
         file,
@@ -256,7 +290,20 @@ impl PendingEdit {
             (None, journal(directory, &document)?)
         } else {
             let (name, text) = edit.field();
-            let updated = patch_field(&xml, meta, name, text)?;
+            let mut updated = patch_field(&xml, meta, name, text)?;
+            if matches!(edit, MetadataEdit::Title(_))
+                && super::summary_store::is_native_source(directory, expected_id)
+            {
+                let parsed = parse_document(&updated)?;
+                let updated_meta = child(parsed.root_element(), "meta")
+                    .ok_or_else(|| invalid("Missing session journal metadata"))?;
+                updated = patch_field(
+                    &updated,
+                    updated_meta,
+                    super::summary_store::MANUAL_TITLE,
+                    "true",
+                )?;
+            }
             if updated.len() as u64 > MAX_DOCUMENT_BYTES {
                 return Err(invalid("Session journal file exceeds the size limit"));
             }

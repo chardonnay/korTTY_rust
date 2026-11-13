@@ -49,8 +49,15 @@ pub(crate) struct Conn<CS: CliServ> {
 
     pub(crate) channels: Channels,
 
-    pub(crate) global_pending: bool,
-    pub(crate) global_reply: Option<GlobalReply>,
+    pub(crate) global_pending: Option<GlobalOwner>,
+    pub(crate) global_reply: Option<(GlobalOwner, GlobalReply)>,
+}
+
+/// Global replies have no wire identifier. A request owns the slot until its reply is consumed.
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum GlobalOwner {
+    Forward,
+    Liveness,
 }
 
 #[derive(Debug)]
@@ -231,7 +238,7 @@ impl<CS: CliServ> Conn<CS> {
             state: ConnState::SendIdent,
             algo_conf,
             channels: Channels::new(CS::is_client()),
-            global_pending: false,
+            global_pending: None,
             global_reply: None,
             parse_ctx: ParseContext::new(),
             cliserv,
@@ -274,17 +281,17 @@ impl<CS: CliServ> Conn<CS> {
     }
 
     /// Updates `ConnState` and sends any packets required to progress the connection state.
-    pub(crate) fn progress(
-        &mut self,
-        s: &mut TrafSend,
-    ) -> Result<Dispatched, Error> {
+    pub(crate) fn progress(&mut self, s: &mut TrafSend) -> Result<Dispatched, Error> {
         self.kex.progress(&self.algo_conf, s)?;
 
         if !self.is_kex_sending() {
             let event = self.channels.progress(s);
             if !event.is_none() {
                 // TODO better Dispatched constructor
-                return Ok(Dispatched { event, disconnect: false });
+                return Ok(Dispatched {
+                    event,
+                    disconnect: false,
+                });
             }
         }
 
@@ -343,6 +350,9 @@ impl<CS: CliServ> Conn<CS> {
         seq: u32,
         s: &mut TrafSend,
     ) -> Result<Dispatched, Error> {
+        if self.kex.discard_guessed_packet() {
+            return Ok(Dispatched::default());
+        }
         // Parse the packet
         match self.packet(payload) {
             Ok(p) => {
@@ -420,6 +430,10 @@ impl<CS: CliServ> Conn<CS> {
     /// True if KexInit has not been sent.
     pub fn is_kex_sending(&self) -> bool {
         self.kex.is_sending()
+    }
+
+    pub(crate) fn is_kex_idle(&self) -> bool {
+        matches!(self.kex, Kex::Idle)
     }
 
     pub(crate) fn is_authenticated(&self) -> bool {
@@ -555,16 +569,17 @@ impl<CS: CliServ> Conn<CS> {
                 }
             }
             Packet::RequestSuccess(p) => {
-                if core::mem::take(&mut self.global_pending) {
-                    self.global_reply = Some(GlobalReply::Accepted(match p {
+                if let Some(owner) = self.global_pending.take() {
+                    let reply = GlobalReply::Accepted(match p {
                         packets::RequestSuccess::SuccessEmpty => None,
                         packets::RequestSuccess::TcpPort(port) => Some(port),
-                    }));
+                    });
+                    self.global_reply = Some((owner, reply));
                 }
             }
             Packet::RequestFailure(_) => {
-                if core::mem::take(&mut self.global_pending) {
-                    self.global_reply = Some(GlobalReply::Refused);
+                if let Some(owner) = self.global_pending.take() {
+                    self.global_reply = Some((owner, GlobalReply::Refused));
                 }
             }
         };
@@ -586,9 +601,7 @@ impl Conn<Client> {
         Ok(&cli.auth)
     }
 
-    pub(crate) fn mut_cliauth(
-        &mut self,
-    ) -> Result<(&mut CliAuth, &mut ParseContext)> {
+    pub(crate) fn mut_cliauth(&mut self) -> Result<(&mut CliAuth, &mut ParseContext)> {
         let cli = self.cliserv.try_mut_client().trap()?;
         Ok((&mut cli.auth, &mut self.parse_ctx))
     }
@@ -597,6 +610,12 @@ impl Conn<Client> {
         let cli = self.client()?;
         let sess_id = self.sess_id.as_ref().trap()?;
         cli.auth.fetch_agentsign_msg(sess_id)
+    }
+
+    pub(crate) fn sign_deferred_private_key(&self) -> Result<OwnedSig> {
+        let cli = self.client()?;
+        let sess_id = self.sess_id.as_ref().trap()?;
+        cli.auth.sign_deferred_private_key(sess_id)
     }
 
     pub(crate) fn resume_checkhostkey(
@@ -621,12 +640,13 @@ impl Conn<Client> {
         }
     }
 
-    pub(crate) fn fetch_checkhostkey<'f>(
-        &self,
-        payload: &'f [u8],
-    ) -> Result<PubKey<'f>> {
+    pub(crate) fn fetch_checkhostkey<'f>(&self, payload: &'f [u8]) -> Result<PubKey<'f>> {
         let packet = self.packet(payload)?;
-        if let Packet::KexDHReply(p) = packet { Ok(p.k_s.0) } else { Error::bug() }
+        if let Packet::KexDHReply(p) = packet {
+            Ok(p.k_s.0)
+        } else {
+            Error::bug()
+        }
     }
 
     pub(crate) fn fetch_cli_session_exit<'p>(
@@ -637,10 +657,7 @@ impl Conn<Client> {
         CliSessionExit::new(&packet)
     }
 
-    pub(crate) fn fetch_cli_banner<'p>(
-        &mut self,
-        payload: &'p [u8],
-    ) -> Result<Banner<'p>> {
+    pub(crate) fn fetch_cli_banner<'p>(&mut self, payload: &'p [u8]) -> Result<Banner<'p>> {
         if let Packet::UserauthBanner(b) = self.packet(payload)? {
             Ok(Banner(b))
         } else {
@@ -658,22 +675,14 @@ impl Conn<Server> {
     ) -> Result<()> {
         let packet = self.packet(payload)?;
         if let Packet::KexDHInit(p) = packet {
-            self.kex.resume_kexdhinit(
-                &p,
-                self.is_first_kex(),
-                keys,
-                &mut self.sess_id,
-                s,
-            )
+            self.kex
+                .resume_kexdhinit(&p, self.is_first_kex(), keys, &mut self.sess_id, s)
         } else {
             Error::bug()
         }
     }
 
-    pub(crate) fn fetch_servpassword<'f>(
-        &self,
-        payload: &'f [u8],
-    ) -> Result<TextString<'f>> {
+    pub(crate) fn fetch_servpassword<'f>(&self, payload: &'f [u8]) -> Result<TextString<'f>> {
         let packet = self.packet(payload)?;
         if let Packet::UserauthRequest(UserauthRequest {
             method: AuthMethod::Password(m),
@@ -685,10 +694,7 @@ impl Conn<Server> {
             Error::bug()
         }
     }
-    pub(crate) fn fetch_servpubkey<'f>(
-        &self,
-        payload: &'f [u8],
-    ) -> Result<PubKey<'f>> {
+    pub(crate) fn fetch_servpubkey<'f>(&self, payload: &'f [u8]) -> Result<PubKey<'f>> {
         let packet = self.packet(payload)?;
         if let Packet::UserauthRequest(UserauthRequest {
             method: AuthMethod::PubKey(m),
@@ -716,20 +722,12 @@ impl Conn<Server> {
         }
     }
 
-    pub(crate) fn resume_servauth_pkok(
-        &mut self,
-        payload: &[u8],
-        s: &mut TrafSend,
-    ) -> Result<()> {
+    pub(crate) fn resume_servauth_pkok(&mut self, payload: &[u8], s: &mut TrafSend) -> Result<()> {
         let p = self.packet(payload)?;
         self.server()?.auth.resume_pkok(p, s)
     }
 
-    pub(crate) fn set_auth_methods(
-        &mut self,
-        password: bool,
-        pubkey: bool,
-    ) -> Result<()> {
+    pub(crate) fn set_auth_methods(&mut self, password: bool, pubkey: bool) -> Result<()> {
         let auth = &mut self.mut_server()?.auth;
         auth.set_auth_methods(password, pubkey);
         Ok(())

@@ -6,6 +6,116 @@ use super::*;
 const HEADER: &str =
     "Name,Protocol,Host,Port,Username,Group,LocalTunnels,RemoteTunnels,DynamicTunnels,Comment";
 
+#[test]
+fn saved_window_geometry_import_accepts_private_java_xml_and_rejects_ambiguity() {
+    let entry = |geometry: &str| {
+        format!(
+            r#"<connections><connection id="test"><host>server.test</host><username>operator</username>{geometry}</connection></connections>"#
+        )
+    };
+    let geometry = "<windowGeometry><x>12.0</x><y>55.75</y><width>900.0</width><height>650.0</height><maximized>true</maximized><fullScreen>false</fullScreen></windowGeometry>";
+    let source = entry(geometry);
+    let preview = xml::parse(source.as_bytes()).unwrap();
+    let (connection, _) = preview.entries().next().unwrap();
+    assert_eq!(
+        connection.window_geometry,
+        Some(crate::connection_store::WindowGeometry {
+            width: 900,
+            height: 650,
+            x: 12,
+            y: 55,
+            maximized: true,
+        }),
+    );
+    let entries = teamwork::read_teamwork_bytes(source.as_bytes()).unwrap();
+    assert_eq!(entries[0].connection.window_geometry, None);
+    for geometry in [
+        "<windowGeometry><x>NaN</x></windowGeometry>",
+        "<windowGeometry><width>999999</width></windowGeometry>",
+        "<windowGeometry><x>12</x><x>13</x></windowGeometry>",
+    ] {
+        let preview = xml::parse(entry(geometry).as_bytes()).unwrap();
+        assert_eq!(preview.invalid, 1, "{geometry}");
+        assert!(preview.entries().next().is_none());
+    }
+}
+
+#[test]
+fn local_shell_integration_import_reads_java_and_legacy_native_flags_without_ambiguity() {
+    for (fields, enabled) in [
+        ("", false),
+        (
+            "<shellIntegrationAutoInject>true</shellIntegrationAutoInject>",
+            true,
+        ),
+        (
+            "<shellIntegrationAutoInject>1</shellIntegrationAutoInject>",
+            true,
+        ),
+        (
+            "<shellIntegrationAutoInject>false</shellIntegrationAutoInject>",
+            false,
+        ),
+        (
+            "<rustLocalShellIntegration>true</rustLocalShellIntegration>",
+            true,
+        ),
+        (
+            "<shellIntegrationAutoInject>true</shellIntegrationAutoInject><rustLocalShellIntegration>true</rustLocalShellIntegration>",
+            true,
+        ),
+    ] {
+        let source = format!(
+            "<connections><connection><protocol>LOCAL_SHELL</protocol>{fields}</connection></connections>"
+        );
+        let preview = xml::parse(source.as_bytes()).unwrap();
+        assert_eq!(preview.invalid, 0, "{fields}");
+        assert_eq!(preview.local_entries.len(), 1);
+        assert_eq!(preview.local_entries[0].profile.shell_integration, enabled);
+    }
+    for fields in [
+        "<shellIntegrationAutoInject>false</shellIntegrationAutoInject><rustLocalShellIntegration>true</rustLocalShellIntegration>",
+        "<shellIntegrationAutoInject>true</shellIntegrationAutoInject><rustLocalShellIntegration>false</rustLocalShellIntegration>",
+        "<shellIntegrationAutoInject>maybe</shellIntegrationAutoInject>",
+        "<shellIntegrationAutoInject>true</shellIntegrationAutoInject><shellIntegrationAutoInject>false</shellIntegrationAutoInject>",
+    ] {
+        let source = format!(
+            "<connections><connection><protocol>LOCAL_SHELL</protocol>{fields}</connection></connections>"
+        );
+        let preview = xml::parse(source.as_bytes()).unwrap();
+        assert_eq!(preview.invalid, 1, "{fields}");
+        assert!(preview.local_entries.is_empty());
+    }
+}
+
+#[test]
+fn local_shell_integration_import_preserves_supported_custom_launch_and_rejects_command_mode() {
+    let source = r#"<connections>
+      <connection><name>Custom shell</name><protocol>LOCAL_SHELL</protocol>
+        <localShellCommand>"C:\Program Files\Git\bin\bash.exe" --login -i</localShellCommand>
+        <shellIntegrationAutoInject>true</shellIntegrationAutoInject>
+      </connection>
+      <connection><name>Command</name><protocol>LOCAL_SHELL</protocol>
+        <localShellCommand>/bin/bash -c "printf unsafe"</localShellCommand>
+        <shellIntegrationAutoInject>true</shellIntegrationAutoInject>
+      </connection>
+    </connections>"#;
+    let preview = xml::parse(source.as_bytes()).unwrap();
+    assert_eq!(preview.invalid, 1);
+    let [entry] = preview.local_entries.as_slice() else {
+        panic!("expected only the supported interactive shell");
+    };
+    assert!(entry.profile.shell_integration);
+    assert_eq!(
+        entry.profile.command.as_ref().unwrap(),
+        &[
+            r"C:\Program Files\Git\bin\bash.exe".to_owned(),
+            "--login".to_owned(),
+            "-i".to_owned(),
+        ]
+    );
+}
+
 struct Scratch(std::path::PathBuf);
 
 impl Scratch {
@@ -50,7 +160,7 @@ fn reviewed_putty_csv_imports_nested_ssh_profiles_with_disabled_loopback_tunnels
             preview.invalid,
             preview.duplicates
         ),
-        (2, 1, 1, 1)
+        (2, 0, 1, 1)
     );
     let (profile, group) = preview.entries().next().unwrap();
     assert_eq!(group, "Ops/US");
@@ -79,7 +189,7 @@ fn reviewed_putty_csv_imports_nested_ssh_profiles_with_disabled_loopback_tunnels
     assert_eq!(
         preview.apply(&mut store).unwrap(),
         Outcome {
-            imported: 2,
+            imported: 3,
             already_saved: 0
         }
     );
@@ -87,7 +197,7 @@ fn reviewed_putty_csv_imports_nested_ssh_profiles_with_disabled_loopback_tunnels
         preview.apply(&mut store).unwrap(),
         Outcome {
             imported: 0,
-            already_saved: 2
+            already_saved: 3
         }
     );
     let stored = Store::open(path).unwrap();
@@ -95,6 +205,10 @@ fn reviewed_putty_csv_imports_nested_ssh_profiles_with_disabled_loopback_tunnels
     assert_eq!(saved.name, profile.name);
     assert_eq!(stored.group_of(saved.id), Some("Ops/US"));
     assert!(saved.plan().rules.is_empty());
+    assert_eq!(
+        stored.serial_profiles()[0].connection.device,
+        std::path::Path::new("COM3")
+    );
 }
 
 #[test]
@@ -447,7 +561,8 @@ fn mobaxterm_preview_ignores_comment_bookmarks_and_preserves_blank_usernames() {
     let preview = Preview::read(&path).unwrap();
     assert_eq!(preview.format(), Format::Mobaxterm);
     assert_eq!(preview.invalid, 0);
-    assert_eq!(preview.unsupported, 1);
+    assert_eq!(preview.unsupported, 0);
+    assert_eq!(preview.serial_entries.len(), 1);
     let (entry, group) = preview.entries().next().unwrap();
     assert_eq!(preview.entries().len(), 2);
     assert_eq!(entry.name, "Production");
@@ -465,4 +580,64 @@ fn mobaxterm_preview_ignores_comment_bookmarks_and_preserves_blank_usernames() {
     };
     assert_eq!(archived.format(), Format::Mobaxterm);
     assert_eq!(archived.entries().len(), 2);
+    assert_eq!(archived.serial_entries.len(), 1);
+}
+
+#[test]
+fn serial_bookmarks_normalize_com_labels_and_keep_device_paths_without_opening_them() {
+    let preview = Preview::parse_bytes(
+        Format::Mobaxterm,
+        br#"[Bookmarks]
+SubRep=Hardware\Lab
+Console=#131#8%com17  (USB Serial Port (COM17))%115200%ignored
+USB=#131#8%/dev/ttyUSB0%invalid%ignored
+Invalid=#131#8%%9600%ignored
+"#,
+    )
+    .unwrap();
+    assert_eq!(preview.invalid, 1);
+    assert_eq!(preview.unsupported, 0);
+    let [console, usb] = preview.serial_entries.as_slice() else {
+        panic!("expected two serial entries")
+    };
+    assert_eq!(
+        console.profile.connection.device,
+        std::path::Path::new("COM17")
+    );
+    assert_eq!(console.profile.line(), "115200 8N1");
+    assert_eq!(console.group, "Hardware/Lab");
+    assert_eq!(
+        usb.profile.connection.device,
+        std::path::Path::new("/dev/ttyUSB0")
+    );
+    assert_eq!(usb.profile.line(), "9600 8N1");
+
+    let csv = Preview::parse(&format!(
+        "{HEADER}\nConsole,Serial,COM22,22,,Hardware\\Lab,,,,\n"
+    ))
+    .unwrap();
+    let [entry] = csv.serial_entries.as_slice() else {
+        panic!("expected a serial entry")
+    };
+    assert_eq!(entry.profile.line(), "9600 8N1");
+    assert_eq!(entry.group, "Hardware/Lab");
+}
+
+#[test]
+fn native_serial_profiles_reject_invalid_line_settings_and_preserve_default_flags() {
+    let xml = br#"<connections schemaVersion="2">
+        <connection><protocol>SERIAL</protocol><serial><portName>COM9</portName><baudRate>0</baudRate></serial></connection>
+        <connection><protocol>SERIAL</protocol><serial><portName>COM9</portName><dataBits>9</dataBits></serial></connection>
+        <connection><protocol>SERIAL</protocol><serial><portName>COM9</portName><parity>INVALID</parity></serial></connection>
+        <connection><protocol>SERIAL</protocol><serial><portName>COM19</portName></serial></connection>
+    </connections>"#;
+    let preview = Preview::parse_bytes(Format::Kortty, xml).unwrap();
+    assert_eq!(preview.invalid, 3);
+    let [entry] = preview.serial_entries.as_slice() else {
+        panic!("expected one valid serial entry")
+    };
+    assert_eq!(
+        entry.profile.connection.settings,
+        crate::session::SerialSettings::default()
+    );
 }

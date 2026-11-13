@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project>
+    <name>Remote tools fixture</name>
+    <autoReconnect>true</autoReconnect>
+    <windows>
+        <window>
+            <windowId>83cf3ce4-af5b-494c-88cd-c5d4f139e5cb</windowId>
+            <geometry><x>20</x><y>30</y><width>960</width><height>710</height></geometry>
+            <tabs>
+                <tab>
+                    <tabType>SFTP_MANAGER</tabType>
+                    <sessionId>manager</sessionId>
+                    <connectionId>Primary</connectionId>
+                    <tabTitle>Deployment files</tabTitle>
+                    <sftpLocalPath>/tmp</sftpLocalPath>
+                    <sftpRemotePath>/srv/deployment</sftpRemotePath>
+                    <sftpAutoCloseTimeout>15</sftpAutoCloseTimeout>
+                </tab>
+                <tab>
+                    <tabType>FILE_EDITOR</tabType>
+                    <sessionId>editor</sessionId>
+                    <connectionId>bf733aa6-04db-4f8e-b8c5-b8a0d3e41710</connectionId>
+                    <tabTitle>Remote configuration</tabTitle>
+                    <editorFilePath>/etc/fixture ü.txt</editorFilePath>
+                    <editorIsRemote>true</editorIsRemote>
+                    <editorFileType>TEXT</editorFileType>
+                </tab>
+                <tab>
+                    <tabType>IMAGE_VIEWER</tabType>
+                    <sessionId>image</sessionId>
+                    <connectionId>94144051-b1fb-40fb-bec7-a160f119ae9e</connectionId>
+                    <tabTitle>Remote diagram</tabTitle>
+                    <imageFilePath>/srv/deployment/topology.png</imageFilePath>
+                    <imageIsRemote>true</imageIsRemote>
+                    <imageZoomLevel>1.75</imageZoomLevel>
+                </tab>
+            </tabs>
+            <activeTabIndex>0</activeTabIndex>
+            <activeSessionId>image</activeSessionId>
+        </window>
+    </windows>
+</project>

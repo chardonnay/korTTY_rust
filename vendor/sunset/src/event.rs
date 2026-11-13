@@ -136,14 +136,20 @@ pub struct RequestPubkey<'g, 'a> {
 impl<'g, 'a> RequestPubkey<'g, 'a> {
     /// Provide a public key to try.
     pub fn pubkey(self, signkey: SignKey) -> Result<()> {
-        self.runner.resume_clipubkey(Some(signkey))
+        self.runner.resume_clipubkey(Some(signkey), false)
+    }
+
+    /// Probe the key and yield `AgentSign` when the server accepts the probe.
+    /// A local private key remains in the runner until the caller permits signing.
+    pub fn pubkey_deferred(self, signkey: SignKey) -> Result<()> {
+        self.runner.resume_clipubkey(Some(signkey), true)
     }
 
     /// Don't provide a public key.
     ///
     /// `RequestPubkey` will not be returned again.
     pub fn skip(self) -> Result<()> {
-        self.runner.resume_clipubkey(None)
+        self.runner.resume_clipubkey(None, false)
     }
 }
 
@@ -157,6 +163,10 @@ impl RequestSign<'_, '_> {
     }
     pub fn message(&self) -> Result<AuthSigMsg<'_>> {
         self.runner.fetch_agentsign_msg()
+    }
+    /// Sign with the deferred local key and the algorithm accepted by the peer.
+    pub fn sign_private(&self) -> Result<OwnedSig> {
+        self.runner.sign_deferred_private_key()
     }
     pub fn signed(self, sig: &OwnedSig) -> Result<()> {
         self.runner.resume_agentsign(Some(sig))
@@ -262,16 +272,15 @@ pub(crate) enum CliEventId {
 }
 
 impl CliEventId {
-    pub fn event<'g, 'a>(
-        self,
-        runner: &'g mut CliRunner<'a>,
-    ) -> Result<CliEvent<'g, 'a>> {
+    pub fn event<'g, 'a>(self, runner: &'g mut CliRunner<'a>) -> Result<CliEvent<'g, 'a>> {
         let pk = runner.packet()?;
 
         match self {
             Self::Username => Ok(CliEvent::Username(RequestUsername { runner })),
             Self::Password => Ok(CliEvent::Password(RequestPassword { runner })),
-            Self::KeyboardChallenge => Ok(CliEvent::KeyboardChallenge(RequestKeyboardChallenge { runner })),
+            Self::KeyboardChallenge => Ok(CliEvent::KeyboardChallenge(RequestKeyboardChallenge {
+                runner,
+            })),
             Self::Pubkey => Ok(CliEvent::Pubkey(RequestPubkey { runner })),
             Self::AgentSign => Ok(CliEvent::AgentSign(RequestSign { runner })),
             Self::Hostkey => {
@@ -279,9 +288,7 @@ impl CliEventId {
                 Ok(CliEvent::Hostkey(CheckHostkey { runner }))
             }
             Self::Authenticated => Ok(CliEvent::Authenticated),
-            Self::SessionOpened(h) => {
-                Ok(CliEvent::SessionOpened(runner.cli_session_opener(h)?))
-            }
+            Self::SessionOpened(h) => Ok(CliEvent::SessionOpened(runner.cli_session_opener(h)?)),
             Self::ForwardedTcpip(num) => Ok(CliEvent::ForwardedTcpip(ForwardedTcpipOpen {
                 runner,
                 num,
@@ -290,9 +297,7 @@ impl CliEventId {
             // (Self::Banner, Packet::UserauthBanner(p)) => {
             //     CliEvent::Banner { banner: p.message, language: p.lang }
             // }
-            Self::SessionExit => {
-                Ok(CliEvent::SessionExit(runner.fetch_cli_session_exit()?))
-            }
+            Self::SessionExit => Ok(CliEvent::SessionExit(runner.fetch_cli_session_exit()?)),
             Self::Banner => Ok(CliEvent::Banner(runner.fetch_cli_banner()?)),
             Self::Defunct => error::BadUsage.fail(),
         }
@@ -429,7 +434,10 @@ pub struct ServPasswordAuth<'g, 'a> {
 
 impl<'g, 'a> ServPasswordAuth<'g, 'a> {
     fn new(runner: &'g mut ServRunner<'a>) -> Self {
-        Self { runner, done: false }
+        Self {
+            runner,
+            done: false,
+        }
     }
 
     /// Retrieve the username.
@@ -442,10 +450,7 @@ impl<'g, 'a> ServPasswordAuth<'g, 'a> {
     }
 
     /// Perform a constant-time comparison of the user-presented username against a passed string.
-    pub fn matches_username(
-        &self,
-        username: impl core::convert::AsRef<str>,
-    ) -> bool {
+    pub fn matches_username(&self, username: impl core::convert::AsRef<str>) -> bool {
         match self.username() {
             Ok(u) => u.as_bytes().ct_eq(username.as_ref().as_bytes()).into(),
             _ => false,
@@ -465,10 +470,7 @@ impl<'g, 'a> ServPasswordAuth<'g, 'a> {
     /// # Caution
     /// This is better than a naive comparison, but passwords should be hashed and stored using a
     /// platform-appropriate password hashing function. Consider bcrypt, argon2, or pbkdf2.
-    pub fn matches_password(
-        &self,
-        password: impl core::convert::AsRef<str>,
-    ) -> bool {
+    pub fn matches_password(&self, password: impl core::convert::AsRef<str>) -> bool {
         match self.password() {
             Ok(p) => p.as_bytes().ct_eq(password.as_ref().as_bytes()).into(),
             _ => false,
@@ -546,7 +548,11 @@ pub struct ServPubkeyAuth<'g, 'a> {
 
 impl<'g, 'a> ServPubkeyAuth<'g, 'a> {
     fn new(runner: &'g mut ServRunner<'a>, real_sig: bool) -> Self {
-        Self { runner, done: false, real_sig }
+        Self {
+            runner,
+            done: false,
+            real_sig,
+        }
     }
 
     /// Retrieve the username.
@@ -633,7 +639,10 @@ pub struct ServFirstAuth<'g, 'a> {
 
 impl<'g, 'a> ServFirstAuth<'g, 'a> {
     fn new(runner: &'g mut ServRunner<'a>) -> Self {
-        Self { runner, done: false }
+        Self {
+            runner,
+            done: false,
+        }
     }
 
     /// Retrieve the username presented by the client.
@@ -646,10 +655,7 @@ impl<'g, 'a> ServFirstAuth<'g, 'a> {
     }
 
     /// Perform a constant-time comparison of the user-presented username against a passed string.
-    pub fn matches_username(
-        &self,
-        username: impl core::convert::AsRef<str>,
-    ) -> bool {
+    pub fn matches_username(&self, username: impl core::convert::AsRef<str>) -> bool {
         match self.username() {
             Ok(u) => u.as_bytes().ct_eq(username.as_ref().as_bytes()).into(),
             _ => false,
@@ -727,7 +733,11 @@ pub struct ServOpenSession<'g, 'a> {
 
 impl<'g, 'a> ServOpenSession<'g, 'a> {
     fn new(runner: &'g mut ServRunner<'a>, num: ChanNum) -> Self {
-        Self { runner, done: false, num }
+        Self {
+            runner,
+            done: false,
+            num,
+        }
     }
     pub fn accept(mut self) -> Result<ChanHandle> {
         self.done = true;
@@ -764,7 +774,11 @@ pub struct ServShellRequest<'g, 'a> {
 
 impl<'g, 'a> ServShellRequest<'g, 'a> {
     fn new(runner: &'g mut Runner<'a, Server>, num: ChanNum) -> Self {
-        Self { runner, num, done: false }
+        Self {
+            runner,
+            num,
+            done: false,
+        }
     }
     /// Indicate that the request succeeded.
     ///
@@ -816,7 +830,11 @@ pub struct ServExecRequest<'g, 'a> {
 
 impl<'g, 'a> ServExecRequest<'g, 'a> {
     fn new(runner: &'g mut Runner<'a, Server>, num: ChanNum) -> Self {
-        Self { runner, num, done: false }
+        Self {
+            runner,
+            num,
+            done: false,
+        }
     }
 
     /// Retrieve the command presented by the client.
@@ -880,7 +898,11 @@ pub struct ServPtyRequest<'g, 'a> {
 
 impl<'g, 'a> ServPtyRequest<'g, 'a> {
     fn new(runner: &'g mut Runner<'a, Server>, num: ChanNum) -> Self {
-        Self { runner, num, done: false }
+        Self {
+            runner,
+            num,
+            done: false,
+        }
     }
 
     // TODO return PTY information to the caller
@@ -936,7 +958,11 @@ pub struct ServEnvironmentRequest<'g, 'a> {
 
 impl<'g, 'a> ServEnvironmentRequest<'g, 'a> {
     fn new(runner: &'g mut Runner<'a, Server>, num: ChanNum) -> Self {
-        Self { runner, num, done: false }
+        Self {
+            runner,
+            num,
+            done: false,
+        }
     }
 
     /// Indicate that the request succeeded.
@@ -1028,11 +1054,12 @@ pub(crate) enum ServEventId {
 }
 
 impl ServEventId {
-    pub fn event<'g, 'a>(
-        self,
-        runner: &'g mut ServRunner<'a>,
-    ) -> Result<ServEvent<'g, 'a>> {
-        let p = if cfg!(debug_assertions) { runner.packet()? } else { None };
+    pub fn event<'g, 'a>(self, runner: &'g mut ServRunner<'a>) -> Result<ServEvent<'g, 'a>> {
+        let p = if cfg!(debug_assertions) {
+            runner.packet()?
+        } else {
+            None
+        };
 
         match self {
             Self::Hostkeys => {
@@ -1069,7 +1096,9 @@ impl ServEventId {
             }
             Self::SessionSubsystem { num } => {
                 debug_assert!(matches!(p, Some(Packet::ChannelRequest(_))));
-                Ok(ServEvent::SessionSubsystem(ServExecRequest::new(runner, num)))
+                Ok(ServEvent::SessionSubsystem(ServExecRequest::new(
+                    runner, num,
+                )))
             }
             Self::SessionPty { num } => {
                 debug_assert!(matches!(p, Some(Packet::ChannelRequest(_))));
@@ -1077,7 +1106,9 @@ impl ServEventId {
             }
             Self::Environment { num } => {
                 debug_assert!(matches!(p, Some(Packet::ChannelRequest(_))));
-                Ok(ServEvent::SessionEnv(ServEnvironmentRequest::new(runner, num)))
+                Ok(ServEvent::SessionEnv(ServEnvironmentRequest::new(
+                    runner, num,
+                )))
             }
             Self::Defunct => Ok(ServEvent::Defunct),
         }

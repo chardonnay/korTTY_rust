@@ -12,8 +12,12 @@ use roxmltree::{Document, Node, ParsingOptions};
 use crate::private_files::Directory;
 use crate::sftp_window::LocalSource;
 
+pub(crate) mod agent_chat;
 pub(crate) mod annotation;
+pub(crate) mod automation;
 mod capture;
+mod command_count;
+mod connection;
 pub(crate) mod content_search;
 pub(crate) mod deletion;
 pub(crate) mod entry_edit;
@@ -25,11 +29,17 @@ mod links;
 pub(crate) mod markers;
 mod metadata;
 pub(crate) mod note_translation;
+pub(crate) mod question;
 pub(crate) mod replace;
 pub(crate) mod screenshot_ai;
 pub(crate) mod screenshot_analysis_store;
 pub(crate) mod screenshot_edit;
 mod settings;
+pub(crate) mod summary_ai;
+pub(crate) mod summary_job;
+pub(crate) mod summary_plan;
+pub(crate) mod summary_queue;
+pub(crate) mod summary_store;
 mod timeline_details;
 pub(crate) mod topic_ai_settings;
 pub(crate) mod tree;
@@ -42,6 +52,9 @@ mod tests;
 #[cfg(test)]
 pub(crate) use capture::capture_page;
 pub(crate) use capture::{CaptureKind, CapturePage, CaptureRecord, Cursor, LiveCursor, LivePage};
+pub(crate) use connection::{
+    ConnectionConfig, MAX_PART_MIB, MAX_PARTS as MAX_CONNECTION_JOURNAL_PARTS, MAX_SUMMARY_MINUTES,
+};
 pub(crate) use links::{LinkField, LinkSpan, LinkTarget};
 pub(crate) use metadata::{MetadataEdit, edit_metadata, edit_metadata_in};
 pub(crate) use settings::{LogFormat, Settings, default_directory};
@@ -91,8 +104,11 @@ pub(crate) struct Summary {
     expires_offset_seconds: i32,
     pub storage_bytes: u64,
     pub log_entry_count: u64,
+    pub command_count: Option<u64>,
+    pub needs_summary: bool,
     pub duplicate_run_count: u64,
     pub usage: tree::Usage,
+    pub usage_partial: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -118,9 +134,13 @@ pub(crate) struct TimelineEntry {
     pub output: Vec<String>,
     pub extra_details: Vec<String>,
     pub chat_details: Vec<String>,
+    agent_chat_id: Option<String>,
 }
 
 impl TimelineEntry {
+    pub(crate) fn has_agent_chat(&self) -> bool {
+        self.kind == "AGENT" && (self.agent_chat_id.is_some() || !self.chat_details.is_empty())
+    }
     pub(crate) fn screenshot_analysis(&self) -> Option<&[String]> {
         if self.kind != "SCREENSHOT" || self.screenshot.is_none() {
             return None;
@@ -351,6 +371,7 @@ fn summary(directory: &Path, document: &Document<'_>) -> io::Result<Summary> {
     let started = number::<tree::DateOrder>(meta, "startedAt")?;
     let run_started = number::<tree::DateOrder>(meta, "runStartedAt")?;
     let expires = number::<tree::DateOrder>(meta, "expiresAt")?;
+    let usage = summary_store::TokenUsage::read(meta)?;
     Ok(Summary {
         directory: directory.to_owned(),
         id: id.into(),
@@ -386,16 +407,19 @@ fn summary(directory: &Path, document: &Document<'_>) -> io::Result<Summary> {
         expires_offset_seconds: expires.map_or(0, tree::DateOrder::offset_seconds),
         storage_bytes: number(meta, "storageBytes")?.unwrap_or(0),
         log_entry_count: number(meta, "logEntryCount")?.unwrap_or(0),
+        command_count: number(meta, "commandCount")?,
+        needs_summary: summary_store::needs_summary(meta),
         duplicate_run_count: number(meta, "duplicateRunCount")?.unwrap_or(0),
         usage: tree::Usage {
-            prompt_tokens: number(meta, "aiPromptTokens")?.unwrap_or(0),
-            completion_tokens: number(meta, "aiCompletionTokens")?.unwrap_or(0),
-            total_tokens: number(meta, "aiTotalTokens")?.unwrap_or(0),
-            call_count: number(meta, "aiCallCount")?.unwrap_or(0),
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+            call_count: usage.call_count,
             cost: finite_cost(meta)?,
             currency: optional_value(meta, "aiCostCurrency")?,
             local: boolean(meta, "aiProfileLocal")?,
         },
+        usage_partial: usage.partial,
     })
 }
 
@@ -462,6 +486,11 @@ fn timeline_entry(
     };
     let (extra_details, chat_details) =
         timeline_details::read(entry, &kind, screenshot.is_some(), zone, limited);
+    let agent_chat_id = (kind == "AGENT")
+        .then(|| bounded_field(entry, "chatId").ok())
+        .flatten()
+        .filter(|value| agent_chat::valid_reference(value))
+        .map(Cow::into_owned);
     let text_source = match kind.as_ref() {
         "USER_NOTE" => Some(links::Source::Note),
         "AI_SUMMARY" | "SESSION_SUMMARY" => Some(links::Source::Summary),
@@ -502,6 +531,7 @@ fn timeline_entry(
         output: excerpt(entry, "outputExcerpt")?,
         extra_details,
         chat_details,
+        agent_chat_id,
     };
     Ok((date, entry))
 }

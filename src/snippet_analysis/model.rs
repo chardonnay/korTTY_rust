@@ -8,10 +8,72 @@ use std::time::SystemTime;
 use pgp::crypto::hash::HashAlgorithm;
 use serde::{Deserialize, Serialize};
 
+use crate::ai_manager::{KnowledgeCitation, ProfileRef};
 use crate::snippets::{SnippetId, folders};
+
+use super::diagram::AnalysisDiagram;
+
+mod apply;
+pub(crate) mod hardening;
+pub(crate) mod modularization;
+mod verification;
+
+pub(in crate::snippet_analysis) use apply::APPLY_PLAN_VERSION;
+pub(crate) use apply::{
+    ApplyRecovery, ApplyRequestSnapshot, ApplyRun, ApplyStatus, ChangeReason, Checkpoint,
+    MAX_APPLY_CONTENT_BYTES, PartialApply, Selection,
+};
+pub(crate) use verification::Verification;
 
 pub(super) const DEFAULT_CONTENT_BYTES: usize = 1024 * 1024;
 pub(super) const MAX_CONTENT_BYTES: usize = 5 * DEFAULT_CONTENT_BYTES;
+
+pub(super) fn source_fits(content: &str, limit: usize) -> bool {
+    limit != 0 && content.len() <= limit
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "UPPERCASE")]
+pub(crate) enum ReportFormat {
+    Html,
+    Pdf,
+    Markdown,
+    Json,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum ExportPhase {
+    BeforeApply,
+    AfterApply,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExportEntry {
+    pub(crate) exported_at: u64,
+    pub(crate) format: ReportFormat,
+    pub(crate) phase: ExportPhase,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) run_id: Option<SnippetId>,
+    pub(crate) file_name: String,
+}
+
+impl ExportEntry {
+    pub(crate) fn new(format: ReportFormat, run_id: Option<SnippetId>, file_name: &str) -> Self {
+        Self {
+            exported_at: now_millis(),
+            format,
+            phase: if run_id.is_some() {
+                ExportPhase::AfterApply
+            } else {
+                ExportPhase::BeforeApply
+            },
+            run_id,
+            file_name: file_name.into(),
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", tag = "kind", content = "id")]
@@ -109,17 +171,48 @@ impl Source {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, rename_all = "camelCase")]
 pub(crate) struct Provenance {
-    pub(crate) profile_id: u64,
+    pub(crate) profile_id: ProfileRef,
     pub(crate) profile_name: String,
     pub(crate) model: String,
     pub(crate) skill_ids: Vec<String>,
     pub(crate) skill_names: Vec<String>,
+    #[serde(
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "deserialize_knowledge_citations"
+    )]
+    pub(crate) knowledge_citations: Vec<KnowledgeCitation>,
     pub(crate) additional_instructions: String,
     pub(crate) usage: Usage,
     pub(crate) duration_millis: u64,
+}
+
+impl Default for Provenance {
+    fn default() -> Self {
+        Self {
+            profile_id: ProfileRef::Numeric(0),
+            profile_name: String::new(),
+            model: String::new(),
+            skill_ids: Vec::new(),
+            skill_names: Vec::new(),
+            knowledge_citations: Vec::new(),
+            additional_instructions: String::new(),
+            usage: Usage::default(),
+            duration_millis: 0,
+        }
+    }
+}
+
+fn deserialize_knowledge_citations<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<KnowledgeCitation>, D::Error> {
+    let citations = Vec::deserialize(deserializer)?;
+    if !KnowledgeCitation::valid_list(&citations) {
+        return Err(serde::de::Error::custom("Invalid knowledge citations"));
+    }
+    Ok(citations)
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -152,6 +245,18 @@ pub(crate) struct Record {
     pub(crate) source: Source,
     pub(crate) provenance: Provenance,
     pub(crate) analysis: Analysis,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) diagram: Option<AnalysisDiagram>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) apply_runs: Vec<ApplyRun>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) apply_recovery: Option<ApplyRecovery>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) modularization: Option<Box<modularization::Job>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) verification: Option<Verification>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) exports: Vec<ExportEntry>,
 }
 
 impl Record {
@@ -162,6 +267,12 @@ impl Record {
         provenance: Provenance,
         analysis: Analysis,
     ) -> io::Result<Self> {
+        if !KnowledgeCitation::valid_list(&provenance.knowledge_citations) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid knowledge citations",
+            ));
+        }
         let now = now_millis();
         Ok(Self {
             id: SnippetId::new()?,
@@ -173,6 +284,12 @@ impl Record {
             source,
             provenance,
             analysis,
+            diagram: None,
+            apply_runs: Vec::new(),
+            apply_recovery: None,
+            modularization: None,
+            verification: None,
+            exports: Vec::new(),
         })
     }
 }

@@ -33,21 +33,27 @@ pub(super) fn read(
     limited: &mut bool,
 ) -> (Vec<String>, Vec<String>) {
     let mut extra = Rows::new(MAX_EXTRA_ROWS, MAX_EXTRA_UNITS);
-    let mut chat = Rows::new(MAX_CHAT_ROWS - 1, MAX_CHAT_UNITS);
     if append_extra(entry, kind, has_screenshot, &mut extra).is_err() {
         extra.limited = true;
     }
-    if kind == "AGENT"
-        && let Some(snapshot) = child(entry, "chatSnapshot")
-        && append_chat(snapshot, zone, &mut chat).is_err()
-    {
+    let chat = if kind == "AGENT" {
+        child(entry, "chatSnapshot").map(|snapshot| chat_rows(snapshot, zone))
+    } else {
+        None
+    };
+    *limited |= extra.limited || chat.as_ref().is_some_and(|chat| chat.limited);
+    (extra.values, chat.map_or_else(Vec::new, |chat| chat.values))
+}
+
+pub(super) fn chat_rows(snapshot: Node<'_, '_>, zone: &TimeZone) -> Rows {
+    let mut chat = Rows::new(MAX_CHAT_ROWS - 1, MAX_CHAT_UNITS);
+    if append_chat(snapshot, zone, &mut chat).is_err() {
         chat.limited = true;
     }
     if chat.limited && !chat.values.is_empty() {
         chat.values.push("Chat transcript shortened".to_owned());
     }
-    *limited |= extra.limited || chat.limited;
-    (extra.values, chat.values)
+    chat
 }
 
 fn append_extra(
@@ -230,8 +236,8 @@ fn formatted_time(
         .map(|time| time.to_zoned(zone.clone()).strftime(format).to_string()))
 }
 
-struct Rows {
-    values: Vec<String>,
+pub(super) struct Rows {
+    pub(super) values: Vec<String>,
     max_rows: usize,
     remaining: usize,
     limited: bool,

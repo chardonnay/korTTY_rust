@@ -139,6 +139,24 @@ pub fn sync_application_menu_items(state: impl Fn(u16) -> Option<(bool, bool)>) 
 
 /// Sets a native Command-key equivalent while a tool owns the application menu.
 pub fn sync_application_menu_command_key(action: u16, key: &str) {
+    sync_application_menu_key(
+        action,
+        key,
+        NSEventModifierFlags::NSEventModifierFlagCommand,
+    );
+}
+
+/// Sets a native Command-Option key equivalent, or clears it with an empty key.
+pub fn sync_application_menu_command_option_key(action: u16, key: &str) {
+    sync_application_menu_key(
+        action,
+        key,
+        NSEventModifierFlags::NSEventModifierFlagCommand
+            | NSEventModifierFlags::NSEventModifierFlagOption,
+    );
+}
+
+fn sync_application_menu_key(action: u16, key: &str, modifiers: NSEventModifierFlags) {
     if MainThreadMarker::new().is_none() {
         return;
     }
@@ -151,7 +169,7 @@ pub fn sync_application_menu_command_key(action: u16, key: &str) {
                     item.setKeyEquivalent(&key);
                 }
             }
-            item.setKeyEquivalentModifierMask(NSEventModifierFlags::NSEventModifierFlagCommand);
+            item.setKeyEquivalentModifierMask(modifiers);
         }
     });
 }
@@ -188,17 +206,7 @@ fn dropdown(
     let mut separator = false;
     for entry in entries {
         let item = match entry {
-            Action { title, id } => {
-                let item = menu_item(main, &NSString::from_str(title), Some(action_selector()));
-                // SAFETY: The installed AppKit delegate outlives the item and
-                // implements the item's action selector.
-                unsafe {
-                    item.setTarget(Some(target));
-                    item.setTag(*id as isize);
-                }
-                ACTIONS.with_borrow_mut(|items| items.push((*id, item.clone())));
-                Some(item)
-            }
+            Action { title, id } => Some(action_item(main, target, title, *id)),
             Disabled { title } => {
                 let item = menu_item(main, &NSString::from_str(title), None);
                 // SAFETY: This retained item is only used on the main thread.
@@ -257,6 +265,22 @@ fn dropdown(
     Some(root)
 }
 
+pub(super) fn action_item(
+    main: MainThreadMarker,
+    target: &AnyObject,
+    title: &str,
+    id: u16,
+) -> Retained<NSMenuItem> {
+    let item = menu_item(main, &NSString::from_str(title), Some(action_selector()));
+    // SAFETY: The installed AppKit delegate outlives the item and implements its selector.
+    unsafe {
+        item.setTarget(Some(target));
+        item.setTag(id as isize);
+    }
+    ACTIONS.with_borrow_mut(|items| items.push((id, item.clone())));
+    item
+}
+
 fn menu_item(
     main: MainThreadMarker,
     title: &NSString,
@@ -304,7 +328,7 @@ extern "C" fn choose_item(_target: &AnyObject, _selector: Sel, sender: Option<&A
     send(NativeEvent::Menu(id));
 }
 
-fn send(event: NativeEvent) {
+pub(super) fn send(event: NativeEvent) {
     EVENTS.with(|events| {
         if let Some(sender) = events.get() {
             let _ = sender.try_send(event);

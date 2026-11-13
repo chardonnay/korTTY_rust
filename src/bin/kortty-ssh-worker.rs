@@ -5,7 +5,12 @@ fn main() -> std::process::ExitCode {
     use kortty::ssh_runtime;
 
     let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref() != Some(ssh_runtime::ARGUMENT.as_ref()) {
+    let first = args.next();
+    #[cfg(windows)]
+    if first.as_deref() == Some(kortty_pty::WINDOWS_LOCAL_SANDBOX_BROKER_ARGUMENT.as_ref()) {
+        std::process::exit(kortty_pty::run_windows_local_sandbox_broker(args).unwrap_or(1));
+    }
+    if first.as_deref() != Some(ssh_runtime::ARGUMENT.as_ref()) {
         return std::process::ExitCode::FAILURE;
     }
     let descriptor = ssh_runtime::descriptor(args);

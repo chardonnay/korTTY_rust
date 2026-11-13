@@ -61,7 +61,7 @@ fn archive_roundtrip_uses_one_encrypted_entry_and_fresh_salts() {
     write(&second, &expected, &password()).unwrap();
     assert_eq!(
         super::super::detect_format(&second).unwrap(),
-        super::super::preferences::EncryptionMode::Password
+        super::super::BackupFormat::Password
     );
     let second_bytes = fs::read(second).unwrap();
     let (_, second_salt) = validate_zip(&second_bytes).unwrap();

@@ -368,8 +368,20 @@ impl Command {
                 ];
             }
             QuickSelect => return [Some(Chord::primary_key(MainKey::Space, true, false)), None],
+            ToggleCodingAgents | NextBlockedCodingAgent => {
+                let key = if self.action == ToggleCodingAgents {
+                    'g'
+                } else {
+                    'n'
+                };
+                return [
+                    Some(Chord::primary_key(MainKey::Character(key), false, true)),
+                    None,
+                ];
+            }
             TerminalOnlyFullscreen => return [Some(Chord::primary('f', true)), None],
             ShowCommandTimestamps => return [Some(Chord::primary('t', true)), None],
+            HighlightToggle => return [Some(Chord::primary('h', true)), None],
             ShowMenuBar => return [Some(Chord::primary('l', true)), None],
             ZoomIn => return [Some(Chord::primary('+', false)), None],
             ZoomOut => return [Some(Chord::primary('-', false)), None],
@@ -455,6 +467,9 @@ pub(super) fn catalog() -> &'static [Command] {
     CATALOG.get_or_init(|| {
         let mut entries = Vec::<Command>::new();
         for (action, title, menu) in Action::shortcut_catalog() {
+            if action == Action::Cut {
+                continue;
+            }
             if let Some(entry) = entries.iter_mut().find(|entry| entry.action == action) {
                 entry.aliases.extend([title, menu]);
                 continue;
@@ -522,6 +537,9 @@ impl Bindings {
             FocusPaneAbove,
             FocusPaneBelow,
             ShowCommandTimestamps,
+            HighlightToggle,
+            ToggleCodingAgents,
+            NextBlockedCodingAgent,
         ];
         for new_action in introduced_defaults
             .into_iter()
@@ -640,17 +658,37 @@ impl Bindings {
     }
 
     pub(super) fn menu_hint(&self, action: Action) -> Option<String> {
+        if action == Action::Cut {
+            return Some(Chord::primary('x', false).to_string());
+        }
         let entry = command(action)?;
+        self.menu_chord(entry)
+            .map(|chord| chord.to_string())
+            .or_else(|| (action == Action::Fullscreen).then(|| "F12".to_owned()))
+    }
+
+    fn menu_chord(&self, entry: &Command) -> Option<Chord> {
         let default = entry.default_chord();
         let effective = self.shortcut(entry);
-        let chord = if effective != default && !self.conflicts().is_empty() {
+        if effective != default && !self.conflicts().is_empty() {
             default
         } else {
             effective
-        };
-        chord
-            .map(|chord| chord.to_string())
-            .or_else(|| (action == Action::Fullscreen).then(|| "F12".to_owned()))
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn native_command_option_key(&self, action: Action) -> Option<char> {
+        match self.menu_chord(command(action)?)? {
+            Chord {
+                key: MainKey::Character(key),
+                shortcut: true,
+                control: false,
+                shift: false,
+                alt: true,
+            } => Some(key),
+            _ => None,
+        }
     }
 
     pub(super) fn conflicts(&self) -> Vec<(Chord, Vec<Action>)> {
@@ -880,6 +918,66 @@ mod tests {
         );
         assert!(bindings.shortcut(recipient).is_none());
         assert!(bindings.conflicts().is_empty());
+    }
+
+    #[test]
+    fn coding_agent_shortcuts_use_primary_alt_and_preserve_existing_overrides() {
+        use Action::{NextBlockedCodingAgent, OpenProject, ToggleCodingAgents};
+
+        for (action, key) in [(ToggleCodingAgents, "g"), (NextBlockedCodingAgent, "n")] {
+            let entry = command(action).unwrap();
+            let key = Key::Character(key.into());
+            for (platform, primary) in [
+                (Platform::Mac, Modifiers::LOGO),
+                (Platform::Linux, Modifiers::CTRL),
+                (Platform::Windows, Modifiers::CTRL),
+            ] {
+                let chord = Chord::from_event(&key, primary | Modifiers::ALT, platform);
+                assert_eq!(entry.defaults(platform), [chord, None]);
+                assert_ne!(Chord::from_event(&key, primary, platform), chord);
+            }
+        }
+        if PLATFORM != Platform::Windows {
+            let mut bindings = Bindings::default();
+            let toggle = command(ToggleCodingAgents).unwrap();
+            let shortcut = toggle.default_chord();
+            bindings.update(OpenProject, shortcut).unwrap();
+            bindings.preserve_user_shortcuts();
+            assert_eq!(bindings.shortcut(command(OpenProject).unwrap()), shortcut);
+            assert!(bindings.shortcut(toggle).is_none());
+            assert!(bindings.conflicts().is_empty());
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn coding_agent_native_equivalent_tracks_remapped_bindings() {
+        use Action::ToggleCodingAgents;
+
+        let mut bindings = Bindings::default();
+        assert_eq!(
+            bindings.native_command_option_key(ToggleCodingAgents),
+            Some('g')
+        );
+        bindings
+            .update(
+                ToggleCodingAgents,
+                Some(Chord::primary_key(MainKey::Character('y'), false, true)),
+            )
+            .unwrap();
+        assert_eq!(
+            bindings.native_command_option_key(ToggleCodingAgents),
+            Some('y')
+        );
+        let other = Chord::primary('y', true);
+        bindings.update(ToggleCodingAgents, Some(other)).unwrap();
+        assert_eq!(bindings.native_command_option_key(ToggleCodingAgents), None);
+        assert_eq!(
+            bindings.shortcut(command(ToggleCodingAgents).unwrap()),
+            Some(other)
+        );
+        bindings.update(ToggleCodingAgents, None).unwrap();
+        assert_eq!(bindings.native_command_option_key(ToggleCodingAgents), None);
     }
 
     #[test]

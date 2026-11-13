@@ -16,3 +16,10 @@ Text damage also compares editor buffer identity. Upstream editor equality
 compares font and dimensions, so two live snippet tabs with different text can
 otherwise reuse the preceding tab's pixels. Unchanged buffers retain the
 existing damage fast path.
+
+The file editor uses a scoped caret painter with iced_widget 0.14.2.
+That TextEditor sends its value color to both the text renderer and the
+blinking caret quad. The scope replaces the adapter's marker in those two
+draw operations and leaves the widget's layout, selection, events and IME
+handling in iced. The block caret repaints the same shaped glyph in a
+clipped layer with contrasting ink.

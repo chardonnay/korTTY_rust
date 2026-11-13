@@ -44,12 +44,15 @@ impl Exports {
 #[derive(Clone, Debug)]
 pub enum Message {
     Open(Format),
+    OpenBrowser,
     BeginRange,
     Range(u64, ranges::Event),
     Options(export_options::Event),
     Previewed(Result<Arc<PreviewData>, String>),
     Browser(browser::Event),
     Saved(u64, Result<Arc<Published>, String>),
+    OpenDocument,
+    DocumentOpened(Result<(), String>),
     OpenFolder,
     FolderOpened(bool),
     Focus,
@@ -75,6 +78,7 @@ pub(super) struct Dialog {
     pub(super) owner: window::Id,
     root: PathBuf,
     targets: Arc<[Target]>,
+    open_in_browser: bool,
     ai_profile: Option<local_ai::Profile>,
     preview_cancelled: Arc<AtomicBool>,
     phase: Phase,
@@ -132,16 +136,41 @@ impl Target {
         }
     }
 
-    fn load(&self, root: &Path, retain_bundle_source: bool) -> io::Result<Snapshot> {
-        let identity = self.identity.as_ref().ok_or_else(|| {
+    fn identity(&self) -> io::Result<&DeletionIdentity> {
+        self.identity.as_ref().ok_or_else(|| {
             io::Error::other("The journal could not be verified. Refresh the journal list.")
-        })?;
-        if retain_bundle_source {
-            export::load_for_bundle(root, &self.directory, &self.id, identity)
-        } else {
-            export::load(root, &self.directory, &self.id, identity)
-        }
+        })
     }
+
+    fn load(&self, root: &Path, format: Format) -> io::Result<Snapshot> {
+        let loader = match format {
+            Format::BrowserHtml => export::load_for_browser,
+            Format::HtmlBundle => export::load_for_bundle,
+            _ => export::load,
+        };
+        loader(root, &self.directory, &self.id, self.identity()?)
+    }
+
+    fn require_browser_source(&self, root: &Path) -> io::Result<()> {
+        export::require_reviewed_source(root, &self.directory, self.identity()?)
+    }
+}
+
+fn require_browser_policy(root: &Path) -> io::Result<()> {
+    let policy = crate::clipboard_policy::ClipboardPolicy::load();
+    if policy.problem.is_some()
+        || !policy.session_journal_allowed
+        || policy
+            .terminal_logging
+            .journal_directory()
+            .is_some_and(|path| path != root)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Session Journal access changed. Open the journal again.",
+        ));
+    }
+    Ok(())
 }
 
 impl Drop for Dialog {
@@ -152,6 +181,9 @@ impl Drop for Dialog {
 
 impl Dialog {
     pub(super) fn title(&self) -> &'static str {
+        if self.open_in_browser {
+            return "Open Session Journal in Browser";
+        }
         match self.phase {
             Phase::Options(_) => "Export Session Journal",
             Phase::Destination(_) => "Save Session Journal",
@@ -171,7 +203,15 @@ impl Dialog {
             ]
             .into(),
             Phase::Destination(save) if save.working.is_none() => {
-                save.browser.view().map(Message::Browser)
+                let browser = if self.open_in_browser {
+                    save.browser.view_with_notice(
+                        "Save a Local Journal Page",
+                        "The HTML file is unencrypted and can contain captured terminal text, screenshots, and agent conversations. Choose where to save it before opening it in your browser.",
+                    )
+                } else {
+                    save.browser.view()
+                };
+                browser.map(Message::Browser)
             }
             Phase::Destination(save) => {
                 let cancelling = save
@@ -197,7 +237,11 @@ impl Dialog {
             }
             Phase::Result(result) => {
                 let mut details = column![
-                    text(format!("Exported {} journal(s)", result.exported)).size(19),
+                    if self.open_in_browser {
+                        text("Review the local file before opening it in your browser").size(19)
+                    } else {
+                        text(format!("Exported {} journal(s)", result.exported)).size(19)
+                    },
                     text(display(&result.path.to_string_lossy(), 4096)).size(14),
                 ]
                 .spacing(8);
@@ -230,7 +274,17 @@ impl Dialog {
                         scrollable(details).height(Length::Fill),
                         row![
                             space::horizontal(),
-                            button("Open Folder").on_press(Message::OpenFolder),
+                            result
+                                .document
+                                .as_ref()
+                                .map(|_| button(if self.open_in_browser {
+                                    "Open in Browser"
+                                } else {
+                                    "Open Export"
+                                })
+                                .on_press(Message::OpenDocument)),
+                            (!self.open_in_browser)
+                                .then(|| button("Open Folder").on_press(Message::OpenFolder)),
                             button("Close").on_press(Message::Close),
                         ]
                         .spacing(8),
@@ -335,16 +389,7 @@ impl Workspace {
         let ai_profile = self.journal_export_ai_profile();
         options.set_topic_ai_available(ai_profile.is_some());
         options.set_viewer_ranges(can_pick_range, preset);
-        let (id, opened) = self.open_placed_dialog(
-            DialogKind::JournalExport,
-            window::Settings {
-                size: Size::new(730.0, 650.0),
-                min_size: Some(Size::new(480.0, 380.0)),
-                position: window::Position::Centered,
-                exit_on_close_request: false,
-                ..window::Settings::default()
-            },
-        );
+        let (id, opened) = self.open_journal_export_window();
         let cancelled = Arc::new(AtomicBool::new(false));
         let preview = if options.wants_preview() {
             let targets = Arc::clone(&targets);
@@ -365,6 +410,7 @@ impl Workspace {
                 owner,
                 root,
                 targets,
+                open_in_browser: false,
                 ai_profile,
                 preview_cancelled: cancelled,
                 phase: Phase::Options(Box::new(options)),
@@ -372,6 +418,65 @@ impl Workspace {
             },
         );
         Task::batch([opened.map(|_| Desktop::Noop), preview])
+    }
+
+    fn open_journal_in_browser(&mut self, source: window::Id) -> Task<Desktop> {
+        let Some(owner) = self.journal_export_owner(source) else {
+            return Task::none();
+        };
+        let Mode::Viewer(viewer) = &self.journals[&source].mode else {
+            return Task::none();
+        };
+        let Some(summary) = viewer
+            .export_summary()
+            .filter(|_| viewer.export_range.is_none())
+        else {
+            return Task::none();
+        };
+        let Some(root) = summary.directory.parent().map(Path::to_owned) else {
+            return Task::none();
+        };
+        let target = Target::from_summary(summary);
+        let filename = format!("{}.html", export_output::export_basename(&target.title));
+        self.dismiss_journal_menu(source);
+        let (id, opened) = self.open_journal_export_window();
+        let mut browser = browser::Browser::new(filename, ".html");
+        let listing = browser.update(id, browser::Event::List);
+        self.journal_exports.dialogs.insert(
+            id,
+            Dialog {
+                source,
+                owner,
+                root,
+                targets: Arc::new([target]),
+                open_in_browser: true,
+                ai_profile: None,
+                preview_cancelled: Arc::new(AtomicBool::new(false)),
+                phase: Phase::Destination(Box::new(Save {
+                    browser,
+                    format: Format::BrowserHtml,
+                    options: export::Options::default(),
+                    protection: Protection::None,
+                    ai_topic: false,
+                    working: None,
+                })),
+                problem: None,
+            },
+        );
+        Task::batch([opened.map(|_| Desktop::Noop), listing])
+    }
+
+    fn open_journal_export_window(&mut self) -> (window::Id, Task<window::Id>) {
+        self.open_placed_dialog(
+            DialogKind::JournalExport,
+            window::Settings {
+                size: Size::new(730.0, 650.0),
+                min_size: Some(Size::new(480.0, 380.0)),
+                position: window::Position::Centered,
+                exit_on_close_request: false,
+                ..window::Settings::default()
+            },
+        )
     }
 
     fn journal_export_scope_is_current(&self, id: window::Id) -> bool {
@@ -399,6 +504,11 @@ impl Workspace {
                     let target = &dialog.targets[0];
                     document.summary.id == target.id
                         && document.summary.directory == target.directory
+                        && (!dialog.open_in_browser
+                            || (!viewer.loading
+                                && viewer.export_range.is_none()
+                                && viewer.screenshot.is_none()
+                                && document.summary.deletion_identity == target.identity))
                 }) && (self
                     .clipboard
                     .policy
@@ -416,7 +526,10 @@ impl Workspace {
         message: Message,
     ) -> Task<Desktop> {
         match message {
-            Message::Open(format) => return self.open_journal_export(id, format, &[]),
+            Message::Open(format) if format != Format::BrowserHtml => {
+                return self.open_journal_export(id, format, &[]);
+            }
+            Message::OpenBrowser => return self.open_journal_in_browser(id),
             Message::BeginRange => {
                 if self.journal_export_owner(id).is_some() {
                     self.begin_journal_export_range(id, Format::Pdf);
@@ -436,6 +549,7 @@ impl Workspace {
                 return self.choose_journal_export_destination(id);
             }
             Message::Browser(browser::Event::Save) => return self.save_journal_export(id),
+            Message::OpenDocument => return self.open_journal_export_document(id),
             Message::OpenFolder => return self.open_journal_export_folder(id),
             _ => {}
         }
@@ -487,6 +601,10 @@ impl Workspace {
             (Phase::Result(_), Message::FolderOpened(opened)) => {
                 dialog.problem =
                     (!opened).then(|| "The desktop could not open the export folder.".into());
+                Task::none()
+            }
+            (Phase::Result(_), Message::DocumentOpened(result)) => {
+                dialog.problem = result.err();
                 Task::none()
             }
             _ => Task::none(),
@@ -694,25 +812,35 @@ impl Workspace {
         let worker = std::thread::Builder::new()
             .name("kortty-journal-export".into())
             .spawn(move || {
-                let journals = targets.iter().map(|target| {
-                    (
-                        target.title.clone(),
-                        target.load(&root, format == Format::HtmlBundle),
+                let journals = targets
+                    .iter()
+                    .map(|target| (target.title.clone(), target.load(&root, format)));
+                let request = Request {
+                    format,
+                    options: &options,
+                    protection: &protection,
+                    links_allowed,
+                    topic_ai: topic_ai.as_ref(),
+                };
+                let cancelled = || cancelled.load(Ordering::Relaxed);
+                let result = if format == Format::BrowserHtml {
+                    export_output::publish_reviewed(
+                        &destination,
+                        targets.len(),
+                        journals,
+                        request,
+                        &cancelled,
+                        &|| require_browser_policy(&root),
                     )
-                });
-                let result = export_output::publish(
-                    &destination,
-                    targets.len(),
-                    journals,
-                    Request {
-                        format,
-                        options: &options,
-                        protection: &protection,
-                        links_allowed,
-                        topic_ai: topic_ai.as_ref(),
-                    },
-                    &|| cancelled.load(Ordering::Relaxed),
-                )
+                } else {
+                    export_output::publish(
+                        &destination,
+                        targets.len(),
+                        journals,
+                        request,
+                        &cancelled,
+                    )
+                }
                 .map(Arc::new)
                 .map_err(|error| error.to_string());
                 let _ = send.try_send(result);
@@ -731,9 +859,56 @@ impl Workspace {
         })
     }
 
+    fn open_journal_export_document(&mut self, id: window::Id) -> Task<Desktop> {
+        let Some(Dialog {
+            phase: Phase::Result(result),
+            open_in_browser,
+            root,
+            targets,
+            ..
+        }) = self.journal_exports.dialogs.get(&id)
+        else {
+            return Task::none();
+        };
+        let Some(document) = result.document.clone() else {
+            return Task::none();
+        };
+        const CHANGED: &str =
+            "Session Journal access changed before the desktop could open the export.";
+        if !self.journal_export_scope_is_current(id) {
+            return self.update_journal_export(id, Message::DocumentOpened(Err(CHANGED.into())));
+        }
+        let browser_source = open_in_browser.then(|| (root.clone(), Arc::clone(targets)));
+        let open = move || {
+            if let Some((root, targets)) = browser_source {
+                require_browser_policy(&root).map_err(|error| error.to_string())?;
+                targets[0]
+                    .require_browser_source(&root)
+                    .map_err(|error| error.to_string())?;
+                return document.open();
+            }
+            let policy = crate::clipboard_policy::ClipboardPolicy::load();
+            if policy.problem.is_some() || !policy.session_journal_allowed {
+                return Err(CHANGED.into());
+            }
+            document.open()
+        };
+        #[cfg(target_os = "macos")]
+        {
+            self.update_journal_export(id, Message::DocumentOpened(open()))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            Task::perform(async move { open() }, move |result| {
+                wrap(id, Message::DocumentOpened(result))
+            })
+        }
+    }
+
     fn open_journal_export_folder(&mut self, id: window::Id) -> Task<Desktop> {
         let Some(Dialog {
             phase: Phase::Result(result),
+            open_in_browser: false,
             ..
         }) = self.journal_exports.dialogs.get(&id)
         else {
@@ -827,7 +1002,7 @@ fn load_preview(
         if cancelled.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::Interrupted.into());
         }
-        match target.load(root, false) {
+        match target.load(root, Format::Markdown) {
             Ok(snapshot) => loaded.push(snapshot),
             Err(_) => skipped += 1,
         }

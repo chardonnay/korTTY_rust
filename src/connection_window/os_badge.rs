@@ -45,24 +45,26 @@ impl<'a> Badge<'a> {
 
     pub(super) fn image(self, size: u32) -> Element<'a, Message> {
         match self {
-            Self::BuiltIn(badge) => {
-                static HANDLES: OnceLock<Vec<svg::Handle>> = OnceLock::new();
-                let handles = HANDLES.get_or_init(|| {
-                    OsBadge::all()
-                        .map(|badge| svg::Handle::from_memory(badge.svg()))
-                        .collect()
-                });
-                svg::Svg::new(handles[badge.index()].clone())
-                    .width(size)
-                    .height(size)
-                    .into()
-            }
+            Self::BuiltIn(badge) => svg::Svg::new(builtin_handle(badge))
+                .width(size)
+                .height(size)
+                .into(),
             Self::Custom(badge) => badge.image_handle().map_or_else(
                 || iced::widget::space().width(size).height(size).into(),
                 |handle| image(handle).width(size).height(size).into(),
             ),
         }
     }
+}
+
+pub(super) fn builtin_handle(badge: OsBadge) -> svg::Handle {
+    static HANDLES: OnceLock<Vec<svg::Handle>> = OnceLock::new();
+    HANDLES.get_or_init(|| {
+        OsBadge::all()
+            .map(|badge| svg::Handle::from_memory(badge.svg()))
+            .collect()
+    })[badge.index()]
+    .clone()
 }
 
 pub(super) fn picker<'a>(

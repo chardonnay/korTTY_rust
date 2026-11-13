@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use iced::widget::{self, text_editor};
+use iced::widget;
 use iced::{Element, Task};
 use serde::{Deserialize, Serialize};
 
@@ -101,6 +101,10 @@ impl Default for Editor {
 }
 
 impl Editor {
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     pub(super) fn changed(&mut self, edited_at: Option<Instant>) {
         self.generation = NEXT_SOURCE.fetch_add(1, Ordering::Relaxed);
         self.edited_at = edited_at;
@@ -275,7 +279,11 @@ impl SnippetWindow {
                     if result
                         .as_ref()
                         .is_none_or(|(ticket, _)| *ticket != revision)
-                        || !select_span(&mut self.draft.content, span)
+                        || !structure::select_name(
+                            &mut self.draft.content,
+                            span.line,
+                            span.column..span.end_column,
+                        )
                     {
                         return Update::None;
                     }
@@ -325,29 +333,10 @@ impl SnippetWindow {
     }
 }
 
-fn select_span(content: &mut text_editor::Content, span: Span) -> bool {
-    let Some(line) = content.line(span.line) else {
-        return false;
-    };
-    if span.column >= span.end_column || line.text.get(span.column..span.end_column).is_none() {
-        return false;
-    }
-    content.move_to(text_editor::Cursor {
-        position: text_editor::Position {
-            line: span.line,
-            column: span.end_column,
-        },
-        selection: Some(text_editor::Position {
-            line: span.line,
-            column: span.column,
-        }),
-    });
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use iced::futures::{StreamExt, executor::block_on};
+    use iced::widget::text_editor;
 
     use super::*;
     use crate::snippets::tests::Profile;

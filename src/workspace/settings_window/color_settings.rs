@@ -129,7 +129,11 @@ impl Editor {
         }
     }
 
-    pub(super) fn view(&self, preferences: &WindowSettings) -> Element<'_, Edit> {
+    pub(super) fn view(
+        &self,
+        preferences: &WindowSettings,
+        target: Option<&iced::widget::Id>,
+    ) -> Element<'_, Edit> {
         let appearance = preferences.terminal_appearance();
         let colors = &preferences.colors;
         let selected = preferences.themes.selected();
@@ -147,9 +151,15 @@ impl Editor {
             .find(|profile| profile.id == selected)
             .cloned();
         let color_row = |label, channel, color, editable| {
+            let focus = target.filter(|_| {
+                matches!(
+                    (selected, channel),
+                    (None, Channel::Foreground) | (Some(_), Channel::Selection)
+                )
+            });
             row![
                 text(label).width(132),
-                self.field(channel, color, editable).width(112),
+                self.field(channel, color, editable, focus).width(112),
             ]
             .spacing(10)
             .align_y(Alignment::Center)
@@ -163,7 +173,8 @@ impl Editor {
                     self.field(
                         Channel::Ansi(index),
                         Rgb::from_bytes(appearance.palette.rgb(index)),
-                        colors.sgr_enabled
+                        colors.sgr_enabled,
+                        None,
                     ),
                 ]
                 .width(Length::Fill)
@@ -229,6 +240,7 @@ impl Editor {
         channel: Channel,
         color: Rgb,
         editable: bool,
+        target: Option<&iced::widget::Id>,
     ) -> iced::widget::Column<'_, Edit> {
         let raw = self.fields[channel.index()]
             .clone()
@@ -239,10 +251,13 @@ impl Editor {
             .style(move |_| container::Style::default().background(color.color()));
         column![
             swatch,
-            text_input("#RRGGBB", &raw)
-                .size(12)
-                .padding(4)
-                .on_input_maybe(editable.then_some(move |value| Edit::Rgb(channel, value))),
+            crate::settings_search::mark_input(
+                text_input("#RRGGBB", &raw)
+                    .size(12)
+                    .padding(4)
+                    .on_input_maybe(editable.then_some(move |value| Edit::Rgb(channel, value))),
+                target,
+            ),
         ]
         .width(Length::Fill)
         .spacing(3)

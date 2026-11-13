@@ -313,6 +313,7 @@ impl<'a> TrafIn<'a> {
         &mut self,
         chan: ChanNum,
         buf: &mut [u8],
+        wipe: bool,
     ) -> (usize, ChanData) {
         match self.state {
             RxState::InChannelData { chan: c, dt, ref mut idx, len }
@@ -320,7 +321,11 @@ impl<'a> TrafIn<'a> {
             {
                 debug_assert!(len > *idx);
                 let wlen = (len - *idx).min(buf.len());
-                buf[..wlen].copy_from_slice(&self.buf[*idx..*idx + wlen]);
+                let source = &mut self.buf[*idx..*idx + wlen];
+                buf[..wlen].copy_from_slice(source);
+                if wipe {
+                    source.zeroize();
+                }
                 *idx += wlen;
 
                 if *idx == len {
@@ -336,6 +341,7 @@ impl<'a> TrafIn<'a> {
     pub fn discard_read_channel(&mut self, chan: ChanNum) -> usize {
         match self.state {
             RxState::InChannelData { chan: c, idx, len, .. } if c == chan => {
+                self.buf[idx..len].zeroize();
                 self.state = RxState::Idle;
                 len - idx
             }
@@ -532,11 +538,13 @@ impl<'a> TrafOut<'a> {
         if wbuf.len() < SSH_PAYLOAD_START {
             return error::NoRoom.fail();
         }
-        let plen = sshwire::write_ssh(&mut wbuf[SSH_PAYLOAD_START..], &p)?;
-        trace!("Sending {p:?}");
-
-        // Encrypt in place
-        let elen = keys.encrypt(plen, wbuf)?;
+        let elen = (|| {
+            let plen = sshwire::write_ssh(&mut wbuf[SSH_PAYLOAD_START..], &p)?;
+            trace!("Sending {p:?}");
+            keys.encrypt(plen, wbuf)
+        })()
+        // A partial encode or failed encryption can leave plaintext in this suffix.
+        .inspect_err(|_| wbuf.zeroize())?;
         self.state = TxState::Write { idx, len: len + elen };
         Ok(())
     }

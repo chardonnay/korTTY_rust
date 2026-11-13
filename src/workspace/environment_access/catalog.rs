@@ -7,6 +7,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::{profile, ssh_dialog::unsafe_text};
 
+pub(crate) mod java;
+
 pub(super) use crate::connection_store::TabColor as Rgb;
 
 const VERSION: u32 = 1;
@@ -228,12 +230,7 @@ impl Catalog {
         }
         let mut ids = std::collections::BTreeSet::new();
         for item in &self.custom {
-            let valid_id = item.id.strip_prefix("custom-").is_some_and(|suffix| {
-                suffix.len() == 32
-                    && suffix
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            });
+            let valid_id = valid_custom_id(&item.id, 32) || valid_custom_id(&item.id, 8);
             if !valid_id || !ids.insert(&item.id) || checked_name(&item.label)? != item.label {
                 return Err(invalid("invalid environment definition"));
             }
@@ -249,6 +246,15 @@ impl Catalog {
         }
         Ok(())
     }
+}
+
+fn valid_custom_id(id: &str, digits: usize) -> bool {
+    id.strip_prefix("custom-").is_some_and(|suffix| {
+        suffix.len() == digits
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 fn checked_name(value: &str) -> io::Result<&str> {

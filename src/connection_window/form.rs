@@ -12,14 +12,17 @@ use crate::connection_store::{
     Auth, AuthMethod, Connection, MAX_TUNNELS, SavedLogin, TunnelConfig, TunnelRule, TunnelTarget,
 };
 use crate::session_security::IsolationLevel;
-use crate::ssh_dialog::{KeyChoice, LoginTarget, StartupField, StartupFields, normalize_host};
+use crate::ssh_dialog::{
+    KeepAliveEdit, KeyChoice, LoginTarget, StartupField, StartupFields, normalize_host,
+};
 use crate::terminal_effects::Effect;
 
 use super::color::ColorDraft;
 use super::view::ViewChoices;
-use super::{CredentialChoice, Message, os_badge};
+use super::{CredentialChoice, Message, os_badge, terminal_overrides};
 
 mod effects;
+mod geometry;
 use effects::EffectDraft;
 
 #[derive(Clone, Debug)]
@@ -30,6 +33,7 @@ pub enum Edit {
     Incognito(bool),
     Isolation(IsolationLevel),
     Startup(StartupField, String),
+    KeepAlive(KeepAliveEdit),
     Logging(crate::terminal_logging::Edit),
     TerminalEffect(Option<Effect>),
     TerminalEffectSpeed(String),
@@ -39,6 +43,8 @@ pub enum Edit {
     ToggleOsBadgePicker,
     OsBadge(Option<String>),
     PasteWarning(Option<PasteWarningMode>),
+    Terminal(terminal_overrides::Edit),
+    WindowGeometry(geometry::Edit),
     UseJump(bool),
     Login(bool, LoginEdit),
     AddTunnel,
@@ -157,6 +163,8 @@ pub(super) struct Draft {
     os_badge: Option<String>,
     badge_picker_open: bool,
     paste_warning: Option<PasteWarningMode>,
+    terminal: terminal_overrides::Draft,
+    window_geometry: geometry::Draft,
     login: Login,
     jump: Option<Login>,
     tunnels: Vec<TunnelDraft>,
@@ -210,6 +218,8 @@ impl Draft {
             os_badge: None,
             badge_picker_open: false,
             paste_warning: None,
+            terminal: terminal_overrides::Draft::new(&Default::default()),
+            window_geometry: geometry::Draft::new(None),
             login: Login::new(),
             jump: None,
             tunnels: Vec::new(),
@@ -237,6 +247,12 @@ impl Draft {
             os_badge: os_badge.map(str::to_owned),
             badge_picker_open: false,
             paste_warning: connection.paste_warning,
+            terminal: terminal_overrides::Draft::new(&connection.terminal),
+            window_geometry: geometry::Draft::new(if duplicate {
+                None
+            } else {
+                connection.window_geometry
+            }),
             login: Login::from_saved(&connection.login),
             jump: connection.jump.as_ref().map(Login::from_saved),
             tunnels: connection
@@ -260,6 +276,7 @@ impl Draft {
             Edit::Incognito(enabled) => self.incognito = enabled,
             Edit::Isolation(level) => self.isolation = level,
             Edit::Startup(field, value) => self.startup.update(field, value),
+            Edit::KeepAlive(edit) => self.startup.update_keepalive(edit),
             Edit::Logging(edit) => self.logging.update(edit),
             Edit::TerminalEffect(effect) => self.terminal_effect.effect = effect,
             Edit::TerminalEffectSpeed(value) => self.terminal_effect.set_speed(value),
@@ -282,6 +299,14 @@ impl Draft {
                 self.os_badge = badge;
             }
             Edit::PasteWarning(mode) => self.paste_warning = mode,
+            Edit::Terminal(edit) => {
+                self.changed |= self.terminal.update(edit);
+                return;
+            }
+            Edit::WindowGeometry(edit) => {
+                self.changed |= self.window_geometry.update(edit);
+                return;
+            }
             Edit::UseJump(true) => {
                 self.jump.get_or_insert_with(Login::new);
             }
@@ -350,6 +375,8 @@ impl Draft {
             command_timestamps: self.command_timestamps,
             tab_color,
             paste_warning: self.paste_warning,
+            window_geometry: self.window_geometry.value()?,
+            terminal: self.terminal.value()?,
         };
         connection.validate().map_err(|error| error.to_string())?;
         Ok(connection)
@@ -360,7 +387,6 @@ impl Draft {
         choices: &ViewChoices<'_>,
         custom_badges: &'a Catalog,
         group: Element<'a, Message>,
-        can_save: bool,
     ) -> Element<'a, Message> {
         let valid = self.connection();
         let paste_choice = |mode| PasteChoice {
@@ -449,6 +475,7 @@ impl Draft {
             self.startup
                 .view(135.0)
                 .map(|(field, value)| Message::Edit(Edit::Startup(field, value))),
+            self.startup.keepalive_view(135.0).map(|edit| Message::Edit(Edit::KeepAlive(edit))),
             checkbox(self.incognito)
                 .label(if choices.incognito_allowed {
                     "Incognito session"
@@ -461,7 +488,9 @@ impl Draft {
                         .then_some(|value| Message::Edit(Edit::Incognito(value)))
                 ),
         ]
-        .spacing(8);
+        .spacing(8)
+        .push(self.terminal.view(choices).map(|edit| Message::Edit(Edit::Terminal(edit))))
+        .push(self.window_geometry.view().map(|edit| Message::Edit(Edit::WindowGeometry(edit))));
         if let Some(effects) = choices.terminal_effects {
             editor = editor.push(self.terminal_effect.view(effects));
         }
@@ -502,18 +531,6 @@ impl Draft {
         for (index, tunnel) in self.tunnels.iter().enumerate() {
             editor = editor.push(tunnel.view(index));
         }
-        editor = editor.push(
-            row![
-                button("Save").on_press_maybe((can_save && valid.is_ok()).then_some(Message::Save)),
-                button(if self.changed {
-                    "Discard draft"
-                } else {
-                    "Cancel"
-                })
-                .on_press(Message::CancelEdit),
-            ]
-            .spacing(8),
-        );
         if let Err(error) = valid {
             editor = editor.push(text(error).size(13));
         }

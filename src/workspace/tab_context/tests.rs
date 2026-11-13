@@ -82,6 +82,7 @@ fn tab_journal_records_note_and_screenshot_for_the_clicked_background_tab() {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
+    use iced::futures::{FutureExt as _, StreamExt as _};
     use iced::widget::text_editor;
     use kortty_terminal::TerminalProfile;
 
@@ -99,23 +100,41 @@ fn tab_journal_records_note_and_screenshot_for_the_clicked_background_tab() {
         crate::private_files::nonce().unwrap(),
     )));
     fs::create_dir(&scratch.0).unwrap();
-    fn wait(mut ready: impl FnMut() -> bool) {
+    fn wait(step: &str, mut ready: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(8);
         while !ready() {
             assert!(
                 Instant::now() < deadline,
-                "journal context-menu fixture did not finish"
+                "journal context-menu fixture timed out waiting for {step}"
             );
             std::thread::sleep(Duration::from_millis(5));
         }
+    }
+    fn next_output(step: &str, task: Task<Desktop>) -> Desktop {
+        let mut stream = iced_runtime::task::into_stream(task)
+            .unwrap_or_else(|| panic!("{step} did not schedule a task"));
+        let mut output = None;
+        wait(step, || match stream.next().now_or_never() {
+            Some(Some(iced_runtime::Action::Output(message))) => {
+                output = Some(message);
+                true
+            }
+            Some(_) => panic!("{step} ended without a completion message"),
+            None => false,
+        });
+        output.unwrap()
     }
     let mut workspace = Workspace::default();
     workspace.window_settings.session_journal.directory =
         scratch.0.join("journals").to_str().unwrap().into();
     let (owner, _) = workspace.open_window(false);
-    let grid = GridSize::default();
+    let grid = GridSize {
+        columns: 32,
+        rows: 8,
+        ..GridSize::default()
+    };
     let shell = Session::start(grid, TerminalProfile::Xterm).unwrap();
-    wait(|| shell.journal_available());
+    wait("shell readiness", || shell.journal_available());
     let session = workspace.store_session(shell, grid, 14);
     workspace.add_tab(owner, session);
     let background = workspace.windows[&owner].active_tab_id().unwrap();
@@ -124,29 +143,37 @@ fn tab_journal_records_note_and_screenshot_for_the_clicked_background_tab() {
     let invoke = |workspace: &mut Workspace, action| {
         let request = open_menu(workspace, owner, background);
         let _ = workspace.update(Desktop::TabContext(owner, Message::OpenJournal(request)));
-        let _ = workspace.update(Desktop::TabContext(
+        workspace.update(Desktop::TabContext(
             owner,
             Message::Invoke(request, Action::Journal(action)),
-        ));
+        ))
     };
-    invoke(&mut workspace, TabJournalAction::Start(None));
+    let start = invoke(&mut workspace, TabJournalAction::Start(None));
     let (TabJournalAction::Stop(run), true) =
         workspace.tab_journal_actions(owner, background).unwrap()[0]
     else {
         panic!("clicked tab did not start recording");
     };
-    wait(|| !workspace.journal_metadata_captures().is_empty());
-    let capture = workspace.journal_metadata_captures().pop().unwrap();
-    // Test doubles for delivery of the real startup and attachment work to Iced.
-    let _ = workspace.update(Desktop::JournalCapture(CaptureMessage::Started(
-        background, run,
-    )));
-    let _ = workspace.update(Desktop::JournalCapture(CaptureMessage::Attached(
-        background,
-        run,
-        session,
-        Ok(()),
-    )));
+    let started = next_output("journal startup", start);
+    assert!(matches!(
+        &started,
+        Desktop::JournalCapture(CaptureMessage::Started(tab, running))
+            if (*tab, *running) == (background, run)
+    ));
+    let capture = workspace
+        .journal_metadata_captures()
+        .pop()
+        .expect("journal startup must create a capture");
+    let attached = next_output("terminal attachment", workspace.update(started));
+    assert!(
+        matches!(
+            &attached,
+            Desktop::JournalCapture(CaptureMessage::Attached(tab, running, source, Ok(())))
+                if (*tab, *running, *source) == (background, run, session)
+        ),
+        "{attached:?}"
+    );
+    let _ = workspace.update(attached);
     let _ = workspace.update(Desktop::SessionUpdate(session));
     assert_eq!(workspace.windows[&owner].active_tab_id(), Some(selected));
     assert!(
@@ -157,7 +184,7 @@ fn tab_journal_records_note_and_screenshot_for_the_clicked_background_tab() {
             .all(|(_, enabled)| !enabled)
     );
 
-    invoke(&mut workspace, TabJournalAction::Note(Some(run)));
+    let _ = invoke(&mut workspace, TabJournalAction::Note(Some(run)));
     let dialog = workspace.tab_journal_note_for_owner(owner).unwrap();
     assert_eq!(workspace.owner_dialog(owner).unwrap().0, dialog);
     assert_eq!(
@@ -177,17 +204,21 @@ fn tab_journal_records_note_and_screenshot_for_the_clicked_background_tab() {
     ));
     assert!(workspace.tab_journal_note_for_owner(owner).is_none());
     assert_eq!(workspace.windows[&owner].active_tab_id(), Some(selected));
-    invoke(&mut workspace, TabJournalAction::Screenshot(Some(run)));
-    wait(|| {
-        session_journal::read(capture.directory()).is_ok_and(|journal| {
-            journal
-                .timeline
-                .iter()
-                .any(|entry| entry.screenshot.is_some())
-        })
-    });
-    invoke(&mut workspace, TabJournalAction::Stop(run));
-    wait(|| capture.done().is_closed());
+    let screenshot = next_output(
+        "screenshot queue",
+        invoke(&mut workspace, TabJournalAction::Screenshot(Some(run))),
+    );
+    assert!(
+        matches!(
+            &screenshot,
+            Desktop::JournalCapture(CaptureMessage::ScreenshotSaved(window, tab, running, Ok(_)))
+                if (*window, *tab, *running) == (owner, background, run)
+        ),
+        "{screenshot:?}"
+    );
+    let _ = workspace.update(screenshot);
+    let _ = invoke(&mut workspace, TabJournalAction::Stop(run));
+    wait("journal drain", || capture.done().is_closed());
     assert_eq!(capture.status(), Status::Complete);
     let journal = session_journal::read(capture.directory()).unwrap();
     assert!(
@@ -200,11 +231,11 @@ fn tab_journal_records_note_and_screenshot_for_the_clicked_background_tab() {
         journal
             .timeline
             .iter()
-            .any(|entry| entry.kind == "SCREENSHOT")
+            .any(|entry| entry.kind == "SCREENSHOT" && entry.screenshot.is_some())
     );
     assert_eq!(workspace.windows[&owner].active_tab_id(), Some(selected));
     let done = workspace.sessions[&session].session.stop();
-    wait(|| done.is_closed());
+    wait("shell shutdown", || done.is_closed());
 }
 
 #[test]
@@ -463,6 +494,8 @@ fn saved_tab_group_changes_only_when_the_connection_folder_changes() {
                 command_timestamps: None,
                 tab_color: None,
                 paste_warning: None,
+                window_geometry: None,
+                terminal: Default::default(),
             },
             Some(&folder),
         )
@@ -651,7 +684,10 @@ fn tab_watch_real_output_marks_a_moved_tab_and_focus_clears_it() {
     let after_output = Instant::now();
     let _ = workspace.poll_tab_watches(after_output);
     let request = workspace.poll_tab_watches(after_output + Duration::from_secs(5));
-    assert_eq!(request.units(), 1);
+    // The window attention request is joined by native notification delivery
+    // on platforms that submit the notification through the window event loop.
+    let native_notification = usize::from(cfg!(any(target_os = "macos", windows)));
+    assert_eq!(request.units(), 1 + native_notification);
     let tab = workspace.windows[&destination].tab().unwrap();
     assert_eq!(
         tab.watch.attention_text().as_deref(),

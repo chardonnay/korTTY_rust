@@ -15,7 +15,12 @@ impl Terminal {
     /// Captures primary history and archives nonempty visible primary rows.
     /// The active alternate screen is temporary and excluded.
     pub fn reconnect_history(&self) -> ReconnectHistory {
-        ReconnectHistory(self.model.primary.copy_reconnect_history())
+        self.reconnect_history_with_presentation(&[])
+    }
+
+    /// Captures opaque presentation marks only on the retained primary rows.
+    pub fn reconnect_history_with_presentation(&self, presentation: &[u64]) -> ReconnectHistory {
+        ReconnectHistory(self.model.primary.copy_reconnect_history(presentation))
     }
 
     /// Prepends older styled rows behind the new connection's output.
@@ -26,9 +31,23 @@ impl Terminal {
     /// connection. Already-truncated command ranges are invalidated if they
     /// would begin in the earlier session. Strict mode drops imported graphics
     /// and applies the same HTTP(S) and length bounds as incoming OSC 8.
-    pub fn prepend_reconnect_history(&mut self, ReconnectHistory(mut older): ReconnectHistory) {
+    pub fn prepend_reconnect_history(&mut self, older: ReconnectHistory) {
+        self.prepend_reconnect_history_with_presentation(older, &[]);
+    }
+
+    /// Returns the allowlisted marks that survived reflow and the replacement's history budget.
+    pub fn prepend_reconnect_history_with_presentation(
+        &mut self,
+        ReconnectHistory(mut older): ReconnectHistory,
+        presentation: &[u64],
+    ) -> Vec<u64> {
         let model = &mut self.model;
         let graphics_enabled = model.kitty_graphics_enabled();
+        let newer_marks = if presentation.is_empty() {
+            Vec::new()
+        } else {
+            model.primary.annotations()
+        };
         for line in &mut older.history {
             if model.strict {
                 line.filter_hyperlinks(|link| {
@@ -47,6 +66,10 @@ impl Terminal {
                 if mark.kind.is_timestamp() {
                     return true;
                 }
+                if mark.kind == LineMarkKind::Annotation {
+                    return presentation.contains(&mark.id)
+                        && !newer_marks.iter().any(|(id, _)| *id == mark.id);
+                }
                 if mark.kind != LineMarkKind::Prompt {
                     return false;
                 }
@@ -57,6 +80,7 @@ impl Terminal {
         }
         // Use normal width reflow with a separate blank grid, so the old last
         // row cannot join or overwrite the replacement's first row.
+        older.scrollback_config = model.primary.scrollback_config;
         older.resize(model.columns, 1);
         let mut placements_left = MAX_IMAGE_PLACEMENTS.saturating_sub(
             image_lines(&model.primary)
@@ -66,7 +90,15 @@ impl Terminal {
         );
         let retained = model.primary.prepend_history(older);
         let mut image_rows = 0;
+        let mut retained_marks = Vec::new();
         for line in model.primary.history.iter_mut().take(retained).rev() {
+            if !presentation.is_empty() {
+                retained_marks.extend(
+                    line.marks.iter().filter_map(|mark| {
+                        (mark.kind == LineMarkKind::Annotation).then_some(mark.id)
+                    }),
+                );
+            }
             line.images.retain(|placement| {
                 if placements_left == 0 || !model.kitty.register_history_image(&placement.image) {
                     return false;
@@ -77,6 +109,7 @@ impl Terminal {
             });
         }
         model.primary.update_history_image_height(image_rows);
+        retained_marks
     }
 }
 
@@ -85,7 +118,7 @@ mod tests {
     use std::borrow::Cow;
     use std::sync::Arc;
 
-    use crate::{Cell, Color, LastOutput, Terminal};
+    use crate::{Cell, Color, LastOutput, ScrollbackConfig, Terminal};
 
     const URL: &str = "https://example.test/reconnect";
     const RED: &[u8] = b"\x1b_Ga=T,i=1,f=24,s=1,v=1,q=2,C=1;/wAA\x1b\\";
@@ -126,6 +159,54 @@ mod tests {
     }
 
     #[test]
+    fn configured_history_survives_reflow_reconnect_and_reset() {
+        let config = ScrollbackConfig {
+            lines: 11_000,
+            memory_mib: 50,
+            compression: false,
+        };
+        let mut old = Terminal::new(16, 2);
+        old.set_scrollback_config(config);
+        old.advance(&b"row\r\n".repeat(10_200));
+        old.advance(RED);
+        let image = old.snapshot().images[0].placement.image.clone();
+        old.advance(b"\r\nnext\r\nlive");
+        old.resize(14, 2);
+        assert_eq!(old.scrollback_config(), config);
+        assert!(old.snapshot().scrollback_lines > 10_000);
+
+        let mut next = Terminal::new(12, 2);
+        next.set_scrollback_config(config);
+        next.prepend_reconnect_history(old.reconnect_history());
+        let history = next.snapshot().scrollback_lines;
+        assert!(history > 10_000);
+        let snapshot = next.scrollback_snapshot();
+        let oldest = snapshot.anchor(history).unwrap();
+        let retained = snapshot.anchor(3).unwrap();
+        let trimmed = ScrollbackConfig {
+            lines: 100,
+            ..config
+        };
+        assert!(next.set_scrollback_config(trimmed));
+        assert_eq!(next.snapshot().scrollback_lines, 100);
+        assert_eq!(next.scrollback_offset(Some(&oldest)), 100);
+        assert_eq!(next.scrollback_offset(Some(&retained)), 3);
+        assert!((1..=6).any(|offset| {
+            next.viewport_snapshot(offset)
+                .images
+                .iter()
+                .any(|placed| Arc::ptr_eq(&placed.placement.image, &image))
+        }));
+
+        next.advance(b"\x1bc");
+        assert_eq!(next.scrollback_config(), trimmed);
+        assert_eq!(next.scrollback_offset(Some(&retained)), 0);
+        next.advance(&b"fresh\r\n".repeat(130));
+        assert_eq!(next.snapshot().scrollback_lines, 100);
+        assert!(!next.compress_idle_scrollback(0));
+    }
+
+    #[test]
     fn reconnect_reflows_hidden_primary_without_importing_alternate_or_modes() {
         let mut old = Terminal::new(6, 2);
         old.advance("abc界de".as_bytes());
@@ -146,6 +227,56 @@ mod tests {
         assert!(!visible.alternate_screen);
         assert!(!visible.application_cursor_keys);
         assert!(!next.bracketed_paste());
+    }
+
+    #[test]
+    fn reconnect_keeps_only_approved_presentation_marks_with_retained_reflowed_rows() {
+        let mut old = Terminal::new(8, 4);
+        old.advance(b"oldest");
+        old.mark_presentation_row(1);
+        old.advance(&b"\r\nfill".repeat(104));
+        old.advance(b"\r\nabcdef");
+        old.mark_presentation_row(2);
+        old.advance(b"\r\npending");
+        old.mark_presentation_row(3);
+
+        let mut next = Terminal::new(4, 2);
+        next.set_scrollback_config(ScrollbackConfig {
+            lines: 100,
+            ..ScrollbackConfig::default()
+        });
+        next.advance(b"new");
+        let before = next.snapshot();
+        let retained = next.prepend_reconnect_history_with_presentation(
+            old.reconnect_history_with_presentation(&[1, 2, 3]),
+            &[1, 2],
+        );
+        assert_eq!(retained, [2]);
+        let [(id, row)]: [(u64, usize); 1] = next.presentation_rows().try_into().unwrap();
+        assert_eq!(id, 2);
+        assert_eq!(text(&next.history_line(row).unwrap()), "abcd");
+        assert_eq!(text(&next.history_line(row + 1).unwrap()), "ef");
+        let after = next.snapshot();
+        assert_eq!(after.cells, before.cells);
+        assert_eq!(after.cursor, before.cursor);
+        assert_eq!(after.scrollback_lines, 100);
+
+        let mut duplicate = Terminal::new(8, 4);
+        duplicate.advance(b"replacement");
+        duplicate.mark_presentation_row(2);
+        assert!(
+            duplicate
+                .prepend_reconnect_history_with_presentation(
+                    old.reconnect_history_with_presentation(&[2]),
+                    &[2],
+                )
+                .is_empty()
+        );
+        assert_eq!(duplicate.presentation_rows().len(), 1);
+        assert_eq!(
+            duplicate.presentation_rows()[0].1,
+            duplicate.snapshot().scrollback_lines
+        );
     }
 
     #[test]

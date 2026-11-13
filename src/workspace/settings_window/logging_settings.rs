@@ -515,8 +515,12 @@ impl Workspace {
         let retention_editable = enabled && policy.retention_days().is_none();
         let folder: Row<'_, Desktop> = row![
             text("Log directory").width(190),
-            text_input("Use the default log folder", &directory).on_input_maybe(
-                folder_editable.then_some(move |value| wrap(id, Edit::Directory(value)))
+            dialog.reveal_input(
+                Setting::LogDirectory,
+                folder_editable,
+                text_input("Use the default log folder", &directory).on_input_maybe(
+                    folder_editable.then_some(move |value| wrap(id, Edit::Directory(value)))
+                ),
             ),
             button("Browse…")
                 .style(button::secondary)
@@ -534,8 +538,12 @@ impl Workspace {
                 (retention_editable && parsed.is_some_and(|days| days > 0))
                     .then(|| wrap(id, Edit::StepRetention(false)))
             ),
-            text_input("0–3650", &retention).width(82).on_input_maybe(
-                retention_editable.then_some(move |value| wrap(id, Edit::Retention(value)))
+            dialog.reveal_input(
+                Setting::LogRetention,
+                retention_editable,
+                text_input("0–3650", &retention).width(82).on_input_maybe(
+                    retention_editable.then_some(move |value| wrap(id, Edit::Retention(value)))
+                ),
             ),
             button("+").on_press_maybe(
                 (retention_editable && parsed.is_some_and(|days| days < 3650))
@@ -585,8 +593,12 @@ impl Workspace {
         let id = dialog.id;
         let folder: Row<'_, Desktop> = row![
             text("Storage folder").width(190),
-            text_input("Use the default journal folder", &directory).on_input_maybe(
-                editable.then_some(move |value| wrap(id, Edit::JournalDirectory(value)))
+            dialog.reveal_input(
+                Setting::JournalDirectory,
+                editable,
+                text_input("Use the default journal folder", &directory).on_input_maybe(
+                    editable.then_some(move |value| wrap(id, Edit::JournalDirectory(value)))
+                ),
             ),
             button("Browse…")
                 .style(button::secondary)
@@ -673,8 +685,12 @@ impl Workspace {
                     .on_toggle_maybe(editable.then_some(move |value| wrap(id, Edit::JournalAiEnabled(value)))),
                 row![
                     text("Local model server").width(190),
-                    text_input(local_ai::DEFAULT_ENDPOINT, endpoint).on_input_maybe(
-                        local_fields_editable.then_some(move |value| wrap(id, Edit::JournalAiEndpoint(value)))
+                    dialog.reveal_input(
+                        Setting::JournalAiProfile,
+                        local_fields_editable,
+                        text_input(local_ai::DEFAULT_ENDPOINT, endpoint).on_input_maybe(
+                            local_fields_editable.then_some(move |value| wrap(id, Edit::JournalAiEndpoint(value)))
+                        ),
                     ),
                 ].spacing(8).align_y(Alignment::Center),
                 row![

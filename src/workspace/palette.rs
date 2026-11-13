@@ -1,13 +1,18 @@
+use std::cmp::Reverse;
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use iced::keyboard::{Key as KeyboardKey, Modifiers, key::Named};
 use iced::{Task, widget, window};
 
-use crate::connection_store::{Connection, Store};
+use crate::clipboard_policy::ServerAccess;
+use crate::connection_store::{Connection, Store, teamwork};
 use crate::snippets::{self, Library, SnippetId};
+use crate::ssh_dialog::LoginTarget;
 
 use super::chrome::Action;
 use super::snippet_access::PaletteTarget;
+use super::ssh_access::TeamworkSelection;
 use super::tab_watch::Kind as WatchKind;
 use super::{Message as Desktop, TabEntry, Window, Workspace};
 
@@ -18,6 +23,9 @@ use model::{Entry, Key, Kind, Mru, Snapshot, Source};
 
 const MAX_QUERY_BYTES: usize = 512;
 const UNAVAILABLE: &str = "Not available right now";
+const TEAMWORK_BADGE: &str = "Shared (Teamwork)";
+const TEAMWORK_RESELECT: &str = "This Teamwork connection changed or is no longer available. Reopen the palette to select it again.";
+const TEAMWORK_DENIED: &str = "Managed policy blocks Teamwork connections.";
 
 #[derive(Clone)]
 pub struct Message {
@@ -72,6 +80,7 @@ struct Picker {
     owner: window::Id,
     request: u64,
     snapshot: Snapshot,
+    teamwork: Option<TeamworkSnapshot>,
     snippet_target: Option<PaletteTarget>,
     field: widget::Id,
     list: widget::Id,
@@ -90,7 +99,7 @@ impl Picker {
             .snapshot
             .query(&self.query, recent)
             .into_iter()
-            .map(|entry| entry.key)
+            .map(|entry| entry.key.clone())
             .collect();
         self.selected = 0;
         self.reason = None;
@@ -109,6 +118,7 @@ impl Picker {
 #[derive(Clone, Default)]
 struct Libraries {
     connections: Vec<ConnectionRow>,
+    teamwork: Option<TeamworkSnapshot>,
     snippets: Vec<Entry>,
     problem: Option<&'static str>,
 }
@@ -119,8 +129,22 @@ struct ConnectionRow {
     incognito: bool,
 }
 
+#[derive(Clone)]
+struct TeamworkSnapshot {
+    catalog: teamwork::Catalog,
+    store_path: PathBuf,
+}
+
+impl TeamworkSnapshot {
+    fn selection(&self, identity: &teamwork::Identity) -> Option<TeamworkSelection> {
+        self.catalog
+            .get(identity)
+            .map(|entry| TeamworkSelection::new(entry, self.store_path.clone()))
+    }
+}
+
 impl Libraries {
-    fn load() -> Self {
+    fn load(catalog: teamwork::Catalog, access: &ServerAccess) -> Self {
         let connections = crate::profile::connections_path().and_then(Store::open);
         let snippets = snippets::profile_path().and_then(Library::open);
         let problem = match (connections.is_err(), snippets.is_err()) {
@@ -129,10 +153,13 @@ impl Libraries {
             (false, true) => Some("Could not read saved snippets."),
             (false, false) => None,
         };
+        let (connections, teamwork) = connections
+            .as_ref()
+            .map(|store| connection_rows(store, catalog, access))
+            .unwrap_or_default();
         Self {
-            connections: connections
-                .as_ref()
-                .map_or_else(|_| Vec::new(), connection_rows),
+            connections,
+            teamwork,
             snippets: snippets.as_ref().map_or_else(|_| Vec::new(), snippet_rows),
             problem,
         }
@@ -260,6 +287,7 @@ impl Workspace {
             owner,
             request,
             snapshot,
+            teamwork: None,
             snippet_target,
             field: widget::Id::unique(),
             list: widget::Id::unique(),
@@ -274,7 +302,15 @@ impl Workspace {
         picker.refresh(&self.palette.recent);
         let focus = picker.focus_field();
         self.palette.open = Some(picker);
-        Task::batch([focus, load(owner, request)])
+        Task::batch([
+            focus,
+            load(
+                owner,
+                request,
+                self.teamwork_catalog(),
+                self.clipboard.policy.server_access().clone(),
+            ),
+        ])
     }
 
     pub(super) fn update_palette(&mut self, owner: window::Id, message: Message) -> Task<Desktop> {
@@ -292,15 +328,20 @@ impl Workspace {
                 Task::none()
             }
             Event::Choose(key, alternate) => self.choose_palette(owner, key, alternate),
-            Event::Loaded(libraries) => {
+            Event::Loaded(mut libraries) => {
                 let problem = libraries.problem;
+                let teamwork = libraries
+                    .teamwork
+                    .take()
+                    .filter(|_| self.teamwork_sync_allowed());
                 let snapshot =
                     self.palette_snapshot(owner, picker.snippet_target.as_ref(), libraries);
                 let picker = self.palette.open.as_mut().expect("current palette");
                 picker.snapshot = snapshot;
+                picker.teamwork = teamwork;
                 picker.loading = false;
                 picker.library_problem = problem;
-                let selected = picker.results.get(picker.selected).copied();
+                let selected = picker.results.get(picker.selected).cloned();
                 picker.refresh(&self.palette.recent);
                 if let Some(index) =
                     selected.and_then(|key| picker.results.iter().position(|row| *row == key))
@@ -372,7 +413,7 @@ impl Workspace {
         let Some(key) = key.filter(|key| picker.results.get(picker.selected) == Some(key)) else {
             return Task::none();
         };
-        let Some(entry) = picker.snapshot.entry(key) else {
+        let Some(entry) = picker.snapshot.entry(&key) else {
             return Task::none();
         };
         let alternate = alternate && entry.alternate;
@@ -411,13 +452,41 @@ impl Workspace {
                         .then_some(Activation::Tab(window, tab))
                         .ok_or_else(|| "Finish the dialog in that window first.".into())
                 }),
+            Key::Connection(id)
+                if let Some(profile) = crate::profile::connections_path()
+                    .and_then(Store::open)
+                    .ok()
+                    .and_then(|store| store.local(id).cloned()) =>
+            {
+                match self.palette_connection_reason(false) {
+                    Some(reason) => Err(reason.into()),
+                    None => Ok(Activation::Local(Box::new(profile))),
+                }
+            }
             Key::Connection(id) => self
                 .saved_connection(id)
                 .ok_or_else(|| "The saved connection no longer exists.".to_owned())
                 .and_then(|connection| {
+                    if let Some(reason) = self.blocked_saved_server(&connection) {
+                        return Err(reason);
+                    }
                     match self.palette_connection_reason(connection.incognito) {
                         Some(reason) => Err(reason.into()),
                         None => Ok(Activation::Connection(Box::new(connection))),
+                    }
+                }),
+            Key::Teamwork(_) if !self.teamwork_sync_allowed() => Err(TEAMWORK_DENIED.into()),
+            Key::Teamwork(ref identity) => picker
+                .teamwork
+                .as_ref()
+                .and_then(|snapshot| snapshot.selection(identity))
+                .filter(|selection| selection.matches_catalog(self))
+                .ok_or_else(|| TEAMWORK_RESELECT.into())
+                .and_then(|selection| {
+                    if let Some(reason) = self.blocked_saved_server(selection.connection()) {
+                        Err(reason)
+                    } else {
+                        Ok(Activation::Teamwork(selection))
                     }
                 }),
             Key::Snippet(id) => {
@@ -446,6 +515,10 @@ impl Workspace {
                     }
                     Activation::Connection(connection) => {
                         self.show_saved_ssh(owner, *connection, false)
+                    }
+                    Activation::Local(profile) => self.open_saved_local(owner, *profile),
+                    Activation::Teamwork(selection) => {
+                        self.show_teamwork_ssh(owner, selection, false)
                     }
                     Activation::Snippet(id, alternate) => {
                         self.invoke_palette_snippet(owner, target, id, alternate)
@@ -494,8 +567,13 @@ impl Workspace {
         let connections = libraries
             .connections
             .into_iter()
+            .filter(|entry| {
+                !matches!(entry.row.key, Key::Teamwork(_)) || self.teamwork_sync_allowed()
+            })
             .map(|ConnectionRow { mut row, incognito }| {
-                row.disabled_reason = self.palette_connection_reason(incognito).map(str::to_owned);
+                if let Some(reason) = self.palette_connection_reason(incognito) {
+                    row.disabled_reason = Some(reason.into());
+                }
                 row.enabled = row.disabled_reason.is_none();
                 row
             })
@@ -595,6 +673,8 @@ enum Activation {
     Monitor(u64, WatchKind),
     Tab(window::Id, u64),
     Connection(Box<Connection>),
+    Local(Box<crate::connection_store::LocalProfile>),
+    Teamwork(TeamworkSelection),
     Snippet(SnippetId, bool),
 }
 
@@ -620,33 +700,99 @@ fn tabs_in_palette_order(window: &Window, own: bool) -> Vec<&TabEntry> {
     tabs
 }
 
-fn connection_rows(store: &Store) -> Vec<ConnectionRow> {
-    store
-        .connections()
-        .iter()
+fn connection_rows(
+    store: &Store,
+    catalog: teamwork::Catalog,
+    access: &ServerAccess,
+) -> (Vec<ConnectionRow>, Option<TeamworkSnapshot>) {
+    let mut saved: Vec<_> = store.connections().iter().collect();
+    saved.sort_by_cached_key(|connection| {
+        (
+            Reverse(store.last_used_at(connection.id)),
+            connection.name.to_lowercase(),
+        )
+    });
+    let mut rows: Vec<_> = saved
+        .into_iter()
         .map(|connection| {
-            let endpoint = &connection.login.endpoint;
-            let host = if endpoint.host.contains(':') {
-                format!("[{}]", endpoint.host)
-            } else {
-                endpoint.host.clone()
-            };
-            let address = if endpoint.port == 22 {
-                format!("{}@{host}", endpoint.username)
-            } else {
-                format!("{}@{host}:{}", endpoint.username, endpoint.port)
-            };
             let detail = join_details([
-                &address,
+                &connection_address(&connection.login.endpoint),
                 store.group_of(connection.id).unwrap_or(""),
                 &connection.tag,
             ]);
+            let mut row = Entry::new(Key::Connection(connection.id), &connection.name, detail);
+            row.disabled_reason = connection
+                .blocked_server(access)
+                .map(|(host, port)| super::server_access::blocked_notice(host, port));
             ConnectionRow {
-                row: Entry::new(Key::Connection(connection.id), &connection.name, detail),
+                row,
                 incognito: connection.incognito,
             }
         })
-        .collect()
+        .collect();
+    rows.extend(store.local_profiles().iter().map(|profile| ConnectionRow {
+        row: Entry::new(
+            Key::Connection(profile.id),
+            profile.display_name(),
+            "Local Shell",
+        ),
+        incognito: false,
+    }));
+    let mut shared: Vec<_> = catalog
+        .entries()
+        .filter(|entry| !store.is_teamwork_hidden(entry.identity()))
+        .collect();
+    if shared.is_empty() {
+        return (rows, None);
+    }
+    shared.sort_by_cached_key(|entry| entry.connection.name.to_lowercase());
+    rows.extend(shared.into_iter().map(|entry| {
+        let connection = &entry.connection;
+        let detail = join_details([
+            &connection_address(&connection.login.endpoint),
+            &entry.group,
+        ]);
+        let mut row = Entry::new(
+            Key::Teamwork(entry.identity().clone()),
+            &connection.name,
+            detail,
+        );
+        row.search_detail = Some(join_details([TEAMWORK_BADGE, &row.detail]));
+        row.disabled_reason = connection
+            .blocked_server(access)
+            .map(|(host, port)| super::server_access::blocked_notice(host, port));
+        ConnectionRow {
+            row,
+            incognito: connection.incognito,
+        }
+    }));
+    (
+        rows,
+        Some(TeamworkSnapshot {
+            catalog,
+            store_path: store.path().to_owned(),
+        }),
+    )
+}
+
+fn connection_address(endpoint: &LoginTarget) -> String {
+    let mut address = String::new();
+    if !endpoint.username.is_empty() {
+        address.push_str(&endpoint.username);
+        address.push('@');
+    }
+    if endpoint.host.contains(':') {
+        address.push('[');
+        address.push_str(&endpoint.host);
+        address.push(']');
+    } else {
+        address.push_str(&endpoint.host);
+    }
+    if endpoint.port != 22 {
+        address.push(':');
+        address.push_str(&endpoint.port.to_string());
+    }
+    address
 }
 
 fn snippet_rows(library: &Library) -> Vec<Entry> {
@@ -693,14 +839,19 @@ fn append_query(query: &mut String, input: &str) {
     }
 }
 
-fn load(owner: window::Id, request: u64) -> Task<Desktop> {
+fn load(
+    owner: window::Id,
+    request: u64,
+    catalog: teamwork::Catalog,
+    access: ServerAccess,
+) -> Task<Desktop> {
     Task::perform(
-        async {
+        async move {
             let (send, receive) = async_channel::bounded(1);
             if std::thread::Builder::new()
                 .name("kortty-palette-load".into())
                 .spawn(move || {
-                    let _ = send.send_blocking(Libraries::load());
+                    let _ = send.send_blocking(Libraries::load(catalog, &access));
                 })
                 .is_ok()
                 && let Ok(libraries) = receive.recv().await
@@ -736,7 +887,7 @@ mod tests {
         let _ = workspace.update_palette(owner, send(Event::Search(">Reconnect".into())));
         let open = workspace.palette.open.as_ref().unwrap();
         assert_eq!(open.results.first(), Some(&Key::ReconnectTab));
-        let row = open.snapshot.entry(Key::ReconnectTab).unwrap();
+        let row = open.snapshot.entry(&Key::ReconnectTab).unwrap();
         assert_eq!(row.title, "Reconnect");
         assert_eq!(row.detail, "Tabs");
         assert!(row.shortcut.is_none());
@@ -943,13 +1094,13 @@ mod tests {
         let request = workspace.palette.open.as_ref().unwrap().request;
         let send = |event| Message { request, event };
         let _ = workspace.update_palette(owner, send(Event::Search("security".into())));
-        let old = workspace.palette.open.as_ref().unwrap().results[0];
+        let old = workspace.palette.open.as_ref().unwrap().results[0].clone();
         assert!(matches!(old, Key::Action(_)));
         let snippet = Key::Snippet(SnippetId::try_from("00".repeat(16)).unwrap());
         let _ = workspace.update_palette(
             owner,
             send(Event::Loaded(Libraries {
-                snippets: vec![Entry::new(snippet, "Security", "")],
+                snippets: vec![Entry::new(snippet.clone(), "Security", "")],
                 ..Libraries::default()
             })),
         );
@@ -957,10 +1108,169 @@ mod tests {
         assert_eq!(picker.results[picker.selected], old);
         assert!(picker.results.contains(&snippet));
 
-        let _ = workspace.update_palette(owner, send(Event::Select(snippet)));
+        let _ = workspace.update_palette(owner, send(Event::Select(snippet.clone())));
         let _ = workspace.update_palette(owner, send(Event::Choose(Some(old), false)));
         let picker = workspace.palette.open.as_ref().unwrap();
         assert_eq!(picker.results[picker.selected], snippet);
         assert!(workspace.windows[&owner].pending_snippet_run.is_none());
+    }
+
+    #[test]
+    fn connection_palette_orders_saved_rows_and_omits_only_the_hidden_teamwork_origin() {
+        let profile = snippets::tests::Profile::new();
+        let alpha = profile.0.join("alpha.xml");
+        let beta = profile.0.join("beta.xml");
+        write_shared(&alpha, "Alpha shared", "alpha.example");
+        write_shared(&beta, "Beta shared", "beta.example");
+        let catalog = shared_catalog(&[&alpha, &beta]);
+        let (alpha_entry, beta_key) = {
+            let mut entries = catalog.entries();
+            let alpha_entry = entries.next().unwrap();
+            let beta_key = Key::Teamwork(entries.next().unwrap().identity().clone());
+            (alpha_entry, beta_key)
+        };
+        let mut store = Store::open(profile.0.join("connections.json")).unwrap();
+        let mut local = alpha_entry.connection.clone();
+        local.id = 0;
+        local.name = "Alpha local".into();
+        let alpha_local = store.save(local.clone()).unwrap();
+        local.name = "Zeta local".into();
+        let zeta_local = store.save(local).unwrap();
+        store.record_used_at(zeta_local, 10).unwrap();
+        store
+            .hide_teamwork(&[teamwork::HiddenEntry::from(alpha_entry)])
+            .unwrap();
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        workspace.set_teamwork_catalog_for_test(catalog);
+        let request = populate_connection_palette(&mut workspace, owner, &store);
+        let picker = workspace.palette.open.as_ref().unwrap();
+        assert_eq!(
+            picker.results,
+            [
+                Key::Connection(zeta_local),
+                Key::Connection(alpha_local),
+                beta_key.clone()
+            ]
+        );
+        let beta_row = picker.snapshot.entry(&beta_key).unwrap();
+        assert_eq!(beta_row.detail, "ops@beta.example:2222 · Shared labs");
+        let send = |event| Message { request, event };
+        let _ = workspace.update_palette(owner, send(Event::Search("@teamwork".into())));
+        assert_eq!(
+            workspace.palette.open.as_ref().unwrap().results.as_slice(),
+            std::slice::from_ref(&beta_key)
+        );
+        let _ = workspace.update_palette(owner, send(Event::Choose(Some(beta_key), false)));
+        assert!(workspace.windows[&owner].pending_ssh.is_some());
+        assert!(!workspace.palette.is_open(owner));
+    }
+
+    #[test]
+    fn connection_palette_revalidates_teamwork_route_local_visibility_and_policy() {
+        let profile = snippets::tests::Profile::new();
+        let source = profile.0.join("teamwork.xml");
+        write_shared(&source, "Shared target", "original.example");
+        let original = shared_catalog(&[&source]);
+        let entry = original.entries().next().unwrap();
+        let hidden = teamwork::HiddenEntry::from(entry);
+        let key = Key::Teamwork(entry.identity().clone());
+        let mut store = Store::open(profile.0.join("connections.json")).unwrap();
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        workspace.set_teamwork_catalog_for_test(original.clone());
+        let request = populate_connection_palette(&mut workspace, owner, &store);
+
+        let choose = || Message {
+            request,
+            event: Event::Choose(Some(key.clone()), false),
+        };
+        write_shared(&source, "Shared target", "changed.example");
+        workspace.set_teamwork_catalog_for_test(shared_catalog(&[&source]));
+        let _ = workspace.update_palette(owner, choose());
+        assert!(workspace.windows[&owner].pending_ssh.is_none());
+        assert_eq!(
+            workspace.palette.open.as_ref().unwrap().reason.as_deref(),
+            Some(TEAMWORK_RESELECT)
+        );
+
+        workspace.set_teamwork_catalog_for_test(original);
+        store.hide_teamwork(std::slice::from_ref(&hidden)).unwrap();
+        let _ = workspace.update_palette(owner, choose());
+        assert!(workspace.windows[&owner].pending_ssh.is_none());
+        assert_eq!(
+            workspace.palette.open.as_ref().unwrap().reason.as_deref(),
+            Some(TEAMWORK_RESELECT)
+        );
+
+        store.restore_teamwork(hidden.identity()).unwrap();
+        workspace.clipboard.policy.teamwork_allowed = false;
+        let _ = workspace.update_palette(owner, choose());
+        assert!(workspace.windows[&owner].pending_ssh.is_none());
+        assert_eq!(
+            workspace.palette.open.as_ref().unwrap().reason.as_deref(),
+            Some(TEAMWORK_DENIED)
+        );
+        workspace.palette.dismiss(owner);
+        populate_connection_palette(&mut workspace, owner, &store);
+        assert!(workspace.palette.open.as_ref().unwrap().results.is_empty());
+    }
+
+    fn write_shared(path: &std::path::Path, name: &str, host: &str) {
+        std::fs::write(
+            path,
+            format!("<connections><connection id=\"same-id\"><name>{name}</name><host>{host}</host><port>2222</port><username>ops</username><group>Shared labs</group></connection></connections>"),
+        )
+        .unwrap();
+    }
+
+    fn shared_catalog(sources: &[&std::path::Path]) -> teamwork::Catalog {
+        let settings = teamwork::Settings {
+            sources: sources
+                .iter()
+                .map(|path| teamwork::Source {
+                    kind: teamwork::SourceKind::File,
+                    enabled: true,
+                    location: path.to_str().unwrap().into(),
+                    check_interval_minutes: teamwork::DEFAULT_CHECK_INTERVAL_MINUTES,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        teamwork::Catalog::default().refreshed(&settings.active_sources(true, &[]).unwrap())
+    }
+
+    fn populate_connection_palette(
+        workspace: &mut Workspace,
+        owner: window::Id,
+        store: &Store,
+    ) -> u64 {
+        let _ = workspace.toggle_palette(owner, false);
+        let request = workspace.palette.open.as_ref().unwrap().request;
+        let (connections, teamwork) = connection_rows(
+            store,
+            workspace.teamwork_catalog(),
+            workspace.clipboard.policy.server_access(),
+        );
+        let _ = workspace.update_palette(
+            owner,
+            Message {
+                request,
+                event: Event::Loaded(Libraries {
+                    connections,
+                    teamwork,
+                    ..Libraries::default()
+                }),
+            },
+        );
+        let _ = workspace.update_palette(
+            owner,
+            Message {
+                request,
+                event: Event::Search("@".into()),
+            },
+        );
+        request
     }
 }

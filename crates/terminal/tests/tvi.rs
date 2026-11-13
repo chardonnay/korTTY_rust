@@ -1,6 +1,8 @@
 use std::fmt::Write;
 
-use kortty_terminal::{KeyModifiers, ScreenSnapshot, Terminal, TerminalKey, TerminalProfile};
+use kortty_terminal::{
+    KeyModifiers, ScreenSnapshot, Terminal, TerminalKey, TerminalProfile, TextEncoding,
+};
 
 #[test]
 fn reference_streams_match_across_all_input_boundaries() {
@@ -37,6 +39,253 @@ fn reference_streams_match_across_all_input_boundaries() {
         }
         assert_eq!(capture(&mut terminal), expected, "{profile:?}, bytewise");
     }
+}
+
+#[test]
+fn horizontal_tabs_preserve_existing_cells_and_use_the_active_attributes() {
+    let input = include_bytes!("fixtures/tvi/tvi-tabs.bin");
+    let expected = include_str!("fixtures/tvi/tvi-tabs.expected.txt");
+    for profile in [
+        TerminalProfile::Tvi910,
+        TerminalProfile::Tvi920,
+        TerminalProfile::Tvi925,
+    ] {
+        for chunk_size in [1, 7, input.len()] {
+            let mut terminal = Terminal::with_profile(16, 6, profile);
+            for chunk in input.chunks(chunk_size) {
+                terminal.advance(chunk);
+            }
+            assert_eq!(
+                capture_with_attributes(&mut terminal),
+                expected,
+                "{profile:?}, chunk size {chunk_size}"
+            );
+        }
+    }
+}
+
+#[test]
+fn factory_reset_preserves_saved_cursor_and_attributes() {
+    let input = include_bytes!("fixtures/tvi/tvi-factory-reset-cursor.bin");
+    let expected = include_str!("fixtures/tvi/tvi-factory-reset-cursor.expected.txt");
+    for profile in [TerminalProfile::Tvi920, TerminalProfile::Tvi925] {
+        for chunk_size in [1, 7, input.len()] {
+            let mut terminal = Terminal::with_profile(16, 6, profile);
+            for chunk in input.chunks(chunk_size) {
+                terminal.advance(chunk);
+            }
+            assert_eq!(
+                capture_with_attributes(&mut terminal),
+                expected,
+                "{profile:?}, chunk size {chunk_size}"
+            );
+        }
+    }
+}
+
+fn capture_with_attributes(terminal: &mut Terminal) -> String {
+    let mut capture = capture(terminal);
+    capture.push_str("attributes:\n");
+    let screen = terminal.snapshot();
+    for row in 0..screen.rows {
+        for cell in screen.row(row).unwrap() {
+            capture.push(match (cell.style.inverse, cell.style.underline) {
+                (false, false) => '.',
+                (true, false) => 'I',
+                (false, true) => 'U',
+                (true, true) => 'B',
+            });
+        }
+        capture.push('\n');
+    }
+    capture
+}
+
+#[test]
+fn utf8_text_preserves_latin_characters_and_ascii_graphics_shift() {
+    let input = include_bytes!("fixtures/tvi/tvi-utf8-text.bin");
+    let expected = include_str!("fixtures/tvi/tvi-utf8-text.expected.txt");
+    for profile in [
+        TerminalProfile::Tvi910,
+        TerminalProfile::Tvi920,
+        TerminalProfile::Tvi925,
+    ] {
+        for chunk_size in [1, 7, input.len()] {
+            let mut terminal = Terminal::with_profile(16, 6, profile);
+            for chunk in input.chunks(chunk_size) {
+                terminal.advance(chunk);
+            }
+            assert_eq!(
+                capture(&mut terminal),
+                expected,
+                "{profile:?}, chunk size {chunk_size}"
+            );
+        }
+    }
+}
+
+#[test]
+fn wide_bmp_insertion_uses_the_utf16_length() {
+    let input = include_bytes!("fixtures/tvi/tvi-wide-insert.bin");
+    let expected =
+        include_str!("fixtures/tvi/tvi-wide-insert.expected.txt").replace('\u{e000}', " ");
+    for profile in [
+        TerminalProfile::Tvi910,
+        TerminalProfile::Tvi920,
+        TerminalProfile::Tvi925,
+    ] {
+        for chunk_size in [1, 7, input.len()] {
+            let mut terminal = Terminal::with_profile(16, 6, profile);
+            for chunk in input.chunks(chunk_size) {
+                terminal.advance(chunk);
+            }
+            assert_eq!(
+                capture(&mut terminal),
+                expected,
+                "{profile:?}, chunk size {chunk_size}"
+            );
+        }
+    }
+}
+
+#[test]
+fn wide_utf8_cursor_addresses_and_reports_match_the_pinned_reference() {
+    let input = include_bytes!("fixtures/tvi/tvi-wide-address.bin");
+    let expected = include_str!("fixtures/tvi/tvi-wide-address.expected.txt").replace("\r\n", "\n");
+    for profile in [
+        TerminalProfile::Tvi910,
+        TerminalProfile::Tvi920,
+        TerminalProfile::Tvi925,
+    ] {
+        for split in 0..=input.len() {
+            let mut terminal = Terminal::with_profile(132, 3, profile);
+            terminal.advance(&input[..split]);
+            terminal.advance(&input[split..]);
+            assert_eq!(
+                capture(&mut terminal),
+                expected,
+                "{profile:?}, split {split}"
+            );
+        }
+        let mut terminal = Terminal::with_profile(132, 3, profile);
+        for byte in input {
+            terminal.advance(std::slice::from_ref(byte));
+        }
+        assert_eq!(capture(&mut terminal), expected, "{profile:?}, bytewise");
+    }
+}
+
+#[test]
+fn tall_utf8_cursor_addresses_and_scroll_bounds_match_the_pinned_reference() {
+    let profiles = [
+        TerminalProfile::Tvi910,
+        TerminalProfile::Tvi920,
+        TerminalProfile::Tvi925,
+    ];
+    for (input, expected, columns, profiles) in [
+        (
+            include_bytes!("fixtures/tvi/tvi-tall-address.bin").as_slice(),
+            include_str!("fixtures/tvi/tvi-tall-address.expected.txt"),
+            132,
+            &profiles[..],
+        ),
+        (
+            include_bytes!("fixtures/tvi/tvi-tall-region.bin").as_slice(),
+            include_str!("fixtures/tvi/tvi-tall-region.expected.txt"),
+            12,
+            &profiles[1..],
+        ),
+    ] {
+        let expected = expected.replace("\r\n", "\n");
+        for &profile in profiles {
+            for split in 0..=input.len() {
+                let mut terminal = Terminal::with_profile(columns, 132, profile);
+                terminal.advance(&input[..split]);
+                terminal.advance(&input[split..]);
+                assert_eq!(
+                    capture_tall(&mut terminal),
+                    expected,
+                    "{profile:?}, split {split}"
+                );
+            }
+            let mut terminal = Terminal::with_profile(columns, 132, profile);
+            for byte in input {
+                terminal.advance(std::slice::from_ref(byte));
+            }
+            assert_eq!(
+                capture_tall(&mut terminal),
+                expected,
+                "{profile:?}, bytewise"
+            );
+        }
+    }
+}
+
+#[test]
+fn raw_cursor_addresses_preserve_protocol_bytes_and_invalid_utf8_keeps_the_next_escape() {
+    let profile = TerminalProfile::Tvi925;
+    for encoding in [
+        TextEncoding::Latin1,
+        TextEncoding::Latin9,
+        TextEncoding::Windows1252,
+    ] {
+        let mut terminal = Terminal::with_profile_and_encoding(132, 3, profile, encoding);
+        terminal.advance(b"\x1b=!\x80\x1bnX\x1b=!\xa1\x1bnY");
+        assert_eq!(terminal.take_responses(), b"\x1b=!\x80\x1b=!\xa1");
+        let screen = terminal.snapshot();
+        assert_eq!(screen.row(1).unwrap()[96].text, "X");
+        assert_eq!(screen.row(1).unwrap()[129].text, "Y");
+    }
+
+    let mut terminal = Terminal::with_profile(132, 3, profile);
+    terminal.advance(b"\x1b= \xa1X\x1b= \xc2");
+    terminal.advance(b"\x1bn");
+    assert_eq!(terminal.snapshot().row(0).unwrap()[129].text, "X");
+    assert_eq!(terminal.take_responses(), b"\x1b= \xc2\xa3");
+
+    let mut larger = Terminal::with_profile(200, 3, profile);
+    larger.advance(b"\x1b= \xc2X");
+    assert_eq!(larger.snapshot().row(0).unwrap()[162].text, "X");
+
+    let mut larger = Terminal::with_profile(12, 200, profile);
+    larger.advance(b"\x1b=\xc2 X");
+    assert_eq!(larger.snapshot().row(162).unwrap()[0].text, "X");
+
+    let mut tall = Terminal::with_profile_and_encoding(12, 132, profile, TextEncoding::Latin1);
+    tall.advance(b"\x1b=\x80 gone\x1b=\x81 keep\x1b~\x80\x81\x1b=\x81 \nX\x1bn");
+    let screen = tall.snapshot();
+    assert_eq!(line(&screen, 96).trim_end(), "keep");
+    assert_eq!(line(&screen, 97).trim_end(), "X");
+    assert_eq!(tall.take_responses(), b"\x1b=\x81!");
+
+    let mut tall = Terminal::with_profile(12, 132, profile);
+    tall.advance(b"\x1b=\xc2");
+    tall.advance(b"\x1bn");
+    assert_eq!(tall.take_responses(), b"\x1b=  ");
+}
+
+fn capture_tall(terminal: &mut Terminal) -> String {
+    let screen = terminal.snapshot();
+    let mut capture = format!(
+        "size={}x{}\ncursor={},{}\nhistory={}\nreply=",
+        screen.columns,
+        screen.rows,
+        screen.cursor.column,
+        screen.cursor.row,
+        screen.scrollback_lines,
+    );
+    for byte in terminal.take_responses() {
+        write!(capture, "{byte:02x}").unwrap();
+    }
+    capture.push('\n');
+    for row in 0..screen.rows {
+        let text = line(&screen, row);
+        let text = text.trim_end();
+        if !text.is_empty() {
+            writeln!(capture, "row{row}={text}").unwrap();
+        }
+    }
+    capture
 }
 
 fn capture(terminal: &mut Terminal) -> String {

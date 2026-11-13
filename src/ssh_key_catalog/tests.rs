@@ -42,6 +42,86 @@ fn draft(name: &str, input: KeyInput) -> KeyDraft {
 }
 
 #[test]
+fn plans_managed_key_additions_without_creating_profile_files_or_a_vault() {
+    let scratch = Scratch::new();
+    let root = scratch.profile();
+    let catalog = Catalog::open(root.clone()).unwrap();
+    let planned = catalog
+        .prepare_managed_additions(vec![ManagedAddition {
+            name: "Managed fixture".into(),
+            description: String::new(),
+            passphrase: None,
+        }])
+        .unwrap();
+    assert!(!root.exists());
+    assert!(planned.before.is_none());
+    let [addition] = planned.additions.as_slice() else {
+        panic!("expected one managed key");
+    };
+    assert_eq!(addition.id, 1);
+    assert!(valid_token(&addition.token));
+    let candidate = decode_document(&planned.contents).unwrap();
+    assert_eq!(candidate.next_id, 2);
+    assert_eq!(
+        candidate.records[0].source,
+        KeySource::Managed(addition.token.clone())
+    );
+    assert!(candidate.records[0].passphrase.is_none());
+    validate_prepared_managed_paths(&planned.contents, &planned.additions, &[]).unwrap();
+}
+
+#[test]
+fn managed_addition_plan_preserves_prior_catalogue_and_rejects_unlisted_ids() {
+    let scratch = Scratch::new();
+    let root = scratch.profile();
+    let source = scratch.source("identity", b"test-only private bytes");
+    let mut catalog = Catalog::open(root.clone()).unwrap();
+    catalog
+        .apply(vec![Edit::Add(draft("Existing", KeyInput::Copy(source)))])
+        .unwrap();
+    let current = fs::read(root.join(CATALOG)).unwrap();
+    let planned = catalog
+        .prepare_managed_additions(vec![ManagedAddition {
+            name: "Imported fixture".into(),
+            description: String::new(),
+            passphrase: Some("fedcba9876543210fedcba9876543210".into()),
+        }])
+        .unwrap();
+    assert_eq!(fs::read(root.join(CATALOG)).unwrap(), current);
+    assert_eq!(planned.before, Some(Sha256::digest(&current).into()));
+    let candidate = decode_document(&planned.contents).unwrap();
+    assert_eq!(candidate.records[0], *catalog.get(1).unwrap());
+    assert_eq!(candidate.records[1].id, 2);
+    assert_eq!(
+        candidate.records[1].passphrase.as_deref(),
+        Some("fedcba9876543210fedcba9876543210")
+    );
+    assert!(
+        !root
+            .join(MANAGED)
+            .join(&planned.additions[0].token)
+            .exists()
+    );
+    validate_prepared_managed_additions(Some(&current), &planned.contents, &planned.additions)
+        .unwrap();
+
+    let mut foreign = candidate;
+    foreign.records[0].name = "Changed existing key".into();
+    let foreign = serde_json::to_vec(&foreign).unwrap();
+    assert!(
+        validate_prepared_managed_additions(Some(&current), &foreign, &planned.additions).is_err()
+    );
+    let wrong = PreparedManagedIdentity {
+        id: planned.additions[0].id,
+        token: "0".repeat(32),
+    };
+    let sealed = ["fedcba9876543210fedcba9876543210".into()];
+    validate_prepared_managed_paths(&planned.contents, &planned.additions, &sealed).unwrap();
+    assert!(validate_prepared_managed_paths(&planned.contents, &planned.additions, &[]).is_err());
+    assert!(validate_prepared_managed_paths(&planned.contents, &[wrong], &sealed).is_err());
+}
+
+#[test]
 fn external_and_managed_lifecycle_preserves_ids_and_original_files() {
     let scratch = Scratch::new();
     let source = scratch.source("identity", b"test-only private bytes");

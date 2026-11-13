@@ -10,7 +10,7 @@ use zeroize::Zeroizing;
 use zip::write::SimpleFileOptions;
 use zip::{AesMode, CompressionMethod, System, ZipWriter};
 
-use crate::private_files::{Directory, EntryIdentity, nonce};
+use crate::private_files::{Directory, EntryIdentity, FileStamp, desktop::Document, nonce};
 use crate::snippets::{
     archive::{ZipSettings, encrypt_saved_payload},
     recipients::Choice,
@@ -28,6 +28,7 @@ pub(crate) enum Format {
     Pdf,
     Markdown,
     HtmlBundle,
+    BrowserHtml,
 }
 
 impl Format {
@@ -44,6 +45,7 @@ impl fmt::Display for Format {
             Self::Pdf => "PDF",
             Self::Markdown => "Markdown",
             Self::HtmlBundle => "HTML bundle (complete)",
+            Self::BrowserHtml => "Browser HTML",
         })
     }
 }
@@ -70,6 +72,7 @@ impl Protection {
         match self {
             Self::None if format == Format::Pdf && !multiple => ".pdf",
             Self::None if format == Format::Markdown && !multiple => ".md",
+            Self::None if format == Format::BrowserHtml && !multiple => ".html",
             Self::None | Self::Password(_) => ".zip",
             Self::OpenPgp { .. } if format == Format::Pdf && !multiple => ".pdf.gpg",
             Self::OpenPgp { .. } => ".zip.gpg",
@@ -137,6 +140,7 @@ impl Destination {
 #[derive(Debug, Default)]
 pub(crate) struct Published {
     pub path: PathBuf,
+    pub document: Option<Document>,
     pub exported: usize,
     pub skipped: Vec<String>,
     pub skipped_assets: usize,
@@ -163,6 +167,24 @@ pub(crate) fn publish(
     request: Request<'_>,
     cancelled: &dyn Fn() -> bool,
 ) -> io::Result<Published> {
+    publish_reviewed(
+        destination,
+        selected_count,
+        journals,
+        request,
+        cancelled,
+        &|| Ok(()),
+    )
+}
+
+pub(crate) fn publish_reviewed(
+    destination: &Destination,
+    selected_count: usize,
+    journals: impl IntoIterator<Item = JournalInput>,
+    request: Request<'_>,
+    cancelled: &dyn Fn() -> bool,
+    require_review: &dyn Fn() -> io::Result<()>,
+) -> io::Result<Published> {
     if !(1..=MAX_CATALOG_ROWS).contains(&selected_count) {
         return Err(invalid("Select between 1 and 512 session journals"));
     }
@@ -173,8 +195,16 @@ pub(crate) fn publish(
         links_allowed,
         topic_ai,
     } = request;
+    if format == Format::BrowserHtml
+        && (selected_count != 1 || !matches!(protection, Protection::None) || topic_ai.is_some())
+    {
+        return Err(invalid(
+            "Browser HTML requires one journal and a local HTML destination",
+        ));
+    }
     protection.validate()?;
     check_cancelled(cancelled)?;
+    require_review()?;
     let name = destination
         .path
         .file_name()
@@ -199,8 +229,38 @@ pub(crate) fn publish(
         path: destination.path.clone(),
         ..Published::default()
     };
-    let check = || destination.require_current(&parent, cancelled);
+    let check = || {
+        destination.require_current(&parent, cancelled)?;
+        require_review()
+    };
+    let mut staged = None;
     match protection {
+        Protection::None if format == Format::BrowserHtml => {
+            let snapshot = single_journal(journals)?;
+            let selection = batch.select(&snapshot)?;
+            let (html, stats) = selection.render_browser_html(options, cancelled)?;
+            let html = Zeroizing::new(html);
+            let check = || {
+                snapshot.require_current_source()?;
+                check()
+            };
+            check()?;
+            parent.publish_checked(
+                name,
+                |file| {
+                    if !local_browser_file(file)? {
+                        return Err(invalid("Choose a local drive for the browser HTML file"));
+                    }
+                    write_bytes(file, html.as_bytes(), cancelled)?;
+                    staged = Some(FileStamp::read(file)?);
+                    Ok(())
+                },
+                check,
+            )?;
+            published.exported = 1;
+            published.skipped_assets = stats.skipped_assets;
+            published.incomplete_capture_journals = usize::from(stats.capture_incomplete);
+        }
         Protection::None if format == Format::Markdown && selected_count == 1 => {
             let snapshot = single_journal(journals)?;
             let folder = asset_folder(stem)?;
@@ -211,7 +271,7 @@ pub(crate) fn publish(
             }
             Budget::default().include(&markdown)?;
             check()?;
-            publish_markdown(&parent, name, &folder, &markdown, check, cancelled)?;
+            staged = publish_markdown(&parent, name, &folder, &markdown, check, cancelled)?;
             published.exported = 1;
             published.skipped_assets = markdown.skipped_assets;
         }
@@ -241,7 +301,9 @@ pub(crate) fn publish(
                         check_cancelled(cancelled)?;
                         result
                     } else {
-                        write_bytes(file, &bytes, cancelled)
+                        write_bytes(file, &bytes, cancelled)?;
+                        staged = FileStamp::read(file).ok();
+                        Ok(())
                     }
                 },
                 check,
@@ -277,15 +339,60 @@ pub(crate) fn publish(
             };
             parent.publish_checked(
                 name,
-                |file| batch.write_zip(file, journals, password, &mut published),
+                |file| {
+                    batch.write_zip(&mut *file, journals, password, &mut published)?;
+                    if matches!(protection, Protection::None) {
+                        staged = FileStamp::read(file).ok();
+                    }
+                    Ok(())
+                },
                 check,
             )?;
         }
     }
+    published.document = staged.and_then(|stamp| {
+        Document::from_publication(destination.path.clone(), &parent, name, &stamp).ok()
+    });
     published.warning = parent.sync().err().map(|error| {
         format!("The export was saved. Its folder could not be synchronized ({error}).")
     });
     Ok(published)
+}
+
+#[cfg(windows)]
+fn local_browser_file(file: &std::fs::File) -> io::Result<bool> {
+    kortty_files::is_local_reference_file(file)
+}
+
+#[cfg(target_os = "linux")]
+fn local_browser_file(file: &std::fs::File) -> io::Result<bool> {
+    let filesystem = rustix::fs::fstatfs(file)?;
+    // Common local filesystems, including overlayfs used for local containers.
+    Ok(matches!(
+        filesystem.f_type as u32,
+        0xef53
+            | 0x58465342
+            | 0x9123683e
+            | 0x01021994
+            | 0xf2f52010
+            | 0x2fc12fc1
+            | 0x794c7630
+            | 0x858458f6
+            | 0x4d44
+            | 0x2011bab0
+            | 0x5346544e
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn local_browser_file(file: &std::fs::File) -> io::Result<bool> {
+    const MNT_LOCAL: u32 = 0x0000_1000;
+    Ok(rustix::fs::fstatfs(file)?.f_flags & MNT_LOCAL != 0)
+}
+
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+fn local_browser_file(_file: &std::fs::File) -> io::Result<bool> {
+    Ok(false)
 }
 
 fn single_journal(journals: impl IntoIterator<Item = JournalInput>) -> io::Result<Snapshot> {
@@ -425,6 +532,7 @@ impl Batch<'_> {
                     published.incomplete_capture_journals += usize::from(stats.capture_incomplete);
                     stats.skipped_assets
                 }
+                Format::BrowserHtml => return Err(invalid("Browser HTML cannot be archived")),
             };
             published.exported += 1;
             published.skipped_assets += skipped_assets;
@@ -487,7 +595,7 @@ fn publish_markdown(
     markdown: &Markdown,
     check: impl Fn() -> io::Result<()>,
     cancelled: &dyn Fn() -> bool,
-) -> io::Result<()> {
+) -> io::Result<Option<FileStamp>> {
     let mut assets = if markdown.assets.is_empty() {
         None
     } else {
@@ -498,9 +606,14 @@ fn publish_markdown(
         }
         Some(stage)
     };
+    let mut staged = None;
     parent.publish_checked(
         name,
-        |file| write_bytes(file, markdown.text.as_bytes(), cancelled),
+        |file| {
+            write_bytes(file, markdown.text.as_bytes(), cancelled)?;
+            staged = FileStamp::read(file).ok();
+            Ok(())
+        },
         || {
             check()?;
             if let Some(stage) = &mut assets {
@@ -515,7 +628,7 @@ fn publish_markdown(
     if let Some(stage) = &mut assets {
         stage.assets = None;
     }
-    Ok(())
+    Ok(staged)
 }
 
 struct AssetStage<'a> {

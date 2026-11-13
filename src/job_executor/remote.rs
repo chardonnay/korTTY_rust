@@ -6,21 +6,28 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use kortty_jobs::{Cancellation, RunOutcome, RunRequest};
-use kortty_ssh::sftp::{Attributes, FileKind, Sftp};
-use kortty_ssh::{SshSession, TrustStore};
+use kortty_ssh::sftp::{Attributes, Error, FileKind, Sftp};
+use kortty_ssh::{SshSession, SshTarget, TrustStore};
 
-use crate::scheduler_window::{Archive, ArchiveFormat, RemoteAction, SshCommand};
+use crate::scheduler_window::{
+    Archive, ArchiveFormat, RemoteAction, SshCommand, windows_drive_ancestors,
+};
 use crate::sftp_window::FolderTransfer;
 use crate::ssh_connection;
 
 use super::{
-    BorrowedArchivePassword, CANCELLATION_POLL, COMMAND_TIMEOUT, Completion, Failure, SavedAuth,
-    check_cancelled, connect_failure, connection,
+    BorrowedArchivePassword, CANCELLATION_POLL, COMMAND_TIMEOUT, Completion, ExecutionPolicy,
+    Failure, SavedAuth, check_cancelled, connect_failure, connection,
 };
 
 mod archive;
 mod delete;
-mod transfer;
+mod privileged;
+mod server_archive;
+pub(super) mod sync;
+pub(super) mod transfer;
+
+pub(crate) use archive::{BrowserArchiveManifest, scan_browser_archive};
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -33,42 +40,128 @@ struct Effects {
 
 pub(super) fn run(
     request: &RunRequest<SshCommand>,
-    file_transfer_allowed: bool,
+    policy: &ExecutionPolicy,
     saved_auth: SavedAuth,
     archive_password: BorrowedArchivePassword<'_>,
     trust_store: impl FnOnce() -> io::Result<TrustStore>,
-) -> Result<Completion, Failure> {
+) -> Result<(Completion, Option<String>), Failure> {
     let cancellation = &request.cancellation;
     check_cancelled(cancellation)?;
+    policy.require_target_groups(&request.action)?;
     let action = request.action.remote_action().map_err(Failure::blocked)?;
-    if action.transfers_files() && !file_transfer_allowed {
+    if action.transfers_files() && !policy.file_transfer_allowed {
         return Err(Failure::blocked(
             "Application policy forbids scheduled file transfers",
         ));
     }
+    if let RemoteAction::Privileged(transfer) = action {
+        return privileged::run(request, policy, transfer, saved_auth, trust_store)
+            .map(|completion| (completion, None));
+    }
+    if let RemoteAction::PrivilegedFileAction(metadata) = action {
+        return privileged::run_file_action(request, policy, metadata, saved_auth, trust_store)
+            .map(|completion| (completion, None));
+    }
+    if let RemoteAction::PrivilegedArchive(archive) = action {
+        return privileged::run_archive(request, policy, archive, saved_auth, trust_store)
+            .map(|completion| (completion, None));
+    }
+    if let RemoteAction::PrivilegedTreeUpload(copy) | RemoteAction::PrivilegedTreeDownload(copy) =
+        action
+    {
+        return privileged::run_tree(request, policy, copy, saved_auth, trust_store)
+            .map(|completion| (completion, None));
+    }
+    if let RemoteAction::Sync(copy) = action {
+        return sync::run(request, policy, copy, saved_auth, trust_store);
+    }
     let archive_password = require_archive_password(action, archive_password)?;
     let saved_auth = saved_auth.map_err(Failure::blocked)?;
+    let (target, jumps) = connection::route(&request.action, saved_auth, &policy.server_access)?;
     let trust =
         trust_store().map_err(|_| Failure::failed("Could not access SSH host-key trust store"))?;
-    let (target, jumps) = connection::route(&request.action, saved_auth)?;
+    policy.require_target_groups(&request.action)?;
     let cancelled = || cancellation.is_requested();
-    let tcp =
-        ssh_connection::connect_transport(&jumps.first().unwrap_or(&target).endpoint, cancelled);
+    if let RemoteAction::ServerArchive(archive) = action {
+        return server_archive::run(request, archive, policy, target, jumps, &trust)
+            .map(|completion| (completion, None));
+    }
+    if let RemoteAction::RsyncDownload(transfer) | RemoteAction::RsyncUpload(transfer) = action {
+        return super::rsync::run(
+            request,
+            transfer,
+            matches!(action, RemoteAction::RsyncUpload(_)),
+            policy,
+            target,
+            jumps,
+            &trust,
+        )
+        .map(|completion| (completion, None));
+    }
+    let session = open_group_subsystem(target, jumps, trust, cancelled, &request.action, policy);
     check_cancelled(cancellation)?;
-    let session = SshSession::connect_subsystem_preconnected_cancellable(
+    policy.require_target_groups(&request.action)?;
+    let mut session = session?;
+    let detail = supervise(&mut session, action, archive_password, cancellation)?;
+    let mut completion = Completion::from_result(request.id, Ok(0));
+    completion.detail = Some(detail);
+    Ok((completion, None))
+}
+
+fn open_group_subsystem(
+    target: SshTarget,
+    jumps: Vec<SshTarget>,
+    trust: TrustStore,
+    cancelled: impl Fn() -> bool,
+    action: &SshCommand,
+    policy: &ExecutionPolicy,
+) -> Result<SshSession, Failure> {
+    let transfer_helper =
+        matches!(&action.remote, Some(RemoteAction::RsyncUpload(transfer)) if transfer.directory);
+    if !transfer_helper && !policy.has_target_groups(action) {
+        return open_subsystem(target, jumps, trust, cancelled);
+    }
+    policy.require_target_groups(action)?;
+    let tcp =
+        ssh_connection::connect_transport(&jumps.first().unwrap_or(&target).endpoint, &cancelled);
+    policy.require_target_groups(action)?;
+    let opened = SshSession::connect_preconnected_guarded(
+        tcp.map_err(|error| connect_failure(error.into()))?,
+        (target, jumps),
+        trust,
+        if transfer_helper {
+            kortty_ssh::StartupChannel::SftpWithTransferHelper
+        } else {
+            kortty_ssh::StartupChannel::Subsystem("sftp")
+        },
+        cancelled,
+        || {
+            policy
+                .require_target_groups(action)
+                .map_err(|failure| io::Error::new(io::ErrorKind::PermissionDenied, failure.detail))
+        },
+    );
+    policy.require_target_groups(action)?;
+    opened.map_err(connect_failure)
+}
+
+fn open_subsystem(
+    target: SshTarget,
+    jumps: Vec<SshTarget>,
+    trust: TrustStore,
+    cancelled: impl Fn() -> bool,
+) -> Result<SshSession, Failure> {
+    let tcp =
+        ssh_connection::connect_transport(&jumps.first().unwrap_or(&target).endpoint, &cancelled);
+    SshSession::connect_subsystem_preconnected_cancellable(
         tcp.map_err(|error| connect_failure(error.into()))?,
         target,
         jumps,
         trust,
         "sftp",
         cancelled,
-    );
-    check_cancelled(cancellation)?;
-    let mut session = session.map_err(connect_failure)?;
-    let detail = supervise(&mut session, action, archive_password, cancellation)?;
-    let mut completion = Completion::from_result(request.id, Ok(0));
-    completion.detail = Some(detail);
-    Ok(completion)
+    )
+    .map_err(connect_failure)
 }
 
 pub(super) fn require_archive_password<'a>(
@@ -180,6 +273,12 @@ fn wait_for_worker(
                 (transfer::FolderRemains::LocalStage, _) => {
                     "SFTP folder download stopped. Its private local staging folder could not be removed."
                 }
+                (transfer::FolderRemains::LocalPublished, _) => {
+                    "SFTP folder download stopped after the complete local folder was published."
+                }
+                (transfer::FolderRemains::LocalPublicationUncertain, _) => {
+                    transfer::LOCAL_PUBLICATION_UNCERTAIN
+                }
             };
         }
     }
@@ -212,7 +311,11 @@ fn wait(
 }
 
 fn before_change(cancellation: &Cancellation) -> Result<(), Failure> {
-    if cancellation.is_requested() {
+    before_change_if(cancellation.is_requested())
+}
+
+fn before_change_if(stopped: bool) -> Result<(), Failure> {
+    if stopped {
         Err(Failure {
             outcome: RunOutcome::Cancelled,
             detail: "SFTP job cancelled. A file-system change may have completed.",
@@ -231,7 +334,7 @@ fn execute(
 ) -> Result<String, Failure> {
     let detail = match action {
         RemoteAction::Mkdir { path } => {
-            let mut parent = "/";
+            let mut parent = path.root();
             for directory in path.prefixes() {
                 before_change(cancellation)?;
                 match client.lstat(directory) {
@@ -338,6 +441,11 @@ fn execute(
                 &mut effects.archive_published,
             );
         }
+        RemoteAction::ServerArchive(_) => {
+            return Err(Failure::blocked(
+                "Server-only archive creation requires its verified command channel.",
+            ));
+        }
         RemoteAction::Delete {
             path, recursive, ..
         } => {
@@ -393,6 +501,23 @@ fn execute(
         } => {
             return transfer::download(client, remote, local, cancellation);
         }
+        RemoteAction::Sync(_) => {
+            return Err(Failure::blocked("Reviewed SFTP approval is required."));
+        }
+        RemoteAction::Privileged(_)
+        | RemoteAction::PrivilegedFileAction(_)
+        | RemoteAction::PrivilegedArchive(_)
+        | RemoteAction::PrivilegedTreeUpload(_)
+        | RemoteAction::PrivilegedTreeDownload(_) => {
+            return Err(Failure::blocked(
+                "Reviewed privileged transfer approval is required.",
+            ));
+        }
+        RemoteAction::RsyncDownload(_) | RemoteAction::RsyncUpload(_) => {
+            return Err(Failure::blocked(
+                "Approved rsync configuration is required.",
+            ));
+        }
     };
     Ok(detail.into())
 }
@@ -417,29 +542,61 @@ fn verify_directory_metadata(
     verify_canonical(client, path)
 }
 
-fn verify_entry(
+pub(super) fn verify_entry(
     client: &mut Sftp<impl Read, impl Write>,
     path: &str,
 ) -> Result<Attributes, Failure> {
+    verify_entry_with(client, path, |_, detail| Failure::failed(detail))
+}
+
+fn verify_entry_with<E: From<Failure>>(
+    client: &mut Sftp<impl Read, impl Write>,
+    path: &str,
+    remote_error: impl Fn(Error, &'static str) -> E,
+) -> Result<Attributes, E> {
     let metadata = client
         .lstat(path)
-        .map_err(|_| Failure::failed("Could not read the remote path"))?;
+        .map_err(|error| remote_error(error, "Could not read the remote path"))?;
     if !matches!(metadata.kind(), FileKind::File | FileKind::Directory) {
-        return Err(Failure::failed(
-            "The remote path must refer to an ordinary file or directory",
-        ));
+        return Err(
+            Failure::failed("The remote path must refer to an ordinary file or directory").into(),
+        );
     }
-    verify_canonical(client, path)?;
+    verify_canonical_with(client, path, remote_error)?;
     Ok(metadata)
 }
 
-fn verify_canonical(client: &mut Sftp<impl Read, impl Write>, path: &str) -> Result<(), Failure> {
+pub(super) fn verify_canonical(
+    client: &mut Sftp<impl Read, impl Write>,
+    path: &str,
+) -> Result<(), Failure> {
+    verify_canonical_with(client, path, |_, detail| Failure::failed(detail))
+}
+
+fn verify_canonical_with<E: From<Failure>>(
+    client: &mut Sftp<impl Read, impl Write>,
+    path: &str,
+    remote_error: impl Fn(Error, &'static str) -> E,
+) -> Result<(), E> {
     if client
         .canonicalize(path)
-        .map_err(|_| Failure::failed("Could not verify the remote path"))?
+        .map_err(|error| remote_error(error, "Could not verify the remote path"))?
         != path.as_bytes()
     {
-        return Err(Failure::failed("The remote path must be canonical"));
+        return Err(Failure::failed("The remote path must be canonical").into());
+    }
+    for ancestor in windows_drive_ancestors(path) {
+        if client
+            .lstat(ancestor)
+            .map_err(|error| remote_error(error, "Could not check a Windows drive path ancestor"))?
+            .kind()
+            != FileKind::Directory
+        {
+            return Err(Failure::failed(
+                "Windows drive path ancestors must be ordinary directories",
+            )
+            .into());
+        }
     }
     Ok(())
 }
@@ -448,6 +605,113 @@ fn verify_canonical(client: &mut Sftp<impl Read, impl Write>, path: &str) -> Res
 mod tests {
     use super::*;
     use crate::job_executor::tests::scheduled_request;
+
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires the disposable Win32 OpenSSH SFTP fixture"]
+    fn windows_openssh_scheduler_executes_drive_qualified_sftp_jobs() {
+        use std::{fs, net::SocketAddr, path::PathBuf, sync::Arc};
+
+        use kortty_ssh::{Endpoint, HostKey};
+        use serde_json::json;
+
+        let required =
+            |key| std::env::var(key).unwrap_or_else(|_| panic!("set {key} for the fixture"));
+        let fixture = PathBuf::from(required("KORTTY_WINDOWS_RELAY_FIXTURE"));
+        let address: SocketAddr = required("KORTTY_WINDOWS_RELAY_ADDRESS").parse().unwrap();
+        assert!(address.ip().is_loopback());
+        let username = required("KORTTY_WINDOWS_RELAY_USER");
+        let key = fs::read_to_string(fixture.join("host.pub")).unwrap();
+        let host_key = HostKey::from_openssh(key.trim()).unwrap();
+        let run_job = |remote, allowed| {
+            let (_, mut request) = scheduled_request();
+            request.action = Arc::new(
+                serde_json::from_value(json!({
+                    "host": address.ip().to_string(),
+                    "port": address.port(),
+                    "username": username,
+                    "key_file": fixture.join("client"),
+                    "remote": remote,
+                }))
+                .unwrap(),
+            );
+            run(
+                &request,
+                &ExecutionPolicy::unrestricted(allowed),
+                Ok(None),
+                Ok(None),
+                || {
+                    assert!(
+                        allowed,
+                        "policy must deny before reading host keys or connecting"
+                    );
+                    let endpoint =
+                        Endpoint::new(&address.ip().to_string(), address.port()).unwrap();
+                    Ok(TrustStore::from_pins(vec![(endpoint, host_key.clone())]).unwrap())
+                },
+            )
+            .map(|(completion, _)| completion)
+        };
+        let directory = fixture.join(format!("drive-path-{}", std::process::id()));
+        let nested = directory.join("new directory");
+        let remote_path = |path: &std::path::Path| {
+            let path = format!("/{}", path.to_str().unwrap().replace('\\', "/"));
+            assert!(
+                crate::scheduler_window::windows_drive_ancestors(&path)
+                    .next()
+                    .is_some()
+            );
+            path
+        };
+        let mkdir = json!({"kind": "mkdir", "path": remote_path(&nested)});
+        assert_eq!(
+            run_job(mkdir.clone(), true)
+                .map_err(|failure| failure.detail)
+                .unwrap()
+                .outcome,
+            RunOutcome::Success
+        );
+        assert!(nested.is_dir());
+        assert_eq!(
+            run_job(mkdir, true)
+                .map_err(|failure| failure.detail)
+                .unwrap()
+                .outcome,
+            RunOutcome::Success
+        );
+
+        let source = nested.join("source bytes");
+        let destination = directory.join("downloaded bytes");
+        fs::write(&source, b"drive-qualified SFTP download\n").unwrap();
+        let download = json!({
+            "kind": "download", "local": destination, "remote": remote_path(&source),
+        });
+        assert!(
+            matches!(run_job(download.clone(), false), Err(failure) if failure.outcome == RunOutcome::Blocked)
+        );
+        assert!(!destination.exists());
+        assert_eq!(
+            run_job(download.clone(), true)
+                .map_err(|failure| failure.detail)
+                .unwrap()
+                .outcome,
+            RunOutcome::Success
+        );
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            b"drive-qualified SFTP download\n"
+        );
+        fs::write(&destination, b"keep this existing destination").unwrap();
+        let failure = run_job(download, true).unwrap_err();
+        assert_eq!(
+            failure.detail,
+            "The local download destination already exists"
+        );
+        assert_eq!(
+            fs::read(destination).unwrap(),
+            b"keep this existing destination"
+        );
+    }
 
     #[test]
     fn sftp_cancellation_retains_known_effects_after_aborting_the_worker() {
@@ -483,6 +747,20 @@ mod tests {
                     ..Effects::default()
                 },
                 "SFTP job cancelled after the server confirmed archive publication.",
+            ),
+            (
+                Effects {
+                    folder_remains: Some(transfer::FolderRemains::LocalPublished),
+                    ..Effects::default()
+                },
+                "SFTP folder download stopped after the complete local folder was published.",
+            ),
+            (
+                Effects {
+                    folder_remains: Some(transfer::FolderRemains::LocalPublicationUncertain),
+                    ..Effects::default()
+                },
+                transfer::LOCAL_PUBLICATION_UNCERTAIN,
             ),
         ] {
             let (scheduler, request) = scheduled_request();

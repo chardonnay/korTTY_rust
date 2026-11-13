@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 use iced::widget::svg::{Handle, Svg};
 
 #[derive(Clone, Copy)]
-pub(super) enum Icon {
+pub(in crate::connection_window) enum Icon {
     AddServer,
     Edit,
     Duplicate,
@@ -28,10 +28,14 @@ pub(super) enum Icon {
     ImportConnections,
     ExportConnections,
     ExportOverview,
+    Serial,
+    Teamwork,
+    Sync,
+    Restore,
 }
 
 impl Icon {
-    const ALL: [Self; 22] = [
+    const ALL: [Self; 26] = [
         Self::AddServer,
         Self::Edit,
         Self::Duplicate,
@@ -54,20 +58,48 @@ impl Icon {
         Self::ImportConnections,
         Self::ExportConnections,
         Self::ExportOverview,
+        Self::Serial,
+        Self::Teamwork,
+        Self::Sync,
+        Self::Restore,
     ];
 
     pub(super) fn widget<'a>(self, size: u32, enabled: bool) -> Svg<'a> {
-        static ACTIVE: OnceLock<[Handle; Icon::ALL.len()]> = OnceLock::new();
-        static DIMMED: OnceLock<[Handle; Icon::ALL.len()]> = OnceLock::new();
-        let cache = if enabled { &ACTIVE } else { &DIMMED };
-        let handles = cache.get_or_init(|| Self::ALL.map(|icon| icon.handle(enabled)));
-        Svg::new(handles[self as usize].clone())
+        Svg::new(self.cached_handle(enabled))
             .width(size)
             .height(size)
     }
 
+    pub(in crate::connection_window) fn cached_handle(self, enabled: bool) -> Handle {
+        static ACTIVE: OnceLock<[Handle; Icon::ALL.len()]> = OnceLock::new();
+        static DIMMED: OnceLock<[Handle; Icon::ALL.len()]> = OnceLock::new();
+        let cache = if enabled { &ACTIVE } else { &DIMMED };
+        let handles = cache.get_or_init(|| Self::ALL.map(|icon| icon.handle(enabled)));
+        handles[self as usize].clone()
+    }
+
     fn handle(self, enabled: bool) -> Handle {
         let (outline, accent, color) = match self {
+            Self::Teamwork => (
+                "M9 4 A3.5 3.5 0 1 0 9.01 4 M2.5 20 Q2.5 14 9 14 Q15.5 14 15.5 20",
+                "M15.5 4.5 A3 3 0 0 1 15.5 10.5 M18 14.3 Q21.5 15.5 21.5 20",
+                "#13a8ad",
+            ),
+            Self::Sync => (
+                "M20 9 A8 8 0 0 0 6 5 L3 8 M3 15 A8 8 0 0 0 17 19 L21 16",
+                "M3 3 V8 H8 M16 16 H21 V21",
+                "#13a8ad",
+            ),
+            Self::Restore => (
+                "M4 6 H20 M9 6 V3.5 H15 V6 M6 6 L7 21 H17 L18 6",
+                "M9 14.5 L12 11.5 L15 14.5 M12 11.5 V18",
+                "#13a8ad",
+            ),
+            Self::Serial => (
+                "M6 10 H18 V12 A6 6 0 0 1 6 12 Z M12 18 V22",
+                "M9 10 V4 M15 10 V4",
+                "#13a8ad",
+            ),
             Self::AddServer => (
                 "M5 3 H19 Q21 3 21 5 V9 Q21 11 19 11 H5 Q3 11 3 9 V5 Q3 3 5 3 M12 21 H5 Q3 21 3 19 V15 Q3 13 5 13 H12 M16 7 H17",
                 "M18 14 V22 M14 18 H22",

@@ -1,16 +1,20 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::time::Instant;
 
 use crate::{
     Cell, Terminal,
     command_timestamps::{Clock, CommandTimestampStatus},
+    is_bidi_control,
     prompts::{LineMark, LineMarkKind},
     screen::{Position, Screen},
 };
 
 const MAX_FINISHED_COMMANDS: usize = 16_384;
 const MAX_LAST_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+const MAX_RECENT_OUTPUT_ROWS: usize = 200;
+const MAX_RECENT_OUTPUT_BYTES: usize = 32 * 1024;
 
 /// A half-open range in the current primary buffer. Rows count from the
 /// oldest retained scrollback line. The range is invalidated by content edits.
@@ -73,7 +77,7 @@ impl CommandMarks {
             LineMarkKind::OutputEnd => {
                 self.finished.remove(&mark.id);
             }
-            LineMarkKind::Prompt | LineMarkKind::Timestamp(_) => {}
+            LineMarkKind::Prompt | LineMarkKind::Timestamp(_) | LineMarkKind::Annotation => {}
         }
     }
 
@@ -266,17 +270,7 @@ impl Screen {
         let mut text = String::new();
         for row in range.start_row..=range.end_row {
             let (cells, wrap) = self.output_line(row)?;
-            let start = if row == range.start_row {
-                usize::from(range.start_column)
-            } else {
-                0
-            };
-            let limit = if row == range.end_row {
-                usize::from(range.end_column)
-            } else {
-                cells.len()
-            };
-            let end = limit.min(wrap.unwrap_or(cells.len())).min(text_end(&cells));
+            let Range { start, end } = output_columns(range, row, &cells, wrap);
             for (offset, cell) in cells.get(start..end).unwrap_or_default().iter().enumerate() {
                 if cell.width == 0 || start + offset + usize::from(cell.width) > end {
                     continue;
@@ -300,6 +294,107 @@ impl Screen {
         }
         Some(text)
     }
+
+    fn recent_output_text(&self, range: LastOutputRange) -> Option<(String, bool)> {
+        let mut parts = Vec::new();
+        let mut remaining = MAX_RECENT_OUTPUT_BYTES;
+        let mut truncated = range.truncated;
+        for row in (range.start_row..=range.end_row).rev() {
+            let (cells, wrap) = self.output_line(row)?;
+            let mut line = visible_output_line(&cells, output_columns(range, row, &cells, wrap));
+            if parts.is_empty() || wrap.is_none() {
+                line.truncate(line.trim_end().len());
+            }
+            if !parts.is_empty() && wrap.is_none() {
+                line.push('\n');
+            }
+            if line.len() > remaining {
+                truncated = true;
+                if parts.is_empty() {
+                    let start = line.ceil_char_boundary(line.len() - remaining);
+                    parts.push(line.split_off(start));
+                }
+                break;
+            }
+            if !line.is_empty() {
+                remaining -= line.len();
+                parts.push(line);
+            }
+        }
+        let mut text: String = parts.into_iter().rev().collect();
+        let leading_blank_bytes: usize = text
+            .split_inclusive('\n')
+            .take_while(|line| line.trim().is_empty())
+            .map(str::len)
+            .sum();
+        text.replace_range(..leading_blank_bytes, "");
+        (!text.is_empty()).then_some((text, truncated))
+    }
+
+    fn recent_tail_range(&self) -> Option<LastOutputRange> {
+        let history = self.history.len();
+        let end_row = self
+            .lines
+            .iter()
+            .rposition(|line| line.cells.iter().any(has_visible_output))
+            .map(|row| history + row)
+            .or_else(|| history.checked_sub(1))?;
+        let start_row = (end_row + 1).saturating_sub(MAX_RECENT_OUTPUT_ROWS);
+        Some(LastOutputRange {
+            start_row,
+            start_column: 0,
+            end_row,
+            end_column: self.lines[0].cells.len() as u16,
+            truncated: start_row > 0,
+        })
+    }
+}
+
+fn output_columns(
+    range: LastOutputRange,
+    row: usize,
+    cells: &[Cell],
+    wrap: Option<usize>,
+) -> Range<usize> {
+    let start = if row == range.start_row {
+        usize::from(range.start_column)
+    } else {
+        0
+    };
+    let limit = if row == range.end_row {
+        usize::from(range.end_column)
+    } else {
+        cells.len()
+    };
+    start..limit.min(wrap.unwrap_or(cells.len())).min(text_end(cells))
+}
+
+fn has_visible_output(cell: &Cell) -> bool {
+    !cell.style.hidden
+        && cell
+            .text
+            .chars()
+            .any(|ch| is_output_character(ch) && !ch.is_whitespace())
+}
+
+fn is_output_character(ch: char) -> bool {
+    !ch.is_control() && !is_bidi_control(ch)
+}
+
+fn visible_output_line(cells: &[Cell], Range { start, end }: Range<usize>) -> String {
+    let mut line = String::new();
+    for (offset, cell) in cells.get(start..end).unwrap_or_default().iter().enumerate() {
+        let width = usize::from(cell.width);
+        if width == 0 || start + offset + width > end {
+            continue;
+        }
+        if cell.style.hidden || cell.text.is_empty() {
+            line.extend(std::iter::repeat_n(' ', width));
+        } else {
+            line.extend(cell.text.chars().filter(|&ch| is_output_character(ch)));
+        }
+    }
+    line
 }
 
 fn text_end(cells: &[Cell]) -> usize {
@@ -353,5 +448,23 @@ impl Terminal {
             return None;
         }
         self.model.primary.output_text(range)
+    }
+
+    /// Reads visible text from the newest finished command or the primary buffer tail.
+    /// The boolean reports whether the capture starts after its source's beginning.
+    pub fn recent_visible_output(&self) -> Result<(String, bool), LastOutput> {
+        if self.model.alternate_screen {
+            return Err(LastOutput::AlternateScreen);
+        }
+        let screen = &self.model.primary;
+        if let LastOutput::Found(range) = self.last_output()
+            && let Some(output) = screen.recent_output_text(range)
+        {
+            return Ok(output);
+        }
+        screen
+            .recent_tail_range()
+            .and_then(|range| screen.recent_output_text(range))
+            .ok_or(LastOutput::NoOutput)
     }
 }

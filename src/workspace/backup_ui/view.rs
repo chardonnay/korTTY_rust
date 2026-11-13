@@ -16,20 +16,39 @@ impl Workspace {
         } else {
             None
         };
-        Some(dialog.view(recipient).map(move |message| wrap(id, message)))
+        let vault_ready = self
+            .vault
+            .as_ref()
+            .is_some_and(VaultWindow::can_manage_environments);
+        Some(
+            dialog
+                .view(
+                    recipient,
+                    vault_ready,
+                    self.clipboard.policy.problem.is_none(),
+                )
+                .map(move |message| wrap(id, message)),
+        )
     }
 }
 
 impl Dialog {
-    fn view(&self, recipient: Option<String>) -> Element<'_, Message> {
+    fn view(
+        &self,
+        recipient: Option<String>,
+        vault_ready: bool,
+        host_import_allowed: bool,
+    ) -> Element<'_, Message> {
         let content = if self.discard.is_some() {
             discard()
+        } else if let Some(review) = &self.host_pins {
+            self.host_pin_view(review, host_import_allowed)
         } else {
             match &self.phase {
                 Phase::Form => self.form(recipient),
                 Phase::Browse(browser) => self.browser(browser),
                 Phase::Working(work) => working(*work, self.encryption()),
-                Phase::Review(preview) => self.review(preview),
+                Phase::Review(preview) => self.review(preview, vault_ready, host_import_allowed),
                 Phase::Exported(archive) => self.exported(archive),
                 Phase::Queued(result) => queued(result),
             }
@@ -153,6 +172,8 @@ impl Dialog {
             "The backup passwords do not match."
         } else if exporting {
             "Use a backup password of 12 to 1024 UTF-8 bytes."
+        } else if self.resolved_import() == Some(BackupFormat::JavaPassword) {
+            "Enter the password used to create the Java backup ZIP."
         } else {
             "Enter the password to authenticate the backup and review its contents."
         };
@@ -265,7 +286,22 @@ impl Dialog {
         .into()
     }
 
-    fn review<'a>(&'a self, preview: &'a Preview) -> Element<'a, Message> {
+    fn review<'a>(
+        &'a self,
+        preview: &'a Preview,
+        vault_ready: bool,
+        host_import_allowed: bool,
+    ) -> Element<'a, Message> {
+        if let Some((format, imported, omissions)) = preview.java_review() {
+            return self.review_java(
+                format,
+                imported,
+                omissions,
+                preview,
+                vault_ready,
+                host_import_allowed,
+            );
+        }
         let count = preview.count();
         let format = if self.encryption() == EncryptionMode::OpenPgp {
             "Integrity-checked OpenPGP backup"
@@ -273,6 +309,9 @@ impl Dialog {
             "Authenticated backup"
         };
         let includes_vault = preview.entries().any(|entry| entry == "vault/vault.bin");
+        let includes_ai = preview
+            .entries()
+            .any(|entry| entry == crate::ai_manager::backup::SETTINGS);
         let replacing = self.restore_mode == RestoreMode::Replace;
         let description = if replacing {
             "The portable profile settings will be replaced by the contents of this backup."
@@ -305,6 +344,7 @@ impl Dialog {
             ].spacing(8).align_y(Alignment::Center),
             text(description),
             includes_vault.then(|| text("If the credential vault is restored, unlock it with its original master password.").size(13)),
+            includes_ai.then(|| text("Review restored AI endpoints, tools and knowledge sources before use. Model files are stored separately.").size(13)),
             scrollable(container(entries).padding(8)).height(Length::Fill),
             row![button("Back").on_press(Message::Back), space::horizontal(),
                 button("Cancel").on_press(Message::Cancel),
@@ -313,6 +353,117 @@ impl Dialog {
                     .on_press(Message::Restore(self.revision)),
             ].spacing(8),
         ].spacing(12).height(Length::Fill).into()
+    }
+
+    fn review_java<'a>(
+        &'a self,
+        format: &'a str,
+        imported: &'a [String],
+        omissions: &'a [String],
+        preview: &'a Preview,
+        vault_ready: bool,
+        host_import_allowed: bool,
+    ) -> Element<'a, Message> {
+        let mut entries = column![].spacing(4);
+        for entry in imported
+            .iter()
+            .chain(omissions.iter())
+            .take(MAX_VISIBLE_PREVIEW_ENTRIES)
+        {
+            entries = entries.push(text(entry).size(13));
+        }
+        let hidden = (imported.len() + omissions.len()).saturating_sub(MAX_VISIBLE_PREVIEW_ENTRIES);
+        if hidden > 0 {
+            entries = entries.push(text(format!("… and {hidden} more")).size(13));
+        }
+        let can_merge = preview.count() > 0;
+        let has_host_pins = preview.java_host_pins().is_some();
+        let imported_host_pins = self.imported_host_pins.as_deref();
+        let review_credentials =
+            self.offers_java_credential_review(JavaCredentialReview::WithVault);
+        let review_keys =
+            self.offers_java_credential_review(JavaCredentialReview::KeysWithoutPassphrases);
+        let password_summary = preview.java_password_summary();
+        let key_summary = preview.java_key_summary();
+        let merge_label = match (
+            review_keys,
+            review_credentials && preview.has_java_passwords(),
+        ) {
+            (true, true) => "Merge Without SSH Credentials",
+            (true, false) => "Merge Without SSH Keys",
+            (false, true) => "Merge Without Passwords",
+            (false, false) => "Merge on Restart",
+        };
+        column![
+            text("Review Java Backup").size(23),
+            text(format),
+            text(if can_merge {
+                "Add supported data on restart. Existing profiles, snippets, variables, themes and projects take precedence on conflicts."
+            } else if review_credentials {
+                "Review the available SSH credentials to continue."
+            } else if has_host_pins {
+                "SSH host keys are imported separately after you confirm their fingerprints."
+            } else {
+                "This backup contains no Java data that this version can import."
+            }),
+            review_keys.then(|| row![
+                text("Keys without passphrases can be reviewed without unlocking the vault.")
+                    .size(13).width(Length::Fill),
+                button("Review Keys Without Passphrases").on_press(Message::ReviewJavaCredentials(
+                    self.revision,
+                    JavaCredentialReview::KeysWithoutPassphrases,
+                )),
+            ].spacing(8).align_y(Alignment::Center)),
+            review_credentials.then(|| self.java_credential_fields(vault_ready, review_keys)),
+            password_summary.map(|(ready, omitted)| text(format!("SSH passwords ready to add: {ready}. Passwords omitted: {omitted}."))),
+            key_summary.map(|(ready, omitted)| text(format!("Managed SSH keys ready to add: {ready}. Keys omitted: {omitted}."))),
+            has_host_pins.then(|| button("Review SSH Host Keys…").on_press_maybe(host_import_allowed.then_some(Message::ReviewHostPins(self.revision)))),
+            imported_host_pins.map(|report| text(format!("SSH host keys added: {}. Already trusted: {}. Conflicts: {}. Need fresh review: {}.", report.added.len(), report.already_trusted, report.conflicts.len(), report.needs_review)).size(13)),
+            self.error.as_ref().map(|error| text(error).size(13)),
+            scrollable(container(entries).padding(8)).height(Length::Fill),
+            row![button("Back").on_press(Message::Back), space::horizontal(),
+                button(if !can_merge && imported_host_pins.is_some() { "Done" } else { "Cancel" }).on_press(Message::Cancel),
+                can_merge.then(|| button(merge_label)
+                    .style(button::primary)
+                    .on_press(Message::Restore(self.revision))),
+            ].spacing(8),
+        ].spacing(12).height(Length::Fill).into()
+    }
+
+    fn java_credential_fields(&self, vault_ready: bool, review_keys: bool) -> Element<'_, Message> {
+        if !vault_ready {
+            return row![
+                text(if review_keys {
+                    "Unlock the credential vault to include SSH passwords and keys with passphrases."
+                } else {
+                    "Unlock the credential vault to review the Java SSH passwords."
+                }).size(13).width(Length::Fill),
+                button("Credential Vault…").on_press(Message::OpenVault),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .into();
+        }
+        let revision = self.revision;
+        let mode = JavaCredentialReview::WithVault;
+        let submit = self
+            .can_review_java_credentials(revision, mode)
+            .then_some(Message::ReviewJavaCredentials(revision, mode));
+        column![
+            text(if review_keys {
+                "Use the Java korTTY master password to include SSH passwords and keys with passphrases."
+            } else {
+                "Use the Java korTTY master password to review which SSH passwords can be imported."
+            }).size(13),
+            row![
+                text_input("Java Master Password", &self.java_master_password)
+                    .secure(true)
+                    .on_input(move |value| Message::JavaMasterPassword(revision, Password::new(value)))
+                    .on_submit_maybe(submit.clone()),
+                button(if review_keys { "Review SSH Credentials" } else { "Review SSH Passwords" })
+                    .on_press_maybe(submit),
+            ].spacing(8).align_y(Alignment::Center),
+        ].spacing(5).into()
     }
 
     fn exported<'a>(&self, archive: &'a Exported) -> Element<'a, Message> {
@@ -349,6 +500,13 @@ fn queued(result: &Queued) -> Element<'static, Message> {
             "The reviewed backup contains {count} profile file(s)."
         )),
         text(format!("Import mode: {}", result.mode)),
+        column(
+            result
+                .scheduler_notes
+                .iter()
+                .map(|note| text(note.clone()).size(13).into())
+        )
+        .spacing(3),
         text("Quit kortty and start it again to apply the backup."),
         (!result.durable).then(|| {
             text("Backup restore was queued. Directory synchronization could not be confirmed.")
@@ -373,6 +531,7 @@ fn working(action: Work, encryption: EncryptionMode) -> Element<'static, Message
         Work::Export => "Creating backup…",
         Work::Inspect if encryption == EncryptionMode::OpenPgp => "Decrypting OpenPGP backup…",
         Work::Inspect => "Authenticating backup…",
+        Work::JavaCredentials => "Reviewing Java SSH credentials…",
         Work::Queue => "Preparing restore…",
     };
     column![text(message).size(23), space::vertical()]

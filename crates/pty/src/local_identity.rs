@@ -1,3 +1,33 @@
+use std::io;
+
+#[cfg(unix)]
+mod unix_groups;
+#[cfg(unix)]
+use unix_groups as groups;
+
+#[cfg(windows)]
+mod windows_groups;
+#[cfg(windows)]
+use windows_groups as groups;
+
+const MAX_GROUPS: usize = 4096;
+const MAX_GROUP_NAME_BYTES: usize = 4096;
+
+/// Names of the local process's OS groups. Windows also includes qualified names.
+/// Account lookups may block while the operating system resolves directory identities.
+pub fn local_group_names() -> io::Result<Vec<String>> {
+    let mut names = groups::names()?;
+    names.sort_unstable();
+    names.dedup();
+    Ok(names)
+}
+
+fn valid_group_name(name: &str) -> bool {
+    !name.trim().is_empty()
+        && name.len() <= MAX_GROUP_NAME_BYTES
+        && !name.chars().any(char::is_control)
+}
+
 /// Host name reported by the local OS, without a network lookup.
 #[cfg(unix)]
 pub fn local_hostname() -> Option<String> {
@@ -46,7 +76,11 @@ pub fn local_username() -> Option<String> {
         }
         // SAFETY: pw_name is NUL-terminated and the backing buffer is still live.
         let name = unsafe { CStr::from_ptr(name) };
-        return (!name.is_empty()).then(|| name.to_string_lossy().into_owned());
+        return name
+            .to_str()
+            .ok()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned);
     }
 }
 
@@ -95,5 +129,13 @@ mod tests {
             assert!(!value.trim().is_empty());
             assert!(!value.contains('\0'));
         }
+    }
+
+    #[test]
+    fn native_identity_provides_sorted_local_group_names() {
+        let names = local_group_names().expect("native test host resolves local group names");
+        assert!(!names.is_empty());
+        assert!(names.iter().all(|name| valid_group_name(name)));
+        assert!(names.windows(2).all(|pair| pair[0] < pair[1]));
     }
 }

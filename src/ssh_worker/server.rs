@@ -7,22 +7,30 @@ use std::thread;
 use std::time::Duration;
 
 use kortty_ssh::{
-    ConnectError, DirectChannel, DirectOpener, RemoteOpener, SftpLease, SftpOpener, SshAbort,
-    SshReader, SshSession, SshWriter,
+    ConnectError, DirectChannel, DirectOpener, ExecOpener, RemoteOpener, SftpLease, SftpOpener,
+    SshAbort, SshReader, SshSession, SshWriter,
 };
 
-use super::mux::{Flow, Mux};
+use super::mux::{Flow, Mux, PasswordSide};
 use super::wire::{Frame, Open};
 use super::{closed, lock};
 
+#[path = "server/exec.rs"]
+mod exec;
+#[path = "server/file_exec.rs"]
+mod file_exec;
+
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
-const MAX_TASKS: usize = 32;
+// Opening a stream and starting its relay can briefly occupy two tasks.
+const MAX_TASKS: usize =
+    2 * kortty_ssh::MAX_SESSION_CHANNELS + kortty_ssh::MAX_REMOTE_FORWARD_LISTENERS;
 
 struct Server {
     mux: Mux,
     ssh: Mutex<SshSession>,
     active: Mutex<BTreeMap<u32, SshAbort>>,
     sftp: Option<SftpOpener>,
+    exec: Option<ExecOpener>,
     direct: DirectOpener,
     remote: RemoteOpener,
     next_id: AtomicU32,
@@ -46,6 +54,7 @@ pub(super) fn run(
     let server = Arc::new(Server {
         mux,
         sftp: ssh.sftp_opener(),
+        exec: ssh.exec_opener(),
         direct: ssh.direct_opener(),
         remote: ssh.remote_opener(),
         ssh: Mutex::new(ssh),
@@ -59,19 +68,22 @@ pub(super) fn run(
     thread::Builder::new()
         .name("kortty-ssh-worker-control".into())
         .spawn(move || inbound.receive(input))?;
-    while let Some(frame) = server.mux.next() {
-        let finished = matches!(
-            frame,
-            Frame::End(0, _) | Frame::Close(0, _) | Frame::Finished(0, _)
-        );
-        frame.send(&mut output)?;
-        if finished {
-            break;
+    let result = (|| {
+        while let Some(frame) = server.mux.next() {
+            let finished = matches!(
+                frame,
+                Frame::End(0, _) | Frame::Close(0, _) | Frame::Finished(0, _)
+            );
+            frame.send(&mut output)?;
+            if finished {
+                break;
+            }
         }
-    }
+        Ok(())
+    })();
     server.mux.stop();
     lock(&server.ssh).abort_handle().abort();
-    Ok(())
+    result
 }
 
 impl Server {
@@ -87,7 +99,7 @@ impl Server {
                         }
                     })
                 }
-                Frame::Open(id, request) if self.terminal && id % 2 == 1 => self.open(id, request),
+                Frame::Open(id, request) if id % 2 == 1 => self.open(id, request),
                 Frame::Close(id, error) => {
                     let result = self.mux.receive(Frame::Close(id, error));
                     if let Some(abort) = lock(&self.active).remove(&id) {
@@ -106,13 +118,36 @@ impl Server {
     }
 
     fn open(self: &Arc<Self>, id: u32, request: Open) -> io::Result<()> {
-        let flow = match self.mux.add(id) {
+        let flow = match &request {
+            Open::PasswordExec { .. } => self.mux.add_password(id, PasswordSide::Worker),
+            Open::PasswordFileExec { .. } => self.mux.add_password_file(id, PasswordSide::Worker),
+            _ => self.mux.add(id),
+        };
+        let flow = match flow {
             Ok(flow) => flow,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                 return self.mux.control(Frame::Close(id, Some(error.to_string())));
             }
             Err(error) => return Err(error),
         };
+        if !self.terminal
+            && !matches!(
+                request,
+                Open::Sftp
+                    | Open::FileExec
+                    | Open::PasswordFileExec { .. }
+                    | Open::AccountLookup { .. }
+                    | Open::ArchiveExtract
+                    | Open::DraftReplace
+                    | Open::FolderUsage(..)
+                    | Open::AccountNames(..)
+            )
+        {
+            flow.close(Some(
+                "This channel is unavailable on a standalone SFTP connection".into(),
+            ));
+            return Ok(());
+        }
         let active = flow.clone();
         if let Err(error) = self.spawn("kortty-ssh-worker-open", move |server| {
             let result = match request {
@@ -127,6 +162,19 @@ impl Server {
                     .open_cancellable(endpoint, origin, || !active.is_open())
                     .and_then(|channel| server.opened(&active, OwnedChannel::Direct(channel))),
                 Open::Listen(address) => server.listen(&active, address),
+                Open::Exec(command) => server.exec(&active, &command),
+                Open::PasswordExec { command, nonce } => {
+                    server.exec_password(&active, &command, nonce)
+                }
+                Open::FileExec => server.exec_file(&active),
+                Open::PasswordFileExec { nonce } => server.exec_password_file(&active, nonce),
+                Open::AccountLookup { kind, name } => {
+                    server.exec_account_lookup(&active, kind, &name)
+                }
+                Open::ArchiveExtract => server.exec_archive_extract(&active),
+                Open::DraftReplace => server.exec_draft_replace(&active),
+                Open::FolderUsage(paths) => server.exec_folder_usage(&active, &paths),
+                Open::AccountNames(query) => server.exec_account_names(&active, &query),
             };
             if let Err(error) = result {
                 active.close(Some(error.to_string()));

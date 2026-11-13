@@ -18,7 +18,7 @@ use crate::snippets::archive::ZipSettings;
 use crate::vault_window::Kind as CredentialKind;
 use crate::workspace::dialog_placement::Kind as DialogKind;
 
-use super::{Message, Workspace, WorkspaceMessage as Desktop, wrap};
+use super::{Message, Workspace, WorkspaceMessage as Desktop, focus_dialog_field, wrap};
 
 mod options;
 
@@ -111,6 +111,7 @@ pub enum Event {
 pub(super) struct Dialog {
     id: window::Id,
     owner: window::Id,
+    focus_scope: iced::widget::Id,
     path: String,
     source: Option<PathBuf>,
     source_identity: Option<FileStamp>,
@@ -140,6 +141,7 @@ impl Dialog {
         Self {
             id,
             owner,
+            focus_scope: iced::widget::Id::unique(),
             path: String::new(),
             source: None,
             source_identity: None,
@@ -296,9 +298,13 @@ impl Dialog {
             BrowseTarget::PrivateKey => {
                 self.browsing = None;
                 self.change_key_path(label.to_owned());
-                iced::widget::operation::focus(PASSWORD_INPUT)
+                self.focus(PASSWORD_INPUT)
             }
         }
+    }
+
+    fn focus(&self, field: &'static str) -> Task<Desktop> {
+        focus_dialog_field(self.focus_scope.clone(), field)
     }
 
     fn change_key_path(&mut self, path: String) {
@@ -374,6 +380,7 @@ impl Dialog {
             .spacing(8),
         );
         let view: Element<'_, Event> = container(body)
+            .id(self.focus_scope.clone())
             .padding(16)
             .width(Length::Fill)
             .height(Length::Fill)
@@ -504,6 +511,46 @@ impl Dialog {
                 };
                 rows = rows.push(column![text(&entry.name), text(location).size(13)]);
             }
+            for (entry, group) in prepared.local_entries() {
+                let location = if group.is_empty() {
+                    "Local shell".to_owned()
+                } else {
+                    format!("Local shell · {group}")
+                };
+                let program = entry.command.as_ref().map_or_else(
+                    || {
+                        entry
+                            .shell
+                            .preset_title()
+                            .unwrap_or("Default shell")
+                            .to_owned()
+                    },
+                    |command| format!("{command:?}"),
+                );
+                rows = rows.push(column![
+                    text(&entry.name),
+                    text(location).size(13),
+                    text("Program and arguments").size(13),
+                    text(program).wrapping(text::Wrapping::Glyph).size(13),
+                    entry.working_directory.as_ref().map(|path| {
+                        text(format!("Working directory · {}", path.display())).size(13)
+                    }),
+                ]);
+            }
+            for (entry, group) in prepared.serial_entries() {
+                let mut details = format!(
+                    "Serial · {} · {}",
+                    entry.connection.device.display(),
+                    entry.line()
+                );
+                if let Some(encoding) = entry.connection.encoding {
+                    details.push_str(&format!(" · {encoding}"));
+                }
+                if !group.is_empty() {
+                    details.push_str(&format!(" · {group}"));
+                }
+                rows = rows.push(column![text(entry.display_name()), text(details).size(13)]);
+            }
         }
         let outcome = self
             .options
@@ -517,6 +564,13 @@ impl Dialog {
                 outcome.imported, preview.unsupported, preview.invalid, preview.duplicates
             )),
         ];
+        if self
+            .options
+            .prepared()
+            .is_some_and(|plan| plan.local_entries().len() != 0)
+        {
+            summary = summary.push(text("Import saves these profiles. Opening a local profile starts the program shown below.").size(13));
+        }
         if preview.format() == Format::PuttyCm {
             summary = summary.push(text(format!(
                 "Imported forwarding rules start disabled. {} invalid or duplicate rules skipped.",
@@ -571,16 +625,12 @@ impl Workspace {
         if self.exiting || self.scheduler_draining || self.clipboard.policy.problem.is_some() {
             return Task::none();
         }
-        let manager = self.connections_id == Some(owner)
-            && self
-                .connections
-                .as_ref()
-                .is_some_and(|manager| manager.can_import_connections());
+        let manager = self
+            .connection_managers
+            .get(&owner)
+            .is_some_and(|manager| manager.window.can_import_connections());
         if !manager && !self.windows.contains_key(&owner) {
             return Task::none();
-        }
-        if let Some(dialog) = &self.chrome.connection_import {
-            return window::gain_focus(dialog.id);
         }
         if let Some((id, focus)) = self.owner_dialog(owner) {
             return window::gain_focus(id).chain(Task::done(focus));
@@ -588,7 +638,8 @@ impl Workspace {
         if let Some(window) = self.windows.get_mut(&owner) {
             window.cancel_paste();
         }
-        let (id, open) = self.open_placed_dialog(
+        let (id, open) = self.open_owned_placed_dialog(
+            owner,
             DialogKind::ConnectionImport,
             window::Settings {
                 size: Size::new(760.0, 525.0),
@@ -597,9 +648,12 @@ impl Workspace {
                 exit_on_close_request: false,
                 ..window::Settings::default()
             },
+            Some(focus),
         );
-        self.chrome.connection_import = Some(Dialog::new(id, owner));
-        open.map(move |_| event(id, Event::Focus))
+        self.chrome
+            .connection_import
+            .insert(id, Dialog::new(id, owner));
+        open
     }
 
     pub(in crate::workspace) fn connection_import_title(
@@ -608,9 +662,8 @@ impl Workspace {
     ) -> Option<&'static str> {
         self.chrome
             .connection_import
-            .as_ref()
-            .filter(|dialog| dialog.id == id)
-            .map(|_| TITLE)
+            .contains_key(&id)
+            .then_some(TITLE)
     }
 
     pub(in crate::workspace) fn connection_import_for_owner(
@@ -619,20 +672,20 @@ impl Workspace {
     ) -> Option<window::Id> {
         self.chrome
             .connection_import
-            .as_ref()
-            .filter(|dialog| dialog.owner == owner)
+            .values()
+            .find(|dialog| dialog.owner == owner)
             .map(|dialog| dialog.id)
     }
 
     pub(in crate::workspace) fn connection_import_open(&self) -> bool {
-        self.chrome.connection_import.is_some()
+        !self.chrome.connection_import.is_empty()
     }
 
     pub(in crate::workspace) fn connection_import_saving(&self) -> Option<window::Id> {
         self.chrome
             .connection_import
-            .as_ref()
-            .filter(|dialog| dialog.phase == Phase::Saving)
+            .values()
+            .find(|dialog| dialog.phase == Phase::Saving)
             .map(|dialog| dialog.id)
     }
 
@@ -643,39 +696,31 @@ impl Workspace {
         if let Some(dialog) = self.connection_import_for_owner(id) {
             return Some(window::gain_focus(dialog));
         }
-        self.connection_import_title(id)?;
-        if self.connection_import_saving() == Some(id) {
+        if self.chrome.connection_import.get(&id)?.phase == Phase::Saving {
             return Some(Task::none());
         }
-        let dialog = self.chrome.connection_import.take()?;
-        Some(Task::batch([
-            self.close_placed_dialog(id),
-            window::gain_focus(dialog.owner),
-        ]))
+        let dialog = self.chrome.connection_import.remove(&id)?;
+        Some(self.close_placed_dialog_and_focus(id, dialog.owner))
     }
 
     pub(in crate::workspace) fn connection_import_view(
         &self,
         id: window::Id,
     ) -> Option<Element<'_, Desktop>> {
-        self.chrome
-            .connection_import
-            .as_ref()
-            .filter(|dialog| dialog.id == id)
-            .map(|dialog| {
-                let passwords = if dialog.unlock == Unlock::Zip {
-                    self.credential_choices(CredentialKind::ArchivePassword)
-                } else {
-                    Vec::new()
-                };
-                dialog.view(
-                    passwords,
-                    options::Choices {
-                        passwords: &self.credential_choices(CredentialKind::Password),
-                        keys: &self.ssh_key_choices,
-                    },
-                )
-            })
+        self.chrome.connection_import.get(&id).map(|dialog| {
+            let passwords = if dialog.unlock == Unlock::Zip {
+                self.credential_choices(CredentialKind::ArchivePassword)
+            } else {
+                Vec::new()
+            };
+            dialog.view(
+                passwords,
+                options::Choices {
+                    passwords: &self.credential_choices(CredentialKind::Password),
+                    keys: &self.ssh_key_choices,
+                },
+            )
+        })
     }
 
     pub(super) fn update_connection_import(
@@ -689,12 +734,7 @@ impl Workspace {
             passwords: &credentials,
             keys: &self.ssh_key_choices,
         };
-        let Some(dialog) = self
-            .chrome
-            .connection_import
-            .as_mut()
-            .filter(|dialog| dialog.id == id)
-        else {
+        let Some(dialog) = self.chrome.connection_import.get_mut(&id) else {
             return Task::none();
         };
         match action {
@@ -708,7 +748,7 @@ impl Workspace {
                         Unlock::OpenPgp => KEY_INPUT,
                     }
                 };
-                return window::gain_focus(id).chain(iced::widget::operation::focus(field));
+                return window::gain_focus(id).chain(dialog.focus(field));
             }
             Event::Cancel => return self.close_connection_import(id).unwrap_or_else(Task::none),
             Event::Listed(generation, result)
@@ -739,12 +779,12 @@ impl Workspace {
                     Ok(Review::ZipPasswordRequired(identity)) => {
                         dialog.unlock = Unlock::Zip;
                         dialog.source_identity = Some(identity);
-                        return iced::widget::operation::focus(PASSWORD_INPUT);
+                        return dialog.focus(PASSWORD_INPUT);
                     }
                     Ok(Review::OpenPgpKeyRequired(identity)) => {
                         dialog.unlock = Unlock::OpenPgp;
                         dialog.source_identity = Some(identity);
-                        return iced::widget::operation::focus(KEY_INPUT);
+                        return dialog.focus(KEY_INPUT);
                     }
                     Err(error) => dialog.problem = Some(error),
                 }
@@ -874,7 +914,7 @@ impl Workspace {
                         } else {
                             PATH_INPUT
                         };
-                        return iced::widget::operation::focus(field);
+                        return dialog.focus(field);
                     }
                     Event::Parent => {
                         if let Some(Location::Local(folder)) =
@@ -921,9 +961,9 @@ impl Workspace {
                                 }
                             };
                         if self
-                            .connections
-                            .as_ref()
-                            .is_some_and(crate::connection_window::ConnectionWindow::busy)
+                            .connection_managers
+                            .get(&dialog.owner)
+                            .is_some_and(|manager| manager.window.busy())
                         {
                             dialog.problem = Some(
                                     "A Connection Manager update is still in progress. Try Import again when it finishes."
@@ -960,7 +1000,7 @@ impl Workspace {
         outcome: Outcome,
         result: Result<Box<Store>, String>,
     ) -> Task<Desktop> {
-        let Some(dialog) = self.chrome.connection_import.take() else {
+        let Some(dialog) = self.chrome.connection_import.remove(&id) else {
             return Task::none();
         };
         let mut status = format!(
@@ -974,18 +1014,17 @@ impl Workspace {
                 status.push_str(&error);
             }
         }
-        if self.connections_id == Some(dialog.owner)
-            && let Some(manager) = &mut self.connections
-        {
-            manager.set_notice(status);
+        if let Some(manager) = self.connection_managers.get_mut(&dialog.owner) {
+            manager.window.set_notice(status);
         } else {
             self.notice(dialog.owner, status);
         }
-        Task::batch([
-            self.close_placed_dialog(id),
-            window::gain_focus(dialog.owner),
-        ])
+        self.close_placed_dialog_and_focus(id, dialog.owner)
     }
+}
+
+fn focus(id: window::Id) -> Desktop {
+    event(id, Event::Focus)
 }
 
 fn reload(id: window::Id, revision: u64, outcome: Outcome) -> Task<Desktop> {
@@ -1021,7 +1060,7 @@ mod tests {
         assert!(workspace.connection_import_view(id).is_some());
         assert!(!workspace.chrome_enabled(owner, Action::ManageConnections));
 
-        let dialog = workspace.chrome.connection_import.as_mut().unwrap();
+        let dialog = workspace.chrome.connection_import.get_mut(&id).unwrap();
         let generation = dialog.begin(Phase::Loading);
         // Test double for an asynchronous response from a superseded file read.
         let response = Event::Reviewed(
@@ -1037,7 +1076,7 @@ mod tests {
             workspace
                 .chrome
                 .connection_import
-                .as_ref()
+                .get(&id)
                 .unwrap()
                 .preview
                 .is_none()
@@ -1045,6 +1084,67 @@ mod tests {
         let _ = workspace.update(event(id, Event::Cancel));
         assert!(!workspace.connection_import_open());
         assert!(workspace.chrome_enabled(owner, Action::ManageConnections));
+    }
+
+    #[test]
+    fn two_connection_managers_keep_their_native_import_children_separate() {
+        use crate::connection_window::ConnectionWindow;
+        use crate::workspace::profile_tools::ConnectionManager;
+
+        let mut workspace = Workspace::default();
+        let managers = [false, false].map(|main| {
+            let (owner, _) = workspace.open_window(main);
+            let manager = window::Id::unique();
+            let path = std::env::temp_dir().join(format!("unused-manager-import-{manager}.json"));
+            workspace.connection_managers.insert(
+                manager,
+                ConnectionManager::new(owner, ConnectionWindow::open(path).unwrap()),
+            );
+            manager
+        });
+        let [first, second] = managers.map(|manager| {
+            let _ = workspace.show_connection_import(manager);
+            let child = workspace.connection_import_for_owner(manager).unwrap();
+            assert_eq!(workspace.placed_dialog_owner(child), Some(manager));
+            assert_eq!(
+                workspace.owner_dialog(manager).map(|(id, _)| id),
+                Some(child)
+            );
+            child
+        });
+        assert_ne!(first, second);
+        assert_ne!(
+            workspace.chrome.connection_import[&first].focus_scope,
+            workspace.chrome.connection_import[&second].focus_scope,
+        );
+
+        for id in [first, second] {
+            workspace
+                .chrome
+                .connection_import
+                .get_mut(&id)
+                .unwrap()
+                .begin(Phase::Saving);
+        }
+        let _ = workspace.close_connection_import(second).unwrap();
+        assert_eq!(
+            workspace.connection_import_for_owner(managers[1]),
+            Some(second)
+        );
+
+        workspace
+            .chrome
+            .connection_import
+            .get_mut(&second)
+            .unwrap()
+            .begin(Phase::Ready);
+        let _ = workspace.close_connection_import(second).unwrap();
+        assert!(workspace.connection_import_for_owner(managers[1]).is_none());
+        assert_eq!(
+            workspace.connection_import_for_owner(managers[0]),
+            Some(first)
+        );
+        assert_eq!(workspace.connection_import_saving(), Some(first));
     }
 
     #[test]
@@ -1058,7 +1158,7 @@ mod tests {
         let fixture = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
         let identity = FileStamp::read(&fixture).unwrap();
         let first_generation = {
-            let dialog = workspace.chrome.connection_import.as_mut().unwrap();
+            let dialog = workspace.chrome.connection_import.get_mut(&id).unwrap();
             let _ = dialog.review_source(archive);
             dialog.generation
         };
@@ -1080,14 +1180,14 @@ mod tests {
             id,
             Event::SavedPassword(first_generation, Some("fixture-vault-id".into())),
         );
-        let dialog = workspace.chrome.connection_import.as_ref().unwrap();
+        let dialog = &workspace.chrome.connection_import[&id];
         assert!(dialog.password.is_empty());
         assert_eq!(dialog.saved_password.as_deref(), Some("fixture-vault-id"));
 
         let next = std::env::temp_dir().join("other-connections.gpg");
         let _ = workspace.update_connection_import(id, Event::Path(next.to_str().unwrap().into()));
         let _ = workspace.update_connection_import(id, password);
-        let dialog = workspace.chrome.connection_import.as_ref().unwrap();
+        let dialog = &workspace.chrome.connection_import[&id];
         assert!(dialog.source.is_none());
         assert_eq!(dialog.unlock, Unlock::None);
         assert!(dialog.password.is_empty());
@@ -1097,7 +1197,7 @@ mod tests {
         let second_generation = workspace
             .chrome
             .connection_import
-            .as_ref()
+            .get(&id)
             .unwrap()
             .generation;
         // Test double for the OpenPGP key-required outcome.
@@ -1111,7 +1211,7 @@ mod tests {
         let key_generation = workspace
             .chrome
             .connection_import
-            .as_ref()
+            .get(&id)
             .unwrap()
             .generation;
         let passphrase = Event::Password(
@@ -1123,7 +1223,7 @@ mod tests {
         let _ = workspace
             .update_connection_import(id, Event::KeyPath(changed.to_str().unwrap().into()));
         let _ = workspace.update_connection_import(id, passphrase);
-        let dialog = workspace.chrome.connection_import.as_ref().unwrap();
+        let dialog = &workspace.chrome.connection_import[&id];
         assert_eq!(dialog.unlock, Unlock::OpenPgp);
         assert!(dialog.password.is_empty());
         assert!(dialog.saved_password.is_none());

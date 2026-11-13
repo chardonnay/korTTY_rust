@@ -1,11 +1,11 @@
-//! Cache terminal paint geometry by physical row for damage-aware rendering.
+//! Cache terminal paint geometry by display row for damage-aware rendering.
 
 use std::sync::Arc;
 
 use iced::advanced::graphics::cache::{Cached, Group};
 use iced::advanced::graphics::text::Text;
 use iced::font::{Style as FontStyle, Weight};
-use iced::{Font, Pixels, Point, Rectangle, Renderer, Size};
+use iced::{Color, Font, Pixels, Point, Rectangle, Renderer, Size};
 use iced_tiny_skia::Geometry;
 use kortty_terminal::{Cell, Color as TerminalColor, CursorShape};
 
@@ -14,7 +14,7 @@ use crate::terminal_theme::Appearance;
 
 use super::{
     CanvasFrame, Metrics, SEARCH_MATCH, SEARCH_SELECTED, SearchHighlight, Selection, cell_colors,
-    cursor_bounds, default_background,
+    cursor_bounds, default_background, inline_visual,
 };
 
 pub(super) struct View<'a> {
@@ -22,11 +22,19 @@ pub(super) struct View<'a> {
     pub(super) metrics: Metrics,
     pub(super) appearance: Appearance,
     pub(super) selection: Option<Selection>,
+    pub(super) projected_selection: Option<Selection>,
     pub(super) search: Option<SearchHighlight<'a>>,
     pub(super) font: Option<(Font, u8)>,
     pub(super) cursor: Option<(u16, u16)>,
     pub(super) preview: Option<&'a TypeAheadFrame>,
     pub(super) backgrounds: bool,
+    pub(super) focus: Option<&'a inline_visual::Focus>,
+}
+
+impl View<'_> {
+    pub(super) fn dim_at(&self, row: u16) -> f32 {
+        self.focus.map_or(0.0, |focus| focus.dim_at(row))
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -52,6 +60,7 @@ struct Row {
     highlights: Vec<Highlight>,
     cursor: Option<(u16, CursorShape)>,
     preview: bool,
+    dim: f32,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -95,15 +104,23 @@ impl Rows {
         let mut visible_rows = 0;
         let mut highlights = Vec::new();
         for row in 0..screen.rows {
-            let Some(cells) = screen.row(row) else { break };
+            let raw = view.frame.display_raw_row(row);
+            let cells = raw.and_then(|raw| screen.row(raw));
+            let line = view
+                .frame
+                .inline
+                .as_deref()
+                .and_then(|inline| inline.line(row));
             let top = view.metrics.point(row, 0).y;
             if top >= size.height {
                 break;
             }
             let clip = row_clip(canvas, top, view.metrics.height);
-            let absolute = first_row.saturating_add(usize::from(row));
             highlights.clear();
-            if view.backgrounds {
+            if view.backgrounds
+                && let Some(raw) = raw
+            {
+                let absolute = first_row.saturating_add(usize::from(raw));
                 while let Some((span, current)) = search.next_if(|(span, _)| span.row <= absolute) {
                     if span.row == absolute {
                         highlights.push(Highlight {
@@ -114,14 +131,18 @@ impl Rows {
                     }
                 }
             }
-            let selection = view
-                .selection
-                .and_then(|selection| row_selection(selection, row));
+            let selection = if let Some(projected) = view.projected_selection {
+                row_selection(projected, row)
+            } else {
+                view.selection
+                    .and_then(|selection| row_selection(selection, raw?))
+            };
             let cursor = view
                 .cursor
                 .filter(|(cursor_row, _)| row == *cursor_row)
                 .map(|(_, column)| (column, screen.cursor_shape));
-            let preview = view.preview.filter(|preview| preview.row == row);
+            let preview = view.preview.filter(|preview| Some(preview.row) == raw);
+            let dim = view.dim_at(row);
             let index = usize::from(row);
             visible_rows = index + 1;
             if same_style
@@ -130,8 +151,15 @@ impl Rows {
                 && old.highlights == highlights
                 && old.cursor == cursor
                 && old.preview == preview.is_some()
+                && old.dim == dim
                 && (same_frame
-                    || previous.is_some_and(|frame| frame.screen.row(row) == Some(cells)))
+                    || previous.is_some_and(|frame| {
+                        frame
+                            .display_raw_row(row)
+                            .and_then(|raw| frame.screen.row(raw))
+                            == cells
+                            && frame.inline.as_deref().and_then(|inline| inline.line(row)) == line
+                    }))
                 && (same_frame
                     || preview.is_none_or(|preview| {
                         previous
@@ -142,20 +170,38 @@ impl Rows {
                 continue;
             }
             let mut frame = CanvasFrame::with_bounds(renderer, clip);
-            if view.backgrounds {
-                paint_backgrounds(&mut frame, &view, row, cells, selection, &highlights);
-            }
-            if let Some((font, font_size)) = view.font {
-                let cells = preview.map_or(cells, |preview| &preview.cells);
-                paint_text(
-                    &mut frame,
-                    &view,
-                    row,
-                    cells,
-                    selection,
-                    cursor,
-                    (font, font_size),
-                );
+            if let Some(cells) = cells {
+                if view.backgrounds {
+                    paint_backgrounds(&mut frame, &view, row, cells, selection, &highlights);
+                }
+                if let Some(font) = view.font {
+                    let cells = preview.map_or(cells, |preview| &preview.cells);
+                    paint_text(&mut frame, &view, row, cells, selection, cursor, font);
+                }
+            } else if let (Some(line), Some(font)) = (line, view.font) {
+                if let Some((start, end)) = selection
+                    && start < line.columns() as u16
+                {
+                    let last = end.min(line.columns() as u16 - 1);
+                    let (_, background) = cell_colors(
+                        kortty_terminal::Style::default(),
+                        screen.reverse_video,
+                        true,
+                        &view.appearance,
+                    );
+                    frame.fill_rectangle(
+                        view.metrics.point(row, start),
+                        Size::new(
+                            view.metrics.width * f32::from(last - start + 1),
+                            view.metrics.height,
+                        ),
+                        Color {
+                            a: 0.35,
+                            ..background
+                        },
+                    );
+                }
+                inline_visual::paint_line(&mut frame, &view, row, line, font);
             }
             let mut geometry = frame.into_geometry();
             if let Geometry::Live { text, .. } = &mut geometry {
@@ -172,6 +218,7 @@ impl Rows {
                 highlights: highlights.clone(),
                 cursor,
                 preview: preview.is_some(),
+                dim,
             };
             if let Some(old) = self.rows.get_mut(index) {
                 *old = entry;
@@ -272,6 +319,8 @@ fn paint_text(
     let cursor_area =
         cursor.map(|(column, shape)| cursor_bounds(shape, metrics.point(row, column), metrics));
     let block = cursor.filter(|(_, shape)| *shape == CursorShape::Block);
+    // The software renderer batches text after shapes in each canvas layer.
+    let opacity = 1.0 - view.dim_at(row);
     if block.is_some()
         && let Some((position, size)) = cursor_area
     {
@@ -295,6 +344,7 @@ fn paint_text(
         if cell.style.dim {
             foreground.a = 0.6;
         }
+        foreground.a *= opacity;
         if cell.text != " " {
             frame.fill_text(iced::widget::canvas::Text {
                 content: cell.text.clone(),
@@ -342,6 +392,8 @@ fn paint_text(
 
 #[cfg(test)]
 mod tests {
+    use std::time::Instant;
+
     use iced::advanced::graphics::{Viewport, damage, geometry::Renderer as _};
     use iced::advanced::renderer::Renderer as _;
     use iced::widget::canvas::Program as _;
@@ -349,6 +401,8 @@ mod tests {
     use iced_tiny_skia::Layer;
     use kortty_terminal::Terminal;
 
+    use crate::session::inline_history;
+    use crate::terminal_agent::design::inline::{Line, Role, Segment};
     use crate::terminal_view::{State, TerminalView, selection_test_frame};
 
     use super::*;
@@ -376,14 +430,19 @@ mod tests {
                 font_size: 14,
                 font: Font::MONOSPACE,
                 appearance: Appearance::default(),
+                background_image: None,
                 scale_factor: 2.0,
                 background_transparency: 40,
                 focused: true,
+                reduced_motion: false,
                 typeahead_enabled: true,
                 owner,
                 plain_text_links: false,
                 selection: None,
+                projected: None,
                 search: None,
+                agent_cursor: None,
+                inline_agent: None,
             };
             for geometry in view.draw(
                 &state,
@@ -443,5 +502,81 @@ mod tests {
             .zip(full.data())
             .position(|(a, b)| a != b);
         assert_eq!(first_difference, None);
+    }
+
+    #[test]
+    fn agent_projection_places_role_text_on_display_rows_and_keeps_the_prompt_bright() {
+        let mut terminal = Terminal::new(24, 7);
+        terminal.advance(b"A\x1b[3;1HB\x1b[4;1H$ ");
+        let mut frame = selection_test_frame(terminal.snapshot());
+        inline_history::fixture(
+            Arc::get_mut(&mut frame).unwrap(),
+            2,
+            vec![Line {
+                segments: vec![
+                    Segment {
+                        text: "  ".into(),
+                        role: Role::Text,
+                    },
+                    Segment {
+                        text: "Agent".into(),
+                        role: Role::Title,
+                    },
+                ],
+            }],
+            true,
+        );
+        let view = TerminalView {
+            session: crate::session::SessionId(1),
+            frame: &frame,
+            font_size: 14,
+            font: Font::MONOSPACE,
+            appearance: Appearance::default(),
+            background_image: None,
+            scale_factor: 1.0,
+            background_transparency: 0,
+            focused: true,
+            reduced_motion: true,
+            typeahead_enabled: false,
+            owner: window::Id::unique(),
+            plain_text_links: true,
+            selection: None,
+            projected: None,
+            search: None,
+            agent_cursor: None,
+            inline_agent: None,
+        };
+        let state = State::default();
+        let renderer = Renderer::new(Font::MONOSPACE, Pixels(14.0));
+        let bounds = Rectangle::with_size(Size::new(360.0, 160.0));
+        let geometry = view.draw(
+            &state,
+            &renderer,
+            &Theme::Dark,
+            bounds,
+            mouse::Cursor::Unavailable,
+        );
+        let cell = Metrics::with_font(view.font_size, view.font);
+        let text_at = |row: u16, expected: &str, column: u16, opacity: f32| {
+            let Geometry::Cache(cache) = &geometry[usize::from(row) + 1] else {
+                panic!("expected cached row geometry");
+            };
+            assert!(cache.text.iter().any(|text| matches!(
+                text,
+                Text::Cached { content, bounds, color, .. }
+                    if content == expected
+                        && bounds.position() == cell.point(row, column)
+                        && (color.a - opacity).abs() < 0.001
+            )));
+        };
+        text_at(0, "A", 0, 0.42);
+        text_at(2, "Agent", 2, 1.0);
+        text_at(3, "B", 0, 1.0);
+        text_at(4, "$", 0, 1.0);
+        assert_eq!(view.display_cursor(), Some((4, 2)));
+        assert!(
+            matches!(geometry.last(), Some(Geometry::Live { primitives, .. }) if primitives.len() >= 3)
+        );
+        assert!(inline_visual::next_redraw(&view, Instant::now()).is_none());
     }
 }

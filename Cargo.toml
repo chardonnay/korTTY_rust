@@ -1,6 +1,6 @@
 [workspace]
-members = ["crates/control", "crates/diagram", "crates/files", "crates/ibm", "crates/jobs", "crates/macos", "crates/pty", "crates/recording", "crates/serial", "crates/ssh", "crates/terminal", "crates/windowing", "crates/vault", "packaging"]
-exclude = ["vendor/iced-tiny-skia", "vendor/smithay-clipboard", "vendor/softbuffer", "vendor/ssh-key", "vendor/sunset"]
+members = ["crates/control", "crates/diagram", "crates/files", "crates/ibm", "crates/jobs", "crates/macos", "crates/pty", "crates/recording", "crates/serial", "crates/server-archive", "crates/ssh", "crates/terminal", "crates/windowing", "crates/vault", "packaging"]
+exclude = ["vendor/iced-runtime", "vendor/iced-tiny-skia", "vendor/iced-widget", "vendor/iced-winit", "vendor/sevenz-rust2", "vendor/smithay-clipboard", "vendor/softbuffer", "vendor/ssh-key", "vendor/sunset"]
 resolver = "3"
 
 [package]
@@ -12,9 +12,11 @@ description = "Native desktop terminal workspace"
 default-run = "kortty"
 
 [dependencies]
+aes-gcm = { version = "0.10", default-features = false, features = ["aes", "zeroize"] }
 base64 = "0.22.1"
 async-channel = "2.5"
 bzip2 = "0.6.1"
+ed25519-dalek = { version = "2.2", default-features = false }
 flate2 = { version = "1.1.10", default-features = false, features = ["zlib-rs"] }
 getrandom = "0.4"
 globset = { version = "0.4.20", default-features = false }
@@ -30,11 +32,15 @@ kortty-jobs = { path = "crates/jobs" }
 kortty-pty = { path = "crates/pty" }
 kortty-recording = { path = "crates/recording" }
 kortty-serial = { path = "crates/serial", features = ["serde"] }
+kortty-server-archive = { path = "crates/server-archive", default-features = false }
 kortty-ssh = { path = "crates/ssh" }
-kortty-terminal = { path = "crates/terminal" }
+kortty-terminal = { path = "crates/terminal", features = ["serde"] }
 kortty-windowing = { path = "crates/windowing" }
 kortty-vault = { path = "crates/vault" }
+latex-rust = "=3.0.3"
+lopdf = { version = "=0.47.0", default-features = false }
 percent-encoding = "2.3"
+pbkdf2 = { version = "0.12", default-features = false, features = ["hmac"] }
 pgp = { version = "0.21.0", default-features = false }
 rand = { version = "0.8.8", default-features = false, features = ["std_rng"] }
 regex = "1"
@@ -43,33 +49,39 @@ roxmltree = "0.21.2"
 rsa = { version = "0.9.10", default-features = false }
 ruzstd = "=0.9.1"
 serde = { version = "1", features = ["derive", "rc"] }
-serde_json = { version = "1", features = ["raw_value"] }
+serde_json = { version = "1", features = ["float_roundtrip", "raw_value"] }
+sha2 = { version = "0.10", default-features = false }
 softbuffer = { version = "=0.4.8", default-features = false, features = ["premultiplied-argb"] }
 svgtypes = "0.16"
+subtle = { version = "2.6", default-features = false }
 tar = { version = "0.4.46", default-features = false }
 tiny-skia = { version = "0.11", default-features = false, features = ["std", "simd"] }
+tiktoken-rs = "=0.12.0"
 toml_edit = { version = "0.25", default-features = false, features = ["parse"] }
 url = "2.5"
-ureq = { version = "3.5.1", default-features = false }
+ureq = { version = "=3.5.1", default-features = false, features = ["native-tls-no-default"] }
 unicode-normalization = "0.1"
 vte = { version = "0.15", default-features = false }
 zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
-zip = { version = "9.4.1", default-features = false, features = ["aes-crypto", "deflate-flate2"] }
+zip = { version = "=9.4.1", default-features = false, features = ["aes-crypto", "deflate-flate2"] }
 pdf-writer = { version = "=0.15.0", default-features = false }
 subsetter = { version = "=0.2.6", default-features = false }
 ttf-parser = { version = "=0.25.1", default-features = false }
+sevenz-rust2 = { version = "=0.25.0", path = "vendor/sevenz-rust2", default-features = false, features = ["compress", "aes256"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # Use the system's libc interface for Linux desktop dependencies.
-rustix = { version = "1", default-features = false, features = ["fs", "use-libc"] }
+rustix = { version = "1", default-features = false, features = ["fs", "param", "use-libc"] }
 rustix-legacy = { package = "rustix", version = "0.38", default-features = false, features = ["use-libc"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
-kortty-files = { path = "crates/files" }
 kortty-macos = { path = "crates/macos" }
 rustix = { version = "1", default-features = false, features = ["fs", "std", "use-libc"] }
 
 [target.'cfg(windows)'.dependencies]
+kortty-files = { path = "crates/files" }
+
+[target.'cfg(unix)'.dependencies]
 kortty-files = { path = "crates/files" }
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dev-dependencies]
@@ -84,7 +96,10 @@ incremental = false
 lto = "thin"
 
 [patch.crates-io]
+iced_runtime = { path = "vendor/iced-runtime" }
 iced_tiny_skia = { path = "vendor/iced-tiny-skia" }
+iced_widget = { path = "vendor/iced-widget" }
+iced_winit = { path = "vendor/iced-winit" }
 smithay-clipboard = { path = "vendor/smithay-clipboard" }
 softbuffer = { path = "vendor/softbuffer" }
 ssh-key = { path = "vendor/ssh-key" }

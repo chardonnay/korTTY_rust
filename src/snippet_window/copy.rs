@@ -2,7 +2,7 @@ use iced::widget::{button, checkbox, column, scrollable, text, text_input};
 use iced::{Element, Length};
 use zeroize::Zeroizing;
 
-use crate::snippets::{Library, SnippetId, resolve, valid_variable_value};
+use crate::snippets::{Library, SnippetId, one_liner, resolve, valid_variable_value};
 
 use super::{SnippetWindow, Update};
 
@@ -31,6 +31,23 @@ struct FieldOptions {
 }
 
 impl SnippetWindow {
+    pub(super) fn copy_snippet_command(&mut self, mode: one_liner::Mode) -> Update {
+        match one_liner::convert(&self.draft.content.text(), &self.draft.language, mode) {
+            Ok(command) => {
+                self.status = Some("Snippet command copied.".into());
+                Update::CopyResolved(command)
+            }
+            Err(error) => {
+                self.status = Some(error.message().into());
+                if mode == one_liner::Mode::Compact && error.offers_ai() && self.can_open_assist() {
+                    Update::ReviewCompactCommand
+                } else {
+                    Update::None
+                }
+            }
+        }
+    }
+
     pub(super) fn update_copy(&mut self, message: Message) -> Update {
         match message {
             Message::Begin if self.copy.is_none() && !self.draft.dirty => {

@@ -3,7 +3,7 @@
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::thread;
 
@@ -12,8 +12,8 @@ use jiff::Timestamp;
 use zeroize::Zeroizing;
 
 use super::{
-    LiveCursor, LivePage, LogFormat, MetadataEdit, capture, entry_edit, markers, screenshot_ai,
-    screenshot_analysis_store, screenshot_edit, viewer,
+    LiveCursor, LivePage, LogFormat, MetadataEdit, agent_chat, capture, entry_edit, markers,
+    screenshot_ai, screenshot_analysis_store, screenshot_edit, viewer,
 };
 use entry_edit::MarkerOutcome;
 use entry_edit::delete::{Deletion, Outcome};
@@ -43,6 +43,8 @@ pub(crate) struct Metadata {
     pub username: String,
     pub seeded: bool,
     pub log_format: LogFormat,
+    pub(crate) connection_config: Option<super::ConnectionConfig>,
+    pub(crate) title_manually_set: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -64,7 +66,10 @@ pub(crate) struct PublishedScreenshot {
 pub(crate) enum RecordKind {
     Seed,
     Output,
+    Input,
+    CommandEnd,
     Note,
+    SystemNote,
 }
 
 impl RecordKind {
@@ -72,7 +77,8 @@ impl RecordKind {
         match self {
             Self::Seed => "seed",
             Self::Output => "out",
-            Self::Note => "note",
+            Self::Input => "in",
+            Self::CommandEnd | Self::Note | Self::SystemNote => "note",
         }
     }
 }
@@ -98,10 +104,12 @@ impl std::error::Error for SendError {}
 
 pub(crate) struct Capture {
     id: String,
+    started_at: Timestamp,
     directory: PathBuf,
     root_identity: storage::DirectoryIdentity,
     directory_identity: storage::DirectoryIdentity,
     log_format: LogFormat,
+    summary_config: Option<super::ConnectionConfig>,
     archives: Arc<capture::LiveArchives>,
     sink: Sink,
     done: Receiver<()>,
@@ -122,12 +130,45 @@ impl Capture {
         Self::start_with_marker_rules(root, metadata, Arc::new(markers::Compiled::default()))
     }
 
+    #[cfg(test)]
     pub(crate) fn start_with_marker_rules(
         root: PathBuf,
         metadata: Metadata,
         rules: Arc<markers::Compiled>,
     ) -> io::Result<Self> {
-        Self::start_with_limits_and_rules(root, metadata, Limits::default(), rules)
+        Self::start_with_limits_and_rules(root, metadata, Limits::default(), rules, None)
+    }
+
+    pub(crate) fn start_configured(
+        root: PathBuf,
+        metadata: Metadata,
+        rules: Arc<markers::Compiled>,
+    ) -> io::Result<Self> {
+        Self::start_configured_inner(root, metadata, rules, None)
+    }
+
+    pub(super) fn start_configured_automation(
+        root: PathBuf,
+        metadata: Metadata,
+        rules: Arc<markers::Compiled>,
+        automation: super::automation::TargetMetadata,
+    ) -> io::Result<Self> {
+        Self::start_configured_inner(root, metadata, rules, Some(automation))
+    }
+
+    fn start_configured_inner(
+        root: PathBuf,
+        metadata: Metadata,
+        rules: Arc<markers::Compiled>,
+        automation: Option<super::automation::TargetMetadata>,
+    ) -> io::Result<Self> {
+        let config = metadata.connection_config.unwrap_or_default();
+        config.validate()?;
+        let limits = Limits {
+            part_bytes: config.part_bytes(),
+            parts: u32::from(config.max_log_parts),
+        };
+        Self::start_with_limits_and_rules(root, metadata, limits, rules, automation)
     }
 
     #[cfg(test)]
@@ -137,6 +178,7 @@ impl Capture {
             metadata,
             limits,
             Arc::new(markers::Compiled::default()),
+            None,
         )
     }
 
@@ -145,12 +187,15 @@ impl Capture {
         metadata: Metadata,
         limits: Limits,
         rules: Arc<markers::Compiled>,
+        automation: Option<super::automation::TargetMetadata>,
     ) -> io::Result<Self> {
+        let started_at = Timestamp::now();
         let id = uuid()?;
         let directory = root.join(format!("journal-{id}"));
         let (send, receive) = async_channel::bounded(QUEUE);
         let shared = Arc::new(Shared {
             input: send,
+            output_paused: AtomicBool::new(false),
             marker_rules: Mutex::new(rules),
             sequence: AtomicU64::default(),
             timeline: AtomicUsize::default(),
@@ -172,12 +217,20 @@ impl Capture {
         };
         let writer_id = id.clone();
         let log_format = metadata.log_format;
+        let summary_config = metadata.connection_config;
         let archives = Arc::new(capture::LiveArchives::default());
         let writer_archives = Arc::clone(&archives);
         thread::Builder::new()
             .name("kortty-session-journal".into())
             .spawn(move || {
-                let writer = Writer::start(&root, writer_id, metadata, limits, writer_archives);
+                let writer = Writer::start(
+                    &root,
+                    writer_id,
+                    metadata,
+                    limits,
+                    writer_archives,
+                    automation,
+                );
                 match writer {
                     Ok(writer) => {
                         if ready.send(Ok(writer.location())).is_err() {
@@ -204,10 +257,12 @@ impl Capture {
             .map_err(|_| io::Error::other("Session journal writer stopped during startup"))??;
         Ok(Self {
             id,
+            started_at,
             directory,
             root_identity,
             directory_identity,
             log_format,
+            summary_config,
             archives,
             sink: Sink { shared },
             done,
@@ -218,12 +273,89 @@ impl Capture {
         &self.directory
     }
 
+    pub(crate) fn started_at(&self) -> Timestamp {
+        self.started_at
+    }
+
     pub(crate) fn log_format(&self) -> LogFormat {
         self.log_format
     }
 
+    pub(crate) fn summary_config(&self) -> Option<super::ConnectionConfig> {
+        self.summary_config
+    }
+
+    pub(crate) fn publish_summary(
+        &self,
+        after: u64,
+        window: super::summary_plan::Window,
+        card: Option<super::summary_ai::Card>,
+        cancelled: Arc<AtomicBool>,
+        authorize: Option<super::summary_ai::Authorization>,
+    ) -> io::Result<Receiver<Result<u64, String>>> {
+        self.enqueue_mutation(move |reply| Item::Summary {
+            update: Box::new(disk::SummaryPublish {
+                after,
+                window,
+                card,
+                cancelled,
+                authorize,
+            }),
+            reply,
+        })
+    }
+
     pub(crate) fn live_tail(&self, after: Option<&LiveCursor>) -> io::Result<LivePage> {
         capture::capture_live_tail(self.directory(), self.log_format(), &self.archives, after)
+    }
+
+    /// Appends a masked Agent card once, in the same FIFO as capture and entry edits.
+    pub(crate) fn ensure_agent_card(
+        &self,
+        card: agent_chat::Card,
+    ) -> io::Result<Receiver<Result<(), String>>> {
+        self.ensure_agent_card_checked(card, None)
+    }
+
+    pub(crate) fn ensure_agent_card_checked(
+        &self,
+        card: agent_chat::Card,
+        permit: Option<Arc<AtomicBool>>,
+    ) -> io::Result<Receiver<Result<(), String>>> {
+        card.validate()?;
+        self.enqueue_mutation(move |reply| Item::AgentCard {
+            card: Box::new(card),
+            permit,
+            reply,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn link_agent_chat(
+        &self,
+        entry: String,
+        snapshot: agent_chat::Snapshot,
+    ) -> io::Result<Receiver<Result<(), String>>> {
+        self.link_agent_chat_checked(entry, snapshot, Arc::new(AtomicBool::new(true)))
+    }
+
+    /// Publishes a bounded chat copy only while its handoff permit remains true.
+    pub(crate) fn link_agent_chat_checked(
+        &self,
+        entry: String,
+        snapshot: agent_chat::Snapshot,
+        permit: Arc<AtomicBool>,
+    ) -> io::Result<Receiver<Result<(), String>>> {
+        if !agent_chat::valid_reference(&entry) {
+            return Err(super::invalid("Invalid Agent journal entry reference"));
+        }
+        snapshot.validate()?;
+        self.enqueue_mutation(move |reply| Item::AgentChat {
+            entry,
+            snapshot: Box::new(snapshot),
+            permit,
+            reply,
+        })
     }
 
     pub(super) fn location(
@@ -357,6 +489,8 @@ impl Capture {
                 | Item::EditScreenshot { .. }
                 | Item::ScreenshotAnalysis { .. }
                 | Item::ApplyMarkers { .. }
+                | Item::Summary { .. }
+                | Item::AgentChat { .. }
         );
         if entry_mutation && progress.entry_mutation_pending {
             return Err(io::Error::new(
@@ -425,12 +559,47 @@ impl fmt::Debug for Sink {
 }
 
 impl Sink {
+    pub(crate) fn output_paused(&self) -> bool {
+        self.shared.output_paused.load(Ordering::Acquire)
+    }
+
     /// Offers prepared, already redacted display text. Queue overflow ends capture explicitly.
     pub(crate) fn try_write(
         &self,
         kind: RecordKind,
         text: Zeroizing<String>,
         partial: bool,
+    ) -> Result<(), SendError> {
+        if matches!(kind, RecordKind::Output | RecordKind::Seed) && self.output_paused() {
+            return Ok(());
+        }
+        self.queue_text(text, |text| Item::Text {
+            kind,
+            text,
+            partial,
+            time: Timestamp::now(),
+        })
+    }
+
+    /// Reserves the command's place before terminal output can overtake the write.
+    /// The disk worker publishes it only after the transport confirms success.
+    pub(crate) fn reserve_input(
+        &self,
+        text: Zeroizing<String>,
+    ) -> Result<mpsc::SyncSender<()>, SendError> {
+        let (confirm, receipt) = mpsc::sync_channel(1);
+        self.queue_text(text, |text| Item::ConfirmedInput {
+            text,
+            time: Timestamp::now(),
+            receipt,
+        })?;
+        Ok(confirm)
+    }
+
+    fn queue_text(
+        &self,
+        text: Zeroizing<String>,
+        item: impl FnOnce(Zeroizing<String>) -> Item,
     ) -> Result<(), SendError> {
         let mut progress = self.shared.lock();
         progress.recording()?;
@@ -441,12 +610,7 @@ impl Sink {
             );
             return Err(SendError::TooLarge);
         }
-        let result = self.shared.input.try_send(Item::Text {
-            kind,
-            text,
-            partial,
-            time: Timestamp::now(),
-        });
+        let result = self.shared.input.try_send(item(text));
         self.handle_text_send(&mut progress, result)
     }
 
@@ -563,6 +727,21 @@ enum Item {
         edit: MetadataEdit,
         reply: Sender<Result<(), String>>,
     },
+    Summary {
+        update: Box<disk::SummaryPublish>,
+        reply: Sender<Result<u64, String>>,
+    },
+    AgentCard {
+        card: Box<agent_chat::Card>,
+        permit: Option<Arc<AtomicBool>>,
+        reply: Sender<Result<(), String>>,
+    },
+    AgentChat {
+        entry: String,
+        snapshot: Box<agent_chat::Snapshot>,
+        permit: Arc<AtomicBool>,
+        reply: Sender<Result<(), String>>,
+    },
     Entry {
         edit: Box<entry_edit::Edit>,
         reply: Sender<Result<(), String>>,
@@ -592,6 +771,11 @@ enum Item {
         partial: bool,
         time: Timestamp,
     },
+    ConfirmedInput {
+        text: Zeroizing<String>,
+        time: Timestamp,
+        receipt: mpsc::Receiver<()>,
+    },
     Seed {
         lines: Vec<Zeroizing<String>>,
         older_omitted: usize,
@@ -605,6 +789,7 @@ enum Item {
 }
 
 struct Shared {
+    output_paused: AtomicBool,
     input: Sender<Item>,
     marker_rules: Mutex<Arc<markers::Compiled>>,
     progress: Mutex<Progress>,
@@ -685,7 +870,7 @@ impl Drop for Completion {
     }
 }
 
-fn uuid() -> io::Result<String> {
+pub(super) fn uuid() -> io::Result<String> {
     let mut bytes = [0; 16];
     getrandom::fill(&mut bytes).map_err(io::Error::other)?;
     bytes[6] = (bytes[6] & 0x0f) | 0x40;

@@ -8,16 +8,20 @@ use iced::widget::canvas::{self, Action, Cache, Frame as CanvasFrame, Geometry};
 use iced::widget::{Canvas, Stack};
 use iced::{Color, Element, Event, Font, Length, Point, Rectangle, Renderer, Size, Theme, window};
 use kortty_terminal::{
-    Color as TerminalColor, CursorShape, KeyModifiers, MouseButton, MouseEvent, MousePosition,
-    ScreenSnapshot, SearchMatch, SearchPosition, Style,
+    Color as TerminalColor, Cursor, CursorShape, KeyModifiers, MouseButton, MouseEvent,
+    MousePosition, ScreenSnapshot, SearchMatch, SearchPosition, Style,
 };
 
 use crate::kitty_view::{ImageLayer, KittyView};
-use crate::session::{Frame, GridSize, SessionId, TypeAheadFrame};
+use crate::session::{Frame, GridSize, SessionId, TypeAheadFrame, inline_history};
 use crate::terminal_links;
 use crate::terminal_theme::{Appearance, Rgb, cell_width_ratio};
 use crate::workspace::{Message, terminal_context, terminal_link_dialog};
 
+pub(crate) mod agent_cursor;
+pub(crate) mod background_image;
+mod inline_visual;
+pub(crate) mod projected_selection;
 pub(crate) mod quick_select;
 mod row_cache;
 mod scrollbar;
@@ -73,14 +77,23 @@ impl Selection {
     }
 
     pub fn text(self, screen: &ScreenSnapshot) -> String {
-        self.extract_text(screen, false)
+        self.extract_text(screen, false, false)
     }
 
     pub(crate) fn visible_text(self, screen: &ScreenSnapshot) -> String {
-        self.extract_text(screen, true)
+        self.extract_text(screen, true, false)
     }
 
-    fn extract_text(self, screen: &ScreenSnapshot, visible_only: bool) -> String {
+    pub(crate) fn visible_joined_text(self, screen: &ScreenSnapshot) -> String {
+        self.extract_text(screen, true, true)
+    }
+
+    fn extract_text(
+        self,
+        screen: &ScreenSnapshot,
+        visible_only: bool,
+        join_wrapped: bool,
+    ) -> String {
         let (first, last) = self.bounds();
         let mut result = String::new();
         for row in first.row..=last.row.min(screen.rows.saturating_sub(1)) {
@@ -95,10 +108,16 @@ impl Selection {
             } else {
                 cells.len()
             };
-            let Some(cells) = cells.get(start..end.min(cells.len())) else {
+            let wrap = if join_wrapped && row < last.row {
+                screen.wrapped_columns(row).map(usize::from)
+            } else {
+                None
+            };
+            let end = end.min(wrap.unwrap_or(cells.len())).min(cells.len());
+            let Some(cells) = cells.get(start..end) else {
                 continue;
             };
-            if row != first.row {
+            if row != first.row && (!join_wrapped || screen.wrapped_columns(row - 1).is_none()) {
                 result.push('\n');
             }
             let mut line = String::new();
@@ -109,7 +128,11 @@ impl Selection {
                     line.push_str(&cell.text);
                 }
             }
-            result.push_str(line.trim_end_matches(' '));
+            result.push_str(if wrap.is_some() {
+                &line
+            } else {
+                line.trim_end_matches(' ')
+            });
         }
         result
     }
@@ -121,14 +144,19 @@ pub struct TerminalView<'a> {
     pub font_size: u8,
     pub font: Font,
     pub appearance: Appearance,
+    pub(crate) background_image: Option<&'a background_image::Image>,
     pub scale_factor: f32,
     pub background_transparency: u8,
     pub focused: bool,
+    pub reduced_motion: bool,
     pub typeahead_enabled: bool,
     pub owner: window::Id,
     pub plain_text_links: bool,
     pub selection: Option<Selection>,
+    pub(crate) projected: Option<projected_selection::View<'a>>,
     pub search: Option<SearchHighlight<'a>>,
+    pub(crate) agent_cursor: Option<agent_cursor::Review<'a>>,
+    pub(crate) inline_agent: Option<inline_history::Interaction>,
 }
 
 #[derive(Clone, Copy)]
@@ -144,8 +172,11 @@ pub fn view(terminal: TerminalView<'_>) -> Element<'_, Message> {
     let screen = &frame.screen;
     let scale = terminal.scale_factor;
     let selection = terminal.selection;
+    let projected_selection = terminal.projected.as_ref().and_then(|view| view.range);
     let search = terminal.search;
     let appearance = terminal.appearance;
+    let background_image = terminal.background_image;
+    let reduced_motion = terminal.reduced_motion;
     let background = with_transparency(
         default_background(screen, &appearance),
         terminal.background_transparency,
@@ -153,7 +184,17 @@ pub fn view(terminal: TerminalView<'_>) -> Element<'_, Message> {
     let text = Canvas::new(terminal)
         .width(Length::Fill)
         .height(Length::Fill);
+    let background_view = || {
+        Canvas::new(Background(background, background_image))
+            .width(Length::Fill)
+            .height(Length::Fill)
+    };
     if screen.images.is_empty() {
+        if background_image.is_some() {
+            // The software backend groups raster images after vector fills in
+            // one layer. Keep explicit cell backgrounds in the higher layer.
+            return Stack::new().push(background_view()).push(text).into();
+        }
         return text.into();
     }
 
@@ -166,7 +207,7 @@ pub fn view(terminal: TerminalView<'_>) -> Element<'_, Message> {
     );
     let graphics = |layer| {
         Canvas::new(KittyView {
-            images: &screen.images,
+            frame,
             layer,
             grid,
             cell: Size::new(metrics.width, metrics.height),
@@ -175,12 +216,8 @@ pub fn view(terminal: TerminalView<'_>) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill)
     };
-    Stack::new()
-        .push(
-            Canvas::new(Background(background))
-                .width(Length::Fill)
-                .height(Length::Fill),
-        )
+    let layers = Stack::new()
+        .push(background_view())
         .push(graphics(ImageLayer::BehindBackground))
         .push(
             Canvas::new(CellBackgrounds {
@@ -188,6 +225,7 @@ pub fn view(terminal: TerminalView<'_>) -> Element<'_, Message> {
                 appearance,
                 metrics,
                 selection,
+                projected_selection,
                 search,
             })
             .width(Length::Fill)
@@ -195,8 +233,23 @@ pub fn view(terminal: TerminalView<'_>) -> Element<'_, Message> {
         )
         .push(graphics(ImageLayer::BehindText))
         .push(text)
-        .push(graphics(ImageLayer::AboveText))
-        .into()
+        .push(graphics(ImageLayer::AboveText));
+    if frame.inline.is_some() {
+        layers
+            .push(
+                Canvas::new(inline_visual::Overlay {
+                    frame,
+                    appearance,
+                    metrics,
+                    reduced_motion,
+                })
+                .width(Length::Fill)
+                .height(Length::Fill),
+            )
+            .into()
+    } else {
+        layers.into()
+    }
 }
 
 pub fn content_size(screen: &ScreenSnapshot, font_size: u8, font: Font) -> Size {
@@ -207,14 +260,19 @@ pub fn content_size(screen: &ScreenSnapshot, font_size: u8, font: Font) -> Size 
     )
 }
 
+pub(crate) fn cell_size(font_size: u8, font: Font) -> Size {
+    let metrics = Metrics::with_font(font_size, font);
+    Size::new(metrics.width, metrics.height)
+}
+
 pub(crate) fn effect_row_bounds(font_size: u8, row: u16) -> (f32, f32) {
     let metrics = Metrics::new(font_size);
     (metrics.point(row, 0).y, metrics.height)
 }
 
-struct Background(Color);
+struct Background<'a>(Color, Option<&'a background_image::Image>);
 
-impl canvas::Program<Message> for Background {
+impl canvas::Program<Message> for Background<'_> {
     type State = BackgroundCache;
 
     fn draw(
@@ -225,23 +283,51 @@ impl canvas::Program<Message> for Background {
         bounds: Rectangle,
         _: mouse::Cursor,
     ) -> Vec<Geometry> {
-        vec![state.draw(renderer, bounds.size(), self.0)]
+        vec![state.draw(renderer, bounds.size(), self.0, self.1)]
     }
 }
 
 #[derive(Default)]
 struct BackgroundCache {
-    color: std::cell::Cell<Option<Color>>,
+    style: std::cell::Cell<Option<(Color, Option<iced::advanced::image::Id>)>>,
     cache: Cache,
 }
 
 impl BackgroundCache {
-    fn draw(&self, renderer: &Renderer, size: Size, color: Color) -> Geometry {
-        if self.color.replace(Some(color)) != Some(color) {
+    fn draw(
+        &self,
+        renderer: &Renderer,
+        size: Size,
+        mut color: Color,
+        image: Option<&background_image::Image>,
+    ) -> Geometry {
+        let image = image.filter(|_| color.a > 0.0);
+        let style = Some((color, image.map(|image| image.handle().id())));
+        if self.style.replace(style) != style {
             self.cache.clear();
         }
         self.cache.draw(renderer, size, |frame| {
+            // Retain the theme color and respect the requested background alpha even
+            // where the image is opaque. Transparent source pixels can reveal more.
+            let opacity = color.a * 0.25;
+            if image.is_some() {
+                color.a = (color.a - opacity) / (1.0 - opacity);
+            }
             frame.fill_rectangle(Point::ORIGIN, size, color);
+            if let Some(image) = image {
+                let fitted = iced::ContentFit::Cover
+                    .fit(Size::new(image.width as f32, image.height as f32), size);
+                frame.draw_image(
+                    Rectangle::new(
+                        Point::new(
+                            (size.width - fitted.width) / 2.0,
+                            (size.height - fitted.height) / 2.0,
+                        ),
+                        fitted,
+                    ),
+                    iced::advanced::image::Image::from(image.handle()).opacity(opacity),
+                );
+            }
         })
     }
 }
@@ -251,6 +337,7 @@ struct CellBackgrounds<'a> {
     appearance: Appearance,
     metrics: Metrics,
     selection: Option<Selection>,
+    projected_selection: Option<Selection>,
     search: Option<SearchHighlight<'a>>,
 }
 
@@ -273,11 +360,13 @@ impl canvas::Program<Message> for CellBackgrounds<'_> {
                 metrics: self.metrics,
                 appearance: self.appearance,
                 selection: self.selection,
+                projected_selection: self.projected_selection,
                 search: self.search,
                 font: None,
                 cursor: None,
                 preview: None,
                 backgrounds: true,
+                focus: None,
             },
         )
     }
@@ -298,11 +387,25 @@ struct SelectionDrag {
     session: SessionId,
     start: CellPosition,
     range: Option<Selection>,
+    projected: Option<(u64, Arc<Frame>)>,
 }
 
 impl SelectionDrag {
     fn belongs_to(&self, terminal: &TerminalView<'_>) -> bool {
-        self.owner == terminal.owner && self.session == terminal.session
+        self.owner == terminal.owner
+            && self.session == terminal.session
+            && self.projected.is_some() == terminal.projected.is_some()
+    }
+
+    fn projected_range(
+        &self,
+        terminal: &TerminalView<'_>,
+        range: Selection,
+    ) -> Option<projected_selection::ProjectedSelection> {
+        let (stream, source) = self.projected.as_ref()?;
+        let view = terminal.projected.as_ref()?;
+        (*stream == view.stream && projected_selection::same_rows(source, view.source, range))
+            .then(|| projected_selection::ProjectedSelection::new(view.source, *stream, range))
     }
 }
 
@@ -333,11 +436,18 @@ struct CursorBlink {
 impl CursorBlink {
     fn advance(&mut self, now: Instant, terminal: &TerminalView<'_>) -> Option<Instant> {
         let screen = &terminal.frame.screen;
-        if !terminal.focused || !screen.cursor.visible || !screen.cursor_blinking {
+        if !terminal.focused
+            || !terminal.frame.at_live_viewport()
+            || !screen.cursor.visible
+            || !screen.cursor_blinking
+        {
             *self = Self::default();
             return None;
         }
-        let (row, column) = terminal.display_cursor();
+        let Some((row, column)) = terminal.display_cursor() else {
+            *self = Self::default();
+            return None;
+        };
         let at = (terminal.session, row, column);
         if self.at != Some(at) {
             self.start = None;
@@ -363,7 +473,13 @@ impl canvas::Program<Message> for TerminalView<'_> {
     ) -> Option<Action<Message>> {
         let metrics = Metrics::with_font(self.font_size, self.font);
         if let Event::Window(window::Event::RedrawRequested(now)) = event {
-            let redraw = state.cursor.advance(*now, self);
+            let redraw = [
+                state.cursor.advance(*now, self),
+                inline_visual::next_redraw(self, *now),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
             let grid = metrics.grid(bounds.size(), self.scale_factor);
             if state.observed_grid != Some((self.session, grid)) {
                 state.observed_grid = Some((self.session, grid));
@@ -371,8 +487,43 @@ impl canvas::Program<Message> for TerminalView<'_> {
             }
             return redraw.map(Action::request_redraw_at);
         }
-        if self.focused && matches!(event, Event::Keyboard(keyboard::Event::KeyPressed { .. })) {
+        if self.focused
+            && let Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+                ..
+            }) = event
+        {
             state.cursor.start = None;
+            if modifiers.is_empty()
+                && let Some(key) = agent_cursor::Key::from_key(key)
+                && let Some(review) = &self.agent_cursor
+                && let Some(projected) = self.projected_cursor()
+                && review.position(bounds.size(), projected, metrics).is_some()
+            {
+                return Some(if *repeat {
+                    Action::request_redraw().and_capture()
+                } else {
+                    Action::publish(Message::AgentCursor(agent_cursor::Message::Key(
+                        review.binding,
+                        key,
+                    )))
+                    .and_capture()
+                });
+            }
+            if self.frame.at_live_viewport()
+                && let Some(interaction) = self.inline_agent
+                && self.projected_grid_fits(metrics, bounds)
+                && let Some(key) =
+                    inline_history::Key::from_event(key, *modifiers, interaction.approval)
+            {
+                return Some(if *repeat {
+                    Action::capture()
+                } else {
+                    Action::publish(Message::AgentInline(interaction.binding, key)).and_capture()
+                });
+            }
             return Some(Action::request_redraw());
         }
         if state.pointer.session != Some(self.session) {
@@ -402,7 +553,7 @@ impl canvas::Program<Message> for TerminalView<'_> {
             _ => {}
         }
         let reporting = self.frame.ibm.is_none()
-            && self.frame.scroll_offset == 0
+            && self.frame.at_live_viewport()
             && self.frame.screen.mouse_reporting();
         if !reporting {
             state.pointer.pressed.clear();
@@ -422,7 +573,7 @@ impl canvas::Program<Message> for TerminalView<'_> {
                             link: Arc::new(link),
                             dragged: false,
                         });
-                        state.selection_drag = Some(self.start_selection(point, metrics));
+                        state.selection_drag = self.start_selection(point, metrics, bounds);
                         return Some(
                             Action::publish(Message::Selection(self.session, None)).and_capture(),
                         );
@@ -487,7 +638,8 @@ impl canvas::Program<Message> for TerminalView<'_> {
         match event {
             Event::Mouse(mouse::Event::ButtonPressed(Button::Left)) => {
                 let point = cursor.position_in(bounds)?;
-                state.selection_drag = Some(self.start_selection(point, metrics));
+                state.selection_drag = self.start_selection(point, metrics, bounds);
+                state.selection_drag.as_ref()?;
                 Some(Action::publish(Message::Selection(self.session, None)))
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
@@ -495,7 +647,15 @@ impl canvas::Program<Message> for TerminalView<'_> {
                 if !drag.belongs_to(self) {
                     return None;
                 }
-                let end = self.position(cursor.position_from(bounds.position())?, metrics);
+                let point = cursor.position_from(bounds.position())?;
+                let end = if drag.projected.is_some() {
+                    if !self.projected_grid_fits(metrics, bounds) {
+                        return None;
+                    }
+                    self.display_position(point, metrics)
+                } else {
+                    self.position(point, metrics)?
+                };
                 let selection = (drag.start != end).then_some(Selection {
                     start: drag.start,
                     end,
@@ -504,6 +664,19 @@ impl canvas::Program<Message> for TerminalView<'_> {
                     return None;
                 }
                 drag.range = selection;
+                if drag.projected.is_some()
+                    && let Some(range) = selection
+                {
+                    if let Some(projected) = drag.projected_range(self, range) {
+                        return Some(Action::publish(Message::ProjectedSelection(
+                            self.owner,
+                            self.session,
+                            projected,
+                        )));
+                    }
+                    state.selection_drag = None;
+                    return Some(Action::publish(Message::Selection(self.session, None)));
+                }
                 Some(Action::publish(Message::Selection(self.session, selection)))
             }
             Event::Mouse(mouse::Event::ButtonReleased(Button::Left)) => {
@@ -511,10 +684,24 @@ impl canvas::Program<Message> for TerminalView<'_> {
                     .selection_drag
                     .take()
                     .filter(|drag| drag.belongs_to(self))?;
+                let range = drag.range?;
+                if drag.projected.is_some() {
+                    if !self.projected_grid_fits(metrics, bounds) {
+                        return None;
+                    }
+                    return Some(Action::publish(Message::ProjectedSelectionFinished(
+                        self.owner,
+                        self.session,
+                        drag.projected_range(self, range)?,
+                    )));
+                }
+                if let Some(point) = cursor.position_from(bounds.position()) {
+                    self.position(point, metrics)?;
+                }
                 Some(Action::publish(Message::SelectionFinished(
                     self.owner,
                     self.session,
-                    drag.range?,
+                    range,
                     Arc::downgrade(self.frame),
                 )))
             }
@@ -543,30 +730,52 @@ impl canvas::Program<Message> for TerminalView<'_> {
     ) -> Vec<Geometry> {
         let screen = &self.frame.screen;
         let cursor_visible = self.focused
+            && self.frame.at_live_viewport()
             && screen.cursor.visible
             && (!screen.cursor_blinking || !state.cursor.hidden);
         let backgrounds = screen.images.is_empty();
+        let metrics = Metrics::with_font(self.font_size, self.font);
+        let focus = backgrounds
+            .then(|| inline_visual::focus(self.frame, self.reduced_motion, Instant::now()))
+            .flatten();
         let mut geometry = state.rows.borrow_mut().draw(
             renderer,
             bounds.size(),
             row_cache::View {
                 frame: self.frame,
-                metrics: Metrics::with_font(self.font_size, self.font),
+                metrics,
                 appearance: self.appearance,
                 selection: self.selection,
+                projected_selection: self.projected.as_ref().and_then(|view| view.range),
                 search: self.search,
                 font: Some((self.font, self.font_size)),
-                cursor: cursor_visible.then(|| self.display_cursor()),
+                cursor: cursor_visible.then(|| self.display_cursor()).flatten(),
                 preview: self.typeahead(),
                 backgrounds,
+                focus: focus.as_ref(),
             },
         );
-        if backgrounds {
+        if backgrounds && self.background_image.is_none() {
             let color = with_transparency(
                 default_background(screen, &self.appearance),
                 self.background_transparency,
             );
-            geometry.insert(0, state.background.draw(renderer, bounds.size(), color));
+            geometry.insert(
+                0,
+                state.background.draw(renderer, bounds.size(), color, None),
+            );
+        }
+        if let Some(focus) = focus {
+            geometry.push(focus.draw(
+                self.frame,
+                self.appearance,
+                renderer,
+                bounds.size(),
+                metrics,
+            ));
+        }
+        if let Some(review) = &self.agent_cursor {
+            geometry.push(review.draw(self, renderer, bounds.size()));
         }
         geometry
     }
@@ -577,16 +786,19 @@ impl canvas::Program<Message> for TerminalView<'_> {
         bounds: Rectangle,
         cursor: mouse::Cursor,
     ) -> mouse::Interaction {
+        let metrics = Metrics::with_font(self.font_size, self.font);
         if state.pointer.link_gesture
             && state.pointer.pressed.is_empty()
             && state.selection_drag.is_none()
-            && cursor.position_in(bounds).is_some_and(|point| {
-                self.link_at(point, Metrics::with_font(self.font_size, self.font))
-                    .is_some()
-            })
+            && cursor
+                .position_in(bounds)
+                .is_some_and(|point| self.link_at(point, metrics).is_some())
         {
             mouse::Interaction::Pointer
-        } else if cursor.is_over(bounds) {
+        } else if cursor.position_in(bounds).is_some_and(|point| {
+            (self.projected.is_some() && self.projected_grid_fits(metrics, bounds))
+                || self.position(point, metrics).is_some()
+        }) {
             mouse::Interaction::Text
         } else {
             mouse::Interaction::None
@@ -603,7 +815,7 @@ impl TerminalView<'_> {
         }
         terminal_links::at(
             &self.frame.screen,
-            row as u16,
+            self.frame.display_raw_row(row as u16)?,
             column as u16,
             self.plain_text_links,
         )
@@ -669,7 +881,8 @@ impl TerminalView<'_> {
         };
         let position = relative
             .map(|point| {
-                let cell = self.position(point, metrics);
+                // The terminal actor suppresses the agent projection in mouse-reporting mode.
+                let cell = self.display_position(point, metrics);
                 let grid = metrics.grid(bounds.size(), self.scale_factor);
                 let pixel = |coordinate: f32, extent: u16| {
                     (((coordinate - INSET) * self.scale_factor).floor() as u16)
@@ -707,7 +920,7 @@ impl TerminalView<'_> {
         Some(Action::publish(Message::TerminalMouse(self.session, bytes)).and_capture())
     }
 
-    fn position(&self, point: Point, metrics: Metrics) -> CellPosition {
+    fn display_position(&self, point: Point, metrics: Metrics) -> CellPosition {
         let screen = &self.frame.screen;
         let column = ((point.x - INSET) / metrics.width).floor() as u16;
         let row = ((point.y - INSET) / metrics.height).floor() as u16;
@@ -717,19 +930,52 @@ impl TerminalView<'_> {
         }
     }
 
-    fn start_selection(&self, point: Point, metrics: Metrics) -> SelectionDrag {
-        SelectionDrag {
+    fn position(&self, point: Point, metrics: Metrics) -> Option<CellPosition> {
+        let mut position = self.display_position(point, metrics);
+        position.row = self.frame.display_raw_row(position.row)?;
+        Some(position)
+    }
+
+    fn projected_grid_fits(&self, metrics: Metrics, bounds: Rectangle) -> bool {
+        let grid = metrics.grid(bounds.size(), self.scale_factor);
+        grid.columns >= self.frame.screen.columns && grid.rows >= self.frame.screen.rows
+    }
+
+    fn start_selection(
+        &self,
+        point: Point,
+        metrics: Metrics,
+        bounds: Rectangle,
+    ) -> Option<SelectionDrag> {
+        let projected = self
+            .projected
+            .as_ref()
+            .map(|view| (view.stream, Arc::clone(view.source)));
+        if projected.is_some() && !self.projected_grid_fits(metrics, bounds) {
+            return None;
+        }
+        Some(SelectionDrag {
             owner: self.owner,
             session: self.session,
-            start: self.position(point, metrics),
+            start: if projected.is_some() {
+                self.display_position(point, metrics)
+            } else {
+                self.position(point, metrics)?
+            },
             range: None,
-        }
+            projected,
+        })
     }
 
     fn typeahead(&self) -> Option<&TypeAheadFrame> {
         if self.typeahead_enabled
             && self.focused
+            && self.frame.at_live_viewport()
             && self.selection.is_none()
+            && self
+                .projected
+                .as_ref()
+                .is_none_or(|view| view.range.is_none())
             && self.search.is_none()
         {
             self.frame.typeahead.as_deref()
@@ -738,12 +984,23 @@ impl TerminalView<'_> {
         }
     }
 
-    fn display_cursor(&self) -> (u16, u16) {
+    fn projected_cursor(&self) -> Option<Cursor> {
+        if !self.frame.at_live_viewport() {
+            return None;
+        }
+        let mut cursor = self.frame.screen.cursor;
+        cursor.row = self.frame.raw_display_row(cursor.row)?;
+        Some(cursor)
+    }
+
+    fn display_cursor(&self) -> Option<(u16, u16)> {
         let cursor = self.frame.screen.cursor;
-        self.typeahead()
+        let (raw, column) = self
+            .typeahead()
             .map_or((cursor.row, cursor.column), |preview| {
                 (preview.row, preview.cursor_column)
-            })
+            });
+        Some((self.frame.raw_display_row(raw)?, column))
     }
 }
 
@@ -784,6 +1041,185 @@ fn wheel_scroll_lines(delta: ScrollDelta, cell_height: f32) -> i32 {
 
 #[cfg(test)]
 #[test]
+fn projected_agent_rows_have_no_raw_hit_and_only_bound_keys_are_captured() {
+    use crate::terminal_agent::design::inline::{Line, Role, Segment};
+    use iced::keyboard::{
+        Location,
+        key::{Code, Physical},
+    };
+    use iced::widget::canvas::Program as _;
+
+    let mut terminal = kortty_terminal::Terminal::new(30, 6);
+    terminal.advance(b"\x1b[2;1Hhttps://visible.example/\x1b[3;1H$ ");
+    let mut frame = selection_test_frame(terminal.snapshot());
+    inline_history::fixture(
+        Arc::get_mut(&mut frame).unwrap(),
+        1,
+        vec![Line {
+            segments: vec![Segment {
+                text: "https://agent.example/".into(),
+                role: Role::Text,
+            }],
+        }],
+        false,
+    );
+    let owner = window::Id::unique();
+    let session = SessionId(1);
+    let binding = agent_cursor::Binding {
+        owner,
+        session,
+        stream: 1,
+        run: window::Id::unique(),
+        epoch: 1,
+        screen_revision: 1,
+        input_revision: 1,
+    };
+    let mut view = TerminalView {
+        session,
+        frame: &frame,
+        font_size: 14,
+        font: Font::MONOSPACE,
+        appearance: Appearance::default(),
+        background_image: None,
+        scale_factor: 1.0,
+        background_transparency: 0,
+        focused: true,
+        reduced_motion: false,
+        typeahead_enabled: false,
+        owner,
+        plain_text_links: true,
+        selection: None,
+        projected: None,
+        search: None,
+        agent_cursor: None,
+        inline_agent: Some(inline_history::Interaction {
+            binding,
+            approval: true,
+        }),
+    };
+    let bounds = Rectangle::with_size(Size::new(360.0, 150.0));
+    let metrics = Metrics::with_font(view.font_size, view.font);
+    let annotation = metrics.point(1, 1) + iced::Vector::new(1.0, 1.0);
+    let raw = metrics.point(2, 1) + iced::Vector::new(1.0, 1.0);
+    assert!(view.position(annotation, metrics).is_none());
+    assert!(view.link_at(annotation, metrics).is_none());
+    assert_eq!(
+        view.position(raw, metrics),
+        Some(CellPosition { row: 1, column: 1 })
+    );
+    assert_eq!(
+        view.link_at(raw, metrics).unwrap().uri(),
+        "https://visible.example/"
+    );
+    assert!(
+        view.update(
+            &mut State::default(),
+            &Event::Mouse(mouse::Event::ButtonPressed(Button::Left)),
+            bounds,
+            mouse::Cursor::Available(annotation),
+        )
+        .is_none()
+    );
+    let mut interrupted = State::default();
+    assert!(
+        view.update(
+            &mut interrupted,
+            &Event::Mouse(mouse::Event::ButtonPressed(Button::Left)),
+            bounds,
+            mouse::Cursor::Available(raw),
+        )
+        .is_some()
+    );
+    view.projected = Some(projected_selection::View {
+        source: &frame,
+        stream: 1,
+        range: None,
+    });
+    let mut drag = State::default();
+    let event = |state: &mut State, event, point| {
+        view.update(state, &event, bounds, mouse::Cursor::Available(point))
+            .and_then(|action| action.into_inner().0)
+    };
+    assert!(
+        event(
+            &mut interrupted,
+            Event::Mouse(mouse::Event::CursorMoved {
+                position: annotation
+            }),
+            annotation,
+        )
+        .is_none()
+    );
+    assert!(matches!(
+        event(
+            &mut drag,
+            Event::Mouse(mouse::Event::ButtonPressed(Button::Left)),
+            annotation
+        ),
+        Some(Message::Selection(_, None))
+    ));
+    let moved = event(
+        &mut drag,
+        Event::Mouse(mouse::Event::CursorMoved { position: raw }),
+        raw,
+    );
+    let Some(Message::ProjectedSelection(actual_owner, actual_session, range)) = moved else {
+        panic!("a projected selection should cross into the original terminal row");
+    };
+    assert_eq!((actual_owner, actual_session), (owner, session));
+    assert_eq!(
+        range.text(&frame, 1).as_deref(),
+        Some("ttps://agent.example/\nht")
+    );
+    assert!(matches!(
+        event(
+            &mut drag,
+            Event::Mouse(mouse::Event::ButtonReleased(Button::Left)),
+            raw
+        ),
+        Some(Message::ProjectedSelectionFinished(_, _, _))
+    ));
+    view.projected = None;
+
+    let press = |view: &TerminalView<'_>, repeat, bounds| {
+        let key = keyboard::Key::Character("1".into());
+        view.update(
+            &mut State::default(),
+            &Event::Keyboard(keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: Physical::Code(Code::Digit1),
+                location: Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat,
+            }),
+            bounds,
+            mouse::Cursor::Unavailable,
+        )
+        .unwrap()
+        .into_inner()
+    };
+    let (message, _, status) = press(&view, false, bounds);
+    assert_eq!(status, iced::event::Status::Captured);
+    assert!(
+        matches!(message, Some(Message::AgentInline(current, inline_history::Key::Approve)) if current == binding)
+    );
+    let (message, _, status) = press(&view, true, bounds);
+    assert!(message.is_none());
+    assert_eq!(status, iced::event::Status::Captured);
+    let clipped = Rectangle::with_size(Size::new(70.0, 48.0));
+    let (message, _, status) = press(&view, false, clipped);
+    assert!(message.is_none());
+    assert_eq!(status, iced::event::Status::Ignored);
+    view.inline_agent.as_mut().unwrap().approval = false;
+    let (message, _, status) = press(&view, false, bounds);
+    assert!(message.is_none());
+    assert_eq!(status, iced::event::Status::Ignored);
+}
+
+#[cfg(test)]
+#[test]
 fn terminal_copy_on_select_only_emits_completion_for_a_local_drag() {
     use iced::widget::canvas::Program as _;
 
@@ -798,14 +1234,19 @@ fn terminal_copy_on_select_only_emits_completion_for_a_local_drag() {
         font_size: 14,
         font: Font::MONOSPACE,
         appearance: Appearance::default(),
+        background_image: None,
         scale_factor: 1.0,
         background_transparency: 0,
         focused: true,
+        reduced_motion: false,
         typeahead_enabled: false,
         owner,
         plain_text_links: false,
         selection: None,
+        projected: None,
         search: None,
+        agent_cursor: None,
+        inline_agent: None,
     };
     let bounds = Rectangle::with_size(Size::new(480.0, 220.0));
     let start = Point::new(INSET + 1.0, INSET + 1.0);
@@ -889,43 +1330,55 @@ fn terminal_transparency_keeps_explicit_background_and_selection_opaque() {
     };
     colors.ansi[1] = Some(Rgb::from_hex(0xC65A14));
     let custom = colors.appearance(None);
-    for (appearance, percent, alpha) in [
-        (Appearance::default(), 0, 255),
-        (custom, 0, 255),
-        (custom, 50, 128),
-        (custom, 100, 0),
+    let image = background_image::Image {
+        handle: iced::widget::image::Handle::from_rgba(1, 1, vec![255, 0, 0, 255]),
+        width: 1,
+        height: 1,
+    };
+    for (appearance, percent, alpha, asset) in [
+        (Appearance::default(), 0, 255, None),
+        (custom, 0, 255, None),
+        (custom, 50, 128, None),
+        (custom, 100, 0, None),
+        (custom, 0, 255, Some(&image)),
+        (custom, 50, 128, Some(&image)),
+        (custom, 100, 0, Some(&image)),
     ] {
         renderer.reset(bounds);
-        for geometry in Background(with_transparency(
-            default_background(screen, &appearance),
-            percent,
-        ))
+        let backdrop = Background(
+            with_transparency(default_background(screen, &appearance), percent),
+            asset,
+        )
         .draw(
             &BackgroundCache::default(),
             &renderer,
             &Theme::Dark,
             bounds,
             mouse::Cursor::Unavailable,
-        )
-        .into_iter()
-        .chain(
-            CellBackgrounds {
-                frame: &frame,
-                appearance,
-                metrics,
-                selection,
-                search: None,
-            }
-            .draw(
-                &RefCell::default(),
-                &renderer,
-                &Theme::Dark,
-                bounds,
-                mouse::Cursor::Unavailable,
-            ),
-        ) {
+        );
+        for geometry in backdrop {
             renderer.draw_geometry(geometry);
         }
+        let cells = CellBackgrounds {
+            frame: &frame,
+            appearance,
+            metrics,
+            selection,
+            projected_selection: None,
+            search: None,
+        }
+        .draw(
+            &RefCell::default(),
+            &renderer,
+            &Theme::Dark,
+            bounds,
+            mouse::Cursor::Unavailable,
+        );
+        renderer.with_layer(bounds, |renderer| {
+            for geometry in cells {
+                renderer.draw_geometry(geometry);
+            }
+        });
         let image = iced_tiny_skia::window::compositor::screenshot(
             &mut renderer,
             &viewport,
@@ -935,14 +1388,18 @@ fn terminal_transparency_keeps_explicit_background_and_selection_opaque() {
             let center = metrics.point(0, column);
             (width as usize * (center.y as usize + 4) + center.x as usize + 4) * 4
         };
-        assert_eq!(image[cell_offset(0) + 3], alpha);
+        assert!(image[cell_offset(0) + 3].abs_diff(alpha) <= 1);
         assert_eq!(image[cell_offset(1) + 3], 255);
         assert_eq!(image[cell_offset(2) + 3], 255);
         if appearance == custom && percent == 0 {
-            assert_eq!(
-                &image[cell_offset(0)..cell_offset(0) + 3],
-                &[0x47, 0x67, 0xB2]
-            );
+            let background = &image[cell_offset(0)..cell_offset(0) + 3];
+            if asset.is_some() {
+                assert!((110..=123).contains(&background[0]));
+                assert!((70..=84).contains(&background[1]));
+                assert!((126..=142).contains(&background[2]));
+            } else {
+                assert_eq!(background, &[0x47, 0x67, 0xB2]);
+            }
             assert_eq!(
                 &image[cell_offset(1)..cell_offset(1) + 3],
                 &[0xC6, 0x5A, 0x14]

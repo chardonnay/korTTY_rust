@@ -16,6 +16,51 @@ fn stream_metadata_has_unique_wire_identifiers() {
 }
 
 #[test]
+fn ansi_identity_and_cursor_queries_preserve_graphics_and_key_modes() {
+    let input = b"\x1b(0lqk\x1b(B\x1b[2;2H\x1b[?1h\x1b>\x1b[c\x1b[>c\x1b[6n\x1b[>1c\x1b[>0c";
+    for (profile, identity) in [
+        (TerminalProfile::Xterm, "\x1b[?6c"),
+        (TerminalProfile::Vt100, "\x1b[?1;2c"),
+        (TerminalProfile::Vt102, "\x1b[?6c"),
+        (TerminalProfile::Vt220, "\x1b[?62;1;2;6;7;8;9c"),
+        (TerminalProfile::Vt320, "\x1b[?63;1;2;6;7;8;9c"),
+        (TerminalProfile::Vt420, "\x1b[?64;1;2;6;7;8;9;15;18;21c"),
+        (TerminalProfile::Vt520, "\x1b[?65;1;2;6;7;8;9;15;18;21c"),
+        (TerminalProfile::SunCde, "\x1b[?62;1;2;6;7;8;9c"),
+        (TerminalProfile::ScoAnsi, "\x1b[?62;1;2;6;7;8;9c"),
+        (TerminalProfile::Cterm, "\x1b[?63;1;2;6;7;8;9c"),
+    ] {
+        for chunk_size in [1, 7, input.len()] {
+            let mut terminal = Terminal::with_profile(12, 4, profile);
+            for chunk in input.chunks(chunk_size) {
+                terminal.advance(chunk);
+            }
+            let context = format!("{profile} chunk={chunk_size}");
+            let replies = format!("{identity}{identity}\x1b[2;2R{identity}");
+            assert_eq!(terminal.take_responses(), replies.as_bytes(), "{context}");
+            let screen = terminal.snapshot();
+            let graphics: String = screen.row(0).unwrap()[..3]
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect();
+            assert_eq!(graphics, "┌─┐", "{context} graphics");
+            assert_eq!(
+                (screen.cursor.column, screen.cursor.row),
+                (1, 1),
+                "{context}"
+            );
+            assert!(terminal.application_cursor_keys(), "{context}");
+            assert!(!terminal.application_keypad(), "{context}");
+            assert_eq!(
+                screen.encode_key(TerminalKey::KeypadUp, KeyModifiers::default()),
+                Some(b"\x1b[A".to_vec()),
+                "{context} keypad Up"
+            );
+        }
+    }
+}
+
+#[test]
 fn sun_sco_and_cterm_select_their_reference_identity_color_and_keys() {
     for (profile, expected_da, color, function) in [
         (
@@ -50,6 +95,69 @@ fn sun_sco_and_cterm_select_their_reference_identity_color_and_keys() {
                 .encode_key(TerminalKey::Function(12), KeyModifiers::default())
                 .unwrap(),
             function
+        );
+    }
+}
+
+#[test]
+fn sco_and_sun_keys_preserve_reference_modifiers_and_keypad_mode() {
+    for line in include_str!("fixtures/sithtermfx/sco-sun-keys.tsv").lines() {
+        let [profile, mode, key, modifiers, expected] =
+            line.split('\t').collect::<Vec<_>>().try_into().unwrap();
+        let profile = TerminalProfile::from_term_name(profile).unwrap();
+        let mut terminal = Terminal::with_profile(12, 3, profile);
+        let input: &[u8] = match mode {
+            "normal" => b"",
+            "application" => b"\x1b=",
+            "restored" => b"\x1b=\x1b>",
+            _ => panic!("unexpected keypad mode {mode}"),
+        };
+        for byte in input {
+            terminal.advance(std::slice::from_ref(byte));
+        }
+        let key = match key {
+            "home" => TerminalKey::Home,
+            "end" => TerminalKey::End,
+            "insert" => TerminalKey::Insert,
+            _ => TerminalKey::Function(key.strip_prefix('f').unwrap().parse().unwrap()),
+        };
+        let modifiers = KeyModifiers {
+            shift: modifiers.contains('s'),
+            alt: modifiers.contains('a'),
+            control: modifiers.contains('c'),
+        };
+        let (pairs, remainder) = expected.as_bytes().as_chunks::<2>();
+        assert!(remainder.is_empty());
+        let expected: Vec<_> = pairs
+            .iter()
+            .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
+            .collect();
+        assert_eq!(
+            terminal.snapshot().encode_key(key, modifiers),
+            Some(expected),
+            "{line}"
+        );
+    }
+
+    for profile in [TerminalProfile::SunCde, TerminalProfile::ScoAnsi] {
+        let mut terminal = Terminal::with_profile(12, 3, profile);
+        terminal.advance(b"\x1b G\x1b=");
+        let screen = terminal.snapshot();
+        let alt = KeyModifiers {
+            alt: true,
+            ..KeyModifiers::default()
+        };
+        let control = KeyModifiers {
+            control: true,
+            ..KeyModifiers::default()
+        };
+        assert_eq!(
+            screen.encode_key(TerminalKey::End, alt).as_deref(),
+            Some(b"\x1b\x8fF".as_slice())
+        );
+        assert_eq!(
+            screen.encode_key(TerminalKey::Home, control).as_deref(),
+            Some(b"\x9b1;5H".as_slice())
         );
     }
 }

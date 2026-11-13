@@ -11,6 +11,36 @@ use crate::{profile, ssh_worker};
 mod channels;
 pub(crate) use channels::{Channel, DirectOpener, RemoteForward, RemoteOpener, SftpOpener};
 
+#[derive(Clone)]
+pub(crate) enum ExecOpener {
+    Direct(kortty_ssh::ExecOpener),
+    Worker(ssh_worker::Opener),
+}
+
+impl ExecOpener {
+    pub(crate) fn verified_host_key(&self) -> Option<&kortty_ssh::HostKey> {
+        match self {
+            Self::Direct(opener) => opener.verified_host_key(),
+            Self::Worker(opener) => opener.verified_host_key(),
+        }
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        match self {
+            Self::Direct(opener) => opener.is_closed(),
+            Self::Worker(opener) => opener.is_closed(),
+        }
+    }
+
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Direct(left), Self::Direct(right)) => left.same_connection(right),
+            (Self::Worker(left), Self::Worker(right)) => left.same_connection(right),
+            _ => false,
+        }
+    }
+}
+
 const MAX_PRIVATE_KEY: u64 = 1024 * 1024;
 
 pub(crate) enum Connected {
@@ -19,6 +49,13 @@ pub(crate) enum Connected {
 }
 
 impl Connected {
+    pub(crate) fn verified_host_key(&self) -> Option<&kortty_ssh::HostKey> {
+        match self {
+            Self::Direct(ssh) => ssh.verified_host_key(),
+            Self::Worker(ssh) => ssh.verified_host_key(),
+        }
+    }
+
     pub(crate) fn sandbox_backend(&self) -> Option<&'static str> {
         match self {
             Self::Direct(_) => None,
@@ -29,7 +66,14 @@ impl Connected {
     pub(crate) fn sftp_opener(&self) -> Option<SftpOpener> {
         match self {
             Self::Direct(ssh) => ssh.sftp_opener().map(SftpOpener::Direct),
-            Self::Worker(ssh) => ssh.opener().map(SftpOpener::Worker),
+            Self::Worker(ssh) => ssh.exec_opener().map(SftpOpener::Worker),
+        }
+    }
+
+    pub(crate) fn exec_opener(&self) -> Option<ExecOpener> {
+        match self {
+            Self::Direct(ssh) => ssh.exec_opener().map(ExecOpener::Direct),
+            Self::Worker(ssh) => ssh.exec_opener().map(ExecOpener::Worker),
         }
     }
 

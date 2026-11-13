@@ -3,13 +3,13 @@ use std::fmt;
 use iced::widget::{column, pick_list, row, slider, text, text_input};
 use iced::{Alignment, Element, Length};
 
-use crate::terminal_effects::{Effect, Selection};
+use crate::terminal_effects::{Effect, Selection, Speed};
 
 use super::{Edit, Message};
 
 pub(super) struct EffectDraft {
     pub(super) effect: Option<Effect>,
-    speed: u8,
+    speed: Speed,
     speed_input: String,
 }
 
@@ -21,7 +21,7 @@ impl Default for EffectDraft {
 
 impl EffectDraft {
     pub(super) fn new(selection: Option<Selection>) -> Self {
-        let speed = selection.map_or(1, Selection::speed);
+        let speed = selection.map_or(Speed::DEFAULT, |selection| selection.speed);
         Self {
             effect: selection.map(|selection| selection.effect),
             speed,
@@ -30,7 +30,12 @@ impl EffectDraft {
     }
 
     pub(super) fn set_speed(&mut self, value: String) {
-        if value.len() <= 2 && value.bytes().all(|byte| byte.is_ascii_digit()) {
+        if value.len() <= 24
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || byte == b'.')
+            && value.bytes().filter(|&byte| byte == b'.').count() <= 1
+        {
             if let Some(speed) = parse_speed(&value) {
                 self.speed = speed;
             }
@@ -58,16 +63,16 @@ impl EffectDraft {
         if let Some(effect) = self.effect {
             if available.contains(&effect) {
                 let speed = self.speed;
-                section = section.push(text(format!("Animation Speed · {speed}.00x")).size(14));
+                section = section.push(text(format!("Animation Speed · {speed:.2}x")).size(14));
                 section = section.push(
                     row![
-                        slider(1..=10, speed.min(10), |speed: u8| {
+                        slider(1.0..=10.0, speed.multiplier().min(10.0), |speed: f64| {
                             Message::Edit(Edit::TerminalEffectSpeed(speed.to_string()))
                         }),
                         text_input("1–99", &self.speed_input)
                             .on_input(|value| Message::Edit(Edit::TerminalEffectSpeed(value)))
                             .on_submit(Message::Edit(Edit::TerminalEffectSpeed(speed.to_string())))
-                            .width(56),
+                            .width(84),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
@@ -83,8 +88,8 @@ impl EffectDraft {
     }
 }
 
-fn parse_speed(value: &str) -> Option<u8> {
-    value.parse().ok().filter(|speed| (1..=99).contains(speed))
+fn parse_speed(value: &str) -> Option<Speed> {
+    Speed::try_from(value.parse::<f64>().ok()?).ok()
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

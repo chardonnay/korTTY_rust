@@ -10,6 +10,7 @@ description = "Native encrypted credential storage for kortty"
 argon2 = { version = "0.5.3", default-features = false, features = ["zeroize"] }
 chacha20poly1305 = { version = "0.10.1", default-features = false }
 getrandom = "0.4"
+sha2 = { version = "0.10", default-features = false }
 zeroize = { version = "1.9.1", default-features = false, features = ["alloc"] }
 
 [target.'cfg(unix)'.dependencies]

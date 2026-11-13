@@ -15,8 +15,9 @@ use kortty_ssh::{
 use kortty_terminal::TerminalProfile;
 use serde::{Deserialize, Serialize};
 
-use crate::connection_store::{Connection, Store};
-use crate::session::{Session, SessionId, Status, ssh_size};
+use crate::connection_store::{Connection, Store, teamwork};
+use crate::profile::InitialTerminalSize;
+use crate::session::{GridSize, Session, SessionId, Status, ssh_size};
 use crate::session_security::IsolationLevel;
 use crate::ssh_connection::{self, Connected, trust_store};
 use crate::ssh_dialog::{self, KeyboardOptions, LoginRequest, LoginTarget, SshDialog};
@@ -25,19 +26,25 @@ use crate::terminal_effects::Selection;
 use crate::vault_window::Kind;
 
 use super::{
-    Message as WorkspaceMessage, Workspace, initial_grid,
+    Message as WorkspaceMessage, Workspace,
     recently_closed::{ReopenToken, SshOutcome},
     split_connection::SplitTarget,
 };
 
 mod challenge;
+mod control_create;
+mod password_command;
 mod reconnect;
 mod registered_keys;
 mod reopen;
+mod teamwork_auth;
+use control_create::ControlLaunch;
+pub(super) use control_create::CreateOptions;
 use reconnect::ReconnectLaunch;
 pub(super) use registered_keys::KeySnapshots;
 use reopen::ReopenLaunch;
 pub(super) use reopen::{ReopenSshOrigin, SavedSshProfile};
+use teamwork_auth::AuthSnapshot;
 #[cfg(test)]
 mod tests;
 
@@ -54,6 +61,44 @@ pub struct SshTarget {
 }
 
 impl SshTarget {
+    pub(crate) fn workflow_route_allowed(
+        &self,
+        policy: &crate::clipboard_policy::ClipboardPolicy,
+    ) -> bool {
+        self.isolation >= policy.minimum_isolation
+            && policy
+                .server_access()
+                .first_blocked(self.login.servers(self.jump.as_ref()))
+                .is_none()
+    }
+
+    pub(super) fn blocked_server(&self, workspace: &Workspace) -> Option<String> {
+        workspace
+            .blocked_ssh_server(&self.login, self.jump.as_ref())
+            .map(|(host, port)| super::server_access::blocked_notice(host, port))
+    }
+
+    pub(crate) fn sftp_sudo_allowed(
+        &self,
+        policy: &crate::clipboard_policy::ClipboardPolicy,
+    ) -> bool {
+        use crate::clipboard_policy::RemoteEditorPolicy;
+
+        policy.problem.is_none()
+            && policy.sftp_sudo_edit_allowed
+            && policy.file_transfer_allowed
+            && policy.remote_editor == RemoteEditorPolicy::Allow
+            && self.isolation >= policy.minimum_isolation
+            && policy
+                .server_access()
+                .first_blocked(self.login.servers(self.jump.as_ref()))
+                .is_none()
+    }
+
+    pub(crate) fn sftp_sudo_login(&self) -> &LoginTarget {
+        &self.login
+    }
+
     pub(crate) fn matches_imported_route(&self, other: &Self) -> bool {
         self.login == other.login && self.jump == other.jump && self.isolation == other.isolation
     }
@@ -85,6 +130,13 @@ impl SshTarget {
 
     pub fn label(&self) -> String {
         self.login.label()
+    }
+
+    pub(super) fn project_route_label(&self) -> String {
+        self.jump.as_ref().map_or_else(
+            || self.login.label(),
+            |jump| format!("{} via {}", self.login.label(), jump.label()),
+        )
     }
 
     pub(super) fn host(&self) -> &str {
@@ -132,6 +184,8 @@ pub(super) struct PendingSsh {
     split: Option<SplitTarget>,
     reopen: Option<ReopenLaunch>,
     reconnect: Option<ReconnectLaunch>,
+    control: Option<ControlLaunch>,
+    teamwork: Option<TeamworkLaunch>,
     sftp: bool,
     saved: Option<u64>,
     incognito: bool,
@@ -143,10 +197,68 @@ pub(super) struct PendingSsh {
     stage: Stage,
 }
 
+struct TeamworkLaunch {
+    selection: TeamworkSelection,
+    route: SshTarget,
+    auth: AuthSnapshot,
+    form_revision: u64,
+}
+
+pub(super) struct TeamworkUnlock {
+    owner: window::Id,
+    vault: window::Id,
+    selection: TeamworkSelection,
+    sftp: bool,
+    preference: teamwork::DefaultAuth,
+    control: Option<CreateOptions>,
+}
+
+#[derive(Clone)]
+pub(super) struct TeamworkSelection {
+    identity: teamwork::Identity,
+    store_path: PathBuf,
+    connection: Box<Connection>,
+    default_auth_eligible: bool,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct TeamworkTerminalInput {
+    pub(super) paste_line_delay_ms: Option<u16>,
+    strict: bool,
+}
+
+impl TeamworkSelection {
+    pub(super) fn connection(&self) -> &Connection {
+        &self.connection
+    }
+
+    pub(super) fn new(entry: &teamwork::Entry, store_path: PathBuf) -> Self {
+        Self {
+            identity: entry.identity().clone(),
+            store_path,
+            connection: Box::new(entry.connection.clone()),
+            default_auth_eligible: entry.default_auth_eligible,
+        }
+    }
+
+    pub(super) fn matches_catalog(&self, workspace: &Workspace) -> bool {
+        workspace
+            .teamwork_entry(&self.identity, &self.store_path)
+            .is_some_and(|entry| {
+                entry.connection == *self.connection
+                    && entry.default_auth_eligible == self.default_auth_eligible
+            })
+    }
+}
+
+const TEAMWORK_RESELECT: &str =
+    "This Teamwork connection changed or is no longer available. Select it again.";
+
 struct RetryLogin {
     keyboard: (KeyboardOptions, Option<KeyboardOptions>),
     target_key: Option<PathBuf>,
     jump_key: Option<PathBuf>,
+    temporary_key: Option<ssh_dialog::TemporaryKey>,
     explicit_vault: Option<(LoginTarget, String)>,
     explicit_key: Option<(LoginTarget, u64)>,
     explicit_jump_key: Option<(LoginTarget, u64)>,
@@ -184,6 +296,10 @@ impl RetryLogin {
             ),
             target_key: key_path(&request.target),
             jump_key: request.jump.as_ref().and_then(key_path),
+            temporary_key: match &request.target.auth {
+                ssh_dialog::Authentication::TemporaryKey(key) => Some(key.clone()),
+                _ => None,
+            },
             explicit_vault,
             explicit_key: explicit_key(&request.target),
             explicit_jump_key: request.jump.as_ref().and_then(explicit_key),
@@ -209,6 +325,9 @@ impl RetryLogin {
         form.restore_keyboard_options(self.keyboard.0, self.keyboard.1);
         form.set_startup(self.startup);
         form.set_logging(self.logging.clone());
+        if let Some(key) = &self.temporary_key {
+            form.restore_temporary_key(key.clone());
+        }
         restore_key(form, self.target_key.as_deref(), Message::Target);
         restore_key(form, self.jump_key.as_deref(), Message::Jump);
         if let Some((endpoint, id)) = &self.explicit_key {
@@ -238,6 +357,11 @@ pub(super) struct QuickLaunch {
 }
 
 impl PendingSsh {
+    pub(super) fn control_anchor(&self) -> Option<SessionId> {
+        self.control.as_ref()?;
+        self.replace
+    }
+
     pub(super) fn refresh_connection_group(&mut self, store: &Store) {
         if let Stage::Dialing {
             target,
@@ -266,11 +390,18 @@ impl PendingSsh {
     }
 
     fn form_key(&self) -> Option<FormKey> {
-        self.reopen_form_key().map(FormKey::Reopen).or_else(|| {
-            self.reconnect
-                .as_ref()
-                .map(|reconnect| FormKey::Reconnect(reconnect.form_revision))
-        })
+        self.reopen_form_key()
+            .map(FormKey::Reopen)
+            .or_else(|| {
+                self.reconnect
+                    .as_ref()
+                    .map(|reconnect| FormKey::Reconnect(reconnect.form_revision))
+            })
+            .or_else(|| {
+                self.teamwork
+                    .as_ref()
+                    .map(|shared| FormKey::Teamwork(shared.form_revision))
+            })
     }
 
     pub(super) fn depends_on(&self, session: SessionId) -> bool {
@@ -285,14 +416,17 @@ impl PendingSsh {
 
 enum Stage {
     Form(Box<SshDialog>),
+    PasswordCommand(Box<password_command::Pending>),
     Dialing {
         id: u64,
         target: SshTarget,
         profile: TerminalProfile,
+        grid: GridSize,
         environment_credential: Option<String>,
         logging: Option<Box<crate::terminal_logging::Prepared>>,
         terminal_effect: Option<Selection>,
         command_timestamps: Option<bool>,
+        journal_config: Option<crate::session_journal::ConnectionConfig>,
         connection_group: Option<String>,
         _cancellation: CancelOnDrop,
         challenge: Option<Box<challenge::Form>>,
@@ -318,6 +452,19 @@ enum Stage {
     },
 }
 
+impl Stage {
+    fn target(&self) -> Option<&SshTarget> {
+        match self {
+            Self::Form(_) => None,
+            Self::PasswordCommand(pending) => Some(&pending.target),
+            Self::Dialing { target, .. }
+            | Self::Unknown { target, .. }
+            | Self::Changed { target, .. }
+            | Self::Remembering { target, .. } => Some(target),
+        }
+    }
+}
+
 struct ChangedKey {
     endpoint: Endpoint,
     expected: HostKey,
@@ -334,7 +481,11 @@ pub enum Message {
     Form(window::Id, ssh_dialog::Message),
     ReopenForm(window::Id, ReopenToken, u64, ssh_dialog::Message),
     ReconnectForm(window::Id, u64, ssh_dialog::Message),
+    TeamworkForm(window::Id, u64, ssh_dialog::Message),
+    TemporaryKeyPasted(window::Id, TemporaryKeyPaste, ssh_dialog::Password),
     Cancel(window::Id),
+    ApprovePasswordCommand(window::Id, u64),
+    PasswordCommandFinished(window::Id, u64, password_command::Response),
     Challenge(window::Id, u64, challenge::Ticket),
     PromptAnswer(window::Id, u64, u64, usize, ssh_dialog::Password),
     PromptSubmit(window::Id, u64, u64),
@@ -344,6 +495,13 @@ pub enum Message {
     VerifyChanged(window::Id, u64, bool),
     ReplaceChanged(window::Id, u64),
     Remembered(window::Id, u64, Result<(), String>),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct TemporaryKeyPaste {
+    form_revision: u64,
+    request: u64,
+    internal_clipboard: bool,
 }
 
 #[derive(Clone)]
@@ -390,14 +548,52 @@ impl Workspace {
                 self.update_ssh_form(window, message)
             }
             Message::Cancel(window) => self.cancel_ssh_login(window),
+            Message::ApprovePasswordCommand(window, id) => {
+                self.approve_password_command(window, id)
+            }
+            Message::PasswordCommandFinished(window, id, response) => {
+                self.password_command_finished(window, id, response)
+            }
             Message::ReconnectForm(window, revision, message)
                 if self.guarded_ssh_form_key(window) == Some(FormKey::Reconnect(revision)) =>
             {
                 self.update_ssh_form(window, message)
             }
-            Message::Form(..) | Message::ReopenForm(..) | Message::ReconnectForm(..) => {
+            Message::TeamworkForm(window, revision, message)
+                if self.guarded_ssh_form_key(window) == Some(FormKey::Teamwork(revision)) =>
+            {
+                self.update_ssh_form(window, message)
+            }
+            Message::TemporaryKeyPasted(window, paste, value) => {
+                if self.guarded_ssh_form_key(window) != Some(FormKey::Teamwork(paste.form_revision))
+                    || !self.pending_ssh_mut(window).is_some_and(|pending| {
+                        matches!(&pending.stage, Stage::Form(form)
+                            if form.expects_temporary_key_paste(paste.request))
+                    })
+                {
+                    return Task::none();
+                }
+                if let Some(cancel) = self.cancel_stale_routed_ssh_login(window) {
+                    return cancel;
+                }
+                let value = if self.clipboard.policy.internal == paste.internal_clipboard {
+                    value
+                } else {
+                    ssh_dialog::Password::default()
+                };
+                if let Some(PendingSsh {
+                    stage: Stage::Form(form),
+                    ..
+                }) = self.pending_ssh_mut(window)
+                {
+                    form.finish_temporary_key_paste(paste.request, value);
+                }
                 Task::none()
             }
+            Message::Form(..)
+            | Message::ReopenForm(..)
+            | Message::ReconnectForm(..)
+            | Message::TeamworkForm(..) => Task::none(),
             Message::Dialed(window, id, result) => self.ssh_dialed(window, id, result),
             Message::Challenge(window, id, ticket) => self.ssh_challenge(window, id, ticket),
             Message::PromptAnswer(window, id, round, index, value) => {
@@ -420,11 +616,15 @@ impl Workspace {
                             } if *active == id => Some((target.clone(), *profile)),
                             _ => None,
                         });
-                if let Some((target, profile)) = attempt
-                    && let Some(refresh) =
+                if let Some((target, profile)) = attempt {
+                    if let Some(cancel) = self.cancel_stale_routed_ssh_login(window) {
+                        return cancel;
+                    }
+                    if let Some(refresh) =
                         self.refresh_registered_key_attempt(window, &target, profile)
-                {
-                    return refresh;
+                    {
+                        return refresh;
+                    }
                 }
                 if let Some(slot) = self.ssh_challenge_slot(window, id)
                     && let Some(form) = slot
@@ -504,6 +704,7 @@ impl Workspace {
         match message {
             ssh_dialog::Message::Connect => self.connect_ssh(owner),
             ssh_dialog::Message::OpenVault => self.show_vault(owner),
+            ssh_dialog::Message::PasteTemporaryKey => self.paste_teamwork_key(owner),
             ssh_dialog::Message::Cancel => self.cancel_ssh_login(owner),
             message => {
                 if let Some(PendingSsh {
@@ -518,15 +719,95 @@ impl Workspace {
         }
     }
 
+    fn paste_teamwork_key(&mut self, owner: window::Id) -> Task<WorkspaceMessage> {
+        let Some(FormKey::Teamwork(revision)) = self.guarded_ssh_form_key(owner) else {
+            return Task::none();
+        };
+        if let Some(cancel) = self.cancel_stale_routed_ssh_login(owner) {
+            return cancel;
+        }
+        let paste = TemporaryKeyPaste {
+            form_revision: revision,
+            request: self.allocate(),
+            internal_clipboard: self.clipboard.policy.internal,
+        };
+        let Some(PendingSsh {
+            stage: Stage::Form(form),
+            ..
+        }) = self.pending_ssh_mut(owner)
+        else {
+            return Task::none();
+        };
+        if !form.begin_temporary_key_paste(paste.request) {
+            return Task::none();
+        }
+        // This button reads on behalf of the user. OSC 5522 permissions apply to terminal programs.
+        self.read_clipboard().map(move |value| {
+            wrap(Message::TemporaryKeyPasted(
+                owner,
+                paste,
+                ssh_dialog::Password::new(value.unwrap_or_default()),
+            ))
+        })
+    }
+
+    fn cancel_stale_routed_ssh_login(
+        &mut self,
+        owner: window::Id,
+    ) -> Option<Task<WorkspaceMessage>> {
+        let pending = self.pending_ssh(owner)?;
+        let blocked = pending
+            .stage
+            .target()
+            .or_else(|| pending.teamwork.as_ref().map(|shared| &shared.route))
+            .and_then(|target| target.blocked_server(self));
+        if let Some(notice) = blocked {
+            self.defer_project_ssh_dial(owner, super::project_access::WaitReason::Policy);
+            let cancel = self.cancel_ssh_login(owner);
+            self.notice(owner, notice);
+            return Some(cancel);
+        }
+        if let Some(reason) = self.control_ssh_stale_reason(owner) {
+            let cancel = self.cancel_ssh_login(owner);
+            self.notice(owner, reason.into());
+            return Some(cancel);
+        }
+        let shared = self
+            .windows
+            .get(&owner)?
+            .pending_ssh
+            .as_ref()?
+            .teamwork
+            .as_ref()?;
+        let reason = if !self.teamwork_sync_allowed() {
+            "Managed policy blocks Teamwork connections."
+        } else if !shared.selection.matches_catalog(self) {
+            TEAMWORK_RESELECT
+        } else if !shared
+            .auth
+            .is_current(self, &shared.selection, &shared.route.login)
+        {
+            "Teamwork authentication changed or is unavailable. Select the connection again."
+        } else {
+            return None;
+        };
+        let cancel = self.cancel_ssh_login(owner);
+        self.notice(owner, reason.into());
+        Some(cancel)
+    }
+
     fn cancel_ssh_login(&mut self, owner: window::Id) -> Task<WorkspaceMessage> {
         if self.project_ssh_target(owner).is_some() {
             self.defer_interrupted_project_reconnects(owner, None);
         }
-        let reopen = self
+        let pending = self
             .windows
             .get_mut(&owner)
-            .and_then(|window| window.pending_ssh.take())
-            .and_then(|pending| pending.reopen_token());
+            .and_then(|window| window.pending_ssh.take());
+        if let Some(anchor) = pending.as_ref().and_then(PendingSsh::control_anchor) {
+            self.close_control_ssh_anchor(anchor);
+        }
+        let reopen = pending.and_then(|pending| pending.reopen_token());
         self.sftp_logins.remove(&owner);
         reopen.map_or_else(Task::none, |token| {
             self.finish_reopen_ssh(owner, token, SshOutcome::Canceled)
@@ -570,6 +851,10 @@ impl Workspace {
                 None,
             )
         };
+        if let Some(notice) = self.blocked_ssh_form(&form) {
+            self.notice(window, notice);
+            return Task::none();
+        }
         if incognito && !self.clipboard.policy.incognito_allowed {
             self.notice(window, "Managed policy blocks incognito sessions.".into());
             return Task::none();
@@ -587,6 +872,8 @@ impl Workspace {
                 split: None,
                 reopen: None,
                 reconnect: None,
+                control: None,
+                teamwork: None,
                 sftp: false,
                 saved,
                 incognito,
@@ -601,12 +888,38 @@ impl Workspace {
         focus
     }
 
+    fn pending_ssh(&self, id: window::Id) -> Option<&PendingSsh> {
+        if let Some(window) = self.windows.get(&id) {
+            window.pending_ssh.as_ref()
+        } else {
+            self.sftp_logins.get(&id)
+        }
+    }
+
     fn pending_ssh_mut(&mut self, id: window::Id) -> Option<&mut PendingSsh> {
         if let Some(window) = self.windows.get_mut(&id) {
             window.pending_ssh.as_mut()
         } else {
             self.sftp_logins.get_mut(&id)
         }
+    }
+
+    fn project_sized_ssh_pane(&self, window: window::Id) -> Option<&super::PaneSession> {
+        let pending = self.pending_ssh(window)?;
+        let source = pending
+            .reconnect
+            .as_ref()
+            .map(|reconnect| reconnect.target.source)
+            .or(pending.replace)?;
+        let pane = self.sessions.get(&source)?;
+        (!pane.project_initial_size.is_default()).then_some(pane)
+    }
+
+    fn live_ssh_grid(&self, window: window::Id) -> Option<(GridSize, bool)> {
+        self.reconnect_ssh_grid(window).or_else(|| {
+            let pane = self.project_sized_ssh_pane(window)?;
+            Some((pane.grid, pane.reconnect_strict_escapes()))
+        })
     }
 
     pub(super) fn duplicate_dashboard_ssh(
@@ -624,6 +937,10 @@ impl Workspace {
         {
             return Task::none();
         }
+        if let Some(notice) = target.blocked_server(self) {
+            self.notice(window, notice);
+            return Task::none();
+        }
         let form = self.ssh_form(target, profile);
         let focus = form
             .focus()
@@ -636,6 +953,8 @@ impl Workspace {
             split: None,
             reopen: None,
             reconnect: None,
+            control: None,
+            teamwork: None,
             sftp: false,
             saved: target.saved_id(),
             incognito,
@@ -656,12 +975,63 @@ impl Workspace {
         connection: Connection,
         sftp: bool,
     ) -> Task<WorkspaceMessage> {
+        self.stage_saved_ssh(id, connection, sftp, None)
+    }
+
+    pub(super) fn show_saved_ssh_in_new_window(
+        &mut self,
+        owner: window::Id,
+        connection: Connection,
+    ) -> Task<WorkspaceMessage> {
+        if !self.allow_ssh_transport(owner, "SSH") || !self.allow_saved_server(owner, &connection) {
+            return Task::none();
+        }
+        if connection.incognito && !self.clipboard.policy.incognito_allowed {
+            self.notice(
+                owner,
+                "Managed policy blocks this incognito connection.".into(),
+            );
+            return Task::none();
+        }
+        let (id, opened) = if let Some(geometry) = connection.window_geometry {
+            let (id, opened) = self.open_window_at_placement(geometry.placement());
+            self.windows
+                .get_mut(&id)
+                .expect("new connection window")
+                .geometry
+                .mark_connection_specific();
+            let opened = if geometry.maximized {
+                opened.chain(window::maximize(id, true))
+            } else {
+                opened
+            };
+            (id, opened)
+        } else {
+            self.open_window(false)
+        };
+        let login = self.show_saved_ssh(id, connection, false);
+        opened.chain(login)
+    }
+
+    fn stage_saved_ssh(
+        &mut self,
+        id: window::Id,
+        connection: Connection,
+        sftp: bool,
+        control: Option<ControlLaunch>,
+    ) -> Task<WorkspaceMessage> {
         if self.reopen_ssh_token(id).is_some()
             || !self.allow_ssh_transport(id, if sftp { "SFTP" } else { "SSH" })
         {
             return Task::none();
         }
-        let incognito = !sftp && connection.incognito;
+        if !self.allow_saved_server(id, &connection) {
+            return Task::none();
+        }
+        let incognito = connection.incognito
+            || control
+                .as_ref()
+                .is_some_and(|launch| launch.options.incognito);
         if incognito && !self.clipboard.policy.incognito_allowed {
             self.notice(
                 id,
@@ -675,10 +1045,15 @@ impl Workspace {
         let Some(profile) = connection.profile() else {
             return Task::none();
         };
-        let form = SshDialog::from_saved(profile, &connection).with_isolation(
-            IsolationLevel::None,
-            self.clipboard.policy.minimum_isolation,
-        );
+        let form = SshDialog::from_saved(profile, &connection);
+        let form = if let Some(launch) = &control {
+            form.with_launch_isolation(launch.floor).with_fixed_route()
+        } else {
+            form.with_isolation(
+                IsolationLevel::None,
+                self.clipboard.policy.minimum_isolation,
+            )
+        };
         let focus = form
             .focus()
             .map(move |message| wrap(Message::Form(id, message)));
@@ -692,6 +1067,8 @@ impl Workspace {
             split: None,
             reopen: None,
             reconnect: None,
+            control,
+            teamwork: None,
             sftp,
             saved: Some(connection.id),
             incognito,
@@ -702,6 +1079,209 @@ impl Workspace {
             duplicate_tab: None,
             stage: Stage::Form(Box::new(form)),
         });
+        focus
+    }
+
+    pub(super) fn show_teamwork_ssh(
+        &mut self,
+        owner: window::Id,
+        selection: TeamworkSelection,
+        sftp: bool,
+    ) -> Task<WorkspaceMessage> {
+        self.open_teamwork_ssh(owner, selection, sftp, true, None)
+    }
+
+    fn open_teamwork_ssh(
+        &mut self,
+        owner: window::Id,
+        selection: TeamworkSelection,
+        sftp: bool,
+        offer_unlock: bool,
+        control: Option<CreateOptions>,
+    ) -> Task<WorkspaceMessage> {
+        if self.exiting
+            || !self.teamwork_sync_allowed()
+            || self.reopen_ssh_token(owner).is_some()
+            || !self.allow_ssh_transport(owner, if sftp { "SFTP" } else { "SSH" })
+            || !self.windows.contains_key(&owner)
+        {
+            return Task::none();
+        }
+        if !selection.matches_catalog(self) {
+            self.notice(owner, TEAMWORK_RESELECT.into());
+            return Task::none();
+        }
+        let connection = &selection.connection;
+        if !self.allow_saved_server(owner, connection) {
+            return Task::none();
+        }
+        let incognito = connection.incognito || control.is_some_and(|options| options.incognito);
+        if incognito && !self.clipboard.policy.incognito_allowed {
+            self.notice(
+                owner,
+                "Managed policy blocks this incognito connection.".into(),
+            );
+            return Task::none();
+        }
+        if connection.validate().is_err()
+            || connection
+                .jump
+                .as_ref()
+                .is_some_and(|jump| jump.endpoint.username.is_empty())
+        {
+            self.notice(
+                owner,
+                "This Teamwork connection requires a valid route with login usernames.".into(),
+            );
+            return Task::none();
+        }
+        if offer_unlock {
+            if let Some(vault) = self.current_vault_unlock() {
+                return window::gain_focus(vault);
+            }
+            if self.vault_id.is_none()
+                && selection.default_auth_eligible
+                && matches!(
+                    self.teamwork_auth_default(),
+                    teamwork::DefaultAuth::Password { .. }
+                )
+                && self.vault_unlock_available()
+            {
+                let open = self.show_vault_unlock(owner);
+                if let Some(vault) = self.vault_unlock_for_owner(owner) {
+                    self.teamwork_unlock = Some(TeamworkUnlock {
+                        owner,
+                        vault,
+                        selection,
+                        sftp,
+                        preference: self.teamwork_auth_default().clone(),
+                        control,
+                    });
+                    return open;
+                }
+            }
+        }
+        let (login, auth) = AuthSnapshot::choose(self, &selection);
+        if login.username.is_empty() {
+            self.notice(
+                owner,
+                "This Teamwork target needs a username from its source or an available authentication default.".into(),
+            );
+            return Task::none();
+        }
+        let Some(profile) = connection.profile() else {
+            return Task::none();
+        };
+        let Ok(route) = SshTarget::from_imported_route(
+            login,
+            connection.jump.as_ref().map(|jump| jump.endpoint.clone()),
+            connection.isolation,
+        ) else {
+            self.notice(
+                owner,
+                "This Teamwork connection has an invalid SSH route.".into(),
+            );
+            return Task::none();
+        };
+        let floor = route
+            .isolation
+            .max(self.clipboard.policy.minimum_isolation)
+            .max(
+                control
+                    .and_then(|options| options.isolation)
+                    .unwrap_or_default(),
+            );
+        let mut form = route
+            .form(profile)
+            .with_startup(connection.startup)
+            .with_isolation(floor, floor)
+            .with_fixed_route();
+        auth.apply_to(&mut form, &route.login);
+        let form_revision = self.allocate();
+        let key = Some(FormKey::Teamwork(form_revision));
+        let focus = form
+            .focus()
+            .map(move |message| wrap(form_message(owner, key, message)));
+        self.refresh_ssh_key_choices();
+        let Some(state) = self.windows.get_mut(&owner) else {
+            return Task::none();
+        };
+        state.cancel_paste();
+        state.pending_ibm = None;
+        state.pending_serial = None;
+        state.pending_tunnels = None;
+        state.notice = auth.notice();
+        state.pending_ssh = Some(PendingSsh {
+            replace: None,
+            split: None,
+            reopen: None,
+            reconnect: None,
+            control: control.map(|options| ControlLaunch {
+                options,
+                floor,
+                saved: None,
+                vault: None,
+            }),
+            teamwork: Some(TeamworkLaunch {
+                selection,
+                route,
+                auth,
+                form_revision,
+            }),
+            sftp,
+            saved: None,
+            incognito,
+            retry: None,
+            key_snapshots: Default::default(),
+            group: VecDeque::new(),
+            font: None,
+            duplicate_tab: None,
+            stage: Stage::Form(Box::new(form)),
+        });
+        focus
+    }
+
+    pub(super) fn resume_teamwork_after_vault(
+        &mut self,
+        closed: window::Id,
+    ) -> Task<WorkspaceMessage> {
+        let Some(pending) = self
+            .teamwork_unlock
+            .take_if(|pending| pending.vault == closed)
+        else {
+            return Task::none();
+        };
+        if self.exiting || !self.windows.contains_key(&pending.owner) {
+            return Task::none();
+        }
+        if self.teamwork_auth_default() != &pending.preference {
+            self.notice(
+                pending.owner,
+                "Teamwork authentication changed. Select the connection again.".into(),
+            );
+            return Task::none();
+        }
+        if pending.control.is_some()
+            && (!self.clipboard.policy.control_allowed()
+                || !self
+                    .vault
+                    .as_ref()
+                    .is_some_and(crate::vault_window::VaultWindow::is_unlocked))
+        {
+            return Task::none();
+        }
+        let focus = self.open_teamwork_ssh(
+            pending.owner,
+            pending.selection,
+            pending.sftp,
+            false,
+            pending.control,
+        );
+        if pending.control.is_some() {
+            return self
+                .start_control_ssh(pending.owner, focus)
+                .map_or_else(|_| Task::none(), |(_, task)| task);
+        }
         focus
     }
 
@@ -773,7 +1353,12 @@ impl Workspace {
                 self.finish_reopen_ssh(id, token, SshOutcome::Unavailable)
             });
         }
-        let incognito = incognito && !sftp;
+        if let Some(notice) = self.blocked_ssh_form(&form) {
+            self.notice(id, notice);
+            return token.map_or_else(Task::none, |token| {
+                self.finish_reopen_ssh(id, token, SshOutcome::Unavailable)
+            });
+        }
         if incognito && !self.clipboard.policy.incognito_allowed {
             self.notice(
                 id,
@@ -799,6 +1384,8 @@ impl Workspace {
             split,
             reopen,
             reconnect: None,
+            control: None,
+            teamwork: None,
             sftp,
             saved,
             incognito,
@@ -837,11 +1424,17 @@ impl Workspace {
             return Task::none();
         }
         self.refresh_ssh_key_choices();
-        let target = self
-            .sftp
-            .get(&id)
-            .map(|window| window.target())
-            .or_else(|| self.focused_session(id).and_then(|pane| pane.ssh.as_ref()));
+        let project = self.project_remote_target(id);
+        let target = project.or_else(|| {
+            self.sftp
+                .get(&id)
+                .map(|window| window.target())
+                .or_else(|| self.focused_session(id).and_then(|pane| pane.ssh.as_ref()))
+        });
+        if let Some(notice) = target.and_then(|target| target.blocked_server(self)) {
+            self.notice(id, notice);
+            return Task::none();
+        }
         let form = target.map_or_else(
             || {
                 SshDialog::new(TerminalProfile::Xterm).with_isolation(
@@ -849,7 +1442,13 @@ impl Workspace {
                     self.clipboard.policy.minimum_isolation,
                 )
             },
-            |target| self.ssh_form(target, TerminalProfile::Xterm),
+            |target| {
+                if project.is_some() {
+                    self.fixed_split_ssh_form(target, TerminalProfile::Xterm)
+                } else {
+                    self.ssh_form(target, TerminalProfile::Xterm)
+                }
+            },
         );
         let focus = form
             .focus()
@@ -859,9 +1458,16 @@ impl Workspace {
             split: None,
             reopen: None,
             reconnect: None,
+            control: None,
+            teamwork: None,
             sftp: true,
             saved: target.and_then(|target| target.saved),
-            incognito: false,
+            incognito: self
+                .sftp
+                .get(&id)
+                .map(|window| window.incognito())
+                .or_else(|| self.windows.get(&id)?.tab().map(|tab| tab.incognito))
+                .unwrap_or_default(),
             retry: None,
             key_snapshots: Default::default(),
             group: VecDeque::new(),
@@ -875,7 +1481,7 @@ impl Workspace {
             window.pending_serial = None;
             window.notice = None;
             window.pending_ssh = Some(pending);
-        } else if self.sftp.contains_key(&id) {
+        } else if self.sftp.contains_key(&id) || self.project_remote_target(id).is_some() {
             self.sftp_logins.insert(id, pending);
         } else {
             return Task::none();
@@ -883,8 +1489,89 @@ impl Workspace {
         focus
     }
 
+    pub(in crate::workspace) fn show_project_sftp_login(
+        &mut self,
+        id: window::Id,
+    ) -> Task<WorkspaceMessage> {
+        if self.project_remote_target(id).is_none() || self.sftp_logins.contains_key(&id) {
+            return Task::none();
+        }
+        if let Some(error) = self.project_remote_denial(id) {
+            self.notice(id, error);
+            return Task::none();
+        }
+        self.show_sftp_login(id)
+    }
+
     fn connect_ssh(&mut self, window: window::Id) -> Task<WorkspaceMessage> {
+        let task = self.prepare_ssh_dial(window);
+        if let Err(error) = self.attach_control_ssh_tab(window) {
+            let canceled = self.cancel_ssh_login(window);
+            self.notice(window, format!("Could not open the SSH tab ({error})."));
+            return canceled;
+        }
+        task
+    }
+
+    fn ssh_needs_terminal_secrets(&self, incognito: bool, sftp: bool, logging: bool) -> bool {
+        let policy = &self.clipboard.policy;
+        !sftp
+            && policy.problem.is_none()
+            && ((self.ai_features_enabled()
+                && (policy.ai_chat_allowed
+                    || policy.ai_agent_allowed()
+                    || policy.ai_planning_allowed()
+                    || policy.ai_swarm_allowed()))
+                || (!incognito
+                    && (logging
+                        || self.journal_allowed()
+                        || policy.control_allowed() && policy.mcp_server_allowed)))
+    }
+
+    fn ssh_terminal_capture(
+        &self,
+        incognito: bool,
+        config: crate::terminal_logging::Config,
+        name: String,
+        target: &SshTarget,
+    ) -> crate::terminal_logging::Prepared {
+        // AI still needs an in-memory credential mask in a private terminal.
+        // Never let that mask enable persistent logging for an incognito pane.
+        crate::terminal_logging::Prepared::new(
+            if incognito {
+                Default::default()
+            } else {
+                config
+            },
+            self.clipboard.policy.terminal_logging.clone(),
+            name,
+            target.login.host.clone(),
+            target.login.username.clone(),
+        )
+    }
+
+    fn prepare_ssh_dial(&mut self, window: window::Id) -> Task<WorkspaceMessage> {
         if !self.allow_ssh_transport(window, "SSH") {
+            return self.fail_pending_reopen_ssh(window);
+        }
+        if let Some(cancel) = self.cancel_stale_routed_ssh_login(window) {
+            return cancel;
+        }
+        let project = self.project_remote_target(window).cloned();
+        if let Some(error) = self.project_remote_denial(window) {
+            let cancel = self.cancel_ssh_login(window);
+            self.notice(window, error);
+            return cancel;
+        }
+        let blocked = self
+            .pending_ssh(window)
+            .and_then(|pending| match &pending.stage {
+                Stage::Form(form) => self.blocked_ssh_form(form),
+                _ => None,
+            });
+        if let Some(notice) = blocked {
+            self.defer_project_ssh_dial(window, super::project_access::WaitReason::Policy);
+            self.notice(window, notice);
             return self.fail_pending_reopen_ssh(window);
         }
         if self.drop_stale_ssh_split(window) || !self.validate_ssh_reconnect(window) {
@@ -901,6 +1588,8 @@ impl Workspace {
             replace,
             incognito,
             retry,
+            teamwork,
+            control,
             ..
         }) = self.pending_ssh_mut(window)
         else {
@@ -913,18 +1602,57 @@ impl Workspace {
         let Ok(mut request) = form.take_request() else {
             return Task::none();
         };
+        let minimum = control
+            .as_ref()
+            .map_or(minimum, |launch| minimum.max(launch.floor));
+        let minimum = if let Some(shared) = teamwork {
+            if !shared.route.matches_endpoints(
+                &request.target.endpoint,
+                request.jump.as_ref().map(|login| &login.endpoint),
+            ) {
+                *retry = None;
+                let route = shared.route.clone();
+                return self.reopen_ssh_form(
+                    window,
+                    route,
+                    request.profile,
+                    "Review the unchanged Teamwork route before connecting.".into(),
+                );
+            }
+            minimum.max(shared.route.isolation)
+        } else {
+            minimum
+        };
+        let shared_name = teamwork
+            .as_ref()
+            .map(|shared| shared.selection.connection.name.clone());
+        let shared_keepalive = teamwork
+            .as_ref()
+            .and_then(|shared| shared.selection.connection.startup.keepalive());
         *retry = Some(RetryLogin::new(
             &request,
             chosen_vault.clone(),
             log_config.clone(),
         ));
-        let (sftp, saved, replace, incognito) = (*sftp, *saved, *replace, *incognito);
+        let saved = if teamwork.is_some() { None } else { *saved };
+        let (sftp, replace, incognito) = (*sftp, *replace, *incognito);
         let mut target = SshTarget {
             login: request.target.endpoint.clone(),
             jump: request.jump.as_ref().map(|login| login.endpoint.clone()),
             saved: None,
             isolation: request.isolation.max(minimum),
         };
+        if let Some(project) = project.as_ref()
+            && (!project.matches_endpoints(&target.login, target.jump.as_ref())
+                || target.isolation != project.isolation.max(minimum))
+        {
+            let cancel = self.cancel_ssh_login(window);
+            self.notice(
+                window,
+                "The reviewed SFTP route changed. Review the project tab again.".into(),
+            );
+            return cancel;
+        }
         request.isolation = target.isolation;
         if target.isolation == IsolationLevel::Sandbox && !ssh_worker::sandbox_available() {
             self.notice(window, "SSH sandbox is unavailable on this system.".into());
@@ -951,7 +1679,22 @@ impl Workspace {
                         .map(|saved| saved.current())
                 }
             });
-        let current_saved = saved.and_then(|id| self.saved_connection_with_group(id));
+        let control_saved = self
+            .windows
+            .get(&window)
+            .and_then(|window| window.pending_ssh.as_ref())
+            .and_then(|pending| pending.control.as_ref())
+            .and_then(|launch| launch.saved.as_ref());
+        let current_saved = if let Some(control_saved) = control_saved {
+            let Some(current) = control_saved.current() else {
+                return self
+                    .cancel_stale_routed_ssh_login(window)
+                    .unwrap_or_else(Task::none);
+            };
+            Some(current)
+        } else {
+            saved.and_then(|id| self.saved_connection_with_group(id))
+        };
         let (saved_connection, connection_group) = current_saved
             .map_or((None, None), |(connection, group)| {
                 (Some(connection), group)
@@ -961,6 +1704,12 @@ impl Workspace {
             return refresh;
         }
         let current = current.filter(|connection| target.matches(connection));
+        let keepalive = current
+            .as_ref()
+            .and_then(|connection| connection.startup.keepalive())
+            .or(shared_keepalive)
+            .unwrap_or_else(|| self.window_settings.ssh_keepalive());
+        request.options = request.options.with_keepalive(Some(keepalive));
         let connection_group = connection_group.filter(|_| current.is_some());
         if current.is_some() {
             target.saved = saved;
@@ -1004,14 +1753,33 @@ impl Workspace {
                     .into(),
             );
         }
+        let continuation = password_command::Continuation {
+            request,
+            target,
+            current,
+            sftp,
+            incognito,
+            log_config,
+            connection_group,
+        };
+        let mut continuation = match self.stage_password_commands(window, continuation) {
+            Ok(continuation) => continuation,
+            Err(task) => return task,
+        };
+        let request = &mut continuation.request;
         let environment_credential = match &request.target.auth {
             ssh_dialog::Authentication::VaultPassword(id) => Some(id.clone()),
             _ => None,
         };
-        let key_snapshots = match self.resolve_ssh_logins(&mut request, current.as_ref()) {
+        let key_snapshots = match self.resolve_ssh_logins(request, continuation.current.as_ref()) {
             Ok(keys) => keys,
             Err(error) => {
                 use super::project_access::WaitReason;
+                if error == crate::vault_window::VAULT_LOCKED
+                    && let Some(unlock) = self.unlock_for_control_ssh(window)
+                {
+                    return unlock;
+                }
                 let reason = if error == crate::vault_window::VAULT_LOCKED {
                     WaitReason::VaultLocked
                 } else {
@@ -1022,44 +1790,83 @@ impl Workspace {
                 return Task::none();
             }
         };
-        let logging = (!incognito
-            && !sftp
-            && self.clipboard.policy.problem.is_none()
-            && (log_config.enabled() || self.journal_allowed()))
-        .then(|| {
-            let capture = crate::terminal_logging::Prepared::new(
-                log_config,
-                self.clipboard.policy.terminal_logging.clone(),
-                current
-                    .as_ref()
-                    .map_or_else(|| target.login.host.clone(), |saved| saved.name.clone()),
-                target.login.host.clone(),
-                target.login.username.clone(),
-            );
-            let secrets = capture.secrets();
-            for login in std::iter::once(&request.target).chain(request.jump.as_ref()) {
-                use ssh_dialog::Authentication;
-                match &login.auth {
-                    Authentication::Password(value)
-                    | Authentication::KeyWithPassphrase(_, value)
-                    | Authentication::ResolvedKey(_, Some(value)) => secrets.add(value.as_str()),
-                    _ => {}
+        self.launch_prepared_ssh(
+            window,
+            continuation,
+            key_snapshots,
+            environment_credential,
+            shared_name,
+            None,
+        )
+    }
+
+    fn launch_prepared_ssh(
+        &mut self,
+        window: window::Id,
+        continuation: password_command::Continuation,
+        key_snapshots: KeySnapshots,
+        environment_credential: Option<String>,
+        shared_name: Option<String>,
+        trust: Option<TrustStore>,
+    ) -> Task<WorkspaceMessage> {
+        let password_command::Continuation {
+            request,
+            target,
+            current,
+            sftp,
+            incognito,
+            log_config,
+            connection_group,
+        } = continuation;
+        let launch_name = current
+            .as_ref()
+            .map(|connection| connection.name.clone())
+            .or(shared_name)
+            .unwrap_or_else(|| target.login.host.clone());
+        let logging = self
+            .ssh_needs_terminal_secrets(incognito, sftp, log_config.enabled())
+            .then(|| {
+                let capture =
+                    self.ssh_terminal_capture(incognito, log_config, launch_name.clone(), &target);
+                let secrets = capture.secrets();
+                for login in std::iter::once(&request.target).chain(request.jump.as_ref()) {
+                    use ssh_dialog::Authentication;
+                    match &login.auth {
+                        Authentication::Password(value)
+                        | Authentication::KeyWithPassphrase(_, value)
+                        | Authentication::ResolvedKey(_, Some(value)) => {
+                            secrets.add(value.as_str())
+                        }
+                        _ => {}
+                    }
                 }
-            }
-            Box::new(capture)
-        });
+                Box::new(capture)
+            });
         let profile = request.profile;
-        let size = ssh_size(
-            self.reconnect_ssh_grid(window)
-                .map_or_else(|| initial_grid(profile), |(grid, _)| grid),
-        );
+        let overrides = current
+            .as_ref()
+            .map(|connection| &connection.terminal)
+            .or_else(|| {
+                let teamwork = self.pending_ssh(window)?.teamwork.as_ref()?;
+                Some(&teamwork.selection.connection().terminal)
+            });
+        let project_pane = self.project_sized_ssh_pane(window);
+        let grid = if let Some(pane) = project_pane.filter(|pane| pane.project_initial_ssh_pending)
+        {
+            self.configured_initial_grid(profile, overrides, pane.project_initial_size)
+        } else {
+            self.live_ssh_grid(window)
+                .map(|(grid, _)| grid)
+                .unwrap_or_else(|| {
+                    self.configured_initial_grid(profile, overrides, InitialTerminalSize::default())
+                })
+        };
+        let size = ssh_size(grid);
         let id = self.allocate();
         let worker_label = if incognito {
             "Incognito SSH".into()
-        } else if let Some(connection) = &current {
-            connection.name.clone()
         } else {
-            target.login.host.clone()
+            launch_name
         };
         let cancellation = DialCancellation::for_session(worker_label);
         let (events, messages) = async_channel::bounded(4);
@@ -1074,7 +1881,7 @@ impl Workspace {
         if let Some(pending) = self.pending_ssh_mut(window) {
             pending.key_snapshots = key_snapshots;
             let terminal_effect = if sftp
-                || pending.replace.is_some()
+                || (pending.replace.is_some() && pending.control.is_none())
                 || pending.reconnect.is_some()
                 || pending.reopen.is_some()
             {
@@ -1083,18 +1890,44 @@ impl Workspace {
                 current
                     .as_ref()
                     .and_then(|connection| connection.terminal_effect)
+                    .or_else(|| {
+                        pending
+                            .teamwork
+                            .as_ref()?
+                            .selection
+                            .connection
+                            .terminal_effect
+                    })
             };
             let command_timestamps = current
                 .as_ref()
-                .and_then(|connection| connection.command_timestamps);
+                .and_then(|connection| connection.command_timestamps)
+                .or_else(|| {
+                    pending
+                        .teamwork
+                        .as_ref()?
+                        .selection
+                        .connection
+                        .command_timestamps
+                });
             pending.stage = Stage::Dialing {
                 id,
                 target: target.clone(),
                 profile,
+                grid,
                 environment_credential,
                 logging,
                 terminal_effect,
                 command_timestamps,
+                journal_config: current
+                    .as_ref()
+                    .map(|connection| connection.terminal.journal)
+                    .or_else(|| {
+                        pending
+                            .teamwork
+                            .as_ref()
+                            .map(|teamwork| teamwork.selection.connection().terminal.journal)
+                    }),
                 connection_group,
                 _cancellation: CancelOnDrop(cancellation),
                 challenge: None,
@@ -1112,7 +1945,7 @@ impl Workspace {
             let publish_result = publish.clone();
             if let Err(error) = thread::Builder::new()
                 .name("kortty-ssh-connect".into())
-                .spawn(move || publish_result(dial(request, sftp, &prompt, size)))
+                .spawn(move || publish_result(dial(request, sftp, &prompt, size, trust)))
             {
                 publish(Err(error.into()));
             }
@@ -1147,6 +1980,10 @@ impl Workspace {
         id: u64,
         ticket: challenge::Ticket,
     ) -> Task<WorkspaceMessage> {
+        if let Some(cancel) = self.cancel_stale_routed_ssh_login(window) {
+            ticket.cancel();
+            return cancel;
+        }
         if self.project_ssh_target(window).is_some() {
             let current = self.ssh_challenge_slot(window, id).is_some();
             ticket.cancel();
@@ -1203,15 +2040,20 @@ impl Workspace {
             font,
             duplicate_tab,
             reopen,
+            reconnect,
+            control,
+            teamwork,
             stage:
                 Stage::Dialing {
                     id: active,
                     target,
                     profile,
+                    grid,
                     environment_credential,
                     logging,
                     terminal_effect,
                     command_timestamps,
+                    journal_config,
                     connection_group,
                     ..
                 },
@@ -1225,14 +2067,28 @@ impl Workspace {
         }
         let (replace, target, profile, sftp, incognito, font) =
             (*replace, target.clone(), *profile, *sftp, *incognito, *font);
+        let dial_grid = *grid;
+        let control = control.is_some();
+        let teamwork_terminal = teamwork.as_ref().map(|teamwork| {
+            let options = &teamwork.selection.connection().terminal;
+            TeamworkTerminalInput {
+                strict: options.strict_terminal_mode == Some(true),
+                paste_line_delay_ms: options.paste_line_delay_ms,
+            }
+        });
+        let saved_journal = *journal_config;
         let split = *split;
         let reopen = reopen.as_ref().map(|reopen| reopen.token);
+        let reconnect_source = reconnect.as_ref().map(|reconnect| reconnect.target.source);
         let environment_credential = environment_credential.clone();
         let logging = logging.take();
         let terminal_effect = *terminal_effect;
         let command_timestamps = *command_timestamps;
         let connection_group = connection_group.clone();
         let duplicate_tab = *duplicate_tab;
+        if let Some(cancel) = self.cancel_stale_routed_ssh_login(window) {
+            return cancel;
+        }
         if reopen.is_some()
             && let Some(refresh) = self.refresh_reopen_ssh_config(window)
         {
@@ -1262,29 +2118,91 @@ impl Workspace {
             return Task::none();
         }
         match result {
+            Some(Ok(ssh)) if sftp && self.project_remote_target(window).is_some() => {
+                return self.open_project_remote_tool(window, target, ssh);
+            }
             Some(Ok(ssh)) if sftp => {
                 let recent = if incognito {
                     Task::none()
                 } else {
                     self.record_connection_used(target.clone())
                 };
-                return Task::batch([self.open_sftp_connection(window, target, ssh), recent]);
+                return Task::batch([
+                    self.open_sftp_connection(window, target, ssh, incognito),
+                    recent,
+                ]);
             }
             Some(Ok(ssh)) => {
+                let slot = if let Some(old) = replace {
+                    let located = if control {
+                        self.windows
+                            .get(&window)
+                            .and_then(|window| window.pane_location(old))
+                    } else {
+                        self.reconnectable_ssh(window, old)
+                            .map(|(tab, pane, _)| (tab, pane))
+                    };
+                    let Some((tab, pane)) = located else {
+                        return Task::none();
+                    };
+                    Some((tab, pane, old))
+                } else {
+                    None
+                };
+                let project_source = slot.map(|(_, _, old)| old).or(reconnect_source);
+                let teamwork_terminal = teamwork_terminal.or_else(|| {
+                    let source = project_source.or_else(|| {
+                        split
+                            .filter(|split| split.same_server)
+                            .map(|split| split.source)
+                    })?;
+                    let pane = self.sessions.get(&source)?;
+                    if pane.ssh.as_ref() != Some(&target) {
+                        return None;
+                    }
+                    pane.teamwork_terminal_input
+                });
+                let project_terminal_appearance = project_source
+                    .and_then(|old| self.sessions.get(&old))
+                    .and_then(|pane| pane.project_terminal_appearance.clone());
+                let project_effect = project_terminal_appearance
+                    .as_ref()
+                    .and_then(|_| project_source.and_then(|old| self.pane_effect(old)));
                 let saved = target.saved;
                 let terminal_effect = terminal_effect
                     .filter(|selection| self.allowed_terminal_effect(selection.effect));
-                let (grid, preserve_strict) = self
-                    .reconnect_ssh_grid(window)
-                    .unwrap_or((initial_grid(profile), false));
-                let strict = preserve_strict || ssh.sandbox_backend().is_some();
+                let (grid, preserve_strict) =
+                    self.live_ssh_grid(window).unwrap_or((dial_grid, false));
                 let forwarding = ssh
                     .tunnel_openers()
                     .map(|(direct, remote)| super::tunnel_access::Forwarding::new(direct, remote));
-                let appearance = self.window_settings.terminal_appearance();
-                let appearance = terminal_effect.map_or(appearance, |selection| {
-                    selection.effect.appearance(appearance)
-                });
+                let overrides = self.saved_terminal_preferences.terminal(&target);
+                let saved_strict = overrides
+                    .and_then(|settings| settings.strict_terminal_mode)
+                    .or_else(|| {
+                        teamwork_terminal.and_then(|settings| settings.strict.then_some(true))
+                    });
+                let strict =
+                    saved_strict.unwrap_or(preserve_strict || ssh.sandbox_backend().is_some());
+                let journal_config = saved_journal
+                    .or_else(|| {
+                        replace
+                            .and_then(|id| self.sessions.get(&id))
+                            .filter(|pane| {
+                                target.saved_id().is_none() && pane.ssh.as_ref() == Some(&target)
+                            })
+                            .map(|pane| pane.journal_config)
+                    })
+                    .unwrap_or_default();
+                let appearance = project_terminal_appearance.as_deref().map_or_else(
+                    || self.terminal_base_appearance(overrides),
+                    |project| self.project_base_appearance(project),
+                );
+                let appearance = terminal_effect
+                    .or(project_effect.map(|active| active.selection))
+                    .map_or(appearance, |selection| {
+                        selection.effect.appearance(appearance)
+                    });
                 let session = match Session::ssh_with_logging(
                     Some(ssh),
                     grid,
@@ -1292,40 +2210,52 @@ impl Workspace {
                     self.window_settings.prompt_navigation_enabled,
                     appearance,
                     logging,
-                    strict,
+                    crate::session::StreamOptions {
+                        strict_escapes: Some(strict),
+                        encoding: overrides.and_then(|settings| settings.encoding),
+                        scrollback: self.terminal_scrollback(overrides),
+                    },
                 ) {
                     Ok(session) => session,
                     Err(error) => {
                         return self.reopen_ssh_form(window, target, profile, error.to_string());
                     }
                 };
-                let slot = if let Some(old) = replace {
-                    let Some((tab, pane, _)) = self.reconnectable_ssh(window, old) else {
-                        return Task::none();
-                    };
-                    Some((tab, pane, old))
-                } else {
-                    None
-                };
+                let project_initial_size = slot
+                    .and_then(|(_, _, old)| self.sessions.get(&old))
+                    .map_or_else(InitialTerminalSize::default, |pane| {
+                        pane.project_initial_size
+                    });
                 let session_id =
                     self.store_connected_session(session, grid, slot.map(|(_, _, old)| old), font);
+                let session_id = if let Some((_, _, anchor)) = slot.filter(|_| control) {
+                    self.replace_control_ssh_session(anchor, session_id);
+                    anchor
+                } else {
+                    session_id
+                };
                 let recent_target = (!incognito
                     && reopen.is_none()
-                    && replace.is_none()
+                    && (replace.is_none() || control)
                     && split.is_none_or(|target| !target.same_server))
                 .then(|| target.clone());
                 if let Some(pane) = self.sessions.get_mut(&session_id) {
                     pane.ssh = Some(target);
+                    pane.project_initial_size = project_initial_size;
+                    pane.project_terminal_appearance = project_terminal_appearance;
+                    pane.journal_config = journal_config;
                     pane.forwarding = forwarding;
                     pane.strict_escapes = strict;
+                    pane.saved_strict_escapes = saved_strict.is_some();
+                    pane.teamwork_terminal_input = teamwork_terminal;
                     pane.credential_environment_source = environment_credential;
                     if let Some(selection) = terminal_effect {
                         pane.effect = Some(super::effects::Active::from_saved(selection));
+                    } else if project_effect.is_some() {
+                        pane.effect = project_effect;
                     }
                 }
-                if terminal_effect.is_some() {
-                    self.sync_pane_appearance(session_id);
-                }
+                self.sync_pane_appearance(session_id);
                 let group = self
                     .pending_ssh_mut(window)
                     .map_or_else(VecDeque::new, |pending| std::mem::take(&mut pending.group));
@@ -1349,6 +2279,13 @@ impl Workspace {
                     );
                 }
                 if let Some((tab, pane, old)) = slot {
+                    let origin = (control && !incognito)
+                        .then(|| {
+                            self.sessions
+                                .get(&session_id)
+                                .and_then(super::recently_closed::Origin::capture)
+                        })
+                        .flatten();
                     if let Some(tab) = self
                         .windows
                         .get_mut(&window)
@@ -1357,11 +2294,23 @@ impl Workspace {
                         && let Some(cell) = tab.grid.get_mut(pane)
                     {
                         *cell = session_id;
-                        if tab.tunnel_owner == Some(old) {
+                        let remap = old != session_id && tab.tunnel_owner == Some(old);
+                        if remap {
                             tab.tunnel_owner = Some(session_id);
+                        }
+                        if control {
+                            tab.reopen_origin = origin;
+                        }
+                        if remap {
                             self.remap_tunnel_predecessors(old, session_id);
                         }
-                        self.stop_session(old);
+                        if control {
+                            self.session_restore.changed(false);
+                        }
+                        if old != session_id {
+                            self.rebind_coding_agent_alias(old, session_id);
+                            self.stop_session(old);
+                        }
                     } else {
                         self.stop_session(session_id);
                     }
@@ -1482,6 +2431,9 @@ impl Workspace {
         }
         let (endpoint, offered) = (endpoint.clone(), offered.clone());
         let (target, profile) = (target.clone(), *profile);
+        if let Some(cancel) = self.cancel_stale_routed_ssh_login(window) {
+            return cancel;
+        }
         if let Some(refresh) = self.refresh_reopen_ssh_config(window) {
             return refresh;
         }
@@ -1550,6 +2502,9 @@ impl Workspace {
             review.offered.clone(),
         );
         let (target, profile) = (target.clone(), *profile);
+        if let Some(cancel) = self.cancel_stale_routed_ssh_login(window) {
+            return cancel;
+        }
         if let Some(refresh) = self.refresh_reopen_ssh_config(window) {
             return refresh;
         }
@@ -1587,6 +2542,9 @@ impl Workspace {
         profile: TerminalProfile,
         notice: String,
     ) -> Task<WorkspaceMessage> {
+        if let Some(cancel) = self.cancel_stale_routed_ssh_login(window) {
+            return cancel;
+        }
         if self.defer_project_ssh_dial(window, super::project_access::WaitReason::ConnectionFailed)
         {
             self.notice(window, notice);
@@ -1599,6 +2557,17 @@ impl Workspace {
         let same_server = pending.split.is_some_and(|split| split.same_server);
         let reopen = pending.reopen_token();
         let reconnect = pending.reconnect.is_some();
+        let control_floor = pending
+            .control
+            .as_ref()
+            .map(|launch| launch.floor.max(minimum));
+        let shared_floor = pending.teamwork.as_ref().map(|shared| {
+            let isolation = target.isolation;
+            target = shared.route.clone();
+            let floor = target.isolation.max(minimum);
+            target.isolation = isolation.max(floor);
+            floor
+        });
         let saved_form = pending
             .reopen
             .as_ref()
@@ -1615,7 +2584,12 @@ impl Workspace {
             });
         let mut form = if let Some(form) = saved_form {
             form
-        } else if same_server {
+        } else if let Some(floor) = shared_floor {
+            target
+                .form(profile)
+                .with_isolation(target.isolation, floor)
+                .with_fixed_route()
+        } else if same_server || self.project_remote_target(window).is_some() {
             self.fixed_split_ssh_form(&target, profile)
         } else if reopen.is_some() || reconnect {
             let floor = target.isolation.max(minimum);
@@ -1626,16 +2600,25 @@ impl Workspace {
         } else {
             self.ssh_form(&target, profile)
         };
-        if let Some(retry) = self
-            .pending_ssh_mut(window)
-            .and_then(|pending| pending.retry.as_ref())
-        {
-            retry.restore(&mut form, &target.login);
+        if let Some(floor) = control_floor {
+            form = form.with_isolation(floor, floor).with_fixed_route();
+        }
+        if let Some(pending) = self.pending_ssh_mut(window) {
+            if let Some(retry) = &pending.retry {
+                if let Some(shared) = &pending.teamwork {
+                    shared.auth.enable_retry(&mut form);
+                }
+                retry.restore(&mut form, &target.login);
+            } else if let Some(shared) = &pending.teamwork {
+                shared.auth.apply_to(&mut form, &target.login);
+            }
         }
         let form_key = if let Some(token) = reopen {
             Some(FormKey::Reopen((token, self.allocate())))
         } else if reconnect {
             Some(FormKey::Reconnect(self.allocate()))
+        } else if shared_floor.is_some() {
+            Some(FormKey::Teamwork(self.allocate()))
         } else {
             None
         };
@@ -1653,6 +2636,11 @@ impl Workspace {
             {
                 reconnect.form_revision = revision;
             }
+            if let Some(shared) = &mut pending.teamwork
+                && let Some(FormKey::Teamwork(revision)) = form_key
+            {
+                shared.form_revision = revision;
+            }
             pending.saved = target.saved;
             pending.key_snapshots = KeySnapshots::default();
             pending.stage = Stage::Form(Box::new(form));
@@ -1669,6 +2657,7 @@ impl Workspace {
         let (tab, pane) = self.windows.get(&window)?.pane_location(id)?;
         let previous = self.sessions.get(&id)?;
         (previous.ssh.is_some()
+            && !previous.control_ssh_provisional
             && matches!(
                 previous.session.frame().status,
                 Status::Disconnected | Status::Exited(_) | Status::Error(_)
@@ -1681,15 +2670,37 @@ impl Workspace {
         target: SshTarget,
         profile: TerminalProfile,
         font: u8,
+        initial_size: InitialTerminalSize,
     ) -> io::Result<SessionId> {
-        let grid = initial_grid(profile);
+        let grid = self.configured_initial_grid(
+            profile,
+            self.saved_terminal_preferences.terminal(&target),
+            initial_size,
+        );
+        let id = self.store_disconnected_ssh_in_grid(target, profile, font, grid)?;
+        let pane = self.sessions.get_mut(&id).expect("restored SSH pane");
+        pane.project_initial_size = initial_size;
+        pane.project_initial_ssh_pending = !initial_size.is_default();
+        Ok(id)
+    }
+
+    fn store_disconnected_ssh_in_grid(
+        &mut self,
+        target: SshTarget,
+        profile: TerminalProfile,
+        font: u8,
+        grid: GridSize,
+    ) -> io::Result<SessionId> {
         let session = Session::ssh(
             None,
             grid,
             profile,
             self.window_settings.prompt_navigation_enabled,
-            self.window_settings.terminal_appearance(),
+            self.terminal_base_appearance(self.saved_terminal_preferences.terminal(&target)),
         )?;
+        session.set_scrollback_config(
+            self.terminal_scrollback(self.saved_terminal_preferences.terminal(&target)),
+        );
         let id = self.store_session(session, grid, font);
         self.sessions
             .get_mut(&id)
@@ -1706,6 +2717,7 @@ impl Workspace {
         let form_key = pending.form_key();
         let cancel = wrap(form_message(id, form_key, ssh_dialog::Message::Cancel));
         match &pending.stage {
+            Stage::PasswordCommand(pending) => pending.view(id, cancel),
             Stage::Form(form) => {
                 let form = form
                     .view_for(
@@ -1714,7 +2726,23 @@ impl Workspace {
                         &self.ssh_key_choices,
                     )
                     .map(move |message| wrap(form_message(id, form_key, message)));
-                if pending.incognito {
+                if let Some(shared) = &pending.teamwork {
+                    let privacy = if pending.incognito {
+                        " · Incognito"
+                    } else {
+                        ""
+                    };
+                    column![
+                        text(format!(
+                            "Teamwork · {}{privacy}",
+                            shared.selection.connection.name
+                        ))
+                        .size(14),
+                        form
+                    ]
+                    .spacing(5)
+                    .into()
+                } else if pending.incognito {
                     column![text("Incognito session").size(14), form]
                         .spacing(5)
                         .into()
@@ -1825,18 +2853,32 @@ fn dial(
     sftp: bool,
     prompt: &challenge::Forwarder,
     size: kortty_ssh::WindowSize,
+    trust: Option<TrustStore>,
 ) -> Result<Connected, ConnectError> {
     if request.isolation >= IsolationLevel::Process {
-        return ssh_worker::Session::dial(
-            request,
-            size,
-            sftp,
-            &prompt.cancellation,
-            &mut |round| prompt.request(round),
-        )
-        .map(|session| Connected::Worker(Box::new(session)));
+        let mut prompts = |round: &kortty_ssh::KeyboardChallenge| prompt.request(round);
+        let result = match trust {
+            Some(trust) => ssh_worker::Session::dial_with_trust(
+                request,
+                size,
+                sftp,
+                &prompt.cancellation,
+                &mut prompts,
+                &trust,
+            ),
+            None => {
+                ssh_worker::Session::dial(request, size, sftp, &prompt.cancellation, &mut prompts)
+            }
+        };
+        return result.map(|session| Connected::Worker(Box::new(session)));
     }
-    dial_direct(request, sftp, prompt, trust_store()?, size)
+    dial_direct(
+        request,
+        sftp,
+        prompt,
+        trust.map_or_else(trust_store, Ok)?,
+        size,
+    )
 }
 
 fn dial_direct(
@@ -1888,6 +2930,10 @@ fn route_login(
         Input::KeyWithPassphrase(path, passphrase) => Some(
             ssh_connection::private_key_with_passphrase(&path, passphrase)?,
         ),
+        Input::TemporaryKey(key) => {
+            let mut bytes = key.copy_for_attempt()?;
+            Some(Authentication::private_key(std::mem::take(&mut *bytes)))
+        }
         Input::ResolvedKey(record, passphrase) => {
             let mut key = ssh_connection::read_registered_key(&record)?;
             let key = std::mem::take(&mut *key);
@@ -1955,6 +3001,7 @@ fn saved_credentials_match(
 enum FormKey {
     Reopen((ReopenToken, u64)),
     Reconnect(u64),
+    Teamwork(u64),
 }
 
 fn form_message(
@@ -1967,6 +3014,7 @@ fn form_message(
             Message::ReopenForm(owner, token, revision, message)
         }
         Some(FormKey::Reconnect(revision)) => Message::ReconnectForm(owner, revision, message),
+        Some(FormKey::Teamwork(revision)) => Message::TeamworkForm(owner, revision, message),
         None => Message::Form(owner, message),
     }
 }

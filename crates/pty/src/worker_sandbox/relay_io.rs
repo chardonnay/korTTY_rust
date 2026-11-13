@@ -1,7 +1,7 @@
 //! Cancellable I/O for the two desktop endpoints of the Windows SSH relay.
 
 use std::io::{self, Read, Write};
-use std::net::{Shutdown, TcpStream};
+use std::net::TcpStream;
 use std::os::windows::io::{AsRawHandle, AsRawSocket, FromRawHandle, OwnedHandle};
 use std::ptr::{null, null_mut};
 use std::sync::{Arc, Mutex};
@@ -48,11 +48,13 @@ impl WindowsRelayIo {
     pub fn close(&self) {
         let mut shared = self.0.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(endpoint) = shared.take() {
-            // SAFETY: this endpoint is owned here. Issuing I/O uses the same
-            // lock, so no operation can start after this cancellation.
-            unsafe { CancelIoEx(endpoint.raw(), null()) };
-            if let Endpoint::Tcp(socket) = endpoint.as_ref() {
-                let _ = socket.shutdown(Shutdown::Both);
+            match endpoint.as_ref() {
+                Endpoint::Pipe(_) => {
+                    // SAFETY: this endpoint is owned here. Issuing I/O uses the same
+                    // lock, so no operation can start after this cancellation.
+                    unsafe { CancelIoEx(endpoint.raw(), null()) };
+                }
+                Endpoint::Tcp(socket) => crate::shutdown_tcp_io(socket),
             }
         }
     }

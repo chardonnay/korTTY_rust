@@ -7,7 +7,8 @@ use regex::{Captures, Regex, RegexBuilder};
 use toml_edit::{Item, Table};
 use zeroize::Zeroizing;
 
-use crate::session_journal::LogFormat;
+use crate::session_journal::automation::{Caps, MAX_DAYS, MAX_RUNS, MAX_STORAGE_MIB};
+use crate::session_journal::{LogFormat, MAX_CONNECTION_JOURNAL_PARTS};
 
 use super::{Config, DirectoryMode};
 
@@ -20,9 +21,13 @@ pub(crate) struct Policy {
     directory_mode: Option<DirectoryMode>,
     journal_directory: Option<PathBuf>,
     journal_log_format: Option<LogFormat>,
+    journal_max_log_parts: Option<u16>,
     journal_clickable_links_denied: bool,
     journal_rename_denied: bool,
     journal_delete_denied: bool,
+    journal_ai_ask_denied: bool,
+    automation_journal_denied: bool,
+    automation_journal_caps: Caps,
     journal_ai_screenshot_analysis: Option<bool>,
     pub(super) rules: Vec<Arc<Rule>>,
 }
@@ -31,9 +36,53 @@ pub(super) struct Rule {
     matcher: Regex,
     replacement: String,
     regex: bool,
+    ignore_case: bool,
 }
 
 impl Policy {
+    pub(crate) fn same_redactions(&self, other: &Self) -> bool {
+        self.rules.len() == other.rules.len()
+            && self
+                .rules
+                .iter()
+                .zip(&other.rules)
+                .all(|(left, right)| Arc::ptr_eq(left, right))
+    }
+
+    pub(crate) fn equivalent_redactions(&self, other: &Self) -> bool {
+        self.rules.len() == other.rules.len()
+            && self.rules.iter().zip(&other.rules).all(|(left, right)| {
+                left.matcher.as_str() == right.matcher.as_str()
+                    && left.replacement == right.replacement
+                    && left.regex == right.regex
+                    && left.ignore_case == right.ignore_case
+            })
+    }
+
+    pub(crate) fn redaction_revision(&self) -> Option<[u8; 32]> {
+        use pgp::crypto::hash::HashAlgorithm;
+
+        let rules: Vec<_> = self
+            .rules
+            .iter()
+            .map(|rule| {
+                (
+                    rule.matcher.as_str(),
+                    rule.replacement.as_str(),
+                    rule.regex,
+                    rule.ignore_case,
+                )
+            })
+            .collect();
+        let encoded = Zeroizing::new(serde_json::to_vec(&rules).ok()?);
+        HashAlgorithm::Sha256
+            .digest(&encoded)
+            .ok()?
+            .as_slice()
+            .try_into()
+            .ok()
+    }
+
     pub(crate) fn has_redactions(&self) -> bool {
         !self.rules.is_empty()
     }
@@ -46,6 +95,10 @@ impl Policy {
         self.journal_log_format
     }
 
+    pub(crate) fn journal_max_log_parts(&self) -> Option<u16> {
+        self.journal_max_log_parts
+    }
+
     pub(crate) fn journal_clickable_links_allowed(&self) -> bool {
         !self.journal_clickable_links_denied
     }
@@ -56,6 +109,18 @@ impl Policy {
 
     pub(crate) fn journal_delete_allowed(&self) -> bool {
         !self.journal_delete_denied
+    }
+
+    pub(crate) fn journal_ai_ask_allowed(&self) -> bool {
+        !self.journal_ai_ask_denied
+    }
+
+    pub(crate) fn automation_journal_caps(&self) -> Caps {
+        self.automation_journal_caps
+    }
+
+    pub(crate) fn automation_journal_allowed(&self) -> bool {
+        !self.automation_journal_denied
     }
 
     pub(crate) fn journal_ai_screenshot_analysis(&self) -> Option<bool> {
@@ -109,16 +174,57 @@ impl Policy {
                     "replace",
                     "storage-path",
                     "log-format",
+                    "max-log-parts",
                     "clickable-links",
                     "allow-rename",
                     "allow-delete",
+                    "ai-ask",
                     "ai-screenshot-analysis",
+                    "automation-allowed",
+                    "automation-max-retention-days",
+                    "automation-max-journals",
+                    "automation-max-storage-mb",
                 ],
             )?;
             self.journal_clickable_links_denied |=
                 boolean(journal, "clickable-links")? == Some(false);
             self.journal_rename_denied |= boolean(journal, "allow-rename")? == Some(false);
             self.journal_delete_denied |= boolean(journal, "allow-delete")? == Some(false);
+            self.journal_ai_ask_denied |= boolean(journal, "ai-ask")? == Some(false);
+            self.automation_journal_denied |=
+                boolean(journal, "automation-allowed")? == Some(false);
+            let cap = |key: &str, max: i64| -> io::Result<Option<i64>> {
+                journal
+                    .get(key)
+                    .map(|item| {
+                        item.as_integer()
+                            .filter(|value| (1..=i64::from(i32::MAX)).contains(value))
+                            .map(|value| value.min(max))
+                            .ok_or_else(|| invalid("Managed automation journal caps must be positive 32-bit integers"))
+                    })
+                    .transpose()
+            };
+            self.automation_journal_caps = self.automation_journal_caps.intersect(Caps {
+                days: cap("automation-max-retention-days", i64::from(MAX_DAYS))?
+                    .map(|value| value as u16),
+                runs: cap("automation-max-journals", i64::from(MAX_RUNS))?
+                    .map(|value| value as u16),
+                storage_mib: cap("automation-max-storage-mb", i64::from(MAX_STORAGE_MIB))?
+                    .map(|value| value as u32),
+            });
+            if let Some(value) = journal.get("max-log-parts") {
+                let value = value
+                    .as_integer()
+                    .filter(|value| *value >= 1)
+                    .ok_or_else(|| {
+                        invalid("Managed session journal max-log-parts must be a positive integer")
+                    })?;
+                let cap = value.min(i64::from(MAX_CONNECTION_JOURNAL_PARTS)) as u16;
+                self.journal_max_log_parts = Some(
+                    self.journal_max_log_parts
+                        .map_or(cap, |current| current.min(cap)),
+                );
+            }
             if let Some(value) = string(journal, "log-format")? {
                 let format = LogFormat::parse_policy(value).ok_or_else(|| {
                     invalid("Managed session journal log format must be XML, JSON or YAML")
@@ -207,38 +313,52 @@ impl Rule {
             matcher,
             replacement: replacement.into(),
             regex,
+            ignore_case,
         })
     }
 
-    pub(super) fn replace(&self, text: &str, deadline: Instant) -> Option<Zeroizing<String>> {
+    #[cfg(test)]
+    fn replace(&self, text: &str, deadline: Instant) -> Option<Zeroizing<String>> {
+        self.replace_counted(text, deadline, MAX_REDACTED)
+            .map(|(text, _)| text)
+    }
+
+    pub(super) fn replace_counted(
+        &self,
+        text: &str,
+        deadline: Instant,
+        limit: usize,
+    ) -> Option<(Zeroizing<String>, usize)> {
         if Instant::now() >= deadline {
             return None;
         }
         let mut out = Zeroizing::new(String::with_capacity(text.len()));
         let mut end = 0;
+        let mut count = 0;
         for captures in self.matcher.captures_iter(text) {
             if Instant::now() >= deadline {
                 return None;
             }
             let found = captures.get(0)?;
-            append(&mut out, &text[end..found.start()])?;
+            append_bounded(&mut out, &text[end..found.start()], limit)?;
             if self.regex {
                 let mut replacement = Zeroizing::new(String::new());
                 if expand(&self.replacement, &captures, &mut replacement).is_some() {
-                    append(&mut out, &replacement)?;
+                    append_bounded(&mut out, &replacement, limit)?;
                 } else {
-                    append(&mut out, &self.replacement)?;
+                    append_bounded(&mut out, &self.replacement, limit)?;
                 }
             } else {
-                append(&mut out, &self.replacement)?;
+                append_bounded(&mut out, &self.replacement, limit)?;
             }
+            count += 1;
             end = found.end();
         }
         if Instant::now() >= deadline {
             return None;
         }
-        append(&mut out, &text[end..])?;
-        Some(out)
+        append_bounded(&mut out, &text[end..], limit)?;
+        Some((out, count))
     }
 }
 
@@ -283,7 +403,11 @@ fn expand(mut template: &str, captures: &Captures<'_>, result: &mut String) -> O
 }
 
 pub(super) fn append(target: &mut String, part: &str) -> Option<()> {
-    if target.len().saturating_add(part.len()) > MAX_REDACTED {
+    append_bounded(target, part, MAX_REDACTED)
+}
+
+pub(super) fn append_bounded(target: &mut String, part: &str, limit: usize) -> Option<()> {
+    if target.len().saturating_add(part.len()) > limit {
         return None;
     }
     target.push_str(part);
@@ -330,6 +454,64 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn independently_loaded_redactions_match_only_with_the_same_rules() {
+        let parse = |ignore_case| {
+            let document = format!(
+                "[[session-journal.replace]]\npattern = 'Secret'\nignore-case = {ignore_case}"
+            )
+            .parse::<toml_edit::DocumentMut>()
+            .unwrap();
+            let mut policy = Policy::default();
+            policy.read_rule(document.as_table()).unwrap();
+            policy
+        };
+        let original = parse(false);
+        let independently_loaded = parse(false);
+        assert!(!original.same_redactions(&independently_loaded));
+        assert!(original.equivalent_redactions(&independently_loaded));
+        assert!(!original.equivalent_redactions(&parse(true)));
+        assert_eq!(
+            original.redaction_revision(),
+            independently_loaded.redaction_revision()
+        );
+        assert_ne!(
+            original.redaction_revision(),
+            parse(true).redaction_revision()
+        );
+    }
+
+    #[test]
+    fn journal_log_part_policy_uses_the_strictest_positive_cap() -> io::Result<()> {
+        let rule = |value: &str| {
+            format!("[session-journal]\nmax-log-parts = {value}")
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap()
+        };
+        assert_eq!(Policy::default().journal_max_log_parts(), None);
+        for values in [["40", "3", "20"], ["20", "3", "40"]] {
+            let mut policy = Policy::default();
+            for value in values {
+                policy.read_rule(rule(value).as_table())?;
+            }
+            assert_eq!(policy.journal_max_log_parts(), Some(3));
+        }
+        let mut policy = Policy::default();
+        policy.read_rule(rule("9223372036854775807").as_table())?;
+        assert_eq!(
+            policy.journal_max_log_parts(),
+            Some(MAX_CONNECTION_JOURNAL_PARTS)
+        );
+        for invalid in ["0", "-1", "1.5", "'3'", "true", "[]"] {
+            assert!(
+                Policy::default()
+                    .read_rule(rule(invalid).as_table())
+                    .is_err()
+            );
+        }
+        Ok(())
+    }
 
     #[test]
     fn journal_delete_policy_defaults_to_allowed_and_denial_wins_independently() -> io::Result<()> {

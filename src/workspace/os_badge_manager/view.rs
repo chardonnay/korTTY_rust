@@ -33,7 +33,8 @@ impl Dialog {
         } else if let Some(problem) = &self.problem {
             body = body.push(container(text(problem).size(13)).padding([4, 14]));
         }
-        body.push(rule::horizontal(1))
+        let content = body
+            .push(rule::horizontal(1))
             .push(
                 row![
                     space::horizontal(),
@@ -41,6 +42,9 @@ impl Dialog {
                 ]
                 .padding([8, 14]),
             )
+            .height(Length::Fill);
+        container(content)
+            .id(self.focus_scope.clone())
             .height(Length::Fill)
             .into()
     }

@@ -13,12 +13,13 @@ use iced::{Element, Length, Size, Task, window};
 use kortty_vault::Secret;
 
 use crate::connection_export::{
-    Entry, Format, Options, encode_with_options,
+    Entry, Format, LocalEntry, Options, SerialEntry, encode_profiles, java_local_profile,
     protection::{self, Protection},
 };
 use crate::connection_store::Store;
 use crate::profile;
 use crate::snippets::recipients::Choice;
+use crate::terminal_theme::Themes;
 use crate::workspace::dialog_placement::Kind;
 use crate::workspace::journal_access::export_dialog::browser::{
     Browser, Event as FileEvent, ReviewedSelection,
@@ -110,6 +111,12 @@ impl ManagerSelection {
             .connections()
             .iter()
             .map(|entry| entry.tag.as_str())
+            .chain(
+                store
+                    .serial_profiles()
+                    .iter()
+                    .map(|entry| entry.tag.as_str()),
+            )
             .filter(|tag| !tag.is_empty())
             .collect::<BTreeSet<_>>()
             .into_iter()
@@ -137,6 +144,20 @@ enum Phase {
 }
 
 impl Dialog {
+    fn local_selection(&self) -> (usize, usize) {
+        let selection = self.selection();
+        self.store
+            .local_profiles()
+            .iter()
+            .filter(|entry| selection.contains(&entry.id))
+            .fold((0, 0), |(count, rust_only), entry| {
+                (
+                    count + 1,
+                    rust_only + usize::from(!java_local_profile(entry)),
+                )
+            })
+    }
+
     fn selection(&self) -> Cow<'_, BTreeSet<u64>> {
         match &self.manager {
             Some(manager) if manager.by_tags => Cow::Owned(
@@ -145,6 +166,13 @@ impl Dialog {
                     .iter()
                     .filter(|entry| manager.selected_tags.contains(&entry.tag))
                     .map(|entry| entry.id)
+                    .chain(
+                        self.store
+                            .serial_profiles()
+                            .iter()
+                            .filter(|entry| manager.selected_tags.contains(&entry.tag))
+                            .map(|entry| entry.id),
+                    )
                     .collect(),
             ),
             _ => Cow::Borrowed(&self.selected),
@@ -153,11 +181,19 @@ impl Dialog {
 
     fn can_choose(&self) -> bool {
         !self.selection().is_empty()
+            && (self.format == Format::Kortty
+                || (self.local_selection().0 == 0 && !self.serial_selected()))
             && match self.encryption {
                 Encryption::None => true,
                 Encryption::Password => !self.password.is_empty() && self.password == self.confirm,
                 Encryption::OpenPgp => self.recipient.is_some(),
             }
+    }
+
+    fn serial_selected(&self) -> bool {
+        self.selection()
+            .iter()
+            .any(|id| self.store.serial(*id).is_some())
     }
 
     fn busy(&self) -> bool {
@@ -230,19 +266,33 @@ impl Dialog {
 
     fn tree(&self) -> Element<'_, Event> {
         let mut groups = BTreeMap::<Option<&str>, Vec<_>>::new();
-        for connection in self.store.connections() {
+        let entries = self
+            .store
+            .connections()
+            .iter()
+            .map(|entry| {
+                (
+                    entry.id,
+                    format!("{} ({})", entry.name, entry.login.endpoint.label()),
+                )
+            })
+            .chain(self.store.serial_profiles().iter().map(|entry| {
+                (
+                    entry.id,
+                    format!("{} (Serial · {})", entry.display_name(), entry.line()),
+                )
+            }));
+        for (id, label) in entries {
             groups
-                .entry(self.store.group_of(connection.id))
+                .entry(self.store.group_of(id))
                 .or_default()
-                .push(connection);
+                .push((id, label));
         }
         let mut tree = column![].spacing(5);
         for (folder, connections) in groups {
             let label = folder.unwrap_or("No folder");
             if let Some(folder) = folder {
-                let all = connections
-                    .iter()
-                    .all(|entry| self.selected.contains(&entry.id));
+                let all = connections.iter().all(|(id, _)| self.selected.contains(id));
                 tree = tree.push(
                     checkbox(all)
                         .label(label)
@@ -251,12 +301,31 @@ impl Dialog {
             } else {
                 tree = tree.push(text(label).size(14).style(text::secondary));
             }
-            for entry in connections {
+            for (id, label) in connections {
                 tree = tree.push(
                     container(
-                        checkbox(self.selected.contains(&entry.id))
-                            .label(format!("{} ({})", entry.name, entry.login.endpoint.label()))
-                            .on_toggle(move |selected| Event::Select(entry.id, selected)),
+                        checkbox(self.selected.contains(&id))
+                            .label(label)
+                            .on_toggle(move |selected| Event::Select(id, selected)),
+                    )
+                    .padding([0, 20]),
+                );
+            }
+        }
+        if !self.store.local_profiles().is_empty() {
+            tree = tree.push(text("Local shell profiles").size(14).style(text::secondary));
+            for entry in self.store.local_profiles() {
+                let id = entry.id;
+                let name = if java_local_profile(entry) {
+                    entry.display_name()
+                } else {
+                    format!("{} · Rust only", entry.name)
+                };
+                tree = tree.push(
+                    container(
+                        checkbox(self.selected.contains(&id))
+                            .label(name)
+                            .on_toggle(move |selected| Event::Select(id, selected)),
                     )
                     .padding([0, 20]),
                 );
@@ -267,6 +336,8 @@ impl Dialog {
                 "{} of {} connections selected",
                 self.selected.len(),
                 self.store.connections().len()
+                    + self.store.local_profiles().len()
+                    + self.store.serial_profiles().len()
             )),
             container(scrollable(tree).height(180))
                 .padding(8)
@@ -401,6 +472,7 @@ impl Dialog {
     }
 
     fn options(&self) -> Element<'_, Event> {
+        let (locals, rust_only) = self.local_selection();
         let body = column![
             text(TITLE).size(20),
             row![
@@ -413,6 +485,16 @@ impl Dialog {
             self.manager
                 .as_ref()
                 .map_or_else(|| self.tree(), |manager| self.manager_options(manager)),
+            (locals != 0 && self.format != Format::Kortty)
+                .then(|| text("Select kortty XML to export local shell profiles.").size(13)),
+            (self.serial_selected() && self.format != Format::Kortty)
+                .then(|| text("Select kortty XML to export serial profiles.").size(13)),
+            (rust_only != 0 && self.format == Format::Kortty).then(|| {
+                text(format!("{rust_only} selected local shell profile(s) require the Rust version to import their exact arguments or shell preset.")).size(13)
+            }),
+            (locals != 0).then(|| {
+                text("Local profiles include executable paths, arguments and working directories.").size(13)
+            }),
             rule::horizontal(1),
             self.manager.is_none().then(|| self.encryption_options()),
             text("Passwords, stored credentials and private keys are excluded from the export.")
@@ -463,7 +545,7 @@ impl Dialog {
         task.map(move |action| event(id, Event::File(attempt, action)))
     }
 
-    fn publish(&mut self, review: Arc<Review>) -> Task<Desktop> {
+    fn publish(&mut self, review: Arc<Review>, themes: &Themes) -> Task<Desktop> {
         let selected = self.selection().into_owned();
         let Some(destination) = &mut self.destination else {
             return Task::none();
@@ -471,6 +553,7 @@ impl Dialog {
         destination.phase = Phase::Write;
         let store = Arc::clone(&self.store);
         let format = self.format;
+        let themes = (format == Format::Kortty).then(|| themes.clone());
         let options = self.options;
         let encryption = self.encryption;
         let password = self.password.clone();
@@ -489,7 +572,32 @@ impl Dialog {
                         os_badge: store.os_badge_id(connection.id),
                     })
                     .collect::<Vec<_>>();
-                let payload = encode_with_options(format, &entries, options)?;
+                let locals = store
+                    .local_profiles()
+                    .iter()
+                    .filter(|entry| selected.contains(&entry.id))
+                    .map(|profile| LocalEntry {
+                        profile,
+                        group: store.group_of(profile.id).unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>();
+                let serials = store
+                    .serial_profiles()
+                    .iter()
+                    .filter(|entry| selected.contains(&entry.id))
+                    .map(|profile| SerialEntry {
+                        profile,
+                        group: store.group_of(profile.id).unwrap_or_default(),
+                    })
+                    .collect::<Vec<_>>();
+                let payload = encode_profiles(
+                    format,
+                    &entries,
+                    &locals,
+                    &serials,
+                    options,
+                    themes.as_ref(),
+                )?;
                 let output = match encryption {
                     Encryption::None => {
                         protection::protect(payload, format.extension(), Protection::None)?
@@ -517,7 +625,7 @@ impl Dialog {
                 let warning = review.0.publish_bytes(&output)?;
                 Ok(Arc::new(Receipt {
                     path: review.0.path().to_owned(),
-                    count: entries.len(),
+                    count: entries.len() + locals.len() + serials.len(),
                     warning,
                 }))
             },
@@ -525,7 +633,7 @@ impl Dialog {
         )
     }
 
-    fn update(&mut self, action: Event) -> Task<Desktop> {
+    fn update(&mut self, action: Event, themes: &Themes) -> Task<Desktop> {
         let (id, attempt) = (self.id, self.attempt);
         if let Some(destination) = &mut self.destination {
             match action {
@@ -562,7 +670,7 @@ impl Dialog {
                         Ok(review) if review.0.exists() => {
                             destination.phase = Phase::Confirm(review)
                         }
-                        Ok(review) => return self.publish(review),
+                        Ok(review) => return self.publish(review, themes),
                         Err(problem) => {
                             destination.browser.set_problem(problem);
                             destination.phase = Phase::Choose;
@@ -573,7 +681,7 @@ impl Dialog {
                     if let Phase::Confirm(review) = &destination.phase {
                         if replace {
                             let review = Arc::clone(review);
-                            return self.publish(review);
+                            return self.publish(review, themes);
                         }
                         destination.phase = Phase::Choose;
                     }
@@ -603,7 +711,10 @@ impl Dialog {
         match action {
             Event::Format(format) => self.format = format,
             Event::Select(id, selected)
-                if self.manager.is_none() && self.store.get(id).is_some() =>
+                if self.manager.is_none()
+                    && (self.store.get(id).is_some()
+                        || self.store.local(id).is_some()
+                        || self.store.serial(id).is_some()) =>
             {
                 if selected {
                     self.selected.insert(id);
@@ -616,6 +727,10 @@ impl Dialog {
                 if selected {
                     self.selected
                         .extend(self.store.connections().iter().map(|entry| entry.id));
+                    self.selected
+                        .extend(self.store.local_profiles().iter().map(|entry| entry.id));
+                    self.selected
+                        .extend(self.store.serial_profiles().iter().map(|entry| entry.id));
                 }
             }
             Event::Folder(folder, selected) if self.manager.is_none() => {
@@ -624,7 +739,14 @@ impl Dialog {
                     .connections()
                     .iter()
                     .filter(|entry| self.store.group_of(entry.id) == Some(folder.as_str()))
-                    .map(|entry| entry.id);
+                    .map(|entry| entry.id)
+                    .chain(
+                        self.store
+                            .serial_profiles()
+                            .iter()
+                            .filter(|entry| self.store.group_of(entry.id) == Some(folder.as_str()))
+                            .map(|entry| entry.id),
+                    );
                 for id in members {
                     if selected {
                         self.selected.insert(id);
@@ -700,16 +822,26 @@ impl Workspace {
         if !self.windows.contains_key(&owner) || !self.connection_export_allowed() {
             return Task::none();
         }
-        if let Some(dialog) = &self.chrome.connection_export {
-            return window::gain_focus(dialog.id);
+        if let Some((id, focus)) = self.owner_dialog(owner) {
+            return window::gain_focus(id).chain(Task::done(focus));
         }
         match profile::connections_path().and_then(Store::open) {
-            Ok(store) if store.connections().is_empty() => {
+            Ok(store)
+                if store.connections().is_empty()
+                    && store.local_profiles().is_empty()
+                    && store.serial_profiles().is_empty() =>
+            {
                 self.notice(owner, "No saved connections to export.".into());
                 Task::none()
             }
             Ok(store) => {
-                let selected = store.connections().iter().map(|entry| entry.id).collect();
+                let selected = store
+                    .connections()
+                    .iter()
+                    .map(|entry| entry.id)
+                    .chain(store.local_profiles().iter().map(|entry| entry.id))
+                    .chain(store.serial_profiles().iter().map(|entry| entry.id))
+                    .collect();
                 self.open_connection_export(owner, store, selected, None)
             }
             Err(error) => {
@@ -726,16 +858,16 @@ impl Workspace {
         &mut self,
         owner: window::Id,
     ) -> Task<Desktop> {
-        if self.connections_id != Some(owner) || !self.connection_export_allowed() {
+        if !self.connection_export_allowed() {
             return Task::none();
         }
-        if let Some(dialog) = &self.chrome.connection_export {
-            return window::gain_focus(dialog.id);
+        if let Some((id, focus)) = self.owner_dialog(owner) {
+            return window::gain_focus(id).chain(Task::done(focus));
         }
         let Some((store, selected)) = self
-            .connections
-            .as_ref()
-            .and_then(|manager| manager.export_connections_sources())
+            .connection_managers
+            .get(&owner)
+            .and_then(|manager| manager.window.export_connections_sources())
         else {
             return Task::none();
         };
@@ -760,42 +892,48 @@ impl Workspace {
         }
         let recipients = self.backup_recipient_choices();
         let recipient = recipients.first().cloned();
-        let (id, opened) = self.open_placed_dialog(
-            Kind::ConnectionExport,
-            window::Settings {
-                size: Size::new(660.0, 710.0),
-                min_size: Some(Size::new(460.0, 365.0)),
-                position: window::Position::Centered,
-                exit_on_close_request: false,
-                ..window::Settings::default()
+        let settings = window::Settings {
+            size: Size::new(660.0, 710.0),
+            min_size: Some(Size::new(460.0, 365.0)),
+            position: window::Position::Centered,
+            exit_on_close_request: false,
+            ..window::Settings::default()
+        };
+        let (id, opened) = if manager.is_some() {
+            self.open_owned_placed_dialog(owner, Kind::ConnectionExport, settings, Some(focus))
+        } else {
+            let (id, opened) = self.open_placed_dialog(Kind::ConnectionExport, settings);
+            (id, opened.discard())
+        };
+        self.chrome.connection_export.insert(
+            id,
+            Dialog {
+                id,
+                owner,
+                store: Arc::new(store),
+                selected,
+                manager,
+                options: Options::default(),
+                format: Format::Kortty,
+                encryption: Encryption::None,
+                password: Secret::default(),
+                confirm: Secret::default(),
+                recipients,
+                recipient,
+                destination: None,
+                receipt: None,
+                attempt: 0,
             },
         );
-        self.chrome.connection_export = Some(Dialog {
-            id,
-            owner,
-            store: Arc::new(store),
-            selected,
-            manager,
-            options: Options::default(),
-            format: Format::Kortty,
-            encryption: Encryption::None,
-            password: Secret::default(),
-            confirm: Secret::default(),
-            recipients,
-            recipient,
-            destination: None,
-            receipt: None,
-            attempt: 0,
-        });
-        opened.discard()
+        opened
     }
 
-    fn connection_export_allowed(&self) -> bool {
+    pub(in crate::workspace) fn connection_export_allowed(&self) -> bool {
         !self.exiting && !self.scheduler_draining && self.clipboard.policy.problem.is_none()
     }
 
     pub(in crate::workspace) fn connection_export_open(&self) -> bool {
-        self.chrome.connection_export.is_some()
+        !self.chrome.connection_export.is_empty()
     }
 
     pub(in crate::workspace) fn connection_export_for_owner(
@@ -804,8 +942,8 @@ impl Workspace {
     ) -> Option<window::Id> {
         self.chrome
             .connection_export
-            .as_ref()
-            .filter(|dialog| dialog.owner == owner)
+            .values()
+            .find(|dialog| dialog.owner == owner)
             .map(|dialog| dialog.id)
     }
 
@@ -815,16 +953,15 @@ impl Workspace {
     ) -> Option<&'static str> {
         self.chrome
             .connection_export
-            .as_ref()
-            .filter(|dialog| dialog.id == id)
-            .map(|_| TITLE)
+            .contains_key(&id)
+            .then_some(TITLE)
     }
 
     pub(in crate::workspace) fn connection_export_saving(&self) -> Option<window::Id> {
         self.chrome
             .connection_export
-            .as_ref()
-            .filter(|dialog| dialog.busy())
+            .values()
+            .find(|dialog| dialog.busy())
             .map(|dialog| dialog.id)
     }
 
@@ -832,11 +969,7 @@ impl Workspace {
         &self,
         id: window::Id,
     ) -> Option<Element<'_, Desktop>> {
-        let dialog = self
-            .chrome
-            .connection_export
-            .as_ref()
-            .filter(|dialog| dialog.id == id)?;
+        let dialog = self.chrome.connection_export.get(&id)?;
         Some(dialog.view().map(move |action| event(id, action)))
     }
 
@@ -847,15 +980,11 @@ impl Workspace {
         if let Some(dialog) = self.connection_export_for_owner(id) {
             return Some(window::gain_focus(dialog));
         }
-        self.connection_export_title(id)?;
-        if self.connection_export_saving() == Some(id) {
+        if self.chrome.connection_export.get(&id)?.busy() {
             return Some(Task::none());
         }
-        let dialog = self.chrome.connection_export.take()?;
-        Some(
-            self.close_placed_dialog(id)
-                .chain(window::gain_focus(dialog.owner)),
-        )
+        let dialog = self.chrome.connection_export.remove(&id)?;
+        Some(self.close_placed_dialog_and_focus(id, dialog.owner))
     }
 
     pub(super) fn update_connection_export(
@@ -872,8 +1001,10 @@ impl Workspace {
             action => self
                 .chrome
                 .connection_export
-                .as_mut()
-                .map_or_else(Task::none, |dialog| dialog.update(action)),
+                .get_mut(&id)
+                .map_or_else(Task::none, |dialog| {
+                    dialog.update(action, &self.window_settings.themes)
+                }),
         }
     }
 }

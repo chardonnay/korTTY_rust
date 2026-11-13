@@ -349,6 +349,23 @@ impl Draft {
         &self.original.fields
     }
 
+    pub(crate) fn require_translation_source(&self) -> io::Result<()> {
+        let check = || {
+            self.source.with_document(|_, document| {
+                let entry = find_entry(document, &self.id)?;
+                require_java_fields(entry, &["userNote"])?;
+                if bounded_field(entry, "userNote")?.as_ref() != self.original.fields.note {
+                    return Err(invalid("The saved session journal note changed"));
+                }
+                Ok(())
+            })
+        };
+        match check() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => check(),
+            result => result,
+        }
+    }
+
     pub(crate) fn marker(&self) -> &MarkerChoice {
         &self.marker
     }

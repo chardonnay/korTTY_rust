@@ -54,15 +54,18 @@ impl<'a> Gutter<'a> {
         let mut next_row = 0;
         let mut zone = None;
         for mark in &self.frame.command_timestamps {
-            if mark.row < next_row || mark.row >= screen.rows {
+            let Some(row) = self.frame.raw_display_row(mark.row) else {
+                continue;
+            };
+            if row < next_row || row >= screen.rows {
                 continue;
             }
-            if mark.row > next_row {
-                rows = rows.push(space::vertical().height(pitch * f32::from(mark.row - next_row)));
+            if row > next_row {
+                rows = rows.push(space::vertical().height(pitch * f32::from(row - next_row)));
             }
             let zone = zone.get_or_insert_with(TimeZone::system);
             rows = rows.push(mark_view(mark, zone, paint, pitch));
-            next_row = mark.row + 1;
+            next_row = row + 1;
         }
 
         let rows = container(rows)
@@ -413,14 +416,19 @@ mod tests {
                 font_size: 14,
                 font: Font::MONOSPACE,
                 appearance,
+                background_image: None,
                 scale_factor: 2.0,
                 background_transparency: 0,
                 focused: true,
+                reduced_motion: false,
                 typeahead_enabled: false,
                 owner,
                 plain_text_links: false,
                 selection: None,
+                projected: None,
                 search: None,
+                agent_cursor: None,
+                inline_agent: None,
             });
             let mut view = with_timestamp_gutter(
                 terminal,

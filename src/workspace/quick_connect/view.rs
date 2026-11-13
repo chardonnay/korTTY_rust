@@ -13,6 +13,7 @@ use super::{
 };
 use crate::ssh_dialog::{self, LoginMessage};
 use crate::vault_window::Kind;
+use crate::workspace::dialog_placement::escape::on_escape;
 
 const RECENT_COUNT: usize = 10;
 const LABEL_WIDTH: f32 = 200.0;
@@ -42,7 +43,7 @@ impl Workspace {
             .as_ref()
             .filter(|dialog| dialog.id == id)?;
         Some(
-            self.quick_view(dialog)
+            on_escape(self.quick_view(dialog), Message::Cancel)
                 .map(move |message| wrap(id, message)),
         )
     }
@@ -51,16 +52,27 @@ impl Workspace {
         let recent: Vec<_> = dialog
             .store
             .iter()
-            .flat_map(Store::recent)
+            .flat_map(|store| {
+                store.recent_ids().filter_map(|id| {
+                    let label = if let Some(connection) = store.get(id) {
+                        connection.name.clone()
+                    } else if let Some(profile) = store.serial(id) {
+                        profile.display_name()
+                    } else {
+                        store.local(id)?.display_name()
+                    };
+                    Some((id, label))
+                })
+            })
             .take(RECENT_COUNT)
             .collect();
         let mut content = column![].spacing(10);
         if !recent.is_empty() {
-            let choices = row(recent.into_iter().map(|connection| {
-                button(text(&connection.name).wrapping(text::Wrapping::None))
+            let choices = row(recent.into_iter().map(|(id, label)| {
+                button(text(label).wrapping(text::Wrapping::None))
                     .width(140)
                     .style(neutral_button)
-                    .on_press_maybe((!dialog.saving).then_some(Message::Recent(connection.id)))
+                    .on_press_maybe((!dialog.saving).then_some(Message::Recent(id)))
                     .into()
             }))
             .spacing(8)
@@ -135,12 +147,21 @@ impl Workspace {
                 Message::Protocol,
             ),
         ));
-        if dialog.protocol.ibm_models().is_none() && dialog.protocol != Protocol::Sftp {
+        let saved_local = (dialog.protocol == Protocol::Local)
+            .then(|| dialog.selected_local())
+            .flatten();
+        if let Some(emulation) = saved_local.and_then(|saved| saved.profile()) {
+            body = body.push(labeled("Terminal emulation", text(emulation.to_string())));
+        } else if dialog.protocol.ibm_models().is_none() && dialog.protocol != Protocol::Sftp {
             body = body.push(labeled(
                 "Terminal emulation",
                 pick_list(
                     TerminalProfile::ALL,
-                    Some(dialog.ssh.profile()),
+                    Some(if dialog.protocol == Protocol::Serial {
+                        dialog.serial.profile()
+                    } else {
+                        dialog.ssh.profile()
+                    }),
                     Message::Profile,
                 ),
             ));
@@ -157,7 +178,12 @@ impl Workspace {
                     .ssh
                     .target_endpoint()
                     .map_or_else(Vec::new, |endpoint| {
-                        self.scoped_credential_choices(Kind::Password, &endpoint)
+                        let mut credentials =
+                            self.scoped_credential_choices(Kind::Password, &endpoint);
+                        credentials.extend(
+                            self.scoped_credential_choices(Kind::PasswordCommand, &endpoint),
+                        );
+                        credentials
                     });
                 let selected = credentials
                     .iter()
@@ -219,9 +245,7 @@ impl Workspace {
                                 .ssh
                                 .logging_view(
                                     self.clipboard.policy.problem.is_none()
-                                        && !dialog
-                                            .selected()
-                                            .is_some_and(|connection| connection.incognito),
+                                        && !dialog.selected_ssh_incognito(),
                                 )
                                 .map(Message::Ssh),
                         );
@@ -231,8 +255,18 @@ impl Workspace {
                     body = body.push(text(notice).size(13));
                 }
             }
+            Protocol::Local if dialog.selected_local.is_some() => {
+                let name = saved_local.map_or_else(
+                    || "This saved shell no longer exists.".into(),
+                    |profile| profile.display_name(),
+                );
+                body = body
+                    .push(labeled("Profile", text(name)))
+                    .push(button("Use an unsaved shell").on_press(Message::AdHocLocal));
+            }
             Protocol::Local => {
-                let integration = self.quick_shell_integration(dialog.ssh.profile());
+                let integration =
+                    self.quick_shell_integration(dialog.ssh.profile(), dialog.local_shell);
                 #[cfg(windows)]
                 let shell = pick_list(
                     [
@@ -248,22 +282,46 @@ impl Workspace {
                 let shell = text("System default");
                 body = body.push(labeled("Shell", shell)).push(labeled(
                     "Shell integration",
-                    checkbox(dialog.shell_integration && integration.is_ok())
+                    checkbox(dialog.shell_integration)
                         .label("Add shell integration automatically")
-                        .on_toggle_maybe(integration.is_ok().then_some(Message::ShellIntegration)),
+                        .on_toggle_maybe(
+                            (dialog.shell_integration || integration.is_ok())
+                                .then_some(Message::ShellIntegration),
+                        ),
                 ));
                 if let Err(reason) = integration {
                     body = body.push(text(reason).size(13));
                 }
             }
-            Protocol::Serial => body = body.push(dialog.serial.fields().map(Message::Serial)),
+            Protocol::Serial => {
+                body = body.push(dialog.serial.fields().map(Message::Serial));
+                body = body.push(
+                    checkbox(dialog.save)
+                        .label("Save as a new connection")
+                        .on_toggle(Message::SaveConnection),
+                );
+                if dialog.save {
+                    body = body.push(labeled(
+                        "Connection name",
+                        text_input("Defaults to port and speed", &dialog.name)
+                            .on_input(Message::ConnectionName),
+                    ));
+                }
+            }
             Protocol::Tn3270 | Protocol::Tn5250 => {
                 if let Some(models) = dialog.protocol.ibm_models() {
                     body = body.push(dialog.ibm_view(models));
                 }
             }
         }
-        if dialog.protocol != Protocol::Sftp {
+        let terminal = match dialog.protocol {
+            Protocol::Local => saved_local.map(|profile| &profile.terminal),
+            Protocol::Ssh => dialog.selected().map(|profile| &profile.terminal),
+            _ => None,
+        };
+        let saved_font = terminal
+            .is_some_and(|settings| settings.font_size.is_some() || settings.theme.is_some());
+        if dialog.protocol != Protocol::Sftp && !saved_font {
             body = body.push(
                 button(if dialog.appearance {
                     "▾ Terminal Appearance"
@@ -304,15 +362,41 @@ impl Workspace {
 
 impl Dialog {
     fn saved_view(&self) -> Element<'_, Message> {
+        let serial_choice = |profile: &crate::connection_store::SerialProfile| SavedChoice {
+            id: profile.id,
+            label: format!(
+                "{} ({} · {})",
+                profile.display_name(),
+                if profile.pinned {
+                    "Pinned serial"
+                } else {
+                    "Serial"
+                },
+                profile.line()
+            ),
+        };
         let options: Vec<_> = self
             .store
             .iter()
-            .flat_map(|store| store.search(&self.query))
-            .map(SavedChoice::from)
+            .flat_map(|store| {
+                let (pinned, serials): (Vec<_>, Vec<_>) = store
+                    .search_serial(&self.query)
+                    .partition(|profile| profile.pinned);
+                pinned
+                    .into_iter()
+                    .map(serial_choice)
+                    .chain(store.search(&self.query).map(SavedChoice::from))
+                    .chain(serials.into_iter().map(serial_choice))
+                    .chain(store.search_local(&self.query).map(|profile| SavedChoice {
+                        id: profile.id,
+                        label: format!("{} (Local Shell)", profile.display_name()),
+                    }))
+            })
             .collect();
+        let empty = options.is_empty();
         let selected = options
             .iter()
-            .find(|choice| Some(choice.id) == self.selected)
+            .find(|choice| Some(choice.id) == self.selected_profile_id())
             .cloned();
         let first = options.first().map(|choice| Message::Select(choice.id));
         let mut fields = column![
@@ -331,12 +415,7 @@ impl Dialog {
             .spacing(7),
         ]
         .spacing(6);
-        if !self.query.trim().is_empty()
-            && self
-                .store
-                .as_ref()
-                .is_some_and(|store| store.search(&self.query).next().is_none())
-        {
+        if !self.query.trim().is_empty() && self.store.is_some() && empty {
             fields = fields.push(text("No saved connections match.").size(13));
         }
         fields.push(rule::horizontal(1)).into()

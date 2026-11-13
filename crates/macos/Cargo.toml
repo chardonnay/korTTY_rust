@@ -11,5 +11,6 @@ block2 = "0.5.1"
 core-foundation-sys = "0.8.7"
 objc2 = "0.5.3"
 raw-window-handle = "0.6.2"
-objc2-app-kit = { version = "0.2.2", default-features = false, features = ["std", "block2", "NSAppearance", "NSApplication", "NSCell", "NSEvent", "NSGraphics", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSScreen", "NSView", "NSWindow", "NSWorkspace"] }
-objc2-foundation = { version = "0.2.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSEnumerator", "NSGeometry", "NSString", "NSThread", "NSURL"] }
+objc2-app-kit = { version = "0.2.2", default-features = false, features = ["std", "block2", "NSAppearance", "NSApplication", "NSButton", "NSCell", "NSControl", "NSDockTile", "NSEvent", "NSGraphics", "NSImage", "NSMenu", "NSMenuItem", "NSPasteboard", "NSPasteboardItem", "NSResponder", "NSScreen", "NSStatusBar", "NSStatusBarButton", "NSStatusItem", "NSView", "NSWindow", "NSWorkspace"] }
+objc2-foundation = { version = "0.2.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSData", "NSEnumerator", "NSGeometry", "NSProcessInfo", "NSString", "NSThread", "NSURL", "NSUUID"] }
+objc2-user-notifications = { version = "0.2.2", default-features = false, features = ["std", "block2", "UNNotification", "UNNotificationContent", "UNNotificationRequest", "UNNotificationResponse", "UNNotificationTrigger", "UNUserNotificationCenter"] }

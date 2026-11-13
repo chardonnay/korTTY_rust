@@ -133,6 +133,10 @@ impl Fixture {
     fn destination(&mut self, id: window::Id) {
         self.export(id, Message::Options(export_options::Event::Confirm));
         self.export(id, Message::Options(export_options::Event::Cancel));
+        self.review_destination(id);
+    }
+
+    fn review_destination(&mut self, id: window::Id) {
         let completion = self
             .browser(id)
             .complete_listing_for_test(&self.scratch.join("absent"));
@@ -196,6 +200,53 @@ fn journal_export_save_publishes_the_original_selection_after_destination_confir
         assert!(markdown.contains("A retained note"));
         assert!(!markdown.contains("A different note"));
     }
+}
+
+#[test]
+fn journal_browser_html_requires_viewer_and_reviewed_local_destination() {
+    for hosted in [false, true] {
+        let mut fixture = Fixture::new(hosted);
+        fixture.export(fixture.source, Message::OpenBrowser);
+        assert!(fixture.workspace.journal_exports.dialogs.is_empty());
+        let (source, directory) = fixture.open_viewer();
+        fs::write(directory.join("journal.html"), "foreign HTML").unwrap();
+        fixture.export(source, Message::OpenBrowser);
+        let id = fixture.workspace.journal_edit_for_owner(source).unwrap();
+        fixture.review_destination(id);
+        fixture.assert_no_output();
+        fixture.export(id, Message::OpenDocument);
+        fixture.assert_no_output();
+
+        fixture.export(id, Message::Browser(browser::Event::Save));
+        fixture.wait_for_export();
+        let html = fs::read_to_string(fixture.destination.join("custom.html")).unwrap();
+        assert!(html.contains("A retained note"));
+        assert!(html.contains("default-src 'none'; img-src data:"));
+        assert!(!html.contains("foreign HTML"));
+        assert!(!html.contains("A different note"));
+        assert_eq!(fs::read_dir(&fixture.destination).unwrap().count(), 1);
+    }
+}
+
+#[test]
+fn journal_browser_html_rejects_revoked_policy_and_changed_reviewed_journal() {
+    let mut fixture = Fixture::new(false);
+    let (source, directory) = fixture.open_viewer();
+    fixture.export(source, Message::OpenBrowser);
+    let id = fixture.workspace.journal_edit_for_owner(source).unwrap();
+    fixture.review_destination(id);
+    fixture.workspace.clipboard.policy.session_journal_allowed = false;
+    fixture.export(id, Message::Browser(browser::Event::Save));
+    assert!(fixture.workspace.pending_shutdown.is_empty());
+    fixture.assert_no_output();
+    fixture.workspace.clipboard.policy.session_journal_allowed = true;
+
+    let document = directory.join("journal.xml");
+    let xml = fs::read_to_string(&document).unwrap();
+    fs::write(&document, xml.replace("A retained note", "Unreviewed data")).unwrap();
+    fixture.export(id, Message::Browser(browser::Event::Save));
+    fixture.wait_for_export();
+    fixture.assert_no_output();
 }
 
 #[test]

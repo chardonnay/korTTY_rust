@@ -464,7 +464,7 @@ impl Page {
             Self::Import(paths) => column![
                 text("Import snippets").size(20),
                 text(
-                    "Enter one absolute path per line. Choose Java JSON, XML, or YAML exports, or individual text files."
+                    "Enter one absolute path per line. Choose JSON, XML or YAML exports, a Java snippets.xml library, or individual text files."
                 ),
                 text_editor(paths)
                     .placeholder("Absolute file paths")

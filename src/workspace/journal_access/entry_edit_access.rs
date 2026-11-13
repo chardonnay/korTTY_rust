@@ -435,7 +435,15 @@ impl Workspace {
             return Task::none();
         };
         let capture = self.journal_entry_capture(&viewer.source);
-        let setup = self.journal_note_translation_setup(&event, capture.as_ref(), MAX_FIELD_BYTES);
+        let Some(draft) = viewer.entry_editor.draft_handle() else {
+            return Task::none();
+        };
+        let source = self.journal_note_entry_source(capture.as_ref(), move || {
+            draft.require_translation_source()
+        });
+        let setup = self
+            .journal_note_translation_setup(&event, capture.as_ref(), MAX_FIELD_BYTES)
+            .with_outbound_source(source);
         let update = self.entry_viewer_mut(id).and_then(|viewer| {
             viewer
                 .entry_editor

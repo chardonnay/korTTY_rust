@@ -6,7 +6,7 @@ use crate::session_journal::export_branding::{
 };
 use crate::terminal_theme::Rgb;
 
-use super::{Desktop, Dialog, Message, Setting, highlighted};
+use super::{Desktop, Dialog, Message, Setting, WindowSettings, highlighted};
 
 #[derive(Clone, Debug)]
 pub enum Edit {
@@ -15,6 +15,7 @@ pub enum Edit {
     WatermarkColor(String),
     Footer(bool),
     FooterText(String),
+    IncludeScriptByDefault(bool),
 }
 
 #[derive(Default)]
@@ -31,8 +32,12 @@ impl Editor {
                 .is_none_or(|input| Rgb::parse(input).is_some())
     }
 
-    pub(super) fn update(&mut self, preferences: &mut Preferences, edit: Edit) {
+    pub(super) fn update(&mut self, settings: &mut WindowSettings, edit: Edit) {
+        let preferences = &mut settings.export_branding;
         match edit {
+            Edit::IncludeScriptByDefault(enabled) => {
+                settings.snippet_analysis_export_include_code = enabled
+            }
             Edit::Watermark(enabled) => preferences.watermark_enabled = enabled,
             Edit::Footer(enabled) => preferences.footer_enabled = enabled,
             Edit::WatermarkText(text) if preferences.watermark_enabled => {
@@ -59,10 +64,14 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
     let preferences = &dialog.draft.preferences.export_branding;
     let color = preferences.watermark_color;
     let color_value = color.to_string();
-    let watermark_text = text_input(DEFAULT_WATERMARK, &preferences.watermark_text).on_input_maybe(
-        preferences
-            .watermark_enabled
-            .then_some(move |text| send(Edit::WatermarkText(text))),
+    let watermark_text = dialog.reveal_input(
+        Setting::ExportWatermark,
+        preferences.watermark_enabled,
+        text_input(DEFAULT_WATERMARK, &preferences.watermark_text).on_input_maybe(
+            preferences
+                .watermark_enabled
+                .then_some(move |text| send(Edit::WatermarkText(text))),
+        ),
     );
     let watermark_color = text_input(
         "#RRGGBB",
@@ -74,10 +83,14 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
             .then_some(move |text| send(Edit::WatermarkColor(text))),
     )
     .width(120);
-    let footer_text = text_input(DEFAULT_FOOTER, &preferences.footer_text).on_input_maybe(
-        preferences
-            .footer_enabled
-            .then_some(move |text| send(Edit::FooterText(text))),
+    let footer_text = dialog.reveal_input(
+        Setting::ExportFooter,
+        preferences.footer_enabled,
+        text_input(DEFAULT_FOOTER, &preferences.footer_text).on_input_maybe(
+            preferences
+                .footer_enabled
+                .then_some(move |text| send(Edit::FooterText(text))),
+        ),
     );
     let swatch = container(space::horizontal())
         .width(20)
@@ -85,14 +98,14 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
         .style(move |_| container::Style::default().background(color.color()));
     column![
         text("Exported documents").size(18),
-        text("Applies to session journal exports.").size(13),
+        text("Applies to supported session journal and snippet analysis exports.").size(13),
         highlighted(dialog, Setting::ExportWatermark, column![
             checkbox(preferences.watermark_enabled)
                 .label(Setting::ExportWatermark.label())
                 .on_toggle(move |enabled| send(Edit::Watermark(enabled))),
             row![text("Watermark text").width(Length::Fixed(140.0)), watermark_text].spacing(8).align_y(Alignment::Center),
             row![text("Watermark colour").width(Length::Fixed(140.0)), watermark_color, swatch].spacing(8).align_y(Alignment::Center),
-            text("Drawn faintly across every PDF page. Leave the text empty for the built-in watermark.").size(13),
+            text("Shown faintly on PDF pages and HTML snippet analysis reports. Leave the text empty for the built-in watermark.").size(13),
         ].spacing(8)),
         rule::horizontal(1),
         highlighted(dialog, Setting::ExportFooter, column![
@@ -100,7 +113,14 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
                 .label(Setting::ExportFooter.label())
                 .on_toggle(move |enabled| send(Edit::Footer(enabled))),
             row![text("Footer text").width(Length::Fixed(140.0)), footer_text].spacing(8).align_y(Alignment::Center),
-            text("Shown in PDF, Markdown and the exported journal page. Leave it empty for the built-in text and repository link.").size(13),
+            text("Shown in PDF, HTML and Markdown. Leave the text empty for the built-in footer and repository link.").size(13),
+        ].spacing(8)),
+        rule::horizontal(1),
+        highlighted(dialog, Setting::ExportSnippetCode, column![
+            checkbox(dialog.draft.preferences.snippet_analysis_export_include_code)
+                .label(Setting::ExportSnippetCode.label())
+                .on_toggle(move |enabled| send(Edit::IncludeScriptByDefault(enabled))),
+            text("Selects the full script for new PDF, HTML and Markdown analysis exports. The report dialog lets you change the choice.").size(13),
         ].spacing(8)),
     ].spacing(12).into()
 }
@@ -134,9 +154,11 @@ mod tests {
         let original = fs::read(&path).unwrap();
         let legacy: WindowSettings = serde_json::from_str("{}").unwrap();
         assert!(legacy.export_branding.is_default());
+        assert!(!legacy.snippet_analysis_export_include_code);
         let (owner, _) = workspace.open_window(false);
         let _ = workspace.update_settings(Message::OpenAt(owner, Section::Export));
         let id = workspace.settings.0.as_ref().unwrap().id;
+        let _ = workspace.update_settings(Message::Export(id, Edit::IncludeScriptByDefault(true)));
         let _ = workspace.update_settings(Message::Export(id, Edit::Watermark(true)));
         let _ = workspace.update_settings(Message::Export(id, Edit::WatermarkColor("#123".into())));
         let _ = workspace.save_settings_to(id, |_| panic!("invalid color reached persistence"));
@@ -150,6 +172,11 @@ mod tests {
             workspace.window_settings.export_branding,
             legacy.export_branding
         );
+        assert!(
+            !workspace
+                .window_settings
+                .snippet_analysis_export_include_code
+        );
 
         let _ = workspace.update_settings(Message::OpenAt(owner, Section::Export));
         let id = workspace.settings.0.as_ref().unwrap().id;
@@ -158,12 +185,19 @@ mod tests {
             Edit::WatermarkColor("#364A71".into()),
             Edit::WatermarkText("Example watermark".into()),
             Edit::FooterText("Example footer".into()),
+            Edit::IncludeScriptByDefault(true),
         ] {
             let _ = workspace.update_settings(Message::Export(id, edit));
         }
         let _ = workspace.save_settings_to(id, |preferences| preferences.save(&path));
         assert!(workspace.settings.0.is_none());
         let saved: WindowSettings = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+        assert!(saved.snippet_analysis_export_include_code);
+        assert!(
+            workspace
+                .window_settings
+                .snippet_analysis_export_include_code
+        );
         assert_eq!(
             saved.export_branding,
             workspace.window_settings.export_branding

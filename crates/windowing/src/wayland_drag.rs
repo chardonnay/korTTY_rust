@@ -7,8 +7,8 @@ use smithay_clipboard::drag::{self, DragOperation, DragProgress, DragTarget};
 /// proxies and obtains the live surface and implicit grab from its pointer event.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Surface {
-    display: usize,
-    surface: usize,
+    pub(super) display: usize,
+    pub(super) surface: usize,
 }
 
 pub fn identify(window: WindowHandle<'_>, display: DisplayHandle<'_>) -> Option<Surface> {

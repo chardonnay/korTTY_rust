@@ -10,6 +10,11 @@ use kortty_jobs::{
     MAX_STORE_BYTES, RunBatch, RunOutcome, Scheduler, SchedulerStore, StoreError, Weekday,
 };
 
+#[path = "store/session_journals.rs"]
+mod session_journals;
+#[path = "store/swarm.rs"]
+mod swarm;
+
 struct TestDirectory(PathBuf);
 
 impl TestDirectory {
@@ -184,7 +189,96 @@ fn optional_metadata_and_summary_round_trip_with_one_atomic_update() {
 }
 
 #[test]
-fn journal_deletion_keeps_own_last_run_but_refreshes_gate_history() {
+fn disabled_additions_preserve_local_history_and_require_exact_predecessors() {
+    let directory = TestDirectory::new();
+    let path = directory.profile();
+    let local = Job::new(id("local"), "Local job", "uptime").unwrap();
+    let mut scheduler = Scheduler::new(JobGraph::new(vec![local]).unwrap());
+    let record = complete(&mut scheduler, "local", 1).finished.remove(0);
+    let mut store = SchedulerStore::open(&path).unwrap();
+    store
+        .commit_with_actions(
+            scheduler.graph(),
+            std::slice::from_ref(&record),
+            &[(record.id, "Local detail".into())],
+        )
+        .unwrap();
+    drop(store);
+    let current = fs::read(&path).unwrap();
+    let make_jobs = |root_action| {
+        let root = Job::new(id("java-root"), "Imported root", root_action)
+            .unwrap()
+            .with_enabled(false);
+        let leaf = Job::new(id("java-leaf"), "Imported leaf", "date")
+            .unwrap()
+            .with_enabled(false)
+            .with_dependencies(DependencyMode::Chain, vec![id("java-root")], None);
+        JobGraph::new(vec![leaf, root]).unwrap()
+    };
+    let initial = make_jobs("ls");
+    let prepared = SchedulerStore::prepare_disabled_additions(Some(&current), &initial).unwrap();
+    assert_eq!(prepared.added, 2);
+    let bytes = prepared.bytes.unwrap();
+    let before: serde_json::Value = serde_json::from_slice(&current).unwrap();
+    let after: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    for (key, value) in before.as_object().unwrap() {
+        match key.as_str() {
+            "actions" => assert_eq!(after[key]["local"], value["local"]),
+            "definitions" => assert_eq!(after[key][0], value[0]),
+            _ => assert_eq!(after[key], *value, "field {key}"),
+        }
+    }
+    assert_eq!(fs::read(&path).unwrap(), current);
+    let repeated = SchedulerStore::prepare_disabled_additions(Some(&bytes), &initial).unwrap();
+    assert_eq!((repeated.added, repeated.unchanged), (0, 2));
+    assert!(repeated.bytes.is_none());
+
+    let conflict =
+        SchedulerStore::prepare_disabled_additions(Some(&bytes), &make_jobs("pwd")).unwrap();
+    assert_eq!((conflict.conflicts, conflict.missing_dependencies), (1, 1));
+    assert!(conflict.bytes.is_none());
+    fs::write(&path, bytes).unwrap();
+    let store = SchedulerStore::open(&path).unwrap();
+    assert_eq!(store.journal_detail(record.id), Some("Local detail"));
+    let restored = store.restore_with_actions::<String>().unwrap();
+    let root = restored.graph().job(&id("java-root")).unwrap();
+    assert!(!root.enabled());
+    assert_eq!(root.action(), "ls");
+}
+
+#[test]
+fn disabled_additions_respect_job_capacity_and_reject_enabled_definitions() {
+    let directory = TestDirectory::new();
+    let path = directory.profile();
+    let local = (0..kortty_jobs::MAX_JOBS)
+        .map(|index| Job::new(id(&format!("local-{index}")), "Local job", "date").unwrap())
+        .collect();
+    let local = JobGraph::new(local).unwrap();
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&local, &[], &[])
+        .unwrap();
+    let current = fs::read(path).unwrap();
+    let incoming = |enabled| {
+        JobGraph::new(vec![
+            Job::new(id("java-root"), "Imported root", "uptime")
+                .unwrap()
+                .with_enabled(enabled),
+        ])
+        .unwrap()
+    };
+    let result =
+        SchedulerStore::prepare_disabled_additions(Some(&current), &incoming(false)).unwrap();
+    assert_eq!(result.full, 1);
+    assert!(result.bytes.is_none());
+    assert!(matches!(
+        SchedulerStore::prepare_disabled_additions(None, &incoming(true)),
+        Err(StoreError::InvalidRecord)
+    ));
+}
+
+#[test]
+fn journal_deletion_preserves_dependency_results_and_own_last_run() {
     let directory = TestDirectory::new();
     let path = directory.profile();
     let jobs = vec![
@@ -220,12 +314,88 @@ fn journal_deletion_keeps_own_last_run_but_refreshes_gate_history() {
     store.commit(restored.graph(), &one_new.finished).unwrap();
     assert_eq!(store.prune_before(at(5)).unwrap(), 2);
     store.apply_history(&mut restored);
-    let blockers = restored.blockers(&id("join"), at(6)).unwrap();
-    assert_eq!(blockers.len(), 1);
-    assert_eq!(blockers[0].predecessor, id("two"));
-    assert_eq!(blockers[0].reason, BlockReason::NeverRan);
+    assert!(restored.last_finished(&id("two")).is_none());
+    assert!(restored.blockers(&id("join"), at(6)).unwrap().is_empty());
     let two_new = complete(&mut restored, "two", 6);
     assert_eq!(two_new.started[0].job, id("join"));
+}
+
+#[test]
+fn deleted_latest_failure_still_blocks_chain_after_restart() {
+    let directory = TestDirectory::new();
+    let path = directory.profile();
+    let jobs = vec![
+        Job::new(id("one"), "one", ()).unwrap(),
+        Job::new(id("two"), "two", ()).unwrap(),
+        Job::new(id("join"), "join", ()).unwrap().with_dependencies(
+            DependencyMode::Chain,
+            vec![id("one"), id("two")],
+            None,
+        ),
+    ];
+    let mut scheduler = Scheduler::new(JobGraph::new(jobs).unwrap());
+    let success = complete(&mut scheduler, "one", 2);
+    let failed = scheduler.start_manual(&id("one"), at(2)).unwrap();
+    let failure = RunOutcome::Failed { exit_code: Some(1) };
+    let failed = scheduler
+        .complete(failed.started[0].id, failure, at(2))
+        .unwrap();
+    let mut store = SchedulerStore::open(&path).unwrap();
+    for batch in [&success, &failed] {
+        store.commit(scheduler.graph(), &batch.finished).unwrap();
+    }
+    store.delete_records(&[failed.finished[0].id]).unwrap();
+    drop(store);
+
+    let store = SchedulerStore::open(&path).unwrap();
+    let mut restored = store.restore(|_| Some(())).unwrap();
+    assert_eq!(
+        restored.last_finished(&id("one")),
+        Some(&success.finished[0])
+    );
+    let two = complete(&mut restored, "two", 3);
+    assert!(two.started.is_empty());
+    let blockers = restored.blockers(&id("join"), at(3)).unwrap();
+    assert_eq!(blockers.len(), 1);
+    assert_eq!(blockers[0].predecessor, id("one"));
+    assert_eq!(blockers[0].reason, BlockReason::NotSuccessful(failure));
+    let recovered = complete(&mut restored, "one", 4);
+    assert_eq!(recovered.started[0].job, id("join"));
+}
+
+#[test]
+fn old_profiles_only_restore_results_from_runs_that_are_still_latest() {
+    let directory = TestDirectory::new();
+    let path = directory.profile();
+    let jobs = vec![
+        Job::new(id("one"), "one", ()).unwrap(),
+        Job::new(id("two"), "two", ()).unwrap(),
+        Job::new(id("join"), "join", ()).unwrap().with_dependencies(
+            DependencyMode::Gate,
+            vec![id("one"), id("two")],
+            None,
+        ),
+    ];
+    let mut scheduler = Scheduler::new(JobGraph::new(jobs).unwrap());
+    let first = complete(&mut scheduler, "one", 2);
+    let latest = complete(&mut scheduler, "one", 3);
+    let two = complete(&mut scheduler, "two", 4);
+    let mut store = SchedulerStore::open(&path).unwrap();
+    for batch in [&first, &latest, &two] {
+        store.commit(scheduler.graph(), &batch.finished).unwrap();
+    }
+    store.delete_records(&[latest.finished[0].id]).unwrap();
+    drop(store);
+
+    let mut old: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    old.as_object_mut().unwrap().remove("dependency_results");
+    fs::write(&path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let store = SchedulerStore::open(&path).unwrap();
+    let restored = store.restore(|_| Some(())).unwrap();
+    let blockers = restored.blockers(&id("join"), at(5)).unwrap();
+    assert_eq!(blockers.len(), 1);
+    assert_eq!(blockers[0].predecessor, id("one"));
+    assert_eq!(blockers[0].reason, BlockReason::NeverRan);
 }
 
 #[test]

@@ -24,7 +24,12 @@ pub(super) enum Origin {
     Local(TerminalProfile, Option<u8>, LocalSettings),
     Ssh(Box<ReopenSshOrigin>),
     Saved(u64),
-    Serial(TerminalProfile, Option<u8>, Arc<SerialConnection>),
+    Serial(
+        TerminalProfile,
+        Option<u8>,
+        Arc<SerialConnection>,
+        Option<u64>,
+    ),
     Ibm(IbmOrigin, Option<u8>),
 }
 
@@ -37,13 +42,21 @@ pub(super) struct IbmOrigin {
 
 impl Origin {
     pub(super) fn capture(pane: &PaneSession) -> Option<Self> {
+        if pane.control_ssh_provisional {
+            return None;
+        }
         let profile = pane.frame.screen.profile;
         let font = pane.font_size_override();
         if let Some(ssh) = ReopenSshOrigin::from_pane(pane) {
             return Some(Self::Ssh(Box::new(ssh)));
         }
         if let Some(serial) = &pane.frame.serial {
-            return Some(Self::Serial(profile, font, Arc::clone(serial)));
+            return Some(Self::Serial(
+                profile,
+                font,
+                Arc::clone(serial),
+                pane.saved_serial.as_ref().map(|saved| saved.id),
+            ));
         }
         if let Some(ibm) = &pane.frame.ibm {
             let origin = pane.ibm_origin.clone().unwrap_or(IbmOrigin {
@@ -199,7 +212,7 @@ impl Workspace {
                         .unwrap_or("Local Shell")
                         .into(),
                     Origin::Ssh(ssh) => ssh.label(),
-                    Origin::Serial(_, _, connection) => connection.device.display().to_string(),
+                    Origin::Serial(_, _, connection, _) => connection.device.display().to_string(),
                     Origin::Ibm(origin, _) => origin.kind.label().into(),
                     Origin::Saved(_) => "SSH".into(),
                 };
@@ -505,7 +518,7 @@ impl Workspace {
             .iter()
             .find(|entry| entry.id == flight.entry)
             .and_then(|entry| entry.tabs.get(flight.index));
-        let Some(Origin::Serial(profile, font, connection)) =
+        let Some(Origin::Serial(profile, font, connection, saved_id)) =
             member.map(|member| &member.origin).cloned()
         else {
             return Task::none();
@@ -516,14 +529,41 @@ impl Workspace {
             return self.finish_reopen_member(owner, Phase::Serial(token), SshOutcome::Unavailable);
         }
         let grid = initial_grid(profile);
-        let session = Session::start_serial(
+        let saved = saved_id.and_then(|id| {
+            let store = crate::profile::connections_path()
+                .and_then(Store::open)
+                .ok()?;
+            store
+                .serial(id)
+                .filter(|saved| saved.matches(&connection, profile))
+                .cloned()
+        });
+        let strict = saved.as_ref().and_then(|saved| saved.strict_terminal_mode);
+        let session = Session::start_serial_with_options(
             (*connection).clone(),
             grid,
             profile,
             self.window_settings.prompt_navigation_enabled,
             self.window_settings.terminal_appearance(),
+            crate::session::StreamOptions {
+                strict_escapes: strict,
+                encoding: Some(self.window_settings.serial_default_encoding),
+                scrollback: self.window_settings.scrollback_config(),
+            },
         )
-        .map(|session| self.store_connected_session(session, grid, None, font));
+        .map(|session| {
+            let id = self.store_connected_session(session, grid, None, font);
+            if let Some(pane) = self.sessions.get_mut(&id) {
+                pane.strict_escapes = strict.unwrap_or(false);
+                pane.saved_strict_escapes = strict.is_some();
+                pane.journal_config = saved
+                    .as_ref()
+                    .map(|saved| saved.journal)
+                    .unwrap_or_default();
+                pane.saved_serial = saved;
+            }
+            id
+        });
         self.attach_reopened_session(owner, token, session)
     }
 

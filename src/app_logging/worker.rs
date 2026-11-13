@@ -33,6 +33,9 @@ pub(crate) enum Event {
     SessionStarted,
     SessionStopped,
     PolicyRejected,
+    CodingAgentOverrideRejected,
+    CodingAgentInputSent { prompt: bool, bytes: usize },
+    CodingAgentExplanationOpened,
     OperationFailed,
 }
 
@@ -47,13 +50,19 @@ impl Event {
             Self::SessionStarted => "Terminal session started",
             Self::SessionStopped => "Terminal session stopped",
             Self::PolicyRejected => "Operation rejected by managed policy",
+            Self::CodingAgentOverrideRejected => {
+                "A coding-agents override was rejected. Bundled rules remain active for that agent."
+            }
+            Self::CodingAgentInputSent { prompt: true, .. } => "Coding agent prompt sent",
+            Self::CodingAgentInputSent { prompt: false, .. } => "Coding agent key sent",
+            Self::CodingAgentExplanationOpened => "Coding agent explanation opened",
             Self::OperationFailed => "Application operation failed",
         }
     }
 
     fn level(self) -> &'static str {
         match self {
-            Self::PolicyRejected => "WARN",
+            Self::PolicyRejected | Self::CodingAgentOverrideRejected => "WARN",
             Self::OperationFailed => "ERROR",
             _ => "INFO",
         }
@@ -329,20 +338,31 @@ impl Log {
             self.rotate(timestamp.date())?;
         }
         let mut bytes = match self.prepared.settings.format {
-            Format::Text => format!(
-                "{} [kortty-app-log] {:<5} kortty - {}",
-                timestamp.strftime("%Y-%m-%d %H:%M:%S.%3f"),
-                event.level(),
-                event.message()
-            )
-            .into_bytes(),
-            Format::Json => serde_json::to_vec(&serde_json::json!({
-                "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S.%3f").to_string(),
-                "level": event.level(),
-                "logger": "kortty",
-                "message": event.message(),
-            }))
-            .map_err(io::Error::other)?,
+            Format::Text => {
+                let mut line = format!(
+                    "{} [kortty-app-log] {:<5} kortty - {}",
+                    timestamp.strftime("%Y-%m-%d %H:%M:%S.%3f"),
+                    event.level(),
+                    event.message()
+                );
+                if let Event::CodingAgentInputSent { bytes, .. } = event {
+                    use std::fmt::Write as _;
+                    let _ = write!(line, " bytes={bytes}");
+                }
+                line.into_bytes()
+            }
+            Format::Json => {
+                let mut entry = serde_json::json!({
+                    "timestamp": timestamp.strftime("%Y-%m-%d %H:%M:%S.%3f").to_string(),
+                    "level": event.level(),
+                    "logger": "kortty",
+                    "message": event.message(),
+                });
+                if let Event::CodingAgentInputSent { bytes, .. } = event {
+                    entry["bytes"] = serde_json::json!(bytes);
+                }
+                serde_json::to_vec(&entry).map_err(io::Error::other)?
+            }
         };
         bytes.push(b'\n');
         let length = self.active.metadata()?.len();

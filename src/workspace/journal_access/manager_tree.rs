@@ -19,7 +19,7 @@ use crate::session_journal::tree::{self, Filter, Kind, Node, NodeKey, SourceKind
 use crate::session_journal::{Catalog, Summary};
 
 use super::super::chrome::{Navigation, popup};
-use super::{Desktop, Message as JournalMessage};
+use super::{Desktop, Message as JournalMessage, summaries::RowStatus};
 
 const ROW_HEIGHT: f32 = 36.0;
 const OVERSCAN: usize = 2;
@@ -709,7 +709,12 @@ impl State {
         }
     }
 
-    pub(super) fn view<'a>(&'a self, catalog: &'a Catalog, enabled: bool) -> Element<'a, Event> {
+    pub(super) fn view<'a>(
+        &'a self,
+        catalog: &'a Catalog,
+        enabled: bool,
+        summary_statuses: Vec<Option<RowStatus>>,
+    ) -> Element<'a, Event> {
         let header = container(cells(
             [
                 "Title",
@@ -724,11 +729,24 @@ impl State {
             .map(str::to_owned),
         ))
         .height(26);
-        let body = responsive(move |size| self.rows(catalog, enabled && self.ready, size.height));
+        let body = responsive(move |size| {
+            self.rows(
+                catalog,
+                enabled && self.ready,
+                size.height,
+                &summary_statuses,
+            )
+        });
         column![header, body].spacing(4).height(Length::Fill).into()
     }
 
-    fn rows<'a>(&'a self, catalog: &'a Catalog, enabled: bool, height: f32) -> Element<'a, Event> {
+    fn rows<'a>(
+        &'a self,
+        catalog: &'a Catalog,
+        enabled: bool,
+        height: f32,
+        summary_statuses: &[Option<RowStatus>],
+    ) -> Element<'a, Event> {
         let visible = if self.ready {
             self.visible()
         } else {
@@ -764,22 +782,31 @@ impl State {
             let title = row![
                 space::horizontal().width(item.depth as f32 * 17.0),
                 arrow,
-                text(super::label(&title, 160))
-                    .size(13)
-                    .font(if node.children.is_empty() {
-                        Font::DEFAULT
-                    } else {
-                        Font {
-                            weight: iced::font::Weight::Bold,
-                            ..Font::DEFAULT
-                        }
-                    })
-                    .wrapping(text::Wrapping::None),
+                container(
+                    text(super::label(&title, 160))
+                        .size(13)
+                        .line_height(1.0)
+                        .font(if node.children.is_empty() {
+                            Font::DEFAULT
+                        } else {
+                            Font {
+                                weight: iced::font::Weight::Bold,
+                                ..Font::DEFAULT
+                            }
+                        })
+                        .wrapping(text::Wrapping::None)
+                )
+                .clip(true)
+                .width(Length::Fill),
             ]
             .align_y(iced::Alignment::Center);
+            let title = match summary_status(&node.journals, summary_statuses) {
+                Some(status) => column![title, summary_badge(status)].into(),
+                None => title.into(),
+            };
             let selected = self.selected.contains(&node.key);
             let focused = self.focused.as_ref() == Some(&node.key);
-            let cells = row_cells(columns, Some(title.into()));
+            let cells = row_cells(columns, Some(title));
             let row = container(cells)
                 .height(ROW_HEIGHT)
                 .width(Length::Fill)
@@ -841,6 +868,46 @@ impl State {
             enabled,
         })
     }
+}
+
+fn summary_status(journals: &[usize], statuses: &[Option<RowStatus>]) -> Option<RowStatus> {
+    if statuses.is_empty() {
+        return None;
+    }
+    let mut waiting = None;
+    for status in journals
+        .iter()
+        .filter_map(|&index| statuses.get(index).copied().flatten())
+    {
+        if status.running() {
+            return Some(status);
+        }
+        waiting = Some(status);
+    }
+    waiting
+}
+
+fn summary_badge<'a>(status: RowStatus) -> Element<'a, Event> {
+    container(
+        text(status.label())
+            .size(11)
+            .line_height(1.0)
+            .wrapping(text::Wrapping::None),
+    )
+    .padding([1, 4])
+    .style(move |theme: &Theme| {
+        let colors = theme.extended_palette();
+        let tone = if status.running() {
+            colors.primary.weak
+        } else {
+            colors.background.weak
+        };
+        container::Style::default()
+            .background(tone.color)
+            .color(tone.text)
+            .border(iced::border::rounded(5))
+    })
+    .into()
 }
 
 fn cells(labels: [String; 8]) -> Element<'static, Event> {
@@ -1303,6 +1370,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn journal_tree_summary_badges_roll_up_active_then_last_waiting() {
+        let fixture = Fixture::new();
+        let catalog = fixture.catalog(3, true);
+        let mut state = State::default();
+        state.rebuild(&fixture.0, &catalog, Filter::All, "");
+        let group = state
+            .nodes
+            .iter()
+            .find(|node| node.kind() == Kind::Group)
+            .unwrap();
+        let run = &group.children[0];
+        let first = &run.children[0];
+        let second = &run.children[1];
+        assert_eq!(group.journals, [0, 1]);
+
+        let waiting = [
+            Some(RowStatus::Waiting),
+            Some(RowStatus::FinishWaiting),
+            None,
+        ];
+        assert_eq!(
+            summary_status(&group.journals, &waiting),
+            Some(RowStatus::FinishWaiting)
+        );
+        assert_eq!(
+            summary_status(&run.journals, &waiting),
+            Some(RowStatus::FinishWaiting)
+        );
+        assert_eq!(
+            summary_status(&first.journals, &waiting),
+            waiting[first.journals[0]]
+        );
+        let finishing = [Some(RowStatus::Finishing), Some(RowStatus::Waiting), None];
+        assert_eq!(
+            summary_status(&group.journals, &finishing),
+            Some(RowStatus::Finishing)
+        );
+        assert_eq!(
+            summary_status(&run.journals, &finishing),
+            Some(RowStatus::Finishing)
+        );
+        assert_eq!(
+            summary_status(&second.journals, &finishing),
+            finishing[second.journals[0]]
+        );
+        assert_eq!(summary_status(&[2], &finishing), None);
+        assert_eq!(summary_status(&group.journals, &[]), None);
+    }
+
     fn press(state: &mut State, key: &NodeKey, modifiers: Modifiers) {
         state.update(Event::Press(state.generation, key.clone()), modifiers);
     }
@@ -1536,7 +1653,7 @@ mod tests {
         let mut state = State::default();
         state.rebuild(&fixture.0, &catalog, Filter::All, "");
         let renderer = Renderer::new(Font::DEFAULT, Pixels(13.0));
-        let mut view = state.view(&catalog, true);
+        let mut view = state.view(&catalog, true, Vec::new());
         let mut tree = Tree::new(view.as_widget());
         let node = view.as_widget_mut().layout(
             &mut tree,
@@ -1567,7 +1684,7 @@ mod tests {
 
         let renderer = Renderer::new(Font::DEFAULT, Pixels(13.0));
         {
-            let mut view = state.rows(&catalog, true, 180.0);
+            let mut view = state.rows(&catalog, true, 180.0, &[]);
             let mut tree = Tree::new(view.as_widget());
             let node = view.as_widget_mut().layout(
                 &mut tree,
@@ -1617,7 +1734,7 @@ mod tests {
             (node, actual.0)
         };
 
-        let mut view = state.view(&catalog, true);
+        let mut view = state.view(&catalog, true, Vec::new());
         let mut tree = Tree::new(view.as_widget());
         let (node, actual) = layout_with_scroll(&mut view, &mut tree);
         assert_eq!(actual, Some(offset));
@@ -1635,12 +1752,12 @@ mod tests {
                 },
             ),
         );
-        let mut view = state.view(&catalog, true);
+        let mut view = state.view(&catalog, true, Vec::new());
         tree.diff(view.as_widget());
         assert_eq!(layout_with_scroll(&mut view, &mut tree).1, Some(moved));
 
         let mut covered: Element<'_, Event> = iced::widget::stack![
-            state.view(&catalog, false),
+            state.view(&catalog, false, Vec::new()),
             iced::widget::opaque(space::vertical().height(Length::Fill)),
         ]
         .into();
@@ -1650,7 +1767,7 @@ mod tests {
         // Test double for a different tab, using a real Iced widget tree replacement.
         let other_tab: Element<'_, Event> = text("Other tab").into();
         tree.diff(other_tab.as_widget());
-        let mut view = state.view(&catalog, true);
+        let mut view = state.view(&catalog, true, Vec::new());
         tree.diff(view.as_widget());
         assert_eq!(layout_with_scroll(&mut view, &mut tree).1, Some(offset));
     }
@@ -1687,7 +1804,7 @@ mod tests {
         let size = Size::new(900.0, height);
         let limits = layout::Limits::new(size, size);
         let mut tree = {
-            let body = state.rows(&catalog, true, height).map(desktop_event);
+            let body = state.rows(&catalog, true, height, &[]).map(desktop_event);
             let mut view = state.context_view(id, body, true, true);
             let mut tree = Tree::new(view.as_widget());
             let node = view.as_widget_mut().layout(&mut tree, &renderer, &limits);
@@ -1707,7 +1824,7 @@ mod tests {
             if !open {
                 assert!(state.dismiss_context());
             }
-            let body = state.rows(&catalog, true, height).map(desktop_event);
+            let body = state.rows(&catalog, true, height, &[]).map(desktop_event);
             let mut view = state.context_view(id, body, true, visible);
             tree.diff(view.as_widget());
             let node = view.as_widget_mut().layout(&mut tree, &renderer, &limits);
@@ -1890,7 +2007,7 @@ mod tests {
             .unwrap();
         let point = Point::new(600.0, (index as f32 + 0.5) * ROW_HEIGHT);
         let renderer = Renderer::new(Font::DEFAULT, Pixels(13.0));
-        let mut view = state.rows(&catalog, true, 180.0);
+        let mut view = state.rows(&catalog, true, 180.0, &[]);
         let mut tree = Tree::new(view.as_widget());
         let node = view.as_widget_mut().layout(
             &mut tree,

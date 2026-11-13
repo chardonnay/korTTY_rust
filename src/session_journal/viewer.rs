@@ -13,12 +13,15 @@ use super::capture::capture_page_in;
 use super::deletion::DeletionIdentity;
 use super::metadata::require_single_link;
 use super::{
-    Capture, CapturePage, Cursor, Journal, Summary, check_path, child, document_id, document_text,
-    invalid, journal, number, open_document, parse_document,
+    Capture, CapturePage, Cursor, Journal, MAX_DOCUMENT_BYTES, Summary, check_path, child,
+    document_id, document_text, invalid, journal, number, open_document, parse_document,
+    source_text,
 };
 
 pub(super) mod screenshot;
 pub(crate) use screenshot::Screenshot;
+mod summary_source;
+pub(crate) use summary_source::SummarySource;
 
 #[derive(Clone, Debug)]
 pub(crate) struct Source {
@@ -77,6 +80,10 @@ impl Source {
         self.id == other.id && self.location == other.location
     }
 
+    pub(super) fn belongs_to_root(&self, root: EntryIdentity) -> bool {
+        self.location.0 == root
+    }
+
     pub(crate) fn matches_location(&self, identity: &DeletionIdentity) -> bool {
         self.location == identity.location()
     }
@@ -86,6 +93,11 @@ impl Source {
             return Err(changed());
         }
         Ok(())
+    }
+
+    pub(crate) fn require_current_location(&self) -> io::Result<()> {
+        let directory = Directory::open(&self.directory, false)?;
+        self.require_location(&self.directory, &directory)
     }
 
     /// `previous` is the stamp from a previously returned snapshot of this source.
@@ -160,11 +172,32 @@ impl Source {
         &self,
         read: impl FnOnce(&LocalSource, &Document<'_>) -> io::Result<T>,
     ) -> io::Result<T> {
+        let mut budget = MAX_DOCUMENT_BYTES;
+        self.with_document_budget(&mut budget, read)
+    }
+
+    pub(super) fn with_document_budget<T>(
+        &self,
+        budget: &mut u64,
+        read: impl FnOnce(&LocalSource, &Document<'_>) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.with_document_stamp_budget(budget, |source, _, document| read(source, document))
+    }
+
+    pub(super) fn with_document_stamp_budget<T>(
+        &self,
+        budget: &mut u64,
+        read: impl FnOnce(&LocalSource, &DeletionIdentity, &Document<'_>) -> io::Result<T>,
+    ) -> io::Result<T> {
         let (source, identity) = self.open_verified()?;
-        let xml = document_text(&source)?;
+        if source.size() <= MAX_DOCUMENT_BYTES && source.size() > *budget {
+            *budget = 0;
+            return Err(invalid("Session journal lookup exceeded its read budget"));
+        }
+        let xml = source_text(&source, MAX_DOCUMENT_BYTES.min(*budget), budget)?;
         let document = self.parse(&xml)?;
         identity.require_document(source.file())?;
-        let result = read(&source, &document);
+        let result = read(&source, &identity, &document);
         if self.is_current(&source, &identity)? {
             result
         } else {

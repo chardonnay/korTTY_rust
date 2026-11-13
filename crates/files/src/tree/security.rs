@@ -2,16 +2,17 @@ use std::fs::File;
 use std::io;
 use std::mem::{offset_of, size_of};
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
-use std::ptr::{from_mut, null_mut};
+use std::ptr::{from_mut, from_ref, null_mut};
 
+use windows_sys::Win32::Security::Authorization::{SE_FILE_OBJECT, SetSecurityInfo};
 use windows_sys::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACL, ACL_REVISION, AddAccessAllowedAceEx, DACL_SECURITY_INFORMATION,
     EqualSid, GetAce, GetKernelObjectSecurity, GetSecurityDescriptorControl,
     GetSecurityDescriptorDacl, GetSecurityDescriptorOwner, GetSidLengthRequired,
     GetTokenInformation, InitializeAcl, InitializeSecurityDescriptor, IsValidAcl, IsValidSid,
-    OWNER_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED, SECURITY_DESCRIPTOR,
-    SECURITY_MAX_SID_SIZE, SetSecurityDescriptorControl, SetSecurityDescriptorDacl,
-    SetSecurityDescriptorOwner, TOKEN_QUERY, TOKEN_USER, TokenUser,
+    OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION, PSID, SE_DACL_PROTECTED,
+    SECURITY_DESCRIPTOR, SECURITY_MAX_SID_SIZE, SetSecurityDescriptorControl,
+    SetSecurityDescriptorDacl, SetSecurityDescriptorOwner, TOKEN_QUERY, TOKEN_USER, TokenUser,
 };
 use windows_sys::Win32::Storage::FileSystem::FILE_ALL_ACCESS;
 use windows_sys::Win32::System::SystemServices::{
@@ -128,6 +129,180 @@ pub(super) fn require_owner_only(file: &File, sid: PSID) -> io::Result<()> {
 pub(super) fn require_current_user_only(file: &File) -> io::Result<()> {
     let owner = UserSid::current()?;
     require_owner_only(file, owner.sid())
+}
+
+/// Validates ownership and effective mutation grants on a model path component.
+pub(super) fn require_administrator_controlled(file: &File, ancestor: bool) -> io::Result<()> {
+    require_controlled(file, ancestor, None)
+}
+
+pub(super) fn require_user_and_administrators(file: &File) -> io::Result<()> {
+    let current_user = UserSid::current()?;
+    require_controlled(file, false, Some(current_user.sid()))
+}
+
+fn require_controlled(file: &File, ancestor: bool, current_user: Option<PSID>) -> io::Result<()> {
+    use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
+    use windows_sys::Win32::Security::{ACE_HEADER, INHERIT_ONLY_ACE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_APPEND_DATA, FILE_DELETE_CHILD, FILE_WRITE_ATTRIBUTES, FILE_WRITE_DATA,
+        FILE_WRITE_EA, WRITE_DAC, WRITE_OWNER,
+    };
+    use windows_sys::Win32::System::SystemServices::ACCESS_DENIED_ACE_TYPE;
+
+    const PROTECTED: u32 = DELETE
+        | FILE_DELETE_CHILD
+        | FILE_WRITE_ATTRIBUTES
+        | FILE_WRITE_EA
+        | WRITE_DAC
+        | WRITE_OWNER
+        | GENERIC_ALL
+        | GENERIC_WRITE;
+    // Creating a new, unrelated child does not permit replacement of an existing path component.
+    let forbidden = if current_user.is_some() {
+        u32::MAX
+    } else if ancestor {
+        PROTECTED
+    } else {
+        PROTECTED | FILE_WRITE_DATA | FILE_APPEND_DATA
+    };
+    let denied = || {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            if current_user.is_some() {
+                "A credential file must be owned by the current user with access restricted to the user and administrators"
+            } else {
+                "A policy model must use an administrator-controlled path"
+            },
+        )
+    };
+    // A DACL has a 16-bit size. Allow a small fixed margin for the rest of the descriptor.
+    let mut buffer = vec![0_u64; 8_224];
+    let length = size_of_val(buffer.as_slice()) as u32;
+    let descriptor = buffer.as_mut_ptr().cast();
+    let (mut owner, mut acl) = (null_mut(), null_mut());
+    let (mut present, mut defaulted, mut required) = (0, 0, 0);
+    // SAFETY: The descriptor storage and output fields are live and suitably aligned. ACL pointers
+    // and the size of each SID are validated before consulting fields or passing pointers back.
+    unsafe {
+        ok(GetKernelObjectSecurity(
+            file.as_raw_handle(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            descriptor,
+            length,
+            &mut required,
+        ))?;
+        ok(GetSecurityDescriptorOwner(
+            descriptor,
+            &mut owner,
+            &mut defaulted,
+        ))?;
+        ok(GetSecurityDescriptorDacl(
+            descriptor,
+            &mut present,
+            &mut acl,
+            &mut defaulted,
+        ))?;
+        let user_sid = |sid: PSID| {
+            current_user.is_some_and(|user| {
+                !sid.is_null() && IsValidSid(sid) != 0 && EqualSid(sid, user) != 0
+            })
+        };
+        let expected_owner = if current_user.is_some() {
+            user_sid(owner)
+        } else {
+            administrative_sid(owner)
+        };
+        if !expected_owner || present == 0 || acl.is_null() || IsValidAcl(acl) == 0 {
+            return Err(denied());
+        }
+        for index in 0..u32::from((*acl).AceCount) {
+            let mut ace = null_mut();
+            ok(GetAce(acl, index, &mut ace))?;
+            if ace.is_null() {
+                return Err(denied());
+            }
+            let header = &*ace.cast::<ACE_HEADER>();
+            if u32::from(header.AceFlags) & INHERIT_ONLY_ACE != 0
+                || u32::from(header.AceType) == ACCESS_DENIED_ACE_TYPE
+            {
+                continue;
+            }
+            let offset = offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+            let sid_bytes = usize::from(header.AceSize).saturating_sub(offset);
+            if u32::from(header.AceType) != ACCESS_ALLOWED_ACE_TYPE || sid_bytes < 8 {
+                return Err(denied());
+            }
+            if (*ace.cast::<ACCESS_ALLOWED_ACE>()).Mask & forbidden == 0 {
+                continue;
+            }
+            let trustee = ace.cast::<u8>().add(offset);
+            if GetSidLengthRequired(*trustee.add(1)) as usize > sid_bytes
+                || !(administrative_sid(trustee.cast()) || user_sid(trustee.cast()))
+            {
+                return Err(denied());
+            }
+        }
+    }
+    Ok(())
+}
+
+unsafe fn administrative_sid(sid: PSID) -> bool {
+    use windows_sys::Win32::Security::{
+        IsWellKnownSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+
+    // NT SERVICE\TrustedInstaller owns Windows-protected installation directories.
+    #[repr(C)]
+    struct ServiceSid {
+        header: [u8; 8],
+        authorities: [u32; 6],
+    }
+    const INSTALLER_SID: ServiceSid = ServiceSid {
+        header: [1, 6, 0, 0, 0, 0, 0, 5],
+        authorities: [
+            80, 956008885, 3418522649, 1831038044, 1853292631, 2271478464,
+        ],
+    };
+    // SAFETY: The caller obtains the SID from Win32 or bounds-checks it inside a valid ACE.
+    unsafe {
+        !sid.is_null()
+            && IsValidSid(sid) != 0
+            && (IsWellKnownSid(sid, WinBuiltinAdministratorsSid) != 0
+                || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                || EqualSid(sid, from_ref(&INSTALLER_SID).cast_mut().cast()) != 0)
+    }
+}
+
+/// Restores the private staging DACL through a retained WRITE_DAC handle.
+pub fn restore_private_file_access(file: &File) -> io::Result<()> {
+    with_private_descriptor(|descriptor, owner| {
+        let mut acl = null_mut();
+        let (mut present, mut defaulted) = (0, 0);
+        // SAFETY: The private descriptor and its ACL remain live for this
+        // synchronous update. The caller retains the stage's WRITE_DAC handle.
+        unsafe {
+            ok(GetSecurityDescriptorDacl(
+                from_ref(descriptor).cast_mut().cast(),
+                &mut present,
+                &mut acl,
+                &mut defaulted,
+            ))?;
+            let result = SetSecurityInfo(
+                file.as_raw_handle(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                null_mut(),
+                null_mut(),
+                acl,
+                null_mut(),
+            );
+            if result != 0 {
+                return Err(io::Error::from_raw_os_error(result as i32));
+            }
+        }
+        require_owner_only(file, owner)
+    })
 }
 
 fn not_private() -> io::Error {

@@ -6,7 +6,7 @@ use regex::{Regex, RegexBuilder};
 
 use super::{MAX_FILE_BYTES, SearchDirection};
 
-const MAX_QUERY_BYTES: usize = 4096;
+pub(crate) const MAX_QUERY_BYTES: usize = 4096;
 const TOO_LARGE: &str = "The file would exceed the editor size limit.";
 const NO_SELECTION: &str = "Select text, then enable Selection only again.";
 const QUERY_TOO_LARGE: &str = "Search text must fit within 4096 UTF-8 bytes.";
@@ -32,6 +32,19 @@ enum Scope {
 }
 
 impl Search {
+    pub(super) fn cursor(
+        &self,
+        content: &text_editor::Content,
+        direction: SearchDirection,
+    ) -> Result<Cursor, &'static str> {
+        let source = Text::read(content)?;
+        let hit = self
+            .plan(&source)?
+            .hit(&source, direction, false)?
+            .ok_or("No matches.")?;
+        Ok(source.selection_cursor(hit))
+    }
+
     pub(super) fn set_query(&mut self, query: String) -> Result<(), &'static str> {
         self.query_too_large = query.len() > MAX_QUERY_BYTES;
         if self.query_too_large {
@@ -126,6 +139,27 @@ impl Search {
             deadline,
         })
     }
+}
+
+pub(crate) fn literal_cursor(
+    content: &text_editor::Content,
+    query: &str,
+    direction: SearchDirection,
+) -> Result<Cursor, &'static str> {
+    let mut search = Search::default();
+    search.set_query(query.to_owned())?;
+    search.cursor(content, direction)
+}
+
+pub(crate) fn source_selection(
+    content: &text_editor::Content,
+) -> Result<(String, Range<usize>), &'static str> {
+    let text = Text::read(content)?;
+    let range = text.raw_range(text.selection.clone().unwrap_or(text.caret..text.caret));
+    if text.raw.get(range.clone()).is_none() {
+        return Err("The editor selection is invalid.");
+    }
+    Ok((text.raw, range))
 }
 
 pub(super) struct Text {

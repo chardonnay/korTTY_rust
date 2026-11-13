@@ -3,7 +3,14 @@ name = "kortty-files"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
-description = "Windows file operations for the kortty desktop"
+description = "Native file operations for the kortty desktop"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix = { version = "1", default-features = false, features = ["std", "use-libc"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemServices", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Wdk_Foundation", "Wdk_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_SystemServices", "Win32_System_Threading"] }

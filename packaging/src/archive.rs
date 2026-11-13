@@ -6,10 +6,25 @@ use flate2::{Compression, GzBuilder};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, System, ZipWriter};
 
-use crate::target::{MACOS_PROGRAMS, Platform, UNIX_PROGRAMS, WINDOWS_PROGRAMS};
+use crate::target::{MACOS_PROGRAMS, UNIX_PROGRAMS, WINDOWS_PROGRAMS};
 use crate::{Result, invalid};
 
-pub(crate) fn write(platform: Platform, path: &Path, payload: &Path) -> Result<()> {
+#[derive(Clone, Copy)]
+pub(crate) enum Format {
+    TarGz,
+    Zip,
+}
+
+impl Format {
+    pub(crate) fn extension(self) -> &'static str {
+        match self {
+            Self::TarGz => "tar.gz",
+            Self::Zip => "zip",
+        }
+    }
+}
+
+pub(crate) fn write(format: Format, path: &Path, payload: &Path) -> Result<()> {
     let base = payload
         .parent()
         .ok_or_else(|| invalid("payload root missing"))?;
@@ -17,8 +32,8 @@ pub(crate) fn write(platform: Platform, path: &Path, payload: &Path) -> Result<(
     collect_files(payload, &mut paths)?;
     paths.sort_unstable();
     let file = File::create(path)?;
-    match platform {
-        Platform::Linux => {
+    match format {
+        Format::TarGz => {
             let gzip = GzBuilder::new()
                 .mtime(0)
                 .write(file, Compression::default());
@@ -30,7 +45,7 @@ pub(crate) fn write(platform: Platform, path: &Path, payload: &Path) -> Result<(
             }
             archive.into_inner()?.finish()?.sync_all()?;
         }
-        Platform::Windows | Platform::Macos => {
+        Format::Zip => {
             let mut archive = ZipWriter::new(file);
             for path in paths {
                 let relative = path.strip_prefix(base)?;

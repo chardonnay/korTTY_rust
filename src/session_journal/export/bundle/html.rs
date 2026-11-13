@@ -1,6 +1,6 @@
 //! Generates the journal bundle's offline page from the validated export snapshot.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::{self, Write as _};
 use std::io;
 
@@ -146,7 +146,7 @@ pub(super) fn render(
     selection: &[&Entry],
     options: &Options,
     log: &LogPreview,
-    screenshots: &HashSet<String>,
+    screenshots: &Screenshots,
     links_allowed: bool,
     counts: &BundleStats,
 ) -> io::Result<String> {
@@ -166,12 +166,17 @@ pub(super) fn render(
     Ok(html.0)
 }
 
+pub(super) enum Screenshots {
+    Relative(HashSet<String>),
+    Inline(HashMap<String, String>),
+}
+
 struct Page<'a> {
     snapshot: &'a Snapshot,
     selection: &'a [&'a Entry],
     options: &'a Options,
     log: &'a LogPreview,
-    screenshots: &'a HashSet<String>,
+    screenshots: &'a Screenshots,
     links_allowed: bool,
     counts: &'a BundleStats,
 }
@@ -184,13 +189,15 @@ impl Page<'_> {
         } else {
             title
         };
+        let standalone = matches!(self.screenshots, Screenshots::Inline(_));
+        let image_sources = if standalone { "data:" } else { "'self' file:" };
         write!(
             html,
             r#"<!doctype html>
 <html lang="en" data-theme="system" data-scale="0"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="referrer" content="no-referrer">
-<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src 'self' file:; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; base-uri 'none'; form-action 'none'">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; img-src {image_sources}; style-src 'nonce-{nonce}'; script-src 'nonce-{nonce}'; base-uri 'none'; form-action 'none'">
 <title>{}</title><style nonce="{nonce}">{STYLE}</style></head><body>
 <header class="session-head"><h1>{}</h1>"#,
             Escaped(title),
@@ -202,7 +209,7 @@ impl Page<'_> {
         self.timeline(html)?;
         if let Some(footer) = &self.options.branding.footer {
             write!(html, "<footer>{}", Escaped(footer.footer_label()))?;
-            if footer.repository_link {
+            if footer.repository_link && !standalone {
                 write!(
                     html,
                     " · <a href=\"{REPOSITORY_URL}\" rel=\"noreferrer\">{REPOSITORY_URL}</a>"
@@ -427,13 +434,17 @@ impl Page<'_> {
         let Some(screenshot) = &entry.screenshot else {
             return Ok(());
         };
-        if let Some(reference) =
-            safe_screenshot(&screenshot.reference).filter(|path| self.screenshots.contains(*path))
-        {
+        let reference =
+            safe_screenshot(&screenshot.reference).and_then(|path| match self.screenshots {
+                Screenshots::Relative(paths) => paths.contains(path).then_some(path),
+                Screenshots::Inline(urls) => urls.get(path).map(String::as_str),
+            });
+        if let Some(reference) = reference {
             writeln!(
                 html,
-                r#"<button type="button" class="screenshot" data-image="{reference}">
-<img loading="lazy" src="{reference}" alt="Open screenshot"></button>"#
+                r#"<button type="button" class="screenshot" data-image>
+<img loading="lazy" src="{}" alt="Open screenshot"></button>"#,
+                Escaped(reference),
             )?;
         } else {
             html.write_str("<p class=\"notice\">Screenshot unavailable in this export.</p>\n")?;

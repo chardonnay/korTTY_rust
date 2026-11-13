@@ -1,6 +1,9 @@
 use std::io;
+use std::sync::LazyLock;
 
-use super::{Format, ImportedProfile, Preview, invalid, ssh_profile};
+use regex::Regex;
+
+use super::{Format, ImportedProfile, Preview, invalid, serial_bookmark, ssh_profile};
 
 pub(super) fn parse(content: &[u8]) -> io::Result<Preview> {
     let content =
@@ -48,6 +51,21 @@ pub(super) fn parse(content: &[u8]) -> io::Result<Preview> {
                         Err(_) => preview.invalid += 1,
                     }
                 }
+                Endpoint::Serial(device, rate) => {
+                    static COM: LazyLock<Regex> =
+                        LazyLock::new(|| Regex::new(r"(?i)\bCOM[0-9]+\b").unwrap());
+                    let normalized;
+                    let device = if let Some(port) = COM.find(device) {
+                        normalized = port.as_str().to_ascii_uppercase();
+                        normalized.as_str()
+                    } else {
+                        device.trim()
+                    };
+                    match serial_bookmark(name.trim(), device, rate.trim().parse().ok(), group) {
+                        Ok(entry) => preview.push_serial(entry)?,
+                        Err(_) => preview.invalid += 1,
+                    }
+                }
                 Endpoint::Unsupported => preview.unsupported += 1,
                 Endpoint::Invalid => preview.invalid += 1,
             },
@@ -61,11 +79,25 @@ pub(super) fn parse(content: &[u8]) -> io::Result<Preview> {
 
 enum Endpoint<'a> {
     Ssh(&'a str, &'a str, &'a str),
+    Serial(&'a str, &'a str),
     Unsupported,
     Invalid,
 }
 
 fn endpoint(value: &str) -> Endpoint<'_> {
+    if let Some((icon, fields)) = value
+        .strip_prefix('#')
+        .and_then(|rest| rest.split_once('#'))
+        && !icon.is_empty()
+        && icon.bytes().all(|byte| byte.is_ascii_digit())
+        && let Some(fields) = fields.strip_prefix("8%")
+    {
+        let mut fields = fields.split('%');
+        return match (fields.next(), fields.next()) {
+            (Some(device), Some(rate)) => Endpoint::Serial(device, rate),
+            _ => Endpoint::Invalid,
+        };
+    }
     if let Some(value) = value.strip_prefix("#109#") {
         let mut fields = value.split('%');
         return match (

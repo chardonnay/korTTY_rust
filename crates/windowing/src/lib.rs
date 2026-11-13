@@ -6,6 +6,8 @@ use raw_window_handle::{DisplayHandle, RawDisplayHandle, RawWindowHandle, Window
 #[cfg(target_os = "linux")]
 mod bell;
 mod clipboard;
+#[cfg(target_os = "linux")]
+mod linux_notifications;
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 mod placement;
 mod power;
@@ -13,6 +15,10 @@ mod power;
 mod wayland_clipboard;
 #[cfg(target_os = "linux")]
 pub mod wayland_drag;
+#[cfg(target_os = "linux")]
+pub mod wayland_file_drag;
+#[cfg(target_os = "linux")]
+pub mod wayland_file_drop;
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(all(target_os = "windows", target_endian = "little"))]
@@ -20,11 +26,21 @@ mod windows_alpha;
 #[cfg(target_os = "windows")]
 mod windows_clipboard;
 #[cfg(target_os = "windows")]
+pub mod windows_file_drag;
+#[cfg(target_os = "windows")]
 mod windows_placement;
+#[cfg(target_os = "windows")]
+mod windows_system;
+#[cfg(target_os = "windows")]
+pub use windows::password_prompt::{NativePassword, open_password_prompt};
 #[cfg(target_os = "linux")]
 mod x11;
 #[cfg(target_os = "linux")]
 mod x11_clipboard;
+#[cfg(target_os = "linux")]
+pub mod x11_file_drag;
+#[cfg(target_os = "linux")]
+mod x11_modal;
 #[cfg(target_os = "linux")]
 mod x11_mode;
 #[cfg(target_os = "linux")]
@@ -35,10 +51,22 @@ mod uri;
 pub use clipboard::{ClipboardPng, shutdown_clipboard};
 #[cfg(target_os = "macos")]
 pub use kortty_macos::TabPress;
+#[cfg(target_os = "linux")]
+pub use linux_notifications::{
+    DESKTOP_APP_ID, LauncherBadge, activate_notification_window, send_desktop_notification,
+};
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 pub use placement::{DesktopPoint, DialogWorkArea};
 pub use power::{SystemSleepRequest, supports_system_sleep_prevention};
-pub use uri::{open_desktop_directory, open_desktop_uri};
+pub use uri::{open_desktop_directory, open_desktop_document, open_desktop_uri};
+#[cfg(target_os = "windows")]
+pub use windows::app_icon::set_app_window_icon;
+#[cfg(target_os = "windows")]
+pub use windows::desktop_notification::{
+    send_desktop_notification, shutdown_desktop_notifications,
+};
+#[cfg(target_os = "windows")]
+pub use windows_system::physical_memory_bytes;
 
 /// Requests the native alert for the window's display, respecting system settings.
 pub fn request_system_bell(display: DisplayHandle<'_>) {
@@ -150,6 +178,71 @@ pub fn identify(window: WindowHandle<'_>, display: DisplayHandle<'_>) -> Option<
         }
         _ => None,
     }
+}
+
+/// Reads the current pointer inside the client receiving an external file event.
+/// The returned coordinates use physical pixels and a top-left origin.
+pub fn file_drop_position(window: WindowHandle<'_>, scale_factor: f64) -> Option<(f64, f64)> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = scale_factor;
+    match window.as_raw() {
+        #[cfg(target_os = "macos")]
+        RawWindowHandle::AppKit(_) => kortty_macos::file_drop_position(window)
+            .map(|(x, y)| (x * scale_factor, y * scale_factor)),
+        #[cfg(target_os = "windows")]
+        RawWindowHandle::Win32(handle) => windows::file_drop_position(handle.hwnd.get() as _),
+        #[cfg(target_os = "linux")]
+        RawWindowHandle::Xlib(handle) => x11::file_drop_position(handle.window.try_into().ok()?),
+        #[cfg(target_os = "linux")]
+        RawWindowHandle::Xcb(handle) => x11::file_drop_position(handle.window.get()),
+        _ => None,
+    }
+}
+
+/// Assigns a Win32 dialog to a top-level owner and blocks its input if modal.
+#[cfg(target_os = "windows")]
+pub fn bind_dialog_owner(dialog: WindowHandle<'_>, owner: NativeWindow, modal: bool) -> bool {
+    let (RawWindowHandle::Win32(dialog), WindowId::Windows(owner)) = (dialog.as_raw(), owner.0)
+    else {
+        return false;
+    };
+    if modal {
+        windows::bind_modal_dialog_owner(dialog.hwnd.get() as _, owner as _)
+    } else {
+        windows::bind_modeless_dialog_owner(dialog.hwnd.get() as _, owner as _)
+    }
+}
+
+/// Releases a dialog's Win32 input block before closing it.
+#[cfg(target_os = "windows")]
+pub fn release_modal_dialog_owner(dialog: WindowHandle<'_>) {
+    if let RawWindowHandle::Win32(dialog) = dialog.as_raw() {
+        windows::release_modal_dialog_owner(dialog.hwnd.get() as _);
+    }
+}
+
+/// Associates the dialog with its AppKit owner and orders it in on the main thread.
+#[cfg(target_os = "macos")]
+pub fn show_appkit_owned_dialog(dialog: WindowHandle<'_>, owner: Option<NativeWindow>) {
+    let owner = owner.map(|NativeWindow(WindowId::Mac(number))| number);
+    kortty_macos::show_owned_dialog(dialog, owner);
+}
+
+/// Releases the AppKit owner relationship on the main thread before closing.
+#[cfg(target_os = "macos")]
+pub fn release_modal_dialog_owner(dialog: WindowHandle<'_>) {
+    kortty_macos::detach_owned_dialog(dialog);
+}
+
+/// Sets the owner and optional modal hint on a withdrawn X11 dialog off the UI thread.
+#[cfg(target_os = "linux")]
+pub fn bind_x11_dialog_owner(dialog: NativeWindow, owner: NativeWindow, modal: bool) -> bool {
+    let WindowId::X11 { window, screen } = dialog.0;
+    let WindowId::X11 {
+        window: owner,
+        screen: owner_screen,
+    } = owner.0;
+    screen == owner_screen && x11_modal::bind(window, owner, screen, modal)
 }
 
 /// Samples the primary pointer. On X11 this performs an X server request and

@@ -10,6 +10,7 @@ use zeroize::Zeroizing;
 use crate::session::{InputError, SessionId, Status};
 use crate::snippets::{self, Library, Snippet, SnippetId, Variable, resolve};
 
+use super::super::highlight::Trigger;
 use super::super::{Message, Tab, Workspace, paste_protection};
 use super::file_task;
 
@@ -100,6 +101,7 @@ pub(crate) struct RunPrompt {
     id: SnippetId,
     target: PaletteTarget,
     stage: Stage,
+    trigger: Option<Trigger>,
 }
 
 impl RunPrompt {
@@ -230,10 +232,35 @@ impl Workspace {
         if alternate {
             return self.show_snippet_manager(owner, Some(snippet));
         }
+        self.begin_snippet_run(owner, target, snippet, None)
+    }
+
+    pub(in crate::workspace) fn invoke_highlight_snippet(
+        &mut self,
+        owner: window::Id,
+        target: Option<PaletteTarget>,
+        trigger: Trigger,
+    ) -> Task<Message> {
+        self.begin_snippet_run(owner, target, trigger.snippet, Some(trigger))
+    }
+
+    fn begin_snippet_run(
+        &mut self,
+        owner: window::Id,
+        target: Option<PaletteTarget>,
+        snippet: SnippetId,
+        trigger: Option<Trigger>,
+    ) -> Task<Message> {
         let Some(target) = target else {
             return self.snippet_run_failure(owner, "Open a terminal pane to run snippets.");
         };
         if let Err(reason) = self.snippet_target(owner, &target) {
+            return self.snippet_run_failure(owner, reason);
+        }
+        if let Some(trigger) = &trigger
+            && let Err(reason) =
+                self.check_highlight_snippet_trigger(owner, target.session, trigger)
+        {
             return self.snippet_run_failure(owner, reason);
         }
         let token = self.allocate();
@@ -243,6 +270,7 @@ impl Workspace {
                 id: snippet,
                 target,
                 stage: Stage::Loading,
+                trigger,
             });
         }
         file_task(
@@ -270,6 +298,12 @@ impl Workspace {
         if matches!(message, RunMessage::Cancel(_)) {
             return Task::none();
         }
+        if let Some(trigger) = &run.trigger
+            && let Err(reason) =
+                self.check_highlight_snippet_trigger(owner, run.target.session, trigger)
+        {
+            return self.snippet_run_failure(owner, reason);
+        }
         let mut task = Task::none();
         run.stage = match (run.stage, message) {
             (Stage::Loading, RunMessage::Loaded(_, result)) => {
@@ -296,7 +330,11 @@ impl Workspace {
                     );
                 }
                 let warning = self.snippet_warning(run.target.session, snapshot.snippet.content());
-                if !requirements.declared && !requirements.clipboard && warning.is_none() {
+                if run.trigger.is_none()
+                    && !requirements.declared
+                    && !requirements.clipboard
+                    && warning.is_none()
+                {
                     let source = match snapshot.expand(&[], None) {
                         Ok(source) => source,
                         Err(reason) => return self.snippet_run_failure(owner, reason),
@@ -312,6 +350,7 @@ impl Workspace {
                             contains_parameters: false,
                             remembered: Vec::new(),
                         },
+                        None,
                     );
                 }
                 let fields = vec![Field::default(); requirements.missing.len()];
@@ -410,6 +449,7 @@ impl Workspace {
                         contains_parameters: review.requirements.declared,
                         remembered: review.remembered(),
                     },
+                    run.trigger,
                 );
             }
             (Stage::Resolved(mut resolved, warning), RunMessage::ConfirmResolved(_)) => {
@@ -433,7 +473,7 @@ impl Workspace {
                 {
                     return self.snippet_run_failure(owner, "The saved snippet or variables changed. Open the palette and review them again.");
                 }
-                return self.send_or_review_resolved(owner, run.target, resolved);
+                return self.send_or_review_resolved(owner, run.target, resolved, run.trigger);
             }
             (stage, _) => stage,
         };
@@ -454,6 +494,18 @@ impl Workspace {
         match &run.stage {
             Stage::Review(review) => {
                 body = body.push(text(review.snapshot.snippet.name()));
+                if run.trigger.is_some() {
+                    body = body
+                        .push(text(
+                            "A terminal rule requested this snippet. Review it before sending.",
+                        ))
+                        .push(
+                            scrollable(text(paste_protection::preview(
+                                review.snapshot.snippet.content(),
+                            )))
+                            .height(140),
+                        );
+                }
                 if let Some(warning) = review.warning {
                     body = body.push(text(warning.explanation()));
                 }
@@ -630,6 +682,7 @@ impl Workspace {
         owner: window::Id,
         target: PaletteTarget,
         resolved: Resolved,
+        trigger: Option<Trigger>,
     ) -> Task<Message> {
         if resolved.uses_clipboard && !self.clipboard.policy.read_allowed {
             return self.snippet_run_failure(
@@ -641,6 +694,12 @@ impl Workspace {
             Ok(tab) => tab.incognito,
             Err(reason) => return self.snippet_run_failure(owner, reason),
         };
+        if let Some(trigger) = &trigger
+            && let Err(reason) =
+                self.check_highlight_snippet_trigger(owner, target.session, trigger)
+        {
+            return self.snippet_run_failure(owner, reason);
+        }
         if let Some(warning) = self
             .snippet_warning(target.session, &resolved.source)
             .and_then(|warning| warning.additional_since(resolved.accepted))
@@ -652,6 +711,7 @@ impl Workspace {
                     id: resolved.snapshot.snippet.id(),
                     target,
                     stage: Stage::Resolved(resolved, warning),
+                    trigger,
                 });
             }
             return Task::none();
@@ -688,7 +748,7 @@ impl Workspace {
             };
             return self.snippet_run_failure(owner, reason);
         }
-        pane.selection = None;
+        pane.clear_selection();
         pane.session.follow_output();
         if let Some(window) = self.windows.get_mut(&owner)
             && let Some(index) = window.tabs.iter().position(|tab| tab.id() == target.tab)

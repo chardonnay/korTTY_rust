@@ -349,13 +349,31 @@ impl Session {
         cancellation: &DialCancellation,
         prompts: &mut PromptHandler<'_>,
     ) -> Result<Self, ConnectError> {
+        Self::dial_with_trust(
+            request,
+            size,
+            sftp,
+            cancellation,
+            prompts,
+            &ssh_connection::trust_store()?,
+        )
+    }
+
+    pub(crate) fn dial_with_trust(
+        request: Request,
+        size: WindowSize,
+        sftp: bool,
+        cancellation: &DialCancellation,
+        prompts: &mut PromptHandler<'_>,
+        trust: &TrustStore,
+    ) -> Result<Self, ConnectError> {
         Self::dial_executable(
             request,
             size,
             sftp,
             cancellation,
             &std::env::current_exe()?,
-            &ssh_connection::trust_store()?,
+            trust,
             Some(prompts),
         )
     }
@@ -534,7 +552,13 @@ impl Session {
         }
         let mux = mux::Mux::default();
         let primary = mux.add(0)?;
-        let opener = Opener::new(mux.clone(), abort.clone());
+        // Ready follows authentication against the immutable strict pins sent above.
+        let host_key = route.first().and_then(|(target, _, _)| {
+            pins.iter()
+                .find(|(endpoint, _)| endpoint == target)
+                .map(|(_, key)| key.clone())
+        });
+        let opener = Opener::new(mux.clone(), abort.clone(), host_key);
         let out_mux = mux.clone();
         let out_opener = opener.clone();
         let out_abort = abort.clone();
@@ -610,6 +634,14 @@ impl Session {
 
     pub(crate) fn opener(&self) -> Option<Opener> {
         self.terminal.then(|| self.opener.clone())
+    }
+
+    pub(crate) fn exec_opener(&self) -> Option<Opener> {
+        (!self.opener.is_closed()).then(|| self.opener.clone())
+    }
+
+    pub(crate) fn verified_host_key(&self) -> Option<&kortty_ssh::HostKey> {
+        self.opener.verified_host_key()
     }
 
     pub(crate) fn resize(&self, size: WindowSize) -> io::Result<()> {

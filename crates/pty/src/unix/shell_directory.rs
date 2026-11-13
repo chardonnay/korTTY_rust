@@ -34,13 +34,9 @@ impl FileId {
     }
 }
 
-pub(super) fn resolve(
-    child: &mut Child,
-    master: &File,
-    executable: Executable,
-) -> io::Result<PathBuf> {
+pub(super) fn resolve(child: &Child, master: &File, executable: Executable) -> io::Result<PathBuf> {
     let pid = i32::try_from(child.id()).map_err(|_| unverified())?;
-    if child.try_wait()?.is_some() {
+    if !super::child_running(child)? {
         return Err(unverified());
     }
     #[cfg(target_os = "linux")]
@@ -50,7 +46,7 @@ pub(super) fn resolve(
     verify(pid, master, executable)?;
     let path = directory(pid)?;
     verify(pid, master, executable)?;
-    if child.try_wait()?.is_some() || !path.is_absolute() {
+    if !super::child_running(child)? || !path.is_absolute() {
         return Err(unverified());
     }
     Ok(path)

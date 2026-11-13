@@ -26,13 +26,14 @@ pub enum Section {
     Font,
     Split,
     Effects,
+    Ai,
 }
 
 impl Section {
     fn parent(self) -> Option<Self> {
         match self {
             Self::Root => None,
-            Self::Extras | Self::Effects => Some(Self::Root),
+            Self::Extras | Self::Effects | Self::Ai => Some(Self::Root),
             Self::Font | Self::Split => Some(Self::Extras),
         }
     }
@@ -44,6 +45,7 @@ impl Section {
             Self::Font => "Font Size",
             Self::Split => "Split Terminal",
             Self::Effects => "Terminal Effect",
+            Self::Ai => "AI",
         }
     }
 
@@ -106,6 +108,9 @@ pub enum Action {
     TerminalEffect(Option<Effect>),
     ShowCommandTimestamps,
     ShowMenuBar,
+    Agent(chrome::Action),
+    Ai(super::terminal_ai::Action),
+    ContinueAgentChat,
 }
 
 impl Action {
@@ -138,6 +143,9 @@ impl Action {
             Self::TerminalEffect(effect) => effect.map_or("None", Effect::name),
             Self::ShowCommandTimestamps => "Show Command Timestamps",
             Self::ShowMenuBar => "Show Menu Bar",
+            Self::Agent(action) => action.title(),
+            Self::Ai(action) => action.label(),
+            Self::ContinueAgentChat => "Continue Last Agent Run in Chat…",
         }
     }
 }
@@ -272,7 +280,7 @@ impl Workspace {
             return Task::none();
         };
         let choices = |section| {
-            self.terminal_context_entries(owner, section, pane, menu.link.is_some())
+            self.terminal_context_entries(owner, section, menu.session, pane, menu.link.is_some())
                 .into_iter()
                 .filter(|entry| {
                     self.terminal_context_entry_enabled(*entry, owner, menu.session, tab, pane)
@@ -364,6 +372,11 @@ impl Workspace {
         match action {
             OpenLink | CopyLink => Task::none(),
             Copy => self.copy_terminal_selection(session),
+            Agent(action) => action.agent_mode().map_or_else(Task::none, |mode| {
+                self.open_terminal_agent(owner, session, mode)
+            }),
+            Ai(action) => self.open_terminal_ai(owner, session, action),
+            ContinueAgentChat => self.continue_latest_agent_chat(owner, session),
             Paste => self.update(Desktop::Paste(owner)),
             ClearBuffer => self.terminal_command(session, Command::ClearBuffer),
             Find => self.update(Desktop::OpenSearch(session)),
@@ -429,6 +442,12 @@ impl Workspace {
         let Some(pane) = self.sessions.get(&session) else {
             return Task::none();
         };
+        if let Some(selection) = &pane.projected_selection {
+            return selection
+                .text(&pane.frame, pane.stream_generation)
+                .filter(|value| !value.is_empty())
+                .map_or_else(Task::none, |value| self.write_clipboard(value));
+        }
         if let Some(selection) = pane.selection {
             return self.write_clipboard(selection.text(&pane.frame.screen));
         }
@@ -442,17 +461,7 @@ impl Workspace {
         selection: Selection,
         frame: &Weak<Frame>,
     ) -> Task<Desktop> {
-        if !self.window_settings.terminal_copy_on_select_enabled
-            || self.exiting
-            || self.scheduler_draining
-            || !self
-                .windows
-                .get(&owner)
-                .is_some_and(|window| window.focused)
-            || !self.window_contains_visible_pane(owner, session)
-            || !self.palette_can_open(owner)
-            || self.palette.is_open(owner)
-        {
+        if !self.terminal_copy_on_select_allowed(owner, session) {
             return Task::none();
         }
         let Some(pane) = self.sessions.get(&session).filter(|pane| {
@@ -463,7 +472,51 @@ impl Workspace {
         }) else {
             return Task::none();
         };
-        let value = selection.visible_text(&pane.frame.screen);
+        self.write_terminal_selection(selection.visible_text(&pane.frame.screen))
+    }
+
+    pub(super) fn finish_projected_selection(
+        &self,
+        owner: window::Id,
+        session: SessionId,
+        selection: crate::terminal_view::projected_selection::ProjectedSelection,
+    ) -> Task<Desktop> {
+        if !self.terminal_copy_on_select_allowed(owner, session) {
+            return Task::none();
+        }
+        let Some(pane) = self.sessions.get(&session) else {
+            return Task::none();
+        };
+        let Some(range) = selection.range(&pane.frame, pane.stream_generation) else {
+            return Task::none();
+        };
+        if pane
+            .projected_selection
+            .as_ref()
+            .and_then(|current| current.range(&pane.frame, pane.stream_generation))
+            != Some(range)
+        {
+            return Task::none();
+        }
+        selection
+            .text(&pane.frame, pane.stream_generation)
+            .map_or_else(Task::none, |value| self.write_terminal_selection(value))
+    }
+
+    fn terminal_copy_on_select_allowed(&self, owner: window::Id, session: SessionId) -> bool {
+        self.window_settings.terminal_copy_on_select_enabled
+            && !self.exiting
+            && !self.scheduler_draining
+            && self
+                .windows
+                .get(&owner)
+                .is_some_and(|window| window.focused)
+            && self.window_contains_visible_pane(owner, session)
+            && self.palette_can_open(owner)
+            && !self.palette.is_open(owner)
+    }
+
+    fn write_terminal_selection(&self, value: String) -> Task<Desktop> {
         if value.is_empty() {
             return Task::none();
         }
@@ -543,13 +596,34 @@ impl Workspace {
         )
     }
 
+    fn terminal_context_agent_entries(
+        &self,
+        session: SessionId,
+    ) -> impl Iterator<Item = Entry> + '_ {
+        [
+            chrome::Action::TerminalAgent,
+            chrome::Action::TerminalAgentAsk,
+            chrome::Action::TerminalAgentPlan,
+        ]
+        .into_iter()
+        .filter(move |action| {
+            action
+                .agent_mode()
+                .is_some_and(|mode| self.terminal_agent_available(session, mode))
+        })
+        .map(|action| Item(Agent(action)))
+    }
+
     fn terminal_context_entries(
         &self,
         owner: window::Id,
         section: Section,
+        session: SessionId,
         pane: &PaneSession,
         has_link: bool,
     ) -> Vec<Entry> {
+        let chat_allowed =
+            self.clipboard.policy.ai_allowed && self.clipboard.policy.ai_chat_allowed;
         match section {
             Section::Root => {
                 let mut entries = Vec::new();
@@ -560,6 +634,17 @@ impl Workspace {
                     entries.extend([Item(OpenLink), Item(CopyLink), Separator]);
                 }
                 entries.extend([Item(Copy), Item(Paste), Item(ClearBuffer), Item(Find)]);
+                if self
+                    .terminal_context_agent_entries(session)
+                    .next()
+                    .is_some()
+                    || (chat_allowed
+                        && (pane.selection.is_some()
+                            || pane.frame.ibm.is_none()
+                            || self.agent_chat_handoff_available(session)))
+                {
+                    entries.extend([Separator, Branch(Section::Ai)]);
+                }
                 if pane.ssh.is_some() && pane.session.sftp_opener().is_some() {
                     entries.extend([Separator, Item(Sftp)]);
                 }
@@ -579,6 +664,7 @@ impl Workspace {
                             Item(NextPrompt),
                             Item(SelectLastOutput),
                             Item(CopyLastOutput),
+                            Item(SetupShellIntegration),
                         ]);
                     }
                     None => {}
@@ -621,6 +707,31 @@ impl Workspace {
                         .map(|effect| Item(TerminalEffect(Some(effect)))),
                 )
                 .collect(),
+            Section::Ai => {
+                use super::terminal_ai::Action;
+                let mut entries: Vec<_> = self.terminal_context_agent_entries(session).collect();
+                if chat_allowed {
+                    if !entries.is_empty() {
+                        entries.push(Separator);
+                    }
+                    if pane.selection.is_some() {
+                        entries.extend([
+                            Item(Ai(Action::Summarize)),
+                            Item(Ai(Action::SolveProblem)),
+                            Item(Ai(Action::Ask)),
+                        ]);
+                    } else {
+                        entries.push(Item(Ai(Action::SummarizeRecent)));
+                    }
+                }
+                if self.agent_chat_handoff_available(session) {
+                    if !entries.is_empty() {
+                        entries.push(Separator);
+                    }
+                    entries.push(Item(ContinueAgentChat));
+                }
+                entries
+            }
         }
     }
 
@@ -634,7 +745,27 @@ impl Workspace {
     ) -> bool {
         match entry {
             Separator => false,
-            Item(Copy) => pane.selection.is_some() || pane.selected_output.is_some(),
+            Item(Copy) => {
+                pane.selection.is_some()
+                    || pane.selected_output.is_some()
+                    || pane.projected_selection.as_ref().is_some_and(|selection| {
+                        selection
+                            .range(&pane.frame, pane.stream_generation)
+                            .is_some()
+                    })
+            }
+            Branch(Section::Ai) => {
+                self.terminal_context_agent_entries(session)
+                    .next()
+                    .is_some()
+                    || self.terminal_ai_available(pane, None)
+                    || self.agent_chat_handoff_available(session)
+            }
+            Item(Agent(action)) => action
+                .agent_mode()
+                .is_some_and(|mode| self.terminal_agent_available(session, mode)),
+            Item(Ai(action)) => self.terminal_ai_available(pane, Some(action)),
+            Item(ContinueAgentChat) => self.agent_chat_handoff_available(session),
             Item(ClearBuffer) => pane.frame.ibm.is_none() && !pane.frame.screen.alternate_screen,
             Item(Find) => pane.session.supports_search(),
             Item(Sftp) => self.remote_pane(session).is_some(),
@@ -698,7 +829,13 @@ impl Workspace {
     ) -> Element<'_, Desktop> {
         let send = move |message| Desktop::TerminalContext(menu.owner, message);
         let mut content = column![].spacing(2);
-        for entry in self.terminal_context_entries(menu.owner, section, pane, menu.link.is_some()) {
+        for entry in self.terminal_context_entries(
+            menu.owner,
+            section,
+            menu.session,
+            pane,
+            menu.link.is_some(),
+        ) {
             if entry == Separator {
                 content = content.push(rule::horizontal(1));
                 continue;
@@ -849,6 +986,74 @@ mod tests {
     }
 
     #[test]
+    fn projected_copy_uses_the_internal_clipboard_and_rejects_a_stale_rendered_frame() {
+        use crate::terminal_agent::design::inline::{Line, Role, Segment};
+        use crate::terminal_view::projected_selection::ProjectedSelection;
+
+        let mut workspace = Workspace::default();
+        workspace.clipboard.policy.internal = true;
+        let (owner, _) = workspace.open_window(false);
+        let session = pane(&mut workspace);
+        workspace.add_tab(owner, session);
+        let _ = workspace.update(Desktop::Window(owner, window::Event::Focused));
+        let mut terminal = kortty_terminal::Terminal::new(32, 4);
+        terminal.advance(b"\x1b[8mconcealed\x1b[0m prompt");
+        let mut frame = crate::terminal_view::selection_test_frame(terminal.snapshot());
+        crate::session::inline_history::fixture(
+            Arc::get_mut(&mut frame).unwrap(),
+            0,
+            vec![Line {
+                segments: vec![Segment {
+                    text: "Agent answer".into(),
+                    role: Role::Text,
+                }],
+            }],
+            false,
+        );
+        let pane = workspace.sessions.get_mut(&session).unwrap();
+        pane.frame = Arc::clone(&frame);
+        let selection = ProjectedSelection::new(
+            &frame,
+            pane.stream_generation,
+            Selection::from_cells((0, 0), (1, 31)),
+        );
+
+        workspace.clipboard.buffer.set("prior".into());
+        let _ = workspace.update(Desktop::Selection(
+            session,
+            Some(Selection::from_cells((0, 0), (0, 8))),
+        ));
+        assert!(workspace.sessions[&session].selection.is_none());
+        let _ = workspace.update(Desktop::ProjectedSelection(
+            owner,
+            session,
+            selection.clone(),
+        ));
+        assert_eq!(workspace.clipboard.buffer.get().as_deref(), Some("prior"));
+        let _ = workspace.update(Desktop::ProjectedSelectionFinished(
+            owner,
+            session,
+            selection.clone(),
+        ));
+        let copied = workspace.clipboard.buffer.get().unwrap();
+        assert!(copied.starts_with("Agent answer\n"));
+        assert!(copied.ends_with(" prompt"));
+        assert!(!copied.contains("concealed"));
+        assert!(workspace.sessions[&session].selection.is_none());
+        let _ = workspace.update(Desktop::Copy(owner));
+        assert_eq!(workspace.clipboard.buffer.get(), Some(copied));
+
+        workspace.clipboard.buffer.set("prior".into());
+        workspace.sessions.get_mut(&session).unwrap().frame = Arc::new(frame.as_ref().clone());
+        let _ = workspace.update(Desktop::ProjectedSelectionFinished(
+            owner, session, selection,
+        ));
+        let _ = workspace.update(Desktop::Copy(owner));
+        assert_eq!(workspace.clipboard.buffer.get().as_deref(), Some("prior"));
+        let _ = workspace.sessions[&session].session.stop().recv_blocking();
+    }
+
+    #[test]
     fn reconnect_is_a_root_command_and_disabled_without_a_restart_route() {
         let mut workspace = Workspace::default();
         let (owner, _) = workspace.open_window(false);
@@ -858,7 +1063,7 @@ mod tests {
         let pane = &workspace.sessions[&session];
         assert!(
             workspace
-                .terminal_context_entries(owner, Section::Root, pane, false)
+                .terminal_context_entries(owner, Section::Root, session, pane, false)
                 .ends_with(&[
                     Separator,
                     Item(Reconnect),
@@ -942,6 +1147,93 @@ mod tests {
     }
 
     #[test]
+    fn terminal_context_agent_actions_follow_policy_and_the_clicked_pane() {
+        use crate::session::{IbmKind, Status};
+
+        let mut workspace = Workspace::default();
+        workspace.set_test_ai_configuration(
+            serde_json::from_value(serde_json::json!({
+                "profiles": {
+                    "profiles": [{"id": 1, "name": "Fixture", "endpoint": "127.0.0.1:12345", "model": "fixture"}],
+                    "default": 1,
+                    "last_id": 1
+                }
+            }))
+            .unwrap(),
+        );
+        let (owner, _) = workspace.open_window(false);
+        let grid = GridSize::default();
+        let source = workspace.store_session(Session::disconnected_ibm(IbmKind::Tn3270e), grid, 14);
+        let sibling =
+            workspace.store_session(Session::disconnected_ibm(IbmKind::Tn3270e), grid, 14);
+        workspace.add_tab(owner, source);
+        let tab = workspace.active_tab_mut(owner).unwrap();
+        let (second, _) = tab
+            .grid
+            .split(pane_grid::Axis::Vertical, tab.focused, sibling)
+            .unwrap();
+        let pane = workspace.sessions.get_mut(&source).unwrap();
+        pane.local_security = Some(crate::session_security::LocalSettings::default());
+        pane.frame = crate::terminal_view::selection_test_frame(pane.frame.screen.clone());
+        Arc::get_mut(&mut pane.frame).unwrap().status = Status::Running;
+
+        let policy = |features: &str| {
+            crate::clipboard_policy::parse(&format!(
+                "[meta]\nschema-version = 1\n[[rule]]\n[rule.features]\n{features}"
+            ))
+            .unwrap()
+        };
+        let entries = |workspace: &Workspace, section, session| {
+            workspace.terminal_context_entries(
+                owner,
+                section,
+                session,
+                &workspace.sessions[&session],
+                false,
+            )
+        };
+        let run = Item(Agent(chrome::Action::TerminalAgent));
+        let ask = Item(Agent(chrome::Action::TerminalAgentAsk));
+        let plan = Item(Agent(chrome::Action::TerminalAgentPlan));
+        let ai = Branch(Section::Ai);
+        workspace.clipboard.policy = policy("ai-chat='deny'");
+        assert!(entries(&workspace, Section::Root, source).contains(&ai));
+        assert!(!entries(&workspace, Section::Root, sibling).contains(&ai));
+        assert_eq!(entries(&workspace, Section::Ai, source), [run, ask, plan]);
+
+        workspace.clipboard.policy = policy("ai-agent='deny'\nai-planning='deny'");
+        assert_eq!(
+            entries(&workspace, Section::Ai, source),
+            [Item(Ai(super::super::terminal_ai::Action::SummarizeRecent))]
+        );
+        workspace.clipboard.policy = policy("ai-chat='deny'\nai-planning='deny'");
+        assert_eq!(entries(&workspace, Section::Ai, source), [run, ask]);
+        let _ =
+            workspace.update_terminal_context(owner, Message::Open(source, Point::ORIGIN, None));
+        let request = workspace.terminal_context.as_ref().unwrap().request;
+        let _ =
+            workspace.update_terminal_context(owner, Message::Point(request, Section::Root, ai));
+
+        workspace.clipboard.policy = policy("ai-chat='deny'\nai-agent='deny'");
+        assert_eq!(entries(&workspace, Section::Ai, source), [plan]);
+        let denied =
+            workspace.update_terminal_context(owner, Message::Invoke(request, Section::Ai, run));
+        assert_eq!(denied.units(), 0);
+        assert!(workspace.terminal_agents.is_empty());
+
+        workspace.active_tab_mut(owner).unwrap().focused = second;
+        let opened =
+            workspace.update_terminal_context(owner, Message::Invoke(request, Section::Ai, plan));
+        assert!(opened.units() > 0);
+        assert!(!workspace.terminal_agents.is_empty());
+        assert!(workspace.terminal_context.is_none());
+        assert_eq!(
+            workspace.windows[&owner].tab().unwrap().focused_session(),
+            Some(source)
+        );
+    }
+
+    #[test]
     fn multi_exec_targets_the_clicked_pane_and_allows_leaving_under_policy_deny() {
         let mut workspace = Workspace::default();
         let (owner, _) = workspace.open_window(false);
@@ -958,6 +1250,7 @@ mod tests {
                 .terminal_context_entries(
                     owner,
                     Section::Extras,
+                    source,
                     &workspace.sessions[&source],
                     false
                 )

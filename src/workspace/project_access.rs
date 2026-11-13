@@ -18,6 +18,8 @@ use super::{Message as WorkspaceMessage, Workspace, tool_tabs::HostedTab};
 
 mod attention;
 mod browser;
+mod java_export;
+pub(super) mod local_files;
 mod reconnect;
 pub(super) use attention::WaitReason;
 use browser::{Browser, Intent, Listing, Mode};
@@ -375,7 +377,7 @@ impl Workspace {
                 return run(window, request, move || {
                     if export {
                         let layout = Store::open()?.load(&name)?;
-                        let prepared = export::prepare(&name, &layout, project, connections)?;
+                        let prepared = java_export::prepare(&name, layout, project, connections)?;
                         return Ok(Outcome::JavaExportPreview(Arc::new(prepared)));
                     }
                     let imported = java::read(&project, connections.as_deref())?;
@@ -456,7 +458,8 @@ impl Workspace {
                     Ok(Outcome::Loaded(name, layout)) => {
                         let tabs = self.project_tab_identity(window);
                         let target = OpenTarget::Named(name);
-                        if tabs.is_empty() {
+                        let details: Vec<_> = local_file_details(&layout).collect();
+                        if tabs.is_empty() && details.is_empty() {
                             return self.open_project_layout(window, target, layout, tabs);
                         }
                         self.windows
@@ -471,7 +474,7 @@ impl Workspace {
                                 target,
                                 layout,
                                 tabs,
-                                details: Vec::new(),
+                                details,
                                 reconnect_offered: false,
                             },
                         );
@@ -711,6 +714,7 @@ impl Workspace {
             details.push(description);
         }
         details.extend(java_notes);
+        details.extend(local_file_details(&layout));
         let panel = self
             .windows
             .get_mut(&window)
@@ -1078,7 +1082,49 @@ fn layout_summary(layout: &WorkspaceLayout) -> String {
     let tabs: usize = layout.windows.iter().map(|window| window.tabs.len()).sum();
     let window_label = if windows == 1 { "window" } else { "windows" };
     let tab_label = if tabs == 1 { "tab" } else { "tabs" };
-    format!("{windows} {window_label} and {tabs} terminal {tab_label}")
+    format!("{windows} {window_label} and {tabs} {tab_label}")
+}
+
+fn local_file_details(layout: &WorkspaceLayout) -> impl Iterator<Item = String> + '_ {
+    layout
+        .windows
+        .iter()
+        .flat_map(|window| &window.tabs)
+        .filter_map(|tab| match tab {
+            crate::profile::PaneLayout::LocalFile { path, .. } => {
+                Some(format!("Local file tab · {}", path.display()))
+            }
+            crate::profile::PaneLayout::RemoteTool { target, tool } => {
+                Some(remote_tool_description(target, tool))
+            }
+            _ => None,
+        })
+}
+
+fn remote_tool_description(
+    target: &super::SshTarget,
+    tool: &crate::profile::RemoteProjectTool,
+) -> String {
+    use crate::profile::RemoteProjectTool;
+
+    let route = target.project_route_label();
+    match tool {
+        RemoteProjectTool::File { path, .. } => format!("Remote file tab · {route} · {path}"),
+        RemoteProjectTool::Sftp {
+            local,
+            remote,
+            idle_minutes,
+        } => {
+            let local = local
+                .as_deref()
+                .map_or_else(|| "local home".into(), |path| path.display().to_string());
+            let remote = remote.as_deref().unwrap_or("remote home");
+            let idle = idle_minutes.map_or_else(String::new, |minutes| {
+                format!(" · Idle close after {minutes} min")
+            });
+            format!("SFTP tab · {route} · {local} ↔ {remote}{idle}")
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1120,6 +1166,7 @@ mod tests {
             font,
             focused,
             term: TerminalProfile::Xterm.term_name().into(),
+            initial_size: Default::default(),
             target: serde_json::from_value(serde_json::json!({
                 "host": host,
                 "port": 22,
@@ -1135,6 +1182,7 @@ mod tests {
             tab_groups: Default::default(),
             tab_primary_panes: Default::default(),
             tab_terminal_effects: Default::default(),
+            tab_terminal_appearance: Default::default(),
             width,
             height: 610.0,
             position: None,
@@ -1151,7 +1199,7 @@ mod tests {
             unreachable!()
         };
         let session = workspace
-            .store_disconnected_ssh(target, TerminalProfile::Xterm, 14)
+            .store_disconnected_ssh(target, TerminalProfile::Xterm, 14, Default::default())
             .unwrap();
         workspace.add_tab(window, session);
         (window, session)
@@ -1314,6 +1362,145 @@ mod tests {
     }
 
     #[test]
+    fn java_project_import_restores_primary_appearance_across_splits() {
+        use crate::terminal_theme::{CursorStyle, Id, Preset, Rgb};
+        use iced::futures::{StreamExt, executor::block_on};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let project = profile.0.join("appearance.kortty");
+        let catalogue = profile.0.join("connections.xml");
+        std::fs::write(&project, r#"<project><windows><window><tabs>
+          <tab><connectionId>primary-local</connectionId><fontSizeOverride>22</fontSizeOverride>
+            <settings><fontSize>49</fontSize></settings>
+            <splitPaneState><orientation>HORIZONTAL</orientation>
+              <leftChild><widgetIndex>0</widgetIndex></leftChild>
+              <rightChild><widgetIndex>1</widgetIndex><connectionId>secondary-ssh</connectionId></rightChild>
+            </splitPaneState>
+          </tab>
+          <tab><connectionId>primary-local</connectionId><localShell>true</localShell>
+            <settings><fontSize>50</fontSize></settings>
+          </tab>
+          <tab><connectionId>global-ssh</connectionId></tab>
+          <tab><connectionId>plain-ssh</connectionId></tab>
+        </tabs></window></windows></project>"#).unwrap();
+        std::fs::write(&catalogue, r#"<connections schemaVersion="2">
+          <connection id="primary-local"><protocol>LOCAL_SHELL</protocol><settings>
+            <useGlobalSettings>false</useGlobalSettings><fontSize>18</fontSize><themeId>nord</themeId>
+            <backgroundColor>#112233</backgroundColor><cursorStyle>STEADY_UNDERLINE</cursorStyle>
+            <terminalColumns>110</terminalColumns><terminalRows>27</terminalRows>
+          </settings></connection>
+          <connection id="secondary-ssh"><host>alternate.example</host><username>operator</username><settings>
+            <useGlobalSettings>false</useGlobalSettings><fontSize>41</fontSize><themeId>monokai</themeId>
+            <terminalColumns>96</terminalColumns><terminalRows>30</terminalRows>
+          </settings></connection>
+          <connection id="global-ssh"><host>global.example</host><username>operator</username><settings>
+            <useGlobalSettings>true</useGlobalSettings><fontSize>46</fontSize><themeId>monokai</themeId>
+          </settings></connection>
+          <connection id="plain-ssh"><host>plain.example</host><username>operator</username><settings>
+            <useGlobalSettings>false</useGlobalSettings><themeId>missing-theme</themeId>
+            <backgroundColor>#334455</backgroundColor>
+          </settings></connection>
+        </connections>"#).unwrap();
+
+        let mut workspace = Workspace::default();
+        workspace.window_settings.terminal_font = 17;
+        workspace
+            .window_settings
+            .themes
+            .select(Some(Id::BuiltIn(Preset::Dark)));
+        let global = workspace.window_settings.terminal_appearance();
+        let nord = workspace
+            .window_settings
+            .themes
+            .find(Id::BuiltIn(Preset::Nord))
+            .unwrap()
+            .scheme;
+        let (owner, _) = workspace.open_window(false);
+        workspace.windows.get_mut(&owner).unwrap().projects = Some(Panel::default());
+        for edit in [
+            Message::Name("Java appearance".into()),
+            Message::JavaProjectPath(project.to_str().unwrap().into()),
+            Message::JavaConnectionsPath(catalogue.to_str().unwrap().into()),
+        ] {
+            let _ = workspace.update(wrap(owner, edit));
+        }
+        let import = workspace.update(wrap(owner, Message::ImportJava));
+        let mut stream = iced_runtime::task::into_stream(import).unwrap();
+        let Some(iced_runtime::Action::Output(result)) = block_on(stream.next()) else {
+            panic!("expected a Java project import result");
+        };
+        let _ = workspace.update(result);
+        let Phase::Confirm(request, Confirmation::ImportJava(_, imported)) =
+            &workspace.windows[&owner].projects.as_ref().unwrap().phase
+        else {
+            panic!("expected the imported project preview");
+        };
+        let request = *request;
+        let source = serde_json::to_vec(&imported.layout).unwrap();
+        let layout: WorkspaceLayout = serde_json::from_slice(&source).unwrap();
+        let _ = workspace.update(wrap(owner, Message::Decide(request, false)));
+        let _ = complete_open(&mut workspace, owner, layout.clone());
+
+        let tabs = workspace.windows[&owner]
+            .terminal_tabs()
+            .collect::<Vec<_>>();
+        assert_eq!(tabs.len(), 4);
+        let split = tabs[0];
+        assert_eq!(split.grid.len(), 2);
+        for (_, &session) in split.grid.iter() {
+            let pane = &workspace.sessions[&session];
+            let appearance = workspace.pane_appearance(session);
+            assert_eq!(appearance.background, nord.background);
+            assert_eq!(
+                workspace.pane_theme_id(session),
+                Some(Id::BuiltIn(Preset::Nord))
+            );
+            assert_ne!(appearance.background, Rgb::from_hex(0x112233));
+            assert_eq!(
+                appearance.cursor_shape,
+                CursorStyle::SteadyUnderline.behavior().0
+            );
+            assert_eq!(appearance.cursor_blink, global.cursor_blink);
+            assert_eq!(workspace.pane_terminal_font(pane, false).0, 22);
+            if let Some(ssh) = &pane.ssh {
+                assert_eq!(ssh.label(), "operator@alternate.example:22");
+                assert_eq!(pane.frame.status, Status::Disconnected);
+                assert_eq!((pane.grid.columns, pane.grid.rows), (96, 30));
+            } else {
+                assert_eq!((pane.grid.columns, pane.grid.rows), (110, 27));
+            }
+        }
+        for tab in &tabs[1..3] {
+            let session = tab.focused_session().unwrap();
+            assert_eq!(workspace.pane_appearance(session), global);
+            assert_eq!(
+                workspace.pane_theme_id(session),
+                Some(Id::BuiltIn(Preset::Dark))
+            );
+            assert_eq!(
+                workspace
+                    .pane_terminal_font(&workspace.sessions[&session], false)
+                    .0,
+                17
+            );
+        }
+        let plain = tabs[3].focused_session().unwrap();
+        assert_eq!(workspace.pane_theme_id(plain), None);
+        assert_eq!(
+            workspace.pane_appearance(plain).background,
+            Rgb::from_hex(0x334455)
+        );
+        let captured = workspace.capture_layout_ordered(Some(owner)).unwrap();
+        assert_eq!(
+            captured.windows[0].tab_terminal_appearance,
+            layout.windows[0].tab_terminal_appearance
+        );
+        for session in workspace.sessions.keys().copied().collect::<Vec<_>>() {
+            workspace.stop_session(session);
+        }
+    }
+
+    #[test]
     fn confirmed_open_reuses_the_invoking_window_and_restores_additional_split_windows() {
         let mut workspace = Workspace::default();
         let (invoking, original) = existing(&mut workspace, "original.example");
@@ -1362,7 +1549,7 @@ mod tests {
         assert_eq!(window.placement().width, first.width);
         let active = window.tab().unwrap();
         assert_eq!(
-            workspace.capture_pane(active, active.grid.layout(), &mut Vec::new()),
+            workspace.capture_pane(active, active.grid.layout(), &mut Vec::new(), &mut |_| {}),
             Some(split)
         );
         assert_eq!(
@@ -1409,6 +1596,7 @@ mod tests {
                     vt100: false,
                     term: None,
                     security: None,
+                    initial_size: Default::default(),
                 }],
             ),
         ]);
@@ -1446,7 +1634,7 @@ mod tests {
         let expected = workspace.project_tab_identity(owner);
         let target = workspace.sessions[&original].ssh.clone().unwrap();
         let added = workspace
-            .store_disconnected_ssh(target, TerminalProfile::Xterm, 14)
+            .store_disconnected_ssh(target, TerminalProfile::Xterm, 14, Default::default())
             .unwrap();
         workspace.add_tab(owner, added);
         let layout = Arc::new(WorkspaceLayout::new(vec![saved_window(
@@ -1512,7 +1700,7 @@ mod tests {
             .incognito = true;
         let target = workspace.sessions[&original].ssh.clone().unwrap();
         let sibling = workspace
-            .store_disconnected_ssh(target, TerminalProfile::Xterm, 18)
+            .store_disconnected_ssh(target, TerminalProfile::Xterm, 18, Default::default())
             .unwrap();
         let tab = workspace.active_tab_mut(invoking).unwrap();
         tab.grid

@@ -11,6 +11,42 @@ use super::{Message as WorkspaceMessage, SessionId, Status, Window, Workspace};
 use crate::profile;
 use crate::terminal_clipboard::{self as clip, ClipboardText, Decision, ReadKind, ReadPrompt};
 
+pub(super) fn publish_png<M: Send + 'static>(
+    native: window::Id,
+    png: kortty_windowing::ClipboardPng,
+    authorize: impl FnOnce() -> Result<(), String> + Send + 'static,
+    finish: impl FnOnce(Result<(), String>) -> M + Copy + Send + 'static,
+) -> Task<M> {
+    window::run(native, move |window| {
+        authorize()?;
+        let (window, display) = window
+            .window_handle()
+            .ok()
+            .zip(window.display_handle().ok())
+            .ok_or_else(|| "The native window is no longer available.".to_owned())?;
+        let (send, receive) = async_channel::bounded(1);
+        png.write(window, display, move |result| {
+            let _ = send.try_send(result.map_err(|error| error.to_string()));
+        });
+        Ok(receive)
+    })
+    .collect()
+    .then(move |mut receivers| {
+        let receive = receivers
+            .pop()
+            .unwrap_or_else(|| Err("The native window is no longer available.".into()));
+        Task::future(async move {
+            finish(match receive {
+                Ok(receive) => receive
+                    .recv()
+                    .await
+                    .unwrap_or_else(|_| Err("The clipboard stopped.".into())),
+                Err(error) => Err(error),
+            })
+        })
+    })
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     ShowSettings(window::Id, bool),

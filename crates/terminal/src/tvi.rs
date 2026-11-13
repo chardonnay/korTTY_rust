@@ -1,18 +1,17 @@
 use crate::{
     CharacterSet, KeyModifiers, Model, Style, TerminalKey, TerminalProfile, is_bidi_control,
-    strict_osc,
+    legacy_modified_key, strict_osc,
 };
 
 const ESC: u8 = 0x1b;
+const UTF8_ADDRESS_LEAD: u8 = 0xc2;
 
 #[derive(Clone, Copy)]
 enum State {
     Ground,
     Escape,
-    AddressRow,
-    AddressColumn(u8),
-    RegionTop,
-    RegionBottom(u8),
+    Coordinate(Coordinate),
+    CoordinateTail(Coordinate),
     Attribute,
     CursorType,
     IgnoreByte,
@@ -20,6 +19,49 @@ enum State {
     FunctionDefinition { escape: bool },
     PageSelect,
     ColumnMode,
+}
+
+#[derive(Clone, Copy)]
+enum Coordinate {
+    CursorRow,
+    CursorColumn(u8),
+    RegionTop,
+    RegionBottom(u8),
+}
+
+impl Coordinate {
+    fn read(self, model: &mut Model, byte: u8) -> State {
+        let extent = match self {
+            Self::CursorColumn(_) => model.columns,
+            _ => model.rows,
+        };
+        if byte == UTF8_ADDRESS_LEAD
+            && !model.text_encoding().is_single_byte()
+            && coordinate(byte) >= extent
+        {
+            // C2 introduces a UTF-8 coordinate only outside the valid raw address range.
+            State::CoordinateTail(self)
+        } else {
+            self.apply(model, byte)
+        }
+    }
+
+    fn apply(self, model: &mut Model, byte: u8) -> State {
+        match self {
+            Self::CursorRow => State::Coordinate(Self::CursorColumn(byte)),
+            Self::CursorColumn(row) => {
+                model.move_cursor(coordinate(row), coordinate(byte));
+                State::Ground
+            }
+            Self::RegionTop => State::Coordinate(Self::RegionBottom(byte)),
+            Self::RegionBottom(top) => {
+                let top = coordinate(top).min(model.rows - 1);
+                let bottom = coordinate(byte).clamp(top, model.rows - 1);
+                set_region(model, top, bottom);
+                State::Ground
+            }
+        }
+    }
 }
 
 pub(crate) struct Tvi {
@@ -52,18 +94,14 @@ impl Tvi {
             self.state = match self.state {
                 State::Ground => self.ground(model, byte),
                 State::Escape => self.escape(model, byte),
-                State::AddressRow => State::AddressColumn(byte),
-                State::AddressColumn(row) => {
-                    model.move_cursor(coordinate(row), coordinate(byte));
-                    State::Ground
+                State::Coordinate(field) => field.read(model, byte),
+                State::CoordinateTail(field) if matches!(byte, 0x80..=0xbf) => {
+                    field.apply(model, byte)
                 }
-                State::RegionTop => State::RegionBottom(byte),
-                State::RegionBottom(top) => {
-                    let top = coordinate(top).min(model.rows - 1);
-                    let bottom = coordinate(byte).clamp(top, model.rows - 1);
-                    set_region(model, top, bottom);
-                    State::Ground
-                }
+                State::CoordinateTail(field) => match field.apply(model, UTF8_ADDRESS_LEAD) {
+                    State::Coordinate(next) if byte != ESC => next.read(model, byte),
+                    _ => self.ground(model, byte),
+                },
                 State::Attribute => {
                     model.style = attribute(byte);
                     State::Ground
@@ -106,13 +144,19 @@ impl Tvi {
             ESC => return State::Escape,
             0x07 => model.ring_bell(),
             0x08 => backspace(model),
-            0x09 if !model.screen().wrap_pending => model.tab(1, true),
+            0x09 => model.horizontal_tab(),
             0x0a | 0x0b => line_motion(model, Model::line_feed),
             0x0d => model.carriage_return(),
             0x0e => model.charset = 1,
             0x0f => model.charset = 0,
             0x1a => clear_and_home(model),
             0x20..=0x7f => print(model, char::from(byte)),
+            0x80..=0xff if model.text_encoding().is_single_byte() => {
+                let ch = model.text_encoding().decode_byte(byte);
+                if !ch.is_control() {
+                    print_character(model, ch);
+                }
+            }
             0x80..=0xff => self.read_utf8(model, byte),
             _ => {}
         }
@@ -125,7 +169,11 @@ impl Tvi {
         match std::str::from_utf8(&self.utf8[..self.utf8_len]) {
             Ok(text) => {
                 for ch in text.chars() {
-                    print(model, ch);
+                    if model.text_encoding.is_some() {
+                        print_character(model, ch);
+                    } else {
+                        print(model, ch);
+                    }
                 }
                 self.utf8_len = 0;
             }
@@ -141,7 +189,7 @@ impl Tvi {
         let extended = self.profile != TerminalProfile::Tvi910;
         let tvi925 = self.profile == TerminalProfile::Tvi925;
         match byte {
-            b'=' => return State::AddressRow,
+            b'=' => return State::Coordinate(Coordinate::CursorRow),
             b'T' | b't' => erase_line_end(model),
             b'Y' | b'y' => {
                 erase_line_end(model);
@@ -181,14 +229,17 @@ impl Tvi {
             }
             b'n' => report_cursor(model),
             b'v' | b'w' => model.auto_wrap = byte == b'v',
-            b'~' if extended => return State::RegionTop,
+            b'~' if extended => return State::Coordinate(Coordinate::RegionTop),
             b'p' if extended => return State::FunctionDefinition { escape: false },
             b'z' if extended => {
                 let title = std::mem::take(&mut model.title);
                 let insert = model.insert_mode;
+                let saved = model.saved;
                 model.reset(false);
                 model.title = title;
                 model.insert_mode = insert;
+                // The factory reset leaves the cursor saved by ESC # available to ESC ".
+                model.saved = saved;
                 self.page = 0;
             }
             b'-' if tvi925 => return State::Attribute,
@@ -213,7 +264,7 @@ impl Tvi {
             }
             return State::Status;
         }
-        let status = String::from_utf8_lossy(&self.status);
+        let status = model.text_encoding().decode(&self.status);
         if !model.strict || !self.status_overflowed && strict_osc("2", &status) {
             model.title = status
                 .chars()
@@ -252,12 +303,14 @@ fn attribute(byte: u8) -> Style {
 fn print(model: &mut Model, ch: char) {
     let ch = match ch {
         '\u{80}'..='\u{9f}' => return,
-        '\u{e0}'..='\u{fe}' => CharacterSet::DecGraphics.map(char::from(ch as u8 - 0x80)),
-        '\u{ff}' => ' ',
         '\x7f' if model.charset == 1 => ' ',
         ch if model.charset == 1 => CharacterSet::DecGraphics.map(ch),
         ch => ch,
     };
+    print_character(model, ch);
+}
+
+fn print_character(model: &mut Model, ch: char) {
     if !model.auto_wrap
         && model.screen().wrap_pending
         && !ch.is_control()
@@ -323,9 +376,21 @@ fn edit_character(model: &mut Model, insert: bool) {
 fn report_cursor(model: &mut Model) {
     let cursor = model.cursor();
     let column = cursor.column + usize::from(model.screen().wrap_pending);
-    // The Java transport encodes the biased cursor coordinates as text.
-    let row = char::from_u32(0x20 + cursor.row as u32).unwrap_or(' ');
-    let column = char::from_u32(0x20 + column as u32).unwrap_or(' ');
+    let row = 0x20 + cursor.row;
+    let column = 0x20 + column;
+    if model.text_encoding().is_single_byte() {
+        // A serial coordinate byte keeps its protocol value in every text encoding.
+        model.reply(&[
+            ESC,
+            b'=',
+            u8::try_from(row).unwrap_or(b'?'),
+            u8::try_from(column).unwrap_or(b'?'),
+        ]);
+        return;
+    }
+    // The Java transport encodes the biased cursor coordinates as text in UTF-8.
+    let row = char::from_u32(row as u32).unwrap_or(' ');
+    let column = char::from_u32(column as u32).unwrap_or(' ');
     let mut response = [0; 10];
     response[..2].copy_from_slice(b"\x1b=");
     let row_end = 2 + row.encode_utf8(&mut response[2..]).len();
@@ -344,7 +409,7 @@ pub(crate) fn encode_key(
     ) {
         return None;
     }
-    if let Some(sequence) = modified_key(key, modifiers) {
+    if let Some(sequence) = legacy_modified_key(key, modifiers) {
         return Some(sequence.to_vec());
     }
     let extended = profile != TerminalProfile::Tvi910;
@@ -387,19 +452,4 @@ pub(crate) fn encode_key(
         result.extend_from_slice(code);
     }
     Some(result)
-}
-
-fn modified_key(key: TerminalKey, modifiers: KeyModifiers) -> Option<&'static [u8]> {
-    match (key, modifiers.shift, modifiers.alt, modifiers.control) {
-        (TerminalKey::Tab, true, false, false) => Some(b"\x1b[Z"),
-        (TerminalKey::Left, false, true, false) if cfg!(target_os = "macos") => Some(b"\x1bb"),
-        (TerminalKey::Right, false, true, false) if cfg!(target_os = "macos") => Some(b"\x1bf"),
-        (TerminalKey::Left, false, true, false) => Some(b"\x1b[1;3D"),
-        (TerminalKey::Right, false, true, false) => Some(b"\x1b[1;3C"),
-        (TerminalKey::Left, false, false, true) if !cfg!(target_os = "macos") => Some(b"\x1b[1;5D"),
-        (TerminalKey::Right, false, false, true) if !cfg!(target_os = "macos") => {
-            Some(b"\x1b[1;5C")
-        }
-        _ => None,
-    }
 }

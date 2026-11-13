@@ -1,5 +1,5 @@
 use std::net::IpAddr;
-use std::sync::LazyLock;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 use kortty_terminal::ScreenSnapshot;
@@ -23,6 +23,10 @@ pub(super) struct Follow {
 }
 
 impl Follow {
+    pub(super) fn reported_host(&self) -> Option<&str> {
+        self.report_host.as_deref()
+    }
+
     pub(super) fn observe(
         &mut self,
         activity: &ShellActivity,
@@ -187,11 +191,94 @@ pub(super) fn file_context(
 }
 
 fn identity(screen: &ScreenSnapshot, user: &str, host: &str) -> Identity {
+    let Some(line) = prompt_line(screen) else {
+        return Identity::Unknown;
+    };
+    if let Some((prompt_user, prompt_host)) = prompt_account(line.trim()) {
+        if !prompt_user.eq_ignore_ascii_case(user) {
+            Identity::Foreign
+        } else if same_host(prompt_host, host) {
+            Identity::Native
+        } else {
+            Identity::OtherHost
+        }
+    } else if line.trim().ends_with('#') && !user.eq_ignore_ascii_case("root") {
+        Identity::Foreign
+    } else {
+        Identity::Unknown
+    }
+}
+
+pub(crate) fn mcp_ssh_prompt_is_verified(
+    activity: &ShellActivity,
+    screen: &ScreenSnapshot,
+    user: &str,
+    host: &str,
+) -> bool {
+    if activity.code_prompt.state != crate::session::PromptState::Ready
+        || foreign_shell(activity, Some(screen), Some(user), Some(host)).is_some()
+    {
+        return false;
+    }
+    let mut row = screen.cursor.row;
+    while row > 0 && screen.wrapped_columns(row - 1).is_some() {
+        row -= 1;
+    }
+    let Some(cells) = screen.row(row) else {
+        return false;
+    };
+    let prompt: String = cells.iter().map(|cell| cell.text.as_str()).collect();
+    prompt_account(prompt.trim_start()).is_some_and(|(actual_user, actual_host)| {
+        actual_user.eq_ignore_ascii_case(user) && same_host(actual_host, host)
+    })
+}
+
+#[derive(Eq, PartialEq)]
+pub(in crate::workspace) enum ForeignShell {
+    Prompt { user: String, host: String },
+    ElevatedPrompt,
+    ReportedHost(Arc<str>),
+}
+
+pub(in crate::workspace) fn foreign_shell(
+    activity: &ShellActivity,
+    screen: Option<&ScreenSnapshot>,
+    expected_user: Option<&str>,
+    known_host: Option<&str>,
+) -> Option<ForeignShell> {
+    if let Some(line) = screen.and_then(prompt_line) {
+        let line = line.trim();
+        if let Some((user, host)) = prompt_account(line) {
+            if expected_user.is_some_and(|expected| !user.eq_ignore_ascii_case(expected))
+                || known_host.is_some_and(|expected| !same_host(host, expected))
+            {
+                return Some(ForeignShell::Prompt {
+                    user: user.to_owned(),
+                    host: host.to_owned(),
+                });
+            }
+        } else if line.ends_with('#')
+            && expected_user.is_some_and(|expected| !expected.eq_ignore_ascii_case("root"))
+        {
+            return Some(ForeignShell::ElevatedPrompt);
+        }
+    }
+    let report = activity.directory.as_ref()?;
+    (!report.host.is_empty() && known_host.is_some_and(|host| !same_host(&report.host, host)))
+        .then(|| ForeignShell::ReportedHost(Arc::clone(&report.host)))
+}
+
+fn prompt_account(line: &str) -> Option<(&str, &str)> {
     static PROMPT: LazyLock<Regex> = LazyLock::new(|| {
         Regex::new(r"^(?:\([^)]*\)\s*)?\[?([A-Za-z_][A-Za-z0-9._-]*)@([A-Za-z0-9][A-Za-z0-9.-]*)")
             .expect("valid prompt pattern")
     });
-    let Some(line) = (0..screen.rows)
+    let captures = PROMPT.captures(line)?;
+    Some((captures.get(1)?.as_str(), captures.get(2)?.as_str()))
+}
+
+fn prompt_line(screen: &ScreenSnapshot) -> Option<String> {
+    (0..screen.rows)
         .rev()
         .filter_map(|row| screen.row(row))
         .find_map(|cells| {
@@ -201,26 +288,7 @@ fn identity(screen: &ScreenSnapshot, user: &str, host: &str) -> Identity {
                 .collect::<String>();
             (!line.trim().is_empty()).then_some(line)
         })
-    else {
-        return Identity::Unknown;
-    };
-    let line = line.trim();
-    if !line.ends_with(['$', '#', '%', '>']) {
-        return Identity::Unknown;
-    }
-    if let Some(captures) = PROMPT.captures(line) {
-        if !captures[1].eq_ignore_ascii_case(user) {
-            Identity::Foreign
-        } else if same_host(&captures[2], host) {
-            Identity::Native
-        } else {
-            Identity::OtherHost
-        }
-    } else if line.ends_with('#') && !user.eq_ignore_ascii_case("root") {
-        Identity::Foreign
-    } else {
-        Identity::Unknown
-    }
+        .filter(|line| line.trim_end().ends_with(['$', '#', '%', '>']))
 }
 
 fn same_host(reported: &str, expected: &str) -> bool {
@@ -262,6 +330,49 @@ mod tests {
     use crate::session::ReportedDirectory;
 
     use super::*;
+
+    #[test]
+    fn chat_foreign_shell_warning_requires_evidence_beyond_an_unknown_alias() {
+        let mut terminal = kortty_terminal::Terminal::new(80, 24);
+        terminal.advance(b"operator@actual-host:~$ ");
+        let activity = ShellActivity::default();
+        let screen = terminal.snapshot();
+        assert!(foreign_shell(&activity, Some(&screen), Some("operator"), None).is_none());
+        assert!(
+            foreign_shell(
+                &activity,
+                Some(&screen),
+                Some("operator"),
+                Some("actual-host.example")
+            )
+            .is_none()
+        );
+        assert!(matches!(
+            foreign_shell(&activity, Some(&screen), Some("different-user"), None),
+            Some(ForeignShell::Prompt { .. })
+        ));
+        assert!(matches!(
+            foreign_shell(
+                &activity,
+                Some(&screen),
+                Some("operator"),
+                Some("initial-shell")
+            ),
+            Some(ForeignShell::Prompt { .. })
+        ));
+        let activity = ShellActivity {
+            directory: Some(ReportedDirectory {
+                sequence: 1,
+                host: Arc::from("nested-host"),
+                path: Arc::from("/home/operator"),
+            }),
+            ..Default::default()
+        };
+        assert!(matches!(
+            foreign_shell(&activity, None, Some("operator"), Some("initial-shell")),
+            Some(ForeignShell::ReportedHost(host)) if host.as_ref() == "nested-host"
+        ));
+    }
 
     #[test]
     fn terminal_file_context_rejects_same_user_on_a_different_host() {

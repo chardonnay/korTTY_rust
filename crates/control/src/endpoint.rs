@@ -89,6 +89,10 @@ impl Drop for Endpoint {
 }
 
 impl Endpoint {
+    pub fn read_profile(root: &Path) -> io::Result<Self> {
+        Self::read(&directory(root, false)?)
+    }
+
     pub fn read(directory: &Path) -> io::Result<Self> {
         let file = open_private_file(&directory.join(DESCRIPTOR), false)?;
         let mut bytes = Zeroizing::new(Vec::new());

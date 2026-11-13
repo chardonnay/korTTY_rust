@@ -1,8 +1,8 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 use std::pin::pin;
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
@@ -16,32 +16,48 @@ use kortty_pty::{LaunchOptions, Pty};
 use kortty_recording::CaptureOptions;
 use kortty_serial::SerialPort;
 use kortty_ssh::WindowSize;
+use kortty_terminal::ScrollbackConfig;
 use kortty_terminal::{
     Cell, CommandTimestamp, Hp2392Input, LastOutput, LastOutputRange, MAX_CLIPBOARD_TEXT_BYTES,
-    MAX_SEARCH_QUERY_BYTES, PromptDirection, PromptLayout, PromptNavigator, ReconnectHistory,
-    ScreenSnapshot, SearchResults, Terminal, TerminalProfile, TypeAhead,
+    MAX_SEARCH_QUERY_BYTES, PromptDirection, PromptLayout, PromptNavigator, ScreenSnapshot,
+    SearchResults, Terminal, TerminalProfile, TextEncoding, TypeAhead,
 };
 
+use crate::terminal_effects::Speed;
 use crate::terminal_theme::Appearance;
 
 mod activity;
+pub(crate) mod agent_takeover;
+pub(crate) mod ai_code_guard;
 mod clipboard;
 mod ibm;
+pub(crate) mod inline_history;
 mod journal;
+mod paste;
+pub(crate) use journal::journal_output_observer;
 mod recording;
 mod serial;
 mod shell_activity;
 mod typewriter;
+#[cfg(windows)]
+mod windows_file;
 pub(crate) use activity::OutputSample;
+pub(crate) use ai_code_guard::{
+    CodingAgentDetails, CodingAgentInput, CodingAgentKey, CodingAgentState, CodingAgentStatus,
+};
 pub use ibm::{IbmAid, IbmEdit, IbmInput, IbmKind};
+pub(crate) use recording::TabRecording;
 pub use recording::{RecordingCommandError, RecordingStatus};
 pub use serial::{
     SerialConnection, SerialFlowControl, SerialLineEnding, SerialParity, SerialSettings,
     SerialStopBits, available_serial_ports,
 };
-#[cfg(test)]
-pub(crate) use shell_activity::ReportedDirectory;
 pub(crate) use shell_activity::ShellActivity;
+pub(crate) use shell_activity::{CodePrompt, PromptState, ShortcutPrompt};
+#[cfg(test)]
+pub(crate) use shell_activity::{ReportedDirectory, TypedCd};
+mod mcp;
+pub(crate) use mcp::{McpGuard, McpIdentity, McpInput};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const SCROLLBACK_IDLE: Duration = Duration::from_millis(1500);
@@ -89,11 +105,15 @@ pub enum Status {
     Error(String),
 }
 
+#[derive(Clone)]
 pub struct Frame {
     pub screen: ScreenSnapshot,
     pub status: Status,
     pub scroll_offset: usize,
+    pub(crate) inline: Option<Arc<inline_history::Frame>>,
     pub(crate) scrollback: Option<kortty_terminal::ScrollbackSnapshot>,
+    pub(crate) output_snapshot: Option<Arc<kortty_terminal::OutputSnapshot>>,
+    pub(crate) recovery_output: Option<Arc<kortty_terminal::OutputSnapshot>>,
     pub application_cursor_keys: bool,
     pub bracketed_paste: bool,
     pub(crate) password_prompt: bool,
@@ -107,6 +127,8 @@ pub struct Frame {
     pub has_prompt_marks: bool,
     pub has_finished_command: bool,
     shell_activity: ShellActivity,
+    coding_agent: Option<CodingAgentStatus>,
+    coding_agent_details: Option<Arc<CodingAgentDetails>>,
     /// The terminal content revision that owns this viewport's absolute search coordinates.
     pub search_revision: u64,
     search_result: Option<Arc<SearchResponse>>,
@@ -119,6 +141,30 @@ pub struct TypeAheadFrame {
 }
 
 impl Frame {
+    pub(crate) fn at_live_viewport(&self) -> bool {
+        self.viewport_scroll_offset() == 0
+    }
+
+    pub(crate) fn viewport_scroll_offset(&self) -> usize {
+        self.inline
+            .as_ref()
+            .map_or(self.scroll_offset, |view| view.offset())
+    }
+
+    pub(crate) fn display_raw_row(&self, row: u16) -> Option<u16> {
+        self.inline.as_ref().map_or_else(
+            || (row < self.screen.rows).then_some(row),
+            |view| view.display_raw_row(row),
+        )
+    }
+
+    pub(crate) fn raw_display_row(&self, row: u16) -> Option<u16> {
+        self.inline.as_ref().map_or_else(
+            || (row < self.screen.rows).then_some(row),
+            |view| view.raw_display_row(row),
+        )
+    }
+
     pub fn search_result(&self) -> Option<&Arc<SearchResponse>> {
         self.search_result.as_ref()
     }
@@ -126,6 +172,27 @@ impl Frame {
     /// Passive SSH evidence published with the corresponding screen.
     pub(crate) fn shell_activity(&self) -> &ShellActivity {
         &self.shell_activity
+    }
+
+    pub(crate) fn coding_agent_visible(&self) -> bool {
+        self.at_live_viewport() && ai_code_guard::coding_agent_visible(&self.screen)
+    }
+
+    pub(crate) fn approval_prompt_visible(&self) -> bool {
+        self.at_live_viewport() && ai_code_guard::approval_prompt_visible(&self.screen)
+    }
+
+    pub(crate) fn coding_agent(&self) -> Option<CodingAgentStatus> {
+        self.coding_agent
+    }
+
+    pub(crate) fn coding_agent_waiting_for_decision(&self) -> bool {
+        self.coding_agent()
+            .is_some_and(|agent| agent.state == CodingAgentState::Blocked)
+    }
+
+    pub(crate) fn coding_agent_details(&self) -> Option<&Arc<CodingAgentDetails>> {
+        self.coding_agent_details.as_ref()
     }
 }
 
@@ -148,18 +215,37 @@ pub enum SearchError {
 struct ViewRequest {
     grid: GridSize,
     scroll_anchor: Option<kortty_terminal::ScrollbackAnchor>,
+    inline_anchor: Option<inline_history::Anchor>,
     typeahead: TypeAheadRequest,
     prompt_navigation_enabled: bool,
     prompt_navigator: PromptNavigator,
     appearance: Appearance,
+    scrollback: ScrollbackConfig,
+    recovery_output_rows: u16,
 }
 
 impl ViewRequest {
     fn set_scroll_anchor(&mut self, anchor: Option<kortty_terminal::ScrollbackAnchor>) {
-        if self.scroll_anchor != anchor {
+        if self.scroll_anchor != anchor || self.inline_anchor.is_some() {
             self.scroll_anchor = anchor;
+            self.inline_anchor = None;
             self.prompt_navigator = PromptNavigator::default();
         }
+    }
+
+    fn set_inline_anchor(&mut self, anchor: Option<inline_history::Anchor>) {
+        if self.inline_anchor != anchor || self.scroll_anchor.is_some() {
+            self.inline_anchor = anchor;
+            self.scroll_anchor = None;
+            self.prompt_navigator = PromptNavigator::default();
+        }
+    }
+
+    fn raw_anchor(&self) -> Option<&kortty_terminal::ScrollbackAnchor> {
+        self.inline_anchor
+            .as_ref()
+            .map(|anchor| &anchor.raw)
+            .or(self.scroll_anchor.as_ref())
     }
 }
 
@@ -171,29 +257,42 @@ struct TypeAheadRequest {
 
 struct Shared {
     view: Mutex<ViewRequest>,
+    inline_updates: Mutex<std::collections::VecDeque<inline_history::Update>>,
     frame: Mutex<Arc<Frame>>,
     redraw: Sender<()>,
     bell_events: AtomicU64,
+    program_notifications: Mutex<std::collections::VecDeque<kortty_terminal::ProgramNotification>>,
     output_activity: Arc<activity::Clock>,
     local_shell_pid: AtomicU32,
     sandbox_backend: Mutex<Option<&'static str>>,
     serial: Option<Arc<SerialConnection>>,
     serial_notice: Mutex<Option<Arc<str>>>,
     shell_activity: Option<Mutex<shell_activity::State>>,
+    // The low bit is the enabled flag. Each change advances the revision.
+    coding_agent_detection: AtomicU64,
     clipboard: Mutex<clipboard::ClipboardBridge>,
     recording: Arc<recording::Control>,
     logfile_warning: crate::terminal_logging::Warning,
     journal_available: AtomicBool,
+    journal_input: Arc<AtomicBool>,
     journal_generation: AtomicU64,
     journal_secrets: Mutex<Option<crate::terminal_logging::RedactionSecrets>>,
-    scrollback_compression_enabled: AtomicBool,
-    typewriter_speed: AtomicU8,
+    // Zero bits mean disabled. Other values are bounded Speed multipliers.
+    typewriter_speed: AtomicU64,
+    paste_cancellation: Mutex<Weak<paste::Cancellation>>,
 }
 
 impl Shared {
-    fn typewriter_speed(&self) -> Option<u8> {
+    fn coding_agent_waiting_for_decision(&self) -> bool {
+        self.frame
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .coding_agent_waiting_for_decision()
+    }
+
+    fn typewriter_speed(&self) -> Option<Speed> {
         let speed = self.typewriter_speed.load(Ordering::Relaxed);
-        (speed != 0).then_some(speed)
+        Speed::try_from(f64::from_bits(speed)).ok()
     }
 
     fn report_bells(&self, count: u32) {
@@ -209,6 +308,31 @@ pub struct Session {
     backend: Backend,
     redraw: Receiver<()>,
     done: Receiver<()>,
+}
+
+pub(crate) struct StreamLiveness(Weak<Shared>);
+
+impl StreamLiveness {
+    pub(crate) fn running(&self) -> bool {
+        self.0.upgrade().is_some_and(|shared| {
+            let frame = shared
+                .frame
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            frame.status == Status::Running && !frame.password_prompt
+        })
+    }
+
+    pub(crate) fn shell_activity(&self) -> Option<ShellActivity> {
+        let shared = self.0.upgrade()?;
+        let activity = shared
+            .shell_activity
+            .as_ref()?
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .snapshot();
+        Some(activity)
+    }
 }
 
 /// An actor-stamped journal attachment. It can be detached after its pane leaves the workspace.
@@ -245,13 +369,19 @@ enum Backend {
         actor: thread::Thread,
         next_search: AtomicU64,
         sftp: Option<crate::ssh_connection::SftpOpener>,
+        exec: Option<crate::ssh_connection::ExecOpener>,
+        ssh_connected_at: Option<(Instant, SystemTime)>,
     },
     Ibm(Sender<IbmInput>),
     Offline,
 }
 
 enum StreamSource {
-    Pty(LaunchOptions),
+    Pty {
+        options: LaunchOptions,
+        initial_grid: GridSize,
+    },
+    ClosedLocal(String),
     Ssh(
         Option<crate::ssh_connection::Connected>,
         Option<Box<crate::terminal_logging::Prepared>>,
@@ -259,20 +389,35 @@ enum StreamSource {
     Serial {
         connection: Arc<SerialConnection>,
         connect: bool,
+        encoding: TextEncoding,
     },
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StreamOptions {
+    pub(crate) strict_escapes: Option<bool>,
+    pub(crate) encoding: Option<TextEncoding>,
+    pub(crate) scrollback: ScrollbackConfig,
+}
+
 enum StreamInput {
+    PacedPaste {
+        bytes: Vec<u8>,
+        clear_typeahead: bool,
+        pacing: paste::Pacing,
+    },
     Raw {
         bytes: Vec<u8>,
         clear_typeahead: bool,
         mirrored: bool,
     },
+    Guarded(GuardedInput, WriteReply),
     Protocol(Vec<u8>, bool),
     Keyboard {
         bytes: Vec<u8>,
         enter: bool,
         generation: Option<u64>,
+        physical: bool,
     },
     User {
         bytes: Vec<u8>,
@@ -281,6 +426,44 @@ enum StreamInput {
         mirrored: bool,
     },
     Break,
+}
+
+enum GuardedInput {
+    AiCode {
+        code: zeroize::Zeroizing<String>,
+        run_at: Option<CodePrompt>,
+    },
+    CodingAgent(ai_code_guard::InputRequest),
+    Mcp(McpInput),
+    AgentTakeover(agent_takeover::Request),
+}
+
+enum WriteReply {
+    AiCode(Sender<TerminalCommandResult>),
+    CodingAgent(Sender<Result<usize, &'static str>>),
+    Mcp(Sender<Result<usize, &'static str>>, McpGuard),
+    AgentTakeover(
+        Sender<Result<usize, &'static str>>,
+        crate::terminal_agent::Cancel,
+    ),
+}
+
+struct ApprovedInput {
+    bytes: zeroize::Zeroizing<Vec<u8>>,
+    output: Option<Instant>,
+}
+
+impl WriteReply {
+    fn finish(self, result: Result<usize, &'static str>) {
+        match self {
+            Self::AiCode(reply) => {
+                let _ = reply.try_send(TerminalCommandResult::AiCodeWritten(result.map(|_| ())));
+            }
+            Self::CodingAgent(reply) | Self::Mcp(reply, _) | Self::AgentTakeover(reply, _) => {
+                let _ = reply.try_send(result);
+            }
+        }
+    }
 }
 
 enum StreamTransport {
@@ -304,6 +487,8 @@ pub enum InputError {
 
 enum Event {
     ViewChanged,
+    ScrollbackChanged,
+    CodingAgentPoll,
     Clipboard,
     Output(Vec<u8>, Instant),
     KeyboardInput {
@@ -312,7 +497,10 @@ enum Event {
         sent_at: Instant,
         wall_time: Option<SystemTime>,
         generation: Option<u64>,
+        journal: Option<Sender<Option<journal::Permit>>>,
     },
+    JournalInput(journal::Permit, zeroize::Zeroizing<Vec<u8>>),
+    JournalInputLost(journal::Permit),
     CommandEnter(SystemTime, Instant),
     CommandTimestampQuiet,
     UntrackedShellInput {
@@ -325,6 +513,7 @@ enum Event {
         kind: Hp2392Input,
         record_enter: bool,
         mirrored: bool,
+        paced_reply: Option<Sender<Option<Vec<u8>>>>,
     },
     Recording(recording::Command),
     Journal(journal::Command),
@@ -336,10 +525,17 @@ enum Event {
     DisconnectSerial(Sender<()>),
     Search(SearchRequest),
     ControlRead(ControlRead),
+    McpPreflight(McpGuard, mcp::Check),
     TerminalCommand(TerminalCommand, Sender<TerminalCommandResult>),
+    AuthorizeInput {
+        input: GuardedInput,
+        reply: Sender<Result<ApprovedInput, &'static str>>,
+    },
     LocalShellDirectory(Sender<io::Result<PathBuf>>),
-    CaptureReconnectHistory(Sender<ReconnectHistory>),
-    PrependReconnectHistory(Box<ReconnectHistory>, Sender<()>),
+    #[cfg(windows)]
+    WindowsTerminalFile(windows_file::Request, Sender<io::Result<PathBuf>>),
+    CaptureReconnectHistory(Sender<inline_history::Reconnect>),
+    PrependReconnectHistory(Box<inline_history::Reconnect>, Sender<()>),
     RevealSearch {
         revision: u64,
         row: usize,
@@ -352,6 +548,11 @@ pub(crate) enum TerminalCommand {
     ClearBuffer,
     SelectLastOutput,
     CopyLastOutput,
+    AiRecentOutput,
+    WriteAiCode {
+        code: zeroize::Zeroizing<String>,
+        run_at: Option<CodePrompt>,
+    },
     CopySelection {
         revision: u64,
         range: LastOutputRange,
@@ -372,6 +573,7 @@ pub(crate) enum TerminalCommandResult {
     },
     SelectionChanged,
     OutputTooLarge,
+    AiCodeWritten(Result<(), &'static str>),
 }
 
 impl std::fmt::Debug for TerminalCommandResult {
@@ -390,6 +592,10 @@ impl std::fmt::Debug for TerminalCommandResult {
                 .finish_non_exhaustive(),
             Self::SelectionChanged => formatter.write_str("SelectionChanged"),
             Self::OutputTooLarge => formatter.write_str("OutputTooLarge"),
+            Self::AiCodeWritten(result) => formatter
+                .debug_tuple("AiCodeWritten")
+                .field(result)
+                .finish(),
         }
     }
 }
@@ -399,6 +605,7 @@ struct ControlRead {
     mode: ReadMode,
     lines: usize,
     reply: Reply,
+    filter: Option<mcp::ReadFilter>,
 }
 
 impl ControlRead {
@@ -406,16 +613,32 @@ impl ControlRead {
         if !self.reply.active() {
             return;
         }
-        let Some(screen) =
-            control_screen(self.pane_id, self.mode, self.lines, live, terminal, || {
-                self.reply.active()
-            })
-        else {
+        if self.filter.is_some() && terminal.is_some_and(Terminal::cursor_line_is_password_prompt) {
+            self.reply.send(Err(ControlFault::new(
+                ControlError::Busy,
+                "The pane is waiting for a password",
+            )));
+            return;
+        }
+        let Some((screen, wraps, starts_with_continuation)) = control_screen_rows(
+            self.pane_id,
+            self.mode,
+            self.lines,
+            live,
+            terminal,
+            self.filter.is_some(),
+            || self.reply.active(),
+        ) else {
             return;
         };
-        self.reply.send(serde_json::to_value(screen).map_err(|_| {
-            ControlFault::new(ControlError::Internal, "Could not encode terminal screen")
-        }));
+        let result = if let Some(filter) = self.filter {
+            filter(screen, wraps, starts_with_continuation)
+        } else {
+            serde_json::to_value(screen).map_err(|_| {
+                ControlFault::new(ControlError::Internal, "Could not encode terminal screen")
+            })
+        };
+        self.reply.send(result);
     }
 }
 
@@ -427,6 +650,7 @@ struct WorkerEvents {
     recording: Arc<recording::Control>,
     output_activity: Arc<activity::Clock>,
     observe_shell: bool,
+    journal_input: Arc<AtomicBool>,
 }
 
 impl WorkerEvents {
@@ -453,6 +677,37 @@ impl WorkerEvents {
             self.actor.unpark();
         }
         sent
+    }
+
+    fn authorize_input(&self, input: GuardedInput) -> Result<ApprovedInput, &'static str> {
+        let (reply, receive) = bounded(1);
+        if !self.send(Event::AuthorizeInput { input, reply }) {
+            return Err("The terminal pane disconnected.");
+        }
+        // The terminal actor closes input before joining the writer.
+        match block_on(select(pin!(self.input.closed()), pin!(receive.recv()))) {
+            Either::Right((Ok(result), _)) => result,
+            _ => Err("The terminal pane disconnected."),
+        }
+    }
+
+    fn paced_hp_input(&self, line: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let (reply, receive) = bounded(1);
+        // Decide on the actor where the current HP block-mode state is known.
+        // The writer is busy with this paste, so send the result back directly.
+        if !self.send(Event::HpUserInput {
+            bytes: line.to_vec(),
+            kind: Hp2392Input::Text,
+            record_enter: false,
+            mirrored: false,
+            paced_reply: Some(reply),
+        }) {
+            return Err(io::ErrorKind::BrokenPipe.into());
+        }
+        match block_on(select(pin!(self.input.closed()), pin!(receive.recv()))) {
+            Either::Right((Ok(result), _)) => Ok(result),
+            _ => Err(io::ErrorKind::BrokenPipe.into()),
+        }
     }
 
     fn recording_activity(&self, generation: u64) {
@@ -484,6 +739,7 @@ struct SearchState {
 
 struct EmulationState {
     search: SearchState,
+    inline: inline_history::History,
     recording: recording::Actor,
     logfile: Option<crate::terminal_logging::Capture>,
     journal: journal::Actor,
@@ -561,7 +817,7 @@ impl Session {
             options,
             prompt_navigation_enabled,
             appearance,
-            false,
+            StreamOptions::default(),
         )
     }
 
@@ -571,15 +827,18 @@ impl Session {
         options: LaunchOptions,
         prompt_navigation_enabled: bool,
         appearance: impl Into<Appearance>,
-        strict_escapes: bool,
+        stream: StreamOptions,
     ) -> io::Result<Self> {
         Self::start_stream(
-            StreamSource::Pty(options),
+            StreamSource::Pty {
+                options,
+                initial_grid: grid,
+            },
             grid,
             profile,
             prompt_navigation_enabled,
             appearance.into(),
-            strict_escapes,
+            stream,
         )
     }
 
@@ -597,7 +856,7 @@ impl Session {
             prompt_navigation_enabled,
             appearance,
             None,
-            false,
+            StreamOptions::default(),
         )
     }
 
@@ -608,7 +867,7 @@ impl Session {
         prompt_navigation_enabled: bool,
         appearance: impl Into<Appearance>,
         logging: Option<Box<crate::terminal_logging::Prepared>>,
-        strict_escapes: bool,
+        stream: StreamOptions,
     ) -> io::Result<Self> {
         Self::start_stream(
             StreamSource::Ssh(connected, logging),
@@ -616,7 +875,23 @@ impl Session {
             profile,
             prompt_navigation_enabled,
             appearance.into(),
-            strict_escapes,
+            stream,
+        )
+    }
+
+    pub(crate) fn closed_local(
+        grid: GridSize,
+        profile: TerminalProfile,
+        appearance: Appearance,
+        error: String,
+    ) -> io::Result<Self> {
+        Self::start_stream(
+            StreamSource::ClosedLocal(error),
+            grid,
+            profile,
+            false,
+            appearance,
+            StreamOptions::default(),
         )
     }
 
@@ -626,31 +901,48 @@ impl Session {
         profile: TerminalProfile,
         prompt_navigation_enabled: bool,
         appearance: Appearance,
-        strict_escapes: bool,
+        stream: StreamOptions,
     ) -> io::Result<Self> {
         let (event_send, event_receive) = bounded(32);
         let (input_send, input_receive) = bounded(WRITE_QUEUE_SIZE);
         let (redraw_send, redraw_receive) = bounded(1);
         let (done_send, done_receive) = bounded(1);
-        let sftp = match &source {
-            StreamSource::Ssh(Some(ssh), _) => ssh.sftp_opener(),
-            _ => None,
+        let (sftp, exec, ssh_connected_at) = match &source {
+            StreamSource::Ssh(Some(ssh), _) => (
+                ssh.sftp_opener(),
+                ssh.exec_opener(),
+                Some((Instant::now(), SystemTime::now())),
+            ),
+            _ => (None, None, None),
         };
-        let observe_shell = matches!(source, StreamSource::Ssh(Some(_), _));
-        let mut terminal = Terminal::with_profile(grid.columns, grid.rows, profile);
+        let observe_shell = matches!(
+            source,
+            StreamSource::Pty { .. } | StreamSource::Ssh(Some(_), _)
+        );
+        let encoding = match &source {
+            StreamSource::Serial { encoding, .. } => Some(*encoding),
+            _ => stream.encoding,
+        };
+        let mut terminal = match encoding {
+            Some(encoding) => {
+                Terminal::with_profile_and_encoding(grid.columns, grid.rows, profile, encoding)
+            }
+            None => Terminal::with_profile(grid.columns, grid.rows, profile),
+        };
         terminal.set_prompt_navigation_enabled(prompt_navigation_enabled);
+        terminal.set_scrollback_config(stream.scrollback);
         set_terminal_appearance(&mut terminal, appearance);
         terminal.set_clipboard_protocol_enabled(true);
         terminal.set_clipboard_write_limit(MAX_CLIPBOARD_TEXT_BYTES);
-        let strict = strict_escapes
-            || match &source {
-                StreamSource::Pty(options) => options.sandbox.is_some(),
-                StreamSource::Ssh(Some(ssh), _) => ssh.sandbox_backend().is_some(),
-                _ => false,
-            };
+        let strict = stream.strict_escapes.unwrap_or_else(|| match &source {
+            StreamSource::Pty { options, .. } => options.sandbox.is_some(),
+            StreamSource::Ssh(Some(ssh), _) => ssh.sandbox_backend().is_some(),
+            _ => false,
+        });
         terminal.set_strict_escape_filter(strict);
         let (serial, status) = match &source {
-            StreamSource::Pty(_) => (None, Status::Starting),
+            StreamSource::Pty { .. } => (None, Status::Starting),
+            StreamSource::ClosedLocal(error) => (None, Status::Error(error.clone())),
             StreamSource::Ssh(connected, _) => (
                 None,
                 if connected.is_some() {
@@ -662,6 +954,7 @@ impl Session {
             StreamSource::Serial {
                 connection,
                 connect,
+                ..
             } => (
                 Some(Arc::clone(connection)),
                 if *connect {
@@ -677,28 +970,35 @@ impl Session {
             view: Mutex::new(ViewRequest {
                 grid,
                 scroll_anchor: None,
+                inline_anchor: None,
                 typeahead: TypeAheadRequest::default(),
                 prompt_navigation_enabled,
                 prompt_navigator: PromptNavigator::default(),
                 appearance,
+                scrollback: stream.scrollback,
+                recovery_output_rows: 0,
             }),
+            inline_updates: Mutex::default(),
             frame: Mutex::new(Arc::new(frame)),
             logfile_warning: crate::terminal_logging::Warning::new(redraw_send.clone()),
             redraw: redraw_send,
             bell_events: AtomicU64::new(0),
+            program_notifications: Mutex::default(),
             output_activity: Arc::default(),
             local_shell_pid: AtomicU32::new(0),
             sandbox_backend: Mutex::default(),
             serial,
             serial_notice: Mutex::new(None),
             shell_activity: observe_shell.then(Mutex::default),
+            coding_agent_detection: AtomicU64::new(0),
             clipboard: Mutex::new(clipboard::ClipboardBridge::with_strict(strict)),
             recording: Arc::default(),
             journal_available: AtomicBool::new(false),
+            journal_input: Arc::new(AtomicBool::new(false)),
             journal_generation: AtomicU64::new(0),
             journal_secrets: Mutex::new(None),
-            scrollback_compression_enabled: AtomicBool::new(true),
-            typewriter_speed: AtomicU8::new(0),
+            typewriter_speed: AtomicU64::new(0),
+            paste_cancellation: Mutex::default(),
         });
         let worker_shared = Arc::clone(&shared);
         let worker_events = event_send.clone();
@@ -730,7 +1030,10 @@ impl Session {
                         screen: last.screen.clone(),
                         status: Status::Error(error.to_string()),
                         scroll_offset: last.scroll_offset,
+                        inline: last.inline.clone(),
                         scrollback: last.scrollback.clone(),
+                        output_snapshot: last.output_snapshot.clone(),
+                        recovery_output: last.recovery_output.clone(),
                         application_cursor_keys: last.application_cursor_keys,
                         bracketed_paste: last.bracketed_paste,
                         password_prompt: false,
@@ -743,6 +1046,8 @@ impl Session {
                         has_prompt_marks: last.has_prompt_marks,
                         has_finished_command: last.has_finished_command,
                         shell_activity: last.shell_activity.clone(),
+                        coding_agent: None,
+                        coding_agent_details: None,
                         search_revision: last.search_revision,
                         search_result: last.search_result.clone(),
                     });
@@ -758,6 +1063,8 @@ impl Session {
                 actor: actor.thread().clone(),
                 next_search: AtomicU64::new(1),
                 sftp,
+                exec,
+                ssh_connected_at,
             },
             redraw: redraw_receive,
             done: done_receive,
@@ -774,12 +1081,100 @@ impl Session {
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn set_mirror_test_frame(&self, state: Option<CodingAgentState>) {
+        let mut frame = self.shared.frame.lock().unwrap();
+        let frame = Arc::make_mut(&mut frame);
+        frame.status = Status::Running;
+        frame.ibm = None;
+        frame.coding_agent = state.map(|state| CodingAgentStatus {
+            id: "gemini-cli",
+            name: "Gemini CLI",
+            state,
+            since: Instant::now(),
+            instance: 1,
+        });
+    }
+
+    pub(crate) fn stream_liveness(&self) -> Option<StreamLiveness> {
+        matches!(self.backend, Backend::Stream { .. })
+            .then(|| StreamLiveness(Arc::downgrade(&self.shared)))
+    }
+
+    pub(crate) fn agent_shortcut_prompt(&self, frame: &Frame) -> Option<ShortcutPrompt> {
+        if frame.status != Status::Running || frame.screen.alternate_screen {
+            return None;
+        }
+        self.shared
+            .shell_activity
+            .as_ref()?
+            .lock()
+            .ok()?
+            .agent_shortcut_prompt()
+            .filter(|prompt| prompt.0 == frame.shell_activity.prompt)
+    }
+
+    pub(crate) fn replay_agent_shortcut(
+        &self,
+        prompt: ShortcutPrompt,
+        bytes: Vec<u8>,
+    ) -> Result<(), InputError> {
+        if bytes.len() > MAX_INPUT_BYTES {
+            return Err(InputError::TooLarge);
+        }
+        let Backend::Stream { input, .. } = &self.backend else {
+            return Err(InputError::Closed);
+        };
+        let request = self.typeahead_request();
+        let mut activity = self
+            .shared
+            .shell_activity
+            .as_ref()
+            .ok_or(InputError::Closed)?
+            .lock()
+            .map_err(|_| InputError::Closed)?;
+        if activity.agent_shortcut_prompt() != Some(prompt) {
+            return Err(InputError::Closed);
+        }
+        // The actor cannot replace the prompt between validation and enqueue.
+        send_input(
+            input,
+            StreamInput::Keyboard {
+                bytes,
+                enter: false,
+                generation: request.enabled.then_some(request.generation),
+                physical: true,
+            },
+        )?;
+        activity.note_code_input();
+        Ok(())
+    }
+
     pub(crate) fn local_shell_pid(&self) -> Option<u32> {
         let Backend::Stream { events, .. } = &self.backend else {
             return None;
         };
         let pid = self.shared.local_shell_pid.load(Ordering::Acquire);
         (pid != 0 && !events.is_closed() && self.frame().status == Status::Running).then_some(pid)
+    }
+
+    pub(crate) fn set_coding_agent_detection(&self, enabled: bool) {
+        if self
+            .shared
+            .coding_agent_detection
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                ((revision & 1 != 0) != enabled).then_some(revision.wrapping_add(1))
+            })
+            .is_ok()
+            && let Backend::Stream { actor, .. } = &self.backend
+        {
+            actor.unpark();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn coding_agent_detection_requested(&self) -> bool {
+        self.shared.coding_agent_detection.load(Ordering::Acquire) & 1 != 0
     }
 
     pub(crate) fn local_shell_directory(
@@ -806,6 +1201,30 @@ impl Session {
         lines: usize,
         reply: Reply,
     ) -> Result<(), ControlFault> {
+        self.control_read_with(pane_id, mode, lines, reply, None)
+    }
+
+    pub(crate) fn control_read_masked(
+        &self,
+        pane_id: String,
+        mode: ReadMode,
+        lines: usize,
+        reply: Reply,
+        filter: impl FnOnce(ControlScreen, Vec<bool>, bool) -> Result<serde_json::Value, ControlFault>
+        + Send
+        + 'static,
+    ) -> Result<(), ControlFault> {
+        self.control_read_with(pane_id, mode, lines, reply, Some(Box::new(filter)))
+    }
+
+    fn control_read_with(
+        &self,
+        pane_id: String,
+        mode: ReadMode,
+        lines: usize,
+        reply: Reply,
+        filter: Option<mcp::ReadFilter>,
+    ) -> Result<(), ControlFault> {
         if !reply.active() {
             return Ok(());
         }
@@ -814,6 +1233,7 @@ impl Session {
             mode,
             lines,
             reply,
+            filter,
         };
         if let Backend::Stream { events, actor, .. } = &self.backend {
             events
@@ -854,8 +1274,46 @@ impl Session {
             .cloned()
     }
 
+    pub(crate) fn exec_opener(&self) -> Option<crate::ssh_connection::ExecOpener> {
+        let Backend::Stream { exec, events, .. } = &self.backend else {
+            return None;
+        };
+        exec.as_ref()
+            .filter(|opener| !events.is_closed() && !opener.is_closed())
+            .cloned()
+    }
+
+    pub(crate) fn ssh_connected_at(&self) -> Option<(Instant, SystemTime)> {
+        let Backend::Stream {
+            exec: Some(exec),
+            events,
+            ssh_connected_at,
+            ..
+        } = &self.backend
+        else {
+            return None;
+        };
+        if events.is_closed() || exec.is_closed() {
+            return None;
+        }
+        *ssh_connected_at
+    }
+
     pub fn take_bell_events(&self) -> u64 {
         self.shared.bell_events.swap(0, Ordering::Relaxed)
+    }
+
+    pub(crate) fn last_mirrored_input(&self) -> Option<Instant> {
+        self.shared.output_activity.last_mirrored_input()
+    }
+
+    pub(crate) fn take_program_notifications(&self) -> Vec<kortty_terminal::ProgramNotification> {
+        self.shared
+            .program_notifications
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .drain(..)
+            .collect()
     }
 
     pub fn recording_status(&self) -> RecordingStatus {
@@ -867,6 +1325,42 @@ impl Session {
             return RecordingStatus::Unavailable;
         }
         status
+    }
+
+    pub(crate) fn can_record_in_tab(&self) -> bool {
+        matches!(self.backend, Backend::Stream { .. } | Backend::Ibm(_))
+            && self.frame().status == Status::Running
+    }
+
+    pub(crate) fn attach_tab_recording(&self, id: SessionId, recording: &TabRecording) {
+        let pane = recording.pane(id);
+        if let Backend::Stream { events, actor, .. } = &self.backend {
+            self.shared.recording.set_tab(Some(pane));
+            let _ = events.try_send(Event::ViewChanged);
+            actor.unpark();
+        } else if matches!(self.backend, Backend::Ibm(_)) {
+            let frame = self
+                .shared
+                .frame
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            self.shared.recording.set_tab(Some(pane.clone()));
+            if frame.status == Status::Running {
+                let view = requested_view(&self.shared);
+                pane.frame(frame.screen.clone(), view.grid, view.appearance);
+            }
+        }
+    }
+
+    pub(crate) fn detach_tab_recording(&self, recording: &TabRecording) {
+        if self
+            .shared
+            .recording
+            .tab_pane()
+            .is_some_and(|pane| pane.belongs_to(recording))
+        {
+            self.shared.recording.set_tab(None);
+        }
     }
 
     pub(crate) fn logfile_notice(&self) -> Option<Arc<str>> {
@@ -908,6 +1402,21 @@ impl Session {
         self.shared.journal_secrets.lock().ok()?.clone()
     }
 
+    pub(crate) fn journal_note_authority(&self) -> Option<impl Fn() -> bool + use<>> {
+        let secrets = self.journal_redaction_secrets()?;
+        let shared = Arc::downgrade(&self.shared);
+        Some(move || {
+            shared.upgrade().is_some_and(|shared| {
+                shared.journal_available.load(Ordering::Acquire)
+                    && shared.journal_secrets.lock().is_ok_and(|current| {
+                        current
+                            .as_ref()
+                            .is_some_and(|current| secrets.matches(current))
+                    })
+            })
+        })
+    }
+
     pub(crate) fn journal_screenshot_allowed(
         &self,
         policy: &crate::terminal_logging::Policy,
@@ -924,15 +1433,16 @@ impl Session {
             return false;
         }
         frame.status == Status::Running
-            && frame.scroll_offset == 0
+            && frame.at_live_viewport()
             && !frame.screen.alternate_screen
     }
 
-    pub(crate) fn attach_journal(
+    pub(crate) fn attach_journal_configured(
         &self,
         sink: crate::session_journal::Sink,
         policy: crate::terminal_logging::Policy,
         seed: bool,
+        capture_input: bool,
     ) -> Result<(JournalAttachment, Receiver<io::Result<()>>), InputError> {
         let Backend::Stream { events, actor, .. } = &self.backend else {
             return Err(InputError::Closed);
@@ -951,6 +1461,7 @@ impl Session {
                 sink,
                 policy,
                 seed,
+                capture_input,
                 reply,
             }))
             .map_err(|error| match error {
@@ -1015,6 +1526,33 @@ impl Session {
         Ok(receive)
     }
 
+    pub(crate) fn send_coding_agent_input(
+        &self,
+        expected: CodingAgentStatus,
+        expected_revision: u64,
+        input: CodingAgentInput,
+    ) -> Result<Receiver<Result<usize, &'static str>>, InputError> {
+        let Backend::Stream { input: queue, .. } = &self.backend else {
+            return Err(InputError::Closed);
+        };
+        if input.exceeds_limit() {
+            return Err(InputError::TooLarge);
+        }
+        let (reply, receive) = bounded(1);
+        send_input(
+            queue,
+            StreamInput::Guarded(
+                GuardedInput::CodingAgent(ai_code_guard::InputRequest {
+                    expected,
+                    expected_revision,
+                    input,
+                }),
+                WriteReply::CodingAgent(reply),
+            ),
+        )?;
+        Ok(receive)
+    }
+
     /// Queues a literal search and returns its ticket. Results arrive with a session frame.
     pub fn search(&self, query: &str, ignore_case: bool) -> Result<u64, SearchError> {
         let Backend::Stream { next_search, .. } = &self.backend else {
@@ -1066,6 +1604,19 @@ impl Session {
     }
 
     pub fn send_keyboard(&self, bytes: Vec<u8>, enter: bool) -> Result<(), InputError> {
+        self.send_keyboard_from(bytes, enter, true)
+    }
+
+    pub(crate) fn journal_input_enabled(&self) -> bool {
+        self.shared.journal_input.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn send_keyboard_from(
+        &self,
+        bytes: Vec<u8>,
+        enter: bool,
+        physical: bool,
+    ) -> Result<(), InputError> {
         if enter
             && (self.shared.serial.is_some()
                 || self.frame().screen.profile == TerminalProfile::Hp2392)
@@ -1082,6 +1633,7 @@ impl Session {
                 bytes,
                 enter,
                 generation: request.enabled.then_some(request.generation),
+                physical,
             })
         } else {
             self.send_user_input(bytes, enter)
@@ -1100,11 +1652,11 @@ impl Session {
         });
     }
 
-    pub(crate) fn set_typewriter_speed(&self, speed: Option<u8>) {
+    pub(crate) fn set_typewriter_speed(&self, speed: Option<Speed>) {
         let Backend::Stream { events, actor, .. } = &self.backend else {
             return;
         };
-        let speed = speed.map_or(0, |speed| speed.clamp(1, 99));
+        let speed = speed.map_or(0, |speed| speed.multiplier().to_bits());
         if self.shared.typewriter_speed.swap(speed, Ordering::Relaxed) != speed {
             let _ = events.try_send(Event::ViewChanged);
             actor.unpark();
@@ -1174,6 +1726,7 @@ impl Session {
                 bytes,
                 enter: true,
                 generation: None,
+                physical: true,
             })
         }
     }
@@ -1185,6 +1738,9 @@ impl Session {
         record_enter: bool,
         mirrored: bool,
     ) -> Result<(), InputError> {
+        if self.is_pacing_paste() {
+            return Err(InputError::Busy);
+        }
         if bytes.len() > MAX_INPUT_BYTES {
             return Err(InputError::TooLarge);
         }
@@ -1207,6 +1763,7 @@ impl Session {
                 kind,
                 record_enter,
                 mirrored,
+                paced_reply: None,
             },
         )?;
         actor.unpark();
@@ -1234,6 +1791,13 @@ impl Session {
     }
 
     fn send_stream(&self, command: StreamInput) -> Result<(), InputError> {
+        if !matches!(
+            command,
+            StreamInput::PacedPaste { .. } | StreamInput::Protocol(..)
+        ) && self.is_pacing_paste()
+        {
+            return Err(InputError::Busy);
+        }
         if matches!(&command,
             StreamInput::Raw { bytes, .. } | StreamInput::Protocol(bytes, _)
                 | StreamInput::Keyboard { bytes, .. } | StreamInput::User { bytes, .. }
@@ -1247,6 +1811,14 @@ impl Session {
         let Backend::Stream { input, .. } = &self.backend else {
             return Err(InputError::Closed);
         };
+        if !matches!(command, StreamInput::Protocol(..) | StreamInput::Break)
+            && let Some(activity) = &self.shared.shell_activity
+        {
+            activity
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .note_code_input();
+        }
         send_input(input, command)
     }
 
@@ -1269,6 +1841,22 @@ impl Session {
         if frame.screen.alternate_screen {
             return;
         }
+        if let Some(presentation) = &frame.inline {
+            self.update_view(|view| {
+                let current = if view.inline_anchor.is_some() {
+                    presentation.offset_of(view.inline_anchor.as_ref())
+                } else if view.scroll_anchor.is_some() {
+                    presentation.offset()
+                } else {
+                    0
+                };
+                let offset = current
+                    .saturating_add_signed(lines as isize)
+                    .min(presentation.history());
+                view.set_inline_anchor(presentation.anchor(offset));
+            });
+            return;
+        }
         let Some(coordinates) = &frame.scrollback else {
             return;
         };
@@ -1285,6 +1873,27 @@ impl Session {
         self.update_view(|view| view.set_scroll_anchor(anchor));
     }
 
+    pub(crate) fn scroll_inline_to(&self, anchor: Option<inline_history::Anchor>) {
+        self.update_view(|view| view.set_inline_anchor(anchor));
+    }
+
+    pub(crate) fn publish_agent_history(&self, update: inline_history::Update) {
+        if let Backend::Stream { events, actor, .. } = &self.backend
+            && !events.is_closed()
+        {
+            inline_history::queue(
+                &mut self
+                    .shared
+                    .inline_updates
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()),
+                update,
+            );
+            let _ = events.try_send(Event::ViewChanged);
+            actor.unpark();
+        }
+    }
+
     pub fn follow_output(&self) {
         if !self.frame().screen.alternate_screen {
             self.update_view(|view| view.set_scroll_anchor(None));
@@ -1298,29 +1907,21 @@ impl Session {
         });
     }
 
-    pub(crate) fn set_scrollback_compression_enabled(&self, enabled: bool) {
-        let Backend::Stream { actor, .. } = &self.backend else {
-            return;
-        };
-        if self
-            .shared
-            .scrollback_compression_enabled
-            .swap(enabled, Ordering::Relaxed)
-            != enabled
-        {
-            actor.unpark();
-        }
+    pub(crate) fn set_scrollback_config(&self, config: ScrollbackConfig) {
+        self.update_view(|view| view.scrollback = config.bounded());
     }
 
     #[cfg(test)]
-    pub(crate) fn scrollback_compression_requested(&self) -> bool {
-        self.shared
-            .scrollback_compression_enabled
-            .load(Ordering::Relaxed)
+    pub(crate) fn scrollback_config_requested(&self) -> ScrollbackConfig {
+        requested_scrollback(&self.shared)
     }
 
     pub(crate) fn set_terminal_appearance(&self, appearance: impl Into<Appearance>) {
         self.update_view(|view| view.appearance = appearance.into());
+    }
+
+    pub(crate) fn set_recovery_output_rows(&self, rows: u16) {
+        self.update_view(|view| view.recovery_output_rows = rows);
     }
 
     /// Returns whether the prompt shortcut belongs to this pane.
@@ -1338,10 +1939,11 @@ impl Session {
                 let offset = view.prompt_navigator.navigate(
                     prompts,
                     direction,
-                    coordinates.offset(view.scroll_anchor.as_ref()),
+                    coordinates.offset(view.raw_anchor()),
                 );
                 // PromptNavigator's consecutive-jump state belongs to this operation.
                 view.scroll_anchor = coordinates.anchor(offset);
+                view.inline_anchor = None;
                 consumed = true;
             }
         });
@@ -1362,6 +1964,7 @@ impl Session {
                 ..
             } => {
                 input.close();
+                self.cancel_paced_paste();
                 events.close();
                 self.shared.local_shell_pid.store(0, Ordering::Release);
                 actor.unpark();
@@ -1437,7 +2040,10 @@ impl Session {
             .unwrap_or_else(|error| error.into_inner());
         let previous = view.clone();
         update(&mut view);
-        if view.grid != previous.grid || view.scroll_anchor != previous.scroll_anchor {
+        if view.grid != previous.grid
+            || view.scroll_anchor != previous.scroll_anchor
+            || view.inline_anchor != previous.inline_anchor
+        {
             view.typeahead.generation = view.typeahead.generation.wrapping_add(1);
         }
         if *view != previous {
@@ -1463,14 +2069,16 @@ impl Drop for Session {
 impl StreamTransport {
     fn open(
         source: StreamSource,
-        grid: GridSize,
         profile: TerminalProfile,
     ) -> io::Result<(Self, StreamReader, StreamWriter)> {
         match source {
-            StreamSource::Pty(options) => {
+            StreamSource::Pty {
+                options,
+                initial_grid,
+            } => {
                 let mut pty = Pty::spawn_with_options(
-                    grid.columns,
-                    grid.rows,
+                    initial_grid.columns,
+                    initial_grid.rows,
                     profile.term_name(),
                     &options,
                 )?;
@@ -1492,9 +2100,11 @@ impl StreamTransport {
                 Ok((Self::Ssh(ssh), reader, writer))
             }
             StreamSource::Ssh(None, _) => Err(io::Error::other("SSH session is disconnected")),
+            StreamSource::ClosedLocal(error) => Err(io::Error::other(error)),
             StreamSource::Serial {
                 connection,
                 connect: true,
+                ..
             } => {
                 let mut port = connection.open()?;
                 let reader = port
@@ -1567,7 +2177,7 @@ impl Drop for LiveShellPid<'_> {
 fn run_session(
     mut source: StreamSource,
     mut terminal: Terminal,
-    shared: &Shared,
+    shared: &Arc<Shared>,
     event_send: &Sender<Event>,
     events: &Receiver<Event>,
     input_send: &Sender<StreamInput>,
@@ -1576,37 +2186,38 @@ fn run_session(
     if events.is_closed() {
         return Ok(());
     }
-    let mut grid = shared
-        .view
-        .lock()
-        .unwrap_or_else(|error| error.into_inner())
-        .grid;
     let mut state = EmulationState {
         search: SearchState::default(),
+        inline: inline_history::History::default(),
         recording: recording::Actor::new(Arc::clone(&shared.recording), shared.redraw.clone()),
         logfile: None,
         journal: journal::Actor::default(),
         serial_released: None,
     };
-    if matches!(
-        source,
-        StreamSource::Ssh(None, _) | StreamSource::Serial { connect: false, .. }
-    ) {
+    let disconnected = match &source {
+        StreamSource::Ssh(None, _) | StreamSource::Serial { connect: false, .. } => {
+            Some(Status::Disconnected)
+        }
+        StreamSource::ClosedLocal(error) => Some(Status::Error(error.clone())),
+        _ => None,
+    };
+    if let Some(status) = disconnected {
+        let mut grid = requested_view(shared).grid;
         inputs.close();
         resize_terminal(&mut terminal, grid);
         show_ended_session(
             &mut terminal,
             shared,
             events,
-            &Status::Disconnected,
-            &mut state.search,
+            &status,
+            (&mut state.search, &mut state.inline),
             &mut grid,
             None,
         );
         return Ok(());
     }
     let logging = match &mut source {
-        StreamSource::Pty(_) => {
+        StreamSource::Pty { .. } => {
             state.journal.secrets = crate::terminal_logging::Secrets::default().seal().ok();
             None
         }
@@ -1618,10 +2229,12 @@ fn run_session(
         }
         _ => None,
     };
-    let (mut transport, reader, writer) = StreamTransport::open(source, grid, terminal.profile())?;
+    let (mut transport, reader, writer) = StreamTransport::open(source, terminal.profile())?;
     if events.is_closed() {
         return transport.close();
     }
+    // Layout may have measured the pane while its transport was opening.
+    let mut grid = requested_view(shared).grid;
     transport.apply_size(&mut terminal, grid)?;
     if let Some(logging) = logging.filter(|logging| logging.enabled()) {
         match logging.start(shared.logfile_warning.clone()) {
@@ -1644,6 +2257,7 @@ fn run_session(
         recording: Arc::clone(&shared.recording),
         output_activity: Arc::clone(&shared.output_activity),
         observe_shell: shared.shell_activity.is_some(),
+        journal_input: Arc::clone(&shared.journal_input),
     };
     let reader_events = worker_events.clone();
     let read_thread = thread::Builder::new()
@@ -1652,10 +2266,17 @@ fn run_session(
             read_output(reader, &reader_events);
         })?;
     let writer_inputs = inputs.clone();
+    let writer_shared = Arc::clone(shared);
     let write_thread = thread::Builder::new()
         .name("kortty-stream-write".into())
         .spawn(move || {
-            write_input(writer, &writer_inputs, &worker_events, serial);
+            write_input(
+                writer,
+                &writer_inputs,
+                &worker_events,
+                &writer_shared,
+                serial,
+            );
         });
     let published_pid = LiveShellPid(&shared.local_shell_pid);
     if write_thread.is_ok() {
@@ -1676,14 +2297,14 @@ fn run_session(
     }
     let result = match &write_thread {
         Ok(_) => {
-            if terminal.supports_journal_output()
-                && let Some(secrets) = &state.journal.secrets
-            {
+            if let Some(secrets) = &state.journal.secrets {
                 *shared
                     .journal_secrets
                     .lock()
                     .unwrap_or_else(|error| error.into_inner()) = Some(secrets.clone());
-                shared.journal_available.store(true, Ordering::Release);
+                shared
+                    .journal_available
+                    .store(terminal.supports_journal_output(), Ordering::Release);
             }
             emulate(
                 &mut terminal,
@@ -1702,6 +2323,7 @@ fn run_session(
     drop(published_pid);
     inputs.close();
     shared.journal_available.store(false, Ordering::Release);
+    shared.journal_input.store(false, Ordering::Release);
     *shared
         .journal_secrets
         .lock()
@@ -1739,14 +2361,15 @@ fn run_session(
             (Err(error), _) | (_, Err(error)) => Status::Error(error.to_string()),
         };
         // The process has ended, but the pane can still inspect its output.
+        let released = state.serial_released.take();
         show_ended_session(
             &mut terminal,
             shared,
             events,
             &status,
-            &mut state.search,
+            (&mut state.search, &mut state.inline),
             &mut grid,
-            state.serial_released.take(),
+            released,
         );
     }
     events.close();
@@ -1780,6 +2403,7 @@ fn write_input(
     mut writer: impl Write,
     inputs: &Receiver<StreamInput>,
     events: &WorkerEvents,
+    shared: &Shared,
     serial: Option<(Arc<SerialPort>, Arc<SerialConnection>)>,
 ) {
     while !inputs.is_closed() {
@@ -1789,10 +2413,11 @@ fn write_input(
         if inputs.is_closed() {
             break;
         }
-        let recording_generation = if matches!(command, StreamInput::Protocol(..)) {
-            0
+        let (recording_generation, tab_recording) = if matches!(command, StreamInput::Protocol(..))
+        {
+            (0, None)
         } else {
-            events.recording.generation()
+            (events.recording.generation(), events.recording.tab_pane())
         };
         let mirrored = matches!(
             &command,
@@ -1800,31 +2425,74 @@ fn write_input(
                 | StreamInput::User { mirrored: true, .. }
                 | StreamInput::Protocol(_, true)
         );
+        if mirrored && shared.coding_agent_waiting_for_decision() {
+            continue;
+        }
+        let user_input = !matches!(&command, StreamInput::Protocol(..) | StreamInput::Break);
+        let mut write_reply = None;
+        let mut approved = None;
+        let mut journal_receipt = None;
+        let mut journal_enter = false;
+        let mut pacing = None;
         let (bytes, before_write) = match command {
+            StreamInput::PacedPaste {
+                bytes,
+                clear_typeahead,
+                pacing: value,
+            } => {
+                pacing = Some(value);
+                let event = if events.observe_shell {
+                    Some(Event::UntrackedShellInput { clear_typeahead })
+                } else {
+                    clear_typeahead.then_some(Event::TypeAheadClear)
+                };
+                (bytes, event)
+            }
             StreamInput::Protocol(bytes, _) => (bytes, None),
             StreamInput::Raw {
                 bytes,
                 clear_typeahead,
                 ..
-            } => (
-                bytes,
-                if events.observe_shell {
+            } => {
+                let before_write = if events.observe_shell {
                     Some(Event::UntrackedShellInput { clear_typeahead })
                 } else {
                     clear_typeahead.then_some(Event::TypeAheadClear)
-                },
-            ),
+                };
+                (bytes, before_write)
+            }
+            StreamInput::Guarded(input, reply) => match events.authorize_input(input) {
+                Ok(input) => {
+                    write_reply = Some(reply);
+                    approved = Some(input);
+                    (Vec::new(), None)
+                }
+                Err(error) => {
+                    reply.finish(Err(error));
+                    continue;
+                }
+            },
             StreamInput::Keyboard {
                 bytes,
                 enter,
                 generation,
+                physical,
             } => {
+                let journal = if physical && events.journal_input.load(Ordering::Acquire) {
+                    let (reply, receipt) = bounded(1);
+                    journal_receipt = Some(receipt);
+                    journal_enter = enter;
+                    Some(reply)
+                } else {
+                    None
+                };
                 let event = Event::KeyboardInput {
                     bytes: bytes.clone(),
                     enter,
                     sent_at: Instant::now(),
                     wall_time: enter.then(SystemTime::now),
                     generation,
+                    journal,
                 };
                 (bytes, Some(event))
             }
@@ -1871,18 +2539,146 @@ fn write_input(
                 break;
             }
         }
-        if let Err(error) = writer.write_all(&bytes).and_then(|()| writer.flush()) {
+        let bytes = approved
+            .as_ref()
+            .map_or(bytes.as_slice(), |input| input.bytes.as_slice());
+        let permit = journal_receipt.and_then(|receipt| {
+            match block_on(select(pin!(events.input.closed()), pin!(receipt.recv()))) {
+                Either::Right((Ok(permit), _)) => permit,
+                _ => None,
+            }
+        });
+        if inputs.is_closed() {
+            break;
+        }
+        let permit = match permit {
+            Some(mut permit) if events.output_activity.last_output() != permit.output => {
+                permit.confirmation.take();
+                events.send(Event::JournalInputLost(permit));
+                None
+            }
+            permit => permit,
+        };
+        if let Some(input) = &approved
+            && matches!(
+                &write_reply,
+                Some(
+                    WriteReply::CodingAgent(_)
+                        | WriteReply::Mcp(..)
+                        | WriteReply::AgentTakeover(..)
+                )
+            )
+            && events.output_activity.last_output() != input.output
+        {
+            if let Some(reply) = write_reply {
+                reply.finish(Err(
+                    "The agent or terminal screen changed. Choose the action again.",
+                ));
+            }
+            continue;
+        }
+        if let Some(WriteReply::Mcp(_, permit)) = &write_reply
+            && !permit.active()
+        {
+            if let Some(reply) = write_reply {
+                reply.finish(Err("request_cancelled"));
+            }
+            continue;
+        }
+        if let Some(WriteReply::AgentTakeover(_, permit)) = &write_reply
+            && permit.requested()
+        {
+            if let Some(reply) = write_reply {
+                reply.finish(Err(
+                    "The terminal changed before the command could be inserted.",
+                ));
+            }
+            continue;
+        }
+        // Output can change the pane while this write waits for the actor's event queue.
+        if mirrored && shared.coding_agent_waiting_for_decision() {
+            continue;
+        }
+        if user_input && !bytes.is_empty() {
+            events.output_activity.note_input();
+        }
+        let write_result = if let Some(pacing) = pacing {
+            pacing.write(
+                bytes,
+                || inputs.is_closed(),
+                |line| {
+                    if pacing.hp2392
+                        && let Some(response) = events.paced_hp_input(line)?
+                    {
+                        return write_terminal_bytes(&mut writer, &response);
+                    }
+                    if let Some((_, connection)) = &serial {
+                        let (line, echo) = connection.prepare_input(line.to_vec(), false);
+                        if let Some(echo) = echo {
+                            let _ = events.send(Event::Echo(echo));
+                        }
+                        write_terminal_bytes(&mut writer, &line)
+                    } else {
+                        write_terminal_bytes(&mut writer, line)
+                    }
+                },
+            )
+        } else {
+            write_terminal_bytes(&mut writer, bytes)
+        };
+        if let Err(error) = write_result {
+            drop(permit);
+            if let Some(reply) = write_reply {
+                let error = match &reply {
+                    WriteReply::AiCode(_) => "Could not write the code to the terminal pane.",
+                    WriteReply::CodingAgent(_) => "Could not write the input to the coding agent.",
+                    WriteReply::Mcp(..) => "terminal_write_failed",
+                    WriteReply::AgentTakeover(..) => {
+                        "Could not insert the command into the terminal."
+                    }
+                };
+                reply.finish(Err(error));
+            }
             events.send(Event::IoError(error.to_string()));
             inputs.close();
             break;
+        }
+        if let Some(reply) = write_reply {
+            reply.finish(Ok(bytes.len()));
+        }
+        if let Some(mut permit) = permit {
+            if let Some(confirmation) = permit.confirmation.take() {
+                let _ = confirmation.try_send(());
+            } else if !journal_enter {
+                let _ = events.send(Event::JournalInput(
+                    permit,
+                    zeroize::Zeroizing::new(bytes.to_vec()),
+                ));
+            }
         }
         if !bytes.is_empty() {
             if mirrored {
                 events.output_activity.mirrored_write(Instant::now());
             }
             events.recording_activity(recording_generation);
+            if let Some(pane) = tab_recording {
+                pane.activity();
+            }
         }
     }
+    // Drop replies in abandoned inputs so a waiting chat can report closure.
+    inputs.close();
+    while inputs.try_recv().is_ok() {}
+}
+
+fn write_terminal_bytes(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
+    writer.write_all(bytes)?;
+    writer.flush()?;
+    #[cfg(target_os = "macos")]
+    if !bytes.is_empty() {
+        kortty_macos::record_terminal_activity(Instant::now());
+    }
+    Ok(())
 }
 
 fn emulate(
@@ -1896,6 +2692,7 @@ fn emulate(
 ) -> io::Result<Status> {
     let EmulationState {
         search,
+        inline,
         recording,
         logfile,
         journal,
@@ -1904,11 +2701,16 @@ fn emulate(
     apply_view_preferences(terminal, &requested_view(shared));
     publish(shared, make_frame(terminal, Status::Running, 0, search));
     let mut last_frame = Instant::now();
+    let mut applied_output = None;
     let mut status = Status::Running;
     let mut pack_at = None;
     let mut typeahead = TypeAhead::default();
     let mut typeahead_request = TypeAheadRequest::default();
     let mut pacer = (terminal.profile() == TerminalProfile::Xterm).then(typewriter::Pacer::default);
+    let mut coding_agent = match transport {
+        StreamTransport::Pty(pty) => pty.job_process_probe().map(ai_code_guard::Monitor::new),
+        _ => None,
+    };
     while let Some(first) = next_stream_event(
         terminal,
         shared,
@@ -1916,6 +2718,7 @@ fn emulate(
         &mut pack_at,
         typeahead.deadline(),
         pacer.as_mut(),
+        coding_agent.as_ref(),
     ) {
         // Keep the most recent frame without rendering every transport read.
         if let Some(delay) = FRAME_INTERVAL.checked_sub(last_frame.elapsed()) {
@@ -1936,12 +2739,18 @@ fn emulate(
             &mut typeahead,
             &mut typeahead_request,
             &view,
-            terminal.scrollback_offset(view.scroll_anchor.as_ref()),
+            if view.inline_anchor.is_some() {
+                1
+            } else {
+                terminal.scrollback_offset(view.raw_anchor())
+            },
             *grid,
         );
-        let queued = std::iter::from_fn(|| poll_stream_event(shared, events, pacer.as_mut()).ok());
+        let queued =
+            std::iter::from_fn(|| poll_stream_event(shared, events, pacer.as_mut(), true).ok());
         for event in std::iter::once(first).chain(queued).take(32) {
             match event {
+                Event::CodingAgentPoll => continue,
                 Event::Output(bytes, received_at) => {
                     if let Some(capture) = logfile {
                         capture.advance(&bytes);
@@ -1950,19 +2759,40 @@ fn emulate(
                         search.invalidate();
                         screen_changed = true;
                     }
-                    apply_view_preferences(terminal, &requested_view(shared));
+                    let current = requested_view(shared);
+                    if sync_scrollback(terminal, &mut pack_at, current.scrollback) {
+                        search.invalidate();
+                        screen_changed = true;
+                    }
+                    apply_view_preferences(terminal, &current);
                     terminal.advance_timed(&bytes, SystemTime::now(), received_at);
+                    applied_output = Some(received_at);
+                    let shell_events = terminal.take_shell_events();
+                    journal.output(terminal, &shell_events);
                     if let Some(activity) = &shared.shell_activity {
                         activity
                             .lock()
                             .unwrap_or_else(|error| error.into_inner())
                             .output(
                                 !terminal.alternate_screen_active(),
-                                terminal.take_shell_events(),
+                                shell_events,
                                 received_at,
                             );
                     }
                     shared.report_bells(terminal.take_bell_events());
+                    let requests = terminal.take_program_notifications();
+                    if !requests.is_empty() {
+                        let mut pending = shared
+                            .program_notifications
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner());
+                        for request in requests {
+                            if pending.len() == 32 {
+                                pending.pop_front();
+                            }
+                            pending.push_back(request);
+                        }
+                    }
                     let clipboard_replies = clipboard::lock(&shared.clipboard).capture(terminal);
                     if can_predict {
                         typeahead.on_output(terminal, received_at);
@@ -1976,6 +2806,17 @@ fn emulate(
                 }
                 Event::Clipboard => {
                     let applied = clipboard::lock(&shared.clipboard).apply(terminal);
+                    if applied.fallback.is_some() {
+                        journal.suppress_input();
+                    }
+                    if applied.fallback.is_some()
+                        && let Some(activity) = &shared.shell_activity
+                    {
+                        activity
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .note_code_input();
+                    }
                     typeahead.clear();
                     let fallback_sent = applied.fallback.is_none_or(|bytes| {
                         !matches!(
@@ -1999,7 +2840,25 @@ fn emulate(
                     sent_at,
                     wall_time,
                     generation,
+                    journal: journal_reply,
                 } => {
+                    if let Some(reply) = journal_reply {
+                        let prompt = shared
+                            .shell_activity
+                            .as_ref()
+                            .and_then(|state| state.lock().ok()?.journal_prompt());
+                        let permit = journal.permit(
+                            terminal,
+                            prompt,
+                            applied_output,
+                            shared.output_activity.last_output() == applied_output,
+                            &bytes,
+                            enter,
+                        );
+                        let _ = reply.try_send(permit);
+                    } else {
+                        journal.suppress_input();
+                    }
                     if let Some(wall_time) = wall_time {
                         terminal.record_command_enter(wall_time, sent_at);
                     }
@@ -2013,7 +2872,10 @@ fn emulate(
                         typeahead.on_input(terminal, &bytes, sent_at);
                     }
                 }
+                Event::JournalInput(permit, bytes) => journal.written(permit, &bytes),
+                Event::JournalInputLost(permit) => journal.missed_input(permit),
                 Event::UntrackedShellInput { clear_typeahead } => {
+                    journal.suppress_input();
                     if let Some(activity) = &shared.shell_activity {
                         activity
                             .lock()
@@ -2041,14 +2903,25 @@ fn emulate(
                     kind,
                     record_enter,
                     mirrored,
+                    paced_reply,
                 } => {
                     if record_enter {
                         terminal.record_command_enter(SystemTime::now(), Instant::now());
                     }
-                    let sent = if terminal.hp2392_local_input(&bytes, kind) {
+                    let local = terminal.hp2392_local_input(&bytes, kind);
+                    if local {
                         search.invalidate();
                         screen_changed = true;
                         recording.activity(shared.recording.generation(), Instant::now());
+                        if let Some(pane) = shared.recording.tab_pane() {
+                            pane.activity();
+                        }
+                    }
+                    if let Some(reply) = paced_reply {
+                        let _ = reply.try_send(local.then(|| terminal.take_responses()));
+                        continue;
+                    }
+                    let sent = if local {
                         queue_reply(input, terminal.take_responses(), mirrored)
                     } else {
                         let enter = matches!(
@@ -2074,11 +2947,21 @@ fn emulate(
                     let appearance = requested_view(shared).appearance;
                     if screen_changed || recording.appearance_changed(appearance) {
                         recording.frame(terminal, *grid, appearance);
+                        recording.tab_frame(terminal, *grid, appearance, screen_changed);
                         screen_changed = false;
                     }
                     recording.command(command, terminal, *grid, appearance);
                 }
-                Event::Journal(command) => journal.command(terminal, command),
+                Event::Journal(command) => {
+                    let prompt = shared
+                        .shell_activity
+                        .as_ref()
+                        .and_then(|state| state.lock().ok()?.journal_prompt());
+                    journal.command(terminal, command, prompt);
+                    shared
+                        .journal_input
+                        .store(journal.captures_input(), Ordering::Release);
+                }
                 Event::RecordingActivity { generation, at } => recording.activity(generation, at),
                 Event::SerialNotice(notice) => {
                     *shared
@@ -2092,10 +2975,30 @@ fn emulate(
                     break;
                 }
                 Event::ViewChanged => {}
+                Event::ScrollbackChanged => {
+                    search.invalidate();
+                    screen_changed = true;
+                }
                 Event::LocalShellDirectory(reply) => {
                     if let StreamTransport::Pty(pty) = transport {
                         let _ = reply.try_send(pty.shell_directory());
                     }
+                    continue;
+                }
+                #[cfg(windows)]
+                Event::WindowsTerminalFile(request, reply) => {
+                    let result = match transport {
+                        StreamTransport::Pty(pty)
+                            if status == Status::Running
+                                && !terminal.alternate_screen_active()
+                                && !terminal.cursor_line_is_password_prompt()
+                                && shared.output_activity.last_output() == applied_output =>
+                        {
+                            windows_file::resolve(request, pty, terminal, shared)
+                        }
+                        _ => Err(windows_file::unverified()),
+                    };
+                    let _ = reply.try_send(result);
                     continue;
                 }
                 Event::Search(next) => request = Some(next),
@@ -2104,6 +3007,16 @@ fn emulate(
                     continue;
                 }
                 Event::TerminalCommand(command, reply) => {
+                    if let TerminalCommand::WriteAiCode { code, run_at } = command {
+                        if let Err(error) =
+                            queue_ai_code(shared, input, &status, code, run_at, reply.clone())
+                        {
+                            let _ =
+                                reply.try_send(TerminalCommandResult::AiCodeWritten(Err(error)));
+                        }
+                        refresh_frame = true;
+                        continue;
+                    }
                     let result = apply_terminal_command(terminal, shared, search, command);
                     if matches!(result, TerminalCommandResult::Cleared) {
                         typeahead.clear();
@@ -2115,12 +3028,99 @@ fn emulate(
                     }
                     command_replies.push((reply, result));
                 }
+                Event::McpPreflight(guard, reply) => {
+                    let _ = reply.try_send(guard.check(mcp::Live {
+                        terminal,
+                        shared,
+                        status: &status,
+                        transport,
+                        output: applied_output,
+                        revision: search.revision,
+                    }));
+                }
+                Event::AuthorizeInput { input, reply } => {
+                    let run = matches!(
+                        &input,
+                        GuardedInput::AiCode {
+                            run_at: Some(_),
+                            ..
+                        }
+                    ) || matches!(&input, GuardedInput::Mcp(input) if input.submits);
+                    let changes_prompt =
+                        matches!(&input, GuardedInput::Mcp(input) if input.changes_prompt);
+                    let bytes = match input {
+                        GuardedInput::AiCode { code, run_at } => authorize_ai_code(
+                            terminal,
+                            shared,
+                            &status,
+                            &code,
+                            run_at,
+                            applied_output,
+                            |screen, run| match transport {
+                                StreamTransport::Pty(pty) => pty.any_job_process(|image, args| {
+                                    ai_code_guard::process_blocks_action(screen, run, image, args)
+                                }),
+                                _ => false,
+                            },
+                        )
+                        .map(zeroize::Zeroizing::new),
+                        GuardedInput::CodingAgent(request) => ai_code_guard::authorize_agent_input(
+                            terminal,
+                            shared,
+                            &status,
+                            coding_agent.as_mut(),
+                            applied_output,
+                            search.revision,
+                            request,
+                        ),
+                        GuardedInput::Mcp(input) => input
+                            .guard
+                            .check(mcp::Live {
+                                terminal,
+                                shared,
+                                status: &status,
+                                transport,
+                                output: applied_output,
+                                revision: search.revision,
+                            })
+                            .map(|()| input.bytes),
+                        GuardedInput::AgentTakeover(request) => request.authorize(mcp::Live {
+                            terminal,
+                            shared,
+                            status: &status,
+                            transport,
+                            output: applied_output,
+                            revision: search.revision,
+                        }),
+                    };
+                    if bytes.is_ok() {
+                        if changes_prompt && let Some(activity) = &shared.shell_activity {
+                            activity
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .untracked_input();
+                        }
+                        journal.suppress_input();
+                        typeahead.clear();
+                        if run {
+                            terminal.record_command_enter(SystemTime::now(), Instant::now());
+                        }
+                    }
+                    let _ = reply.try_send(bytes.map(|bytes| ApprovedInput {
+                        bytes,
+                        output: applied_output,
+                    }));
+                }
                 Event::CaptureReconnectHistory(reply) => {
-                    let _ = reply.try_send(terminal.reconnect_history());
+                    sync_scrollback(terminal, &mut pack_at, requested_scrollback(shared));
+                    refresh_frame |= inline.apply(terminal, take_inline_updates(shared));
+                    let _ = reply.try_send(inline.capture_reconnect(terminal));
                     continue;
                 }
                 Event::PrependReconnectHistory(history, reply) => {
-                    terminal.prepend_reconnect_history(*history);
+                    sync_scrollback(terminal, &mut pack_at, requested_scrollback(shared));
+                    inline.apply(terminal, take_inline_updates(shared));
+                    inline.prepend_reconnect(terminal, *history);
                     search.invalidate();
                     screen_changed = true;
                     history_replies.push(reply);
@@ -2140,6 +3140,10 @@ fn emulate(
             refresh_frame = true;
         }
         let view = requested_view(shared);
+        if sync_scrollback(terminal, &mut pack_at, view.scrollback) {
+            search.invalidate();
+            screen_changed = true;
+        }
         if status == Status::Running && *grid != view.grid {
             transport.apply_size(terminal, view.grid)?;
             if (grid.columns, grid.rows) != (view.grid.columns, view.grid.rows) {
@@ -2152,6 +3156,7 @@ fn emulate(
         if screen_changed || recording.appearance_changed(view.appearance) {
             recording.frame(terminal, *grid, view.appearance);
         }
+        recording.tab_frame(terminal, *grid, view.appearance, screen_changed);
         if let Some((revision, row)) = reveal {
             search.reveal(shared, revision, row);
         }
@@ -2163,18 +3168,41 @@ fn emulate(
             answer_terminal_commands(command_replies);
             break;
         }
+        if let Some(monitor) = &mut coding_agent {
+            refresh_frame |= monitor.tick(
+                shared.coding_agent_detection.load(Ordering::Acquire),
+                screen_changed,
+                terminal,
+                Instant::now(),
+            );
+        }
+        refresh_frame |= inline.apply(terminal, take_inline_updates(shared));
         if !refresh_frame && !screen_changed {
             answer_control_reads(terminal, None, control_reads);
             continue;
         }
         let view = requested_view(shared);
         apply_view_preferences(terminal, &view);
-        let offset = terminal.scrollback_offset(view.scroll_anchor.as_ref());
+        let mut frame = inline.frame(terminal, status.clone(), &view, search);
+        if view.recovery_output_rows != 0
+            && !frame.screen.alternate_screen
+            && !frame.password_prompt
+        {
+            frame.recovery_output = terminal
+                .recovery_output_snapshot(usize::from(view.recovery_output_rows))
+                .map(Arc::new);
+        }
+        let offset = if frame.at_live_viewport() { 0 } else { 1 };
         let can_predict =
             sync_typeahead(&mut typeahead, &mut typeahead_request, &view, offset, *grid);
         typeahead.expire(Instant::now());
-        let mut frame = make_frame(terminal, status.clone(), offset, search);
-        let live = (frame.scroll_offset == 0).then_some(&frame.screen);
+        if let Some(monitor) = &coding_agent {
+            frame.coding_agent = monitor.status();
+            if !frame.password_prompt {
+                frame.coding_agent_details = monitor.details();
+            }
+        }
+        let live = frame.at_live_viewport().then_some(&frame.screen);
         answer_control_reads(terminal, live, control_reads);
         if can_predict && let Some(overlay) = typeahead.overlay() {
             frame.typeahead = Some(Arc::new(TypeAheadFrame {
@@ -2208,6 +3236,7 @@ fn apply_terminal_command(
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
             view.scroll_anchor = None;
+            view.inline_anchor = None;
             view.prompt_navigator = PromptNavigator::default();
             search.invalidate();
             TerminalCommandResult::Cleared
@@ -2226,6 +3255,13 @@ fn apply_terminal_command(
             LastOutput::Found(range) => copy_terminal_output(terminal, range),
             other => TerminalCommandResult::LastOutput(other),
         },
+        TerminalCommand::AiRecentOutput => match terminal.recent_visible_output() {
+            Ok((text, truncated)) => TerminalCommandResult::Copied { text, truncated },
+            Err(status) => TerminalCommandResult::LastOutput(status),
+        },
+        TerminalCommand::WriteAiCode { .. } => TerminalCommandResult::AiCodeWritten(Err(
+            "This terminal does not accept AI code input.",
+        )),
         TerminalCommand::CopySelection { revision, range } => {
             if revision != search.revision || !requested_view(shared).prompt_navigation_enabled {
                 return TerminalCommandResult::SelectionChanged;
@@ -2233,6 +3269,139 @@ fn apply_terminal_command(
             copy_terminal_output(terminal, range)
         }
     }
+}
+
+fn queue_ai_code(
+    shared: &Shared,
+    input: &Sender<StreamInput>,
+    status: &Status,
+    code: zeroize::Zeroizing<String>,
+    run_at: Option<CodePrompt>,
+    reply: Sender<TerminalCommandResult>,
+) -> Result<(), &'static str> {
+    if *status != Status::Running || shared.serial.is_some() {
+        return Err("The terminal is disconnected or does not accept AI code input.");
+    }
+    if !input.is_empty() {
+        return Err("The terminal pane is busy.");
+    }
+    if let Some(expected) = run_at {
+        let activity = shared
+            .shell_activity
+            .as_ref()
+            .ok_or("Could not verify the terminal input state.")?;
+        let current = activity
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .code_prompt();
+        if current != expected || expected.state == PromptState::Busy {
+            return Err("The terminal input or prompt changed. Review the command again.");
+        }
+    }
+    input
+        .try_send(StreamInput::Guarded(
+            GuardedInput::AiCode { code, run_at },
+            WriteReply::AiCode(reply),
+        ))
+        .map_err(|error| match error {
+            TrySendError::Full(_) => "The terminal input queue is full.",
+            TrySendError::Closed(_) => "The terminal pane disconnected.",
+        })
+}
+
+fn authorize_ai_code(
+    terminal: &Terminal,
+    shared: &Shared,
+    status: &Status,
+    code: &str,
+    run_at: Option<CodePrompt>,
+    applied_output: Option<Instant>,
+    local_process_blocks: impl FnOnce(&ScreenSnapshot, bool) -> bool,
+) -> Result<Vec<u8>, &'static str> {
+    if *status != Status::Running || shared.serial.is_some() {
+        return Err("The terminal is disconnected or does not accept AI code input.");
+    }
+    if terminal.alternate_screen_active()
+        || terminal.cursor_line_is_password_prompt()
+        || shared.typewriter_speed.load(Ordering::Relaxed) != 0
+    {
+        return Err("The terminal pane is busy.");
+    }
+    const OUTPUT_CHANGED: &str = "The terminal output changed. Choose the action again.";
+    if shared.output_activity.last_output() != applied_output {
+        return Err(OUTPUT_CHANGED);
+    }
+    let screen = terminal.snapshot();
+    if ai_code_guard::approval_prompt_visible(&screen) {
+        return Err("The terminal is waiting for a coding-agent approval.");
+    }
+    if run_at.is_some() {
+        if ai_code_guard::coding_agent_visible(&screen) {
+            return Err("A coding agent is using this terminal pane.");
+        }
+        if !valid_ai_run_line(code) {
+            return Err("Run requires one shell line without control characters.");
+        }
+    }
+    if local_process_blocks(&screen, run_at.is_some()) {
+        return Err(if run_at.is_some() {
+            "A coding agent is using this terminal pane."
+        } else {
+            "The terminal is waiting for a coding-agent approval."
+        });
+    }
+    let bracketed = run_at.is_none() && terminal.bracketed_paste();
+    if code.contains(['\n', '\t']) && !bracketed {
+        return Err("Bracketed paste is no longer active. Review the code again.");
+    }
+    let mut bytes = crate::input::encode_stream_paste(&screen, code, bracketed);
+    // The stream encoders preserve literal question marks and use this byte for
+    // unsupported characters. A replacement can change the meaning of shell code.
+    if bytes.iter().filter(|&&byte| byte == b'?').count()
+        != code.bytes().filter(|&byte| byte == b'?').count()
+    {
+        return Err("The terminal encoding cannot represent this code exactly.");
+    }
+    if run_at.is_some() {
+        bytes.extend(
+            screen
+                .encode_key(kortty_terminal::TerminalKey::Enter, Default::default())
+                .unwrap_or_else(|| vec![b'\r']),
+        );
+    }
+    if bytes.len() > MAX_INPUT_BYTES {
+        return Err("The code exceeds the terminal input limit.");
+    }
+    let mut prompt = shared
+        .shell_activity
+        .as_ref()
+        .map(|activity| activity.lock().unwrap_or_else(|error| error.into_inner()));
+    if let Some(expected) = run_at
+        && (expected.state == PromptState::Busy
+            || prompt
+                .as_ref()
+                .is_none_or(|state| state.code_prompt() != expected))
+    {
+        return Err("The terminal input or prompt changed. Review the command again.");
+    }
+    // The reader can queue new output while the actor inspects local processes.
+    if shared.output_activity.last_output() != applied_output {
+        return Err(OUTPUT_CHANGED);
+    }
+    if let Some(state) = &mut prompt {
+        state.untracked_input();
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn valid_ai_run_line(code: &str) -> bool {
+    !code.trim().is_empty()
+        && !code.contains("***")
+        && code.chars().all(|character| {
+            !character.is_control()
+                && crate::session_journal::is_display_character(character)
+                && !matches!(character, '\u{2028}' | '\u{2029}')
+        })
 }
 
 fn copy_terminal_output(terminal: &Terminal, range: LastOutputRange) -> TerminalCommandResult {
@@ -2286,24 +3455,24 @@ fn show_ended_session(
     shared: &Shared,
     events: &Receiver<Event>,
     status: &Status,
-    search: &mut SearchState,
+    presentation: (&mut SearchState, &mut inline_history::History),
     grid: &mut GridSize,
     serial_released: Option<Sender<()>>,
 ) {
-    apply_view_preferences(terminal, &requested_view(shared));
+    let (search, inline) = presentation;
+    let view = requested_view(shared);
+    apply_view_preferences(terminal, &view);
+    inline.apply(terminal, take_inline_updates(shared));
     publish(
         shared,
-        make_frame(
-            terminal,
-            status.clone(),
-            requested_offset(shared, terminal),
-            search,
-        ),
+        inline.frame(terminal, status.clone(), &view, search),
     );
     // Both I/O threads have returned, so the exclusive serial handle has been released.
     drop(serial_released);
     let mut pack_at = Some(Instant::now() + SCROLLBACK_IDLE);
-    while let Some(event) = next_stream_event(terminal, shared, events, &mut pack_at, None, None) {
+    while let Some(event) =
+        next_stream_event(terminal, shared, events, &mut pack_at, None, None, None)
+    {
         let mut command_reply = None;
         match event {
             Event::Journal(command) => {
@@ -2328,8 +3497,12 @@ fn show_ended_session(
                 command_reply = Some((reply, result));
             }
             Event::CaptureReconnectHistory(reply) => {
-                let _ = reply.try_send(terminal.reconnect_history());
-                continue;
+                sync_scrollback(terminal, &mut pack_at, requested_scrollback(shared));
+                let changed = inline.apply(terminal, take_inline_updates(shared));
+                let _ = reply.try_send(inline.capture_reconnect(terminal));
+                if !changed {
+                    continue;
+                }
             }
             Event::RevealSearch { revision, row } => search.reveal(shared, revision, row),
             Event::ViewChanged => {
@@ -2344,16 +3517,13 @@ fn show_ended_session(
                     *grid = requested;
                 }
             }
+            Event::ScrollbackChanged => search.invalidate(),
             _ => continue,
         }
+        inline.apply(terminal, take_inline_updates(shared));
         publish(
             shared,
-            make_frame(
-                terminal,
-                status.clone(),
-                requested_offset(shared, terminal),
-                search,
-            ),
+            inline.frame(terminal, status.clone(), &requested_view(shared), search),
         );
         answer_terminal_commands(command_reply);
         pack_at = Some(Instant::now() + SCROLLBACK_IDLE);
@@ -2385,6 +3555,7 @@ fn answer_control_reads(
     }
 }
 
+#[cfg(test)]
 fn control_screen(
     pane_id: String,
     mode: ReadMode,
@@ -2393,6 +3564,19 @@ fn control_screen(
     terminal: Option<&Terminal>,
     active: impl Fn() -> bool,
 ) -> Option<ControlScreen> {
+    control_screen_rows(pane_id, mode, limit, live, terminal, false, active)
+        .map(|(screen, _, _)| screen)
+}
+
+fn control_screen_rows(
+    pane_id: String,
+    mode: ReadMode,
+    limit: usize,
+    live: &ScreenSnapshot,
+    terminal: Option<&Terminal>,
+    mask_context: bool,
+    active: impl Fn() -> bool,
+) -> Option<(ControlScreen, Vec<bool>, bool)> {
     let recent = mode == ReadMode::Recent;
     let history = if recent && terminal.is_some() {
         live.scrollback_lines
@@ -2406,6 +3590,16 @@ fn control_screen(
         rows
     };
     let mut lines = Vec::new();
+    let mut wraps = Vec::new();
+    let mut first_row = 0;
+    let wrapped_columns = |row: usize| {
+        if row < history {
+            terminal.and_then(|terminal| terminal.history_wrapped_columns(row))
+        } else {
+            live.wrapped_columns((row - history) as u16)
+                .map(usize::from)
+        }
+    };
     let mut size = 0;
     let mut longest = 0;
     let mut truncated = false;
@@ -2416,16 +3610,17 @@ fn control_screen(
         if lines.len() == max_lines {
             break;
         }
+        let wrap = mask_context.then(|| wrapped_columns(row)).flatten();
         let line = if row < history {
             let Some(cells) = terminal.and_then(|terminal| terminal.history_line(row)) else {
                 continue;
             };
-            control_line(&cells)
+            control_line(&cells, wrap)
         } else {
             let Some(cells) = live.row((row - history) as u16) else {
                 continue;
             };
-            control_line(cells)
+            control_line(cells, wrap)
         };
         // Recent output excludes the blank padding after the last content row.
         if recent && lines.is_empty() && line.is_empty() {
@@ -2439,24 +3634,36 @@ fn control_screen(
         }
         size += cost;
         lines.push(line);
+        if mask_context {
+            wraps.push(wrap.is_some());
+        }
+        first_row = row;
     }
     lines.reverse();
-    Some(ControlScreen {
-        pane_id,
-        mode: mode.name().into(),
-        lines,
-        columns: live.columns,
-        rows: live.rows,
-        alternate_screen: !recent && live.alternate_screen,
-        osc_title: (!live.title.is_empty()).then(|| live.title.clone()),
-        truncated,
-    })
+    wraps.reverse();
+    let starts_with_continuation = mask_context
+        && (first_row.checked_sub(1).and_then(wrapped_columns).is_some()
+            || (first_row == 0 && history == 0 && live.starts_with_continuation()));
+    Some((
+        ControlScreen {
+            pane_id,
+            mode: mode.name().into(),
+            lines,
+            columns: live.columns,
+            rows: live.rows,
+            alternate_screen: !recent && live.alternate_screen,
+            osc_title: (!live.title.is_empty()).then(|| live.title.clone()),
+            truncated,
+        },
+        wraps,
+        starts_with_continuation,
+    ))
 }
 
-fn control_line(cells: &[Cell]) -> String {
+fn control_line(cells: &[Cell], wrap: Option<usize>) -> String {
     let mut line = String::new();
     let mut spaces = 0;
-    for cell in cells {
+    for cell in cells.iter().take(wrap.unwrap_or(cells.len())) {
         if cell.width == 0 {
             continue;
         }
@@ -2467,6 +3674,10 @@ fn control_line(cells: &[Cell]) -> String {
             line.push_str(&cell.text);
             spaces = 0;
         }
+    }
+    if wrap.is_some() {
+        line.extend(std::iter::repeat_n(' ', spaces));
+        return line;
     }
     // Match Java String.stripTrailing, which leaves non-breaking spaces intact.
     let trimmed = line.trim_end_matches(|character: char| {
@@ -2496,24 +3707,24 @@ fn next_stream_event(
     pack_at: &mut Option<Instant>,
     typeahead_deadline: Option<Instant>,
     mut pacer: Option<&mut typewriter::Pacer>,
+    coding_agent: Option<&ai_code_guard::Monitor>,
 ) -> Option<Event> {
     while !events.is_closed() {
-        sync_scrollback_compression(
-            terminal,
-            pack_at,
-            shared
-                .scrollback_compression_enabled
-                .load(Ordering::Relaxed),
-        );
-        if clipboard::lock(&shared.clipboard).has_commands() {
-            return Some(Event::Clipboard);
+        if sync_scrollback(terminal, pack_at, requested_scrollback(shared)) {
+            return Some(Event::ScrollbackChanged);
         }
-        match poll_stream_event(shared, events, pacer.as_deref_mut()) {
+        match poll_stream_event(shared, events, pacer.as_deref_mut(), false) {
             Ok(event) => return Some(event),
             Err(TryRecvError::Closed) => return None,
             Err(TryRecvError::Empty) => {}
         }
         let now = Instant::now();
+        let agent_deadline = coding_agent.and_then(|monitor| {
+            monitor.deadline(shared.coding_agent_detection.load(Ordering::Acquire), now)
+        });
+        if agent_deadline.is_some_and(|deadline| deadline <= now) {
+            return Some(Event::CodingAgentPoll);
+        }
         if typeahead_deadline.is_some_and(|deadline| deadline <= now) {
             return Some(Event::TypeAheadClear);
         }
@@ -2531,6 +3742,7 @@ fn next_stream_event(
             .into_iter()
             .chain(typeahead_deadline)
             .chain(timestamp_deadline)
+            .chain(agent_deadline)
             .chain(pacer.as_deref().and_then(typewriter::Pacer::deadline))
             .min()
         {
@@ -2543,24 +3755,39 @@ fn next_stream_event(
     None
 }
 
-fn sync_scrollback_compression(
+fn sync_scrollback(
     terminal: &mut Terminal,
     pack_at: &mut Option<Instant>,
-    enabled: bool,
-) {
-    let changed = terminal.set_scrollback_compression_enabled(enabled);
-    if !enabled {
+    config: ScrollbackConfig,
+) -> bool {
+    let changed = terminal.set_scrollback_config(config);
+    if !config.compression {
         *pack_at = None;
     } else if changed {
         *pack_at = Some(Instant::now() + SCROLLBACK_IDLE);
     }
+    changed
+}
+
+fn requested_scrollback(shared: &Shared) -> ScrollbackConfig {
+    shared
+        .view
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .scrollback
 }
 
 fn poll_stream_event(
     shared: &Shared,
     events: &Receiver<Event>,
     pacer: Option<&mut typewriter::Pacer>,
+    batch_continuation: bool,
 ) -> Result<Event, TryRecvError> {
+    // Order the next transport event with any concurrent strict-mode request.
+    let bridge = clipboard::lock(&shared.clipboard);
+    if bridge.has_commands(batch_continuation) {
+        return Ok(Event::Clipboard);
+    }
     match pacer {
         Some(pacer) => pacer.poll(events, shared.typewriter_speed(), Instant::now()),
         None => events.try_recv(),
@@ -2568,7 +3795,16 @@ fn poll_stream_event(
 }
 
 fn requested_offset(shared: &Shared, terminal: &Terminal) -> usize {
-    terminal.scrollback_offset(requested_view(shared).scroll_anchor.as_ref())
+    terminal.scrollback_offset(requested_view(shared).raw_anchor())
+}
+
+fn take_inline_updates(shared: &Shared) -> std::collections::VecDeque<inline_history::Update> {
+    std::mem::take(
+        &mut *shared
+            .inline_updates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()),
+    )
 }
 
 fn apply_view_preferences(terminal: &mut Terminal, view: &ViewRequest) {
@@ -2631,7 +3867,10 @@ fn make_frame(
         screen,
         status,
         scroll_offset,
+        inline: None,
         scrollback: Some(terminal.scrollback_snapshot()),
+        output_snapshot: Some(Arc::new(terminal.output_snapshot(scroll_offset != 0))),
+        recovery_output: None,
         application_cursor_keys: terminal.application_cursor_keys(),
         bracketed_paste: terminal.bracketed_paste(),
         password_prompt: terminal.cursor_line_is_password_prompt(),
@@ -2643,6 +3882,8 @@ fn make_frame(
         has_prompt_marks,
         has_finished_command,
         shell_activity: ShellActivity::default(),
+        coding_agent: None,
+        coding_agent_details: None,
         prompts,
         search_revision: search.revision,
         search_result: search.result.clone(),
@@ -2664,10 +3905,19 @@ fn publish(shared: &Shared, mut frame: Frame) {
             .unwrap_or_else(|error| error.into_inner())
             .clone();
     }
-    *shared
+    let mut previous = shared
         .frame
         .lock()
-        .unwrap_or_else(|error| error.into_inner()) = Arc::new(frame);
+        .unwrap_or_else(|error| error.into_inner());
+    if frame.ibm.is_some()
+        && frame.status == Status::Running
+        && let Some(pane) = shared.recording.tab_pane()
+    {
+        let view = requested_view(shared);
+        pane.frame(frame.screen.clone(), view.grid, view.appearance);
+    }
+    *previous = Arc::new(frame);
+    drop(previous);
     let _ = shared.redraw.try_send(());
 }
 
@@ -2678,20 +3928,140 @@ mod search_tests {
     const TIMEOUT: Duration = Duration::from_secs(8);
 
     #[test]
+    fn mirrored_input_writer_drops_a_blocked_pane_and_resumes_when_idle() {
+        struct Wire(std::sync::mpsc::Sender<Vec<u8>>);
+
+        impl Write for Wire {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0
+                    .send(bytes.to_vec())
+                    .map_err(|_| io::ErrorKind::BrokenPipe)?;
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let session = Session::disconnected_ibm(IbmKind::Tn3270e);
+        session.set_mirror_test_frame(Some(CodingAgentState::Blocked));
+        let shared = Arc::clone(&session.shared);
+        let (input, inputs) = bounded(4);
+        let (sender, _events) = bounded(4);
+        let events = WorkerEvents {
+            sender,
+            input: input.clone(),
+            actor: thread::current(),
+            recording: Arc::clone(&shared.recording),
+            output_activity: Arc::clone(&shared.output_activity),
+            observe_shell: false,
+            journal_input: Arc::new(AtomicBool::new(false)),
+        };
+        let (wire, writes) = std::sync::mpsc::channel();
+        let writer =
+            thread::spawn(move || write_input(Wire(wire), &inputs, &events, &shared, None));
+        let queue = |bytes: &[u8], mirrored| {
+            input
+                .try_send(StreamInput::Raw {
+                    bytes: bytes.to_vec(),
+                    clear_typeahead: false,
+                    mirrored,
+                })
+                .is_ok()
+        };
+        let blocked = queue(b"mirrored while blocked", true);
+        let direct = queue(b"direct", false);
+        let first = writes.recv_timeout(TIMEOUT);
+        let blocked_activity = session.last_mirrored_input();
+        session.set_mirror_test_frame(Some(CodingAgentState::Idle));
+        let resumed = queue(b"mirrored when idle", true);
+        let second = writes.recv_timeout(TIMEOUT);
+        input.close();
+        writer.join().unwrap();
+
+        assert!(blocked && direct && resumed);
+        assert_eq!(first.unwrap(), b"direct");
+        assert!(blocked_activity.is_none());
+        assert_eq!(second.unwrap(), b"mirrored when idle");
+        assert!(session.last_mirrored_input().is_some());
+    }
+
+    #[test]
     fn scrollback_compression_actor_cancels_and_resumes_the_idle_deadline() {
         let mut terminal = Terminal::new(16, 4);
         let before = Instant::now();
         let mut deadline = Some(before);
-        sync_scrollback_compression(&mut terminal, &mut deadline, false);
+        let config = ScrollbackConfig::default();
+        sync_scrollback(
+            &mut terminal,
+            &mut deadline,
+            ScrollbackConfig {
+                compression: false,
+                ..config
+            },
+        );
         assert!(deadline.is_none());
         assert!(!terminal.set_scrollback_compression_enabled(false));
 
-        sync_scrollback_compression(&mut terminal, &mut deadline, true);
+        sync_scrollback(&mut terminal, &mut deadline, config);
         let resumed = deadline.unwrap();
         assert!(resumed >= before + SCROLLBACK_IDLE);
         assert!(!terminal.set_scrollback_compression_enabled(true));
-        sync_scrollback_compression(&mut terminal, &mut deadline, true);
+        sync_scrollback(&mut terminal, &mut deadline, config);
         assert_eq!(deadline, Some(resumed));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn active_pty_applies_latest_scrollback_limits_without_more_output() {
+        let config = ScrollbackConfig {
+            lines: 200,
+            ..ScrollbackConfig::default()
+        };
+        let session = Session::start_local_with_strict(
+            GridSize {
+                columns: 64,
+                rows: 4,
+                ..GridSize::default()
+            },
+            TerminalProfile::Xterm,
+            LaunchOptions {
+                command: Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    concat!(
+                        r#"i=0; while [ "$i" -lt 250 ]; do printf 'row\n'; i=$((i+1)); done; "#,
+                        "printf 'history-ready\\n'; IFS= read -r gate",
+                    )
+                    .into(),
+                ]),
+                ..LaunchOptions::default()
+            },
+            true,
+            Appearance::default(),
+            StreamOptions {
+                scrollback: config,
+                ..StreamOptions::default()
+            },
+        )
+        .unwrap();
+        let initial = wait_for_frame(&session, |frame| visible_text(frame, "history-ready"));
+        assert_eq!(initial.screen.scrollback_lines, 200);
+        session.scroll(180);
+        wait_for_frame(&session, |frame| frame.scroll_offset == 180);
+
+        session.set_scrollback_config(ScrollbackConfig {
+            lines: 150,
+            ..config
+        });
+        session.set_scrollback_config(ScrollbackConfig {
+            lines: 100,
+            ..config
+        });
+        let trimmed = wait_for_frame(&session, |frame| frame.screen.scrollback_lines == 100);
+        assert_eq!(trimmed.scroll_offset, 100);
+        let _ = session.stop().recv_blocking();
     }
 
     #[cfg(unix)]
@@ -3104,28 +4474,35 @@ mod search_tests {
             view: Mutex::new(ViewRequest {
                 grid: GridSize::default(),
                 scroll_anchor: None,
+                inline_anchor: None,
                 typeahead: TypeAheadRequest::default(),
                 prompt_navigation_enabled: true,
                 prompt_navigator: PromptNavigator::default(),
                 appearance: Appearance::default(),
+                scrollback: ScrollbackConfig::default(),
+                recovery_output_rows: 0,
             }),
+            inline_updates: Mutex::default(),
             frame: Mutex::new(Arc::new(frame)),
             logfile_warning: crate::terminal_logging::Warning::new(redraw.clone()),
             redraw,
             bell_events: AtomicU64::new(0),
+            program_notifications: Mutex::default(),
             output_activity: Arc::default(),
             local_shell_pid: AtomicU32::new(0),
             sandbox_backend: Mutex::default(),
             serial: None,
             serial_notice: Mutex::new(None),
             shell_activity: None,
+            coding_agent_detection: AtomicU64::new(0),
             clipboard: Mutex::default(),
             recording: Arc::default(),
             journal_available: AtomicBool::new(false),
+            journal_input: Arc::new(AtomicBool::new(false)),
             journal_generation: AtomicU64::new(0),
             journal_secrets: Mutex::new(None),
-            scrollback_compression_enabled: AtomicBool::new(true),
-            typewriter_speed: AtomicU8::new(0),
+            typewriter_speed: AtomicU64::new(0),
+            paste_cancellation: Mutex::default(),
         };
         search.reveal(&shared, search.revision, row);
         assert_eq!(requested_offset(&shared, &terminal), 2);
@@ -3361,6 +4738,105 @@ mod search_tests {
         assert_eq!(session.take_bell_events(), 0);
     }
 
+    #[test]
+    fn ai_code_insertion_checks_live_brackets_and_never_adds_enter() {
+        let session = Session::disconnected_ibm(IbmKind::Tn3270e);
+        let mut terminal = Terminal::new(80, 24);
+        let insert = |terminal: &Terminal, code| {
+            authorize_ai_code(
+                terminal,
+                &session.shared,
+                &Status::Running,
+                code,
+                None,
+                None,
+                |_, _| false,
+            )
+        };
+        assert_eq!(
+            authorize_ai_code(
+                &terminal,
+                &session.shared,
+                &Status::Running,
+                "line",
+                None,
+                None,
+                |_, run| !run
+            ),
+            Err("The terminal is waiting for a coding-agent approval.")
+        );
+        assert!(insert(&terminal, "first\nsecond").is_err());
+        assert_eq!(insert(&terminal, "single line").unwrap(), b"single line");
+        terminal.advance(b"\x1b[?2004h");
+        assert_eq!(
+            insert(&terminal, "first\nsecond").unwrap(),
+            b"\x1b[200~first\nsecond\x1b[201~"
+        );
+        terminal.advance(b"\x1b[?2004l");
+        assert!(insert(&terminal, "first\nsecond").is_err());
+        terminal.advance(b"\x1b[?1049h");
+        assert!(insert(&terminal, "single line").is_err());
+        let legacy = Terminal::with_profile(80, 24, TerminalProfile::Vt220);
+        assert!(insert(&legacy, "printf 🧪").is_err());
+    }
+
+    #[test]
+    fn ai_code_insertion_refuses_output_arriving_during_process_inspection() {
+        let session = Session::disconnected_ibm(IbmKind::Tn3270e);
+        let terminal = Terminal::new(80, 24);
+        let shared = &session.shared;
+        assert_eq!(
+            authorize_ai_code(
+                &terminal,
+                shared,
+                &Status::Running,
+                "line",
+                None,
+                None,
+                |_, _| {
+                    shared.output_activity.output(Instant::now());
+                    false
+                }
+            ),
+            Err("The terminal output changed. Choose the action again.")
+        );
+    }
+
+    #[test]
+    fn batched_pty_output_follows_the_strict_mode_change() {
+        let session = Session::disconnected_ibm(IbmKind::Tn3270e);
+        let shared = &session.shared;
+        let (sender, events) = bounded(2);
+        let mut pacer = typewriter::Pacer::default();
+        sender.try_send(Event::ViewChanged).unwrap();
+        assert!(matches!(
+            poll_stream_event(shared, &events, Some(&mut pacer), false),
+            Ok(Event::ViewChanged)
+        ));
+
+        assert!(clipboard::lock(&shared.clipboard).request_strict(true));
+        sender
+            .try_send(Event::Output(
+                b"\x1b_Ga=T,i=74,f=24,s=1,v=1,q=2,C=1;AP8A\x1b\\".to_vec(),
+                Instant::now(),
+            ))
+            .unwrap();
+        assert!(matches!(
+            poll_stream_event(shared, &events, Some(&mut pacer), true),
+            Ok(Event::Clipboard)
+        ));
+
+        let mut terminal = Terminal::new(12, 2);
+        clipboard::lock(&shared.clipboard).apply(&mut terminal);
+        let Ok(Event::Output(bytes, _)) =
+            poll_stream_event(shared, &events, Some(&mut pacer), true)
+        else {
+            panic!("expected queued PTY output");
+        };
+        terminal.advance(&bytes);
+        assert!(terminal.snapshot().images.is_empty());
+    }
+
     #[cfg(unix)]
     #[test]
     fn local_pty_kitty_graphics_survive_scrollback_and_respect_strict_mode() {
@@ -3505,16 +4981,20 @@ mod search_tests {
         wait_for_frame(&session, |frame| {
             frame.screen.cursor.column == 3 && visible_text(frame, "HP:     OK")
         });
-        session.send_keyboard(b"AB".to_vec(), false).unwrap();
+        session.send_keyboard(b"A".to_vec(), false).unwrap();
+        session.send_paste_with_delay(b"B\rC".to_vec(), 25).unwrap();
+        wait_for_frame(&session, |frame| {
+            !session.is_pacing_paste() && visible_text(frame, "HP:ABC  OK")
+        });
         session.send_paste(b"\r".to_vec()).unwrap();
         session.send_shifted_hp_enter(b"\r".to_vec()).unwrap();
-        wait_for_frame(&session, |frame| visible_text(frame, "HP:AB   OK"));
+        wait_for_frame(&session, |frame| visible_text(frame, "HP:ABC  OK"));
         assert_eq!(session.frame().status, Status::Running);
         session.send_keyboard(b"\x1b[Z".to_vec(), false).unwrap();
         session.send_keyboard(b"\r".to_vec(), true).unwrap();
         let completed = wait_for_frame(&session, |frame| matches!(frame.status, Status::Exited(_)));
-        assert!(visible_text(&completed, "HP-HOST:AB  "));
-        assert!(!visible_text(&completed, "HP-HOST:ABAB"));
+        assert!(visible_text(&completed, "HP-HOST:ABC "));
+        assert!(!visible_text(&completed, "HP-HOST:ABCABC"));
     }
 
     #[cfg(unix)]
@@ -3595,6 +5075,7 @@ mod search_tests {
         assert!(found, "no recorded frame contains the colored PTY output");
     }
 
+    #[track_caller]
     fn wait_for_frame(session: &Session, check: impl Fn(&Frame) -> bool) -> Arc<Frame> {
         let deadline = Instant::now() + TIMEOUT;
         loop {
@@ -3605,6 +5086,285 @@ mod search_tests {
             assert!(Instant::now() < deadline, "timed out in {:?}", frame.status);
             thread::sleep(FRAME_INTERVAL);
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agent_cursor_takeover_revalidates_native_prompt_and_writes_only_the_draft() {
+        use crate::session::agent_takeover::{Destination, Request};
+        use crate::terminal_agent::{Cancel, LocalDirectory};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let other = root.join("different");
+        std::fs::create_dir(&other).unwrap();
+        let directory = LocalDirectory::capture(root.clone()).unwrap();
+        let session = Session::start_local(
+            GridSize::default(),
+            TerminalProfile::Xterm,
+            LaunchOptions {
+                working_directory: Some(root),
+                ..LaunchOptions::default()
+            },
+            true,
+            None,
+        )
+        .unwrap();
+        wait_for_frame(&session, |frame| frame.status == Status::Running);
+        session.send(concat!(
+            r#"stty -echo; expected=$(printf '\033[200~printf "takeover draft"\033[201~'); "#,
+            r#"printf '\033[?2004h\033]133;A\007draft-ready\033]133;B\007'; "#,
+            r#"IFS= read -r draft; if [ "$draft" = "$expected" ]; then printf '\n%s-%s\n' draft matches; "#,
+            r#"else printf '\n%s-%s\n' draft differs; fi"#,
+            "\r"
+        ).as_bytes().to_vec()).unwrap();
+        let frame = wait_for_frame(&session, |frame| {
+            visible_text(frame, "draft-ready") && session.agent_shortcut_prompt(frame).is_some()
+        });
+        let prompt = session.agent_shortcut_prompt(&frame).unwrap();
+        let revision = session.mcp_input_revision();
+        let request = |directory, revision, permit, command: &str| {
+            Request::new(
+                Destination::Local(directory),
+                prompt,
+                frame.search_revision,
+                revision,
+                permit,
+                command.into(),
+            )
+        };
+        let assert_rejected = |request| {
+            let receipt = session.take_over_agent_command(request).unwrap();
+            assert!(receipt.recv_blocking().unwrap().is_err());
+        };
+        let command = "printf \"takeover draft\"";
+        assert!(
+            request(
+                directory.clone(),
+                revision,
+                Cancel::default(),
+                "echo a\necho b"
+            )
+            .is_err()
+        );
+        let revoked = Cancel::default();
+        revoked.request();
+        assert_rejected(request(directory.clone(), revision, revoked, command).unwrap());
+        assert_rejected(
+            request(
+                directory.clone(),
+                revision.wrapping_add(1),
+                Cancel::default(),
+                command,
+            )
+            .unwrap(),
+        );
+        assert_rejected(
+            request(
+                LocalDirectory::capture(other).unwrap(),
+                revision,
+                Cancel::default(),
+                command,
+            )
+            .unwrap(),
+        );
+
+        let receipt = session
+            .take_over_agent_command(
+                request(directory, revision, Cancel::default(), command).unwrap(),
+            )
+            .unwrap();
+        assert_eq!(receipt.recv_blocking().unwrap(), Ok(command.len() + 12));
+        thread::sleep(FRAME_INTERVAL * 3);
+        assert!(!visible_text(&session.frame(), "draft-matches"));
+        assert!(!visible_text(&session.frame(), "draft-differs"));
+        session.send_keyboard(b"\r".to_vec(), true).unwrap();
+        wait_for_frame(&session, |frame| visible_text(frame, "draft-matches"));
+        let _ = session.stop().recv_blocking();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn coding_agent_monitor_requires_a_live_process_and_rule_then_clears_on_exit() {
+        use std::os::unix::fs::DirBuilderExt as _;
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "kortty-agent-monitor-{}",
+            crate::private_files::nonce().unwrap()
+        ));
+        std::fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&root)
+            .unwrap();
+        let scratch = Scratch(root);
+        let executable = scratch.0.join("gemini");
+        let script_path = scratch.0.join("monitor.sh");
+        let answer_gate = scratch.0.join("answer");
+        // Darwin's /bin/sh can exec a different shell image. Use an actual
+        // shell binary so the foreground process keeps the test executable name.
+        let shell = if cfg!(target_os = "macos") {
+            "/bin/bash"
+        } else {
+            "/bin/sh"
+        };
+        std::fs::copy(shell, &executable).unwrap();
+        #[cfg(target_os = "macos")]
+        {
+            // The copied system image needs a signature for its new location.
+            let signature = std::process::Command::new("/usr/bin/codesign")
+                .args(["--force", "--sign", "-", "--timestamp=none"])
+                .arg(&executable)
+                .output()
+                .unwrap();
+            assert!(
+                signature.status.success(),
+                "could not sign the coding agent fixture: {}",
+                String::from_utf8_lossy(&signature.stderr)
+            );
+        }
+        let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
+        let script = concat!(
+            r#"saved=$(stty -g); trap 'stty "$saved"' EXIT; stty -echo; "#,
+            r#"printf '\033[2J\033[H%s%s\n' 'monitor-' 'ready'; while IFS= read -r action; do case "$action" in "#,
+            r#"block|renew) printf '\033[2J\033[Hquestion-%s\n%s\n%s\n' "$action" '│ How would you like to authenticate for this project? │' '│ (Use Enter to select) │';; "#,
+            r#"YES) while [ ! -f "$1" ]; do sleep .05; done; printf '\033[2J\033[Hanswer-accepted\nType your message or @path/to/file\n';; "#,
+            r#"'hello agent') printf '\033[2J\033[Hprompt-accepted\nType your message or @path/to/file\n';; "#,
+            r#"password) printf '\033[2J\033[HPassword: ';; "#,
+            r#"plain) printf '\033[2J\033[Hmonitor-fallback\n';; quit) break;; esac; done"#,
+        );
+        // Keep rule evidence out of the launch line echoed by the interactive shell.
+        std::fs::write(&script_path, script).unwrap();
+        let session = Session::start(GridSize::default(), TerminalProfile::Xterm).unwrap();
+        wait_for_frame(&session, |frame| frame.status == Status::Running);
+        assert!(!session.coding_agent_detection_requested());
+        session.set_coding_agent_detection(true);
+        let send = |line: &str| session.send(format!("{line}\r").into_bytes()).unwrap();
+        send(&format!(
+            "{} {} {}",
+            quote(executable.to_str().unwrap()),
+            quote(script_path.to_str().unwrap()),
+            quote(answer_gate.to_str().unwrap())
+        ));
+        let ready = wait_for_frame(&session, |frame| visible_text(frame, "monitor-ready"));
+        assert!(ready.coding_agent().is_none());
+        send("block");
+        #[track_caller]
+        fn read_state(session: &Session, state: CodingAgentState) -> CodingAgentStatus {
+            wait_for_frame(session, |frame| {
+                frame
+                    .coding_agent()
+                    .is_some_and(|agent| agent.state == state)
+            })
+            .coding_agent()
+            .unwrap()
+        }
+        let blocked = read_state(&session, CodingAgentState::Blocked);
+        assert_eq!((blocked.id, blocked.name), ("gemini-cli", "Gemini CLI"));
+        let frame = session.frame();
+        let details = frame.coding_agent_details().unwrap();
+        assert_ne!(details.pid, 0);
+        assert_eq!(details.command.as_ref(), "gemini");
+        assert!(details.started_at.is_some());
+        let rule = details.rule.as_ref().unwrap();
+        assert_eq!(rule.id.as_ref(), "auth-prompt");
+        assert!(rule.evidence.contains("How would you like to authenticate"));
+        let initial_privacy_generation = details.privacy_generation;
+        let revision = session.frame().search_revision;
+        let write = |status, revision, input| {
+            session
+                .send_coding_agent_input(status, revision, input)
+                .unwrap()
+                .recv_blocking()
+                .unwrap()
+        };
+        let prompt = || CodingAgentInput::Prompt(zeroize::Zeroizing::new("hello agent".into()));
+        assert_eq!(
+            write(blocked, revision, prompt()),
+            Err("The agent is waiting for a decision. Answer it before sending a prompt.")
+        );
+        session
+            .send_interactive(b"plain\r".to_vec(), Hp2392Input::Key { enter: true }, true)
+            .unwrap();
+        send("renew");
+        let renewed = wait_for_frame(&session, |frame| visible_text(frame, "question-renew"));
+        assert_eq!(renewed.coding_agent(), Some(blocked));
+        assert!(session.last_mirrored_input().is_none());
+        let yes = || CodingAgentInput::Key(CodingAgentKey::Yes);
+        assert!(write(blocked, revision, yes()).is_err());
+        assert_eq!(write(blocked, renewed.search_revision, yes()), Ok(4));
+        assert_eq!(
+            write(blocked, renewed.search_revision, yes()),
+            Err("This decision was already sent. Wait for the agent to respond.")
+        );
+        std::fs::write(answer_gate, []).unwrap();
+        wait_for_frame(&session, |frame| visible_text(frame, "answer-accepted"));
+        let idle = read_state(&session, CodingAgentState::Idle);
+        assert_eq!(
+            write(idle, session.frame().search_revision, prompt()),
+            Ok(12)
+        );
+        wait_for_frame(&session, |frame| visible_text(frame, "prompt-accepted"));
+        session
+            .send_interactive(b"plain\r".to_vec(), Hp2392Input::Key { enter: true }, true)
+            .unwrap();
+        wait_for_frame(&session, |frame| {
+            visible_text(frame, "monitor-fallback") && session.last_mirrored_input().is_some()
+        });
+        send("block");
+        read_state(&session, CodingAgentState::Blocked);
+        send("plain");
+        let fallback = read_state(&session, CodingAgentState::Idle);
+        assert_eq!(fallback.instance, blocked.instance);
+        assert!(fallback.since > blocked.since);
+        assert!(
+            session
+                .frame()
+                .coding_agent_details()
+                .unwrap()
+                .rule
+                .is_none()
+        );
+        send("password");
+        let password = wait_for_frame(&session, |frame| frame.password_prompt);
+        assert!(password.coding_agent_details().is_none());
+        send("block");
+        assert_eq!(
+            read_state(&session, CodingAgentState::Blocked).instance,
+            blocked.instance
+        );
+        assert_ne!(
+            session
+                .frame()
+                .coding_agent_details()
+                .unwrap()
+                .privacy_generation,
+            initial_privacy_generation
+        );
+        session.set_coding_agent_detection(false);
+        let disabled = wait_for_frame(&session, |frame| frame.coding_agent().is_none());
+        assert!(disabled.coding_agent_details().is_none());
+        session.set_coding_agent_detection(true);
+        let reenabled = read_state(&session, CodingAgentState::Blocked);
+        assert_ne!(reenabled.instance, blocked.instance);
+        session.set_coding_agent_detection(false);
+        session.set_coding_agent_detection(true);
+        wait_for_frame(&session, |frame| {
+            frame.coding_agent().is_some_and(|agent| {
+                agent.state == CodingAgentState::Blocked && agent.instance != reenabled.instance
+            })
+        });
+        send("quit");
+        wait_for_frame(&session, |frame| {
+            frame.status == Status::Running && frame.coding_agent().is_none()
+        });
+        let _ = session.stop().recv_blocking();
     }
 
     #[cfg(unix)]
@@ -3687,7 +5447,7 @@ mod search_tests {
         )
         .unwrap();
         let (attachment, attached) = session
-            .attach_journal(capture.sink(), Default::default(), true)
+            .attach_journal_configured(capture.sink(), Default::default(), true, false)
             .unwrap();
         attached.recv_blocking().unwrap().unwrap();
         let mut note_policy = crate::terminal_logging::Policy::default();

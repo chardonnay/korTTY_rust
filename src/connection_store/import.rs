@@ -3,24 +3,34 @@
 use std::collections::{BTreeSet, HashSet};
 use std::io::{self, Read as _};
 use std::net::Ipv4Addr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use kortty_vault::Secret;
 use zeroize::Zeroizing;
 
 use super::{
-    Auth, Connection, LoginTarget, MAX_BYTES, MAX_PROFILES, MAX_TUNNELS, SavedLogin, Store,
-    TerminalProfile, TunnelConfig, TunnelRule, TunnelTarget, invalid, library, normalize_host,
+    Auth, Connection, LocalProfile, LoginTarget, MAX_BYTES, MAX_PROFILES, MAX_TUNNELS, SavedLogin,
+    SerialProfile, Store, TerminalProfile, TunnelConfig, TunnelRule, TunnelTarget, invalid,
+    library, normalize_host,
 };
 use crate::private_files::FileStamp;
 
 mod archive;
+mod java_bindings;
 mod kortty;
 mod mobaxterm;
 mod options;
+mod teamwork;
 mod xml;
 
+pub(crate) use java_bindings::{
+    JavaConnectionBindings, JavaImportedRoute, JavaManagedKeyBinding, JavaPasswordBinding,
+    check_java_connection_routes, check_java_imported_routes, prepare_java_connection_import,
+};
 pub(crate) use options::{CredentialReplacement, Destination, Options, Prepared, SourceGroup};
+pub(crate) use teamwork::{
+    MAX_TEAMWORK_BYTES, TeamworkEntry, read_teamwork, read_teamwork_bytes, valid_teamwork_id,
+};
 
 const COLUMNS: [&str; 10] = [
     "Name",
@@ -39,25 +49,46 @@ const COLUMNS: [&str; 10] = [
 pub(crate) struct Preview {
     format: Format,
     entries: Vec<ImportedProfile>,
+    local_entries: Vec<ImportedLocal>,
+    serial_entries: Vec<ImportedSerial>,
     pub(crate) unsupported: usize,
     pub(crate) invalid: usize,
     pub(crate) duplicates: usize,
     pub(crate) skipped_tunnels: usize,
+    java_key_references: usize,
 }
 
 #[derive(Clone)]
 struct ImportedProfile {
     connection: Connection,
+    java_id: Option<String>,
+    java_key_id: Option<String>,
+    java_route: Option<(LoginTarget, Option<LoginTarget>)>,
     group: String,
     badge: Option<String>,
     has_password: bool,
     jump_has_password: bool,
 }
 
+#[derive(Clone)]
+struct ImportedLocal {
+    profile: LocalProfile,
+    group: String,
+}
+
+#[derive(Clone)]
+struct ImportedSerial {
+    profile: SerialProfile,
+    group: String,
+}
+
 impl ImportedProfile {
     fn new(connection: Connection, group: String) -> Self {
         Self {
             connection,
+            java_id: None,
+            java_key_id: None,
+            java_route: None,
             group,
             badge: None,
             has_password: false,
@@ -125,7 +156,10 @@ pub(crate) fn supports_path(path: &Path) -> bool {
 impl std::fmt::Debug for Preview {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionImportPreview")
-            .field("entries", &self.entries.len())
+            .field(
+                "entries",
+                &(self.entries.len() + self.local_entries.len() + self.serial_entries.len()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -148,6 +182,28 @@ pub(crate) struct Outcome {
 }
 
 impl Preview {
+    pub(crate) fn java_backup(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(invalid("connection import exceeds its size limit"));
+        }
+        let preview = Self::parse_bytes(Format::Kortty, bytes)?;
+        if preview.format != Format::Kortty {
+            return Err(invalid("expected Java connections.xml"));
+        }
+        Ok(preview)
+    }
+
+    pub(crate) fn portable_java_backup(&self) -> io::Result<(Vec<u8>, usize)> {
+        options::portable_java_backup(self)
+    }
+
+    pub(crate) fn merge_java_backup(
+        local: Option<&[u8]>,
+        incoming: &[u8],
+    ) -> io::Result<Option<Vec<u8>>> {
+        options::merge_java_backup(local, incoming)
+    }
+
     #[cfg(test)]
     pub(crate) fn read(path: &Path) -> io::Result<Self> {
         match Self::read_with(path, Access::Plain)? {
@@ -206,7 +262,10 @@ impl Preview {
     pub(crate) fn source_groups(&self) -> BTreeSet<SourceGroup> {
         self.entries
             .iter()
-            .map(|entry| SourceGroup::from_path(&entry.group))
+            .map(|entry| &entry.group)
+            .chain(self.local_entries.iter().map(|entry| &entry.group))
+            .chain(self.serial_entries.iter().map(|entry| &entry.group))
+            .map(|group| SourceGroup::from_path(group))
             .collect()
     }
 
@@ -232,6 +291,15 @@ impl Preview {
                 result.invalid += 1;
                 continue;
             };
+            if row[1].trim().eq_ignore_ascii_case("serial") {
+                let rate = row[3].trim().parse().ok().filter(|&rate| rate != 22);
+                let group = row.get(5).map_or("", |value| value.trim());
+                match serial_bookmark(row[0].trim(), row[2].trim(), rate, group) {
+                    Ok(entry) => result.push_serial(entry)?,
+                    Err(_) => result.invalid += 1,
+                }
+                continue;
+            }
             if !row[1].trim().eq_ignore_ascii_case("ssh") {
                 result.unsupported += 1;
                 continue;
@@ -248,7 +316,7 @@ impl Preview {
     }
 
     fn push(&mut self, entry: ImportedProfile) -> io::Result<bool> {
-        if self.entries.iter().any(|previous| {
+        if let Some(previous) = self.entries.iter_mut().find(|previous| {
             same_profile(
                 &previous.connection,
                 &previous.group,
@@ -256,16 +324,52 @@ impl Preview {
                 &entry.group,
             )
         }) {
+            previous.java_route = None;
+            previous.java_key_id = None;
             self.duplicates += 1;
             return Ok(false);
         }
-        if self.entries.len() == MAX_PROFILES {
+        self.check_capacity()?;
+        self.entries.push(entry);
+        Ok(true)
+    }
+
+    fn push_local(&mut self, entry: ImportedLocal) -> io::Result<()> {
+        if self
+            .local_entries
+            .iter()
+            .any(|previous| previous.profile == entry.profile && previous.group == entry.group)
+        {
+            self.duplicates += 1;
+        } else {
+            self.check_capacity()?;
+            self.local_entries.push(entry);
+        }
+        Ok(())
+    }
+
+    fn check_capacity(&self) -> io::Result<()> {
+        if self.entries.len() + self.local_entries.len() + self.serial_entries.len() >= MAX_PROFILES
+        {
             return Err(invalid(
                 "connection import contains more than 512 distinct profiles",
             ));
         }
-        self.entries.push(entry);
-        Ok(true)
+        Ok(())
+    }
+
+    fn push_serial(&mut self, entry: ImportedSerial) -> io::Result<()> {
+        if self
+            .serial_entries
+            .iter()
+            .any(|previous| previous.profile == entry.profile && previous.group == entry.group)
+        {
+            self.duplicates += 1;
+        } else {
+            self.check_capacity()?;
+            self.serial_entries.push(entry);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -302,6 +406,35 @@ fn read_stable(
 
 fn bad_header() -> io::Error {
     invalid("expected a PuTTY CM CSV with Name, Protocol, Host and Port columns")
+}
+
+fn serial_bookmark(
+    name: &str,
+    device: &str,
+    baud_rate: Option<u32>,
+    group: &str,
+) -> io::Result<ImportedSerial> {
+    let mut connection = crate::session::SerialConnection {
+        device: PathBuf::from(device),
+        ..Default::default()
+    };
+    if let Some(baud_rate) = baud_rate.filter(|rate| (1..=20_000_000).contains(rate)) {
+        connection.settings.baud_rate = baud_rate;
+    }
+    let profile = SerialProfile::new(name, connection, TerminalProfile::default());
+    profile.validate()?;
+    Ok(ImportedSerial {
+        profile,
+        group: import_group(group)?,
+    })
+}
+
+fn import_group(group: &str) -> io::Result<String> {
+    let group = group.replace('\\', "/");
+    if !group.is_empty() && !library::valid_path(&group) {
+        return Err(invalid("invalid imported connection folder"));
+    }
+    Ok(group)
 }
 
 // PuTTY CM writes one physical line per profile. Reject malformed quotes and
@@ -384,10 +517,7 @@ fn ssh_profile(
     } else {
         port(port_field)?
     };
-    let group = group.replace('\\', "/");
-    if !group.is_empty() && !library::valid_path(&group) {
-        return Err(invalid("invalid imported connection folder"));
-    }
+    let group = import_group(group)?;
     let connection = Connection {
         id: 0,
         name: name.to_owned(),
@@ -412,6 +542,8 @@ fn ssh_profile(
         command_timestamps: None,
         tab_color: None,
         paste_warning: None,
+        window_geometry: None,
+        terminal: Default::default(),
     };
     connection.validate()?;
     Ok((connection, group))

@@ -1,7 +1,7 @@
 //! Shared, single-pass expansion for interactive and unattended snippets.
 
 use std::cell::OnceCell;
-use std::collections::{HashMap, hash_map::Entry};
+use std::collections::{HashMap, HashSet, hash_map::Entry};
 use std::time::SystemTime;
 
 use kortty_jobs::TimeZone;
@@ -229,9 +229,39 @@ pub(crate) fn headless(
     )
 }
 
+/// Resolve a local script header against the facts captured when it was reviewed.
+pub(crate) fn workflow_header(
+    source: &str,
+    variables: &[Variable],
+    generated_at: jiff::civil::DateTime,
+    creator: &str,
+    limit: usize,
+) -> Result<String, &'static str> {
+    let builtins = Builtins {
+        clock: OnceCell::from(Some(Clock::from_datetime(generated_at))),
+        username: OnceCell::from(creator.to_owned()),
+        ..Builtins::new(None)
+    };
+    resolve(source, variables, Use::WorkflowHeader, &builtins, limit)
+}
+
+/// Identify the exact stored values a review depends on, in source order.
+pub(crate) fn referenced_variables<'a>(
+    source: &str,
+    variables: &'a [Variable],
+) -> Vec<&'a Variable> {
+    let mut seen = HashSet::new();
+    placeholders(source)
+        .filter(|placeholder| !placeholder.escaped && Builtin::parse(placeholder.name).is_none())
+        .filter_map(|placeholder| lookup(variables, placeholder.name))
+        .filter(|variable| seen.insert(variable.name.as_str()))
+        .collect()
+}
+
 enum Use<'a> {
     Interactive(&'a [Entered]),
     Headless,
+    WorkflowHeader,
 }
 
 fn resolve(
@@ -254,17 +284,21 @@ fn resolve(
         let replacement = if placeholder.escaped {
             &raw[1..]
         } else if let Some(builtin) = Builtin::parse(name) {
+            if matches!(usage, Use::WorkflowHeader) && matches!(builtin, Builtin::Clipboard) {
+                return Err("Remove the clipboard placeholder from the saved script header.");
+            }
             builtins.value(builtin)?
         } else if let Some(variable) = lookup(variables, name) {
-            let entered = match usage {
-                Use::Interactive(entered) => {
-                    entered.iter().find(|entry| variable.matches(&entry.name))
-                }
-                Use::Headless => None,
+            let value = match usage {
+                Use::Interactive(entered) => entered
+                    .iter()
+                    .find(|entry| variable.matches(&entry.name))
+                    .map(|entry| entry.value.as_str())
+                    .or_else(|| variable.default_value()),
+                Use::Headless => variable.default_value(),
+                Use::WorkflowHeader => Some(variable.value.as_str()),
             };
-            entered
-                .map(|entry| entry.value.as_str())
-                .or_else(|| variable.default_value())
+            value
                 .filter(|value| valid_variable_value(value))
                 .ok_or("A declared snippet variable needs a value in the Variable Manager")?
         } else if matches!(usage, Use::Headless) && unresolved_name(name) {
@@ -298,6 +332,19 @@ struct Placeholder<'a> {
     end: usize,
     name: &'a str,
     escaped: bool,
+}
+
+pub(crate) fn same_placeholders(before: &str, after: &str) -> bool {
+    fn inventory(source: &str) -> HashMap<(&str, bool), usize> {
+        let mut names = HashMap::new();
+        for placeholder in placeholders(source) {
+            *names
+                .entry((placeholder.name, placeholder.escaped))
+                .or_default() += 1;
+        }
+        names
+    }
+    inventory(before) == inventory(after)
 }
 
 fn placeholders(source: &str) -> impl Iterator<Item = Placeholder<'_>> {
@@ -419,7 +466,12 @@ struct Clock {
 impl Clock {
     fn local() -> Option<Self> {
         let timestamp = SystemTime::now().try_into().ok()?;
-        let local = TimeZone::try_system().ok()?.to_datetime(timestamp);
+        Some(Self::from_datetime(
+            TimeZone::try_system().ok()?.to_datetime(timestamp),
+        ))
+    }
+
+    fn from_datetime(local: jiff::civil::DateTime) -> Self {
         let date = local.date().to_string();
         let time = format!(
             "{:02}:{:02}:{:02}",
@@ -428,11 +480,11 @@ impl Clock {
             local.second()
         );
         let datetime = format!("{date} {time}");
-        Some(Self {
+        Self {
             date,
             time,
             datetime,
-        })
+        }
     }
 }
 

@@ -3,6 +3,8 @@ use std::path::PathBuf;
 
 use super::*;
 
+mod ordinary_download;
+
 struct Fixture(PathBuf);
 
 impl Fixture {
@@ -70,6 +72,29 @@ fn local_directory_publication_refuses_collisions_and_cleans_staging() {
     let mut contents = Vec::new();
     file.read_to_end(&mut contents).unwrap();
     assert_eq!(contents, b"complete");
+}
+
+#[cfg(windows)]
+#[test]
+fn private_windows_stage_cleanup_unlinks_a_file_with_an_open_shared_reader() {
+    let fixture = Fixture::new();
+    let parent = local::Directory::open_path(&fixture.0).unwrap();
+    let stage_name = OsStr::new("stage");
+    let stage = parent.create_child(stage_name).unwrap();
+    let nested = stage.create_child(OsStr::new("nested")).unwrap();
+    nested
+        .create_file(OsStr::new("data"))
+        .unwrap()
+        .write_all(b"private bytes")
+        .unwrap();
+    let mut reader = nested.read_child(OsStr::new("data")).unwrap().unwrap();
+    drop(nested);
+
+    local::discard(&parent, stage_name, stage).unwrap();
+    assert!(parent.names(1).unwrap().is_empty());
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, b"private bytes");
 }
 
 #[cfg(unix)]

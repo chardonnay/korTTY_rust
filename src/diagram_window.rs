@@ -16,6 +16,7 @@ use kortty_diagram::{
 };
 
 mod ai;
+pub(crate) use ai::AnalysisFlowchartRequest;
 
 const MAX_PREVIEW_DIMENSION: f32 = 4096.0;
 const MAX_PREVIEW_PIXELS: f32 = 8_000_000.0;
@@ -31,6 +32,7 @@ pub enum Message {
     ShowAi(bool),
     AiEndpoint(String),
     AiModel(String),
+    AiUseLocalApi,
     AiFamily(ai::Family),
     GenerateAi,
     PreviewPointer(Option<Point>),
@@ -41,6 +43,9 @@ pub enum Message {
     Fit,
     CopySource,
     CopyMermaid,
+    SnippetTitle(String),
+    SnippetInstructions(String),
+    SaveToSnippet,
     SetPath(String),
     Export(Format),
     ExportReport,
@@ -65,6 +70,7 @@ pub struct Chart {
     scene: Arc<Scene>,
     code_links: Option<HashMap<String, SourceRange>>,
     fallback: bool,
+    fallback_reason: Option<String>,
 }
 
 impl Chart {
@@ -75,6 +81,7 @@ impl Chart {
             scene,
             code_links: None,
             fallback: false,
+            fallback_reason: None,
         }
     }
 
@@ -85,11 +92,44 @@ impl Chart {
         }
     }
 
-    fn fallback(diagram: Diagram) -> Self {
+    fn fallback(diagram: Diagram, reason: String) -> Self {
         Self {
             fallback: true,
+            fallback_reason: Some(reason),
             ..Self::local(diagram)
         }
+    }
+
+    pub(crate) fn stored(
+        diagram: Diagram,
+        code_links: HashMap<String, SourceRange>,
+        fallback: bool,
+        fallback_reason: Option<String>,
+    ) -> Self {
+        Self {
+            fallback,
+            fallback_reason,
+            ..Self::ai(diagram, code_links)
+        }
+    }
+
+    pub(crate) fn diagram(&self) -> &Diagram {
+        &self.diagram
+    }
+
+    pub(crate) fn source_range(&self, node: &kortty_diagram::Node) -> Option<SourceRange> {
+        match &self.code_links {
+            Some(links) => links.get(node.id()).copied(),
+            None => node.source_range(),
+        }
+    }
+
+    pub(crate) fn is_fallback(&self) -> bool {
+        self.fallback
+    }
+
+    pub(crate) fn fallback_reason(&self) -> Option<&str> {
+        self.fallback_reason.as_deref()
     }
 }
 
@@ -113,7 +153,15 @@ pub struct DiagramWindow {
     ai: ai::Draft,
     ai_pending: bool,
     ai_cancel: Option<crate::local_ai::Cancel>,
+    ai_skill_usage: Option<crate::ai_manager::SkillUsageReceipt>,
+    saved: bool,
+    snippet: Option<snippet::Draft>,
+    saved_snippet_title: Option<String>,
+    saved_snippet_source: Option<snippet::SavedSource>,
+    snippet_saving: bool,
 }
+
+pub(crate) mod snippet;
 
 impl DiagramWindow {
     pub fn source(&self) -> String {
@@ -163,6 +211,12 @@ impl DiagramWindow {
             ai: ai::Draft::default(),
             ai_pending: false,
             ai_cancel: None,
+            ai_skill_usage: None,
+            saved: false,
+            snippet: None,
+            saved_snippet_title: None,
+            saved_snippet_source: None,
+            snippet_saving: false,
         }
     }
 
@@ -173,11 +227,40 @@ impl DiagramWindow {
         window
     }
 
+    pub(crate) fn with_saved_chart(size: Size, source: Option<&str>, chart: Chart) -> Self {
+        let mut window = Self::new(size, false);
+        window.saved = true;
+        window.replace_saved_chart(source, chart);
+        window
+    }
+
+    pub(crate) fn with_attachment_chart(size: Size, source: &str, chart: Chart) -> Self {
+        let mut window = Self::with_saved_chart(size, Some(source), chart);
+        window.saved_snippet_title = Some("Attachment flowchart".into());
+        window
+    }
+
+    pub(crate) fn with_workflow_chart(size: Size, source: &str, chart: Chart) -> Self {
+        let mut window = Self::with_saved_chart(size, Some(source), chart);
+        window.saved_snippet_title = Some("Workflow flowchart".into());
+        window
+    }
+
+    pub(crate) fn replace_saved_chart(&mut self, source: Option<&str>, chart: Chart) {
+        self.clear_preview();
+        self.content = text_editor::Content::with_text(source.unwrap_or_default());
+        self.mode = SourceMode::Shell;
+        self.accept_render(self.revision, Ok(Arc::new(chart)));
+    }
+
     pub(crate) fn configure_ai(
         &mut self,
         allowed: bool,
         configuration: Option<Arc<crate::ai_manager::Configuration>>,
     ) {
+        if self.saved {
+            return;
+        }
         self.cancel_ai_preview();
         self.ai.configure(configuration);
         self.ai_allowed = allowed;
@@ -197,8 +280,24 @@ impl DiagramWindow {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if self.snippet_saving
+            && matches!(
+                message,
+                Message::Render
+                    | Message::GenerateAi
+                    | Message::SnippetTitle(_)
+                    | Message::SnippetInstructions(_)
+                    | Message::AiFamily(_)
+            )
+        {
+            return Task::none();
+        }
         match message {
             Message::Close => {}
+            Message::Edit(action) if (self.saved || self.snippet.is_some()) && action.is_edit() => {
+            }
+            Message::SetMode(_) if self.saved || self.snippet.is_some() => {}
+            Message::Render if !self.can_render_locally() => {}
             Message::Edit(action) => {
                 if action.is_edit() {
                     self.clear_preview();
@@ -244,6 +343,11 @@ impl DiagramWindow {
             Message::AiRendered(revision, result) if revision == self.revision => {
                 self.ai_pending = false;
                 self.ai_cancel = None;
+                if let Some(receipt) = self.ai_skill_usage.take()
+                    && result.as_ref().is_ok_and(|chart| !chart.is_fallback())
+                {
+                    receipt.record();
+                }
                 self.accept_render(revision, result);
             }
             Message::AiRendered(_, _) => {}
@@ -260,19 +364,30 @@ impl DiagramWindow {
                 self.ai.manual_override();
                 self.ai.model = value;
             }
-            Message::AiFamily(value) => {
+            Message::AiUseLocalApi => {
                 self.cancel_ai_preview();
-                self.ai.family = value;
+                self.ai.manual_override();
+            }
+            Message::AiFamily(value) => {
+                if !self.regenerating_snippet() && value != self.ai.family {
+                    if self.snippet.is_some() {
+                        self.clear_preview();
+                    } else {
+                        self.cancel_ai_preview();
+                    }
+                    self.ai.family = value;
+                }
             }
             Message::GenerateAi if self.ai_allowed && self.show_ai && !self.ai_pending => {
                 match self
                     .script_source()
-                    .and_then(|source| self.ai.start(source))
+                    .and_then(|source| self.ai.start(source, self.snippet_instructions()))
                 {
-                    Ok(crate::local_ai::Pending { reply, cancel }) => {
+                    Ok((crate::local_ai::Pending { reply, cancel }, skill_usage)) => {
                         self.clear_preview();
                         self.ai_pending = true;
                         self.ai_cancel = Some(cancel);
+                        self.ai_skill_usage = skill_usage;
                         let revision = self.revision;
                         self.status = Some("Waiting for the local AI diagram…".into());
                         return Task::future(async move {
@@ -288,6 +403,23 @@ impl DiagramWindow {
                 }
             }
             Message::ShowAi(_) | Message::GenerateAi => {}
+            Message::SnippetTitle(title) => {
+                if let Some(draft) = &mut self.snippet
+                    && title.len() <= crate::snippets::MAX_NAME_BYTES
+                {
+                    draft.title = title;
+                }
+            }
+            Message::SnippetInstructions(value) => {
+                if let Some(draft) = &mut self.snippet
+                    && value.len() <= crate::snippets::diagrams::MAX_INSTRUCTIONS
+                    && value != draft.instructions
+                {
+                    draft.instructions = value;
+                    self.clear_preview();
+                }
+            }
+            Message::SaveToSnippet => {}
             Message::PreviewPointer(position) => self.pointer = position,
             Message::JumpToSource => {
                 if let Some(source) = self.pointed_source() {
@@ -374,26 +506,52 @@ impl DiagramWindow {
     }
 
     pub fn view(&self, content_theme: iced::Theme) -> Element<'_, Message> {
-        let mut toolbar = row![
-            button("Mermaid")
-                .style(if self.mode == SourceMode::Mermaid {
-                    button::primary
+        let toolbar = if self.saved {
+            row![
+                text(
+                    self.saved_snippet_title
+                        .as_deref()
+                        .unwrap_or("Saved analysis flowchart")
+                ),
+                button("Copy source").on_press(Message::CopySource)
+            ]
+        } else if let Some(draft) = &self.snippet {
+            row![
+                text(draft.source.scope.to_string()),
+                button("Render shell flowchart")
+                    .on_press_maybe(self.can_render_locally().then_some(Message::Render)),
+                button("Copy source").on_press(Message::CopySource),
+                button(if self.snippet_saving {
+                    "Saving…"
                 } else {
-                    button::secondary
+                    "Save to snippet"
                 })
-                .on_press(Message::SetMode(SourceMode::Mermaid)),
-            button("Script")
-                .style(if self.mode == SourceMode::Shell {
-                    button::primary
-                } else {
-                    button::secondary
-                })
-                .on_press(Message::SetMode(SourceMode::Shell)),
-            button("Render").on_press(Message::Render),
-            button("Copy source").on_press(Message::CopySource),
-        ]
-        .spacing(6)
-        .align_y(Alignment::Center);
+                .on_press_maybe(
+                    (self.chart.is_some() && !self.snippet_saving)
+                        .then_some(Message::SaveToSnippet)
+                ),
+            ]
+        } else {
+            row![
+                button("Mermaid")
+                    .style(if self.mode == SourceMode::Mermaid {
+                        button::primary
+                    } else {
+                        button::secondary
+                    })
+                    .on_press(Message::SetMode(SourceMode::Mermaid)),
+                button("Script")
+                    .style(if self.mode == SourceMode::Shell {
+                        button::primary
+                    } else {
+                        button::secondary
+                    })
+                    .on_press(Message::SetMode(SourceMode::Shell)),
+                button("Render").on_press(Message::Render),
+                button("Copy source").on_press(Message::CopySource),
+            ]
+        };
+        let mut toolbar = toolbar.spacing(6).align_y(Alignment::Center);
         if self.ai_allowed && self.mode == SourceMode::Shell {
             toolbar = toolbar.push(
                 button(if self.show_ai {
@@ -433,10 +591,13 @@ impl DiagramWindow {
             .id(self.editor_id.clone())
             .style(move |_, status| text_editor::default(&content_theme, status))
             .font(iced::Font::MONOSPACE)
+            .wrapping(text::Wrapping::WordOrGlyph)
             .placeholder(match self.mode {
                 SourceMode::Mermaid => {
                     "Paste a flowchart, sequence, state, class, ER, mindmap, or architecture diagram"
                 }
+                SourceMode::Shell if self.saved_snippet_title.is_some() => "Source links are unavailable for this diagram revision.",
+                SourceMode::Shell if self.saved => "The analysed source was not stored.",
                 SourceMode::Shell => "Paste source code. Local Render supports shell scripts.",
             })
             .height(Length::Fill)
@@ -445,6 +606,16 @@ impl DiagramWindow {
         let mut contents = column![toolbar.width(Length::Fill).wrap()]
             .spacing(8)
             .padding(10);
+        if let Some(draft) = &self.snippet {
+            contents = contents.push(
+                row![
+                    text_input("Diagram title", &draft.title).on_input(Message::SnippetTitle),
+                    text_input("Optional AI diagram instructions", &draft.instructions)
+                        .on_input(Message::SnippetInstructions),
+                ]
+                .spacing(6),
+            );
+        }
         if self.show_ai {
             contents = contents.push(self.ai_settings());
         }
@@ -477,7 +648,7 @@ impl DiagramWindow {
                 .align_y(Alignment::Center),
             );
         }
-        let status = self.status.as_deref().map(Fragment::Borrowed).or_else(|| {
+        let pointed = || {
             self.pointed_source().map(|source| {
                 Fragment::Owned(format!(
                     "Source lines {}–{} · click to jump",
@@ -485,7 +656,13 @@ impl DiagramWindow {
                     source.end()
                 ))
             })
-        });
+        };
+        let current_status = || self.status.as_deref().map(Fragment::Borrowed);
+        let status = if self.saved {
+            pointed().or_else(current_status)
+        } else {
+            current_status().or_else(pointed)
+        };
         if self.scene.is_some() {
             // Keep the export controls in place when the pointer leaves the preview.
             contents = contents.push(
@@ -501,19 +678,47 @@ impl DiagramWindow {
     }
 
     fn ai_settings(&self) -> Element<'_, Message> {
+        let (route, consent): (Element<'_, Message>, _) = if let Some(model) =
+            &self.ai.managed_model
+        {
+            (
+                row![
+                    text(format!("Managed llama.cpp · {model}")).width(Length::Fill),
+                    button("Use local API")
+                        .style(button::secondary)
+                        .on_press(Message::AiUseLocalApi),
+                ]
+                .spacing(6)
+                .into(),
+                "Generate sends numbered source to the managed model on this computer. Long scripts use a structural outline.",
+            )
+        } else {
+            (
+                row![
+                    text_input("Loopback address and port", &self.ai.endpoint)
+                        .on_input(Message::AiEndpoint)
+                        .width(180),
+                    text_input("Installed local model", &self.ai.model).on_input(Message::AiModel),
+                ]
+                .spacing(6)
+                .into(),
+                "Generate sends numbered source to the configured loopback service. Long scripts use a structural outline. A model may forward the input.",
+            )
+        };
+        let family: Element<'_, Message> = if self.regenerating_snippet() {
+            text(self.ai.family.to_string()).into()
+        } else {
+            pick_list(ai::Family::ALL, Some(self.ai.family), Message::AiFamily).into()
+        };
         column![
             row![
-                text_input("Loopback address and port", &self.ai.endpoint)
-                    .on_input(Message::AiEndpoint)
-                    .width(180),
-                text_input("Installed Ollama model", &self.ai.model)
-                    .on_input(Message::AiModel),
-                pick_list(ai::Family::ALL, Some(self.ai.family), Message::AiFamily),
+                route,
+                family,
                 button("Generate with AI")
                     .on_press_maybe((!self.ai_pending).then_some(Message::GenerateAi)),
-            ].spacing(6),
-            text("Generate sends numbered source to the configured loopback service. Long scripts use a structural outline. A model may forward the input.")
-                .size(13),
+            ]
+            .spacing(6),
+            text(consent).size(13),
         ]
         .spacing(6)
         .into()
@@ -525,8 +730,11 @@ impl DiagramWindow {
         }
         match result {
             Ok(chart) => {
-                self.status = chart.fallback.then(|| {
-                    "AI diagram unavailable. Showing the locally generated flowchart.".into()
+                self.status = chart.fallback.then(|| match chart.fallback_reason() {
+                    Some(reason) => format!("Showing the locally generated flowchart. {reason}."),
+                    None => {
+                        "AI diagram unavailable. Showing the locally generated flowchart.".into()
+                    }
                 });
                 self.chart = Some(chart);
                 self.refresh_scene();
@@ -552,6 +760,7 @@ impl DiagramWindow {
         self.revision += 1;
         self.ai_pending = false;
         self.ai_cancel = None;
+        self.ai_skill_usage = None;
         self.chart = None;
         self.scene = None;
         self.svg = None;
@@ -565,7 +774,7 @@ impl DiagramWindow {
         }
     }
 
-    fn pointed_source(&self) -> Option<SourceRange> {
+    pub(crate) fn pointed_source(&self) -> Option<SourceRange> {
         let point = self.pointer?;
         let zoom = self.zoom();
         let point = ScenePoint {
@@ -577,6 +786,23 @@ impl DiagramWindow {
             Some(links) => links.get(scene.node_at(point)?.id()).copied(),
             None => scene.source_at(point),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn linked_node_center(&self, range: SourceRange) -> Option<Point> {
+        let links = self.chart.as_ref()?.code_links.as_ref()?;
+        let node = self
+            .scene
+            .as_ref()?
+            .nodes()
+            .iter()
+            .find(|node| links.get(node.id()) == Some(&range))?;
+        let bounds = node.bounds();
+        let zoom = self.zoom();
+        Some(Point::new(
+            (bounds.x as f32 + bounds.width as f32 / 2.0) * zoom,
+            (bounds.y as f32 + bounds.height as f32 / 2.0) * zoom,
+        ))
     }
 
     fn zoom(&self) -> f32 {

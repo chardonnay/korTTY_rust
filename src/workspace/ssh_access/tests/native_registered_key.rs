@@ -118,6 +118,8 @@ fn openssh_registered_copy_reaches_kitty_desktop_session() {
             command_timestamps: Some(true),
             tab_color: None,
             paste_warning: None,
+            window_geometry: None,
+            terminal: Default::default(),
         })
         .unwrap();
     let store = Store::open(connections).unwrap();

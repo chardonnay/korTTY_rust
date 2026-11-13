@@ -4,6 +4,7 @@ use std::sync::Arc;
 use kortty_ssh::{Authentication, Endpoint, SshTarget};
 use kortty_vault::Secret;
 
+use crate::clipboard_policy::ServerAccess;
 #[cfg(test)]
 use crate::connection_store::Auth;
 use crate::connection_store::{ActiveAuth, Connection, SavedLogin, Store};
@@ -15,6 +16,8 @@ use crate::vault_window::Kind;
 
 use super::Failure;
 
+const SERVER_BLOCKED: &str = "Managed policy blocks this SSH server or jump host";
+
 pub(crate) type SavedAuth = Result<Option<Credentials>, &'static str>;
 pub(crate) type BatchAuth = Result<Vec<Result<Credentials, &'static str>>, &'static str>;
 pub(super) type KeyCatalog = Option<Result<Arc<Catalog>, &'static str>>;
@@ -25,10 +28,38 @@ pub(crate) enum JobAuth {
     Batch(BatchAuth),
 }
 
+impl JobAuth {
+    pub(crate) fn with_sudo_passwords(
+        self,
+        mut password: impl FnMut(&ConnectionRef) -> Result<Secret, &'static str>,
+    ) -> Self {
+        match self {
+            Self::Manual => Self::Manual,
+            Self::Saved(saved) => Self::Saved(saved.and_then(|mut credentials| {
+                credentials.sudo_password = Some(password(&credentials.reference)?);
+                Ok(credentials)
+            })),
+            Self::Batch(saved) => Self::Batch(saved.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|entry| {
+                        entry.and_then(|mut credentials| {
+                            credentials.sudo_password = Some(password(&credentials.reference)?);
+                            Ok(credentials)
+                        })
+                    })
+                    .collect()
+            })),
+        }
+    }
+}
+
 pub(crate) struct Credentials {
     reference: ConnectionRef,
     target: Login,
     jump: Option<Login>,
+    server_access: ServerAccess,
+    sudo_password: Option<Secret>,
 }
 
 struct Login {
@@ -47,9 +78,72 @@ enum LoginAuth {
 }
 
 impl Credentials {
+    pub(super) fn take_sudo_password(&mut self) -> Option<Secret> {
+        self.sudo_password.take()
+    }
+
+    pub(crate) fn add_journal_secrets(&self, secrets: &crate::terminal_logging::Secrets) {
+        if let Some(password) = &self.sudo_password {
+            secrets.add(password.as_str());
+        }
+        for login in std::iter::once(&self.target).chain(self.jump.iter()) {
+            let secret = match &login.authentication {
+                LoginAuth::Password(secret) => Some(secret),
+                LoginAuth::Key(_, passphrase) | LoginAuth::StoredKey { passphrase, .. } => {
+                    passphrase.as_ref()
+                }
+            };
+            if let Some(secret) = secret {
+                secrets.add(secret.as_str());
+            }
+        }
+    }
+
+    pub(crate) fn resolve_directory_browser(
+        reference: &ConnectionRef,
+        current: &Connection,
+        server_access: &ServerAccess,
+        secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
+    ) -> Result<Self, &'static str> {
+        Self::resolve_for(
+            Some(reference),
+            current,
+            false,
+            &mut None,
+            server_access,
+            secret,
+        )
+    }
+
+    pub(super) fn into_route(self) -> Result<(SshTarget, Vec<SshTarget>), Failure> {
+        let target = self.target.endpoint()?;
+        let jump = self.jump.as_ref().map(Login::endpoint).transpose()?;
+        if jump
+            .as_ref()
+            .is_some_and(|jump| !endpoint_allowed(jump, &self.server_access))
+            || !endpoint_allowed(&target, &self.server_access)
+        {
+            return Err(Failure::blocked(SERVER_BLOCKED));
+        }
+        Ok((
+            self.target.load(target)?,
+            self.jump
+                .zip(jump)
+                .map(|(login, endpoint)| login.load(endpoint))
+                .transpose()?
+                .into_iter()
+                .collect(),
+        ))
+    }
+
+    pub(crate) fn into_swarm_route(self) -> Result<(SshTarget, Vec<SshTarget>), &'static str> {
+        self.into_route().map_err(|failure| failure.detail)
+    }
+
     pub(crate) fn resolve_batch(
         action: &SshCommand,
         store: &Store,
+        server_access: &ServerAccess,
         mut secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
     ) -> BatchAuth {
         action.validate_target_selection()?;
@@ -71,7 +165,14 @@ impl Credentials {
         Ok(profiles
             .into_iter()
             .map(|(reference, profile)| {
-                Self::resolve_for(Some(reference), profile, false, &mut keys, &mut secret)
+                Self::resolve_for(
+                    Some(reference),
+                    profile,
+                    false,
+                    &mut keys,
+                    server_access,
+                    &mut secret,
+                )
             })
             .collect())
     }
@@ -79,6 +180,7 @@ impl Credentials {
     pub(crate) fn resolve(
         action: &SshCommand,
         current: &Connection,
+        server_access: &ServerAccess,
         secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
     ) -> Result<Self, &'static str> {
         Self::resolve_for(
@@ -86,6 +188,7 @@ impl Credentials {
             current,
             action.virtual_terminal.is_some(),
             &mut None,
+            server_access,
             secret,
         )
     }
@@ -95,11 +198,15 @@ impl Credentials {
         current: &Connection,
         recording: bool,
         keys: &mut KeyCatalog,
+        server_access: &ServerAccess,
         mut secret: impl FnMut(&str, Kind, &LoginTarget) -> Result<Secret, &'static str>,
     ) -> Result<Self, &'static str> {
         let reference = ConnectionRef::from(current);
         if reviewed != Some(&reference) {
             return Err("The saved SSH route changed. Choose the connection again in this job.");
+        }
+        if !reference_allowed(&reference, server_access) {
+            return Err(SERVER_BLOCKED);
         }
         if current.incognito || !current.isolation.is_none() {
             return Err("This saved connection requires privacy or isolation unavailable to jobs.");
@@ -157,6 +264,8 @@ impl Credentials {
             reference,
             target: resolve(&current.login)?,
             jump: current.jump.as_ref().map(resolve).transpose()?,
+            server_access: server_access.clone(),
+            sudo_password: None,
         })
     }
 }
@@ -174,23 +283,17 @@ fn key_catalog(keys: &mut KeyCatalog) -> Result<&Arc<Catalog>, &'static str> {
 pub(super) fn route(
     action: &SshCommand,
     credentials: Option<Credentials>,
+    server_access: &ServerAccess,
 ) -> Result<(SshTarget, Vec<SshTarget>), Failure> {
     match (action.connection.as_ref(), credentials) {
-        (Some(reference), Some(credentials)) if *reference == credentials.reference => Ok((
-            credentials.target.load()?,
-            credentials
-                .jump
-                .map(Login::load)
-                .transpose()?
-                .into_iter()
-                .collect(),
-        )),
+        (Some(reference), Some(credentials)) if *reference == credentials.reference => {
+            credentials.into_route()
+        }
         (Some(_), None) => Err(Failure::blocked("The saved SSH connection is unavailable.")),
         (_, Some(_)) => Err(Failure::blocked("Unexpected saved SSH credentials.")),
         (None, None) => Ok((
             SshTarget {
-                endpoint: Endpoint::new(&action.host, action.port)
-                    .map_err(|_| Failure::blocked("Invalid SSH endpoint"))?,
+                endpoint: manual_endpoint(action, server_access)?,
                 username: action.username.clone(),
                 authentication: ssh_connection::private_key(&action.key_file)
                     .map_err(|_| Failure::failed("Could not read the SSH private key"))?,
@@ -200,10 +303,47 @@ pub(super) fn route(
     }
 }
 
+pub(super) fn reference_allowed(reference: &ConnectionRef, server_access: &ServerAccess) -> bool {
+    let route = reference
+        .jump
+        .iter()
+        .chain(std::iter::once(&reference.target));
+    server_access
+        .first_blocked(route.map(|login| (login.host.as_str(), login.port)))
+        .is_none()
+}
+
+pub(super) fn check_action_route(
+    action: &SshCommand,
+    server_access: &ServerAccess,
+) -> Result<(), Failure> {
+    match &action.connection {
+        Some(reference) if reference_allowed(reference, server_access) => Ok(()),
+        Some(_) => Err(Failure::blocked(SERVER_BLOCKED)),
+        None => manual_endpoint(action, server_access).map(|_| ()),
+    }
+}
+
+fn manual_endpoint(action: &SshCommand, server_access: &ServerAccess) -> Result<Endpoint, Failure> {
+    let endpoint = Endpoint::new(&action.host, action.port)
+        .map_err(|_| Failure::blocked("Invalid SSH endpoint"))?;
+    if !endpoint_allowed(&endpoint, server_access) {
+        return Err(Failure::blocked(SERVER_BLOCKED));
+    }
+    Ok(endpoint)
+}
+
+fn endpoint_allowed(endpoint: &Endpoint, server_access: &ServerAccess) -> bool {
+    server_access.allows(endpoint.wire_host().as_ref(), endpoint.port())
+}
+
 impl Login {
-    fn load(self) -> Result<SshTarget, Failure> {
-        let endpoint = Endpoint::new(&self.endpoint.host, self.endpoint.port)
-            .map_err(|_| Failure::blocked("Invalid saved SSH endpoint"))?;
+    fn endpoint(&self) -> Result<Endpoint, Failure> {
+        Endpoint::new(&self.endpoint.host, self.endpoint.port)
+            .map_err(|_| Failure::blocked("Invalid saved SSH endpoint"))
+    }
+
+    fn load(self, endpoint: Endpoint) -> Result<SshTarget, Failure> {
         let authentication = match self.authentication {
             LoginAuth::Password(secret) => {
                 Authentication::password(Password::from_secret(secret).into_string())
@@ -247,23 +387,26 @@ mod tests {
     use kortty_vault::{CredentialInput, Vault};
 
     use super::*;
-    use crate::job_executor::{run, tests::scheduled_request, virtual_terminal};
+    use crate::job_executor::{
+        ExecutionPolicy, batch, open_directory_browser, run,
+        tests::{blocked_server_policy, scheduled_request},
+        virtual_terminal,
+    };
     use crate::session_security::IsolationLevel;
     use crate::vault_window::{VaultWindow, resolve_credential};
 
-    #[test]
-    fn saved_job_rejects_stale_routes_interaction_and_locked_vault_before_authentication() {
+    fn saved_profile() -> Connection {
         let endpoint = LoginTarget {
             host: "target.example.test".into(),
             port: 22,
             username: "operator".into(),
         };
-        let mut profile = Connection {
+        Connection {
             id: 1,
             name: "Saved target".into(),
             tag: String::new(),
             login: SavedLogin {
-                endpoint: endpoint.clone(),
+                endpoint,
                 auth: Auth::VaultPassword("test-reference".into()),
                 keyboard_interactive: false,
             },
@@ -278,7 +421,15 @@ mod tests {
             command_timestamps: None,
             tab_color: None,
             paste_warning: None,
-        };
+            window_geometry: None,
+            terminal: Default::default(),
+        }
+    }
+
+    #[test]
+    fn saved_job_rejects_stale_routes_interaction_and_locked_vault_before_authentication() {
+        let mut profile = saved_profile();
+        let endpoint = profile.login.endpoint.clone();
         let (_, mut request) = scheduled_request();
         request.action = std::sync::Arc::new(
             serde_json::from_value(serde_json::json!({
@@ -290,35 +441,44 @@ mod tests {
             |_: &str, _, _: &LoginTarget| panic!("a rejected job must not request a vault secret");
         profile.login.endpoint.port = 2222;
         assert!(
-            matches!(Credentials::resolve(&request.action, &profile, should_not_lookup), Err(error) if error.contains("route changed"))
+            matches!(Credentials::resolve(&request.action, &profile, &ServerAccess::default(), should_not_lookup), Err(error) if error.contains("route changed"))
         );
         profile.login.endpoint = endpoint;
         profile.login.keyboard_interactive = true;
         assert!(
-            matches!(Credentials::resolve(&request.action, &profile, should_not_lookup), Err(error) if error.contains("interactive"))
+            matches!(Credentials::resolve(&request.action, &profile, &ServerAccess::default(), should_not_lookup), Err(error) if error.contains("interactive"))
         );
         profile.login.keyboard_interactive = false;
         profile.isolation = IsolationLevel::Process;
         assert!(
-            matches!(Credentials::resolve(&request.action, &profile, should_not_lookup), Err(error) if error.contains("isolation"))
+            matches!(Credentials::resolve(&request.action, &profile, &ServerAccess::default(), should_not_lookup), Err(error) if error.contains("isolation"))
         );
         profile.isolation = IsolationLevel::None;
         let mut recording = request.action.as_ref().clone();
         recording.virtual_terminal = Some(virtual_terminal::Options::default());
         assert!(
-            matches!(Credentials::resolve(&recording, &profile, should_not_lookup), Err(error) if error.contains("cannot record"))
+            matches!(Credentials::resolve(&recording, &profile, &ServerAccess::default(), should_not_lookup), Err(error) if error.contains("cannot record"))
         );
 
         let temporary = crate::snippets::tests::Profile::new();
         let path = temporary.0.join("vault");
         let vault = VaultWindow::open(path.clone()).unwrap();
-        let saved = Credentials::resolve(&request.action, &profile, |id, kind, endpoint| {
-            vault.resolve(id, kind, endpoint)
-        })
+        let saved = Credentials::resolve(
+            &request.action,
+            &profile,
+            &ServerAccess::default(),
+            |id, kind, endpoint| vault.resolve(id, kind, endpoint),
+        )
         .map(Some);
-        let completion = run(&request, None, None, true, saved, Ok(None), || {
-            panic!("a locked vault must not start SSH setup")
-        });
+        let completion = run(
+            &request,
+            None,
+            None,
+            &ExecutionPolicy::unrestricted(true),
+            saved,
+            Ok(None),
+            || panic!("a locked vault must not start SSH setup"),
+        );
         assert_eq!(completion.outcome, kortty_jobs::RunOutcome::Blocked);
         assert_eq!(
             completion.detail.as_deref(),
@@ -335,9 +495,12 @@ mod tests {
         let id = vault.save(input.clone(), secret()).unwrap();
         profile.login.auth = Auth::VaultPassword(id.clone());
         let resolve = |vault: &Vault| {
-            Credentials::resolve(&request.action, &profile, |id, kind, endpoint| {
-                resolve_credential(vault, id, kind, endpoint)
-            })
+            Credentials::resolve(
+                &request.action,
+                &profile,
+                &ServerAccess::default(),
+                |id, kind, endpoint| resolve_credential(vault, id, kind, endpoint),
+            )
         };
         assert!(matches!(resolve(&vault), Err(error) if error.contains("outside the scope")));
         input.id = Some(id);
@@ -347,5 +510,85 @@ mod tests {
         assert!(
             matches!(password.target.authentication, LoginAuth::Password(value) if value.as_str() == "scheduler-test-password")
         );
+    }
+
+    #[test]
+    fn saved_jump_policy_blocks_before_vault_and_is_reported_per_target() {
+        let mut blocked = saved_profile();
+        blocked.id = 0;
+        let mut jump = blocked.login.clone();
+        jump.endpoint.host = "jump.example.test.".into();
+        jump.endpoint.port = 2222;
+        blocked.jump = Some(jump);
+        let mut other = saved_profile();
+        other.id = 0;
+        other.login.auth = Auth::Prompt;
+        let directory = crate::snippets::tests::Profile::new();
+        let mut store = Store::open(directory.0.join("connections.json")).unwrap();
+        let blocked = store.save(blocked).unwrap();
+        let other = store.save(other).unwrap();
+        let blocked = store.get(blocked).unwrap();
+        let reference = ConnectionRef::from(blocked);
+        let policy = blocked_server_policy("jump.example.test.:2222");
+        let secret =
+            |_: &str, _: Kind, _: &LoginTarget| panic!("do not load blocked SSH credentials");
+        let (_, mut request) = scheduled_request();
+        request.action = std::sync::Arc::new(
+            serde_json::from_value(serde_json::json!({
+                "connection": reference,
+                "additional_connections": [ConnectionRef::from(store.get(other).unwrap())],
+                "command": "true",
+            }))
+            .unwrap(),
+        );
+
+        assert!(matches!(
+            Credentials::resolve(&request.action, blocked, &policy.server_access, secret),
+            Err(SERVER_BLOCKED)
+        ));
+        assert!(matches!(
+            Credentials::resolve_directory_browser(
+                &reference,
+                blocked,
+                &policy.server_access,
+                secret
+            ),
+            Err(SERVER_BLOCKED)
+        ));
+        let credentials =
+            Credentials::resolve_batch(&request.action, &store, &policy.server_access, secret);
+        let completion = batch::run(&request, None, &policy, credentials, Ok(None), || {
+            panic!("neither target can reach the SSH trust store")
+        });
+        assert_eq!(completion.outcome, kortty_jobs::RunOutcome::Blocked);
+        let detail = completion.detail.unwrap();
+        assert!(detail.contains("2 blocked") && detail.contains(SERVER_BLOCKED));
+        assert!(detail.contains("interactive SSH login"));
+    }
+
+    #[test]
+    fn standalone_browser_checks_its_cached_route_before_reading_a_key() {
+        let mut profile = saved_profile();
+        profile.login.auth = Auth::KeyFile {
+            path: crate::snippets::tests::Profile::new().0.join("missing-key"),
+            passphrase: None,
+        };
+        let reference = ConnectionRef::from(&profile);
+        let mut credentials = Credentials::resolve_directory_browser(
+            &reference,
+            &profile,
+            &ServerAccess::default(),
+            |_, _, _| panic!("no passphrase"),
+        )
+        .unwrap();
+        credentials.server_access = blocked_server_policy("target.example.test").server_access;
+        assert!(matches!(
+            open_directory_browser(
+                credentials,
+                || false,
+                || { panic!("blocked standalone browser must not reach host-key trust") }
+            ),
+            Err(SERVER_BLOCKED)
+        ));
     }
 }

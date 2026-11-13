@@ -2,8 +2,12 @@
 
 use std::fs::File;
 use std::io;
+use std::ops::Deref;
 use std::time::SystemTime;
 
+pub(crate) mod batch;
+pub(crate) mod desktop;
+pub(crate) mod executable;
 pub(crate) mod overwrite;
 #[cfg(unix)]
 mod unix;
@@ -11,7 +15,7 @@ mod unix;
 mod windows;
 
 #[cfg(unix)]
-pub(crate) use unix::Directory;
+pub(crate) use unix::{Directory, require_administrator_controlled};
 #[cfg(windows)]
 pub(crate) use windows::Directory;
 
@@ -19,6 +23,32 @@ pub(crate) use windows::Directory;
 pub(crate) type EntryIdentity = (u64, u64);
 #[cfg(windows)]
 pub(crate) type EntryIdentity = (u64, [u8; 16]);
+
+/// A held file lock whose owner releases it before closing the descriptor.
+#[derive(Debug)]
+pub(crate) struct FileLock(File);
+
+impl FileLock {
+    /// Takes ownership of a file with an acquired lock.
+    pub(crate) fn new(file: File) -> Self {
+        Self(file)
+    }
+}
+
+impl Deref for FileLock {
+    type Target = File;
+
+    fn deref(&self) -> &File {
+        &self.0
+    }
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // A forked child can retain the descriptor until it execs.
+        let _ = self.0.unlock();
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct FileStamp {
@@ -68,18 +98,34 @@ impl FileStamp {
         Ok(())
     }
 
-    #[cfg(unix)]
+    pub(crate) fn append_identity(&self, bytes: &mut Vec<u8>) {
+        bytes.extend(self.identity.0.to_le_bytes());
+        #[cfg(unix)]
+        {
+            bytes.extend(self.identity.1.to_le_bytes());
+            bytes.extend(self.identity.2.to_le_bytes());
+            bytes.extend(self.identity.3.to_le_bytes());
+        }
+        #[cfg(windows)]
+        bytes.extend(self.identity.1);
+        let (before_epoch, duration) = match self.modified.duration_since(SystemTime::UNIX_EPOCH) {
+            Ok(duration) => (false, duration),
+            Err(error) => (true, error.duration()),
+        };
+        bytes.push(u8::from(before_epoch));
+        bytes.extend(duration.as_secs().to_le_bytes());
+        bytes.extend(duration.subsec_nanos().to_le_bytes());
+        bytes.extend(self.length.to_le_bytes());
+    }
+
     pub(crate) fn stamp_after_move(&self, file: &File) -> io::Result<Self> {
         let moved = Self::read(file)?;
-        // Renaming can change ctime, so compare the immutable identity and content metadata.
-        if (self.identity.0, self.identity.1, self.modified, self.length)
-            != (
-                moved.identity.0,
-                moved.identity.1,
-                moved.modified,
-                moved.length,
-            )
-        {
+        let same_file = (self.identity.0, self.identity.1, self.length)
+            == (moved.identity.0, moved.identity.1, moved.length);
+        // Rename changes ctime on Unix. On Windows, mtime may settle when the writer closes.
+        #[cfg(unix)]
+        let same_file = same_file && self.modified == moved.modified;
+        if !same_file {
             return Err(invalid("file changed before the operation could finish"));
         }
         Ok(moved)

@@ -133,6 +133,33 @@ fn bundle(fixture: &Fixture, options: &Options) -> (BundleStats, BTreeMap<String
 }
 
 #[test]
+fn journal_browser_html_embeds_only_validated_pngs_and_disables_links() {
+    let fixture = Fixture::new();
+    let journal = fixture.journal.join(DOCUMENT);
+    let xml = XML
+        .replace("screenshots/private.orig.png", "screenshots/entry.png")
+        .replace("Edited image", "Edited image https://example.org/");
+    fs::write(journal, xml).unwrap();
+    let snapshot = fixture.load();
+    let options = Options::default();
+    let selection = snapshot
+        .select_for_export(&options.filter, None, &|| false)
+        .unwrap();
+    let (html, _) = selection.render_browser_html(&options, &|| false).unwrap();
+    let inline = format!(
+        "src=\"data:image/png;base64,{}\"",
+        STANDARD.encode(&fixture.png)
+    );
+    assert!(html.contains(&inline));
+    assert!(html.contains("retained command"));
+    assert!(html.contains("https://example.org/"));
+    assert!(!html.contains("href=\"https://"));
+    assert!(!html.contains("src=\"screenshots/"));
+    assert!(!html.contains("unreferenced.png"));
+    assert!(!html.contains("stale-foreign-html"));
+}
+
+#[test]
 #[ignore = "writes a browser smoke fixture into the test scratch directory"]
 fn journal_html_bundle_browser_fixture() {
     let fixture = Fixture::new();

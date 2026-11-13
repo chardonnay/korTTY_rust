@@ -318,6 +318,7 @@ mod tests {
             font: 14,
             focused,
             term: "xterm-256color".into(),
+            initial_size: Default::default(),
             target: serde_json::from_value(serde_json::json!({
                 "host": host, "port": 22, "username": "operator",
                 // No store can contain this ID because next_id must be greater.
@@ -343,6 +344,7 @@ mod tests {
             tab_groups: Default::default(),
             tab_primary_panes: Default::default(),
             tab_terminal_effects: Default::default(),
+            tab_terminal_appearance: Default::default(),
             tabs: vec![PaneLayout::Split {
                 vertical: true,
                 ratio: 0.5,

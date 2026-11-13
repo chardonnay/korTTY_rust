@@ -8,9 +8,14 @@ use std::io::{self, Read, Write};
 use std::sync::Arc;
 
 mod edit;
+mod in_place;
+mod resume;
+mod upload_resume;
 mod wire;
 
-pub use edit::{MAX_EDIT_BYTES, RemoteText};
+pub use edit::{MAX_EDIT_BYTES, RemoteFile, RemoteText};
+pub use in_place::InPlaceUpload;
+pub use upload_resume::{UploadMetadata, UploadOwner, UploadStage};
 use wire::Decoder;
 
 const VERSION: u32 = 3;
@@ -22,6 +27,8 @@ const COPY_CHUNK: u64 = 8 * 1024 * 1024;
 const MAX_PATH: usize = 16 * 1024;
 const MAX_HANDLE: usize = 256;
 const CHUNK: usize = 32 * 1024;
+/// Bytes before a resume point which must match the checked remote handle.
+pub const DOWNLOAD_OVERLAP_BYTES: usize = 64 * 1024;
 const MAX_DIRECTORY_ENTRIES: usize = 100_000;
 const MAX_DIRECTORY_BYTES: usize = 32 * 1024 * 1024;
 
@@ -319,7 +326,7 @@ impl<R: Read, W: Write> Sftp<R, W> {
         fields.extend_from_slice(&0u32.to_be_bytes());
         let handle = self.open_handle(wire::OPEN, &fields)?;
         self.with_handle(&handle, |client, handle| {
-            let offset = client.copy_download(handle, &mut destination)?;
+            let offset = client.copy_download(handle, 0, None, &mut destination)?;
             destination.flush().map_err(Error::LocalIo)?;
             Ok(offset)
         })
@@ -334,23 +341,37 @@ impl<R: Read, W: Write> Sftp<R, W> {
         &mut self,
         path: &[u8],
         expected: Attributes,
-        mut destination: impl Write,
+        destination: impl Write,
     ) -> Result<u64, Error> {
-        check_regular(expected, self.lstat(path)?)?;
-        let handle = self.open_read_file(path)?;
-        let count = self.with_handle(&handle, |client, handle| {
-            check_regular(expected, client.handle_attributes(handle)?)?;
-            check_regular(expected, client.lstat(path)?)?;
-            let count = client.copy_download(handle, &mut destination)?;
-            if expected.size.is_some_and(|size| size != count) {
-                return Err(Error::SourceChanged);
+        self.download_regular_from(path, expected, 0, &[], destination)
+    }
+
+    /// Continues a checked regular file at a caller-owned staging offset.
+    ///
+    /// The overlap is the last 64 KiB of the saved prefix, or the whole
+    /// prefix when it is shorter. Its bytes must match on the same remote
+    /// handle used for copying. The writer must already be positioned at the
+    /// offset. Returns the final size including the saved prefix.
+    pub fn download_regular_from(
+        &mut self,
+        path: &[u8],
+        expected: Attributes,
+        offset: u64,
+        overlap: &[u8],
+        destination: impl Write,
+    ) -> Result<u64, Error> {
+        if overlap.len() as u64 != offset.min(DOWNLOAD_OVERLAP_BYTES as u64)
+            || (offset != 0
+                && (expected.modified.is_none() || expected.size.is_none_or(|size| offset > size)))
+        {
+            return Err(Error::InvalidInput("Invalid SFTP download resume point"));
+        }
+        self.download_verified(path, expected, offset, destination, |client, handle| {
+            if !overlap.is_empty() {
+                client.check_download_overlap(handle, offset, overlap)?;
             }
-            check_regular(expected, client.handle_attributes(handle)?)?;
-            destination.flush().map_err(Error::LocalIo)?;
-            Ok(count)
-        })?;
-        check_regular(expected, self.lstat(path)?)?;
-        Ok(count)
+            Ok(())
+        })
     }
 
     /// Streams into a new remote file with requested mode `0600` and exclusive creation.
@@ -410,6 +431,18 @@ impl<R: Read, W: Write> Sftp<R, W> {
         destination: &[u8],
         cancelled: impl Fn() -> bool,
     ) -> Result<u64, Error> {
+        self.copy_regular_new_with_progress(source, expected, destination, cancelled, |_| {})
+    }
+
+    /// Copies a checked regular file and reports each completed server-side copy offset.
+    pub fn copy_regular_new_with_progress(
+        &mut self,
+        source: &[u8],
+        expected: Attributes,
+        destination: &[u8],
+        cancelled: impl Fn() -> bool,
+        mut progress: impl FnMut(u64),
+    ) -> Result<u64, Error> {
         if !self.supports_copy_data() {
             return Err(Error::Unsupported("Server-side copy was not advertised"));
         }
@@ -447,6 +480,7 @@ impl<R: Read, W: Write> Sftp<R, W> {
                     fields.extend_from_slice(&offset.to_be_bytes());
                     client.status_request(wire::EXTENDED, &fields)?;
                     offset += count;
+                    progress(offset);
                 }
                 let copied = client.handle_attributes(write)?;
                 if copied.kind() != FileKind::File || copied.size != Some(size) {
@@ -541,6 +575,27 @@ impl<R: Read, W: Write> Sftp<R, W> {
         self.lsetstat
     }
 
+    /// Sets only POSIX mode bits using OpenSSH's no-follow metadata request.
+    pub fn set_permissions_no_follow(
+        &mut self,
+        path: impl AsRef<[u8]>,
+        mode: u32,
+    ) -> Result<(), Error> {
+        if !self.supports_lsetstat() {
+            return Err(Error::Unsupported(
+                "No-follow permission changes were not advertised",
+            ));
+        }
+        if mode > 0o7777 {
+            return Err(Error::InvalidInput("Expected POSIX permission bits"));
+        }
+        let mut fields = Vec::new();
+        wire::string(&mut fields, LSETSTAT)?;
+        push_path(&mut fields, path.as_ref(), false)?;
+        push_permissions(&mut fields, mode);
+        self.status_request(wire::EXTENDED, &fields)
+    }
+
     /// Sets numeric ownership with OpenSSH's no-follow ownership request.
     /// Omitted IDs use the POSIX `chown` sentinel and retain that field.
     pub fn set_owner_no_follow(
@@ -615,32 +670,97 @@ impl<R: Read, W: Write> Sftp<R, W> {
         })
     }
 
-    fn copy_download(&mut self, handle: &[u8], destination: &mut impl Write) -> Result<u64, Error> {
-        let mut offset = 0u64;
+    fn check_download_overlap(
+        &mut self,
+        handle: &[u8],
+        offset: u64,
+        mut overlap: &[u8],
+    ) -> Result<(), Error> {
+        let mut offset = offset - overlap.len() as u64;
+        let mut fields = handle_fields(handle)?;
+        let handle_end = fields.len();
+        while !overlap.is_empty() {
+            fields.truncate(handle_end);
+            let count =
+                self.read_download_chunk(&mut fields, offset, overlap.len().min(CHUNK), |bytes| {
+                    if !overlap.starts_with(bytes) {
+                        return Err(Error::SourceChanged);
+                    }
+                    Ok(())
+                });
+            if is_eof(&count) {
+                return Err(Error::SourceChanged);
+            }
+            let count = count?;
+            offset += count as u64;
+            overlap = &overlap[count..];
+        }
+        Ok(())
+    }
+
+    fn copy_download(
+        &mut self,
+        handle: &[u8],
+        mut offset: u64,
+        expected_size: Option<u64>,
+        destination: &mut impl Write,
+    ) -> Result<u64, Error> {
         let mut fields = handle_fields(handle)?;
         let handle_end = fields.len();
         loop {
             fields.truncate(handle_end);
-            fields.extend_from_slice(&offset.to_be_bytes());
-            fields.extend_from_slice(&(CHUNK as u32).to_be_bytes());
-            let result = self.request(wire::READ, &fields, wire::DATA, |decoder| {
-                let bytes = decoder.string()?;
-                if bytes.is_empty() || bytes.len() > CHUNK {
-                    return Err(Error::Protocol("invalid SFTP READ data length"));
+            let result = self.read_download_chunk(&mut fields, offset, CHUNK, |bytes| {
+                if expected_size
+                    .is_some_and(|size| bytes.len() as u64 > size.saturating_sub(offset))
+                {
+                    return Err(Error::SourceChanged);
                 }
-                if decoder.length() != 0 {
-                    return Err(Error::Protocol("trailing bytes in SFTP READ response"));
+                let mut remaining = bytes;
+                while !remaining.is_empty() {
+                    // Local transfer adapters use Interrupted to cancel. Unlike
+                    // Write::write_all, this loop retries only after progress.
+                    let count = destination.write(remaining).map_err(Error::LocalIo)?;
+                    if count == 0 {
+                        return Err(Error::LocalIo(io::ErrorKind::WriteZero.into()));
+                    }
+                    remaining = remaining.get(count..).ok_or_else(|| {
+                        Error::LocalIo(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "download writer returned an invalid byte count",
+                        ))
+                    })?;
                 }
-                destination.write_all(bytes).map_err(Error::LocalIo)?;
-                Ok(bytes.len() as u64)
+                Ok(())
             });
             if is_eof(&result) {
                 return Ok(offset);
             }
             offset = offset
-                .checked_add(result?)
+                .checked_add(result? as u64)
                 .ok_or(Error::Limit("download file offset"))?;
         }
+    }
+
+    fn read_download_chunk(
+        &mut self,
+        fields: &mut Vec<u8>,
+        offset: u64,
+        length: usize,
+        consume: impl FnOnce(&[u8]) -> Result<(), Error>,
+    ) -> Result<usize, Error> {
+        fields.extend_from_slice(&offset.to_be_bytes());
+        fields.extend_from_slice(&(length as u32).to_be_bytes());
+        self.request(wire::READ, fields, wire::DATA, |decoder| {
+            let bytes = decoder.string()?;
+            if bytes.is_empty() || bytes.len() > length {
+                return Err(Error::Protocol("invalid SFTP READ data length"));
+            }
+            if decoder.length() != 0 {
+                return Err(Error::Protocol("trailing bytes in SFTP READ response"));
+            }
+            consume(bytes)?;
+            Ok(bytes.len())
+        })
     }
 
     fn copy_upload(&mut self, handle: &[u8], source: &mut impl Read) -> Result<u64, Error> {
@@ -649,12 +769,10 @@ impl<R: Read, W: Write> Sftp<R, W> {
         let mut fields = handle_fields(handle)?;
         let handle_end = fields.len();
         loop {
-            let count = match source.read(&mut buffer) {
-                Ok(0) => return Ok(offset),
-                Ok(count) => count,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(Error::LocalIo(error)),
-            };
+            let count = source.read(&mut buffer).map_err(Error::LocalIo)?;
+            if count == 0 {
+                return Ok(offset);
+            }
             let end = offset
                 .checked_add(count as u64)
                 .ok_or(Error::Limit("upload file offset"))?;
@@ -680,6 +798,7 @@ impl<R: Read, W: Write> Sftp<R, W> {
         let result = operation(self, handle);
         let closed = self.status_request(wire::CLOSE, &handle_fields(handle)?);
         match (result, closed) {
+            (Err(Error::SourceChanged), _) => Err(Error::SourceChanged),
             (Err(error), _) if error.connection_lost() => Err(error),
             (_, Err(error)) if error.connection_lost() => Err(error),
             (Err(error), _) | (Ok(_), Err(error)) => Err(error),
@@ -788,6 +907,42 @@ fn check_regular(expected: Attributes, current: Attributes) -> Result<(), Error>
     } else {
         Err(Error::SourceChanged)
     }
+}
+
+fn check_regular_handle(
+    path: &[u8],
+    expected: Attributes,
+    mut opened: Attributes,
+) -> Result<(), Error> {
+    // Win32 OpenSSH 10.4p1 synthesizes different permission bits for LSTAT
+    // and FSTAT. Match only the observed file modes on explicit drive paths.
+    // Path checks and the subsequent same-handle comparison stay exact.
+    let windows_modes = matches!(
+        (expected.permissions, opened.permissions),
+        (Some(0o100600 | 0o100700), Some(0o100666)) | (Some(0o100400 | 0o100500), Some(0o100444))
+    );
+    if windows_modes
+        && expected.uid == Some(0)
+        && expected.gid == Some(0)
+        && expected.size.is_some()
+        && expected.modified.is_some()
+        && windows_drive_file(path)
+    {
+        opened.permissions = expected.permissions;
+    }
+    check_regular(expected, opened)
+}
+
+fn windows_drive_file(path: &[u8]) -> bool {
+    let [b'/', letter, b':', b'/', rest @ ..] = path else {
+        return false;
+    };
+    letter.is_ascii_alphabetic()
+        && !rest.contains(&b':')
+        && !rest.contains(&b'\\')
+        && rest
+            .split(|&byte| byte == b'/')
+            .all(|component| !component.is_empty() && !matches!(component, b"." | b".."))
 }
 
 fn check_copy_cancelled(cancelled: &impl Fn() -> bool) -> Result<(), Error> {

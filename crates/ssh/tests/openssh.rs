@@ -14,12 +14,176 @@ use std::time::{Duration, Instant};
 
 use kortty_ssh::sftp::{Error as SftpError, FileKind, MAX_EDIT_BYTES, Sftp};
 use kortty_ssh::{
-    Authentication, Connect, ConnectError, DirectChannel, Endpoint, HostKey, HostKeyStatus,
-    JumpRoute, SshReader, SshSession, SshTarget, SshWriter, TrustMode, TrustStore, WindowSize,
+    Authentication, Connect, ConnectError, ConnectOptions, DirectChannel, Endpoint, ExecConnection,
+    HostKey, HostKeyStatus, JumpRoute, KeepAlive, KnownHostsFile, MAX_FORWARD_STREAMS,
+    MAX_SFTP_LEASES, SshReader, SshSession, SshTarget, SshWriter, StartupChannel, TrustMode,
+    TrustStore, WindowSize,
 };
 
 mod support;
 use support::TempDirectory;
+#[path = "openssh/liveness.rs"]
+mod liveness;
+
+#[test]
+#[ignore = "requires installed OpenSSH ssh-keygen and sshd, and a usable local account"]
+fn openssh_guard_revocation_stops_guarded_exec_after_authentication() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let temp = TempDirectory::new("ssh-guarded-exec");
+    let user = fixture_user();
+    generate_keys(&temp.0, &["host", "client"]);
+    let config = write_config(&temp.0, "host", &user);
+    // The fixture can run under a sticky temporary root while trusting only its fresh key.
+    let settings = fs::read_to_string(&config)
+        .unwrap()
+        .replace("StrictModes yes", "StrictModes no");
+    fs::write(&config, settings).unwrap();
+    for pty in [None, Some(("xterm", fixture_size()))] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let target = fixture_target(&temp.0, &user, "client", &listener);
+        let trust = TrustStore::new(temp.0.join("pins"), TrustMode::Strict);
+        pin(&trust, &target.endpoint, &temp.0, "host");
+        let server = serve(&listener, &config);
+        let checks = AtomicUsize::new(0);
+        let deny_at = if pty.is_some() { 4 } else { 3 };
+        let result = SshSession::connect_preconnected_guarded(
+            TcpStream::connect(address).unwrap(),
+            (target, Vec::new()),
+            trust,
+            StartupChannel::Exec {
+                command: "printf unexpected",
+                pty,
+            },
+            || false,
+            || {
+                if checks.fetch_add(1, Ordering::Relaxed) >= deny_at {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "fixture guard revoked",
+                    ));
+                }
+                Ok(())
+            },
+        );
+        let output = server.join().unwrap();
+        let log = String::from_utf8_lossy(&output.stderr);
+        let error = result.err().expect("guard must reject the command");
+        assert_eq!(
+            error.to_string(),
+            "fixture guard revoked",
+            "guard calls: {}\n{log}",
+            checks.load(Ordering::Relaxed)
+        );
+        assert!(log.contains("Accepted publickey"), "{log}");
+        assert!(!log.contains("request exec"), "{log}");
+    }
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH ssh-keygen and sshd, and a usable local account"]
+fn openssh_transfer_helper_reserves_two_exec_slots_only_when_requested() {
+    let temp = TempDirectory::new("ssh-transfer-exec");
+    let user = fixture_user();
+    generate_keys(&temp.0, &["host", "client"]);
+    let config = write_config(&temp.0, "host", &user);
+    for transfer_helper in [false, true] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let target = fixture_target(&temp.0, &user, "client", &listener);
+        let trust = TrustStore::new(temp.0.join("pins"), TrustMode::Strict);
+        pin(&trust, &target.endpoint, &temp.0, "host");
+        let server = serve(&listener, &config);
+        let mut session = SshSession::connect_preconnected_guarded(
+            TcpStream::connect(listener.local_addr().unwrap()).unwrap(),
+            (target, Vec::new()),
+            trust,
+            if transfer_helper {
+                StartupChannel::SftpWithTransferHelper
+            } else {
+                StartupChannel::Subsystem("sftp")
+            },
+            || false,
+            || Ok(()),
+        )
+        .unwrap();
+        let opener = session.exec_opener().unwrap();
+        let first = opener.open_cancellable("cat", || false).unwrap();
+        let second = opener.open_cancellable("cat", || false);
+        if transfer_helper {
+            let second = second.unwrap();
+            assert!(matches!(
+                opener.open_cancellable("cat", || false),
+                Err(ConnectError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+            drop(second);
+        } else {
+            assert!(matches!(
+                second,
+                Err(ConnectError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+            ));
+        }
+        drop(first);
+        session.close().unwrap();
+        let result = server.join().unwrap();
+        let log = String::from_utf8_lossy(&result.stderr);
+        assert_eq!(log.matches("Accepted publickey").count(), 1, "{log}");
+    }
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH ssh-keygen and sshd, and a usable local account"]
+fn openssh_configured_idle_keepalive_is_encrypted_and_channel_neutral() {
+    let temp = TempDirectory::new("ssh-keepalive");
+    let user = fixture_user();
+    generate_keys(&temp.0, &["host", "client"]);
+    let config = write_config(&temp.0, "host", &user);
+    let debug = fs::read_to_string(&config)
+        .unwrap()
+        .replace("LogLevel DEBUG2", "LogLevel DEBUG3");
+    fs::write(&config, debug).unwrap();
+    for enabled in [true, false] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let trust = TrustStore::new(temp.0.join("pins"), TrustMode::Strict);
+        let target = fixture_target(&temp.0, &user, "client", &listener);
+        pin(&trust, &target.endpoint, &temp.0, "host");
+        let server = serve(&listener, &config);
+        let mut shell = SshSession::connect_preconnected_with_options(
+            TcpStream::connect(address).unwrap(),
+            (target, Vec::new()),
+            trust,
+            StartupChannel::Terminal {
+                term: "xterm",
+                size: fixture_size(),
+            },
+            ConnectOptions::default().with_keepalive(Some(KeepAlive::new(enabled, 5).unwrap())),
+            || false,
+        )
+        .unwrap();
+        let mut input = shell.take_writer().unwrap();
+        let mut output = shell.take_reader().unwrap();
+        assert_shell_usable(&mut input, &mut output, "before-keepalive");
+        thread::sleep(Duration::from_secs(6));
+        let mut lease = shell.sftp_opener().unwrap().open().unwrap();
+        let mut sftp =
+            Sftp::new(lease.take_reader().unwrap(), lease.take_writer().unwrap()).unwrap();
+        assert_eq!(sftp.stat(".").unwrap().kind(), FileKind::Directory);
+        drop(sftp);
+        drop(lease);
+        assert_shell_usable(&mut input, &mut output, "after-keepalive");
+        shell.close().unwrap();
+        let result = server.join().unwrap();
+        let log = String::from_utf8_lossy(&result.stderr);
+        assert!(log.contains("subsystem request for sftp"));
+        assert_eq!(
+            log.lines()
+                .any(|line| line.ends_with("receive packet: type 2")),
+            enabled,
+            "unexpected transport heartbeat state with keepalive enabled={enabled}"
+        );
+    }
+}
 
 #[test]
 #[ignore = "requires installed OpenSSH ssh-keygen and sshd, and a usable local account"]
@@ -59,10 +223,14 @@ fn openssh_sftp_leases_share_the_terminal_connection_and_close_independently() {
         Err(ConnectError::Io(error)) if error.kind() == std::io::ErrorKind::Interrupted
     ));
     let mut lease = opener.open().unwrap();
+    let extra_leases: Vec<_> = (1..MAX_SFTP_LEASES)
+        .map(|_| opener.open().unwrap())
+        .collect();
     assert!(matches!(
         opener.open(),
         Err(ConnectError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
     ));
+    drop(extra_leases);
     let reader = lease.take_reader().unwrap();
     let writer = lease.take_writer().unwrap();
     let remote_tree = temp.0.canonicalize().unwrap().join("transfer-tree");
@@ -274,6 +442,33 @@ fn openssh_remote_text_checks_versions_modes_links_and_channel_identity() {
     assert_eq!(fs::read_to_string(&target).unwrap(), "alt é\r\n");
     assert!(edit_stages(&directory).is_empty());
     let original = client.open_text(target_path).unwrap();
+    let parent_mode = directory.metadata().unwrap().permissions();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o770)).unwrap();
+    assert!(matches!(
+        client.save_external_text(&original, Arc::from("external"), || false),
+        Err(SftpError::Unsupported(_))
+    ));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "alt é\r\n");
+    assert!(edit_stages(&directory).is_empty());
+    fs::set_permissions(&directory, parent_mode).unwrap();
+
+    let external = client
+        .save_external_text(&original, Arc::from("external"), || false)
+        .unwrap();
+    assert_eq!(fs::read_to_string(&target).unwrap(), "external");
+    let modified = target.metadata().unwrap().modified().unwrap();
+    fs::write(&target, "changed!").unwrap();
+    fs::File::open(&target)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert!(matches!(
+        client.save_external_text(&external, Arc::from("stale"), || false),
+        Err(SftpError::EditConflict(_))
+    ));
+    assert_eq!(fs::read_to_string(&target).unwrap(), "changed!");
+    assert!(edit_stages(&directory).is_empty());
+    let original = client.open_text(target_path).unwrap();
 
     let large = wire_directory.join("large.txt");
     fs::File::create(&large)
@@ -284,6 +479,10 @@ fn openssh_remote_text_checks_versions_modes_links_and_channel_identity() {
         client.open_text(large.as_os_str().as_encoded_bytes()),
         Err(SftpError::Limit(_))
     ));
+    assert!(matches!(
+        client.open_external_file(large.as_os_str().as_encoded_bytes()),
+        Err(SftpError::Limit(_))
+    ));
     let binary = wire_directory.join("binary.txt");
     for bytes in [b"bad\0data".as_slice(), b"bad\xffdata"] {
         fs::write(&binary, bytes).unwrap();
@@ -292,6 +491,26 @@ fn openssh_remote_text_checks_versions_modes_links_and_channel_identity() {
             Err(SftpError::InvalidInput(_))
         ));
     }
+    let binary_path = binary.as_os_str().as_encoded_bytes();
+    let binary_opened = client.open_external_file(binary_path).unwrap();
+    assert_eq!(binary_opened.bytes().as_ref(), b"bad\xffdata");
+    let edited: &[u8] = b"new\0\x81data";
+    let binary_saved = client
+        .save_external_file(&binary_opened, Arc::from(edited), || false)
+        .unwrap();
+    assert_eq!(fs::read(&binary).unwrap(), edited);
+    let modified = binary.metadata().unwrap().modified().unwrap();
+    fs::write(&binary, b"new\0\x82data").unwrap();
+    fs::File::open(&binary)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    assert!(matches!(
+        client.save_external_file(&binary_saved, Arc::from(edited), || false),
+        Err(SftpError::EditConflict(_))
+    ));
+    assert_eq!(fs::read(&binary).unwrap(), b"new\0\x82data");
+    assert!(edit_stages(&directory).is_empty());
 
     let separate = directory.join("separate.txt");
     fs::write(&separate, "leave intact").unwrap();
@@ -560,6 +779,197 @@ fn openssh_authenticates_with_all_three_ecdsa_user_curves() {
     }
 }
 
+#[test]
+#[ignore = "requires OpenSSH ssh-keygen and sshd, OpenSSL for local PEM fixtures, and a local account"]
+fn openssh_rsa_sha2_pins_and_private_key_formats() {
+    const PASSWORD: &str = "test-only rsa passphrase";
+    let temp = TempDirectory::new("openssh-rsa-sha2");
+    let user = fixture_user();
+    generate_keys(&temp.0, &["host-ed25519"]);
+    for name in ["host-rsa", "rotated-rsa", "client-rsa"] {
+        generate_rsa_key(&temp.0, name);
+    }
+    let original = temp.0.join("client-rsa");
+    let encrypted_open = temp.0.join("client-encrypted-openssh");
+    let pkcs1 = temp.0.join("client-pkcs1");
+    for (path, password) in [(&encrypted_open, PASSWORD), (&pkcs1, "")] {
+        fs::copy(&original, path).unwrap();
+        let mut command = Command::new("ssh-keygen");
+        command
+            .args(["-q", "-p", "-a", "8", "-P", "", "-N", password, "-f"])
+            .arg(path);
+        if path == &pkcs1 {
+            command.args(["-m", "PEM"]);
+        }
+        assert_success(&command.output().unwrap());
+    }
+    let plain_pkcs8 = temp.0.join("client-pkcs8");
+    assert_success(
+        &Command::new("openssl")
+            .args(["pkcs8", "-topk8", "-nocrypt", "-in"])
+            .arg(&pkcs1)
+            .arg("-out")
+            .arg(&plain_pkcs8)
+            .output()
+            .unwrap(),
+    );
+    let variants = [
+        ("pkcs8-sha1", "hmacWithSHA1", "2048"),
+        ("pkcs8-sha256", "hmacWithSHA256", "2048"),
+        ("pkcs8-too-expensive", "hmacWithSHA256", "1000001"),
+    ];
+    for (name, prf, rounds) in variants {
+        assert_success(
+            &Command::new("openssl")
+                .args([
+                    "pkcs8",
+                    "-topk8",
+                    "-v2",
+                    "aes-256-cbc",
+                    "-v2prf",
+                    prf,
+                    "-iter",
+                    rounds,
+                    "-in",
+                ])
+                .arg(&pkcs1)
+                .arg("-out")
+                .arg(temp.0.join(name))
+                .arg("-passout")
+                .arg(format!("pass:{PASSWORD}"))
+                .output()
+                .unwrap(),
+        );
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = Endpoint::new("127.0.0.1", address.port()).unwrap();
+    let config = |authentication| Connect {
+        address,
+        endpoint: endpoint.clone(),
+        username: user.clone(),
+        authentication,
+        term: "xterm".into(),
+        size: fixture_size(),
+    };
+    let unencrypted = || Authentication::private_key(fs::read(&original).unwrap());
+    let host = fs::read_to_string(temp.0.join("host-rsa.pub")).unwrap();
+    let key = HostKey::from_openssh(host.trim()).unwrap();
+    let trust = TrustStore::new(temp.0.join("rsa-pins"), TrustMode::Strict);
+    let rsa_only = "HostKeyAlgorithms rsa-sha2-512\nPubkeyAcceptedAlgorithms rsa-sha2-256\n";
+    let sshd = write_config_with_key(&temp.0, "host-rsa", &user, "client-rsa", rsa_only);
+    let daemon = serve(&listener, &sshd);
+    // A malformed encrypted credential must stay unread until the host is accepted.
+    assert!(
+        matches!(SshSession::connect(config(Authentication::private_key(b"-----BEGIN ENCRYPTED PRIVATE KEY-----\ninvalid".to_vec())), trust.clone()),
+        Err(ConnectError::UnknownHostKey { endpoint: actual, offered }) if actual == endpoint && offered == key)
+    );
+    assert_no_auth(&daemon.join().unwrap());
+    let known_hosts = KnownHostsFile::parse(&format!("{endpoint} {host}")).unwrap();
+    let review = trust.preview_import(known_hosts).unwrap();
+    assert_eq!(review.report().added.len(), 1);
+    trust.import_reviewed(&review).unwrap();
+    assert_eq!(trust.check(&endpoint, &key).unwrap(), HostKeyStatus::Known);
+
+    for (host_algorithm, user_algorithm) in [
+        ("rsa-sha2-512", "rsa-sha2-256"),
+        ("rsa-sha2-256", "rsa-sha2-512"),
+    ] {
+        let both = format!(
+            "HostKey {}\nHostKeyAlgorithms ssh-ed25519,{host_algorithm}\nPubkeyAcceptedAlgorithms {user_algorithm}\n",
+            temp.0.join("host-ed25519").display()
+        );
+        let sshd = write_config_with_key(&temp.0, "host-rsa", &user, "client-rsa", &both);
+        for (path, password) in [
+            (&original, None),
+            (&encrypted_open, Some(PASSWORD)),
+            (&pkcs1, None),
+            (&plain_pkcs8, None),
+            (&temp.0.join("pkcs8-sha1"), Some(PASSWORD)),
+            (&temp.0.join("pkcs8-sha256"), Some(PASSWORD)),
+        ] {
+            let key = fs::read(path).unwrap();
+            let auth = match password {
+                Some(password) => Authentication::private_key_with_passphrase(key, password.into()),
+                None => Authentication::private_key(key),
+            };
+            let daemon = serve(&listener, &sshd);
+            let mut session = SshSession::connect_exec(
+                config(auth),
+                trust.clone(),
+                &[],
+                "printf 'rsa-sha2-ok\\n'",
+            )
+            .unwrap_or_else(|error| {
+                panic!(
+                    "{} using {host_algorithm}/{user_algorithm}: {error}",
+                    path.display()
+                )
+            });
+            let mut output = session.take_reader().unwrap();
+            let received = collect_output(move || {
+                let mut bytes = Vec::new();
+                output.read_to_end(&mut bytes).unwrap();
+                bytes
+            });
+            assert_eq!(received, b"rsa-sha2-ok\n");
+            session.close().unwrap();
+            assert!(
+                String::from_utf8_lossy(&daemon.join().unwrap().stderr)
+                    .contains("Accepted publickey")
+            );
+        }
+    }
+
+    let sshd = write_config_with_key(&temp.0, "host-rsa", &user, "client-rsa", rsa_only);
+    for (file, passphrase, kind) in [
+        ("pkcs8-sha1", None, std::io::ErrorKind::PermissionDenied),
+        (
+            "pkcs8-sha256",
+            Some("wrong fixture passphrase"),
+            std::io::ErrorKind::PermissionDenied,
+        ),
+        (
+            "pkcs8-too-expensive",
+            Some(PASSWORD),
+            std::io::ErrorKind::InvalidInput,
+        ),
+    ] {
+        let key = fs::read(temp.0.join(file)).unwrap();
+        let auth = match passphrase {
+            Some(password) => Authentication::private_key_with_passphrase(key, password.into()),
+            None => Authentication::private_key(key),
+        };
+        let daemon = serve(&listener, &sshd);
+        assert!(
+            matches!(SshSession::connect(config(auth), trust.clone()),
+            Err(ConnectError::Io(error)) if error.kind() == kind),
+            "{file}"
+        );
+        assert!(
+            !String::from_utf8_lossy(&daemon.join().unwrap().stderr).contains("method publickey")
+        );
+    }
+
+    let rotated = write_config_with_key(&temp.0, "rotated-rsa", &user, "client-rsa", rsa_only);
+    let daemon = serve(&listener, &rotated);
+    assert!(
+        matches!(SshSession::connect(config(unencrypted()), trust.clone()),
+        Err(ConnectError::ChangedHostKey { expected, offered, .. }) if expected == key && offered != key)
+    );
+    assert_no_auth(&daemon.join().unwrap());
+    let sha1 = write_config_with_key(
+        &temp.0,
+        "host-rsa",
+        &user,
+        "client-rsa",
+        "HostKeyAlgorithms ssh-rsa\n",
+    );
+    let daemon = serve(&listener, &sha1);
+    assert!(SshSession::connect(config(unencrypted()), trust).is_err());
+    assert_no_auth(&daemon.join().unwrap());
+}
+
 fn generate_named_ecdsa_pem(path: &Path, curve: &str, pkcs8: bool) {
     let sec1 = if pkcs8 {
         path.with_extension("sec1")
@@ -680,7 +1090,7 @@ fn openssh_encrypted_ed25519_key_is_decrypted_after_host_verification() {
     let mut writer = session.take_writer().unwrap();
     let mut reader = session.take_reader().unwrap();
     writer
-        .write_all(b"printf 'encrypted-key-ok\\n'; exit 6\n")
+        .write_all(b"HISTFILE=/dev/null; printf '\\nencrypted-key-ok\\n'; exit 6\n")
         .unwrap();
     let bytes = collect_output(move || {
         let mut bytes = Vec::new();
@@ -1055,6 +1465,8 @@ fn openssh_shell_resize_and_changed_key_before_userauth() {
 #[test]
 #[ignore = "requires installed OpenSSH ssh-keygen and sshd, and a usable local account"]
 fn openssh_direct_channels_preserve_half_close_and_reuse_on_one_connection() {
+    let forwarding_limit = u8::try_from(MAX_FORWARD_STREAMS).unwrap();
+    let fixture_streams = 7 + forwarding_limit;
     let temp = TempDirectory::new("openssh");
     let user = fixture_user();
     generate_keys(&temp.0, &["host", "client"]);
@@ -1070,11 +1482,11 @@ fn openssh_direct_channels_preserve_half_close_and_reuse_on_one_connection() {
     );
     let service_worker = thread::spawn(move || {
         let mut clients = Vec::new();
-        for _ in 0..7 {
+        for _ in 0..fixture_streams {
             let (mut socket, _) = service.accept().unwrap();
             clients.push(thread::spawn(move || {
                 socket
-                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
                 socket.write_all(b"remote-half-close").unwrap();
                 socket.shutdown(Shutdown::Write).unwrap();
@@ -1094,7 +1506,7 @@ fn openssh_direct_channels_preserve_half_close_and_reuse_on_one_connection() {
     let trust = TrustStore::new(temp.0.join("pins"), TrustMode::Strict);
     pin(&trust, &target.endpoint, &temp.0, "host");
     let server = serve(&ssh, &config);
-    let mut session = SshSession::connect(
+    let mut session = match SshSession::connect(
         Connect {
             address,
             endpoint: target.endpoint,
@@ -1104,8 +1516,16 @@ fn openssh_direct_channels_preserve_half_close_and_reuse_on_one_connection() {
             size: fixture_size(),
         },
         trust,
-    )
-    .unwrap();
+    ) {
+        Ok(session) => session,
+        Err(error) => {
+            let output = server.join().unwrap();
+            panic!(
+                "Could not connect to the OpenSSH fixture ({error:?}): {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    };
     let opener = session.direct_opener();
     let denied = opener.open(Endpoint::new("localhost.", service_port).unwrap(), address);
     assert!(
@@ -1118,10 +1538,55 @@ fn openssh_direct_channels_preserve_half_close_and_reuse_on_one_connection() {
         exchange_forward(opener.open(destination.clone(), address).unwrap(), index);
     }
     exchange_forward(held, 6);
+
+    let mut forwards = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while forwards.len() < usize::from(forwarding_limit) {
+        match opener.open(destination.clone(), address) {
+            Ok(channel) => forwards.push(channel),
+            Err(ConnectError::Io(error))
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("could not reach the shared forwarding limit: {error}"),
+        }
+    }
+    assert!(matches!(
+        opener.open(destination, address),
+        Err(ConnectError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock
+    ));
+    let mut sftp_lease = session.sftp_opener().unwrap().open().unwrap();
+    let mut sftp = Sftp::new(
+        sftp_lease.take_reader().unwrap(),
+        sftp_lease.take_writer().unwrap(),
+    )
+    .unwrap();
+    assert!(sftp.canonicalize(".").unwrap().starts_with(b"/"));
+    let mut exec = session
+        .exec_opener()
+        .unwrap()
+        .open_cancellable("printf reserved; exit 0", || false)
+        .unwrap();
+    let _ = exec.take_writer().unwrap().close_input();
+    let mut exec_output = exec.take_reader().unwrap();
+    assert_eq!(
+        collect_output(move || {
+            let mut output = Vec::new();
+            exec_output.read_to_end(&mut output).unwrap();
+            output
+        }),
+        b"reserved"
+    );
+    assert_eq!(exec.exit_code(), Some(0));
+    drop((exec, sftp, sftp_lease));
+    for (index, channel) in (7..fixture_streams).zip(forwards) {
+        exchange_forward(channel, index);
+    }
     let mut writer = session.take_writer().unwrap();
     let mut reader = session.take_reader().unwrap();
     writer
-        .write_all(b"printf 'shell-still-open\\n'; exit 8\n")
+        .write_all(b"HISTFILE=/dev/null; printf '\\nshell-still-open\\n'; exit 8\n")
         .unwrap();
     let output = collect_output(move || {
         let mut bytes = Vec::new();
@@ -1140,7 +1605,9 @@ fn openssh_direct_channels_preserve_half_close_and_reuse_on_one_connection() {
     replies.sort();
     assert_eq!(
         replies,
-        (0..7).map(|index| vec![b'a' + index]).collect::<Vec<_>>()
+        (0..fixture_streams)
+            .map(|index| vec![b'a' + index])
+            .collect::<Vec<_>>()
     );
     let server_log = server.join().unwrap().stderr;
     assert!(String::from_utf8_lossy(&server_log).contains("localhost."));
@@ -1213,7 +1680,7 @@ fn openssh_jump_chain_verifies_and_authenticates_each_endpoint_separately() {
     let mut reader = target.take_reader().unwrap();
     let mut writer = target.take_writer().unwrap();
     writer
-        .write_all(b"printf 'jump-shell\\n'; exit 9\n")
+        .write_all(b"HISTFILE=/dev/null; printf '\\njump-shell\\n'; exit 9\n")
         .unwrap();
     let output = collect_output(move || {
         let mut bytes = Vec::new();
@@ -1257,6 +1724,257 @@ fn openssh_jump_chain_verifies_and_authenticates_each_endpoint_separately() {
     subsystem.close().unwrap();
     for daemon in [entry_server, middle_server, target_server] {
         daemon.join().unwrap();
+    }
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH ssh-keygen and sshd, and a usable local account"]
+fn openssh_rsa_sha2_jump_chain_pins_and_authenticates_each_endpoint() {
+    let temp = TempDirectory::new("openssh-rsa-jump");
+    let user = fixture_user();
+    let hops = [
+        ("entry", "entry-user", "rsa-sha2-512", "rsa-sha2-256"),
+        ("middle", "middle-user", "rsa-sha2-256", "rsa-sha2-512"),
+        ("target", "target-user", "rsa-sha2-512", "rsa-sha2-256"),
+    ];
+    let [entry, middle, target] = hops.map(|_| TcpListener::bind("127.0.0.1:0").unwrap());
+    let configs = hops.map(|(host, key, host_algorithm, user_algorithm)| {
+        generate_rsa_key(&temp.0, host);
+        generate_rsa_key(&temp.0, key);
+        let algorithms = format!(
+            "HostKeyAlgorithms {host_algorithm}\nPubkeyAcceptedAlgorithms {user_algorithm}\n"
+        );
+        write_config_with_key(&temp.0, host, &user, key, &algorithms)
+    });
+    let route = || JumpRoute {
+        address: entry.local_addr().unwrap(),
+        additional: Vec::new(),
+        jumps: vec![
+            fixture_target(&temp.0, &user, hops[0].1, &entry),
+            fixture_target(&temp.0, &user, hops[1].1, &middle),
+        ],
+        target: fixture_target(&temp.0, &user, hops[2].1, &target),
+    };
+    let read_public_key = |name| {
+        let key = fs::read_to_string(temp.0.join(format!("{name}.pub"))).unwrap();
+        HostKey::from_openssh(key.trim()).unwrap()
+    };
+    let endpoints = route();
+    let entry_key = read_public_key(hops[0].0);
+    let middle_key = read_public_key(hops[1].0);
+    let middle_endpoint = &endpoints.jumps[1].endpoint;
+    let trust = TrustStore::new(temp.0.join("pins"), TrustMode::Strict);
+    pin(&trust, &endpoints.jumps[0].endpoint, &temp.0, hops[0].0);
+    pin(&trust, middle_endpoint, &temp.0, hops[0].0);
+    pin(&trust, &endpoints.target.endpoint, &temp.0, hops[2].0);
+
+    let entry_server = serve(&entry, &configs[0]);
+    let middle_server = serve(&middle, &configs[1]);
+    let rejected = SshSession::connect_via(route(), trust.clone(), "xterm".into(), fixture_size());
+    assert!(matches!(
+        rejected,
+        Err(ConnectError::ChangedHostKey { endpoint, expected, offered })
+            if &endpoint == middle_endpoint && expected == entry_key && offered == middle_key
+    ));
+    assert_no_auth(&middle_server.join().unwrap());
+    entry_server.join().unwrap();
+    assert!(
+        trust
+            .replace_pin(middle_endpoint, &entry_key, &middle_key)
+            .unwrap()
+    );
+
+    let servers = [&entry, &middle, &target]
+        .into_iter()
+        .zip(&configs)
+        .map(|(listener, config)| serve(listener, config))
+        .collect::<Vec<_>>();
+    let mut session =
+        SshSession::connect_via(route(), trust, "xterm".into(), fixture_size()).unwrap();
+    let mut reader = session.take_reader().unwrap();
+    session
+        .take_writer()
+        .unwrap()
+        .write_all(b"HISTFILE=/dev/null; printf '\\nrsa-jump-ok\\n'; exit 9\n")
+        .unwrap();
+    let received = collect_output(move || {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).unwrap();
+        bytes
+    });
+    assert!(
+        String::from_utf8_lossy(&received)
+            .lines()
+            .any(|line| line.trim() == "rsa-jump-ok")
+    );
+    assert_eq!(session.exit_code(), Some(9));
+    session.close().unwrap();
+    for ((host, key, host_algorithm, _), server) in hops.into_iter().zip(servers) {
+        let output = server.join().unwrap();
+        let log = String::from_utf8_lossy(&output.stderr);
+        let fingerprint = read_public_key(key).fingerprint();
+        assert!(
+            log.contains(&format!("kex: host key algorithm: {host_algorithm}")),
+            "{host}: {log}"
+        );
+        assert!(
+            log.lines()
+                .any(|line| line.contains("Accepted publickey") && line.contains(&fingerprint)),
+            "{host}: {log}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH ssh-keygen and sshd, and a usable local account"]
+fn openssh_exec_only_transport_rechecks_authority_without_starting_a_shell() {
+    let temp = TempDirectory::new("openssh-exec-only");
+    let user = fixture_user();
+    generate_keys(&temp.0, &["host", "client"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let config = write_config(&temp.0, "host", &user);
+    let target = || fixture_target(&temp.0, &user, "client", &listener);
+    let trust = TrustStore::new(temp.0.join("pins"), TrustMode::Strict);
+    pin(&trust, &target().endpoint, &temp.0, "host");
+    let connect = |authorize: &dyn Fn() -> std::io::Result<()>| {
+        ExecConnection::connect_preconnected(
+            TcpStream::connect(listener.local_addr().unwrap()).unwrap(),
+            (target(), Vec::new()),
+            trust.clone(),
+            ConnectOptions::default(),
+            || false,
+            authorize,
+        )
+    };
+    let denied = || Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    let server = serve(&listener, &config);
+    assert!(
+        matches!(connect(&denied), Err(ConnectError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied)
+    );
+    assert_no_auth(&server.join().unwrap());
+
+    let server = serve(&listener, &config);
+    let auth_checks = std::cell::Cell::new(0);
+    let connection = connect(&|| {
+        auth_checks.set(auth_checks.get() + 1);
+        Ok(())
+    })
+    .unwrap();
+    assert!(auth_checks.get() >= 2);
+    let opener = connection.exec_opener().unwrap();
+    let unexpected = temp.0.join("unauthorized-command");
+    let command = format!("touch '{}'", unexpected.display());
+    assert!(matches!(
+        opener.open_guarded(&command, || false, denied),
+        Err(ConnectError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied
+    ));
+    for (command, expected, code) in [
+        ("printf 'first\\n'", b"first\n".as_slice(), 0),
+        ("printf 'second\\n'; exit 7", b"second\n".as_slice(), 7),
+    ] {
+        let mut lease = opener.open_guarded(command, || false, || Ok(())).unwrap();
+        let mut reader = lease.take_reader().unwrap();
+        let bytes = collect_output(move || {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        assert_eq!(bytes, expected);
+        assert_eq!(lease.exit_code(), Some(code));
+    }
+    drop(connection);
+    let output = server.join().unwrap();
+    let log = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(log.matches("Accepted publickey").count(), 1, "{log}");
+    assert_eq!(log.matches("request exec").count(), 2, "{log}");
+    assert!(!log.contains("request shell"), "{log}");
+    assert!(!unexpected.exists());
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH ssh-keygen and sshd, and a usable local account"]
+fn openssh_exec_only_rechecks_authority_before_signing_private_keys() {
+    let temp = TempDirectory::new("openssh-guarded-signing");
+    let user = fixture_user();
+    generate_keys(&temp.0, &["host", "ed25519"]);
+    generate_rsa_key(&temp.0, "rsa");
+    for bits in ["256", "384", "521"] {
+        assert_success(
+            &Command::new("ssh-keygen")
+                .args(["-q", "-t", "ecdsa", "-b", bits, "-N", "", "-f"])
+                .arg(temp.0.join(format!("ecdsa{bits}")))
+                .output()
+                .unwrap(),
+        );
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let endpoint = Endpoint::new("127.0.0.1", address.port()).unwrap();
+    let trust = TrustStore::new(temp.0.join("pins"), TrustMode::Strict);
+    pin(&trust, &endpoint, &temp.0, "host");
+    for (key, algorithm) in [
+        ("ed25519", "ssh-ed25519"),
+        ("ecdsa256", "ecdsa-sha2-nistp256"),
+        ("ecdsa384", "ecdsa-sha2-nistp384"),
+        ("ecdsa521", "ecdsa-sha2-nistp521"),
+        ("rsa", "rsa-sha2-256"),
+        ("rsa", "rsa-sha2-512"),
+    ] {
+        let config = write_config_with_key(
+            &temp.0,
+            "host",
+            &user,
+            key,
+            &format!("PubkeyAcceptedAlgorithms {algorithm}\n"),
+        );
+        let mut denied_public_key_requests = 0;
+        for allow_signature in [false, true] {
+            let server = serve(&listener, &config);
+            let checks = std::cell::Cell::new(0);
+            let result = ExecConnection::connect_preconnected(
+                TcpStream::connect(address).unwrap(),
+                (fixture_target(&temp.0, &user, key, &listener), Vec::new()),
+                trust.clone(),
+                ConnectOptions::default(),
+                || false,
+                || {
+                    checks.set(checks.get() + 1);
+                    if checks.get() == 3 && !allow_signature {
+                        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+                    }
+                    Ok(())
+                },
+            );
+            assert_eq!(checks.get(), 3, "{algorithm}");
+            if allow_signature {
+                drop(result.unwrap_or_else(|error| panic!("{algorithm}: {error}")));
+            } else {
+                assert!(
+                    matches!(result, Err(ConnectError::Io(error)) if error.kind() == std::io::ErrorKind::PermissionDenied),
+                    "{algorithm}"
+                );
+            }
+            let output = server.join().unwrap();
+            let log = String::from_utf8_lossy(&output.stderr);
+            assert!(log.contains("Postponed publickey"), "{algorithm}: {log}");
+            let requests = log
+                .lines()
+                .filter(|line| {
+                    line.contains("userauth-request for user ") && line.contains("method publickey")
+                })
+                .count();
+            if allow_signature {
+                assert!(log.contains("Accepted publickey"), "{algorithm}: {log}");
+                assert_eq!(
+                    requests,
+                    denied_public_key_requests + 1,
+                    "{algorithm}: {log}"
+                );
+            } else {
+                assert!(!log.contains("Accepted publickey"), "{algorithm}: {log}");
+                denied_public_key_requests = requests;
+            }
+        }
     }
 }
 
@@ -1436,6 +2154,16 @@ fn generate_keys(dir: &Path, names: &[&str]) {
             .unwrap();
         assert_success(&output);
     }
+}
+
+fn generate_rsa_key(dir: &Path, name: &str) {
+    assert_success(
+        &Command::new("ssh-keygen")
+            .args(["-q", "-t", "rsa", "-b", "2048", "-N", "", "-f"])
+            .arg(dir.join(name))
+            .output()
+            .unwrap(),
+    );
 }
 
 fn pin(trust: &TrustStore, endpoint: &Endpoint, dir: &Path, host: &str) {

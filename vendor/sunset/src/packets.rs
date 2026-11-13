@@ -210,9 +210,7 @@ impl<'de: 'a, 'a> SSHDecode<'de> for Userauth60<'a> {
         S: SSHSource<'de>,
     {
         match s.ctx().cli_auth_type {
-            Some(auth::AuthType::Password) => {
-                Ok(Self::PwChangeReq(SSHDecode::dec(s)?))
-            }
+            Some(auth::AuthType::Password) => Ok(Self::PwChangeReq(SSHDecode::dec(s)?)),
             Some(auth::AuthType::PubKey) => Ok(Self::PkOk(SSHDecode::dec(s)?)),
             Some(auth::AuthType::KeyboardInteractive) => Ok(Self::InfoRequest(SSHDecode::dec(s)?)),
             _ => {
@@ -274,9 +272,34 @@ pub struct MethodPubKey<'a> {
 
 impl<'a> MethodPubKey<'a> {
     pub fn new(pubkey: PubKey<'a>, sig: Option<&'a OwnedSig>) -> Result<Self> {
-        let sig_algo = Signature::sig_name_for_pubkey(&pubkey).trap()?;
-        let sig = sig.map(|s| Blob((s).into()));
-        Ok(MethodPubKey { sig_algo, pubkey: Blob(pubkey), sig, force_sig: false })
+        let sig_algo = match sig {
+            Some(signature) => Signature::from(signature).sig_type()?.algorithm_name(),
+            None => Signature::sig_name_for_pubkey(&pubkey)?,
+        };
+        Self::with_algorithm(pubkey, sig, sig_algo)
+    }
+
+    pub(crate) fn with_algorithm(
+        pubkey: PubKey<'a>,
+        sig: Option<&'a OwnedSig>,
+        sig_algo: &'static str,
+    ) -> Result<Self> {
+        Signature::check_pubkey_algorithm(&pubkey, sig_algo)?;
+        let sig: Option<Blob<Signature<'a>>> = sig.map(|s| Blob(s.into()));
+        if sig.as_ref().is_some_and(|signature| {
+            !signature
+                .0
+                .algorithm_name()
+                .is_ok_and(|algorithm| algorithm == sig_algo)
+        }) {
+            return Err(Error::BadSig);
+        }
+        Ok(MethodPubKey {
+            sig_algo,
+            pubkey: Blob(pubkey),
+            sig,
+            force_sig: false,
+        })
     }
 }
 
@@ -310,7 +333,12 @@ impl<'de: 'a, 'a> SSHDecode<'de> for MethodPubKey<'a> {
         let sig_algo = SSHDecode::dec(s)?;
         let pubkey = SSHDecode::dec(s)?;
         let sig = if sig { Some(SSHDecode::dec(s)?) } else { None };
-        Ok(Self { sig_algo, pubkey, sig, force_sig: false })
+        Ok(Self {
+            sig_algo,
+            pubkey,
+            sig,
+            force_sig: false,
+        })
     }
 }
 
@@ -407,14 +435,16 @@ impl TryFrom<&PubKey<'_>> for ssh_key::PublicKey {
     type Error = Error;
     fn try_from(k: &PubKey) -> Result<Self> {
         match k {
-            PubKey::Ed25519(e) => {
-                Ok(ssh_key::public::Ed25519PublicKey(e.key.0).into())
-            }
+            PubKey::Ed25519(e) => Ok(ssh_key::public::Ed25519PublicKey(e.key.0).into()),
 
             #[cfg(feature = "rsa")]
             PubKey::RSA(r) => {
-                let k = ssh_key::public::RsaPublicKey::try_from(&r.key)
-                    .map_err(|_| Error::BadKey)?;
+                let k = ssh_key::public::RsaPublicKey {
+                    n: ssh_key::Mpint::from_positive_bytes(&r.key.n_bytes())
+                        .map_err(|_| Error::BadKey)?,
+                    e: ssh_key::Mpint::from_positive_bytes(&r.key.e_bytes())
+                        .map_err(|_| Error::BadKey)?,
+                };
                 Ok(k.into())
             }
 
@@ -427,8 +457,7 @@ impl TryFrom<&PubKey<'_>> for ssh_key::PublicKey {
             _ => {
                 let mut bytes = [0; 192];
                 let length = sshwire::write_ssh(&mut bytes, k)?;
-                ssh_key::PublicKey::from_bytes(&bytes[..length])
-                    .map_err(|_| Error::BadKey)
+                ssh_key::PublicKey::from_bytes(&bytes[..length]).map_err(|_| Error::BadKey)
             }
         }
     }
@@ -445,20 +474,14 @@ pub struct Ed25519PubKey {
 pub struct RSAPubKey {
     // mpint     e
     // mpint     n
-    pub key: rsa::RsaPublicKey,
-}
-
-#[cfg(feature = "rsa")]
-impl RSAPubKey {
-    /// Bits for `rsa::BoxedUint::from_be_slice()`.
-    pub(crate) const MAX_BITS: u32 = 8192;
+    pub key: rsa::PublicKey,
 }
 
 #[cfg(feature = "rsa")]
 impl SSHEncode for RSAPubKey {
     fn enc(&self, s: &mut dyn SSHSink) -> WireResult<()> {
         self.key.e().enc(s)?;
-        self.key.n().enc(s)?;
+        self.key.n().as_ref().enc(s)?;
         Ok(())
     }
 }
@@ -469,9 +492,9 @@ impl<'de> SSHDecode<'de> for RSAPubKey {
     where
         S: SSHSource<'de>,
     {
-        let e = SSHDecode::dec(s)?;
-        let n = SSHDecode::dec(s)?;
-        let key = rsa::RsaPublicKey::new(n, e).map_err(|e| {
+        let e = sshwire::Mpint::dec(s)?;
+        let n = sshwire::Mpint::dec(s)?;
+        let key = crate::rsa_keys::public_components(n.as_ref(), e.as_ref()).map_err(|e| {
             debug!("Invalid RSA public key: {e}");
             WireError::BadKey
         })?;
@@ -483,7 +506,7 @@ impl<'de> SSHDecode<'de> for RSAPubKey {
 impl Debug for RSAPubKey {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("RSAPubKey")
-            .field(".key bits", &(self.key.n().bits()))
+            .field(".key bits", &(self.key.n().bit_width_vartime()))
             .finish_non_exhaustive()
     }
 }
@@ -491,14 +514,9 @@ impl Debug for RSAPubKey {
 #[cfg(all(feature = "arbitrary", feature = "rsa"))]
 impl Arbitrary<'_> for RSAPubKey {
     fn arbitrary(u: &mut arbitrary::Unstructured) -> arbitrary::Result<Self> {
-        // OK to use vartime with arbitrary.
-        let e = rsa::BoxedUint::from_be_slice_vartime(
-            arbitrary::Arbitrary::arbitrary(u)?,
-        );
-        let n = rsa::BoxedUint::from_be_slice_vartime(
-            arbitrary::Arbitrary::arbitrary(u)?,
-        );
-        let key = rsa::RsaPublicKey::new(n, e)
+        let e: &[u8] = arbitrary::Arbitrary::arbitrary(u)?;
+        let n: &[u8] = arbitrary::Arbitrary::arbitrary(u)?;
+        let key = crate::rsa_keys::public_components(n, e)
             .map_err(|_| arbitrary::Error::IncorrectFormat)?;
         Ok(Self { key })
     }
@@ -584,7 +602,11 @@ pub enum Signature<'a> {
 
     #[cfg(feature = "rsa")]
     #[sshwire(variant = SSH_NAME_RSA_SHA256)]
-    RSA(RSASig<'a>),
+    RSA256(RSASig<'a>),
+
+    #[cfg(feature = "rsa")]
+    #[sshwire(variant = SSH_NAME_RSA_SHA512)]
+    RSA512(RSASig<'a>),
 
     #[cfg(any(feature = "ecdsa256", feature = "ecdsa-hostkeys"))]
     #[sshwire(variant = SSH_NAME_ECDSA256)]
@@ -608,7 +630,9 @@ impl<'a> Signature<'a> {
         match self {
             Signature::Ed25519(_) => Ok(SSH_NAME_ED25519),
             #[cfg(feature = "rsa")]
-            Signature::RSA(_) => Ok(SSH_NAME_RSA_SHA256),
+            Signature::RSA256(_) => Ok(SSH_NAME_RSA_SHA256),
+            #[cfg(feature = "rsa")]
+            Signature::RSA512(_) => Ok(SSH_NAME_RSA_SHA512),
             #[cfg(any(feature = "ecdsa256", feature = "ecdsa-hostkeys"))]
             Signature::ECDSA256(_) => Ok(SSH_NAME_ECDSA256),
             #[cfg(feature = "ecdsa-hostkeys")]
@@ -621,15 +645,13 @@ impl<'a> Signature<'a> {
 
     /// Returns the signature algorithm name for a public key.
     /// Returns (`Error::UnknownMethod`) if the PubKey is unknown
-    /// Currently can return a unique signature name for a public key
-    /// since ssh-rsa isn't supported, only rsa-sha2-256.
-    /// It's possible that in future there isn't a distinct signature
-    /// type for each key type.
+    /// RSA defaults to SHA-512; authentication uses the server's advertised
+    /// SHA-2 algorithms to choose between SHA-512 and SHA-256.
     pub fn sig_name_for_pubkey(pubkey: &PubKey) -> Result<&'static str> {
         match pubkey {
             PubKey::Ed25519(_) => Ok(SSH_NAME_ED25519),
             #[cfg(feature = "rsa")]
-            PubKey::RSA(_) => Ok(SSH_NAME_RSA_SHA256),
+            PubKey::RSA(_) => Ok(SSH_NAME_RSA_SHA512),
             #[cfg(any(feature = "ecdsa256", feature = "ecdsa-hostkeys"))]
             PubKey::ECDSA256(_) => Ok(SSH_NAME_ECDSA256),
             #[cfg(feature = "ecdsa-hostkeys")]
@@ -643,11 +665,29 @@ impl<'a> Signature<'a> {
         }
     }
 
+    pub(crate) fn check_pubkey_algorithm(pubkey: &PubKey, algorithm: &str) -> Result<()> {
+        #[cfg(feature = "rsa")]
+        if matches!(pubkey, PubKey::RSA(_)) {
+            return if matches!(algorithm, SSH_NAME_RSA_SHA256 | SSH_NAME_RSA_SHA512) {
+                Ok(())
+            } else {
+                Err(Error::BadSig)
+            };
+        }
+        if Self::sig_name_for_pubkey(pubkey)? == algorithm {
+            Ok(())
+        } else {
+            Err(Error::BadSig)
+        }
+    }
+
     pub fn sig_type(&self) -> Result<SigType> {
         match self {
             Signature::Ed25519(_) => Ok(SigType::Ed25519),
             #[cfg(feature = "rsa")]
-            Signature::RSA(_) => Ok(SigType::RSA),
+            Signature::RSA256(_) => Ok(SigType::RSA256),
+            #[cfg(feature = "rsa")]
+            Signature::RSA512(_) => Ok(SigType::RSA512),
             #[cfg(any(feature = "ecdsa256", feature = "ecdsa-hostkeys"))]
             Signature::ECDSA256(_) => Ok(SigType::ECDSA256),
             #[cfg(feature = "ecdsa-hostkeys")]
@@ -665,13 +705,15 @@ impl<'a> Signature<'a> {
 impl<'a> From<&'a OwnedSig> for Signature<'a> {
     fn from(s: &'a OwnedSig) -> Self {
         match s {
-            OwnedSig::Ed25519(s) => {
-                Signature::Ed25519(Ed25519Sig { sig: BinString(s) })
-            }
+            OwnedSig::Ed25519(s) => Signature::Ed25519(Ed25519Sig { sig: BinString(s) }),
             #[cfg(feature = "rsa")]
-            OwnedSig::RSA(s) => {
-                Signature::RSA(RSASig { sig: BinString(s.as_ref()) })
-            }
+            OwnedSig::RSA256(s) => Signature::RSA256(RSASig {
+                sig: BinString(s.as_ref()),
+            }),
+            #[cfg(feature = "rsa")]
+            OwnedSig::RSA512(s) => Signature::RSA512(RSASig {
+                sig: BinString(s.as_ref()),
+            }),
             #[cfg(feature = "ecdsa256")]
             OwnedSig::ECDSA256 { r, s } => Signature::ECDSA256(Blob(ECDSASig {
                 r: sshwire::Mpint::new(r),
@@ -718,6 +760,8 @@ pub enum GlobalRequestMethod<'a> {
     TcpipForward(TcpipForward<'a>),
     #[sshwire(variant = "cancel-tcpip-forward")]
     CancelTcpipForward(TcpipForward<'a>),
+    #[sshwire(variant = "keepalive@kortty.de")]
+    Liveness,
     #[sshwire(unknown)]
     Unknown(Unknown<'a>),
 }
@@ -1007,7 +1051,10 @@ pub struct ParseContext {
 
 impl ParseContext {
     pub fn new() -> Self {
-        ParseContext { cli_auth_type: None, seen_unknown: false }
+        ParseContext {
+            cli_auth_type: None,
+            seen_unknown: false,
+        }
     }
 }
 
@@ -1231,10 +1278,13 @@ mod tests {
         init_test_log();
         // with None sig
         let k = SignKey::generate(KeyType::Ed25519, None).unwrap();
-        let method =
-            AuthMethod::PubKey(MethodPubKey::new(k.pubkey(), None).unwrap());
-        let p = UserauthRequest { username: "matt".into(), service: "conn", method }
-            .into();
+        let method = AuthMethod::PubKey(MethodPubKey::new(k.pubkey(), None).unwrap());
+        let p = UserauthRequest {
+            username: "matt".into(),
+            service: "conn",
+            method,
+        }
+        .into();
         test_roundtrip(&p);
 
         // again with a sig
@@ -1248,8 +1298,12 @@ mod tests {
             sig,
             force_sig: false,
         });
-        let p = UserauthRequest { username: "matt".into(), service: "conn", method }
-            .into();
+        let p = UserauthRequest {
+            username: "matt".into(),
+            service: "conn",
+            method,
+        }
+        .into();
         test_roundtrip(&p);
     }
 
@@ -1297,7 +1351,10 @@ mod tests {
         trace!("broken: {p2:#?}");
         assert!(matches!(
             p2,
-            Packet::ChannelOpen(ChannelOpen { ty: ChannelOpenType::Unknown(_), .. })
+            Packet::ChannelOpen(ChannelOpen {
+                ty: ChannelOpenType::Unknown(_),
+                ..
+            })
         ));
     }
 

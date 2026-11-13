@@ -9,6 +9,8 @@ use crate::ssh_dialog::{Authentication, LoginRequest, LoginTarget, Password};
 
 use super::*;
 
+pub(super) mod exec;
+
 const GRID: WindowSize = WindowSize {
     columns: 80,
     rows: 24,
@@ -269,6 +271,14 @@ fn windows_sandbox_relay_authenticates_shell_and_sftp_and_rejects_a_changed_host
     use kortty_ssh::{HostKey, sftp::Sftp};
 
     let required = |key| std::env::var(key).unwrap_or_else(|_| panic!("set {key} for the fixture"));
+    let (shell_command, exit_code): (&[u8], u32) =
+        match std::env::var("KORTTY_WINDOWS_RELAY_SERVER_SHELL").as_deref() {
+            Ok("cmd") => (b"echo relay-shell-rea^dy&exit 0\r\n", 0),
+            Ok("posix") | Err(std::env::VarError::NotPresent) => {
+                (b"printf '\\n%s%s\\n' 'relay-shell-' 'ready'; exit 23\n", 23)
+            }
+            _ => panic!("set KORTTY_WINDOWS_RELAY_SERVER_SHELL to cmd or posix"),
+        };
     let fixture = PathBuf::from(required("KORTTY_WINDOWS_RELAY_FIXTURE"));
     let address: std::net::SocketAddr = required("KORTTY_WINDOWS_RELAY_ADDRESS").parse().unwrap();
     let endpoint = Endpoint::new(&address.ip().to_string(), address.port()).unwrap();
@@ -294,11 +304,33 @@ fn windows_sandbox_relay_authenticates_shell_and_sftp_and_rejects_a_changed_host
         )
     };
 
-    verify_windows_relay_shell(dial("host.pub", false).unwrap());
+    let terminal = dial("host.pub", false).unwrap();
+    if std::env::var_os("KORTTY_WINDOWS_RELAY_TEST_FORWARDING").is_some() {
+        assert!(address.ip().is_loopback());
+        verify_windows_relay_forwarding(terminal, shell_command, exit_code);
+    } else {
+        verify_windows_relay_shell(terminal, shell_command, exit_code);
+    }
 
     let mut worker = dial("host.pub", true).unwrap();
+    assert_eq!(worker.sandbox_backend(), Some("LPAC + Job"));
     let mut sftp = Sftp::new(worker.take_reader().unwrap(), worker.take_writer().unwrap()).unwrap();
-    assert!(sftp.canonicalize(".").unwrap().starts_with(b"/"));
+    let cwd = sftp.canonicalize(".").unwrap();
+    assert!(
+        cwd.starts_with(b"/")
+            || matches!(cwd.as_slice(), [drive, b':', b'/', ..] if drive.is_ascii_alphabetic()),
+        "expected an absolute remote working directory, got {cwd:?}"
+    );
+    if let Ok(path) = std::env::var("KORTTY_WINDOWS_RELAY_SFTP_FILE") {
+        let expected = std::fs::read(fixture.join("sftp-sample")).unwrap();
+        assert!(!expected.is_empty());
+        let mut actual = Vec::new();
+        assert_eq!(
+            sftp.download(path, &mut actual).unwrap(),
+            expected.len() as u64
+        );
+        assert_eq!(actual, expected);
+    }
     drop(sftp);
     worker.close().unwrap();
 
@@ -339,18 +371,106 @@ fn windows_sandbox_relay_authenticates_shell_and_sftp_and_rejects_a_changed_host
         None,
     )
     .unwrap();
-    verify_windows_relay_shell(worker);
+    verify_windows_relay_shell(worker, shell_command, exit_code);
 }
 
 #[cfg(windows)]
-fn verify_windows_relay_shell(mut worker: Session) {
+fn verify_windows_relay_forwarding(worker: Session, shell_command: &[u8], exit_code: u32) {
+    use kortty_ssh::{MAX_FORWARD_STREAMS, MAX_REMOTE_FORWARD_LISTENERS, sftp::Sftp};
+
+    use crate::ssh_connection::DirectOpener;
+    use crate::ssh_tunnel::{Capacity, Destination, Listener};
+
+    let loopback = "127.0.0.1:0".parse().unwrap();
+    let service = TcpListener::bind(loopback).unwrap();
+    service.set_nonblocking(true).unwrap();
+    let opener = worker.opener().unwrap();
+    let registrations = (0..MAX_REMOTE_FORWARD_LISTENERS)
+        .map(|_| opener.bind(loopback, || false).unwrap())
+        .collect::<Vec<_>>();
+    let (listener, _updates) = Listener::start(
+        DirectOpener::Worker(opener.clone()),
+        loopback,
+        Destination::Fixed(
+            Endpoint::new("127.0.0.1", service.local_addr().unwrap().port()).unwrap(),
+        ),
+        Capacity::default(),
+    )
+    .unwrap();
+    let mut streams = Vec::with_capacity(MAX_FORWARD_STREAMS);
+    for index in 0..MAX_FORWARD_STREAMS {
+        let mut client = TcpStream::connect(listener.bound_address()).unwrap();
+        let mut server = accept_forward_service(&service);
+        server.set_nonblocking(false).unwrap();
+        for socket in [&client, &server] {
+            socket
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+        }
+        let marker = u8::try_from(index).unwrap();
+        let mut byte = [0];
+        client.write_all(&[marker]).unwrap();
+        server.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [marker]);
+        server.write_all(&[!marker]).unwrap();
+        client.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [!marker]);
+        streams.push((client, server));
+    }
+
+    for address in [listener.bound_address(), registrations[0].remote_addr()] {
+        let mut overflow = TcpStream::connect(address).unwrap();
+        overflow
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        match overflow.read(&mut [0]) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::ConnectionReset | io::ErrorKind::ConnectionAborted
+                ) => {}
+            result => panic!("forward above the shared budget was not closed: {result:?}"),
+        }
+    }
+
+    let mut channel = opener.open_sftp(|| false).unwrap();
+    let mut sftp = Sftp::new(
+        channel.take_reader().unwrap(),
+        channel.take_writer().unwrap(),
+    )
+    .unwrap();
+    assert!(!sftp.canonicalize(".").unwrap().is_empty());
+    verify_windows_relay_shell(worker, shell_command, exit_code);
+    drop((sftp, channel, listener, streams, registrations));
+}
+
+#[cfg(windows)]
+fn accept_forward_service(listener: &TcpListener) -> TcpStream {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match listener.accept() {
+            Ok((socket, _)) => return socket,
+            Err(error)
+                if error.kind() == io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("forward did not reach the test service: {error}"),
+        }
+    }
+}
+
+#[cfg(windows)]
+fn verify_windows_relay_shell(mut worker: Session, command: &[u8], exit_code: u32) {
     use std::sync::mpsc;
 
     assert_eq!(worker.sandbox_backend(), Some("LPAC + Job"));
     let mut writer = worker.take_writer().unwrap();
-    writer
-        .write_all(b"printf '\\n%s%s\\n' 'relay-shell-' 'ready'; exit 23\n")
-        .unwrap();
+    writer.write_all(command).unwrap();
     let mut reader = worker.take_reader().unwrap();
     let (send, receive) = mpsc::sync_channel(1);
     let read = thread::spawn(move || {
@@ -364,6 +484,6 @@ fn verify_windows_relay_shell(mut worker: Session) {
         .unwrap();
     read.join().unwrap();
     assert!(String::from_utf8_lossy(&output).contains("relay-shell-ready"));
-    assert_eq!(worker.exit_code(), Some(23));
+    assert_eq!(worker.exit_code(), Some(exit_code));
     worker.close().unwrap();
 }

@@ -68,6 +68,26 @@ fn windows_release_requires_the_matching_worker_and_archives_it_with_the_app() {
         .count();
     assert_eq!(executables, programs.len());
     assert!(path.with_extension("zip.sha256").is_file());
+
+    let notices = Path::new(env!("CARGO_MANIFEST_DIR")).join("../third-party/latex-rust");
+    for name in [
+        "license-stix-ofl.txt",
+        "license-lppl-1.3c.txt",
+        "notice.txt",
+        "dvipsnames.tsv",
+    ] {
+        assert!(
+            archive
+                .by_name(&format!("{stem}/licenses/latex-rust/{name}"))
+                .is_ok()
+        );
+    }
+    let mut colors = archive
+        .by_name(&format!("{stem}/licenses/latex-rust/dvipsnames.tsv"))
+        .unwrap();
+    let mut data = Vec::new();
+    colors.read_to_end(&mut data).unwrap();
+    assert_eq!(data, fs::read(notices.join("dvipsnames.tsv")).unwrap());
 }
 
 fn package(binaries: &Path, output: &Path) -> Output {

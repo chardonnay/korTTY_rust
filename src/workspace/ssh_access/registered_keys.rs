@@ -34,9 +34,24 @@ impl Workspace {
         request: &mut Request,
         saved: Option<&Connection>,
     ) -> Result<KeySnapshots, &'static str> {
+        self.resolve_ssh_logins_filtered(request, saved, [false; 2])
+    }
+
+    pub(super) fn resolve_ssh_logins_filtered(
+        &self,
+        request: &mut Request,
+        saved: Option<&Connection>,
+        skip: [bool; 2],
+    ) -> Result<KeySnapshots, &'static str> {
         let mut catalog = None;
         let mut keys = KeySnapshots::default();
-        for login in std::iter::once(&mut request.target).chain(request.jump.as_mut()) {
+        for (index, login) in std::iter::once(&mut request.target)
+            .chain(request.jump.as_mut())
+            .enumerate()
+        {
+            if skip[index] {
+                continue;
+            }
             if let Authentication::StoredKey { id, explicit } = login.auth {
                 if catalog.is_none() {
                     catalog = Some(

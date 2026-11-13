@@ -5,7 +5,7 @@ use std::fmt::Write as _;
 use std::io;
 
 use super::super::exchange::yaml_text;
-use super::{Portable, boolean, check_count, invalid};
+use super::{Portable, boolean, check_count, invalid, read_diagrams, write_diagrams};
 
 pub(super) fn read(source: &str) -> io::Result<Vec<Portable>> {
     let mut lines = source.lines().peekable();
@@ -71,9 +71,11 @@ pub(super) fn read(source: &str) -> io::Result<Vec<Portable>> {
                 "language" => entry.language = Some(yaml_text(value)?),
                 "category" => entry.category = Some(yaml_text(value)?),
                 "description" => entry.description = Some(yaml_text(value)?),
+                "operatingSystem" => entry.operating_system = Some(yaml_text(value)?),
                 "folderPath" => entry.folder_path = Some(yaml_text(value)?),
                 "fileName" => entry.file_name = Some(yaml_text(value)?),
                 "executable" => entry.executable = Some(boolean(&yaml_text(value)?)?),
+                "savedDiagrams" => entry.diagrams = read_diagrams(&yaml_text(value)?)?,
                 "tags" if value.is_empty() => {
                     while let Some(tag) =
                         lines.peek().and_then(|line| line.strip_prefix("      - "))
@@ -116,6 +118,7 @@ pub(super) fn write(entries: &[Portable], date: &str) -> io::Result<String> {
                 "description",
                 entry.description.as_deref().filter(|text| !text.is_empty()),
             ),
+            ("operatingSystem", entry.operating_system.as_deref()),
             ("folderPath", entry.folder_path.as_deref()),
             ("fileName", entry.file_name.as_deref()),
         ] {
@@ -132,6 +135,14 @@ pub(super) fn write(entries: &[Portable], date: &str) -> io::Result<String> {
                 let tag = quote(tag)?;
                 let _ = writeln!(output, "      - {tag}");
             }
+        }
+        if !entry.diagrams.is_empty() {
+            scalar(
+                &mut output,
+                "    ",
+                "savedDiagrams",
+                &write_diagrams(&entry.diagrams)?,
+            )?;
         }
         let content = entry.content.as_deref().unwrap_or_default();
         // Java adds a leading newline and strips trailing newlines from literal

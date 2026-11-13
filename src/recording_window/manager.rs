@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use iced::widget::{
-    button, checkbox, column, container, responsive, row, rule, scrollable, space, text, text_input,
+    button, checkbox, column, container, pick_list, responsive, row, rule, scrollable, space, text,
+    text_input,
 };
 use iced::{Alignment, Element, Length, Task};
 
 use super::catalog::{self, Change, Entry, Operation};
-use super::preferences::{Preferences, default_directory};
-use super::{MAX_PATH, absolute, bounded, open_managed};
+use super::java_import;
+use super::preferences::{Preferences, Scope, default_directory};
+use super::{MAX_PATH, absolute, bounded, open_managed, video_export};
 
 mod folders;
 mod icons;
@@ -20,6 +22,7 @@ const PAGE_SIZE: usize = 64;
 pub enum Message {
     Enable(bool),
     Directory(String),
+    EncoderPath(String),
     Browse,
     BrowseTo(PathBuf),
     Browsed(Result<folders::Listing, String>),
@@ -29,6 +32,7 @@ pub enum Message {
     CaptureColor(bool),
     AutoPause(bool),
     IdleSeconds(String),
+    Scope(Scope),
     Refresh,
     Listed(Result<Vec<Entry>, String>),
     Select(PathBuf),
@@ -37,6 +41,10 @@ pub enum Message {
     Export,
     OtherPath(String),
     OpenOther,
+    ImportJava,
+    CancelJavaImport,
+    JavaImportProgress(u64, usize),
+    JavaImported(u64, Result<java_import::Imported, String>),
     Rename,
     Delete,
     Name(String),
@@ -62,9 +70,12 @@ impl Settings {
 struct Draft {
     enabled: bool,
     directory: String,
+    ffmpeg: String,
+    ffmpeg_edited: bool,
     include_color: bool,
     auto_pause: bool,
     idle_seconds: String,
+    scope: Scope,
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -73,6 +84,13 @@ enum Job {
     Browse,
     Change,
     Save,
+    Import,
+}
+
+struct Import {
+    cancel: Option<java_import::Cancel>,
+    done: Option<async_channel::Receiver<()>>,
+    frames: usize,
 }
 
 enum Prompt {
@@ -91,6 +109,8 @@ pub(crate) struct Manager {
     browser: Option<folders::Listing>,
     page: usize,
     job: Option<Job>,
+    importing: Option<Import>,
+    import_ticket: u64,
     prompt: Option<Prompt>,
     notice: Option<String>,
 }
@@ -104,9 +124,15 @@ impl Manager {
             directory: directory
                 .as_deref()
                 .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+            ffmpeg: preferences
+                .ffmpeg
+                .as_deref()
+                .map_or_else(String::new, |path| path.to_string_lossy().into_owned()),
+            ffmpeg_edited: false,
             include_color: preferences.include_color,
             auto_pause: preferences.auto_pause,
             idle_seconds: preferences.idle_seconds.to_string(),
+            scope: preferences.scope,
         };
         Self {
             draft,
@@ -119,6 +145,8 @@ impl Manager {
             browser: None,
             page: 0,
             job: None,
+            importing: None,
+            import_ticket: 0,
             prompt: None,
             notice,
         }
@@ -143,6 +171,10 @@ impl Manager {
             Message::Enable(value) if self.ready() && self.allowed => self.draft.enabled = value,
             Message::Directory(value) if self.ready() => {
                 self.draft.directory = bounded(value, MAX_PATH)
+            }
+            Message::EncoderPath(value) if self.ready() && self.allowed => {
+                self.draft.ffmpeg = bounded(value, MAX_PATH);
+                self.draft.ffmpeg_edited = true;
             }
             Message::Browse if self.ready() => {
                 let path = absolute(&self.draft.directory).or_else(|| self.directory.clone());
@@ -177,6 +209,7 @@ impl Manager {
             Message::DefaultDirectory if self.ready() => self.draft.directory.clear(),
             Message::CaptureColor(value) if self.ready() => self.draft.include_color = value,
             Message::AutoPause(value) if self.ready() => self.draft.auto_pause = value,
+            Message::Scope(value) if self.ready() => self.draft.scope = value,
             Message::IdleSeconds(value) if self.ready() => {
                 self.draft.idle_seconds = bounded(value, 4)
             }
@@ -211,6 +244,36 @@ impl Manager {
                 self.selected = None;
             }
             Message::OtherPath(path) if self.ready() => self.other_path = bounded(path, MAX_PATH),
+            Message::ImportJava if self.ready() && self.allowed => return self.import_java(),
+            Message::CancelJavaImport if self.job == Some(Job::Import) => self.cancel_import(),
+            Message::JavaImportProgress(ticket, frames) if self.import_ticket == ticket => {
+                if let Some(importing) = &mut self.importing {
+                    importing.frames = frames;
+                }
+            }
+            Message::JavaImported(ticket, result)
+                if self.import_ticket == ticket && self.job == Some(Job::Import) =>
+            {
+                self.importing = None;
+                self.job = None;
+                match result {
+                    Ok(imported) => {
+                        self.notice = Some(format!(
+                            "Imported {} frames to {}.{}",
+                            imported.frames,
+                            display_name(&imported.path),
+                            if imported.sync_failed {
+                                " The recording was saved, but directory synchronization failed."
+                            } else {
+                                ""
+                            },
+                        ));
+                        self.selected = Some(imported.path);
+                        return self.refresh();
+                    }
+                    Err(error) => self.notice = Some(error),
+                }
+            }
             Message::Rename if self.ready() => {
                 if let Some(source) = self.selected.clone() {
                     let name = source
@@ -286,6 +349,62 @@ impl Manager {
         }
     }
 
+    fn import_java(&mut self) -> Task<Message> {
+        let Some(source) = absolute(&self.other_path).filter(|path| java_import::supports(path))
+        else {
+            self.notice = Some(
+                "Enter the absolute path to a .korttyrec.jsonl or .korttyrec.jsonl.gz file.".into(),
+            );
+            return Task::none();
+        };
+        let Some(destination) = self.directory.clone() else {
+            self.notice =
+                Some("Save a recording directory before importing a Java recording.".into());
+            return Task::none();
+        };
+        let pending = match java_import::start(source, destination) {
+            Ok(pending) => pending,
+            Err(error) => {
+                self.notice = Some(format!("Could not start Java recording import ({error})."));
+                return Task::none();
+            }
+        };
+        self.job = Some(Job::Import);
+        self.notice = None;
+        self.import_ticket = self.import_ticket.wrapping_add(1);
+        let ticket = self.import_ticket;
+        self.importing = Some(Import {
+            cancel: Some(pending.cancel),
+            done: Some(pending.done),
+            frames: 0,
+        });
+        Task::batch([
+            Task::perform(
+                async move {
+                    pending
+                        .reply
+                        .recv()
+                        .await
+                        .unwrap_or_else(|_| Err("The Java recording import worker stopped.".into()))
+                },
+                move |result| Message::JavaImported(ticket, result),
+            ),
+            Task::run(pending.progress, move |frames| {
+                Message::JavaImportProgress(ticket, frames)
+            }),
+        ])
+    }
+
+    pub(crate) fn take_import_done(&mut self) -> Option<async_channel::Receiver<()>> {
+        self.importing.as_mut()?.done.take()
+    }
+
+    pub(crate) fn cancel_import(&mut self) {
+        if let Some(importing) = &mut self.importing {
+            importing.cancel = None;
+        }
+    }
+
     pub(crate) fn save_request(&mut self, latest: &Settings) -> Option<Settings> {
         if !self.ready() {
             return None;
@@ -300,6 +419,10 @@ impl Manager {
                 if preferences.directory == initial.directory {
                     preferences.directory.clone_from(&current.directory);
                 }
+                if !self.encoder_approval_requested() {
+                    preferences.ffmpeg.clone_from(&current.ffmpeg);
+                    preferences.ffmpeg_sha256 = current.ffmpeg_sha256;
+                }
                 if preferences.include_color == initial.include_color {
                     preferences.include_color = current.include_color;
                 }
@@ -308,6 +431,9 @@ impl Manager {
                 }
                 if preferences.idle_seconds == initial.idle_seconds {
                     preferences.idle_seconds = current.idle_seconds;
+                }
+                if preferences.scope == initial.scope {
+                    preferences.scope = current.scope;
                 }
                 if settings.enabled == (self.original.enabled && self.allowed) {
                     settings.enabled = latest.enabled && self.allowed;
@@ -329,6 +455,10 @@ impl Manager {
         }
     }
 
+    pub(crate) fn encoder_approval_requested(&self) -> bool {
+        self.allowed && self.draft.ffmpeg_edited
+    }
+
     pub(crate) fn save_failed(&mut self, error: String) {
         if self.job == Some(Job::Save) {
             self.job = None;
@@ -341,7 +471,13 @@ impl Manager {
     }
 
     pub(crate) fn escape_action(&self) -> Message {
-        if self.prompt.is_some() {
+        if self
+            .importing
+            .as_ref()
+            .is_some_and(|importing| importing.cancel.is_some())
+        {
+            Message::CancelJavaImport
+        } else if self.prompt.is_some() {
             Message::Cancel
         } else if self.browser.is_some() {
             Message::CancelFolder
@@ -364,12 +500,23 @@ impl Manager {
             .trim()
             .parse()
             .map_err(|_| "Enter an idle threshold between 1 and 3600 seconds.".to_string())?;
+        let ffmpeg = self.draft.ffmpeg.trim();
+        let ffmpeg = if !self.encoder_approval_requested() {
+            self.original.preferences.ffmpeg.clone()
+        } else if ffmpeg.is_empty() {
+            None
+        } else {
+            Some(video_export::resolve_encoder(Path::new(ffmpeg))?)
+        };
         let preferences = Preferences {
             directory,
+            ffmpeg,
+            ffmpeg_sha256: None,
             include_color: self.draft.include_color,
             enabled_after_restart: self.original.preferences.enabled_after_restart,
             auto_pause: self.draft.auto_pause,
             idle_seconds,
+            scope: self.draft.scope,
         };
         preferences.validate().map_err(|error| error.to_string())?;
         Ok(Settings {
@@ -448,7 +595,26 @@ impl Manager {
         } else {
             idle
         };
+        let ffmpeg = text_input(
+            "Absolute path · blank disables video export",
+            &self.draft.ffmpeg,
+        );
+        let ffmpeg = if ready && self.allowed {
+            ffmpeg.on_input(Message::EncoderPath)
+        } else {
+            ffmpeg
+        };
         let label_width = 145;
+        let scope: Element<'_, Message> = if ready {
+            pick_list(
+                [Scope::ActiveSplit, Scope::WholeTab],
+                Some(self.draft.scope),
+                Message::Scope,
+            )
+            .into()
+        } else {
+            text(self.draft.scope.to_string()).into()
+        };
         let form = column![
             row![space::horizontal().width(label_width), enable].spacing(7),
             row![
@@ -462,17 +628,18 @@ impl Manager {
             ]
             .spacing(7)
             .align_y(Alignment::Center),
-            row![
-                text("Recording scope").width(label_width),
-                text("Active split")
-            ]
-            .spacing(7)
-            .align_y(Alignment::Center),
+            row![text("Recording scope").width(label_width), scope]
+                .spacing(7)
+                .align_y(Alignment::Center),
             row![space::horizontal().width(label_width), color].spacing(7),
             row![space::horizontal().width(label_width), pause].spacing(7),
             row![text("Idle threshold (seconds)").width(label_width), idle]
                 .spacing(7)
                 .align_y(Alignment::Center),
+            row![text("FFmpeg executable").width(label_width), ffmpeg]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            text("Enter and save the FFmpeg path to approve it. Re-enter the path after replacing FFmpeg.").size(12),
         ]
         .spacing(8);
 
@@ -494,10 +661,16 @@ impl Manager {
         ]
         .spacing(7);
         let other = text_input("Absolute recording path", &self.other_path);
+        let java = absolute(&self.other_path).is_some_and(|path| java_import::supports(&path));
         let other = if ready {
-            other
-                .on_input(Message::OtherPath)
-                .on_submit(Message::OpenOther)
+            let input = other.on_input(Message::OtherPath);
+            if java && self.allowed {
+                input.on_submit(Message::ImportJava)
+            } else if !java {
+                input.on_submit(Message::OpenOther)
+            } else {
+                input
+            }
         } else {
             other
         };
@@ -555,10 +728,33 @@ impl Manager {
         content = content.push(
             row![
                 other,
-                button("Open file…").on_press_maybe(ready.then_some(Message::OpenOther))
+                button("Open file…").on_press_maybe((ready && !java).then_some(Message::OpenOther)),
+                button("Import Java…")
+                    .on_press_maybe((ready && self.allowed && java).then_some(Message::ImportJava)),
             ]
             .spacing(7),
         );
+        content = content.push(text("Import Java .korttyrec.jsonl or .korttyrec.jsonl.gz into the saved recording directory.").size(13));
+        if let Some(importing) = &self.importing {
+            content = content.push(
+                row![
+                    text(if importing.cancel.is_some() {
+                        format!("Importing Java recording · {} frames", importing.frames)
+                    } else {
+                        "Canceling Java recording import…".into()
+                    })
+                    .size(13),
+                    button("Cancel import").on_press_maybe(
+                        importing
+                            .cancel
+                            .is_some()
+                            .then_some(Message::CancelJavaImport)
+                    ),
+                ]
+                .spacing(7)
+                .align_y(Alignment::Center),
+            );
+        }
         let body = if compact {
             column![scrollable(content).height(Length::Fill), footer].spacing(9)
         } else {
@@ -656,6 +852,105 @@ mod tests {
     use super::*;
 
     #[test]
+    fn video_encoder_is_off_by_default_and_applies_only_from_an_explicit_saved_path() {
+        let scratch = crate::recording_window::tests::TestDirectory::new();
+        let path = scratch.0.join("video-settings.json");
+        let settings = Settings::default();
+        assert!(settings.preferences.ffmpeg.is_none());
+        let mut manager = Manager::new(&settings, true, None);
+        let _ = manager.update(Message::EncoderPath("ffmpeg".into()));
+        assert!(manager.save_request(&settings).is_none());
+        let executable = video_export::fixture_encoder(&scratch.0);
+        let _ = manager.update(Message::EncoderPath(executable.to_str().unwrap().into()));
+        assert!(settings.preferences.ffmpeg.is_none());
+        let mut pending = manager.save_request(&settings).unwrap();
+        assert_eq!(pending.preferences.ffmpeg.as_ref(), Some(&executable));
+        assert!(pending.preferences.encoder().is_none());
+        pending.preferences.save_to(&path).unwrap();
+        assert!(Preferences::load_from(&path).unwrap().encoder().is_none());
+        pending.preferences.approve_encoder().unwrap();
+        pending.preferences.save_to(&path).unwrap();
+        let saved = Preferences::load_from(&path).unwrap();
+        assert_eq!(saved.encoder(), pending.preferences.encoder());
+        let mut other = Manager::new(&pending, true, None);
+        let _ = other.update(Message::CaptureColor(true));
+        let unrelated = other.save_request(&pending).unwrap();
+        assert!(!other.encoder_approval_requested());
+        assert_eq!(unrelated.preferences.encoder(), saved.encoder());
+    }
+
+    #[test]
+    fn java_recording_import_refreshes_the_manager_and_opens_as_native_replay() {
+        use iced::futures::{StreamExt, executor::block_on};
+        use iced_runtime::{Action, task};
+
+        use crate::recording_window::{
+            Message as ViewerMessage, RecordingWindow, tests::TestDirectory,
+        };
+
+        let scratch = TestDirectory::new();
+        let root = scratch.0.canonicalize().unwrap();
+        let source = root.join("java.korttyrec.jsonl");
+        let storage = root.join("recordings");
+        std::fs::write(
+            &source,
+            concat!(
+                "{\"type\":\"session_created\",\"formatVersion\":1,\"at\":\"2026-05-13T12:00:00Z\"}\n",
+                "{\"type\":\"recording_start\",\"at\":\"2026-05-13T12:00:00Z\"}\n",
+                "{\"type\":\"screen\",\"at\":\"2026-05-13T12:00:00Z\",\"content\":\"Java\"}\n",
+                "{\"type\":\"recording_stop\",\"at\":\"2026-05-13T12:00:01Z\"}\n",
+            ),
+        )
+        .unwrap();
+        let settings = Settings {
+            preferences: Preferences {
+                directory: Some(storage.clone()),
+                ..Preferences::default()
+            },
+            enabled: false,
+        };
+        let mut manager = Manager::new(&settings, true, None);
+        let _ = manager.update(Message::OtherPath(source.to_str().unwrap().into()));
+        let mut outcomes = task::into_stream(manager.update(Message::ImportJava)).unwrap();
+        let done = manager.take_import_done().unwrap();
+        assert!(manager.replay(false).is_none());
+        let mut refresh = loop {
+            let Some(Action::Output(event)) = block_on(outcomes.next()) else {
+                panic!("expected an import worker result");
+            };
+            match &event {
+                Message::JavaImported(_, Ok(_)) => {
+                    break task::into_stream(manager.update(event)).unwrap();
+                }
+                Message::JavaImported(_, Err(error)) => panic!("{error}"),
+                _ => {
+                    let _ = manager.update(event);
+                }
+            }
+        };
+        assert!(done.recv_blocking().is_err());
+        let Some(Action::Output(listed @ Message::Listed(Ok(_)))) = block_on(refresh.next()) else {
+            panic!("expected the refreshed recording catalog");
+        };
+        let _ = manager.update(listed);
+        let path = manager.replay(false).unwrap();
+        assert_eq!(path, storage.join("java.korttyrec"));
+        assert!(source.exists());
+
+        let mut viewer = RecordingWindow::replay(path, false);
+        let mut opened = task::into_stream(viewer.initialize()).unwrap();
+        let Some(Action::Output(event @ ViewerMessage::Opened(Ok(_)))) = block_on(opened.next())
+        else {
+            panic!("expected the native replay to open");
+        };
+        let _ = viewer.update(event);
+        let shown = viewer.shown.as_ref().unwrap();
+        assert_eq!(viewer.frame_count, 1);
+        assert_eq!(viewer.duration, std::time::Duration::from_secs(1));
+        assert_eq!(shown.frame.screen.row(0).unwrap()[0].text, "J");
+    }
+
+    #[test]
     fn save_requests_from_concurrent_drafts_merge_distinct_preferences() {
         let root = std::env::current_dir().unwrap();
         let initial = Settings {
@@ -672,6 +967,7 @@ mod tests {
             Message::Directory(directory.to_str().unwrap().into()),
             Message::Enable(true),
             Message::AutoPause(false),
+            Message::Scope(Scope::WholeTab),
         ] {
             let _ = first.update(message);
         }
@@ -689,6 +985,7 @@ mod tests {
             Preferences {
                 directory: Some(directory.clone()),
                 auto_pause: false,
+                scope: Scope::WholeTab,
                 ..Preferences::default()
             }
         );
@@ -699,10 +996,13 @@ mod tests {
             merged.preferences,
             Preferences {
                 directory: Some(directory),
+                ffmpeg: None,
+                ffmpeg_sha256: None,
                 include_color: true,
                 enabled_after_restart: true,
                 auto_pause: false,
                 idle_seconds: 71,
+                scope: Scope::WholeTab,
             }
         );
     }
