@@ -693,8 +693,7 @@ impl Screen {
 
     pub(crate) fn shift_rectangle(&mut self, rectangle: Rectangle, forward: bool) {
         let blank = Cell::blank(Style::default());
-        for row in rectangle.top..=rectangle.bottom {
-            let line = &mut self.lines[row];
+        for line in &mut self.lines[rectangle.top..=rectangle.bottom] {
             let cells = &mut line.cells[rectangle.left..=rectangle.right];
             if forward {
                 cells.rotate_left(1);
@@ -715,8 +714,7 @@ impl Screen {
 
     pub(crate) fn fill_rectangle(&mut self, rectangle: Rectangle, cell: &Cell) {
         let blank = Cell::blank(Style::default());
-        for row in rectangle.top..=rectangle.bottom {
-            let line = &mut self.lines[row];
+        for line in &mut self.lines[rectangle.top..=rectangle.bottom] {
             line.clear_glyph(rectangle.left, &blank);
             line.clear_glyph(rectangle.right, &blank);
             line.cells[rectangle.left..=rectangle.right].fill(cell.clone());
