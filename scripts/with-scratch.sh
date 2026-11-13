@@ -34,7 +34,6 @@ cleanup() {
 
 # Keep the caller's working directory and isolate the command's temp files.
 main() {
-  local workspace
   local zsh_tests=false
   if [[ "${1:-}" == --zsh-tests ]]; then
     zsh_tests=true
@@ -45,13 +44,12 @@ main() {
     return 2
   fi
 
-  workspace="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
-  mkdir -p -- "${workspace}/target/.scratch"
   trap cleanup EXIT
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  scratch_dir="$(mktemp -d "${workspace}/target/.scratch/run.XXXXXXXX")"
+  # Canonical Unix socket paths must also fit when the checkout path is long.
+  scratch_dir="$(mktemp -d /tmp/kortty.XXXXXXXX)"
   export TMPDIR="${scratch_dir}"
   export TMP="${scratch_dir}"
   export TEMP="${scratch_dir}"

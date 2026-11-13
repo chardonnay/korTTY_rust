@@ -5229,7 +5229,6 @@ mod search_tests {
                 String::from_utf8_lossy(&signature.stderr)
             );
         }
-        let quote = |text: &str| format!("'{}'", text.replace('\'', "'\\''"));
         let script = concat!(
             r#"saved=$(stty -g); trap 'stty "$saved"' EXIT; stty -echo; "#,
             r#"printf '\033[2J\033[H%s%s\n' 'monitor-' 'ready'; while IFS= read -r action; do case "$action" in "#,
@@ -5241,17 +5240,23 @@ mod search_tests {
         );
         // Keep rule evidence out of the launch line echoed by the interactive shell.
         std::fs::write(&script_path, script).unwrap();
-        let session = Session::start(GridSize::default(), TerminalProfile::Xterm).unwrap();
+        let session = Session::start_local(
+            GridSize::default(),
+            TerminalProfile::Xterm,
+            LaunchOptions {
+                command: Some(vec![shell.into(), "-i".into()]),
+                working_directory: Some(scratch.0.clone()),
+                ..LaunchOptions::default()
+            },
+            true,
+            None,
+        )
+        .unwrap();
         wait_for_frame(&session, |frame| frame.status == Status::Running);
         assert!(!session.coding_agent_detection_requested());
         session.set_coding_agent_detection(true);
         let send = |line: &str| session.send(format!("{line}\r").into_bytes()).unwrap();
-        send(&format!(
-            "{} {} {}",
-            quote(executable.to_str().unwrap()),
-            quote(script_path.to_str().unwrap()),
-            quote(answer_gate.to_str().unwrap())
-        ));
+        send("./gemini ./monitor.sh ./answer");
         let ready = wait_for_frame(&session, |frame| visible_text(frame, "monitor-ready"));
         assert!(ready.coding_agent().is_none());
         send("block");
