@@ -95,6 +95,9 @@ incremental = false
 [profile.release]
 lto = "thin"
 
+[profile.release.package.kortty]
+opt-level = "s"
+
 [patch.crates-io]
 iced_runtime = { path = "vendor/iced-runtime" }
 iced_tiny_skia = { path = "vendor/iced-tiny-skia" }
