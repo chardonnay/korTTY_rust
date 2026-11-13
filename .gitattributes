@@ -3,6 +3,8 @@
 *.bash text eol=lf
 *.zsh text eol=lf
 *.fish text eol=lf
+crates/pty/src/shell_integration/*.cmd text eol=lf
+crates/pty/src/shell_integration/*.ps1 text eol=lf
 
 # Replay assertions compare these snapshots byte for byte.
 crates/terminal/tests/fixtures/hp/*.after.txt text eol=lf
