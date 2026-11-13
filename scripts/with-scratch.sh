@@ -49,7 +49,10 @@ main() {
   trap 'exit 130' INT
   trap 'exit 143' TERM
   # Canonical Unix socket paths must also fit when the checkout path is long.
-  scratch_dir="$(mktemp -d /tmp/kortty.XXXXXXXX)"
+  # Resolve macOS's /tmp symlink for consumers that refuse symlink traversal.
+  local temp_root
+  temp_root="$(cd -- /tmp && pwd -P)"
+  scratch_dir="$(mktemp -d "${temp_root}/kortty.XXXXXXXX")"
   export TMPDIR="${scratch_dir}"
   export TMP="${scratch_dir}"
   export TEMP="${scratch_dir}"
