@@ -68,6 +68,19 @@ mod tests {
         }
     }
 
+    fn assert_exclusive_owner(mut check: impl FnMut() -> io::Result<bool>) {
+        // A parallel fork can briefly share an open descriptor before exec
+        // closes it. The production probe must reject it during that interval.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !check().unwrap() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the fixture socket never acquired exclusive ownership"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn verifies_live_listener_and_exact_accepted_socket() {
         if std::env::var_os(WAIT_FOR_PARENT).is_some() {
@@ -92,14 +105,14 @@ mod tests {
         let pid = std::process::id();
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let local = ipv4(listener.local_addr().unwrap());
-        assert!(owns_loopback_listener(pid, local).unwrap());
+        assert_exclusive_owner(|| owns_loopback_listener(pid, local));
         assert!(!owns_loopback_listener(other.0.id(), local).unwrap());
 
         let client = TcpStream::connect(local).unwrap();
         let (_server, remote) = listener.accept().unwrap();
         let remote = ipv4(remote);
         assert_eq!(remote, ipv4(client.local_addr().unwrap()));
-        assert!(owns_loopback_connection(pid, local, remote).unwrap());
+        assert_exclusive_owner(|| owns_loopback_connection(pid, local, remote));
         assert!(!owns_loopback_connection(other.0.id(), local, remote).unwrap());
         assert!(other.0.try_wait().unwrap().is_none());
         assert!(other.0.wait().unwrap().success());
