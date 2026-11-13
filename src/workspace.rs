@@ -7709,9 +7709,10 @@ mod tests {
             .focused_session()
             .unwrap();
         let first = &workspace.sessions[&stalled].session;
+        // The initial prompt may arrive after the PTY echoes the command.
         #[cfg(unix)]
         let block =
-            b"stty -echo -icanon min 1 time 0; printf '%s%s\\n' 'kortty_blocked_' 'ready'; sleep 12\r";
+            b"stty -echo -icanon min 1 time 0; printf '\\n%s%s\\n' 'kortty_blocked_' 'ready'; sleep 12\r";
         #[cfg(windows)]
         let block = b"[Console]::WriteLine('kortty_blocked_'+'ready'); Start-Sleep -Seconds 12\r";
         first.send(block.to_vec()).unwrap();
@@ -7740,7 +7741,7 @@ mod tests {
         targets.sort_by_key(|target| *target != stalled);
         assert_eq!(targets, [stalled, ready]);
         #[cfg(unix)]
-        let command = b"printf '%s%s\\n' 'kortty_broadcast_' 'reached'\r";
+        let command = b"printf '\\n%s%s\\n' 'kortty_broadcast_' 'reached'\r";
         #[cfg(windows)]
         let command = b"[Console]::WriteLine('kortty_broadcast_'+'reached')\r";
         workspace.send_to(
