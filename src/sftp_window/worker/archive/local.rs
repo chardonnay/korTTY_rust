@@ -567,20 +567,17 @@ fn refresh(plan: &Plan, note: &mut String) -> Option<Arc<Directory>> {
 }
 
 fn matches_listing(entry: &Entry, metadata: &Metadata) -> bool {
-    if entry.kind != files::local_kind(metadata)
-        || entry.size != metadata.is_file().then_some(metadata.len())
-    {
-        return false;
-    }
+    let matches = entry.kind == files::local_kind(metadata)
+        && entry.size == metadata.is_file().then_some(metadata.len());
     #[cfg(unix)]
-    {
+    let matches = {
         use std::os::unix::fs::MetadataExt as _;
-        entry.owner == Some(metadata.uid())
+        matches
+            && entry.owner == Some(metadata.uid())
             && entry.group == Some(metadata.gid())
             && entry.mode == Some(metadata.mode() & 0o777)
-    }
-    #[cfg(windows)]
-    true
+    };
+    matches
 }
 
 fn directory_metadata(directory: &LocalDirectory) -> io::Result<Metadata> {
