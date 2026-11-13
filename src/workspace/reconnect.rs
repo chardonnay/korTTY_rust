@@ -4,7 +4,7 @@ use iced::{Task, window};
 use crate::session::{SessionId, Status};
 
 use super::{
-    Message, PaneSession, Tab, Workspace,
+    LocalLaunchView, Message, PaneSession, Tab, Workspace,
     ssh_access::{KeySnapshots, SavedSshProfile},
 };
 
@@ -164,8 +164,18 @@ impl Workspace {
         let profile = pane.frame.screen.profile;
         let font = pane.font_size_override();
         let security = pane.local_security.clone();
-        let (grid, strict) = (pane.grid, pane.strict_escapes);
-        match self.store_local_session_in_grid(profile, font, security, grid, strict) {
+        let (grid, strict) = (pane.grid, pane.reconnect_strict_escapes());
+        let appearance = pane
+            .project_terminal_appearance
+            .as_ref()
+            .map(|_| self.pane_appearance(target.source));
+        match self.store_local_session_with_grid(
+            profile,
+            font,
+            security,
+            LocalLaunchView::Existing(grid, appearance),
+            strict,
+        ) {
             Ok(candidate) => {
                 self.start_reconnect_worker(owner, target, candidate, None, KeySnapshots::default())
             }
@@ -192,14 +202,14 @@ impl Workspace {
             return Task::none();
         };
         let grid = old.grid;
-        let strict = old.strict_escapes;
+        let strict = old.reconnect_strict_escapes();
         let Some(next) = self.sessions.get_mut(&candidate) else {
             return Task::none();
         };
         if next.frame.ibm.is_none() {
             next.grid = grid;
             next.session.resize(grid);
-            if strict && !next.strict_escapes {
+            if strict && !next.strict_escapes && !next.saved_strict_escapes {
                 next.strict_escapes = true;
                 next.session.set_strict_escapes(true);
             }
@@ -295,6 +305,7 @@ impl Workspace {
                 Some("Could not carry the previous scrollback into the new session.".into())
             }
             Status::Running => None,
+            Status::Exited(_) if next.saved_local.is_some() => None,
             Status::Error(error) => Some(format!("Could not reconnect ({error})")),
             _ => Some("The new connection closed before it was ready.".into()),
         };
@@ -333,8 +344,10 @@ impl Workspace {
         let mirrored = self.tab_broadcast_active(tab) || self.multi_exec_member(target.source);
         let owns_tunnels = tab.tunnel_owner == Some(target.source);
         let (grid, font, baseline) = (old.grid, old.font, old.font_baseline);
+        let project_initial_size = old.project_initial_size;
+        let project_terminal_appearance = old.project_terminal_appearance.clone();
         let inherits_font_size = old.inherits_font_size;
-        let (strict, typeahead) = (old.strict_escapes, old.typeahead_enabled);
+        let (strict, typeahead) = (old.reconnect_strict_escapes(), old.typeahead_enabled);
         let effect = old.effect;
         let Some(next) = self.sessions.get_mut(&candidate) else {
             return Task::none();
@@ -359,16 +372,21 @@ impl Workspace {
         next.font_baseline = baseline;
         next.inherits_font_size = inherits_font_size;
         next.effect = effect;
+        next.project_initial_size = project_initial_size;
+        next.project_terminal_appearance = project_terminal_appearance;
+        let styled = next.project_terminal_appearance.is_some();
         if next.frame.ibm.is_none() {
             next.grid = grid;
             next.session.resize(grid);
-            next.strict_escapes |= strict;
+            if !next.saved_strict_escapes {
+                next.strict_escapes |= strict;
+            }
             next.session.set_strict_escapes(next.strict_escapes);
         }
         next.typeahead_enabled = typeahead && next.supports_typeahead();
         next.session
             .set_typeahead_enabled(next.typeahead_enabled && !mirrored);
-        if effect.is_some() {
+        if effect.is_some() || styled {
             self.sync_pane_appearance(candidate);
         }
 
@@ -397,6 +415,7 @@ impl Workspace {
         if window.notice.as_deref() == Some(RECONNECTING) {
             window.notice = None;
         }
+        self.rebind_coding_agent_alias(target.source, candidate);
         if can_mirror {
             self.multi_exec.replace(target.source, candidate);
         }
@@ -410,7 +429,10 @@ impl Workspace {
             Task::batch([closing, tunnels])
         } else {
             self.stop_session(target.source);
-            Task::none()
+            Task::batch([
+                self.record_serial_session_used(candidate),
+                self.record_local_session_used(candidate),
+            ])
         }
     }
 

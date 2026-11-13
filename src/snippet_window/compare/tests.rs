@@ -59,3 +59,32 @@ fn snippet_comparison_bounds_work_after_removing_common_lines() {
     assert!(comparison(&"\n".repeat(MAX_LINES), "").is_err());
     assert!(comparison(&"X".repeat(MAX_LINE_BYTES + 1), "").is_err());
 }
+
+#[test]
+fn snippet_reason_jump_requires_one_changed_block_and_opens_its_page() {
+    let before: Vec<_> = (1..=150).map(|line| format!("original {line}")).collect();
+    let mut after = before.clone();
+    after[75] = "    repeated change".into();
+    after[76] = "unique second line".into();
+    after[140] = "repeated change".into();
+    let diff = comparison(&before.join("\n"), &after.join("\n")).unwrap();
+    assert!(diff.anchored_change("repeated change").is_none());
+    assert!(diff.anchored_change("original 50").is_none());
+    let location = diff.anchored_change(" unique second line ").unwrap();
+    assert_eq!(location.label(), "Proposed lines 76–77");
+    assert_eq!(diff.original_change(76), Some(location));
+    assert!(diff.original_change(75).is_none());
+    let mut view = View::default();
+    let _ = view.update(Message::Loaded(Ok(Arc::new(diff))));
+    let _ = view.reveal_change(location);
+    assert_eq!(view.page, 1);
+    assert_eq!(view.focused, Some(location));
+    view.clear_change_focus();
+    assert!(view.focused.is_none());
+
+    let bom = comparison("\u{feff}old\r\nend\r\n", "\u{feff}new\r\nend\r\n").unwrap();
+    assert_eq!(
+        bom.anchored_change("new").unwrap().label(),
+        "Proposed line 1"
+    );
+}

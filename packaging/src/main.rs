@@ -12,6 +12,9 @@ use sha2::{Digest, Sha256};
 use toml_edit::DocumentMut;
 
 mod archive;
+mod linux;
+#[path = "../../src/native_executable.rs"]
+mod native_executable;
 mod target;
 
 use target::{Platform, Target};
@@ -20,15 +23,20 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const USAGE: &str = "usage: kortty-package [--target <rust-target>] [--bin-dir <directory>]
                       [--output-dir <directory> | --stage-app <kortty.app>]
+                      [--linux-zip] [--linux-deb] [--linux-rpm]
 
 Run from the kortty workspace root.
 Defaults to the native Rust target, target/release, and target/dist.
+For Linux releases, --linux-zip also creates a portable ZIP and its checksum.
+Use --linux-deb on a matching Debian build host with dpkg-dev and dpkg-deb.
+Use --linux-rpm on a matching Linux build host with rpmbuild and ELF dependency generators.
 The macOS --stage-app mode creates a signed local app bundle instead of an archive.";
 
 struct Options {
     target: Option<String>,
     bin_dir: PathBuf,
     destination: Destination,
+    linux: linux::Packages,
 }
 
 enum Destination {
@@ -41,6 +49,7 @@ impl Options {
         let mut target = None;
         let mut bin_dir = None;
         let mut destination = None;
+        let mut linux = linux::Packages::default();
         while let Some(flag) = args.next() {
             if flag == "--help" || flag == "-h" {
                 return Ok(None);
@@ -68,6 +77,9 @@ impl Options {
                         args.next().ok_or_else(value)?,
                     )));
                 }
+                Some("--linux-zip") if !linux.zip => linux.zip = true,
+                Some("--linux-deb") if !linux.deb => linux.deb = true,
+                Some("--linux-rpm") if !linux.rpm => linux.rpm = true,
                 _ => {
                     return Err(invalid(format!(
                         "unknown, repeated, or conflicting option {}",
@@ -82,6 +94,7 @@ impl Options {
             bin_dir: bin_dir.unwrap_or_else(|| root.join("target/release")),
             destination: destination
                 .unwrap_or_else(|| Destination::Archive(root.join("target/dist"))),
+            linux,
         }))
     }
 }
@@ -135,11 +148,30 @@ fn run() -> Result<()> {
         None => target::native()?,
     };
     let target = Target::parse(&triple)?;
+    if options.linux.selected()
+        && (target.platform != Platform::Linux
+            || !matches!(&options.destination, Destination::Archive(_)))
+    {
+        return Err(invalid(format!(
+            "{} requires Linux archive output",
+            options.linux.option()
+        ))
+        .into());
+    }
+    options.linux.require_host(&triple)?;
     let version = version(&root)?;
     let binaries = target.binaries(&options.bin_dir)?;
     match options.destination {
         Destination::Archive(directory) => {
-            let release = package(&root, &directory, &target, &triple, &version, &binaries)?;
+            let release = package(
+                &root,
+                &directory,
+                &target,
+                &triple,
+                &version,
+                &binaries,
+                options.linux,
+            )?;
             println!("{}", release.display());
         }
         Destination::App(path) => {
@@ -199,6 +231,7 @@ fn package(
     triple: &str,
     version: &str,
     binaries: &[PathBuf],
+    linux: linux::Packages,
 ) -> Result<PathBuf> {
     let stem = format!("kortty-{version}-{triple}");
     let final_dir = output.join(&stem);
@@ -208,7 +241,21 @@ fn package(
     let payload = staging.0.join("payload").join(&stem);
     fs::create_dir_all(&payload)?;
     match target.platform {
-        Platform::Linux => copy_binaries(binaries, &payload.join("bin"))?,
+        Platform::Linux => {
+            copy_binaries(binaries, &payload.join("bin"))?;
+            let applications = payload.join("share/applications");
+            let icons = payload.join("share/pixmaps");
+            fs::create_dir_all(&applications)?;
+            fs::create_dir_all(&icons)?;
+            fs::copy(
+                root.join("packaging/linux/kortty.desktop"),
+                applications.join("kortty.desktop"),
+            )?;
+            fs::copy(
+                root.join("src/workspace/coding_agent_app_icon/kortty_icon.png"),
+                icons.join("kortty.png"),
+            )?;
+        }
         Platform::Windows => copy_binaries(binaries, &payload)?,
         Platform::Macos => macos_bundle(root, &payload.join("kortty.app"), version, binaries)?,
     }
@@ -216,22 +263,43 @@ fn package(
 
     let release = staging.0.join("release");
     fs::create_dir(&release)?;
-    let extension = if target.platform == Platform::Linux {
-        "tar.gz"
+    let format = if target.platform == Platform::Linux {
+        archive::Format::TarGz
     } else {
-        "zip"
+        archive::Format::Zip
     };
-    let name = format!("{stem}.{extension}");
+    let name = write_archive(format, &stem, &release, &payload)?;
+    if linux.zip {
+        write_archive(archive::Format::Zip, &stem, &release, &payload)?;
+    }
+    for native in linux.write(triple, version, &payload, &staging.0, &release)? {
+        checksum(&release, &native)?;
+    }
+    fs::rename(release, &final_dir)?;
+    Ok(final_dir.join(name))
+}
+
+fn write_archive(
+    format: archive::Format,
+    stem: &str,
+    release: &Path,
+    payload: &Path,
+) -> Result<String> {
+    let name = format!("{stem}.{}", format.extension());
     let archive = release.join(&name);
-    archive::write(target.platform, &archive, &payload)?;
+    archive::write(format, &archive, payload)?;
+    checksum(release, &name)?;
+    Ok(name)
+}
+
+fn checksum(release: &Path, name: &str) -> Result<()> {
     let mut hash = Sha256::new();
-    io::copy(&mut File::open(archive)?, &mut hash)?;
+    io::copy(&mut File::open(release.join(name))?, &mut hash)?;
     fs::write(
         release.join(format!("{name}.sha256")),
         format!("{:x}  {name}\n", hash.finalize()),
     )?;
-    fs::rename(release, &final_dir)?;
-    Ok(final_dir.join(name))
+    Ok(())
 }
 
 fn copy_binaries(binaries: &[PathBuf], destination: &Path) -> Result<()> {
@@ -260,6 +328,14 @@ fn copy_licenses(root: &Path, payload: &Path) -> Result<()> {
     copy_vendor_licenses(
         &root.join("src/session_journal/export/pdf/fonts"),
         &payload.join("licenses/noto-fonts"),
+    )?;
+    copy_vendor_licenses(&root.join("third-party/7z"), &payload.join("licenses/7z"))?;
+    let latex_source = root.join("third-party/latex-rust");
+    let latex_notices = payload.join("licenses/latex-rust");
+    copy_vendor_licenses(&latex_source, &latex_notices)?;
+    fs::copy(
+        latex_source.join("dvipsnames.tsv"),
+        latex_notices.join("dvipsnames.tsv"),
     )?;
     for crate_dir in fs::read_dir(root.join("vendor"))? {
         let crate_dir = crate_dir?;
@@ -321,6 +397,19 @@ fn macos_bundle(root: &Path, app: &Path, version: &str, binaries: &[PathBuf]) ->
         root.join("packaging/macos/WorkerInfo.plist"),
         helper_contents.join("Info.plist"),
     )?;
+    let signing = Staging::new(
+        app.parent()
+            .ok_or_else(|| invalid("app parent is missing"))?,
+    )?;
+    let entitlements = signing.0.join("Worker.entitlements");
+    // AMFI's XML parser rejects CRLF even when plutil accepts the property list.
+    command(
+        Command::new("/usr/bin/plutil")
+            .args(["-convert", "xml1", "-o"])
+            .arg(&entitlements)
+            .arg(root.join("packaging/macos/Worker.entitlements")),
+        "normalize macOS SSH sandbox entitlements",
+    )?;
     command(
         Command::new("/usr/bin/codesign")
             .args([
@@ -332,7 +421,7 @@ fn macos_bundle(root: &Path, app: &Path, version: &str, binaries: &[PathBuf]) ->
                 "runtime",
             ])
             .arg("--entitlements")
-            .arg(root.join("packaging/macos/Worker.entitlements"))
+            .arg(entitlements)
             .arg(&helper),
         "sign macOS SSH sandbox worker",
     )?;

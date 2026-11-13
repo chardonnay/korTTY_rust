@@ -61,6 +61,35 @@ fn close(writer: &mut Writer) {
     }
 }
 
+#[test]
+fn coding_agent_input_audit_records_only_the_verb_and_byte_count() {
+    for format in [Format::Text, Format::Json] {
+        let scratch = Scratch::new();
+        let mut settings = scratch.settings();
+        settings.format = format;
+        let mut log = Log::open(Prepared::new(&settings).unwrap(), now()).unwrap();
+        log.append(
+            Event::CodingAgentInputSent {
+                prompt: true,
+                bytes: 17,
+            },
+            now(),
+        )
+        .unwrap();
+        drop(log);
+        let line = fs::read_to_string(settings.directory.join(ACTIVE)).unwrap();
+        match format {
+            Format::Text => assert!(line.ends_with("Coding agent prompt sent bytes=17\n")),
+            Format::Json => {
+                let entry: serde_json::Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(entry["message"], "Coding agent prompt sent");
+                assert_eq!(entry["bytes"], 17);
+                assert_eq!(entry.as_object().unwrap().len(), 5);
+            }
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn shutdown_unlocks_the_log_before_completion_with_an_inherited_description() {

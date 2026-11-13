@@ -70,10 +70,20 @@ pub(super) fn read(path: &Path) -> Result<Vec<u8>, Error> {
 }
 
 pub(super) fn publish(path: &Path, contents: &[u8], replace: bool) -> Result<(), Error> {
+    publish_checked(path, contents, replace, || Ok(()))
+}
+
+pub(super) fn publish_checked(
+    path: &Path,
+    contents: &[u8],
+    replace: bool,
+    check: impl FnOnce() -> Result<(), Error>,
+) -> Result<(), Error> {
     let (mut temporary, mut file) = create_temporary(path)?;
     file.write_all(contents)?;
     file.sync_all()?;
     drop(file);
+    check()?;
     let result = if replace {
         fs::rename(&temporary.path, path)
     } else {

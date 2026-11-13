@@ -616,6 +616,31 @@ impl Viewer {
         }
         Task::none()
     }
+
+    pub(super) fn reveal_question_entry(&mut self, entry: &str) -> Task<Desktop> {
+        let Some(document) = &self.document else {
+            return Task::none();
+        };
+        let mut matches = document
+            .timeline
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| candidate.id == entry);
+        let Some(index) = matches
+            .next()
+            .filter(|_| matches.next().is_none())
+            .map(|(index, _)| index)
+        else {
+            self.error = Some("The cited journal entry is no longer available.".into());
+            return Task::none();
+        };
+        self.navigation.find_open = false;
+        self.navigation.query.clear();
+        self.navigation.clear_scan();
+        self.navigation.rebuild_marker_rows(document);
+        self.capture_shown = false;
+        self.reveal_timeline(Some(index), true)
+    }
 }
 
 pub(super) fn message(event: Event) -> Message {

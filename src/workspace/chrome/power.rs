@@ -14,6 +14,10 @@ pub(super) struct State {
     pending: Option<Pending>,
     failed_for_current_work: bool,
     connected_terminal: Option<SessionId>,
+    #[cfg(target_os = "macos")]
+    terminal_activity: Option<kortty_macos::TerminalActivity>,
+    #[cfg(target_os = "macos")]
+    scheduler_activity: Option<kortty_macos::AppNapActivity>,
 }
 
 struct Pending {
@@ -40,6 +44,38 @@ pub(super) const fn label() -> &'static str {
 }
 
 impl Workspace {
+    #[cfg(target_os = "macos")]
+    pub(in crate::workspace) fn start_terminal_activity(&mut self) {
+        match kortty_macos::TerminalActivity::start() {
+            Ok(activity) => self.chrome.power.terminal_activity = Some(activity),
+            Err(error) => {
+                eprintln!("kortty: could not track terminal activity for App Nap ({error})")
+            }
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::workspace) fn stop_terminal_activity(&mut self) {
+        self.chrome.power.terminal_activity = None;
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(in crate::workspace) fn reconcile_scheduler_activity(&mut self) {
+        let active = !self.exiting
+            && self
+                .scheduler
+                .as_ref()
+                .is_some_and(crate::scheduler_window::SchedulerWindow::has_active_runs);
+        if active {
+            self.chrome
+                .power
+                .scheduler_activity
+                .get_or_insert_with(kortty_macos::AppNapActivity::begin);
+        } else {
+            self.chrome.power.scheduler_activity = None;
+        }
+    }
+
     pub(super) fn sleep_prevention_available(&self) -> bool {
         supports_system_sleep_prevention()
             && !self
@@ -226,6 +262,59 @@ mod tests {
 
     use super::super::{Action, Category, Entry};
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn app_nap_keeps_scheduled_work_awake_only_while_a_run_is_active() {
+        use crate::job_executor::Completion;
+        use crate::scheduler_window::{Message as SchedulerMessage, SchedulerWindow, SshCommand};
+        use kortty_jobs::{Job, JobGraph, JobId, JobSchedule, RunOutcome, SchedulerStore};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let path = profile.0.join("jobs.json");
+        let action: SshCommand = serde_json::from_value(serde_json::json!({
+            "host": "server.example", "port": 22, "username": "operator",
+            "key_file": profile.0.join("fixture-key"), "command": "true",
+        }))
+        .unwrap();
+        let job = Job::new(JobId::new("fixture").unwrap(), "Fixture", action)
+            .unwrap()
+            .with_schedule(JobSchedule::default().with_fixed_times(["12:00".parse().unwrap()]));
+        SchedulerStore::open(&path)
+            .unwrap()
+            .commit_with_actions(&JobGraph::new(vec![job]).unwrap(), &[], &[])
+            .unwrap();
+        let mut scheduler = SchedulerWindow::open(path).unwrap();
+        scheduler.set_execution_allowed(true);
+        let due = scheduler.next_due().unwrap();
+        let mut workspace = Workspace {
+            scheduler: Some(scheduler),
+            ..Workspace::default()
+        };
+        assert!(workspace.sleep_work_active());
+        workspace.reconcile_scheduler_activity();
+        assert!(workspace.chrome.power.scheduler_activity.is_none());
+
+        let scheduler = workspace.scheduler.as_mut().unwrap();
+        let mut started = scheduler.update_runtime_at(SchedulerMessage::Tick, due);
+        let run = started.pop().unwrap();
+        assert!(started.is_empty());
+        workspace.reconcile_scheduler_activity();
+        assert!(workspace.chrome.power.scheduler_activity.is_some());
+        let scheduler = workspace.scheduler.as_mut().unwrap();
+        scheduler.update_runtime_at(
+            SchedulerMessage::Finished(Completion {
+                id: run.id,
+                outcome: RunOutcome::Cancelled,
+                detail: None,
+                recording: None,
+                swarm_report: None,
+            }),
+            due,
+        );
+        workspace.reconcile_scheduler_activity();
+        assert!(workspace.chrome.power.scheduler_activity.is_none());
+    }
 
     #[test]
     fn sleep_prevention_menu_uses_opt_in_profile_state_and_platform_support() {

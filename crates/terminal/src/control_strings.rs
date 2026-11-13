@@ -28,15 +28,18 @@ enum State {
     #[default]
     Ground,
     Escape,
+    CsiEntry {
+        leading_empty: usize,
+    },
     String {
         kind: StringKind,
         escaped: bool,
     },
 }
 
-/// Frames control strings before they reach vte. Metadata is delivered only
-/// when its terminator is complete, and bytes inside an opaque string do
-/// not become terminal commands.
+/// Frames control strings before they reach vte and retains CSI parameter
+/// presence for line edits. Bytes inside an opaque string do not become
+/// terminal commands.
 #[derive(Default)]
 pub(crate) struct ControlStrings {
     state: State,
@@ -48,22 +51,37 @@ pub(crate) struct ControlStrings {
 impl ControlStrings {
     pub(crate) fn advance(&mut self, parser: &mut Parser, model: &mut Model, mut bytes: &[u8]) {
         let dec_bytes = model.uses_dec_bytes();
+        let single_byte = model.text_encoding().is_single_byte();
         while !bytes.is_empty() {
             match self.state {
                 State::Ground => {
-                    let Some((offset, control, width)) = next_special(bytes, dec_bytes) else {
+                    let Some((offset, control, width)) =
+                        next_special(bytes, dec_bytes || single_byte, model.is_dec_profile())
+                    else {
                         parser.advance(model, bytes);
                         return;
                     };
                     parser.advance(model, &bytes[..offset]);
                     bytes = &bytes[offset + width..];
                     match control {
-                        0x1b => self.state = State::Escape,
+                        0x1b => {
+                            model.first_csi_parameter = None;
+                            self.state = State::Escape;
+                        }
+                        byte if single_byte && (byte >= 0xa0 || model.windows_c1_text()) => {
+                            let mut buffer = [0; 4];
+                            let text = model
+                                .text_encoding()
+                                .decode_byte(byte)
+                                .encode_utf8(&mut buffer);
+                            parser.advance(model, text.as_bytes());
+                        }
                         0x9d => self.start_string(parser, model, StringKind::Osc),
                         0x90 => self.start_string(parser, model, StringKind::Dcs),
                         0x9f => self.start_string(parser, model, StringKind::Apc),
                         0x98 | 0x9e => self.start_string(parser, model, StringKind::Opaque),
-                        0x84 | 0x85 | 0x88 | 0x8d..=0x8f | 0x9b if model.dec_mode.level >= 2 => {
+                        0x9b if model.dec_mode.level >= 2 => self.start_csi(parser, model),
+                        0x84 | 0x85 | 0x88 | 0x8d..=0x8f if model.dec_mode.level >= 2 => {
                             parser.advance(model, &[0x1b, control - 0x40]);
                         }
                         0xa0..=0xff if dec_bytes => model.print_dec_right(control),
@@ -81,6 +99,9 @@ impl ControlStrings {
                     if let Some(kind) = kind {
                         self.start_string(parser, model, kind);
                         bytes = &bytes[1..];
+                    } else if bytes[0] == b'[' {
+                        self.start_csi(parser, model);
+                        bytes = &bytes[1..];
                     } else if bytes[0] == 0x1b {
                         bytes = &bytes[1..];
                     } else if bytes[0] == 0x07 {
@@ -94,13 +115,43 @@ impl ControlStrings {
                         self.state = State::Ground;
                     }
                 }
+                State::CsiEntry { leading_empty } => match bytes[0] {
+                    b';' => {
+                        self.state = State::CsiEntry {
+                            leading_empty: leading_empty.saturating_add(1),
+                        };
+                        parser.advance(model, &bytes[..1]);
+                        bytes = &bytes[1..];
+                    }
+                    0x00..=0x17 | 0x19 | 0x1c..=0x1f | 0x7f => {
+                        parser.advance(model, &bytes[..1]);
+                        bytes = &bytes[1..];
+                    }
+                    byte => {
+                        // vte reports empty parameters and explicit zeros alike.
+                        if byte.is_ascii_digit() {
+                            model.first_csi_parameter = Some(leading_empty);
+                        }
+                        self.state = State::Ground;
+                    }
+                },
                 State::String { kind, escaped } => {
-                    let (byte, width) = unit(bytes);
+                    let (byte, width) = if single_byte {
+                        (bytes[0], 1)
+                    } else {
+                        unit(bytes)
+                    };
                     self.advance_string(model, kind, escaped, byte, &bytes[..width]);
                     bytes = &bytes[width..];
                 }
             }
         }
+    }
+
+    fn start_csi(&mut self, parser: &mut Parser, model: &mut Model) {
+        model.first_csi_parameter = None;
+        parser.advance(model, b"\x1b[");
+        self.state = State::CsiEntry { leading_empty: 0 };
     }
 
     fn advance_string(
@@ -116,7 +167,9 @@ impl ControlStrings {
             && (self.body.starts_with(b"5522;") || (self.body == b"5522" && byte == b';'))
             && (self.clipboard_generation.is_none()
                 || self.clipboard_generation != model.clipboard.framing_generation());
-        let finished = byte == 0x9c || (escaped && byte == b'\\') || (osc && byte == 0x07);
+        let finished = (byte == 0x9c && !model.windows_c1_text())
+            || (escaped && byte == b'\\')
+            || (osc && byte == 0x07);
         if finished || matches!(byte, 0x18 | 0x1a) {
             if finished
                 && !self.discarded
@@ -149,9 +202,14 @@ impl ControlStrings {
             };
             let whitespace = clipboard && osc52::is_blank(byte);
             let title = osc && matches!(self.body.as_slice(), [b'0' | b'1' | b'2', b';', ..]);
+            let reserved_c1 = model.text_encoding() == crate::TextEncoding::Windows1252
+                && !model.windows_c1_text()
+                && (0x80..=0x9f).contains(&byte);
             if escaped
                 || (byte != 0x1b
-                    && ((!title && (byte < 0x20 && !whitespace || (0x7f..=0x9f).contains(&byte)))
+                    && (reserved_c1
+                        || (!title
+                            && (byte < 0x20 && !whitespace || (0x7f..=0x9f).contains(&byte)))
                         || (matches!(kind, StringKind::Apc)
                             && self.body.is_empty()
                             && byte != b'G')
@@ -202,8 +260,12 @@ impl ControlStrings {
     }
 }
 
-fn next_special(bytes: &[u8], dec_bytes: bool) -> Option<(usize, u8, usize)> {
-    if dec_bytes {
+fn next_special(
+    bytes: &[u8],
+    scan_high_bytes: bool,
+    dec_profile: bool,
+) -> Option<(usize, u8, usize)> {
+    if scan_high_bytes {
         return bytes
             .iter()
             .position(|&byte| byte == 0x1b || byte >= 0x80)
@@ -212,7 +274,9 @@ fn next_special(bytes: &[u8], dec_bytes: bool) -> Option<(usize, u8, usize)> {
     let mut offset = 0;
     while offset < bytes.len() {
         let (byte, width) = unit(&bytes[offset..]);
-        if matches!(byte, 0x1b | 0x90 | 0x98 | 0x9d..=0x9f) {
+        if matches!(byte, 0x1b | 0x90 | 0x98 | 0x9d..=0x9f)
+            || (dec_profile && matches!(byte, 0x84 | 0x85 | 0x88 | 0x8d..=0x8f | 0x9b))
+        {
             return Some((offset, byte, width));
         }
         offset += width;

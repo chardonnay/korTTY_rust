@@ -5,26 +5,82 @@ use std::io::{self, Write as _};
 
 use flate2::Compression;
 use flate2::write::ZlibEncoder;
-use pdf_writer::types::{ActionType, AnnotationType};
-use pdf_writer::{Content, Filter, Finish as _, Name, Pdf, Rect, Ref, Str, TextStr};
+use pdf_writer::types::{ActionType, AnnotationType, LineCapStyle};
+use pdf_writer::{Content, Date, Filter, Finish as _, Name, Pdf, Rect, Ref, Str, TextStr};
 
 use crate::session_journal::{
     MAX_PNG_PIXELS, export_branding::REPOSITORY_URL, is_display_character,
 };
 
 mod fonts;
-pub(super) use fonts::Font;
+pub(crate) use fonts::Font;
 
 pub(super) const PAGE_WIDTH: f32 = 595.2756;
 pub(super) const PAGE_HEIGHT: f32 = 841.8898;
 const MAX_PAGES: usize = 4096;
 const MAX_IMAGES: usize = 4096;
 const MAX_BOOKMARKS: usize = 4096;
+const MAX_PAGE_LINKS: usize = 4096;
 const MAX_OPACITIES: usize = 256;
 const MAX_BYTES: usize = 64 * 1024 * 1024;
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
 pub(super) type Color = [u8; 3];
+
+#[derive(Clone, Copy)]
+pub(crate) enum Orientation {
+    Portrait,
+    Landscape,
+}
+
+impl Orientation {
+    pub(crate) const fn size(self) -> [f32; 2] {
+        match self {
+            Self::Portrait => [PAGE_WIDTH, PAGE_HEIGHT],
+            Self::Landscape => [PAGE_HEIGHT, PAGE_WIDTH],
+        }
+    }
+}
+
+pub(crate) struct Metadata<'a> {
+    pub title: &'a str,
+    pub subject: &'a str,
+    pub keywords: &'a str,
+    pub created: jiff::Timestamp,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct VectorStroke {
+    pub color: Color,
+    pub width: f32,
+    pub dash: Option<[f32; 2]>,
+    pub round_caps: bool,
+}
+
+impl VectorStroke {
+    fn validate(self) -> io::Result<()> {
+        line_width(self.width)?;
+        if self.dash.is_some_and(|parts| {
+            !parts
+                .into_iter()
+                .all(|part| (0.001..=512.0).contains(&part))
+        }) {
+            return Err(invalid("Invalid PDF dash pattern"));
+        }
+        Ok(())
+    }
+
+    fn apply(self, stream: &mut Content) {
+        let [r, g, b] = rgb(self.color);
+        stream.set_stroke_rgb(r, g, b).set_line_width(self.width);
+        if let Some(pattern) = self.dash {
+            stream.set_dash_pattern(pattern, 0.0);
+        }
+        if self.round_caps {
+            stream.set_line_cap(LineCapStyle::RoundCap);
+        }
+    }
+}
 
 pub(super) struct Document {
     fonts: [fonts::Embedded; 3],
@@ -32,15 +88,24 @@ pub(super) struct Document {
     images: Vec<Image>,
     opacities: Vec<f32>,
     bookmarks: Vec<Bookmark>,
+    page_links: usize,
     retained_bytes: usize,
 }
 
 struct Page {
+    orientation: Orientation,
     content: Content,
     fonts: [bool; 3],
     images: BTreeSet<usize>,
     opacities: BTreeSet<usize>,
     footer_link: Option<Rect>,
+    links: Vec<PageLink>,
+}
+
+struct PageLink {
+    bounds: Rect,
+    target: usize,
+    top: f32,
 }
 
 struct Image {
@@ -77,27 +142,34 @@ impl Document {
             images: Vec::new(),
             opacities: Vec::new(),
             bookmarks: Vec::new(),
+            page_links: 0,
             retained_bytes: 0,
         })
     }
 
-    pub(super) fn new_page(&mut self) -> io::Result<usize> {
+    pub(super) fn new_page(&mut self, orientation: Orientation) -> io::Result<usize> {
         if self.pages.len() == MAX_PAGES {
             return Err(invalid("The journal PDF exceeds its page limit"));
         }
         let index = self.pages.len();
         self.pages.push(Page {
+            orientation,
             content: Content::new(),
             fonts: [false; 3],
             images: BTreeSet::new(),
             opacities: BTreeSet::new(),
             footer_link: None,
+            links: Vec::new(),
         });
         Ok(index)
     }
 
     pub(super) fn page_count(&self) -> usize {
         self.pages.len()
+    }
+
+    pub(super) fn orientation(&self, page: usize) -> Orientation {
+        self.pages[page].orientation
     }
 
     pub(super) fn text_width(&self, font: Font, size: f32, text: &str) -> f32 {
@@ -224,6 +296,102 @@ impl Document {
         })
     }
 
+    pub(super) fn curve(
+        &mut self,
+        page: usize,
+        points: [[f32; 2]; 4],
+        stroke: VectorStroke,
+    ) -> io::Result<()> {
+        coordinates(points.as_flattened())?;
+        stroke.validate()?;
+        let [[x0, y0], [x1, y1], [x2, y2], [x3, y3]] = points;
+        self.paint(page, |page| {
+            let stream = &mut page.content;
+            stream.save_state();
+            stroke.apply(stream);
+            stream
+                .move_to(x0, y0)
+                .cubic_to(x1, y1, x2, y2, x3, y3)
+                .stroke()
+                .restore_state();
+        })
+    }
+
+    pub(super) fn round_rect(
+        &mut self,
+        page: usize,
+        bounds: [f32; 4],
+        radius: f32,
+        fill: Color,
+        stroke: VectorStroke,
+    ) -> io::Result<()> {
+        rectangle(bounds)?;
+        line_width(radius)?;
+        stroke.validate()?;
+        let [x, y, width, height] = bounds;
+        let radius = radius.min(width / 2.0).min(height / 2.0);
+        let bend = radius * 0.552_284_8;
+        let right = x + width;
+        let top = y + height;
+        let [r, g, b] = rgb(fill);
+        self.paint(page, |page| {
+            let stream = &mut page.content;
+            stream.save_state().set_fill_rgb(r, g, b);
+            stroke.apply(stream);
+            stream
+                .move_to(x + radius, y)
+                .line_to(right - radius, y)
+                .cubic_to(
+                    right - radius + bend,
+                    y,
+                    right,
+                    y + radius - bend,
+                    right,
+                    y + radius,
+                )
+                .line_to(right, top - radius)
+                .cubic_to(
+                    right,
+                    top - radius + bend,
+                    right - radius + bend,
+                    top,
+                    right - radius,
+                    top,
+                )
+                .line_to(x + radius, top)
+                .cubic_to(
+                    x + radius - bend,
+                    top,
+                    x,
+                    top - radius + bend,
+                    x,
+                    top - radius,
+                )
+                .line_to(x, y + radius)
+                .cubic_to(x, y + radius - bend, x + radius - bend, y, x + radius, y)
+                .close_fill_nonzero_and_stroke()
+                .restore_state();
+        })
+    }
+
+    pub(super) fn start_clip(&mut self, page: usize, bounds: [f32; 4]) -> io::Result<()> {
+        rectangle(bounds)?;
+        let [x, y, width, height] = bounds;
+        self.paint(page, |page| {
+            page.content
+                .save_state()
+                .rect(x, y, width, height)
+                .clip_nonzero()
+                .end_path();
+        })
+    }
+
+    pub(super) fn finish_clip(&mut self, page: usize) -> io::Result<()> {
+        self.paint(page, |page| {
+            page.content.restore_state();
+        })
+    }
+
     pub(super) fn embed_image(
         &mut self,
         width: u32,
@@ -301,7 +469,7 @@ impl Document {
             .collect();
         self.bookmarks.push(Bookmark {
             page,
-            top: top.clamp(0.0, PAGE_HEIGHT),
+            top: top.clamp(0.0, self.orientation(page).size()[1]),
             title,
             parent,
         });
@@ -313,6 +481,30 @@ impl Document {
         let [x, y, width, height] = bounds;
         let page = self.page(page)?;
         page.footer_link = Some(Rect::new(x, y, x + width, y + height));
+        Ok(())
+    }
+
+    pub(super) fn link_page(
+        &mut self,
+        page: usize,
+        bounds: [f32; 4],
+        target: usize,
+        top: f32,
+    ) -> io::Result<()> {
+        rectangle(bounds)?;
+        if target >= self.pages.len()
+            || !(0.0..=self.orientation(target).size()[1]).contains(&top)
+            || self.page_links == MAX_PAGE_LINKS
+        {
+            return Err(invalid("Invalid PDF page link"));
+        }
+        let [x, y, width, height] = bounds;
+        self.page(page)?.links.push(PageLink {
+            bounds: Rect::new(x, y, x + width, y + height),
+            target,
+            top,
+        });
+        self.page_links += 1;
         Ok(())
     }
 
@@ -350,7 +542,15 @@ impl Document {
         }
     }
 
+    #[cfg(test)]
     pub(super) fn finish(self) -> io::Result<Vec<u8>> {
+        self.finish_with_metadata(None)
+    }
+
+    pub(super) fn finish_with_metadata(
+        self,
+        metadata: Option<Metadata<'_>>,
+    ) -> io::Result<Vec<u8>> {
         if self.pages.is_empty() || self.retained_bytes > MAX_BYTES {
             return Err(invalid(
                 "The journal PDF has no pages or exceeds its size limit",
@@ -368,9 +568,26 @@ impl Document {
             entry.outlines(outline);
         }
         entry.finish();
-        pdf.document_info(ids.bump())
-            .creator(TextStr("kortty"))
-            .producer(TextStr("kortty"));
+        let mut info = pdf.document_info(ids.bump());
+        info.producer(TextStr("kortty"));
+        if let Some(metadata) = metadata {
+            let utc = metadata.created.to_zoned(jiff::tz::TimeZone::UTC);
+            let date = Date::new(utc.year() as u16)
+                .month(utc.month() as u8)
+                .day(utc.day() as u8)
+                .hour(utc.hour() as u8)
+                .minute(utc.minute() as u8)
+                .second(utc.second() as u8)
+                .utc_offset_hour(0);
+            info.title(TextStr(metadata.title))
+                .subject(TextStr(metadata.subject))
+                .keywords(TextStr(metadata.keywords))
+                .creator(TextStr(concat!("kortty ", env!("CARGO_PKG_VERSION"))))
+                .creation_date(date);
+        } else {
+            info.creator(TextStr("kortty"));
+        }
+        info.finish();
         pdf.pages(page_tree)
             .kids(page_ids.iter().copied())
             .count(page_ids.len() as i32);
@@ -397,6 +614,7 @@ impl Document {
             fonts,
             images: &images,
             opacities: &opacities,
+            pages: &page_ids,
         };
         for (page, &id) in self.pages.into_iter().zip(&page_ids) {
             page.write(&mut pdf, &mut ids, id, page_tree, &resources)?;
@@ -416,6 +634,7 @@ struct Resources<'a> {
     fonts: [Option<Ref>; 3],
     images: &'a [Ref],
     opacities: &'a [Ref],
+    pages: &'a [Ref],
 }
 
 impl Page {
@@ -430,7 +649,8 @@ impl Page {
         let stream = ids.bump();
         pdf.stream(stream, &deflate(&self.content.finish())?)
             .filter(Filter::FlateDecode);
-        let annotation = self.footer_link.map(|bounds| {
+        let mut annotations = Vec::new();
+        if let Some(bounds) = self.footer_link {
             let annotation = ids.bump();
             pdf.annotation(annotation)
                 .subtype(AnnotationType::Link)
@@ -440,14 +660,29 @@ impl Page {
                 .action()
                 .action_type(ActionType::Uri)
                 .uri(Str(REPOSITORY_URL.as_bytes()));
-            annotation
-        });
+            annotations.push(annotation);
+        }
+        for link in self.links {
+            let annotation = ids.bump();
+            pdf.annotation(annotation)
+                .subtype(AnnotationType::Link)
+                .page(id)
+                .rect(link.bounds)
+                .border(0.0, 0.0, 0.0, None)
+                .action()
+                .action_type(ActionType::GoTo)
+                .destination()
+                .page(resources.pages[link.target])
+                .xyz(0.0, link.top, None);
+            annotations.push(annotation);
+        }
         let mut page = pdf.page(id);
+        let [width, height] = self.orientation.size();
         page.parent(parent)
-            .media_box(Rect::new(0.0, 0.0, PAGE_WIDTH, PAGE_HEIGHT))
+            .media_box(Rect::new(0.0, 0.0, width, height))
             .contents(stream);
-        if let Some(annotation) = annotation {
-            page.annotations([annotation]);
+        if !annotations.is_empty() {
+            page.annotations(annotations);
         }
         let mut page_resources = page.resources();
         if self.fonts.iter().any(|&used| used) {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use kortty_serial::SerialPort;
-use kortty_terminal::TerminalProfile;
+use kortty_terminal::{TerminalProfile, TextEncoding};
 use serde::{Deserialize, Serialize};
 
 use super::{Appearance, GridSize, Session, StreamSource};
@@ -41,6 +41,8 @@ pub struct SerialConnection {
     pub settings: SerialSettings,
     pub line_ending: SerialLineEnding,
     pub local_echo: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encoding: Option<TextEncoding>,
 }
 
 impl SerialConnection {
@@ -60,6 +62,7 @@ impl SerialConnection {
 }
 
 impl Session {
+    #[cfg(all(test, unix))]
     pub fn start_serial(
         connection: SerialConnection,
         grid: GridSize,
@@ -67,35 +70,37 @@ impl Session {
         prompt_navigation_enabled: bool,
         appearance: impl Into<Appearance>,
     ) -> io::Result<Self> {
-        Self::start_serial_with_strict(
+        Self::start_serial_with_options(
             connection,
             grid,
             profile,
             prompt_navigation_enabled,
             appearance,
-            false,
+            super::StreamOptions::default(),
         )
     }
 
-    pub(crate) fn start_serial_with_strict(
+    pub(crate) fn start_serial_with_options(
         connection: SerialConnection,
         grid: GridSize,
         profile: TerminalProfile,
         prompt_navigation_enabled: bool,
         appearance: impl Into<Appearance>,
-        strict_escapes: bool,
+        stream: super::StreamOptions,
     ) -> io::Result<Self> {
         connection.validate()?;
+        let encoding = connection.encoding.or(stream.encoding).unwrap_or_default();
         Self::start_stream(
             StreamSource::Serial {
                 connection: Arc::new(connection),
                 connect: true,
+                encoding,
             },
             grid,
             profile,
             prompt_navigation_enabled,
             appearance.into(),
-            strict_escapes,
+            stream,
         )
     }
 
@@ -107,16 +112,18 @@ impl Session {
         appearance: impl Into<Appearance>,
     ) -> io::Result<Self> {
         connection.validate()?;
+        let encoding = connection.encoding.unwrap_or_default();
         Self::start_stream(
             StreamSource::Serial {
                 connection: Arc::new(connection),
                 connect: false,
+                encoding,
             },
             grid,
             profile,
             prompt_navigation_enabled,
             appearance.into(),
-            false,
+            super::StreamOptions::default(),
         )
     }
 }
@@ -311,6 +318,43 @@ mod unix_tests {
         });
         stop(&session);
         assert_eq!(session.send(b"x".to_vec()), Err(InputError::Closed));
+    }
+
+    #[test]
+    fn serial_actor_applies_inherited_encoding_without_rewriting_saved_override() {
+        let (mut peer, device) = pty_pair().unwrap();
+        let connection = SerialConnection {
+            device,
+            local_echo: true,
+            ..SerialConnection::default()
+        };
+        let session = Session::start_serial_with_options(
+            connection.clone(),
+            GridSize::default(),
+            TerminalProfile::Xterm,
+            true,
+            None,
+            super::super::StreamOptions {
+                encoding: Some(TextEncoding::Windows1252),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let frame = wait_for(&session, |frame| frame.status == Status::Running);
+        assert_eq!(frame.serial.as_deref(), Some(&connection));
+        let typed = frame.screen.encode_text("€é");
+        session.send_user_input(typed, false).unwrap();
+        expect_bytes(&mut peer, b"\x80\xe9").unwrap();
+        wait_for(&session, |frame| line(frame, 0) == "€é");
+
+        peer.write_all(b"\x1b[32m\x93\xe9\x94\x1b[5n").unwrap();
+        expect_bytes(&mut peer, b"\x1b[0n").unwrap();
+        let frame = wait_for(&session, |frame| line(frame, 0) == "€é“é”");
+        assert_eq!(
+            frame.screen.row(0).unwrap()[2].style.foreground,
+            Color::Indexed(2)
+        );
+        stop(&session);
     }
 
     #[test]

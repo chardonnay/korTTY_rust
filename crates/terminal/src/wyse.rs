@@ -1,7 +1,8 @@
 //! The native Wyse byte stream used by the WY-50, WY-60 and WY-160 profiles.
 
 use crate::{
-    CharacterSet, Color, KeyModifiers, Model, Style, TerminalKey, TerminalProfile, is_bidi_control,
+    CharacterSet, Color, KeyModifiers, Model, Style, TerminalKey, TerminalProfile, TextEncoding,
+    is_bidi_control,
 };
 
 const ESC: u8 = 0x1b;
@@ -28,6 +29,16 @@ impl Command {
             _ => 1,
         }
     }
+
+    fn coordinate_extent(self, model: &Model, used: usize) -> Option<usize> {
+        match (self, used) {
+            (Self::Address, 0) | (Self::PreviousField, 1) | (Self::ScrollRegion, _) => {
+                Some(model.rows)
+            }
+            (Self::Address, 1) | (Self::PreviousField, 2) => Some(model.columns),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -44,6 +55,12 @@ enum State {
         command: Command,
         bytes: [u8; 3],
         used: usize,
+    },
+    CoordinateTail {
+        command: Command,
+        bytes: [u8; 3],
+        used: usize,
+        lead: u8,
     },
     Message {
         kind: Message,
@@ -107,6 +124,26 @@ impl Wyse {
                     bytes,
                     used,
                 } => self.parameter(model, command, bytes, used, byte),
+                State::CoordinateTail {
+                    command,
+                    bytes,
+                    used,
+                    lead,
+                } => {
+                    if (0x80..=0xbf).contains(&byte) {
+                        let coordinate = ((lead & 3) << 6) | (byte & 0x3f);
+                        Self::store_parameter(model, command, bytes, used, coordinate)
+                    } else {
+                        match Self::store_parameter(model, command, bytes, used, lead) {
+                            State::Parameters {
+                                command,
+                                bytes,
+                                used,
+                            } => self.parameter(model, command, bytes, used, byte),
+                            _ => self.ground(model, byte),
+                        }
+                    }
+                }
                 State::Message {
                     kind,
                     selector,
@@ -117,7 +154,14 @@ impl Wyse {
                     escaped,
                     utf8_remaining,
                     utf8_c1,
-                } => skip_foreign_string(osc, escaped, utf8_remaining, utf8_c1, byte),
+                } => skip_foreign_string(
+                    osc,
+                    escaped,
+                    utf8_remaining,
+                    utf8_c1,
+                    byte,
+                    model.text_encoding(),
+                ),
                 State::ForeignCsi if matches!(byte, 0x18 | 0x1a | 0x40..=0x7e) => State::Ground,
                 State::ForeignCsi => State::ForeignCsi,
             };
@@ -151,8 +195,8 @@ impl Wyse {
             ESC => return State::Escape,
             0x07 => model.ring_bell(),
             0x08 => backspace(model),
-            0x09 => model.tab(1, true),
-            0x0a => model.line_feed(),
+            0x09 => model.horizontal_tab(),
+            0x0a => keep_virtual_column(model, Model::line_feed),
             0x0d => model.carriage_return(),
             0x0e => model.charset = 1,
             0x0f => model.charset = 0,
@@ -164,6 +208,12 @@ impl Wyse {
                     ch
                 };
                 model.put_character(ch, 1);
+            }
+            0x80..=0xff
+                if model.text_encoding().is_single_byte()
+                    && (byte >= 0xa0 || model.windows_c1_text()) =>
+            {
+                model.put_char(model.text_encoding().decode_byte(byte));
             }
             0x80..=0x9f => return c1(byte),
             _ if utf8_width(byte) > 1 => {
@@ -209,8 +259,13 @@ impl Wyse {
                     discarded: false,
                 };
             }
-            b'T' => model.erase_in_line(0, false),
+            b'T' if !model.screen().wrap_pending => model.erase_in_line(0, false),
             b't' => model.erase_in_line(1, false),
+            b'Y' if model.screen().wrap_pending => {
+                for row in cursor.row + 1..model.rows {
+                    model.erase_line(row, 0, model.columns, false);
+                }
+            }
             b'Y' => model.erase_display(0, false),
             b'y' => model.erase_display(1, false),
             b'*' | b'+' => {
@@ -218,9 +273,15 @@ impl Wyse {
                 model.move_cursor(0, 0);
             }
             0x0c => model.move_columns(1),
-            b'.' => model.move_cursor(cursor.row + 1, cursor.column),
-            // ESC ^ is a native cursor command, not a privacy message introducer.
-            b'^' => model.move_cursor(cursor.row.saturating_sub(1), cursor.column),
+            b'.' | b'^' => {
+                // ESC ^ is a native cursor command.
+                let row = if byte == b'.' {
+                    cursor.row + 1
+                } else {
+                    cursor.row.saturating_sub(1)
+                };
+                keep_virtual_column(model, |model| model.move_cursor(row, cursor.column));
+            }
             b'E' if cursor.row <= model.scroll_bottom => {
                 model.scroll_down(cursor.row, model.scroll_bottom, 1);
             }
@@ -234,7 +295,7 @@ impl Wyse {
             b'"' => model.restore_cursor(),
             b'/' => model.cursor_visible = false,
             b'F' if wy50 => model.cursor_visible = true,
-            b'I' if wy50 => model.tab(1, true),
+            b'I' if wy50 => model.horizontal_tab(),
             b'e' | b'r' if !wy160 => model.insert_mode = byte == b'e',
             b'{' | b'}' if !wy50 => model.auto_wrap = byte == b'{',
             b'Z' if wy160 => model.reply(b"160\r"),
@@ -253,7 +314,7 @@ impl Wyse {
         &mut self,
         model: &mut Model,
         command: Command,
-        mut bytes: [u8; 3],
+        bytes: [u8; 3],
         used: usize,
         byte: u8,
     ) -> State {
@@ -262,6 +323,30 @@ impl Wyse {
             0x18 | 0x1a => return State::Ground,
             _ => {}
         }
+        if matches!(byte, 0xc2 | 0xc3)
+            && !model.text_encoding().is_single_byte()
+            && command
+                .coordinate_extent(model, used)
+                .is_some_and(|extent| position(byte) >= extent)
+        {
+            // A lead byte within the address range still denotes a raw coordinate.
+            return State::CoordinateTail {
+                command,
+                bytes,
+                used,
+                lead: byte,
+            };
+        }
+        Self::store_parameter(model, command, bytes, used, byte)
+    }
+
+    fn store_parameter(
+        model: &mut Model,
+        command: Command,
+        mut bytes: [u8; 3],
+        used: usize,
+        byte: u8,
+    ) -> State {
         bytes[used] = byte;
         let used = used + 1;
         if used < command.length() {
@@ -283,18 +368,28 @@ impl Wyse {
                     ..Style::default()
                 };
             }
-            Command::ScrollRegion => model.set_margins(position(first), position(second)),
+            Command::ScrollRegion => {
+                let top = position(first).min(model.rows - 1);
+                let bottom = position(second).min(model.rows - 1);
+                if top <= bottom {
+                    model.scroll_top = top;
+                    model.scroll_bottom = bottom;
+                    model.address_cursor(0, 0);
+                }
+            }
             Command::CursorVisibility => match first {
                 b'0' => model.cursor_visible = false,
                 b'1' | b'5' => model.cursor_visible = true,
                 _ => {}
             },
-            Command::ColumnMode => match first {
-                b'!' => model.resize(80, model.rows),
-                b'"' => model.resize(132, model.rows),
-                _ => {}
-            },
-            Command::IgnoredParameter => {}
+            Command::ColumnMode if matches!(first, b'!' | b'"') => {
+                let columns = if first == b'!' { 80 } else { 132 };
+                let margins = (model.scroll_top, model.scroll_bottom);
+                model.resize(columns, model.rows);
+                // The host's column switch retains the vertical scrolling region.
+                (model.scroll_top, model.scroll_bottom) = margins;
+            }
+            Command::ColumnMode | Command::IgnoredParameter => {}
         }
         State::Ground
     }
@@ -316,7 +411,9 @@ impl Wyse {
         }
         if byte == b'\r' {
             if matches!(kind, Message::Status) && !discarded && !model.strict {
-                model.title = String::from_utf8_lossy(&self.status)
+                model.title = model
+                    .text_encoding()
+                    .decode(&self.status)
                     .chars()
                     .filter(|&ch| !ch.is_control() && !is_bidi_control(ch))
                     .take(MAX_TITLE_CHARS)
@@ -343,6 +440,10 @@ impl Wyse {
 
 fn backspace(model: &mut Model) {
     let cursor = model.cursor();
+    if model.screen().wrap_pending {
+        model.move_cursor(cursor.row, cursor.column);
+        return;
+    }
     match (cursor.row, cursor.column) {
         (_, 1..) => model.move_columns(-1),
         (1.., 0) => model.move_cursor(cursor.row - 1, model.columns - 1),
@@ -350,7 +451,17 @@ fn backspace(model: &mut Model) {
     }
 }
 
+fn keep_virtual_column(model: &mut Model, action: impl FnOnce(&mut Model)) {
+    // Wyse vertical motion keeps the virtual column past the right edge.
+    let wrap_pending = model.screen().wrap_pending;
+    action(model);
+    model.screen_mut().wrap_pending = wrap_pending;
+}
+
 fn edit_character(model: &mut Model, insert: bool) {
+    if model.screen().wrap_pending {
+        return;
+    }
     let style = model.style.erase();
     let right = model.columns - 1;
     if insert {
@@ -407,9 +518,22 @@ fn skip_foreign_string(
     utf8_remaining: usize,
     utf8_c1: bool,
     byte: u8,
+    encoding: TextEncoding,
 ) -> State {
     if (escaped && byte == b'\\') || (osc && byte == 0x07) || matches!(byte, 0x18 | 0x1a) {
         return State::Ground;
+    }
+    if encoding.is_single_byte() {
+        return if byte == 0x9c && encoding != TextEncoding::Windows1252 {
+            State::Ground
+        } else {
+            State::ForeignString {
+                osc,
+                escaped: byte == ESC,
+                utf8_remaining: 0,
+                utf8_c1: false,
+            }
+        };
     }
     if utf8_remaining != 0 && (0x80..=0xbf).contains(&byte) {
         if utf8_c1 && byte == 0x9c {

@@ -27,6 +27,15 @@ fn openssh_worker_shares_attached_sftp_with_the_shell() {
     attached_sftp_with_shell(IsolationLevel::Process);
 }
 
+#[test]
+#[ignore = "requires OpenSSH and KORTTY_SSH_TEST_EXE pointing to the built app"]
+fn openssh_worker_password_exec_commits_one_line_without_relaying_output() {
+    let fixture = Fixture::new();
+    let (worker, server) = connected(&fixture, IsolationLevel::Process);
+    crate::ssh_worker::smoke::exec::assert_password_exec(worker);
+    let _ = one_login(server);
+}
+
 fn attached_sftp_with_shell(isolation: IsolationLevel) {
     let fixture = Fixture::new();
     let (mut worker, server) = connected(&fixture, isolation);

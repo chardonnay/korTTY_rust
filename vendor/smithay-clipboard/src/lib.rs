@@ -13,6 +13,8 @@ use sctk::reexports::client::Connection;
 use sctk::reexports::client::backend::Backend;
 
 pub mod drag;
+pub mod file_drag;
+pub mod file_drop;
 mod mime;
 pub mod selection;
 mod state;
@@ -49,7 +51,12 @@ impl Clipboard {
             .as_ref()
             .and_then(|_| worker::Registration::new(display as usize, request_sender.clone()));
 
-        Self { request_receiver, request_sender, clipboard_thread, _registration: registration }
+        Self {
+            request_receiver,
+            request_sender,
+            clipboard_thread,
+            _registration: registration,
+        }
     }
 
     /// Load clipboard data.

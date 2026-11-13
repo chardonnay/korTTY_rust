@@ -11,7 +11,7 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use ed25519::pkcs8::spki::der::{Decode as _, pem};
-use ed25519::pkcs8::{self, KeypairBytes, PrivateKeyInfo};
+use ed25519::pkcs8::{ALGORITHM_OID as ED25519_OID, KeypairBytes, PrivateKeyInfo};
 use mio::net::TcpStream as MioTcpStream;
 #[cfg(target_os = "macos")]
 use mio::net::UnixStream as MioRelay;
@@ -30,16 +30,20 @@ use zeroize::Zeroizing;
 
 use crate::{Endpoint, HostKey, HostKeyStatus, TrustMode, TrustStore};
 
+mod auxiliary;
 mod forward;
 mod interactive;
+mod liveness;
 mod output;
+mod private_key;
 mod remote;
-mod sftp_lease;
+mod sensitive;
+pub use auxiliary::{ExecLease, ExecOpener, MAX_EXEC_COMMAND_BYTES, SftpLease, SftpOpener};
 pub use forward::{DirectChannel, DirectOpener};
 use interactive::InteractiveAuth;
 pub use interactive::{KeyboardChallenge, KeyboardPrompt, KeyboardResponse};
 pub use remote::{RemoteConnection, RemoteForward, RemoteOpener};
-pub use sftp_lease::{SftpLease, SftpOpener};
+pub use sensitive::{SensitiveExecInput, SensitiveLine};
 
 const CONNECT_TIMEOUT_SECONDS: u16 = 8;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(CONNECT_TIMEOUT_SECONDS as u64);
@@ -49,14 +53,55 @@ const QUEUE_DEPTH: usize = 16;
 const TRANSPORT: Token = Token(0);
 const CONTROL: Token = Token(1);
 const NO_EXIT_CODE: u64 = u64::MAX;
+const MAX_PRIVATE_KEY_BYTES: usize = 1024 * 1024;
 const MAX_KEY_PASSPHRASE_BYTES: usize = 1024;
 const MAX_OPENSSH_BCRYPT_ROUNDS: u32 = 128;
 
-/// Bounded desktop SSH startup policy. Attempts count TCP connections only.
+/// Configured SSH transport keepalive. The saved interval is retained while disabled.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeepAlive {
+    enabled: bool,
+    seconds: u16,
+}
+
+impl Default for KeepAlive {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            seconds: 60,
+        }
+    }
+}
+
+impl KeepAlive {
+    pub const MIN_SECONDS: u16 = 5;
+    pub const MAX_SECONDS: u16 = 600;
+
+    pub fn new(enabled: bool, seconds: u16) -> io::Result<Self> {
+        if !(Self::MIN_SECONDS..=Self::MAX_SECONDS).contains(&seconds) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SSH keepalive requires 5 to 600 seconds",
+            ));
+        }
+        Ok(Self { enabled, seconds })
+    }
+
+    pub fn enabled(self) -> bool {
+        self.enabled
+    }
+
+    pub fn seconds(self) -> u16 {
+        self.seconds
+    }
+}
+
+/// Bounded desktop SSH connection policy. Attempts count TCP connections only.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ConnectOptions {
     seconds: u16,
     attempts: u8,
+    keepalive: Option<KeepAlive>,
 }
 
 impl Default for ConnectOptions {
@@ -64,6 +109,7 @@ impl Default for ConnectOptions {
         Self {
             seconds: CONNECT_TIMEOUT_SECONDS,
             attempts: 0,
+            keepalive: None,
         }
     }
 }
@@ -72,6 +118,7 @@ impl ConnectOptions {
     pub const QUICK: Self = Self {
         seconds: 10,
         attempts: 0,
+        keepalive: None,
     };
 
     pub fn new(seconds: u16, attempts: u8) -> io::Result<Self> {
@@ -81,7 +128,11 @@ impl ConnectOptions {
                 "SSH timeout or attempt count is out of range",
             ));
         }
-        Ok(Self { seconds, attempts })
+        Ok(Self {
+            seconds,
+            attempts,
+            keepalive: None,
+        })
     }
 
     pub fn seconds(self) -> u16 {
@@ -95,12 +146,30 @@ impl ConnectOptions {
     pub fn timeout(self) -> Duration {
         Duration::from_secs(self.seconds.into())
     }
+
+    pub fn keepalive(self) -> Option<KeepAlive> {
+        self.keepalive
+    }
+
+    pub fn with_keepalive(mut self, keepalive: Option<KeepAlive>) -> Self {
+        self.keepalive = keepalive;
+        self
+    }
 }
 
 /// The first channel requested after SSH verification and authentication.
 pub enum StartupChannel<'a> {
-    Terminal { term: &'a str, size: WindowSize },
+    Terminal {
+        term: &'a str,
+        size: WindowSize,
+    },
     Subsystem(&'a str),
+    /// An SFTP session that reserves an additional exec lease for its transfer helper.
+    SftpWithTransferHelper,
+    Exec {
+        command: &'a str,
+        pty: Option<(&'a str, WindowSize)>,
+    },
 }
 
 impl<'a> StartupChannel<'a> {
@@ -113,6 +182,8 @@ impl<'a> StartupChannel<'a> {
                 validate_subsystem(subsystem)?;
                 Ok(OpenRequest::Subsystem(subsystem))
             }
+            Self::SftpWithTransferHelper => Ok(OpenRequest::SftpWithTransferHelper),
+            Self::Exec { command, pty } => exec_request(command, pty),
         }
     }
 }
@@ -166,9 +237,9 @@ impl Authentication {
         }
     }
 
-    /// Supplies an unencrypted Ed25519 or ECDSA private key.
+    /// Supplies an unencrypted Ed25519, ECDSA, or RSA private key.
     ///
-    /// Accepts OpenSSH and PKCS#8 PEM, plus SEC1 PEM for named ECDSA curves.
+    /// Accepts OpenSSH and PKCS#8 PEM, SEC1 for named ECDSA curves, and RSA PKCS#1 PEM.
     pub fn private_key(key: Vec<u8>) -> Self {
         Self {
             credential: Some(Credential::PrivateKey(KeyCredential {
@@ -179,7 +250,7 @@ impl Authentication {
         }
     }
 
-    /// Supplies an OpenSSH Ed25519 or ECDSA key and its local decryption passphrase.
+    /// Supplies an OpenSSH or PBES2 PKCS#8 key and its local decryption passphrase.
     pub fn private_key_with_passphrase(key: Vec<u8>, passphrase: String) -> Self {
         Self {
             credential: Some(Credential::PrivateKey(KeyCredential {
@@ -219,20 +290,24 @@ impl Authentication {
 
 impl KeyCredential {
     fn signing_key(&self) -> Result<SignKey, ConnectError> {
-        let bytes = self.bytes.trim_ascii_start();
-        if bytes.starts_with(b"-----BEGIN PRIVATE KEY-----")
-            || bytes.starts_with(b"-----BEGIN EC PRIVATE KEY-----")
+        Self::parse_signing_key(
+            self.bytes.as_slice(),
+            self.passphrase
+                .as_ref()
+                .map(|passphrase| passphrase.as_str()),
+        )
+    }
+
+    fn parse_signing_key(bytes: &[u8], passphrase: Option<&str>) -> Result<SignKey, ConnectError> {
+        let trimmed = bytes.trim_ascii_start();
+        if trimmed.starts_with(b"-----BEGIN PRIVATE KEY-----")
+            || trimmed.starts_with(b"-----BEGIN EC PRIVATE KEY-----")
+            || trimmed.starts_with(b"-----BEGIN RSA PRIVATE KEY-----")
+            || trimmed.starts_with(b"-----BEGIN ENCRYPTED PRIVATE KEY-----")
         {
-            return Self::pem_signing_key(bytes);
+            return Self::pem_signing_key(trimmed, passphrase);
         }
-        if bytes.starts_with(b"-----BEGIN ENCRYPTED PRIVATE KEY-----") {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "encrypted PKCS#8 keys are unsupported",
-            )
-            .into());
-        }
-        let key = PrivateKey::from_openssh(self.bytes.as_slice()).map_err(|_| {
+        let key = PrivateKey::from_openssh(bytes).map_err(|_| {
             io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "invalid private key, expected OpenSSH or supported PEM",
@@ -240,20 +315,18 @@ impl KeyCredential {
         })?;
         if !matches!(
             key.algorithm(),
-            Algorithm::Ed25519 | Algorithm::Ecdsa { .. }
+            Algorithm::Ed25519 | Algorithm::Ecdsa { .. } | Algorithm::Rsa { .. }
         ) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "SSH requires an Ed25519 or NIST ECDSA private key",
+                "SSH requires an Ed25519, NIST ECDSA, or RSA private key",
             )
             .into());
         }
         if !key.is_encrypted() {
             return Self::openssh_signing_key(&key);
         }
-        let passphrase = self
-            .passphrase
-            .as_ref()
+        let passphrase = passphrase
             .filter(|passphrase| !passphrase.is_empty())
             .ok_or_else(|| {
                 io::Error::new(
@@ -279,21 +352,41 @@ impl KeyCredential {
         Self::openssh_signing_key(&decrypted)
     }
 
-    fn pem_signing_key(bytes: &[u8]) -> Result<SignKey, ConnectError> {
-        let invalid = || {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "invalid Ed25519 or named-curve ECDSA private key in PEM format",
-            )
-        };
+    fn pem_signing_key(bytes: &[u8], passphrase: Option<&str>) -> Result<SignKey, ConnectError> {
+        let invalid = private_key::invalid_pem;
         let mut decoder = pem::Decoder::new(bytes).map_err(|_| invalid())?;
         let mut decoded = Zeroizing::new(vec![0; decoder.remaining_len()]);
         let der = decoder.decode(&mut decoded).map_err(|_| invalid())?;
-        if decoder.type_label() == "EC PRIVATE KEY" {
-            return SignKey::ecdsa_sec1(der).map_err(|_| invalid().into());
+        match decoder.type_label() {
+            "EC PRIVATE KEY" => SignKey::ecdsa_sec1(der).map_err(|_| invalid().into()),
+            "RSA PRIVATE KEY" => private_key::rsa_pkcs1(der, None),
+            "PRIVATE KEY" => Self::pkcs8_signing_key(der),
+            "ENCRYPTED PRIVATE KEY" => {
+                let passphrase = passphrase
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "encrypted PKCS#8 key requires a passphrase",
+                        )
+                    })?;
+                private_key::with_decrypted_pkcs8(
+                    der,
+                    passphrase.as_bytes(),
+                    Self::pkcs8_signing_key,
+                )
+            }
+            _ => Err(invalid().into()),
         }
+    }
+
+    fn pkcs8_signing_key(der: &[u8]) -> Result<SignKey, ConnectError> {
+        let invalid = private_key::invalid_pem;
         let info = PrivateKeyInfo::from_der(der).map_err(|_| invalid())?;
-        if info.algorithm.oid != pkcs8::ALGORITHM_OID {
+        if info.algorithm.oid == pkcs1::ALGORITHM_OID {
+            return private_key::rsa_pkcs8(info);
+        }
+        if info.algorithm.oid != ED25519_OID {
             return SignKey::ecdsa_pkcs8(info).map_err(|_| invalid().into());
         }
         let pair = KeypairBytes::try_from(info).map_err(|_| invalid())?;
@@ -329,9 +422,19 @@ impl KeyCredential {
                     pair.public_key_bytes(),
                 )?)
             }
+            KeypairData::Rsa(pair) => private_key::rsa_openssh(pair),
             _ => Err(sunset::Error::BadKey.into()),
         }
     }
+}
+
+/// Validates a private SSH key and its optional passphrase without a network connection.
+///
+/// Uses the same parser and size limits as session authentication. Callers importing
+/// encrypted keys should run this on a worker because local key derivation can be slow.
+pub fn validate_private_key(bytes: &[u8], passphrase: Option<&str>) -> Result<(), ConnectError> {
+    validate_private_key_size(bytes, passphrase)?;
+    KeyCredential::parse_signing_key(bytes, passphrase).map(drop)
 }
 
 /// The address to dial, the identity to verify, and the requested remote terminal.
@@ -468,10 +571,45 @@ pub struct SshSession {
     forwarding: DirectOpener,
     remote_forwarding: RemoteOpener,
     sftp: Option<SftpOpener>,
+    exec: Option<ExecOpener>,
+}
+
+/// An authenticated SSH transport with no shell, PTY or initial channel.
+pub struct ExecConnection(SshSession);
+
+impl ExecConnection {
+    /// Uses the supplied connected TCP stream and strict pins for every hop.
+    /// The authentication guard runs before disclosing identity or credentials.
+    pub fn connect_preconnected(
+        tcp: TcpStream,
+        (target, jumps): (SshTarget, Vec<SshTarget>),
+        trust: TrustStore,
+        options: ConnectOptions,
+        cancelled: impl Fn() -> bool,
+        before_authentication: impl Fn() -> io::Result<()>,
+    ) -> Result<Self, ConnectError> {
+        SshSession::start_preconnected_with_startup(
+            tcp,
+            target,
+            jumps,
+            trust.strict(),
+            OpenRequest::ExecOnly,
+            Startup {
+                before_authentication: Some(&before_authentication),
+                ..Startup::configured(options, &cancelled)
+            },
+        )
+        .map(Self)
+    }
+
+    pub fn exec_opener(&self) -> Option<ExecOpener> {
+        self.0.exec_opener()
+    }
 }
 
 struct Shared {
     wake: Arc<Waker>,
+    host_key: OnceLock<HostKey>,
     closed: AtomicBool,
     exit_code: AtomicU64,
     resize: Mutex<Option<WindowSize>>,
@@ -493,6 +631,7 @@ impl Shared {
     fn new(wake: Arc<Waker>) -> Arc<Self> {
         Arc::new(Self {
             wake,
+            host_key: OnceLock::new(),
             closed: AtomicBool::new(false),
             exit_code: AtomicU64::new(NO_EXIT_CODE),
             resize: Mutex::new(None),
@@ -545,7 +684,9 @@ impl SshAbort {
 enum ChannelMode {
     Terminal,
     Exec,
+    SensitiveExec,
     ExecPty,
+    ExecOnly,
     Subsystem,
     SftpLease,
     Direct,
@@ -557,7 +698,9 @@ enum OpenRequest<'a> {
         command: &'a str,
         pty: Option<Box<Pty>>,
     },
+    ExecOnly,
     Subsystem(&'a str),
+    SftpWithTransferHelper,
     Direct {
         target: &'a Endpoint,
         origin: SocketAddr,
@@ -575,7 +718,8 @@ impl OpenRequest<'_> {
             Self::Terminal(_) => ChannelMode::Terminal,
             Self::Exec { pty: Some(_), .. } => ChannelMode::ExecPty,
             Self::Exec { pty: None, .. } => ChannelMode::Exec,
-            Self::Subsystem(_) => ChannelMode::Subsystem,
+            Self::ExecOnly => ChannelMode::ExecOnly,
+            Self::Subsystem(_) | Self::SftpWithTransferHelper => ChannelMode::Subsystem,
             Self::Direct { .. } => ChannelMode::Direct,
         }
     }
@@ -767,7 +911,29 @@ impl SshSession {
             jumps,
             trust,
             channel.request()?,
-            Startup::with_timeout(options.timeout(), Some(&cancelled)),
+            Startup::configured(options, &cancelled),
+        )
+    }
+
+    /// Rechecks the caller's authority before authentication and channel startup.
+    pub fn connect_preconnected_guarded(
+        tcp: TcpStream,
+        (target, jumps): (SshTarget, Vec<SshTarget>),
+        trust: TrustStore,
+        channel: StartupChannel<'_>,
+        cancelled: impl Fn() -> bool,
+        authorize: impl Fn() -> io::Result<()>,
+    ) -> Result<Self, ConnectError> {
+        Self::start_preconnected_with_startup(
+            tcp,
+            target,
+            jumps,
+            trust,
+            channel.request()?,
+            Startup {
+                before_authentication: Some(&authorize),
+                ..Startup::new(Some(&cancelled))
+            },
         )
     }
 
@@ -847,7 +1013,7 @@ impl SshSession {
             jumps,
             trust,
             channel.request()?,
-            Startup::with_timeout(options.timeout(), Some(&cancelled)),
+            Startup::configured(options, &cancelled),
         )
     }
 
@@ -979,11 +1145,14 @@ impl SshSession {
                     target: &next.endpoint,
                     origin,
                 },
-                startup,
+                Startup {
+                    keepalive: None,
+                    ..startup
+                },
             )?;
             (wire, wake) = Wire::forwarded(link)?;
             target = next;
-            startup = Startup::with_timeout(startup.timeout, startup.cancelled);
+            startup.deadline = Instant::now() + startup.timeout;
         }
         Self::start_wire(wire, wake, target, trust, request, startup)
     }
@@ -1089,6 +1258,11 @@ impl SshSession {
         startup: Startup<'_>,
     ) -> Result<Self, ConnectError> {
         let mode = request.mode();
+        let transfer_helper = matches!(&request, OpenRequest::SftpWithTransferHelper);
+        let auxiliary_channels = mode == ChannelMode::Terminal
+            || transfer_helper
+            || matches!(&request, OpenRequest::Subsystem("sftp"));
+        let exec_only = mode == ChannelMode::ExecOnly;
         let shared = Shared::new(wake);
         let (input, commands) = mpsc::sync_channel(QUEUE_DEPTH);
         let (stdout, output) = output::queue();
@@ -1103,7 +1277,7 @@ impl SshSession {
             stdout: Some(stdout),
             stderr,
         };
-        let channel = wire.handshake(
+        let (channel, host_key) = wire.handshake(
             &target.endpoint,
             UserAuth {
                 username: &target.username,
@@ -1114,31 +1288,48 @@ impl SshSession {
             &outputs,
             startup,
         )?;
+        let _ = shared.host_key.set(host_key);
         startup.check_cancelled()?;
+        wire.heartbeat = startup
+            .keepalive
+            .filter(|config| config.enabled())
+            .map(|config| {
+                Heartbeat::new(
+                    Duration::from_secs(u64::from(config.seconds())),
+                    Instant::now(),
+                )
+            });
+        wire.liveness = auxiliary_channels.then(|| liveness::Probe::new(Instant::now()));
         let (forwarding, requests) = forward::control(&shared);
         let (remote_forwarding, remote_requests) = remote::control(&shared);
-        let (sftp, sftp_requests) = sftp_lease::control(&shared);
+        let (sftp, exec, side_channels) = auxiliary::control(&shared, transfer_helper);
         let worker_shared = Arc::clone(&shared);
         let worker = thread::Builder::new()
             .name("kortty-ssh-io".into())
             .spawn(move || {
                 let _closed = NotifyClosed(Arc::clone(&worker_shared));
-                let mut pump = ChannelPump::new(channel, worker_shared, commands, outputs);
+                let mut pump = channel.map(|channel| {
+                    ChannelPump::new(channel, Arc::clone(&worker_shared), commands, outputs)
+                });
                 let result = drive_connection(
                     &mut wire,
-                    &mut pump,
+                    (&worker_shared, pump.as_mut()),
                     &target.endpoint,
                     &trust,
-                    requests,
+                    (requests, transfer_helper),
                     remote_requests,
-                    sftp_requests,
+                    side_channels,
                 );
-                pump.finish(result);
+                if let Some(pump) = pump {
+                    pump.finish(result);
+                } else {
+                    worker_shared.finish(result);
+                }
             })?;
         Ok(Self {
-            reader: Some(SshReader::new(&shared, output)),
+            reader: (!exec_only).then(|| SshReader::new(&shared, output)),
             stderr: error_output.map(|output| SshReader::new(&shared, output)),
-            writer: Some(SshWriter {
+            writer: (!exec_only).then_some(SshWriter {
                 shared: Arc::clone(&shared),
                 input,
                 input_closed: false,
@@ -1148,7 +1339,8 @@ impl SshSession {
             mode,
             forwarding,
             remote_forwarding,
-            sftp: (mode == ChannelMode::Terminal).then_some(sftp),
+            sftp: auxiliary_channels.then_some(sftp),
+            exec: (auxiliary_channels || exec_only).then_some(exec),
         })
     }
 
@@ -1157,9 +1349,22 @@ impl SshSession {
         self.forwarding.clone()
     }
 
-    /// Returns a channel opener tied to this authenticated terminal.
+    /// The peer key verified during the authenticated connection setup.
+    pub fn verified_host_key(&self) -> Option<&HostKey> {
+        self.shared.host_key.get()
+    }
+
+    /// Returns an SFTP opener tied to this authenticated terminal or SFTP session.
     pub fn sftp_opener(&self) -> Option<SftpOpener> {
         self.sftp
+            .as_ref()
+            .filter(|opener| !opener.is_closed())
+            .cloned()
+    }
+
+    /// Returns a non-PTY command opener bound to this authenticated terminal or SFTP session.
+    pub fn exec_opener(&self) -> Option<ExecOpener> {
+        self.exec
             .as_ref()
             .filter(|opener| !opener.is_closed())
             .cloned()
@@ -1181,6 +1386,14 @@ impl SshSession {
 
     pub fn take_writer(&mut self) -> Option<SshWriter> {
         self.writer.take()
+    }
+
+    /// Takes the one-use input of a standalone non-PTY exec channel.
+    pub fn take_sensitive_exec_input(&mut self) -> Option<SensitiveExecInput> {
+        if self.mode != ChannelMode::Exec {
+            return None;
+        }
+        self.take_writer().map(SensitiveExecInput::new)
     }
 
     /// Schedules the latest terminal size for the remote SSH channel.
@@ -1274,24 +1487,31 @@ fn validate_target(target: &SshTarget) -> io::Result<()> {
             "invalid SSH username",
         ));
     }
-    let oversized = match &target.authentication.credential {
-        Some(Credential::Password(password)) => password.len() > 1024,
-        Some(Credential::PrivateKey(key)) => {
-            key.bytes.len() > 1024 * 1024
-                || key
-                    .passphrase
-                    .as_ref()
-                    .is_some_and(|passphrase| passphrase.len() > MAX_KEY_PASSPHRASE_BYTES)
+    match &target.authentication.credential {
+        Some(Credential::Password(password)) if password.len() > 1024 => {
+            Err(oversized_credential())
         }
-        None => false,
-    };
-    if oversized {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "SSH credential is too large",
-        ));
+        Some(Credential::PrivateKey(key)) => validate_private_key_size(
+            key.bytes.as_slice(),
+            key.passphrase
+                .as_ref()
+                .map(|passphrase| passphrase.as_str()),
+        ),
+        _ => Ok(()),
+    }
+}
+
+fn validate_private_key_size(bytes: &[u8], passphrase: Option<&str>) -> io::Result<()> {
+    if bytes.len() > MAX_PRIVATE_KEY_BYTES
+        || passphrase.is_some_and(|passphrase| passphrase.len() > MAX_KEY_PASSPHRASE_BYTES)
+    {
+        return Err(oversized_credential());
     }
     Ok(())
+}
+
+fn oversized_credential() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, "SSH credential is too large")
 }
 
 fn validate_route(jumps: &[SshTarget], target: &SshTarget) -> io::Result<()> {
@@ -1327,6 +1547,8 @@ struct Startup<'a> {
     deadline: Instant,
     timeout: Duration,
     cancelled: Option<&'a dyn Fn() -> bool>,
+    before_authentication: Option<&'a dyn Fn() -> io::Result<()>>,
+    keepalive: Option<KeepAlive>,
 }
 
 impl<'a> Startup<'a> {
@@ -1339,6 +1561,15 @@ impl<'a> Startup<'a> {
             deadline: Instant::now() + timeout,
             timeout,
             cancelled,
+            before_authentication: None,
+            keepalive: None,
+        }
+    }
+
+    fn configured(options: ConnectOptions, cancelled: &'a dyn Fn() -> bool) -> Self {
+        Self {
+            keepalive: options.keepalive(),
+            ..Self::with_timeout(options.timeout(), Some(cancelled))
         }
     }
 
@@ -1348,6 +1579,14 @@ impl<'a> Startup<'a> {
                 io::ErrorKind::Interrupted,
                 "SSH connection cancelled",
             ));
+        }
+        Ok(())
+    }
+
+    fn authorize_authentication(self) -> io::Result<()> {
+        if let Some(authorize) = self.before_authentication {
+            authorize()?;
+            self.remaining()?;
         }
         Ok(())
     }
@@ -1395,6 +1634,8 @@ pub fn connect_tcp_transport_until(
         deadline,
         timeout: CONNECT_TIMEOUT,
         cancelled: Some(&cancelled),
+        before_authentication: None,
+        keepalive: None,
     };
     let tcp = connect_tcp(primary, additional, startup)?;
     startup.remaining()?;
@@ -1454,6 +1695,11 @@ fn connect_address(address: SocketAddr, startup: Startup<'_>) -> io::Result<TcpS
             return Err(error);
         }
         match socket.peer_addr() {
+            // A loopback connect can be reported as established when the kernel
+            // selects the destination port as its own ephemeral source port.
+            Ok(peer) if peer == socket.local_addr()? => {
+                return Err(io::Error::from(io::ErrorKind::ConnectionRefused));
+            }
             Ok(_) => break,
             Err(error) if connect_pending(&error) => continue,
             Err(error) => return Err(error),
@@ -1559,9 +1805,32 @@ pub struct SshWriter {
 }
 
 enum Command {
-    Data(Vec<u8>),
+    Data(InputBytes),
     Flush(SyncSender<()>),
     Eof(SyncSender<()>),
+}
+
+enum InputBytes {
+    Stream(Vec<u8>),
+    Sensitive(SensitiveLine, Option<Box<dyn Fn() -> bool + Send + Sync>>),
+}
+
+impl AsRef<[u8]> for InputBytes {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Stream(bytes) => bytes,
+            Self::Sensitive(line, _) => line.as_bytes(),
+        }
+    }
+}
+
+impl InputBytes {
+    fn permitted(&self) -> bool {
+        match self {
+            Self::Sensitive(_, Some(guard)) => guard(),
+            _ => true,
+        }
+    }
 }
 
 impl SshWriter {
@@ -1594,7 +1863,7 @@ impl SshWriter {
             return Err(closed());
         }
         self.input
-            .try_send(Command::Data(bytes[..count].to_vec()))
+            .try_send(Command::Data(InputBytes::Stream(bytes[..count].to_vec())))
             .map_err(|error| match error {
                 TrySendError::Full(_) => io::ErrorKind::WouldBlock.into(),
                 TrySendError::Disconnected(_) => closed(),
@@ -1613,7 +1882,7 @@ impl Write for SshWriter {
         if self.input_closed {
             return Err(closed());
         }
-        self.queue(Command::Data(bytes[..count].to_vec()))?;
+        self.queue(Command::Data(InputBytes::Stream(bytes[..count].to_vec())))?;
         Ok(count)
     }
 
@@ -1665,6 +1934,9 @@ struct Wire {
     incoming: [u8; CHUNK_BYTES],
     unread: Range<usize>,
     eof: bool,
+    heartbeat: Option<Heartbeat>,
+    liveness: Option<liveness::Probe>,
+    inbound_activity: u64,
 }
 
 impl Wire {
@@ -1735,6 +2007,9 @@ impl Wire {
             incoming: [0; CHUNK_BYTES],
             unread: 0..0,
             eof: false,
+            heartbeat: None,
+            liveness: None,
+            inbound_activity: 0,
         }
     }
 
@@ -1746,7 +2021,7 @@ impl Wire {
         trust: &TrustStore,
         output: &Outputs,
         mut startup: Startup<'_>,
-    ) -> Result<ChanHandle, ConnectError> {
+    ) -> Result<(Option<ChanHandle>, HostKey), ConnectError> {
         startup.check_cancelled()?;
         if let Some(algorithm) = trust.pinned_algorithm(endpoint)? {
             self.runner.prefer_host_key(&algorithm)?;
@@ -1761,7 +2036,7 @@ impl Wire {
             interactive.is_some(),
         )?;
         let mut channel = None;
-        let mut host_verified = false;
+        let mut host_key = None;
         let mut authenticated = false;
         let mut start = Some(start);
         let mut awaiting_reply = None;
@@ -1771,18 +2046,18 @@ impl Wire {
             startup.remaining()?;
             let progressed = match self.runner.progress()? {
                 Event::Cli(CliEvent::Hostkey(request)) => {
-                    verify_host(request, endpoint, trust)?;
-                    host_verified = true;
+                    host_key = Some(verify_host(request, endpoint, trust)?);
                     true
                 }
                 Event::Cli(
                     CliEvent::Username(_)
                     | CliEvent::Pubkey(_)
+                    | CliEvent::AgentSign(_)
                     | CliEvent::Password(_)
                     | CliEvent::KeyboardChallenge(_)
                     | CliEvent::Authenticated
                     | CliEvent::SessionOpened(_),
-                ) if !host_verified => {
+                ) if host_key.is_none() => {
                     return Err(io::Error::new(
                         io::ErrorKind::PermissionDenied,
                         "SSH authentication requires a verified host key",
@@ -1790,6 +2065,7 @@ impl Wire {
                     .into());
                 }
                 Event::Cli(CliEvent::Username(request)) => {
+                    startup.authorize_authentication()?;
                     request.username(user.username)?;
                     true
                 }
@@ -1798,15 +2074,30 @@ impl Wire {
                         startup.remaining()?;
                         let signing_key = key.signing_key()?;
                         startup.remaining()?;
-                        request.pubkey(signing_key)?;
+                        startup.authorize_authentication()?;
+                        if startup.before_authentication.is_some() {
+                            request.pubkey_deferred(signing_key)?;
+                        } else {
+                            request.pubkey(signing_key)?;
+                        }
                         credential = None;
                     } else {
                         request.skip()?;
                     }
                     true
                 }
+                Event::Cli(CliEvent::AgentSign(request))
+                    if startup.before_authentication.is_some() =>
+                {
+                    startup.authorize_authentication()?;
+                    let signature = request.sign_private()?;
+                    startup.remaining()?;
+                    request.signed(&signature)?;
+                    true
+                }
                 Event::Cli(CliEvent::Password(request)) => {
                     if let Some(Credential::Password(password)) = credential.take() {
+                        startup.authorize_authentication()?;
                         request.password(password.as_str())?;
                     } else {
                         request.skip()?;
@@ -1827,6 +2118,7 @@ impl Wire {
                         &mut startup,
                     )?;
                     let answers: Vec<_> = responses.iter().map(KeyboardResponse::as_str).collect();
+                    startup.authorize_authentication()?;
                     request.respond(&answers)?;
                     true
                 }
@@ -1839,10 +2131,16 @@ impl Wire {
                     authenticated = true;
                     credential = None;
                     interactive = None;
+                    if matches!(start, Some(OpenRequest::ExecOnly)) {
+                        return host_key.map(|key| (None, key)).ok_or_else(|| {
+                            io::Error::other("SSH authentication has no host key").into()
+                        });
+                    }
                     true
                 }
                 Event::Cli(CliEvent::SessionOpened(mut request)) => {
                     startup.check_cancelled()?;
+                    startup.authorize_authentication()?;
                     if channel
                         .as_ref()
                         .is_none_or(|channel: &ChanHandle| channel.num() != request.channel())
@@ -1856,7 +2154,7 @@ impl Wire {
                         OpenRequest::Terminal(pty) => {
                             request.pty(*pty)?;
                             request.cmd(&SessionCommand::<&str>::Shell)?;
-                            return channel.ok_or_else(|| {
+                            return channel.map(Some).zip(host_key).ok_or_else(|| {
                                 io::Error::other("SSH session did not open").into()
                             });
                         }
@@ -1874,7 +2172,11 @@ impl Wire {
                             request.cmd_confirmed(&SessionCommand::Subsystem(name))?;
                             awaiting_reply = Some("subsystem");
                         }
-                        OpenRequest::Direct { .. } => {
+                        OpenRequest::SftpWithTransferHelper => {
+                            request.cmd_confirmed(&SessionCommand::Subsystem("sftp"))?;
+                            awaiting_reply = Some("subsystem");
+                        }
+                        OpenRequest::Direct { .. } | OpenRequest::ExecOnly => {
                             return Err(io::Error::other(
                                 "unexpected session opened for SSH direct channel",
                             )
@@ -1912,7 +2214,7 @@ impl Wire {
                 if matches!(start, Some(OpenRequest::Direct { .. })) {
                     match self.runner.direct_status(handle)? {
                         DirectStatus::Open => {
-                            return channel.ok_or_else(|| {
+                            return channel.map(Some).zip(host_key).ok_or_else(|| {
                                 io::Error::other("SSH direct channel did not open").into()
                             });
                         }
@@ -1930,13 +2232,14 @@ impl Wire {
                             Some(true) => {
                                 if let Some(command) = command_after_pty {
                                     startup.check_cancelled()?;
+                                    startup.authorize_authentication()?;
                                     if self.runner.client_exec_after_pty(handle, command)? {
                                         command_after_pty = None;
                                         awaiting_reply = Some("exec");
                                         continue;
                                     }
                                 } else {
-                                    return channel.ok_or_else(|| {
+                                    return channel.map(Some).zip(host_key).ok_or_else(|| {
                                         io::Error::other("SSH session did not open").into()
                                     });
                                 }
@@ -1995,7 +2298,10 @@ impl Wire {
                         self.runner.close_input();
                         return Ok(true);
                     }
-                    Ok(count) => self.unread = 0..count,
+                    Ok(count) => {
+                        self.inbound_activity = self.inbound_activity.wrapping_add(1);
+                        self.unread = 0..count;
+                    }
                     Err(error) if error.kind() == io::ErrorKind::Interrupted => return Ok(true),
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(progress),
                     Err(error) => return Err(error.into()),
@@ -2033,7 +2339,7 @@ fn verify_host(
     request: CheckHostkey<'_, '_>,
     endpoint: &Endpoint,
     trust: &TrustStore,
-) -> Result<(), ConnectError> {
+) -> Result<HostKey, ConnectError> {
     let offered = HostKey::try_from(&request.hostkey()?)?;
     let status = trust.check(endpoint, &offered)?;
     if let HostKeyStatus::Changed { expected } = status {
@@ -2057,7 +2363,7 @@ fn verify_host(
             }
         }
     }
-    Ok(())
+    Ok(offered)
 }
 
 fn changed(endpoint: &Endpoint, expected: HostKey, offered: HostKey) -> ConnectError {
@@ -2082,10 +2388,15 @@ impl Outputs {
             | (ChanData::Stderr, ChannelMode::Terminal | ChannelMode::ExecPty) => {
                 self.stdout.as_ref()
             }
-            (ChanData::Stderr, ChannelMode::Exec) => self.stderr.as_ref(),
+            (ChanData::Stderr, ChannelMode::Exec | ChannelMode::SensitiveExec) => {
+                self.stderr.as_ref()
+            }
             (
                 ChanData::Stderr,
-                ChannelMode::Subsystem | ChannelMode::SftpLease | ChannelMode::Direct,
+                ChannelMode::Subsystem
+                | ChannelMode::SftpLease
+                | ChannelMode::Direct
+                | ChannelMode::ExecOnly,
             ) => None,
         };
         let Some(stream) = stream else {
@@ -2094,7 +2405,8 @@ impl Outputs {
         match stream.send(data) {
             Ok(()) => Ok(0),
             Err(error)
-                if self.mode == ChannelMode::Exec && error.kind() == io::ErrorKind::BrokenPipe =>
+                if matches!(self.mode, ChannelMode::Exec | ChannelMode::SensitiveExec)
+                    && error.kind() == io::ErrorKind::BrokenPipe =>
             {
                 Ok(data.len())
             }
@@ -2117,6 +2429,54 @@ struct ChannelPump {
 enum PumpStep {
     Active(bool),
     Done,
+}
+
+struct Heartbeat {
+    interval: Duration,
+    deadline: Instant,
+}
+
+impl Heartbeat {
+    fn new(interval: Duration, now: Instant) -> Self {
+        Self {
+            interval,
+            deadline: now + interval,
+        }
+    }
+
+    fn defer(&mut self, now: Instant) {
+        self.deadline = now + self.interval;
+    }
+
+    fn due(&mut self, now: Instant) -> bool {
+        if now < self.deadline {
+            return false;
+        }
+        self.defer(now);
+        true
+    }
+
+    fn wait_time(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn keepalive_deadline_defers_for_real_traffic_and_never_catches_up() {
+    let start = Instant::now();
+    let interval = Duration::from_secs(5);
+    let mut heartbeat = Heartbeat::new(interval, start);
+    let traffic = start + Duration::from_secs(4);
+    heartbeat.defer(traffic);
+    assert!(!heartbeat.due(start + interval));
+    assert!(heartbeat.due(traffic + interval));
+    let after_pause = start + Duration::from_secs(60);
+    assert!(heartbeat.due(after_pause));
+    assert!(!heartbeat.due(after_pause));
+    assert!(heartbeat.due(after_pause + interval));
+    assert!(KeepAlive::new(true, 4).is_err());
+    assert!(KeepAlive::new(false, 601).is_err());
 }
 
 impl ChannelPump {
@@ -2156,7 +2516,12 @@ impl ChannelPump {
             .read_channel_ready()
             .is_some_and(|(channel, _, _)| channel == self.channel.num())
         {
-            let (count, kind) = runner.read_channel_either_deferred(&self.channel, buffer);
+            let sensitive = self.output.mode == ChannelMode::SensitiveExec;
+            let (count, kind) = if sensitive {
+                runner.read_sensitive_channel_either_deferred(&self.channel, buffer)
+            } else {
+                runner.read_channel_either_deferred(&self.channel, buffer)
+            };
             if self.output.mode == ChannelMode::SftpLease
                 && kind == ChanData::Normal
                 && !self.wrote_input
@@ -2166,7 +2531,12 @@ impl ChannelPump {
                     "SFTP peer sent data before the client request",
                 ));
             }
-            let discarded = match self.output.send(kind, &buffer[..count]) {
+            let sent = self.output.send(kind, &buffer[..count]);
+            if sensitive {
+                use zeroize::Zeroize as _;
+                buffer[..count].zeroize();
+            }
+            let discarded = match sent {
                 Ok(discarded) => discarded,
                 Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
                     return Ok(PumpStep::Done);
@@ -2213,6 +2583,10 @@ impl ChannelPump {
         }
         match &self.pending_input {
             Some(Command::Data(data)) => {
+                if !data.permitted() {
+                    return Ok(PumpStep::Done);
+                }
+                let data = data.as_ref();
                 let count = runner
                     .write_channel(&self.channel, ChanData::Normal, &data[self.input_offset..])
                     .map_err(io::Error::other)?;
@@ -2260,33 +2634,40 @@ impl ChannelPump {
 
 fn drive_connection(
     wire: &mut Wire,
-    main: &mut ChannelPump,
+    (shared, mut main): (&Arc<Shared>, Option<&mut ChannelPump>),
     endpoint: &Endpoint,
     trust: &TrustStore,
-    requests: Receiver<forward::OpenForward>,
+    (requests, transfer_helper): (Receiver<forward::OpenForward>, bool),
     remote_requests: Receiver<remote::BindRequest>,
-    sftp_requests: Receiver<sftp_lease::OpenLease>,
+    mut side_channels: auxiliary::Channels,
 ) -> io::Result<()> {
     let mut buffer = [0; CHUNK_BYTES];
-    let mut forwards = forward::Forwards::new(requests);
+    let mut forwards = forward::Forwards::new(requests, transfer_helper);
     let mut remotes = remote::Remotes::new(remote_requests);
-    let mut leases = sftp_lease::Leases::new(sftp_requests);
     loop {
-        if main.shared.closed.load(Ordering::Acquire) {
+        if shared.closed.load(Ordering::Acquire) {
             break;
         }
         let output_drained = !wire.runner.is_output_pending();
         let mut progressed = match wire.runner.progress().map_err(io::Error::other)? {
             Event::Cli(CliEvent::Hostkey(request)) => {
-                verify_host(request, endpoint, trust).map_err(io::Error::other)?;
+                let key = verify_host(request, endpoint, trust).map_err(io::Error::other)?;
+                if let Some(initial) = shared.host_key.get()
+                    && initial != &key
+                {
+                    return Err(io::Error::other("SSH peer key changed during the session"));
+                }
                 true
             }
-            Event::Cli(CliEvent::SessionExit(CliSessionExit::Status { channel, status }))
-                if channel == main.channel.num() =>
-            {
-                main.shared
-                    .exit_code
-                    .store(u64::from(status), Ordering::Release);
+            Event::Cli(CliEvent::SessionExit(CliSessionExit::Status { channel, status })) => {
+                if main
+                    .as_ref()
+                    .is_some_and(|main| channel == main.channel.num())
+                {
+                    shared.exit_code.store(u64::from(status), Ordering::Release);
+                } else {
+                    side_channels.exit_status(channel, status);
+                }
                 true
             }
             Event::Cli(CliEvent::ForwardedTcpip(request)) => {
@@ -2295,6 +2676,9 @@ fn drive_connection(
                     .map_err(io::Error::other)?;
                 true
             }
+            Event::Cli(CliEvent::Defunct) if main.is_none() => {
+                return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+            }
             Event::Cli(CliEvent::Defunct) | Event::None => false,
             Event::Cli(CliEvent::Banner(_) | CliEvent::PollAgain | CliEvent::SessionExit(_))
             | Event::Progressed => true,
@@ -2302,28 +2686,66 @@ fn drive_connection(
                 return Err(io::Error::other("unexpected SSH channel event"));
             }
         };
-        match main.step(&mut wire.runner, &mut buffer, output_drained)? {
-            PumpStep::Active(made_progress) => progressed |= made_progress,
-            PumpStep::Done => {
-                if !wire.eof {
-                    let _ = wire.exchange();
+        if let Some(main) = main.as_mut() {
+            match main.step(&mut wire.runner, &mut buffer, output_drained)? {
+                PumpStep::Active(made_progress) => progressed |= made_progress,
+                PumpStep::Done => {
+                    if !wire.eof {
+                        let _ = wire.exchange();
+                    }
+                    break;
                 }
-                break;
             }
         }
-        progressed |= leases.step(&mut wire.runner, &main.shared, &mut buffer, output_drained);
-        progressed |= forwards.step(&mut wire.runner, &main.shared, &mut buffer, output_drained)?;
-        progressed |= remotes.step(&mut wire.runner, &main.shared)?;
-        if !wire.exchange().map_err(io::Error::other)? && !progressed {
-            wire.wait(
-                forwards
-                    .wait_time()
-                    .into_iter()
-                    .chain(remotes.wait_time())
-                    .chain(leases.wait_time())
-                    .min(),
+        progressed |= side_channels.step(&mut wire.runner, shared, &mut buffer, output_drained);
+        progressed |= forwards.step(&mut wire.runner, shared, &mut buffer, output_drained)?;
+        let mut liveness_progressed = wire
+            .liveness
+            .as_mut()
+            .is_some_and(|probe| probe.receive(&mut wire.runner, Instant::now()));
+        let overdue = wire.liveness.as_ref().is_some_and(liveness::Probe::overdue);
+        progressed |= remotes.step(&mut wire.runner, shared, overdue)?;
+        let exchanged = wire.exchange().map_err(io::Error::other)?;
+        let liveness_now = Instant::now();
+        if let Some(probe) = &mut wire.liveness {
+            liveness_progressed |= probe.progress(
+                &mut wire.runner,
+                liveness_now,
+                wire.inbound_activity,
+                !wire.eof && wire.unread.is_empty(),
             )?;
         }
+        // Application/channel traffic postpones the idle heartbeat. The liveness
+        // probe runs independently and must not suppress the user's heartbeat.
+        if progressed && let Some(heartbeat) = &mut wire.heartbeat {
+            heartbeat.defer(liveness_now);
+        }
+        if exchanged || progressed || liveness_progressed {
+            continue;
+        }
+        if let Some(heartbeat) = &mut wire.heartbeat
+            && heartbeat.due(Instant::now())
+            && !wire.eof
+            && wire.unread.is_empty()
+            && wire.runner.read_channel_ready().is_none()
+            && wire.runner.try_send_keepalive().map_err(io::Error::other)?
+        {
+            continue;
+        }
+        wire.wait(
+            forwards
+                .wait_time()
+                .into_iter()
+                .chain(remotes.wait_time())
+                .chain(side_channels.wait_time())
+                .chain(wire.heartbeat.as_ref().map(Heartbeat::wait_time))
+                .chain(
+                    wire.liveness
+                        .as_ref()
+                        .and_then(|probe| probe.wait_time(liveness_now)),
+                )
+                .min(),
+        )?;
     }
     Ok(())
 }

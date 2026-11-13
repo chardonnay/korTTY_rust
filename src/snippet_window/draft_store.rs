@@ -651,6 +651,7 @@ mod tests {
                 file_name: Some("run.sh".into()),
                 executable: Some(true),
                 tags: vec!["ops".into()],
+                ..Metadata::default()
             },
             content: text.into(),
             base_hash: Some(hash_content("saved content").unwrap()),

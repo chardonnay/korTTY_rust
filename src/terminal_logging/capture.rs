@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 use async_channel::{Sender, TrySendError, bounded};
 use zeroize::{Zeroize as _, Zeroizing};
 
-use super::policy::append;
+use super::policy::{MAX_REDACTED, append, append_bounded};
 use super::{Config, DirectoryMode, Format, Policy, writer};
 use crate::logfile_window::document::Fields;
 
@@ -50,8 +50,27 @@ impl Shutdown {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct Secrets(Arc<Mutex<SecretState>>);
+
+#[derive(Clone, Copy)]
+struct SecretLimits {
+    values: usize,
+    bytes: usize,
+}
+
+impl SecretLimits {
+    const TERMINAL: Self = Self {
+        values: MAX_SECRETS,
+        bytes: SECRET_BYTES,
+    };
+}
+
+impl Default for Secrets {
+    fn default() -> Self {
+        Self::with_limits(SecretLimits::TERMINAL)
+    }
+}
 
 #[derive(Clone)]
 pub(crate) struct Warning {
@@ -84,23 +103,80 @@ impl Warning {
     }
 }
 
-#[derive(Default)]
 struct SecretState {
+    limits: SecretLimits,
+    bytes: usize,
     values: Vec<Zeroizing<String>>,
     unusable: bool,
     sealed: Option<RedactionSecrets>,
 }
 
 #[derive(Clone)]
-pub(crate) struct RedactionSecrets(Arc<[Zeroizing<String>]>);
+pub(crate) struct RedactionSecrets(Arc<[Zeroizing<String>]>, SecretLimits);
 
 impl RedactionSecrets {
+    pub(crate) fn has_multiline_values(&self) -> bool {
+        self.0.iter().any(|secret| secret.contains(['\r', '\n']))
+    }
+
+    pub(crate) fn matches(&self, current: &Self) -> bool {
+        self.0.len() == current.0.len()
+            && self
+                .0
+                .iter()
+                .zip(current.0.iter())
+                .all(|(left, right)| left.as_str() == right.as_str())
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    /// Extends an immutable, bounded mask without exposing any stored values.
+    pub(crate) fn with_secret(previous: Option<&Self>, secret: &str) -> io::Result<Self> {
+        let limits = previous.map_or(SecretLimits::TERMINAL, |known| known.1);
+        let previous = previous.into_iter().flat_map(|known| known.0.iter());
+        Self::from_values(
+            previous
+                .map(|value| value.as_str())
+                .chain(std::iter::once(secret)),
+            limits,
+        )
+    }
+
+    fn from_values<'a>(
+        values: impl Iterator<Item = &'a str>,
+        limits: SecretLimits,
+    ) -> io::Result<Self> {
+        let secrets = Secrets::with_limits(limits);
+        for value in values {
+            secrets.add(value);
+        }
+        secrets.seal()
     }
 }
 
 impl Secrets {
+    pub(crate) fn scheduled_targets(count: usize) -> Self {
+        // A saved route can carry a credential for the server and its jump host.
+        // Keep room for normalized variants and a reviewed provider credential.
+        let count = count.min(kortty_jobs::MAX_SWARM_TARGETS);
+        Self::with_limits(SecretLimits {
+            values: MAX_SECRETS.max(count * 8 + 4),
+            bytes: SECRET_BYTES.max(count * 8 * 1024),
+        })
+    }
+
+    fn with_limits(limits: SecretLimits) -> Self {
+        Self(Arc::new(Mutex::new(SecretState {
+            limits,
+            bytes: 0,
+            values: Vec::new(),
+            unusable: false,
+            sealed: None,
+        })))
+    }
+
     pub(crate) fn add(&self, value: &str) {
         if value.is_empty() {
             return;
@@ -120,14 +196,14 @@ impl Secrets {
             if value.is_empty() || state.values.iter().any(|known| known.as_str() == value) {
                 continue;
             }
-            if state.values.len() == MAX_SECRETS
-                || value.len() + state.values.iter().map(|value| value.len()).sum::<usize>()
-                    > SECRET_BYTES
+            if state.values.len() == state.limits.values
+                || value.len() > state.limits.bytes - state.bytes
             {
                 state.unusable = true;
                 state.values.clear();
                 return;
             }
+            state.bytes += value.len();
             state.values.push(Zeroizing::new(value.into()));
         }
     }
@@ -144,12 +220,13 @@ impl Secrets {
         }
         let mut values = std::mem::take(&mut state.values);
         values.sort_by_key(|value| std::cmp::Reverse(value.len()));
-        let sealed = RedactionSecrets(Arc::from(values));
+        let sealed = RedactionSecrets(Arc::from(values), state.limits);
         state.sealed = Some(sealed.clone());
         Ok(sealed)
     }
 }
 
+#[derive(Clone)]
 pub(crate) struct Redactor {
     secrets: RedactionSecrets,
     policy: Policy,
@@ -157,6 +234,28 @@ pub(crate) struct Redactor {
 }
 
 impl Redactor {
+    pub(crate) fn add_known_secrets(&self, target: &Secrets) {
+        for value in self.secrets.0.iter() {
+            target.add(value);
+        }
+    }
+
+    pub(crate) fn matches_secrets(&self, current: &Self) -> bool {
+        self.secrets.matches(&current.secrets)
+    }
+
+    pub(crate) fn redaction_policy(&self) -> &Policy {
+        &self.policy
+    }
+
+    pub(crate) fn uses_redactions(&self, policy: &Policy) -> bool {
+        self.policy.same_redactions(policy)
+    }
+
+    pub(crate) fn allows_incremental_output(&self) -> bool {
+        !self.policy.has_redactions()
+    }
+
     pub(crate) fn for_journal(secrets: RedactionSecrets, policy: Policy) -> Self {
         Self {
             secrets,
@@ -165,8 +264,36 @@ impl Redactor {
         }
     }
 
+    pub(crate) fn with_overlay(&self, overlay: &RedactionSecrets) -> io::Result<Self> {
+        let secrets = RedactionSecrets::from_values(
+            self.secrets
+                .0
+                .iter()
+                .chain(overlay.0.iter())
+                .map(|secret| secret.as_str()),
+            SecretLimits {
+                values: self.secrets.1.values.max(overlay.1.values),
+                bytes: self.secrets.1.bytes.max(overlay.1.bytes),
+            },
+        )?;
+        Ok(Self {
+            secrets,
+            policy: self.policy.clone(),
+            xml: self.xml,
+        })
+    }
+
     pub(crate) fn journal_text(&self, input: &str, deadline: Instant) -> Option<Zeroizing<String>> {
-        self.redacted_text(input, deadline, true)
+        self.redacted_text(input, deadline, true, MAX_REDACTED)
+            .map(|(text, _)| text)
+    }
+
+    pub(crate) fn outbound_text(
+        &self,
+        input: &str,
+        deadline: Instant,
+    ) -> Option<(Zeroizing<String>, usize)> {
+        self.redacted_text(input, deadline, true, 512 * 1024)
     }
 
     fn redacted_text(
@@ -174,7 +301,8 @@ impl Redactor {
         input: &str,
         deadline: Instant,
         journal: bool,
-    ) -> Option<Zeroizing<String>> {
+        limit: usize,
+    ) -> Option<(Zeroizing<String>, usize)> {
         if Instant::now() >= deadline {
             return None;
         }
@@ -182,47 +310,53 @@ impl Redactor {
         if journal {
             text.retain(crate::session_journal::is_display_character);
         }
-        self.mask(&mut text)?;
+        let mut count = self.mask(&mut text, limit)?;
         for rule in &self.policy.rules {
-            text = rule.replace(&text, deadline)?;
+            let (next, replacements) = rule.replace_counted(&text, deadline, limit)?;
+            text = next;
+            count += replacements;
         }
         if journal {
             text.retain(crate::session_journal::is_display_character);
         }
-        self.mask(&mut text)?;
+        count += self.mask(&mut text, limit)?;
         // A mask or combination of two replacements may itself equal a short credential.
-        if self
-            .secrets
-            .0
-            .iter()
-            .any(|secret| text.contains(secret.as_str()))
-        {
+        if self.contains_known_secret(&text) {
             return None;
         }
-        Some(text)
+        Some((text, count))
     }
 
-    fn mask(&self, text: &mut Zeroizing<String>) -> Option<()> {
+    pub(crate) fn contains_known_secret(&self, input: &str) -> bool {
+        self.secrets
+            .0
+            .iter()
+            .any(|secret| input.contains(secret.as_str()))
+    }
+
+    fn mask(&self, text: &mut Zeroizing<String>, limit: usize) -> Option<usize> {
+        let mut count = 0;
         for secret in self.secrets.0.iter() {
             if !text.contains(secret.as_str()) {
                 continue;
             }
             let mut masked = Zeroizing::new(String::with_capacity(text.len()));
             let mut parts = text.split(secret.as_str());
-            append(&mut masked, parts.next()?)?;
+            append_bounded(&mut masked, parts.next()?, limit)?;
             for tail in parts {
-                append(&mut masked, "***")?;
-                append(&mut masked, tail)?;
+                append_bounded(&mut masked, "***", limit)?;
+                append_bounded(&mut masked, tail, limit)?;
+                count += 1;
             }
             *text = masked;
         }
-        Some(())
+        Some(count)
     }
 
     fn logged_text(&self, input: &str) -> Option<String> {
         // All managed rules share the same budget on the terminal actor.
         let deadline = Instant::now() + Duration::from_millis(8);
-        let mut text = self.redacted_text(input, deadline, false)?;
+        let (mut text, _) = self.redacted_text(input, deadline, false, MAX_REDACTED)?;
         if !self.xml || !text.contains(invalid_xml_character) {
             return Some(std::mem::take(&mut *text));
         }
@@ -234,12 +368,7 @@ impl Redactor {
             append(&mut safe, part)?;
         }
         // Substituting an XML-safe character can itself recreate a credential.
-        if self
-            .secrets
-            .0
-            .iter()
-            .any(|secret| safe.contains(secret.as_str()))
-        {
+        if self.contains_known_secret(&safe) {
             return None;
         }
         Some(std::mem::take(&mut *safe))
@@ -616,4 +745,33 @@ fn relative_directory(base: &str, directory: &str) -> Zeroizing<String> {
     } else {
         parts.join("/")
     })
+}
+
+#[cfg(test)]
+mod scheduled_secret_tests {
+    use super::*;
+
+    #[test]
+    fn scheduled_swarm_masks_all_route_and_provider_credentials() {
+        let values = (0..kortty_jobs::MAX_SWARM_TARGETS * 2)
+            .map(|index| format!(" unique-sw-arm-{index:03} "))
+            .collect::<Vec<_>>();
+        let regular = Secrets::default();
+        let scheduled = Secrets::scheduled_targets(kortty_jobs::MAX_SWARM_TARGETS);
+        for secret in &values {
+            regular.add(secret);
+            scheduled.add(secret);
+        }
+        assert!(regular.seal().is_err());
+        let redactor = Redactor::for_journal(scheduled.seal().unwrap(), Policy::default());
+        let overlay =
+            RedactionSecrets::with_secret(None, "fixture-remote-provider-secret").unwrap();
+        let redactor = redactor.with_overlay(&overlay).unwrap();
+        let text = format!("{} fixture-remote-provider-secret", values.join("\n"));
+        let masked = redactor
+            .journal_text(&text, Instant::now() + Duration::from_secs(2))
+            .unwrap();
+        assert!(!masked.contains("unique-sw-arm") && !masked.contains("fixture-remote-provider"));
+        assert_eq!(masked.matches("***").count(), values.len() + 1);
+    }
 }

@@ -50,6 +50,8 @@ fn connection() -> Connection {
         command_timestamps: None,
         tab_color: None,
         paste_warning: None,
+        window_geometry: None,
+        terminal: Default::default(),
         tunnels: vec![TunnelConfig {
             enabled: true,
             description: "Local service".into(),
@@ -65,6 +67,84 @@ fn connection() -> Connection {
 }
 
 #[test]
+fn saved_window_geometry_round_trips_private_store_and_validates_bounds() {
+    let directory = TestDir::new();
+    let geometry = WindowGeometry {
+        width: 907,
+        maximized: true,
+        ..WindowGeometry::default()
+    };
+    let mut profile = connection();
+    profile.window_geometry = Some(geometry);
+    let id = directory.store().save(profile).unwrap();
+    let store = directory.store();
+    let mut profile = store.get(id).unwrap().clone();
+    assert_eq!(profile.window_geometry, Some(geometry));
+    profile.window_geometry.as_mut().unwrap().height = 0;
+    assert!(profile.validate().is_err());
+    assert_eq!(
+        directory.store().get(id).unwrap().window_geometry,
+        Some(geometry)
+    );
+}
+
+#[test]
+fn serial_profiles_share_store_ids_and_merge_usage_without_touching_ssh() {
+    use crate::session::{SerialFlowControl, SerialLineEnding, SerialSettings};
+    use kortty_terminal::TextEncoding;
+
+    let directory = TestDir::new();
+    let mut store = directory.store();
+    let ssh = store.save(connection()).unwrap();
+    let connection = SerialConnection {
+        // A profile copied from a different OS must not prevent the library from opening.
+        device: "COM7".into(),
+        settings: SerialSettings {
+            baud_rate: 115200,
+            data_bits: 7,
+            parity: SerialParity::Even,
+            stop_bits: SerialStopBits::Two,
+            flow_control: SerialFlowControl::XonXoff,
+            assert_dtr: false,
+            assert_rts: false,
+        },
+        line_ending: SerialLineEnding::CrLf,
+        local_echo: true,
+        encoding: Some(TextEncoding::Latin9),
+    };
+    let serial = store
+        .save_serial(SerialProfile::new(
+            "",
+            connection.clone(),
+            TerminalProfile::Vt220,
+        ))
+        .unwrap();
+    assert_ne!(ssh, serial);
+    assert!(store.get(serial).is_none());
+    let mut tracker = directory.store();
+    let saved = tracker.serial(serial).unwrap().clone();
+    assert!(saved.matches(&connection, TerminalProfile::Vt220));
+    assert_eq!(saved.display_name(), "COM7 @ 115200");
+    assert_eq!(saved.line(), "115200 7E2");
+    assert_eq!(tracker.search_serial("com*").next(), Some(&saved));
+    tracker.record_serial_used_at(&saved, 12).unwrap();
+
+    let mut updated = saved.clone();
+    updated.name = "Console".into();
+    updated.connection.settings.baud_rate = 57600;
+    store.save_serial(updated.clone()).unwrap();
+    assert_eq!(store.recent_serial_since(0).next(), Some((&updated, 12)));
+    tracker.record_serial_used_at(&saved, 20).unwrap();
+    assert_eq!(tracker.recent_serial_since(13).count(), 0);
+
+    tracker.delete_connections(&[serial]).unwrap();
+    let reopened = directory.store();
+    assert!(reopened.serial(serial).is_none());
+    assert!(reopened.recent_ids().next().is_none());
+    assert!(reopened.get(ssh).is_some());
+}
+
+#[test]
 fn batch_edits_commit_together_and_reject_stale_members() {
     let profile = TestDir::new();
     let mut store = profile.store();
@@ -76,9 +156,9 @@ fn batch_edits_commit_together_and_reject_stale_members() {
     third.name = "Untouched".into();
     let third = store.save(third).unwrap();
     let selected = [first, second];
-    assert!(store.toggle_favorites(&selected).unwrap());
+    assert!(store.toggle_connection_favorites(&selected, &[]).unwrap());
     assert!(selected.iter().all(|id| store.is_favorite(*id)));
-    assert!(!store.toggle_favorites(&selected).unwrap());
+    assert!(!store.toggle_connection_favorites(&selected, &[]).unwrap());
     store.set_connection_tags(&selected, "batch").unwrap();
     let badge = "custom:00000000-0000-4000-8000-000000000001";
     store.set_os_badges(&selected, Some(badge)).unwrap();
@@ -97,6 +177,247 @@ fn batch_edits_commit_together_and_reject_stale_members() {
     assert_eq!(reopened.connections().len(), 1);
     assert!(reopened.get(third).is_some());
     assert_eq!(reopened.os_badge_id(first), None);
+}
+
+#[test]
+fn teamwork_favorites_are_local_to_the_source_and_toggle_with_local_connections_atomically() {
+    let profile = TestDir::new();
+    let mut store = profile.store();
+    let local = store.save(connection()).unwrap();
+    let external = local.to_string();
+    let first = shared_identity(&profile.0.join("first.xml"), &external);
+    let second = shared_identity(&profile.0.join("second.xml"), &external);
+    assert_ne!(first, second);
+    assert!(
+        store
+            .toggle_connection_favorites(&[local], std::slice::from_ref(&first))
+            .unwrap()
+    );
+    let mut stale = profile.store();
+    assert!(stale.is_favorite(local));
+    assert!(stale.is_teamwork_favorite(&first));
+    assert!(!stale.is_teamwork_favorite(&second));
+
+    assert!(
+        store
+            .toggle_connection_favorites(&[local], &[first.clone(), second.clone()])
+            .unwrap()
+    );
+    assert!(
+        stale
+            .toggle_connection_favorites(&[local], std::slice::from_ref(&first))
+            .is_err()
+    );
+    let mut reopened = profile.store();
+    assert!(reopened.is_favorite(local));
+    assert!(reopened.is_teamwork_favorite(&first));
+    assert!(reopened.is_teamwork_favorite(&second));
+    assert!(
+        !reopened
+            .toggle_connection_favorites(&[local], &[first.clone(), second.clone()])
+            .unwrap()
+    );
+    let mut reopened = profile.store();
+    assert!(!reopened.is_favorite(local));
+    assert!(!reopened.is_teamwork_favorite(&first));
+    assert!(!reopened.is_teamwork_favorite(&second));
+    assert!(reopened.toggle_connection_favorites(&[], &[]).is_err());
+    assert!(
+        reopened
+            .toggle_connection_favorites(&[u64::MAX], std::slice::from_ref(&second))
+            .is_err()
+    );
+    assert!(!profile.store().is_teamwork_favorite(&second));
+}
+
+#[test]
+fn teamwork_favorites_do_not_travel_in_portable_profile_backups() {
+    let profile = TestDir::new();
+    let mut store = profile.store();
+    let local = store.save(connection()).unwrap();
+    store.toggle_connection_favorites(&[local], &[]).unwrap();
+    let baseline = portable_backup(&fs::read(store.path()).unwrap()).unwrap();
+
+    let shared = shared_identity(&profile.0.join("private-share.xml"), "shared");
+    assert!(
+        store
+            .toggle_connection_favorites(&[], std::slice::from_ref(&shared))
+            .unwrap()
+    );
+    let full = fs::read(store.path()).unwrap();
+    assert!(validate_backup(&full).is_err());
+    let portable = portable_backup(&full).unwrap();
+    assert_eq!(portable, baseline);
+    assert!(!String::from_utf8_lossy(&portable).contains("private-share.xml"));
+    validate_backup(&portable).unwrap();
+    assert!(profile.store().is_teamwork_favorite(&shared));
+}
+
+#[test]
+fn hidden_teamwork_can_be_restored_offline_by_origin_without_removing_favorites() {
+    let profile = TestDir::new();
+    let mut store = profile.store();
+    store.save(connection()).unwrap();
+    let original = portable_backup(&fs::read(store.path()).unwrap()).unwrap();
+    let path = profile.0.join("first.xml");
+    let first_catalog = shared_catalog(&path, "same-id");
+    let second_catalog = shared_catalog(&profile.0.join("second.xml"), "same-id");
+    let first = teamwork::HiddenEntry::from(first_catalog.entries().next().unwrap());
+    let second = teamwork::HiddenEntry::from(second_catalog.entries().next().unwrap());
+    assert_ne!(first.identity(), second.identity());
+    assert_ne!(first.identity().source(), second.identity().source());
+    assert!(store.hidden_teamwork().next().is_none());
+    store
+        .toggle_connection_favorites(&[], std::slice::from_ref(first.identity()))
+        .unwrap();
+    store.hide_teamwork(std::slice::from_ref(&first)).unwrap();
+    fs::remove_file(&path).unwrap();
+
+    let mut stale = profile.store();
+    assert_eq!(stale.hidden_teamwork().collect::<Vec<_>>(), [&first]);
+    let offline = stale.hidden_teamwork().next().unwrap();
+    assert_eq!(offline.name(), "Shared");
+    assert_eq!(offline.host(), "shared.example");
+    assert!(stale.is_teamwork_hidden(first.identity()));
+    assert!(!stale.is_teamwork_hidden(second.identity()));
+    assert!(stale.is_teamwork_favorite(first.identity()));
+
+    store.hide_teamwork(std::slice::from_ref(&second)).unwrap();
+    assert!(stale.restore_teamwork(first.identity()).is_err());
+    let both = profile.store();
+    assert_eq!(both.hidden_teamwork().count(), 2);
+    let raw = fs::read(both.path()).unwrap();
+    assert!(validate_backup(&raw).is_err());
+    assert_eq!(portable_backup(&raw).unwrap(), original);
+
+    store.restore_teamwork(first.identity()).unwrap();
+    let mut reopened = profile.store();
+    assert!(!reopened.is_teamwork_hidden(first.identity()));
+    assert!(reopened.is_teamwork_hidden(second.identity()));
+    assert!(reopened.is_teamwork_favorite(first.identity()));
+    assert!(reopened.restore_teamwork(first.identity()).is_err());
+    assert!(reopened.hide_teamwork(&[]).is_err());
+    assert!(!path.exists());
+}
+
+#[test]
+fn hidden_teamwork_metadata_is_bounded_and_batches_fail_without_writing() {
+    use serde_json::{Value, json};
+
+    let profile = TestDir::new();
+    let mut store = profile.store();
+    store.save(connection()).unwrap();
+    let catalog = shared_catalog(&profile.0.join("shared.xml"), "first");
+    let first = teamwork::HiddenEntry::from(catalog.entries().next().unwrap());
+    let stored = serde_json::to_value(&first).unwrap();
+    let bytes = fs::read(store.path()).unwrap();
+    let original: Value = serde_json::from_slice(&bytes).unwrap();
+    let encode = |entries: Vec<Value>| {
+        let mut document = original.clone();
+        document["library"] = json!({ "teamwork_hidden": entries });
+        serde_json::to_vec(&document).unwrap()
+    };
+    let decode = |entries| decode_document(&encode(entries));
+    assert!(decode(vec![stored.clone()]).is_ok());
+    assert!(validate_backup(&encode(vec![stored.clone()])).is_err());
+    assert!(decode(vec![stored.clone(), stored.clone()]).is_err());
+    for (field, value) in [
+        ("name", json!("unsafe\u{202e} name")),
+        ("name", json!("x".repeat(161))),
+        ("host", json!("SHARED.EXAMPLE")),
+        ("host", json!("shared.example:22")),
+    ] {
+        let mut tampered = stored.clone();
+        tampered[field] = value;
+        let invalid: teamwork::HiddenEntry = serde_json::from_value(tampered.clone()).unwrap();
+        assert!(store.hide_teamwork(&[first.clone(), invalid]).is_err());
+        assert!(decode(vec![tampered]).is_err());
+    }
+    let mut injected_route = stored.clone();
+    injected_route["username"] = json!("must-not-load");
+    assert!(decode(vec![injected_route]).is_err());
+    let over_limit = (0..513)
+        .map(|index| {
+            let mut entry = stored.clone();
+            entry["identity"]["id"] = json!(index.to_string());
+            entry
+        })
+        .collect::<Vec<_>>();
+    assert!(decode(over_limit.clone()).is_err());
+    let over_limit = over_limit
+        .into_iter()
+        .map(|entry| serde_json::from_value(entry).unwrap())
+        .collect::<Vec<_>>();
+    assert!(store.hide_teamwork(&over_limit).is_err());
+    assert_eq!(fs::read(store.path()).unwrap(), bytes);
+    assert!(store.hidden_teamwork().next().is_none());
+}
+
+#[test]
+fn teamwork_favorite_records_reject_invalid_ids_origins_duplicates_and_counts() {
+    use serde_json::{Value, json};
+
+    let item = |kind: &str, location: &str, id: &str| json!({"kind": kind, "location": location, "id": id});
+    let decode = |favorites: Vec<Value>| {
+        let bytes = serde_json::to_vec(&json!({
+            "version": VERSION,
+            "next_id": 1,
+            "connections": [],
+            "approvals": {},
+            "library": { "teamwork_favorites": favorites },
+        }))
+        .unwrap();
+        decode_document(&bytes)
+    };
+    let first = item("git", "https://git.example/team", "shared");
+    assert!(decode(vec![first.clone()]).is_ok());
+    assert!(
+        decode(vec![
+            first,
+            item("git", "HTTPS://GIT.EXAMPLE:443/team", "shared")
+        ])
+        .is_err()
+    );
+    for invalid in [
+        item("file", "relative.xml", "shared"),
+        item("git", "https://user:password@git.example/team", "shared"),
+        item("git", "https://git.example/team", "invalid id"),
+        item("git", "https://git.example/team", ""),
+        item("unknown", "https://git.example/team", "shared"),
+    ] {
+        assert!(decode(vec![invalid]).is_err());
+    }
+    assert!(
+        decode(
+            (0..513)
+                .map(|id| item("git", "https://git.example/team", &id.to_string()))
+                .collect()
+        )
+        .is_err()
+    );
+}
+
+fn shared_identity(path: &Path, id: &str) -> teamwork::Identity {
+    shared_catalog(path, id)
+        .entries()
+        .next()
+        .unwrap()
+        .identity()
+        .clone()
+}
+
+fn shared_catalog(path: &Path, id: &str) -> teamwork::Catalog {
+    fs::write(path, format!(r#"<connections><connection id="{id}"><name>Shared</name><host>shared.example</host><username>ops</username></connection></connections>"#)).unwrap();
+    let settings = teamwork::Settings {
+        sources: vec![teamwork::Source {
+            kind: teamwork::SourceKind::File,
+            location: path.to_str().unwrap().into(),
+            enabled: true,
+            check_interval_minutes: teamwork::DEFAULT_CHECK_INTERVAL_MINUTES,
+        }],
+        ..teamwork::Settings::default()
+    };
+    teamwork::Catalog::default().refreshed(&settings.active_sources(true, &[]).unwrap())
 }
 
 #[test]
@@ -291,8 +612,8 @@ fn approval_survives_description_edits_and_is_invalidated_by_route_or_rule_chang
 }
 
 #[test]
-fn terminal_effect_round_trips_and_invalid_speed_cannot_be_saved() {
-    use crate::terminal_effects::Effect;
+fn terminal_effect_round_trips_and_invalid_speed_cannot_be_loaded() {
+    use crate::terminal_effects::{Effect, Speed};
 
     let dir = TestDir::new();
     let mut store = dir.store();
@@ -308,19 +629,23 @@ fn terminal_effect_round_trips_and_invalid_speed_cannot_be_saved() {
 
     let selection = Selection {
         effect: Effect::DigitalRain,
-        speed: 99,
+        speed: Speed::try_from(2.5000000000000004).unwrap(),
     };
     profile.terminal_effect = Some(selection);
     let id = store.save(profile).unwrap();
     let loaded = dir.store().get(id).unwrap().clone();
     assert_eq!(loaded.terminal_effect, Some(selection));
+    let mut value = serde_json::to_value(&loaded).unwrap();
+    value["terminal_effect"]["speed"] = serde_json::json!(99);
+    let legacy = serde_json::from_value::<Connection>(value.clone()).unwrap();
+    assert_eq!(
+        legacy.terminal_effect.unwrap().speed,
+        Speed::try_from(99.0).unwrap(),
+    );
+    assert_eq!(serde_json::to_value(&legacy).unwrap(), value);
     for speed in [0, 100] {
-        let mut invalid = loaded.clone();
-        invalid.terminal_effect = Some(Selection { speed, ..selection });
-        assert_eq!(
-            store.save(invalid).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
+        value["terminal_effect"]["speed"] = serde_json::json!(speed);
+        assert!(serde_json::from_value::<Connection>(value.clone()).is_err());
     }
     assert_eq!(
         dir.store().get(id).unwrap().terminal_effect,
@@ -416,7 +741,7 @@ fn library_subtrees_and_metadata_round_trip_without_changing_profile_ids_or_rout
     let adjacent = store.save_in_group(connection(), Some(&sibling)).unwrap();
     let plan = store.get(member).unwrap().plan();
     store.approve(member, plan.clone()).unwrap();
-    store.set_favorite(member, true).unwrap();
+    assert!(store.toggle_connection_favorites(&[member], &[]).unwrap());
     store.record_used(member).unwrap();
 
     let renamed = store.rename_group(&folder, "Live").unwrap();
@@ -557,6 +882,8 @@ fn shared_search_follows_anchored_literal_star_and_quick_connection_fields() {
 
 #[test]
 fn ssh_startup_policy_round_trips_and_old_profiles_keep_original_bounds() {
+    use kortty_ssh::KeepAlive;
+
     let mut old = connection();
     let old_document = serde_json::to_value(&old).unwrap();
     assert!(old_document.get("startup").is_none());
@@ -565,16 +892,23 @@ fn ssh_startup_policy_round_trips_and_old_profiles_keep_original_bounds() {
 
     let dir = TestDir::new();
     let mut store = dir.store();
-    old.startup = ConnectOptions::new(300, 20).unwrap();
+    let startup = ConnectOptions::new(300, 20)
+        .unwrap()
+        .with_keepalive(Some(KeepAlive::new(false, 600).unwrap()));
+    old.startup = startup;
     let id = store.save(old).unwrap();
-    assert_eq!(
-        dir.store().get(id).unwrap().startup,
-        ConnectOptions::new(300, 20).unwrap()
-    );
+    assert_eq!(dir.store().get(id).unwrap().startup, startup,);
 
     for (seconds, attempts) in [(0, 1), (301, 1), (20, 21)] {
         let mut invalid = old_document.clone();
         invalid["startup"] = serde_json::json!({"timeout_seconds": seconds, "attempts": attempts});
+        assert!(serde_json::from_value::<Connection>(invalid).is_err());
+    }
+    for seconds in [4, 601] {
+        let mut invalid = old_document.clone();
+        invalid["startup"] = serde_json::json!({
+            "timeout_seconds": 20, "attempts": 1, "keepalive": {"enabled": true, "seconds": seconds},
+        });
         assert!(serde_json::from_value::<Connection>(invalid).is_err());
     }
 }

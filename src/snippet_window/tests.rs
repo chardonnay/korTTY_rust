@@ -11,7 +11,7 @@ fn snippet_editor_tab_switch_damage_matches_a_full_render() {
     use iced::advanced::graphics::{Viewport, damage, text::Editor};
     use iced::advanced::renderer::Renderer as _;
     use iced::advanced::text::{self, Renderer as _, editor::Editor as _};
-    use iced::{Color, Pixels, Point, Rectangle, Size};
+    use iced::{Color, Font, Pixels, Point, Rectangle, Size};
     use iced_tiny_skia::{Layer, Renderer};
 
     let viewport = Viewport::with_physical_size(Size::new(400, 220), 2.0);

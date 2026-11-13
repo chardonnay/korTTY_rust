@@ -1,14 +1,23 @@
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::Arc;
+
 use iced::font::Weight;
+use iced::widget::image;
 use iced::widget::{
     button, checkbox, column, container, pick_list, row, scrollable, slider, space, text,
     text_input,
 };
-use iced::{Alignment, Color, Element, Font, Length};
+use iced::{Alignment, Color, ContentFit, Element, Font, Length, Task};
 use kortty_terminal::CursorShape;
 
 use crate::profile::{MAX_TERMINAL_FONT, MIN_TERMINAL_FONT};
-use crate::terminal_theme::{CursorStyle, FontFamily, Id, Rgb, Scheme, Themes};
+use crate::terminal_theme::{AgentPanelColors, CursorStyle, FontFamily, Id, Rgb, Scheme, Themes};
 use crate::terminal_view::ansi_color;
+use crate::terminal_view::background_image::{AssetId, Images, Prepared};
+
+pub(super) mod background;
+pub(super) mod exchange;
 
 #[derive(Clone, Copy, Debug)]
 pub enum Channel {
@@ -53,6 +62,9 @@ pub enum Edit {
     Color(Channel, String),
     Cursor(CursorStyle),
     Apply,
+    AgentColor(usize, String),
+    Background(background::Action),
+    Java(exchange::Action),
 }
 
 #[derive(Default)]
@@ -60,6 +72,9 @@ pub(super) struct Editor {
     form: Option<Form>,
     deletion: Option<Id>,
     problem: Option<&'static str>,
+    exchange: exchange::Editor,
+    background_revision: u64,
+    staged_backgrounds: BTreeMap<AssetId, Arc<Prepared>>,
 }
 
 struct Form {
@@ -67,7 +82,18 @@ struct Form {
     name: String,
     scheme: Scheme,
     colors: [String; 3],
+    agent_colors: [String; 6],
+    background: background::Draft,
 }
+
+const AGENT_FIELDS: [&str; 6] = [
+    "Background",
+    "Border",
+    "Text",
+    "Muted text",
+    "Accent",
+    "Error",
+];
 
 impl Form {
     fn new(id: Option<Id>, name: String, scheme: Scheme) -> Self {
@@ -77,7 +103,37 @@ impl Form {
             scheme,
             colors: [scheme.foreground, scheme.background, scheme.cursor]
                 .map(|color| color.to_string()),
+            agent_colors: Default::default(),
+            background: background::Draft::default(),
         }
+    }
+
+    fn from_theme(
+        id: Option<Id>,
+        name: String,
+        theme: crate::terminal_theme::Theme<'_>,
+        themes: &Themes,
+    ) -> Self {
+        let mut form = Self::new(id, name, theme.scheme);
+        form.agent_colors = themes
+            .agent_panel_colors(theme.id)
+            .unwrap_or_default()
+            .map(|color| color.map_or_else(String::new, |color| color.to_string()));
+        form.background = background::Draft::new(
+            themes.background_asset(theme.id),
+            id.and_then(|id| themes.java_background_path(id)),
+        );
+        form
+    }
+
+    fn agent_colors(&self) -> Option<AgentPanelColors> {
+        let mut colors = [None; 6];
+        for (output, input) in colors.iter_mut().zip(&self.agent_colors) {
+            if !input.trim().is_empty() {
+                *output = Some(Rgb::parse(input)?);
+            }
+        }
+        Some(colors)
     }
 
     fn parsed(&self) -> Option<Scheme> {
@@ -92,10 +148,64 @@ impl Form {
 
 impl Editor {
     pub(super) fn editing(&self) -> bool {
-        self.form.is_some() || self.deletion.is_some()
+        self.form.is_some() || self.deletion.is_some() || self.exchange.open()
     }
 
-    pub(super) fn update(&mut self, themes: &mut Themes, message: Edit) {
+    pub(super) fn cancel_message(&self) -> Option<Edit> {
+        if self.exchange.open() {
+            Some(Edit::Java(exchange::Action::Cancel))
+        } else {
+            self.editing().then_some(Edit::Cancel)
+        }
+    }
+
+    pub(super) fn exchanging(&self) -> Option<&'static str> {
+        self.exchange.working()
+    }
+
+    pub(super) fn leave(&mut self) {
+        self.exchange.close();
+        if let Some(form) = &mut self.form {
+            form.background.cancel_read();
+        }
+    }
+
+    pub(super) fn publish_backgrounds(&self, themes: &Themes, root: &Path) -> std::io::Result<()> {
+        for (&id, asset) in &self.staged_backgrounds {
+            if themes.background_assets().any(|reference| reference == id) {
+                asset.publish(root)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn has_staged_backgrounds(&self) -> bool {
+        !self.staged_backgrounds.is_empty()
+    }
+
+    fn background_handle<'a>(
+        &'a self,
+        images: &'a Images,
+        asset: Option<AssetId>,
+    ) -> Option<&'a image::Handle> {
+        let id = asset?;
+        self.staged_backgrounds
+            .get(&id)
+            .map(|image| image.handle())
+            .or_else(|| images.get(id).map(|image| image.handle()))
+    }
+
+    pub(super) fn update(&mut self, themes: &mut Themes, message: Edit) -> Task<Edit> {
+        if let Edit::Java(action) = message {
+            return if self.form.is_none() && self.deletion.is_none() {
+                self.exchange.update(themes, action).map(Edit::Java)
+            } else {
+                Task::none()
+            };
+        }
+        if self.exchange.open() {
+            return Task::none();
+        }
         self.problem = None;
         if let Some(form) = &mut self.form {
             match message {
@@ -112,31 +222,62 @@ impl Editor {
                     form.colors[channel.index()] = color;
                 }
                 Edit::Cursor(style) => form.scheme.cursor_style = style,
+                Edit::AgentColor(index, mut color) => {
+                    color.truncate(color.floor_char_boundary(12));
+                    if let Some(value) = form.agent_colors.get_mut(index) {
+                        *value = color;
+                    }
+                }
+                Edit::Background(action) => {
+                    return form
+                        .background
+                        .update(action, &mut self.background_revision)
+                        .map(Edit::Background);
+                }
                 Edit::Cancel => self.form = None,
-                Edit::Apply => {
+                Edit::Apply if !form.background.working() => {
                     let result = form
                         .parsed()
                         .ok_or("Enter all three colors as #RRGGBB.")
-                        .and_then(|scheme| themes.store(form.id, &form.name, scheme));
+                        .and_then(|scheme| {
+                            let colors = form.agent_colors().ok_or(
+                                "Enter Agent panel colors as #RRGGBB or leave them blank.",
+                            )?;
+                            themes
+                                .store(form.id, &form.name, scheme)
+                                .map(|id| (id, colors))
+                        });
                     match result {
-                        Ok(_) => self.form = None,
+                        Ok((id, colors)) => {
+                            themes.set_background_asset(id, form.background.asset);
+                            themes.set_agent_panel_colors(id, colors);
+                            if let Some(prepared) = form.background.prepared.take() {
+                                self.staged_backgrounds.insert(prepared.id(), prepared);
+                            }
+                            self.staged_backgrounds.retain(|id, _| {
+                                themes.background_assets().any(|current| current == *id)
+                            });
+                            self.form = None;
+                        }
                         Err(problem) => self.problem = Some(problem),
                     }
                 }
                 _ => {}
             }
-            return;
+            return Task::none();
         }
         if let Some(id) = self.deletion {
             match message {
                 Edit::ConfirmDelete => {
                     themes.remove(id);
+                    self.staged_backgrounds
+                        .retain(|id, _| themes.background_assets().any(|current| current == *id));
                     self.deletion = None;
                 }
                 Edit::Cancel => self.deletion = None,
                 _ => {}
             }
-            return;
+            return Task::none();
         }
         let selected = themes.selected().and_then(|id| themes.find(id));
         match message {
@@ -147,13 +288,23 @@ impl Editor {
             }
             Edit::Modify => {
                 if let Some(theme) = selected {
-                    self.form = Some(Form::new(Some(theme.id), theme.name.into(), theme.scheme));
+                    self.form = Some(Form::from_theme(
+                        Some(theme.id),
+                        theme.name.into(),
+                        theme,
+                        themes,
+                    ));
                 }
             }
             Edit::Duplicate if themes.can_add() => {
                 if let Some(theme) = selected {
                     let prefix = &theme.name[..theme.name.floor_char_boundary(67)];
-                    self.form = Some(Form::new(None, format!("{prefix} Copy"), theme.scheme));
+                    self.form = Some(Form::from_theme(
+                        None,
+                        format!("{prefix} Copy"),
+                        theme,
+                        themes,
+                    ));
                 }
             }
             Edit::Delete => {
@@ -163,12 +314,25 @@ impl Editor {
             }
             _ => {}
         }
+        Task::none()
     }
 
-    pub(super) fn view<'a>(&'a self, preferences: &'a super::WindowSettings) -> Element<'a, Edit> {
+    pub(super) fn view<'a>(
+        &'a self,
+        preferences: &'a super::WindowSettings,
+        images: &'a Images,
+        target: Option<&iced::widget::Id>,
+    ) -> Element<'a, Edit> {
         let themes = &preferences.themes;
+        if let Some(page) = self.exchange.view(themes, target) {
+            return page.map(Edit::Java);
+        }
         if let Some(form) = &self.form {
-            return self.form_view(form);
+            return self.form_view(
+                form,
+                self.background_handle(images, form.background.asset),
+                target,
+            );
         }
         if let Some(theme) = self.deletion.and_then(|id| themes.find(id)) {
             return column![
@@ -234,28 +398,56 @@ impl Editor {
             preferences.terminal_font
         };
         let font = preferences.terminal_font_face(selected.map(|theme| theme.scheme));
-        column![
+        let mut preview_pane = column![
+            text("Theme Preview").size(16),
+            preview(name, scheme, font, size)
+        ]
+        .spacing(8)
+        .width(Length::Fill);
+        let asset = selected.and_then(|theme| themes.background_asset(theme.id));
+        if let Some(handle) = self.background_handle(images, asset) {
+            preview_pane = preview_pane.push(
+                image(handle.clone())
+                    .width(180)
+                    .height(100)
+                    .content_fit(ContentFit::Contain),
+            );
+        } else if asset.is_some() {
+            preview_pane = preview_pane.push(text("Background image unavailable.").size(12));
+        }
+        let mut page = column![
             text("Terminal Themes").size(20),
             text("Create and manage color themes for the terminal and application.").size(13),
             checkbox(themes.apply_font)
                 .label("When enabled, applying a theme also changes font family and size.")
                 .on_toggle(Edit::ApplyFont),
+            row![list, preview_pane].spacing(16),
             row![
-                list,
-                column![
-                    text("Theme Preview").size(16),
-                    preview(name, scheme, font, size)
-                ]
-                .spacing(8)
-                .width(Length::Fill)
+                button("Import Java Themes…")
+                    .on_press(Edit::Java(exchange::Action::Open(exchange::Mode::Import))),
+                button("Export Java Themes…").on_press_maybe(
+                    themes
+                        .iter()
+                        .any(|theme| !theme.id.built_in())
+                        .then_some(Edit::Java(exchange::Action::Open(exchange::Mode::Export)))
+                ),
             ]
-            .spacing(16),
+            .spacing(8)
+            .wrap(),
         ]
-        .spacing(12)
-        .into()
+        .spacing(12);
+        if let Some(notice) = self.exchange.notice() {
+            page = page.push(text(notice).size(13));
+        }
+        page.into()
     }
 
-    fn form_view<'a>(&'a self, form: &'a Form) -> Element<'a, Edit> {
+    fn form_view<'a>(
+        &'a self,
+        form: &'a Form,
+        background: Option<&image::Handle>,
+        target: Option<&iced::widget::Id>,
+    ) -> Element<'a, Edit> {
         let mut controls = column![
             text(if form.id.is_some() {
                 "Edit Theme"
@@ -265,7 +457,10 @@ impl Editor {
             .size(20),
             field(
                 "Name",
-                text_input("Theme name", &form.name).on_input(Edit::Name)
+                crate::settings_search::mark_input(
+                    text_input("Theme name", &form.name).on_input(Edit::Name),
+                    target,
+                ),
             ),
             field(
                 "Font family",
@@ -314,6 +509,31 @@ impl Editor {
                 Edit::Cursor,
             ),
         ));
+        controls = controls
+            .push(form.background.view(background).map(Edit::Background))
+            .push(text("Agent panel colors").size(16));
+        let scheme = form.parsed().unwrap_or(form.scheme);
+        let derived = form
+            .agent_colors()
+            .filter(|colors| colors.iter().any(Option::is_some))
+            .map(|colors| {
+                crate::workspace::terminal_agent::palette::resolved_panel_colors(scheme, colors)
+            });
+        for (index, (label, input)) in AGENT_FIELDS.into_iter().zip(&form.agent_colors).enumerate()
+        {
+            let color = Rgb::parse(input).or_else(|| derived.map(|colors| colors[index]));
+            controls = controls.push(field(
+                label,
+                row![
+                    text_input("Default", input)
+                        .width(110)
+                        .on_input(move |value| Edit::AgentColor(index, value)),
+                    swatch(color.map_or(Color::TRANSPARENT, Rgb::color), 24.0, 20.0),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+            ));
+        }
         if let Some(problem) = self.problem {
             controls = controls.push(text(problem).style(text::danger).size(13));
         }
@@ -322,12 +542,13 @@ impl Editor {
                 button("Cancel")
                     .style(button::secondary)
                     .on_press(Edit::Cancel),
-                button("Save theme")
-                    .on_press_maybe((!form.name.trim().is_empty()).then_some(Edit::Apply)),
+                button("Save theme").on_press_maybe(
+                    (!form.name.trim().is_empty() && !form.background.working())
+                        .then_some(Edit::Apply),
+                ),
             ]
             .spacing(8),
         );
-        let scheme = form.parsed().unwrap_or(form.scheme);
         row![
             controls,
             preview(&form.name, scheme, scheme.family.font(), scheme.font_size)
@@ -513,5 +734,56 @@ fn preview_host(name: &str) -> String {
         "theme".into()
     } else {
         host
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced_runtime::{Action, task};
+
+    #[test]
+    fn theme_form_stages_image_and_panel_color_until_settings_save() {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let source = root.join("wallpaper.png");
+        ::image::RgbaImage::from_pixel(3, 2, ::image::Rgba([80, 96, 112, 255]))
+            .save(&source)
+            .unwrap();
+        let mut editor = Editor::default();
+        let mut themes = Themes::default();
+        let load = |editor: &mut Editor, themes: &mut Themes| {
+            let _ = editor.update(
+                themes,
+                Edit::Background(background::Action::Path(source.to_str().unwrap().into())),
+            );
+            let task = editor.update(themes, Edit::Background(background::Action::Preview));
+            let mut results = task::into_stream(task).unwrap();
+            let Some(Action::Output(result)) = block_on(results.next()) else {
+                panic!("expected the prepared image");
+            };
+            result
+        };
+        let _ = editor.update(&mut themes, Edit::New);
+        let obsolete = load(&mut editor, &mut themes);
+        let _ = editor.update(&mut themes, Edit::Cancel);
+        let _ = editor.update(&mut themes, Edit::New);
+        let _ = editor.update(&mut themes, obsolete);
+        assert!(editor.form.as_ref().unwrap().background.asset.is_none());
+        let loaded = load(&mut editor, &mut themes);
+        let _ = editor.update(&mut themes, loaded);
+        let _ = editor.update(&mut themes, Edit::Name("Preview".into()));
+        let _ = editor.update(&mut themes, Edit::AgentColor(4, "#AA88CC".into()));
+        let _ = editor.update(&mut themes, Edit::Apply);
+        let id = themes.selected().unwrap();
+        let asset = themes.background_asset(id).unwrap();
+        assert_eq!(
+            themes.agent_panel_colors(id).unwrap()[4],
+            Some(Rgb::from_hex(0xAA88CC))
+        );
+        assert!(!root.join(asset.relative_path()).exists());
+        editor.publish_backgrounds(&themes, &root).unwrap();
+        assert!(root.join(asset.relative_path()).is_file());
     }
 }

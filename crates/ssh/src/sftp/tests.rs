@@ -2,6 +2,9 @@ use std::io::Cursor;
 
 use super::*;
 
+mod in_place;
+mod upload_resume;
+
 #[test]
 fn negotiates_v3_and_checks_the_exact_replace_extension_version() {
     let mut replies = Vec::new();
@@ -54,6 +57,10 @@ fn checks_the_exact_server_copy_and_owner_extension_versions() {
         Err(Error::Unsupported(_))
     ));
     assert!(matches!(
+        client.set_permissions_no_follow("file", 0o640),
+        Err(Error::Unsupported(_))
+    ));
+    assert!(matches!(
         client.copy_regular_new(b"source", Attributes::default(), b"stage", || false),
         Err(Error::Unsupported(_))
     ));
@@ -89,6 +96,29 @@ fn no_follow_owner_encodes_the_omitted_id() {
     assert_eq!(fields.u32().unwrap(), wire::ATTR_UID_GID);
     assert_eq!(fields.u32().unwrap(), u32::MAX);
     assert_eq!(fields.u32().unwrap(), 17);
+    fields.finish().unwrap();
+}
+
+#[test]
+fn no_follow_permissions_encode_only_the_requested_mode() {
+    let mut replies = Vec::new();
+    push_version(&mut replies, 3, &[(LSETSTAT, b"1")]);
+    push_status(&mut replies, 1, 0, "");
+    let mut client = Sftp::new(Cursor::new(replies), Vec::new()).unwrap();
+    assert!(matches!(
+        client.set_permissions_no_follow("file", 0o100640),
+        Err(Error::InvalidInput(_))
+    ));
+    client.set_permissions_no_follow("file", 0o640).unwrap();
+    let packets = requests(client.writer);
+    assert_eq!(packets.len(), 2);
+    let mut fields = Decoder::new(&packets[1]);
+    assert_eq!(fields.byte().unwrap(), wire::EXTENDED);
+    assert_eq!(fields.u32().unwrap(), 1);
+    assert_eq!(fields.string().unwrap(), LSETSTAT);
+    assert_eq!(fields.string().unwrap(), b"file");
+    assert_eq!(fields.u32().unwrap(), wire::ATTR_PERMISSIONS);
+    assert_eq!(fields.u32().unwrap(), 0o640);
     fields.finish().unwrap();
 }
 
@@ -284,6 +314,392 @@ fn advances_download_by_actual_byte_count_and_checks_remote_close() {
 }
 
 #[test]
+fn download_cancellation_after_a_short_local_write_closes_the_handle() {
+    struct Destination(u8);
+    impl Write for Destination {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 += 1;
+            match self.0 {
+                1 => {
+                    assert_eq!(bytes, b"abc");
+                    Ok(1)
+                }
+                2 => {
+                    assert_eq!(bytes, b"bc");
+                    Err(io::ErrorKind::Interrupted.into())
+                }
+                _ => panic!("Cancellation must not retry the download writer"),
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            panic!("Cancellation must not flush the download writer")
+        }
+    }
+
+    let mut replies = Vec::new();
+    push_version(&mut replies, 3, &[]);
+    push_string_reply(&mut replies, wire::HANDLE, 1, b"read");
+    push_string_reply(&mut replies, wire::DATA, 2, b"abc");
+    push_status(&mut replies, 3, 0, "");
+    push_reply(&mut replies, wire::ATTRS, 4, &[0; 4]);
+    let mut client = Sftp::new(Cursor::new(replies), Vec::new()).unwrap();
+    let mut destination = Destination(0);
+    let error = client.download("data", &mut destination).unwrap_err();
+    assert!(matches!(error, Error::LocalIo(error) if error.kind() == io::ErrorKind::Interrupted));
+    assert_eq!(destination.0, 2);
+    client.stat(".").unwrap();
+    let packets = requests(client.writer);
+    assert_eq!(packets.len(), 5);
+    assert_eq!(packets[2][0], wire::READ);
+    assert_eq!(packets[3][0], wire::CLOSE);
+    assert_eq!(packets[4][0], wire::STAT);
+}
+
+#[test]
+fn download_rejects_zero_and_invalid_local_write_counts() {
+    struct Destination(usize);
+    impl Write for Destination {
+        fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+            Ok(self.0)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            panic!("A failed local write must not flush the destination")
+        }
+    }
+
+    for (count, kind) in [
+        (0, io::ErrorKind::WriteZero),
+        (4, io::ErrorKind::InvalidData),
+    ] {
+        let mut replies = Vec::new();
+        push_version(&mut replies, 3, &[]);
+        push_string_reply(&mut replies, wire::HANDLE, 1, b"read");
+        push_string_reply(&mut replies, wire::DATA, 2, b"abc");
+        push_status(&mut replies, 3, 0, "");
+        let mut client = Sftp::new(Cursor::new(replies), Vec::new()).unwrap();
+        let error = client.download("data", Destination(count)).unwrap_err();
+        assert!(matches!(error, Error::LocalIo(error) if error.kind() == kind));
+        let packets = requests(client.writer);
+        assert_eq!(packets.len(), 4);
+        assert_eq!(packets[3][0], wire::CLOSE);
+    }
+}
+
+#[test]
+fn regular_download_resume_checks_a_bounded_overlap_before_appending() {
+    let offset = (DOWNLOAD_OVERLAP_BYTES + 101) as u64;
+    let expected = Attributes {
+        size: Some(offset + 3),
+        permissions: Some(0o100600),
+        accessed: Some(0),
+        modified: Some(23),
+        ..Attributes::default()
+    };
+    let mut attrs = (1u32 | wire::ATTR_PERMISSIONS | 8).to_be_bytes().to_vec();
+    attrs.extend_from_slice(&expected.size.unwrap().to_be_bytes());
+    attrs.extend_from_slice(&expected.permissions.unwrap().to_be_bytes());
+    attrs.extend_from_slice(&0u32.to_be_bytes());
+    attrs.extend_from_slice(&23u32.to_be_bytes());
+    let overlap = vec![b'x'; DOWNLOAD_OVERLAP_BYTES];
+    for changed in [false, true] {
+        let mut replies = Vec::new();
+        push_version(&mut replies, 3, &[]);
+        push_reply(&mut replies, wire::ATTRS, 1, &attrs);
+        push_string_reply(&mut replies, wire::HANDLE, 2, b"read");
+        push_reply(&mut replies, wire::ATTRS, 3, &attrs);
+        push_reply(&mut replies, wire::ATTRS, 4, &attrs);
+        push_string_reply(&mut replies, wire::DATA, 5, &overlap[..CHUNK]);
+        if changed {
+            push_string_reply(&mut replies, wire::DATA, 6, b"y");
+            // The source mismatch is decisive even if CLOSE loses the connection.
+        } else {
+            push_string_reply(&mut replies, wire::DATA, 6, &overlap[CHUNK..]);
+            push_string_reply(&mut replies, wire::DATA, 7, b"new");
+            push_status(&mut replies, 8, 1, "EOF");
+            push_reply(&mut replies, wire::ATTRS, 9, &attrs);
+            push_status(&mut replies, 10, 0, "");
+            push_reply(&mut replies, wire::ATTRS, 11, &attrs);
+        }
+        let mut client = Sftp::new(Cursor::new(replies), Vec::new()).unwrap();
+        let mut appended = Vec::new();
+        let result =
+            client.download_regular_from(b"/file", expected, offset, &overlap, &mut appended);
+        let requested_offsets = requests(client.writer)
+            .into_iter()
+            .filter(|packet| packet[0] == wire::READ)
+            .map(|packet| {
+                let mut fields = Decoder::new(&packet);
+                assert_eq!(fields.byte().unwrap(), wire::READ);
+                fields.u32().unwrap();
+                assert_eq!(fields.string().unwrap(), b"read");
+                let at = fields.u64().unwrap();
+                assert_eq!(fields.u32().unwrap(), CHUNK as u32);
+                fields.finish().unwrap();
+                at
+            })
+            .collect::<Vec<_>>();
+        if changed {
+            assert!(matches!(result, Err(Error::SourceChanged)));
+            assert!(appended.is_empty());
+            assert_eq!(requested_offsets, [101, 101 + CHUNK as u64]);
+        } else {
+            assert_eq!(result.unwrap(), offset + 3);
+            assert_eq!(appended, b"new");
+            assert_eq!(
+                requested_offsets,
+                [101, 101 + CHUNK as u64, offset, offset + 3]
+            );
+        }
+    }
+}
+
+#[test]
+fn win32_checked_download_accepts_only_measured_handle_mode_pairs() {
+    let expected = Attributes {
+        size: Some(3),
+        uid: Some(0),
+        gid: Some(0),
+        modified: Some(23),
+        ..Attributes::default()
+    };
+    for (path_mode, handle_mode) in [
+        (0o100600, 0o100666),
+        (0o100700, 0o100666),
+        (0o100400, 0o100444),
+        (0o100500, 0o100444),
+    ] {
+        let path = Attributes {
+            permissions: Some(path_mode),
+            ..expected
+        };
+        let handle = Attributes {
+            permissions: Some(handle_mode),
+            ..expected
+        };
+        assert!(check_regular_handle(b"/C:/test/file", path, handle).is_ok());
+        for invalid in [
+            b"/file".as_slice(),
+            b"/C:/",
+            b"/C:/test/../file",
+            b"/C:/file:stream",
+        ] {
+            assert!(matches!(
+                check_regular_handle(invalid, path, handle),
+                Err(Error::SourceChanged)
+            ));
+        }
+        for incomplete in [
+            Attributes { size: None, ..path },
+            Attributes {
+                modified: None,
+                ..path
+            },
+            Attributes {
+                uid: Some(4),
+                ..path
+            },
+        ] {
+            assert!(matches!(
+                check_regular_handle(
+                    b"/C:/test/file",
+                    incomplete,
+                    Attributes {
+                        permissions: Some(handle_mode),
+                        ..incomplete
+                    }
+                ),
+                Err(Error::SourceChanged)
+            ));
+        }
+    }
+}
+
+#[test]
+fn durable_resume_checks_bytes_before_the_overlap_on_the_same_handle() {
+    let prefix = vec![b'x'; DOWNLOAD_OVERLAP_BYTES + 101];
+    let offset = prefix.len() as u64;
+    let expected = Attributes {
+        size: Some(offset + 3),
+        permissions: Some(0o100600),
+        accessed: Some(0),
+        modified: Some(23),
+        ..Attributes::default()
+    };
+    let mut attrs = (1u32 | wire::ATTR_PERMISSIONS | 8).to_be_bytes().to_vec();
+    attrs.extend_from_slice(&expected.size.unwrap().to_be_bytes());
+    attrs.extend_from_slice(&expected.permissions.unwrap().to_be_bytes());
+    attrs.extend_from_slice(&0u32.to_be_bytes());
+    attrs.extend_from_slice(&23u32.to_be_bytes());
+    for changed in [false, true] {
+        let mut replies = Vec::new();
+        push_version(&mut replies, 3, &[]);
+        push_reply(&mut replies, wire::ATTRS, 1, &attrs);
+        push_string_reply(&mut replies, wire::HANDLE, 2, b"read");
+        push_reply(&mut replies, wire::ATTRS, 3, &attrs);
+        push_reply(&mut replies, wire::ATTRS, 4, &attrs);
+        if changed {
+            // The old overlap starts at 101 and would miss this modification.
+            push_string_reply(&mut replies, wire::DATA, 5, b"y");
+        } else {
+            for (index, bytes) in prefix.chunks(CHUNK).enumerate() {
+                push_string_reply(&mut replies, wire::DATA, 5 + index as u32, bytes);
+            }
+            push_string_reply(&mut replies, wire::DATA, 8, b"new");
+            push_status(&mut replies, 9, 1, "EOF");
+            push_reply(&mut replies, wire::ATTRS, 10, &attrs);
+            push_status(&mut replies, 11, 0, "");
+            push_reply(&mut replies, wire::ATTRS, 12, &attrs);
+        }
+        let mut client = Sftp::new(Cursor::new(replies), Vec::new()).unwrap();
+        let mut appended = Vec::new();
+        let result = client.download_regular_with_prefix(
+            b"/file",
+            expected,
+            offset,
+            Cursor::new(&prefix),
+            &mut appended,
+        );
+        if changed {
+            assert!(matches!(result, Err(Error::SourceChanged)));
+            assert!(appended.is_empty());
+        } else {
+            assert_eq!(result.unwrap(), offset + 3);
+            assert_eq!(appended, b"new");
+        }
+    }
+}
+
+#[test]
+fn durable_resume_propagates_prefix_cancellation_without_retrying() {
+    struct Cancelled(bool);
+    impl Read for Cancelled {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            assert!(!self.0, "Cancellation must not retry the prefix reader");
+            self.0 = true;
+            Err(io::ErrorKind::Interrupted.into())
+        }
+    }
+    let expected = Attributes {
+        size: Some(2),
+        permissions: Some(0o100600),
+        accessed: Some(0),
+        modified: Some(23),
+        ..Attributes::default()
+    };
+    let mut attrs = (1u32 | wire::ATTR_PERMISSIONS | 8).to_be_bytes().to_vec();
+    attrs.extend_from_slice(&2u64.to_be_bytes());
+    attrs.extend_from_slice(&0o100600u32.to_be_bytes());
+    attrs.extend_from_slice(&0u32.to_be_bytes());
+    attrs.extend_from_slice(&23u32.to_be_bytes());
+    let mut replies = Vec::new();
+    push_version(&mut replies, 3, &[]);
+    push_reply(&mut replies, wire::ATTRS, 1, &attrs);
+    push_string_reply(&mut replies, wire::HANDLE, 2, b"read");
+    push_reply(&mut replies, wire::ATTRS, 3, &attrs);
+    push_reply(&mut replies, wire::ATTRS, 4, &attrs);
+    push_string_reply(&mut replies, wire::DATA, 5, b"x");
+    push_status(&mut replies, 6, 0, "");
+    let mut client = Sftp::new(Cursor::new(replies), Vec::new()).unwrap();
+    let error = client
+        .download_regular_with_prefix(b"/file", expected, 1, Cancelled(false), Vec::new())
+        .unwrap_err();
+    assert!(matches!(error, Error::LocalIo(error) if error.kind() == io::ErrorKind::Interrupted));
+}
+
+#[test]
+fn win32_checked_download_keeps_identity_and_same_handle_checks() {
+    let path = Attributes {
+        size: Some(3),
+        uid: Some(0),
+        gid: Some(0),
+        permissions: Some(0o100600),
+        accessed: Some(0),
+        modified: Some(23),
+    };
+    let handle = Attributes {
+        permissions: Some(0o100666),
+        ..path
+    };
+    let attrs = |attrs: Attributes| {
+        let mut fields = (1u32 | 2 | wire::ATTR_PERMISSIONS | 8)
+            .to_be_bytes()
+            .to_vec();
+        fields.extend_from_slice(&attrs.size.unwrap().to_be_bytes());
+        for value in [
+            attrs.uid,
+            attrs.gid,
+            attrs.permissions,
+            attrs.accessed,
+            attrs.modified,
+        ] {
+            fields.extend_from_slice(&value.unwrap().to_be_bytes());
+        }
+        fields
+    };
+    for (opened, final_handle, final_path) in [
+        (handle, handle, path),
+        (
+            Attributes {
+                uid: Some(4),
+                ..handle
+            },
+            handle,
+            path,
+        ),
+        (
+            Attributes {
+                modified: Some(24),
+                ..handle
+            },
+            handle,
+            path,
+        ),
+        (handle, path, path),
+        (
+            handle,
+            handle,
+            Attributes {
+                permissions: Some(0o100700),
+                ..path
+            },
+        ),
+    ] {
+        let mut replies = Vec::new();
+        push_version(&mut replies, 3, &[]);
+        push_reply(&mut replies, wire::ATTRS, 1, &attrs(path));
+        push_string_reply(&mut replies, wire::HANDLE, 2, b"read");
+        push_reply(&mut replies, wire::ATTRS, 3, &attrs(opened));
+        if opened != handle {
+            push_status(&mut replies, 4, 0, "");
+        } else {
+            push_reply(&mut replies, wire::ATTRS, 4, &attrs(path));
+            push_string_reply(&mut replies, wire::DATA, 5, b"abc");
+            push_status(&mut replies, 6, 1, "EOF");
+            push_reply(&mut replies, wire::ATTRS, 7, &attrs(final_handle));
+            push_status(&mut replies, 8, 0, "");
+            if final_handle == handle {
+                push_reply(&mut replies, wire::ATTRS, 9, &attrs(final_path));
+            }
+        }
+        let mut client = Sftp::new(Cursor::new(replies), Vec::new()).unwrap();
+        let mut local = Vec::new();
+        let result = client.download_regular(b"/C:/file", path, &mut local);
+        if opened == handle && final_handle == handle && final_path == path {
+            assert_eq!(result.unwrap(), 3);
+        } else {
+            assert!(matches!(result, Err(Error::SourceChanged)));
+        }
+        if opened == handle {
+            assert_eq!(local, b"abc");
+        } else {
+            assert!(local.is_empty());
+        }
+    }
+}
+
+#[test]
 fn uploads_exclusively_and_closes_the_handle_after_a_local_failure() {
     // Test double for a local file whose next read fails.
     struct FailingSource;
@@ -318,6 +734,35 @@ fn uploads_exclusively_and_closes_the_handle_after_a_local_failure() {
     fields.finish().unwrap();
     assert_eq!(requests[2][0], wire::CLOSE);
     assert_eq!(requests[3][0], wire::STAT);
+}
+
+#[test]
+fn new_upload_cancellation_closes_the_handle_without_retrying_the_local_reader() {
+    struct CancelledSource(bool);
+    impl Read for CancelledSource {
+        fn read(&mut self, _: &mut [u8]) -> io::Result<usize> {
+            assert!(!self.0, "Cancellation must not retry the upload reader");
+            self.0 = true;
+            Err(io::ErrorKind::Interrupted.into())
+        }
+    }
+
+    let mut replies = Vec::new();
+    push_version(&mut replies, 3, &[]);
+    push_string_reply(&mut replies, wire::HANDLE, 1, b"write");
+    push_status(&mut replies, 2, 0, "");
+    push_reply(&mut replies, wire::ATTRS, 3, &[0; 4]);
+    let mut client = Sftp::new(Cursor::new(replies), Vec::new()).unwrap();
+    let mut source = CancelledSource(false);
+    let error = client.upload_new("part", &mut source).unwrap_err();
+    assert!(matches!(error, Error::LocalIo(error) if error.kind() == io::ErrorKind::Interrupted));
+    assert!(source.0);
+    client.stat(".").unwrap();
+    let packets = requests(client.writer);
+    assert_eq!(packets.len(), 4);
+    assert_eq!(packets[1][0], wire::OPEN);
+    assert_eq!(packets[2][0], wire::CLOSE);
+    assert_eq!(packets[3][0], wire::STAT);
 }
 
 // Scripted protocol peer used only by the focused wire tests.

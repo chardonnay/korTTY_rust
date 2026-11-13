@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+#[cfg(unix)]
 use std::io;
+#[cfg(unix)]
 use std::path::{Path, PathBuf};
 
 use async_channel::bounded;
@@ -49,14 +51,11 @@ impl Workspace {
                 self.terminal_file_error(owner, "Wait for the snippet transfer to finish."),
             );
         }
-        if !remote && (!cfg!(unix) || pane.session.local_shell_pid().is_none()) {
+        if !remote && pane.session.local_shell_pid().is_none() {
             return None;
         }
         let policy = self.clipboard.policy.remote_editor;
-        if self.clipboard.policy.problem.is_some()
-            || policy == RemoteEditorPolicy::Deny
-            || (remote && !self.clipboard.policy.file_transfer_allowed)
-        {
+        if self.clipboard.policy.problem.is_some() || policy == RemoteEditorPolicy::Deny {
             return Some(self.terminal_file_error(owner, "File opening is disabled by policy."));
         }
         if self.terminal_files.pending.len() >= MAX_PENDING {
@@ -120,28 +119,33 @@ impl Workspace {
         {
             return Err("Opening files from a sandboxed shell is unavailable.".into());
         }
-        let directory = pane
+        #[cfg(unix)]
+        let path = pane
             .session
             .local_shell_directory()
             .map_err(|_| "The shell directory could not be requested.")?;
+        #[cfg(windows)]
+        let path = pane.session.windows_terminal_file(&file)?;
         let (reply, received) = bounded(1);
         let (finished, done) = bounded(1);
         std::thread::Builder::new()
             .name("kortty-terminal-file".into())
             .spawn(move || {
-                let result = directory
+                let path = path
                     .recv_blocking()
-                    .map_err(|_| "The original shell closed.".into())
-                    .and_then(|result| result.map_err(|error| error.to_string()))
-                    .and_then(|directory| {
-                        let path =
-                            local_path(&directory, &file).map_err(|error| error.to_string())?;
-                        editor_window::open_terminal_document(
-                            &path,
-                            policy == RemoteEditorPolicy::Allow,
-                        )
-                        .map_err(|error| error.to_string())
-                    });
+                    .map_err(|_| "The original shell closed.".to_owned())
+                    .and_then(|result| result.map_err(|error| error.to_string()));
+                #[cfg(unix)]
+                let path = path.and_then(|directory| {
+                    local_path(&directory, &file).map_err(|error| error.to_string())
+                });
+                let result = path.and_then(|path| {
+                    editor_window::open_terminal_document(
+                        &path,
+                        policy == RemoteEditorPolicy::Allow,
+                    )
+                    .map_err(|error| error.to_string())
+                });
                 let _ = reply.try_send(result);
                 drop(finished);
             })
@@ -169,11 +173,12 @@ impl Workspace {
         let (pane, opener) = self
             .remote_pane(session)
             .ok_or("The original SSH connection is unavailable.")?;
-        let label = pane
+        let target = pane
             .ssh
             .as_ref()
             .ok_or("The original SSH target is unavailable.")?
-            .label();
+            .clone();
+        let label = target.label();
         let directory = self
             .remote_shell_file_context(session)
             .ok_or("The original remote shell could not be verified.")?;
@@ -213,6 +218,7 @@ impl Workspace {
                 ),
             }
         };
+        worker.bind_policy_route(&target);
         let editor = worker
             .editor()
             .ok_or("The original SFTP channel is unavailable.")?;
@@ -260,7 +266,10 @@ impl Workspace {
         let task = if self.clipboard.policy.problem.is_none()
             && self.clipboard.policy.remote_editor == policy
             && self.terminal_file_pane(owner, session).is_some_and(|pane| {
-                pane.ssh.is_none() || self.clipboard.policy.file_transfer_allowed
+                remote
+                    || (pane.session.sandbox_backend().is_none()
+                        && self.clipboard.policy.minimum_isolation
+                            != crate::session_security::IsolationLevel::Sandbox)
             }) {
             match result {
                 Ok(document)
@@ -397,6 +406,7 @@ impl Workspace {
     }
 }
 
+#[cfg(unix)]
 fn local_path(directory: &Path, path: &str) -> io::Result<PathBuf> {
     if path.contains('\\') || path.starts_with("//") || path.contains(':') || path.ends_with('/') {
         return Err(io::Error::new(

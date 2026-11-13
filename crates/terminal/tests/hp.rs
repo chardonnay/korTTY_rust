@@ -1,7 +1,8 @@
 use std::fmt::Write;
 
 use kortty_terminal::{
-    Color, Hp2392Input, KeyModifiers, ScreenSnapshot, Terminal, TerminalKey, TerminalProfile,
+    Cell, Color, Hp2392Input, KeyModifiers, ScreenSnapshot, Terminal, TerminalKey, TerminalProfile,
+    TextEncoding,
 };
 
 fn feed(terminal: &mut Terminal, bytes: &[u8]) {
@@ -11,9 +12,11 @@ fn feed(terminal: &mut Terminal, bytes: &[u8]) {
 }
 
 fn line(screen: &ScreenSnapshot, row: u16) -> String {
-    screen
-        .row(row)
-        .unwrap()
+    line_text(screen.row(row).unwrap())
+}
+
+fn line_text(cells: &[Cell]) -> String {
+    cells
         .iter()
         .map(|cell| {
             if cell.text.is_empty() {
@@ -22,6 +25,15 @@ fn line(screen: &ScreenSnapshot, row: u16) -> String {
                 cell.text.as_str()
             }
         })
+        .collect()
+}
+
+fn decode_hex(hex: &str) -> Vec<u8> {
+    let (pairs, remainder) = hex.as_bytes().as_chunks::<2>();
+    assert!(remainder.is_empty());
+    pairs
+        .iter()
+        .map(|pair| u8::from_str_radix(std::str::from_utf8(pair).unwrap(), 16).unwrap())
         .collect()
 }
 
@@ -168,6 +180,314 @@ fn hp_mode_streams_match_pinned_java_captures() {
     }
 }
 
+#[test]
+fn hp_stream_tabs_and_page_clears_match_the_pinned_capture() {
+    let input = include_bytes!("fixtures/hp/hp-stream-operations.bin");
+    let expected = include_str!("fixtures/hp/hp-stream-operations.after.txt");
+    for profile in [TerminalProfile::Hp2392, TerminalProfile::Hp70092] {
+        for chunk_size in [1, 7, input.len()] {
+            let mut terminal = Terminal::with_profile(12, 4, profile);
+            for chunk in input.chunks(chunk_size) {
+                terminal.advance(chunk);
+            }
+            let screen = terminal.snapshot();
+            let mut capture = String::new();
+            for row in 0..screen.rows {
+                writeln!(capture, "row{row}={}", line(&screen, row).trim_end()).unwrap();
+            }
+            writeln!(
+                capture,
+                "cursor={},{}",
+                screen.cursor.row, screen.cursor.column
+            )
+            .unwrap();
+            writeln!(capture, "history={}", screen.scrollback_lines).unwrap();
+            for row in 0..screen.scrollback_lines {
+                let cells = terminal.history_line(row).unwrap();
+                let underline: String = cells
+                    .iter()
+                    .map(|cell| if cell.style.underline { 'U' } else { '.' })
+                    .collect();
+                writeln!(capture, "{}|{underline}", line_text(&cells).trim_end()).unwrap();
+            }
+            assert_eq!(capture, expected, "{profile:?}, chunk size {chunk_size}");
+        }
+    }
+}
+
+#[test]
+fn hp_stream_edits_preserve_the_pending_right_margin() {
+    let streams: Vec<_> = include_str!("fixtures/hp/hp-right-margin-edits.tsv")
+        .lines()
+        .map(|line| {
+            let (label, hex) = line.split_once('\t').unwrap();
+            (label, decode_hex(hex))
+        })
+        .collect();
+    let expected =
+        include_str!("fixtures/hp/hp-right-margin-edits.after.txt").replace("\r\n", "\n");
+    for (profile, ansi) in [
+        (TerminalProfile::Hp2392, false),
+        (TerminalProfile::Hp70092, false),
+        (TerminalProfile::Hp70092, true),
+    ] {
+        for chunk_size in [1, 7, usize::MAX] {
+            let mut capture = String::new();
+            for (label, bytes) in &streams {
+                let mut terminal = Terminal::with_profile(12, 4, profile);
+                if ansi {
+                    feed(&mut terminal, b"\x1b)");
+                }
+                for chunk in bytes.chunks(chunk_size) {
+                    terminal.advance(chunk);
+                }
+                let screen = terminal.snapshot();
+                let visible = (0..screen.rows)
+                    .map(|row| line(&screen, row).trim_end().to_owned())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                writeln!(
+                    capture,
+                    "{label} cursor={},{} wrapped={} underline={} screen=[{visible}]",
+                    screen.cursor.row,
+                    screen.cursor.column,
+                    screen.wrapped_columns(1).is_some(),
+                    screen.row(1).unwrap()[11].style.underline,
+                )
+                .unwrap();
+            }
+            assert_eq!(
+                capture, expected,
+                "{profile:?}, ANSI={ansi}, chunk size {chunk_size}"
+            );
+        }
+    }
+}
+
+#[test]
+fn hp_stream_cursor_and_line_edits_cross_scroll_margins_as_in_the_reference() {
+    let streams: Vec<_> = include_str!("fixtures/hp/hp-scroll-region-edits.tsv")
+        .lines()
+        .map(|line| {
+            let (label, stream) = line.split_once('\t').unwrap();
+            let (profile, hex) = stream.split_once('\t').unwrap();
+            let profile = match profile {
+                "2392" => TerminalProfile::Hp2392,
+                "70092" => TerminalProfile::Hp70092,
+                _ => panic!("unknown HP fixture profile {profile}"),
+            };
+            (label, profile, decode_hex(hex))
+        })
+        .collect();
+    let expected =
+        include_str!("fixtures/hp/hp-scroll-region-edits.after.txt").replace("\r\n", "\n");
+    for chunk_size in [1, 7, usize::MAX] {
+        let mut capture = String::new();
+        for (label, profile, bytes) in &streams {
+            let mut terminal = Terminal::with_profile(12, 4, *profile);
+            for chunk in bytes.chunks(chunk_size) {
+                terminal.advance(chunk);
+            }
+            let screen = terminal.snapshot();
+            let lock = terminal
+                .hp2392_modes()
+                .and_then(|mode| mode.memory_lock_row)
+                .map_or_else(|| "-".to_owned(), |row| row.to_string());
+            let history = (0..screen.scrollback_lines)
+                .map(|row| {
+                    line_text(&terminal.history_line(row).unwrap())
+                        .trim_end()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+                .join("|");
+            let visible = (0..screen.rows)
+                .map(|row| line(&screen, row).trim_end().to_owned())
+                .collect::<Vec<_>>()
+                .join("|");
+            writeln!(
+                capture,
+                "{label} cursor={},{} lock={lock} history=[{history}] screen=[{visible}]",
+                screen.cursor.row, screen.cursor.column,
+            )
+            .unwrap();
+        }
+        assert_eq!(capture, expected, "chunk size {chunk_size}");
+    }
+}
+
+#[test]
+fn hp2392_hardware_block_mode_keeps_locked_row_controls() {
+    let mut terminal = Terminal::with_profile(12, 4, TerminalProfile::Hp2392);
+    feed(
+        &mut terminal,
+        b"head\r\nlock\r\none\r\ntwo\x1b&a3c1R\x1b`\x1b&k1B\x1b&a2c2R\x1bA",
+    );
+    let cursor = terminal.snapshot().cursor;
+    assert_eq!((cursor.row, cursor.column), (2, 2));
+    assert!(terminal.hp2392_modes().unwrap().block_mode);
+    feed(&mut terminal, b"\x1b&a2c1R\x1bL");
+    let screen = terminal.snapshot();
+    assert_eq!(line(&screen, 1).trim_end(), "lock");
+    assert_eq!(line(&screen, 2).trim_end(), "one");
+    assert_eq!(line(&screen, 3).trim_end(), "two");
+}
+
+#[test]
+fn hp2392_last_row_lock_updates_when_hardware_block_mode_changes() {
+    let changes = b"\x1b&k1B\x1bS\x1b&a0c3Rfield\x1b&k0B\x1bS";
+    for chunk_size in [1, changes.len()] {
+        let mut terminal = Terminal::with_profile(12, 4, TerminalProfile::Hp2392);
+        terminal.advance(b"header\r\nlocked\r\nthird\r\nbottom\x1b`");
+        for chunk in changes.chunks(chunk_size) {
+            terminal.advance(chunk);
+        }
+        let screen = terminal.snapshot();
+        assert_eq!(line(&screen, 2).trim_end(), "third");
+        assert_eq!(line(&screen, 3).trim_end(), "field");
+        let modes = terminal.hp2392_modes().unwrap();
+        assert!(!modes.block_mode);
+        assert_eq!(modes.memory_lock_row, Some(3));
+    }
+}
+
+#[test]
+fn hp2392_last_row_lock_survives_grid_resize() {
+    let mut terminal = Terminal::with_profile(12, 4, TerminalProfile::Hp2392);
+    terminal.advance(b"header\r\nlocked\r\nthird\r\nbottom\x1b`\x1b&a1c3R");
+    terminal.resize(13, 4);
+    assert_eq!(terminal.snapshot().cursor.row, 3);
+    terminal.echo_serial_input(b"\n");
+    let screen = terminal.snapshot();
+    assert_eq!(line(&screen, 3).trim_end(), "bottom");
+    assert_eq!(screen.scrollback_lines, 0);
+
+    terminal.resize(13, 5);
+    terminal.advance(b"\x1b&a0c4Rfree\x1bS");
+    let screen = terminal.snapshot();
+    assert_eq!(line(&screen, 3).trim_end(), "bottom");
+    assert!(line(&screen, 4).trim_end().is_empty());
+}
+
+#[test]
+fn hp_stream_cursor_motion_preserves_the_virtual_right_margin() {
+    assert_shared_stream_captures(
+        include_str!("fixtures/hp/hp-virtual-cursor.tsv"),
+        include_str!("fixtures/hp/hp-virtual-cursor.after.txt"),
+    );
+}
+
+#[test]
+fn hp_stream_erase_saved_lines_clears_the_visible_page() {
+    let streams = include_str!("fixtures/hp/hp-clear-history.tsv");
+    let expected = include_str!("fixtures/hp/hp-clear-history.after.txt");
+    assert_eq!(streams.lines().count(), expected.lines().count());
+    for (stream, expected) in streams.lines().zip(expected.lines()) {
+        let (label, stream) = stream.split_once('\t').unwrap();
+        let (rows, hex_input) = stream.split_once('\t').unwrap();
+        let rows = rows.parse().unwrap();
+        let input = decode_hex(hex_input);
+        for (profile, ansi) in [
+            (TerminalProfile::Hp2392, false),
+            (TerminalProfile::Hp70092, false),
+            (TerminalProfile::Hp70092, true),
+        ] {
+            for chunk_size in [1, 7, input.len()] {
+                let mut terminal = Terminal::with_profile(12, rows, profile);
+                if ansi {
+                    terminal.advance(b"\x1b)");
+                }
+                for chunk in input.chunks(chunk_size) {
+                    terminal.advance(chunk);
+                }
+                let screen = terminal.snapshot();
+                let visible = (0..screen.rows)
+                    .map(|row| line(&screen, row).trim_end().to_owned())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                let history = (0..screen.scrollback_lines)
+                    .map(|row| {
+                        line_text(&terminal.history_line(row).unwrap())
+                            .trim_end()
+                            .to_owned()
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|");
+                let actual = format!(
+                    "{label} cursor={},{} reply={} screen=[{visible}] history=[{history}]",
+                    screen.cursor.row,
+                    screen.cursor.column,
+                    hex(&terminal.take_responses()),
+                );
+                assert_eq!(
+                    actual, expected,
+                    "{profile:?}, ANSI={ansi}, chunk size {chunk_size}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn hp_stream_softkeys_count_utf16_units_and_replay_text() {
+    // The Java capture keeps a trailing wide-cell marker that Rust trims.
+    let expected = include_str!("fixtures/hp/hp-softkey-text.after.txt").replace("\u{e000}|", "|");
+    assert_shared_stream_captures(include_str!("fixtures/hp/hp-softkey-text.tsv"), &expected);
+
+    for profile in [TerminalProfile::Hp2392, TerminalProfile::Hp70092] {
+        let mut serial = Terminal::with_profile_and_encoding(12, 4, profile, TextEncoding::Latin1);
+        feed(&mut serial, b"\x1b&f1a1d\xc31L\xe9\x1bp");
+        assert_eq!(line(&serial.snapshot(), 0).trim_end(), "é");
+
+        let mut malformed = Terminal::with_profile(12, 4, profile);
+        feed(&mut malformed, b"\x1b&f1a1L\xc3\x1bpX");
+        assert_eq!(line(&malformed.snapshot(), 0).trim_end(), "�X");
+    }
+}
+
+fn assert_shared_stream_captures(streams: &str, expected: &str) {
+    assert_eq!(streams.lines().count(), expected.lines().count());
+    for (stream, expected) in streams.lines().zip(expected.lines()) {
+        let (label, stream) = stream.split_once('\t').unwrap();
+        let (mode, input) = stream.split_once('\t').unwrap();
+        assert!(matches!(mode, "shared" | "ansi"));
+        let bytes = decode_hex(input);
+        for (profile, ansi) in [
+            (TerminalProfile::Hp2392, false),
+            (TerminalProfile::Hp70092, false),
+            (TerminalProfile::Hp70092, true),
+        ] {
+            if mode == "ansi" && !ansi {
+                continue;
+            }
+            for chunk_size in [1, 7, bytes.len()] {
+                let mut terminal = Terminal::with_profile(12, 4, profile);
+                if ansi {
+                    feed(&mut terminal, b"\x1b)");
+                }
+                for chunk in bytes.chunks(chunk_size) {
+                    terminal.advance(chunk);
+                }
+                let screen = terminal.snapshot();
+                let visible = (0..screen.rows)
+                    .map(|row| line(&screen, row).trim_end().to_owned())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                let actual = format!(
+                    "{label} cursor={},{} reply={} screen=[{visible}]",
+                    screen.cursor.row,
+                    screen.cursor.column,
+                    hex(&terminal.take_responses()),
+                );
+                assert_eq!(
+                    actual, expected,
+                    "{profile:?}, ANSI={ansi}, chunk size {chunk_size}"
+                );
+            }
+        }
+    }
+}
+
 const ENTER: Hp2392Input = Hp2392Input::Key { enter: true };
 const KEY: Hp2392Input = Hp2392Input::Key { enter: false };
 
@@ -294,6 +614,39 @@ fn malformed_sequences_and_recursive_softkeys_recover_without_host_side_effects(
     assert!(!screen.row(1).unwrap()[1].style.bold);
     assert!(terminal.take_responses().is_empty());
     assert!(terminal.take_clipboard_requests().is_empty());
+}
+
+#[test]
+fn hp_modified_arrows_use_the_platform_bindings_on_both_profiles() {
+    for profile in [TerminalProfile::Hp2392, TerminalProfile::Hp70092] {
+        let snapshot = Terminal::with_profile(80, 24, profile).snapshot();
+        for line in include_str!("fixtures/hp/hp-modified-arrows.tsv").lines() {
+            let [key, flags, windows, linux, mac] =
+                <[_; 5]>::try_from(line.split('\t').collect::<Vec<_>>()).unwrap();
+            let key = match key {
+                "left" => TerminalKey::Left,
+                "right" => TerminalKey::Right,
+                "up" => TerminalKey::Up,
+                "down" => TerminalKey::Down,
+                "tab" => TerminalKey::Tab,
+                _ => panic!("Unknown HP key {key}"),
+            };
+            let modifiers = KeyModifiers {
+                alt: flags.contains('a'),
+                control: flags.contains('c'),
+                shift: flags.contains('s'),
+            };
+            let expected = if cfg!(target_os = "macos") {
+                mac
+            } else if cfg!(target_os = "windows") {
+                windows
+            } else {
+                linux
+            };
+            let actual = snapshot.encode_key(key, modifiers).unwrap();
+            assert_eq!(hex(&actual), expected, "{profile:?}: {line}");
+        }
+    }
 }
 
 #[test]

@@ -32,6 +32,33 @@ class CheckExport {
     public static void main(String[] args) throws Exception {
         var directory = Path.of(args[1]);
         var project = new ProjectManager(directory).loadProject(Path.of(args[0]));
+        if (args.length == 4 && args[2].equals("remote-tools")) {
+            var windows = project.getWindows();
+            check(windows.size() == 1, "remote tool window count");
+            var window = windows.getFirst();
+            var tabs = window.getTabs();
+            check(tabs.size() == 3 && window.getActiveTabIndex() == 2
+                && window.getActiveSessionId().equals(tabs.get(2).getSessionId()), "remote tab order and selection");
+            var manager = tabs.get(0);
+            check(manager.getTabType() == SessionState.TabType.SFTP_MANAGER
+                && PRIMARY.equals(manager.getConnectionId())
+                && args[3].equals(manager.getSftpLocalPath())
+                && "/srv/deployment".equals(manager.getSftpRemotePath())
+                && Integer.valueOf(15).equals(manager.getSftpAutoCloseTimeout()), "SFTP tab state");
+            var editor = tabs.get(1);
+            check(editor.getTabType() == SessionState.TabType.FILE_EDITOR
+                && ALTERNATE.equals(editor.getConnectionId())
+                && Boolean.TRUE.equals(editor.getEditorIsRemote())
+                && "/etc/fixture ü.txt".equals(editor.getEditorFilePath()), "independent remote editor route");
+            var image = tabs.get(2);
+            check(image.getTabType() == SessionState.TabType.IMAGE_VIEWER
+                && PRIMARY.equals(image.getConnectionId())
+                && Boolean.TRUE.equals(image.getImageIsRemote())
+                && "/srv/deployment/topology.png".equals(image.getImageFilePath())
+                && Double.valueOf(1.75).equals(image.getImageZoomLevel()), "remote image zoom and route");
+            System.out.println("pinned Java loader accepted the Rust remote tool tabs");
+            return;
+        }
         check(project.getName().equals("Native verified") && project.isAutoReconnect(), "project metadata");
         var windows = project.getWindows();
         check(windows.size() == 2, "window count");
@@ -41,9 +68,14 @@ class CheckExport {
         var geometry = first.getGeometry();
         check(geometry.getWidth() == 910 && geometry.getHeight() == 680
             && geometry.getX() == 35 && geometry.getY() == 61, "first window geometry");
-        check(first.getTabs().size() == 2 && first.getActiveTabIndex() == 1, "first window tabs");
+        check(first.getTabs().size() == 3 && first.getActiveTabIndex() == 1, "first window tabs");
+        var editor = first.getTabs().get(2);
+        check(editor.getTabType() == SessionState.TabType.FILE_EDITOR
+            && "/tmp/fixture-editor.txt".equals(editor.getEditorFilePath())
+            && Boolean.FALSE.equals(editor.getEditorIsRemote()), "local editor path");
         var local = first.getTabs().get(0);
-        check(Boolean.TRUE.equals(local.getLocalShell()) && local.getFontSizeOverride() == 15, "default local shell");
+        check(Boolean.TRUE.equals(local.getLocalShell()) && local.getFontSizeOverride() == null,
+            "default local shell inherits the global font");
         check("mother".equals(local.getTerminalEffectPluginId())
             && local.getTerminalEffectAnimationSpeed() == null, "default terminal effect speed");
         UUID.fromString(local.getConnectionId());

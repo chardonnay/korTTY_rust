@@ -1,8 +1,11 @@
 //! Native UTF-8 editor for local and SFTP source files.
 
+#[cfg(any(unix, test))]
+use std::fs;
 use std::{
     collections::VecDeque,
-    fs::{self, File, OpenOptions},
+    fmt,
+    fs::File,
     io::{self, Read, Write},
     path::{Path, PathBuf},
     sync::{
@@ -13,7 +16,7 @@ use std::{
 };
 
 use iced::{
-    Alignment, Element, Font, Length, Task,
+    Alignment, Element, Font, Length, Task, Theme,
     widget::{
         self, button, checkbox, column, container, pick_list, row, scrollable, text, text_editor,
         text_input,
@@ -21,28 +24,50 @@ use iced::{
 };
 use kortty_ssh::sftp::{MAX_EDIT_BYTES as MAX_FILE_BYTES, RemoteText};
 
+use crate::profile::{MAX_TERMINAL_FONT as MAX_FONT_SIZE, MIN_TERMINAL_FONT as MIN_FONT_SIZE};
 use crate::sftp_window::RemoteEditor;
+use crate::terminal_theme::Rgb;
 
+pub(crate) mod caret;
 mod line_endings;
+pub(crate) mod lua;
 mod search;
 pub(crate) mod structure;
+pub(crate) mod tools;
 
 use line_endings::Conversion;
+pub(crate) use search::{MAX_QUERY_BYTES, literal_cursor, source_selection};
 
 const MAX_OUTLINE_ITEMS: usize = 256;
 const MAX_HISTORY_STEPS: usize = 32;
 const MAX_HISTORY_BYTES: usize = 4 * 1024 * 1024;
 const EDIT_GROUP_TIMEOUT: Duration = Duration::from_millis(650);
-const DEFAULT_FONT_SIZE: u8 = 14;
-const MIN_FONT_SIZE: u8 = 8;
-const MAX_FONT_SIZE: u8 = 48;
 const FONT_SIZE_STEP: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Appearance {
+    pub(crate) font: Font,
+    pub(crate) size: u8,
+    pub(crate) foreground: Rgb,
+    pub(crate) background: Rgb,
+}
+
+impl Appearance {
+    pub(crate) fn style(self, theme: &Theme, status: text_editor::Status) -> text_editor::Style {
+        text_editor::Style {
+            background: self.background.color().into(),
+            value: self.foreground.color(),
+            ..text_editor::default(theme, status)
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub enum Message {
     RequestClose,
     RequestQuit,
     Edit(text_editor::Action),
+    Cut,
     SetPath(String),
     Open,
     Save,
@@ -52,7 +77,11 @@ pub enum Message {
     DecideDiscard(bool),
     RefreshOutline,
     OutlineReady(u64, Outline),
-    Jump(usize),
+    Jump { revision: u64, item: usize },
+    CompleteLua,
+    ChooseLua(&'static str),
+    DismissLua,
+    Tools(tools::Message),
     ShowFind,
     HideFind,
     SetFind(String),
@@ -66,8 +95,8 @@ pub enum Message {
     ConvertLineEndings(Conversion),
     Undo,
     Redo,
-    ZoomIn,
-    ZoomOut,
+    ZoomIn(u8),
+    ZoomOut(u8),
     ResetZoom,
 }
 
@@ -147,14 +176,17 @@ pub struct Outline {
 #[derive(Debug, Clone)]
 struct OutlineItem {
     line: usize,
+    column: usize,
+    end_column: usize,
     kind: &'static str,
     name: String,
 }
 
 pub struct EditorWindow {
     content: text_editor::Content,
+    syntax_source: u64,
     endings: line_endings::State,
-    font_size: u8,
+    font_override: Option<u8>,
     editor_id: widget::Id,
     find_id: widget::Id,
     find_visible: bool,
@@ -172,6 +204,8 @@ pub struct EditorWindow {
     revision: u64,
     outline: Outline,
     outline_revision: Option<u64>,
+    lua_completion: Option<lua::Completion>,
+    tools: tools::Panel,
 }
 
 impl Default for EditorWindow {
@@ -181,10 +215,55 @@ impl Default for EditorWindow {
 }
 
 impl EditorWindow {
+    pub(crate) fn with_unsaved_draft(text: &str) -> (Self, Task<Message>) {
+        let mut editor = Self::new();
+        editor.load_text(text);
+        editor.mark_edited();
+        editor.status =
+            Some("Review the generated draft and enter a new local path to save it.".into());
+        let outline = editor.refresh_outline();
+        (editor, outline)
+    }
+
     pub(crate) fn with_file(path: PathBuf) -> (Self, Task<Message>) {
         let mut editor = Self::new();
         let opened = editor.open(path);
         (editor, opened)
+    }
+
+    pub(crate) fn with_project_file(path: PathBuf) -> (Self, Task<Message>) {
+        let mut editor = Self::new();
+        editor.busy = true;
+        editor.status = Some("Opening…".into());
+        let opened = Task::perform(
+            async move {
+                let open = || crate::profile::projects::open_local_file(&path);
+                let original = read_opened_file(open)
+                    .map_err(|error| format!("Could not open project file ({error})"))?;
+                let path = canonical_target(&path).map_err(|error| error.to_string())?;
+                Ok(Document::local(path, original))
+            },
+            Message::Opened,
+        );
+        (editor, opened)
+    }
+
+    pub(crate) fn local_document_path(&self) -> Option<&Path> {
+        match &self.document.as_ref()?.source {
+            DocumentSource::Local(path) => Some(path),
+            DocumentSource::Remote { .. } => None,
+        }
+    }
+
+    pub(crate) fn needs_close_decision(&self) -> bool {
+        self.dirty || self.busy
+    }
+
+    pub(crate) fn cancel_hosted_close(&mut self) {
+        if matches!(self.discard, Some(Discard::Close)) {
+            self.discard = None;
+        }
+        self.close_ready = false;
     }
 
     pub(crate) fn with_remote(
@@ -229,8 +308,9 @@ impl EditorWindow {
     pub fn new() -> Self {
         Self {
             content: text_editor::Content::new(),
+            syntax_source: lua::source_id(),
             endings: line_endings::State::default(),
-            font_size: DEFAULT_FONT_SIZE,
+            font_override: None,
             editor_id: widget::Id::unique(),
             find_id: widget::Id::unique(),
             find_visible: false,
@@ -248,16 +328,18 @@ impl EditorWindow {
             revision: 0,
             outline: Outline::default(),
             outline_revision: Some(0),
+            lua_completion: None,
+            tools: tools::Panel::default(),
         }
     }
 
-    pub(crate) fn with_initial_font_size(mut self, size: u8) -> Self {
-        self.font_size = size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE);
-        self
+    fn font_size(&self, inherited: u8) -> u8 {
+        self.font_override.unwrap_or(inherited)
     }
 
     /// Returns whether the window can close immediately.
     pub fn request_close(&mut self) -> bool {
+        self.tools.invalidate(None);
         if self.busy {
             self.status = Some("A file operation is in progress.".into());
             return false;
@@ -282,7 +364,29 @@ impl EditorWindow {
         self.document.as_ref()?.remote_editor()
     }
 
+    pub(crate) fn can_cut(&self) -> bool {
+        self.available() && self.writable()
+    }
+
+    pub(crate) fn cut_selection(&mut self) -> Option<String> {
+        if !self.can_cut() {
+            return None;
+        }
+        let selection = self.content.selection().filter(|text| !text.is_empty())?;
+        self.perform(text_editor::Action::Edit(text_editor::Edit::Delete));
+        Some(selection)
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        let task = self.update_inner(message);
+        if self.tools.active() {
+            let context = self.tool_context();
+            self.tools.invalidate(context);
+        }
+        task
+    }
+
+    fn update_inner(&mut self, message: Message) -> Task<Message> {
         match message {
             Message::Edit(action) if self.available() && (self.writable() || !action.is_edit()) => {
                 if let text_editor::Action::Edit(text_editor::Edit::Paste(text)) = &action
@@ -294,6 +398,7 @@ impl EditorWindow {
                 self.perform(action);
             }
             Message::SetPath(path) if self.can_set_path() => {
+                self.lua_completion = None;
                 self.path = path;
                 self.revision = self.revision.wrapping_add(1);
             }
@@ -354,19 +459,42 @@ impl EditorWindow {
                 }
             }
             Message::RefreshOutline if self.available() => return self.refresh_outline(),
+            Message::CompleteLua if self.available() && self.writable() && self.is_lua() => {
+                self.lua_completion = lua::Completion::open(&self.content);
+                if self.lua_completion.is_none() {
+                    self.status = Some("No Lua completions at the caret.".into());
+                }
+            }
+            Message::ChooseLua(item) if self.available() && self.writable() && self.is_lua() => {
+                if let Some(action) = self
+                    .lua_completion
+                    .take()
+                    .and_then(|completion| completion.edit(&mut self.content, item))
+                {
+                    self.perform(action);
+                    return widget::operation::focus(self.editor_id.clone());
+                }
+            }
+            Message::DismissLua => self.lua_completion = None,
+            Message::Tools(message) => return self.update_tools(message),
             Message::OutlineReady(revision, outline) if revision == self.revision => {
                 self.outline = outline;
                 self.outline_revision = Some(revision);
             }
-            Message::Jump(line) if self.available() && self.outline_is_current() => {
+            Message::Jump { revision, item }
+                if self.available() && self.outline_is_current() && revision == self.revision =>
+            {
+                let Some(item) = self.outline.items.get(item) else {
+                    return Task::none();
+                };
+                if !structure::select_name(
+                    &mut self.content,
+                    item.line,
+                    item.column..item.end_column,
+                ) {
+                    return Task::none();
+                }
                 self.edit_group = None;
-                // The widget's move_to updates the anchor only when one is supplied.
-                self.content
-                    .perform(text_editor::Action::Move(text_editor::Motion::Home));
-                self.content.move_to(text_editor::Cursor {
-                    position: text_editor::Position { line, column: 0 },
-                    selection: None,
-                });
                 return widget::operation::focus(self.editor_id.clone());
             }
             Message::ShowFind if self.available() => {
@@ -434,13 +562,17 @@ impl EditorWindow {
                     return widget::operation::focus(self.editor_id.clone());
                 }
             }
-            Message::ZoomIn if self.available() => {
-                self.font_size = (self.font_size + FONT_SIZE_STEP).min(MAX_FONT_SIZE);
+            Message::ZoomIn(inherited) if self.available() => {
+                let size = self.font_size(inherited).saturating_add(FONT_SIZE_STEP);
+                let size = size.min(MAX_FONT_SIZE);
+                self.font_override = (size != inherited).then_some(size);
             }
-            Message::ZoomOut if self.available() => {
-                self.font_size = (self.font_size - FONT_SIZE_STEP).max(MIN_FONT_SIZE);
+            Message::ZoomOut(inherited) if self.available() => {
+                let size = self.font_size(inherited).saturating_sub(FONT_SIZE_STEP);
+                let size = size.max(MIN_FONT_SIZE);
+                self.font_override = (size != inherited).then_some(size);
             }
-            Message::ResetZoom if self.available() => self.font_size = DEFAULT_FONT_SIZE,
+            Message::ResetZoom if self.available() => self.font_override = None,
             _ => {}
         }
         Task::none()
@@ -472,6 +604,7 @@ impl EditorWindow {
     }
 
     fn perform(&mut self, action: text_editor::Action) {
+        self.lua_completion = None;
         if action.is_edit() {
             let pasted_endings = matches!(&action, text_editor::Action::Edit(text_editor::Edit::Paste(text))
                 if text.contains(['\r', '\n']));
@@ -529,7 +662,8 @@ impl EditorWindow {
     }
 
     fn restore(&mut self, snapshot: Snapshot) {
-        self.content = text_editor::Content::with_text(&snapshot.text);
+        self.lua_completion = None;
+        self.replace_content(text_editor::Content::with_text(&snapshot.text));
         self.content.move_to(text_editor::Cursor {
             position: clamp_position(&self.content, snapshot.cursor.position),
             selection: snapshot
@@ -549,11 +683,7 @@ impl EditorWindow {
     }
 
     fn find(&mut self, direction: SearchDirection) -> bool {
-        let result = search::Text::read(&self.content).and_then(|source| {
-            let plan = self.search.plan(&source)?;
-            let hit = plan.hit(&source, direction, false)?.ok_or("No matches.")?;
-            Ok(source.selection_cursor(hit))
-        });
+        let result = self.search.cursor(&self.content, direction);
         self.edit_group = None;
         match result {
             Ok(cursor) => {
@@ -607,7 +737,7 @@ impl EditorWindow {
         });
         self.redo = Snapshots::default();
         self.edit_group = None;
-        self.content = text_editor::Content::with_text(&rewritten.output);
+        self.replace_content(text_editor::Content::with_text(&rewritten.output));
         self.endings.update_from_text(&rewritten.output);
         let position = if all {
             clamp_position(&self.content, cursor.position)
@@ -628,8 +758,14 @@ impl EditorWindow {
     }
 
     fn load_text(&mut self, text: &str) {
-        self.content = text_editor::Content::with_text(text);
+        self.replace_content(text_editor::Content::with_text(text));
         self.endings = line_endings::State::from_text(text);
+    }
+
+    fn replace_content(&mut self, replacement: text_editor::Content) {
+        self.content = replacement;
+        self.syntax_source = lua::source_id();
+        self.lua_completion = None;
     }
 
     fn convert_line_endings(&mut self, conversion: Conversion) -> bool {
@@ -656,7 +792,7 @@ impl EditorWindow {
         self.search.invalidate_scope();
         self.endings.choose(conversion);
         self.endings.update_from_text(&converted.text);
-        self.content = text_editor::Content::with_text(&converted.text);
+        self.replace_content(text_editor::Content::with_text(&converted.text));
         self.content.move_to(cursor);
         self.mark_edited();
         self.status = Some(format!("Converted line endings to {conversion}."));
@@ -741,6 +877,7 @@ impl EditorWindow {
     }
 
     fn install(&mut self, document: Document, action: &str) {
+        self.lua_completion = None;
         self.path = match &document.source {
             DocumentSource::Local(path) => path.to_string_lossy().into_owned(),
             DocumentSource::Remote { label, .. } => label.clone(),
@@ -758,9 +895,100 @@ impl EditorWindow {
         self.outline_revision == Some(self.revision)
     }
 
+    fn source_path(&self) -> &Path {
+        let path = match self.document.as_ref().map(|document| &document.source) {
+            Some(DocumentSource::Remote { document, .. }) => {
+                std::str::from_utf8(document.path()).unwrap_or(&self.path)
+            }
+            _ => &self.path,
+        };
+        Path::new(path)
+    }
+
+    fn is_lua(&self) -> bool {
+        lua::detects(self.source_path(), &self.content)
+    }
+
+    fn tool_context(&self) -> Option<tools::Context> {
+        if !self.available() || self.remote_editor().is_some_and(RemoteEditor::is_closed) {
+            return None;
+        }
+        let path = self.source_path();
+        let language = if self.is_lua() {
+            tools::Language::Lua
+        } else if let Some(language) = tools::Language::extension(path) {
+            language
+        } else {
+            let first = self.content.line(0)?;
+            if Language::detect(path, &first.text) != Language::Shell {
+                return None;
+            }
+            tools::Language::Shell
+        };
+        Some(tools::Context {
+            revision: self.revision,
+            language,
+            limit: MAX_FILE_BYTES,
+            remote: self.is_remote(),
+            writable: self.writable(),
+        })
+    }
+
+    fn update_tools(&mut self, message: tools::Message) -> Task<Message> {
+        let context = self.tool_context();
+        let remote = self.document.as_ref().and_then(Document::remote_editor);
+        match self
+            .tools
+            .update(message, context, remote, || self.content.text())
+        {
+            tools::Update::None => {}
+            tools::Update::Notice(notice) => self.status = Some(notice),
+            tools::Update::Job(job) => return job.task().map(Message::Tools),
+            tools::Update::Apply(formatted) => {
+                let converted = match self
+                    .endings
+                    .convert_formatted(&formatted, self.content.line_count())
+                {
+                    Ok(converted) => converted,
+                    Err(error) => {
+                        self.status = Some(error.into());
+                        return Task::none();
+                    }
+                };
+                let formatted = converted.as_deref().unwrap_or(&formatted);
+                if self.content.text() == formatted {
+                    self.status = Some("The source is already formatted.".into());
+                    return Task::none();
+                }
+                let replacement = text_editor::Content::with_text(formatted);
+                if replacement.text() != formatted {
+                    self.status = Some("The editor could not represent the formatted text.".into());
+                    return Task::none();
+                }
+                let cursor = self.content.cursor();
+                self.remember_edit(None);
+                self.replace_content(replacement);
+                self.content.move_to(text_editor::Cursor {
+                    position: clamp_position(&self.content, cursor.position),
+                    selection: None,
+                });
+                self.endings.update_from_text(formatted);
+                self.search.invalidate_scope();
+                self.lua_completion = None;
+                self.mark_edited();
+                self.status = Some("Formatted the editor buffer.".into());
+                return Task::batch([
+                    self.refresh_outline(),
+                    widget::operation::focus(self.editor_id.clone()),
+                ]);
+            }
+        }
+        Task::none()
+    }
+
     fn refresh_outline(&mut self) -> Task<Message> {
         let source = self.content.text();
-        let language = Language::detect(Path::new(&self.path), &source);
+        let language = Language::detect(self.source_path(), &source);
         let revision = self.revision;
         Task::perform(
             async move { scan_outline(&source, language) },
@@ -768,10 +996,18 @@ impl EditorWindow {
         )
     }
 
-    pub fn view(&self, content_theme: iced::Theme) -> Element<'_, Message> {
+    pub(crate) fn view(
+        &self,
+        content_theme: Theme,
+        appearance: Appearance,
+        caret_preferences: caret::Preferences,
+    ) -> Element<'_, Message> {
         let available = self.available();
+        let inherited = appearance.size;
+        let font_size = self.font_size(inherited);
         let remote = self.is_remote();
         let writable = self.writable();
+        let is_lua = self.is_lua();
         let path: Element<'_, Message> = if remote {
             container(text(&self.path).wrapping(text::Wrapping::None))
                 .width(Length::Fill)
@@ -793,28 +1029,38 @@ impl EditorWindow {
         };
         let mut editor = text_editor(&self.content)
             .id(self.editor_id.clone())
-            .style(move |_, status| text_editor::default(&content_theme, status))
-            .font(Font::MONOSPACE)
-            .size(f32::from(self.font_size))
             .height(Length::Fill)
             .placeholder("Start typing or open a UTF-8 source file");
         if available {
-            editor = editor
-                .on_action(Message::Edit)
-                .key_binding(editor_key_binding);
+            editor = editor.on_action(Message::Edit).key_binding(move |event| {
+                if is_lua && writable && lua::completion_key(&event) {
+                    return Some(text_editor::Binding::Custom(Message::CompleteLua));
+                }
+                editor_key_binding(event, inherited, writable)
+            });
         }
+        let editor = caret::view(
+            editor.highlight_with::<lua::Lua>(
+                lua::Settings::new(is_lua, appearance, self.syntax_source),
+                lua::format,
+            ),
+            content_theme,
+            appearance,
+            font_size,
+            caret_preferences,
+        );
         let zoom = row![
             button("−").on_press_maybe(
-                (available && self.font_size > MIN_FONT_SIZE).then_some(Message::ZoomOut)
+                (available && font_size > MIN_FONT_SIZE).then_some(Message::ZoomOut(inherited))
             ),
-            text(format!("{} pt", self.font_size))
+            text(format!("{font_size} pt"))
                 .width(42)
                 .align_x(Alignment::Center),
             button("+").on_press_maybe(
-                (available && self.font_size < MAX_FONT_SIZE).then_some(Message::ZoomIn)
+                (available && font_size < MAX_FONT_SIZE).then_some(Message::ZoomIn(inherited))
             ),
             button("Reset zoom").on_press_maybe(
-                (available && self.font_size != DEFAULT_FONT_SIZE).then_some(Message::ResetZoom),
+                (available && self.font_override.is_some()).then_some(Message::ResetZoom),
             ),
         ]
         .spacing(5)
@@ -823,6 +1069,14 @@ impl EditorWindow {
         if !remote && writable {
             toolbar =
                 toolbar.push(button("Open").on_press_maybe(available.then_some(Message::Open)));
+        }
+        if is_lua && writable {
+            toolbar = toolbar.push(
+                button("Complete Lua…").on_press_maybe(available.then_some(Message::CompleteLua)),
+            );
+        }
+        for button in self.tools.actions(self.tool_context()) {
+            toolbar = toolbar.push(Element::new(button).map(Message::Tools));
         }
         let toolbar = toolbar
             .push(
@@ -847,6 +1101,15 @@ impl EditorWindow {
             .wrap();
 
         let mut content = column![path, toolbar].spacing(10);
+        if available
+            && is_lua
+            && let Some(completion) = &self.lua_completion
+        {
+            content = content.push(completion.view(Message::ChooseLua, Message::DismissLua));
+        }
+        if let Some(tools) = self.tools.view() {
+            content = content.push(tools.map(Message::Tools));
+        }
         if self.find_visible {
             content = content.push(self.find_view());
         }
@@ -937,12 +1200,15 @@ impl EditorWindow {
         } else if self.outline.items.is_empty() {
             outline = outline.push(text("No supported declarations or placeholders.").size(13));
         } else {
-            for item in &self.outline.items {
+            for (index, item) in self.outline.items.iter().enumerate() {
                 let label = format!("{}  {}  {}", item.line + 1, item.kind, item.name);
                 outline = outline.push(
                     button(text(label).size(13))
                         .width(Length::Fill)
-                        .on_press_maybe(self.available().then_some(Message::Jump(item.line))),
+                        .on_press_maybe(self.available().then_some(Message::Jump {
+                            revision: self.revision,
+                            item: index,
+                        })),
                 );
             }
         }
@@ -1027,7 +1293,11 @@ impl EditorWindow {
     }
 }
 
-fn editor_key_binding(event: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
+fn editor_key_binding(
+    event: text_editor::KeyPress,
+    inherited: u8,
+    writable: bool,
+) -> Option<text_editor::Binding<Message>> {
     if matches!(event.status, text_editor::Status::Focused { .. })
         && event.modifiers.command()
         && !event.modifiers.alt()
@@ -1048,8 +1318,8 @@ fn editor_key_binding(event: text_editor::KeyPress) -> Option<text_editor::Bindi
                 Message::Undo
             }),
             Some('y') if !shifted => Some(Message::Redo),
-            Some('+' | '=') => Some(Message::ZoomIn),
-            Some('-') if !shifted => Some(Message::ZoomOut),
+            Some('+' | '=') => Some(Message::ZoomIn(inherited)),
+            Some('-') if !shifted => Some(Message::ZoomOut(inherited)),
             Some('0') if !shifted => Some(Message::ResetZoom),
             _ => None,
         };
@@ -1058,8 +1328,13 @@ fn editor_key_binding(event: text_editor::KeyPress) -> Option<text_editor::Bindi
         }
     }
     let command = event.modifiers.logo() || (event.modifiers.command() && !event.modifiers.alt());
-    text_editor::Binding::from_key_press(event)
-        .filter(|binding| !command || !matches!(binding, text_editor::Binding::Insert(_)))
+    match text_editor::Binding::from_key_press(event) {
+        Some(text_editor::Binding::Cut) => {
+            writable.then_some(text_editor::Binding::Custom(Message::Cut))
+        }
+        binding => binding
+            .filter(|binding| !command || !matches!(binding, text_editor::Binding::Insert(_))),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1147,14 +1422,21 @@ fn open_document(path: &Path) -> io::Result<Document> {
 }
 
 pub(crate) fn open_terminal_document(path: &Path, writable: bool) -> io::Result<Document> {
+    #[cfg(unix)]
     let mut document = open_document(path)?;
+    #[cfg(windows)]
+    let mut document = {
+        let lease = kortty_files::tree::ExternalLease::open_terminal_path(path)?;
+        let path = canonical_target(lease.path())?;
+        let (original, stamp) = read_opened_contents(lease.file())?;
+        stamp.require_unchanged(&open_regular_editor_file(&path)?)?;
+        Document::local(path, original)
+    };
     document.local_read_only = !writable;
     Ok(document)
 }
 
 fn read_regular_file(path: &Path) -> io::Result<Arc<str>> {
-    use crate::private_files::FileStamp;
-
     let metadata = path.symlink_metadata()?;
     if !metadata.is_file() {
         return Err(io::Error::other("only regular files can be edited"));
@@ -1162,22 +1444,30 @@ fn read_regular_file(path: &Path) -> io::Result<Arc<str>> {
     if metadata.len() > MAX_FILE_BYTES as u64 {
         return Err(file_too_large());
     }
-    let file = open_regular_editor_file(path)?;
-    let stamp = FileStamp::read(&file)?;
+    read_opened_file(|| open_regular_editor_file(path))
+}
+
+fn read_opened_file(open: impl Fn() -> io::Result<File>) -> io::Result<Arc<str>> {
+    let file = open()?;
+    let (text, stamp) = read_opened_contents(&file)?;
+    stamp.require_unchanged(&open()?)?;
+    Ok(text)
+}
+
+fn read_opened_contents(file: &File) -> io::Result<(Arc<str>, crate::private_files::FileStamp)> {
+    let stamp = crate::private_files::FileStamp::read(file)?;
     let mut bytes = Vec::new();
-    (&file)
-        .take(MAX_FILE_BYTES as u64 + 1)
+    file.take(MAX_FILE_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
     if bytes.len() > MAX_FILE_BYTES {
         return Err(file_too_large());
     }
-    stamp.require_unchanged(&file)?;
-    stamp.require_unchanged(&open_regular_editor_file(path)?)?;
+    stamp.require_unchanged(file)?;
     let text = String::from_utf8(bytes).map_err(|_| io::Error::other("the file is not UTF-8"))?;
     if text.contains('\0') {
         return Err(io::Error::other("the file contains binary data"));
     }
-    Ok(Arc::from(text))
+    Ok((Arc::from(text), stamp))
 }
 
 fn open_regular_editor_file(path: &Path) -> io::Result<File> {
@@ -1198,81 +1488,159 @@ fn file_too_large() -> io::Error {
     io::Error::other("editor file limit is 2 MiB")
 }
 
+#[derive(Debug)]
+struct SaveError {
+    stage: &'static str,
+    source: io::Error,
+}
+
+impl fmt::Display for SaveError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{} failed ({})", self.stage, self.source)
+    }
+}
+
+fn save_stage<T>(stage: &'static str, result: io::Result<T>) -> Result<T, SaveError> {
+    result.map_err(|source| SaveError { stage, source })
+}
+
 fn save_document(
     path: &Path,
     contents: Arc<str>,
     previous: Option<&Document>,
-) -> io::Result<Document> {
+) -> Result<Document, SaveError> {
     if previous.is_some_and(|document| document.local_read_only) {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "the file is read-only",
-        ));
+        return save_stage(
+            "checking write access",
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the file is read-only",
+            )),
+        );
     }
     if contents.len() > MAX_FILE_BYTES {
-        return Err(file_too_large());
+        return save_stage("checking the document size", Err(file_too_large()));
     }
     if contents.contains('\0') {
-        return Err(io::Error::other("the document contains binary data"));
+        return save_stage(
+            "checking the document contents",
+            Err(io::Error::other("the document contains binary data")),
+        );
     }
-    let path = canonical_target(path)?;
+    let path = save_stage("resolving the destination", canonical_target(path))?;
     let previous = previous.filter(
         |previous| matches!(&previous.source, DocumentSource::Local(existing) if *existing == path),
     );
     if let Some(previous) = previous {
-        check_current_file(previous)?;
+        save_stage("checking the original file", check_current_file(previous))?;
         if contents == previous.original {
             return Ok(Document::local(path, contents));
         }
     } else {
-        match path.symlink_metadata() {
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "open an existing file before replacing it",
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
+        let available = match path.symlink_metadata() {
+            Ok(_) => Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "open an existing file before replacing it",
+            )),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+        save_stage("checking the new destination", available)?;
     }
-    let directory = path
-        .parent()
-        .ok_or_else(|| io::Error::other("missing parent directory"))?;
-    let (temporary, mut file) = TemporarySave::new(directory)?;
-    file.write_all(contents.as_bytes())?;
+    let directory = save_stage(
+        "finding the destination folder",
+        path.parent()
+            .ok_or_else(|| io::Error::other("missing parent directory")),
+    )?;
+    let mut temporary = save_stage("creating the temporary file", TemporarySave::new(directory))?;
+    save_stage(
+        "writing the temporary file",
+        temporary.file_mut().write_all(contents.as_bytes()),
+    )?;
     if previous.is_some() {
-        let permissions = path.symlink_metadata()?.permissions();
+        #[cfg(unix)]
+        let metadata = path.symlink_metadata();
+        #[cfg(windows)]
+        let metadata = temporary
+            .open_destination(&path)
+            .and_then(|file| file.metadata());
+        let permissions = save_stage("reading destination attributes", metadata)?.permissions();
+        #[cfg(windows)]
+        if permissions.readonly() {
+            return save_stage(
+                "checking write access",
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "the file is read-only",
+                )),
+            );
+        }
         #[cfg(unix)]
         let permissions = {
             use std::os::unix::fs::PermissionsExt;
             fs::Permissions::from_mode(permissions.mode() & 0o777)
         };
-        file.set_permissions(permissions)?;
+        save_stage(
+            "setting temporary file attributes",
+            temporary.file_mut().set_permissions(permissions),
+        )?;
     }
-    file.sync_all()?;
-    drop(file);
+    save_stage(
+        "synchronizing the temporary file",
+        temporary.file_mut().sync_all(),
+    )?;
+    #[cfg(unix)]
+    drop(temporary.file.take());
     if let Some(previous) = previous {
         // Several editor windows can save the same path concurrently. Keep
         // the last content check and publication together within this process.
         static SAVE_COMMIT: Mutex<()> = Mutex::new(());
-        let _commit = SAVE_COMMIT
-            .lock()
-            .map_err(|_| io::Error::other("editor save lock failed"))?;
-        check_current_file(previous)?;
-        fs::rename(&temporary.path, &path)?;
+        let _commit = save_stage(
+            "acquiring the editor save lock",
+            SAVE_COMMIT
+                .lock()
+                .map_err(|_| io::Error::other("the lock was poisoned")),
+        )?;
+        temporary.replace(&path, previous)?;
     } else {
         // Publish new files atomically without overwriting another writer.
-        fs::hard_link(&temporary.path, &path)?;
+        save_stage("publishing the new file", temporary.publish_new(&path))?;
     }
     Ok(Document::local(path, contents))
+}
+
+#[cfg(windows)]
+fn retry_windows_replacement(
+    mut replace: impl FnMut() -> Result<(), SaveError>,
+) -> Result<(), SaveError> {
+    const ACCESS_DENIED: i32 = 5;
+    const SHARING_VIOLATION: i32 = 32;
+    // Each retry rechecks the original after a transient sharing denial.
+    for delay in [10, 25, 50, 100, 200] {
+        match replace() {
+            Err(error)
+                if matches!(
+                    error.source.raw_os_error(),
+                    Some(ACCESS_DENIED | SHARING_VIOLATION)
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(delay));
+            }
+            result => return result,
+        }
+    }
+    replace()
 }
 
 fn check_current_file(previous: &Document) -> io::Result<()> {
     let DocumentSource::Local(path) = &previous.source else {
         return Err(io::Error::other("expected a local file"));
     };
-    if read_regular_file(path)? == previous.original {
+    check_original_contents(read_regular_file(path)?, previous)
+}
+
+fn check_original_contents(contents: Arc<str>, previous: &Document) -> io::Result<()> {
+    if contents == previous.original {
         Ok(())
     } else {
         Err(io::Error::other(
@@ -1282,38 +1650,134 @@ fn check_current_file(previous: &Document) -> io::Result<()> {
 }
 
 struct TemporarySave {
+    file: Option<File>,
+    #[cfg(unix)]
     path: PathBuf,
+    #[cfg(windows)]
+    directory: kortty_files::tree::Directory,
 }
 
 impl TemporarySave {
-    fn new(directory: &Path) -> io::Result<(Self, File)> {
+    fn new(directory: &Path) -> io::Result<Self> {
         static NEXT_FILE: AtomicU64 = AtomicU64::new(0);
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
         #[cfg(unix)]
-        {
+        let options = {
             use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true).mode(0o600);
+            options
+        };
+        #[cfg(windows)]
+        let directory = kortty_files::tree::Directory::open_publish_parent(directory)?;
         for _ in 0..32 {
             let number = NEXT_FILE.fetch_add(1, Ordering::Relaxed);
-            let path = directory.join(format!(
-                ".kortty-editor-{}-{number}.tmp",
-                std::process::id()
-            ));
-            match options.open(&path) {
-                Ok(file) => return Ok((Self { path }, file)),
+            let name = format!(".kortty-editor-{}-{number}.tmp", std::process::id());
+            #[cfg(unix)]
+            let path = directory.join(name);
+            #[cfg(unix)]
+            let opened = options.open(&path);
+            #[cfg(windows)]
+            let opened = directory.create_staging_file(std::ffi::OsStr::new(&name));
+            match opened {
+                Ok(file) => {
+                    return Ok(Self {
+                        file: Some(file),
+                        #[cfg(unix)]
+                        path,
+                        #[cfg(windows)]
+                        directory,
+                    });
+                }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
             }
         }
         Err(io::Error::other("could not allocate a temporary save file"))
     }
+
+    fn file_mut(&mut self) -> &mut File {
+        self.file.as_mut().expect("open temporary save file")
+    }
+
+    #[cfg(unix)]
+    fn replace(&mut self, path: &Path, previous: &Document) -> Result<(), SaveError> {
+        save_stage("rechecking the original file", check_current_file(previous))?;
+        save_stage(
+            "replacing the destination file",
+            fs::rename(&self.path, path),
+        )
+    }
+
+    #[cfg(windows)]
+    fn replace(&mut self, path: &Path, previous: &Document) -> Result<(), SaveError> {
+        retry_windows_replacement(|| self.replace_once(path, previous))
+    }
+
+    #[cfg(windows)]
+    fn replace_once(&mut self, path: &Path, previous: &Document) -> Result<(), SaveError> {
+        save_stage(
+            "rechecking the original file",
+            (|| {
+                let contents = read_opened_file(|| self.open_destination(path))?;
+                check_original_contents(contents, previous)?;
+                self.require_current_parent(path)
+            })(),
+        )?;
+        save_stage(
+            "replacing the destination file",
+            self.directory.replace_file_with_shared_readers(
+                self.file.as_ref().expect("open temporary save file"),
+                path.file_name().expect("canonical editor destination"),
+            ),
+        )?;
+        drop(self.file.take());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn publish_new(&mut self, path: &Path) -> io::Result<()> {
+        fs::hard_link(&self.path, path)
+    }
+
+    #[cfg(windows)]
+    fn publish_new(&mut self, path: &Path) -> io::Result<()> {
+        self.require_current_parent(path)?;
+        self.directory.publish_file(
+            self.file.as_ref().expect("open temporary save file"),
+            path.file_name().expect("canonical editor destination"),
+        )?;
+        drop(self.file.take());
+        Ok(())
+    }
+
+    #[cfg(windows)]
+    fn open_destination(&self, path: &Path) -> io::Result<File> {
+        self.directory
+            .read_child(path.file_name().expect("canonical editor destination"))?
+            .ok_or_else(|| io::Error::other("only regular files can be edited"))
+    }
+
+    #[cfg(windows)]
+    fn require_current_parent(&self, path: &Path) -> io::Result<()> {
+        let parent = path.parent().expect("canonical editor destination");
+        let current = kortty_files::tree::Directory::open_publish_parent(parent)?;
+        if !self.directory.same_as(&current)? {
+            return Err(io::Error::other(
+                "the destination folder changed during the save",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for TemporarySave {
     fn drop(&mut self) {
+        #[cfg(unix)]
         let _ = fs::remove_file(&self.path);
+        #[cfg(windows)]
+        if let Some(file) = self.file.take() {
+            let _ = kortty_files::tree::remove(file);
+        }
     }
 }
 
@@ -1322,16 +1786,36 @@ enum Language {
     Rust,
     Python,
     Shell,
+    Dockerfile,
+    Sql,
+    Extended(&'static str),
     Other,
 }
 
 impl Language {
     fn detect(path: &Path, source: &str) -> Self {
-        match path.extension().and_then(|extension| extension.to_str()) {
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                let name = name.to_ascii_lowercase();
+                name == "dockerfile" || name.ends_with(".dockerfile")
+            })
+        {
+            return Self::Dockerfile;
+        }
+        let extension = path.extension().and_then(|extension| extension.to_str());
+        match extension.map(str::to_ascii_lowercase).as_deref() {
             Some("rs") => Self::Rust,
             Some("py" | "pyw") => Self::Python,
             Some("sh" | "bash" | "zsh" | "ksh") => Self::Shell,
+            Some("sql") => Self::Sql,
+            Some("md" | "markdown") => Self::Extended("markdown"),
+            Some("adoc" | "asciidoc") => Self::Extended("asciidoc"),
             _ => {
+                if let Some(language) = structure::additional_language(path, source) {
+                    return Self::Extended(language);
+                }
                 let shebang = source
                     .lines()
                     .next()
@@ -1350,28 +1834,34 @@ impl Language {
 }
 
 fn scan_outline(source: &str, language: Language) -> Outline {
+    match language {
+        Language::Shell => return structured_outline(source, structure::shell_outline(source)),
+        Language::Python => return structured_outline(source, structure::python_outline(source)),
+        Language::Dockerfile => {
+            return structured_outline(source, structure::analyze(source, "dockerfile"));
+        }
+        Language::Sql => return structured_outline(source, structure::analyze(source, "sql")),
+        Language::Extended(language) => {
+            return structured_outline(source, structure::analyze(source, language));
+        }
+        _ => {}
+    }
     let mut outline = Outline::default();
     let mut state = SourceState::default();
-    for (line, text) in source.lines().enumerate() {
+    for (line, text) in structure::lines(source).enumerate() {
         if state.line_starts_in_code(text, language)
             && let Some((kind, name)) = declaration(text.trim_start(), language)
         {
-            outline.items.push(OutlineItem {
-                line,
-                kind,
-                name: name.to_owned(),
-            });
+            outline.items.push(outline_item(line, text, kind, name));
         }
         for name in placeholders(text) {
             if outline.items.len() >= MAX_OUTLINE_ITEMS {
                 outline.limited = true;
                 return outline;
             }
-            outline.items.push(OutlineItem {
-                line,
-                kind: "placeholder",
-                name: format!("${{{name}}}"),
-            });
+            outline
+                .items
+                .push(outline_item(line, text, "placeholder", name));
         }
         if outline.items.len() >= MAX_OUTLINE_ITEMS {
             outline.limited = true;
@@ -1379,6 +1869,56 @@ fn scan_outline(source: &str, language: Language) -> Outline {
         }
     }
     outline
+}
+
+fn structured_outline(source: &str, analysis: structure::Analysis) -> Outline {
+    if analysis.status == structure::Status::TooLarge {
+        return Outline {
+            limited: true,
+            ..Outline::default()
+        };
+    }
+    let mut items: Vec<_> = analysis
+        .nodes
+        .into_iter()
+        .map(|node| OutlineItem {
+            line: node.line,
+            column: node.column,
+            end_column: node.end_column,
+            kind: node.kind,
+            name: node.name,
+        })
+        .chain(analysis.variables.into_iter().map(|variable| OutlineItem {
+            line: variable.line,
+            column: variable.column,
+            end_column: variable.end_column,
+            kind: variable.kind,
+            name: variable.name,
+        }))
+        .collect();
+    items.extend(
+        structure::lines(source)
+            .enumerate()
+            .flat_map(|(line, text)| {
+                placeholders(text).map(move |name| outline_item(line, text, "placeholder", name))
+            })
+            .take(MAX_OUTLINE_ITEMS + 1),
+    );
+    items.sort_by_key(|item| item.line);
+    let limited = analysis.limited || items.len() > MAX_OUTLINE_ITEMS;
+    items.truncate(MAX_OUTLINE_ITEMS);
+    Outline { items, limited }
+}
+
+fn outline_item(line: usize, text: &str, kind: &'static str, name: &str) -> OutlineItem {
+    let column = structure::column_of(text, name);
+    OutlineItem {
+        line,
+        column,
+        end_column: column + name.len(),
+        kind,
+        name: name.to_owned(),
+    }
 }
 
 fn declaration(mut text: &str, language: Language) -> Option<(&'static str, &str)> {
@@ -1451,29 +1991,11 @@ fn declaration(mut text: &str, language: Language) -> Option<(&'static str, &str
             (tail.starts_with('(') || kind == "class" && tail.starts_with(':'))
                 .then_some((kind, name))
         }
-        Language::Shell => {
-            let binding =
-                leading_keyword(text, &["local", "declare", "typeset", "export", "readonly"]);
-            if let Some((name, tail)) = identifier(binding.map_or(text, |(_, rest)| rest))
-                && name.is_ascii()
-                && (tail.starts_with('=')
-                    || tail.starts_with("+=")
-                    || binding.is_some()
-                        && (tail.is_empty() || tail.starts_with(char::is_whitespace)))
-            {
-                return Some(("variable", name));
-            }
-            let explicit = text.strip_prefix("function").and_then(after_space);
-            let (name, tail) = identifier(explicit.unwrap_or(text))?;
-            let tail = tail.trim_start();
-            if let Some(parameters) = tail.strip_prefix('(') {
-                let next = parameters.trim_start().strip_prefix(')')?.trim_start();
-                (next.starts_with('{') || next.is_empty()).then_some(("function", name))
-            } else {
-                (explicit.is_some() && tail.starts_with('{')).then_some(("function", name))
-            }
-        }
-        Language::Other => None,
+        Language::Shell
+        | Language::Dockerfile
+        | Language::Sql
+        | Language::Extended(_)
+        | Language::Other => None,
     }
 }
 
@@ -1505,11 +2027,12 @@ fn identifier(text: &str) -> Option<(&str, &str)> {
 fn placeholders(mut text: &str) -> impl Iterator<Item = &str> {
     std::iter::from_fn(move || {
         loop {
-            let (_, tail) = text.split_once("${")?;
+            let (prefix, tail) = text.split_once("${")?;
             let (name, rest) = tail.split_once('}')?;
+            let token = &text[prefix.len()..text.len() - rest.len()];
             text = rest;
             if identifier(name).is_some_and(|(_, rest)| rest.is_empty()) {
-                return Some(name);
+                return Some(token);
             }
         }
     })
@@ -1519,7 +2042,7 @@ fn placeholders(mut text: &str) -> impl Iterator<Item = &str> {
 struct SourceState {
     block_comments: usize,
     literal: Option<Literal>,
-    heredoc: Option<(String, bool)>,
+    shell_arithmetic_depth: usize,
     python_group_depth: usize,
     python_continuation: bool,
 }
@@ -1546,28 +2069,19 @@ impl SourceState {
         if language == Language::Other {
             return false;
         }
-        if let Some((delimiter, strip_tabs)) = self.heredoc.as_ref() {
-            let candidate = if *strip_tabs {
-                line.trim_start_matches('\t')
-            } else {
-                line
-            };
-            if candidate == delimiter {
-                self.heredoc = None;
-            }
-            return false;
-        }
         let code = self.block_comments == 0
             && self.literal.is_none()
+            && self.shell_arithmetic_depth == 0
             && self.python_group_depth == 0
             && !self.python_continuation;
         self.python_continuation = false;
         let bytes = line.as_bytes();
+        let dollar_expansions = matches!(language, Language::Shell | Language::Dockerfile);
         let mut offset = 0;
         while offset < bytes.len() {
             let rest = &bytes[offset..];
             if self.block_comments != 0 {
-                if rest.starts_with(b"/*") {
+                if language != Language::Sql && rest.starts_with(b"/*") {
                     self.block_comments += 1;
                     offset += 2;
                 } else if rest.starts_with(b"*/") {
@@ -1581,15 +2095,23 @@ impl SourceState {
             if let Some(literal) = self.literal {
                 let closing = closing_literal(literal, rest);
                 if closing > 0 {
+                    if language == Language::Sql {
+                        if matches!(literal, Literal::Quote(b'\'')) && rest.starts_with(b"''") {
+                            offset += 2;
+                            continue;
+                        }
+                        visit(offset, false);
+                    }
                     self.literal = None;
                     offset += closing;
                 } else if rest[0] == b'\\'
+                    && language != Language::Sql
                     && !matches!(literal, Literal::RustRaw(_))
-                    && !(language == Language::Shell && matches!(literal, Literal::Quote(b'\'')))
+                    && !(dollar_expansions && matches!(literal, Literal::Quote(b'\'')))
                 {
                     offset += 2;
                 } else {
-                    if language == Language::Shell && matches!(literal, Literal::Quote(b'"')) {
+                    if dollar_expansions && matches!(literal, Literal::Quote(b'"')) {
                         visit(offset, true);
                     }
                     offset += 1;
@@ -1598,7 +2120,8 @@ impl SourceState {
             }
             match language {
                 Language::Rust if rest.starts_with(b"//") => break,
-                Language::Rust if rest.starts_with(b"/*") => {
+                Language::Sql if rest.starts_with(b"--") => break,
+                Language::Rust | Language::Sql if rest.starts_with(b"/*") => {
                     self.block_comments = 1;
                     offset += 2;
                     continue;
@@ -1618,7 +2141,16 @@ impl SourceState {
                     }
                 }
                 Language::Rust if rest[0] == b'"' => self.literal = Some(Literal::Quote(b'"')),
-                Language::Python | Language::Shell if rest[0] == b'#' => break,
+                Language::Python if rest[0] == b'#' => break,
+                Language::Shell if rest[0] == b'#' && shell_comment_start(bytes, offset) => break,
+                Language::Dockerfile
+                    if rest[0] == b'#'
+                        && (offset == 0
+                            || bytes[offset - 1].is_ascii_whitespace()
+                            || b";|&()".contains(&bytes[offset - 1])) =>
+                {
+                    break;
+                }
                 Language::Python if matches!(rest[0], b'\'' | b'"') => {
                     if rest.starts_with(&[rest[0]; 3]) {
                         self.literal = Some(Literal::TripleQuote(rest[0]));
@@ -1637,18 +2169,37 @@ impl SourceState {
                 Language::Shell if matches!(rest[0], b'\'' | b'"' | b'`') => {
                     self.literal = Some(Literal::Quote(rest[0]));
                 }
-                Language::Shell if rest[0] == b'\\' => {
+                Language::Dockerfile if matches!(rest[0], b'\'' | b'"') => {
+                    self.literal = Some(Literal::Quote(rest[0]));
+                }
+                Language::Sql if matches!(rest[0], b'\'' | b'"') => {
+                    visit(offset, false);
+                    self.literal = Some(Literal::Quote(rest[0]));
+                }
+                Language::Shell | Language::Dockerfile if rest[0] == b'\\' => {
                     offset += 2;
                     continue;
                 }
+                Language::Shell if self.shell_arithmetic_depth == 0 && rest.starts_with(b"((") => {
+                    self.shell_arithmetic_depth = 2;
+                    visit(offset, false);
+                    visit(offset + 1, false);
+                    offset += 2;
+                    continue;
+                }
+                Language::Shell if self.shell_arithmetic_depth > 0 => match rest[0] {
+                    b'(' => self.shell_arithmetic_depth += 1,
+                    b')' => self.shell_arithmetic_depth -= 1,
+                    b'<' if rest.starts_with(b"<<") => {
+                        // A shift cannot introduce a here-document.
+                        offset += 2;
+                        continue;
+                    }
+                    _ => {}
+                },
                 Language::Shell if rest.starts_with(b"<<<") => {
                     offset += 3;
                     continue;
-                }
-                Language::Shell if rest.starts_with(b"<<") => {
-                    if let Ok(tail) = std::str::from_utf8(&rest[2..]) {
-                        self.heredoc = shell_heredoc(tail);
-                    }
                 }
                 _ => {}
             }
@@ -1657,9 +2208,9 @@ impl SourceState {
             }
             offset += 1;
         }
-        if language == Language::Python
-            && matches!(self.literal, Some(Literal::Quote(_)))
-            && !line.ends_with('\\')
+        if matches!(self.literal, Some(Literal::Quote(_)))
+            && (language == Language::Dockerfile
+                || language == Language::Python && !line.ends_with('\\'))
         {
             self.literal = None;
         }
@@ -1710,23 +2261,18 @@ fn closing_literal(literal: Literal, rest: &[u8]) -> usize {
     }
 }
 
-fn shell_heredoc(text: &str) -> Option<(String, bool)> {
-    let (text, strip_tabs) = text
-        .strip_prefix('-')
-        .map_or((text, false), |text| (text, true));
-    let token = text.split_whitespace().next()?;
-    let token = token
-        .strip_prefix('\'')
-        .and_then(|token| token.strip_suffix('\''))
-        .or_else(|| {
-            token
-                .strip_prefix('"')
-                .and_then(|token| token.strip_suffix('"'))
-        })
-        .unwrap_or(token);
-    identifier(token)
-        .filter(|(_, tail)| tail.is_empty())
-        .map(|_| (token.to_owned(), strip_tabs))
+fn shell_comment_start(bytes: &[u8], offset: usize) -> bool {
+    let Some(previous) = offset.checked_sub(1) else {
+        return true;
+    };
+    let byte = bytes[previous];
+    (byte.is_ascii_whitespace() || b";|&()<>".contains(&byte))
+        && bytes[..previous]
+            .iter()
+            .rev()
+            .take_while(|&&byte| byte == b'\\')
+            .count()
+            .is_multiple_of(2)
 }
 
 #[cfg(test)]
@@ -1735,8 +2281,9 @@ mod tests {
 
     #[test]
     fn editor_zoom_preserves_dirty_text_selection_and_undo() {
-        let mut editor = EditorWindow::new().with_initial_font_size(21);
-        assert_eq!(editor.font_size, 21);
+        let mut editor = EditorWindow::new();
+        let inherited = 21;
+        assert_eq!(editor.font_size(inherited), inherited);
         let _ = editor.update(Message::Edit(text_editor::Action::Edit(
             text_editor::Edit::Paste(Arc::new(String::from("edited text"))),
         )));
@@ -1749,20 +2296,20 @@ mod tests {
         let revision = editor.revision;
         assert!(editor.dirty);
 
-        let _ = editor.update(Message::ZoomIn);
-        assert_eq!(editor.font_size, 23);
-        let _ = editor.update(Message::ZoomOut);
-        assert_eq!(editor.font_size, 21);
+        let _ = editor.update(Message::ZoomIn(inherited));
+        assert_eq!(editor.font_size(26), 23);
+        let _ = editor.update(Message::ZoomOut(inherited));
+        assert_eq!(editor.font_size(26), 26);
         for _ in 0..24 {
-            let _ = editor.update(Message::ZoomOut);
+            let _ = editor.update(Message::ZoomOut(inherited));
         }
-        assert_eq!(editor.font_size, MIN_FONT_SIZE);
-        for _ in 0..24 {
-            let _ = editor.update(Message::ZoomIn);
+        assert_eq!(editor.font_size(inherited), MIN_FONT_SIZE);
+        for _ in 0..MAX_FONT_SIZE {
+            let _ = editor.update(Message::ZoomIn(inherited));
         }
-        assert_eq!(editor.font_size, MAX_FONT_SIZE);
+        assert_eq!(editor.font_size(inherited), MAX_FONT_SIZE);
         let _ = editor.update(Message::ResetZoom);
-        assert_eq!(editor.font_size, DEFAULT_FONT_SIZE);
+        assert_eq!(editor.font_size(26), 26);
 
         assert_eq!(editor.content.text(), text);
         assert_eq!(editor.content.cursor(), cursor);
@@ -1770,7 +2317,7 @@ mod tests {
         assert!(editor.dirty);
         let _ = editor.update(Message::Undo);
         assert!(editor.content.text().trim().is_empty());
-        assert_eq!(editor.font_size, DEFAULT_FONT_SIZE);
+        assert_eq!(editor.font_size(26), 26);
     }
 
     #[test]
@@ -1795,26 +2342,50 @@ mod tests {
             ("+", Code::NumpadAdd, command),
         ] {
             assert!(matches!(
-                editor_key_binding(event(key, code, modifiers)),
-                Some(text_editor::Binding::Custom(Message::ZoomIn))
+                editor_key_binding(event(key, code, modifiers), 22, true),
+                Some(text_editor::Binding::Custom(Message::ZoomIn(22)))
             ));
         }
         for code in [Code::Minus, Code::NumpadSubtract] {
             assert!(matches!(
-                editor_key_binding(event("-", code, command)),
-                Some(text_editor::Binding::Custom(Message::ZoomOut))
+                editor_key_binding(event("-", code, command), 22, true),
+                Some(text_editor::Binding::Custom(Message::ZoomOut(22)))
             ));
         }
         for code in [Code::Digit0, Code::Numpad0] {
             assert!(matches!(
-                editor_key_binding(event("0", code, command)),
+                editor_key_binding(event("0", code, command), 22, true),
                 Some(text_editor::Binding::Custom(Message::ResetZoom))
             ));
         }
         assert!(!matches!(
-            editor_key_binding(event("=", Code::Equal, command | Modifiers::ALT)),
-            Some(text_editor::Binding::Custom(Message::ZoomIn))
+            editor_key_binding(event("=", Code::Equal, command | Modifiers::ALT), 22, true),
+            Some(text_editor::Binding::Custom(Message::ZoomIn(22)))
         ));
+    }
+
+    #[test]
+    fn editor_cut_key_requires_focus_and_a_writable_document() {
+        use iced::keyboard::{
+            Key, Modifiers,
+            key::{Code, Physical},
+        };
+
+        let mut event = text_editor::KeyPress {
+            key: Key::Character("x".into()),
+            modified_key: Key::Character("x".into()),
+            physical_key: Physical::Code(Code::KeyX),
+            modifiers: Modifiers::COMMAND,
+            text: None,
+            status: text_editor::Status::Focused { is_hovered: false },
+        };
+        assert!(matches!(
+            editor_key_binding(event.clone(), 16, true),
+            Some(text_editor::Binding::Custom(Message::Cut))
+        ));
+        assert!(editor_key_binding(event.clone(), 16, false).is_none());
+        event.status = text_editor::Status::Hovered;
+        assert!(editor_key_binding(event, 16, true).is_none());
     }
 
     #[test]
@@ -1822,8 +2393,17 @@ mod tests {
         use iced::advanced::{Layout, layout, widget::Tree};
         use iced::{Renderer, Size, Theme};
 
-        let editor = EditorWindow::new().with_initial_font_size(MAX_FONT_SIZE);
-        let mut view = editor.view(Theme::Dark);
+        let editor = EditorWindow::new();
+        let mut view = editor.view(
+            Theme::Dark,
+            Appearance {
+                font: Font::MONOSPACE,
+                size: MAX_FONT_SIZE,
+                foreground: Rgb::from_hex(0xffffff),
+                background: Rgb::from_hex(0x000000),
+            },
+            caret::Preferences::default(),
+        );
         let mut tree = Tree::new(view.as_widget());
         let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
         let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, 320.0));
@@ -2071,8 +2651,19 @@ mod tests {
             text_editor::Edit::Insert('x'),
         )));
         let _ = editor.update(Message::ConvertLineEndings(Conversion::CrLf));
+        let _ = editor.update(Message::Edit(text_editor::Action::SelectAll));
+        assert!(editor.cut_selection().is_none());
         assert_eq!(editor.content.text(), source);
+        #[cfg(unix)]
         assert_eq!(Path::new(&editor.path), canonical_target(&path).unwrap());
+        #[cfg(windows)]
+        assert_eq!(
+            crate::private_files::FileStamp::read(
+                &open_regular_editor_file(Path::new(&editor.path)).unwrap()
+            )
+            .unwrap(),
+            crate::private_files::FileStamp::read(&File::open(&path).unwrap()).unwrap()
+        );
         assert!(!editor.dirty);
     }
 
@@ -2239,11 +2830,13 @@ mod tests {
         assert_eq!(
             save_document(&file, Arc::from("new"), None)
                 .unwrap_err()
+                .source
                 .kind(),
             io::ErrorKind::AlreadyExists,
         );
         fs::write(&file, "external changes").unwrap();
-        assert!(save_document(&file, Arc::from("new"), Some(&document)).is_err());
+        let error = save_document(&file, Arc::from("new"), Some(&document)).unwrap_err();
+        assert_eq!(error.stage, "checking the original file");
         assert_eq!(fs::read_to_string(&file).unwrap(), "external changes");
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
     }
@@ -2275,6 +2868,97 @@ mod tests {
             other => panic!("expected one saved document, got {other:?}"),
         };
         assert_eq!(fs::read_to_string(&file).unwrap(), &*winner.original);
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    const SHARE_READ_WRITE: u32 = 0x1 | 0x2;
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_staging_reserves_delete_access_and_keeps_new_publication_no_clobber() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let directory = TestDirectory::new();
+        let mut staged = TemporarySave::new(&directory.0).unwrap();
+        staged.file_mut().write_all(b"staged").unwrap();
+        staged.file_mut().sync_all().unwrap();
+        let staging_path = fs::read_dir(&directory.0)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let blocked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(SHARE_READ_WRITE)
+            .open(&staging_path)
+            .unwrap_err();
+        assert_eq!(blocked.raw_os_error(), Some(32));
+
+        let path = directory.0.join("source.rs");
+        fs::write(&path, "other writer").unwrap();
+        assert_eq!(
+            staged.publish_new(&path).unwrap_err().kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        drop(staged);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "other writer");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_preserves_delete_shared_readers_of_the_original() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("source.rs");
+        let previous = save_document(&path, Arc::from("original"), None).unwrap();
+        // File::open shares read, write and delete on Windows.
+        let mut reader = File::open(&path).unwrap();
+        save_document(&path, Arc::from("updated"), Some(&previous)).unwrap();
+        let mut opened = String::new();
+        reader.read_to_string(&mut opened).unwrap();
+        assert_eq!(opened, "original");
+        assert_eq!(fs::read_to_string(&path).unwrap(), "updated");
+        assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_replacement_rechecks_the_snapshot_after_destination_sharing_denial() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+
+        let directory = TestDirectory::new();
+        let path = directory.0.join("source.rs");
+        let previous = save_document(&path, Arc::from("original"), None).unwrap();
+        let mut blocker = Some(
+            fs::OpenOptions::new()
+                .read(true)
+                .share_mode(SHARE_READ_WRITE)
+                .open(&path)
+                .unwrap(),
+        );
+        let mut staged = TemporarySave::new(&directory.0).unwrap();
+        staged.file_mut().write_all(b"staged").unwrap();
+        staged.file_mut().sync_all().unwrap();
+        let mut attempts = 0;
+        let error = retry_windows_replacement(|| {
+            attempts += 1;
+            let result = staged.replace_once(&path, &previous);
+            if let Some(blocker) = blocker.take() {
+                let denied = result.as_ref().unwrap_err();
+                assert_eq!(denied.stage, "replacing the destination file");
+                assert!(matches!(denied.source.raw_os_error(), Some(5 | 32)));
+                drop(blocker);
+                fs::write(&path, "external change").unwrap();
+            }
+            result
+        })
+        .unwrap_err();
+        assert_eq!(attempts, 2);
+        assert_eq!(error.stage, "rechecking the original file");
+        drop(staged);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "external change");
         assert_eq!(fs::read_dir(&directory.0).unwrap().count(), 1);
     }
 
@@ -2340,7 +3024,77 @@ let placeholder = "${workspace}";"##;
     }
 
     #[test]
-    fn outline_lists_variable_bindings_and_jumps_to_their_source_line() {
+    fn dockerfile_outline_refresh_and_jump_work_in_the_native_editor() {
+        use iced::futures::{StreamExt, executor::block_on};
+
+        let source = "ARG BASE=alpine\nFROM ${BASE} AS build\nENV APP_HOME=/app\nFROM alpine\n";
+        assert!(matches!(
+            Language::detect(Path::new("Dockerfile"), source),
+            Language::Dockerfile
+        ));
+        let mut editor = EditorWindow::new();
+        editor.path = "build.Dockerfile".into();
+        editor.content = text_editor::Content::with_text(source);
+        let mut actions =
+            iced_runtime::task::into_stream(editor.update(Message::RefreshOutline)).unwrap();
+        let Some(iced_runtime::Action::Output(result)) = block_on(actions.next()) else {
+            panic!("native Editor did not refresh its Dockerfile outline");
+        };
+        let _ = editor.update(result);
+        assert_eq!(
+            editor
+                .outline
+                .items
+                .iter()
+                .map(|item| (item.kind, item.name.as_str(), item.line))
+                .collect::<Vec<_>>(),
+            [
+                ("parameter", "BASE", 0),
+                ("stage", "build", 1),
+                ("placeholder", "${BASE}", 1),
+                ("exported", "APP_HOME", 2),
+                ("stage", "alpine", 3)
+            ]
+        );
+        let _ = editor.update(Message::Jump {
+            revision: editor.revision,
+            item: 1,
+        });
+        assert_eq!(editor.content.selection().as_deref(), Some("build"));
+    }
+
+    #[test]
+    fn sql_outline_refresh_and_jump_work_in_the_native_editor() {
+        use iced::futures::{StreamExt, executor::block_on};
+
+        let source = "-- Heading\nCREATE TABLE users (id INT);\nDECLARE @limit INT = 5;\n";
+        let mut editor = EditorWindow::new();
+        editor.path = "setup.SQL".into();
+        editor.content = text_editor::Content::with_text(source);
+        let mut actions =
+            iced_runtime::task::into_stream(editor.update(Message::RefreshOutline)).unwrap();
+        let Some(iced_runtime::Action::Output(result)) = block_on(actions.next()) else {
+            panic!("native Editor did not refresh its SQL outline");
+        };
+        let _ = editor.update(result);
+        assert_eq!(
+            editor
+                .outline
+                .items
+                .iter()
+                .map(|item| (item.kind, item.name.as_str(), item.line))
+                .collect::<Vec<_>>(),
+            [("sql table", "users", 1), ("variable", "@limit", 2)]
+        );
+        let _ = editor.update(Message::Jump {
+            revision: editor.revision,
+            item: 0,
+        });
+        assert_eq!(editor.content.selection().as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn outline_lists_variable_bindings_and_selects_their_source_name() {
         let variables = |source, language| {
             scan_outline(source, language)
                 .items
@@ -2369,24 +3123,139 @@ let placeholder = "${workspace}";"##;
         let shell = "MODE=fast\nrun() {\n    local first=1\n    export PATH\n    echo ignored=1\n    DATA+=more\n    cat <<'EOF'\n    HIDDEN=yes\nEOF\n}";
         assert_eq!(
             variables(shell, Language::Shell),
-            [(0, "MODE"), (2, "first"), (3, "PATH"), (5, "DATA")]
-                .map(|(line, name)| (line, name.to_owned()))
+            [(0, "MODE"), (2, "first"), (5, "DATA")].map(|(line, name)| (line, name.to_owned()))
+        );
+        assert!(
+            scan_outline(shell, Language::Shell)
+                .items
+                .iter()
+                .any(|item| {
+                    (item.line, item.kind, item.name.as_str()) == (3, "exported", "PATH")
+                })
         );
 
         let mut editor = EditorWindow::new();
         editor.content = text_editor::Content::with_text(python);
         let outline = scan_outline(python, Language::Python);
-        let line = outline
+        let item = outline
             .items
             .iter()
-            .find(|item| item.name == "threshold")
-            .unwrap()
-            .line;
+            .position(|item| item.name == "threshold")
+            .unwrap();
         let _ = editor.update(Message::OutlineReady(editor.revision, outline));
-        let _ = editor.update(Message::Jump(line));
+        let _ = editor.update(Message::Jump {
+            revision: editor.revision,
+            item,
+        });
+        assert_eq!(editor.content.selection().as_deref(), Some("threshold"));
         assert_eq!(
             editor.content.cursor().position,
-            text_editor::Position { line: 6, column: 0 }
+            text_editor::Position { line: 6, column: 9 }
+        );
+    }
+
+    #[test]
+    fn python_file_outline_selects_a_parameter_on_a_continuation_line() {
+        use iced::futures::{StreamExt, executor::block_on};
+
+        let source = "def render(\r\n    prefix: str,\r\n    größe: int = 1,\r\n):\r\n    return prefix * größe\r\n";
+        let mut editor = EditorWindow::new();
+        editor.path = "layout.py".into();
+        editor.content = text_editor::Content::with_text(source);
+        let mut actions =
+            iced_runtime::task::into_stream(editor.update(Message::RefreshOutline)).unwrap();
+        let Some(iced_runtime::Action::Output(result)) = block_on(actions.next()) else {
+            panic!("native Editor did not refresh its Python outline");
+        };
+        let _ = editor.update(result);
+        let item = editor
+            .outline
+            .items
+            .iter()
+            .position(|item| item.kind == "parameter" && item.name == "größe" && item.line == 2)
+            .unwrap();
+        let _ = editor.update(Message::Jump {
+            revision: editor.revision,
+            item,
+        });
+        assert_eq!(editor.content.selection().as_deref(), Some("größe"));
+    }
+
+    #[test]
+    fn markup_outline_selects_exact_unicode_names_and_rejects_old_clicks() {
+        use iced::futures::{StreamExt, executor::block_on};
+
+        fn refresh(editor: &mut EditorWindow) {
+            let mut actions =
+                iced_runtime::task::into_stream(editor.update(Message::RefreshOutline)).unwrap();
+            let Some(iced_runtime::Action::Output(result)) = block_on(actions.next()) else {
+                panic!("native Editor did not refresh its markup outline");
+            };
+            let _ = editor.update(result);
+        }
+
+        let mut editor = EditorWindow::new();
+        editor.path = "manual.MD".into();
+        editor.content = text_editor::Content::with_text(concat!(
+            "# Overview\r\n",
+            "~~~md\r\n",
+            "## Hidden\r\n",
+            "~~~\r\n",
+            "## Größe 🐚 ###\r\n",
+            "ä ${δ} ${δ}\r\n",
+        ));
+        refresh(&mut editor);
+        assert_eq!(
+            editor
+                .outline
+                .items
+                .iter()
+                .map(|item| item.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Overview", "Größe 🐚", "${δ}", "${δ}"],
+        );
+        let heading = Message::Jump {
+            revision: editor.revision,
+            item: 1,
+        };
+        let _ = editor.update(heading.clone());
+        assert_eq!(editor.content.selection().as_deref(), Some("Größe 🐚"));
+        let _ = editor.update(Message::Jump {
+            revision: editor.revision,
+            item: 3,
+        });
+        assert_eq!(editor.content.selection().as_deref(), Some("${δ}"));
+        assert_eq!(
+            editor.content.cursor().selection,
+            Some(text_editor::Position {
+                line: 5,
+                column: "ä ${δ} ".len(),
+            })
+        );
+
+        let _ = editor.update(Message::Edit(text_editor::Action::Edit(
+            text_editor::Edit::Insert('x'),
+        )));
+        refresh(&mut editor);
+        let after_edit = editor.content.cursor();
+        assert_ne!(editor.revision, 0);
+        assert!(iced_runtime::task::into_stream(editor.update(heading)).is_none());
+        assert_eq!(editor.content.cursor(), after_edit);
+        let _ = editor.update(Message::Jump {
+            revision: editor.revision,
+            item: 1,
+        });
+        assert_eq!(editor.content.selection().as_deref(), Some("Größe 🐚"));
+
+        let adoc = "= Erste\n----\n== Hidden\n----\n== Größe\n";
+        let outline = scan_outline(adoc, Language::detect(Path::new("guide.adoc"), adoc));
+        assert_eq!(
+            outline
+                .items
+                .iter()
+                .map(|item| (item.name.as_str(), item.line, item.column))
+                .collect::<Vec<_>>(),
+            [("Erste", 0, 2), ("Größe", 4, 3)]
         );
     }
 }

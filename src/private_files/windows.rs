@@ -104,7 +104,12 @@ impl Directory {
 
     pub(crate) fn move_entry(&self, name: &OsStr, destination: &Self) -> io::Result<()> {
         let entry = self.0.child_for_removal(name)?;
-        destination.0.publish_file(&entry, name)
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() && !tree::is_reparse_point(&metadata) {
+            destination.0.publish(&Handle::from_file(entry)?, name)
+        } else {
+            destination.0.publish_file(&entry, name)
+        }
     }
 
     pub(crate) fn deletion_child(&self, name: &OsStr) -> io::Result<Self> {
@@ -114,6 +119,13 @@ impl Directory {
                 "Journal deletion cannot cross a filesystem boundary",
             ));
         }
+        Ok(child)
+    }
+
+    /// Opens a private directory without following reparse points or crossing a volume.
+    pub(crate) fn private_deletion_child(&self, name: &OsStr) -> io::Result<Self> {
+        let child = self.deletion_child(name)?;
+        child.0.require_owner_only()?;
         Ok(child)
     }
 
@@ -138,6 +150,19 @@ impl Directory {
         self.0.names(limit)
     }
 
+    /// Reads the hidden attribute through a no-follow child handle.
+    pub(crate) fn is_hidden_child(&self, name: &str) -> io::Result<bool> {
+        use std::os::windows::fs::MetadataExt as _;
+
+        const FILE_ATTRIBUTE_HIDDEN: u32 = 0x2;
+        Ok(self
+            .read_child(OsStr::new(name))?
+            .metadata()?
+            .file_attributes()
+            & FILE_ATTRIBUTE_HIDDEN
+            != 0)
+    }
+
     pub(crate) fn has_entry(&self, name: &str) -> io::Result<bool> {
         match self.0.read_child(OsStr::new(name)) {
             Ok(_) => Ok(true),
@@ -158,6 +183,10 @@ impl Directory {
         let file = self.open_file(name)?;
         Handle::require_owner_only_file(&file)?;
         Ok(file)
+    }
+
+    pub(crate) fn open_existing_lock(&self, name: &str) -> io::Result<File> {
+        self.0.open_shared_lock_file(OsStr::new(name))
     }
 
     pub(crate) fn open_lock(&self, name: &str) -> io::Result<File> {
@@ -193,7 +222,26 @@ impl Directory {
         write: impl FnOnce(&mut File) -> io::Result<()>,
         check: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
-        self.write_staged(write, |file| {
+        self.publish_checked_access(name, false, write, check)
+    }
+
+    pub(crate) fn publish_checked_readable(
+        &self,
+        name: &str,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+        check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.publish_checked_access(name, true, write, check)
+    }
+
+    fn publish_checked_access(
+        &self,
+        name: &str,
+        readable: bool,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+        check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.write_staged(readable, write, |file| {
             check()?;
             self.0.publish_file(file, OsStr::new(name))
         })
@@ -209,10 +257,64 @@ impl Directory {
         write: impl FnOnce(&mut File) -> io::Result<()>,
         check: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
-        self.write_staged(write, |file| {
+        self.write_staged(false, write, |file| {
             check()?;
             self.0.replace_file(file, OsStr::new(name))
         })
+    }
+
+    pub(crate) fn replace_with_readable(
+        &self,
+        name: &str,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+        check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.write_staged(true, write, |file| {
+            check()?;
+            self.0.replace_file(file, OsStr::new(name))
+        })
+    }
+
+    /// Publishes while a caller-held lock protects a checked replacement.
+    pub(crate) fn publish_bytes_with_retry(
+        &self,
+        name: &str,
+        bytes: &[u8],
+        check_replacement: Option<impl Fn() -> io::Result<()>>,
+    ) -> io::Result<()> {
+        const ACCESS_DENIED: i32 = 5;
+        const SHARING_VIOLATION: i32 = 32;
+
+        let name = OsStr::new(name);
+        self.write_staged(
+            false,
+            |file| file.write_all(bytes),
+            |file| {
+                let publish = || {
+                    if let Some(check) = &check_replacement {
+                        check()?;
+                        self.0.replace_file_with_shared_readers(file, name)
+                    } else {
+                        self.0.publish_file(file, name)
+                    }
+                };
+                // Keep the same staged file and recheck the destination on each attempt.
+                for delay in [10, 25, 50, 100, 200] {
+                    match publish() {
+                        Err(error)
+                            if matches!(
+                                error.raw_os_error(),
+                                Some(ACCESS_DENIED | SHARING_VIOLATION)
+                            ) =>
+                        {
+                            std::thread::sleep(std::time::Duration::from_millis(delay));
+                        }
+                        result => return result,
+                    }
+                }
+                publish()
+            },
+        )
     }
 
     pub(crate) fn replace_staged(
@@ -232,11 +334,18 @@ impl Directory {
 
     fn write_staged(
         &self,
+        readable: bool,
         write: impl FnOnce(&mut File) -> io::Result<()>,
         publish: impl FnOnce(&File) -> io::Result<()>,
     ) -> io::Result<()> {
         let stage = format!(".stage-{}", nonce()?);
-        let mut file = self.0.create_file(OsStr::new(&stage)).map_err(|error| {
+        let name = OsStr::new(&stage);
+        let mut file = if readable {
+            self.0.create_read_write_file(name)
+        } else {
+            self.0.create_file(name)
+        }
+        .map_err(|error| {
             io::Error::new(
                 error.kind(),
                 format!("creating protected file stage: {error}"),

@@ -79,6 +79,11 @@ impl Cancellation {
         self.0.load(Ordering::Acquire)
     }
 
+    /// Whether both handles refer to the same run's cancellation signal.
+    pub fn shares_signal_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     fn request(&self) {
         self.0.store(true, Ordering::Release);
     }
@@ -93,6 +98,14 @@ pub struct RunRequest<A> {
     pub trigger: RunTrigger,
     pub started_at: SystemTime,
     pub cancellation: Cancellation,
+}
+
+/// Identifies the original root of an active cascade request.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CascadeOrigin<'a> {
+    pub root_run: RunId,
+    pub root_job: &'a JobId,
+    pub is_root: bool,
 }
 
 /// A finished run to persist or show in a journal.
@@ -110,6 +123,31 @@ pub struct RunRecord {
     pub outcome: RunOutcome,
     pub blockers: Box<[Blocker]>,
     pub(crate) counted_as_run: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DependencyResult {
+    pub(crate) id: RunId,
+    #[serde(with = "record_time")]
+    pub(crate) finished_at: SystemTime,
+    pub(crate) outcome: RunOutcome,
+}
+
+impl DependencyResult {
+    pub(crate) fn newer_than(self, previous: Self) -> bool {
+        (self.finished_at, self.id) > (previous.finished_at, previous.id)
+    }
+}
+
+impl From<&RunRecord> for DependencyResult {
+    fn from(record: &RunRecord) -> Self {
+        Self {
+            id: record.id,
+            finished_at: record.finished_at,
+            outcome: record.outcome,
+        }
+    }
 }
 
 mod record_time {
@@ -153,6 +191,7 @@ impl<A> Default for RunBatch<A> {
 struct JobState {
     active: Option<ActiveRun>,
     last_finished: Option<RunRecord>,
+    dependency_result: Option<DependencyResult>,
     last_run_at: Option<SystemTime>,
     reserved_by: Option<RunId>,
     next_due: Option<SystemTime>,
@@ -175,6 +214,7 @@ enum Stage {
 }
 
 struct Cascade {
+    root: usize,
     order: Vec<usize>,
     stages: Vec<Stage>,
 }
@@ -281,6 +321,55 @@ impl<A> Scheduler<A> {
             .is_some_and(|index| self.states[index].active.is_some())
     }
 
+    /// Returns the origin only for the exact, currently active cascade request.
+    pub fn active_cascade_origin(&self, request: &RunRequest<A>) -> Option<CascadeOrigin<'_>> {
+        let (index, root_run, cascade) = self.active_cascade(request)?;
+        Some(CascadeOrigin {
+            root_run,
+            root_job: self.graph.jobs[cascade.root].id(),
+            is_root: index == cascade.root,
+        })
+    }
+
+    /// Rechecks external predecessors for an exact, active cascade successor.
+    /// Returns `None` for the root, whose conditions a manual start can bypass.
+    pub fn active_cascade_blockers(
+        &self,
+        request: &RunRequest<A>,
+        now: SystemTime,
+    ) -> Option<Vec<Blocker>> {
+        let (index, _, cascade) = self.active_cascade(request)?;
+        (index != cascade.root).then(|| self.cascade_blockers(cascade, index, now))
+    }
+
+    fn active_cascade(&self, request: &RunRequest<A>) -> Option<(usize, RunId, &Cascade)> {
+        if request.trigger != RunTrigger::Cascade {
+            return None;
+        }
+        let index = *self.active.get(&request.id)?;
+        let job = &self.graph.jobs[index];
+        let state = &self.states[index];
+        let active = state.active.as_ref()?;
+        if job.id() != &request.job
+            || !Arc::ptr_eq(&job.action, &request.action)
+            || active.id != request.id
+            || active.trigger != request.trigger
+            || active.started_at != request.started_at
+            || !active
+                .cancellation
+                .shares_signal_with(&request.cancellation)
+        {
+            return None;
+        }
+        let root_run = state.reserved_by?;
+        Some((index, root_run, self.cascades.get(&root_run)?))
+    }
+
+    /// Whether the root's cascade still has running or waiting work.
+    pub fn has_cascade(&self, root_run: RunId) -> bool {
+        self.cascades.contains_key(&root_run)
+    }
+
     /// Checks current gate conditions without starting a run. A manual start
     /// can use this to present the predecessor failures before overriding them.
     pub fn blockers(&self, job: &JobId, now: SystemTime) -> Result<Vec<Blocker>, SchedulerError> {
@@ -324,6 +413,16 @@ impl<A> Scheduler<A> {
         Ok(batch)
     }
 
+    /// Previews the exact reservation set, starting with the selected root.
+    /// Uses the same availability and enabled-branch rules as a cascade start.
+    pub fn cascade_preview(&self, job: &JobId) -> Result<Vec<&Job<A>>, SchedulerError> {
+        let order = self.cascade_plan(self.index(job)?)?;
+        Ok(order
+            .into_iter()
+            .map(|index| &self.graph.jobs[index])
+            .collect())
+    }
+
     /// Starts a manual root, then runs enabled descendants in dependency order.
     /// Branches with disabled descendants are omitted. Overlapping cascades or
     /// active jobs are rejected before any job is started.
@@ -333,6 +432,27 @@ impl<A> Scheduler<A> {
         now: SystemTime,
     ) -> Result<RunBatch<A>, SchedulerError> {
         let root = self.index(job)?;
+        let order = self.cascade_plan(root)?;
+        let mut batch = RunBatch::default();
+        let id = self.start(root, RunTrigger::Cascade, now, &mut batch);
+        let mut stages = vec![Stage::Excluded; self.states.len()];
+        for &index in &order {
+            self.states[index].reserved_by = Some(id);
+            stages[index] = Stage::Waiting;
+        }
+        stages[root] = Stage::Running;
+        self.cascades.insert(
+            id,
+            Cascade {
+                root,
+                order,
+                stages,
+            },
+        );
+        Ok(batch)
+    }
+
+    fn cascade_plan(&self, root: usize) -> Result<Vec<usize>, SchedulerError> {
         self.ensure_available(root)?;
         let mut included = self.graph.descendants(root);
         for &index in &self.graph.topological {
@@ -353,16 +473,7 @@ impl<A> Scheduler<A> {
         for &index in &order {
             self.ensure_available(index)?;
         }
-        let mut batch = RunBatch::default();
-        let id = self.start(root, RunTrigger::Cascade, now, &mut batch);
-        let mut stages = vec![Stage::Excluded; self.states.len()];
-        for &index in &order {
-            self.states[index].reserved_by = Some(id);
-            stages[index] = Stage::Waiting;
-        }
-        stages[root] = Stage::Running;
-        self.cascades.insert(id, Cascade { order, stages });
-        Ok(batch)
+        Ok(order)
     }
 
     /// Completes one active ticket. Stale or duplicate completions are rejected.
@@ -553,7 +664,7 @@ impl<A> Scheduler<A> {
         let max_age = self.graph.jobs[job].max_age_minutes;
         predecessors
             .filter_map(|predecessor| {
-                let reason = match &self.states[predecessor].last_finished {
+                let reason = match self.states[predecessor].dependency_result {
                     None => BlockReason::NeverRan,
                     Some(run) if run.outcome != RunOutcome::Success => {
                         BlockReason::NotSuccessful(run.outcome)
@@ -614,7 +725,17 @@ impl<A> Scheduler<A> {
     fn store(&mut self, index: usize, record: RunRecord, batch: &mut RunBatch<A>) {
         let state = &mut self.states[index];
         if record.counted_as_run {
-            state.last_run_at = Some(record.finished_at);
+            state.last_run_at = state.last_run_at.max(Some(record.finished_at));
+        }
+        let result = DependencyResult::from(&record);
+        if state
+            .last_run_at
+            .is_none_or(|last| result.finished_at >= last)
+            && state
+                .dependency_result
+                .is_none_or(|previous| result.newer_than(previous))
+        {
+            state.dependency_result = Some(result);
         }
         if state
             .last_finished
@@ -629,15 +750,22 @@ impl<A> Scheduler<A> {
     pub(crate) fn restore_history<'a>(
         &mut self,
         last_runs: impl Iterator<Item = (&'a JobId, SystemTime)>,
+        dependency_results: impl Iterator<Item = (&'a JobId, DependencyResult)>,
         journal: &[RunRecord],
     ) {
         for state in &mut self.states {
             state.last_finished = None;
+            state.dependency_result = None;
             state.last_run_at = None;
         }
         for (id, finished_at) in last_runs {
             if let Some(index) = self.graph.index(id) {
                 self.states[index].last_run_at = Some(finished_at);
+            }
+        }
+        for (id, result) in dependency_results {
+            if let Some(index) = self.graph.index(id) {
+                self.states[index].dependency_result = Some(result);
             }
         }
         for run in journal {
@@ -723,11 +851,7 @@ impl<A> Scheduler<A> {
             }) {
                 continue;
             }
-            let outside = predecessors
-                .iter()
-                .copied()
-                .filter(|&p| cascade.stages[p] == Stage::Excluded);
-            let blockers = self.check(index, outside, now, false);
+            let blockers = self.cascade_blockers(cascade, index, now);
             if blockers.is_empty() {
                 cascade.stages[index] = Stage::Running;
                 self.start(index, RunTrigger::Cascade, now, batch);
@@ -737,6 +861,14 @@ impl<A> Scheduler<A> {
                 self.stop_descendants(cascade, index, Some(RunOutcome::Blocked), now, batch);
             }
         }
+    }
+
+    fn cascade_blockers(&self, cascade: &Cascade, index: usize, now: SystemTime) -> Vec<Blocker> {
+        let outside = self.graph.predecessors[index]
+            .iter()
+            .copied()
+            .filter(|&predecessor| cascade.stages[predecessor] == Stage::Excluded);
+        self.check(index, outside, now, false)
     }
 
     fn stop_descendants(

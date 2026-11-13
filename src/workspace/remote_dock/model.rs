@@ -15,6 +15,7 @@ use crate::sftp_window::{
     ConflictChoice, Directory, Entry, EntryKind, EntryName, Location, MAX_SELECTION,
 };
 use crate::ssh_connection::SftpOpener;
+use crate::workspace::SshTarget;
 
 const HOME: &[u8] = b".";
 const MAX_REMOTE_PATH: usize = 16 * 1024;
@@ -54,13 +55,26 @@ pub(super) struct Browser {
 }
 
 impl Browser {
+    pub(super) fn configure_saved_transfers(
+        &self,
+        profile: Option<&std::path::Path>,
+        route: &SshTarget,
+        preferences: crate::sftp_window::ResumePreferences,
+    ) {
+        if let Some(worker) = &self.worker {
+            worker.configure_saved_transfers(profile, route, preferences);
+        }
+    }
+
     pub(super) fn open(
         session: SessionId,
+        target: &SshTarget,
         opener: SftpOpener,
         initial: Option<Vec<u8>>,
         editor_policy: RemoteEditorPolicy,
     ) -> io::Result<(Self, Task<Completion>)> {
         let worker = Worker::start(Connection::Terminal(opener), editor_policy)?;
+        worker.bind_policy_route(target);
         Ok(Self::with_worker(session, worker, initial))
     }
 
@@ -132,7 +146,7 @@ impl Browser {
         self.worker.is_some()
     }
 
-    pub(super) fn terminal_editor_worker(&self) -> Option<&Worker> {
+    pub(super) fn idle_worker(&self) -> Option<&Worker> {
         if self.busy() || !self.connected() {
             return None;
         }
@@ -272,7 +286,13 @@ impl Browser {
     }
 
     /// Called at the operation-completion boundary, before another queued copy is submitted.
-    pub(super) fn cancel_pending_transfers(&mut self) {
+    pub(super) fn revalidate_transfers(&mut self, allowed: bool) {
+        if let Some(worker) = &self.worker {
+            worker.set_transfer_allowed(allowed);
+        }
+        if allowed {
+            return;
+        }
         self.pending_transfers.clear();
         self.conflict = None;
         if let Some(busy) = self.busy.as_mut() {
@@ -336,6 +356,7 @@ impl Browser {
 
     pub(super) fn resume(
         &mut self,
+        target: &SshTarget,
         opener: SftpOpener,
         editor_policy: RemoteEditorPolicy,
     ) -> io::Result<Task<Completion>> {
@@ -346,6 +367,7 @@ impl Browser {
             ));
         }
         let worker = Worker::start(Connection::Terminal(opener), editor_policy)?;
+        worker.bind_policy_route(target);
         Ok(self.resume_with_worker(worker))
     }
 

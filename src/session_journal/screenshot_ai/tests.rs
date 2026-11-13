@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use serde_json::json;
 
 use super::*;
+use crate::local_ai::PromptPreset;
 use crate::local_ai::test_support::{fixture_http_response, listener, start_test_double};
 use crate::private_files::{Directory, nonce};
 use crate::session_journal::{DOCUMENT, viewer::Source};
@@ -82,6 +83,9 @@ fn journal_screenshot_analysis_sends_visible_png_and_redacted_caption_to_loopbac
         fixture_http_response("400 Bad Request", "", &unsupported.to_string()),
         fixture_http_response("200 OK", "", &answer.to_string()),
     ]);
+    let profile = profile.with_prompt_preset(PromptPreset::Gemma);
+    let base = system_prompt("de-DE");
+    let expected_system = profile.render_system_prompt(&base);
     let analysis = analyze(&Client::new(profile), &fixture.screenshot, Some(&redactor)).unwrap();
     let requests = server.join().unwrap();
     assert_eq!(analysis.model, "fixture:local");
@@ -99,7 +103,10 @@ fn journal_screenshot_analysis_sends_visible_png_and_redacted_caption_to_loopbac
     assert!(requests[1].get("response_format").is_none());
     assert_eq!(requests[0]["messages"], requests[1]["messages"]);
     let messages = &requests[0]["messages"];
-    assert!(messages[0]["content"].as_str().unwrap().contains("de-DE"));
+    assert_eq!(
+        messages[0]["content"].as_str(),
+        Some(expected_system.as_ref())
+    );
     let parts = messages[1]["content"].as_array().unwrap();
     assert_eq!(parts.len(), 2);
     assert_eq!(parts[0]["type"], "text");
@@ -137,6 +144,10 @@ fn journal_screenshot_analysis_rejects_truncation_and_omits_unredacted_caption()
     let result = analyze(&Client::new(profile), &fixture.screenshot, None);
     let requests = server.join().unwrap();
     assert!(result.unwrap_err().contains("token limit"));
+    assert_eq!(
+        requests[0]["messages"][0]["content"],
+        system_prompt("de-DE")
+    );
     assert_eq!(
         requests[0]["messages"][1]["content"][0]["text"],
         "Analyze the attached screenshot."

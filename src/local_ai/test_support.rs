@@ -54,7 +54,14 @@ pub(crate) fn listener() -> (TcpListener, Profile) {
 }
 
 pub(crate) fn accept(listener: &TcpListener) -> BufReader<TcpStream> {
-    let deadline = Instant::now() + Duration::from_secs(4);
+    accept_with_timeout(listener, Duration::from_secs(4))
+}
+
+pub(crate) fn accept_with_timeout(
+    listener: &TcpListener,
+    timeout: Duration,
+) -> BufReader<TcpStream> {
+    let deadline = Instant::now() + timeout;
     let stream = loop {
         match listener.accept() {
             Ok((stream, _)) => break stream,
@@ -77,7 +84,7 @@ pub(crate) fn request(stream: &mut BufReader<TcpStream>) -> Value {
     serde_json::from_slice(&wire_request(stream, "POST /v1/chat/completions HTTP/1.1")).unwrap()
 }
 
-pub(super) fn wire_request(stream: &mut BufReader<TcpStream>, request_line: &str) -> Vec<u8> {
+pub(crate) fn wire_request(stream: &mut BufReader<TcpStream>, request_line: &str) -> Vec<u8> {
     let mut line = String::new();
     stream.read_line(&mut line).unwrap();
     assert_eq!(line.trim_end(), request_line);
@@ -100,6 +107,51 @@ pub(super) fn wire_request(stream: &mut BufReader<TcpStream>, request_line: &str
 }
 
 #[test]
+fn reviewed_https_completion_rejects_a_different_credential_before_connecting() {
+    let (listener, _) = listener();
+    let endpoint = format!("https://{}", listener.local_addr().unwrap());
+    let profile = Profile::remote(
+        &endpoint,
+        "fixture",
+        RemoteProtocol::OpenAi,
+        ProfileOptions::default(),
+    )
+    .unwrap();
+    let result = Client::new(profile).complete_reviewed_https_text_before(
+        "workflow system",
+        "reviewed evidence",
+        Instant::now() + Duration::from_secs(4),
+        Some(Zeroizing::new("reviewed-fixture-key".into())),
+        || Ok(()),
+    );
+    assert!(
+        matches!(result, Err(Error::Review(message)) if message.contains("credential changed"))
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn guarded_text_completion_checks_authority_before_dispatch() {
+    let (listener, profile) = listener();
+    let result = Client::new(profile).complete_text_before_guarded(
+        "workflow system",
+        "reviewed evidence",
+        false,
+        Instant::now() + Duration::from_secs(4),
+        || Err("Managed workflow header changed".into()),
+    );
+    assert!(
+        matches!(result, Err(Error::Review(reason)) if reason == "Managed workflow header changed")
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+}
+
+#[test]
 fn an_oversized_local_ai_body_is_an_invalid_response() {
     let large = "x".repeat(MAX_RESPONSE_BYTES as usize);
     let (profile, server) = start_test_double(vec![fixture_response("200 OK", "", &large)]);
@@ -108,6 +160,51 @@ fn an_oversized_local_ai_body_is_an_invalid_response() {
         Err(Error::Invalid("response exceeds 256 KiB"))
     ));
     server.join().unwrap();
+}
+
+#[test]
+fn malformed_openai_choices_keep_reported_usage_and_remain_invalid() {
+    let malformed = [
+        r#"{
+            "choices": [{"message": {"content": "valid first choice"}}, {"message": {"content": 42}}],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14},
+            "model": "fixture:reported", "id": "later-choice"
+        }"#,
+        r#"{
+            "usage": {"prompt_tokens": 12, "completion_tokens": 4, "total_tokens": 16},
+            "model": "fixture:reported", "id": "duplicate-content",
+            "choices": [{"message": {"content": "first", "content": "duplicate"}}]
+        }"#,
+    ];
+    let (profile, server) = start_test_double(
+        malformed
+            .into_iter()
+            .map(|body| fixture_http_response("200 OK", "", body))
+            .collect(),
+    );
+    let client = Client::new(profile);
+    for (id, input, output, total) in [
+        ("later-choice", 11, 3, 14),
+        ("duplicate-content", 12, 4, 16),
+    ] {
+        assert!(matches!(
+            client.complete_before(
+                "fixture",
+                "request",
+                true,
+                Instant::now() + Duration::from_secs(4),
+            ),
+            Err(Error::Invalid("invalid chat response"))
+        ));
+        let usage = client.take_usage().unwrap();
+        assert_eq!(usage.request_id.as_deref(), Some(id));
+        assert_eq!(usage.model.as_deref(), Some("fixture:reported"));
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+            (Some(input), Some(output), Some(total))
+        );
+    }
+    assert_eq!(server.join().unwrap().len(), malformed.len());
 }
 
 #[test]
@@ -146,6 +243,66 @@ fn dropping_local_ai_cancel_closes_an_inflight_http_socket() {
 }
 
 #[test]
+fn cancelling_native_lm_studio_while_reading_the_body_keeps_observed_usage() {
+    let _exclusive = exclusive_run();
+    let (listener, _) = listener();
+    let profile = Profile::lm_studio(
+        &listener.local_addr().unwrap().to_string(),
+        "fixture:native",
+        ProfileOptions::default(),
+    )
+    .unwrap();
+    let server = thread::spawn(move || {
+        let mut socket = accept(&listener);
+        let _ = wire_request(&mut socket, "POST /api/v1/chat HTTP/1.1");
+        socket.get_mut().write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 200\r\nX-Request-Id: native-fixture\r\nConnection: close\r\n\r\n{").unwrap();
+        socket.get_mut().flush().unwrap();
+        match socket.read(&mut [0_u8; 1]) {
+            Ok(0) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+                ) => {}
+            result => {
+                panic!("expected cancellation to close the native response socket: {result:?}")
+            }
+        }
+    });
+    let (headers_read, wait_for_headers) = mpsc::channel();
+    let pending = start(profile, move |client| {
+        let result = client.with_completion(|attempt| {
+            let deadline = Some(Instant::now() + Duration::from_secs(6));
+            let transport = client.transport(deadline)?;
+            let body = providers::lm_request(
+                client,
+                &chat_messages("system", &[], "fixture"),
+                true,
+                false,
+            )?;
+            let mut response = client.completion_response(transport, &body, deadline, attempt)?;
+            headers_read.send(()).unwrap();
+            client.cancellable_response_bytes(&mut response, true)
+        });
+        Ok((result, client.take_usage()))
+    })
+    .unwrap();
+    wait_for_headers
+        .recv_timeout(Duration::from_secs(4))
+        .unwrap();
+    drop(pending.cancel);
+    let (result, usage) = pending.reply.recv_blocking().unwrap().unwrap();
+    assert!(matches!(result, Err(Error::Cancelled)));
+    let usage = usage.unwrap();
+    assert_eq!(usage.request_id.as_deref(), Some("native-fixture"));
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+        (None, None, None)
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn configured_local_chat_sends_the_selected_output_limit_and_reasoning() {
     let (listener, profile) = listener();
     let server = thread::spawn(move || {
@@ -158,7 +315,7 @@ fn configured_local_chat_sends_the_selected_output_limit_and_reasoning() {
             .write_all(fixture_response("200 OK", "", "reply").as_bytes())
             .unwrap();
     });
-    let endpoint = format!("http://{}/v1/", profile.address);
+    let endpoint = format!("http://{}/v1/", profile.external_address());
     let configured = Profile::configured(
         &endpoint,
         "model",

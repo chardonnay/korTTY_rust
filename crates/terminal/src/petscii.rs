@@ -1,4 +1,4 @@
-use crate::{Color, Model, TerminalKey};
+use crate::{Color, Model, Style, TerminalKey};
 
 /// The C64 character modes share punctuation and shifted graphics.
 /// These Unicode approximations match the SithTermFX v1.2.7 mapping.
@@ -36,28 +36,41 @@ impl Petscii {
                 }
                 0x0e => self.uppercase_graphics = false,
                 0x8e => self.uppercase_graphics = true,
-                0x11 => model.move_rows(1, cursor.column),
-                0x91 => model.move_rows(-1, cursor.column),
+                0x11 | 0x91 => {
+                    let wrap_pending = model.screen().wrap_pending;
+                    let rows = if byte == 0x11 { 1 } else { -1 };
+                    model.move_rows(rows, cursor.column);
+                    // Vertical motion keeps PETSCII's one-past-right cursor.
+                    model.screen_mut().wrap_pending = wrap_pending;
+                }
                 0x1d => model.move_cursor(cursor.row, cursor.column + 1),
-                0x9d => model.move_cursor(cursor.row, cursor.column.saturating_sub(1)),
                 0x13 => model.move_cursor(0, 0),
                 0x12 => model.style.inverse = true,
                 0x92 => model.style.inverse = false,
-                0x14 => {
-                    model.move_cursor(cursor.row, cursor.column.saturating_sub(1));
-                    let style = model.style.erase();
-                    let right = model.columns - 1;
-                    model.screen_mut().delete_cells(1, style, right);
+                0x9d | 0x14 => {
+                    let column = if model.screen().wrap_pending {
+                        cursor.column
+                    } else {
+                        cursor.column.saturating_sub(1)
+                    };
+                    model.move_cursor(cursor.row, column);
+                    if byte == 0x14 {
+                        let right = model.columns - 1;
+                        model.screen_mut().delete_cells(1, Style::default(), right);
+                    }
                 }
                 0x93 => {
+                    // Erased cells retain the normal background even in reverse mode.
+                    model.style.inverse = false;
                     model.erase_display(2, false);
                     model.move_cursor(0, 0);
-                    model.style.inverse = false;
                 }
                 0x94 => {
-                    let style = model.style.erase();
-                    let right = model.columns - 1;
-                    model.screen_mut().insert_cells(1, style, right);
+                    // Insertion has no room while the virtual cursor is past the edge.
+                    if !model.screen().wrap_pending {
+                        let right = model.columns - 1;
+                        model.screen_mut().insert_cells(1, Style::default(), right);
+                    }
                 }
                 _ => {
                     if let Some(color) = color(byte) {

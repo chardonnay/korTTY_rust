@@ -6,6 +6,7 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::connection_store::teamwork;
 use crate::snippets::SnippetId;
 use crate::workspace::chrome::Action;
 
@@ -46,22 +47,23 @@ impl Kind {
 }
 
 /// Stable identities only. Display text, query text, and payloads stay out of the MRU.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum Key {
     Action(Action),
     ReconnectTab,
     Monitor(super::super::tab_watch::Kind),
     Tab(u64),
     Connection(u64),
+    Teamwork(teamwork::Identity),
     Snippet(SnippetId),
 }
 
 impl Key {
-    pub(super) const fn kind(self) -> Kind {
+    pub(super) const fn kind(&self) -> Kind {
         match self {
             Self::Action(_) | Self::ReconnectTab | Self::Monitor(_) => Kind::Action,
             Self::Tab(_) => Kind::Tab,
-            Self::Connection(_) => Kind::Connection,
+            Self::Connection(_) | Self::Teamwork(_) => Kind::Connection,
             Self::Snippet(_) => Kind::Snippet,
         }
     }
@@ -123,16 +125,16 @@ impl Mru {
     /// Record a dispatched choice. Tabs already have their own source order.
     pub(super) fn choose(&mut self, key: Key) {
         if key.kind() != Kind::Tab {
-            self.items.retain(|&previous| previous != key);
+            self.items.retain(|previous| previous != &key);
             self.items.insert(0, key);
             self.items.truncate(RECENT_CAPACITY);
         }
     }
 
-    fn boost(&self, key: Key) -> i32 {
+    fn boost(&self, key: &Key) -> i32 {
         self.items
             .iter()
-            .position(|&item| item == key)
+            .position(|item| item == key)
             .map_or(0, |index| {
                 (RECENT_CAPACITY - index) as i32 * RECENT_BOOST_STEP
             })
@@ -164,7 +166,7 @@ impl Snapshot {
                     continue;
                 }
                 let index = snapshot.rows.len();
-                snapshot.keys.insert(entry.key, index);
+                snapshot.keys.insert(entry.key.clone(), index);
                 snapshot.browse[source.kind as usize].push(index);
                 let row = Row::new(entry.cleaned());
                 snapshot.longest_field = snapshot.longest_field.max(row.path_and_title.text.len());
@@ -176,8 +178,8 @@ impl Snapshot {
     }
 
     /// Look up a captured row by identity. The caller still checks current state on dispatch.
-    pub(super) fn entry(&self, key: Key) -> Option<&Entry> {
-        self.keys.get(&key).map(|&index| &self.rows[index].entry)
+    pub(super) fn entry(&self, key: &Key) -> Option<&Entry> {
+        self.keys.get(key).map(|&index| &self.rows[index].entry)
     }
 
     pub(super) fn scoped_query(&self, scope: Option<Kind>) -> &'static str {
@@ -208,7 +210,7 @@ impl Snapshot {
             if let Some(score) = row.score(&query) {
                 matches.push((
                     !row.entry.enabled,
-                    Reverse(score + recent.boost(row.entry.key)),
+                    Reverse(score + recent.boost(&row.entry.key)),
                     kind,
                     // Equal commands sort by title. Other kinds keep their source order.
                     (kind != Kind::Action).then_some(index),
@@ -250,7 +252,7 @@ impl Snapshot {
         } else {
             limit.min(RECENT_ON_EMPTY_QUERY)
         };
-        for &key in &recent.items {
+        for key in &recent.items {
             if entries.len() >= recent_limit {
                 break;
             }
@@ -258,7 +260,7 @@ impl Snapshot {
             if scope.map_or(kind != Kind::Snippet, |scope| scope == kind)
                 && let Some(entry) = self.entry(key)
             {
-                listed.insert(key);
+                listed.insert(&entry.key);
                 entries.push(entry);
             }
         }
@@ -273,7 +275,7 @@ impl Snapshot {
                     return entries;
                 }
                 let entry = &self.rows[index].entry;
-                if listed.insert(entry.key) {
+                if listed.insert(&entry.key) {
                     entries.push(entry);
                 }
             }
@@ -484,7 +486,7 @@ mod tests {
     }
 
     fn keys(entries: Vec<&Entry>) -> Vec<Key> {
-        entries.into_iter().map(|entry| entry.key).collect()
+        entries.into_iter().map(|entry| entry.key.clone()).collect()
     }
 
     #[test]
@@ -537,12 +539,15 @@ mod tests {
     #[test]
     fn supported_prefixes_scope_rows_and_missing_prefixes_match_literally() {
         let action = action(Action::Editor, "C# Format", "Edit");
-        let action_key = action.key;
+        let action_key = action.key.clone();
         let snapshot = Snapshot::new([source(Kind::Action, [action])]);
         assert_eq!(snapshot.scoped_query(Some(Kind::Action)), ">");
         assert_eq!(snapshot.scoped_query(Some(Kind::Snippet)), "");
         assert_eq!(snapshot.parse(" \t# "), (None, "#"));
-        assert_eq!(keys(snapshot.query("#", &Mru::default())), [action_key]);
+        assert_eq!(
+            keys(snapshot.query("#", &Mru::default())).as_slice(),
+            std::slice::from_ref(&action_key)
+        );
 
         let snapshot = Snapshot::new([
             source(
@@ -739,6 +744,63 @@ mod tests {
     }
 
     #[test]
+    fn teamwork_keys_keep_matching_external_ids_separate_by_origin() {
+        let profile = crate::snippets::tests::Profile::new();
+        let settings = teamwork::Settings {
+            sources: ["alpha.xml", "beta.xml"]
+                .into_iter()
+                .map(|file| {
+                    let path = profile.0.join(file);
+                    std::fs::write(
+                        &path,
+                        r#"<connections><connection id="7"><name>Database</name>
+                            <host>db.example</host><username>operator</username>
+                            </connection></connections>"#,
+                    )
+                    .unwrap();
+                    teamwork::Source {
+                        location: path.to_str().unwrap().into(),
+                        enabled: true,
+                        kind: teamwork::SourceKind::File,
+                        check_interval_minutes: teamwork::DEFAULT_CHECK_INTERVAL_MINUTES,
+                    }
+                })
+                .collect(),
+            ..teamwork::Settings::default()
+        };
+        let catalog =
+            teamwork::Catalog::default().refreshed(&settings.active_sources(true, &[]).unwrap());
+        let mut entries = catalog.entries();
+        let first = Key::Teamwork(entries.next().unwrap().identity().clone());
+        let second = Key::Teamwork(entries.next().unwrap().identity().clone());
+        let local = Key::Connection(7);
+        let snapshot = Snapshot::new([source(
+            Kind::Connection,
+            [&local, &first, &second]
+                .into_iter()
+                .map(|key| Entry::new(key.clone(), "Database", "")),
+        )]);
+        let mut recent = Mru::default();
+        assert_eq!(
+            keys(snapshot.query("@", &recent)),
+            [local.clone(), first.clone(), second.clone()]
+        );
+        recent.choose(second.clone());
+        assert_eq!(
+            keys(snapshot.query("@database", &recent)),
+            [second.clone(), local, first.clone()]
+        );
+
+        let reopened = Snapshot::new([source(
+            Kind::Connection,
+            [Entry::new(first.clone(), "Database", "")],
+        )]);
+        assert!(reopened.entry(&second).is_none());
+        assert!(reopened.query("", &recent).is_empty());
+        assert_eq!(keys(reopened.query("@", &recent)), [first]);
+    }
+
+    #[test]
     fn recent_and_result_limits_are_independent_and_old_snapshots_do_not_supply_rows() {
         let connections = (0..80).map(|id| Entry::new(Key::Connection(id), "db", ""));
         let snapshot = Snapshot::new([source(Kind::Connection, connections)]);
@@ -758,9 +820,9 @@ mod tests {
         assert_eq!(scoped.len(), DEFAULT_LIMIT);
         assert_eq!(keys(scoped)[..RECENT_CAPACITY], mru.items);
         assert_eq!(snapshot.query_limit("@db", &mru, 0).len(), 80);
-        assert!(snapshot.entry(Key::Connection(12)).is_some());
+        assert!(snapshot.entry(&Key::Connection(12)).is_some());
         let reopened = Snapshot::new([source(Kind::Connection, [])]);
-        assert!(reopened.entry(Key::Connection(12)).is_none());
+        assert!(reopened.entry(&Key::Connection(12)).is_none());
         assert!(reopened.query("", &mru).is_empty());
     }
 
@@ -774,7 +836,7 @@ mod tests {
         entry.shortcut = Some("Ctrl+\0K".into());
         entry.disabled_reason = Some("Managed\x1b[31m".into());
         let snapshot = Snapshot::new([source(Kind::Connection, [entry])]);
-        let entry = snapshot.entry(Key::Connection(1)).unwrap();
+        let entry = snapshot.entry(&Key::Connection(1)).unwrap();
         assert_eq!(entry.title, "prod10.0.0.1");
         assert_eq!(entry.detail, "root@web log next");
         assert_eq!(entry.shortcut.as_deref(), Some("Ctrl+K"));

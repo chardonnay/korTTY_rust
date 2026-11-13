@@ -243,20 +243,54 @@ impl Workspace {
         ) {
             return Task::none();
         }
-        let (grid, strict) = (source.grid, source.strict_escapes);
-        match Session::start_serial_with_strict(
+        let grid = source.grid;
+        let saved = source
+            .saved_serial
+            .as_ref()
+            .filter(|saved| saved.matches(&connection, profile))
+            .cloned();
+        let current = saved.as_ref().and_then(|saved| {
+            let store = crate::profile::connections_path()
+                .and_then(crate::connection_store::Store::open)
+                .ok()?;
+            store
+                .serial(saved.id)
+                .filter(|saved| saved.matches(&connection, profile))
+                .cloned()
+        });
+        let journal_config = current
+            .as_ref()
+            .map(|saved| saved.journal)
+            .unwrap_or_default();
+        let saved = current.or(saved);
+        let saved_strict = saved.as_ref().and_then(|saved| saved.strict_terminal_mode);
+        let strict = saved_strict.unwrap_or(source.reconnect_strict_escapes());
+        let usage_pending = source.serial_use_pending && saved.is_some();
+        let appearance = source.project_terminal_appearance.as_ref().map_or_else(
+            || self.window_settings.terminal_appearance(),
+            |_| self.pane_appearance(target.source),
+        );
+        match Session::start_serial_with_options(
             connection,
             grid,
             profile,
             self.window_settings.prompt_navigation_enabled,
-            self.window_settings.terminal_appearance(),
-            strict,
+            appearance,
+            crate::session::StreamOptions {
+                strict_escapes: Some(strict),
+                encoding: Some(self.window_settings.serial_default_encoding),
+                scrollback: self.window_settings.scrollback_config(),
+            },
         ) {
             Ok(session) => {
                 let candidate =
                     self.store_connected_session(session, grid, Some(target.source), None);
                 if let Some(pane) = self.sessions.get_mut(&candidate) {
                     pane.strict_escapes = strict;
+                    pane.saved_strict_escapes = saved_strict.is_some();
+                    pane.journal_config = journal_config;
+                    pane.saved_serial = saved;
+                    pane.serial_use_pending = usage_pending;
                 }
                 self.start_reconnect_worker(owner, target, candidate, None, Default::default())
             }

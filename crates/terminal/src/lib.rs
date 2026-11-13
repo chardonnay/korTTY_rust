@@ -11,12 +11,14 @@ mod command_output;
 mod command_timestamps;
 mod control_strings;
 mod dec;
+mod encoding;
 mod hp;
 mod journal;
 mod kitty;
 mod mouse;
 mod osc52;
 mod osc5522;
+mod output;
 mod packed_cells;
 mod palette;
 mod password_prompt;
@@ -52,8 +54,14 @@ use vte::{Params, Parser, Perform};
 use wyse::Wyse;
 
 pub use attributes::{Cell, Color, Cursor, CursorShape, Style};
+
+/// Returns the width used by the terminal for a printable or combining character.
+pub fn character_cell_width(character: char) -> Option<usize> {
+    character.width()
+}
 pub use command_output::{LastOutput, LastOutputRange};
 pub use command_timestamps::{CommandTimestamp, CommandTimestampStatus};
+pub use encoding::TextEncoding;
 pub use hp::{Hp2392Input, Hp2392Modes};
 pub use journal::{JournalEvent, JournalObserver, JournalRow};
 pub use kitty::{KittyImage, KittyPlacement};
@@ -63,6 +71,7 @@ pub use osc5522::{
     ClipboardCredentials, ClipboardError, ClipboardLocation, ClipboardRequest, ClipboardRequestId,
     ClipboardRequestKind, ClipboardResult,
 };
+pub use output::{OutputRow, OutputSnapshot};
 pub use palette::Palette;
 pub use prompts::{PromptDirection, PromptLayout, PromptNavigator};
 pub use reconnect::ReconnectHistory;
@@ -73,6 +82,45 @@ pub use search::{
 };
 pub use shell::{ShellEvent, ShellEventKind, ShellPosition};
 pub use typeahead::{TypeAhead, TypeAheadOverlay, TypeAheadShell};
+
+/// Limits for retained primary-screen history. The first limit reached evicts
+/// the oldest rows. The memory limit counts the stored representation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScrollbackConfig {
+    pub lines: u32,
+    pub memory_mib: u8,
+    pub compression: bool,
+}
+
+impl ScrollbackConfig {
+    pub const MIN_LINES: u32 = 100;
+    pub const MAX_LINES: u32 = 100_000;
+    pub const DEFAULT_LINES: u32 = 10_000;
+    pub const MIN_MEMORY_MIB: u8 = 1;
+    pub const MAX_MEMORY_MIB: u8 = 50;
+    pub const DEFAULT_MEMORY_MIB: u8 = 10;
+
+    /// Bounds options received from disk or external callers.
+    pub fn bounded(self) -> Self {
+        Self {
+            lines: self.lines.clamp(Self::MIN_LINES, Self::MAX_LINES),
+            memory_mib: self
+                .memory_mib
+                .clamp(Self::MIN_MEMORY_MIB, Self::MAX_MEMORY_MIB),
+            compression: self.compression,
+        }
+    }
+}
+
+impl Default for ScrollbackConfig {
+    fn default() -> Self {
+        Self {
+            lines: Self::DEFAULT_LINES,
+            memory_mib: Self::DEFAULT_MEMORY_MIB,
+            compression: true,
+        }
+    }
+}
 
 const MAX_COLUMNS: u16 = 1024;
 const MAX_ROWS: u16 = 512;
@@ -294,10 +342,18 @@ pub struct ScreenSnapshot {
     pub scrollback_lines: usize,
     petscii_uppercase_graphics: bool,
     dec_mode: DecMode,
+    text_encoding: Option<TextEncoding>,
     application_cursor_keys: bool,
     application_keypad: bool,
     mouse: MouseState,
     newline_mode: bool,
+}
+
+/// Text from a terminal program. It carries no executable action or URI.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProgramNotification {
+    pub title: String,
+    pub body: String,
 }
 
 /// A Kitty placement at a row relative to the top of a viewport.
@@ -351,11 +407,31 @@ impl ScreenSnapshot {
     ///
     /// PETSCII replaces unrepresentable characters with a question mark.
     pub fn encode_text(&self, text: &str) -> Vec<u8> {
-        match self.profile {
-            TerminalProfile::Petscii => petscii::encode_text(text, self.petscii_uppercase_graphics),
-            profile if DecMode::for_profile(profile).level >= 2 => self.dec_mode.encode_text(text),
+        match (self.profile, self.text_encoding) {
+            (TerminalProfile::Petscii, _) => {
+                petscii::encode_text(text, self.petscii_uppercase_graphics)
+            }
+            (_, Some(encoding)) => {
+                let mut bytes = encoding.encode(text);
+                if encoding == TextEncoding::Windows1252 && self.dec_mode.eight_bit {
+                    // These values belong to the negotiated wire controls.
+                    for byte in &mut bytes {
+                        if (0x80..=0x9f).contains(byte) {
+                            *byte = b'?';
+                        }
+                    }
+                }
+                bytes
+            }
+            (profile, None) if DecMode::for_profile(profile).level >= 2 => {
+                self.dec_mode.encode_text(text)
+            }
             _ => text.as_bytes().to_vec(),
         }
+    }
+
+    pub fn text_encoding(&self) -> TextEncoding {
+        self.text_encoding.unwrap_or_default()
     }
 
     /// Encodes a DEC key using the session's current conformance level and C1 mode.
@@ -375,14 +451,25 @@ impl ScreenSnapshot {
             TerminalKey::KeypadLeft => Some((TerminalKey::Left, b'D')),
             _ => None,
         } {
-            if matches!(
-                self.profile,
+            let legacy_keypad = match self.profile {
                 TerminalProfile::Tvi910
-                    | TerminalProfile::Tvi920
-                    | TerminalProfile::Hp2392
-                    | TerminalProfile::Hp70092
-            ) {
-                return Some(vec![0x1b, b'[', suffix]);
+                | TerminalProfile::Tvi920
+                | TerminalProfile::Hp2392
+                | TerminalProfile::Hp70092 => Some(vec![0x1b, b'[', suffix]),
+                TerminalProfile::Tvi925 => {
+                    tvi::encode_key(self.profile, arrow, KeyModifiers::default())
+                }
+                TerminalProfile::Wy50 | TerminalProfile::Wy60 | TerminalProfile::Wy160 => {
+                    wyse::encode_key(self.profile, arrow, KeyModifiers::default())
+                }
+                _ => None,
+            };
+            if let Some(mut bytes) = legacy_keypad {
+                // The reference adds an Alt prefix without applying the ordinary arrow bindings.
+                if modifiers.alt {
+                    bytes.insert(0, 0x1b);
+                }
+                return Some(bytes);
             }
             if modifiers == KeyModifiers::default()
                 && (self.profile == TerminalProfile::Xterm || self.dec_mode.level != 0)
@@ -438,6 +525,22 @@ fn ordinary_enter(key: TerminalKey) -> TerminalKey {
     }
 }
 
+// The legacy profiles inherit these exact modifier bindings from the common key encoder.
+fn legacy_modified_key(key: TerminalKey, modifiers: KeyModifiers) -> Option<&'static [u8]> {
+    match (key, modifiers.shift, modifiers.alt, modifiers.control) {
+        (TerminalKey::Tab, true, false, false) => Some(b"\x1b[Z"),
+        (TerminalKey::Left, false, true, false) if cfg!(target_os = "macos") => Some(b"\x1bb"),
+        (TerminalKey::Right, false, true, false) if cfg!(target_os = "macos") => Some(b"\x1bf"),
+        (TerminalKey::Left, false, true, false) => Some(b"\x1b[1;3D"),
+        (TerminalKey::Right, false, true, false) => Some(b"\x1b[1;3C"),
+        (TerminalKey::Left, false, false, true) if !cfg!(target_os = "macos") => Some(b"\x1b[1;5D"),
+        (TerminalKey::Right, false, false, true) if !cfg!(target_os = "macos") => {
+            Some(b"\x1b[1;5C")
+        }
+        _ => None,
+    }
+}
+
 /// Terminal emulation state for a single session.
 ///
 /// The owner feeds the transport's chunks in order. Snapshots can be sent to a
@@ -471,8 +574,31 @@ impl Terminal {
 
     /// Creates an empty terminal with the chosen wire protocol and grid dimensions.
     pub fn with_profile(columns: u16, rows: u16, profile: TerminalProfile) -> Self {
+        Self::with_wire_encoding(columns, rows, profile, None)
+    }
+
+    /// Overrides text encoding while keeping the profile's wire controls.
+    /// PETSCII always uses its native character set.
+    pub fn with_profile_and_encoding(
+        columns: u16,
+        rows: u16,
+        profile: TerminalProfile,
+        encoding: TextEncoding,
+    ) -> Self {
+        Self::with_wire_encoding(columns, rows, profile, Some(encoding))
+    }
+
+    fn with_wire_encoding(
+        columns: u16,
+        rows: u16,
+        profile: TerminalProfile,
+        encoding: Option<TextEncoding>,
+    ) -> Self {
         let (columns, rows) = dimensions(columns, rows);
         let mut model = Model::new(columns, rows, profile);
+        if profile != TerminalProfile::Petscii {
+            model.text_encoding = encoding;
+        }
         let input = match profile {
             TerminalProfile::Petscii => {
                 model.style.foreground = Color::Indexed(14);
@@ -548,6 +674,15 @@ impl Terminal {
                     self.model.echo_serial_character(character);
                 }
             }
+        } else if let Some(encoding) = self
+            .model
+            .text_encoding
+            .filter(|encoding| encoding.is_single_byte())
+        {
+            for &byte in bytes {
+                let character = encoding.decode_byte(byte);
+                self.model.echo_serial_character(character);
+            }
         } else if self.model.uses_dec_bytes() {
             for &byte in bytes {
                 let character = if byte >= 0xa0 {
@@ -568,12 +703,26 @@ impl Terminal {
     /// Changes the grid dimensions, reflowing wrapped lines when its width changes.
     pub fn resize(&mut self, columns: u16, rows: u16) {
         let (columns, rows) = dimensions(columns, rows);
-        if let Input::Hp(input) = &mut self.input
-            && (columns, rows) != (self.model.columns, self.model.rows)
-        {
-            input.cancel_transfer();
+        if (columns, rows) == (self.model.columns, self.model.rows) {
+            return;
         }
+        let top = self.model.scroll_top;
+        // The reference keeps the bottom margin's distance from the bottom row.
+        let bottom = (rows + self.model.scroll_bottom)
+            .checked_sub(self.model.rows)
+            .filter(|&bottom| bottom >= top);
         self.model.resize(columns, rows);
+        match &mut self.input {
+            Input::Xterm(_) if let Some(bottom) = bottom => {
+                self.model.scroll_top = top;
+                self.model.scroll_bottom = bottom;
+            }
+            Input::Hp(input) => {
+                input.cancel_transfer();
+                input.apply_memory_lock(&mut self.model);
+            }
+            _ => {}
+        }
     }
 
     /// Sets the measured character cell and text area dimensions in physical pixels.
@@ -757,6 +906,7 @@ impl Terminal {
                 _ => false,
             },
             dec_mode: model.dec_mode,
+            text_encoding: model.text_encoding,
             application_cursor_keys: model.application_cursor_keys,
             application_keypad: model.application_keypad,
             mouse: model.mouse,
@@ -768,6 +918,27 @@ impl Terminal {
     /// The alternate screen never replaces these retained primary coordinates.
     pub fn scrollback_snapshot(&self) -> ScrollbackSnapshot {
         self.model.primary.scrollback_snapshot()
+    }
+
+    /// Tags the physical row before the current primary prompt for desktop
+    /// presentation. The tag does not add text, a prompt, or a protocol event.
+    pub fn mark_presentation_row(&mut self, id: u64) {
+        self.model.primary.mark_annotation(id);
+    }
+
+    /// Returns the tags with their raw row positions, oldest row first.
+    pub fn presentation_rows(&self) -> Vec<(u64, usize)> {
+        self.model.primary.annotations()
+    }
+
+    pub fn remove_presentation_row(&mut self, id: u64) {
+        self.model.primary.remove_annotation(id);
+    }
+
+    /// Unused rows below the primary cursor that a display projection may
+    /// use without hiding terminal output.
+    pub fn presentation_blank_tail(&self) -> usize {
+        self.model.primary.blank_tail()
     }
 
     /// Resolves a held viewport after output, eviction, or a grid resize.
@@ -793,13 +964,27 @@ impl Terminal {
             .map(screen::HistoryLine::cells)
     }
 
+    /// Width of a stored row which continues onto the following physical row.
+    pub fn history_wrapped_columns(&self, index: usize) -> Option<usize> {
+        self.model.screen().history.get(index)?.wrap_length
+    }
+
     /// Sets whether the primary scrollback can be packed, preserving already packed rows.
     /// Returns whether the setting changed.
     pub fn set_scrollback_compression_enabled(&mut self, enabled: bool) -> bool {
-        std::mem::replace(
-            &mut self.model.primary.scrollback_compression_enabled,
-            enabled,
-        ) != enabled
+        self.set_scrollback_config(ScrollbackConfig {
+            compression: enabled,
+            ..self.scrollback_config()
+        })
+    }
+
+    pub fn scrollback_config(&self) -> ScrollbackConfig {
+        self.model.primary.scrollback_config
+    }
+
+    /// Applies both limits immediately and preserves retained rows when possible.
+    pub fn set_scrollback_config(&mut self, config: ScrollbackConfig) -> bool {
+        self.model.primary.configure_scrollback(config.bounded())
     }
 
     /// Packs one bounded slice of the primary scrollback. The owning session
@@ -823,6 +1008,11 @@ impl Terminal {
     /// This never plays sound or emits transport bytes.
     pub fn take_bell_events(&mut self) -> u32 {
         std::mem::take(&mut self.model.bell_events)
+    }
+
+    /// Drains bounded display-only notifications requested through OSC 9/777.
+    pub fn take_program_notifications(&mut self) -> Vec<ProgramNotification> {
+        self.model.program_notifications.drain(..).collect()
     }
 
     /// Drains the latest shell events in stream order. The oldest is discarded
@@ -854,7 +1044,7 @@ impl Terminal {
 
 impl XtermInput {
     fn advance(&mut self, model: &mut Model, bytes: &[u8]) {
-        if model.uses_dec_bytes() {
+        if model.uses_dec_bytes() || model.text_encoding().is_single_byte() {
             self.control_strings.advance(&mut self.parser, model, bytes);
             return;
         }
@@ -1004,6 +1194,7 @@ struct PixelMetrics {
 struct Model {
     profile: TerminalProfile,
     dec_mode: DecMode,
+    text_encoding: Option<TextEncoding>,
     primary: Screen,
     alternate: Screen,
     columns: usize,
@@ -1013,7 +1204,8 @@ struct Model {
     protected: bool,
     national_mode: bool,
     hyperlink: Option<Arc<str>>,
-    saved: [Option<SavedCursor>; 2],
+    saved: Option<SavedCursor>,
+    saved_cursor_tracks_primary_reflow: bool,
     scroll_top: usize,
     scroll_bottom: usize,
     scroll_left: usize,
@@ -1041,10 +1233,12 @@ struct Model {
     right_charset: usize,
     single_shift: Option<usize>,
     last_printed: Option<char>,
+    first_csi_parameter: Option<usize>,
     title: String,
     title_stack: VecDeque<String>,
     responses: Vec<u8>,
     bell_events: u32,
+    program_notifications: VecDeque<ProgramNotification>,
     shell_events: VecDeque<ShellEvent>,
     prompt_navigation_enabled: bool,
     prompt_serial: u64,
@@ -1071,6 +1265,7 @@ impl Model {
         Self {
             profile,
             dec_mode,
+            text_encoding: None,
             primary: Screen::new(columns, rows, true),
             alternate: Screen::new(columns, rows, false),
             columns,
@@ -1080,7 +1275,8 @@ impl Model {
             protected: false,
             national_mode: false,
             hyperlink: None,
-            saved: [None; 2],
+            saved: None,
+            saved_cursor_tracks_primary_reflow: false,
             scroll_top: 0,
             scroll_bottom: rows - 1,
             scroll_left: 0,
@@ -1108,10 +1304,12 @@ impl Model {
             right_charset: 2,
             single_shift: None,
             last_printed: None,
+            first_csi_parameter: None,
             title: String::new(),
             title_stack: VecDeque::new(),
             responses: Vec::new(),
             bell_events: 0,
+            program_notifications: VecDeque::new(),
             shell_events: VecDeque::new(),
             prompt_navigation_enabled: true,
             prompt_serial: 0,
@@ -1164,10 +1362,15 @@ impl Model {
         self.scroll_bottom = rows - 1;
         self.scroll_left = 0;
         self.scroll_right = columns - 1;
-        for saved in self.saved.iter_mut().flatten() {
-            saved.position.row = saved.position.row.min(rows - 1);
-            saved.position.column = saved.position.column.min(columns - 1);
-            saved.wrap_pending = false;
+        if let Some(saved) = &mut self.saved {
+            if self.saved_cursor_tracks_primary_reflow {
+                saved.position = self.primary.cursor;
+                saved.wrap_pending = self.primary.wrap_pending;
+            } else {
+                saved.position.row = saved.position.row.min(rows - 1);
+                saved.position.column = saved.position.column.min(columns - 1);
+                saved.wrap_pending = false;
+            }
         }
     }
 
@@ -1197,6 +1400,16 @@ impl Model {
         self.move_cursor(row, column);
     }
 
+    fn address_ansi_column(&mut self, row: usize, column: usize) {
+        // The ANSI reference feeds the physical row back into origin-relative positioning.
+        let row = if self.origin_mode {
+            (self.scroll_top + row).min(self.scroll_bottom)
+        } else {
+            row
+        };
+        self.move_cursor(row, column);
+    }
+
     fn move_rows(&mut self, delta: isize, column: usize) {
         let cursor = self.cursor();
         let in_region = (self.scroll_top..=self.scroll_bottom).contains(&cursor.row);
@@ -1211,6 +1424,22 @@ impl Model {
         );
     }
 
+    fn move_ansi_rows(&mut self, count: usize, down: bool) {
+        let cursor = self.cursor();
+        let row = if down {
+            let bottom = if self.origin_mode {
+                self.scroll_bottom
+            } else {
+                self.rows - 1
+            };
+            (cursor.row + count).min(bottom)
+        } else {
+            let top = if self.origin_mode { self.scroll_top } else { 0 };
+            cursor.row.saturating_sub(count).max(top)
+        };
+        self.keep_pending_wrap(|model| model.move_cursor(row, cursor.column));
+    }
+
     fn move_columns(&mut self, delta: isize) {
         let cursor = self.cursor();
         let (left, right) = self.horizontal_bounds(cursor.column);
@@ -1219,6 +1448,12 @@ impl Model {
             .saturating_add_signed(delta)
             .clamp(left, right);
         self.move_cursor(cursor.row, column);
+    }
+
+    fn move_ansi_cursor_left(&mut self, count: usize) {
+        // A pending wrap places the cursor one column beyond its stored position.
+        let count = count.saturating_sub(usize::from(self.screen().wrap_pending));
+        self.move_columns(-(count as isize));
     }
 
     fn carriage_return(&mut self) {
@@ -1256,6 +1491,12 @@ impl Model {
         self.move_cursor(row, cursor.column);
     }
 
+    fn keep_pending_wrap(&mut self, motion: impl FnOnce(&mut Self)) {
+        let pending = self.screen().wrap_pending;
+        motion(self);
+        self.screen_mut().wrap_pending = pending;
+    }
+
     fn tab(&mut self, count: usize, forward: bool) {
         let cursor = self.cursor();
         let mut column = cursor.column;
@@ -1275,8 +1516,35 @@ impl Model {
         self.move_cursor(cursor.row, column);
     }
 
+    fn horizontal_tab(&mut self) {
+        if self.screen().wrap_pending {
+            return;
+        }
+        let cursor = self.cursor();
+        self.tab(1, true);
+        let stop = self.cursor().column;
+        if cursor.column == stop {
+            return;
+        }
+
+        let mut space = Cell::blank(self.style);
+        space.hyperlink = self.hyperlink.clone();
+        space.protected = self.protected;
+        let cells = &mut self.screen_mut().lines[cursor.row].cells;
+        // The reference only extends the line after its last materialized cell.
+        let text_end = cells
+            .iter()
+            .rposition(|cell| !cell.text.is_empty() || cell.width == 0)
+            .map_or(0, |column| column + 1);
+        let start = cursor.column.max(text_end);
+        if start < stop {
+            space.text.push(' ');
+            cells[start..stop].fill(space);
+        }
+    }
+
     fn put_char(&mut self, ch: char) {
-        let width = match ch.width() {
+        let width = match character_cell_width(ch) {
             Some(0) => {
                 self.screen_mut().append_combining(ch);
                 return;
@@ -1307,8 +1575,9 @@ impl Model {
         let (left, right) = self.horizontal_bounds(cursor.column);
         let width = width.min(right - left + 1);
         let no_room = cursor.column + width > right + 1;
-        if self.auto_wrap && (self.screen().wrap_pending || no_room) {
-            let used = if self.screen().wrap_pending {
+        let wrap_pending = self.screen().wrap_pending;
+        if self.auto_wrap && (wrap_pending || no_room) {
+            let used = if wrap_pending {
                 right + 1
             } else {
                 cursor.column
@@ -1322,23 +1591,36 @@ impl Model {
             }
             self.carriage_return();
             self.line_feed();
+        } else if wrap_pending
+            && !self.horizontal_margins
+            && (self.profile == TerminalProfile::Xterm || self.dec_mode.level != 0)
+        {
+            // With autowrap disabled, the ANSI reference returns to column one of the same row.
+            self.carriage_return();
         } else if no_room {
             return;
         }
         let style = self.style;
         let hyperlink = self.hyperlink.clone();
-        let insert_mode = self.insert_mode;
         let protected = self.protected;
-        let screen = self.screen_mut();
-        if insert_mode {
-            screen.insert_cells(width, style.erase(), right);
+        if self.insert_mode {
+            let insert_width = match self.profile {
+                TerminalProfile::Tvi910 | TerminalProfile::Tvi920 | TerminalProfile::Tvi925 => {
+                    // TeleVideo inserts one cell for a double-width BMP character.
+                    width.min(ch.len_utf16())
+                }
+                _ => width,
+            };
+            self.screen_mut()
+                .insert_cells(insert_width, style.erase(), right);
         }
-        screen.put(ch, width, style, hyperlink, protected, right);
+        self.screen_mut()
+            .put(ch, width, style, hyperlink, protected, right);
         self.last_printed = Some(ch);
     }
 
     fn save_cursor(&mut self) {
-        self.saved[usize::from(self.alternate_screen)] = Some(SavedCursor {
+        self.saved = Some(SavedCursor {
             position: self.cursor(),
             style: self.style,
             charsets: self.charsets,
@@ -1349,10 +1631,11 @@ impl Model {
             wrap_pending: self.screen().wrap_pending,
             protected: self.protected,
         });
+        self.saved_cursor_tracks_primary_reflow = false;
     }
 
     fn restore_cursor(&mut self) {
-        let saved = self.saved[usize::from(self.alternate_screen)].unwrap_or_else(|| SavedCursor {
+        let saved = self.saved.unwrap_or_else(|| SavedCursor {
             // DECRC before the first save leaves the active autowrap mode alone.
             auto_wrap: self.auto_wrap,
             ..SavedCursor::default()
@@ -1369,7 +1652,18 @@ impl Model {
     }
 
     fn scroll_up(&mut self, top: usize, bottom: usize, count: usize, record_history: bool) {
-        let style = self.style.erase();
+        if top > bottom {
+            return;
+        }
+        let style = if self.profile == TerminalProfile::Petscii {
+            // Reverse video colors printed cells while scrolled-in blanks use the normal background.
+            Style {
+                background: self.style.background,
+                ..Style::default()
+            }
+        } else {
+            self.style.erase()
+        };
         if self.scroll_left == 0 && self.scroll_right + 1 == self.columns {
             self.screen_mut()
                 .scroll_up(top, bottom, count, style, record_history);
@@ -1386,6 +1680,9 @@ impl Model {
     }
 
     fn scroll_down(&mut self, top: usize, bottom: usize, count: usize) {
+        if top > bottom {
+            return;
+        }
         let style = self.style.erase();
         if self.scroll_left == 0 && self.scroll_right + 1 == self.columns {
             self.screen_mut().scroll_down(top, bottom, count, style);
@@ -1407,14 +1704,18 @@ impl Model {
             .erase_line(row, start, end, style, selective);
     }
 
+    fn erase_below(&mut self, row: usize, selective: bool) {
+        for row in row + 1..self.rows {
+            self.erase_line(row, 0, self.columns, selective);
+        }
+    }
+
     fn erase_display(&mut self, mode: u16, selective: bool) {
         let cursor = self.cursor();
         match mode {
             0 => {
                 self.erase_line(cursor.row, cursor.column, self.columns, selective);
-                for row in cursor.row + 1..self.rows {
-                    self.erase_line(row, 0, self.columns, selective);
-                }
+                self.erase_below(cursor.row, selective);
             }
             1 => {
                 for row in 0..cursor.row {
@@ -1423,13 +1724,8 @@ impl Model {
                 self.erase_line(cursor.row, 0, cursor.column + 1, selective);
             }
             2 => {
-                if self.profile == TerminalProfile::Xterm && !selective {
-                    let style = self.style.erase();
-                    self.screen_mut().archive_display(style);
-                } else {
-                    for row in 0..self.rows {
-                        self.erase_line(row, 0, self.columns, selective);
-                    }
+                for row in 0..self.rows {
+                    self.erase_line(row, 0, self.columns, selective);
                 }
             }
             3 if !selective => {
@@ -1437,11 +1733,16 @@ impl Model {
                     self.current_prompt = None;
                     self.command_timing.clear_pending();
                 }
+                let clear_display = self.rows > 1;
+                let style = self.style.erase();
                 let screen = self.screen_mut();
                 screen.clear_history();
-                screen.clear_live_prompts();
-                for line in &mut screen.lines {
-                    line.images.clear();
+                if clear_display {
+                    screen.clear_display(style);
+                } else {
+                    // SithTermFX leaves the visible line intact on a one-row display.
+                    screen.clear_live_prompts();
+                    screen.lines[0].images.clear();
                 }
             }
             _ => {}
@@ -1459,9 +1760,10 @@ impl Model {
     }
 
     fn set_margins(&mut self, top: usize, bottom: usize) {
+        let single_row = top == bottom && top < self.rows;
         let top = top.min(self.rows - 1);
         let bottom = bottom.min(self.rows - 1);
-        if top < bottom || self.rows == 1 {
+        if top < bottom || single_row || self.rows == 1 {
             self.scroll_top = top;
             self.scroll_bottom = bottom;
             self.address_cursor(0, 0);
@@ -1488,7 +1790,17 @@ impl Model {
             12 => self.cursor_blinking = Some(enabled),
             25 => self.cursor_visible = enabled,
             42 if self.dec_mode.level >= 2 => self.national_mode = enabled,
-            47 | 1047 | 1049 => self.switch_screen(mode, enabled),
+            47 | 1047 => self.switch_screen(enabled),
+            1049 => {
+                if enabled {
+                    self.save_cursor();
+                    // The cursor saved on entry follows the hidden primary page through resize.
+                    self.saved_cursor_tracks_primary_reflow = !self.alternate_screen;
+                } else {
+                    self.restore_cursor();
+                }
+                self.switch_screen(enabled);
+            }
             66 => self.application_keypad = enabled,
             69 if self.dec_mode.level >= 4 => self.set_horizontal_margins(enabled),
             1048 if enabled => self.save_cursor(),
@@ -1499,29 +1811,23 @@ impl Model {
         }
     }
 
-    fn switch_screen(&mut self, mode: u16, enabled: bool) {
+    fn switch_screen(&mut self, enabled: bool) {
         if self.alternate_screen == enabled {
             return;
         }
         self.journal_boundary();
-        if enabled && mode == 1049 {
-            self.save_cursor();
-            self.alternate = Screen::new(self.columns, self.rows, false);
-        }
+        // The live cursor follows the active buffer, including a pending wrap.
+        let cursor = self.cursor();
+        let wrap_pending = self.screen().wrap_pending;
         self.alternate_screen = enabled;
         if !enabled {
-            if matches!(mode, 1047 | 1049) {
-                self.alternate = Screen::new(self.columns, self.rows, false);
-            }
-            if mode == 1049 {
-                // The primary position may have been reflowed while it was hidden.
-                let cursor = self.primary.cursor;
-                let wrap_pending = self.primary.wrap_pending;
-                self.restore_cursor();
-                self.primary.cursor = cursor;
-                self.primary.wrap_pending = wrap_pending;
-            }
+            // Each alternate page ends when the primary page is restored.
+            self.alternate = Screen::new(self.columns, self.rows, false);
+            self.saved_cursor_tracks_primary_reflow = false;
         }
+        let screen = self.screen_mut();
+        screen.cursor = cursor;
+        screen.wrap_pending = wrap_pending;
     }
 
     fn reply(&mut self, bytes: &[u8]) {
@@ -1547,7 +1853,11 @@ impl Model {
 
     fn report_cursor(&mut self, private: bool) {
         let position = self.cursor();
-        let (row, column) = if self.origin_mode {
+        let (row, column) = if !private && !self.horizontal_margins {
+            // The ANSI reference reports the physical row and the virtual column while wrap is pending.
+            let pending = position.column + 1 == self.columns && self.screen().wrap_pending;
+            (position.row, position.column + usize::from(pending))
+        } else if self.origin_mode {
             (
                 position.row.saturating_sub(self.scroll_top),
                 position.column.saturating_sub(self.scroll_left),
@@ -1563,15 +1873,17 @@ impl Model {
     fn reset(&mut self, retain_history: bool) {
         self.journal_boundary();
         let mut reset = Self::new(self.columns, self.rows, self.profile);
+        reset.text_encoding = self.text_encoding;
         if retain_history {
             reset.primary.take_history_from(&mut self.primary);
             reset.kitty = std::mem::take(&mut self.kitty);
         }
-        reset.primary.scrollback_compression_enabled = self.primary.scrollback_compression_enabled;
+        reset.primary.scrollback_config = self.primary.scrollback_config;
         reset.title = std::mem::take(&mut self.title);
         reset.title_stack = std::mem::take(&mut self.title_stack);
         reset.responses = std::mem::take(&mut self.responses);
         reset.bell_events = self.bell_events;
+        reset.program_notifications = std::mem::take(&mut self.program_notifications);
         reset.shell_events = std::mem::take(&mut self.shell_events);
         reset.prompt_navigation_enabled = self.prompt_navigation_enabled;
         reset.prompt_serial = self.prompt_serial;
@@ -1591,6 +1903,18 @@ impl Model {
         reset.clipboard.reset();
         reset.journal = self.journal.take();
         *self = reset;
+    }
+
+    fn reset_ansi(&mut self, retain_history: bool) {
+        let saved = self.saved;
+        let tabs = std::mem::take(&mut self.tabs);
+        let dec_mode = self.dec_mode;
+        self.reset(retain_history);
+        self.saved = saved;
+        self.tabs = tabs;
+        if retain_history {
+            self.dec_mode = dec_mode;
+        }
     }
 }
 
@@ -1616,13 +1940,13 @@ impl Perform for Model {
         }
         match byte {
             b'\x07' => self.ring_bell(),
-            b'\x08' => self.move_columns(-1),
-            b'\t' => self.tab(1, true),
+            b'\x08' => self.move_ansi_cursor_left(1),
+            b'\t' => self.horizontal_tab(),
             b'\n' | b'\x0b' | b'\x0c' => {
                 if self.newline_mode {
                     self.carriage_return();
                 }
-                self.line_feed();
+                self.keep_pending_wrap(Self::line_feed);
             }
             b'\r' => self.carriage_return(),
             b'\x0e' => self.charset = 1,
@@ -1640,7 +1964,7 @@ impl Perform for Model {
             ([], b'8') => self.restore_cursor(),
             ([], b'D') => {
                 self.journal_event(JournalEvent::LineFeed);
-                self.line_feed();
+                self.keep_pending_wrap(Self::line_feed);
             }
             ([], b'E') => {
                 self.journal_event(JournalEvent::LineFeed);
@@ -1652,7 +1976,7 @@ impl Perform for Model {
                 let column = self.cursor().column;
                 self.tabs[column] = true;
             }
-            ([], b'M') => self.reverse_index(),
+            ([], b'M') => self.keep_pending_wrap(Self::reverse_index),
             ([], b'6' | b'9') if self.dec_mode.level >= 4 => self.horizontal_index(byte == b'9'),
             ([], b'N') if self.allows_four_sets() => self.single_shift = Some(2),
             ([], b'O') if self.allows_four_sets() => self.single_shift = Some(3),
@@ -1664,10 +1988,18 @@ impl Perform for Model {
             ([b' '], b'F' | b'G') if self.dec_mode.level >= 2 => {
                 self.dec_mode.eight_bit = byte == b'G';
             }
+            ([b' '], b'L'..=b'N') => {
+                self.charsets[0] = CharacterSet::Ascii;
+                self.charset = 0;
+                if byte != b'N' {
+                    self.charsets[1] = CharacterSet::Supplemental;
+                    self.right_charset = 1;
+                }
+            }
             ([], b'=') => self.application_keypad = true,
             ([], b'>') => self.application_keypad = false,
             ([], b'Z') if self.dec_mode.level != 0 => self.report_device_attributes(),
-            ([], b'c') => self.reset(false),
+            ([], b'c') => self.reset_ansi(false),
             ([b'#'], b'8') => {
                 let cell = Cell {
                     text: "E".into(),
@@ -1708,6 +2040,7 @@ impl Perform for Model {
     }
 
     fn csi_dispatch(&mut self, params: &Params, intermediates: &[u8], ignore: bool, action: char) {
+        let first_parameter_index = self.first_csi_parameter.take();
         if ignore {
             return;
         }
@@ -1715,18 +2048,78 @@ impl Perform for Model {
         let first = values.next().unwrap_or(0);
         let count = usize::from(first.max(1));
         let second = usize::from(values.next().unwrap_or(0).max(1));
+        let first_numeric = || {
+            first_parameter_index
+                .and_then(|index| params.iter().nth(index))
+                .map(|value| value[0])
+        };
+        let edit_count = |horizontal_margins| {
+            if horizontal_margins {
+                count
+            } else {
+                first_numeric().map_or(count, usize::from)
+            }
+        };
         let cursor = self.cursor();
+        let at_virtual_right_margin =
+            cursor.column + 1 == self.columns && self.screen().wrap_pending;
+        // VT100 and VT102 start at level one. Later DEC profiles can explicitly select it.
+        let at_profile_level = self.dec_mode.level == DecMode::for_profile(self.profile).level;
         match (intermediates, action) {
+            ([], 'A' | 'B') if !self.horizontal_margins => {
+                let rows = usize::from(first_numeric().unwrap_or(first).max(1));
+                self.move_ansi_rows(rows, action == 'B');
+            }
             ([], 'A') => self.move_rows(-(count as isize), cursor.column),
-            ([], 'B' | 'e') => self.move_rows(count as isize, cursor.column),
-            ([], 'C' | 'a') => self.move_columns(count as isize),
-            ([], 'D') => self.move_columns(-(count as isize)),
-            ([], 'E') => self.move_rows(count as isize, 0),
-            ([], 'F') => self.move_rows(-(count as isize), 0),
-            ([], 'G' | '`') => self.move_cursor(cursor.row, count - 1),
+            ([], 'B') => self.move_rows(count as isize, cursor.column),
+            ([], 'C' | 'D') => {
+                let columns = if self.horizontal_margins {
+                    count
+                } else {
+                    usize::from(first_numeric().unwrap_or(first).max(1))
+                };
+                if action == 'C' {
+                    self.move_columns(columns as isize);
+                } else {
+                    self.move_ansi_cursor_left(columns);
+                }
+            }
+            // Keep the relative-position commands in Rust's horizontal margin extension.
+            ([], 'a') if self.horizontal_margins => self.move_columns(count as isize),
+            ([], 'e') if self.horizontal_margins => self.move_rows(count as isize, cursor.column),
+            ([], 'E') => self.address_ansi_column(cursor.row + count, 0),
+            ([], 'F') => {
+                let top = if self.origin_mode { self.scroll_top } else { 0 };
+                self.address_ansi_column(cursor.row.saturating_sub(count).max(top), 0);
+            }
+            ([], 'G' | '`') => self.address_ansi_column(cursor.row, count - 1),
             ([], 'H' | 'f') => self.address_cursor(count - 1, second - 1),
-            ([], 'I') => self.tab(count, true),
-            ([], 'Z') => self.tab(count, false),
+            // Keep CSI tab motion only in Rust's horizontal margin extension.
+            ([], 'I' | 'Z') if self.horizontal_margins => self.tab(count, action == 'I'),
+            ([], 'J') if first == 0 => {
+                if !at_virtual_right_margin {
+                    self.erase_line(cursor.row, cursor.column, self.columns, false);
+                }
+                // SithTermFX skips the lower range when it consists of one row.
+                if self.horizontal_margins || cursor.row + 2 < self.rows {
+                    self.erase_below(cursor.row, false);
+                }
+            }
+            ([], 'J') if first == 1 && !self.horizontal_margins && cursor.row > 0 => {
+                // SithTermFX includes the current row in the upper range.
+                for row in 0..=cursor.row {
+                    self.erase_line(row, 0, self.columns, false);
+                }
+            }
+            ([], 'J') if first == 2 => {
+                // The shared ANSI reference retains the cleared page in scrollback.
+                let style = self.style.erase();
+                self.screen_mut().archive_display(style);
+            }
+            ([], 'K') if first == 0 && at_virtual_right_margin => {
+                // At the virtual right margin there are no more cells on this row.
+                self.screen_mut().lines[cursor.row].wrap_length = None;
+            }
             ([], 'J') => self.erase_display(first, false),
             ([], 'K') => self.erase_in_line(first, false),
             ([b'?'], 'J') if self.dec_mode.level >= 2 => self.erase_display(first, true),
@@ -1734,34 +2127,52 @@ impl Perform for Model {
             ([b'"'], 'q') if self.dec_mode.level >= 2 && first <= 2 => {
                 self.protected = first == 1;
             }
-            ([], 'X') if self.dec_mode.level != 1 => {
-                let end = (cursor.column + count).min(self.columns);
-                self.erase_line(cursor.row, cursor.column, end, false);
-            }
-            ([], '@') if self.dec_mode.level != 1 => {
-                let style = self.style.erase();
-                let right = self.horizontal_bounds(cursor.column).1;
-                self.screen_mut().insert_cells(count, style, right);
-            }
-            ([], 'P') if self.profile != TerminalProfile::Vt100 => {
-                let style = self.style.erase();
-                let right = self.horizontal_bounds(cursor.column).1;
-                self.screen_mut().delete_cells(count, style, right);
-            }
-            ([], 'L' | 'M')
-                if self.profile != TerminalProfile::Vt100
-                    && (self.scroll_top..=self.scroll_bottom).contains(&cursor.row)
-                    && (self.scroll_left..=self.scroll_right).contains(&cursor.column) =>
+            ([], '@' | 'P' | 'X')
+                if !at_virtual_right_margin && (action == 'P' || at_profile_level) =>
             {
-                self.carriage_return();
-                if action == 'L' {
-                    self.scroll_down(cursor.row, self.scroll_bottom, count);
+                let characters = edit_count(self.horizontal_margins);
+                if characters == 0 {
+                    return;
+                }
+                if action == 'X' {
+                    let end = (cursor.column + characters).min(self.columns);
+                    self.erase_line(cursor.row, cursor.column, end, false);
                 } else {
-                    self.scroll_up(cursor.row, self.scroll_bottom, count, false);
+                    let style = self.style.erase();
+                    let right = self.horizontal_bounds(cursor.column).1;
+                    if action == '@' {
+                        self.screen_mut().insert_cells(characters, style, right);
+                    } else {
+                        self.screen_mut().delete_cells(characters, style, right);
+                    }
                 }
             }
-            ([], 'S') => self.scroll_up(self.scroll_top, self.scroll_bottom, count, true),
-            ([], 'T') => self.scroll_down(self.scroll_top, self.scroll_bottom, count),
+            ([], 'L' | 'M')
+                if cursor.row <= self.scroll_bottom
+                    && (self.scroll_left..=self.scroll_right).contains(&cursor.column) =>
+            {
+                let lines = first_numeric().map_or(count, usize::from);
+                // Line edits also start above the top margin and leave the cursor in place.
+                if lines == 0 {
+                    return;
+                }
+                if action == 'L' {
+                    self.scroll_down(cursor.row, self.scroll_bottom, lines);
+                } else {
+                    self.scroll_up(cursor.row, self.scroll_bottom, lines, false);
+                }
+            }
+            ([], 'S' | 'T') => {
+                let lines = edit_count(self.horizontal_margins);
+                if lines == 0 {
+                    return;
+                }
+                if action == 'S' {
+                    self.scroll_up(self.scroll_top, self.scroll_bottom, lines, true);
+                } else {
+                    self.scroll_down(self.scroll_top, self.scroll_bottom, lines);
+                }
+            }
             ([], 'b') => {
                 if let Some(ch) = self.last_printed {
                     for _ in 0..count.min(self.columns * self.rows) {
@@ -1769,7 +2180,10 @@ impl Perform for Model {
                     }
                 }
             }
-            ([], 'd') => self.address_cursor(count - 1, cursor.column),
+            ([], 'd') => {
+                // VPA addresses a physical row and leaves the horizontal position alone.
+                self.keep_pending_wrap(|model| model.move_cursor(count - 1, cursor.column));
+            }
             ([], 'g') if first == 0 => self.tabs[cursor.column] = false,
             ([], 'g') if first == 3 => self.tabs.fill(false),
             ([], 'h' | 'l') => {
@@ -1784,8 +2198,14 @@ impl Perform for Model {
                 }
             }
             ([b'?'], 'h' | 'l') => {
+                let enabled = action == 'h';
                 for mode in params.iter().map(|value| value[0]) {
-                    self.set_private_mode(mode, action == 'h');
+                    if mode == 6 && !self.horizontal_margins {
+                        // The ANSI reference preserves the cursor and pending wrap across DECOM.
+                        self.origin_mode = enabled;
+                    } else {
+                        self.set_private_mode(mode, enabled);
+                    }
                 }
             }
             ([], 'm') => {
@@ -1820,9 +2240,13 @@ impl Perform for Model {
             }
             ([], 's') => self.save_cursor(),
             ([], 'u') => self.restore_cursor(),
-            ([], 'n') if first == 5 => self.reply(b"\x1b[0n"),
-            ([], 'n') if first == 6 => self.report_cursor(false),
-            ([b'?'], 'n') if first == 6 => self.report_cursor(true),
+            ([], 'n') => match first_numeric().unwrap_or(first) {
+                5 => self.reply(b"\x1b[0n"),
+                6 => self.report_cursor(false),
+                _ => {}
+            },
+            // DEC private cursor reports are retained for the horizontal margin extension.
+            ([b'?'], 'n') if first == 6 && self.horizontal_margins => self.report_cursor(true),
             ([b'?', b'$'], 'p') if first == 5522 && !self.strict => {
                 let response = format!("\x1b[?5522;{}$y", self.clipboard.mode());
                 self.reply(response.as_bytes());
@@ -1831,7 +2255,8 @@ impl Perform for Model {
                 let response = format!("\x1b[?{first};{value}$y");
                 self.reply(response.as_bytes());
             }
-            ([], 'c') if first == 0 => self.report_device_attributes(),
+            // The pinned SithTermFX profiles answer both forms with their device identity.
+            ([] | [b'>'], 'c') if first == 0 => self.report_device_attributes(),
             ([b'$'], 'x' | 'z' | '{' | 'v' | 'r' | 't') if self.dec_mode.level >= 4 => {
                 self.edit_rectangle(params, action);
             }
@@ -1851,8 +2276,8 @@ impl Perform for Model {
                 let controls = params.iter().nth(1).map_or(0, |value| value[0]);
                 self.select_dec_conformance(first, controls);
             }
-            ([b'!'], 'p') if self.dec_mode.level >= 2 => self.reset_dec_modes(),
-            ([b'!'], 'p') if self.dec_mode.level == 0 => self.reset(true),
+            ([b'!'], 'p') if self.horizontal_margins => self.reset_dec_modes(),
+            ([b'!'], 'p') if at_profile_level => self.reset_ansi(true),
             ([b' '], 'q') if first <= 6 => {
                 self.cursor_shape = Some(match first {
                     3 | 4 => CursorShape::Underline,
@@ -1892,8 +2317,22 @@ impl Perform for Model {
 }
 
 impl Model {
-    fn uses_dec_bytes(&self) -> bool {
+    fn text_encoding(&self) -> TextEncoding {
+        self.text_encoding.unwrap_or_default()
+    }
+
+    fn is_dec_profile(&self) -> bool {
         DecMode::for_profile(self.profile).level >= 2
+    }
+
+    fn uses_dec_bytes(&self) -> bool {
+        self.text_encoding.is_none() && self.is_dec_profile()
+    }
+
+    fn windows_c1_text(&self) -> bool {
+        // Windows-1252 puts printable characters in the C1 range. A peer
+        // that explicitly enables eight-bit DEC controls reserves that range.
+        self.text_encoding == Some(TextEncoding::Windows1252) && !self.dec_mode.eight_bit
     }
 
     fn allows_four_sets(&self) -> bool {
@@ -2109,6 +2548,28 @@ impl Model {
         }
     }
 
+    fn program_notification(&mut self, title: &str, body: &str) {
+        if self.strict {
+            return;
+        }
+        fn clean(value: &str, limit: usize) -> String {
+            value.chars().filter(|ch| !ch.is_control() && !matches!(*ch,
+                '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2060}'..='\u{206f}' | '\u{feff}'))
+                .take(limit).collect()
+        }
+        let body = clean(body, 200);
+        if body.trim().is_empty() {
+            return;
+        }
+        if self.program_notifications.len() == 32 {
+            self.program_notifications.pop_front();
+        }
+        self.program_notifications.push_back(ProgramNotification {
+            title: clean(title, 80),
+            body,
+        });
+    }
+
     fn apply_osc(&mut self, body: &[u8], terminator: &[u8]) {
         if let Some(packet) = body.strip_prefix(b"5522;") {
             let output = self.clipboard.handle(packet);
@@ -2128,9 +2589,16 @@ impl Model {
             }
             return;
         }
-        let Ok(text) = std::str::from_utf8(body) else {
-            return;
-        };
+        let decoded;
+        let text =
+            if self.text_encoding().is_single_byte() && matches!(body, [b'0'..=b'2', b';', ..]) {
+                decoded = self.text_encoding().decode(body);
+                &decoded
+            } else if let Ok(text) = std::str::from_utf8(body) {
+                text
+            } else {
+                return;
+            };
         let Some((command, payload)) = text.split_once(';') else {
             return;
         };
@@ -2140,6 +2608,14 @@ impl Model {
             return;
         }
         match command {
+            "9" => self.program_notification("", payload),
+            "777" => {
+                if let Some(payload) = payload.strip_prefix("notify;")
+                    && let Some((title, body)) = payload.split_once(';')
+                {
+                    self.program_notification(title, body);
+                }
+            }
             "0" | "1" | "2" => {
                 // SithTermFX uses the first argument following the command.
                 self.title =

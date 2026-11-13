@@ -3,9 +3,13 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use super::{Connection, TabColor, invalid, valid_text};
+use super::{
+    Connection, TabColor, invalid,
+    teamwork::{Favorites, HiddenEntries},
+    valid_text,
+};
 
-pub(super) const RECENT_LIMIT: usize = 15;
+pub(crate) const RECENT_LIMIT: usize = 15;
 const MAX_GROUPS: usize = 512;
 const MAX_GROUP_DEPTH: usize = 8;
 pub(crate) const MAX_GROUP_PATH_BYTES: usize = 512;
@@ -23,6 +27,10 @@ pub(super) struct Library {
     pub os_badges: BTreeMap<u64, String>,
     #[serde(skip_serializing_if = "BTreeSet::is_empty")]
     pub favorites: BTreeSet<u64>,
+    #[serde(skip_serializing_if = "Favorites::is_empty")]
+    pub teamwork_favorites: Favorites,
+    #[serde(skip_serializing_if = "HiddenEntries::is_empty")]
+    pub teamwork_hidden: HiddenEntries,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub recent: Vec<u64>,
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
@@ -36,6 +44,8 @@ impl Library {
             && self.membership.is_empty()
             && self.os_badges.is_empty()
             && self.favorites.is_empty()
+            && self.teamwork_favorites.is_empty()
+            && self.teamwork_hidden.is_empty()
             && self.recent.is_empty()
             && self.used_at.is_empty()
     }
@@ -201,7 +211,7 @@ fn new_path(parent: Option<&str>, name: &str) -> io::Result<String> {
     Ok(path)
 }
 
-pub(super) fn valid_path(path: &str) -> bool {
+pub(crate) fn valid_path(path: &str) -> bool {
     path.len() <= MAX_GROUP_PATH_BYTES
         && path.split('/').count() <= MAX_GROUP_DEPTH
         && path.split('/').all(valid_segment)
@@ -247,6 +257,26 @@ impl Search {
                 "{}@{}",
                 connection.login.endpoint.username, connection.login.endpoint.host,
             ))
+    }
+
+    pub(crate) fn serial(&self, profile: &super::SerialProfile) -> bool {
+        self.matches(&profile.display_name())
+            || self.matches(&profile.connection.device.to_string_lossy())
+            || self.matches(&profile.tag)
+    }
+
+    pub(crate) fn local(&self, profile: &super::LocalProfile) -> bool {
+        self.matches(&profile.name)
+            || self.matches("Local Shell")
+            || profile
+                .command
+                .as_ref()
+                .and_then(|command| command.first())
+                .is_some_and(|program| self.matches(program))
+            || profile
+                .working_directory
+                .as_ref()
+                .is_some_and(|path| self.matches(&path.to_string_lossy()))
     }
 
     fn matches(&self, value: &str) -> bool {

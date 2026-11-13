@@ -63,8 +63,8 @@ pub use sign::{KeyType, OwnedSig, SignKey};
 pub use sshnames::ChanFail;
 
 pub use event::{CliEvent, Event, ServEvent};
-pub use runner::{ChanHandle, GlobalReply};
 pub use runner::Runner;
+pub use runner::{ChanHandle, GlobalReply};
 
 pub use client::Client;
 pub use conn::CliServ;
@@ -96,3 +96,5 @@ pub use p256;
 
 #[cfg(feature = "rsa")]
 pub use rsa;
+#[cfg(feature = "rsa")]
+mod rsa_keys;

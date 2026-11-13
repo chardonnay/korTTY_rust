@@ -190,20 +190,64 @@ fn cascade_uses_current_round_and_blocks_only_affected_branches() {
         job("fail", Gate, &["root"]),
         job("pass", Gate, &["root"]),
         job("join", Gate, &["fail", "pass"]),
-        job("leaf", Gate, &["pass"]),
+        Job::new(id("leaf"), "leaf", ()).unwrap().with_dependencies(
+            Gate,
+            vec![id("pass"), id("outside_leaf")],
+            NonZeroU32::new(1),
+        ),
         job("external", Gate, &[]),
+        job("outside_leaf", Gate, &[]),
         job("needs_external", Gate, &["root", "external"]),
         job("disabled", Gate, &["root"]).with_enabled(false),
         job("omitted", Gate, &["disabled"]),
     ]);
-    let root = scheduler.start_cascade(&id("root"), at(1)).unwrap();
+    let _ = run(&mut scheduler, "outside_leaf", RunOutcome::Success, 1);
+    let busy = scheduler.start_manual(&id("fail"), at(1)).unwrap();
+    assert_eq!(
+        scheduler.cascade_preview(&id("root")).unwrap_err(),
+        SchedulerError::Busy(id("fail"))
+    );
+    let _ = scheduler
+        .complete(busy.started[0].id, RunOutcome::Success, at(1))
+        .unwrap();
+    let preview = scheduler.cascade_preview(&id("root")).unwrap();
+    assert_eq!(
+        preview
+            .iter()
+            .map(|job| job.id().as_str())
+            .collect::<Vec<_>>(),
+        ["root", "fail", "pass", "needs_external", "join", "leaf"]
+    );
+    let mut root = scheduler.start_cascade(&id("root"), at(1)).unwrap();
+    let root_run = root.started[0].id;
+    assert!(scheduler.has_cascade(root_run));
+    let origin = scheduler.active_cascade_origin(&root.started[0]).unwrap();
+    assert_eq!(origin.root_run, root_run);
+    assert_eq!(origin.root_job, &id("root"));
+    assert!(origin.is_root);
+    assert!(
+        scheduler
+            .active_cascade_blockers(&root.started[0], at(1))
+            .is_none()
+    );
+    let cancellation = std::mem::take(&mut root.started[0].cancellation);
+    assert!(scheduler.active_cascade_origin(&root.started[0]).is_none());
+    root.started[0].cancellation = cancellation;
     assert!(matches!(
         scheduler.start_manual(&id("join"), at(2)),
         Err(SchedulerError::Busy(_))
     ));
     let after_root = scheduler
-        .complete(root.started[0].id, RunOutcome::Success, at(3))
+        .complete(root_run, RunOutcome::Success, at(3))
         .unwrap();
+    assert!(scheduler.has_cascade(root_run));
+    assert!(scheduler.active_cascade_origin(&root.started[0]).is_none());
+    let origin = scheduler
+        .active_cascade_origin(&after_root.started[0])
+        .unwrap();
+    assert_eq!(origin.root_run, root_run);
+    assert_eq!(origin.root_job, &id("root"));
+    assert!(!origin.is_root);
     assert_eq!(names(&after_root), ["fail", "pass"]);
     assert_eq!(after_root.finished[1].job, id("needs_external"));
     assert_eq!(
@@ -224,12 +268,25 @@ fn cascade_uses_current_round_and_blocks_only_affected_branches() {
         .complete(after_root.started[1].id, RunOutcome::Success, at(5))
         .unwrap();
     assert_eq!(names(&after_pass), ["leaf"]);
+    let leaf = &after_pass.started[0];
+    let blockers = scheduler.active_cascade_blockers(leaf, at(125)).unwrap();
+    assert_eq!(blockers.len(), 1);
+    assert_eq!(blockers[0].predecessor, id("outside_leaf"));
+    assert_eq!(blockers[0].reason, BlockReason::TooOld);
+    let _ = run(&mut scheduler, "outside_leaf", RunOutcome::Success, 125);
+    assert!(
+        scheduler
+            .active_cascade_blockers(leaf, at(125))
+            .unwrap()
+            .is_empty()
+    );
     let _ = scheduler
-        .complete(after_pass.started[0].id, RunOutcome::Success, at(6))
+        .complete(leaf.id, RunOutcome::Success, at(126))
         .unwrap();
+    assert!(!scheduler.has_cascade(root_run));
     assert!(scheduler.last_finished(&id("disabled")).is_none());
     assert!(scheduler.last_finished(&id("omitted")).is_none());
-    assert!(scheduler.start_manual(&id("join"), at(7)).is_ok());
+    assert!(scheduler.start_manual(&id("join"), at(127)).is_ok());
 }
 
 #[test]

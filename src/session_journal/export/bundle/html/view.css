@@ -88,3 +88,14 @@ body.capture-open { padding-bottom: min(55vh, 34rem); }
 #image-dialog { color: var(--text); background: var(--surface); border: 1px solid var(--border); max-width: 96vw; max-height: 96vh; }
 #image-dialog::backdrop { background: rgb(0 0 0 / 75%); }
 #large-image { display: block; max-width: 90vw; max-height: 82vh; margin: .5rem auto 0; }
+
+@media (forced-colors: none) {
+    :is(html, #capture-panel, #image-dialog)::-webkit-scrollbar { width: 12px; height: 12px; }
+    :is(html, #capture-panel, #image-dialog)::-webkit-scrollbar-track { background: var(--background); }
+    :is(html, #capture-panel, #image-dialog)::-webkit-scrollbar-thumb {
+        background: var(--muted); border: 2px solid var(--background); border-radius: 6px;
+    }
+    :is(html, #capture-panel, #image-dialog)::-webkit-scrollbar-thumb:vertical { min-height: 40px; }
+    :is(html, #capture-panel, #image-dialog)::-webkit-scrollbar-thumb:horizontal { min-width: 40px; }
+    :is(html, #capture-panel, #image-dialog)::-webkit-scrollbar-thumb:hover { background: var(--text); }
+}

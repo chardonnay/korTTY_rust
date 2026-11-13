@@ -13,6 +13,13 @@ use crate::snippets::SnippetId;
 
 const QUIET_TIME: Duration = Duration::from_secs(2);
 
+#[derive(Default)]
+enum Mode {
+    #[default]
+    Persistent,
+    MemoryOnly,
+}
+
 #[derive(Clone, Debug)]
 pub enum Message {
     Restore(SnippetId),
@@ -34,6 +41,7 @@ pub(super) struct State {
     checked: bool,
     changed_at: Option<Instant>,
     base_changed: bool,
+    mode: Mode,
 }
 
 impl State {
@@ -45,8 +53,21 @@ impl State {
         }
     }
 
+    pub(super) fn memory_only() -> Self {
+        Self {
+            mode: Mode::MemoryOnly,
+            ..Self::new(None)
+        }
+    }
+
+    pub(super) fn is_memory_only(&self) -> bool {
+        matches!(self.mode, Mode::MemoryOnly)
+    }
+
     pub(super) fn changed(&mut self) {
-        self.changed_at = Some(Instant::now());
+        if !self.is_memory_only() {
+            self.changed_at = Some(Instant::now());
+        }
     }
 
     pub(super) fn saved(&mut self) {
@@ -116,7 +137,9 @@ impl Draft {
         self.language = snapshot.language.clone();
         self.category = snapshot.category.clone();
         self.metadata = snapshot.metadata.clone();
-        self.content = iced::widget::text_editor::Content::with_text(&snapshot.content);
+        self.replace_content(iced::widget::text_editor::Content::with_text(
+            &snapshot.content,
+        ));
         self.structure.changed(None);
         self.content_changed = true;
         self.metadata_changed = true;

@@ -347,6 +347,8 @@ fn journal_metadata_rename_save_closes_prompt_and_releases_native_and_hosted_own
 
 #[test]
 fn journal_metadata_description_refreshes_pristine_managers_and_preserves_unsaved_drafts() {
+    use iced::futures::{StreamExt as _, executor::block_on};
+
     for hosted in [false, true] {
         for other_has_draft in [false, true] {
             let mut harness = Harness::new(hosted);
@@ -367,13 +369,38 @@ fn journal_metadata_description_refreshes_pristine_managers_and_preserves_unsave
                 &document,
                 "Saved description",
             );
+            assert_eq!(
+                manager(&harness.workspace, first).description.text(),
+                "Saved description"
+            );
+            let save = harness.workspace.update(Desktop::SessionJournal(
+                first,
+                JournalMessage::Metadata(Message::SaveDescription(target(&document))),
+            ));
+            for done in &harness.workspace.pending_shutdown {
+                wait(done);
+            }
+            let mut actions = iced_runtime::task::into_stream(save).unwrap();
+            let (ticket, result) = loop {
+                let action = block_on(actions.next()).expect("missing metadata worker result");
+                if let iced_runtime::Action::Output(Desktop::SessionJournal(
+                    id,
+                    JournalMessage::Metadata(Message::Saved(ticket, result)),
+                )) = action
+                {
+                    assert_eq!(id, first);
+                    break (ticket, result);
+                }
+            };
+            let saved = result.expect("description worker could not save the journal");
+            assert_eq!(saved.document.summary.description, "Saved description");
+            let persisted = session_journal::read(&document.summary.directory).unwrap();
+            assert_eq!(persisted.summary.description, "Saved description");
             edit(
                 &mut harness.workspace,
                 first,
-                Message::SaveDescription(target(&document)),
+                Message::Saved(ticket, Ok(saved)),
             );
-            let saved = harness.complete_save(first);
-            assert_eq!(saved.summary.description, "Saved description");
             assert_eq!(
                 manager(&harness.workspace, first).description.text(),
                 "Saved description"

@@ -703,7 +703,7 @@ mod tests {
              same.example {first}\nconflict.example {second}\n\
              alias.example {revoked_line}\n@revoked * {revoked_line}\n\
              @cert-authority *.example {first}\n|1|hidden {first}\n\
-             unsupported.example ssh-rsa invalid\ninvalid.example ssh-ed25519 malformed\n",
+             unsupported.example ssh-dss invalid\ninvalid.example ssh-ed25519 malformed\n",
         );
         let source = KnownHostsFile::parse(&contents).unwrap();
         let original = fs::read(&path).unwrap();
@@ -770,6 +770,51 @@ mod tests {
         assert_eq!(result.conflicts[0].endpoint, new);
         assert_eq!(result.needs_review, 1);
         assert_eq!(fs::read(path).unwrap(), unchanged);
+    }
+
+    #[test]
+    fn selected_import_preserves_unselected_new_keys_and_concurrent_local_pins() {
+        let directory = TempDir::new();
+        let store = TrustStore::new(directory.0.join("pins"), TrustMode::Strict);
+        let endpoint = |name| Endpoint::new(name, 22).unwrap();
+        let imported = key(14);
+        let local = key(15);
+        let formerly_conflicting = endpoint("a-conflict.example");
+        let selected = endpoint("b-selected.example");
+        let unselected = endpoint("c-unselected.example");
+        let changed = endpoint("d-changed.example");
+        store.remember(&formerly_conflicting, &local).unwrap();
+        let public = imported.to_openssh().unwrap();
+        let source = KnownHostsFile::parse(&format!(
+            "{formerly_conflicting} {public}\n{selected} {public}\n{unselected} {public}\n{changed} {public}\n"
+        )).unwrap();
+        let review = store.preview_import(source).unwrap();
+        assert_eq!(review.report().added[0].endpoint, selected);
+        assert_eq!(review.report().added[1].endpoint, unselected);
+        assert_eq!(review.report().added[2].endpoint, changed);
+        assert!(store.remove_pin(&formerly_conflicting, &local).unwrap());
+        store.remember(&changed, &local).unwrap();
+        assert!(
+            store
+                .import_reviewed_selected(&review, &std::collections::BTreeSet::from([3]))
+                .is_err()
+        );
+        let result = store
+            .import_reviewed_selected(&review, &std::collections::BTreeSet::from([0, 2]))
+            .unwrap();
+        assert_eq!(result.added[0].endpoint, selected);
+        assert_eq!(result.added.len(), 1);
+        assert_eq!(result.conflicts[0].endpoint, changed);
+        assert_eq!(result.needs_review, 1);
+        assert_eq!(
+            store.check(&unselected, &imported).unwrap(),
+            HostKeyStatus::Unknown
+        );
+        assert_eq!(
+            store.check(&formerly_conflicting, &imported).unwrap(),
+            HostKeyStatus::Unknown
+        );
+        assert_eq!(store.check(&changed, &local).unwrap(), HostKeyStatus::Known);
     }
 
     #[test]

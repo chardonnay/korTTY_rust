@@ -1,0 +1,17 @@
+cursor=1,5
+title=
+reply=1b3d20291b3d21291b3d22291b3d23301b3d24301b3d2521
+screen:
+A       X
+ABCD    X
+        X
+               X
+abcdefghijklmnop
+X
+attributes:
+IIIIIIIII.......
+....UUUUU.......
+IIIIIIIIU.......
+..........UUUUUU
+................
+................

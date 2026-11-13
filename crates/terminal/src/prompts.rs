@@ -18,6 +18,7 @@ pub(crate) enum LineMarkKind {
     OutputStart,
     OutputEnd,
     Timestamp(SystemTime),
+    Annotation,
 }
 
 impl LineMarkKind {

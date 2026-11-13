@@ -4,26 +4,42 @@ use std::sync::Arc;
 
 use async_channel::Receiver;
 use iced::futures::{StreamExt, stream::BoxStream};
-use iced::widget::{button, column, pane_grid, row, text};
+use iced::widget::{button, checkbox, column, pane_grid, row, text};
 use iced::{Element, Subscription, Task, window};
 use kortty_control::{
-    ErrorCode, Fault, Method, Params, ReadMode, Reply, Request, Server, profile_root,
+    ErrorCode, Fault, Method, Params, ReadMode, Reply, Request, Server, TabCreateParams,
+    tab_create_result,
 };
 use serde_json::{Value, json};
 
+use crate::clipboard_policy::ControlApiPolicy;
 use crate::session::{Frame, SessionId, Status};
+use crate::session_security::IsolationLevel;
 
+use super::ssh_access::CreateOptions;
 use super::{Message as Desktop, PaneSession, Tab, Window, Workspace};
 
+mod agents;
+mod create_target;
 mod input;
+mod mcp;
+mod preferences;
+use create_target::CreateTarget;
 
 #[derive(Clone, Debug)]
 pub enum Message {
     Settings(window::Id, bool),
     Enable(window::Id),
     Disable(window::Id),
+    McpServer(window::Id, bool),
+    McpWrites(window::Id, bool),
+    McpChecked(u64, Result<(), &'static str>),
+    McpAnswer(window::Id, u64, mcp::Decision),
+    McpWritten(u64, Result<usize, &'static str>),
     Stopped,
     Request(Request),
+    AgentWritten(u64, Result<usize, &'static str>),
+    Tick,
 }
 
 #[derive(Default)]
@@ -34,20 +50,33 @@ pub(super) struct Control {
     stopping: bool,
     first_write: bool,
     pending_splits: HashMap<SessionId, PendingSplit>,
+    agents: agents::AgentControl,
+    preferences: preferences::Preferences,
+    consent: mcp::Consent,
+    mcp_delivery: HashMap<u64, mcp::Delivery>,
 }
 
 impl Control {
     pub(super) fn subscription(&self) -> Subscription<Desktop> {
-        self.server
+        let requests = self
+            .server
             .as_ref()
             .map_or_else(Subscription::none, |server| {
                 Subscription::run_with(Watch(self.generation, server.requests()), watch)
-            })
+            });
+        if self.agents.needs_tick() || self.consent.active() || !self.mcp_delivery.is_empty() {
+            Subscription::batch([requests, Subscription::run(agent_clock)])
+        } else {
+            requests
+        }
     }
 
     pub(super) fn detach(&mut self) -> Option<Server> {
         let server = self.server.take()?;
         server.revoke();
+        self.agents = agents::AgentControl::default();
+        self.consent.clear();
+        self.mcp_delivery.clear();
         Some(server)
     }
 
@@ -57,7 +86,7 @@ impl Control {
         }
     }
 
-    pub(super) fn settings_view(&self, id: window::Id) -> Element<'_, Desktop> {
+    fn settings_view(&self, id: window::Id, editable: bool) -> Element<'_, Desktop> {
         let status = if let Some(server) = &self.server {
             format!("Listening locally at {}", server.address())
         } else if self.stopping {
@@ -71,7 +100,7 @@ impl Control {
             text("While enabled, local processes running as your OS user can read and type into open terminals."),
             row![
                 button("Done").on_press(Desktop::Control(Message::Settings(id, false))),
-                button("Disable").on_press_maybe(self.server.is_some().then_some(
+                button("Disable").on_press_maybe((editable && self.server.is_some()).then_some(
                     Desktop::Control(Message::Disable(id)),
                 )),
             ]
@@ -100,6 +129,19 @@ fn watch(watch: &Watch) -> BoxStream<'static, Desktop> {
         .boxed()
 }
 
+fn agent_clock() -> BoxStream<'static, Desktop> {
+    let (sender, receiver) = async_channel::bounded(1);
+    let _ = std::thread::Builder::new()
+        .name("kortty-control-agent-waits".into())
+        .spawn(move || {
+            while !sender.is_closed() {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                let _ = sender.try_send(());
+            }
+        });
+    receiver.map(|()| Desktop::Control(Message::Tick)).boxed()
+}
+
 #[derive(Clone, Copy)]
 struct Address {
     window: window::Id,
@@ -117,6 +159,45 @@ struct PendingSplit {
 }
 
 impl Workspace {
+    pub(super) fn control_boot(&mut self) {
+        let result = crate::profile::root().and_then(|root| self.control_boot_from(&root));
+        if let Err(error) = result {
+            eprintln!("kortty: could not start saved Control API settings ({error})");
+        }
+    }
+
+    fn control_boot_from(&mut self, root: &std::path::Path) -> std::io::Result<()> {
+        self.control.preferences = preferences::Preferences::load(root)?;
+        let policy = &self.clipboard.policy;
+        if policy.control_allowed()
+            && (policy.control_api == ControlApiPolicy::Allow || self.control.preferences.enabled)
+        {
+            self.control_start(root)?;
+        }
+        Ok(())
+    }
+
+    fn control_editable(&self) -> bool {
+        let policy = &self.clipboard.policy;
+        policy.control_allowed() && policy.control_api == ControlApiPolicy::Personal
+    }
+
+    fn control_start(&mut self, root: &std::path::Path) -> std::io::Result<()> {
+        let server = Server::start(root)?;
+        server.set_mcp_mode(self.control_mcp_mode());
+        self.control.server = Some(server);
+        self.control.generation = self.control.generation.wrapping_add(1);
+        self.control.first_write = true;
+        Ok(())
+    }
+
+    fn control_save(&mut self, id: window::Id) {
+        let preferences = self.control.preferences;
+        if let Err(error) = crate::profile::root().and_then(|root| preferences.save(&root)) {
+            self.notice(id, format!("Could not save Control API settings ({error})"));
+        }
+    }
+
     pub(super) fn update_control(&mut self, message: Message) -> Task<Desktop> {
         match message {
             Message::Settings(id, true) if self.windows.contains_key(&id) => {
@@ -125,16 +206,14 @@ impl Workspace {
             Message::Settings(id, false) => self.control.close_settings(id),
             Message::Enable(id)
                 if self.control.settings == Some(id)
-                    && self.clipboard.policy.control_allowed
+                    && self.control_editable()
                     && self.control.server.is_none()
                     && !self.control.stopping =>
             {
-                match profile_root().and_then(|root| Server::start(&root)) {
-                    Ok(server) => {
-                        self.control.server = Some(server);
-                        self.control.generation = self.control.generation.wrapping_add(1);
-                        self.control.first_write = true;
-                        self.control.close_settings(id);
+                match crate::profile::root().and_then(|root| self.control_start(&root)) {
+                    Ok(()) => {
+                        self.control.preferences.enabled = true;
+                        self.control_save(id);
                     }
                     Err(error) => {
                         self.control.close_settings(id);
@@ -145,8 +224,13 @@ impl Workspace {
                     }
                 }
             }
-            Message::Disable(id) if self.control.settings == Some(id) => {
-                if let Some(server) = self.control.detach() {
+            Message::Disable(id)
+                if self.control.settings == Some(id) && self.control_editable() =>
+            {
+                self.control.preferences.enabled = false;
+                let server = self.control.detach();
+                self.control_save(id);
+                if let Some(server) = server {
                     for (session, _) in std::mem::take(&mut self.control.pending_splits) {
                         self.stop_session(session);
                     }
@@ -157,22 +241,91 @@ impl Workspace {
                     });
                 }
             }
+            Message::McpServer(id, enabled)
+                if self.control.settings == Some(id)
+                    && self.control.server.is_some()
+                    && self.clipboard.policy.control_allowed()
+                    && self.clipboard.policy.mcp_server_allowed =>
+            {
+                self.control.preferences.mcp_server_enabled = enabled;
+                self.control_update_mcp(id);
+            }
+            Message::McpWrites(id, enabled)
+                if self.control.settings == Some(id)
+                    && self.control.server.is_some()
+                    && self.control.preferences.mcp_server_enabled
+                    && self.clipboard.policy.control_allowed()
+                    && self.clipboard.policy.mcp_server_allowed =>
+            {
+                self.control.preferences.mcp_write_tools_enabled = enabled;
+                self.control_update_mcp(id);
+            }
+            Message::McpChecked(ticket, result) => return self.control_mcp_checked(ticket, result),
+            Message::McpAnswer(owner, ticket, decision) => {
+                return self.control_mcp_answer(owner, ticket, decision);
+            }
+            Message::McpWritten(ticket, result) => return self.control_mcp_written(ticket, result),
             Message::Stopped => self.control.stopping = false,
             Message::Request(request) => return self.control_request(&request),
+            Message::AgentWritten(ticket, result) => {
+                return self.control_agent_written(ticket, result);
+            }
+            Message::Tick => {
+                self.control_agent_tick();
+                self.control_mcp_tick();
+            }
             _ => {}
         }
         Task::none()
     }
 
-    pub(super) fn view_control_settings(&self, id: window::Id) -> Element<'_, Desktop> {
-        let mut body = column![self.control.settings_view(id)].padding(8);
-        if !self.clipboard.policy.control_allowed {
-            body = body.push(text("Managed policy blocks the Control API."));
-        } else if self.control.server.is_none() && !self.control.stopping {
-            body = body.push(
-                button("Enable for this run").on_press(Desktop::Control(Message::Enable(id))),
-            );
+    fn control_update_mcp(&mut self, owner: window::Id) {
+        let mode = self.control_mcp_mode();
+        self.control.consent.clear();
+        self.control.mcp_delivery.clear();
+        if let Some(server) = &self.control.server {
+            server.set_mcp_mode(mode);
         }
+        self.control_save(owner);
+    }
+
+    pub(super) fn view_control_settings(&self, id: window::Id) -> Element<'_, Desktop> {
+        let editable = self.control_editable();
+        let mut body = column![self.control.settings_view(id, editable)].padding(8);
+        if !self.clipboard.policy.control_allowed() {
+            body = body.push(text("Managed policy blocks the Control API."));
+        } else if !editable {
+            body = body.push(text("Managed policy requires the Control API."));
+        } else if self.control.server.is_none() && !self.control.stopping {
+            body = body
+                .push(button("Enable Control API").on_press(Desktop::Control(Message::Enable(id))));
+        }
+        let policy =
+            self.clipboard.policy.control_allowed() && self.clipboard.policy.mcp_server_allowed;
+        let editable = policy && self.control.server.is_some();
+        let preferences = self.control.preferences;
+        body = body.push(
+            column![
+                checkbox(policy && preferences.mcp_server_enabled)
+                    .label("MCP server")
+                    .on_toggle_maybe(editable.then_some(move |enabled| {
+                        Desktop::Control(Message::McpServer(id, enabled))
+                    })),
+                checkbox(policy && preferences.mcp_write_tools_enabled)
+                    .label("Allow MCP write tools")
+                    .on_toggle_maybe((editable && preferences.mcp_server_enabled).then_some(
+                        move |enabled| { Desktop::Control(Message::McpWrites(id, enabled)) }
+                    )),
+                text(if !policy {
+                    "Managed policy blocks MCP access."
+                } else if !editable {
+                    "Enable the Control API to configure MCP access."
+                } else {
+                    "MCP reads mask known secrets. Terminal writes require desktop consent."
+                }),
+            ]
+            .spacing(8),
+        );
         body.into()
     }
 
@@ -180,14 +333,50 @@ impl Workspace {
         if !request.reply.active() {
             return Task::none();
         }
-        if !self.clipboard.policy.control_allowed {
+        if !self.clipboard.policy.control_allowed() {
             request.reply.send(Err(Fault::new(
                 ErrorCode::Policy,
                 "Managed policy blocks local control",
             )));
             return Task::none();
         }
+        if request.reply.mcp_client().is_some() {
+            return self.control_mcp_route(request);
+        }
         let result = match request.method {
+            Method::AgentPrompt | Method::AgentKeys => {
+                return self.control_agent_write(request);
+            }
+            Method::AgentWait => {
+                if let Err(error) = self.control_agent_wait(request, None) {
+                    request.reply.send(Err(error));
+                }
+                return Task::none();
+            }
+            Method::Agents | Method::Agent | Method::AgentExplain | Method::AgentRename => self
+                .control_agents(request)
+                .map(|value| (value, Task::none())),
+            Method::AgentStart => (|| {
+                let address =
+                    self.control_resolve(request.params.required("pane")?, &request.instance)?;
+                let value = self.control_agent_start(request)?;
+                Ok((
+                    value,
+                    self.control_first_mutation(
+                        address.window,
+                        "A local Control API client started a coding agent.",
+                    ),
+                ))
+            })(),
+            Method::Notify => {
+                return match self.control_notification(request) {
+                    Ok(task) => task,
+                    Err(error) => {
+                        request.reply.send(Err(error));
+                        Task::none()
+                    }
+                };
+            }
             Method::Read | Method::Split => {
                 let pending = if request.method == Method::Read {
                     self.control_read(request)
@@ -211,6 +400,32 @@ impl Workspace {
                 Task::none()
             }
         }
+    }
+
+    fn control_first_mutation(&mut self, owner: window::Id, message: &str) -> Task<Desktop> {
+        if !std::mem::take(&mut self.control.first_write) {
+            return Task::none();
+        }
+        self.notice(owner, message.into());
+        self.notify_control_activity("Local Control API", message)
+    }
+
+    fn control_notification(&self, request: &Request) -> Result<Task<Desktop>, Fault> {
+        if !self.clipboard.policy.desktop_notifications_allowed {
+            return Err(Fault::new(
+                ErrorCode::Policy,
+                "Managed policy blocks desktop notifications",
+            ));
+        }
+        if !self.terminal_notifications_enabled() {
+            return Err(Fault::new(
+                ErrorCode::Unsupported,
+                "Desktop notifications are disabled",
+            ));
+        }
+        let title = request.params.required("title")?.to_owned();
+        let body = request.params.required("body")?.to_owned();
+        Ok(self.notify_control_request(title, body, request.reply.clone()))
     }
 
     fn control_read(&self, request: &Request) -> Result<(), Fault> {
@@ -244,18 +459,24 @@ impl Workspace {
             }
             Method::Tabs => {
                 let workspace = &*self;
+                let mcp = request.reply.mcp_client().is_some();
                 let tabs: Vec<_> = self
                     .control_windows(params.string("window")?)?
                     .into_iter()
                     .flat_map(|(_, window)| {
-                        indexed_terminal_tabs(window).map(move |(index, tab)| {
-                            workspace.control_tab_info(window, tab, index, instance)
-                        })
+                        indexed_terminal_tabs(window)
+                            .filter(move |(_, tab)| !mcp || !tab.incognito)
+                            .map(move |(index, tab)| {
+                                workspace.control_tab_info(window, tab, index, instance)
+                            })
                     })
                     .collect();
                 json!({"instance": instance.as_ref(), "tabs": tabs})
             }
-            Method::Panes => self.control_pane_list(params, instance)?,
+            Method::CreateTab => return self.control_create_tab(request),
+            Method::Panes => {
+                self.control_pane_list(params, instance, request.reply.mcp_client().is_some())?
+            }
             Method::Current => json!({"pane": self.control_current().map(|address| {
                 self.control_pane_info(address, instance)
             })}),
@@ -284,6 +505,13 @@ impl Workspace {
                             task = window::gain_focus(address.window);
                         }
                         self.control_focus(address, pane);
+                        task = Task::batch([
+                            task,
+                            self.control_first_mutation(
+                                address.window,
+                                "A local Control API client changed terminal focus.",
+                            ),
+                        ]);
                         if pane {
                             json!({"ok": true, "pane": self.control_pane_info(address, instance)})
                         } else {
@@ -292,8 +520,16 @@ impl Workspace {
                                 window, window.tabs[address.tab].terminal().expect("resolved terminal tab"), address.tab, instance)})
                         }
                     }
-                    Method::Close => self.control_close(address)?,
+                    Method::Close => {
+                        let result = self.control_close(address)?;
+                        task = self.control_first_mutation(
+                            address.window,
+                            "A local Control API client closed a terminal pane.",
+                        );
+                        result
+                    }
                     _ => {
+                        let aliases = self.control_shortcut_aliases();
                         let written = input::write(
                             self.sessions
                                 .get_mut(&address.session)
@@ -301,14 +537,12 @@ impl Workspace {
                             address.session,
                             request.method,
                             params,
+                            aliases.as_ref(),
                         )?;
-                        if self.control.first_write {
-                            self.control.first_write = false;
-                            self.notice(
-                                address.window,
-                                "A local Control API client sent terminal input.".into(),
-                            );
-                        }
+                        task = self.control_first_mutation(
+                            address.window,
+                            "A local Control API client sent terminal input.",
+                        );
                         written
                     }
                 }
@@ -321,6 +555,113 @@ impl Workspace {
             }
         };
         Ok((result, task))
+    }
+
+    fn control_create_tab(&mut self, request: &Request) -> Result<(Value, Task<Desktop>), Fault> {
+        let params = TabCreateParams::parse(&request.params)?;
+        let windows = self
+            .control_windows(params.window)
+            .map_err(|error| error.with("window", json!(params.window)))?;
+        let owner = windows
+            .iter()
+            .find(|(_, window)| window.focused)
+            .or_else(|| windows.first())
+            .map(|(id, _)| *id)
+            .ok_or_else(|| Fault::new(ErrorCode::Unavailable, "No kortty window is open"))?;
+        self.control_allow_mutation(owner)?;
+        if self.exiting
+            || self.owner_dialog(owner).is_some()
+            || self.reopen_busy(owner)
+            || self.palette.is_open(owner)
+        {
+            return Err(Fault::new(
+                ErrorCode::Busy,
+                "The window is waiting for user input",
+            ));
+        }
+        if self.clipboard.policy.problem.is_some() {
+            return Err(Fault::new(
+                ErrorCode::Policy,
+                "Managed policy blocks the connection",
+            ));
+        }
+        let isolation = params.isolation.and_then(IsolationLevel::from_id);
+        let minimum = self.clipboard.policy.minimum_isolation;
+        if isolation.is_some_and(|requested| requested < minimum) {
+            return Err(Fault::new(
+                ErrorCode::Policy,
+                "Managed policy requires stronger isolation",
+            )
+            .with("isolation", json!(isolation))
+            .with("minimum", json!(minimum)));
+        }
+        if params.incognito && !self.clipboard.policy.incognito_allowed {
+            return Err(Fault::new(
+                ErrorCode::Policy,
+                "Managed policy blocks incognito sessions",
+            ));
+        }
+        let target = self.control_create_target(params.connection)?;
+        if !request.reply.active() {
+            return Err(Fault::new(
+                ErrorCode::Timeout,
+                "The tab creation request expired",
+            ));
+        }
+        let options = CreateOptions {
+            isolation,
+            incognito: params.incognito,
+        };
+        let (tab, task) = match target {
+            CreateTarget::Ssh(connection, path) => {
+                self.create_control_saved_ssh(owner, *connection, path, options)?
+            }
+            CreateTarget::Teamwork(selection) => {
+                self.create_control_teamwork_ssh(owner, selection, options)?
+            }
+            CreateTarget::Serial(profile) => {
+                if !self.serial_profiles_allowed() {
+                    return Err(Fault::new(
+                        ErrorCode::Policy,
+                        "Managed policy blocks serial connections",
+                    ));
+                }
+                if isolation.is_some_and(|level| level != IsolationLevel::None) {
+                    return Err(Fault::new(
+                        ErrorCode::Unsupported,
+                        "Serial connections do not support session isolation",
+                    ));
+                }
+                let previous = self.windows[&owner].active_tab_id();
+                let task = self.open_saved_serial_with_privacy(owner, profile, options.incognito);
+                let tab = self.windows[&owner]
+                    .active_tab_id()
+                    .filter(|id| Some(*id) != previous)
+                    .ok_or_else(|| {
+                        Fault::new(ErrorCode::Unavailable, "Could not open the serial tab")
+                    })?;
+                (Some(tab), task)
+            }
+        };
+        let tab = tab
+            .map(|id| {
+                let window = &self.windows[&owner];
+                indexed_terminal_tabs(window)
+                    .find(|(_, tab)| tab.id == id)
+                    .map(|(index, tab)| {
+                        self.control_tab_info(window, tab, index, &request.instance)
+                    })
+                    .ok_or_else(|| Fault::new(ErrorCode::Unavailable, "The new tab is unavailable"))
+            })
+            .transpose()?;
+        let notice = self.control_first_mutation(
+            owner,
+            "A local Control API client requested a terminal tab.",
+        );
+        Ok((
+            tab_create_result(&request.instance, tab),
+            Task::batch([task, notice]),
+        ))
     }
 
     fn control_windows(
@@ -432,13 +773,21 @@ impl Workspace {
         Err(missing())
     }
 
-    fn control_pane_list(&self, params: &Params, instance: &str) -> Result<Value, Fault> {
+    fn control_pane_list(
+        &self,
+        params: &Params,
+        instance: &str,
+        mcp: bool,
+    ) -> Result<Value, Fault> {
         let mut panes = Vec::new();
         let wanted = params.string("tab")?;
         let mut found = wanted.is_none();
         let local_only = params.flag("local_shell_only", false)?;
         for (id, window) in self.control_windows(params.string("window")?)? {
             for (index, tab) in indexed_terminal_tabs(window) {
+                if mcp && tab.incognito {
+                    continue;
+                }
                 if wanted.is_some_and(|wanted| wanted != tab_id(instance, tab.id)) {
                     continue;
                 }
@@ -467,13 +816,14 @@ impl Workspace {
         let pane = tab
             .focused_session()
             .and_then(|session| self.sessions.get(&session));
+        let agents = self.control_agent_totals(Some(tab));
         json!({"window_id": window_id(window), "tab_id": tab_id(instance, tab.id),
             "title": self.tab_names(tab).0,
             "protocol": pane.map(|pane| protocol(pane, &pane.frame)).unwrap_or("UNKNOWN"),
             "host": pane.and_then(|pane| pane.ssh.as_ref().map(super::SshTarget::host)),
             "connected": pane.is_some_and(|pane| pane.session.frame().status == Status::Running),
             "active": window.active == index, "pane_count": tab.grid.len(),
-            "agents": {"blocked": 0, "working": 0, "done": 0, "idle": 0, "total": 0, "most_urgent": null}})
+            "agents": agents})
     }
 
     fn control_pane_info(&self, address: Address, instance: &str) -> Value {
@@ -491,6 +841,7 @@ impl Workspace {
         let index = ordered_panes(tab)
             .iter()
             .position(|(pane, _)| *pane == address.pane);
+        let agent = self.control_agent_info(address, instance);
         json!({"window_id": window_id, "tab_id": tab_id, "pane_id": pane_id,
             "index": index, "focused": address.pane == tab.focused,
             "protocol": protocol, "connected": frame.status == Status::Running,
@@ -498,15 +849,14 @@ impl Workspace {
             "columns": frame.screen.columns, "rows": frame.screen.rows,
             "alternate_screen": frame.screen.alternate_screen, "bracketed_paste": frame.bracketed_paste,
             "isolation": pane.isolation_name(&frame.status), "incognito": tab.incognito,
-            "agent": {"pane_id": pane_id, "tab_id": tab_id, "window_id": window_id,
-                "detected": false, "state": "unknown", "kind": null, "display_name": null,
-                "alias": null, "matched_rule_id": null, "evidence": null, "state_since_millis": 0,
-                "seconds_in_state": 0, "done_until_seen": false, "pid": -1, "command": null}})
+            "stream_generation":pane.stream_generation,
+            "agent": agent})
     }
 
     fn control_allow_mutation(&self, id: window::Id) -> Result<(), Fault> {
         let window = &self.windows[&id];
         if self.control.settings == Some(id)
+            || self.control.consent.owner() == Some(id)
             || self.journal_options_modal(id).is_some()
             || self.journal_edit_for_owner(id).is_some()
             || window.clipboard_settings
@@ -606,13 +956,13 @@ impl Workspace {
         Ok(())
     }
 
-    pub(super) fn control_finish_split(&mut self, session: SessionId) {
+    pub(super) fn control_finish_split(&mut self, session: SessionId) -> Task<Desktop> {
         let Some(pending) = self.control.pending_splits.get(&session) else {
-            return;
+            return Task::none();
         };
         let status = &self.sessions[&session].frame.status;
         if pending.reply.active() && *status == Status::Starting {
-            return;
+            return Task::none();
         }
         let running = *status == Status::Running;
         let pending = self
@@ -628,7 +978,19 @@ impl Workspace {
         if result.is_err() {
             self.stop_session(session);
         }
+        let owner = result
+            .is_ok()
+            .then(|| {
+                self.windows
+                    .iter()
+                    .find(|(_, window)| window.pane_location(session).is_some())
+                    .map(|(&id, _)| id)
+            })
+            .flatten();
         pending.reply.send(result);
+        owner.map_or_else(Task::none, |owner| {
+            self.control_first_mutation(owner, "A local Control API client split a terminal pane.")
+        })
     }
 
     fn control_attach_split(
@@ -753,8 +1115,84 @@ mod tests {
     use super::*;
     use crate::session::{IbmKind, Session};
     use kortty_terminal::TerminalProfile;
-    use std::thread;
+    use std::path::PathBuf;
     use std::time::{Duration, Instant};
+    use std::{fs, thread};
+
+    struct TestProfile(PathBuf);
+
+    impl TestProfile {
+        fn new() -> Self {
+            // The profile must leave room for the control socket in sockaddr_un.
+            let mut nonce = [0; 8];
+            getrandom::fill(&mut nonce).unwrap();
+            let path = std::env::temp_dir().join(format!("kc-{:016x}", u64::from_ne_bytes(nonce)));
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt as _;
+                fs::DirBuilder::new().mode(0o700).create(&path).unwrap();
+            }
+            #[cfg(windows)]
+            fs::create_dir(&path).unwrap();
+            Self(path)
+        }
+    }
+
+    impl Drop for TestProfile {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn managed_control_api_boot_applies_policy_and_preserves_personal_preferences() {
+        use kortty_control::mcp::Mode;
+
+        for (rule, enabled, listening, editable) in [
+            ("", false, false, true),
+            ("", true, true, true),
+            ("control-api = 'allow'", false, true, false),
+            ("control-api = 'deny'", true, false, false),
+        ] {
+            let profile = TestProfile::new();
+            let preferences = preferences::Preferences {
+                enabled,
+                mcp_server_enabled: false,
+                mcp_write_tools_enabled: true,
+            };
+            preferences.save(&profile.0).unwrap();
+            let mut workspace = Workspace::default();
+            workspace.clipboard.policy = crate::clipboard_policy::parse(&format!(
+                "[meta]\nschema-version=1\n[[rule]]\n[rule.features]\nmcp-server = 'allow'\n{rule}"
+            ))
+            .unwrap();
+            workspace.control_boot_from(&profile.0).unwrap();
+            assert_eq!(workspace.control_editable(), editable, "{rule}");
+            assert_eq!(workspace.control.preferences, preferences);
+            assert_eq!(
+                preferences::Preferences::load(&profile.0).unwrap(),
+                preferences
+            );
+            assert_eq!(
+                workspace.control_mcp_mode(),
+                if workspace.clipboard.policy.control_allowed() {
+                    Mode::Off
+                } else {
+                    Mode::PolicyDenied
+                }
+            );
+            assert_eq!(workspace.control.server.is_some(), listening, "{rule}");
+            if let Some(server) = workspace.control.server.take() {
+                let mut client =
+                    kortty_control::Client::connect(&profile.0, Duration::from_secs(5)).unwrap();
+                let response = client.call("ping", &json!({})).unwrap();
+                assert_eq!(response["pong"], true);
+                assert_eq!(response["instance"], server.instance());
+                drop(client);
+                server.stop();
+            }
+        }
+    }
 
     fn wait_for_shell(session: &Session) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -765,6 +1203,145 @@ mod tests {
             assert!(Instant::now() < deadline, "local shell did not start");
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    fn control_reports_host_shortcut_conflicts_and_allows_literal_input() {
+        let profile = TestProfile::new();
+        let server = Server::start(&profile.0).unwrap();
+        let requests = server.requests();
+        let mut workspace = Workspace::default();
+        workspace.set_test_ai_configuration(
+            serde_json::from_value(json!({
+                "general":{"agent_shortcut":{"enabled":true,"name":"fixture","case_insensitive":true}}
+            }))
+            .unwrap(),
+        );
+        let (owner, _) = workspace.open_window(false);
+        workspace.new_tab(owner, TerminalProfile::Xterm);
+        let session = workspace.windows[&owner]
+            .tab()
+            .unwrap()
+            .focused_session()
+            .unwrap();
+        wait_for_shell(&workspace.sessions[&session].session);
+        let pane = pane_id(session);
+        let call = |workspace: &mut Workspace, method, params, dispatched: &[Method]| {
+            thread::scope(|scope| {
+                let root = &profile.0;
+                let client = scope.spawn(move || {
+                    kortty_control::Client::connect(root, Duration::from_secs(5))
+                        .unwrap()
+                        .call(method, &params)
+                });
+                for &expected in dispatched {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let request = loop {
+                        match requests.try_recv() {
+                            Ok(request) => break request,
+                            Err(async_channel::TryRecvError::Empty)
+                                if Instant::now() < deadline =>
+                            {
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("Missing {expected:?} request: {error}"),
+                        }
+                    };
+                    assert_eq!(request.method, expected);
+                    let _ = workspace.update(Desktop::Control(Message::Request(request)));
+                }
+                client.join().unwrap()
+            })
+        };
+        let command = "FIXTURE-ask safe question";
+        for (method, params, dispatched) in [
+            (
+                "pane.send_text",
+                json!({"pane":pane,"text":format!("{command}\r\nother"),"bracketed":"never"}),
+                &[Method::SendText][..],
+            ),
+            (
+                "pane.run",
+                json!({"pane":pane,"command":command}),
+                &[Method::Run][..],
+            ),
+            (
+                "agent.start",
+                json!({"pane":pane,"kind":"gemini-cli","command":["FIXTURE-ask", "safe question"]}),
+                &[Method::Pane, Method::AgentStart][..],
+            ),
+        ] {
+            let error = call(&mut workspace, method, params, dispatched).unwrap_err();
+            assert_eq!(error.exit_code(), 2);
+            let kortty_control::ClientError::Server { rpc, .. } = error else {
+                panic!("Expected a Control API fault");
+            };
+            assert_eq!(rpc["code"], -32024);
+            assert_eq!(
+                rpc["data"],
+                json!({"code":"host_shortcut_conflict","retryable":false,"exit":2,
+                    "pane":pane,"shortcut":"fixture",
+                    "hint":"pass allow_shortcut_conflict:true to write it anyway"})
+            );
+        }
+
+        for (params, length, bracketed) in [
+            (
+                json!({"pane":pane,"text":command,"allow_shortcut_conflict":true}),
+                command.len(),
+                false,
+            ),
+            (
+                json!({"pane":pane,"text":command,"bracketed":"always"}),
+                command.len() + 12,
+                true,
+            ),
+            (json!({"pane":pane,"text":"fixture"}), 7, false),
+        ] {
+            let reply = call(
+                &mut workspace,
+                "pane.send_text",
+                params,
+                &[Method::SendText],
+            )
+            .unwrap();
+            assert_eq!(reply["bytes_written"], length);
+            assert_eq!(reply["bracketed"], bracketed);
+            assert_eq!(reply["submitted"], false);
+        }
+        server.stop();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn control_notification_reports_unavailable_when_the_owner_disappears() {
+        let fixture = TestProfile::new();
+        let server = Server::start(&fixture.0).unwrap();
+        let root = fixture.0.clone();
+        let client = thread::spawn(move || {
+            kortty_control::Client::connect(&root, Duration::from_secs(5))
+                .unwrap()
+                .call("notification.show", &json!({"title":"Fixture","body":""}))
+                .unwrap()
+        });
+        let request = server.requests().recv_blocking().unwrap();
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let task = workspace.control_request(&request);
+        let mut stream = iced_runtime::task::into_stream(task).unwrap();
+        let action = iced::futures::executor::block_on(stream.next()).unwrap();
+        assert!(matches!(
+            &action,
+            iced_runtime::Action::Window(iced_runtime::window::Action::Run(id, _)) if *id == owner
+        ));
+        // The runtime drops the callback when its owner is no longer present.
+        drop(action);
+        assert!(iced::futures::executor::block_on(stream.next()).is_none());
+        assert_eq!(
+            client.join().unwrap(),
+            json!({"shown":true,"supported":false})
+        );
+        server.stop();
     }
 
     #[test]

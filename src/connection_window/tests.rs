@@ -7,6 +7,8 @@ use crate::ssh_dialog::LoginTarget;
 
 use super::*;
 
+mod serial_selection;
+
 struct Profile(PathBuf);
 
 impl Profile {
@@ -57,7 +59,330 @@ fn connection(name: &str, tag: &str) -> Connection {
         command_timestamps: None,
         tab_color: None,
         paste_warning: None,
+        window_geometry: None,
+        terminal: Default::default(),
     }
+}
+
+#[test]
+fn saved_window_geometry_is_kept_by_edit_and_omitted_by_duplicate() {
+    use crate::connection_store::WindowGeometry;
+
+    let mut connection = connection("fixture", "");
+    connection.window_geometry = Some(WindowGeometry {
+        width: 900,
+        maximized: true,
+        ..WindowGeometry::default()
+    });
+    let mut editor = Draft::from_profile(&connection, None, false);
+    editor.update(Edit::Name("renamed".into()));
+    assert_eq!(
+        editor.connection().unwrap().window_geometry,
+        connection.window_geometry
+    );
+    let duplicate = Draft::from_profile(&connection, None, true);
+    assert_eq!(duplicate.connection().unwrap().window_geometry, None);
+}
+
+fn complete_persisted(manager: &mut ConnectionWindow, message: Message) {
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced_runtime::{Action, task};
+
+    let mut result = task::into_stream(manager.update(message)).unwrap();
+    let Some(Action::Output(completed @ Message::Completed(Ok(_)))) = block_on(result.next())
+    else {
+        panic!("expected a completed connection store update");
+    };
+    let _ = manager.update(completed);
+}
+
+#[test]
+fn network_map_selects_collapsed_connections_and_restores_a_moved_folder() {
+    use iced_runtime::task;
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let from = store.create_group(None, "Original folder").unwrap();
+    let to = store.create_group(None, "Destination").unwrap();
+    let id = store
+        .save_in_group(connection("Mapped host", ""), Some(&from))
+        .unwrap();
+    store
+        .save_in_group(connection("Other host", ""), Some(&to))
+        .unwrap();
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    let _ = manager.update(Message::ToggleGroup(from.clone()));
+    assert!(!manager.visible_row_keys().contains(&RowKey::Connection(id)));
+    let _ = manager.update(Message::MapView(true));
+    let _ = manager.update(Message::MapSelect(RowKey::Connection(id)));
+    assert_eq!(manager.selected().unwrap().id, id);
+    assert!(manager.visible_row_keys().contains(&RowKey::Connection(id)));
+    complete_persisted(&mut manager, Message::MapMove(id, Some(to.clone())));
+    assert_eq!(
+        Store::open(profile.path()).unwrap().group_of(id),
+        Some(to.as_str())
+    );
+    complete_persisted(&mut manager, Message::MapUndo);
+    assert_eq!(
+        Store::open(profile.path()).unwrap().group_of(id),
+        Some(from.as_str())
+    );
+    assert!(task::into_stream(manager.update(Message::MapUndo)).is_none());
+    let _ = manager.update(Message::MapView(false));
+    assert_eq!(manager.selected().unwrap().id, id);
+}
+
+#[test]
+fn serial_profiles_are_searchable_and_duplicate_with_the_same_terminal_settings() {
+    use crate::session::{SerialConnection, SerialLineEnding};
+    use kortty_terminal::{TerminalProfile, TextEncoding};
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let serial = SerialConnection {
+        device: "COM18".into(),
+        line_ending: SerialLineEnding::Lf,
+        encoding: Some(TextEncoding::Windows1252),
+        ..SerialConnection::default()
+    };
+    let saved = store
+        .save_serial(SerialProfile::new(
+            "Router",
+            serial.clone(),
+            TerminalProfile::Vt220,
+        ))
+        .unwrap();
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    let _ = manager.update(Message::Search("com18".into()));
+    assert_eq!(manager.visible_row_keys(), vec![RowKey::Serial(saved)]);
+    let _ = manager.update(Message::SelectSerial(saved));
+    assert_eq!(manager.selected_serial().unwrap().id, saved);
+    assert_eq!(manager.export_connections_sources().unwrap().1, [saved]);
+
+    let _ = manager.update(Message::Duplicate);
+    let copied = manager.serial_draft.as_ref().unwrap().profile().unwrap();
+    assert_eq!(copied.id, 0);
+    assert_eq!(copied.display_name(), "Router (copy)");
+    assert!(copied.matches(&serial, TerminalProfile::Vt220));
+    let _ = manager.update(Message::SerialName("Edited copy".into()));
+    assert!(!manager.request_close());
+}
+
+#[test]
+fn grouped_serial_favorites_pins_tags_and_duplicate_are_persisted() {
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let folder = store.create_group(None, "Hardware").unwrap();
+    let mut draft = SerialProfile::new(
+        "Console",
+        crate::session::SerialConnection {
+            device: "COM21".into(),
+            ..Default::default()
+        },
+        kortty_terminal::TerminalProfile::Vt220,
+    );
+    draft.tag = "Switches".into();
+    let id = store.save_serial_in_group(draft, Some(&folder)).unwrap();
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    assert_eq!(
+        manager.visible_row_keys(),
+        [RowKey::Group(folder.clone()), RowKey::Serial(id)]
+    );
+    let _ = manager.update(Message::ToggleGroup(folder.clone()));
+    assert_eq!(manager.visible_row_keys(), [RowKey::Group(folder.clone())]);
+    let _ = manager.update(Message::Search("switches".into()));
+    assert!(manager.visible_row_keys().contains(&RowKey::Serial(id)));
+    let _ = manager.update(Message::SelectSerial(id));
+    complete_persisted(&mut manager, Message::ToggleFavorite);
+    complete_persisted(&mut manager, Message::ToggleSerialPin);
+    let _ = manager.update(Message::Scope(Scope::Favorites));
+    assert_eq!(manager.visible_row_keys(), [RowKey::Serial(id)]);
+    let _ = manager.update(Message::Duplicate);
+    let copy = manager.serial_draft.as_ref().unwrap().profile().unwrap();
+    assert!(!copy.pinned);
+    assert_eq!(copy.tag, "Switches");
+    assert_eq!(manager.draft_group.as_deref(), Some(folder.as_str()));
+    complete_persisted(&mut manager, Message::Save);
+    let mut store = Store::open(profile.path()).unwrap();
+    assert!(store.is_favorite(id) && store.serial(id).unwrap().pinned);
+    assert_eq!(store.serial_in_group(&folder).count(), 2);
+    store.delete_group(&folder).unwrap();
+    assert!(store.serial_profiles().is_empty());
+    assert!(!store.is_favorite(id));
+}
+
+#[test]
+fn local_shell_editor_persists_exact_arguments_and_keeps_cancelled_edits_private() {
+    use super::local::Edit as Local;
+
+    let directory = Profile::new();
+    let mut manager = ConnectionWindow::open(directory.path()).unwrap();
+    let _ = manager.update(Message::NewLocal);
+    let _ = manager.update(Message::Local(Local::Name("Custom build".into())));
+    let _ = manager.update(Message::Local(Local::Directory(
+        directory.0.display().to_string(),
+    )));
+    let _ = manager.update(Message::Local(Local::Custom(true)));
+    let _ = manager.update(Message::Local(Local::Program("Build tool".into())));
+    let _ = manager.update(Message::Local(Local::AddArgument));
+    let _ = manager.update(Message::Local(Local::Argument(
+        0,
+        " file with spaces ".into(),
+    )));
+    let _ = manager.update(Message::Local(Local::AddArgument));
+    complete_persisted(&mut manager, Message::Save);
+    let id = manager.selected_local().unwrap().id;
+    assert_eq!(manager.export_connections_sources().unwrap().1, vec![id]);
+
+    let mut manager = ConnectionWindow::open(directory.path()).unwrap();
+    let _ = manager.update(Message::Search("Build*".into()));
+    assert_eq!(manager.visible_row_keys(), vec![RowKey::Local(id)]);
+    let saved = manager.selected_local().unwrap().clone();
+    assert_eq!(saved.working_directory.as_ref(), Some(&directory.0));
+    assert_eq!(
+        saved.command.as_ref().unwrap(),
+        &["Build tool", " file with spaces ", ""]
+    );
+
+    let _ = manager.update(Message::Duplicate);
+    let copy = manager.local_draft.as_ref().unwrap().profile().unwrap();
+    assert_eq!(copy.id, 0);
+    assert_eq!(copy.command, saved.command);
+    let _ = manager.update(Message::Local(Local::Name("Edited copy".into())));
+    assert!(!manager.request_close());
+    let _ = manager.update(Message::KeepEditing);
+    let _ = manager.update(Message::CancelEdit);
+    assert_eq!(manager.selected_local(), Some(&saved));
+
+    let _ = manager.update(Message::Delete);
+    complete_persisted(&mut manager, Message::ConfirmDelete(true));
+    assert!(Store::open(directory.path()).unwrap().local(id).is_none());
+}
+
+#[test]
+fn initial_terminal_dimensions_save_for_ssh_and_local_profiles() {
+    use super::local::Edit as Local;
+    use super::terminal_overrides::Edit as Terminal;
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let ssh = store.save(connection("SSH terminal", "")).unwrap();
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    let _ = manager.update(Message::Select(ssh));
+    let _ = manager.update(Message::EditSelected);
+    let _ = manager.update(Message::Edit(Edit::Terminal(Terminal::Columns(
+        "39".into(),
+    ))));
+    assert_eq!(manager.update(Message::Save).units(), 0);
+    let _ = manager.update(Message::Edit(Edit::Terminal(Terminal::Columns(
+        "40".into(),
+    ))));
+    let _ = manager.update(Message::Edit(Edit::Terminal(Terminal::Rows("200".into()))));
+    complete_persisted(&mut manager, Message::Save);
+
+    let _ = manager.update(Message::NewLocal);
+    let _ = manager.update(Message::Local(Local::Name("Local terminal".into())));
+    let _ = manager.update(Message::Local(Local::Terminal(Terminal::Columns(
+        "500".into(),
+    ))));
+    let _ = manager.update(Message::Local(Local::Terminal(Terminal::Rows(
+        "201".into(),
+    ))));
+    assert_eq!(manager.update(Message::Save).units(), 0);
+    let _ = manager.update(Message::Local(Local::Terminal(Terminal::Rows(" ".into()))));
+    complete_persisted(&mut manager, Message::Save);
+    let local = manager.selected_local().unwrap().id;
+
+    let store = Store::open(profile.path()).unwrap();
+    let ssh_terminal = &store.get(ssh).unwrap().terminal;
+    assert_eq!(ssh_terminal.terminal_columns, Some(40));
+    assert_eq!(ssh_terminal.terminal_rows, Some(200));
+    let local_terminal = &store.local(local).unwrap().terminal;
+    assert_eq!(local_terminal.terminal_columns, Some(500));
+    assert_eq!(local_terminal.terminal_rows, None);
+
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    let _ = manager.update(Message::Select(ssh));
+    let _ = manager.update(Message::EditSelected);
+    let _ = manager.update(Message::Edit(Edit::Terminal(Terminal::Reset)));
+    complete_persisted(&mut manager, Message::Save);
+    assert!(
+        Store::open(profile.path())
+            .unwrap()
+            .get(ssh)
+            .unwrap()
+            .terminal
+            .is_default()
+    );
+}
+
+#[test]
+fn connection_editor_persists_highlight_choices_for_ssh_and_local_profiles() {
+    use super::local::Edit as Local;
+    use super::terminal_overrides::Edit as Terminal;
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let mut ssh = connection("SSH terminal", "");
+    ssh.terminal.highlight_set = Some("missing-shared-set".into());
+    let ssh = store.save(ssh).unwrap();
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    let _ = manager.update(Message::Select(ssh));
+    let _ = manager.update(Message::EditSelected);
+    let _ = manager.update(Message::Edit(Edit::Name("Renamed SSH terminal".into())));
+    complete_persisted(&mut manager, Message::Save);
+    assert_eq!(
+        manager
+            .selected()
+            .unwrap()
+            .terminal
+            .highlight_set
+            .as_deref(),
+        Some("missing-shared-set")
+    );
+
+    let _ = manager.update(Message::EditSelected);
+    let _ = manager.update(Message::Edit(Edit::Terminal(Terminal::HighlightSet(
+        "none".into(),
+    ))));
+    complete_persisted(&mut manager, Message::Save);
+
+    let _ = manager.update(Message::NewLocal);
+    let _ = manager.update(Message::Local(Local::Name("Local terminal".into())));
+    let _ = manager.update(Message::Local(Local::Terminal(Terminal::HighlightSet(
+        "ops-errors".into(),
+    ))));
+    complete_persisted(&mut manager, Message::Save);
+    let local = manager.selected_local().unwrap().id;
+    let saved = Store::open(profile.path()).unwrap();
+    assert_eq!(
+        saved.get(ssh).unwrap().terminal.highlight_set.as_deref(),
+        Some("none")
+    );
+    assert_eq!(
+        saved
+            .local(local)
+            .unwrap()
+            .terminal
+            .highlight_set
+            .as_deref(),
+        Some("ops-errors")
+    );
+
+    let _ = manager.update(Message::EditSelected);
+    let _ = manager.update(Message::Local(Local::Terminal(Terminal::HighlightSet(
+        String::new(),
+    ))));
+    complete_persisted(&mut manager, Message::Save);
+    assert_eq!(
+        Store::open(profile.path())
+            .unwrap()
+            .local(local)
+            .unwrap()
+            .terminal
+            .highlight_set,
+        None
+    );
 }
 
 #[test]
@@ -83,6 +408,308 @@ fn range_selection_and_context_keep_the_same_visible_profiles() {
     let _ = manager.update(Message::Search("Bravo".into()));
     assert_eq!(manager.selected_connection_ids(), vec![middle]);
     assert_eq!(manager.selected().unwrap().id, middle);
+}
+
+#[test]
+fn teamwork_favorites_toggle_mixed_selection_and_filter_the_map_and_pdf() {
+    use super::tree_context::{Message as Context, Page};
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let local = store.save(connection("Local favorite", "")).unwrap();
+    assert!(store.toggle_connection_favorites(&[local], &[]).unwrap());
+    let shared_file = profile.0.join("shared.xml");
+    let xml = r#"<connections>
+        <connection id="primary"><name>Shared primary</name><host>one.example</host>
+            <username>operator</username></connection>
+        <connection id="spare"><name>Shared spare</name><host>two.example</host>
+            <username>operator</username></connection>
+        </connections>"#;
+    fs::write(&shared_file, xml).unwrap();
+    let settings = teamwork::Settings {
+        sources: vec![teamwork::Source {
+            location: shared_file.to_str().unwrap().into(),
+            enabled: true,
+            kind: teamwork::SourceKind::File,
+            check_interval_minutes: teamwork::DEFAULT_CHECK_INTERVAL_MINUTES,
+        }],
+        ..teamwork::Settings::default()
+    };
+    let catalog =
+        teamwork::Catalog::default().refreshed(&settings.active_sources(true, &[]).unwrap());
+    let identity = |name| {
+        catalog
+            .entries()
+            .find(|entry| entry.connection.name == name)
+            .unwrap()
+            .identity()
+            .clone()
+    };
+    let primary = identity("Shared primary");
+    let spare = identity("Shared spare");
+    let primary_row = RowKey::Shared(primary.clone());
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    manager.set_teamwork(catalog.clone(), None);
+    manager.set_open_counts(BTreeMap::new());
+    assert_eq!(manager.favorite_count(), 1);
+
+    let _ = manager.update(Message::Select(local));
+    manager.set_modifiers(Modifiers::COMMAND);
+    let _ = manager.update(Message::SelectShared(primary.clone()));
+    manager.set_modifiers(Modifiers::empty());
+    let _ = manager.update(Message::OpenTreeContext(primary_row.clone(), Point::ORIGIN));
+    assert_eq!(manager.selected_connection_ids(), vec![local]);
+    assert!(manager.selection.contains(&primary_row));
+    manager.set_open_counts(BTreeMap::new());
+    complete_persisted(
+        &mut manager,
+        Message::TreeContext(Context::Activate(Page::Root, 0)),
+    );
+    assert!(manager.store.is_favorite(local));
+    assert!(manager.store.is_teamwork_favorite(&primary));
+    assert!(!manager.store.is_teamwork_favorite(&spare));
+    assert_eq!(manager.favorite_count(), 2);
+    assert_eq!(fs::read_to_string(&shared_file).unwrap(), xml);
+
+    let _ = manager.update(Message::Scope(Scope::Teamwork));
+    assert_eq!(manager.visible_shared().len(), 2);
+    let _ = manager.update(Message::Scope(Scope::Favorites));
+    assert_eq!(
+        manager.visible_row_keys(),
+        [RowKey::Connection(local), primary_row.clone()]
+    );
+    let _ = manager.update(Message::MapView(true));
+    let snapshot = manager.map_pdf_snapshot().unwrap();
+    assert_eq!(snapshot.scope, "Favorites");
+    assert_eq!(snapshot.connection_count, 2);
+    let _ = manager.update(Message::Search("Shared".into()));
+    assert_eq!(
+        manager.visible_row_keys().as_slice(),
+        std::slice::from_ref(&primary_row)
+    );
+    assert_eq!(manager.map_pdf_snapshot().unwrap().connection_count, 1);
+    let _ = manager.update(Message::MapSelect(primary_row.clone()));
+    let _ = manager.update(Message::MapSelect(RowKey::Shared(spare)));
+    assert_eq!(manager.selected_shared().unwrap().identity(), &primary);
+
+    let _ = manager.update(Message::Search(String::new()));
+    manager.set_teamwork(teamwork::Catalog::default(), None);
+    assert_eq!(manager.favorite_count(), 1);
+    manager.set_teamwork(catalog, None);
+    assert_eq!(manager.favorite_count(), 2);
+    let _ = manager.update(Message::MapView(false));
+    let _ = manager.update(Message::Select(local));
+    manager.set_modifiers(Modifiers::COMMAND);
+    let _ = manager.update(Message::SelectShared(primary.clone()));
+    manager.set_modifiers(Modifiers::empty());
+    complete_persisted(&mut manager, Message::ToggleFavorite);
+    assert!(manager.visible_row_keys().is_empty());
+    assert!(manager.selected_shared().is_none());
+    assert_eq!(manager.favorite_count(), 0);
+    let persisted = Store::open(profile.path()).unwrap();
+    assert!(!persisted.is_favorite(local));
+    assert!(!persisted.is_teamwork_favorite(&primary));
+}
+
+#[test]
+fn teamwork_hide_confirms_separately_and_excludes_hidden_rows_from_every_scope() {
+    use super::tree_context::{Message as Context, Page};
+
+    let profile = Profile::new();
+    let source = profile.0.join("shared.xml");
+    let xml = r#"<connections><connection id="primary">
+        <name>Shared primary</name><host>shared.example</host><username>operator</username>
+        <tag>prod</tag><lastUsed>1700000000012</lastUsed>
+        </connection></connections>"#;
+    fs::write(&source, xml).unwrap();
+    let settings = teamwork::Settings {
+        sources: vec![teamwork::Source {
+            location: source.to_str().unwrap().into(),
+            enabled: true,
+            kind: teamwork::SourceKind::File,
+            check_interval_minutes: teamwork::DEFAULT_CHECK_INTERVAL_MINUTES,
+        }],
+        ..teamwork::Settings::default()
+    };
+    let catalog =
+        teamwork::Catalog::default().refreshed(&settings.active_sources(true, &[]).unwrap());
+    let identity = catalog.entries().next().unwrap().identity().clone();
+    let shared = RowKey::Shared(identity.clone());
+    let mut store = Store::open(profile.path()).unwrap();
+    let local = store.save(connection("Local production", "prod")).unwrap();
+    store.record_used_at(local, 1_700_000_000_010).unwrap();
+    store
+        .toggle_connection_favorites(&[local], std::slice::from_ref(&identity))
+        .unwrap();
+
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    manager.set_teamwork(catalog.clone(), None);
+    assert!(!manager.can_restore_teamwork());
+    manager.set_teamwork_available(true);
+    assert!(manager.can_restore_teamwork());
+    let _ = manager.update(Message::Select(local));
+    manager.set_modifiers(Modifiers::COMMAND);
+    let _ = manager.update(Message::SelectShared(identity.clone()));
+    manager.set_modifiers(Modifiers::empty());
+    let _ = manager.update(Message::OpenTreeContext(shared.clone(), Point::ORIGIN));
+    let _ = manager.update(Message::TreeContext(Context::Activate(Page::Root, 1)));
+    assert_eq!(manager.confirming_teamwork_hide.len(), 1);
+    assert_eq!(manager.confirming_delete, [local]);
+    assert!(!manager.can_restore_teamwork());
+    assert_eq!(manager.update(Message::ConfirmDelete(true)).units(), 0);
+    assert!(manager.store.get(local).is_some());
+    complete_persisted(&mut manager, Message::ConfirmTeamworkHide(true));
+    assert_eq!(manager.confirming_delete, [local]);
+    let _ = manager.update(Message::ConfirmDelete(false));
+    assert!(manager.store.get(local).is_some());
+    assert!(manager.can_restore_teamwork());
+    assert_eq!(manager.favorite_count(), 1);
+    assert_eq!(fs::read_to_string(&source).unwrap(), xml);
+
+    let _ = manager.update(Message::MapView(true));
+    for (scope, count) in [
+        (Scope::All, 1),
+        (Scope::Teamwork, 0),
+        (Scope::Favorites, 1),
+        (Scope::Recent, 1),
+        (Scope::Tag("prod".into()), 1),
+    ] {
+        let _ = manager.update(Message::Scope(scope));
+        assert!(!manager.visible_row_keys().contains(&shared));
+        assert_eq!(
+            manager
+                .map_pdf_snapshot()
+                .map_or(0, |map| map.connection_count),
+            count
+        );
+        let _ = manager.update(Message::MapSelect(shared.clone()));
+        assert!(!manager.selection.contains(&shared));
+    }
+    manager.selection.replace(Some(shared.clone()));
+    assert!(manager.selected_shared().is_none());
+
+    manager.set_teamwork(teamwork::Catalog::default(), None);
+    let mut persisted = Store::open(profile.path()).unwrap();
+    let hidden = persisted.hidden_teamwork().next().unwrap();
+    assert_eq!(hidden.identity(), &identity);
+    assert_eq!(hidden.name(), "Shared primary");
+    assert_eq!(hidden.host(), "shared.example");
+    persisted.restore_teamwork(&identity).unwrap();
+    manager.update_store(persisted);
+    manager.set_teamwork(catalog, None);
+    let _ = manager.update(Message::Scope(Scope::Teamwork));
+    assert_eq!(manager.visible_row_keys(), [shared]);
+    assert_eq!(manager.map_pdf_snapshot().unwrap().connection_count, 1);
+    assert_eq!(manager.favorite_count(), 2);
+}
+
+#[test]
+fn teamwork_recency_shares_the_combined_cutoff_order_and_search_with_map_pdf() {
+    use crate::connection_store::RECENT_LIMIT;
+    use crate::session::SerialConnection;
+    use kortty_terminal::TerminalProfile;
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let local = store.save(connection("Local SSH", "")).unwrap();
+    store.record_used_at(local, 1_700_000_000_010).unwrap();
+    let serial = store
+        .save_serial(SerialProfile::new(
+            "Local serial",
+            SerialConnection {
+                device: "COM19".into(),
+                ..SerialConnection::default()
+            },
+            TerminalProfile::Vt220,
+        ))
+        .unwrap();
+    let serial_profile = store.serial(serial).unwrap().clone();
+    store
+        .record_serial_used_at(&serial_profile, 1_700_000_000_008)
+        .unwrap();
+
+    let source = profile.0.join("recency.xml");
+    let xml_row = |id: &str, name: &str, millis: u64| {
+        format!(
+            r#"<connection id="{id}"><name>{name}</name><host>shared.example</host><username>operator</username><lastUsed>{millis}</lastUsed></connection>"#,
+        )
+    };
+    let mut xml = String::from("<connections>");
+    xml.push_str(&xml_row("newest", "Shared newest", 1_700_000_000_012));
+    xml.push_str(&xml_row("tie", "Shared tie", 1_700_000_000_010));
+    xml.push_str(&xml_row("outside", "Outside limit", 1));
+    xml.push_str(&xml_row("never", "Never used", 0));
+    for index in 0..RECENT_LIMIT {
+        xml.push_str(&xml_row(
+            &format!("fill-{index}"),
+            &format!("Filler {index}"),
+            1_699_999_999_999 - index as u64,
+        ));
+    }
+    xml.push_str("</connections>");
+    fs::write(&source, &xml).unwrap();
+    let settings = teamwork::Settings {
+        sources: vec![teamwork::Source {
+            location: source.to_str().unwrap().into(),
+            enabled: true,
+            kind: teamwork::SourceKind::File,
+            check_interval_minutes: teamwork::DEFAULT_CHECK_INTERVAL_MINUTES,
+        }],
+        ..teamwork::Settings::default()
+    };
+    let catalog =
+        teamwork::Catalog::default().refreshed(&settings.active_sources(true, &[]).unwrap());
+    let row = |name| {
+        RowKey::Shared(
+            catalog
+                .entries()
+                .find(|entry| entry.connection.name == name)
+                .unwrap()
+                .identity()
+                .clone(),
+        )
+    };
+    let newest = row("Shared newest");
+    let outside = row("Outside limit");
+    let mut manager = ConnectionWindow::open(profile.path()).unwrap();
+    manager.set_teamwork(catalog.clone(), None);
+    let _ = manager.update(Message::Scope(Scope::Recent));
+    let rows = manager.visible_row_keys();
+    assert_eq!(rows.len(), RECENT_LIMIT);
+    assert_eq!(
+        rows[..4],
+        [
+            newest.clone(),
+            RowKey::Connection(local),
+            row("Shared tie"),
+            RowKey::Serial(serial)
+        ]
+    );
+    assert!(!rows.contains(&outside));
+    assert!(!rows.contains(&row("Never used")));
+
+    let _ = manager.update(Message::MapView(true));
+    let snapshot = manager.map_pdf_snapshot().unwrap();
+    assert_eq!(snapshot.scope, "Recently used");
+    assert_eq!(snapshot.connection_count, RECENT_LIMIT);
+    let _ = manager.update(Message::MapSelect(newest.clone()));
+    let _ = manager.update(Message::MapSelect(outside));
+    assert!(manager.selection.contains(&newest));
+    let _ = manager.update(Message::Search("Shared newest".into()));
+    assert_eq!(manager.visible_row_keys(), [newest]);
+    assert_eq!(manager.map_pdf_snapshot().unwrap().connection_count, 1);
+    let _ = manager.update(Message::Search("Outside limit".into()));
+    assert!(manager.visible_row_keys().is_empty());
+    assert!(manager.map_pdf_snapshot().is_none());
+
+    assert_eq!(fs::read_to_string(&source).unwrap(), xml);
+    assert_eq!(
+        Store::open(profile.path())
+            .unwrap()
+            .recent_ids()
+            .collect::<Vec<_>>(),
+        [local, serial]
+    );
 }
 
 #[test]
@@ -128,7 +755,7 @@ fn library_navigation_and_search_never_leave_a_hidden_connection_connectable() {
     let web = store
         .save_in_group(connection("Web 01", "prod"), Some(&nested))
         .unwrap();
-    store.set_favorite(web, true).unwrap();
+    assert!(store.toggle_connection_favorites(&[web], &[]).unwrap());
     store.record_used(web).unwrap();
     let mut window = ConnectionWindow::open(profile.path()).unwrap();
     assert_eq!(window.selected().map(|entry| entry.id), Some(root));
@@ -496,9 +1123,16 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
     let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
     for width in [1240.0, 940.0] {
         let mut view = window.view(ViewChoices {
+            journal_max_parts: None,
+            serial_allowed: true,
             passwords: &[],
             passphrases: &[],
             keys: &[],
+            ai_profiles: &[],
+            ai_skills: &[],
+            ai_agent_designs: &[],
+            highlighting: HighlightChoices::default(),
+            themes: &crate::terminal_theme::Themes::default(),
             incognito_allowed: true,
             terminal_effects: Some(&Effect::ALL),
             default_paste_warning: Default::default(),
@@ -521,30 +1155,122 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
 }
 
 #[test]
+fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
+    use iced::advanced::{Layout, layout, widget::Tree};
+    use iced::{Font, Renderer, Size};
+
+    let profile = Profile::new();
+    let mut store = Store::open(profile.path()).unwrap();
+    let long_scope = "W".repeat(96);
+    let folder = store.create_group(None, &long_scope).unwrap();
+    store
+        .save_in_group(connection("Mapped host", &long_scope), Some(&folder))
+        .unwrap();
+    let mut window = ConnectionWindow::open(profile.path()).unwrap();
+    let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+    let switch_widths = |window: &ConnectionWindow| {
+        let mut view = window.view(ViewChoices {
+            journal_max_parts: None,
+            serial_allowed: true,
+            passwords: &[],
+            passphrases: &[],
+            keys: &[],
+            ai_profiles: &[],
+            ai_skills: &[],
+            ai_agent_designs: &[],
+            highlighting: HighlightChoices::default(),
+            themes: &crate::terminal_theme::Themes::default(),
+            incognito_allowed: true,
+            terminal_effects: Some(&Effect::ALL),
+            default_paste_warning: Default::default(),
+            minimum_paste_warning: PasteWarningMode::Off,
+        });
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(940.0, 760.0)),
+        );
+        let workbench = Layout::new(&node).children().nth(2).unwrap();
+        let center = workbench.children().nth(2).unwrap();
+        let results = center.children().next().unwrap();
+        let header = results.children().next().unwrap();
+        let switch = header.children().last().unwrap();
+        let widths: Vec<_> = switch
+            .children()
+            .map(|button| {
+                let button = button.bounds();
+                let center = center.bounds();
+                assert!(button.x >= center.x && button.x + button.width <= center.x + center.width);
+                assert!(button.width > 0.0);
+                button.width
+            })
+            .collect();
+        assert_eq!(widths.len(), 2);
+        widths
+    };
+    let expected = switch_widths(&window);
+    for scope in [Scope::Group(folder), Scope::Tag(long_scope.to_lowercase())] {
+        let _ = window.update(Message::Scope(scope));
+        assert_eq!(switch_widths(&window), expected);
+        let _ = window.update(Message::MapView(true));
+        assert_eq!(switch_widths(&window), expected);
+        assert_eq!(window.map_pdf_snapshot().unwrap().connection_count, 1);
+        let _ = window.update(Message::MapView(false));
+    }
+}
+
+#[test]
 fn editor_retains_the_last_valid_speed_and_duplicates_the_saved_effect() {
-    use crate::terminal_effects::Selection;
+    use crate::terminal_effects::{Selection, Speed};
 
     let profile = Profile::new();
     let mut saved = connection("Console", "");
     let effect = Effect::AmberCrt90;
-    saved.terminal_effect = Some(Selection { effect, speed: 7 });
+    let imported_speed = Speed::try_from(2.5).unwrap();
+    saved.terminal_effect = Some(Selection {
+        effect,
+        speed: imported_speed,
+    });
     Store::open(profile.path()).unwrap().save(saved).unwrap();
     let mut window = ConnectionWindow::open(profile.path()).unwrap();
     let _ = window.update(Message::Duplicate);
     assert_eq!(window.editing_terminal_effect(), Some(effect));
-    for value in ["", "99", "0", "100", "∅"] {
+    assert_eq!(
+        window
+            .draft
+            .as_ref()
+            .unwrap()
+            .connection()
+            .unwrap()
+            .terminal_effect,
+        Some(Selection {
+            effect,
+            speed: imported_speed
+        })
+    );
+    for value in ["", "8.75", "0", "100", "∅"] {
         let _ = window.update(Message::Edit(Edit::TerminalEffectSpeed(value.to_owned())));
     }
     let draft = window.draft.as_ref().unwrap().connection().unwrap();
     assert_eq!(draft.id, 0);
-    assert_eq!(draft.terminal_effect, Some(Selection { effect, speed: 99 }));
+    assert_eq!(
+        draft.terminal_effect,
+        Some(Selection {
+            effect,
+            speed: Speed::try_from(8.75).unwrap()
+        })
+    );
     let _ = window.update(Message::Edit(Edit::TerminalEffect(None)));
     let draft = window.draft.as_ref().unwrap().connection().unwrap();
     assert_eq!(draft.terminal_effect, None);
     let _ = window.update(Message::CancelEdit);
     assert_eq!(
         window.selected().unwrap().terminal_effect,
-        Some(Selection { effect, speed: 7 })
+        Some(Selection {
+            effect,
+            speed: imported_speed
+        })
     );
 }
 

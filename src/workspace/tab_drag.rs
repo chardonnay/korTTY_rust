@@ -216,6 +216,10 @@ impl DragState {
         self.gesture.as_ref().and_then(|gesture| gesture.hover)
     }
 
+    pub(super) fn active(&self) -> bool {
+        self.gesture.is_some()
+    }
+
     pub fn cancel(&mut self) -> bool {
         self.gesture.take().is_some()
     }

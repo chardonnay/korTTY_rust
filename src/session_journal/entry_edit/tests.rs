@@ -83,6 +83,26 @@ fn choice(draft: &Draft, id: &str) -> MarkerChoice {
         .clone()
 }
 
+#[test]
+fn journal_note_translation_source_checks_the_original_note_and_journal() {
+    let fixture = Fixture::new(ORIGINAL);
+    let draft = fixture.draft();
+    draft.require_translation_source().unwrap();
+    let new_entry = ORIGINAL.replace(
+        "</entries>",
+        "<entry><id>later</id><kind>USER_NOTE</kind></entry></entries>",
+    );
+    fixture.write(&new_entry);
+    draft.require_translation_source().unwrap();
+    fixture.write(&new_entry.replace("first<?keep parse?> note", "Changed note"));
+    assert!(draft.require_translation_source().is_err());
+    let old = fixture.root.join("old");
+    fs::rename(&fixture.directory, old).unwrap();
+    fs::create_dir(&fixture.directory).unwrap();
+    fixture.write(ORIGINAL);
+    assert!(draft.require_translation_source().is_err());
+}
+
 fn deploy_marker() -> Definition {
     Definition {
         id: "deploy".into(),

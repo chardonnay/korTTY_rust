@@ -817,7 +817,11 @@ impl Workspace {
             .collect()
     }
 
-    pub(super) fn tab_batch_has_serial(&self, owner: window::Id, request: u64) -> bool {
+    pub(super) fn tab_batch_needs_close_confirmation(
+        &self,
+        owner: window::Id,
+        request: u64,
+    ) -> bool {
         let Some(batch) = self
             .tab_context
             .closing
@@ -828,7 +832,7 @@ impl Workspace {
         };
         batch.targets.iter().any(|target| {
             self.terminal_tab(owner, target.tab)
-                .is_some_and(|tab| self.tab_has_open_serial(tab))
+                .is_some_and(|tab| self.tab_needs_close_confirmation(tab))
         })
     }
 
@@ -927,7 +931,8 @@ impl Workspace {
         } else {
             DialogKind::TabGroupName
         };
-        let (id, opened) = self.open_placed_dialog(
+        let (id, opened) = self.open_owned_placed_dialog(
+            owner,
             dialog_kind,
             window::Settings {
                 size: Size::new(475.0, 200.0),
@@ -936,6 +941,7 @@ impl Workspace {
                 exit_on_close_request: false,
                 ..window::Settings::default()
             },
+            Some(|id| Desktop::TabContext(id, Message::RenameFocus)),
         );
         self.tab_context.renames.insert(
             id,
@@ -947,7 +953,7 @@ impl Workspace {
                 input: widget::Id::unique(),
             },
         );
-        opened.map(move |_| Desktop::TabContext(id, Message::RenameFocus))
+        opened
     }
 
     fn finish_rename_tab(&mut self, id: window::Id, commit: bool) -> Task<Desktop> {
@@ -982,11 +988,10 @@ impl Workspace {
                 }
             }
         }
-        let close = self.close_placed_dialog(id);
         if self.windows.contains_key(&rename.owner) {
-            Task::batch([close, window::gain_focus(rename.owner)])
+            self.close_placed_dialog_and_focus(id, rename.owner)
         } else {
-            close
+            self.close_placed_dialog(id)
         }
     }
 
@@ -1004,6 +1009,12 @@ impl Workspace {
             .find_map(|(&id, rename)| (rename.owner == owner).then_some(id))
     }
 
+    pub(super) fn remove_rename_dialog_for_owner(&mut self, owner: window::Id) {
+        if let Some(id) = self.rename_dialog_for_owner(owner) {
+            self.tab_context.renames.remove(&id);
+        }
+    }
+
     pub(super) fn close_rename_dialog(&mut self, id: window::Id) -> Option<Task<Desktop>> {
         self.tab_context
             .renames
@@ -1014,20 +1025,12 @@ impl Workspace {
     pub(super) fn close_tab_context_owner(&mut self, owner: window::Id) -> Task<Desktop> {
         self.dismiss_tab_context(owner);
         self.tab_context.closing.remove(&owner);
-        let rename = self
-            .rename_dialog_for_owner(owner)
-            .map_or_else(Task::none, |id| {
-                self.tab_context.renames.remove(&id);
-                self.close_placed_dialog(id)
-            });
-        let note = self
-            .tab_journal_note_for_owner(owner)
+        self.tab_journal_note_for_owner(owner)
             .and_then(|id| {
                 self.remove_tab_journal_note(id)
                     .map(|_| self.close_placed_dialog(id))
             })
-            .unwrap_or_else(Task::none);
-        Task::batch([rename, note])
+            .unwrap_or_else(Task::none)
     }
 
     fn show_tab_journal_note(&mut self, owner: window::Id, tab: u64, run: u64) -> Task<Desktop> {

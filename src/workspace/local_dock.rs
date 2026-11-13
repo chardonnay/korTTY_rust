@@ -16,6 +16,7 @@ use crate::horizontal_divider::{self, Grow, WIDTH as DIVIDER_WIDTH};
 use crate::profile;
 use crate::sftp_window::{Directory, EntryKind, EntryName, Location, list_local};
 
+use super::transparency;
 use super::{Message as WorkspaceMessage, Workspace};
 
 const MIN_WIDTH: f32 = 280.0;
@@ -615,6 +616,47 @@ impl Workspace {
 pub(super) fn dock_divider<'a>(side: Side, width: f32) -> Element<'a, Message> {
     canvas(divider_program(side, width))
         .width(DIVIDER_WIDTH)
+        .height(Length::Fill)
+        .into()
+}
+
+pub(super) fn dock_terminal<'a>(
+    side: Option<Side>,
+    width: f32,
+    resize_from: f32,
+    panel: Element<'a, WorkspaceMessage>,
+    panes: Element<'a, WorkspaceMessage>,
+    resize: impl Fn(f32) -> WorkspaceMessage + 'a,
+    finish: WorkspaceMessage,
+) -> Element<'a, WorkspaceMessage> {
+    let empty = || -> Element<'a, WorkspaceMessage> { space::Space::new().into() };
+    let (left, right) = if let Some(side) = side {
+        let divider = dock_divider(side, resize_from).map(move |message| match message {
+            Message::Resize(_, width) => resize(width),
+            Message::FinishResize(_) => finish.clone(),
+            _ => WorkspaceMessage::Noop,
+        });
+        let panel = container(panel).width(width).height(Length::Fill);
+        match side {
+            Side::Left => (
+                container(row![panel, divider])
+                    .style(transparency::opaque_chrome)
+                    .into(),
+                empty(),
+            ),
+            Side::Right => (
+                empty(),
+                container(row![divider, panel])
+                    .style(transparency::opaque_chrome)
+                    .into(),
+            ),
+        }
+    } else {
+        (empty(), empty())
+    };
+    // Keep the terminal widget tree at the same index when a dock moves or hides.
+    row![left, panes, right]
+        .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }

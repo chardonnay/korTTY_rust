@@ -6,11 +6,15 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use kortty_ssh::{ConnectError, Endpoint};
+use kortty_ssh::{ConnectError, Endpoint, HostKey};
 
 use super::mux::{Flow, Mux, Reader, Writer};
 use super::wire::{Frame, Open, invalid};
 use super::{Abort, NO_EXIT, closed, lock};
+use kortty::ssh_runtime::account_lookup::{self, DisplayQuery, Kind};
+use kortty::ssh_runtime::folder_usage;
+use kortty::ssh_runtime::mux::{PasswordEvent, PasswordFileEvent, PasswordSide};
+use kortty_ssh::SensitiveLine;
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(9);
 const CANCEL_POLL: Duration = Duration::from_millis(100);
@@ -23,6 +27,7 @@ pub(crate) struct Opener(Arc<Client>);
 struct Client {
     mux: Mux,
     abort: Abort,
+    host_key: Option<HostKey>,
     next_id: AtomicU32,
     requests: Mutex<Requests>,
 }
@@ -64,11 +69,86 @@ impl Channel {
     pub(crate) fn abort_handle(&self) -> StreamAbort {
         StreamAbort(self.flow.clone())
     }
+
+    pub(crate) fn exit_code(&self) -> Option<u32> {
+        self.flow.exit_code()
+    }
 }
 
 impl Drop for Channel {
     fn drop(&mut self) {
         self.flow.close(None);
+    }
+}
+
+pub(crate) struct PasswordChannel(Flow);
+
+impl PasswordChannel {
+    pub(crate) fn next(&self, timeout: Duration) -> io::Result<Option<PasswordEvent>> {
+        self.0.password_event(timeout)
+    }
+
+    pub(crate) fn stage(
+        &self,
+        line: SensitiveLine,
+        permitted: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        self.0.stage_password(line, permitted)
+    }
+
+    pub(crate) fn commit(
+        &self,
+        permitted: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        self.0.commit_password(permitted)
+    }
+}
+
+impl Drop for PasswordChannel {
+    fn drop(&mut self) {
+        self.0.close(None);
+    }
+}
+
+pub(crate) struct PasswordFileChannel(Option<Flow>);
+
+impl PasswordFileChannel {
+    pub(crate) fn next(&self, timeout: Duration) -> io::Result<Option<PasswordFileEvent>> {
+        self.flow()?.password_file_event(timeout)
+    }
+
+    pub(crate) fn stage(
+        &self,
+        line: SensitiveLine,
+        permitted: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        self.flow()?.stage_password(line, permitted)
+    }
+
+    pub(crate) fn commit(
+        &self,
+        permitted: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        self.flow()?.commit_password(permitted)
+    }
+
+    pub(crate) fn into_channel(mut self) -> io::Result<Channel> {
+        if !self.flow()?.password_file_ready() {
+            return Err(invalid());
+        }
+        self.0.take().map(Channel::new).ok_or_else(closed)
+    }
+
+    fn flow(&self) -> io::Result<&Flow> {
+        self.0.as_ref().ok_or_else(closed)
+    }
+}
+
+impl Drop for PasswordFileChannel {
+    fn drop(&mut self) {
+        if let Some(flow) = self.0.take() {
+            flow.close(None);
+        }
     }
 }
 
@@ -160,21 +240,143 @@ impl Drop for RemoteForward {
 }
 
 impl Opener {
-    pub(super) fn new(mux: Mux, abort: Abort) -> Self {
+    pub(super) fn new(mux: Mux, abort: Abort, host_key: Option<HostKey>) -> Self {
         Self(Arc::new(Client {
             mux,
             abort,
+            host_key,
             next_id: AtomicU32::new(1),
             requests: Mutex::default(),
         }))
+    }
+
+    pub(crate) fn verified_host_key(&self) -> Option<&HostKey> {
+        self.0.host_key.as_ref()
     }
 
     pub(crate) fn is_closed(&self) -> bool {
         !self.0.mux.running() || self.0.abort.is_closed()
     }
 
+    pub(crate) fn same_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+
     pub(crate) fn open_sftp(&self, cancelled: impl Fn() -> bool) -> Result<Channel, ConnectError> {
         self.open_channel(Open::Sftp, cancelled)
+    }
+
+    pub(crate) fn open_exec(
+        &self,
+        command: &str,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Channel, ConnectError> {
+        self.open_channel(Open::Exec(command.into()), cancelled)
+    }
+
+    pub(crate) fn open_account_lookup(
+        &self,
+        kind: Kind,
+        name: &str,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Channel, ConnectError> {
+        if !account_lookup::valid_name(name) {
+            return Err(invalid().into());
+        }
+        let mut channel = self.open_channel(
+            Open::AccountLookup {
+                kind,
+                name: name.into(),
+            },
+            cancelled,
+        )?;
+        channel.writer = None;
+        Ok(channel)
+    }
+
+    pub(crate) fn open_account_names(
+        &self,
+        query: &DisplayQuery,
+        stopped: impl Fn() -> bool,
+    ) -> Result<Channel, ConnectError> {
+        if self.verified_host_key().is_none() || self.is_closed() {
+            return Err(closed().into());
+        }
+        let mut channel = self.open_channel(Open::AccountNames(query.clone()), stopped)?;
+        channel.writer = None;
+        Ok(channel)
+    }
+
+    pub(crate) fn open_file_exec(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Channel, ConnectError> {
+        self.open_channel(Open::FileExec, cancelled)
+    }
+
+    pub(crate) fn open_folder_usage(
+        &self,
+        paths: &[Vec<u8>],
+        stopped: &dyn Fn() -> bool,
+    ) -> Result<Channel, ConnectError> {
+        if self.verified_host_key().is_none() || self.is_closed() {
+            return Err(closed().into());
+        }
+        folder_usage::command(paths)?;
+        let mut channel = self.open_channel(Open::FolderUsage(paths.to_vec()), stopped)?;
+        channel.writer = None;
+        Ok(channel)
+    }
+
+    pub(crate) fn open_archive_extract(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Channel, ConnectError> {
+        if self.verified_host_key().is_none() || self.is_closed() {
+            return Err(closed().into());
+        }
+        self.open_channel(Open::ArchiveExtract, cancelled)
+    }
+
+    pub(crate) fn open_draft_replace(
+        &self,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Channel, ConnectError> {
+        if self.verified_host_key().is_none() || self.is_closed() {
+            return Err(closed().into());
+        }
+        self.open_channel(Open::DraftReplace, cancelled)
+    }
+
+    pub(crate) fn open_password_exec(
+        &self,
+        command: &str,
+        nonce: [u8; 16],
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PasswordChannel, ConnectError> {
+        let request = Open::PasswordExec {
+            command: command.into(),
+            nonce,
+        };
+        let (flow, address) = self.open(request, None, cancelled)?;
+        if address.is_some() {
+            flow.close(None);
+            return Err(invalid().into());
+        }
+        Ok(PasswordChannel(flow))
+    }
+
+    pub(crate) fn open_password_file_exec(
+        &self,
+        nonce: [u8; 16],
+        cancelled: impl Fn() -> bool,
+    ) -> Result<PasswordFileChannel, ConnectError> {
+        let (flow, address) = self.open(Open::PasswordFileExec { nonce }, None, cancelled)?;
+        if address.is_some() {
+            flow.close(None);
+            return Err(invalid().into());
+        }
+        Ok(PasswordFileChannel(Some(flow)))
     }
 
     pub(crate) fn open_direct(
@@ -233,7 +435,13 @@ impl Opener {
             .next_id
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(2))
             .map_err(|_| io::Error::other("SSH worker stream IDs exhausted"))?;
-        let flow = self.0.mux.add(id)?;
+        let flow = match &request {
+            Open::PasswordExec { .. } => self.0.mux.add_password(id, PasswordSide::Desktop)?,
+            Open::PasswordFileExec { .. } => {
+                self.0.mux.add_password_file(id, PasswordSide::Desktop)?
+            }
+            _ => self.0.mux.add(id)?,
+        };
         let (reply, receiver) = mpsc::sync_channel(1);
         {
             let mut requests = lock(&self.0.requests);
@@ -247,11 +455,25 @@ impl Opener {
                 requests.listeners.insert(id, listener);
             }
         }
+        let timeout = if matches!(
+            &request,
+            Open::Exec(_)
+                | Open::PasswordExec { .. }
+                | Open::PasswordFileExec { .. }
+                | Open::FileExec
+                | Open::ArchiveExtract
+                | Open::DraftReplace
+                | Open::FolderUsage(..)
+        ) {
+            Duration::from_secs(31)
+        } else {
+            REQUEST_TIMEOUT
+        };
         let reply = self
             .0
             .mux
             .control(Frame::Open(id, request))
-            .and_then(|()| wait_reply(receiver, cancelled));
+            .and_then(|()| wait_reply_until(receiver, cancelled, Instant::now() + timeout));
         match reply {
             Ok(Reply::Opened(address)) => Ok((flow, address)),
             outcome => {
@@ -324,7 +546,14 @@ impl Client {
 }
 
 fn wait_reply(receiver: Receiver<Reply>, cancelled: impl Fn() -> bool) -> io::Result<Reply> {
-    let deadline = Instant::now() + REQUEST_TIMEOUT;
+    wait_reply_until(receiver, cancelled, Instant::now() + REQUEST_TIMEOUT)
+}
+
+fn wait_reply_until(
+    receiver: Receiver<Reply>,
+    cancelled: impl Fn() -> bool,
+    deadline: Instant,
+) -> io::Result<Reply> {
     loop {
         if cancelled() {
             return Err(cancelled_error());

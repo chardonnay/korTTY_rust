@@ -36,6 +36,12 @@ impl Workspace {
         self.link_confirmations.contains_key(&id).then_some(TITLE)
     }
 
+    pub(super) fn remove_link_confirmation_for_owner(&mut self, owner: window::Id) {
+        if let Some(id) = self.link_confirmation_for_owner(owner) {
+            self.link_confirmations.remove(&id);
+        }
+    }
+
     pub(super) fn update_terminal_link(
         &mut self,
         id: window::Id,
@@ -48,9 +54,7 @@ impl Workspace {
                 let Some(dialog) = self.link_confirmations.remove(&id) else {
                     return Task::none();
                 };
-                let close = self
-                    .close_placed_dialog(id)
-                    .chain(window::gain_focus(dialog.owner));
+                let close = self.close_placed_dialog_and_focus(id, dialog.owner);
                 if approved {
                     close.chain(Task::done(Desktop::TerminalLink(
                         dialog.owner,
@@ -95,7 +99,8 @@ impl Workspace {
             return self.dispatch_terminal_uri(owner, &link);
         }
 
-        let (id, opened) = self.open_placed_dialog(
+        let (id, opened) = self.open_owned_placed_dialog(
+            owner,
             DialogKind::TerminalLink,
             window::Settings {
                 size: Size::new(490.0, 250.0),
@@ -104,6 +109,7 @@ impl Workspace {
                 exit_on_close_request: false,
                 ..window::Settings::default()
             },
+            None,
         );
         self.link_confirmations.insert(
             id,
@@ -113,7 +119,7 @@ impl Workspace {
                 link,
             },
         );
-        opened.map(|_| Desktop::Noop)
+        opened
     }
 
     fn dispatch_terminal_uri(&mut self, owner: window::Id, link: &Hit) -> Task<Desktop> {
@@ -169,6 +175,9 @@ mod tests {
 
     #[test]
     fn mismatch_confirmation_only_blocks_its_owner_and_cancel_releases_it() {
+        use iced::futures::{StreamExt, executor::block_on, future::ready};
+        use iced_runtime::{Action as RuntimeAction, task, window::Action as WindowAction};
+
         let mut workspace = Workspace::default();
         let (owner, _) = workspace.open_window(false);
         let (other, _) = workspace.open_window(false);
@@ -183,7 +192,7 @@ mod tests {
         let link = Arc::new(crate::terminal_links::at(&terminal.snapshot(), 0, 0, false).unwrap());
         let _ = workspace.update_terminal_link(other, Message::Open(session, link.clone()));
         assert!(workspace.link_confirmations.is_empty());
-        let _ = workspace.update_terminal_link(owner, Message::Open(session, link));
+        let _ = workspace.update_terminal_link(owner, Message::Open(session, link.clone()));
         let dialog = workspace.link_confirmation_for_owner(owner).unwrap();
 
         assert_eq!(workspace.owner_dialog(owner).unwrap().0, dialog);
@@ -191,5 +200,18 @@ mod tests {
         let _ = workspace.update_terminal_link(dialog, Message::Decide(false));
         assert!(workspace.owner_dialog(owner).is_none());
         assert!(workspace.link_confirmation_title(dialog).is_none());
+
+        let _ = workspace.update_terminal_link(owner, Message::Open(session, link));
+        let dialog = workspace.link_confirmation_for_owner(owner).unwrap();
+        let shutdown = workspace.close_window(owner);
+        let closed = task::into_stream(shutdown).unwrap().filter_map(|action| {
+            ready(match action {
+                RuntimeAction::Window(WindowAction::Close(id)) => Some(id),
+                _ => None,
+            })
+        });
+        assert_eq!(block_on(closed.collect::<Vec<_>>()), [dialog, owner]);
+        assert!(workspace.link_confirmation_title(dialog).is_none());
+        assert!(workspace.windows.contains_key(&other));
     }
 }

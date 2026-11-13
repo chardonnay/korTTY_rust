@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::{
-    Cell, KittyPlacement, ScrollbackAnchor, ScrollbackSnapshot, Style, ViewportImage,
+    Cell, KittyPlacement, ScrollbackAnchor, ScrollbackConfig, ScrollbackSnapshot, Style,
+    ViewportImage,
     command_output::CommandMarks,
     kitty::MAX_PLACEMENTS_PER_LINE,
     packed_cells::PackedCells,
@@ -14,8 +15,7 @@ use crate::{
     scrollback::{ReflowMap, ScrollbackRegistry},
 };
 
-const MAX_HISTORY_LINES: usize = 10_000;
-const MAX_HISTORY_BYTES: usize = 10 * 1024 * 1024;
+const MIB: usize = 1024 * 1024;
 const PACK_SCAN_ROWS: usize = 64;
 const PACK_SLICE: Duration = Duration::from_millis(4);
 const MAX_MARKS_PER_KIND_PER_LINE: usize = 8;
@@ -50,11 +50,24 @@ impl Line {
 
     fn is_empty_for_history(&self) -> bool {
         self.images.is_empty()
-            && self.marks.is_empty()
+            && self
+                .marks
+                .iter()
+                .all(|mark| mark.kind == LineMarkKind::Annotation)
             && self.cells.iter().all(Cell::is_default_blank)
     }
 
     pub(crate) fn add_mark(&mut self, mark: LineMark) {
+        if mark.kind == LineMarkKind::Annotation {
+            if !self
+                .marks
+                .iter()
+                .any(|existing| existing.kind == mark.kind && existing.id == mark.id)
+            {
+                self.marks.push(mark);
+            }
+            return;
+        }
         if mark.kind.is_timestamp() {
             let mut timestamps = self
                 .marks
@@ -109,7 +122,7 @@ impl Line {
 
     fn shift_marks(&mut self, left: usize, right: usize, delta: isize) {
         self.marks.retain_mut(|mark| {
-            if !(left..=right).contains(&mark.column) {
+            if mark.kind == LineMarkKind::Annotation || !(left..=right).contains(&mark.column) {
                 return true;
             }
             if let Some(column) = mark.column.checked_add_signed(delta)
@@ -187,14 +200,14 @@ impl Line {
 }
 
 #[derive(Clone)]
-enum HistoryCells {
-    Unpacked(Vec<Cell>),
-    Packed(PackedCells),
+pub(crate) enum HistoryCells {
+    Unpacked(Arc<Vec<Cell>>),
+    Packed(Arc<PackedCells>),
 }
 
 #[derive(Clone)]
 pub(crate) struct HistoryLine {
-    cells: HistoryCells,
+    pub(crate) cells: HistoryCells,
     pub(crate) images: Vec<KittyPlacement>,
     pub(crate) wrap_length: Option<usize>,
     bytes: usize,
@@ -206,7 +219,7 @@ impl HistoryLine {
     fn new(line: Line) -> Self {
         let bytes = line.history_bytes();
         Self {
-            cells: HistoryCells::Unpacked(line.cells),
+            cells: HistoryCells::Unpacked(Arc::new(line.cells)),
             images: line.images,
             wrap_length: line.wrap_length,
             bytes,
@@ -218,11 +231,11 @@ impl HistoryLine {
     pub(crate) fn filter_hyperlinks(&mut self, filter: impl Fn(&mut Option<Arc<str>>)) {
         match &mut self.cells {
             HistoryCells::Unpacked(cells) => {
-                for cell in cells {
+                for cell in Arc::make_mut(cells) {
                     filter(&mut cell.hyperlink);
                 }
             }
-            HistoryCells::Packed(cells) => cells.filter_hyperlinks(filter),
+            HistoryCells::Packed(cells) => Arc::make_mut(cells).filter_hyperlinks(filter),
         }
     }
 
@@ -247,7 +260,7 @@ impl HistoryLine {
         if let HistoryCells::Unpacked(cells) = &self.cells
             && let Some((packed, bytes)) = PackedCells::pack(cells, self.bytes)
         {
-            self.cells = HistoryCells::Packed(packed);
+            self.cells = HistoryCells::Packed(Arc::new(packed));
             return std::mem::replace(&mut self.bytes, bytes) - bytes;
         }
         0
@@ -256,7 +269,7 @@ impl HistoryLine {
     fn into_line(self) -> Line {
         Line {
             cells: match self.cells {
-                HistoryCells::Unpacked(cells) => cells,
+                HistoryCells::Unpacked(cells) => Arc::unwrap_or_clone(cells),
                 HistoryCells::Packed(cells) => cells.unpack(),
             },
             images: self.images,
@@ -279,12 +292,14 @@ pub(crate) struct Screen {
     // indexed, so publishing a frame never walks the whole scrollback.
     history_prompt_rows: VecDeque<usize>,
     history_timestamp_rows: VecDeque<usize>,
-    history_origin: usize,
+    history_annotation_rows: VecDeque<usize>,
+    pub(crate) history_origin: usize,
+    pub(crate) output_epoch: u64,
     scrollback: ScrollbackRegistry,
     prompt_epoch: u64,
     pack_scan: usize,
     pack_protection: Range<usize>,
-    pub(crate) scrollback_compression_enabled: bool,
+    pub(crate) scrollback_config: ScrollbackConfig,
     keeps_history: bool,
     max_image_rows: usize,
 }
@@ -316,12 +331,14 @@ impl Screen {
             history_bytes: 0,
             history_prompt_rows: VecDeque::new(),
             history_timestamp_rows: VecDeque::new(),
+            history_annotation_rows: VecDeque::new(),
             history_origin: 0,
+            output_epoch: crate::output::next_epoch(),
             scrollback: ScrollbackRegistry::default(),
             prompt_epoch: 0,
             pack_scan: 0,
             pack_protection: 0..0,
-            scrollback_compression_enabled: true,
+            scrollback_config: ScrollbackConfig::default(),
             keeps_history,
             max_image_rows: 0,
         }
@@ -338,6 +355,95 @@ impl Screen {
             id,
             column,
             kind: LineMarkKind::Prompt,
+        });
+    }
+
+    pub(crate) fn mark_annotation(&mut self, id: u64) {
+        // Start before the full prompt even when its first cells are on a
+        // different physical row from the cursor.
+        let mut row = self.history.len() + self.cursor.row;
+        while row > 0 && self.wrapped_row(row - 1) {
+            row -= 1;
+        }
+        let mark = LineMark {
+            id,
+            column: 0,
+            kind: LineMarkKind::Annotation,
+        };
+        if let Some(line) = self.history.get_mut(row) {
+            if !has_annotation(&line.marks) {
+                let index = self
+                    .history_annotation_rows
+                    .partition_point(|&index| index.wrapping_sub(self.history_origin) < row);
+                self.history_annotation_rows
+                    .insert(index, self.history_origin.wrapping_add(row));
+            }
+            line.marks.push(mark);
+        } else {
+            self.lines[row - self.history.len()].add_mark(mark);
+        }
+    }
+
+    fn wrapped_row(&self, row: usize) -> bool {
+        if let Some(line) = self.history.get(row) {
+            return line.wrap_length.is_some();
+        }
+        self.lines
+            .get(row - self.history.len())
+            .is_some_and(|line| line.wrap_length.is_some())
+    }
+
+    pub(crate) fn annotations(&self) -> Vec<(u64, usize)> {
+        let mut positions = Vec::new();
+        let mut collect = |row, marks: &[LineMark]| {
+            positions.extend(
+                marks
+                    .iter()
+                    .filter(|mark| mark.kind == LineMarkKind::Annotation)
+                    .map(|mark| (mark.id, row)),
+            );
+        };
+        for &index in &self.history_annotation_rows {
+            let row = index.wrapping_sub(self.history_origin);
+            collect(row, &self.history[row].marks);
+        }
+        for (row, line) in self.lines.iter().enumerate() {
+            collect(self.history.len() + row, &line.marks);
+        }
+        positions
+    }
+
+    pub(crate) fn blank_tail(&self) -> usize {
+        let blank = self
+            .lines
+            .iter()
+            .skip(self.cursor.row + 1)
+            .rev()
+            .take_while(|line| line.is_empty_for_history())
+            .count();
+        if blank == 0 || self.max_image_rows == 0 {
+            return blank;
+        }
+        // A placement lives at its anchor, but can paint into later blank cells.
+        let occupied = self
+            .image_placements(self.history.len())
+            .map(|(row, placement)| {
+                (f64::from(row) + placement.top + placement.height).ceil() as usize
+            })
+            .max()
+            .unwrap_or(0);
+        blank.min(self.lines.len().saturating_sub(occupied))
+    }
+
+    pub(crate) fn remove_annotation(&mut self, id: u64) {
+        let keep = |mark: &LineMark| mark.kind != LineMarkKind::Annotation || mark.id != id;
+        for line in &mut self.lines {
+            line.marks.retain(keep);
+        }
+        self.history_annotation_rows.retain(|&index| {
+            let marks = &mut self.history[index.wrapping_sub(self.history_origin)].marks;
+            marks.retain(keep);
+            has_annotation(marks)
         });
     }
 
@@ -587,8 +693,7 @@ impl Screen {
 
     pub(crate) fn shift_rectangle(&mut self, rectangle: Rectangle, forward: bool) {
         let blank = Cell::blank(Style::default());
-        for row in rectangle.top..=rectangle.bottom {
-            let line = &mut self.lines[row];
+        for line in self.lines.range_mut(rectangle.top..=rectangle.bottom) {
             let cells = &mut line.cells[rectangle.left..=rectangle.right];
             if forward {
                 cells.rotate_left(1);
@@ -609,8 +714,7 @@ impl Screen {
 
     pub(crate) fn fill_rectangle(&mut self, rectangle: Rectangle, cell: &Cell) {
         let blank = Cell::blank(Style::default());
-        for row in rectangle.top..=rectangle.bottom {
-            let line = &mut self.lines[row];
+        for line in self.lines.range_mut(rectangle.top..=rectangle.bottom) {
             line.clear_glyph(rectangle.left, &blank);
             line.clear_glyph(rectangle.right, &blank);
             line.cells[rectangle.left..=rectangle.right].fill(cell.clone());
@@ -634,10 +738,12 @@ impl Screen {
     }
 
     pub(crate) fn take_history_from(&mut self, other: &mut Self) {
+        self.output_epoch = crate::output::next_epoch();
         self.history = std::mem::take(&mut other.history);
         self.history_bytes = std::mem::take(&mut other.history_bytes);
         self.history_prompt_rows = std::mem::take(&mut other.history_prompt_rows);
         self.history_timestamp_rows = std::mem::take(&mut other.history_timestamp_rows);
+        self.history_annotation_rows = std::mem::take(&mut other.history_annotation_rows);
         self.history_origin = other.history_origin;
         self.scrollback = std::mem::take(&mut other.scrollback);
         self.prompt_epoch = other.prompt_epoch.wrapping_add(1);
@@ -652,10 +758,12 @@ impl Screen {
     }
 
     fn clear_history_contents(&mut self) {
+        self.output_epoch = crate::output::next_epoch();
         self.history.clear();
         self.history_bytes = 0;
         self.history_prompt_rows.clear();
         self.history_timestamp_rows.clear();
+        self.history_annotation_rows.clear();
         self.history_origin = 0;
         self.prompt_epoch = self.prompt_epoch.wrapping_add(1);
         self.pack_scan = 0;
@@ -690,7 +798,7 @@ impl Screen {
     }
 
     pub(crate) fn compress_idle(&mut self, scroll_offset: usize) -> bool {
-        if !self.scrollback_compression_enabled {
+        if !self.scrollback_config.compression {
             return false;
         }
         let rows = self.lines.len();
@@ -752,12 +860,17 @@ impl Screen {
         self.lines.resize_with(rows, || Line::blank(columns, style));
     }
 
-    pub(crate) fn copy_reconnect_history(&self) -> Self {
+    pub(crate) fn copy_reconnect_history(&self, presentation: &[u64]) -> Self {
         // A single blank live row provides a hard boundary when the history
         // is reflowed separately from the replacement's live grid.
         let mut copy = Self::new(self.lines[0].cells.len(), 1, true);
+        copy.scrollback_config = self.scrollback_config;
+        let keep_mark = |mark: &LineMark| {
+            mark.kind != LineMarkKind::Annotation || presentation.contains(&mark.id)
+        };
         for line in &self.history {
             let mut archived = line.clone();
+            archived.marks.retain(keep_mark);
             archived.archived = true;
             copy.push_history_line(archived);
         }
@@ -772,10 +885,12 @@ impl Screen {
                     images: line.images.clone(),
                     wrap_length: line.wrap_length,
                     hp_form: None,
-                    marks: line.marks.clone(),
+                    marks: line.marks.iter().copied().filter(keep_mark).collect(),
                     archived: true,
                 });
-                archived.pack();
+                if self.scrollback_config.compression {
+                    archived.pack();
+                }
                 copy.push_history_line(archived);
             }
         }
@@ -856,11 +971,8 @@ impl Screen {
         (cells, wrapped_columns)
     }
 
-    pub(crate) fn viewport_images(&self, start: usize) -> Vec<ViewportImage> {
-        if self.max_image_rows == 0 {
-            return Vec::new();
-        }
-        let first = start.saturating_sub(self.max_image_rows - 1);
+    fn image_placements(&self, start: usize) -> impl Iterator<Item = (i32, &KittyPlacement)> {
+        let first = start.saturating_sub(self.max_image_rows.saturating_sub(1));
         let archive_end = self.live_history_start();
         // A tall image anchored before the reconnect boundary stays in the
         // scrollback even when its geometry would reach the live viewport.
@@ -869,23 +981,33 @@ impl Screen {
         } else {
             first
         };
-        let mut images = self
-            .history
+        let count = if self.max_image_rows == 0 {
+            0
+        } else {
+            start + self.lines.len() - first
+        };
+        self.history
             .iter()
             .map(|line| &line.images)
             .chain(self.lines.iter().map(|line| &line.images))
             .skip(first)
-            .take(start + self.lines.len() - first)
+            .take(count)
             .enumerate()
-            .flat_map(|(index, images)| {
+            .flat_map(move |(index, images)| {
                 let row = (first + index) as i32 - start as i32;
                 images
                     .iter()
                     .filter(move |placement| row + i32::from(placement.rows) > 0)
-                    .map(move |placement| ViewportImage {
-                        row,
-                        placement: placement.clone(),
-                    })
+                    .map(move |placement| (row, placement))
+            })
+    }
+
+    pub(crate) fn viewport_images(&self, start: usize) -> Vec<ViewportImage> {
+        let mut images = self
+            .image_placements(start)
+            .map(|(row, placement)| ViewportImage {
+                row,
+                placement: placement.clone(),
             })
             .collect::<Vec<_>>();
         images.sort_by_key(|image| image.placement.z_index);
@@ -909,8 +1031,27 @@ impl Screen {
             self.history_prompt_rows
                 .push_back(self.history_origin.wrapping_add(self.history.len()));
         }
+        if has_annotation(&line.marks) {
+            self.history_annotation_rows
+                .push_back(self.history_origin.wrapping_add(self.history.len()));
+        }
         self.history.push_back(line);
-        while self.history.len() > MAX_HISTORY_LINES || self.history_bytes > MAX_HISTORY_BYTES {
+        self.trim_history();
+    }
+
+    pub(crate) fn configure_scrollback(&mut self, config: ScrollbackConfig) -> bool {
+        if self.scrollback_config == config {
+            return false;
+        }
+        self.scrollback_config = config;
+        self.trim_history();
+        true
+    }
+
+    fn trim_history(&mut self) {
+        let lines = self.scrollback_config.lines as usize;
+        let bytes = usize::from(self.scrollback_config.memory_mib) * MIB;
+        while self.history.len() > lines || self.history_bytes > bytes {
             let Some(line) = self.history.pop_front() else {
                 break;
             };
@@ -920,6 +1061,9 @@ impl Screen {
             }
             if line.has_timestamp() {
                 self.history_timestamp_rows.pop_front();
+            }
+            if has_annotation(&line.marks) {
+                self.history_annotation_rows.pop_front();
             }
             for mark in line.marks {
                 self.commands.trim(mark);
@@ -935,6 +1079,7 @@ impl Screen {
         if (old_columns, old_rows) == (columns, rows) {
             return;
         }
+        self.output_epoch = crate::output::next_epoch();
         self.prompt_epoch = self.prompt_epoch.wrapping_add(1);
 
         if columns != old_columns {
@@ -945,7 +1090,7 @@ impl Screen {
             let first_visible = self.history.len();
             let history = std::mem::take(&mut self.history);
             let visible = std::mem::take(&mut self.lines);
-            let pack_history = self.scrollback_compression_enabled
+            let pack_history = self.scrollback_config.compression
                 && history
                     .iter()
                     .any(|line| matches!(line.cells, HistoryCells::Packed(_)));
@@ -996,6 +1141,9 @@ impl Screen {
                 }
                 if line.has_timestamp() {
                     self.history_timestamp_rows.pop_back();
+                }
+                if has_annotation(&line.marks) {
+                    self.history_annotation_rows.pop_back();
                 }
                 self.lines.push_front(line.into_line());
                 self.cursor.row += 1;
@@ -1107,7 +1255,12 @@ fn reflow(
                     .last()
                     .map_or(0, |placement| usize::from(placement.column) + 1),
             )
-            .max(line.marks.last().map_or(0, |mark| mark.column + 1));
+            .max(
+                line.marks
+                    .iter()
+                    .rfind(|mark| mark.kind != LineMarkKind::Annotation)
+                    .map_or(0, |mark| mark.column + 1),
+            );
         let mut images = line.images.into_iter().peekable();
         let mut marks = line.marks.into_iter().peekable();
         let old_columns = line.cells.len();
@@ -1199,7 +1352,16 @@ fn reflow(
             };
             next_column += width;
         }
-        reanchor_marks(&mut marks, &mut target, old_columns, next_column);
+        // Sidecar marks must survive a blank line without extending its cells.
+        for mut mark in marks {
+            if mark.kind == LineMarkKind::Annotation {
+                mark.column = next_column.min(columns - 1);
+                target.add_mark(mark);
+            } else if mark.column == old_columns {
+                mark.column = next_column;
+                target.add_mark(mark);
+            }
+        }
         if row == original_cursor.row && original_cursor.pending {
             output.cursor = Some(ReflowCursor {
                 row: output.next_row,
@@ -1216,6 +1378,12 @@ fn reflow(
     if next_column > 0 || output.next_row == 0 {
         output.push(target);
     }
+}
+
+fn has_annotation(marks: &[LineMark]) -> bool {
+    marks
+        .iter()
+        .any(|mark| mark.kind == LineMarkKind::Annotation)
 }
 
 fn reanchor_images(
@@ -1252,22 +1420,55 @@ mod tests {
     fn packed_rows_leave_space_without_changing_scrollback_limits() {
         let columns = 1024;
         let blank = || Line::blank(columns, Style::default());
-        let raw_capacity = MAX_HISTORY_BYTES / blank().history_bytes();
+        let max_bytes = usize::from(ScrollbackConfig::DEFAULT_MEMORY_MIB) * MIB;
+        let raw_capacity = max_bytes / blank().history_bytes();
         let mut screen = Screen::new(columns, 2, true);
         for _ in 0..raw_capacity + 20 {
             screen.push_history(blank());
         }
         assert_eq!(screen.history.len(), raw_capacity);
-        assert!(screen.history_bytes <= MAX_HISTORY_BYTES);
+        assert!(screen.history_bytes <= max_bytes);
 
         while screen.compress_idle(0) {}
-        assert!(screen.history_bytes < MAX_HISTORY_BYTES / 4);
+        assert!(screen.history_bytes < max_bytes / 4);
         for _ in 0..raw_capacity / 2 {
             screen.push_history(blank());
         }
         assert_eq!(screen.history.len(), raw_capacity + raw_capacity / 2);
-        assert!(screen.history_bytes <= MAX_HISTORY_BYTES);
+        assert!(screen.history_bytes <= max_bytes);
         assert_eq!(screen.history[0].cells().len(), columns);
         assert!(matches!(screen.history[0].cells(), Cow::Owned(_)));
+    }
+
+    #[test]
+    fn live_scrollback_limits_evict_oldest_rows_by_bytes_and_lines() {
+        let mut screen = Screen::new(512, 2, true);
+        let blank = || Line::blank(512, Style::default());
+        let config = ScrollbackConfig {
+            lines: 100_000,
+            memory_mib: 1,
+            compression: false,
+        };
+        let per_line = blank().history_bytes();
+        for _ in 0..MIB / per_line + 10 {
+            screen.push_history(blank());
+        }
+        assert!(screen.configure_scrollback(config));
+        assert_eq!(screen.history.len(), MIB / per_line);
+        assert_eq!(screen.history_origin, 10);
+        assert!(!screen.configure_scrollback(config));
+        let before = screen.history.len();
+        screen.resize(64, 2);
+        assert!(screen.history_bytes <= MIB);
+        assert!(screen.history.len() >= before);
+        screen.configure_scrollback(ScrollbackConfig {
+            lines: 100,
+            ..config
+        });
+        for _ in 0..110 {
+            screen.push_history(Line::blank(64, Style::default()));
+        }
+        assert_eq!(screen.history.len(), 100);
+        assert!(screen.history_bytes <= MIB);
     }
 }

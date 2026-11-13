@@ -1,4 +1,4 @@
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
@@ -12,25 +12,50 @@ pub(super) const DEFAULT_IDLE: u16 = 20;
 pub(super) const MAX_IDLE: u16 = 3600;
 const MAX_BYTES: u64 = 32 * 1024;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum Scope {
+    #[default]
+    ActiveSplit,
+    WholeTab,
+}
+
+impl std::fmt::Display for Scope {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::ActiveSplit => "Active split",
+            Self::WholeTab => "Whole tab",
+        })
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct Preferences {
     pub(super) directory: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ffmpeg: Option<PathBuf>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ffmpeg_sha256: Option<[u8; 32]>,
     pub(crate) include_color: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) enabled_after_restart: bool,
     pub(super) auto_pause: bool,
     pub(super) idle_seconds: u16,
+    pub(crate) scope: Scope,
 }
 
 impl Default for Preferences {
     fn default() -> Self {
         Self {
             directory: None,
+            ffmpeg: None,
+            ffmpeg_sha256: None,
             include_color: false,
             enabled_after_restart: false,
             auto_pause: true,
             idle_seconds: DEFAULT_IDLE,
+            scope: Scope::default(),
         }
     }
 }
@@ -41,11 +66,14 @@ impl Preferences {
     }
 
     pub(crate) fn load_from(path: &Path) -> io::Result<Self> {
-        let file = match File::open(path) {
+        let file = match profile::open_preference(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
             Err(error) => return Err(error),
         };
+        if !file.metadata()?.is_file() {
+            return Err(invalid("Recording settings must be a regular file"));
+        }
         let mut bytes = Vec::new();
         file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
         if bytes.len() as u64 > MAX_BYTES {
@@ -81,6 +109,22 @@ impl Preferences {
         self.directory.clone().map_or_else(default_directory, Ok)
     }
 
+    pub(crate) fn encoder(&self) -> Option<super::video_export::Selection> {
+        Some(super::video_export::Selection {
+            path: self.ffmpeg.clone()?,
+            sha256: self.ffmpeg_sha256?,
+        })
+    }
+
+    pub(crate) fn approve_encoder(&mut self) -> io::Result<()> {
+        self.ffmpeg_sha256 = self
+            .ffmpeg
+            .as_deref()
+            .map(super::video_export::fingerprint)
+            .transpose()?;
+        Ok(())
+    }
+
     pub(crate) fn capture_options(&self) -> CaptureOptions {
         CaptureOptions {
             include_style: self.include_color,
@@ -108,6 +152,18 @@ impl Preferences {
             return Err(invalid(
                 "Enter an absolute recording folder without parent segments",
             ));
+        }
+        if self
+            .ffmpeg
+            .as_deref()
+            .is_some_and(|path| !super::video_export::valid_encoder_path(path))
+        {
+            return Err(invalid(
+                "Enter an absolute path to a local FFmpeg executable",
+            ));
+        }
+        if self.ffmpeg.is_none() && self.ffmpeg_sha256.is_some() {
+            return Err(invalid("FFmpeg approval is missing its executable path"));
         }
         Ok(())
     }
@@ -144,10 +200,13 @@ mod tests {
 
         let configured = Preferences {
             directory: Some(scratch.0.join("recordings")),
+            ffmpeg: None,
+            ffmpeg_sha256: None,
             include_color: true,
             enabled_after_restart: true,
             auto_pause: false,
             idle_seconds: 71,
+            scope: Scope::WholeTab,
         };
         configured.save_to(&config).unwrap();
         let loaded = Preferences::load_from(&config).unwrap();

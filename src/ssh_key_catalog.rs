@@ -6,6 +6,7 @@ use std::io::{self, Read};
 use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 #[cfg(test)]
@@ -13,9 +14,9 @@ mod tests;
 
 use crate::private_files::{Directory, nonce};
 
-const CATALOG: &str = "ssh-keys.json";
+pub(crate) const CATALOG: &str = "ssh-keys.json";
 const LOCK: &str = "ssh-keys.json.lock";
-const MANAGED: &str = "ssh-keys";
+pub(crate) const MANAGED: &str = "ssh-keys";
 const MAX_RECORDS: usize = 512;
 const MAX_CATALOG_BYTES: usize = 1024 * 1024;
 const MAX_KEY_BYTES: usize = 1024 * 1024;
@@ -64,6 +65,28 @@ pub(crate) struct CommitReport {
     pub added: Vec<u64>,
     pub retained_copies: usize,
     pub durability_warning: bool,
+}
+
+/// Metadata for an already validated managed private key.
+pub(crate) struct ManagedAddition {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) passphrase: Option<String>,
+}
+
+/// Native identity allocated before a managed key is published.
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedManagedIdentity {
+    pub(crate) id: u64,
+    pub(crate) token: String,
+}
+
+/// A frozen additive catalogue and the identities for its new managed files.
+pub(crate) struct PreparedManagedAdditions {
+    pub(crate) before: Option<[u8; 32]>,
+    pub(crate) contents: Zeroizing<Vec<u8>>,
+    pub(crate) additions: Vec<PreparedManagedIdentity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -137,6 +160,66 @@ impl Catalog {
         Ok(key)
     }
 
+    /// Plans managed additions without creating a profile, files or locks.
+    pub(crate) fn prepare_managed_additions(
+        &self,
+        additions: Vec<ManagedAddition>,
+    ) -> io::Result<PreparedManagedAdditions> {
+        let directory = match Directory::open(&self.root, false) {
+            Ok(directory) => Some(directory),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        let before = directory
+            .as_ref()
+            .map(read_catalog_for_restore)
+            .transpose()?
+            .flatten();
+        let mut document = before
+            .as_deref()
+            .map(|bytes| decode_document(bytes))
+            .transpose()?
+            .unwrap_or_default();
+        if document != self.document {
+            return Err(stale());
+        }
+        if additions.is_empty() || additions.len() > MAX_RECORDS - document.records.len() {
+            return Err(invalid("invalid number of managed SSH key additions"));
+        }
+        let mut planned = Vec::with_capacity(additions.len());
+        for addition in additions {
+            validate_metadata(
+                &addition.name,
+                &addition.description,
+                addition.passphrase.as_deref(),
+            )?;
+            let id = document.next_id;
+            document.next_id = id
+                .checked_add(1)
+                .ok_or_else(|| invalid("SSH key IDs are exhausted"))?;
+            let token = nonce()?;
+            document.records.push(KeyRecord {
+                id,
+                name: addition.name,
+                description: addition.description,
+                source: KeySource::Managed(token.clone()),
+                passphrase: addition.passphrase,
+            });
+            planned.push(PreparedManagedIdentity { id, token });
+        }
+        let contents = Zeroizing::new(serde_json::to_vec(&document).map_err(io::Error::other)?);
+        validate_prepared_managed_additions(
+            before.as_deref().map(Vec::as_slice),
+            &contents,
+            &planned,
+        )?;
+        Ok(PreparedManagedAdditions {
+            before: before.as_deref().map(|bytes| Sha256::digest(bytes).into()),
+            contents,
+            additions: planned,
+        })
+    }
+
     /// Errors leave the previous catalog live. Publication is the commit point.
     pub fn apply(&mut self, edits: Vec<Edit>) -> io::Result<CommitReport> {
         if edits.is_empty() {
@@ -147,7 +230,7 @@ impl Catalog {
         }
 
         let directory = Directory::open(&self.root, true)?;
-        let _lock = StoreLock::acquire(directory.open_lock(LOCK)?)?;
+        let _lock = lock_for_restore(&directory)?;
         if read_document(&directory)? != self.document {
             return Err(stale());
         }
@@ -423,15 +506,105 @@ fn read_document(directory: &Directory) -> io::Result<Document> {
 }
 
 fn read_document_if_present(directory: &Directory) -> io::Result<Option<Document>> {
+    read_catalog_for_restore(directory)?
+        .map(|bytes| decode_document(&bytes))
+        .transpose()
+}
+
+/// Reads the exact bounded bytes used to compare catalogue revisions.
+pub(crate) fn read_catalog_for_restore(
+    directory: &Directory,
+) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
     let file = match directory.open_private_file(CATALOG) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error),
     };
-    let mut bytes = Vec::new();
+    let mut bytes = Zeroizing::new(Vec::new());
     file.take(MAX_CATALOG_BYTES as u64 + 1)
         .read_to_end(&mut bytes)?;
-    decode_document(&bytes).map(Some)
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err(invalid("SSH key catalog exceeds the profile size limit"));
+    }
+    Ok(Some(bytes))
+}
+
+/// Uses the same lock as ordinary key catalogue edits.
+pub(crate) fn lock_for_restore(directory: &Directory) -> io::Result<impl Drop> {
+    StoreLock::acquire(directory.open_lock(LOCK)?)
+}
+
+/// Validates the candidate and its exact appended managed identity sequence.
+/// Use this after a committing plan has already installed the catalogue.
+pub(crate) fn validate_prepared_managed_paths(
+    contents: &[u8],
+    additions: &[PreparedManagedIdentity],
+    credential_ids: &[String],
+) -> io::Result<()> {
+    let document = decode_document(contents)?;
+    let (existing, _) = require_prepared_managed_tail(&document, additions)?;
+    if document.records[existing.len()..].iter().any(|record| {
+        record
+            .passphrase
+            .as_ref()
+            .is_some_and(|id| !credential_ids.contains(id))
+    }) {
+        return Err(invalid(
+            "prepared SSH key passphrase is missing from the vault additions",
+        ));
+    }
+    Ok(())
+}
+
+/// Validates a prepared catalogue against the exact original document.
+pub(crate) fn validate_prepared_managed_additions(
+    before: Option<&[u8]>,
+    contents: &[u8],
+    additions: &[PreparedManagedIdentity],
+) -> io::Result<()> {
+    let current = before.map(decode_document).transpose()?.unwrap_or_default();
+    let candidate = decode_document(contents)?;
+    let (existing, first_id) = require_prepared_managed_tail(&candidate, additions)?;
+    if candidate.version != current.version
+        || existing != current.records
+        || first_id != current.next_id
+    {
+        return Err(invalid(
+            "prepared SSH key catalog does not preserve its original records",
+        ));
+    }
+    Ok(())
+}
+
+fn require_prepared_managed_tail<'a>(
+    document: &'a Document,
+    additions: &[PreparedManagedIdentity],
+) -> io::Result<(&'a [KeyRecord], u64)> {
+    if additions.is_empty() {
+        return Err(invalid("prepared SSH key catalog has no additions"));
+    }
+    let prefix_len = document
+        .records
+        .len()
+        .checked_sub(additions.len())
+        .ok_or_else(|| invalid("prepared SSH key catalog is missing additions"))?;
+    let (existing, appended) = document.records.split_at(prefix_len);
+    let first_id = document
+        .next_id
+        .checked_sub(additions.len() as u64)
+        .filter(|id| *id != 0)
+        .ok_or_else(|| invalid("prepared SSH key IDs are invalid"))?;
+    for (offset, (record, addition)) in appended.iter().zip(additions).enumerate() {
+        if record.id != first_id + offset as u64
+            || record.id != addition.id
+            || !matches!(&record.source, KeySource::Managed(token) if token == &addition.token)
+        {
+            return Err(invalid(
+                "prepared SSH key does not match its managed identity",
+            ));
+        }
+    }
+    Ok((existing, first_id))
 }
 
 fn decode_document(bytes: &[u8]) -> io::Result<Document> {

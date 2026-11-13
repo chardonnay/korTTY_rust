@@ -3,6 +3,24 @@ use iced::advanced::{Clipboard, Layout, Shell, Widget, layout, mouse, renderer};
 use iced::widget::{rich_text, text};
 use iced::{Element, Event, Font, Length, Rectangle, Renderer, Size, Theme};
 
+/// Keeps a pressed app action bound to the journal/card that displayed it.
+pub(in crate::workspace) fn journal_keyed_action<'a, Key, Message>(
+    key: Key,
+    content: Element<'a, Message>,
+) -> Element<'a, Message>
+where
+    Key: Clone + Eq + 'static,
+    Message: 'a,
+{
+    Element::new(LinkText {
+        identity: Identity::<Key, ()> {
+            key,
+            targets: Vec::new(),
+        },
+        content,
+    })
+}
+
 pub(in crate::workspace) fn journal_rich_text<'a, Key, Link, Message>(
     key: Key,
     spans: Vec<text::Span<'a, Link, Font>>,

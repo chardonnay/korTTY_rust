@@ -137,6 +137,13 @@ impl Workspace {
                 .with_isolation(floor, floor)
                 .with_fixed_route()
         };
+        if let Some(notice) = self.blocked_ssh_form(&form) {
+            if automatic {
+                self.defer_project_ssh(owner, target, WaitReason::Policy);
+            }
+            self.notice(owner, notice);
+            return Task::none();
+        }
         if floor == IsolationLevel::Sandbox && !ssh_worker::sandbox_available() {
             if automatic {
                 self.defer_project_ssh(owner, target, WaitReason::Policy);
@@ -187,6 +194,8 @@ impl Workspace {
                 saved,
                 project: automatic,
             }),
+            control: None,
+            teamwork: None,
             sftp: false,
             saved: saved_id,
             incognito,
@@ -266,7 +275,7 @@ impl Workspace {
             .as_ref()?
             .target;
         let (_, pane) = self.reconnect_target(owner, target)?;
-        Some((pane.grid, pane.strict_escapes))
+        Some((pane.grid, pane.reconnect_strict_escapes()))
     }
 
     pub(super) fn validate_ssh_reconnect(&mut self, owner: window::Id) -> bool {

@@ -146,6 +146,7 @@ impl Workspace {
             .is_some_and(|state| matches!(state.placement, Placement::Standalone { .. }))
     }
 
+    #[cfg(any(target_os = "macos", test))]
     pub(super) fn has_standalone_openpgp(&self) -> bool {
         self.standalone_openpgp().is_some()
     }

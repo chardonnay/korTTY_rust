@@ -12,13 +12,16 @@ impl Scratch {
             "kortty-ssh-keys-ui-{:016x}",
             u64::from_ne_bytes(nonce)
         ));
-        let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt as _;
-            builder.mode(0o700);
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&directory)
+                .unwrap();
         }
-        builder.create(&directory).unwrap();
+        #[cfg(not(unix))]
+        fs::create_dir(&directory).unwrap();
         Self(directory)
     }
 

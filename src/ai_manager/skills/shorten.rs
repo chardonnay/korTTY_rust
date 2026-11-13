@@ -60,9 +60,10 @@ pub(super) fn request(
     };
     let input = Zeroizing::new(input.to_string());
     local_ai::start(profile, move |client| {
+        let system = client.render_system_prompt(PROMPT);
         let response = Zeroizing::new(
             client
-                .complete(PROMPT, &input)
+                .complete(&system, &input)
                 .map_err(local_ai::Error::message)?,
         );
         parse(skill, &response)
@@ -109,6 +110,7 @@ fn parse(original: Skill, response: &str) -> Result<Proposal, String> {
             .filter(|(_, replaced)| !replaced)
             .map(|(rule, _)| rule.clone()),
     );
+    super::learning::prune_identities(&mut suggested)?;
     suggested.check()?;
     if suggested.bytes() >= original.bytes() {
         return Err("The model's proposal is not shorter.".into());
@@ -135,7 +137,39 @@ pub(super) fn display(skill: &Skill) -> String {
 
 #[cfg(test)]
 mod tests {
+    use crate::local_ai::test_support::{exclusive_run, fixture_response, start_test_double};
+
     use super::*;
+
+    #[test]
+    fn skill_shortening_dispatches_the_selected_prompt_preset() {
+        let _serial = exclusive_run();
+        let (profile, fixture) = start_test_double(vec![fixture_response(
+            "200 OK",
+            "",
+            r#"{"content":"Review the diff."}"#,
+        )]);
+        let profile = profile.with_prompt_preset(local_ai::PromptPreset::Mistral);
+        let expected = profile.render_system_prompt(PROMPT);
+        let skill = Skill {
+            name: "Review".into(),
+            content: "Review the whole diff thoroughly and review the diff.".into(),
+            ..Skill::default()
+        };
+        let pending = request(profile, skill.clone()).unwrap();
+        let proposal = pending.reply.recv_blocking().unwrap().unwrap();
+        assert_eq!(proposal.suggested.content, "Review the diff.");
+        let requests = fixture.join().unwrap();
+        assert_eq!(requests.len(), 1);
+        assert!(expected.contains("<kortty_model_preset>"));
+        assert_eq!(requests[0]["messages"][0]["content"], expected.as_ref());
+        let input: serde_json::Value =
+            serde_json::from_str(requests[0]["messages"][1]["content"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            input,
+            serde_json::json!({"content": skill.content, "rules": []})
+        );
+    }
 
     #[test]
     fn shortening_keeps_unmentioned_rules_and_rejects_new_or_repeated_rule_numbers() {

@@ -97,10 +97,32 @@ enum Section {
 
 type OutlineId = (&'static str, String);
 
+#[derive(Clone, PartialEq, Eq)]
+struct OutlineSelection {
+    id: OutlineId,
+    source_line: Option<usize>,
+}
+
+impl OutlineSelection {
+    fn new(node: &Node) -> Self {
+        Self {
+            id: outline_id(node),
+            source_line: (node.kind == "stage" || node.kind.starts_with("sql "))
+                .then_some(node.line),
+        }
+    }
+
+    fn matches(&self, node: &Node) -> bool {
+        self.id.0 == node.kind
+            && self.id.1 == node.qualified
+            && self.source_line.is_none_or(|line| line == node.line)
+    }
+}
+
 #[derive(PartialEq, Eq)]
 enum Identity {
-    Outline(OutlineId),
-    Variable(&'static str, String, String),
+    Outline(OutlineSelection),
+    Variable(&'static str, String, String, Option<usize>),
     Placeholder(PlaceholderStatus, String),
 }
 
@@ -115,7 +137,7 @@ pub(super) struct Panel {
     sort: SortColumn,
     descending: bool,
     selected: Option<Identity>,
-    caret_outline: Option<OutlineId>,
+    caret_outline: Option<OutlineSelection>,
 }
 
 impl Default for Panel {
@@ -214,7 +236,7 @@ impl Panel {
                 }) {
                     self.selected = Some(target.identity());
                     if let Target::Outline(node) = target {
-                        self.caret_outline = Some(outline_id(node));
+                        self.caret_outline = Some(OutlineSelection::new(node));
                     }
                 }
             }
@@ -229,7 +251,7 @@ impl Panel {
             .enumerate()
             .filter(|(_, node)| node.line <= line && line <= node.end_line)
             .max_by_key(|(index, node)| (node.line, Reverse(node.end_line), *index));
-        self.caret_outline = innermost.map(|(_, node)| outline_id(node));
+        self.caret_outline = innermost.map(|(_, node)| OutlineSelection::new(node));
         if matches!(self.selected, Some(Identity::Outline(_))) {
             self.selected = self.caret_outline.clone().map(Identity::Outline);
         }
@@ -502,9 +524,10 @@ impl Panel {
         let mut body = column![].spacing(1);
         for row in outline {
             let target = Target::Outline(row.node);
-            let caret = self.caret_outline.as_ref().is_some_and(|identity| {
-                identity.0 == row.node.kind && identity.1 == row.node.qualified
-            });
+            let caret = self
+                .caret_outline
+                .as_ref()
+                .is_some_and(|identity| identity.matches(row.node));
             let label = row![
                 text(display_label(&row.node.name))
                     .size(13)
@@ -619,9 +642,13 @@ impl Panel {
                 &variable.scope
             });
             let name = display_label(&variable.name);
+            let kind = variable.container.map_or_else(
+                || variable.kind.to_owned(),
+                |container| format!("{} ({container})", variable.kind),
+            );
             let description = format!(
-                "{} · {} · {} · line {line} · {} uses",
-                name, variable.kind, scope, variable.uses
+                "{name} · {kind} · {scope} · line {line} · {} uses",
+                variable.uses
             );
             let label: Element<'_, SnippetMessage> = if compact {
                 column![
@@ -756,21 +783,25 @@ enum Target<'a> {
 impl Target<'_> {
     fn identity(self) -> Identity {
         match self {
-            Self::Outline(node) => Identity::Outline(outline_id(node)),
-            Self::Variable(variable) => {
-                Identity::Variable(variable.kind, variable.name.clone(), variable.scope.clone())
-            }
+            Self::Outline(node) => Identity::Outline(OutlineSelection::new(node)),
+            Self::Variable(variable) => Identity::Variable(
+                variable.kind,
+                variable.name.clone(),
+                variable.scope.clone(),
+                variable.stage_index,
+            ),
             Self::Placeholder(entry) => Identity::Placeholder(entry.status, entry.name.clone()),
         }
     }
 
     fn matches(self, identity: &Identity) -> bool {
         match (self, identity) {
-            (Self::Outline(node), Identity::Outline((kind, name))) => {
-                node.kind == *kind && node.qualified == *name
-            }
-            (Self::Variable(variable), Identity::Variable(kind, name, scope)) => {
-                variable.kind == *kind && variable.name == *name && variable.scope == *scope
+            (Self::Outline(node), Identity::Outline(selected)) => selected.matches(node),
+            (Self::Variable(variable), Identity::Variable(kind, name, scope, stage_index)) => {
+                variable.kind == *kind
+                    && variable.name == *name
+                    && variable.scope == *scope
+                    && variable.stage_index == *stage_index
             }
             (Self::Placeholder(entry), Identity::Placeholder(status, name)) => {
                 entry.status == *status && entry.name == *name
@@ -911,6 +942,80 @@ fn wrap(message: Message) -> SnippetMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dockerfile_repeated_stage_names_keep_the_clicked_source_selection() {
+        let report = Report {
+            analysis: crate::editor_window::structure::analyze(
+                "FROM alpine\nARG PORT=1\nFROM alpine\nARG PORT=2\n",
+                "dockerfile",
+            ),
+            placeholders: Default::default(),
+        };
+        let mut panel = Panel::default();
+        for (first, second) in [
+            (
+                Target::Outline(&report.analysis.nodes[0]),
+                Target::Outline(&report.analysis.nodes[1]),
+            ),
+            (
+                Target::Variable(&report.analysis.variables[0]),
+                Target::Variable(&report.analysis.variables[1]),
+            ),
+        ] {
+            panel.update(
+                Message::Jump {
+                    revision: 1,
+                    span: second.span(),
+                    focus: false,
+                },
+                Some(&report),
+            );
+            assert!(!panel.is_selected(first));
+            assert!(panel.is_selected(second));
+            // The filter's Enter handler uses this first matching target for its jump.
+            let enter = targets(&report)
+                .find(|target| panel.is_selected(*target))
+                .unwrap();
+            assert_eq!(enter.span(), second.span());
+        }
+        panel.follow_caret(&report, 3);
+        let caret = panel.caret_outline.as_ref().unwrap();
+        assert!(!caret.matches(&report.analysis.nodes[0]));
+        assert!(caret.matches(&report.analysis.nodes[1]));
+    }
+
+    #[test]
+    fn sql_repeated_object_names_keep_the_clicked_source_selection() {
+        let report = Report {
+            analysis: crate::editor_window::structure::analyze(
+                "CREATE VIEW active AS SELECT 1;\nCREATE OR REPLACE VIEW active AS SELECT 2;\n",
+                "sql",
+            ),
+            placeholders: Default::default(),
+        };
+        let mut panel = Panel::default();
+        let first = Target::Outline(&report.analysis.nodes[0]);
+        let second = Target::Outline(&report.analysis.nodes[1]);
+        panel.update(
+            Message::Jump {
+                revision: 1,
+                span: second.span(),
+                focus: false,
+            },
+            Some(&report),
+        );
+        assert!(!panel.is_selected(first));
+        assert!(panel.is_selected(second));
+        let enter = targets(&report)
+            .find(|target| panel.is_selected(*target))
+            .unwrap();
+        assert_eq!(enter.span(), second.span());
+        panel.follow_caret(&report, 1);
+        let caret = panel.caret_outline.as_ref().unwrap();
+        assert!(!caret.matches(&report.analysis.nodes[0]));
+        assert!(caret.matches(&report.analysis.nodes[1]));
+    }
 
     #[test]
     fn fitting_to_a_small_window_preserves_the_requested_width_until_resized() {

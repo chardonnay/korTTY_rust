@@ -1,0 +1,14 @@
+cursor=1,2
+reply=1b5b313b33521b5b333b3252
+screen:
+qrcdefghijklmnop
+0123456789ABCDEF
+W
+
+
+attributes:
+UUIIIIIIIIIIIIII
+................
+B...............
+................
+................

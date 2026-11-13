@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{self, BufReader};
+use std::io::{self, Read};
 use std::net::TcpStream;
 use std::sync::{Mutex, MutexGuard};
 use std::thread;
@@ -17,13 +17,22 @@ use kortty_pty::WorkerSandbox;
 #[cfg(any(windows, target_os = "macos"))]
 use kortty_ssh::PipeTransport;
 use kortty_ssh::{ConnectError, ConnectOptions, SshSession, SshTarget, StartupChannel, TrustStore};
+use zeroize::{Zeroize, Zeroizing};
 
+#[path = "account_lookup.rs"]
+pub mod account_lookup;
 #[path = "connect.rs"]
 mod connect;
 pub use connect::{connect_transport, connect_transport_with_options};
 
+#[path = "folder_usage.rs"]
+pub mod folder_usage;
 #[path = "mux.rs"]
 pub mod mux;
+#[path = "password.rs"]
+pub mod password;
+#[path = "password_file.rs"]
+pub mod password_file;
 #[path = "server.rs"]
 mod server;
 #[path = "wire.rs"]
@@ -164,7 +173,49 @@ pub fn serve(descriptor: Option<u32>) -> io::Result<()> {
         Err(error) => return wire::send(&mut output, wire::Message::Failed(error)),
     };
     wire::send(&mut output, wire::Message::Ready)?;
-    server::run(ssh, BufReader::new(pipe), output.lock(), !sftp)
+    server::run(ssh, WorkerInput::new(pipe), output.lock(), !sftp)
+}
+
+// Control frames can carry a credential. Wipe bytes as they leave read-ahead,
+// and wipe any remaining buffer when the worker stops or decoding fails.
+struct WorkerInput<R> {
+    inner: R,
+    buffer: Zeroizing<[u8; wire::CHUNK]>,
+    offset: usize,
+    length: usize,
+}
+
+impl<R> WorkerInput<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            buffer: Zeroizing::new([0; wire::CHUNK]),
+            offset: 0,
+            length: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for WorkerInput<R> {
+    fn read(&mut self, destination: &mut [u8]) -> io::Result<usize> {
+        if destination.is_empty() {
+            return Ok(0);
+        }
+        if self.offset == self.length {
+            self.offset = 0;
+            self.length = 0;
+            self.length = self
+                .inner
+                .read(&mut self.buffer[..])
+                .inspect_err(|_| self.buffer.zeroize())?;
+        }
+        let count = destination.len().min(self.length - self.offset);
+        let consumed = &mut self.buffer[self.offset..self.offset + count];
+        destination[..count].copy_from_slice(consumed);
+        consumed.zeroize();
+        self.offset += count;
+        Ok(count)
+    }
 }
 
 #[cfg(test)]

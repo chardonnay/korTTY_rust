@@ -107,7 +107,7 @@ fn an_ended_ssh_worker_is_offline_and_unverified_isolation_takes_priority() {
         )
         .unwrap();
         workspace
-            .store_disconnected_ssh(target, TerminalProfile::Xterm, 14)
+            .store_disconnected_ssh(target, TerminalProfile::Xterm, 14, Default::default())
             .unwrap()
     };
     let process = store_pane(IsolationLevel::Process);

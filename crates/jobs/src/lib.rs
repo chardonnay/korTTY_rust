@@ -8,6 +8,7 @@
 
 mod diagram;
 mod graph;
+mod profile_ref;
 mod schedule;
 mod scheduler;
 mod store;
@@ -21,11 +22,20 @@ pub use jiff::{
     civil::{Date, Time, Weekday},
     tz::TimeZone,
 };
+pub use profile_ref::{MAX_POLICY_PROFILE_ID_BYTES, ProfileRef, valid_policy_ai_profile_id};
 pub use schedule::{JobSchedule, SCHEDULE_SEARCH_DAYS, ScheduleError};
 pub use scheduler::{
-    BlockReason, Blocker, Cancellation, RunBatch, RunId, RunOutcome, RunRecord, RunRequest,
-    RunTrigger, Scheduler, SchedulerError,
+    BlockReason, Blocker, Cancellation, CascadeOrigin, RunBatch, RunId, RunOutcome, RunRecord,
+    RunRequest, RunTrigger, Scheduler, SchedulerError,
 };
 pub use store::{
-    JournalRecording, MAX_JOURNAL_RECORDS, MAX_STORE_BYTES, SchedulerStore, StoreError,
+    FinishedRunMetadata, JournalRecording, MAX_JOURNAL_RECORDS, MAX_SESSION_JOURNALS_PER_RUN,
+    MAX_STORE_BYTES, MAX_SWARM_COMPARISON_BYTES, MAX_SWARM_QUESTION_BYTES,
+    MAX_SWARM_TARGET_DETAIL_BYTES, MAX_SWARM_TARGET_LABEL_BYTES, MAX_SWARM_TARGETS,
+    MAX_WEBHOOKS_PER_RUN, PreparedJobAdditions, SchedulerStore, StoreError, StoreLock,
+    SwarmChatOrigin, SwarmChatSeed, SwarmReport, SwarmTargetReport, WebhookOutcome,
+    valid_session_journal_id, valid_session_journal_ids, valid_swarm_comparison,
 };
+
+/// Maximum simultaneously active targets in one scheduled iterative Swarm.
+pub const MAX_SWARM_PARALLELISM: usize = 16;

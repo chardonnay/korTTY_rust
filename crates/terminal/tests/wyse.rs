@@ -1,5 +1,5 @@
 use kortty_terminal::{
-    Color, KeyModifiers, ScreenSnapshot, Terminal, TerminalKey, TerminalProfile,
+    Color, KeyModifiers, ScreenSnapshot, Terminal, TerminalKey, TerminalProfile, TextEncoding,
 };
 
 fn fragmented(terminal: &mut Terminal, bytes: &[u8]) {
@@ -64,6 +64,18 @@ fn wy160_fixture_uses_the_full_byte_address_and_color_palette() {
 
     fragmented(&mut terminal, b"\x1b~!");
     assert_eq!(terminal.snapshot().columns, 80);
+}
+
+#[test]
+fn wy160_raw_coordinates_preserve_following_text() {
+    let mut native = Terminal::with_profile(132, 2, TerminalProfile::Wy160);
+    fragmented(&mut native, b"\x1b= \xc2X");
+    assert_eq!(native.snapshot().row(0).unwrap()[131].text, "X");
+
+    let mut serial =
+        Terminal::with_profile_and_encoding(132, 2, TerminalProfile::Wy160, TextEncoding::Latin1);
+    fragmented(&mut serial, b"\x1b= \xc2\xa2");
+    assert_eq!(serial.snapshot().row(0).unwrap()[131].text, "¢");
 }
 
 #[test]

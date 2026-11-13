@@ -13,7 +13,7 @@ use crate::private_files::{Directory, nonce};
 
 use super::{invalid, valid_text};
 
-mod raster;
+pub(super) mod raster;
 #[cfg(test)]
 mod tests;
 
@@ -212,6 +212,10 @@ impl CustomBadge {
 
     pub(crate) fn image_handle(&self) -> Option<Handle> {
         self.image.clone()
+    }
+
+    pub(crate) fn raster(&self) -> io::Result<image::RgbaImage> {
+        raster::stored_pixels(self.png())
     }
 }
 

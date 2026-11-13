@@ -1,10 +1,17 @@
-//! Ordered, output-only manual capture on the terminal actor.
+//! Ordered journal capture on the terminal actor.
 
 use std::io;
+use std::sync::mpsc::SyncSender;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::time::{Duration, Instant};
 
 use async_channel::Sender;
-use kortty_terminal::{JournalEvent, JournalObserver, JournalRow, Terminal};
+use kortty_terminal::{
+    JournalEvent, JournalObserver, JournalRow, ShellEvent, ShellEventKind, Terminal,
+};
 use zeroize::{Zeroize as _, Zeroizing};
 
 use crate::session_journal::{
@@ -15,6 +22,10 @@ use crate::terminal_logging::{Policy, RedactionSecrets, Redactor};
 const SEED_BUDGET: Duration = Duration::from_millis(32);
 const OUTPUT_BUDGET: Duration = Duration::from_millis(8);
 const MAX_METADATA_BYTES: usize = 4096;
+mod input;
+#[cfg(test)]
+#[path = "journal/tests.rs"]
+mod input_capture_tests;
 
 pub(super) fn redact_metadata(
     mut metadata: Metadata,
@@ -48,6 +59,7 @@ pub(super) enum Command {
         sink: Sink,
         policy: Policy,
         seed: bool,
+        capture_input: bool,
         reply: Sender<io::Result<()>>,
     },
     Detach {
@@ -74,24 +86,53 @@ impl Command {
 #[derive(Default)]
 pub(super) struct Actor {
     pub(super) secrets: Option<RedactionSecrets>,
-    active: Option<u64>,
+    active: Option<Active>,
+}
+
+struct Active {
+    id: u64,
+    sink: Sink,
+    input: Option<Input>,
+}
+
+struct Input {
+    redact: Redactor,
+    lines: input::Lines,
+    prompt: Option<u64>,
+}
+
+pub(super) struct Permit {
+    id: u64,
+    prompt: u64,
+    pub(super) output: Option<Instant>,
+    pub(super) confirmation: Option<SyncSender<()>>,
+    encoding: kortty_terminal::TextEncoding,
 }
 
 impl Actor {
-    pub(super) fn command(&mut self, terminal: &mut Terminal, command: Command) {
+    pub(super) fn command(
+        &mut self,
+        terminal: &mut Terminal,
+        command: Command,
+        prompt: Option<u64>,
+    ) {
         match command {
             Command::Attach {
                 id,
                 sink,
                 policy,
                 seed,
+                capture_input,
                 reply,
             } => {
-                let result = self.attach(terminal, id, sink, policy, seed);
+                let result = self.attach(terminal, id, sink, policy, seed, capture_input);
+                if result.is_ok() {
+                    self.bind_existing_prompt(prompt);
+                }
                 let _ = reply.try_send(result);
             }
             Command::Detach { id, reply } => {
-                if self.active == Some(id) {
+                if self.active.as_ref().is_some_and(|active| active.id == id) {
                     self.stop(terminal);
                 }
                 let _ = reply.try_send(());
@@ -106,6 +147,7 @@ impl Actor {
         sink: Sink,
         policy: Policy,
         seed: bool,
+        capture_input: bool,
     ) -> io::Result<()> {
         let secrets = self
             .secrets
@@ -117,6 +159,11 @@ impl Actor {
                 "This terminal already has an attached session journal.",
             ));
         }
+        let input = capture_input.then(|| Input {
+            redact: Redactor::for_journal(secrets.clone(), policy.clone()),
+            lines: input::Lines::default(),
+            prompt: None,
+        });
         let redact = Redactor::for_journal(secrets.clone(), policy);
         if seed {
             let (lines, omitted) = seed_lines(terminal, &redact);
@@ -126,18 +173,146 @@ impl Actor {
                 })?;
             }
         }
-        terminal.set_journal_observer(Some(Box::new(Output {
-            sink,
-            redact,
-            line: Zeroizing::default(),
-            deadline: Instant::now(),
-            carriage_return: false,
-            skip_until_boundary: !terminal.journal_at_line_start(),
-            last_blank: false,
-            failed: false,
-        })));
-        self.active = Some(id);
+        terminal.set_journal_observer(Some(journal_output_observer(
+            sink.clone(),
+            Arc::new(redact),
+            "",
+            !terminal.journal_at_line_start(),
+            None,
+        )));
+        self.active = Some(Active { id, sink, input });
         Ok(())
+    }
+
+    pub(super) fn captures_input(&self) -> bool {
+        self.active
+            .as_ref()
+            .is_some_and(|active| active.input.is_some())
+    }
+
+    pub(super) fn suppress_input(&mut self) {
+        if let Some(input) = self
+            .active
+            .as_mut()
+            .and_then(|active| active.input.as_mut())
+        {
+            input.lines.suppress();
+        }
+    }
+
+    fn bind_existing_prompt(&mut self, prompt: Option<u64>) {
+        if let Some(prompt) = prompt
+            && let Some(input) = self
+                .active
+                .as_mut()
+                .and_then(|active| active.input.as_mut())
+        {
+            input.prompt = Some(prompt);
+            input.lines.suppress();
+        }
+    }
+
+    pub(super) fn permit(
+        &mut self,
+        terminal: &Terminal,
+        prompt: Option<u64>,
+        output: Option<Instant>,
+        coherent: bool,
+        bytes: &[u8],
+        enter: bool,
+    ) -> Option<Permit> {
+        let active = self.active.as_mut()?;
+        let input = active.input.as_mut()?;
+        if prompt.is_some() && input.prompt != prompt {
+            input.lines.reset();
+            input.prompt = prompt;
+        }
+        let Some(prompt) = prompt.filter(|_| {
+            coherent
+                && !terminal.alternate_screen_active()
+                && !terminal.cursor_line_is_password_prompt()
+        }) else {
+            input.lines.suppress();
+            return None;
+        };
+        let confirmation = if enter {
+            input
+                .lines
+                .written(bytes, true)
+                .and_then(|line| {
+                    input
+                        .redact
+                        .journal_text(&line, Instant::now() + OUTPUT_BUDGET)
+                })
+                .and_then(|text| active.sink.reserve_input(text).ok())
+        } else {
+            None
+        };
+        Some(Permit {
+            id: active.id,
+            prompt,
+            output,
+            confirmation,
+            encoding: terminal.journal_input_encoding(),
+        })
+    }
+
+    pub(super) fn missed_input(&mut self, permit: Permit) {
+        if let Some(active) = self.active.as_mut().filter(|active| active.id == permit.id)
+            && let Some(input) = active
+                .input
+                .as_mut()
+                .filter(|input| input.prompt == Some(permit.prompt))
+        {
+            input.lines.suppress();
+        }
+    }
+
+    pub(super) fn written(&mut self, permit: Permit, bytes: &[u8]) {
+        let Some(active) = self.active.as_mut().filter(|active| active.id == permit.id) else {
+            return;
+        };
+        let Some(input) = active
+            .input
+            .as_mut()
+            .filter(|input| input.prompt == Some(permit.prompt))
+        else {
+            return;
+        };
+        if permit.encoding == kortty_terminal::TextEncoding::Utf8 {
+            let _ = input.lines.written(bytes, false);
+        } else {
+            let text = Zeroizing::new(permit.encoding.decode(bytes).into_owned());
+            if text.contains(char::REPLACEMENT_CHARACTER) {
+                input.lines.suppress();
+            } else {
+                let _ = input.lines.written(text.as_bytes(), false);
+            }
+        }
+    }
+
+    pub(super) fn output(&mut self, terminal: &Terminal, events: &[ShellEvent]) {
+        let Some(active) = self.active.as_mut() else {
+            return;
+        };
+        if let Some(input) = active.input.as_mut()
+            && (terminal.alternate_screen_active() || terminal.cursor_line_is_password_prompt())
+        {
+            input.lines.suppress();
+        }
+        for event in events {
+            if let ShellEventKind::CommandFinished { exit_status } = event.kind
+                && !event.position.alternate_screen
+            {
+                let text = exit_status.map_or_else(
+                    || "shell integration: command finished".to_owned(),
+                    |status| format!("shell integration: command finished (exit {status})"),
+                );
+                let _ = active
+                    .sink
+                    .try_write(RecordKind::CommandEnd, Zeroizing::new(text), false);
+            }
+        }
     }
 
     pub(super) fn stop(&mut self, terminal: &mut Terminal) {
@@ -149,7 +324,9 @@ impl Actor {
 
 struct Output {
     sink: Sink,
-    redact: Redactor,
+    redact: Arc<Redactor>,
+    prefix: &'static str,
+    stopped: Option<Arc<AtomicBool>>,
     line: Zeroizing<String>,
     deadline: Instant,
     carriage_return: bool,
@@ -158,7 +335,33 @@ struct Output {
     failed: bool,
 }
 
+pub(crate) fn journal_output_observer(
+    sink: Sink,
+    redact: Arc<Redactor>,
+    prefix: &'static str,
+    skip_until_boundary: bool,
+    stopped: Option<Arc<AtomicBool>>,
+) -> Box<dyn JournalObserver> {
+    Box::new(Output {
+        sink,
+        redact,
+        prefix,
+        stopped,
+        line: Zeroizing::default(),
+        deadline: Instant::now(),
+        carriage_return: false,
+        skip_until_boundary,
+        last_blank: false,
+        failed: false,
+    })
+}
+
 impl Output {
+    fn stopped(&self) -> bool {
+        self.stopped
+            .as_ref()
+            .is_some_and(|stop| stop.load(Ordering::Acquire))
+    }
     fn reset(&mut self) {
         self.line.zeroize();
         self.carriage_return = false;
@@ -182,17 +385,24 @@ impl Output {
     }
 
     fn emit(&mut self, partial: bool) {
+        if self.stopped() {
+            self.reset();
+            return;
+        }
         let line = self.line.trim_end();
         if line.is_empty() && (partial || self.last_blank) {
             self.reset();
             return;
         }
-        let Some(text) = self.redact.journal_text(line, self.deadline) else {
+        let Some(mut text) = self.redact.journal_text(line, self.deadline) else {
             self.truncate();
             return;
         };
         self.last_blank = text.is_empty();
         self.reset();
+        if !text.is_empty() {
+            text.insert_str(0, self.prefix);
+        }
         if self
             .sink
             .try_write(RecordKind::Output, text, partial)
@@ -205,11 +415,15 @@ impl Output {
 
 impl JournalObserver for Output {
     fn begin_chunk(&mut self) {
+        if self.stopped() || self.sink.output_paused() {
+            self.reset();
+            return;
+        }
         self.deadline = Instant::now() + OUTPUT_BUDGET;
     }
 
     fn observe(&mut self, event: JournalEvent) {
-        if self.failed {
+        if self.failed || self.stopped() || self.sink.output_paused() {
             return;
         }
         if self.skip_until_boundary {

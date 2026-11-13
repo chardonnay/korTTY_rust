@@ -6,7 +6,9 @@ use iced::advanced::renderer::Renderer as _;
 use iced::font::{Style as FontStyle, Weight};
 use iced::widget::canvas::{self, Cache};
 use iced::widget::{Canvas, scrollable};
-use iced::{Color, Element, Font, Length, Pixels, Point, Rectangle, Renderer, Size, Theme, mouse};
+use iced::{
+    Color, Element, Font, Length, Pixels, Point, Rectangle, Renderer, Size, Theme, Vector, mouse,
+};
 use kortty_recording::RecordedScreen;
 use kortty_terminal::{Color as TerminalColor, CursorShape, Style};
 
@@ -22,9 +24,13 @@ pub(super) const MAX_IMAGE_PIXELS: u64 = 16 * 1024 * 1024;
 
 pub(super) fn view<'a>(screen: &'a RecordedScreen, cache: &'a Cache) -> Element<'a, Message> {
     scrollable(
-        Canvas::new(Grid { screen, cache })
-            .width(grid_size(screen).width)
-            .height(grid_size(screen).height),
+        Canvas::new(Grid {
+            screen,
+            cache,
+            fit: false,
+        })
+        .width(grid_size(screen).width)
+        .height(grid_size(screen).height),
     )
     .direction(scrollable::Direction::Both {
         horizontal: scrollable::Scrollbar::default(),
@@ -35,11 +41,60 @@ pub(super) fn view<'a>(screen: &'a RecordedScreen, cache: &'a Cache) -> Element<
     .into()
 }
 
+pub(super) fn tile<'a>(screen: &'a RecordedScreen, cache: &'a Cache) -> Element<'a, Message> {
+    Canvas::new(Grid {
+        screen,
+        cache,
+        fit: true,
+    })
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .into()
+}
+
 /// Rasterizes the full replay grid, independently of its current window or scroll position.
 pub(crate) fn png(screen: &RecordedScreen) -> Result<Vec<u8>, String> {
+    rasterize(grid_size(screen), |frame, size| {
+        paint(screen, frame, size, true)
+    })
+}
+
+pub(super) fn video_size(screen: &RecordedScreen) -> (u32, u32) {
+    let grid = grid_size(screen);
+    (
+        (grid.width.ceil() as u32).max(u32::from(screen.pixels.0)),
+        (grid.height.ceil() as u32).max(u32::from(screen.pixels.1)),
+    )
+}
+
+pub(super) fn video_png<'a>(
+    dimensions: (u32, u32),
+    screens: impl Iterator<Item = ((u32, u32), &'a RecordedScreen)>,
+    include_color: bool,
+) -> Result<Vec<u8>, String> {
+    let size = Size::new(dimensions.0 as f32, dimensions.1 as f32);
+    rasterize(size, |frame, _| {
+        for ((x, y), screen) in screens {
+            let (width, height) = video_size(screen);
+            frame.with_save(|frame| {
+                frame.translate(Vector::new(x as f32, y as f32));
+                paint(
+                    screen,
+                    frame,
+                    Size::new(width as f32, height as f32),
+                    include_color,
+                );
+            });
+        }
+    })
+}
+
+fn rasterize(
+    size: Size,
+    draw: impl FnOnce(&mut canvas::Frame<iced_tiny_skia::Renderer>, Size),
+) -> Result<Vec<u8>, String> {
     static RASTERIZER: Mutex<()> = Mutex::new(());
 
-    let size = grid_size(screen);
     let width = size.width.ceil() as u32;
     let height = size.height.ceil() as u32;
     if u64::from(width) * u64::from(height) > MAX_IMAGE_PIXELS {
@@ -53,7 +108,7 @@ pub(crate) fn png(screen: &RecordedScreen) -> Result<Vec<u8>, String> {
     let mut renderer = iced_tiny_skia::Renderer::new(Font::MONOSPACE, Pixels(FONT_SIZE));
     renderer.reset(Rectangle::with_size(viewport.logical_size()));
     let mut frame = canvas::Frame::new(&renderer, viewport.logical_size());
-    paint(screen, &mut frame);
+    draw(&mut frame, viewport.logical_size());
     renderer.draw_geometry(frame.into_geometry());
     let pixels =
         iced_tiny_skia::window::compositor::screenshot(&mut renderer, &viewport, BACKGROUND);
@@ -73,6 +128,7 @@ fn grid_size(screen: &RecordedScreen) -> Size {
 struct Grid<'a> {
     screen: &'a RecordedScreen,
     cache: &'a Cache,
+    fit: bool,
 }
 
 impl canvas::Program<Message> for Grid<'_> {
@@ -86,23 +142,45 @@ impl canvas::Program<Message> for Grid<'_> {
         bounds: Rectangle,
         _: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        vec![
-            self.cache
-                .draw(renderer, bounds.size(), |frame| paint(self.screen, frame)),
-        ]
+        if bounds.width <= 0.0 || bounds.height <= 0.0 {
+            return Vec::new();
+        }
+        vec![self.cache.draw(renderer, bounds.size(), |frame| {
+            let size = if self.fit {
+                let grid = grid_size(self.screen);
+                let scale = (bounds.width / grid.width)
+                    .min(bounds.height / grid.height)
+                    .min(1.0);
+                frame.translate(Vector::new(
+                    (bounds.width - grid.width * scale) / 2.0,
+                    (bounds.height - grid.height * scale) / 2.0,
+                ));
+                frame.scale(scale);
+                grid
+            } else {
+                frame.size()
+            };
+            paint(self.screen, frame, size, true);
+        })]
     }
 }
 
 fn paint<R: iced::advanced::graphics::geometry::Renderer>(
     screen: &RecordedScreen,
     frame: &mut canvas::Frame<R>,
+    size: Size,
+    include_color: bool,
 ) {
-    let default = if screen.reverse_video {
-        FOREGROUND
-    } else {
-        BACKGROUND
+    let reverse = include_color && screen.reverse_video;
+    let appearance = |style: Style| {
+        if include_color {
+            style
+        } else {
+            Style::default()
+        }
     };
-    frame.fill_rectangle(Point::ORIGIN, frame.size(), default);
+    let default = if reverse { FOREGROUND } else { BACKGROUND };
+    frame.fill_rectangle(Point::ORIGIN, size, default);
     for row in 0..screen.rows {
         let Some(cells) = screen.row(row) else { break };
         let cursor = |column| {
@@ -111,7 +189,7 @@ fn paint<R: iced::advanced::graphics::geometry::Renderer>(
                 && usize::from(screen.cursor.column) == column
         };
         for (column, cell) in cells.iter().enumerate() {
-            let (foreground, background) = colors(cell.style, screen.reverse_video);
+            let (foreground, background) = colors(appearance(cell.style), reverse);
             let background = if cursor(column) && screen.cursor_shape == CursorShape::Block {
                 foreground
             } else {
@@ -127,16 +205,15 @@ fn paint<R: iced::advanced::graphics::geometry::Renderer>(
         }
         for (column, cell) in cells.iter().enumerate() {
             let position = point(row, column as u16);
-            let (foreground, background) = colors(cell.style, screen.reverse_video);
+            let style = appearance(cell.style);
+            let (foreground, background) = colors(style, reverse);
             let foreground = if cursor(column) && screen.cursor_shape == CursorShape::Block {
                 background
             } else {
                 foreground
             };
             if cell.width != 0 && !cell.style.hidden && !cell.text.is_empty() {
-                paint_cell(
-                    frame, position, foreground, cell.style, cell.width, &cell.text,
-                );
+                paint_cell(frame, position, foreground, style, cell.width, &cell.text);
             }
             if cursor(column) {
                 let cursor = match screen.cursor_shape {
@@ -241,6 +318,17 @@ fn color(value: TerminalColor, default: Color) -> Color {
             Color::from_rgb8(red, green, blue)
         }
     }
+}
+
+pub(super) fn replay_style_rgb(style: Style) -> ([u8; 3], [u8; 3]) {
+    let rgb = |color: Color| {
+        let [red, green, blue, _] = color.into_rgba8();
+        [red, green, blue]
+    };
+    (
+        rgb(color(style.foreground, FOREGROUND)),
+        rgb(color(style.background, BACKGROUND)),
+    )
 }
 
 const ANSI: [[u8; 3]; 16] = [

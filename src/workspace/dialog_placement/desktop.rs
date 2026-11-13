@@ -1,10 +1,13 @@
 //! Resolve desktop bounds before creating a native dialog.
 
 use iced::{Point, Size, Task, window};
-use kortty_windowing::{DesktopPoint, DialogWorkArea};
+use kortty_windowing::{DesktopPoint, DialogWorkArea, NativeWindow};
 
 use crate::profile::SavedPosition;
 use crate::workspace::window_lifecycle;
+
+#[cfg(target_os = "linux")]
+use super::Owner;
 
 #[cfg(target_os = "linux")]
 mod wayland;
@@ -20,11 +23,18 @@ enum Bounds {
     Monitor(Size),
 }
 
+#[cfg(target_os = "linux")]
+enum Backend {
+    X11,
+    Wayland,
+}
+
 pub(super) fn open(
     reference: window::Id,
     settings: window::Settings,
     saved: Option<SavedPosition>,
     #[cfg(target_os = "linux")] opening: Option<Opening>,
+    #[cfg(target_os = "linux")] owner: Option<Owner>,
 ) -> (window::Id, Task<window::Id>) {
     let id = window::Id::unique();
     let opened = probe(reference, saved).collect().then(move |result| {
@@ -48,12 +58,9 @@ pub(super) fn open(
             None => saved,
         };
         #[cfg(target_os = "linux")]
-        let opened = match opening.clone() {
-            Some(opening) => wayland::open(reference, id, settings, opening),
-            None => open_native(id, settings),
-        };
+        let opened = open_linux(reference, id, settings, opening.clone(), owner);
         #[cfg(target_os = "windows")]
-        let opened = open_native(id, settings);
+        let opened = open_native(id, settings, None);
         opened.then(move |id| {
             window_lifecycle::restore_native_position(id, position)
                 .discard()
@@ -63,10 +70,86 @@ pub(super) fn open(
     (id, opened)
 }
 
-fn open_native(id: window::Id, settings: window::Settings) -> Task<window::Id> {
+#[cfg(target_os = "linux")]
+fn open_linux(
+    reference: window::Id,
+    id: window::Id,
+    settings: window::Settings,
+    opening: Option<Opening>,
+    owner: Option<Owner>,
+) -> Task<window::Id> {
+    if owner.is_none() && opening.is_none() {
+        return open_native(id, settings, None);
+    }
+    window::run(reference, |native| {
+        use window::raw_window_handle::RawDisplayHandle;
+
+        match native.display_handle().ok().map(|handle| handle.as_raw()) {
+            Some(RawDisplayHandle::Xlib(_) | RawDisplayHandle::Xcb(_)) => Some(Backend::X11),
+            Some(RawDisplayHandle::Wayland(_)) => Some(Backend::Wayland),
+            _ => None,
+        }
+    })
+    .then(move |backend| {
+        let mut settings = settings.clone();
+        let wayland_parent = match backend {
+            Some(Backend::X11) => {
+                if let Some(owner) = owner {
+                    // Publish the ICCCM and EWMH hints before the WM maps the window.
+                    settings.visible = false;
+                    settings.minimizable &= !owner.modal;
+                }
+                None
+            }
+            Some(Backend::Wayland) => {
+                if let Some(opening) = &opening {
+                    opening.constrain(&mut settings);
+                }
+                owner.map(|owner| owner.window)
+            }
+            _ => None,
+        };
+        open_native(id, settings, wayland_parent)
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn attach_x11_owner(dialog: window::Id, owner: Owner) -> Task<bool> {
+    window::run(dialog, identify).then(move |dialog| {
+        let Some(dialog) = dialog else {
+            // Wayland attached the native parent during creation.
+            return Task::done(false);
+        };
+        window::run(owner.window, identify)
+            .then(move |native_owner| {
+                Task::future(async move {
+                    if let Some(native_owner) = native_owner {
+                        kortty_windowing::bind_x11_dialog_owner(dialog, native_owner, owner.modal);
+                    }
+                })
+            })
+            .discard()
+            .chain(Task::done(true))
+    })
+}
+
+fn identify(native: &dyn window::Window) -> Option<NativeWindow> {
+    kortty_windowing::identify(native.window_handle().ok()?, native.display_handle().ok()?)
+}
+
+fn open_native(
+    id: window::Id,
+    settings: window::Settings,
+    wayland_parent: Option<window::Id>,
+) -> Task<window::Id> {
     // Reserve the ID before the asynchronous work-area probe.
-    iced_runtime::task::oneshot(move |reply| {
-        iced_runtime::Action::Window(iced_runtime::window::Action::Open(id, settings, reply))
+    iced_runtime::task::oneshot(move |on_open| {
+        iced_runtime::Action::Window(iced_runtime::window::Action::Open {
+            id,
+            settings,
+            on_open,
+            wayland_parent,
+        })
     })
 }
 
@@ -99,19 +182,13 @@ fn work_area(id: window::Id, saved: Option<DesktopPoint>) -> Task<Option<DialogW
     #[cfg(target_os = "windows")]
     {
         window::run(id, move |native| {
-            let window = kortty_windowing::identify(
-                native.window_handle().ok()?,
-                native.display_handle().ok()?,
-            )?;
+            let window = identify(native)?;
             kortty_windowing::dialog_work_area(window, saved)
         })
     }
     #[cfg(target_os = "linux")]
     {
-        window::run(id, |native| {
-            kortty_windowing::identify(native.window_handle().ok()?, native.display_handle().ok()?)
-        })
-        .then(move |window| {
+        window::run(id, identify).then(move |window| {
             if let Some(window) = window {
                 Task::future(async move { kortty_windowing::dialog_work_area(window, saved) })
             } else {
@@ -161,5 +238,38 @@ fn fit_size(settings: &mut window::Settings, available: Size) {
     if let Some(minimum) = &mut settings.min_size {
         minimum.width = minimum.width.min(available.width);
         minimum.height = minimum.height.min(available.height);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced_runtime::{Action, task, window::Action as WindowAction};
+
+    use super::*;
+
+    #[test]
+    fn native_open_preserves_exact_wayland_owner() {
+        let dialog = window::Id::unique();
+        let owner = window::Id::unique();
+        let mut actions = task::into_stream(open_native(
+            dialog,
+            window::Settings::default(),
+            Some(owner),
+        ))
+        .unwrap();
+        let Some(Action::Window(WindowAction::Open {
+            id,
+            wayland_parent,
+            on_open,
+            ..
+        })) = block_on(actions.next())
+        else {
+            panic!("native open action missing");
+        };
+        assert_eq!(id, dialog);
+        assert_eq!(wayland_parent, Some(owner));
+        on_open.send(id).unwrap();
+        assert!(matches!(block_on(actions.next()), Some(Action::Output(id)) if id == dialog));
     }
 }

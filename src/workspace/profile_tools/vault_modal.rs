@@ -18,7 +18,13 @@ pub(in crate::workspace) fn view(
     )
 }
 
-pub(super) fn gate(content: Element<'_, Message>, modal: Option<Message>) -> Element<'_, Message> {
+pub(in crate::workspace) fn gate(
+    content: Element<'_, Message>,
+    modal: Option<Message>,
+) -> Element<'_, Message> {
+    if modal.is_none() {
+        return content;
+    }
     Element::new(InputGate { content, modal })
 }
 

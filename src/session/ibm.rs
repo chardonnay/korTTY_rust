@@ -190,28 +190,35 @@ fn init(kind: IbmKind, status: Status) -> (Actor, Arc<Shared>, Receiver<()>) {
     let frame = actor.frame(status);
     let (send, redraw) = bounded(1);
     let shared = Arc::new(Shared {
-        scrollback_compression_enabled: std::sync::atomic::AtomicBool::new(true),
         view: Mutex::new(ViewRequest {
             grid: GridSize::default(),
             scroll_anchor: None,
+            inline_anchor: None,
             typeahead: Default::default(),
             prompt_navigation_enabled: false,
             prompt_navigator: Default::default(),
             appearance: super::Appearance::default(),
+            scrollback: Default::default(),
+            recovery_output_rows: 0,
         }),
+        inline_updates: Mutex::default(),
+        paste_cancellation: Mutex::default(),
         frame: Mutex::new(Arc::new(frame)),
         logfile_warning: crate::terminal_logging::Warning::new(send.clone()),
         redraw: send,
         bell_events: Default::default(),
+        program_notifications: Mutex::default(),
         output_activity: Arc::default(),
         local_shell_pid: Default::default(),
         sandbox_backend: Mutex::default(),
         serial: None,
         serial_notice: Mutex::new(None),
         shell_activity: None,
+        coding_agent_detection: Default::default(),
         clipboard: Mutex::default(),
         recording: Arc::default(),
         journal_available: Default::default(),
+        journal_input: Arc::default(),
         journal_generation: Default::default(),
         journal_secrets: Default::default(),
         typewriter_speed: Default::default(),
@@ -268,6 +275,11 @@ fn connect_and_run(
                     actor.presentation.notice = alarm.then(|| "Host alarm".into());
                     if let Some(reply) = reply {
                         client.send_record(&reply)?;
+                        #[cfg(target_os = "macos")]
+                        kortty_macos::record_terminal_activity(Instant::now());
+                    }
+                    if let Some(pane) = shared.recording.tab_pane() {
+                        pane.activity();
                     }
                 }
                 Err(error) => actor.presentation.notice = Some(error.to_string()),
@@ -439,7 +451,10 @@ impl Actor {
             screen: self.raster.clone(),
             status,
             scroll_offset: 0,
+            inline: None,
             scrollback: None,
+            output_snapshot: None,
+            recovery_output: None,
             application_cursor_keys: false,
             bracketed_paste: false,
             password_prompt: false,
@@ -452,6 +467,8 @@ impl Actor {
             has_prompt_marks: false,
             has_finished_command: false,
             shell_activity: super::ShellActivity::default(),
+            coding_agent: None,
+            coding_agent_details: None,
             search_revision: 0,
             search_result: None,
         }

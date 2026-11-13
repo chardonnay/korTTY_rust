@@ -82,16 +82,16 @@ pub(crate) fn discard(parent: &Directory, name: &OsStr, stage: Directory) -> io:
 fn discard_windows(directory: Directory, depth: usize, remaining: &mut usize) -> io::Result<()> {
     for name in directory.names(*remaining)? {
         *remaining = remaining.checked_sub(1).ok_or_else(limit)?;
-        let file = directory.child_for_removal(&name)?;
+        let file = directory.child_for_stage_cleanup(&name)?;
         let metadata = file.metadata()?;
         if metadata.is_dir() && !kortty_files::tree::is_reparse_point(&metadata) {
             let depth = depth.checked_sub(1).ok_or_else(limit)?;
             discard_windows(Directory::from_file(file)?, depth, remaining)?;
         } else {
-            kortty_files::tree::remove(file)?;
+            kortty_files::tree::discard_stage_entry(file)?;
         }
     }
-    directory.remove()
+    directory.discard_stage()
 }
 
 fn limit() -> io::Error {

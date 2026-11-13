@@ -11,12 +11,10 @@ struct TestProfile(PathBuf);
 
 impl TestProfile {
     fn new() -> Self {
-        // Keep Unix socket names well below sockaddr_un's path limit.
-        #[cfg(unix)]
-        let temporary = PathBuf::from("/tmp");
-        #[cfg(windows)]
-        let temporary = std::env::temp_dir();
-        let path = temporary.join(format!("kt-{}", uuid().unwrap()));
+        // The profile must leave room for the control socket in sockaddr_un.
+        let mut nonce = [0; 8];
+        getrandom::fill(&mut nonce).unwrap();
+        let path = std::env::temp_dir().join(format!("ks-{:016x}", u64::from_ne_bytes(nonce)));
         fs::create_dir(&path).unwrap();
         Self(path)
     }
@@ -63,6 +61,310 @@ fn next_request(server: &Server) -> Request {
             Err(error) => panic!("could not receive the dispatched request: {error}"),
         }
     }
+}
+
+#[test]
+fn mcp_allowlist_and_policy_are_enforced_by_the_listener() {
+    let profile = TestProfile::new();
+    let server = Server::start(&profile.0).unwrap();
+    let connect = || Client::connect_mcp(&profile.0, TEST_TIMEOUT, "fixture");
+    assert!(
+        matches!(connect(), Err(ClientError::Server { code, .. }) if code == ErrorCode::McpDisabled.wire())
+    );
+    server.set_mcp_mode(Mode::PolicyDenied);
+    assert!(
+        matches!(connect(), Err(ClientError::Server { code, .. }) if code == ErrorCode::Policy.wire())
+    );
+    server.set_mcp_mode(Mode::Read);
+    let mut client = connect().unwrap();
+    assert_eq!(
+        client.call("mcp.capabilities", &json!({})).unwrap()["mcp_write_tools"],
+        false
+    );
+    for method in [
+        "tab.focus",
+        "agent.prompt",
+        "notification.show",
+        "auth",
+        "pane.send_text",
+    ] {
+        let error = client.call(method, &json!({})).unwrap_err();
+        assert!(
+            matches!(error, ClientError::Server { code, .. } if code == ErrorCode::McpMethod.wire())
+        );
+    }
+    assert!(server.requests().is_empty());
+    server.set_mcp_mode(Mode::Write);
+    assert!(
+        matches!(client.call("mcp.capabilities", &json!({})), Err(ClientError::Server { code, .. }) if code == ErrorCode::Stale.wire())
+    );
+    let mut client = connect().unwrap();
+    assert!(
+        matches!(client.call("pane.run", &json!({"pane":"@focused","command":"echo test"})), Err(ClientError::Server { code, .. }) if code == ErrorCode::InvalidParams.wire())
+    );
+    assert!(server.requests().is_empty());
+    server.stop();
+}
+
+#[test]
+fn mcp_listener_rejects_unmasked_results_and_matches_only_masked_output() {
+    let profile = TestProfile::new();
+    let server = Server::start(&profile.0).unwrap();
+    server.set_mcp_mode(Mode::Read);
+    let mut client = Client::connect_mcp(&profile.0, TEST_TIMEOUT, "fixture").unwrap();
+    thread::scope(|scope| {
+        let read = scope.spawn(|| client.call("pane.read", &json!({"pane":"p1"})));
+        next_request(&server)
+            .reply
+            .send(Ok(json!({"lines":["unmasked test double"]})));
+        assert!(
+            matches!(read.join().unwrap(), Err(ClientError::Server { code, .. }) if code == ErrorCode::Internal.wire())
+        );
+    });
+    thread::scope(|scope| {
+        let wait = scope.spawn(|| {
+            client.call(
+                "pane.wait_output",
+                &json!({"pane":"p1","contains":"***","lines":9999}),
+            )
+        });
+        let request = next_request(&server);
+        assert_eq!(request.method, Method::Read);
+        assert_eq!(
+            request.params.number("lines", 0).unwrap(),
+            mcp::MAX_READ_LINES as u64
+        );
+        request.reply.send(Ok(json!({"pane_id":"p1","mode":"recent","lines":["known ***"],"columns":80,"rows":24,"alternate_screen":false,"osc_title":null,"truncated":false,"masked_count":1})));
+        let result = wait.join().unwrap().unwrap();
+        assert_eq!(result["match"], "***");
+        assert_eq!(result["masked_count"], 1);
+    });
+    server.stop();
+}
+
+#[test]
+fn subscription_events_share_the_authenticated_stream_with_request_replies() {
+    let profile = TestProfile::new();
+    let server = Server::start(&profile.0).unwrap();
+    let mut client = Client::connect(&profile.0, TEST_TIMEOUT).unwrap();
+    let subscribed = client
+        .call("events.subscribe", &json!({"kinds":["agent.added"]}))
+        .unwrap();
+    let second = client
+        .call("events.subscribe", &json!({"kinds":["agent.removed"]}))
+        .unwrap();
+    let mut other = Client::connect(&profile.0, TEST_TIMEOUT).unwrap();
+    let foreign = other.call("events.subscribe", &json!({})).unwrap();
+    let remaining = client
+        .call(
+            "events.unsubscribe",
+            &json!({"subscription_id":foreign["subscription_id"]}),
+        )
+        .unwrap();
+    assert_eq!(
+        remaining["subscribed"],
+        json!([subscribed["subscription_id"], second["subscription_id"]])
+    );
+    server
+        .events()
+        .publish("agent.added", json!({"pane_id":"p1"}));
+    assert_eq!(client.call("ping", &json!({})).unwrap()["pong"], true);
+    let event = client.next_event().unwrap();
+    assert_eq!(event["method"], "event");
+    assert_eq!(event["params"]["kind"], "agent.added");
+    assert_eq!(event["params"]["pane_id"], "p1");
+    assert!(event["params"]["at_millis"].as_u64().unwrap() > 0);
+    let result = client
+        .call(
+            "events.unsubscribe",
+            &json!({"subscription_id":subscribed["subscription_id"]}),
+        )
+        .unwrap();
+    assert_eq!(result["subscribed"], json!([second["subscription_id"]]));
+    assert_eq!(
+        client.call("events.unsubscribe", &json!({})).unwrap()["subscribed"],
+        json!([])
+    );
+    assert_eq!(client.call("ping", &json!({})).unwrap()["pong"], true);
+    server.stop();
+}
+
+#[test]
+fn interleaved_events_preserve_server_and_client_overflow_before_ping() {
+    use crate::events::DEPTH;
+
+    let profile = TestProfile::new();
+    let server = Server::start(&profile.0).unwrap();
+    let mut client = Client::connect(&profile.0, TEST_TIMEOUT).unwrap();
+    let first = client
+        .call("events.subscribe", &json!({"kinds":["agent.added"]}))
+        .unwrap();
+    let second = client
+        .call("events.subscribe", &json!({"kinds":["agent.removed"]}))
+        .unwrap();
+
+    thread::scope(|scope| {
+        let call = scope.spawn(|| {
+            let response = client
+                .call(Method::Read.name(), &json!({"pane":"p1"}))
+                .unwrap();
+            assert_eq!(response, json!({"lines":["test fixture"]}));
+            let ping = client.call("ping", &json!({})).unwrap();
+            assert_eq!(ping["pong"], true);
+            assert_eq!(ping["instance"], client.instance());
+        });
+        // While the request is waiting for the desktop, this connection cannot
+        // flush either server subscription. Both overflow before replying.
+        let request = next_request(&server);
+        assert_eq!(request.method, Method::Read);
+        let events = server.events();
+        for (kind, dropped) in [("agent.added", 5), ("agent.removed", 9)] {
+            for index in 0..DEPTH + dropped {
+                events.publish(kind, json!({"pane_id":"p1","index":index}));
+            }
+        }
+        request.reply.send(Ok(json!({"lines":["test fixture"]})));
+        call.join().unwrap();
+    });
+
+    let first_overflow = client.next_event().unwrap();
+    assert_eq!(first_overflow["params"]["kind"], "events.overflow");
+    assert_eq!(
+        first_overflow["params"]["subscription_id"],
+        first["subscription_id"]
+    );
+    assert_eq!(first_overflow["params"]["dropped"], 5);
+    assert!(first_overflow["params"].get("source").is_none());
+
+    let client_overflow = client.next_event().unwrap();
+    assert_eq!(client_overflow["params"]["kind"], "events.overflow");
+    assert_eq!(client_overflow["params"]["source"], "client");
+    assert_eq!(client_overflow["params"]["dropped"], DEPTH);
+    assert!(client_overflow["params"].get("subscription_id").is_none());
+    assert!(
+        client_overflow["params"]
+            .get("server_markers_dropped")
+            .is_none()
+    );
+
+    let second_overflow = client.next_event().unwrap();
+    assert_eq!(second_overflow["params"]["kind"], "events.overflow");
+    assert_eq!(
+        second_overflow["params"]["subscription_id"],
+        second["subscription_id"]
+    );
+    assert_eq!(second_overflow["params"]["dropped"], 9);
+    assert!(second_overflow["params"].get("source").is_none());
+
+    for index in 9..DEPTH + 9 {
+        let event = client.next_event().unwrap();
+        assert_eq!(event["params"]["kind"], "agent.removed");
+        assert_eq!(event["params"]["index"], index);
+    }
+    assert_eq!(client.call("ping", &json!({})).unwrap()["pong"], true);
+    server
+        .events()
+        .publish("agent.added", json!({"pane_id":"p1","index":DEPTH+5}));
+    assert_eq!(client.next_event().unwrap()["params"]["index"], DEPTH + 5);
+    server.stop();
+}
+
+#[test]
+fn notification_normalizes_payload_before_per_connection_rate_limit() {
+    fn record(
+        server: &Server,
+        client: &mut Client,
+        input: Value,
+        expected_title: &str,
+        expected_body: &str,
+        supported: bool,
+    ) {
+        thread::scope(|scope| {
+            let call = scope.spawn(|| client.call(Method::Notify.name(), &input));
+            let request = next_request(server);
+            assert_eq!(request.method, Method::Notify);
+            assert_eq!(request.params.required("title").unwrap(), expected_title);
+            assert_eq!(request.params.required("body").unwrap(), expected_body);
+            let result = json!({"shown":true,"supported":supported});
+            request.reply.send(Ok(result.clone()));
+            assert_eq!(call.join().unwrap().unwrap(), result);
+        });
+    }
+
+    fn assert_busy(client: &mut Client) {
+        let error = client
+            .call(
+                Method::Notify.name(),
+                &json!({"title":"Build","body":"Ready"}),
+            )
+            .unwrap_err();
+        let ClientError::Server { code, rpc, .. } = error else {
+            panic!("Expected a server rate-limit error, got {error:?}");
+        };
+        assert_eq!(code, ErrorCode::Busy.wire());
+        let retry = rpc["data"]["retry_after_millis"].as_u64().unwrap();
+        assert!((1..=NOTIFY_INTERVAL.as_millis() as u64).contains(&retry));
+    }
+
+    let profile = TestProfile::new();
+    let server = Server::start(&profile.0).unwrap();
+    let connect = || Client::connect(&profile.0, TEST_TIMEOUT).unwrap();
+    let mut first = connect();
+    let title = "🙂".repeat(39);
+    let body = "🧪".repeat(100);
+    record(
+        &server,
+        &mut first,
+        json!({"title":format!(" \t\u{202e}{title}\u{200b}x🙂too long \u{feff}"),
+            "body":format!("\u{200e}\t{body}\0too long \n")}),
+        &format!("korTTY · {title}x"),
+        &body,
+        true,
+    );
+    for (params, name) in [
+        (json!({"title":" \t", "body":"\n"}), Some("title")),
+        (
+            json!({"title":"\u{202e}", "body":"\u{200b}\0"}),
+            Some("title"),
+        ),
+        (json!({"title":12, "body":"ready"}), Some("title")),
+        (json!({"title":"Build", "body":null}), Some("body")),
+        (json!({"title":"Build"}), Some("body")),
+        (
+            json!({"title":"Build", "body":"ready", "instance":"extra"}),
+            None,
+        ),
+    ] {
+        let error = first.call(Method::Notify.name(), &params).unwrap_err();
+        let ClientError::Server { code, rpc, .. } = error else {
+            panic!("Expected a server parameter error, got {error:?}");
+        };
+        assert_eq!(code, ErrorCode::InvalidParams.wire());
+        assert_eq!(rpc["data"]["param"].as_str(), name);
+    }
+    assert_busy(&mut first);
+
+    let mut title_only = connect();
+    record(
+        &server,
+        &mut title_only,
+        json!({"title":"  Build finished  ","body":""}),
+        "korTTY · Build finished",
+        "",
+        false,
+    );
+    assert_busy(&mut title_only);
+    let mut body_only = connect();
+    record(
+        &server,
+        &mut body_only,
+        json!({"title":"","body":"  Ready  "}),
+        "korTTY · ",
+        "Ready",
+        true,
+    );
+    assert!(server.requests().is_empty());
+    server.stop();
 }
 
 #[test]
@@ -132,8 +434,11 @@ fn revoke_cancels_inflight_reply_and_stop_releases_descriptor_and_profile_lock()
         assert!(!request.reply.active());
         assert!(server.requests().is_closed());
         request.reply.send(Ok(json!({"too_late": true})));
+        drop(request);
+        let result = call.join().unwrap();
         assert!(
-            matches!(call.join().unwrap(), Err(ClientError::Server { code, .. }) if code == ErrorCode::Disabled.wire())
+            matches!(&result, Err(ClientError::Server { code, .. }) if code == ErrorCode::Disabled.wire()),
+            "Expected a disabled control reply after revocation, got {result:?}"
         );
     });
     server.stop();

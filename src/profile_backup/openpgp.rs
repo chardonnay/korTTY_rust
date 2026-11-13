@@ -11,15 +11,17 @@ use pgp::composed::{
 };
 use pgp::crypto::{aead::AeadAlgorithm, sym::SymmetricKeyAlgorithm};
 use pgp::packet::{
-    DataMode, PacketHeader, PublicKeyEncryptedSessionKey, SymEncryptedProtectedDataConfig,
+    DataMode, LiteralDataHeader, PacketHeader, PublicKeyEncryptedSessionKey,
+    SymEncryptedProtectedDataConfig,
 };
 use pgp::types::{
-    PacketLength, Password, PkeskVersion, S2kParams, SecretParams, Seipdv1ReadMode, StringToKey,
-    Tag,
+    CompressionAlgorithm, PacketLength, Password, PkeskVersion, S2kParams, SecretParams,
+    Seipdv1ReadMode, StringToKey, Tag,
 };
 use zeroize::Zeroizing;
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::SimpleFileOptions};
 
+use super::archive::java;
 use super::{Snapshot, archive};
 use crate::private_files::FileStamp;
 use crate::{profile, snippets::archive::encrypt_profile_zip};
@@ -38,6 +40,7 @@ const MAX_ZIP: usize = archive::MAX_PAYLOAD_BYTES + ZIP_HEADER + ZIP_CENTRAL + Z
 const ENCRYPTION_OVERHEAD_LIMIT: usize = 4 * 1024 * 1024;
 const MAX_BINARY: usize = MAX_ZIP + ENCRYPTION_OVERHEAD_LIMIT;
 const MAX_ARMORED: usize = armor_limit(MAX_BINARY);
+const MAX_PROFILE_ARMORED: usize = armor_limit(java::MAX_ZIP_BYTES + ENCRYPTION_OVERHEAD_LIMIT);
 const MAX_SECRET_KEY: usize = 1024 * 1024;
 const MAX_SESSION_KEY_PACKET: u32 = 16 * 1024;
 
@@ -53,11 +56,37 @@ pub(super) fn write_to(
     encrypt_profile_zip(root, recipient, &zip, output, LITERAL, COMMENT)
 }
 
-pub(super) fn read(source: &Path, private_key: &Path, password: &Secret) -> io::Result<Snapshot> {
+pub(super) enum ProfileBackup {
+    Native(Snapshot),
+    Java(java::Members),
+}
+
+struct Literal {
+    bytes: Zeroizing<Vec<u8>>,
+    compressed: bool,
+}
+
+pub(super) fn read_profile(
+    source: &Path,
+    private_key: &Path,
+    password: &Secret,
+) -> io::Result<ProfileBackup> {
     let source = profile::open_preference(source)?;
-    let source_size = file_size(&source, MAX_ARMORED)?;
-    let zip = read_document(source, source_size, private_key, password, MAX_ZIP)?;
-    read_zip(&zip)
+    let source_size = file_size(&source, MAX_PROFILE_ARMORED)?;
+    let literal = read_document(
+        source,
+        source_size,
+        private_key,
+        password,
+        java::MAX_ZIP_BYTES,
+        true,
+    )?;
+    if !literal.compressed
+        && let Ok(snapshot) = read_zip(&literal.bytes)
+    {
+        return Ok(ProfileBackup::Native(snapshot));
+    }
+    java::decode_openpgp_zip(&literal.bytes).map(ProfileBackup::Java)
 }
 
 /// Decrypts an immutable, already reviewed connection archive to a single binary literal.
@@ -83,7 +112,15 @@ pub(crate) fn decrypt_openpgp_document(
     if !(1..=armor_limit(max_payload + ENCRYPTION_OVERHEAD_LIMIT)).contains(&source.len()) {
         return Err(invalid("OpenPGP message exceeds the size limit"));
     }
-    read_document(source, source.len(), private_key, password, max_payload)
+    read_document(
+        source,
+        source.len(),
+        private_key,
+        password,
+        max_payload,
+        false,
+    )
+    .map(|literal| literal.bytes)
 }
 
 const fn armor_limit(binary: usize) -> usize {
@@ -96,22 +133,29 @@ fn read_document(
     private_key: &Path,
     password: &Secret,
     max_payload: usize,
-) -> io::Result<Zeroizing<Vec<u8>>> {
+    allow_compressed: bool,
+) -> io::Result<Literal> {
     let max_binary = max_payload + ENCRYPTION_OVERHEAD_LIMIT;
     let mut ciphertext = Vec::with_capacity(source_size.min(max_binary + 1));
-    with_binary(source, Armor::Message, false, |reader| {
-        reader
-            .take((max_binary + 1) as u64)
-            .read_to_end(&mut ciphertext)?;
-        if ciphertext.len() > max_binary {
-            return Err(invalid("OpenPGP message exceeds the size limit"));
-        }
-        Ok(())
-    })?;
-    validate_packets(&mut ciphertext.as_slice())?;
+    with_binary_limit(
+        source,
+        Armor::Message,
+        false,
+        armor_limit(max_binary),
+        |reader| {
+            reader
+                .take((max_binary + 1) as u64)
+                .read_to_end(&mut ciphertext)?;
+            if ciphertext.len() > max_binary {
+                return Err(invalid("OpenPGP message exceeds the size limit"));
+            }
+            Ok(())
+        },
+    )?;
+    validate_packets_limit(&mut ciphertext.as_slice(), max_binary)?;
 
     let key = read_secret_key(private_key)?;
-    decrypt(&ciphertext, &key, password, max_payload)
+    decrypt_literal(&ciphertext, &key, password, max_payload, allow_compressed)
 }
 
 /// Recognizes only the native envelope, without requiring its decryption key.
@@ -142,12 +186,25 @@ fn with_binary<R: Read>(
     require_comment: bool,
     read_binary: impl FnOnce(&mut dyn BufRead) -> io::Result<()>,
 ) -> io::Result<()> {
-    let (prefix, block, limit) = match armor {
-        Armor::Message => (MESSAGE_ARMOR_HEADER, BlockType::Message, MAX_ARMORED),
+    let limit = match armor {
+        Armor::Message => MAX_ARMORED,
+        Armor::PrivateKey => MAX_SECRET_KEY,
+    };
+    with_binary_limit(file, armor, require_comment, limit, read_binary)
+}
+
+fn with_binary_limit<R: Read>(
+    file: R,
+    armor: Armor,
+    require_comment: bool,
+    limit: usize,
+    read_binary: impl FnOnce(&mut dyn BufRead) -> io::Result<()>,
+) -> io::Result<()> {
+    let (prefix, block) = match armor {
+        Armor::Message => (MESSAGE_ARMOR_HEADER, BlockType::Message),
         Armor::PrivateKey => (
             b"-----BEGIN PGP PRIVATE KEY BLOCK-----".as_slice(),
             BlockType::PrivateKey,
-            MAX_SECRET_KEY,
         ),
     };
     let mut input = BufReader::new(file.take((limit + 1) as u64));
@@ -187,6 +244,10 @@ fn with_binary<R: Read>(
 }
 
 fn validate_packets(input: &mut dyn BufRead) -> io::Result<()> {
+    validate_packets_limit(input, MAX_BINARY)
+}
+
+fn validate_packets_limit(input: &mut dyn BufRead, max_binary: usize) -> io::Result<()> {
     let header = PacketHeader::try_from_reader(&mut *input)?;
     if !is_recipient_header(header) {
         return Err(invalid("expected one OpenPGP recipient packet"));
@@ -243,8 +304,8 @@ fn validate_packets(input: &mut dyn BufRead) -> io::Result<()> {
             ));
         }
     };
-    let remaining = io::copy(&mut encrypted.take(MAX_BINARY as u64), &mut io::sink())?;
-    if !(minimum..MAX_BINARY as u64).contains(&remaining) {
+    let remaining = io::copy(&mut encrypted.take(max_binary as u64), &mut io::sink())?;
+    if !(minimum..max_binary as u64).contains(&remaining) {
         return Err(invalid("invalid OpenPGP encrypted packet size"));
     }
     require_eof(input)
@@ -279,12 +340,13 @@ fn read_secret_key(path: &Path) -> io::Result<SignedSecretKey> {
     }
 }
 
-fn decrypt(
+fn decrypt_literal(
     ciphertext: &[u8],
     key: &SignedSecretKey,
     password: &Secret,
     max_payload: usize,
-) -> io::Result<Zeroizing<Vec<u8>>> {
+    allow_compressed: bool,
+) -> io::Result<Literal> {
     let message =
         Message::from_bytes(ciphertext).map_err(|_| invalid("invalid OpenPGP message"))?;
     let Message::Encrypted { esk, .. } = &message else {
@@ -328,25 +390,82 @@ fn decrypt(
     let (message, _) = message
         .decrypt_the_ring(ring, true)
         .map_err(|_| invalid("could not unlock or decrypt the OpenPGP document"))?;
-    let Message::Literal { mut reader, .. } = message else {
+    match message {
+        Message::Literal { mut reader, .. } => {
+            check_binary_literal(reader.data_header())?;
+            let bytes = read_literal_bytes(&mut reader, max_payload)?;
+            // Reading the parent forces crypto EOF and rejects trailing packets.
+            require_eof(reader.get_mut().get_mut())?;
+            Ok(Literal {
+                bytes,
+                compressed: false,
+            })
+        }
+        Message::Compressed { reader, .. } if allow_compressed => {
+            let mut packet = reader.into_inner();
+            let mut method = [0];
+            packet.read_exact(&mut method)?;
+            let bytes = match CompressionAlgorithm::from(method[0]) {
+                CompressionAlgorithm::Uncompressed => {
+                    read_literal_packet(&mut packet, max_payload)?
+                }
+                CompressionAlgorithm::ZIP => read_literal_packet(
+                    flate2::bufread::DeflateDecoder::new(&mut packet),
+                    max_payload,
+                )?,
+                CompressionAlgorithm::ZLIB => read_literal_packet(
+                    flate2::bufread::ZlibDecoder::new(&mut packet),
+                    max_payload,
+                )?,
+                CompressionAlgorithm::BZip2 => {
+                    read_literal_packet(bzip2::bufread::BzDecoder::new(&mut packet), max_payload)?
+                }
+                _ => return Err(invalid("unsupported OpenPGP compression method")),
+            };
+            require_eof(&mut packet)?;
+            require_eof(packet.get_mut())?;
+            Ok(Literal {
+                bytes,
+                compressed: true,
+            })
+        }
+        _ => Err(invalid("expected a single OpenPGP literal document")),
+    }
+}
+
+fn read_literal_packet(reader: impl Read, max_payload: usize) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut reader = BufReader::new(reader);
+    let header = PacketHeader::try_from_reader(&mut reader)?;
+    if header.tag() != Tag::LiteralData
+        || matches!(header.packet_length(), PacketLength::Indeterminate)
+    {
         return Err(invalid(
-            "expected a single OpenPGP literal document without nested packets",
+            "expected one binary literal packet inside OpenPGP compression",
         ));
-    };
-    // OpenPGP literal filenames are optional and are never used as local paths.
-    if reader.data_header().mode() != DataMode::Binary {
+    }
+    let mut body = PacketBodyReader::new(header, &mut reader)?;
+    check_binary_literal(&LiteralDataHeader::try_from_reader(&mut body)?)?;
+    let bytes = read_literal_bytes(&mut body, max_payload)?;
+    require_eof(&mut reader)?;
+    Ok(bytes)
+}
+
+fn check_binary_literal(header: &LiteralDataHeader) -> io::Result<()> {
+    // Literal filenames are optional and never used as local paths.
+    if header.mode() != DataMode::Binary {
         return Err(invalid("unexpected OpenPGP literal data mode"));
     }
-    let mut payload = Zeroizing::new(Vec::with_capacity(ciphertext.len().min(max_payload + 1)));
-    (&mut reader)
+    Ok(())
+}
+
+fn read_literal_bytes(reader: impl Read, max_payload: usize) -> io::Result<Zeroizing<Vec<u8>>> {
+    let mut payload = Zeroizing::new(Vec::new());
+    reader
         .take((max_payload + 1) as u64)
         .read_to_end(&mut payload)?;
     if payload.len() > max_payload {
         return Err(invalid("OpenPGP literal document exceeds the size limit"));
     }
-    // The literal packet reader ends at its packet boundary. Reading the parent
-    // forces crypto EOF and rejects trailing packets, even marker/padding packets.
-    require_eof(reader.get_mut().get_mut())?;
     Ok(payload)
 }
 

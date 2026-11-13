@@ -1,4 +1,4 @@
-//! Passive evidence from an SSH session's own terminal and accepted keyboard input.
+//! Passive evidence from terminal output and accepted keyboard input.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -8,6 +8,24 @@ use kortty_terminal::{ShellEvent, ShellEventKind};
 const MAX_TYPED_BYTES: usize = 4096;
 const TYPED_CD_WINDOW: Duration = Duration::from_secs(3);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum PromptState {
+    #[default]
+    Unknown,
+    Ready,
+    Busy,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct CodePrompt {
+    pub(crate) state: PromptState,
+    revision: u64,
+}
+
+/// Identity of the current OSC 133 prompt, independent of unrelated output.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ShortcutPrompt(pub(super) u64);
+
 #[derive(Clone, Default)]
 pub(crate) struct ShellActivity {
     pub(crate) directory: Option<ReportedDirectory>,
@@ -15,6 +33,8 @@ pub(crate) struct ShellActivity {
     pub(crate) output: u64,
     pub(crate) typed_cd: Option<TypedCd>,
     pub(crate) command_exit: Option<CommandExit>,
+    pub(crate) completed_runtime: Option<Duration>,
+    pub(crate) code_prompt: CodePrompt,
 }
 
 #[derive(Clone)]
@@ -37,6 +57,7 @@ pub(crate) struct TypedCd {
 pub(crate) struct CommandExit {
     pub(crate) sequence: u64,
     pub(crate) status: Option<i32>,
+    pub(crate) started: Option<Instant>,
 }
 
 #[derive(Default)]
@@ -44,9 +65,11 @@ pub(super) struct State {
     activity: ShellActivity,
     sequence: u64,
     at_prompt: bool,
+    saw_command_start: bool,
     ignored_line: bool,
     input: Vec<u8>,
     pending: Option<Pending>,
+    command_started: Option<Instant>,
 }
 
 struct Pending {
@@ -73,6 +96,34 @@ impl State {
         self.activity.clone()
     }
 
+    pub(super) fn code_prompt(&self) -> CodePrompt {
+        self.activity.code_prompt
+    }
+
+    pub(super) fn agent_shortcut_prompt(&self) -> Option<ShortcutPrompt> {
+        (self.at_prompt && self.saw_command_start && self.code_prompt().state == PromptState::Ready)
+            .then_some(ShortcutPrompt(self.activity.prompt))
+    }
+
+    pub(super) fn journal_prompt(&self) -> Option<u64> {
+        (self.at_prompt && self.activity.prompt != 0).then_some(self.activity.prompt)
+    }
+
+    fn update_code_prompt(&mut self, state: PromptState) {
+        self.activity.code_prompt = CodePrompt {
+            state,
+            revision: self.next_sequence(),
+        };
+    }
+
+    pub(super) fn note_code_input(&mut self) {
+        let state = match self.code_prompt().state {
+            PromptState::Unknown => PromptState::Unknown,
+            PromptState::Ready | PromptState::Busy => PromptState::Busy,
+        };
+        self.update_code_prompt(state);
+    }
+
     fn next_sequence(&mut self) -> u64 {
         self.sequence = self.sequence.saturating_add(1);
         self.sequence
@@ -81,6 +132,7 @@ impl State {
     pub(super) fn output(&mut self, primary: bool, events: Vec<ShellEvent>, received_at: Instant) {
         if primary {
             self.activity.output = self.next_sequence();
+            self.activity.code_prompt.revision = self.activity.output;
         }
         for event in events {
             if event.position.alternate_screen {
@@ -88,6 +140,7 @@ impl State {
             }
             match event.kind {
                 ShellEventKind::WorkingDirectory { host, path } => {
+                    self.update_code_prompt(self.code_prompt().state);
                     self.pending = None;
                     self.activity.typed_cd = None;
                     self.activity.directory = Some(ReportedDirectory {
@@ -97,8 +150,10 @@ impl State {
                     });
                 }
                 ShellEventKind::PromptStart => {
+                    self.update_code_prompt(PromptState::Ready);
                     self.activity.prompt = self.next_sequence();
                     self.at_prompt = true;
+                    self.saw_command_start = false;
                     self.ignored_line = false;
                     self.input.clear();
                     if let Some(pending) = self.pending.take()
@@ -108,8 +163,15 @@ impl State {
                         self.activity.typed_cd = Some(pending.change);
                     }
                 }
-                ShellEventKind::CommandStart => {}
+                ShellEventKind::CommandStart => {
+                    self.saw_command_start = self.at_prompt;
+                    if self.code_prompt().state == PromptState::Unknown {
+                        self.update_code_prompt(PromptState::Ready);
+                    }
+                }
                 ShellEventKind::OutputStart => {
+                    self.command_started = Some(received_at);
+                    self.update_code_prompt(PromptState::Busy);
                     self.at_prompt = false;
                     self.input.clear();
                     if let Some(pending) = self.pending.as_mut()
@@ -122,11 +184,16 @@ impl State {
                     }
                 }
                 ShellEventKind::CommandFinished { exit_status } => {
+                    let started = self.command_started.take();
+                    self.activity.completed_runtime =
+                        started.map(|start| received_at.saturating_duration_since(start));
+                    self.update_code_prompt(PromptState::Busy);
                     self.at_prompt = false;
                     self.input.clear();
                     self.activity.command_exit = Some(CommandExit {
                         sequence: self.next_sequence(),
                         status: exit_status,
+                        started,
                     });
                     if let Some(pending) = self.pending.as_mut()
                         && pending.phase == Phase::Running
@@ -146,6 +213,7 @@ impl State {
     }
 
     pub(super) fn untracked_input(&mut self) {
+        self.note_code_input();
         self.at_prompt = false;
         self.input.clear();
         self.pending = None;
@@ -159,6 +227,9 @@ impl State {
         enter: bool,
         submitted_at: Instant,
     ) {
+        if !bytes.is_empty() {
+            self.note_code_input();
+        }
         if !primary || !self.at_prompt {
             return;
         }
@@ -239,6 +310,65 @@ mod tests {
     }
 
     #[test]
+    fn ai_run_prompt_revision_changes_on_input_and_shell_transitions() {
+        let mut terminal = Terminal::new(80, 24);
+        let mut state = State::default();
+        let initial = state.code_prompt();
+        assert_eq!(initial.state, PromptState::Unknown);
+        output(&mut state, &mut terminal, b"changed output", Instant::now());
+        assert_ne!(state.code_prompt(), initial);
+        let before_input = state.code_prompt();
+        state.note_code_input();
+        assert_ne!(state.code_prompt(), before_input);
+        assert_eq!(state.code_prompt().state, PromptState::Unknown);
+        output(&mut state, &mut terminal, b"\x1b]133;A\x07", Instant::now());
+        let prompt = state.code_prompt();
+        assert_eq!(prompt.state, PromptState::Ready);
+        state.keyboard(true, b"a", false, Instant::now());
+        assert_eq!(state.code_prompt().state, PromptState::Busy);
+        output(
+            &mut state,
+            &mut terminal,
+            b"\x1b]133;C\x07\x1b]133;D;0\x07",
+            Instant::now(),
+        );
+        assert_eq!(state.code_prompt().state, PromptState::Busy);
+        output(&mut state, &mut terminal, b"\x1b]133;A\x07", Instant::now());
+        assert_eq!(state.code_prompt().state, PromptState::Ready);
+        assert_ne!(state.code_prompt(), prompt);
+    }
+
+    #[test]
+    fn agent_shortcut_prompt_requires_both_markers_and_no_intervening_input() {
+        let now = Instant::now();
+        let mut state = State::default();
+        let mut terminal = Terminal::new(80, 24);
+        output(&mut state, &mut terminal, b"\x1b]133;B\x07", now);
+        assert!(state.agent_shortcut_prompt().is_none());
+        output(&mut state, &mut terminal, b"\x1b]133;A\x07$ ", now);
+        assert!(state.agent_shortcut_prompt().is_none());
+        output(&mut state, &mut terminal, b"\x1b]133;B\x07", now);
+        let prompt = state.agent_shortcut_prompt().unwrap();
+        let revision = state.code_prompt();
+        output(&mut state, &mut terminal, b"An asynchronous message", now);
+        assert_eq!(state.agent_shortcut_prompt(), Some(prompt));
+        assert_ne!(state.code_prompt(), revision);
+        state.note_code_input();
+        assert!(state.agent_shortcut_prompt().is_none());
+        output(&mut state, &mut terminal, b"\x1b]133;B\x07", now);
+        assert!(state.agent_shortcut_prompt().is_none());
+        output(
+            &mut state,
+            &mut terminal,
+            b"\x1b]133;A\x07$ \x1b]133;B\x07",
+            now,
+        );
+        assert_ne!(state.agent_shortcut_prompt().unwrap(), prompt);
+        output(&mut state, &mut terminal, b"\x1b[?1049h", now);
+        assert!(state.agent_shortcut_prompt().is_none());
+    }
+
+    #[test]
     fn shell_activity_drains_real_osc7_and_osc133_without_alternate_reports() {
         let now = Instant::now();
         let mut state = State::default();
@@ -272,6 +402,42 @@ mod tests {
         assert_eq!(alternate.prompt, first.prompt);
         assert_eq!(alternate.output, first.output);
         assert_eq!(alternate.directory.unwrap().sequence, directory.sequence);
+    }
+
+    #[test]
+    fn agent_shortcut_prompt_survives_transport_chunking_and_rejects_stale_input() {
+        let now = Instant::now();
+        // Both native SSH and local PTY output enter this same parser. CMD can
+        // report A/B without C/D, and PowerShell can terminate OSC with ST.
+        for prompt in [
+            &b"\x1b]133;A\x07C:\\work>\x1b]133;B\x07"[..],
+            &b"\x1b]7;file://localhost/C:/work%20tree\x1b\\\x1b]133;A\x1b\\PS C:\\work tree> \x1b]133;B\x1b\\"[..],
+            &b"\x1b]7;file://fedora.test/home/daniel\x07\x1b]133;A\x07daniel@fedora $ \x1b]133;B\x07"[..],
+        ] {
+            for split in 0..=prompt.len() {
+                let mut state = State::default();
+                let mut terminal = Terminal::new(100, 24);
+                output(&mut state, &mut terminal, &prompt[..split], now);
+                if split < prompt.len() {
+                    assert!(state.agent_shortcut_prompt().is_none());
+                }
+                output(&mut state, &mut terminal, &prompt[split..], now);
+                let original = state.agent_shortcut_prompt().unwrap();
+                state.keyboard(true, b"ordinary", false, now);
+                assert!(state.agent_shortcut_prompt().is_none());
+                output(&mut state, &mut terminal, b"\x1b]133;B\x07", now);
+                assert!(state.agent_shortcut_prompt().is_none());
+                state.keyboard(true, b"\r", true, now);
+                for byte in prompt {
+                    output(&mut state, &mut terminal, &[*byte], now);
+                }
+                assert_ne!(state.agent_shortcut_prompt().unwrap(), original);
+                state.untracked_input();
+                assert!(state.agent_shortcut_prompt().is_none());
+                output(&mut state, &mut terminal, b"\x1b]133;B\x07", now);
+                assert!(state.agent_shortcut_prompt().is_none());
+            }
+        }
     }
 
     #[test]
@@ -352,5 +518,29 @@ mod tests {
         let snapshot = state.snapshot();
         assert_eq!(&*snapshot.directory.unwrap().path, "/actual");
         assert!(snapshot.typed_cd.is_none());
+    }
+
+    #[test]
+    fn command_notification_duration_uses_distinct_start_and_finish_marks() {
+        let now = Instant::now();
+        let mut state = State::default();
+        let mut terminal = Terminal::new(80, 24);
+        output(&mut state, &mut terminal, b"\x1b]133;C\x07", now);
+        output(
+            &mut state,
+            &mut terminal,
+            b"\x1b]133;D;7\x07",
+            now + Duration::from_secs(41),
+        );
+        let snapshot = state.snapshot();
+        assert_eq!(snapshot.completed_runtime, Some(Duration::from_secs(41)));
+        assert_eq!(snapshot.command_exit.unwrap().status, Some(7));
+        output(
+            &mut state,
+            &mut terminal,
+            b"\x1b]133;D;0\x07",
+            now + Duration::from_secs(42),
+        );
+        assert_eq!(state.snapshot().completed_runtime, None);
     }
 }

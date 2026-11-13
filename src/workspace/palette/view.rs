@@ -2,7 +2,7 @@ use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::{column, container, mouse_area, row, scrollable, text, text_input};
 use iced::{Alignment, Element, Length, Task, Theme, mouse, widget, window};
 
-use super::{Action, Desktop, Entry, Event, Kind, Picker, UNAVAILABLE, Workspace};
+use super::{Action, Desktop, Entry, Event, Kind, Picker, TEAMWORK_BADGE, UNAVAILABLE, Workspace};
 use crate::workspace::chrome::popup;
 
 const ROW_HEIGHT: f32 = 34.0;
@@ -40,7 +40,7 @@ impl Workspace {
                 keyboard(key, modifiers).map(|event| {
                     let event = match event {
                         Event::Choose(_, alternate) => {
-                            Event::Choose(picker.results.get(picker.selected).copied(), alternate)
+                            Event::Choose(picker.results.get(picker.selected).cloned(), alternate)
                         }
                         event => event,
                     };
@@ -84,16 +84,16 @@ impl Picker {
             .size(16)
             .padding([7, 10])
             .on_input(|query| self.send(Event::Search(query)));
-        let rows =
-            self.results
-                .iter()
-                .enumerate()
-                .fold(column![], |list, (index, &key)| {
-                    match self.snapshot.entry(key) {
-                        Some(entry) => list.push(self.row(entry, index == self.selected)),
-                        None => list,
-                    }
-                });
+        let rows = self
+            .results
+            .iter()
+            .enumerate()
+            .fold(column![], |list, (index, key)| {
+                match self.snapshot.entry(key) {
+                    Some(entry) => list.push(self.row(entry, index == self.selected)),
+                    None => list,
+                }
+            });
         let list: Element<'_, Desktop> = if self.results.is_empty() {
             container(
                 text(if self.loading {
@@ -137,9 +137,13 @@ impl Picker {
         let title = text(entry.title.as_str())
             .size(14)
             .wrapping(text::Wrapping::None);
-        let details = text(entry.detail.as_str())
-            .size(12)
-            .wrapping(text::Wrapping::None);
+        let details = if matches!(&entry.key, super::Key::Teamwork(_)) {
+            text(format!("{TEAMWORK_BADGE} · {}", entry.detail))
+        } else {
+            text(entry.detail.as_str())
+        }
+        .size(12)
+        .wrapping(text::Wrapping::None);
         let content = row![
             container(text(kind).size(11))
                 .padding([3, 5])
@@ -193,8 +197,8 @@ impl Picker {
             });
         mouse_area(cell)
             .interaction(mouse::Interaction::Pointer)
-            .on_press(self.send(Event::Select(entry.key)))
-            .on_double_click(self.send(Event::Choose(Some(entry.key), false)))
+            .on_press(self.send(Event::Select(entry.key.clone())))
+            .on_double_click(self.send(Event::Choose(Some(entry.key.clone()), false)))
             .into()
     }
 
@@ -205,7 +209,7 @@ impl Picker {
         let selected = self
             .results
             .get(self.selected)
-            .and_then(|key| self.snapshot.entry(*key));
+            .and_then(|key| self.snapshot.entry(key));
         let keys = match selected {
             Some(entry) if entry.alternate => format!(
                 "{}\nEnter runs the snippet · {ALT}+Enter opens it in the Snippet Manager · Esc closes",

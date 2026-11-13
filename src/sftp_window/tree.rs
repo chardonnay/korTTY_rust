@@ -11,13 +11,18 @@ use super::worker::{Counted, Failure, Progress};
 use super::{Location, parent};
 
 pub(crate) mod local;
+pub(super) mod ordinary_download;
+#[cfg(unix)]
+pub(crate) use ordinary_download::Stage as VerifiedTreeStage;
+pub(super) mod privileged_download;
 pub(super) mod single_file;
+pub(super) mod snapshot;
 #[cfg(test)]
 mod tests;
 
-const MAX_DEPTH: usize = 32;
-const MAX_ENTRIES: usize = 20_000;
-const MAX_BYTES: u64 = 1 << 40;
+pub(super) const MAX_DEPTH: usize = 32;
+pub(super) const MAX_ENTRIES: usize = 20_000;
+pub(super) const MAX_BYTES: u64 = 1 << 40;
 const MAX_LISTING_PAYLOAD: usize = 2 * 1024 * 1024;
 
 type Result<T> = std::result::Result<T, Failure>;
@@ -31,6 +36,7 @@ pub(crate) enum FolderError {
     HardlinkRequired,
     IncompleteUpload,
     LocalStageRemains,
+    LocalPublicationUncertain,
     TransferFailed,
 }
 
@@ -50,6 +56,8 @@ pub(crate) fn copy_scheduled(
     tree.transfer(client, transfer).map_err(|_| {
         if tree.remote_upload_started {
             FolderError::IncompleteUpload
+        } else if tree.local_publication_uncertain {
+            FolderError::LocalPublicationUncertain
         } else if tree.local_cleanup_failed {
             FolderError::LocalStageRemains
         } else {
@@ -83,6 +91,8 @@ struct Tree<'a> {
     no_replace_publication: bool,
     remote_upload_started: bool,
     local_cleanup_failed: bool,
+    local_cleanup_note: Option<String>,
+    local_publication_uncertain: bool,
     entries: usize,
     files: usize,
     folders: usize,
@@ -102,6 +112,8 @@ impl<'a> Tree<'a> {
             no_replace_publication,
             remote_upload_started: false,
             local_cleanup_failed: false,
+            local_cleanup_note: None,
+            local_publication_uncertain: false,
             entries: 0,
             files: 0,
             folders: 1,
@@ -124,8 +136,9 @@ impl<'a> Tree<'a> {
         } else {
             format!(" · {} links or special entries skipped", self.skipped)
         };
+        let cleanup = self.local_cleanup_note.as_deref().unwrap_or("");
         Ok(format!(
-            "{} folders · {} files · {} bytes{skipped}",
+            "{} folders · {} files · {} bytes{skipped}{cleanup}",
             self.folders, self.files, self.bytes
         ))
     }
@@ -274,6 +287,9 @@ impl<'a> Tree<'a> {
         source: &[u8],
         target: &Path,
     ) -> Result<()> {
+        if self.no_replace_publication {
+            return self.download_ordinary(client, source, target);
+        }
         self.check_cancelled()?;
         remote_directory(client, source, false)?;
         let path = parent(target)?;
@@ -282,7 +298,7 @@ impl<'a> Tree<'a> {
         let name = OsStr::new(&name);
         let stage = parent.create_child(name)?;
         let result = (|| {
-            self.download_contents(client, source, &stage, 0)?;
+            self.download_contents(client, source, &stage, 0, None)?;
             self.check_cancelled()?;
             if !parent.same_as(&local::Directory::open_path(path)?)? {
                 return Err(io::Error::other("The local destination folder changed").into());
@@ -311,6 +327,7 @@ impl<'a> Tree<'a> {
         source: &[u8],
         target: &local::Directory,
         depth: usize,
+        barrier: Option<&local::Directory>,
     ) -> Result<()> {
         self.check_cancelled()?;
         remote_directory(client, source, false)?;
@@ -332,15 +349,25 @@ impl<'a> Tree<'a> {
             match attrs.kind() {
                 FileKind::Directory => {
                     let depth = self.subfolder(depth)?;
-                    let folder = target.create_child(&files::local_name(&entry.name)?)?;
-                    self.download_contents(client, &child, &folder, depth)?;
+                    let name = files::local_name(&entry.name)?;
+                    let folder = if barrier.is_some() {
+                        target.create_transfer_child(&name)?
+                    } else {
+                        target.create_child(&name)?
+                    };
+                    self.download_contents(client, &child, &folder, depth, barrier)?;
                 }
                 FileKind::File => {
                     let size = attrs
                         .size
                         .ok_or_else(|| io::Error::other("Server did not report a file size"))?;
                     self.reserve_file(size)?;
-                    let file = target.create_file(&files::local_name(&entry.name)?)?;
+                    let name = files::local_name(&entry.name)?;
+                    let file = if barrier.is_some() {
+                        target.create_ordinary_file(&name)?
+                    } else {
+                        target.create_file(&name)?
+                    };
                     client.download_regular(
                         &child,
                         attrs,
@@ -349,6 +376,8 @@ impl<'a> Tree<'a> {
                             LimitedOutput {
                                 file: &file,
                                 remaining: size,
+                                cancelled: self.cancelled,
+                                barrier,
                             },
                         ),
                     )?;
@@ -369,10 +398,18 @@ impl<'a> Tree<'a> {
 struct LimitedOutput<'a> {
     file: &'a File,
     remaining: u64,
+    cancelled: &'a dyn Fn() -> bool,
+    barrier: Option<&'a local::Directory>,
 }
 
 impl Write for LimitedOutput<'_> {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if (self.cancelled)() {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        if let Some(barrier) = self.barrier {
+            ordinary_download::require_private(barrier)?;
+        }
         if bytes.len() as u64 > self.remaining {
             return Err(io::Error::other("Remote file exceeded its reported size"));
         }

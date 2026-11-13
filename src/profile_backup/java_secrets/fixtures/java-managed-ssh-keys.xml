@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<sshKeys>
+    <sshKey>
+        <id>f99ec24c-9aec-4978-a57f-ec37c449ca35</id>
+        <name>Managed café</name>
+        <keyPath>C:\Users\fixture\.ssh\fixture-ed25519.pem</keyPath>
+        <encryptedPassphrase>TohxTTg0J4OqNqkXKUK37qH2Ph8PWizUc4edPvpjwHI=:el0gm1WZUBuXJ2rMG1M89CsEvwqCNdppLBQ2BrJ5w5Pxv4Nosw25ffEhtE0i</encryptedPassphrase>
+        <description>Synthetic Java-managed identity</description>
+        <copiedToUserDir>true</copiedToUserDir>
+        <userDirPath>C:\Users\fixture\.kortty\ssh-keys\f99ec24c-9aec-4978-a57f-ec37c449ca35_fixture-ed25519.pem</userDirPath>
+        <createdAt>0</createdAt>
+        <lastUsed>0</lastUsed>
+    </sshKey>
+    <sshKey>
+        <id>fe33d0a9-ab84-4351-8d5c-ece77f40432f</id>
+        <name>Encrypted Java key</name>
+        <keyPath>/home/fixture/.ssh/fixture-encrypted</keyPath>
+        <encryptedPassphrase>ZR8wDMkVY6VfFaU89u1QKYX7WjX7LrnobNth9IbrGDM=:3stR1n7N9eU73MTsGU6mtX1jHr2lw16/K/qQCpayThTPhnFE7p+Kjbn7cdak2iuo8p84</encryptedPassphrase>
+        <copiedToUserDir>true</copiedToUserDir>
+        <userDirPath>/home/fixture/.kortty/ssh-keys/fe33d0a9-ab84-4351-8d5c-ece77f40432f_fixture-encrypted</userDirPath>
+        <createdAt>0</createdAt>
+        <lastUsed>0</lastUsed>
+    </sshKey>
+</sshKeys>

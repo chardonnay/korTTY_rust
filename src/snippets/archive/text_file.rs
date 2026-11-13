@@ -50,7 +50,7 @@ pub(super) fn language(name: &str, content: &str) -> &'static str {
             "py" => return "python",
             "pl" => return "perl",
             "rb" => return "ruby",
-            "lua" => return "lua",
+            "lua" | "luajit" => return "lua",
             "js" => return "javascript",
             "ts" => return "typescript",
             "ps" | "ps1" | "pwsh" => return "powershell",

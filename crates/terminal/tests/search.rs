@@ -106,7 +106,7 @@ fn alternate_screen_search_does_not_include_hidden_primary_content() {
 
     let result = terminal.search("secondary", false);
     assert_eq!(result.scrollback_lines, 0);
-    assert_eq!(result.matches[0].spans.as_ref(), [span(0, 0, 9)]);
+    assert_eq!(result.matches[0].spans.as_ref(), [span(1, 0, 9)]);
     terminal.advance(b"\x1b[?1049l");
     assert_eq!(terminal.search("primary", false).matches[0].start.row, 0);
     assert!(terminal.search("secondary", false).matches.is_empty());

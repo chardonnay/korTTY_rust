@@ -32,6 +32,10 @@ impl OsBadge {
     pub(crate) fn svg(self) -> &'static [u8] {
         BUILT_INS[self.0].svg
     }
+
+    pub(crate) fn raster(self) -> std::io::Result<image::RgbaImage> {
+        super::custom_os_badges::raster::render_svg(self.svg())
+    }
 }
 
 struct Art {

@@ -18,8 +18,12 @@ pub(super) enum Kind {
     SessionProcesses,
     RecordingManager,
     AiManager,
+    AiChat,
+    JournalChatTranscript,
+    SavedChats,
     LogfileManager,
     LogfileViewer,
+    ProjectFile,
     Snippets,
     Scheduler,
     SessionJournalManager,
@@ -155,7 +159,11 @@ impl Workspace {
             Kind::SessionProcesses => self.session_process_view(tool.instance),
             Kind::RecordingManager => self.recording_view(tool.instance),
             Kind::AiManager => self.ai_manager_view(tool.instance),
+            Kind::AiChat => self.terminal_ai_view(tool.instance),
+            Kind::JournalChatTranscript => self.journal_transcript_view(tool.instance),
+            Kind::SavedChats => self.saved_chats_view(tool.instance),
             Kind::LogfileManager | Kind::LogfileViewer => self.logfile_view(tool.instance),
+            Kind::ProjectFile => self.project_file_view(tool.instance),
             Kind::Snippets => self.snippet_view(tool.instance),
             Kind::Scheduler => self.scheduler_view(tool.instance),
             Kind::TerminalEffects => self.terminal_effect_dialog_view(tool.instance),
@@ -173,7 +181,18 @@ impl Workspace {
             Kind::SessionProcesses => super::session_processes::TITLE,
             Kind::RecordingManager => super::recording_access::MANAGER_TITLE,
             Kind::AiManager => crate::ai_manager::TITLE,
+            Kind::AiChat => return self.terminal_chat_title(tool.instance),
+            Kind::JournalChatTranscript => {
+                if self.journal_allowed()
+                    && let Some(tab) = self.journal_chat_transcripts.get(&tool.instance)
+                {
+                    return Cow::Owned(tab.title().to_owned());
+                }
+                "Recorded AI Chat"
+            }
+            Kind::SavedChats => super::saved_chats::TITLE,
             Kind::LogfileManager => super::logfile_access::MANAGER_TITLE,
+            Kind::ProjectFile => return Cow::Owned(self.project_file_title(tool.instance)),
             Kind::Snippets => return self.snippet_tool_title(tool.instance),
             Kind::Scheduler => super::scheduler_access::TITLE,
             Kind::TerminalEffects => super::terminal_effect_access::TITLE,
@@ -199,11 +218,19 @@ impl Workspace {
             }
             Kind::KnownHosts => self.dismiss_hosted_known_hosts(tool.instance),
             Kind::SshKeys => self.dismiss_hosted_ssh_keys(tool.instance),
-            Kind::SessionProcesses => self.request_hosted_tool_close(tool.instance),
+            Kind::SessionProcesses | Kind::ProjectFile => {
+                self.request_hosted_tool_close(tool.instance)
+            }
+            Kind::AiChat => self
+                .dismiss_terminal_rule(tool.instance)
+                .unwrap_or_else(|| self.request_hosted_tool_close(tool.instance)),
+            Kind::SavedChats | Kind::JournalChatTranscript => {
+                self.request_hosted_tool_close(tool.instance)
+            }
             Kind::RecordingManager => self.dismiss_hosted_recording_manager(tool.instance),
             Kind::AiManager => self.update_ai_manager(super::ai_access::Message::Dialog(
                 tool.instance,
-                crate::ai_manager::Message::Close,
+                Box::new(crate::ai_manager::Message::Close),
             )),
             Kind::LogfileManager | Kind::LogfileViewer => {
                 self.dismiss_hosted_logfile(tool.instance)
@@ -232,6 +259,7 @@ impl Workspace {
             }
             Kind::SessionProcesses => self.hosted_session_process_busy(tool.instance),
             Kind::RecordingManager => self.hosted_recording_manager_busy(tool.instance),
+            Kind::ProjectFile => self.project_file_needs_close(tool.instance),
             Kind::AiManager => self.ai_manager_needs_close(tool.instance),
             Kind::LogfileManager | Kind::LogfileViewer => {
                 self.hosted_logfile_busy(tool.instance) || self.logfile_badge_dirty(tool.instance)
@@ -242,7 +270,11 @@ impl Workspace {
             }
             Kind::Scheduler => self.hosted_scheduler_dirty(tool.instance),
             Kind::SessionJournalViewer => self.journal_entry_needs_close(tool.instance),
-            Kind::SessionJournalManager | Kind::TerminalEffects => false,
+            Kind::AiChat => self.terminal_rule_write_pending(tool.instance),
+            Kind::SavedChats
+            | Kind::JournalChatTranscript
+            | Kind::SessionJournalManager
+            | Kind::TerminalEffects => false,
         }
     }
 
@@ -255,9 +287,13 @@ impl Workspace {
             Kind::LogfileManager => self.prompt_logfile_close(tool.instance, token),
             Kind::SessionJournalViewer => self.prompt_journal_entry_close(tool.instance, token),
             Kind::AiManager => self.prompt_ai_manager_close(tool.instance, Some(token)),
+            Kind::ProjectFile => self.prompt_project_file_close(tool.instance, Some(token)),
             Kind::KnownHosts
             | Kind::SessionProcesses
             | Kind::RecordingManager
+            | Kind::AiChat
+            | Kind::JournalChatTranscript
+            | Kind::SavedChats
             | Kind::LogfileViewer
             | Kind::SessionJournalManager
             | Kind::TerminalEffects => {}
@@ -273,9 +309,13 @@ impl Workspace {
             Kind::LogfileManager => self.cancel_logfile_close(tool.instance),
             Kind::SessionJournalViewer => self.cancel_journal_entry_close(tool.instance),
             Kind::AiManager => self.prompt_ai_manager_close(tool.instance, None),
+            Kind::ProjectFile => self.prompt_project_file_close(tool.instance, None),
             Kind::KnownHosts
             | Kind::SessionProcesses
             | Kind::RecordingManager
+            | Kind::AiChat
+            | Kind::JournalChatTranscript
+            | Kind::SavedChats
             | Kind::LogfileViewer
             | Kind::SessionJournalManager
             | Kind::TerminalEffects => {}
@@ -290,7 +330,19 @@ impl Workspace {
             Kind::SessionProcesses => self.remove_hosted_session_processes(tool.instance),
             Kind::RecordingManager => self.remove_hosted_recording_manager(tool.instance),
             Kind::AiManager => self.remove_ai_manager(tool.instance),
+            Kind::AiChat => {
+                self.terminal_chats.remove(&tool.instance);
+            }
+            Kind::JournalChatTranscript => {
+                self.journal_chat_transcripts.remove(&tool.instance);
+            }
+            Kind::SavedChats => {
+                self.saved_chat_browsers.remove(&tool.instance);
+            }
             Kind::LogfileManager | Kind::LogfileViewer => self.logfiles.remove(tool.instance),
+            Kind::ProjectFile => {
+                self.remove_project_file(tool.instance);
+            }
             Kind::Snippets => return self.remove_hosted_snippets(tool.instance),
             Kind::Scheduler => self.remove_hosted_scheduler(tool.instance),
             Kind::TerminalEffects => {
@@ -422,6 +474,11 @@ impl Workspace {
             .into_iter()
             .map(CloseTarget::Hosted)
             .chain(self.native_close_targets(Some(owner)))
+            .chain(
+                self.native_logfile_close_targets(Some(owner))
+                    .into_iter()
+                    .map(CloseTarget::NativeLogfile),
+            )
             .collect()
     }
 
@@ -439,7 +496,7 @@ impl Workspace {
                     .map(CloseTarget::NativeAiManager),
             )
             .chain(
-                self.native_logfile_close_targets()
+                self.native_logfile_close_targets(None)
                     .into_iter()
                     .map(CloseTarget::NativeLogfile),
             )
@@ -460,15 +517,24 @@ impl Workspace {
                     .into_iter()
                     .map(CloseTarget::NativeJournal),
             )
+            .chain(
+                owner
+                    .and_then(|owner| self.native_ai_manager_for_owner(owner))
+                    .map(CloseTarget::NativeAiManager),
+            )
     }
 
     fn focus_close_target(&mut self, instance: window::Id) -> Option<Task<Message>> {
+        if self.ai_manager_id() == Some(instance) {
+            return Some(self.focus_ai_manager(instance));
+        }
         self.focus_hosted_tool(instance).or_else(|| {
+            if self.logfiles.contains(instance) {
+                return Some(Self::focus_native_logfile(instance));
+            }
             (self.is_snippet_window(instance)
                 || self.is_scheduler_window(instance)
-                || self.logfiles.contains(instance)
-                || self.is_journal_window(instance)
-                || self.ai_manager_id() == Some(instance))
+                || self.is_journal_window(instance))
             .then(|| window::gain_focus(instance))
         })
     }
@@ -680,20 +746,26 @@ impl Workspace {
                     tasks.push(self.close_native_scheduler_after_preflight(id))
                 }
                 CloseTarget::NativeLogfile(id) => {
-                    self.logfiles.remove(id);
-                    tasks.push(if matches!(pending.scope, CloseScope::Tab) {
-                        self.close_window(id)
+                    if matches!(pending.scope, CloseScope::Tab) {
+                        tasks.push(self.close_associated_logfile(id).unwrap_or_else(|| {
+                            self.logfiles.remove(id);
+                            self.close_window(id)
+                        }));
                     } else {
-                        self.close_placed_dialog(id)
-                    });
+                        self.logfiles.remove(id);
+                        if !matches!(pending.scope, CloseScope::Window(..)) {
+                            tasks.push(self.close_placed_dialog(id));
+                        }
+                    }
                 }
                 CloseTarget::NativeAiManager(id) => {
                     self.remove_ai_manager(id);
-                    tasks.push(if matches!(pending.scope, CloseScope::Tab) {
-                        self.close_window(id)
-                    } else {
-                        self.close_placed_dialog(id)
-                    });
+                    match pending.scope {
+                        CloseScope::Tab => tasks.push(self.close_window(id)),
+                        // The main-window close task detaches its native children first.
+                        CloseScope::Window(..) => {}
+                        _ => tasks.push(self.close_placed_dialog(id)),
+                    }
                 }
                 CloseTarget::NativeJournal(id) => {
                     tasks.push(self.remove_closed_journal_windows(id));

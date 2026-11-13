@@ -31,8 +31,12 @@ use windows_sys::Win32::System::Threading::{
 
 use super::WindowsRelayIo;
 
+mod cli;
 mod pipe;
 mod policy;
+
+pub use cli::WindowsCli;
+pub(crate) use policy::with_private_pipe;
 
 const REAP_TIMEOUT_MS: u32 = 5000;
 const ALL_APPLICATION_PACKAGES_OPT_OUT: u32 = 1;
@@ -298,6 +302,24 @@ fn launch(
     command: Option<&mut [u16]>,
     environment: &policy::Environment,
     pipes: Option<[HANDLE; 3]>,
+    attributes: Attributes<'_>,
+) -> io::Result<Suspended> {
+    launch_in(
+        executable,
+        command,
+        &environment.block,
+        &environment.system_root,
+        pipes,
+        attributes,
+    )
+}
+
+fn launch_in(
+    executable: &Path,
+    command: Option<&mut [u16]>,
+    environment: &[u16],
+    directory: &[u16],
+    pipes: Option<[HANDLE; 3]>,
     mut attributes: Attributes<'_>,
 ) -> io::Result<Suspended> {
     let path = wide(executable.as_os_str());
@@ -324,8 +346,8 @@ fn launch(
                 | CREATE_NO_WINDOW
                 | CREATE_UNICODE_ENVIRONMENT
                 | EXTENDED_STARTUPINFO_PRESENT,
-            environment.block.as_ptr().cast(),
-            environment.system_root.as_ptr(),
+            environment.as_ptr().cast(),
+            directory.as_ptr(),
             &startup.StartupInfo,
             &mut result,
         )

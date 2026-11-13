@@ -1,10 +1,10 @@
 use std::io;
 use std::path::PathBuf;
 
-use kortty_terminal::TerminalProfile;
+use kortty_terminal::{TerminalProfile, TextEncoding};
 use roxmltree::Node;
 
-use crate::profile::{PaneLayout, invalid};
+use crate::profile::{InitialTerminalSize, PaneLayout, invalid};
 use crate::session::{
     SerialConnection, SerialFlowControl, SerialLineEnding, SerialParity, SerialSettings,
     SerialStopBits,
@@ -13,14 +13,18 @@ use crate::session_security::{IsolationLevel, LocalSettings};
 use crate::ssh_dialog::{LoginTarget, normalize_host, unsafe_text};
 use crate::workspace::SshTarget;
 
-use super::{Note, boolean, child, flag, has_any, number, tag, value};
+use super::{Note, appearance::clamp_font, boolean, child, flag, has_any, number, tag, value};
 
 const DEFAULT_FONT: u8 = 14;
+pub(super) const JAVA_DEFAULT_INITIAL_SIZE: InitialTerminalSize = InitialTerminalSize {
+    columns: Some(80),
+    rows: Some(24),
+};
 
 pub(super) struct Tab<'a> {
     pub(super) connection: Option<&'a str>,
     pub(super) local: bool,
-    font: Option<u8>,
+    pub(super) font: Option<u8>,
 }
 
 impl<'a> Tab<'a> {
@@ -29,8 +33,8 @@ impl<'a> Tab<'a> {
             connection: value(node, "connectionId")?,
             local: flag(node, "localShell")?,
             font: number::<i32>(node, "fontSizeOverride")?
-                .map(clamp_font)
-                .or(settings_font(node)?),
+                .filter(|&size| size > 0)
+                .map(clamp_font),
         })
     }
 
@@ -40,6 +44,7 @@ impl<'a> Tab<'a> {
             self.font.unwrap_or(DEFAULT_FONT),
             focused,
             IsolationLevel::None,
+            false,
         )
     }
 }
@@ -53,6 +58,7 @@ pub(super) fn convert(
         return Ok(Err(Note::PrivateConnection));
     }
     let protocol = value(connection, "protocol")?.unwrap_or("SSH_TCP");
+    let encoding = value(connection, "encoding")?;
     if matches!(protocol, "MOSH" | "MOSH_CLIENT") {
         return Ok(Err(Note::Mosh));
     }
@@ -66,14 +72,19 @@ pub(super) fn convert(
     else {
         return Ok(Err(Note::UnsupportedConnection));
     };
-    let font = tab
-        .font
-        .or(settings_font(connection)?)
-        .unwrap_or(DEFAULT_FONT);
+    let font = tab.font.unwrap_or(DEFAULT_FONT);
     let term = profile.term_name().into();
     let pane = match protocol {
         "LOCAL_SHELL" if isolation != IsolationLevel::Sandbox => {
-            local(profile, font, focused, isolation)
+            let integration = flag(connection, "shellIntegrationAutoInject")?;
+            // Portable layouts cannot retain arbitrary launch commands or working directories.
+            if value(connection, "localShellCommand")?.is_some()
+                || value(connection, "localShellWorkingDirectory")?.is_some()
+                || (integration && value(connection, "connectionSource")? == Some("TEAMWORK"))
+            {
+                return Ok(Err(Note::UnsupportedConnection));
+            }
+            local(profile, font, focused, isolation, integration)
         }
         "SSH_TCP" => {
             let target = ssh(connection, isolation);
@@ -83,6 +94,7 @@ pub(super) fn convert(
                     focused,
                     term,
                     target,
+                    initial_size: InitialTerminalSize::default(),
                 },
                 Err(_) => return Ok(Err(Note::UnsupportedConnection)),
             }
@@ -90,7 +102,9 @@ pub(super) fn convert(
         "SERIAL" if isolation == IsolationLevel::None => {
             let settings =
                 child(connection, "serial")?.ok_or_else(|| invalid("missing Java serial settings"));
-            match settings.and_then(serial) {
+            match settings
+                .and_then(|settings| serial(settings, encoding.and_then(TextEncoding::from_name)))
+            {
                 Ok(connection) => PaneLayout::Serial {
                     font,
                     focused,
@@ -105,19 +119,19 @@ pub(super) fn convert(
     let omitted = has_any(
         connection,
         &["terminalEffectPluginId", "tabColor", "highlightRuleSetId"],
-    ) || value(connection, "encoding")?
-        .is_some_and(|value| !value.eq_ignore_ascii_case("UTF-8"));
+    ) || encoding.is_some_and(|value| encoding_omitted(protocol, value));
     Ok(Ok((pane, omitted)))
 }
 
 pub(super) fn catalogue_pane(connection: Node<'_, '_>) -> io::Result<Option<PaneLayout>> {
+    let protocol = value(connection, "protocol")?.unwrap_or("SSH_TCP");
     // Existing Java settings can change effective routes or introduce side effects on opening.
     if value(connection, "connectionSource")? == Some("TEAMWORK")
         || flag(connection, "disableHostKeyCheck")?
-        || flag(connection, "shellIntegrationAutoInject")?
+        || (protocol != "LOCAL_SHELL" && flag(connection, "shellIntegrationAutoInject")?)
         || value(connection, "localShellCommand")?.is_some()
         || value(connection, "localShellWorkingDirectory")?.is_some()
-        || value(connection, "encoding")?.is_some_and(|value| !value.eq_ignore_ascii_case("UTF-8"))
+        || value(connection, "encoding")?.is_some_and(|value| encoding_omitted(protocol, value))
     {
         return Ok(None);
     }
@@ -155,6 +169,42 @@ pub(super) fn catalogue_pane(connection: Node<'_, '_>) -> io::Result<Option<Pane
         .map(|(pane, _)| pane))
 }
 
+pub(super) fn catalogue_initial_size(connection: Node<'_, '_>) -> io::Result<InitialTerminalSize> {
+    let Some(settings) = child(connection, "settings")? else {
+        return Ok(JAVA_DEFAULT_INITIAL_SIZE);
+    };
+    // Java starts the shell with the connection's raw dimensions even when appearance inherits.
+    let size = InitialTerminalSize {
+        columns: number(settings, "terminalColumns")?.or(JAVA_DEFAULT_INITIAL_SIZE.columns),
+        rows: number(settings, "terminalRows")?.or(JAVA_DEFAULT_INITIAL_SIZE.rows),
+    };
+    size.validate()?;
+    Ok(size)
+}
+
+pub(super) fn remote_tool(connection: Node<'_, '_>) -> io::Result<Result<SshTarget, Note>> {
+    if flag(connection, "incognito")? {
+        return Ok(Err(Note::PrivateConnection));
+    }
+    if !matches!(value(connection, "protocol")?, None | Some("SSH_TCP")) {
+        return Ok(Err(Note::UnsupportedConnection));
+    }
+    let Some(isolation) =
+        IsolationLevel::from_id(value(connection, "isolationMode")?.unwrap_or("none"))
+    else {
+        return Ok(Err(Note::UnsupportedConnection));
+    };
+    Ok(ssh(connection, isolation).map_err(|_| Note::UnsupportedConnection))
+}
+
+fn encoding_omitted(protocol: &str, value: &str) -> bool {
+    match TextEncoding::from_name(value) {
+        Some(TextEncoding::Utf8) => false,
+        Some(_) => protocol != "SERIAL",
+        None => true,
+    }
+}
+
 fn unpadded(node: Node<'_, '_>, name: &str) -> io::Result<bool> {
     // JAXB retains whitespace in strings, while the offline import trims fields.
     let Some(field) = child(node, name)? else {
@@ -172,17 +222,22 @@ fn local(
     font: u8,
     focused: bool,
     isolation: IsolationLevel,
+    shell_integration: bool,
 ) -> PaneLayout {
     PaneLayout::Terminal {
         font,
         focused,
+        initial_size: InitialTerminalSize::default(),
         vt100: profile == TerminalProfile::Vt100,
         term: (!matches!(profile, TerminalProfile::Xterm | TerminalProfile::Vt100))
             .then(|| profile.term_name().into()),
-        security: (isolation != IsolationLevel::None).then_some(LocalSettings {
-            isolation,
-            ..LocalSettings::default()
-        }),
+        security: (isolation != IsolationLevel::None || shell_integration).then_some(
+            LocalSettings {
+                isolation,
+                shell_integration,
+                ..LocalSettings::default()
+            },
+        ),
     }
 }
 
@@ -193,19 +248,6 @@ fn terminal_profile(value: &str) -> Option<TerminalProfile> {
         "HP700_92" => Some(TerminalProfile::Hp70092),
         name => TerminalProfile::from_term_name(&name.to_ascii_lowercase()),
     }
-}
-
-fn settings_font(node: Node<'_, '_>) -> io::Result<Option<u8>> {
-    child(node, "settings")?.map_or(Ok(None), |settings| {
-        number::<i32>(settings, "fontSize").map(|value| value.map(clamp_font))
-    })
-}
-
-fn clamp_font(value: i32) -> u8 {
-    value.clamp(
-        i32::from(crate::profile::MIN_TERMINAL_FONT),
-        i32::from(crate::profile::MAX_TERMINAL_FONT),
-    ) as u8
 }
 
 fn ssh(connection: Node<'_, '_>, isolation: IsolationLevel) -> io::Result<SshTarget> {
@@ -226,7 +268,7 @@ fn login(node: Node<'_, '_>) -> io::Result<LoginTarget> {
     })
 }
 
-fn serial(node: Node<'_, '_>) -> io::Result<SerialConnection> {
+fn serial(node: Node<'_, '_>, encoding: Option<TextEncoding>) -> io::Result<SerialConnection> {
     let device = value(node, "portName")?
         .filter(|path| !unsafe_text(path))
         .map(PathBuf::from)
@@ -279,6 +321,7 @@ fn serial(node: Node<'_, '_>) -> io::Result<SerialConnection> {
         },
         line_ending,
         local_echo: flag(node, "localEcho")?,
+        encoding,
     };
     connection.validate()?;
     Ok(connection)

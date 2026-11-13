@@ -18,20 +18,31 @@ use objc2_foundation::{MainThreadMarker, NSBundle};
 
 mod application_menu;
 mod clipboard;
+mod desktop_notifications;
+mod dock_badge;
+mod executable_metadata;
+mod owned_dialog;
 mod power;
+mod status_item;
 mod tab_drag;
 mod window_chrome;
 pub use application_menu::{
     ApplicationMenu, ApplicationMenuEntry, JobMenuRow, OpenRecentMenuRow,
-    install_application_menus, sync_application_menu_command_key, sync_application_menu_items,
+    install_application_menus, sync_application_menu_command_key,
+    sync_application_menu_command_option_key, sync_application_menu_items,
     sync_application_submenu_visibility, sync_jobs_menu, sync_open_recent_menu,
     sync_recently_closed_menu,
 };
 pub use clipboard::write_clipboard_png;
-pub use power::IdleSleepAssertion;
+pub use desktop_notifications::{initialize_desktop_notifications, send_desktop_notification};
+pub use dock_badge::set_dock_badge;
+pub use executable_metadata::{ExecutableMetadata, copy_executable_metadata};
+pub use owned_dialog::{detach_owned_dialog, show_owned_dialog};
+pub use power::{AppNapActivity, IdleSleepAssertion, TerminalActivity, record_terminal_activity};
+pub use status_item::{install_status_item, remove_status_item};
 pub use tab_drag::{
-    TabHit, TabPointer, TabPress, claim_tab_press, pending_tab_press, sample_tab_pointer,
-    tab_window_number, track_tab_window, untrack_tab_window,
+    TabHit, TabPointer, TabPress, claim_tab_press, file_drop_position, pending_tab_press,
+    sample_tab_pointer, tab_window_number, track_tab_window, untrack_tab_window,
 };
 pub use window_chrome::{set_dark_titlebar, titlebar_top_inset};
 
@@ -59,6 +70,51 @@ pub struct WorkArea {
     pub y: f64,
     pub width: f64,
     pub height: f64,
+}
+
+/// Reads the macOS product version, including minor and patch components.
+pub fn operating_system_version() -> Option<String> {
+    use std::ffi::CStr;
+    let mut bytes = [0_u8; 64];
+    let length = read_sysctl(c"kern.osproductversion", &mut bytes)?;
+    let version = CStr::from_bytes_with_nul(bytes.get(..length)?).ok()?;
+    Some(version.to_str().ok()?.to_owned())
+}
+
+/// Returns total physical memory exposed to macOS in bytes.
+pub fn physical_memory_bytes() -> Option<u64> {
+    let mut bytes = [0_u8; size_of::<u64>()];
+    if read_sysctl(c"hw.memsize", &mut bytes)? != bytes.len() {
+        return None;
+    }
+    let total = u64::from_ne_bytes(bytes);
+    (total != 0).then_some(total)
+}
+
+fn read_sysctl(name: &std::ffi::CStr, bytes: &mut [u8]) -> Option<usize> {
+    use std::ffi::{c_char, c_int, c_void};
+
+    unsafe extern "C" {
+        fn sysctlbyname(
+            name: *const c_char,
+            output: *mut c_void,
+            length: *mut usize,
+            input: *mut c_void,
+            input_length: usize,
+        ) -> c_int;
+    }
+    let mut length = bytes.len();
+    // SAFETY: `name` is NUL-terminated and `bytes` contains `length` writable bytes.
+    let status = unsafe {
+        sysctlbyname(
+            name.as_ptr(),
+            bytes.as_mut_ptr().cast(),
+            &mut length,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (status == 0 && length <= bytes.len()).then_some(length)
 }
 
 /// Plays the user's system alert sound from the AppKit main thread.
@@ -128,6 +184,7 @@ pub fn install() -> Option<Receiver<NativeEvent>> {
         subclass.add_method(quit, should_terminate as extern "C" fn(_, _, _) -> _);
     }
     application_menu::register_action(&mut subclass);
+    status_item::register_action(&mut subclass);
     let subclass = subclass.register();
     if subclass.instance_size() != base.instance_size() {
         return None;

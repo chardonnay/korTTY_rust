@@ -135,6 +135,59 @@ fn connect(directory: &Path) -> (Session, SshTarget, JoinHandle<Output>) {
 }
 
 #[test]
+#[ignore = "requires OpenSSH ssh-keygen, sshd, and a usable local account"]
+fn openssh_live_diagnostics_hide_private_and_closed_terminal_connections() {
+    let fixture = TempDirectory::new("ssh-diagnostics");
+    let root = fixture.0.canonicalize().unwrap();
+    let mut workspace = Workspace::default();
+    let (public_window, _) = workspace.open_window(false);
+    let (private_window, _) = workspace.open_window(false);
+    let grid = initial_grid(TerminalProfile::Xterm);
+    let mut add = |window, folder, private| {
+        let path = root.join(folder);
+        fs::create_dir(&path).unwrap();
+        let (session, target, server) = connect(&path);
+        let id = workspace.store_session(session, grid, 14);
+        let endpoint = target.label();
+        workspace.sessions.get_mut(&id).unwrap().ssh = Some(target);
+        workspace.add_tab_with_privacy(window, id, private);
+        (id, endpoint, server)
+    };
+    let (public, endpoint, public_server) = add(public_window, "public", false);
+    let (private, _, private_server) = add(private_window, "private", true);
+    let rows = workspace.live_ssh_connections();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].session, public);
+    assert_eq!(rows[0].endpoint, endpoint);
+
+    workspace
+        .sessions
+        .get_mut(&public)
+        .unwrap()
+        .control_ssh_provisional = true;
+    assert!(workspace.live_ssh_connections().is_empty());
+    workspace
+        .sessions
+        .get_mut(&public)
+        .unwrap()
+        .control_ssh_provisional = false;
+    let stopped = workspace.sessions[&public].session.stop();
+    wait_for(|| stopped.is_closed().then_some(()));
+    // The cached workspace frame has not received the actor's last update.
+    assert_eq!(workspace.sessions[&public].frame.status, Status::Running);
+    assert!(workspace.live_ssh_connections().is_empty());
+    assert_eq!(
+        workspace.sessions[&private].session.frame().status,
+        Status::Running
+    );
+
+    let stopped = workspace.sessions[&private].session.stop();
+    wait_for(|| stopped.is_closed().then_some(()));
+    let _ = public_server.join().unwrap();
+    let _ = private_server.join().unwrap();
+}
+
+#[test]
 #[ignore = "requires OpenSSH ssh-keygen, sshd with internal-sftp, and a usable local account"]
 fn openssh_remote_dock_coalesces_listing_transfers_files_and_only_closes_its_channel() {
     let fixture = TempDirectory::new("remote-dock");
@@ -157,6 +210,7 @@ fn openssh_remote_dock_coalesces_listing_transfers_files_and_only_closes_its_cha
 
     let (mut browser, _) = Browser::open(
         SessionId(7),
+        &target,
         session.sftp_opener().unwrap(),
         Some(path_bytes(&first)),
         RemoteEditorPolicy::Allow,
@@ -172,7 +226,8 @@ fn openssh_remote_dock_coalesces_listing_transfers_files_and_only_closes_its_cha
     assert_eq!(browser.path(), Some(path_bytes(&latest).as_slice()));
     let source = latest.join("terminal-source.txt");
     fs::write(&source, "original file\n").unwrap();
-    let worker = browser.terminal_editor_worker().unwrap();
+    browser.revalidate_transfers(false);
+    let worker = browser.idle_worker().unwrap();
     let editor = worker.editor().unwrap();
     let reply = worker
         .submit(Operation::OpenTerminalEditor(path_bytes(
@@ -193,7 +248,8 @@ fn openssh_remote_dock_coalesces_listing_transfers_files_and_only_closes_its_cha
         fs::read_to_string(&source).unwrap(),
         "saved from terminal\n"
     );
-    assert!(browser.terminal_editor_worker().is_some());
+    browser.revalidate_transfers(true);
+    assert!(browser.idle_worker().is_some());
     assert!(browser.entries().iter().any(|entry| {
         entry.name == EntryName::Remote(raw.clone())
             && entry.display == "raw-\\n"
@@ -218,7 +274,7 @@ fn openssh_remote_dock_coalesces_listing_transfers_files_and_only_closes_its_cha
     let _ = browser.upload(vec![upload.clone(), blocked]);
     assert_eq!(browser.active_transfer_count(), 2);
     let _ = browser.browse(path_bytes(&latest));
-    browser.cancel_pending_transfers();
+    browser.revalidate_transfers(false);
     let _ = complete(&mut browser);
     assert!(browser.conflict().is_none());
     assert_eq!(browser.active_transfer_count(), 0);
@@ -226,6 +282,7 @@ fn openssh_remote_dock_coalesces_listing_transfers_files_and_only_closes_its_cha
     assert_eq!(browser.listing_revision(), 2);
     assert!(!latest.join("blocked.txt").exists());
 
+    browser.revalidate_transfers(true);
     let _ = browser.upload(vec![upload]);
     assert!(browser.transfers_active());
     let _ = complete(&mut browser);
@@ -268,7 +325,11 @@ fn openssh_remote_dock_coalesces_listing_transfers_files_and_only_closes_its_cha
         "closing the original channel revokes the old editor"
     );
     let _ = browser
-        .resume(session.sftp_opener().unwrap(), RemoteEditorPolicy::Deny)
+        .resume(
+            &target,
+            session.sftp_opener().unwrap(),
+            RemoteEditorPolicy::Deny,
+        )
         .unwrap();
     let _ = complete(&mut browser);
     assert!(browser.has_worker() && browser.connected());

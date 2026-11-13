@@ -29,7 +29,6 @@ struct Dialog {
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Message {
-    Opened,
     Focus,
     Decide(bool),
 }
@@ -50,7 +49,8 @@ impl Workspace {
             return Task::none();
         }
         let includes_terminals = count > self.tool_targets_for_batch(owner, batch).len();
-        let (id, opened) = self.open_placed_dialog(
+        let (id, opened) = self.open_owned_placed_dialog(
+            owner,
             DialogKind::CloseAll,
             window::Settings {
                 size: Size::new(475.0, 220.0),
@@ -59,6 +59,7 @@ impl Workspace {
                 exit_on_close_request: false,
                 ..window::Settings::default()
             },
+            Some(|id| Desktop::CloseAllDialog(id, Message::Focus)),
         );
         self.close_all_dialogs.0.insert(
             id,
@@ -70,7 +71,7 @@ impl Workspace {
                 includes_terminals,
             },
         );
-        opened.map(move |_| Desktop::CloseAllDialog(id, Message::Opened))
+        opened
     }
 
     pub(super) fn update_close_all_dialog(
@@ -79,15 +80,10 @@ impl Workspace {
         message: Message,
     ) -> Task<Desktop> {
         let Some(&dialog) = self.close_all_dialogs.0.get(&id) else {
-            // A programmatic decision may arrive while the native open task is
-            // still in flight. Close the late window as soon as it exists.
-            return match message {
-                Message::Opened => self.close_placed_dialog(id),
-                _ => Task::none(),
-            };
+            return Task::none();
         };
         match message {
-            Message::Opened | Message::Focus => window::gain_focus(id),
+            Message::Focus => window::gain_focus(id),
             Message::Decide(approved) => {
                 let pending = self
                     .windows
@@ -130,11 +126,10 @@ impl Workspace {
             return Task::none();
         };
         self.close_all_dialogs.0.remove(&id);
-        let close = self.close_placed_dialog(id);
         if self.windows.contains_key(&owner) {
-            close.chain(window::gain_focus(owner))
+            self.close_placed_dialog_and_focus(id, owner)
         } else {
-            close
+            self.close_placed_dialog(id)
         }
     }
 
@@ -145,14 +140,12 @@ impl Workspace {
             .then(|| self.update_close_all_dialog(id, Message::Decide(false)))
     }
 
-    pub(super) fn close_all_dialog_owner_closed(&mut self, owner: window::Id) -> Task<Desktop> {
-        let Some(id) = self.close_all_dialog_for_owner(owner) else {
-            return Task::none();
-        };
-        if let Some(dialog) = self.close_all_dialogs.0.remove(&id) {
+    pub(super) fn remove_close_all_dialog_for_owner(&mut self, owner: window::Id) {
+        if let Some(id) = self.close_all_dialog_for_owner(owner)
+            && let Some(dialog) = self.close_all_dialogs.0.remove(&id)
+        {
             self.cancel_tab_batch_close(owner, dialog.batch);
         }
-        self.close_placed_dialog(id)
     }
 
     pub(super) fn close_all_dialog_view(&self, id: window::Id) -> Option<Element<'_, Desktop>> {
@@ -218,6 +211,9 @@ mod tests {
 
     #[test]
     fn owner_only_modal_preserves_layout_until_programmatic_confirmation() {
+        use iced::futures::{StreamExt, executor::block_on};
+        use iced_runtime::{Action as RuntimeAction, task, window::Action as WindowAction};
+
         let mut workspace = Workspace::default();
         let (owner, _) = workspace.open_window(false);
         let (other, _) = workspace.open_window(false);
@@ -245,7 +241,17 @@ mod tests {
         assert_eq!(workspace.windows[&other].tab().unwrap().id, untouched);
         assert!(workspace.has_recently_closed_entries());
 
-        let _ = workspace.update(Desktop::CloseAllDialog(id, Message::Opened));
+        let late_open = workspace.update(Desktop::OwnedDialogOpened(
+            id,
+            owner,
+            Some(Box::new(Desktop::CloseAllDialog(id, Message::Focus))),
+        ));
+        let mut actions = task::into_stream(late_open).unwrap();
+        assert!(matches!(
+            block_on(actions.next()),
+            Some(RuntimeAction::Window(WindowAction::Close(dialog))) if dialog == id
+        ));
+        assert!(block_on(actions.next()).is_none());
         assert!(workspace.close_all_dialogs.is_empty());
     }
 

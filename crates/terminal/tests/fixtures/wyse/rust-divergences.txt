@@ -1,0 +1,20 @@
+[wy50_original]
+size=12x5
+cursor=2,4,true
+title=Wyse 50 status
+history=0
+bells=0
+replies=
+row0=AXYDE
+row2= M P
+[wy60_original]
+size=6x4
+cursor=1,1,true
+title=
+history=0
+bells=0
+replies=36300d
+row0=ABCDEZ
+ink0=0:32/-/-,1:32/-/-,2:32/-/-,3:32/-/-,4:32/-/-,5:32/-/-
+row1=!
+ink1=0:32/-/-

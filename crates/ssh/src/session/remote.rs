@@ -7,7 +7,7 @@ use sunset::event::ForwardedTcpipOpen;
 use super::forward::Forwards;
 use super::*;
 
-const MAX_REMOTE_LISTENERS: usize = 4;
+use crate::MAX_REMOTE_FORWARD_LISTENERS as MAX_REMOTE_LISTENERS;
 const BIND: &str = "tcpip-forward";
 const CANCEL: &str = "cancel-tcpip-forward";
 
@@ -262,6 +262,9 @@ impl Remotes {
         request: ForwardedTcpipOpen<'_, '_>,
         forwards: &mut Forwards,
     ) -> sunset::Result<()> {
+        if !forwards.has_capacity() {
+            return request.reject();
+        }
         let addresses = request.addresses()?;
         let destination = numeric_address(addresses.address, addresses.port);
         let origin = numeric_address(addresses.origin, addresses.origin_port);
@@ -294,6 +297,7 @@ impl Remotes {
         &mut self,
         runner: &mut Runner<'_, Client>,
         owner: &Arc<Shared>,
+        probe_overdue: bool,
     ) -> io::Result<bool> {
         if self
             .pending
@@ -327,6 +331,14 @@ impl Remotes {
                 listener.cancel_deadline.map(|deadline| (index, deadline))
             });
         if let Some((index, deadline)) = closing {
+            if probe_overdue {
+                // Release the server's listener by closing the connection when
+                // an unanswered probe makes cancellation impossible to confirm.
+                let _ = self.listeners[index]
+                    .cancelled
+                    .try_send(Err(probe_blocks_forwarding().into()));
+                return Err(probe_blocks_forwarding());
+            }
             if Instant::now() >= deadline {
                 return Err(remote_timeout());
             }
@@ -340,15 +352,22 @@ impl Remotes {
         if self.pending.is_some() {
             return Ok(replied);
         }
-        self.start_bind(runner).map(|started| replied || started)
+        self.start_bind(runner, probe_overdue)
+            .map(|started| replied || started)
     }
 
-    fn start_bind(&mut self, runner: &mut Runner<'_, Client>) -> io::Result<bool> {
+    fn start_bind(
+        &mut self,
+        runner: &mut Runner<'_, Client>,
+        probe_overdue: bool,
+    ) -> io::Result<bool> {
         let Some(bind) = self.ready.take().or_else(|| self.requests.try_recv().ok()) else {
             return Ok(false);
         };
         if bind.expired() {
             let _ = bind.reply.try_send(Err(remote_timeout().into()));
+        } else if probe_overdue {
+            let _ = bind.reply.try_send(Err(probe_blocks_forwarding().into()));
         } else if self.listeners.len() >= MAX_REMOTE_LISTENERS {
             let error = io::Error::new(
                 io::ErrorKind::WouldBlock,
@@ -434,6 +453,13 @@ impl Remotes {
             (Pending::Cancel(_, _), GlobalReply::Accepted(Some(_))) => Err(invalid_reply()),
         }
     }
+}
+
+fn probe_blocks_forwarding() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        "SSH forwarding is unavailable while the server's liveness reply is outstanding",
+    )
 }
 
 fn send_request(

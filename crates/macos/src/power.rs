@@ -4,6 +4,9 @@ use std::ptr;
 use core_foundation_sys::string::CFStringRef;
 use objc2_foundation::ns_string;
 
+mod app_nap;
+pub use app_nap::{AppNapActivity, TerminalActivity, record_terminal_activity};
+
 const ASSERTION_LEVEL_ON: u32 = 255;
 
 #[link(name = "IOKit", kind = "framework")]

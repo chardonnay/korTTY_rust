@@ -78,16 +78,10 @@ impl Workspace {
         {
             return None;
         }
-        let themes = &self.window_settings.themes;
-        let scheme = themes.appearance();
-        let size = themes.font_size(scheme, pane.font, pane.font_baseline);
         let effect = pane
             .effect
             .is_some_and(|active| self.allowed_terminal_effect(active.selection.effect));
-        let font = self
-            .window_settings
-            .terminal_font_face(scheme.filter(|_| !effect));
-        Some((session, pane, (size, font)))
+        Some((session, pane, self.pane_terminal_font(pane, effect)))
     }
 
     pub(in crate::workspace) fn quick_select_available(&self, owner: window::Id) -> bool {
@@ -109,12 +103,13 @@ impl Workspace {
             return Task::none();
         };
         let grid = pane.grid;
+        let windows_paths = cfg!(windows) && pane.session.local_shell_pid().is_some();
         let frame = Arc::clone(&pane.frame);
         let settings = self
             .chrome
             .quick_select
             .settings(&self.window_settings.quick_select);
-        let Some(labels) = Labels::capture(&frame.screen, settings) else {
+        let Some(labels) = Labels::capture(&frame, settings, windows_paths) else {
             self.notice(
                 owner,
                 "No Quick Select matches in the visible terminal.".into(),
@@ -161,7 +156,7 @@ impl Workspace {
             return;
         }
         if active.frame.as_ptr() != Arc::as_ptr(&pane.frame) {
-            if !active.labels.retain_visible(&pane.frame.screen) {
+            if !active.labels.retain_visible(&pane.frame) {
                 return;
             }
             active.frame = Arc::downgrade(&pane.frame);
@@ -284,7 +279,7 @@ impl Workspace {
             || active.font != font
             || latest.password_prompt
             || active.viewport != viewport(&latest)
-            || !active.labels.retain_visible(&latest.screen)
+            || !active.labels.retain_visible(&latest)
         {
             return Some(Task::none());
         }
@@ -383,5 +378,153 @@ mod tests {
         ));
         assert_eq!(repeat.units(), 0);
         let _ = workspace.sessions[&id].session.stop().recv_blocking();
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    use iced::futures::{StreamExt, executor::block_on};
+    use iced::keyboard::Location;
+    use kortty_pty::{LaunchOptions, LocalShell};
+    use kortty_terminal::TerminalProfile;
+
+    use crate::session::Session;
+
+    use super::*;
+
+    #[test]
+    fn quick_select_windows_shift_opens_a_conpty_relative_file() {
+        const DISPLAYED_FILE: &str = r".\kortty-path-fixture.txt:2:3";
+        let directory = std::env::temp_dir().join(crate::private_files::nonce().unwrap());
+        std::fs::create_dir(&directory).unwrap();
+        let file = directory.join("kortty-path-fixture.txt");
+        let mut workspace = Workspace::default();
+        let mut session_id = None;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::fs::write(&file, "first\nsecond\n").unwrap();
+            workspace.clipboard.policy.internal = true;
+            workspace.window_settings.quick_select = Preferences {
+                alphabet: "zx".into(),
+                patterns: Vec::new(),
+            };
+            let (owner, _) = workspace.open_window(false);
+            workspace.windows.get_mut(&owner).unwrap().focused = true;
+            let grid = GridSize::default();
+            let session = Session::start_local(
+                grid,
+                TerminalProfile::Xterm,
+                LaunchOptions {
+                    shell: LocalShell::CommandPrompt,
+                    working_directory: Some(directory.clone()),
+                    shell_integration: true,
+                    ..LaunchOptions::default()
+                },
+                true,
+                None,
+            )
+            .unwrap();
+            let id = workspace.store_session(session, grid, 14);
+            session_id = Some(id);
+            workspace.add_tab(owner, id);
+            let shell = &workspace.sessions[&id].session;
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while shell.local_shell_pid().is_none()
+                || shell.frame().shell_activity().code_prompt.state
+                    != crate::session::PromptState::Ready
+            {
+                assert!(Instant::now() < deadline, "CMD fixture did not start");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            eprintln!("owned Quick Select CMD PID {:?}", shell.local_shell_pid());
+            shell
+                .send(b"cls & echo .\\kortty-path-fixture.txt:2:3\r".to_vec())
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let frame = shell.frame();
+                if frame.shell_activity().code_prompt.state == crate::session::PromptState::Ready
+                    && (0..frame.screen.rows).any(|row| {
+                        frame.screen.row(row).is_some_and(|cells| {
+                            cells
+                                .iter()
+                                .map(|cell| cell.text.as_str())
+                                .collect::<String>()
+                                .starts_with(DISPLAYED_FILE)
+                        })
+                    })
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "CMD fixture did not reach its prompt"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let _ = workspace.update(Desktop::SessionUpdate(id));
+            let select_file = |workspace: &mut Workspace, modifiers: Modifiers| {
+                let _ =
+                    workspace.update(Desktop::Chrome(Message::Invoke(owner, Action::QuickSelect)));
+                let label = workspace
+                    .quick_select_labels(owner, id)
+                    .and_then(|labels| labels.label_for_text(DISPLAYED_FILE))
+                    .expect("Quick Select labeled the relative file")
+                    .to_owned();
+                let mut task = Task::none();
+                for mut letter in label.chars() {
+                    if modifiers.shift() {
+                        letter = letter.to_ascii_uppercase();
+                    }
+                    let text = letter.to_string();
+                    task = workspace.update(Desktop::Key(
+                        owner,
+                        Key::Character(text.clone().into()),
+                        Location::Standard,
+                        modifiers,
+                        Some(text),
+                    ));
+                }
+                task
+            };
+            let _ = select_file(&mut workspace, Modifiers::empty());
+            assert_eq!(
+                workspace.clipboard.buffer.get().as_deref(),
+                Some(DISPLAYED_FILE)
+            );
+            assert!(workspace.editors.is_empty());
+            workspace.clipboard.buffer.set("clipboard sentinel".into());
+            let task = select_file(&mut workspace, Modifiers::SHIFT);
+            let mut actions = iced_runtime::task::into_stream(task).expect("file open task");
+            let action = block_on(actions.next()).expect("file open result");
+            let iced_runtime::Action::Output(Desktop::TerminalFileLoaded(ticket, result)) = action
+            else {
+                panic!("expected file open result");
+            };
+            let _ = workspace.finish_terminal_file(ticket, Ok(result.unwrap()));
+            let opened = workspace
+                .editors
+                .values()
+                .find_map(crate::editor_window::EditorWindow::local_document_path)
+                .expect("the editor opened the selected file");
+            assert_eq!(
+                opened.file_name(),
+                Some(Path::new("kortty-path-fixture.txt").as_os_str())
+            );
+            assert_eq!(
+                workspace.clipboard.buffer.get().as_deref(),
+                Some("clipboard sentinel")
+            );
+        }));
+        if let Some(id) = session_id {
+            let _ = workspace.sessions[&id].session.stop().recv_blocking();
+        }
+        let _ = std::fs::remove_file(&file);
+        let _ = std::fs::remove_dir(&directory);
+        if let Err(payload) = result {
+            std::panic::resume_unwind(payload);
+        }
     }
 }

@@ -24,7 +24,7 @@ mod bundle;
 mod filter;
 mod markdown;
 pub(super) use markdown::screenshot_bytes;
-mod pdf;
+pub(crate) mod pdf;
 pub(crate) mod topic_ai;
 
 pub(crate) use filter::{
@@ -224,14 +224,37 @@ impl Snapshot {
         Ok(filter.select(self)?.0)
     }
 
-    fn open_current_source(&self) -> io::Result<LocalSource> {
-        let source = open_document(&self.directory)?;
-        let root = Directory::open(&self.root, false)?;
-        if DeletionIdentity::capture(&root, &source)? != self.identity {
-            return Err(changed());
-        }
-        Ok(source)
+    pub(super) fn require_current_source(&self) -> io::Result<()> {
+        self.open_current_source().map(|_| ())
     }
+
+    fn open_current_source(&self) -> io::Result<LocalSource> {
+        open_reviewed_source(&self.root, &self.directory, &self.identity)
+    }
+}
+
+pub(crate) fn require_reviewed_source(
+    root: &Path,
+    directory: &Path,
+    expected: &DeletionIdentity,
+) -> io::Result<()> {
+    open_reviewed_source(root, directory, expected).map(|_| ())
+}
+
+fn open_reviewed_source(
+    root: &Path,
+    directory: &Path,
+    expected: &DeletionIdentity,
+) -> io::Result<LocalSource> {
+    if directory.parent() != Some(root) {
+        return Err(changed());
+    }
+    let source = open_document(directory)?;
+    let root = Directory::open(root, false)?;
+    if &DeletionIdentity::capture(&root, &source)? != expected {
+        return Err(changed());
+    }
+    Ok(source)
 }
 
 /// Reads the current version of the selected journal from its verified catalog location.
@@ -241,17 +264,32 @@ pub(crate) fn load(
     expected_id: &str,
     expected: &DeletionIdentity,
 ) -> io::Result<Snapshot> {
-    load_snapshot(root, directory, expected_id, expected, false)
+    load_snapshot(root, directory, expected_id, expected, HtmlSource::Discard)
 }
 
-/// Keeps the validated source XML only when the export will publish an HTML bundle.
+/// Keeps the validated source XML for an HTML export.
 pub(crate) fn load_for_bundle(
     root: &Path,
     directory: &Path,
     expected_id: &str,
     expected: &DeletionIdentity,
 ) -> io::Result<Snapshot> {
-    load_snapshot(root, directory, expected_id, expected, true)
+    load_snapshot(root, directory, expected_id, expected, HtmlSource::Bundle)
+}
+
+pub(crate) fn load_for_browser(
+    root: &Path,
+    directory: &Path,
+    expected_id: &str,
+    expected: &DeletionIdentity,
+) -> io::Result<Snapshot> {
+    load_snapshot(root, directory, expected_id, expected, HtmlSource::Browser)
+}
+
+enum HtmlSource {
+    Discard,
+    Bundle,
+    Browser,
 }
 
 fn load_snapshot(
@@ -259,7 +297,7 @@ fn load_snapshot(
     directory: &Path,
     expected_id: &str,
     expected: &DeletionIdentity,
-    retain_xml: bool,
+    html_source: HtmlSource,
 ) -> io::Result<Snapshot> {
     if directory.parent() != Some(root) {
         return Err(changed());
@@ -267,7 +305,9 @@ fn load_snapshot(
     let source = open_document(directory)?;
     let root_handle = Directory::open(root, false)?;
     let identity = DeletionIdentity::capture(&root_handle, &source)?;
-    if !identity.same_location(expected) {
+    if !identity.same_location(expected)
+        || (matches!(html_source, HtmlSource::Browser) && &identity != expected)
+    {
         return Err(changed());
     }
     let xml = document_text(&source)?;
@@ -291,7 +331,7 @@ fn load_snapshot(
         root: root.to_owned(),
         directory: directory.to_owned(),
         identity,
-        xml: retain_xml.then_some(xml),
+        xml: (!matches!(html_source, HtmlSource::Discard)).then_some(xml),
         header,
         entries: selected,
         markers: markers.used,

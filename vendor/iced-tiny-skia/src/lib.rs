@@ -3,6 +3,7 @@
 pub mod window;
 
 mod clip_mask;
+mod editor_caret;
 mod engine;
 mod layer;
 mod primitive;
@@ -23,6 +24,7 @@ use iced_debug as debug;
 pub use iced_graphics as graphics;
 pub use iced_graphics::core;
 
+pub use editor_caret::{TextEditorCaret, TextEditorCaretShape};
 pub use layer::Layer;
 pub use primitive::Primitive;
 pub use settings::Settings;
@@ -47,6 +49,7 @@ use crate::graphics::text::{Editor, Paragraph};
 pub struct Renderer {
     default_font: Font,
     default_text_size: Pixels,
+    editor_caret: Option<editor_caret::Scope>,
     layers: layer::Stack,
     engine: Engine, // TODO: Shared engine
 }
@@ -56,6 +59,7 @@ impl Renderer {
         Self {
             default_font,
             default_text_size,
+            editor_caret: None,
             layers: layer::Stack::new(),
             engine: Engine::new(),
         }
@@ -200,8 +204,15 @@ impl core::Renderer for Renderer {
         quad: renderer::Quad,
         background: impl Into<Background>,
     ) {
+        let background = background.into();
+        if background == Background::Color(TextEditorCaret::VALUE_COLOR)
+            && self.editor_caret.is_some()
+        {
+            self.paint_editor_caret(quad);
+            return;
+        }
         let (layer, transformation) = self.layers.current_mut();
-        layer.draw_quad(quad, background.into(), transformation);
+        layer.draw_quad(quad, background, transformation);
     }
 
     fn reset(&mut self, new_bounds: Rectangle) {
@@ -272,6 +283,12 @@ impl core::text::Renderer for Renderer {
         color: Color,
         clip_bounds: Rectangle,
     ) {
+        let color = match self.editor_caret.as_mut() {
+            Some(scope) if color == TextEditorCaret::VALUE_COLOR => {
+                scope.record_text(editor, position)
+            }
+            _ => color,
+        };
         let (layer, transformation) = self.layers.current_mut();
         layer.draw_editor(
             editor,

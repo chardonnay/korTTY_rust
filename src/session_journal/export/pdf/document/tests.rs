@@ -50,7 +50,7 @@ fn contains(bytes: &[u8], expected: &str) -> bool {
 #[test]
 fn journal_pdf_embeds_real_unicode_subsets_with_searchable_cids() {
     let mut document = Document::new().unwrap();
-    let page = document.new_page().unwrap();
+    let page = document.new_page(Orientation::Portrait).unwrap();
     assert_eq!(
         document.text_width(Font::Regular, 12.0, "🦀"),
         document.text_width(Font::Regular, 12.0, "?")
@@ -121,8 +121,8 @@ fn journal_pdf_embeds_real_unicode_subsets_with_searchable_cids() {
 #[test]
 fn journal_pdf_writes_lossless_rgb_alpha_outline_links_and_opacity() {
     let mut document = Document::new().unwrap();
-    let first = document.new_page().unwrap();
-    let second = document.new_page().unwrap();
+    let first = document.new_page(Orientation::Portrait).unwrap();
+    let second = document.new_page(Orientation::Portrait).unwrap();
     assert_eq!(document.page_count(), 2);
     let rgb = [255, 0, 0, 0, 255, 0];
     let alpha = [0, 170];
@@ -195,7 +195,7 @@ fn journal_pdf_rejects_invalid_geometry_image_dimensions_and_references() {
     let mut document = Document::new().unwrap();
     assert!(document.finish().is_err());
     document = Document::new().unwrap();
-    let page = document.new_page().unwrap();
+    let page = document.new_page(Orientation::Portrait).unwrap();
     assert!(
         document
             .draw_text(

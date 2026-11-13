@@ -1,6 +1,6 @@
 //! The Java application's grouped icon toolbar and window menu structure.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::ops::RangeInclusive;
 
 use iced::theme::Base as _;
@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 use crate::terminal_theme::{Rgb, Scheme};
 
 use super::{
-    IbmKind, Message as WorkspaceMessage, Window, Workspace, control_access, local_dock,
+    IbmKind, Message as WorkspaceMessage, Tab, Window, Workspace,
+    coding_agent_dock::Placement as CodingAgentPlacement, control_access, local_dock,
     multi_exec_access, project_access, recording_access, session_restore, session_security,
     settings_window, ssh_access, tab_titles::RemoteSidebarPosition,
     terminal_context::FontAdjustment,
@@ -139,8 +140,8 @@ pub(super) struct Chrome {
     hidden_menu_bars: HashSet<window::Id>,
     manual: manual::State,
     power: power::State,
-    connection_import: Option<connection_import::Dialog>,
-    connection_export: Option<connection_export::Dialog>,
+    connection_import: BTreeMap<window::Id, connection_import::Dialog>,
+    connection_export: BTreeMap<window::Id, connection_export::Dialog>,
     open_recent: std::cell::RefCell<open_recent_menu::Rows>,
 }
 
@@ -176,6 +177,7 @@ pub enum Category {
     Jobs,
     Toolbar,
     StatusRecovery,
+    CodingAgentStatus,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -324,14 +326,27 @@ pub enum Action {
     PreventSystemSleep,
     ImportConnections,
     AiManager,
+    SavedChats,
     ExportConnections,
+    TeamworkSettings,
+    CodingAgentsLeft,
+    CodingAgentsRight,
+    ToggleCodingAgents,
+    NextBlockedCodingAgent,
+    HighlightToggle,
+    HighlightRules,
+    TerminalAgent,
+    TerminalAgentAsk,
+    TerminalAgentPlan,
+    AgentSwarm,
+    AgentDesign,
+    Cut,
 }
 
 #[derive(Clone, Copy)]
 enum Entry {
     Action(Action),
     Submenu(Branch),
-    Unavailable(&'static str),
     BackgroundTransparency,
     Separator,
 }
@@ -350,11 +365,12 @@ pub enum Branch {
     TerminalEffects,
     LiveJournal,
     MultiExec,
+    CodingAgents,
 }
 
 impl Branch {
     #[cfg(target_os = "macos")]
-    const ALL: [Self; 9] = [
+    const ALL: [Self; 10] = [
         Self::Security,
         Self::FileBrowser,
         Self::Panes,
@@ -364,6 +380,7 @@ impl Branch {
         Self::TerminalEffects,
         Self::LiveJournal,
         Self::MultiExec,
+        Self::CodingAgents,
     ];
 
     fn title(self) -> &'static str {
@@ -377,6 +394,7 @@ impl Branch {
             Self::TerminalEffects => "Terminal Effect",
             Self::LiveJournal => "Live Journal",
             Self::MultiExec => "Multi-exec",
+            Self::CodingAgents => "Coding Agents",
         }
     }
 
@@ -391,6 +409,7 @@ impl Branch {
             Self::TerminalEffects => "View › Terminal Effect",
             Self::LiveJournal => "View › Live Journal",
             Self::MultiExec => "View › Multi-exec",
+            Self::CodingAgents => "View › Coding Agents",
         }
     }
 
@@ -403,7 +422,8 @@ impl Branch {
             | Self::RemoteSidebar
             | Self::TerminalEffects
             | Self::LiveJournal
-            | Self::MultiExec => Category::View,
+            | Self::MultiExec
+            | Self::CodingAgents => Category::View,
             Self::RecentlyClosed | Self::OpenRecent => Category::File,
         }
     }
@@ -433,6 +453,13 @@ impl Branch {
                 Item(JournalDockRight),
                 Separator,
                 Item(ToggleJournalDock),
+            ],
+            Self::CodingAgents => &[
+                Item(CodingAgentsLeft),
+                Item(CodingAgentsRight),
+                Separator,
+                Item(ToggleCodingAgents),
+                Item(NextBlockedCodingAgent),
             ],
             Self::TerminalEffects => &[
                 Item(EffectNone),
@@ -533,6 +560,7 @@ impl Category {
             Self::Jobs => "Jobs: none",
             Self::Toolbar => "Toolbar",
             Self::StatusRecovery => "Status Bar",
+            Self::CodingAgentStatus => "Coding Agents",
         }
     }
 
@@ -566,6 +594,7 @@ impl Category {
                 Item(Quit),
             ],
             Self::Edit => &[
+                Item(Cut),
                 Item(CopySelection),
                 Item(Paste),
                 Separator,
@@ -643,6 +672,7 @@ impl Category {
                 Separator,
                 Submenu(Branch::FileBrowser),
                 Submenu(Branch::LiveJournal),
+                Submenu(Branch::CodingAgents),
                 Submenu(Branch::RemoteSidebar),
                 Separator,
                 Item(ZoomIn),
@@ -658,6 +688,8 @@ impl Category {
                 Item(TabTitles),
                 Item(PromptJumps),
                 Submenu(Branch::TerminalEffects),
+                Item(HighlightToggle),
+                Item(HighlightRules),
                 Separator,
                 Item(Fullscreen),
                 Item(TerminalOnlyFullscreen),
@@ -677,18 +709,17 @@ impl Category {
                 Item(ToggleActionToolbar),
                 Item(ToggleConnectionToolbar),
             ],
+            Self::CodingAgentStatus => &[Item(ToggleCodingAgents), Item(NextBlockedCodingAgent)],
             Self::Ai => &[
                 Item(AiManager),
-                Entry::Unavailable("Saved Chats…"),
-                Entry::Unavailable("AI Agent…"),
-                Entry::Unavailable("AI Planning…"),
-                Entry::Unavailable("AI Swarm…"),
+                Item(SavedChats),
+                Item(TerminalAgent),
+                Item(TerminalAgentAsk),
+                Item(TerminalAgentPlan),
+                Item(AgentSwarm),
             ],
-            Self::Teamwork => &[Entry::Unavailable("Teamwork Settings…")],
-            Self::Plugins => &[
-                Item(TerminalEffectsManager),
-                Entry::Unavailable("AI Agent Design…"),
-            ],
+            Self::Teamwork => &[Item(TeamworkSettings)],
+            Self::Plugins => &[Item(TerminalEffectsManager), Item(AgentDesign)],
         }
     }
 
@@ -698,6 +729,15 @@ impl Category {
 }
 
 impl Action {
+    pub(super) fn agent_mode(self) -> Option<crate::terminal_agent::Mode> {
+        match self {
+            TerminalAgent => Some(crate::terminal_agent::Mode::Run),
+            TerminalAgentAsk => Some(crate::terminal_agent::Mode::Ask),
+            TerminalAgentPlan => Some(crate::terminal_agent::Mode::Plan),
+            _ => None,
+        }
+    }
+
     pub(super) fn font_zoom(self) -> Option<FontAdjustment> {
         match self {
             ZoomIn => Some(FontAdjustment::Increase),
@@ -779,7 +819,7 @@ impl Action {
             )
     }
 
-    fn title(self) -> &'static str {
+    pub(super) fn title(self) -> &'static str {
         match self {
             QuickConnect => "New Tab",
             LocalShell => "New Local Shell",
@@ -803,6 +843,7 @@ impl Action {
             CreateBackup => "Create Backup…",
             ImportBackup => "Import Backup…",
             Quit => "Quit",
+            Cut => "Cut",
             CopySelection => "Copy",
             Paste => "Paste",
             Find => "Find…",
@@ -834,6 +875,13 @@ impl Action {
             ToggleRecording => "Start/Stop Terminal Recording",
             Recordings => "Video Manager…",
             AiManager => "AI Manager…",
+            SavedChats => "Saved Chats…",
+            TerminalAgent => "AI Agent…",
+            TerminalAgentAsk => "Ask Terminal Agent…",
+            TerminalAgentPlan => "AI Planning…",
+            AgentSwarm => "AI Swarm…",
+            AgentDesign => "AI Agent Design…",
+            TeamworkSettings => "Teamwork Settings…",
             LogfileManager => "Logfile Manager…",
             SessionProcesses => "Session Processes…",
             AsciiArt => "ASCII Art…",
@@ -841,6 +889,8 @@ impl Action {
             ToggleSessionJournal => "Start/Stop Session Journal",
             SessionJournalScreenshot => "Add Journal Screenshot",
             TerminalEffectsManager => "Terminal Effects…",
+            HighlightToggle => "Highlighting On",
+            HighlightRules => "Manage Highlight Rules…",
             EffectNone => "None",
             EffectAmber => crate::terminal_effects::Effect::AmberCrt90.name(),
             EffectCommodore => crate::terminal_effects::Effect::CommodoreHeritage.name(),
@@ -856,6 +906,10 @@ impl Action {
             JournalDockLeft => "Dock Left",
             JournalDockRight => "Dock Right",
             ToggleJournalDock => "Show/Hide",
+            CodingAgentsLeft => "Dock Left",
+            CodingAgentsRight => "Dock Right",
+            ToggleCodingAgents => "Show/Hide",
+            NextBlockedCodingAgent => "Next Blocked Agent",
             MultiExecIncludePane => "Include This Pane",
             MultiExecIncludeTab => "Include All Panes of This Tab",
             MultiExecIncludeWindow => "Include All Terminals of This Window",
@@ -1044,14 +1098,11 @@ impl Chrome {
         }
     }
 
-    pub(super) fn window_closed(&mut self, id: window::Id) -> Option<window::Id> {
+    pub(super) fn window_closed(&mut self, id: window::Id) {
         self.dismiss(id);
         self.hidden_menu_bars.remove(&id);
         self.toolbar.close(id);
-        let dialog = self
-            .dialog
-            .take_if(|dialog| dialog.id == id || dialog.owner == id)?;
-        (id == dialog.owner).then_some(dialog.id)
+        let _ = self.dialog.take_if(|dialog| dialog.owner == id);
     }
 }
 
@@ -1152,8 +1203,20 @@ impl Workspace {
         match category {
             Category::Toolbar => true,
             Category::StatusRecovery => self.menu_bar_hidden(id) && self.palette_can_open(id),
+            Category::CodingAgentStatus => self.coding_agent_status_context_available(id),
             Category::Jobs => !self.menu_bar_hidden(id) && self.job_menu_title().is_some(),
             _ => !self.menu_bar_hidden(id),
+        }
+    }
+
+    pub(super) fn reconcile_coding_agent_status_menu(&mut self) {
+        if let Some(menu) = self
+            .chrome
+            .menu
+            .filter(|menu| menu.category == Category::CodingAgentStatus)
+            && !self.menu_surface_available(menu.window, menu.category)
+        {
+            self.chrome.dismiss(menu.window);
         }
     }
 
@@ -1268,7 +1331,10 @@ impl Workspace {
                     self.open_menu_branch(id, branch);
                     return Task::none();
                 }
-                if matches!(menu.category, Category::Toolbar | Category::StatusRecovery) {
+                if matches!(
+                    menu.category,
+                    Category::Toolbar | Category::StatusRecovery | Category::CodingAgentStatus
+                ) {
                     return Task::none();
                 }
                 let categories: Vec<_> = Category::ALL
@@ -1426,6 +1492,30 @@ impl Workspace {
             }
             QuickConnect => return self.show_quick_connect(id),
             QuickSelect => return self.start_quick_select(id),
+            CodingAgentsLeft | CodingAgentsRight | ToggleCodingAgents => {
+                return match action {
+                    CodingAgentsLeft => self.set_coding_agent_panel(id, CodingAgentPlacement::Left),
+                    CodingAgentsRight => {
+                        self.set_coding_agent_panel(id, CodingAgentPlacement::Right)
+                    }
+                    _ => self.toggle_coding_agent_panel(id),
+                };
+            }
+            NextBlockedCodingAgent => return self.focus_next_blocked_coding_agent(id),
+            AgentSwarm => return self.open_agent_swarm(id),
+            TerminalAgent | TerminalAgentAsk | TerminalAgentPlan => {
+                let Some(session) = self
+                    .windows
+                    .get(&id)
+                    .and_then(Window::tab)
+                    .and_then(Tab::focused_session)
+                else {
+                    return Task::none();
+                };
+                return self.open_terminal_agent(id, session, action.agent_mode().unwrap());
+            }
+            HighlightToggle => return self.update_highlight(super::highlight::Message::Toggle(id)),
+            HighlightRules => return self.update_highlight(super::highlight::Message::Open(id)),
             Manual => return self.show_manual(),
             About => return self.show_about(id),
             OpenPgpRecipients => return self.show_openpgp(id),
@@ -1506,8 +1596,22 @@ impl Workspace {
             | AsciiArt
             | Fullscreen
             | TerminalOnlyFullscreen
+            | CodingAgentsLeft
+            | CodingAgentsRight
+            | ToggleCodingAgents
+            | NextBlockedCodingAgent
             | HideTerminalScrollbarsFullscreen => self.windows.contains_key(&id),
             ToggleSessionJournal => self.journal_toggle_enabled(id),
+            SavedChats => self.windows.contains_key(&id) && self.ai_chat_enabled(),
+            AgentSwarm => self.windows.contains_key(&id) && self.agent_swarm_available(),
+            TerminalAgent | TerminalAgentAsk | TerminalAgentPlan => self
+                .windows
+                .get(&id)
+                .and_then(Window::tab)
+                .and_then(Tab::focused_session)
+                .is_some_and(|session| {
+                    self.terminal_agent_available(session, action.agent_mode().unwrap())
+                }),
             QuickSelect => self.quick_select_available(id),
             ShowMenuBar => self.palette_can_open(id),
             ZoomIn | ZoomOut | ResetZoom => {
@@ -1517,6 +1621,10 @@ impl Workspace {
             TerminalEffectsManager => {
                 self.windows.contains_key(&id) && self.terminal_effects_permitted()
             }
+            HighlightRules => {
+                self.windows.contains_key(&id) && self.clipboard.policy.problem.is_none()
+            }
+            HighlightToggle => self.windows.get(&id).and_then(Window::tab).is_some(),
             action if action.effect_choice().is_some() => {
                 self.effect_menu_target(id).is_some()
                     && self.terminal_effects_enabled()
@@ -1600,6 +1708,9 @@ impl Workspace {
             | Fullscreen
             | NewSnippetManagerWindow => return None,
             NewWindow => W::NewWindow,
+            TeamworkSettings if self.teamwork_sync_allowed() => {
+                W::TeamworkSettings(id, super::teamwork_settings::Message::Open)
+            }
             Dashboard if self.palette_can_open(id) => {
                 W::Dashboard(id, super::dashboard::Message::Toggle)
             }
@@ -1633,6 +1744,10 @@ impl Workspace {
             }
             CreateBackup if permitted => W::Backup(id, super::backup_ui::Message::OpenExport),
             ImportBackup if permitted => W::Backup(id, super::backup_ui::Message::OpenImport),
+            Cut => W::ProjectFile(
+                self.active_cut_editor(id)?,
+                project_access::local_files::Message::Editor(crate::editor_window::Message::Cut),
+            ),
             CopySelection => {
                 tab?.focused_session()?;
                 W::Copy(id)
@@ -1676,6 +1791,10 @@ impl Workspace {
                 id,
                 settings_window::Section::Appearance,
             )),
+            AgentDesign => W::Settings(settings_window::Message::OpenAt(
+                id,
+                settings_window::Section::AgentDesign,
+            )),
             LoggingSettings => W::Settings(settings_window::Message::OpenAt(
                 id,
                 settings_window::Section::Logging,
@@ -1705,6 +1824,7 @@ impl Workspace {
             }
             Recordings => W::Recording(recording_access::Message::Open(id)),
             AiManager => W::AiManager(super::ai_access::Message::Open(id)),
+            SavedChats => W::SavedChats(id, super::saved_chats::Message::Open),
             Editor => W::OpenEditor,
             Diagrams => W::OpenDiagram,
             FilesLeft => W::LocalDock(id, local_dock::Message::Toggle(local_dock::Side::Left)),
@@ -1759,10 +1879,18 @@ impl Workspace {
             JournalDockRight => {
                 self.journal_dock_placement(id) == super::journal_dock::Placement::Right
             }
+            CodingAgentsLeft => self.coding_agent_panel_placement(id) == CodingAgentPlacement::Left,
+            CodingAgentsRight => {
+                self.coding_agent_panel_placement(id) == CodingAgentPlacement::Right
+            }
             ToggleActionToolbar => self.chrome.toolbar.layout(id).actions_visible(),
             ToggleConnectionToolbar => self.chrome.toolbar.layout(id).visible(Group::Connections),
             ShowMenuBar => !self.menu_bar_hidden(id),
             AudibleBell => self.bell.enabled,
+            HighlightToggle => window
+                .tab()
+                .and_then(|tab| tab.focused_session())
+                .is_some_and(|session| self.highlight.enabled_for(session)),
             TabTitles => self.window_settings.tab_title_from_shell_enabled,
             PromptJumps => self.window_settings.prompt_navigation_enabled,
             Broadcast => window.tab().is_some_and(|tab| tab.broadcast),
@@ -1795,7 +1923,10 @@ impl Workspace {
         let colors = self.chrome_colors();
         let menu = self.chrome.menu.filter(|menu| {
             menu.window == id
-                && !matches!(menu.category, Category::Toolbar | Category::StatusRecovery)
+                && !matches!(
+                    menu.category,
+                    Category::Toolbar | Category::StatusRecovery | Category::CodingAgentStatus
+                )
         });
         let buttons = Category::ALL
             .into_iter()
@@ -1887,6 +2018,27 @@ impl Workspace {
         }
     }
 
+    pub(super) fn coding_agent_status_menu<'a>(
+        &'a self,
+        id: window::Id,
+        trigger: Element<'a, WorkspaceMessage>,
+    ) -> Element<'a, WorkspaceMessage> {
+        let Some((menu, window)) = self
+            .chrome
+            .menu
+            .filter(|menu| menu.window == id && menu.category == Category::CodingAgentStatus)
+            .zip(self.windows.get(&id))
+        else {
+            return popup::without_menu(trigger);
+        };
+        popup::anchor(
+            trigger,
+            self.menu_items(window, menu, None),
+            wrap(Message::Dismiss(id)),
+            move |navigation| wrap(Message::Navigate(id, navigation)),
+        )
+    }
+
     fn menu_items(
         &self,
         window: &Window,
@@ -1920,14 +2072,6 @@ impl Workspace {
                             rows
                         }
                     }
-                    Entry::Unavailable(label) => rows.push(
-                        button(row![space::horizontal().width(15), text(*label).size(13)])
-                            .width(Length::Fill)
-                            .padding([5, 6])
-                            .style(move |_, status| {
-                                button_style(status, colors.menu_hover, false, colors)
-                            }),
-                    ),
                     Submenu(Branch::RemoteSidebar)
                         if !self.remote_sidebar_menu_offered(Some(id)) =>
                     {
@@ -2069,6 +2213,11 @@ impl Workspace {
     }
 
     #[cfg(target_os = "macos")]
+    fn native_window_fallback_enabled(&self, action: Action) -> bool {
+        native_can_open_window(action) && (action != SavedChats || self.ai_chat_enabled())
+    }
+
+    #[cfg(target_os = "macos")]
     fn native_focused_main_owner(&self) -> Option<(window::Id, &Window)> {
         let id = self.native_focused_window?;
         let window = self.windows.get(&id)?;
@@ -2103,10 +2252,21 @@ impl Workspace {
     #[cfg(target_os = "macos")]
     fn native_focused_connection_dialog(&self) -> Option<window::Id> {
         self.native_focused_window.filter(|&id| {
-            self.connection_import_title(id).is_some()
+            self.connection_managers.contains_key(&id)
+                || self.connection_editor_manager(id).is_some()
+                || self.connection_import_title(id).is_some()
                 || self.connection_export_title(id).is_some()
                 || self.connection_overview_title(id).is_some()
                 || self.os_badge_manager_title(id).is_some()
+        })
+    }
+
+    #[cfg(target_os = "macos")]
+    fn native_focused_owner_modal(&self) -> Option<window::Id> {
+        self.native_focused_window.filter(|&id| {
+            self.settings.title(id).is_some()
+                || self.quick_connect_title(id).is_some()
+                || self.highlight_title(id).is_some()
         })
     }
 
@@ -2124,10 +2284,12 @@ impl Workspace {
         self.current_vault_unlock().is_some()
             || self.chrome.dialog.is_some()
             || self.native_focused_connection_dialog().is_some()
+            || self.native_focused_owner_modal().is_some()
             || active.is_none_or(|(_, window)| !window.focused)
                 && (!self.close_all_dialogs.is_empty()
-                    || self.chrome.connection_import.is_some()
-                    || self.chrome.connection_export.is_some()
+                    || !self.connection_managers.is_empty()
+                    || !self.chrome.connection_import.is_empty()
+                    || !self.chrome.connection_export.is_empty()
                     || self.has_standalone_openpgp()
                     || self.native_terminal_effects().is_some()
                     || !self.ascii_art.is_empty()
@@ -2160,6 +2322,7 @@ impl Workspace {
             || comparison_focused
             || snippet_focused.is_some()
             || self.native_focused_connection_dialog().is_some()
+            || self.native_focused_owner_modal().is_some()
             || self
                 .native_focused_window
                 .is_some_and(|id| self.ascii_art.contains_key(&id))
@@ -2182,6 +2345,19 @@ impl Workspace {
                 ""
             },
         );
+        for action in [ToggleCodingAgents, NextBlockedCodingAgent] {
+            let mut encoded = [0; 4];
+            let key: &str = if let Some(key) = self
+                .window_settings
+                .key_bindings
+                .native_command_option_key(action)
+            {
+                key.encode_utf8(&mut encoded)
+            } else {
+                ""
+            };
+            kortty_macos::sync_application_menu_command_option_key(action as u16, key);
+        }
         let sidebar_offered = self.remote_sidebar_menu_offered(active.map(|(id, _)| id));
         let sidebar_position = self.window_settings.remote_sidebar_position;
         kortty_macos::sync_application_submenu_visibility(
@@ -2259,7 +2435,7 @@ impl Workspace {
                     let enabled = if action == ReopenClosedTab {
                         self.has_recently_closed()
                     } else {
-                        native_can_open_window(action)
+                        self.native_window_fallback_enabled(action)
                     };
                     (enabled, false)
                 },
@@ -2324,7 +2500,7 @@ impl Workspace {
             return if action == CloseWindow && self.native_focused_window == Some(dialog.id) {
                 self.close_window(dialog.id)
             } else {
-                Task::none()
+                window::gain_focus(dialog.id)
             };
         }
         if action == NewWindow {
@@ -2335,7 +2511,9 @@ impl Workspace {
                 .native_focused_window
                 .filter(|&id| self.ai_manager_title(id).is_some())
         {
-            return self.close_window(id);
+            return self
+                .cancel_ai_manager_form_on_window_close(id)
+                .unwrap_or_else(|| self.close_window(id));
         }
         if action == CloseWindow
             && let Some(id) = self.native_focused_manual()
@@ -2344,6 +2522,11 @@ impl Workspace {
         }
         if action == CloseWindow
             && let Some(id) = self.native_focused_connection_dialog()
+        {
+            return self.close_window(id);
+        }
+        if action == CloseWindow
+            && let Some(id) = self.native_focused_owner_modal()
         {
             return self.close_window(id);
         }
@@ -2376,6 +2559,12 @@ impl Workspace {
         if modal_blocks {
             return Task::none();
         }
+        if action == CloseTab
+            && let Some((owner, _)) = self.native_focused_main_owner()
+            && let Some(cancel) = self.ai_manager_form_tab_close_action(owner)
+        {
+            return self.update_ai_manager(cancel);
+        }
         if action == Manual && active.is_none() {
             return self.show_manual();
         }
@@ -2405,7 +2594,7 @@ impl Workspace {
                 Task::none()
             };
         }
-        if !native_can_open_window(action) {
+        if !self.native_window_fallback_enabled(action) {
             return Task::none();
         }
         let (id, opened) = self.open_window(false);
@@ -2450,12 +2639,21 @@ const NATIVE_REMOTE_SIDEBAR_VISIBILITY: u16 = RemoteSidebarToggle as u16;
 fn native_menu_requires_focused_owner(action: Action) -> bool {
     matches!(
         action,
-        ShowCommandTimestamps
+        Cut | ShowCommandTimestamps
+            | HighlightToggle
             | ShowMenuBar
             | QuickSelect
             | SftpHere
             | SendSerialBreak
             | HideTerminalScrollbarsFullscreen
+            | CodingAgentsLeft
+            | CodingAgentsRight
+            | ToggleCodingAgents
+            | NextBlockedCodingAgent
+            | TerminalAgent
+            | TerminalAgentAsk
+            | TerminalAgentPlan
+            | AgentSwarm
     ) || action.multi_exec_action().is_some()
         || action.font_zoom().is_some()
 }
@@ -2511,7 +2709,6 @@ pub(super) fn install_native_menus() {
                 id: action as u16,
             },
             Separator => ApplicationMenuEntry::Separator,
-            Entry::Unavailable(title) => ApplicationMenuEntry::Disabled { title },
             Entry::BackgroundTransparency | Submenu(_) => return None,
         })
     }
@@ -2563,6 +2760,11 @@ pub(super) fn install_native_menus() {
         })
         .collect();
     let _ = kortty_macos::install_application_menus(&menus);
+    kortty_macos::install_status_item(
+        include_bytes!("coding_agent_app_icon/kortty_icon.png"),
+        NewWindow as u16,
+        Quit as u16,
+    );
 }
 
 fn next_item<T: Copy + Eq>(items: &[T], current: Option<T>, forward: bool) -> Option<T> {
@@ -2577,6 +2779,15 @@ fn next_item<T: Copy + Eq>(items: &[T], current: Option<T>, forward: bool) -> Op
         (None, false) => items.len() - 1,
     };
     items.get(next).copied()
+}
+
+pub(super) fn focus_dialog_field<T: Send + 'static>(
+    scope: iced::widget::Id,
+    field: &'static str,
+) -> Task<T> {
+    use iced::advanced::widget::operation::{focusable, scope as in_container};
+
+    iced_runtime::task::widget(in_container(scope, focusable::focus::<()>(field.into()))).discard()
 }
 
 fn wrap(message: Message) -> WorkspaceMessage {
@@ -3069,7 +3280,7 @@ mod menu_tests {
 
         let _ = workspace.invoke_chrome(first, ShowMenuBar);
         assert!(workspace.menu_bar_hidden(first));
-        let _ = workspace.chrome.window_closed(first);
+        workspace.chrome.window_closed(first);
         assert!(!workspace.menu_bar_hidden(first));
     }
 
@@ -3086,6 +3297,25 @@ mod menu_tests {
         let _ = workspace.update(WorkspaceMessage::Window(owner, window::Event::Focused));
         let _ = workspace.native_menu(ShowMenuBar as u16);
         assert!(!workspace.menu_bar_hidden(owner));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn native_saved_chats_menu_requires_ai_policy_before_creating_an_owner() {
+        let mut workspace = Workspace::default();
+        assert!(workspace.windows.is_empty());
+        for (ai_allowed, ai_chat_allowed) in [(true, false), (false, true)] {
+            workspace.clipboard.policy.ai_allowed = ai_allowed;
+            workspace.clipboard.policy.ai_chat_allowed = ai_chat_allowed;
+            assert!(!workspace.native_window_fallback_enabled(SavedChats));
+            let _ = workspace.native_menu(SavedChats as u16);
+            assert!(workspace.windows.is_empty());
+        }
+
+        workspace.clipboard.policy.ai_allowed = true;
+        assert!(workspace.native_window_fallback_enabled(SavedChats));
+        let _ = workspace.native_menu(SavedChats as u16);
+        assert_eq!(workspace.windows.len(), 1);
     }
 
     #[test]
@@ -3195,6 +3425,49 @@ mod menu_tests {
         assert_ne!(new_owner, source);
         assert_ne!(new_owner, destination);
         assert_eq!(workspace.windows[&new_owner].active_tab_id(), Some(tab));
+    }
+
+    #[test]
+    fn coding_agents_menu_keeps_reference_order_and_uses_the_shared_catalog() {
+        let entries = Category::View.entries();
+        assert!(entries.windows(3).any(|entries| matches!(
+            entries,
+            [
+                Submenu(Branch::LiveJournal),
+                Submenu(Branch::CodingAgents),
+                Submenu(Branch::RemoteSidebar)
+            ]
+        )));
+        assert!(matches!(
+            Branch::CodingAgents.entries(),
+            [
+                Item(CodingAgentsLeft),
+                Item(CodingAgentsRight),
+                Separator,
+                Item(ToggleCodingAgents),
+                Item(NextBlockedCodingAgent)
+            ]
+        ));
+        let mut workspace = Workspace::default();
+        workspace.window_settings.coding_agent_detection_enabled = false;
+        let (owner, _) = workspace.open_window(false);
+        for (action, label) in [
+            (CodingAgentsLeft, "Dock Left"),
+            (CodingAgentsRight, "Dock Right"),
+            (ToggleCodingAgents, "Show/Hide"),
+            (NextBlockedCodingAgent, "Next Blocked Agent"),
+        ] {
+            assert!(
+                Action::shortcut_catalog()
+                    .any(|entry| entry == (action, label, "View › Coding Agents"))
+            );
+            assert!(workspace.chrome_enabled(owner, action));
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(Action::from_native(action as u16), Some(action));
+                assert!(native_menu_requires_focused_owner(action));
+            }
+        }
     }
 
     #[test]
@@ -3451,13 +3724,16 @@ mod menu_tests {
             "kortty-unlock-vault-menu-{:016x}",
             u64::from_ne_bytes(nonce)
         )));
-        let mut directory = std::fs::DirBuilder::new();
         #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt as _;
-            directory.mode(0o700);
+            std::fs::DirBuilder::new()
+                .mode(0o700)
+                .create(&scratch.0)
+                .unwrap();
         }
-        directory.create(&scratch.0).unwrap();
+        #[cfg(not(unix))]
+        std::fs::create_dir(&scratch.0).unwrap();
         let path = scratch.0.join("vault.bin");
         let password = b"app-test-master-password";
 

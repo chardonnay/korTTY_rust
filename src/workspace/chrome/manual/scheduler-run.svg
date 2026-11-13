@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="176" viewBox="0 0 720 176">
+  <title>Scheduler run from trigger to persisted outcome</title>
+  <desc>A trigger starts route and dependency checks. A permitted action runs on its selected targets, and the scheduler saves the outcomes in the run journal.</desc>
+  <rect width="720" height="176" rx="12" fill="#111b27"/>
+  <g fill="#21354a" stroke="#8bafce" stroke-width="1.5">
+    <rect x="20" y="46" width="140" height="84" rx="8"/>
+    <rect x="200" y="46" width="140" height="84" rx="8"/>
+    <rect x="380" y="46" width="140" height="84" rx="8"/>
+    <rect x="560" y="46" width="140" height="84" rx="8"/>
+  </g>
+  <path d="M167 88h26m-7-7 7 7-7 7m161-7h26m-7-7 7 7-7 7m161-7h26m-7-7 7 7-7 7"
+        fill="none" stroke="#90d1f9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#f6faff" font-family="sans-serif" font-size="17" text-anchor="middle">
+    <text x="90" y="94">Trigger</text>
+    <text x="270" y="84">Check route and<tspan x="270" dy="23">dependencies</tspan></text>
+    <text x="450" y="84">Run action<tspan x="450" dy="23">on targets</tspan></text>
+    <text x="630" y="84">Save outcome<tspan x="630" dy="23">in run journal</tspan></text>
+  </g>
+</svg>

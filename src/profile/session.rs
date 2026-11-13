@@ -20,6 +20,8 @@ const MAX_CLOSED_TITLE_UNITS: usize = 120;
 // A full history holds 2,500 tabs, each with up to 1,024 JSON-escaped group
 // bytes, 360 title bytes and the saved ID and field names.
 const MAX_CLOSED_BYTES: u64 = 4 * 1024 * 1024;
+const MAX_OUTPUT_ENCODED: usize = kortty_vault::MAX_SEALED_RECOVERY_OUTPUT_BYTES.div_ceil(3) * 4;
+const MAX_SNAPSHOT_BYTES: u64 = MAX_BYTES + MAX_OUTPUT_ENCODED as u64 + 128;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum RestoreMode {
@@ -32,11 +34,21 @@ pub enum RestoreMode {
 impl RestoreMode {
     pub(crate) const ALL: [Self; 3] = [Self::Ask, Self::Auto, Self::Off];
 
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|mode| mode.id().eq_ignore_ascii_case(id))
+    }
+
     fn parse(text: &str) -> Self {
-        match text.trim().to_ascii_lowercase().as_str() {
-            "auto" => Self::Auto,
-            "off" => Self::Off,
-            _ => Self::Ask,
+        Self::from_id(text.trim()).unwrap_or_default()
+    }
+
+    pub(crate) fn least_automatic(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Off, _) | (_, Self::Off) => Self::Off,
+            (Self::Ask, _) | (_, Self::Ask) => Self::Ask,
+            _ => Self::Auto,
         }
     }
 
@@ -64,11 +76,23 @@ impl std::fmt::Display for RestoreMode {
 pub(crate) struct Snapshot {
     pub(crate) clean_exit: bool,
     pub(crate) layout: WorkspaceLayout,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) output: Option<String>,
 }
 
 impl Snapshot {
     fn validate(&self) -> io::Result<()> {
         self.layout.validate()?;
+        if serde_json::to_vec(&self.layout).map_err(invalid)?.len() as u64 > MAX_BYTES {
+            return Err(invalid("session layout exceeds the profile size limit"));
+        }
+        if self
+            .output
+            .as_ref()
+            .is_some_and(|output| output.len() > MAX_OUTPUT_ENCODED)
+        {
+            return Err(invalid("encrypted session output exceeds its size limit"));
+        }
         if self
             .layout
             .windows
@@ -208,12 +232,27 @@ impl Store {
     }
 
     pub(crate) fn previous(&self) -> io::Result<Option<Snapshot>> {
-        let Some(bytes) = read_regular(&self.directory.join(SNAPSHOT), MAX_BYTES)? else {
+        let Some(bytes) = read_regular(&self.directory.join(SNAPSHOT), MAX_SNAPSHOT_BYTES)? else {
             return Ok(None);
         };
         let snapshot: Snapshot = serde_json::from_slice(&bytes).map_err(invalid)?;
         snapshot.validate()?;
         Ok(Some(snapshot))
+    }
+
+    pub(crate) fn purge_saved_output(root: &Path) -> io::Result<()> {
+        let directory = root.join("session");
+        if !directory.try_exists()? {
+            return Ok(());
+        }
+        let store = Self::open_at(directory)?;
+        let Some(mut snapshot) = store.previous()? else {
+            return Ok(());
+        };
+        if snapshot.output.take().is_some() {
+            store.write(Some(&snapshot))?;
+        }
+        Ok(())
     }
 
     pub(crate) fn recently_closed(&self) -> io::Result<RecentlyClosed> {
@@ -271,7 +310,7 @@ impl Store {
         };
         snapshot.validate()?;
         let bytes = serde_json::to_vec(snapshot).map_err(invalid)?;
-        if bytes.len() as u64 > MAX_BYTES {
+        if bytes.len() as u64 > MAX_SNAPSHOT_BYTES {
             return Err(invalid("session snapshot exceeds the profile size limit"));
         }
         save_atomic(&path, &bytes)

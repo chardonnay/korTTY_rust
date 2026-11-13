@@ -94,10 +94,10 @@ fn journal_html_bundle_uses_escaped_markup_relative_images_and_policy_links() {
     options.filter.zone = TimeZone::UTC;
     let log = LogPreview::new(&selection);
     // Test double for the assembly's inventory of actually published assets.
-    let images = HashSet::from([
+    let images = Screenshots::Relative(HashSet::from([
         "screenshots/shot.png".into(),
         "screenshots/shot.ORIG.png".into(),
-    ]);
+    ]));
     let page = render(
         &snapshot,
         &selection,
@@ -110,6 +110,12 @@ fn journal_html_bundle_uses_escaped_markup_relative_images_and_policy_links() {
     .unwrap();
     assert!(page.contains("&lt;script&gt; Host &amp; notes"));
     assert!(page.contains("<dt>Commands</dt><dd>7</dd>"));
+    assert!(page.contains(
+        "#capture-panel, #image-dialog)::-webkit-scrollbar-thumb:vertical { min-height: 40px; }"
+    ));
+    assert!(page.contains(
+        "#capture-panel, #image-dialog)::-webkit-scrollbar-thumb:horizontal { min-width: 40px; }"
+    ));
     assert!(page.contains("data-marker=\"error\""));
     assert!(page.contains("data-time=\"2026-11-07 10:00:00\""));
     assert!(page.contains("src=\"screenshots/shot.png\""));
@@ -163,7 +169,7 @@ fn journal_html_bundle_embeds_inert_log_data_and_masks_redacted_rows() {
         &selection,
         &options,
         &log,
-        &HashSet::new(),
+        &Screenshots::Relative(HashSet::new()),
         false,
         &stats(),
     )

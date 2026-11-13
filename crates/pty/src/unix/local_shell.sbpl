@@ -1,0 +1,79 @@
+(version 1)
+(deny default)
+
+; System programs and their children stay under this policy.
+(allow process-fork)
+(allow process-exec
+    (subpath "/bin")
+    (subpath "/usr/bin")
+    (subpath "/usr/libexec")
+    (subpath (param "WORKSPACE"))
+    (subpath (param "SCRATCH")))
+(allow signal (target same-sandbox))
+(allow process-info* (target same-sandbox))
+
+(allow file-read* file-map-executable
+    (subpath "/bin")
+    (subpath "/usr/bin")
+    (subpath "/usr/lib")
+    (subpath "/usr/libexec")
+    (subpath "/System/Library")
+    (subpath "/private/var/db/dyld")
+    (subpath (param "WORKSPACE"))
+    (subpath (param "SCRATCH")))
+; The system shell startup reads the root directory and its shell selector.
+(allow file-read-data (literal "/"))
+(allow file-read*
+    (subpath "/usr/share/locale")
+    (subpath "/usr/share/terminfo")
+    (subpath "/usr/share/zoneinfo")
+    (literal "/private/etc/hosts")
+    (literal "/private/etc/resolv.conf")
+    (literal "/private/var/run/resolv.conf")
+    (literal "/private/var/select/sh")
+    (literal "/private/etc/localtime")
+    (literal "/private/etc/passwd")
+    (literal "/private/etc/group")
+    (literal "/dev/null")
+    (literal "/dev/zero")
+    (literal "/dev/random")
+    (literal "/dev/urandom"))
+(allow file-write*
+    (subpath (param "WORKSPACE"))
+    (subpath (param "SCRATCH")))
+(allow file-write-data
+    (require-all
+        (vnode-type CHARACTER-DEVICE)
+        (require-any
+            (literal "/dev/null")
+            (literal "/dev/tty")
+            (literal (param "PTY")))))
+(allow file-read* file-ioctl
+    (literal "/dev/tty")
+    (literal (param "PTY")))
+
+; Permit IP sockets without granting arbitrary local IPC.
+(allow network-bind (local ip "*:*"))
+(allow network-inbound (local ip "*:*"))
+(allow network-outbound (remote ip "*:*"))
+; Darwin's DNS resolver uses this system Unix socket.
+(allow network-outbound
+    (remote unix-socket (literal "/var/run/mDNSResponder"))
+    (remote unix-socket (literal "/private/var/run/mDNSResponder")))
+(allow system-socket
+    (socket-domain AF_UNIX)
+    (require-all (socket-domain AF_SYSTEM) (socket-protocol 2)))
+(allow mach-lookup
+    (global-name "com.apple.system.opendirectoryd.libinfo")
+    (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+    (global-name "com.apple.SystemConfiguration.configd")
+    (global-name "com.apple.networkd")
+    (global-name "com.apple.trustd.agent"))
+(allow sysctl-read
+    (sysctl-name-prefix "hw.")
+    (sysctl-name-prefix "kern.os")
+    (sysctl-name-prefix "net.routetable")
+    (sysctl-name "kern.argmax")
+    (sysctl-name "kern.hostname")
+    (sysctl-name "kern.maxfilesperproc")
+    (sysctl-name "kern.version"))

@@ -1,9 +1,10 @@
 //! Assembles an HTML bundle from one validated journal snapshot.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::io;
 
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use roxmltree::Node;
 
 use crate::private_files::Directory;
@@ -21,6 +22,9 @@ mod xml;
 
 const MAX_CAPTURE_INPUT_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SCREENSHOT_REFERENCES: usize = 4096;
+const MAX_INLINE_PNG_BYTES: usize = 24 * 1024 * 1024;
+
+type WriteMember<'a> = dyn FnMut(&str, &[u8]) -> io::Result<()> + 'a;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct BundleStats {
@@ -56,6 +60,26 @@ impl Selection<'_> {
         mut emit: impl FnMut(&str, &[u8]) -> io::Result<()>,
         cancelled: &dyn Fn() -> bool,
     ) -> io::Result<BundleStats> {
+        let (_, stats) = self.render_html(options, links_allowed, Some(&mut emit), cancelled)?;
+        Ok(stats)
+    }
+
+    /// Renders a self-contained page for a reviewed local browser handoff.
+    pub(crate) fn render_browser_html(
+        &self,
+        options: &Options,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<(String, BundleStats)> {
+        self.render_html(options, false, None, cancelled)
+    }
+
+    fn render_html(
+        &self,
+        options: &Options,
+        links_allowed: bool,
+        mut archive: Option<&mut WriteMember<'_>>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> io::Result<(String, BundleStats)> {
         check_cancelled(cancelled)?;
         self.require_matches(&options.filter)?;
         let snapshot = self.snapshot;
@@ -93,7 +117,10 @@ impl Selection<'_> {
             &mut capture_budget,
             cancelled,
             |output| match output {
-                capture::Output::Part(part) => emit(part.name, part.bytes),
+                capture::Output::Part(part) => match &mut archive {
+                    Some(emit) => emit(part.name, part.bytes),
+                    None => Ok(()),
+                },
                 capture::Output::Record(row) => {
                     log.push(
                         &row.record,
@@ -126,11 +153,21 @@ impl Selection<'_> {
                 capture_incomplete: captured.partial,
             }
         };
-        let screenshots = if options.include_screenshots {
+        let standalone = archive.is_none();
+        let mut screenshots = if standalone {
+            html::Screenshots::Inline(HashMap::new())
+        } else {
+            html::Screenshots::Relative(HashSet::new())
+        };
+        if options.include_screenshots {
             let references = screenshot_references(
                 &nodes,
                 selected,
-                captured.screenshot_refs,
+                if standalone {
+                    BTreeSet::new()
+                } else {
+                    captured.screenshot_refs
+                },
                 &mut stats,
                 cancelled,
             )?;
@@ -142,15 +179,40 @@ impl Selection<'_> {
             if !same {
                 return Err(super::changed());
             }
+            let mut inline_bytes = 0;
             write_screenshots(
-                &journal, references, filtered, &mut stats, &mut emit, cancelled,
-            )?
-        } else {
-            HashSet::new()
-        };
-        let published_xml = xml::rewrite(original, &document, &nodes, selected, options, &stats)?;
-        check_cancelled(cancelled)?;
-        emit(DOCUMENT, published_xml.as_bytes())?;
+                &journal,
+                references,
+                filtered || standalone,
+                &mut stats,
+                &mut |path, bytes| {
+                    match &mut screenshots {
+                        html::Screenshots::Relative(paths) => {
+                            let emit = archive.as_mut().expect("archive renderer");
+                            emit(path, bytes)?;
+                            paths.insert(path.to_owned());
+                        }
+                        html::Screenshots::Inline(urls) => {
+                            if inline_bytes + bytes.len() > MAX_INLINE_PNG_BYTES {
+                                return Ok(false);
+                            }
+                            inline_bytes += bytes.len();
+                            let mut url = String::from("data:image/png;base64,");
+                            STANDARD.encode_string(bytes, &mut url);
+                            urls.insert(path.to_owned(), url);
+                        }
+                    }
+                    Ok(true)
+                },
+                cancelled,
+            )?;
+        }
+        if let Some(emit) = &mut archive {
+            let published_xml =
+                xml::rewrite(original, &document, &nodes, selected, options, &stats)?;
+            check_cancelled(cancelled)?;
+            emit(DOCUMENT, published_xml.as_bytes())?;
+        }
         let page = html::render(
             snapshot,
             selected,
@@ -161,11 +223,13 @@ impl Selection<'_> {
             &stats,
         )?;
         check_cancelled(cancelled)?;
-        emit("journal.html", page.as_bytes())?;
+        if let Some(emit) = archive {
+            emit("journal.html", page.as_bytes())?;
+        }
         snapshot.identity.require_document(source.file())?;
         snapshot.open_current_source()?;
         check_cancelled(cancelled)?;
-        Ok(stats)
+        Ok((page, stats))
     }
 }
 
@@ -213,18 +277,17 @@ fn write_screenshots(
     mut references: BTreeSet<capture::ScreenshotRef>,
     filtered: bool,
     stats: &mut BundleStats,
-    emit: &mut impl FnMut(&str, &[u8]) -> io::Result<()>,
+    emit: &mut impl FnMut(&str, &[u8]) -> io::Result<bool>,
     cancelled: &dyn Fn() -> bool,
-) -> io::Result<HashSet<String>> {
-    let mut published = HashSet::new();
+) -> io::Result<()> {
     if filtered && references.is_empty() {
-        return Ok(published);
+        return Ok(());
     }
     let folder = match journal.deletion_child(OsStr::new("screenshots")) {
         Ok(folder) => folder,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             stats.skipped_assets += references.len();
-            return Ok(published);
+            return Ok(());
         }
         Err(error) => return Err(error),
     };
@@ -250,15 +313,16 @@ fn write_screenshots(
             stats.skipped_assets += 1;
             continue;
         };
-        emit(path, &bytes)?;
-        published.insert(path.to_owned());
+        if !emit(path, &bytes)? {
+            stats.skipped_assets += 1;
+        }
     }
     if !folder.same_as(&journal.deletion_child(OsStr::new("screenshots"))?)? {
         return Err(invalid(
             "The journal screenshot directory changed during export",
         ));
     }
-    Ok(published)
+    Ok(())
 }
 
 fn add_directory_screenshots(

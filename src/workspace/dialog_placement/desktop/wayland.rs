@@ -32,7 +32,7 @@ impl Opening {
             .then(Self::default)
     }
 
-    fn constrain(&self, settings: &mut window::Settings) {
+    pub(super) fn constrain(&self, settings: &mut window::Settings) {
         let size = settings.size;
         // Preserve the dialog's normal resize limits and Winit's minimum surface size.
         if size.width < 2.0
@@ -91,26 +91,4 @@ impl Opening {
                 iced_runtime::window::Action::RedrawAll,
             )))
     }
-}
-
-pub(super) fn open(
-    reference: window::Id,
-    id: window::Id,
-    settings: window::Settings,
-    opening: Opening,
-) -> Task<window::Id> {
-    window::run(reference, |native| {
-        use window::raw_window_handle::RawDisplayHandle;
-
-        native
-            .display_handle()
-            .is_ok_and(|display| matches!(display.as_raw(), RawDisplayHandle::Wayland(_)))
-    })
-    .then(move |wayland| {
-        let mut settings = settings.clone();
-        if wayland {
-            opening.constrain(&mut settings);
-        }
-        super::open_native(id, settings)
-    })
 }

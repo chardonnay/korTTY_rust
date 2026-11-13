@@ -10,9 +10,46 @@ use sunset::ed25519_dalek::{Signer, SigningKey};
 
 #[test]
 fn rejects_signed_zero_x25519_before_first_use_approval() {
-    let error = reject_peer("zero", send_zero_point_reply);
+    let error = reject_peer("zero", |stream| send_zero_point_reply(stream, None));
     assert!(
         matches!(error, ConnectError::Protocol(sunset::Error::BadKex)),
+        "{error:?}"
+    );
+}
+
+#[test]
+fn ignores_wrong_kex_guess_before_decoding_or_host_key_approval() {
+    let decoy = SigningKey::from_bytes(&[43; 32]);
+    let key = ed25519_host_key(decoy.verifying_key().as_bytes());
+    for (name, guess) in [
+        ("guessed-host-key", ed25519_reply(&key, &[9; 32], &[0; 64])),
+        ("malformed-guess", vec![31]),
+    ] {
+        let error = reject_peer(name, |stream| send_zero_point_reply(stream, Some(guess)));
+        assert!(
+            matches!(error, ConnectError::Protocol(sunset::Error::BadKex)),
+            "{error:?}"
+        );
+    }
+}
+
+#[test]
+fn rejects_ed25519_identity_key_before_first_use_approval() {
+    let error = reject_peer("ed25519-identity", |stream| {
+        let (mut stream, _, _, _) = exchange_kex_init(stream, true, "ssh-ed25519", false);
+        assert_eq!(read_packet(&mut stream).first(), Some(&30));
+        let mut identity = [0; 32];
+        identity[0] = 1;
+        let mut signature = [0; 64];
+        signature[..32].fill(0x66);
+        signature[0] = 0x58;
+        signature[32] = 1;
+        let key = ed25519_host_key(&identity);
+        write_packet(stream.get_mut(), &ed25519_reply(&key, &[9; 32], &signature));
+        assert_closed(&mut stream);
+    });
+    assert!(
+        matches!(error, ConnectError::Protocol(sunset::Error::BadSig)),
         "{error:?}"
     );
 }
@@ -21,7 +58,7 @@ fn rejects_signed_zero_x25519_before_first_use_approval() {
 fn rejects_legacy_kex_before_sending_ephemeral_key_or_credentials() {
     let error = reject_peer("legacy", |stream| {
         // This protocol test double omits the strict KEX extension.
-        let (mut stream, _, _, _) = exchange_kex_init(stream, false, "ssh-ed25519");
+        let (mut stream, _, _, _) = exchange_kex_init(stream, false, "ssh-ed25519", false);
         assert_closed(&mut stream);
     });
     assert!(
@@ -40,7 +77,7 @@ fn rejects_ecdsa_key_with_a_different_curve_name_before_userauth() {
     let error = reject_peer("wrong-curve", |stream| {
         // This protocol test double substitutes a curve identifier inside the key blob.
         let algorithm = "ecdsa-sha2-nistp256";
-        let (mut stream, _, _, _) = exchange_kex_init(stream, true, algorithm);
+        let (mut stream, _, _, _) = exchange_kex_init(stream, true, algorithm, false);
         assert_eq!(read_packet(&mut stream).first(), Some(&30));
         let mut key = Vec::new();
         ssh_string(&mut key, algorithm.as_bytes());
@@ -109,6 +146,7 @@ fn exchange_kex_init(
     stream: TcpStream,
     strict: bool,
     host_key_algorithm: &str,
+    wrong_guess: bool,
 ) -> (BufReader<TcpStream>, String, Vec<u8>, Vec<u8>) {
     stream
         .set_read_timeout(Some(Duration::from_secs(4)))
@@ -123,10 +161,10 @@ fn exchange_kex_init(
 
     let mut server_kex = vec![20];
     server_kex.extend_from_slice(&[7; 16]);
-    let kex = if strict {
-        "curve25519-sha256,kex-strict-s-v00@openssh.com"
-    } else {
-        "curve25519-sha256"
+    let kex = match (strict, wrong_guess) {
+        (true, true) => "unsupported@fixture,curve25519-sha256,kex-strict-s-v00@openssh.com",
+        (true, false) => "curve25519-sha256,kex-strict-s-v00@openssh.com",
+        (false, _) => "curve25519-sha256",
     };
     for names in [
         kex,
@@ -142,24 +180,25 @@ fn exchange_kex_init(
     ] {
         ssh_string(&mut server_kex, names.as_bytes());
     }
-    server_kex.extend_from_slice(&[0; 5]);
+    server_kex.extend_from_slice(&[u8::from(wrong_guess), 0, 0, 0, 0]);
     write_packet(stream.get_mut(), &server_kex);
     (stream, client_ident, client_kex, server_kex)
 }
 
-fn send_zero_point_reply(stream: TcpStream) {
+fn send_zero_point_reply(stream: TcpStream, guess: Option<Vec<u8>>) {
     // This protocol test double deliberately signs a forbidden exchange.
     // The signing key is public test data and never used in production.
     let (mut stream, client_ident, client_kex, server_kex) =
-        exchange_kex_init(stream, true, "ssh-ed25519");
+        exchange_kex_init(stream, true, "ssh-ed25519", guess.is_some());
     let client_share = read_packet(&mut stream);
     assert_eq!(&client_share[..5], &[30, 0, 0, 0, 32]);
     assert_eq!(client_share.len(), 37);
 
     let signing = SigningKey::from_bytes(&[42; 32]);
-    let mut host_key = Vec::new();
-    ssh_string(&mut host_key, b"ssh-ed25519");
-    ssh_string(&mut host_key, signing.verifying_key().as_bytes());
+    if let Some(guess) = guess {
+        write_packet(stream.get_mut(), &guess);
+    }
+    let host_key = ed25519_host_key(signing.verifying_key().as_bytes());
     let server_share = [0; 32];
     let mut exchange = Vec::new();
     for field in [
@@ -175,16 +214,30 @@ fn send_zero_point_reply(stream: TcpStream) {
     ] {
         ssh_string(&mut exchange, field);
     }
-    let signature = signing.sign(&Sha256::digest(&exchange));
+    let signature = signing.sign(&Sha256::digest(&exchange)).to_bytes();
+    write_packet(
+        stream.get_mut(),
+        &ed25519_reply(&host_key, &server_share, &signature),
+    );
+    assert_closed(&mut stream);
+}
+
+fn ed25519_host_key(key: &[u8; 32]) -> Vec<u8> {
+    let mut host_key = Vec::new();
+    ssh_string(&mut host_key, b"ssh-ed25519");
+    ssh_string(&mut host_key, key);
+    host_key
+}
+
+fn ed25519_reply(key: &[u8], share: &[u8; 32], signature: &[u8; 64]) -> Vec<u8> {
     let mut signature_blob = Vec::new();
     ssh_string(&mut signature_blob, b"ssh-ed25519");
-    ssh_string(&mut signature_blob, &signature.to_bytes());
+    ssh_string(&mut signature_blob, signature);
     let mut reply = vec![31];
-    ssh_string(&mut reply, &host_key);
-    ssh_string(&mut reply, &server_share);
+    ssh_string(&mut reply, key);
+    ssh_string(&mut reply, share);
     ssh_string(&mut reply, &signature_blob);
-    write_packet(stream.get_mut(), &reply);
-    assert_closed(&mut stream);
+    reply
 }
 
 fn assert_closed(stream: &mut impl Read) {

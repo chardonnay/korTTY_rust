@@ -1,10 +1,13 @@
-//! Portable, credential-free exports of selected saved SSH profiles.
+//! Portable, credential-free exports of selected saved connection profiles.
 
 use std::fmt::{self, Write as _};
 use std::io;
 
-use crate::connection_store::{Connection, MAX_GROUP_PATH_BYTES, TunnelConfig, TunnelTarget};
+use crate::connection_store::{
+    Connection, LocalProfile, MAX_GROUP_PATH_BYTES, SerialProfile, TunnelConfig, TunnelTarget,
+};
 use crate::ssh_dialog::unsafe_text;
+use crate::terminal_theme::Themes;
 
 pub(crate) mod protection;
 mod xml;
@@ -51,6 +54,27 @@ pub(crate) struct Entry<'a> {
     pub(crate) os_badge: Option<&'a str>,
 }
 
+pub(crate) struct LocalEntry<'a> {
+    pub(crate) profile: &'a LocalProfile,
+    pub(crate) group: &'a str,
+}
+
+pub(crate) struct SerialEntry<'a> {
+    pub(crate) profile: &'a SerialProfile,
+    pub(crate) group: &'a str,
+}
+
+pub(crate) fn java_local_profile(profile: &LocalProfile) -> bool {
+    profile.shell.is_default()
+        && profile.command.as_ref().is_none_or(|command| {
+            command.iter().all(|word| {
+                !word.is_empty()
+                    && !word.contains(['"', '\u{fffe}', '\u{ffff}'])
+                    && !word.chars().any(char::is_control)
+            })
+        })
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Options {
     pub(crate) include_username: bool,
@@ -87,23 +111,56 @@ fn encode(format: Format, entries: &[Entry<'_>]) -> io::Result<Vec<u8>> {
     encode_with_options(format, entries, Options::default())
 }
 
-/// Serializes the requested profiles without consulting the vault or filesystem.
-pub(crate) fn encode_with_options(
+#[cfg(test)]
+fn encode_with_options(
     format: Format,
     entries: &[Entry<'_>],
     options: Options,
 ) -> io::Result<Vec<u8>> {
-    if entries.is_empty() || entries.len() > 512 {
+    encode_profiles(format, entries, &[], &[], options, None)
+}
+
+/// Serializes the requested profiles without consulting the vault or filesystem.
+pub(crate) fn encode_profiles(
+    format: Format,
+    entries: &[Entry<'_>],
+    locals: &[LocalEntry<'_>],
+    serials: &[SerialEntry<'_>],
+    options: Options,
+    themes: Option<&Themes>,
+) -> io::Result<Vec<u8>> {
+    if !(1..=512).contains(&(entries.len() + locals.len() + serials.len())) {
         return Err(invalid("Select between 1 and 512 connections to export."));
+    }
+    if !locals.is_empty() && format != Format::Kortty {
+        return Err(invalid(
+            "Local shell profiles require the kortty XML format.",
+        ));
+    }
+    if !serials.is_empty() && format != Format::Kortty {
+        return Err(invalid("Serial profiles require the kortty XML format."));
     }
     for entry in entries {
         entry.connection.validate()?;
-        if entry.group.len() > MAX_GROUP_PATH_BYTES || unsafe_text(entry.group) {
+    }
+    for entry in locals {
+        entry.profile.validate()?;
+    }
+    for entry in serials {
+        entry.profile.validate()?;
+    }
+    for group in entries
+        .iter()
+        .map(|entry| entry.group)
+        .chain(locals.iter().map(|entry| entry.group))
+        .chain(serials.iter().map(|entry| entry.group))
+    {
+        if group.len() > MAX_GROUP_PATH_BYTES || unsafe_text(group) {
             return Err(invalid("An exported connection has an invalid folder."));
         }
     }
     let result = match format {
-        Format::Kortty => xml::kortty(entries, options),
+        Format::Kortty => xml::kortty(entries, locals, serials, options, themes)?,
         Format::Mtputty => xml::mtputty(entries, options),
         Format::Mobaxterm => mobaxterm(entries, options)?,
         Format::PuttyCm => putty_cm(entries, options)?,

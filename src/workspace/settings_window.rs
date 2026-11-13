@@ -1,26 +1,38 @@
 use std::fmt;
+use std::ops::RangeInclusive;
 
-use iced::keyboard::{Key, Modifiers};
+use iced::keyboard::{Key, Modifiers, key::Named};
 use iced::widget::{
-    self, button, checkbox, column, container, pick_list, row, rule, scrollable, slider, space,
-    text, text_input, tooltip,
+    self, button, checkbox, column, container, opaque, pick_list, row, rule, scrollable, slider,
+    space, stack, text, text_input, tooltip,
 };
 use iced::{Alignment, Element, Length, Size, Task, window};
+use kortty_ssh::KeepAlive;
+use kortty_terminal::TextEncoding;
 use unicode_normalization::{UnicodeNormalization, char::is_combining_mark};
 
 use crate::clipboard_policy::ClipboardPolicy;
+use crate::connection_store::{
+    MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS,
+};
 use crate::profile::{self, session::RestoreMode};
 use crate::profile_backup::preferences::Preferences as BackupPreferences;
+use crate::sftp_window::ConflictDefault;
+#[cfg(test)]
+use crate::terminal_agent::design::Preset as AgentDesign;
 use crate::terminal_theme::{BoldTextMode, MONOSPACED, Scheme, installed_families, installed_font};
-use crate::workspace::dialog_placement::Kind as DialogKind;
+use crate::workspace::dialog_placement::{Kind as DialogKind, escape::on_escape};
+use kortty_terminal::ScrollbackConfig;
 
 use super::{
     Message as Desktop, Workspace,
     appearance::Design,
     chrome::TOOLBAR_ICON_SIZE,
+    highlight,
     key_bindings::{Edit, Editor as KeyboardEditor},
     paste_protection::{MAX_PASTE_KIB, WarningMode},
     session_restore,
+    sftp_access::SftpConflictPolicy,
     tab_titles::{
         MAX_TERMINAL_SILENCE_SECONDS, MIN_TERMINAL_SILENCE_SECONDS, RemoteSidebarPosition,
         WindowSettings,
@@ -29,13 +41,22 @@ use super::{
 
 const TITLE: &str = "Settings";
 const MAX_SEARCH_BYTES: usize = 192;
+const SEARCH_MAX_WIDTH: f32 = 660.0;
+const SEARCH_RESULTS_MAX_HEIGHT: f32 = 380.0;
+const SEARCH_ROW_HEIGHT: f32 = 32.0;
 
+mod agent_design_settings;
 mod appearance_settings;
 mod backup;
 mod color_settings;
+mod editor_settings;
 mod export_settings;
+mod highlight_settings;
 mod logging_settings;
 mod quick_select_settings;
+mod search_input;
+mod sftp_settings;
+mod snippet_editor_settings;
 mod startup_settings;
 mod theme_settings;
 mod video_settings;
@@ -54,10 +75,15 @@ pub enum Section {
     Export,
     Window,
     Keyboard,
+    Editor,
+    SnippetEditor,
+    AgentDesign,
+    Updates,
+    Sftp,
 }
 
 impl Section {
-    const ALL: [Self; 12] = [
+    pub(in crate::workspace) const ALL: [Self; 17] = [
         Self::Font,
         Self::Colors,
         Self::Themes,
@@ -70,6 +96,11 @@ impl Section {
         Self::Export,
         Self::Window,
         Self::Keyboard,
+        Self::Editor,
+        Self::SnippetEditor,
+        Self::AgentDesign,
+        Self::Updates,
+        Self::Sftp,
     ];
 
     fn label(self) -> &'static str {
@@ -86,6 +117,11 @@ impl Section {
             Self::Export => "Export",
             Self::Window => "Window",
             Self::Keyboard => "Keyboard",
+            Self::Editor => "Editor",
+            Self::SnippetEditor => "Snippet Editor",
+            Self::AgentDesign => "AI Agent Design",
+            Self::Updates => "Updates",
+            Self::Sftp => "SFTP",
         }
     }
 
@@ -103,6 +139,11 @@ impl Section {
             Self::Export => 9,
             Self::Window => 10,
             Self::Keyboard => 11,
+            Self::Editor => 12,
+            Self::SnippetEditor => 13,
+            Self::AgentDesign => 14,
+            Self::Updates => 15,
+            Self::Sftp => 16,
         }
     }
 
@@ -120,17 +161,35 @@ pub enum Setting {
     Appearance,
     PasteWarning,
     LargePasteWarning,
+    PasteLineDelay,
     ClipboardWrite,
     ClipboardRead,
     CommandMarks,
     CommandTimestamps,
     RemoteSidebar,
+    SftpParallel,
+    SftpResume,
+    SftpConflictDefault,
+    SftpArchive,
+    SftpIdle,
+    InitialTerminalSize,
+    SerialDefaultEncoding,
     TerminalLinkDetection,
     TerminalCopyOnSelect,
     QuickSelectAlphabet,
     QuickSelectPatterns,
+    Highlighting,
     TerminalScrollbar,
+    ScrollbackLines,
+    ScrollbackMemory,
     ScrollbackCompression,
+    SshKeepAlive,
+    SshKeepAliveInterval,
+    CodingAgentDetection,
+    CodingAgentAppBadge,
+    CodingAgentNotifications,
+    TerminalNotifications,
+    CodingAgentDockAutomatic,
     BoldTextMode,
     SilenceThreshold,
     RecordingAfterRestart,
@@ -147,7 +206,9 @@ pub enum Setting {
     JournalAutomaticVision,
     ExportWatermark,
     ExportFooter,
+    ExportSnippetCode,
     ToolbarIconSize,
+    StartupMasterPassword,
     RememberGeometry,
     RememberDashboard,
     FixedGeometry,
@@ -159,10 +220,21 @@ pub enum Setting {
     Restore,
     Transparency,
     Shortcuts,
+    EditorCursorStyle,
+    EditorCursorColor,
+    SnippetFontFamily,
+    SnippetFontSize,
+    SnippetForeground,
+    SnippetBackground,
+    SnippetCursorStyle,
+    SnippetCursorColor,
+    AgentDesign,
+    ApplicationUpdates,
+    ApplicationUpdateInterval,
 }
 
 impl Setting {
-    const ALL: [Self; 46] = [
+    const ALL: [Self; 77] = [
         Self::FontFamily,
         Self::FontSize,
         Self::Colors,
@@ -170,17 +242,35 @@ impl Setting {
         Self::Appearance,
         Self::PasteWarning,
         Self::LargePasteWarning,
+        Self::PasteLineDelay,
         Self::ClipboardWrite,
         Self::ClipboardRead,
         Self::CommandMarks,
         Self::CommandTimestamps,
         Self::RemoteSidebar,
+        Self::SftpParallel,
+        Self::SftpResume,
+        Self::SftpConflictDefault,
+        Self::SftpArchive,
+        Self::SftpIdle,
+        Self::InitialTerminalSize,
+        Self::SerialDefaultEncoding,
         Self::TerminalLinkDetection,
         Self::TerminalCopyOnSelect,
         Self::QuickSelectAlphabet,
         Self::QuickSelectPatterns,
+        Self::Highlighting,
         Self::TerminalScrollbar,
+        Self::ScrollbackLines,
+        Self::ScrollbackMemory,
         Self::ScrollbackCompression,
+        Self::SshKeepAlive,
+        Self::SshKeepAliveInterval,
+        Self::CodingAgentDetection,
+        Self::CodingAgentAppBadge,
+        Self::CodingAgentNotifications,
+        Self::TerminalNotifications,
+        Self::CodingAgentDockAutomatic,
         Self::BoldTextMode,
         Self::SilenceThreshold,
         Self::RecordingAfterRestart,
@@ -197,7 +287,9 @@ impl Setting {
         Self::JournalAutomaticVision,
         Self::ExportWatermark,
         Self::ExportFooter,
+        Self::ExportSnippetCode,
         Self::ToolbarIconSize,
+        Self::StartupMasterPassword,
         Self::RememberGeometry,
         Self::RememberDashboard,
         Self::FixedGeometry,
@@ -209,6 +301,17 @@ impl Setting {
         Self::Restore,
         Self::Transparency,
         Self::Shortcuts,
+        Self::EditorCursorStyle,
+        Self::EditorCursorColor,
+        Self::SnippetFontFamily,
+        Self::SnippetFontSize,
+        Self::SnippetForeground,
+        Self::SnippetBackground,
+        Self::SnippetCursorStyle,
+        Self::SnippetCursorColor,
+        Self::AgentDesign,
+        Self::ApplicationUpdates,
+        Self::ApplicationUpdateInterval,
     ];
 
     fn label(self) -> &'static str {
@@ -220,6 +323,7 @@ impl Setting {
             Self::Appearance => "App design and animations",
             Self::PasteWarning => "Warn about line breaks and control characters",
             Self::LargePasteWarning => "Warn about pastes larger than",
+            Self::PasteLineDelay => "Pause between pasted lines",
             Self::ClipboardWrite => {
                 "Let programs in the terminal copy text to the clipboard (OSC 52 and OSC 5522)"
             }
@@ -231,12 +335,33 @@ impl Setting {
             }
             Self::CommandTimestamps => "Show command timestamps",
             Self::RemoteSidebar => "Remote files sidebar",
+            Self::SftpParallel => "Parallel file transfers",
+            Self::SftpResume => "Resume partial transfers",
+            Self::SftpConflictDefault => "Default transfer conflict action",
+            Self::SftpArchive => "Archive defaults",
+            Self::SftpIdle => "Close SFTP after inactivity",
+            Self::InitialTerminalSize => "Initial terminal size",
+            Self::SerialDefaultEncoding => "Default serial character encoding",
             Self::TerminalLinkDetection => "Detect web and e-mail addresses in terminal text",
             Self::TerminalCopyOnSelect => "Copy selection to clipboard automatically",
             Self::QuickSelectAlphabet => "Quick select label letters",
             Self::QuickSelectPatterns => "Quick select patterns",
+            Self::Highlighting => "Keyword highlighting",
             Self::TerminalScrollbar => "Show scrollbar in terminal",
+            Self::ScrollbackLines => "Maximum scrollback lines",
+            Self::ScrollbackMemory => "Scrollback memory limit",
             Self::ScrollbackCompression => "Compress the scrollback in the background while idle",
+            Self::SshKeepAlive => "Enable SSH keepalive",
+            Self::SshKeepAliveInterval => "SSH keepalive interval",
+            Self::CodingAgentDetection => "Detect coding agents in local shell tabs",
+            Self::CodingAgentAppBadge => {
+                "Show the number of agents waiting for a decision on the app icon"
+            }
+            Self::CodingAgentNotifications => {
+                "Notify when a coding agent needs a decision or finishes in an unfocused pane"
+            }
+            Self::TerminalNotifications => "Terminal desktop notifications",
+            Self::CodingAgentDockAutomatic => "Automatically show and hide the Coding Agents panel",
             Self::BoldTextMode => "Bold text",
             Self::SilenceThreshold => "Monitor for Silence reports after",
             Self::RecordingAfterRestart => "Enable terminal recording after app restart",
@@ -251,9 +376,11 @@ impl Setting {
             Self::JournalAiProfile => "Enable local journal AI profile",
             Self::JournalVision => "Allow image input for this local model",
             Self::JournalAutomaticVision => "Automatically analyze screenshots with AI",
-            Self::ExportWatermark => "Add a watermark to exported PDFs",
+            Self::ExportWatermark => "Add a watermark to exported documents",
             Self::ExportFooter => "Show a footer in exported documents",
+            Self::ExportSnippetCode => "Include full script in analysis reports by default",
             Self::ToolbarIconSize => "Toolbar icon size",
+            Self::StartupMasterPassword => "Require master password at startup",
             Self::RememberGeometry => "Remember window geometry",
             Self::RememberDashboard => "Remember dashboard state",
             Self::FixedGeometry => "Use fixed window geometry",
@@ -265,6 +392,17 @@ impl Setting {
             Self::Restore => "At startup",
             Self::Transparency => "Terminal transparency",
             Self::Shortcuts => "Keyboard shortcuts",
+            Self::EditorCursorStyle => "Cursor style",
+            Self::EditorCursorColor => "Cursor color",
+            Self::SnippetFontFamily => "Font family",
+            Self::SnippetFontSize => "Font size",
+            Self::SnippetForeground => "Foreground color",
+            Self::SnippetBackground => "Background color",
+            Self::SnippetCursorStyle => "Cursor style",
+            Self::SnippetCursorColor => "Cursor color",
+            Self::AgentDesign => "Default AI agent design",
+            Self::ApplicationUpdates => "Check automatically for Rust updates",
+            Self::ApplicationUpdateInterval => "Update check interval",
         }
     }
 
@@ -274,21 +412,41 @@ impl Setting {
             Self::Colors => Section::Colors,
             Self::Themes => Section::Themes,
             Self::Appearance => Section::Appearance,
+            Self::AgentDesign => Section::AgentDesign,
+            Self::ApplicationUpdates | Self::ApplicationUpdateInterval => Section::Updates,
+            Self::SftpParallel
+            | Self::SftpResume
+            | Self::SftpConflictDefault
+            | Self::SftpArchive
+            | Self::SftpIdle => Section::Sftp,
             Self::PasteWarning
             | Self::LargePasteWarning
+            | Self::PasteLineDelay
             | Self::ClipboardWrite
             | Self::ClipboardRead
             | Self::CommandMarks
             | Self::CommandTimestamps
             | Self::RemoteSidebar
+            | Self::InitialTerminalSize
+            | Self::SerialDefaultEncoding
             | Self::TerminalLinkDetection
             | Self::TerminalCopyOnSelect
             | Self::QuickSelectAlphabet
             | Self::QuickSelectPatterns
+            | Self::Highlighting
             | Self::TerminalScrollbar
+            | Self::ScrollbackLines
+            | Self::ScrollbackMemory
             | Self::ScrollbackCompression
+            | Self::SshKeepAlive
+            | Self::SshKeepAliveInterval
+            | Self::CodingAgentDetection
+            | Self::CodingAgentAppBadge
+            | Self::CodingAgentDockAutomatic
             | Self::BoldTextMode => Section::Terminal,
-            Self::SilenceThreshold => Section::Messaging,
+            Self::CodingAgentNotifications
+            | Self::TerminalNotifications
+            | Self::SilenceThreshold => Section::Messaging,
             Self::RecordingAfterRestart | Self::RecordingColors => Section::Video,
             Self::BackupRetention | Self::BackupCredential | Self::AutomaticBackup => {
                 Section::Backup
@@ -300,8 +458,9 @@ impl Setting {
             | Self::JournalAiProfile
             | Self::JournalVision
             | Self::JournalAutomaticVision => Section::Logging,
-            Self::ExportWatermark | Self::ExportFooter => Section::Export,
+            Self::ExportWatermark | Self::ExportFooter | Self::ExportSnippetCode => Section::Export,
             Self::ToolbarIconSize
+            | Self::StartupMasterPassword
             | Self::RememberGeometry
             | Self::RememberDashboard
             | Self::FixedGeometry
@@ -313,6 +472,13 @@ impl Setting {
             | Self::Restore
             | Self::Transparency => Section::Window,
             Self::Shortcuts => Section::Keyboard,
+            Self::EditorCursorStyle | Self::EditorCursorColor => Section::Editor,
+            Self::SnippetFontFamily
+            | Self::SnippetFontSize
+            | Self::SnippetForeground
+            | Self::SnippetBackground
+            | Self::SnippetCursorStyle
+            | Self::SnippetCursorColor => Section::SnippetEditor,
         }
     }
 
@@ -329,11 +495,27 @@ impl Setting {
                 "paste safety protection multiline bracketed escape bidi confirmation"
             }
             Self::LargePasteWarning => "paste size limit threshold KiB bytes confirmation",
+            Self::PasteLineDelay => "clipboard paste line delay pace pacing milliseconds",
             Self::ClipboardWrite => "paste write",
             Self::ClipboardRead => "paste access consent",
             Self::CommandMarks => "prompt navigation jumps setup bash zsh fish",
             Self::CommandTimestamps => "terminal time gutter command date",
             Self::RemoteSidebar => "sftp ssh folder dock left right hidden",
+            Self::SftpParallel => {
+                "sftp simultaneous parallel uploads downloads transfer queue channels"
+            }
+            Self::SftpResume => "sftp resume interrupted partial cancel upload download",
+            Self::SftpConflictDefault => {
+                "sftp default conflict ask skip overwrite replace existing files"
+            }
+            Self::SftpArchive => "sftp archive remote destination path zip compression level",
+            Self::SftpIdle => "sftp idle auto close inactive timeout minutes",
+            Self::InitialTerminalSize => {
+                "initial terminal grid dimensions columns rows pty shell ssh"
+            }
+            Self::SerialDefaultEncoding => {
+                "serial device port character set charset utf-8 latin1 latin9 iso-8859 windows-1252"
+            }
             Self::TerminalLinkDetection => "links clickable open URL email hyperlink OSC 8",
             Self::TerminalCopyOnSelect => {
                 "copy on select automatic mouse drag terminal text clipboard PRIMARY"
@@ -342,8 +524,30 @@ impl Setting {
             Self::QuickSelectPatterns => {
                 "links quick select custom match regex regular expressions"
             }
+            Self::Highlighting => {
+                "highlight rule set default full screen alternate screen trigger notifications snippets"
+            }
             Self::TerminalScrollbar => "scroll back scrollback history vertical right",
+            Self::ScrollbackLines => "scrollback history maximum lines rows",
+            Self::ScrollbackMemory => "scrollback history memory bytes MiB",
             Self::ScrollbackCompression => "scrollback history memory compress idle background",
+            Self::SshKeepAlive => "ssh keep-alive heartbeat idle connection network",
+            Self::SshKeepAliveInterval => "ssh keep-alive heartbeat seconds interval",
+            Self::CodingAgentDetection => {
+                "coding agents Claude Code Codex Gemini local status monitor tab badge"
+            }
+            Self::CodingAgentAppBadge => {
+                "coding agents blocked count application badge window title taskbar Dock"
+            }
+            Self::CodingAgentNotifications => {
+                "coding agents desktop notifications alerts waiting blocked finished completion"
+            }
+            Self::TerminalNotifications => {
+                "desktop notifications bell BEL OSC 9 777 programs long commands duration AI approval"
+            }
+            Self::CodingAgentDockAutomatic => {
+                "coding agents sidebar dock panel automatic visibility"
+            }
             Self::BoldTextMode => "terminal font weight bright ansi colors palette sgr xterm",
             Self::SilenceThreshold => {
                 "silence threshold monitor notification quiet timeout seconds terminal output"
@@ -372,9 +576,15 @@ impl Setting {
             Self::JournalAutomaticVision => {
                 "session journal automatically analyze screenshot capture description tags"
             }
-            Self::ExportWatermark => "pdf branding text color mark document page",
+            Self::ExportWatermark => {
+                "pdf html snippet analysis branding text color mark document page"
+            }
             Self::ExportFooter => "pdf markdown html branding text document page",
+            Self::ExportSnippetCode => {
+                "snippet analysis source script code report appendix pdf html markdown"
+            }
             Self::ToolbarIconSize => "symbol size toolbar button pixels appearance",
+            Self::StartupMasterPassword => "vault unlock startup login authentication security",
             Self::RememberGeometry => "startup normal bounds size position maximized",
             Self::RememberDashboard => "startup show hide dashboard state navigation dock",
             Self::FixedGeometry => "startup width height fixed window position dimensions",
@@ -385,7 +595,22 @@ impl Setting {
             Self::RecentTabs => "MRU most recently used switch previous next cycle control tab",
             Self::Restore => "session restore previous automatic",
             Self::Transparency => "opacity background see-through",
+            Self::EditorCursorStyle => "file editor caret shape block line underscore",
+            Self::EditorCursorColor => "file editor caret colour color hex rgb",
+            Self::SnippetFontFamily => "monospace typeface typography font face",
+            Self::SnippetFontSize => "zoom typography text size",
+            Self::SnippetForeground => "text color hex rgb",
+            Self::SnippetBackground => "editor background color hex rgb",
+            Self::SnippetCursorStyle => "caret shape block line underscore",
+            Self::SnippetCursorColor => "caret colour color hex rgb",
             Self::Shortcuts => "key bindings accelerator record commands keymap",
+            Self::AgentDesign => "AI agent presentation activity status floating classic standard",
+            Self::ApplicationUpdates => {
+                "software application release background GitHub stable check"
+            }
+            Self::ApplicationUpdateInterval => {
+                "update schedule frequency every days automatic background"
+            }
         }
     }
 }
@@ -394,19 +619,30 @@ impl Setting {
 pub enum Message {
     Open(window::Id),
     OpenAt(window::Id, Section),
+    Focus(window::Id),
     Section(window::Id, Section),
     Guide(window::Id),
     Search(window::Id, String),
+    SearchStep(window::Id, isize),
+    SearchChoose(window::Id),
+    SearchClear(window::Id),
+    Escape(window::Id),
     Reveal(window::Id, Setting),
     FontFamily(window::Id, String),
     FontSize(window::Id, u8),
     FontSizeInput(window::Id, String),
     Color(window::Id, color_settings::Edit),
+    EditorCaret(window::Id, editor_settings::Edit),
+    SnippetAppearance(window::Id, snippet_editor_settings::Edit),
     Theme(window::Id, theme_settings::Edit),
     Design(window::Id, Design),
     DesignAnimations(window::Id, bool),
+    AgentDesignCatalog(window::Id, agent_design_settings::Edit),
+    ApplicationUpdates(window::Id, bool),
+    ApplicationUpdateInterval(window::Id, u8),
     PasteWarning(window::Id, WarningMode),
     LargePasteWarning(window::Id, u8),
+    PasteLineDelay(window::Id, u16),
     ToolbarIconSize(window::Id, u16),
     ToolbarIconSizeSaved(window::Id, Result<(), String>),
     Video(window::Id, video_settings::Edit),
@@ -423,21 +659,45 @@ pub enum Message {
     CommandMarks(window::Id, bool),
     CommandTimestamps(window::Id, bool),
     RemoteSidebar(window::Id, RemoteSidebarPosition),
+    SftpParallel(window::Id, u8),
+    SftpResume(window::Id, bool),
+    SftpKeepPartial(window::Id, bool),
+    SftpXml(window::Id, sftp_settings::java::Action),
+    SftpConflictDefault(window::Id, ConflictDefault),
+    SftpArchiveDirectory(window::Id, String),
+    SftpArchiveLevel(window::Id, u8),
+    SftpIdleEnabled(window::Id, bool),
+    SftpIdleMinutes(window::Id, u16),
+    TerminalColumns(window::Id, String),
+    TerminalRows(window::Id, String),
+    SerialDefaultEncoding(window::Id, TextEncoding),
     TerminalLinkDetection(window::Id, bool),
     TerminalCopyOnSelect(window::Id, bool),
     QuickSelect(window::Id, quick_select_settings::Edit),
     TerminalScrollbar(window::Id, bool),
     ScrollbackCompression(window::Id, bool),
+    ScrollbackLines(window::Id, u32),
+    ScrollbackMemory(window::Id, u8),
+    SshKeepAlive(window::Id, bool),
+    SshKeepAliveInterval(window::Id, u16),
+    CodingAgentDetection(window::Id, bool),
+    CodingAgentAppBadge(window::Id, bool),
+    CodingAgentNotifications(window::Id, bool),
+    TerminalNotifications(window::Id, super::terminal_notifications::Edit),
+    CodingAgentDockAutomatic(window::Id, bool),
     BoldTextMode(window::Id, BoldTextMode),
     SilenceSeconds(window::Id, String),
     StepSilenceSeconds(window::Id, bool),
     ClipboardWrite(window::Id, bool),
     ClipboardRead(window::Id, bool),
     Restore(window::Id, RestoreMode),
+    RestoreOutput(window::Id, bool),
+    RestoreOutputLines(window::Id, u16),
     KeyBinding(window::Id, Edit),
     Backup(window::Id, backup::Edit),
     Logging(window::Id, logging_settings::Edit),
     Export(window::Id, export_settings::Edit),
+    Highlighting(window::Id, highlight_settings::Edit),
     LoggingPrepared(
         window::Id,
         u64,
@@ -484,10 +744,53 @@ impl Draft {
         if edit.appearance != before.appearance {
             current.appearance = edit.appearance;
         }
+        if edit.ai_agent_design != before.ai_agent_design {
+            current.ai_agent_design = edit.ai_agent_design;
+        }
+        if edit.ai_agent_designs != before.ai_agent_designs {
+            current.ai_agent_designs = edit.ai_agent_designs.clone();
+        }
+        if policy.problem.is_none() && policy.updates_allowed {
+            if edit.application_updates.enabled != before.application_updates.enabled {
+                current.application_updates.enabled = edit.application_updates.enabled;
+            }
+            if edit.application_updates.interval_days != before.application_updates.interval_days {
+                current.application_updates.interval_days = edit.application_updates.interval_days;
+            }
+        }
+        if edit.editor_caret != before.editor_caret {
+            current.editor_caret = edit.editor_caret;
+        }
+        if policy.problem.is_none() && policy.session_restore_output.is_none() {
+            if edit.restore_output.enabled != before.restore_output.enabled {
+                current.restore_output.enabled = edit.restore_output.enabled;
+            }
+            if edit.restore_output.lines != before.restore_output.lines
+                && session_restore::OutputPreferences::LINES.contains(&edit.restore_output.lines)
+            {
+                current.restore_output.lines = edit.restore_output.lines;
+            }
+        }
+        if edit.snippet_appearance != before.snippet_appearance {
+            current
+                .snippet_appearance
+                .clone_from(&edit.snippet_appearance);
+        }
         if edit.export_branding != before.export_branding {
             current.export_branding = edit.export_branding.clone();
         }
+        if edit.snippet_analysis_export_include_code != before.snippet_analysis_export_include_code
+        {
+            current.snippet_analysis_export_include_code =
+                edit.snippet_analysis_export_include_code;
+        }
         if edit.startup != before.startup {
+            if policy.problem.is_none()
+                && !policy.require_master_password
+                && edit.startup.require_master_password != before.startup.require_master_password
+            {
+                current.startup.require_master_password = edit.startup.require_master_password;
+            }
             current.startup.remember_geometry = edit.startup.remember_geometry;
             current.startup.remember_dashboard = edit.startup.remember_dashboard;
             current.startup.use_fixed_geometry = edit.startup.use_fixed_geometry;
@@ -500,6 +803,9 @@ impl Draft {
         }
         if edit.paste_large_warning_kib != before.paste_large_warning_kib {
             current.paste_large_warning_kib = edit.paste_large_warning_kib;
+        }
+        if edit.paste_line_delay_ms != before.paste_line_delay_ms {
+            current.paste_line_delay_ms = edit.paste_line_delay_ms;
         }
         if edit.open_tool_windows_as_tabs != before.open_tool_windows_as_tabs {
             current.open_tool_windows_as_tabs = edit.open_tool_windows_as_tabs;
@@ -525,8 +831,37 @@ impl Draft {
         if edit.remote_sidebar_position != before.remote_sidebar_position {
             current.remote_sidebar_position = edit.remote_sidebar_position;
         }
+        if policy.problem.is_none() && policy.file_transfer_allowed {
+            let cap = crate::sftp_window::parallel::managed_cap(policy.sftp_max_parallel);
+            if cap > 1 && edit.sftp_parallel_transfers != before.sftp_parallel_transfers {
+                current.sftp_parallel_transfers = edit.sftp_parallel_transfers.clamp(1, cap);
+            }
+            if edit.sftp_resume_partial_transfers != before.sftp_resume_partial_transfers {
+                current.sftp_resume_partial_transfers = edit.sftp_resume_partial_transfers;
+            }
+            if edit.sftp_keep_partial_on_cancel != before.sftp_keep_partial_on_cancel {
+                current.sftp_keep_partial_on_cancel = edit.sftp_keep_partial_on_cancel;
+            }
+        }
+        if SftpConflictPolicy::from_policy(policy).editable()
+            && edit.sftp_conflict_default != before.sftp_conflict_default
+        {
+            current.sftp_conflict_default = edit.sftp_conflict_default;
+        }
+        if edit.sftp_idle_minutes != before.sftp_idle_minutes {
+            current.sftp_idle_minutes = edit.sftp_idle_minutes;
+        }
+        if edit.sftp_archive.remote_directory != before.sftp_archive.remote_directory {
+            current.sftp_archive.remote_directory = edit.sftp_archive.remote_directory.clone();
+        }
+        if edit.sftp_archive.level != before.sftp_archive.level {
+            current.sftp_archive.level = edit.sftp_archive.level;
+        }
         if edit.terminal_link_detection_enabled != before.terminal_link_detection_enabled {
             current.terminal_link_detection_enabled = edit.terminal_link_detection_enabled;
+        }
+        if edit.serial_default_encoding != before.serial_default_encoding {
+            current.serial_default_encoding = edit.serial_default_encoding;
         }
         if edit.terminal_copy_on_select_enabled != before.terminal_copy_on_select_enabled {
             current.terminal_copy_on_select_enabled = edit.terminal_copy_on_select_enabled;
@@ -534,14 +869,53 @@ impl Draft {
         if edit.show_terminal_scrollbar != before.show_terminal_scrollbar {
             current.show_terminal_scrollbar = edit.show_terminal_scrollbar;
         }
+        if edit.terminal_columns != before.terminal_columns {
+            current.terminal_columns = edit.terminal_columns;
+        }
+        if edit.terminal_rows != before.terminal_rows {
+            current.terminal_rows = edit.terminal_rows;
+        }
         if edit.scrollback_compression_enabled != before.scrollback_compression_enabled {
             current.scrollback_compression_enabled = edit.scrollback_compression_enabled;
+        }
+        if edit.scrollback_lines != before.scrollback_lines {
+            current.scrollback_lines = edit.scrollback_lines;
+        }
+        if edit.scrollback_memory_mib != before.scrollback_memory_mib {
+            current.scrollback_memory_mib = edit.scrollback_memory_mib;
+        }
+        if edit.ssh_keepalive_enabled != before.ssh_keepalive_enabled {
+            current.ssh_keepalive_enabled = edit.ssh_keepalive_enabled;
+        }
+        if edit.ssh_keepalive_interval != before.ssh_keepalive_interval {
+            current.ssh_keepalive_interval = edit.ssh_keepalive_interval;
+        }
+        if edit.coding_agent_detection_enabled != before.coding_agent_detection_enabled {
+            current.coding_agent_detection_enabled = edit.coding_agent_detection_enabled;
+        }
+        if edit.coding_agent_app_badge_enabled != before.coding_agent_app_badge_enabled {
+            current.coding_agent_app_badge_enabled = edit.coding_agent_app_badge_enabled;
+        }
+        if policy.desktop_notifications_allowed
+            && policy.problem.is_none()
+            && edit.coding_agent_notifications_enabled != before.coding_agent_notifications_enabled
+        {
+            current.coding_agent_notifications_enabled = edit.coding_agent_notifications_enabled;
+        }
+        if edit.coding_agent_dock_automatic != before.coding_agent_dock_automatic {
+            current.coding_agent_dock_automatic = edit.coding_agent_dock_automatic;
         }
         if edit.terminal_bold_text_mode != before.terminal_bold_text_mode {
             current.terminal_bold_text_mode = edit.terminal_bold_text_mode;
         }
         if edit.terminal_silence_seconds != before.terminal_silence_seconds {
             current.terminal_silence_seconds = edit.terminal_silence_seconds;
+        }
+        if policy.desktop_notifications_allowed
+            && policy.problem.is_none()
+            && edit.terminal_notifications != before.terminal_notifications
+        {
+            current.terminal_notifications = edit.terminal_notifications.clone();
         }
         if policy.read_allowed && edit.clipboard_read_enabled != before.clipboard_read_enabled {
             current.clipboard_read_enabled = edit.clipboard_read_enabled;
@@ -558,13 +932,24 @@ struct Dialog {
     owner: window::Id,
     initial: Draft,
     draft: Draft,
+    installed_sftp_conflict_policy: SftpConflictPolicy,
+    sftp_xml: sftp_settings::java::Exchange,
+    initial_highlighting: highlight::Preferences,
+    highlighting: highlight::Preferences,
     section: Section,
     search_input: widget::Id,
+    search_scroll: widget::Id,
     tab_scroll: widget::Id,
     page_scroll: widget::Id,
+    revealed_row: widget::Id,
+    revealed_input: widget::Id,
     search: String,
+    search_selection: usize,
     font_size_input: Option<String>,
+    editor_cursor_color_input: Option<String>,
     silence_seconds_input: Option<String>,
+    terminal_columns_input: Option<String>,
+    terminal_rows_input: Option<String>,
     toolbar_icon_size: Option<u16>,
     saving_toolbar_icon_size: bool,
     saving_logging: bool,
@@ -575,7 +960,9 @@ struct Dialog {
     problem: Option<String>,
     keyboard: KeyboardEditor,
     colors: color_settings::Editor,
+    snippet_appearance: snippet_editor_settings::Editor,
     themes: theme_settings::Editor,
+    agent_design: agent_design_settings::Editor,
     backup: backup::Editor,
     logging: logging_settings::Editor,
     export: export_settings::Editor,
@@ -585,16 +972,34 @@ struct Dialog {
 
 impl Dialog {
     fn saving(&self) -> bool {
-        self.saving_toolbar_icon_size || self.saving_logging || self.saving_video
+        self.saving_toolbar_icon_size
+            || self.saving_logging
+            || self.saving_video
+            || self.sftp_xml.busy()
+            || self.themes.exchanging().is_some()
+    }
+
+    fn search_results(&self, has_transparency: bool) -> impl Iterator<Item = Setting> {
+        search_matches(&self.search).filter(move |setting| match setting {
+            Setting::Restore => self.draft.restore.is_some(),
+            Setting::Transparency => has_transparency,
+            _ => true,
+        })
     }
 
     fn select_section(&mut self, section: Section) {
         self.section = section;
+        if section == Section::Sftp {
+            self.installed_sftp_conflict_policy = SftpConflictPolicy::load();
+        }
         if section != Section::Backup {
             self.backup.close_browser();
         }
         if section != Section::Logging {
             self.logging.close_browser();
+        }
+        if section != Section::Themes {
+            self.themes.leave();
         }
         self.revealed = None;
         self.keyboard.stop_recording();
@@ -604,20 +1009,38 @@ impl Dialog {
         self.select_section(setting.section());
         self.revealed = Some(setting);
         self.search.clear();
-        let page = match setting {
+        if setting == Setting::JournalAutomaticVision {
+            self.logging.close_browser();
+        }
+        let focus = match setting {
             Setting::QuickSelectAlphabet | Setting::QuickSelectPatterns => {
-                self.focus_quick_select(setting)
-            }
-            Setting::JournalAutomaticVision => {
-                self.logging.close_browser();
-                widget::operation::snap_to(
-                    self.page_scroll.clone(),
-                    widget::operation::RelativeOffset::END,
-                )
+                self.quick_select.focus(setting)
             }
             _ => Task::none(),
         };
-        Task::batch([self.reveal_tab(), page])
+        let scroll =
+            search_input::scroll_to_row(self.page_scroll.clone(), self.revealed_row.clone());
+        Task::batch([self.reveal_tab(), scroll.chain(focus)])
+    }
+
+    fn reveal_result(&mut self, setting: Setting) -> Task<Desktop> {
+        self.reveal(setting)
+            .chain(crate::settings_search::focus_if_present(
+                self.revealed_input.clone(),
+            ))
+    }
+
+    fn input_target(&self, setting: Setting, editable: bool) -> Option<&widget::Id> {
+        (editable && self.revealed == Some(setting)).then_some(&self.revealed_input)
+    }
+
+    fn reveal_input<'a>(
+        &self,
+        setting: Setting,
+        editable: bool,
+        input: widget::TextInput<'a, Desktop>,
+    ) -> widget::TextInput<'a, Desktop> {
+        crate::settings_search::mark_input(input, self.input_target(setting, editable))
     }
 
     fn reveal_tab(&self) -> Task<Desktop> {
@@ -657,6 +1080,10 @@ impl Dialog {
     }
 
     fn reveal_invalid_input(&mut self) -> Option<Task<Desktop>> {
+        if self.terminal_columns_input.is_some() || self.terminal_rows_input.is_some() {
+            self.problem = None;
+            return Some(self.reveal(Setting::InitialTerminalSize));
+        }
         if let Some(setting) = self.quick_select.first_problem() {
             self.select_section(Section::Terminal);
             self.search.clear();
@@ -670,6 +1097,14 @@ impl Dialog {
             self.revealed = Some(Setting::SilenceThreshold);
             self.problem = None;
             return Some(Task::none());
+        }
+        if self.editor_cursor_color_input.is_some() {
+            self.problem = None;
+            return Some(self.reveal(Setting::EditorCursorColor));
+        }
+        if let Some(setting) = self.snippet_appearance.first_problem() {
+            self.problem = None;
+            return Some(self.reveal(setting));
         }
         None
     }
@@ -732,31 +1167,41 @@ impl Workspace {
     }
 
     pub(super) fn close_settings(&mut self, id: window::Id) -> Option<Task<Desktop>> {
-        self.settings.title(id)?;
-        if self.settings.0.as_ref().is_some_and(Dialog::saving) {
+        let dialog = self.settings.0.as_ref().filter(|dialog| dialog.id == id)?;
+        if dialog.saving() {
             return Some(Task::none());
         }
         if let Some(dialog) = self.openpgp_for_source(id) {
             return Some(window::gain_focus(dialog));
         }
+        if let Some(dialog) = self.highlight_rules_for_settings(id) {
+            return Some(window::gain_focus(dialog));
+        }
+        let owner = dialog.owner;
         self.settings.0 = None;
-        Some(Task::batch([
-            self.close_placed_dialog(id),
-            self.close_shell_integration_owner(id),
-        ]))
+        let close = self.close_placed_dialog_and_focus(id, owner);
+        Some(self.close_shell_integration_owner_then(id, close))
     }
 
     pub(super) fn focus_settings_search(&self, id: window::Id) -> Option<Task<Desktop>> {
         let dialog = self.settings.0.as_ref().filter(|dialog| dialog.id == id)?;
-        Some(widget::operation::focus(dialog.search_input.clone()))
+        Some(
+            widget::operation::focus(dialog.search_input.clone())
+                .chain(widget::operation::select_all(dialog.search_input.clone())),
+        )
     }
 
     pub(super) fn update_settings(&mut self, message: Message) -> Task<Desktop> {
         if !matches!(
             &message,
-            Message::ToolbarIconSizeSaved(..)
+            Message::Focus(_)
+                | Message::ToolbarIconSizeSaved(..)
                 | Message::LoggingPrepared(..)
                 | Message::VideoSaved(..)
+                | Message::Theme(
+                    _,
+                    theme_settings::Edit::Java(theme_settings::exchange::Action::Finished(..))
+                )
         ) && let Some(dialog) = self.settings.0.as_ref().filter(|dialog| dialog.saving())
         {
             return if matches!(message, Message::Open(_) | Message::OpenAt(..)) {
@@ -772,6 +1217,22 @@ impl Workspace {
             Message::OpenAt(owner, section) => {
                 return self.open_settings(owner, Some(section));
             }
+            Message::Focus(id) => {
+                if let Some(dialog) = self
+                    .settings
+                    .dialog_mut(id)
+                    .filter(|dialog| dialog.section == Section::Sftp)
+                {
+                    dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
+                }
+                return self.settings.title(id).map_or_else(Task::none, |_| {
+                    window::gain_focus(
+                        self.openpgp_for_source(id)
+                            .or_else(|| self.highlight_rules_for_settings(id))
+                            .unwrap_or(id),
+                    )
+                });
+            }
             Message::Guide(id) => {
                 return self
                     .settings
@@ -780,6 +1241,9 @@ impl Workspace {
                     .filter(|dialog| dialog.id == id)
                     .map(|dialog| dialog.section.guide_chapter())
                     .map_or_else(Task::none, |chapter| self.show_manual_chapter(&chapter));
+            }
+            Message::Escape(id) => {
+                return self.dismiss_settings(id);
             }
             Message::Cancel(id) => return self.close_settings(id).unwrap_or_else(Task::none),
             Message::Save(id) => return self.save_settings(id),
@@ -801,22 +1265,32 @@ impl Workspace {
             Message::VideoSaved(id, result) => return self.video_settings_saved(id, result),
             Message::Backup(id, edit) => return self.update_backup_settings(id, edit),
             Message::Logging(id, edit) => return self.update_logging_settings(id, edit),
+            Message::Highlighting(id, edit) => return self.update_highlight_settings(id, edit),
             Message::LoggingPrepared(id, revision, settings, result) => {
                 return self.logging_settings_prepared(id, revision, settings, result);
             }
             message @ (Message::Section(id, _)
             | Message::Search(id, _)
+            | Message::SearchStep(id, _)
+            | Message::SearchChoose(id)
+            | Message::SearchClear(id)
             | Message::Reveal(id, _)
             | Message::FontFamily(id, _)
             | Message::FontSize(id, _)
             | Message::FontSizeInput(id, _)
             | Message::Color(id, _)
+            | Message::SnippetAppearance(id, _)
+            | Message::EditorCaret(id, _)
             | Message::Theme(id, _)
             | Message::Export(id, _)
             | Message::Design(id, _)
             | Message::DesignAnimations(id, _)
+            | Message::AgentDesignCatalog(id, _)
+            | Message::ApplicationUpdates(id, _)
+            | Message::ApplicationUpdateInterval(id, _)
             | Message::PasteWarning(id, _)
             | Message::LargePasteWarning(id, _)
+            | Message::PasteLineDelay(id, _)
             | Message::ToolbarIconSize(id, _)
             | Message::Startup(id, _)
             | Message::ToolWindowTabs(id, _)
@@ -827,19 +1301,55 @@ impl Workspace {
             | Message::CommandMarks(id, _)
             | Message::CommandTimestamps(id, _)
             | Message::RemoteSidebar(id, _)
+            | Message::SftpParallel(id, _)
+            | Message::SftpResume(id, _)
+            | Message::SftpKeepPartial(id, _)
+            | Message::SftpXml(id, _)
+            | Message::SftpConflictDefault(id, _)
+            | Message::SftpArchiveDirectory(id, _)
+            | Message::SftpArchiveLevel(id, _)
+            | Message::SftpIdleEnabled(id, _)
+            | Message::SftpIdleMinutes(id, _)
+            | Message::TerminalColumns(id, _)
+            | Message::TerminalRows(id, _)
+            | Message::SerialDefaultEncoding(id, _)
             | Message::TerminalLinkDetection(id, _)
             | Message::TerminalCopyOnSelect(id, _)
             | Message::QuickSelect(id, _)
             | Message::TerminalScrollbar(id, _)
+            | Message::ScrollbackLines(id, _)
+            | Message::ScrollbackMemory(id, _)
             | Message::ScrollbackCompression(id, _)
+            | Message::SshKeepAlive(id, _)
+            | Message::SshKeepAliveInterval(id, _)
+            | Message::CodingAgentDetection(id, _)
+            | Message::CodingAgentAppBadge(id, _)
+            | Message::CodingAgentNotifications(id, _)
+            | Message::TerminalNotifications(id, _)
+            | Message::CodingAgentDockAutomatic(id, _)
             | Message::BoldTextMode(id, _)
             | Message::SilenceSeconds(id, _)
             | Message::StepSilenceSeconds(id, _)
             | Message::ClipboardWrite(id, _)
             | Message::ClipboardRead(id, _)
             | Message::Restore(id, _)
+            | Message::RestoreOutput(id, _)
+            | Message::RestoreOutputLines(id, _)
             | Message::KeyBinding(id, _)) => (id, message),
         };
+        let has_transparency =
+            matches!(message, Message::SearchStep(..) | Message::SearchChoose(_))
+                && self
+                    .settings
+                    .0
+                    .as_ref()
+                    .filter(|dialog| dialog.id == id)
+                    .and_then(|dialog| self.windows.get(&dialog.owner))
+                    .and_then(|window| self.transparency_controls(window))
+                    .is_some();
+        if let Some(child) = self.highlight_rules_for_settings(id) {
+            return window::gain_focus(child);
+        }
         let Some(dialog) = self.settings.dialog_mut(id) else {
             return Task::none();
         };
@@ -851,10 +1361,44 @@ impl Workspace {
             Message::Search(_, mut query) => {
                 query.truncate(query.floor_char_boundary(MAX_SEARCH_BYTES));
                 dialog.search = query;
+                dialog.search_selection = 0;
                 dialog.revealed = None;
                 dialog.keyboard.stop_recording();
+                return widget::operation::snap_to(
+                    dialog.search_scroll.clone(),
+                    widget::operation::RelativeOffset::START,
+                );
             }
-            Message::Reveal(_, setting) => return dialog.reveal(setting),
+            Message::SearchStep(_, direction) => {
+                let last = dialog
+                    .search_results(has_transparency)
+                    .count()
+                    .saturating_sub(1);
+                dialog.search_selection = dialog
+                    .search_selection
+                    .saturating_add_signed(direction)
+                    .min(last);
+                return widget::operation::snap_to(
+                    dialog.search_scroll.clone(),
+                    widget::operation::RelativeOffset {
+                        x: None,
+                        y: Some(dialog.search_selection as f32 / last.max(1) as f32),
+                    },
+                );
+            }
+            Message::SearchChoose(_) => {
+                let choice = dialog
+                    .search_results(has_transparency)
+                    .nth(dialog.search_selection);
+                return choice.map_or_else(Task::none, |setting| dialog.reveal_result(setting));
+            }
+            Message::SearchClear(_) => {
+                dialog.search.clear();
+                dialog.search_selection = 0;
+                dialog.revealed = None;
+                return widget::operation::focus(dialog.search_input.clone());
+            }
+            Message::Reveal(_, setting) => return dialog.reveal_result(setting),
             Message::FontFamily(_, family) if dialog.section == Section::Font => {
                 if installed_font(&family).is_some() {
                     dialog.draft.preferences.set_terminal_font_family(family);
@@ -891,18 +1435,17 @@ impl Workspace {
             }
             Message::Theme(_, edit) if dialog.section == Section::Themes => {
                 let selected = dialog.draft.preferences.themes.selected();
-                dialog
+                let task = dialog
                     .themes
                     .update(&mut dialog.draft.preferences.themes, edit);
                 if dialog.draft.preferences.themes.selected() != selected {
                     dialog.colors.profile_changed();
                 }
                 dialog.problem = None;
+                return task.map(move |edit| Desktop::Settings(Message::Theme(id, edit)));
             }
             Message::Export(_, edit) if dialog.section == Section::Export => {
-                dialog
-                    .export
-                    .update(&mut dialog.draft.preferences.export_branding, edit);
+                dialog.export.update(&mut dialog.draft.preferences, edit);
                 dialog.problem = None;
             }
             Message::Design(_, design) if dialog.section == Section::Appearance => {
@@ -913,6 +1456,16 @@ impl Workspace {
                 dialog.draft.preferences.appearance.animations = enabled;
                 dialog.problem = None;
             }
+            Message::EditorCaret(_, edit) if dialog.section == Section::Editor => {
+                editor_settings::update(dialog, edit);
+                dialog.problem = None;
+            }
+            Message::SnippetAppearance(_, edit) if dialog.section == Section::SnippetEditor => {
+                dialog
+                    .snippet_appearance
+                    .update(&mut dialog.draft.preferences.snippet_appearance, edit);
+                dialog.problem = None;
+            }
             Message::PasteWarning(_, mode)
                 if mode >= self.clipboard.policy.minimum_paste_warning =>
             {
@@ -921,6 +1474,10 @@ impl Workspace {
             Message::LargePasteWarning(_, value) => {
                 dialog.draft.preferences.paste_large_warning_kib = value.min(MAX_PASTE_KIB);
             }
+            Message::PasteLineDelay(_, value) => {
+                dialog.draft.preferences.paste_line_delay_ms =
+                    value.min(crate::connection_store::MAX_PASTE_LINE_DELAY_MS);
+            }
             Message::ToolbarIconSize(_, size) if dialog.section == Section::Window => {
                 let size = size.clamp(*TOOLBAR_ICON_SIZE.start(), *TOOLBAR_ICON_SIZE.end());
                 dialog.toolbar_icon_size =
@@ -928,6 +1485,12 @@ impl Workspace {
                 dialog.problem = None;
             }
             Message::Startup(_, edit) if dialog.section == Section::Window => {
+                if matches!(edit, startup_settings::Edit::MasterPassword(_))
+                    && (self.clipboard.policy.problem.is_some()
+                        || self.clipboard.policy.require_master_password)
+                {
+                    return Task::none();
+                }
                 dialog
                     .startup
                     .update(&mut dialog.draft.preferences.startup, edit);
@@ -957,6 +1520,116 @@ impl Workspace {
             Message::RemoteSidebar(_, position) => {
                 dialog.draft.preferences.remote_sidebar_position = position;
             }
+            Message::SftpParallel(_, parallel) if dialog.section == Section::Sftp => {
+                dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
+                let policy = dialog
+                    .installed_sftp_conflict_policy
+                    .restrict(&self.clipboard.policy);
+                if policy.transfer_allowed
+                    && policy.parallel_cap > 1
+                    && (1..=policy.parallel_cap).contains(&parallel)
+                {
+                    dialog.draft.preferences.sftp_parallel_transfers = parallel;
+                }
+            }
+            Message::SftpResume(_, enabled) if dialog.section == Section::Sftp => {
+                dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
+                if dialog
+                    .installed_sftp_conflict_policy
+                    .restrict(&self.clipboard.policy)
+                    .transfer_allowed
+                {
+                    dialog.draft.preferences.sftp_resume_partial_transfers = enabled;
+                }
+            }
+            Message::SftpKeepPartial(_, enabled) if dialog.section == Section::Sftp => {
+                dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
+                if dialog.draft.preferences.sftp_resume_partial_transfers
+                    && dialog
+                        .installed_sftp_conflict_policy
+                        .restrict(&self.clipboard.policy)
+                        .transfer_allowed
+                {
+                    dialog.draft.preferences.sftp_keep_partial_on_cancel = enabled;
+                }
+            }
+            Message::SftpXml(_, action) => {
+                dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
+                let policy = dialog
+                    .installed_sftp_conflict_policy
+                    .restrict(&self.clipboard.policy);
+                let (imported, task) = dialog.sftp_xml.update(
+                    action,
+                    (&self.window_settings).into(),
+                    dialog.section == Section::Sftp && policy.transfer_allowed,
+                );
+                if let Some(imported) = imported {
+                    let preferences = &mut dialog.draft.preferences;
+                    if policy.parallel_cap > 1 {
+                        preferences.sftp_parallel_transfers =
+                            imported.parallel.min(policy.parallel_cap);
+                    }
+                    preferences.sftp_resume_partial_transfers = imported.resume;
+                    preferences.sftp_keep_partial_on_cancel = imported.keep;
+                    if let Some(directory) = imported.archive_directory {
+                        preferences.sftp_archive.remote_directory = directory;
+                    }
+                    if let Some(level) = imported.archive_level {
+                        preferences.sftp_archive.level = level;
+                    }
+                }
+                return task.map(move |action| Desktop::Settings(Message::SftpXml(id, action)));
+            }
+            Message::SftpConflictDefault(_, preference) if dialog.section == Section::Sftp => {
+                dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
+                if dialog
+                    .installed_sftp_conflict_policy
+                    .restrict(&self.clipboard.policy)
+                    .editable()
+                {
+                    dialog.draft.preferences.sftp_conflict_default = preference;
+                }
+            }
+            Message::SftpIdleEnabled(_, enabled) if dialog.section == Section::Sftp => {
+                dialog.draft.preferences.sftp_idle_minutes =
+                    enabled.then_some(dialog.draft.preferences.sftp_idle_minutes.unwrap_or(10));
+            }
+            Message::SftpArchiveDirectory(_, path)
+                if dialog.section == Section::Sftp && path.len() <= 4096 =>
+            {
+                dialog.draft.preferences.sftp_archive.remote_directory = path;
+            }
+            Message::SftpArchiveLevel(_, level)
+                if dialog.section == Section::Sftp && level <= 9 =>
+            {
+                dialog.draft.preferences.sftp_archive.level = level;
+            }
+            Message::SftpIdleMinutes(_, minutes)
+                if dialog.section == Section::Sftp
+                    && dialog.draft.preferences.sftp_idle_minutes.is_some()
+                    && (1..=profile::RemoteProjectTool::MAX_IDLE_MINUTES).contains(&minutes) =>
+            {
+                dialog.draft.preferences.sftp_idle_minutes = Some(minutes);
+            }
+            Message::TerminalColumns(_, value) if dialog.section == Section::Terminal => {
+                update_grid_dimension(
+                    &mut dialog.draft.preferences.terminal_columns,
+                    &mut dialog.terminal_columns_input,
+                    value,
+                    MIN_TERMINAL_COLUMNS..=MAX_TERMINAL_COLUMNS,
+                );
+            }
+            Message::TerminalRows(_, value) if dialog.section == Section::Terminal => {
+                update_grid_dimension(
+                    &mut dialog.draft.preferences.terminal_rows,
+                    &mut dialog.terminal_rows_input,
+                    value,
+                    MIN_TERMINAL_ROWS..=MAX_TERMINAL_ROWS,
+                );
+            }
+            Message::SerialDefaultEncoding(_, encoding) if dialog.section == Section::Terminal => {
+                dialog.draft.preferences.serial_default_encoding = encoding;
+            }
             Message::TerminalLinkDetection(_, value) => {
                 dialog.draft.preferences.terminal_link_detection_enabled = value;
             }
@@ -972,8 +1645,78 @@ impl Workspace {
             Message::ScrollbackCompression(_, value) => {
                 dialog.draft.preferences.scrollback_compression_enabled = value;
             }
+            Message::ScrollbackLines(_, value) if dialog.section == Section::Terminal => {
+                dialog.draft.preferences.scrollback_lines =
+                    value.clamp(ScrollbackConfig::MIN_LINES, ScrollbackConfig::MAX_LINES);
+            }
+            Message::ScrollbackMemory(_, value) if dialog.section == Section::Terminal => {
+                dialog.draft.preferences.scrollback_memory_mib = value.clamp(
+                    ScrollbackConfig::MIN_MEMORY_MIB,
+                    ScrollbackConfig::MAX_MEMORY_MIB,
+                );
+            }
+            Message::SshKeepAlive(_, value) if dialog.section == Section::Terminal => {
+                dialog.draft.preferences.ssh_keepalive_enabled = value;
+            }
+            Message::SshKeepAliveInterval(_, value) if dialog.section == Section::Terminal => {
+                dialog.draft.preferences.ssh_keepalive_interval =
+                    value.clamp(KeepAlive::MIN_SECONDS, KeepAlive::MAX_SECONDS);
+            }
+            Message::CodingAgentDetection(_, value) if dialog.section == Section::Terminal => {
+                dialog.draft.preferences.coding_agent_detection_enabled = value;
+            }
+            Message::CodingAgentAppBadge(_, value) if dialog.section == Section::Terminal => {
+                dialog.draft.preferences.coding_agent_app_badge_enabled = value;
+            }
+            Message::CodingAgentNotifications(_, value)
+                if dialog.section == Section::Messaging
+                    && self.clipboard.policy.desktop_notifications_allowed
+                    && self.clipboard.policy.problem.is_none() =>
+            {
+                dialog.draft.preferences.coding_agent_notifications_enabled = value;
+            }
+            Message::TerminalNotifications(_, edit)
+                if dialog.section == Section::Messaging
+                    && self.clipboard.policy.desktop_notifications_allowed
+                    && self.clipboard.policy.problem.is_none()
+                    && (dialog.draft.preferences.prompt_navigation_enabled
+                        || !matches!(
+                            edit,
+                            super::terminal_notifications::Edit::Seconds(_)
+                                | super::terminal_notifications::Edit::Commands(_)
+                        )) =>
+            {
+                dialog.draft.preferences.terminal_notifications.edit(edit);
+            }
+            Message::CodingAgentDockAutomatic(_, value) if dialog.section == Section::Terminal => {
+                dialog.draft.preferences.coding_agent_dock_automatic = value;
+            }
             Message::BoldTextMode(_, mode) if dialog.section == Section::Terminal => {
                 dialog.draft.preferences.terminal_bold_text_mode = mode;
+            }
+            Message::AgentDesignCatalog(_, edit) if dialog.section == Section::AgentDesign => {
+                let preferences = &mut dialog.draft.preferences;
+                dialog.agent_design.update(
+                    &mut preferences.ai_agent_designs,
+                    &mut preferences.ai_agent_design,
+                    edit,
+                );
+            }
+            Message::ApplicationUpdates(_, enabled)
+                if dialog.section == Section::Updates
+                    && self.clipboard.policy.problem.is_none()
+                    && self.clipboard.policy.updates_allowed =>
+            {
+                dialog.draft.preferences.application_updates.enabled = enabled;
+            }
+            Message::ApplicationUpdateInterval(_, days)
+                if dialog.section == Section::Updates
+                    && self.clipboard.policy.problem.is_none()
+                    && self.clipboard.policy.updates_allowed
+                    && dialog.draft.preferences.application_updates.enabled
+                    && crate::application_update::Preferences::INTERVAL_DAYS.contains(&days) =>
+            {
+                dialog.draft.preferences.application_updates.interval_days = days;
             }
             Message::SilenceSeconds(_, mut value) if dialog.section == Section::Messaging => {
                 if let Some(seconds) = value.trim().parse::<u16>().ok().filter(|seconds| {
@@ -1001,8 +1744,27 @@ impl Workspace {
             Message::ClipboardRead(_, value) if self.clipboard.policy.read_allowed => {
                 dialog.draft.preferences.clipboard_read_enabled = value;
             }
-            Message::Restore(_, mode) if dialog.draft.restore.is_some() => {
+            Message::Restore(_, mode)
+                if dialog.draft.restore.is_some()
+                    && self.clipboard.policy.session_restore_mode.is_none() =>
+            {
                 dialog.draft.restore = Some(mode)
+            }
+            Message::RestoreOutput(_, enabled)
+                if dialog.section == Section::Window
+                    && self.clipboard.policy.problem.is_none()
+                    && self.clipboard.policy.session_restore_output.is_none() =>
+            {
+                dialog.draft.preferences.restore_output.enabled = enabled;
+            }
+            Message::RestoreOutputLines(_, lines)
+                if dialog.section == Section::Window
+                    && dialog.draft.preferences.restore_output.enabled
+                    && self.clipboard.policy.problem.is_none()
+                    && self.clipboard.policy.session_restore_output.is_none()
+                    && session_restore::OutputPreferences::LINES.contains(&lines) =>
+            {
+                dialog.draft.preferences.restore_output.lines = lines;
             }
             Message::KeyBinding(_, edit) if dialog.section == Section::Keyboard => {
                 dialog
@@ -1018,23 +1780,32 @@ impl Workspace {
         if !self.windows.contains_key(&owner) {
             return Task::none();
         }
+        if let Some((_, focus)) = self.owner_dialog(owner)
+            && !matches!(focus, Desktop::Settings(Message::Focus(_)))
+        {
+            return self.update(focus);
+        }
         if let Some(dialog) = &mut self.settings.0 {
-            dialog.owner = owner;
-            let focus = window::gain_focus(dialog.id);
-            if let Some(section) = section {
+            let id = dialog.id;
+            let reveal = section.map_or_else(Task::none, |section| {
                 dialog.select_section(section);
                 dialog.search.clear();
-                return focus.chain(dialog.reveal_page_start());
-            }
-            return focus;
+                dialog.reveal_page_start()
+            });
+            return self.update_settings(Message::Focus(id)).chain(reveal);
         }
         let draft = Draft {
             preferences: self.window_settings.clone(),
             restore: self.session_restore.preference(),
             backup: self.backup_preferences.clone(),
         };
+        let highlighting = self.highlight.preferences();
         let quick_select = quick_select_settings::Editor::new(&draft.preferences.quick_select);
-        let (id, opened) = self.open_placed_dialog(
+        if let Some(window) = self.windows.get_mut(&owner) {
+            window.cancel_paste();
+        }
+        let (id, opened) = self.open_owned_placed_dialog(
+            owner,
             DialogKind::GlobalSettings,
             window::Settings {
                 size: Size::new(1120.0, 960.0),
@@ -1043,19 +1814,31 @@ impl Workspace {
                 exit_on_close_request: false,
                 ..window::Settings::default()
             },
+            None,
         );
         self.settings.0 = Some(Dialog {
             id,
             owner,
             initial: draft.clone(),
             draft,
+            installed_sftp_conflict_policy: SftpConflictPolicy::load(),
+            sftp_xml: sftp_settings::java::Exchange::default(),
+            initial_highlighting: highlighting.clone(),
+            highlighting,
             section: section.unwrap_or(Section::Font),
             search_input: widget::Id::unique(),
+            search_scroll: widget::Id::unique(),
             tab_scroll: widget::Id::unique(),
             page_scroll: widget::Id::unique(),
+            revealed_row: widget::Id::unique(),
+            revealed_input: widget::Id::unique(),
             search: String::new(),
+            search_selection: 0,
             font_size_input: None,
+            editor_cursor_color_input: None,
             silence_seconds_input: None,
+            terminal_columns_input: None,
+            terminal_rows_input: None,
             toolbar_icon_size: None,
             saving_toolbar_icon_size: false,
             saving_logging: false,
@@ -1066,14 +1849,16 @@ impl Workspace {
             problem: None,
             keyboard: KeyboardEditor::default(),
             colors: color_settings::Editor::default(),
+            snippet_appearance: snippet_editor_settings::Editor::default(),
             themes: theme_settings::Editor::default(),
+            agent_design: agent_design_settings::Editor::default(),
             backup: backup::Editor::default(),
             logging: logging_settings::Editor::default(),
             export: export_settings::Editor::default(),
             quick_select,
             video: video_settings::Editor::new(self.video.preferences()),
         });
-        opened.discard().chain(
+        opened.chain(
             self.settings
                 .0
                 .as_ref()
@@ -1082,13 +1867,16 @@ impl Workspace {
     }
 
     pub(super) fn open_journal_options(&mut self, owner: window::Id) -> Task<Desktop> {
-        let open = self.update_settings(Message::OpenAt(owner, Section::Logging));
-        if let Some(dialog) = self
-            .settings
-            .0
-            .as_mut()
-            .filter(|dialog| dialog.owner == owner && !dialog.saving())
+        if !self.windows.contains_key(&owner) {
+            return Task::none();
+        }
+        if let Some((_, focus)) = self.owner_dialog(owner)
+            && !matches!(focus, Desktop::Settings(Message::Focus(_)))
         {
+            return self.update(focus);
+        }
+        let open = self.update_settings(Message::OpenAt(owner, Section::Logging));
+        if let Some(dialog) = self.settings.0.as_mut().filter(|dialog| !dialog.saving()) {
             return open.chain(dialog.reveal(Setting::JournalAutomaticVision));
         }
         open
@@ -1096,6 +1884,9 @@ impl Workspace {
 
     fn save_settings(&mut self, id: window::Id) -> Task<Desktop> {
         if let Some(dialog) = self.openpgp_for_source(id) {
+            return window::gain_focus(dialog);
+        }
+        if let Some(dialog) = self.highlight_rules_for_settings(id) {
             return window::gain_focus(dialog);
         }
         let manager_profile_ready = self.manager_journal_profile_ready();
@@ -1299,7 +2090,7 @@ impl Workspace {
         save: impl FnOnce(&WindowSettings) -> std::io::Result<()>,
         mut prepared: Option<crate::app_logging::Candidate>,
     ) -> Task<Desktop> {
-        let task = self.apply_settings_to(id, save, &mut prepared);
+        let task = self.apply_settings_to(id, save, &mut prepared, profile::root);
         self.abort_app_logging(prepared);
         task
     }
@@ -1309,6 +2100,7 @@ impl Workspace {
         id: window::Id,
         save: impl FnOnce(&WindowSettings) -> std::io::Result<()>,
         prepared: &mut Option<crate::app_logging::Candidate>,
+        highlight_root: impl FnOnce() -> std::io::Result<std::path::PathBuf>,
     ) -> Task<Desktop> {
         if let Some(dialog) = self.openpgp_for_source(id) {
             return window::gain_focus(dialog);
@@ -1318,6 +2110,10 @@ impl Workspace {
         let Some(dialog) = self.settings.dialog_mut(id) else {
             return Task::none();
         };
+        dialog.installed_sftp_conflict_policy = SftpConflictPolicy::load();
+        let sftp_conflict_policy = dialog
+            .installed_sftp_conflict_policy
+            .restrict(&self.clipboard.policy);
         if let Some(reveal) = dialog.reveal_invalid_input() {
             return reveal;
         }
@@ -1387,6 +2183,8 @@ impl Workspace {
             return Task::none();
         }
         let (draft, initial) = (&dialog.draft, &dialog.initial);
+        let initial_highlighting = dialog.initial_highlighting.clone();
+        let edited_highlighting = dialog.highlighting.clone();
         if let Some((_, actions)) = draft.preferences.key_bindings.conflicts().first() {
             dialog.section = Section::Keyboard;
             dialog.search.clear();
@@ -1421,7 +2219,9 @@ impl Workspace {
                 return Task::none();
             }
         };
-        let restore = draft.restore.filter(|mode| Some(*mode) != initial.restore);
+        let restore = draft.restore.filter(|mode| {
+            self.clipboard.policy.session_restore_mode.is_none() && Some(*mode) != initial.restore
+        });
         let session_journal = match dialog.logging.merge_journal(
             &initial.preferences.session_journal,
             &self.window_settings.session_journal,
@@ -1456,6 +2256,30 @@ impl Workspace {
             self.window_settings.clone(),
             &self.clipboard.policy,
         );
+        if !next.sftp_archive.valid() {
+            if let Some(dialog) = self.settings.dialog_mut(id) {
+                dialog.select_section(Section::Sftp);
+                dialog.search.clear();
+                dialog.revealed = Some(Setting::SftpArchive);
+                dialog.problem =
+                    Some("Enter an absolute SFTP archive directory or leave it blank.".into());
+            }
+            return Task::none();
+        }
+        if !sftp_conflict_policy.editable() {
+            next.sftp_conflict_default = self.window_settings.sftp_conflict_default;
+        }
+        if !sftp_conflict_policy.transfer_allowed || sftp_conflict_policy.parallel_cap == 1 {
+            next.sftp_parallel_transfers = self.window_settings.sftp_parallel_transfers;
+        } else if next.sftp_parallel_transfers != self.window_settings.sftp_parallel_transfers {
+            next.sftp_parallel_transfers = next
+                .sftp_parallel_transfers
+                .min(sftp_conflict_policy.parallel_cap);
+        }
+        if !sftp_conflict_policy.transfer_allowed {
+            next.sftp_resume_partial_transfers = self.window_settings.sftp_resume_partial_transfers;
+            next.sftp_keep_partial_on_cancel = self.window_settings.sftp_keep_partial_on_cancel;
+        }
         next.app_logging = app_logging;
         next.session_journal = session_journal;
         next.journal_ai = journal_ai;
@@ -1466,8 +2290,14 @@ impl Workspace {
         let journal_directory_changed =
             next.session_journal.directory != self.window_settings.session_journal.directory;
         let preferences_changed = next != self.window_settings;
+        let backgrounds_changed = !next
+            .themes
+            .background_assets()
+            .collect::<std::collections::BTreeSet<_>>()
+            .eq(&self.window_settings.themes.background_assets().collect());
         let appearance = next.terminal_appearance();
-        let appearance_changed = appearance != self.window_settings.terminal_appearance();
+        let appearance_changed = appearance != self.window_settings.terminal_appearance()
+            || next.themes != self.window_settings.themes;
         let prompt_changed =
             next.prompt_navigation_enabled != self.window_settings.prompt_navigation_enabled;
         let sidebar_changed =
@@ -1503,8 +2333,23 @@ impl Workspace {
         if write == Some(false) {
             self.apply_clipboard_write(false);
         }
+        let mut geometry = Task::none();
         if preferences_changed {
-            if let Err(error) = save(&next) {
+            let saved = self
+                .settings
+                .0
+                .as_ref()
+                .filter(|dialog| dialog.id == id)
+                .map_or(Ok(()), |dialog| {
+                    if dialog.themes.has_staged_backgrounds() {
+                        profile::root()
+                            .and_then(|root| dialog.themes.publish_backgrounds(&next.themes, &root))
+                    } else {
+                        Ok(())
+                    }
+                })
+                .and_then(|()| save(&next));
+            if let Err(error) = saved {
                 self.abort_app_logging(logging_candidate);
                 if let Some(dialog) = self.settings.dialog_mut(id) {
                     let detail = if read == Some(false) || write == Some(false) {
@@ -1531,16 +2376,34 @@ impl Workspace {
                     pane.font_baseline = next.terminal_font;
                 }
             }
-            if next.scrollback_compression_enabled
-                != self.window_settings.scrollback_compression_enabled
-            {
-                for pane in self.sessions.values() {
+            let scrollback_changed =
+                next.scrollback_config() != self.window_settings.scrollback_config();
+            let detection_changed = next.coding_agent_detection_enabled
+                != self.window_settings.coding_agent_detection_enabled;
+            let dock_changed = next.coding_agent_dock_automatic
+                != self.window_settings.coding_agent_dock_automatic;
+            if detection_changed {
+                for pane in self.sessions.values_mut() {
                     pane.session
-                        .set_scrollback_compression_enabled(next.scrollback_compression_enabled);
+                        .set_coding_agent_detection(next.coding_agent_detection_enabled);
+                    pane.coding_agent.clear_detection();
                 }
             }
             let journal_ai_changed = next.journal_ai != self.window_settings.journal_ai;
+            geometry = self
+                .dialog_placement
+                .set_remembering(next.startup.remember_geometry);
             self.window_settings = next;
+            if backgrounds_changed {
+                self.refresh_terminal_backgrounds();
+            }
+            if scrollback_changed {
+                self.sync_open_scrollback();
+            }
+            self.refresh_sftp_preferences();
+            if detection_changed || dock_changed {
+                self.reconcile_coding_agent_docks();
+            }
             if journal_ai_changed {
                 self.renew_journal_screenshot_ai_consents();
                 self.cancel_obsolete_journal_screenshot_analyses();
@@ -1556,6 +2419,7 @@ impl Workspace {
                 }
             }
         }
+        self.refresh_sftp_conflict_defaults(sftp_conflict_policy);
         if read == Some(true) {
             self.apply_clipboard_read(true);
         }
@@ -1576,6 +2440,28 @@ impl Workspace {
         } else {
             Task::none()
         };
+        match self.commit_highlight_preferences(
+            &initial_highlighting,
+            &edited_highlighting,
+            highlight_root,
+        ) {
+            Ok(committed) => {
+                if let Some(dialog) = self.settings.dialog_mut(id) {
+                    dialog.initial_highlighting = committed.clone();
+                    dialog.highlighting = committed;
+                }
+            }
+            Err(error) => {
+                if let Some(dialog) = self.settings.dialog_mut(id) {
+                    dialog.select_section(Section::Terminal);
+                    dialog.search.clear();
+                    dialog.revealed = Some(Setting::Highlighting);
+                    dialog.problem =
+                        Some(format!("Could not save keyword highlighting ({error})."));
+                }
+                return Task::batch([restore, sidebar, journals, geometry]);
+            }
+        }
         let complete = if backup != self.backup_preferences
             && let Err(error) = self.commit_backup_preferences(backup)
         {
@@ -1609,7 +2495,7 @@ impl Workspace {
         } else {
             self.finish_toolbar_settings(id)
         };
-        Task::batch([restore, sidebar, journals, complete])
+        Task::batch([restore, sidebar, journals, geometry, complete])
     }
 
     pub(super) fn settings_view(&self, id: window::Id) -> Option<Element<'_, Desktop>> {
@@ -1621,7 +2507,10 @@ impl Workspace {
                 } else if dialog.saving_video {
                     "Saving recording settings…"
                 } else {
-                    "Saving toolbar icon size…"
+                    dialog
+                        .themes
+                        .exchanging()
+                        .unwrap_or("Saving toolbar icon size…")
                 }))
                 .center_x(Length::Fill)
                 .center_y(Length::Fill)
@@ -1633,40 +2522,55 @@ impl Workspace {
             .windows
             .get(&dialog.owner)
             .and_then(|window| self.transparency_controls(window));
-        let matches = search_matches(&dialog.search).filter(|setting| match setting {
-            Setting::Restore => dialog.draft.restore.is_some(),
-            Setting::Transparency => transparency.is_some(),
-            _ => true,
-        });
-        let mut matches = matches.peekable();
+        let mut matches = dialog.search_results(transparency.is_some()).peekable();
         let input = row![
-            text_input("Search settings…", &dialog.search)
-                .id(dialog.search_input.clone())
-                .on_input(move |query| msg(Message::Search(id, query)))
-                .on_submit_maybe(
-                    matches
-                        .peek()
-                        .map(|&setting| msg(Message::Reveal(id, setting)))
-                ),
-            button("×").style(button::secondary).on_press_maybe(
-                (!dialog.search.is_empty()).then(|| msg(Message::Search(id, String::new())))
+            search_input::view(
+                text_input("Search settings…", &dialog.search)
+                    .id(dialog.search_input.clone())
+                    .on_input(move |query| msg(Message::Search(id, query)))
+                    .on_submit(msg(Message::SearchChoose(id))),
+                id,
             ),
+            button("×")
+                .style(button::secondary)
+                .on_press_maybe((!dialog.search.is_empty()).then(|| msg(Message::SearchClear(id)))),
         ]
         .spacing(6);
-        let mut search = column![input].width(Length::Fill).spacing(4);
-        for setting in matches {
-            search = search.push(
-                button(text(format!(
-                    "{} · {}",
-                    setting.label(),
-                    setting.section().label()
-                )))
-                .style(button::secondary)
+        let search = container(container(input).max_width(SEARCH_MAX_WIDTH)).center_x(Length::Fill);
+        let results = matches.peek().is_some().then(|| {
+            let items = column(matches.enumerate().map(|(index, setting)| {
+                button(
+                    text(format!(
+                        "{} · {}",
+                        setting.label(),
+                        setting.section().label()
+                    ))
+                    .wrapping(text::Wrapping::None),
+                )
+                .style(if dialog.search_selection == index {
+                    button::primary
+                } else {
+                    button::secondary
+                })
+                .height(SEARCH_ROW_HEIGHT)
                 .width(Length::Fill)
-                .on_press(msg(Message::Reveal(id, setting))),
-            );
-        }
-        let search = container(search.max_width(660.0)).center_x(Length::Fill);
+                .on_press(msg(Message::Reveal(id, setting)))
+                .into()
+            }))
+            .spacing(4)
+            .width(Length::Fill);
+            let panel = container(
+                scrollable(items)
+                    .id(dialog.search_scroll.clone())
+                    .height(Length::Shrink),
+            )
+            .padding(6)
+            .width(Length::Fill)
+            .max_width(SEARCH_MAX_WIDTH)
+            .max_height(SEARCH_RESULTS_MAX_HEIGHT)
+            .style(container::bordered_box);
+            container(opaque(panel)).center_x(Length::Fill)
+        });
 
         let index = dialog.section.index();
         let navigation = row![
@@ -1723,7 +2627,9 @@ impl Workspace {
             });
         let tabs = scrollable(tabs)
             .id(dialog.tab_scroll.clone())
-            .horizontal()
+            .direction(scrollable::Direction::Horizontal(
+                scrollable::Scrollbar::new().spacing(4),
+            ))
             .width(Length::Fill);
         let page = match dialog.section {
             Section::Font => font_settings_page(dialog),
@@ -1732,7 +2638,10 @@ impl Workspace {
                 Setting::Colors,
                 dialog
                     .colors
-                    .view(&dialog.draft.preferences)
+                    .view(
+                        &dialog.draft.preferences,
+                        dialog.input_target(Setting::Colors, true),
+                    )
                     .map(move |edit| msg(Message::Color(id, edit))),
             ),
             Section::Themes => highlighted(
@@ -1740,7 +2649,11 @@ impl Workspace {
                 Setting::Themes,
                 dialog
                     .themes
-                    .view(&dialog.draft.preferences)
+                    .view(
+                        &dialog.draft.preferences,
+                        &self.terminal_backgrounds,
+                        dialog.input_target(Setting::Themes, true),
+                    )
                     .map(move |edit| msg(Message::Theme(id, edit))),
             ),
             Section::Appearance => highlighted(
@@ -1749,7 +2662,12 @@ impl Workspace {
                 appearance_settings::view(dialog.draft.preferences.appearance, id).map(msg),
             ),
             Section::Terminal => self.terminal_settings_page(dialog),
-            Section::Messaging => messaging_settings_page(dialog),
+            Section::Sftp => self.sftp_settings_page(dialog),
+            Section::Messaging => messaging_settings_page(
+                dialog,
+                self.clipboard.policy.desktop_notifications_allowed
+                    && self.clipboard.policy.problem.is_none(),
+            ),
             Section::Video => video_settings::view(dialog, self.recording_allowed()),
             Section::Backup => self.backup_settings_page(dialog),
             Section::Logging => self.logging_settings_page(dialog),
@@ -1762,6 +2680,63 @@ impl Workspace {
                     .keyboard
                     .view(&dialog.draft.preferences.key_bindings, id),
             ),
+            Section::Editor => editor_settings::view(dialog),
+            Section::SnippetEditor => snippet_editor_settings::view(dialog),
+            Section::AgentDesign => {
+                let preferences = &dialog.draft.preferences;
+                highlighted(
+                    dialog,
+                    Setting::AgentDesign,
+                    dialog.agent_design.view(
+                        &preferences.ai_agent_designs,
+                        preferences.ai_agent_design,
+                        id,
+                        dialog.input_target(Setting::AgentDesign, true),
+                    ),
+                )
+            }
+            Section::Updates => {
+                let preferences = dialog.draft.preferences.application_updates;
+                let allowed = self.clipboard.policy.problem.is_none()
+                    && self.clipboard.policy.updates_allowed;
+                let interval: Element<'_, Desktop> = if allowed && preferences.enabled {
+                    pick_list(
+                        crate::application_update::Preferences::INTERVAL_DAYS.collect::<Vec<_>>(),
+                        Some(preferences.interval_days),
+                        move |days| msg(Message::ApplicationUpdateInterval(id, days)),
+                    )
+                    .into()
+                } else {
+                    text(preferences.interval_days.to_string()).into()
+                };
+                column![
+                    highlighted(
+                        dialog,
+                        Setting::ApplicationUpdates,
+                        checkbox(preferences.enabled)
+                            .label(Setting::ApplicationUpdates.label())
+                            .on_toggle_maybe(allowed.then_some(move |enabled| {
+                                msg(Message::ApplicationUpdates(id, enabled))
+                            })),
+                    ),
+                    highlighted(
+                        dialog,
+                        Setting::ApplicationUpdateInterval,
+                        row![
+                            text(Setting::ApplicationUpdateInterval.label()),
+                            interval,
+                            text("days")
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                    ),
+                    text(self.application_update_channel()).size(14),
+                    text("Review available archives in Help → About kortty.").size(14),
+                    text(self.application_update_status()).size(14),
+                ]
+                .spacing(10)
+                .into()
+            }
         };
         let footer = row![space::horizontal()]
             .spacing(10)
@@ -1791,33 +2766,77 @@ impl Workspace {
             footer
         ]
         .spacing(6);
+        let page = column![
+            navigation,
+            column![rule::horizontal(1), tabs].spacing(4),
+            container(
+                scrollable(container(page).width(Length::Fill).padding(20))
+                    .id(dialog.page_scroll.clone())
+            )
+            .height(Length::Fill)
+            .width(Length::Fill)
+            .style(container::bordered_box),
+        ]
+        .spacing(10)
+        .height(Length::Fill);
+        // The suggestions occupy a layer over the section, leaving the footer in place.
+        let mut body = stack![page].height(Length::Fill).width(Length::Fill);
+        if let Some(results) = results {
+            body = body.push(results);
+        }
 
-        Some(
-            column![
-                container(text("Global Terminal Settings").size(19))
-                    .width(Length::Fill)
-                    .padding([12, 14])
-                    .style(container::secondary),
-                column![
-                    search,
-                    navigation,
-                    column![rule::horizontal(1), tabs].spacing(4),
-                    container(
-                        scrollable(container(page).width(Length::Fill).padding(20))
-                            .id(dialog.page_scroll.clone())
-                    )
-                    .height(Length::Fill)
-                    .width(Length::Fill)
-                    .style(container::bordered_box),
-                    footer,
-                ]
+        let content = column![
+            container(text("Global Terminal Settings").size(19))
+                .width(Length::Fill)
+                .padding([12, 14])
+                .style(container::secondary),
+            column![search, body, footer]
                 .spacing(10)
                 .padding(12)
                 .height(Length::Fill),
-            ]
-            .height(Length::Fill)
-            .into(),
-        )
+        ]
+        .height(Length::Fill)
+        .into();
+        let content = on_escape(content, msg(Message::Escape(id)));
+        let modal = self
+            .highlight_rules_for_settings(id)
+            .map(|id| Desktop::Highlight(highlight::Message::Focus(id)));
+        Some(super::profile_tools::vault_modal::gate(content, modal))
+    }
+
+    fn dismiss_settings(&mut self, id: window::Id) -> Task<Desktop> {
+        if let Some(child) = self
+            .openpgp_for_source(id)
+            .or_else(|| self.highlight_rules_for_settings(id))
+        {
+            return window::gain_focus(child);
+        }
+        if self.capture_settings_shortcut(id, &Key::Named(Named::Escape), Modifiers::empty()) {
+            return Task::none();
+        }
+        let Some(dialog) = self.settings.dialog_mut(id) else {
+            return Task::none();
+        };
+        let message = if !dialog.search.is_empty() {
+            Message::SearchClear(id)
+        } else {
+            match dialog.section {
+                Section::Themes => dialog
+                    .themes
+                    .cancel_message()
+                    .map_or(Message::Cancel(id), |edit| Message::Theme(id, edit)),
+                Section::Backup if dialog.backup.browsing() => {
+                    dialog.backup.close_browser();
+                    return Task::none();
+                }
+                Section::Logging if dialog.logging.browsing() => {
+                    dialog.logging.close_browser();
+                    return Task::none();
+                }
+                _ => Message::Cancel(id),
+            }
+        };
+        self.update_settings(message)
     }
 
     fn terminal_settings_page<'a>(&'a self, dialog: &'a Dialog) -> Element<'a, Desktop> {
@@ -1825,6 +2844,7 @@ impl Workspace {
         let settings = &dialog.draft.preferences;
         let policy = &self.clipboard.policy;
         let threshold = settings.paste_large_warning_kib;
+        let delay = settings.paste_line_delay_ms;
         let paste_floor = policy.minimum_paste_warning;
         let paste_modes: Vec<_> = WarningMode::ALL
             .into_iter()
@@ -1866,6 +2886,30 @@ impl Workspace {
                 "The size warning is independent of the line-break and control-character warning."
             )
             .size(13),
+            highlighted(
+                dialog,
+                Setting::PasteLineDelay,
+                column![
+                    row![
+                        text(Setting::PasteLineDelay.label()),
+                        slider(
+                            0..=crate::connection_store::MAX_PASTE_LINE_DELAY_MS,
+                            delay,
+                            move |value| { Desktop::Settings(Message::PasteLineDelay(id, value)) }
+                        )
+                        .width(180),
+                        text(if delay == 0 {
+                            "Off".to_owned()
+                        } else {
+                            format!("{delay} ms")
+                        }),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    text("Press Esc in the terminal to stop a paced paste.").size(13),
+                ]
+                .spacing(5),
+            ),
             (paste_floor != WarningMode::Off)
                 .then(|| text("Your organization sets the minimum paste warning level.").size(13)),
         ]
@@ -1893,6 +2937,18 @@ impl Workspace {
         .spacing(7);
         let mut page = column![
             text("Terminal Settings").size(18),
+            initial_terminal_size(dialog),
+            highlighted(
+                dialog,
+                Setting::SerialDefaultEncoding,
+                column![
+                    text(Setting::SerialDefaultEncoding.label()),
+                    pick_list(TextEncoding::ALL, Some(settings.serial_default_encoding), move |encoding| {
+                        Desktop::Settings(Message::SerialDefaultEncoding(id, encoding))
+                    }),
+                    text("Applies when a serial connection uses the default. Reconnect to apply changes.").size(13),
+                ].spacing(5),
+            ),
             text("Links").size(16),
             highlighted(
                 dialog,
@@ -1916,6 +2972,27 @@ impl Workspace {
             ),
             highlighted(
                 dialog,
+                Setting::ScrollbackLines,
+                column![
+                    text(format!("{} · {}", Setting::ScrollbackLines.label(), settings.scrollback_lines)),
+                    slider(ScrollbackConfig::MIN_LINES..=ScrollbackConfig::MAX_LINES, settings.scrollback_lines, move |lines| {
+                        Desktop::Settings(Message::ScrollbackLines(id, lines))
+                    }),
+                ].spacing(3),
+            ),
+            highlighted(
+                dialog,
+                Setting::ScrollbackMemory,
+                column![
+                    text(format!("{} · {} MiB", Setting::ScrollbackMemory.label(), settings.scrollback_memory_mib)),
+                    slider(ScrollbackConfig::MIN_MEMORY_MIB..=ScrollbackConfig::MAX_MEMORY_MIB, settings.scrollback_memory_mib, move |memory| {
+                        Desktop::Settings(Message::ScrollbackMemory(id, memory))
+                    }),
+                    text("The first limit reached removes the oldest lines. Applies to open panes when saved.").size(12),
+                ].spacing(3),
+            ),
+            highlighted(
+                dialog,
                 Setting::ScrollbackCompression,
                 column![
                     checkbox(settings.scrollback_compression_enabled)
@@ -1924,6 +3001,27 @@ impl Workspace {
                             Desktop::Settings(Message::ScrollbackCompression(id, enabled))
                         }),
                     text("Packs older scrollback lines while the terminal is idle. Applies to open panes when saved.").size(12),
+                ].spacing(3),
+            ),
+            highlighted(
+                dialog,
+                Setting::SshKeepAlive,
+                column![
+                    checkbox(settings.ssh_keepalive_enabled)
+                        .label(Setting::SshKeepAlive.label())
+                        .on_toggle(move |enabled| Desktop::Settings(Message::SshKeepAlive(id, enabled))),
+                    text("Sends an encrypted heartbeat when an SSH connection is idle. Applies to new connections and reconnects.").size(12),
+                ].spacing(3),
+            ),
+            highlighted(
+                dialog,
+                Setting::SshKeepAliveInterval,
+                column![
+                    text(format!("{} · {} seconds", Setting::SshKeepAliveInterval.label(), settings.ssh_keepalive_interval)),
+                    settings.ssh_keepalive_enabled.then(|| slider(
+                        KeepAlive::MIN_SECONDS..=KeepAlive::MAX_SECONDS, settings.ssh_keepalive_interval,
+                        move |seconds| Desktop::Settings(Message::SshKeepAliveInterval(id, seconds)),
+                    )),
                 ].spacing(3),
             ),
             highlighted(
@@ -1952,6 +3050,8 @@ impl Workspace {
                 ]
                 .spacing(3),
             ),
+            rule::horizontal(1),
+            self.highlight_settings_section(dialog),
             rule::horizontal(1),
             text("Paste Protection").size(16),
             paste,
@@ -2008,6 +3108,39 @@ impl Workspace {
                 .spacing(8)
                 .align_y(Alignment::Center),
             ))
+            .push(rule::horizontal(1))
+            .push(text("Coding agents").size(16))
+            .push(highlighted(
+                dialog,
+                Setting::CodingAgentDetection,
+                column![
+                    checkbox(settings.coding_agent_detection_enabled)
+                        .label(Setting::CodingAgentDetection.label())
+                        .on_toggle(move |enabled| {
+                            Desktop::Settings(Message::CodingAgentDetection(id, enabled))
+                        }),
+                    text("Shows the state of supported coding agents in local terminal tabs. Applies to open panes when saved.").size(12),
+                ]
+                .spacing(3),
+            ))
+            .push(highlighted(
+                dialog,
+                Setting::CodingAgentAppBadge,
+                checkbox(settings.coding_agent_app_badge_enabled)
+                    .label(Setting::CodingAgentAppBadge.label())
+                    .on_toggle(move |enabled| {
+                        Desktop::Settings(Message::CodingAgentAppBadge(id, enabled))
+                    }),
+            ))
+            .push(highlighted(
+                dialog,
+                Setting::CodingAgentDockAutomatic,
+                checkbox(settings.coding_agent_dock_automatic)
+                    .label(Setting::CodingAgentDockAutomatic.label())
+                    .on_toggle(move |enabled| {
+                        Desktop::Settings(Message::CodingAgentDockAutomatic(id, enabled))
+                    }),
+            ))
             .spacing(12)
             .into()
     }
@@ -2043,7 +3176,7 @@ impl Workspace {
                     .label(Setting::RememberGeometry.label())
                     .on_toggle(move |enabled| Desktop::Settings(Message::Startup(id, startup_settings::Edit::RememberGeometry(enabled)))),
             ),
-            text("Restore the last size, position and maximized state when opening a window.").size(13),
+            text("Restore the last size and position of main windows and native dialogs, and the maximized state of main windows.").size(13),
             highlighted(
                 dialog,
                 Setting::RememberDashboard,
@@ -2110,8 +3243,25 @@ impl Workspace {
             rule::horizontal(1),
             text("Session Restore").size(16),
         ];
-        page = match dialog.draft.restore {
-            Some(mode) => page.push(highlighted(
+        page = match (
+            dialog.draft.restore,
+            self.clipboard.policy.session_restore_mode,
+        ) {
+            (Some(_), Some(mode)) => page.push(highlighted(
+                dialog,
+                Setting::Restore,
+                column![
+                    row![
+                        text(format!("{}:", Setting::Restore.label())).width(128),
+                        text(RestoreChoice(mode).to_string()),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                    text("Managed by your organization.").size(13),
+                ]
+                .spacing(4),
+            )),
+            (Some(mode), None) => page.push(highlighted(
                 dialog,
                 Setting::Restore,
                 row![
@@ -2125,14 +3275,68 @@ impl Workspace {
                 .spacing(8)
                 .align_y(Alignment::Center),
             )),
-            None => page.push(text("Session recovery is unavailable.").size(14)),
+            (None, _) => page.push(text("Session recovery is unavailable.").size(14)),
         };
+        let master_password_managed = self.clipboard.policy.require_master_password;
+        let edit_master_password =
+            !master_password_managed && self.clipboard.policy.problem.is_none();
+        page = page.push(highlighted(
+            dialog,
+            Setting::StartupMasterPassword,
+            column![
+                checkbox(master_password_managed || startup.require_master_password)
+                    .label(Setting::StartupMasterPassword.label())
+                    .on_toggle_maybe(edit_master_password.then_some(move |enabled| {
+                        Desktop::Settings(Message::Startup(id, startup_settings::Edit::MasterPassword(enabled)))
+                    })),
+                text(if master_password_managed {
+                    "Managed by your organization."
+                } else {
+                    "Unlock or create the credential vault before opening the workspace. Takes effect at the next start."
+                }).size(13),
+            ].spacing(4),
+        ));
+        let output = dialog.draft.preferences.restore_output;
+        let managed = self.clipboard.policy.session_restore_output;
+        let enabled = managed.unwrap_or(output.enabled);
+        let editable = self.clipboard.policy.problem.is_none() && managed.is_none();
+        let lines: Element<'_, Desktop> = if editable && enabled {
+            slider(
+                session_restore::OutputPreferences::LINES,
+                output.lines,
+                move |lines| Desktop::Settings(Message::RestoreOutputLines(id, lines)),
+            )
+            .width(180)
+            .into()
+        } else {
+            space::horizontal().width(0).into()
+        };
+        page = page.push(
+            column![
+                checkbox(enabled)
+                    .label("Restore terminal output (encrypted)")
+                    .on_toggle_maybe(editable.then_some(move |enabled| {
+                        Desktop::Settings(Message::RestoreOutput(id, enabled))
+                    })),
+                row![
+                    text(format!("Lines of output per pane · {}", output.lines)),
+                    lines
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center),
+                managed
+                    .is_some()
+                    .then(|| text("Managed by your organization.").size(13)),
+                text("Saving and restoring output requires an unlocked credential vault.").size(13),
+            ]
+            .spacing(6),
+        );
         page = page.push(rule::horizontal(1)).push(highlighted(
             dialog,
             Setting::FixedGeometry,
             dialog
                 .startup
-                .view(startup)
+                .view(startup, dialog.input_target(Setting::FixedGeometry, true))
                 .map(move |edit| Desktop::Settings(Message::Startup(id, edit))),
         ));
         if let Some(controls) = transparency {
@@ -2177,13 +3381,112 @@ fn toolbar_size_scale(id: window::Id, size: u16) -> Element<'static, Desktop> {
     .into()
 }
 
-fn messaging_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
+fn update_grid_dimension(
+    dimension: &mut Option<u16>,
+    invalid: &mut Option<String>,
+    mut input: String,
+    range: RangeInclusive<u16>,
+) {
+    input.truncate(input.floor_char_boundary(16));
+    let value = input.trim();
+    if value.is_empty() {
+        *dimension = None;
+        *invalid = None;
+    } else if let Some(value) = value.parse().ok().filter(|value| range.contains(value)) {
+        *dimension = Some(value);
+        *invalid = None;
+    } else {
+        *invalid = Some(input);
+    }
+}
+
+fn initial_terminal_size(dialog: &Dialog) -> Element<'_, Desktop> {
+    let id = dialog.id;
+    let settings = &dialog.draft.preferences;
+    let columns = settings
+        .terminal_columns
+        .map_or_else(String::new, |v| v.to_string());
+    let rows = settings
+        .terminal_rows
+        .map_or_else(String::new, |v| v.to_string());
+    highlighted(
+        dialog,
+        Setting::InitialTerminalSize,
+        column![
+            text(Setting::InitialTerminalSize.label()),
+            row![
+                column![
+                    text("Columns"),
+                    dialog.reveal_input(
+                        Setting::InitialTerminalSize,
+                        true,
+                        text_input("Automatic", dialog.terminal_columns_input.as_deref().unwrap_or(&columns))
+                            .on_input(move |value| Desktop::Settings(Message::TerminalColumns(id, value))),
+                    ),
+                ]
+                .spacing(3)
+                .width(120),
+                column![
+                    text("Rows"),
+                    text_input("Automatic", dialog.terminal_rows_input.as_deref().unwrap_or(&rows))
+                        .on_input(move |value| Desktop::Settings(Message::TerminalRows(id, value))),
+                ]
+                .spacing(3)
+                .width(120),
+            ]
+            .spacing(8)
+            .wrap(),
+            (dialog.terminal_columns_input.is_some() || dialog.terminal_rows_input.is_some())
+                .then(|| text("Enter 40 to 500 columns and 10 to 200 rows, or leave either field blank.")
+                    .style(text::danger)
+                    .size(13)),
+            text("Applies when starting local shells and SSH sessions. Blank fields use the terminal emulation’s default.")
+                .size(13),
+        ]
+        .spacing(5),
+    )
+}
+
+fn messaging_settings_page(
+    dialog: &Dialog,
+    desktop_notifications_allowed: bool,
+) -> Element<'_, Desktop> {
     let id = dialog.id;
     let seconds = dialog.draft.preferences.terminal_silence_seconds;
     let saved = seconds.to_string();
     let value = dialog.silence_seconds_input.as_deref().unwrap_or(&saved);
     column![
         text("Notifications").size(18),
+        highlighted(
+            dialog,
+            Setting::TerminalNotifications,
+            dialog.draft.preferences.terminal_notifications.view(
+                id,
+                desktop_notifications_allowed,
+                dialog.draft.preferences.prompt_navigation_enabled,
+            ),
+        ),
+        highlighted(
+            dialog,
+            Setting::CodingAgentNotifications,
+            column![
+                checkbox(
+                    desktop_notifications_allowed
+                        && dialog.draft.preferences.coding_agent_notifications_enabled,
+                )
+                .label(Setting::CodingAgentNotifications.label())
+                .on_toggle_maybe(desktop_notifications_allowed.then_some(move |enabled| {
+                    Desktop::Settings(Message::CodingAgentNotifications(id, enabled))
+                })),
+                text(if desktop_notifications_allowed {
+                    "Uses the system notification service. Private tabs stay out of desktop notifications."
+                } else {
+                    "Desktop notifications are disabled by managed policy."
+                })
+                .size(13),
+            ]
+            .spacing(5),
+        ),
         highlighted(
             dialog,
             Setting::SilenceThreshold,
@@ -2194,11 +3497,13 @@ fn messaging_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
                         (seconds > MIN_TERMINAL_SILENCE_SECONDS)
                             .then_some(Desktop::Settings(Message::StepSilenceSeconds(id, false)))
                     ),
-                    text_input("30", value)
-                        .width(72)
-                        .on_input(move |value| Desktop::Settings(Message::SilenceSeconds(
-                            id, value
-                        ))),
+                    dialog.reveal_input(
+                        Setting::SilenceThreshold,
+                        true,
+                        text_input("30", value)
+                            .width(72)
+                            .on_input(move |value| Desktop::Settings(Message::SilenceSeconds(id, value))),
+                    ),
                     button("+").on_press_maybe(
                         (seconds < MAX_TERMINAL_SILENCE_SECONDS)
                             .then_some(Desktop::Settings(Message::StepSilenceSeconds(id, true)))
@@ -2258,12 +3563,16 @@ fn font_settings_page(dialog: &Dialog) -> Element<'_, Desktop> {
             Setting::FontSize,
             row![
                 text(Setting::FontSize.label()).width(150),
-                text_input(
-                    "8–72",
-                    dialog.font_size_input.as_deref().unwrap_or(&formatted_size)
-                )
-                .width(50)
-                .on_input(move |value| Desktop::Settings(Message::FontSizeInput(id, value))),
+                dialog.reveal_input(
+                    Setting::FontSize,
+                    true,
+                    text_input(
+                        "8–72",
+                        dialog.font_size_input.as_deref().unwrap_or(&formatted_size)
+                    )
+                    .width(50)
+                    .on_input(move |value| Desktop::Settings(Message::FontSizeInput(id, value))),
+                ),
                 button("−").style(button::secondary).on_press_maybe(
                     (size > profile::MIN_TERMINAL_FONT)
                         .then(|| Desktop::Settings(Message::FontSize(id, size - 1))),
@@ -2309,15 +3618,14 @@ fn highlighted<'a>(
     setting: Setting,
     content: impl Into<Element<'a, Desktop>>,
 ) -> Element<'a, Desktop> {
-    container(content)
-        .width(Length::Fill)
-        .padding(4)
-        .style(if dialog.revealed == Some(setting) {
-            container::secondary
-        } else {
-            container::transparent
-        })
-        .into()
+    let row = container(content).width(Length::Fill).padding(4);
+    if dialog.revealed == Some(setting) {
+        row.id(dialog.revealed_row.clone())
+            .style(container::secondary)
+            .into()
+    } else {
+        row.style(container::transparent).into()
+    }
 }
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -2365,6 +3673,59 @@ fn save_preferences(preferences: &WindowSettings) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn settings_keep_their_owner_and_route_close_requests_until_dismissed() {
+        use super::super::chrome::Action;
+        use iced::futures::{StreamExt, executor::block_on};
+        use iced_runtime::{Action as RuntimeAction, task, window::Action as WindowAction};
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let (other, _) = workspace.open_window(false);
+        let _ = workspace.update_settings(Message::Open(owner));
+        let dialog = workspace.settings.for_owner(owner).unwrap();
+        #[cfg(target_os = "windows")]
+        let _ = workspace.finish_owned_dialog_open(dialog, owner, None);
+        let _ = workspace.update_settings(Message::OpenAt(other, Section::Appearance));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().section,
+            Section::Appearance
+        );
+        assert!(matches!(
+            workspace.owner_dialog(owner),
+            Some((id, Desktop::Settings(Message::Focus(target)))) if id == dialog && target == dialog
+        ));
+        assert!(workspace.owner_dialog(other).is_none());
+        assert!(!workspace.chrome_enabled(owner, Action::QuickConnect));
+        assert!(workspace.chrome_enabled(other, Action::QuickConnect));
+
+        let close_owner = workspace.update(Desktop::Window(owner, window::Event::CloseRequested));
+        let mut actions = task::into_stream(close_owner).unwrap();
+        assert!(matches!(
+            block_on(actions.next()),
+            Some(RuntimeAction::Window(WindowAction::GainFocus(id))) if id == dialog
+        ));
+        assert!(workspace.windows.contains_key(&owner));
+
+        let close = workspace.update_settings(Message::Cancel(dialog));
+        let mut actions = task::into_stream(close).unwrap();
+        #[cfg(target_os = "windows")]
+        assert!(matches!(
+            block_on(actions.next()),
+            Some(RuntimeAction::Window(WindowAction::Run(id, _))) if id == dialog
+        ));
+        assert!(matches!(
+            block_on(actions.next()),
+            Some(RuntimeAction::Window(WindowAction::Close(id))) if id == dialog
+        ));
+        assert!(matches!(
+            block_on(actions.next()),
+            Some(RuntimeAction::Window(WindowAction::GainFocus(id))) if id == owner
+        ));
+        assert!(workspace.owner_dialog(owner).is_none());
+        assert!(workspace.chrome_enabled(owner, Action::QuickConnect));
+    }
 
     #[test]
     fn app_design_save_is_atomic_and_keeps_terminal_and_editor_colors() {
@@ -2423,6 +3784,73 @@ mod tests {
         }
         assert_eq!(workspace.window_settings.terminal_appearance(), terminal);
         assert_eq!(workspace.editor_content_theme(), editor);
+    }
+
+    #[test]
+    fn java_theme_import_is_reviewed_and_only_saved_through_settings() {
+        use iced::futures::{StreamExt, executor::block_on};
+        use iced_runtime::{Action, task};
+        use theme_settings::{Edit, exchange};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let path = profile.0.join("themes.xml");
+        let settings_path = profile.0.join("window-settings.json");
+        std::fs::write(
+            &path,
+            r#"<themes><theme id="test-appearance"><name>Portable colors</name></theme></themes>"#,
+        )
+        .unwrap();
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        for save in [false, true] {
+            let _ = workspace.update_settings(Message::OpenAt(owner, Section::Themes));
+            let id = workspace.settings.for_owner(owner).unwrap();
+            let send = |workspace: &mut Workspace, action| {
+                workspace.update_settings(Message::Theme(id, Edit::Java(action)))
+            };
+            let _ = send(
+                &mut workspace,
+                exchange::Action::Open(exchange::Mode::Import),
+            );
+            let _ = send(
+                &mut workspace,
+                exchange::Action::Path(path.to_str().unwrap().to_owned()),
+            );
+            let work = send(&mut workspace, exchange::Action::Run);
+            let mut events = task::into_stream(work).unwrap();
+            let Some(Action::Output(Desktop::Settings(finished))) = block_on(events.next()) else {
+                panic!("expected the import result");
+            };
+            let _ = workspace.update_settings(finished);
+            let draft = &workspace.settings.0.as_ref().unwrap().draft.preferences;
+            assert!(draft.themes.find_java("test-appearance").is_none());
+            let _ = send(&mut workspace, exchange::Action::Apply);
+            let draft = &workspace.settings.0.as_ref().unwrap().draft.preferences;
+            assert_eq!(
+                draft.themes.find_java("test-appearance").unwrap().name,
+                "Portable colors"
+            );
+            assert!(
+                workspace
+                    .window_settings
+                    .themes
+                    .find_java("test-appearance")
+                    .is_none()
+            );
+            if save {
+                let _ =
+                    workspace.save_settings_to(id, |preferences| preferences.save(&settings_path));
+            } else {
+                let _ = workspace.update_settings(Message::Cancel(id));
+                assert!(!settings_path.exists());
+            }
+        }
+        let saved: WindowSettings =
+            serde_json::from_slice(&std::fs::read(settings_path).unwrap()).unwrap();
+        assert_eq!(
+            saved.themes.find_java("test-appearance").unwrap().name,
+            "Portable colors"
+        );
     }
 
     #[test]
@@ -2587,11 +4015,11 @@ mod tests {
         );
         assert_eq!(
             search_matches("font zoom").collect::<Vec<_>>(),
-            [Setting::FontSize]
+            [Setting::FontSize, Setting::SnippetFontSize]
         );
         assert_eq!(
             search_matches("font face").collect::<Vec<_>>(),
-            [Setting::FontFamily]
+            [Setting::FontFamily, Setting::SnippetFontFamily]
         );
         assert_eq!(
             search_matches("terminal bracketed").collect::<Vec<_>>(),
@@ -2605,6 +4033,564 @@ mod tests {
             search_matches("paste threshold").collect::<Vec<_>>(),
             [Setting::LargePasteWarning]
         );
+    }
+
+    #[test]
+    fn editor_cursor_settings_apply_only_after_valid_save() {
+        use crate::editor_window::caret::{Preferences, Shape};
+        use crate::terminal_theme::Rgb;
+        use editor_settings::Edit;
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let inherited = workspace.window_settings.editor_appearance();
+        assert_eq!(
+            workspace.window_settings.editor_caret,
+            Preferences::default()
+        );
+
+        let _ = workspace.update_settings(Message::Open(owner));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::Search(id, "editor cursor style".into()));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().section,
+            Section::Editor
+        );
+        let _ = workspace.update_settings(Message::EditorCaret(id, Edit::Color("bad".into())));
+        let _ =
+            workspace.save_settings_to(id, |_| panic!("invalid cursor color reached persistence"));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().revealed,
+            Some(Setting::EditorCursorColor)
+        );
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert_eq!(
+            workspace.window_settings.editor_caret,
+            Preferences::default()
+        );
+
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::Editor));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::EditorCaret(id, Edit::Shape(Shape::Underscore)));
+        let _ = workspace.update_settings(Message::EditorCaret(id, Edit::Color("#12A0BC".into())));
+        assert_eq!(
+            workspace.window_settings.editor_caret,
+            Preferences::default()
+        );
+        let mut saved = Vec::new();
+        let _ = workspace.save_settings_to(id, |settings| {
+            saved = serde_json::to_vec(settings)?;
+            Ok(())
+        });
+        let restored: WindowSettings = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(workspace.window_settings, restored);
+        assert_eq!(
+            restored.editor_caret,
+            Preferences {
+                shape: Shape::Underscore,
+                color: Rgb::from_hex(0x12a0bc),
+            }
+        );
+        assert_eq!(restored.editor_appearance(), inherited);
+        assert!(workspace.settings.for_owner(owner).is_none());
+    }
+
+    #[test]
+    fn snippet_editor_appearance_inherits_and_only_applies_after_valid_save() {
+        use crate::terminal_theme::Rgb;
+        use snippet_editor_settings::{Color, Edit};
+
+        let mut workspace = Workspace::default();
+        workspace.window_settings.terminal_font = 22;
+        workspace.window_settings.colors.foreground = Some(Rgb::from_hex(0xbbccdd));
+        workspace.window_settings.colors.background = Some(Rgb::from_hex(0x112233));
+        let terminal = workspace.window_settings.terminal_appearance();
+        let file_editor = workspace.window_settings.editor_appearance();
+        let inherited = workspace.window_settings.snippet_editor_appearance();
+        assert_eq!(file_editor, inherited);
+        assert_eq!(inherited.size, 22);
+        assert_eq!(inherited.foreground, terminal.foreground);
+        assert_eq!(inherited.background, terminal.background);
+
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.update_settings(Message::Open(owner));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::Search(id, "snippet foreground".into()));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().section,
+            Section::SnippetEditor
+        );
+        assert!(workspace.settings_view(id).is_some());
+        let _ = workspace.update_settings(Message::SnippetAppearance(id, Edit::Size("73".into())));
+        let _ = workspace.save_settings_to(id, |_| panic!("invalid size reached persistence"));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().revealed,
+            Some(Setting::SnippetFontSize)
+        );
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert_eq!(
+            workspace.window_settings.snippet_editor_appearance(),
+            inherited
+        );
+
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::SnippetEditor));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        for edit in [
+            Edit::Family(Some(MONOSPACED.into())),
+            Edit::Size("30".into()),
+            Edit::Color(Color::Foreground, "#AABBCC".into()),
+            Edit::Color(Color::Background, "#223344".into()),
+            Edit::Color(Color::Background, String::new()),
+        ] {
+            let _ = workspace.update_settings(Message::SnippetAppearance(id, edit));
+        }
+        assert_eq!(
+            workspace.window_settings.snippet_editor_appearance(),
+            inherited
+        );
+        let mut saved = Vec::new();
+        let _ = workspace.save_settings_to(id, |settings| {
+            saved = serde_json::to_vec(settings)?;
+            Ok(())
+        });
+        let restored: WindowSettings = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(workspace.window_settings, restored);
+        let actual = restored.snippet_editor_appearance();
+        assert_eq!(
+            restored.snippet_appearance.font_family.as_deref(),
+            Some(MONOSPACED)
+        );
+        assert_eq!(actual.size, 30);
+        assert_eq!(actual.foreground, Rgb::from_hex(0xaabbcc));
+        assert_eq!(actual.background, terminal.background);
+        assert_eq!(restored.editor_appearance(), file_editor);
+        assert_eq!(restored.terminal_appearance(), terminal);
+        assert_eq!(restored.terminal_font, 22);
+        assert!(workspace.settings.for_owner(owner).is_none());
+    }
+
+    #[test]
+    fn snippet_cursor_overrides_save_and_reset_independently() {
+        use crate::editor_window::caret::{Preferences, Shape};
+        use crate::terminal_theme::Rgb;
+        use snippet_editor_settings::{Color, Edit};
+
+        let mut workspace = Workspace {
+            window_settings: serde_json::from_str(r#"{"snippet_appearance":{"font_size":20}}"#)
+                .unwrap(),
+            ..Workspace::default()
+        };
+        assert_eq!(workspace.window_settings.snippet_appearance.font_size, 20);
+        let file_cursor = Preferences {
+            shape: Shape::Underscore,
+            color: Rgb::from_hex(0x123456),
+        };
+        workspace.window_settings.editor_caret = file_cursor;
+        assert_eq!(
+            workspace.window_settings.snippet_editor_caret(),
+            file_cursor
+        );
+
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.update_settings(Message::Open(owner));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::Search(id, "snippet cursor style".into()));
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().revealed,
+            Some(Setting::SnippetCursorStyle)
+        );
+        let _ = workspace.update_settings(Message::SnippetAppearance(
+            id,
+            Edit::CursorStyle(Some(Shape::Line)),
+        ));
+        let _ = workspace.update_settings(Message::SnippetAppearance(
+            id,
+            Edit::Color(Color::Cursor, "invalid".into()),
+        ));
+        let _ =
+            workspace.save_settings_to(id, |_| panic!("invalid cursor color reached persistence"));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().revealed,
+            Some(Setting::SnippetCursorColor)
+        );
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert_eq!(
+            workspace.window_settings.snippet_editor_caret(),
+            file_cursor
+        );
+
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::SnippetEditor));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::SnippetAppearance(
+            id,
+            Edit::CursorStyle(Some(Shape::Line)),
+        ));
+        let mut saved = Vec::new();
+        let _ = workspace.save_settings_to(id, |settings| {
+            saved = serde_json::to_vec(settings)?;
+            Ok(())
+        });
+        let restored: WindowSettings = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(workspace.window_settings, restored);
+        assert_eq!(restored.editor_caret, file_cursor);
+        assert_eq!(
+            restored.snippet_editor_caret(),
+            Preferences {
+                shape: Shape::Line,
+                ..file_cursor
+            }
+        );
+
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::SnippetEditor));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::SnippetAppearance(id, Edit::CursorStyle(None)));
+        let _ = workspace.update_settings(Message::SnippetAppearance(
+            id,
+            Edit::Color(Color::Cursor, "#ABCDEF".into()),
+        ));
+        assert_eq!(workspace.window_settings, restored);
+        let _ = workspace.save_settings_to(id, |settings| {
+            saved = serde_json::to_vec(settings)?;
+            Ok(())
+        });
+        let restored: WindowSettings = serde_json::from_slice(&saved).unwrap();
+        assert_eq!(workspace.window_settings, restored);
+        assert_eq!(restored.editor_caret, file_cursor);
+        assert_eq!(
+            restored.snippet_editor_caret(),
+            Preferences {
+                color: Rgb::from_hex(0xabcdef),
+                ..file_cursor
+            }
+        );
+    }
+
+    #[test]
+    fn settings_search_selects_the_active_result_and_clears_before_closing() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Window));
+        let id = workspace.settings.for_owner(owner).unwrap();
+
+        let _ = workspace.update_settings(Message::Search(id, "quick select".into()));
+        let _ = workspace.update_settings(Message::SearchStep(id, -1));
+        assert_eq!(workspace.settings.0.as_ref().unwrap().search_selection, 0);
+        let _ = workspace.update_settings(Message::SearchStep(id, 1));
+        let _ = workspace.update_settings(Message::SearchStep(id, 1));
+        assert_eq!(workspace.settings.0.as_ref().unwrap().search_selection, 1);
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.section, Section::Terminal);
+        assert_eq!(dialog.revealed, Some(Setting::QuickSelectPatterns));
+        assert!(dialog.search.is_empty());
+
+        let _ = workspace.update_settings(Message::Search(id, "z".into()));
+        assert_eq!(workspace.settings.0.as_ref().unwrap().search_selection, 0);
+        let _ = workspace.update_settings(Message::SearchChoose(id));
+        assert_eq!(workspace.settings.for_owner(owner), Some(id));
+        let _ = workspace.update_settings(Message::Escape(id));
+        assert!(workspace.settings.0.as_ref().unwrap().search.is_empty());
+        let _ = workspace.update_settings(Message::Escape(id));
+        assert!(workspace.settings.for_owner(owner).is_none());
+    }
+
+    #[test]
+    fn settings_escape_cancels_focused_theme_and_parent_fields_separately() {
+        use iced::advanced::{
+            clipboard,
+            widget::operation::{self, Operation, focusable},
+        };
+        use iced::keyboard::{self, Location, key};
+        use iced::{Event, Font, Renderer, event, mouse};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Font));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let original_font_size = workspace.window_settings.terminal_font;
+        let edited_font_size = if original_font_size == 24 { 25 } else { 24 };
+        let _ = workspace.update_settings(Message::FontSize(id, edited_font_size));
+        let _ = workspace.update_settings(Message::Section(id, Section::Themes));
+        let _ = workspace.update_settings(Message::Theme(id, theme_settings::Edit::New));
+
+        let type_and_escape = |workspace: &Workspace| {
+            let key_press = |key: Key, text: Option<&str>| {
+                Event::Keyboard(keyboard::Event::KeyPressed {
+                    modified_key: key.clone(),
+                    key,
+                    physical_key: key::Physical::Unidentified(key::NativeCode::Unidentified),
+                    location: Location::Standard,
+                    modifiers: Modifiers::empty(),
+                    text: text.map(Into::into),
+                    repeat: false,
+                })
+            };
+            let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+            let mut interface = UserInterface::build(
+                workspace.settings_view(id).unwrap(),
+                Size::new(800.0, 550.0),
+                Cache::default(),
+                &mut renderer,
+            );
+            for _ in 0..2 {
+                let mut focus = focusable::focus_next();
+                interface.operate(&renderer, &mut focus);
+                let operation::Outcome::Chain(mut focus) = focus.finish() else {
+                    panic!("expected a focusable Settings field");
+                };
+                interface.operate(&renderer, focus.as_mut());
+            }
+            let mut messages = Vec::new();
+            let (_, statuses) = interface.update(
+                &[
+                    key_press(Key::Character("x".into()), Some("x")),
+                    key_press(Key::Named(Named::Escape), None),
+                ],
+                mouse::Cursor::Unavailable,
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            assert_eq!(statuses, [event::Status::Captured; 2]);
+            messages
+        };
+
+        let messages = type_and_escape(&workspace);
+        assert!(matches!(messages.as_slice(),
+                [Desktop::Settings(Message::Theme(theme, theme_settings::Edit::Name(name))),
+                    Desktop::Settings(Message::Escape(escape))]
+                if *theme == id && *escape == id && name == "x"));
+        for message in messages {
+            let _ = workspace.update(message);
+        }
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert!(!dialog.themes.editing());
+        assert_eq!(dialog.draft.preferences.terminal_font, edited_font_size);
+
+        let _ = workspace.update_settings(Message::Section(id, Section::Font));
+        let messages = type_and_escape(&workspace);
+        assert!(matches!(messages.as_slice(),
+                [Desktop::Settings(Message::FontSizeInput(font, _)),
+                    Desktop::Settings(Message::Escape(escape))]
+                if *font == id && *escape == id));
+        for message in messages {
+            let _ = workspace.update(message);
+        }
+        assert!(workspace.settings.for_owner(owner).is_none());
+        assert_eq!(workspace.window_settings.terminal_font, original_font_size);
+    }
+
+    #[test]
+    fn settings_search_enter_focuses_an_editable_result_and_keeps_search_for_disabled_fields() {
+        use iced::advanced::widget::operation::focusable;
+        use iced::{Font, Renderer};
+        use iced_runtime::{UserInterface, user_interface::Cache};
+
+        use crate::settings_search::test_input;
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Window));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ =
+            workspace.update_settings(Message::Startup(id, startup_settings::Edit::Fixed(false)));
+        let search = workspace.settings.0.as_ref().unwrap().search_input.clone();
+        let mut renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let bounds = Size::new(800.0, 360.0);
+
+        for (query, setting) in [
+            ("terminal font size", Setting::FontSize),
+            ("fixed geometry", Setting::FixedGeometry),
+        ] {
+            let _ = workspace.update_settings(Message::Search(id, query.into()));
+            let mut interface = UserInterface::build(
+                workspace.settings_view(id).unwrap(),
+                bounds,
+                Cache::default(),
+                &mut renderer,
+            );
+            interface.operate(&renderer, &mut focusable::focus(search.clone()));
+            let messages = test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Named(Named::Enter),
+                None,
+            );
+            assert!(
+                matches!(messages.as_slice(), [Desktop::Settings(Message::SearchChoose(target))] if *target == id)
+            );
+            let cache = interface.into_cache();
+            let reveal = workspace.update(messages.into_iter().next().unwrap());
+            assert_eq!(
+                workspace.settings.0.as_ref().unwrap().revealed,
+                Some(setting)
+            );
+            let mut interface = UserInterface::build(
+                workspace.settings_view(id).unwrap(),
+                bounds,
+                cache,
+                &mut renderer,
+            );
+            test_input::apply(&mut interface, &renderer, reveal);
+            let messages = test_input::press(
+                &mut interface,
+                &mut renderer,
+                Key::Character("2".into()),
+                Some("2"),
+            );
+            if setting == Setting::FontSize {
+                assert!(
+                    matches!(messages.as_slice(), [Desktop::Settings(Message::FontSizeInput(target, value))] if *target == id && value.ends_with('2'))
+                );
+            } else {
+                assert!(
+                    matches!(messages.as_slice(), [Desktop::Settings(Message::Search(target, value))] if *target == id && value == "2")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn settings_search_scrolls_the_chosen_row_into_the_page_viewport() {
+        use iced::advanced::widget::{Operation, Tree, operation};
+        use iced::advanced::{Layout, layout};
+        use iced::futures::{StreamExt, executor::block_on};
+        use iced::{Font, Rectangle, Renderer, Vector};
+
+        struct Measure {
+            page: widget::Id,
+            row: widget::Id,
+            viewport: Rectangle,
+            row_y: f32,
+            scroll: f32,
+        }
+
+        impl Operation for Measure {
+            fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) {
+                operate(self);
+            }
+
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if id == Some(&self.row) {
+                    self.row_y = bounds.y;
+                }
+            }
+
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                bounds: Rectangle,
+                _: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.page) {
+                    self.viewport = bounds;
+                    self.scroll = translation.y;
+                }
+            }
+        }
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Font));
+        let id = workspace.settings.for_owner(owner).unwrap();
+        let _ = workspace.update_settings(Message::Search(id, "fixed geometry".into()));
+        let reveal = workspace.update_settings(Message::SearchChoose(id));
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.revealed, Some(Setting::FixedGeometry));
+        let mut measure = Measure {
+            page: dialog.page_scroll.clone(),
+            row: dialog.revealed_row.clone(),
+            viewport: Rectangle::default(),
+            row_y: 0.0,
+            scroll: 0.0,
+        };
+        let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let mut view = workspace.settings_view(id).unwrap();
+        let mut tree = Tree::new(view.as_widget());
+        let node = view.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(620.0, 300.0)),
+        );
+        let mut apply = |op: &mut dyn Operation| {
+            view.as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, op);
+        };
+        apply(&mut measure);
+        assert!(measure.row_y >= measure.viewport.y + measure.viewport.height);
+
+        let mut actions = iced_runtime::task::into_stream(reveal).unwrap();
+        while let Some(iced_runtime::Action::Widget(mut operation)) = block_on(actions.next()) {
+            loop {
+                apply(operation.as_mut());
+                let operation::Outcome::Chain(next) = operation.finish() else {
+                    break;
+                };
+                operation = next;
+            }
+        }
+        apply(&mut measure);
+        assert!(measure.scroll > 0.0);
+        let visible_y = measure.row_y - measure.scroll;
+        assert!(visible_y >= measure.viewport.y);
+        assert!(visible_y < measure.viewport.y + measure.viewport.height);
+    }
+
+    #[test]
+    fn settings_search_results_scroll_without_displacing_the_section_or_footer() {
+        use iced::advanced::{Layout, layout, widget::Tree};
+        use iced::{Font, Renderer};
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.open_settings(owner, Some(Section::Window));
+        let id = workspace.settings.0.as_ref().unwrap().id;
+        let renderer = Renderer::new(Font::DEFAULT, 16.0.into());
+        let compact = Size::new(620.0, 300.0);
+        let measure = |workspace: &Workspace| {
+            let mut view = workspace.settings_view(id).unwrap();
+            let mut tree = Tree::new(view.as_widget());
+            let node = view.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, compact),
+            );
+            let pane = Layout::new(&node).children().nth(1).unwrap();
+            let mut pane = pane.children();
+            let search = pane.next().unwrap().bounds();
+            let body = pane.next().unwrap();
+            let footer = pane.next().unwrap().bounds();
+            let results = body.children().nth(1).map(|overlay| {
+                let panel = overlay.children().next().unwrap();
+                let viewport = panel.children().next().unwrap();
+                let list = viewport.children().next().unwrap();
+                (panel.bounds(), viewport.bounds(), list.bounds())
+            });
+            (search, body.bounds(), footer, results)
+        };
+        let (search, body, footer, results) = measure(&workspace);
+        assert!(results.is_none());
+        assert!(body.height > 0.0);
+        assert!(footer.height > 0.0 && footer.y + footer.height <= compact.height);
+
+        let query = "in";
+        assert!(search_matches(query).count() > 10);
+        let _ = workspace.update_settings(Message::Search(id, query.into()));
+        let (with_search, with_body, with_footer, results) = measure(&workspace);
+        assert_eq!(
+            (with_search, with_body, with_footer),
+            (search, body, footer)
+        );
+        let (panel, viewport, list) = results.unwrap();
+        assert!(panel.height <= SEARCH_RESULTS_MAX_HEIGHT);
+        assert!(panel.y >= body.y && panel.y + panel.height <= body.y + body.height);
+        assert!(list.height > viewport.height && viewport.height > 0.0);
     }
 
     #[test]
@@ -2622,6 +4608,7 @@ mod tests {
         draft.preferences.terminal_font = 36;
         draft.preferences.paste_large_warning_kib = 1;
         draft.preferences.command_timestamps_enabled = true;
+        draft.preferences.startup.require_master_password = true;
         let current = WindowSettings {
             terminal_transparency: 42,
             open_tool_windows_as_tabs: true,
@@ -2631,9 +4618,10 @@ mod tests {
         let policy = ClipboardPolicy {
             read_allowed: false,
             minimum_paste_warning: WarningMode::Always,
+            require_master_password: true,
             ..ClipboardPolicy::default()
         };
-        let next = draft.merge_preferences(&initial, current, &policy);
+        let next = draft.merge_preferences(&initial, current.clone(), &policy);
         assert!(!next.tab_title_from_shell_enabled);
         assert!(next.open_tool_windows_as_tabs);
         assert!(!next.prompt_navigation_enabled);
@@ -2644,6 +4632,9 @@ mod tests {
         assert_eq!(next.paste_warning, WarningMode::Always);
         assert_eq!(next.terminal_font, 36);
         assert_eq!(next.paste_large_warning_kib, 1);
+        assert!(!next.startup.require_master_password);
+        let next = draft.merge_preferences(&initial, current, &ClipboardPolicy::default());
+        assert!(next.startup.require_master_password);
     }
 
     #[test]
@@ -2728,70 +4719,294 @@ mod tests {
     }
 
     #[test]
-    fn scrollback_compression_settings_save_updates_open_and_new_streams() {
-        use crate::session::{GridSize, Session};
-        use kortty_terminal::TerminalProfile;
+    fn ssh_keepalive_settings_save_keeps_disabled_interval() {
+        let legacy: WindowSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(legacy.ssh_keepalive(), KeepAlive::default());
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::Terminal));
+        let id = workspace.settings.0.as_ref().unwrap().id;
+        let _ = workspace.update_settings(Message::SshKeepAliveInterval(id, 120));
+        let _ = workspace.update_settings(Message::SshKeepAlive(id, false));
+        assert_eq!(
+            workspace.window_settings.ssh_keepalive(),
+            KeepAlive::default()
+        );
+        let expected = KeepAlive::new(false, 120).unwrap();
+        let scratch = crate::snippets::tests::Profile::new();
+        let path = scratch.0.join("window-settings.json");
+        let _ = workspace.save_settings_to(id, |settings| settings.save(&path));
+        assert_eq!(workspace.window_settings.ssh_keepalive(), expected);
+        assert_eq!(
+            WindowSettings::read(&path).unwrap().ssh_keepalive(),
+            expected
+        );
+    }
+
+    #[test]
+    fn initial_terminal_size_settings_validate_save_and_clear_each_dimension() {
+        let legacy: WindowSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(
+            (legacy.terminal_columns, legacy.terminal_rows),
+            (None, None)
+        );
+        assert_eq!(
+            search_matches("initial columns").next(),
+            Some(Setting::InitialTerminalSize)
+        );
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let open = |workspace: &mut Workspace| {
+            let _ = workspace.update_settings(Message::OpenAt(owner, Section::Terminal));
+            workspace.settings.0.as_ref().unwrap().id
+        };
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::TerminalColumns(id, "160".into()));
+        let _ = workspace.update_settings(Message::TerminalRows(id, "9".into()));
+        let _ = workspace.save_settings_to(id, |_| panic!("invalid dimensions must not be saved"));
+        assert_eq!(
+            workspace.settings.0.as_ref().unwrap().revealed,
+            Some(Setting::InitialTerminalSize)
+        );
+        let scratch = crate::snippets::tests::Profile::new();
+        let path = scratch.0.join("window-settings.json");
+        let _ = workspace.update_settings(Message::TerminalRows(id, "48".into()));
+        let _ = workspace.save_settings_to(id, |settings| settings.save(&path));
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::TerminalColumns(id, String::new()));
+        let _ = workspace.save_settings_to(id, |settings| settings.save(&path));
+        let restored = WindowSettings::read(&path).unwrap();
+        assert_eq!(
+            (restored.terminal_columns, restored.terminal_rows),
+            (None, Some(48))
+        );
+        assert_eq!(workspace.window_settings, restored);
+        assert!(WindowSettings::validate_backup(br#"{"terminal_columns":501}"#).is_err());
+    }
+
+    #[test]
+    fn scrollback_settings_save_updates_open_and_new_streams() {
+        use kortty_terminal::{ScrollbackConfig, TerminalProfile};
 
         let legacy: WindowSettings = serde_json::from_str("{}").unwrap();
-        assert!(legacy.scrollback_compression_enabled);
+        assert_eq!(legacy.scrollback_config(), ScrollbackConfig::default());
         let mut workspace = Workspace::default();
         let (owner, _) = workspace.open_window(false);
         let start_stream = |workspace: &mut Workspace| {
-            let grid = GridSize::default();
-            let session = Session::ssh(
-                None,
-                grid,
-                TerminalProfile::Xterm,
-                true,
-                workspace.window_settings.terminal_appearance(),
-            )
-            .unwrap();
-            workspace.store_session(session, grid, workspace.window_settings.terminal_font)
+            workspace
+                .store_local_session(TerminalProfile::Xterm, None, None)
+                .unwrap()
         };
         let requested = |workspace: &Workspace, id| {
             workspace.sessions[&id]
                 .session
-                .scrollback_compression_requested()
+                .scrollback_config_requested()
         };
         let open = |workspace: &mut Workspace| {
             let _ = workspace.update_settings(Message::OpenAt(owner, Section::Terminal));
             workspace.settings.0.as_ref().unwrap().id
         };
         let existing = start_stream(&mut workspace);
-        assert!(requested(&workspace, existing));
+        assert_eq!(requested(&workspace, existing), ScrollbackConfig::default());
+        let edit = |workspace: &mut Workspace, id| {
+            let _ = workspace.update_settings(Message::ScrollbackLines(id, 125));
+            let _ = workspace.update_settings(Message::ScrollbackMemory(id, 2));
+            let _ = workspace.update_settings(Message::ScrollbackCompression(id, false));
+        };
+        let configured = ScrollbackConfig {
+            lines: 125,
+            memory_mib: 2,
+            compression: false,
+        };
         let id = open(&mut workspace);
-        let _ = workspace.update_settings(Message::ScrollbackCompression(id, false));
+        edit(&mut workspace, id);
         // Test double for a failed preference write. The live request stays unchanged.
         let _ = workspace.save_settings_to(id, |_| Err(std::io::Error::other("test write error")));
-        assert!(requested(&workspace, existing));
+        assert_eq!(requested(&workspace, existing), ScrollbackConfig::default());
         let _ = workspace.update_settings(Message::Cancel(id));
-        assert!(workspace.window_settings.scrollback_compression_enabled);
+        assert_eq!(
+            workspace.window_settings.scrollback_config(),
+            ScrollbackConfig::default()
+        );
 
-        let directory = std::env::temp_dir().join(format!(
-            "kortty-scrollback-settings-{}",
-            crate::private_files::nonce().unwrap()
-        ));
-        std::fs::create_dir(&directory).unwrap();
-        let path = directory.join("window-settings.json");
+        let scratch = crate::snippets::tests::Profile::new();
+        let path = scratch.0.join("window-settings.json");
         let id = open(&mut workspace);
-        let _ = workspace.update_settings(Message::ScrollbackCompression(id, false));
+        edit(&mut workspace, id);
         let _ = workspace.save_settings_to(id, |preferences| preferences.save(&path));
         let restored: WindowSettings =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-        assert!(!restored.scrollback_compression_enabled);
-        assert!(!requested(&workspace, existing));
+        assert_eq!(restored.scrollback_config(), configured);
+        assert_eq!(requested(&workspace, existing), configured);
         let new = start_stream(&mut workspace);
-        assert!(!requested(&workspace, new));
+        assert_eq!(requested(&workspace, new), configured);
 
         let id = open(&mut workspace);
         let _ = workspace.update_settings(Message::ScrollbackCompression(id, true));
         let _ = workspace.save_settings_to(id, |preferences| preferences.save(&path));
-        std::fs::remove_dir_all(directory).unwrap();
-        assert!(requested(&workspace, existing));
-        assert!(requested(&workspace, new));
+        let compressed = ScrollbackConfig {
+            compression: true,
+            ..configured
+        };
+        assert_eq!(requested(&workspace, existing), compressed);
+        assert_eq!(requested(&workspace, new), compressed);
         for pane in workspace.sessions.values() {
             let _ = pane.session.stop().recv_blocking();
         }
+    }
+
+    #[test]
+    fn serial_default_encoding_is_searchable_and_commits_only_on_save() -> std::io::Result<()> {
+        let scratch = crate::snippets::tests::Profile::new();
+        let path = scratch.0.join("window-settings.json");
+        let legacy: WindowSettings = serde_json::from_str("{}")?;
+        assert_eq!(legacy.serial_default_encoding, TextEncoding::Utf8);
+        assert!(
+            search_matches("serial charset")
+                .any(|setting| setting == Setting::SerialDefaultEncoding)
+        );
+
+        let mut workspace = Workspace::default();
+        workspace.window_settings.save(&path)?;
+        let (owner, _) = workspace.open_window(false);
+        let open = |workspace: &mut Workspace| {
+            let _ = workspace.update_settings(Message::OpenAt(owner, Section::Terminal));
+            workspace.settings.0.as_ref().unwrap().id
+        };
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::SerialDefaultEncoding(id, TextEncoding::Latin1));
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert_eq!(
+            workspace.window_settings.serial_default_encoding,
+            TextEncoding::Utf8
+        );
+
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::SerialDefaultEncoding(id, TextEncoding::Latin9));
+        let _ = workspace.save_settings_to(id, |settings| settings.save(&path));
+        let saved: WindowSettings = serde_json::from_slice(&std::fs::read(path)?)?;
+        assert_eq!(saved.serial_default_encoding, TextEncoding::Latin9);
+        assert_eq!(
+            workspace.window_settings.serial_default_encoding,
+            TextEncoding::Latin9
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn coding_agent_detection_is_saved_and_updates_open_and_new_panes() -> std::io::Result<()> {
+        use kortty_terminal::TerminalProfile;
+
+        let legacy: WindowSettings = serde_json::from_str("{}")?;
+        assert!(legacy.coding_agent_detection_enabled);
+        assert!(
+            search_matches("coding agents").any(|setting| setting == Setting::CodingAgentDetection)
+        );
+        let scratch = crate::snippets::tests::Profile::new();
+        let path = scratch.0.join("window-settings.json");
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let store = |workspace: &mut Workspace| {
+            workspace.store_local_session(TerminalProfile::Xterm, None, None)
+        };
+        let requested = |workspace: &Workspace, session| {
+            workspace.sessions[&session]
+                .session
+                .coding_agent_detection_requested()
+        };
+        let existing = store(&mut workspace)?;
+        let open = |workspace: &mut Workspace| {
+            let _ = workspace.update_settings(Message::OpenAt(owner, Section::Terminal));
+            workspace.settings.0.as_ref().unwrap().id
+        };
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::CodingAgentDetection(id, false));
+        let _ = workspace.save_settings_to(id, |_| Err(std::io::Error::other("test write error")));
+        assert!(requested(&workspace, existing));
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert!(workspace.window_settings.coding_agent_detection_enabled);
+
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::CodingAgentDetection(id, false));
+        let _ = workspace.save_settings_to(id, |preferences| preferences.save(&path));
+        let saved: WindowSettings = serde_json::from_slice(&std::fs::read(path)?)?;
+        assert!(!saved.coding_agent_detection_enabled);
+        assert!(!requested(&workspace, existing));
+        let new = store(&mut workspace)?;
+        assert!(!requested(&workspace, new));
+        for pane in workspace.sessions.values() {
+            let _ = pane.session.stop().recv_blocking();
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn coding_agent_app_badge_defaults_on_and_saves_independently() -> std::io::Result<()> {
+        let legacy: WindowSettings = serde_json::from_str("{}")?;
+        assert!(legacy.coding_agent_app_badge_enabled);
+        assert!(
+            search_matches("application badge")
+                .any(|setting| setting == Setting::CodingAgentAppBadge)
+        );
+        let scratch = crate::snippets::tests::Profile::new();
+        let path = scratch.0.join("window-settings.json");
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let open = |workspace: &mut Workspace| {
+            let _ = workspace.update_settings(Message::OpenAt(owner, Section::Terminal));
+            workspace.settings.0.as_ref().unwrap().id
+        };
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::CodingAgentAppBadge(id, false));
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert!(workspace.window_settings.coding_agent_app_badge_enabled);
+
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::CodingAgentAppBadge(id, false));
+        let _ = workspace.save_settings_to(id, |settings| settings.save(&path));
+        let saved: WindowSettings = serde_json::from_slice(&std::fs::read(path)?)?;
+        assert!(!saved.coding_agent_app_badge_enabled);
+        assert!(saved.coding_agent_detection_enabled);
+        assert!(!workspace.window_settings.coding_agent_app_badge_enabled);
+        Ok(())
+    }
+
+    #[test]
+    fn coding_agent_notifications_save_independently_and_respect_managed_policy()
+    -> std::io::Result<()> {
+        let legacy: WindowSettings = serde_json::from_str("{}")?;
+        assert!(legacy.coding_agent_notifications_enabled);
+        assert!(
+            search_matches("coding agents desktop notifications")
+                .any(|setting| setting == Setting::CodingAgentNotifications)
+        );
+        let scratch = crate::snippets::tests::Profile::new();
+        let path = scratch.0.join("window-settings.json");
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let open = |workspace: &mut Workspace| {
+            let _ = workspace.update_settings(Message::OpenAt(owner, Section::Messaging));
+            workspace.settings.0.as_ref().unwrap().id
+        };
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::CodingAgentNotifications(id, false));
+        let _ = workspace.update_settings(Message::Cancel(id));
+        assert!(workspace.window_settings.coding_agent_notifications_enabled);
+
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::CodingAgentNotifications(id, false));
+        let _ = workspace.save_settings_to(id, |settings| settings.save(&path));
+        let saved: WindowSettings = serde_json::from_slice(&std::fs::read(&path)?)?;
+        assert!(!saved.coding_agent_notifications_enabled);
+        assert!(saved.coding_agent_detection_enabled && saved.coding_agent_app_badge_enabled);
+
+        workspace.clipboard.policy.desktop_notifications_allowed = false;
+        let id = open(&mut workspace);
+        let _ = workspace.update_settings(Message::CodingAgentNotifications(id, true));
+        let _ = workspace.save_settings_to(id, |settings| settings.save(&path));
+        assert!(!workspace.window_settings.coding_agent_notifications_enabled);
+        assert!(!workspace.coding_agent_notifications_enabled());
+        Ok(())
     }
 
     #[test]
@@ -2913,6 +5128,127 @@ mod tests {
     }
 
     #[test]
+    fn agent_design_menu_reaches_the_saved_global_preference() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.invoke_chrome(owner, super::super::chrome::Action::AgentDesign);
+        let dialog = workspace.settings.0.as_ref().unwrap();
+        assert_eq!(dialog.section, Section::AgentDesign);
+        let id = dialog.id;
+        assert!(workspace.settings_view(id).is_some());
+        let _ = workspace.update_settings(Message::AgentDesignCatalog(
+            id,
+            agent_design_settings::Edit::Default("classic".into()),
+        ));
+        assert_eq!(
+            workspace.window_settings.ai_agent_design,
+            AgentDesign::Standard
+        );
+        let _ = workspace.save_settings_to(id, |preferences| {
+            let restored: WindowSettings =
+                serde_json::from_value(serde_json::to_value(preferences).unwrap()).unwrap();
+            assert_eq!(restored.ai_agent_design, AgentDesign::Classic);
+            Ok(())
+        });
+        assert_eq!(
+            workspace.window_settings.ai_agent_design,
+            AgentDesign::Classic
+        );
+        let old_profile: WindowSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(old_profile.ai_agent_design, AgentDesign::Standard);
+    }
+
+    #[test]
+    fn custom_agent_design_is_edited_previewed_and_saved_through_settings() {
+        use crate::terminal_agent::design::{Approval, Arrangement, History, Status};
+        use agent_design_settings::{Edit, Module};
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.invoke_chrome(owner, super::super::chrome::Action::AgentDesign);
+        let id = workspace.settings.0.as_ref().unwrap().id;
+        let _ = workspace.update_settings(Message::AgentDesignCatalog(
+            id,
+            Edit::Duplicate("floating".into()),
+        ));
+        let choice = workspace
+            .settings
+            .0
+            .as_ref()
+            .unwrap()
+            .draft
+            .preferences
+            .ai_agent_designs
+            .choices()
+            .pop()
+            .unwrap();
+        for edit in [
+            Edit::Name(choice.id.clone(), "Review cards".into()),
+            Edit::Rename(choice.id.clone()),
+            Edit::Module(choice.id.clone(), Module::History(History::StepCards)),
+            Edit::Module(choice.id.clone(), Module::Status(Status::Pill)),
+            Edit::Module(choice.id.clone(), Module::Approval(Approval::AboveActivity)),
+            Edit::Default(choice.id.clone()),
+        ] {
+            let _ = workspace.update_settings(Message::AgentDesignCatalog(id, edit));
+        }
+        assert!(workspace.settings_view(id).is_some());
+        assert!(
+            workspace
+                .window_settings
+                .ai_agent_designs
+                .layout(&choice.id)
+                .is_none()
+        );
+        let _ = workspace.save_settings_to(id, |preferences| {
+            let restored: WindowSettings =
+                serde_json::from_value(serde_json::to_value(preferences).unwrap()).unwrap();
+            let catalog = restored.ai_agent_designs;
+            assert_eq!(catalog.default_id(restored.ai_agent_design), choice.id);
+            assert_eq!(catalog.choices().last().unwrap().name, "Review cards");
+            let layout = catalog.layout(&choice.id).unwrap();
+            assert_eq!(layout.history, History::StepCards);
+            assert_eq!(layout.status, Status::Pill);
+            assert_eq!(layout.approval, Approval::AboveActivity);
+            assert_eq!(layout.arrangement, Arrangement::Floating);
+            Ok(())
+        });
+        assert_eq!(
+            workspace
+                .window_settings
+                .ai_agent_designs
+                .default_id(AgentDesign::Standard),
+            choice.id
+        );
+    }
+
+    #[test]
+    fn application_update_opt_in_and_interval_apply_only_after_settings_save() -> std::io::Result<()>
+    {
+        let profile = crate::snippets::tests::Profile::new();
+        let path = profile.0.join("window-settings.json");
+        let mut workspace = Workspace::default();
+        let legacy: WindowSettings = serde_json::from_str("{}")?;
+        assert!(!legacy.application_updates.enabled);
+        assert_eq!(legacy.application_updates.interval_days, 1);
+        let (owner, _) = workspace.open_window(false);
+        let _ = workspace.update_settings(Message::OpenAt(owner, Section::Updates));
+        let id = workspace.settings.0.as_ref().unwrap().id;
+        assert!(workspace.settings_view(id).is_some());
+        assert_eq!(Setting::ApplicationUpdates.section(), Section::Updates);
+        let _ = workspace.update_settings(Message::ApplicationUpdates(id, true));
+        let _ = workspace.update_settings(Message::ApplicationUpdateInterval(id, 12));
+        let _ = workspace.update_settings(Message::ApplicationUpdateInterval(id, 31));
+        assert!(!workspace.window_settings.application_updates.enabled);
+        let _ = workspace.save_settings_to(id, |preferences| preferences.save(&path));
+        let saved = WindowSettings::read(&path)?.application_updates;
+        assert!(saved.enabled);
+        assert_eq!(saved.interval_days, 12);
+        assert_eq!(workspace.window_settings.application_updates, saved);
+        Ok(())
+    }
+
+    #[test]
     fn remote_sidebar_setting_commits_only_on_save_and_preserves_a_newer_width() {
         let mut workspace = Workspace::default();
         let (owner, _) = workspace.open_window(false);
@@ -3022,6 +5358,7 @@ mod tests {
                 },
                 &mut restored,
                 &mut None,
+                None,
             )
             .unwrap();
         let restored = restored[0];

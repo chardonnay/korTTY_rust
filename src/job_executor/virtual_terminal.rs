@@ -74,8 +74,12 @@ pub(super) fn supervise(
     cancellation: &Cancellation,
     options: Options,
     capture: Capture,
+    journal: Option<&crate::session_journal::automation::Recorder>,
 ) -> Completion {
     let mut screen = Screen::new(options, capture);
+    if let Some(journal) = journal {
+        super::automation::attach(&mut screen.terminal, journal, false);
+    }
     let (result, limit_detail) = run(session, cancellation, options, &mut screen);
     let mut completion = Completion::from_result(id, result);
     if let Some(detail) = limit_detail {
@@ -281,6 +285,7 @@ impl Screen {
     }
 
     fn finish(mut self) -> Result<Option<FinishedCapture>, kortty_recording::Error> {
+        self.terminal.set_journal_observer(None);
         let now = self.started.elapsed();
         self.snapshot(now)?;
         if self.frames == 0 {

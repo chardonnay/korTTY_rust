@@ -1,6 +1,6 @@
 use std::ops::RangeInclusive;
 
-use iced::widget::{button, checkbox, column, row, text, text_input};
+use iced::widget::{Id, button, checkbox, column, row, text, text_input};
 use iced::{Alignment, Element};
 
 use super::super::window_lifecycle::{FixedGeometry, StartupPreferences};
@@ -54,6 +54,7 @@ impl Field {
 
 #[derive(Clone, Debug)]
 pub enum Edit {
+    MasterPassword(bool),
     RememberGeometry(bool),
     RememberDashboard(bool),
     Fixed(bool),
@@ -72,6 +73,7 @@ impl Editor {
 
     pub(super) fn update(&mut self, preferences: &mut StartupPreferences, edit: Edit) {
         match edit {
+            Edit::MasterPassword(enabled) => preferences.require_master_password = enabled,
             Edit::RememberGeometry(enabled) => preferences.remember_geometry = enabled,
             Edit::RememberDashboard(enabled) => preferences.remember_dashboard = enabled,
             Edit::Fixed(enabled) => {
@@ -95,10 +97,20 @@ impl Editor {
         }
     }
 
-    pub(super) fn view(&self, mut preferences: StartupPreferences) -> Element<'_, Edit> {
+    pub(super) fn view(
+        &self,
+        mut preferences: StartupPreferences,
+        target: Option<&Id>,
+    ) -> Element<'_, Edit> {
         let enabled = preferences.use_fixed_geometry;
-        let mut field =
-            |field: Field| self.field(field, *field.value(&mut preferences.fixed), enabled);
+        let mut field = |field: Field| {
+            self.field(
+                field,
+                *field.value(&mut preferences.fixed),
+                enabled,
+                target.filter(|_| enabled && matches!(field, Field::Width)),
+            )
+        };
         column![
             text("Fixed Window Geometry").size(16),
             checkbox(enabled).label(Setting::FixedGeometry.label()).on_toggle(Edit::Fixed),
@@ -109,7 +121,13 @@ impl Editor {
         ].spacing(8).into()
     }
 
-    fn field(&self, field: Field, value: u16, enabled: bool) -> Element<'_, Edit> {
+    fn field(
+        &self,
+        field: Field,
+        value: u16,
+        enabled: bool,
+        target: Option<&Id>,
+    ) -> Element<'_, Edit> {
         let range = field.limits();
         let placeholder = format!("{}–{}", range.start(), range.end());
         let formatted = value.to_string();
@@ -117,9 +135,12 @@ impl Editor {
         column![
             row![
                 text(field.label()).width(46),
-                text_input(&placeholder, invalid.unwrap_or(&formatted))
-                    .width(86)
-                    .on_input_maybe(enabled.then_some(move |value| Edit::Value(field, value))),
+                crate::settings_search::mark_input(
+                    text_input(&placeholder, invalid.unwrap_or(&formatted))
+                        .width(86)
+                        .on_input_maybe(enabled.then_some(move |value| Edit::Value(field, value))),
+                    target,
+                ),
                 button("−").style(button::secondary).on_press_maybe(
                     (enabled && value > *range.start())
                         .then(|| Edit::Value(field, (value - 1).to_string())),

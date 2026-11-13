@@ -17,12 +17,16 @@ use super::tab_titles::{
 };
 use super::{Message as Desktop, PaneSession, Tab, Window, Workspace};
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+pub(super) mod desktop_drag;
 mod dialog;
 mod follow;
 mod model;
 mod view;
 pub(super) use dialog::{Dialogs, Message as DialogMessage};
 use follow::Follow;
+pub(crate) use follow::mcp_ssh_prompt_is_verified;
+pub(super) use follow::{ForeignShell, foreign_shell};
 use model::{Browser, Completion};
 
 const PAGE: usize = 120;
@@ -38,6 +42,8 @@ pub(super) struct Dock {
     page: usize,
     keyboard_focus: bool,
     pending_drop: Option<PendingDrop>,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    desktop_drag: desktop_drag::State,
 }
 
 struct Binding {
@@ -79,6 +85,8 @@ pub enum Message {
     ManagerReturned(SessionId),
     ManagerAfterBrowser(SessionId, Option<Vec<u8>>),
     Dialog(dialog::Message),
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    DesktopDragPrepared(desktop_drag::Scope, u64, desktop_drag::PreparationResult),
 }
 
 #[derive(Clone, Debug)]
@@ -96,6 +104,10 @@ pub enum Action {
     Download(u64, u64),
     Dropped(u64, u64, PathBuf),
     Resolve(u64, u64, ConflictChoice),
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    PrepareDesktopDrag(desktop_drag::Scope),
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    StartDesktopDrag(desktop_drag::Scope, iced::Point),
 }
 
 impl Dock {
@@ -166,6 +178,30 @@ impl Binding {
 }
 
 impl Workspace {
+    pub(super) fn refresh_sidebar_resume_preferences(&self) {
+        let preferences = self.sftp_resume_preferences();
+        let profile = self
+            .clipboard
+            .policy
+            .file_transfer_allowed
+            .then(|| crate::profile::root().ok())
+            .flatten();
+        for tab in self.windows.values().flat_map(Window::terminal_tabs) {
+            if let Some(binding) = &tab.remote_files.binding
+                && let Some(route) = self
+                    .sessions
+                    .get(&binding.browser.session())
+                    .and_then(|pane| pane.ssh.as_ref())
+            {
+                binding.browser.configure_saved_transfers(
+                    profile.as_deref().filter(|_| !tab.incognito),
+                    route,
+                    preferences,
+                );
+            }
+        }
+    }
+
     pub(super) fn remote_dock_key(
         &mut self,
         owner: window::Id,
@@ -258,6 +294,7 @@ impl Workspace {
         let minimum = self.clipboard.policy.minimum_isolation;
         let target = pane.ssh.as_ref()?;
         if self.clipboard.policy.problem.is_some()
+            || target.blocked_server(self).is_some()
             || pane.frame.status != Status::Running
             || target.isolation < minimum
             || (minimum == IsolationLevel::Sandbox && pane.session.sandbox_backend().is_none())
@@ -276,7 +313,7 @@ impl Workspace {
         let pane = self.sessions.get(&session)?;
         let ssh = pane.ssh.as_ref()?;
         let frame = pane.session.frame();
-        if frame.scroll_offset != 0 || frame.screen.alternate_screen {
+        if !frame.at_live_viewport() || frame.screen.alternate_screen {
             return None;
         }
         let mut follow = tab
@@ -299,7 +336,7 @@ impl Workspace {
         let pane = self.sessions.get(&session)?;
         let ssh = pane.ssh.as_ref()?;
         let frame = pane.session.frame();
-        if frame.scroll_offset != 0 || frame.screen.alternate_screen {
+        if !frame.at_live_viewport() || frame.screen.alternate_screen {
             return None;
         }
         follow::file_context(
@@ -308,6 +345,19 @@ impl Workspace {
             ssh.username(),
             ssh.host(),
         )
+    }
+
+    pub(super) fn observed_remote_shell_host(&self, session: SessionId) -> Option<&str> {
+        self.windows.values().find_map(|window| {
+            let (index, _) = window.pane_location(session)?;
+            let tab = window.tabs.get(index)?.terminal()?;
+            let binding = tab.remote_files.binding.as_ref()?;
+            if binding.browser.session() == session {
+                binding.follow.reported_host()
+            } else {
+                None
+            }
+        })
     }
 
     pub(super) fn remote_dock_editor_worker(
@@ -325,7 +375,7 @@ impl Workspace {
         (binding.browser.session() == session
             && (binding.browser.has_worker()
                 || matches!(binding.manager_loan, Some(ManagerLoan::Opening(_)))))
-        .then(|| binding.browser.terminal_editor_worker())
+        .then(|| binding.browser.idle_worker())
     }
 
     fn preferred_remote_pane(&self, tab: &Tab) -> Option<SessionId> {
@@ -427,8 +477,14 @@ impl Workspace {
         };
         let managed = self.remote_manager_owns(target);
         let editor_policy = self.clipboard.policy.remote_editor;
+        let transfer_allowed = self.clipboard.policy.file_transfer_allowed;
+        let preferences = self.sftp_resume_preferences();
+        let resume_profile = (transfer_allowed && !tab.incognito)
+            .then(|| crate::profile::root().ok())
+            .flatten();
         let ssh = pane.ssh.as_ref().expect("validated SSH pane");
         let (user, host) = (ssh.username().to_owned(), ssh.host().to_owned());
+        let route = ssh.clone();
         let frame = pane.session.frame();
         let activity = frame.shell_activity();
         let now = Instant::now();
@@ -445,7 +501,7 @@ impl Workspace {
                 .expect("visible tab")
                 .remote_files;
             let binding = dock.binding.as_mut().expect("current remote binding");
-            if frame.scroll_offset == 0 {
+            if frame.at_live_viewport() {
                 binding
                     .follow
                     .observe(activity, &frame.screen, &user, &host, now);
@@ -456,16 +512,30 @@ impl Workspace {
                 let opened = if let Some(worker) = worker {
                     Ok(binding.browser.resume_with_worker(worker))
                 } else {
-                    binding.browser.resume(opener, editor_policy)
+                    binding.browser.resume(&route, opener, editor_policy)
                 };
                 return match opened {
-                    Ok(task) => completion(owner, tab_id, generation, task),
+                    Ok(task) => {
+                        binding.browser.revalidate_transfers(transfer_allowed);
+                        binding.browser.configure_saved_transfers(
+                            resume_profile.as_deref(),
+                            &route,
+                            preferences,
+                        );
+                        completion(owner, tab_id, generation, task)
+                    }
                     Err(error) => {
                         self.notice(owner, format!("Could not reopen Remote Files ({error})"));
                         Task::none()
                     }
                 };
             }
+            binding.browser.revalidate_transfers(transfer_allowed);
+            binding.browser.configure_saved_transfers(
+                resume_profile.as_deref(),
+                &route,
+                preferences,
+            );
             return Task::none();
         }
         if managed {
@@ -479,14 +549,14 @@ impl Workspace {
         }
         let generation = self.allocate();
         let mut follow = Follow::default();
-        if frame.scroll_offset == 0 {
+        if frame.at_live_viewport() {
             follow.observe(activity, &frame.screen, &user, &host, now);
         }
         let initial = follow.initial_path();
         let opened = if let Some(worker) = self.take_terminal_file_worker(target) {
             Ok(Browser::with_worker(target, worker, initial))
         } else {
-            Browser::open(target, opener, initial, editor_policy)
+            Browser::open(target, &route, opener, initial, editor_policy)
         };
         let dock = &mut self
             .active_tab_mut(owner)
@@ -496,7 +566,9 @@ impl Workspace {
         dock.reset_selection();
         dock.pending_drop = None;
         let task = match opened {
-            Ok((browser, task)) => {
+            Ok((mut browser, task)) => {
+                browser.revalidate_transfers(transfer_allowed);
+                browser.configure_saved_transfers(resume_profile.as_deref(), &route, preferences);
                 dock.binding = Some(Binding {
                     generation,
                     browser,
@@ -753,6 +825,10 @@ impl Workspace {
         message: Message,
     ) -> Task<Desktop> {
         match message {
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            Message::DesktopDragPrepared(scope, ticket, result) => {
+                self.finish_sidebar_file_drag_preparation(owner, scope, ticket, result);
+            }
             Message::Completed(tab, generation, result) => {
                 return self.remote_completion(tab, generation, result);
             }
@@ -831,9 +907,9 @@ impl Workspace {
             return Task::none();
         };
         let before = binding.browser.listing_revision();
-        if !self.clipboard.policy.file_transfer_allowed {
-            binding.browser.cancel_pending_transfers();
-        }
+        binding
+            .browser
+            .revalidate_transfers(self.clipboard.policy.file_transfer_allowed);
         let next = binding.browser.finish(result);
         if binding.browser.listing_revision() != before {
             binding.listing = binding.listing.wrapping_add(1);
@@ -853,6 +929,16 @@ impl Workspace {
         tab_id: u64,
         action: Action,
     ) -> Task<Desktop> {
+        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        match action {
+            Action::PrepareDesktopDrag(scope) if scope.tab() == tab_id => {
+                return self.prepare_sidebar_file_drag(owner, scope);
+            }
+            Action::StartDesktopDrag(scope, position) if scope.tab() == tab_id => {
+                return self.start_sidebar_file_drag(owner, scope, position);
+            }
+            _ => {}
+        }
         if self.window_settings.remote_sidebar_position == RemoteSidebarPosition::Hidden
             || self.owner_dialog(owner).is_some()
         {

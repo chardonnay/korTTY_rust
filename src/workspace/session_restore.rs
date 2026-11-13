@@ -1,5 +1,5 @@
 use async_channel::Receiver;
-use iced::widget::{button, row, text};
+use iced::widget::{button, column, row, text};
 use iced::{Alignment, Element, Subscription, Task, window};
 use kortty_terminal::TerminalProfile;
 
@@ -10,11 +10,15 @@ use super::{Message as WorkspaceMessage, Workspace, window_lifecycle};
 
 mod writer;
 use writer::{Event, Writer};
+mod output;
+pub(super) use output::Preferences as OutputPreferences;
 
 #[derive(Clone, Debug)]
 pub enum Message {
     Restore(window::Id),
     Dismiss(window::Id),
+    HideOutput(crate::session::SessionId),
+    UnlockOutput(window::Id),
     Mode(RestoreMode),
     Worker(Event),
 }
@@ -32,11 +36,14 @@ pub(super) struct Restore {
     history_writable: bool,
     loaded_history: Option<RecentlyClosed>,
     notice: Option<String>,
+    output_enabled: bool,
+    output_locked: bool,
+    output_capture_lines: u16,
 }
 
 impl Restore {
-    pub(super) fn initialize() -> Self {
-        match Self::load() {
+    pub(super) fn initialize(managed: Option<RestoreMode>, output_enabled: bool) -> Self {
+        match Store::open().and_then(|store| Self::load_from(store, managed, output_enabled)) {
             Ok(restore) => restore,
             Err(error) => Self {
                 notice: Some(format!("Session recovery unavailable ({error})")),
@@ -45,14 +52,20 @@ impl Restore {
         }
     }
 
-    fn load() -> std::io::Result<Self> {
-        Self::load_from(Store::open()?)
-    }
-
-    fn load_from(store: Store) -> std::io::Result<Self> {
+    fn load_from(
+        store: Store,
+        managed: Option<RestoreMode>,
+        output_enabled: bool,
+    ) -> std::io::Result<Self> {
         // Do not replace unreadable recovery data during this run.
-        let previous = store.previous()?;
-        let (mode, mut notice) = match store.restore_mode() {
+        let mut previous = store.previous()?;
+        if !output_enabled
+            && let Some(snapshot) = &mut previous
+            && snapshot.output.take().is_some()
+        {
+            store.write(Some(snapshot))?;
+        }
+        let (mode, mut notice) = match managed.map_or_else(|| store.restore_mode(), Ok) {
             Ok(mode) => (mode, None),
             Err(error) => (
                 RestoreMode::Ask,
@@ -97,6 +110,7 @@ impl Restore {
             history_writable: loaded_history.is_some(),
             loaded_history,
             notice,
+            output_enabled,
             ..Self::default()
         })
     }
@@ -136,7 +150,7 @@ impl Restore {
         }
     }
 
-    fn save_layout(&mut self, layout: WorkspaceLayout) {
+    fn save_layout(&mut self, layout: WorkspaceLayout, output: Option<String>) {
         let Some(writer) = &self.writer else {
             return;
         };
@@ -150,6 +164,7 @@ impl Restore {
             Some(Snapshot {
                 layout,
                 clean_exit: false,
+                output,
             })
         };
         if self.latest != candidate || self.write_failed {
@@ -159,7 +174,11 @@ impl Restore {
         }
     }
 
-    fn final_write(&self, layout: Option<WorkspaceLayout>) -> Option<Option<Snapshot>> {
+    fn final_write(
+        &self,
+        layout: Option<WorkspaceLayout>,
+        output: Option<String>,
+    ) -> Option<Option<Snapshot>> {
         let layout = layout?;
         if layout.windows.is_empty() {
             if self.clear_when_empty {
@@ -177,12 +196,17 @@ impl Restore {
         Some(Some(Snapshot {
             layout,
             clean_exit: true,
+            output,
         }))
     }
 
-    fn finish(&mut self, layout: Option<WorkspaceLayout>) -> Option<Receiver<()>> {
+    fn finish(
+        &mut self,
+        layout: Option<WorkspaceLayout>,
+        output: Option<String>,
+    ) -> Option<Receiver<()>> {
         let writer = self.writer.take()?;
-        Some(writer.finish(self.final_write(layout)))
+        Some(writer.finish(self.final_write(layout, output)))
     }
 }
 
@@ -203,6 +227,14 @@ pub(super) fn changes_layout(message: &WorkspaceMessage) -> bool {
         | WorkspaceMessage::Serial(_, crate::serial_dialog::Message::Connect)
         | WorkspaceMessage::Ssh(super::ssh_access::Message::Dialed(..))
         | WorkspaceMessage::SelectTab(_, _)
+        | WorkspaceMessage::ProjectFile(
+            _,
+            super::project_access::local_files::Message::Zoom(_)
+            | super::project_access::local_files::Message::Editor(
+                crate::editor_window::Message::Opened(Ok(_))
+                | crate::editor_window::Message::Saved(Ok(_)),
+            ),
+        )
         | WorkspaceMessage::Split(_, _)
         | WorkspaceMessage::FocusPane(_, _)
         | WorkspaceMessage::ClosePane(_, _)
@@ -226,9 +258,15 @@ pub(super) fn changes_layout(message: &WorkspaceMessage) -> bool {
 impl Workspace {
     pub(super) fn boot_session_restore(&mut self) -> (window::Id, Task<WorkspaceMessage>) {
         if self.clipboard.policy.problem.is_some() {
+            if let Ok(root) = crate::profile::root() {
+                let _ = Store::purge_saved_output(&root);
+            }
             return self.open_policy_window();
         }
-        self.session_restore = Restore::initialize();
+        self.session_restore = Restore::initialize(
+            self.clipboard.policy.session_restore_mode,
+            self.session_output_enabled(),
+        );
         if let Some(history) = self.session_restore.loaded_history.take() {
             self.load_recently_closed(history);
         }
@@ -263,11 +301,13 @@ impl Workspace {
         let Some(previous) = self.session_restore.previous.take() else {
             return Ok(None);
         };
-        match self.restore_layout_into(&previous.layout, reuse) {
-            Ok(opened) => {
+        match self.restore_layout_with_panes(&previous.layout, reuse, &[]) {
+            Ok(restored) => {
+                let id = restored.windows[0];
+                self.restore_session_output(id, &previous, &restored.panes);
                 self.session_restore.offered = false;
                 self.session_restore.changed(false);
-                Ok(Some(opened))
+                Ok(Some((id, restored.task)))
             }
             Err(error) => {
                 self.session_restore.previous = Some(previous);
@@ -286,8 +326,16 @@ impl Workspace {
 
     pub(super) fn update_session_restore(&mut self, message: Message) -> Task<WorkspaceMessage> {
         match message {
+            Message::HideOutput(session) => {
+                if let Some(pane) = self.sessions.get_mut(&session) {
+                    pane.restored_output = None;
+                }
+            }
+            Message::UnlockOutput(id) => return self.show_vault_unlock(id),
             Message::Mode(mode) => {
-                if let Some(writer) = &self.session_restore.writer {
+                if self.clipboard.policy.session_restore_mode.is_none()
+                    && let Some(writer) = &self.session_restore.writer
+                {
                     self.session_restore.mode = mode;
                     writer.mode(mode);
                 }
@@ -327,8 +375,8 @@ impl Workspace {
                 self.session_restore.changed(false);
             }
             Message::Worker(Event::Capture) => {
-                if let Some(layout) = self.capture_session_layout() {
-                    self.session_restore.save_layout(layout);
+                if let Some((layout, output)) = self.capture_session_layout() {
+                    self.session_restore.save_layout(layout, output);
                 }
             }
             Message::Worker(Event::HistoryWriteFailed(error)) => {
@@ -372,25 +420,43 @@ impl Workspace {
             .iter()
             .map(|window| window.tabs.len())
             .sum();
+        let unlock = snapshot.output.is_some()
+            && self.session_output_enabled()
+            && self.vault_unlock_available();
         Some(
-            row![
-                text(format!(
-                    "Restore previous session ({windows} windows, {tabs} tabs)?"
-                ))
-                .size(13),
-                button("Restore").on_press(WorkspaceMessage::SessionRestore(Message::Restore(id))),
-                button("Dismiss").on_press(WorkspaceMessage::SessionRestore(Message::Dismiss(id))),
+            column![
+                row![
+                    text(format!(
+                        "Restore previous session ({windows} windows, {tabs} tabs)?"
+                    ))
+                    .size(13),
+                    button("Restore")
+                        .on_press(WorkspaceMessage::SessionRestore(Message::Restore(id))),
+                    button("Dismiss")
+                        .on_press(WorkspaceMessage::SessionRestore(Message::Dismiss(id))),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center),
+                unlock.then(|| row![
+                    text("Unlock the vault first to include the previous terminal output.")
+                        .size(13),
+                    button("Unlock vault")
+                        .on_press(WorkspaceMessage::SessionRestore(Message::UnlockOutput(id))),
+                ]
+                .spacing(5)
+                .align_y(Alignment::Center)),
             ]
-            .spacing(5)
-            .align_y(Alignment::Center)
+            .spacing(4)
             .into(),
         )
     }
 
-    fn capture_session_layout(&self) -> Option<WorkspaceLayout> {
-        let mut layout = self.capture_layout()?;
+    fn capture_session_layout(&self) -> Option<(WorkspaceLayout, Option<String>)> {
+        let mut panes = Vec::new();
+        let mut layout = self.capture_layout_with_panes(None, |pane| panes.push(pane))?;
         layout.windows.retain(|window| !window.tabs.is_empty());
-        Some(layout)
+        let output = self.capture_session_output(&layout, &panes);
+        Some((layout, output))
     }
 
     pub(super) fn preserve_closing_session_window(&mut self, closing: window::Id) {
@@ -398,16 +464,18 @@ impl Workspace {
             && self.windows.iter().all(|(&id, window)| {
                 id == closing || window.terminal_tabs().all(|tab| tab.incognito)
             })
-            && let Some(layout) = self.capture_session_layout()
+            && let Some((layout, output)) = self.capture_session_layout()
         {
-            self.session_restore.save_layout(layout);
+            self.session_restore.save_layout(layout, output);
         }
     }
 
     pub(super) fn finish_session_restore(&mut self) {
         if self.session_restore.writer.is_some() {
-            let layout = self.capture_session_layout();
-            if let Some(done) = self.session_restore.finish(layout) {
+            let (layout, output) = self
+                .capture_session_layout()
+                .map_or((None, None), |(layout, output)| (Some(layout), output));
+            if let Some(done) = self.session_restore.finish(layout, output) {
                 self.pending_shutdown.push(done);
             }
         }

@@ -1,3 +1,4 @@
+use std::fs;
 use std::io::{self, Read};
 use std::path::Path;
 use std::{fmt, fmt::Display};
@@ -6,7 +7,12 @@ use iced::{Font, Task, window};
 use kortty_terminal::TerminalProfile;
 use serde::{Deserialize, Serialize};
 
+use crate::connection_store::{
+    MAX_TERMINAL_COLUMNS, MAX_TERMINAL_ROWS, MIN_TERMINAL_COLUMNS, MIN_TERMINAL_ROWS,
+};
 use crate::profile;
+use crate::scheduler_window::{DEFAULT_JOURNAL_RETENTION_DAYS, MAX_JOURNAL_RETENTION_DAYS};
+use crate::session::CodingAgentState;
 use crate::terminal_theme::{
     Appearance, BoldTextMode, Colors, MONOSPACED, Scheme, Themes, installed_font,
 };
@@ -16,6 +22,7 @@ use crate::terminal_view::quick_select::{
 
 use super::{
     DEFAULT_FONT, Message, Tab, Workspace, appearance, key_bindings::Bindings, paste_protection,
+    snippet_access::workflow_headers::Defaults as WorkflowHeaderDefaults,
     window_lifecycle::StartupPreferences,
 };
 
@@ -28,6 +35,12 @@ const REMOTE_SIDEBAR_DEFAULT_WIDTH: u16 = 300;
 pub(super) const DEFAULT_JOURNAL_EDIT_SPLIT: u16 = 6200;
 pub(super) const MIN_TERMINAL_SILENCE_SECONDS: u16 = 5;
 pub(super) const MAX_TERMINAL_SILENCE_SECONDS: u16 = 3600;
+pub(super) const MIN_MANUAL_SCALE: u16 = 70;
+pub(super) const MAX_MANUAL_SCALE: u16 = 250;
+pub(super) const DEFAULT_MANUAL_SCALE: u16 = 100;
+pub(super) const MIN_WORKFLOW_FONT: u8 = 8;
+pub(super) const MAX_WORKFLOW_FONT: u8 = 48;
+const DEFAULT_WORKFLOW_FONT: u8 = 14;
 
 fn default_journal_edit_split(value: &u16) -> bool {
     *value == DEFAULT_JOURNAL_EDIT_SPLIT
@@ -76,10 +89,36 @@ pub(super) struct WindowSettings {
         skip_serializing_if = "crate::session_journal::export_branding::Preferences::is_default"
     )]
     pub(super) export_branding: crate::session_journal::export_branding::Preferences,
+    pub(super) snippet_analysis_export_include_code: bool,
     pub(super) open_tool_windows_as_tabs: bool,
+    #[serde(skip_serializing_if = "crate::sftp_window::ConflictDefault::is_default")]
+    pub(super) sftp_conflict_default: crate::sftp_window::ConflictDefault,
+    pub(super) sftp_parallel_transfers: u8,
+    pub(super) sftp_resume_partial_transfers: bool,
+    pub(super) sftp_keep_partial_on_cancel: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sftp_idle_minutes: Option<u16>,
+    #[serde(skip_serializing_if = "crate::sftp_window::ArchivePreferences::is_default")]
+    pub(super) sftp_archive: crate::sftp_window::ArchivePreferences,
+    pub(super) manual_scale: u16,
+    #[serde(skip_serializing_if = "crate::editor_window::caret::Preferences::is_default")]
+    pub(super) editor_caret: crate::editor_window::caret::Preferences,
     #[serde(skip_serializing_if = "crate::snippet_window::structure::Preferences::is_default")]
     pub(super) snippet_structure: crate::snippet_window::structure::Preferences,
+    #[serde(skip_serializing_if = "crate::snippet_window::appearance::Preferences::is_default")]
+    pub(super) snippet_appearance: crate::snippet_window::appearance::Preferences,
+    pub(super) snippet_analysis_auto_diagram: bool,
+    pub(super) snippet_analysis_auto_modularization: bool,
+    #[serde(
+        skip_serializing_if = "crate::snippet_analysis::model::hardening::Preferences::is_default"
+    )]
+    pub(super) snippet_hardening: crate::snippet_analysis::model::hardening::Preferences,
+    #[serde(skip_serializing_if = "WorkflowHeaderDefaults::is_default")]
+    pub(super) workflow_header_defaults: WorkflowHeaderDefaults,
+    pub(super) workflow_single_language: bool,
+    pub(super) workflow_script_font: u8,
     pub(super) job_menu_status_enabled: bool,
+    pub(super) job_scheduler_journal_retention_days: u16,
     pub(super) connection_color_border_enabled: bool,
     pub(super) split_pane_focus_ring_enabled: bool,
     pub(super) tab_title_from_shell_enabled: bool,
@@ -88,11 +127,34 @@ pub(super) struct WindowSettings {
     pub(super) command_timestamps_enabled: bool,
     pub(super) terminal_silence_seconds: u16,
     pub(super) terminal_link_detection_enabled: bool,
+    pub(super) serial_default_encoding: kortty_terminal::TextEncoding,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) terminal_columns: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) terminal_rows: Option<u16>,
     pub(super) terminal_copy_on_select_enabled: bool,
     #[serde(skip_serializing_if = "QuickSelectPreferences::is_default")]
     pub(super) quick_select: QuickSelectPreferences,
     pub(super) show_terminal_scrollbar: bool,
+    pub(super) scrollback_lines: u32,
+    pub(super) scrollback_memory_mib: u8,
     pub(super) scrollback_compression_enabled: bool,
+    pub(super) ssh_keepalive_enabled: bool,
+    pub(super) ssh_keepalive_interval: u16,
+    pub(super) coding_agent_detection_enabled: bool,
+    pub(super) coding_agent_app_badge_enabled: bool,
+    pub(super) coding_agent_notifications_enabled: bool,
+    pub(super) terminal_notifications: super::terminal_notifications::Preferences,
+    #[serde(skip_serializing_if = "crate::application_update::Preferences::is_default")]
+    pub(super) application_updates: crate::application_update::Preferences,
+    #[serde(skip_serializing_if = "super::session_restore::OutputPreferences::is_default")]
+    pub(super) restore_output: super::session_restore::OutputPreferences,
+    pub(super) coding_agent_dock_automatic: bool,
+    pub(super) coding_agent_dock: super::coding_agent_dock::Preferences,
+    #[serde(skip_serializing_if = "crate::terminal_agent::design::Preset::is_default")]
+    pub(super) ai_agent_design: crate::terminal_agent::design::Preset,
+    #[serde(skip_serializing_if = "crate::terminal_agent::design::Catalog::is_default")]
+    pub(super) ai_agent_designs: crate::terminal_agent::design::Catalog,
     #[serde(skip_serializing_if = "BoldTextMode::is_default")]
     pub(super) terminal_bold_text_mode: BoldTextMode,
     pub(super) hide_terminal_scrollbars_in_fullscreen: bool,
@@ -104,6 +166,7 @@ pub(super) struct WindowSettings {
     pub(super) terminal_font_family: Option<String>,
     pub(super) paste_warning: paste_protection::WarningMode,
     pub(super) paste_large_warning_kib: u8,
+    pub(super) paste_line_delay_ms: u16,
     pub(super) remote_sidebar_position: RemoteSidebarPosition,
     #[serde(deserialize_with = "WindowSettings::decode_sidebar_width")]
     pub(super) remote_sidebar_width: u16,
@@ -141,9 +204,26 @@ impl Default for WindowSettings {
             journal_marker_geometry: None,
             journal_screenshot_geometry: None,
             export_branding: crate::session_journal::export_branding::Preferences::default(),
+            snippet_analysis_export_include_code: false,
             open_tool_windows_as_tabs: false,
+            sftp_conflict_default: Default::default(),
+            sftp_parallel_transfers: crate::sftp_window::parallel::DEFAULT_PARALLEL,
+            sftp_resume_partial_transfers: true,
+            sftp_keep_partial_on_cancel: false,
+            sftp_idle_minutes: None,
+            sftp_archive: Default::default(),
+            manual_scale: DEFAULT_MANUAL_SCALE,
+            editor_caret: crate::editor_window::caret::Preferences::default(),
             snippet_structure: crate::snippet_window::structure::Preferences::default(),
+            snippet_appearance: crate::snippet_window::appearance::Preferences::default(),
+            snippet_analysis_auto_diagram: true,
+            snippet_analysis_auto_modularization: false,
+            snippet_hardening: Default::default(),
+            workflow_header_defaults: WorkflowHeaderDefaults::default(),
+            workflow_single_language: false,
+            workflow_script_font: DEFAULT_WORKFLOW_FONT,
             job_menu_status_enabled: true,
+            job_scheduler_journal_retention_days: 0,
             connection_color_border_enabled: true,
             split_pane_focus_ring_enabled: true,
             tab_title_from_shell_enabled: true,
@@ -152,10 +232,27 @@ impl Default for WindowSettings {
             command_timestamps_enabled: false,
             terminal_silence_seconds: 30,
             terminal_link_detection_enabled: true,
+            serial_default_encoding: kortty_terminal::TextEncoding::default(),
+            terminal_columns: None,
+            terminal_rows: None,
             terminal_copy_on_select_enabled: true,
             quick_select: QuickSelectPreferences::default(),
             show_terminal_scrollbar: true,
+            scrollback_lines: kortty_terminal::ScrollbackConfig::DEFAULT_LINES,
+            scrollback_memory_mib: kortty_terminal::ScrollbackConfig::DEFAULT_MEMORY_MIB,
             scrollback_compression_enabled: true,
+            ssh_keepalive_enabled: kortty_ssh::KeepAlive::default().enabled(),
+            ssh_keepalive_interval: kortty_ssh::KeepAlive::default().seconds(),
+            coding_agent_detection_enabled: true,
+            coding_agent_app_badge_enabled: true,
+            coding_agent_notifications_enabled: true,
+            terminal_notifications: Default::default(),
+            application_updates: Default::default(),
+            restore_output: Default::default(),
+            coding_agent_dock_automatic: true,
+            coding_agent_dock: super::coding_agent_dock::Preferences::default(),
+            ai_agent_design: Default::default(),
+            ai_agent_designs: Default::default(),
             terminal_bold_text_mode: BoldTextMode::default(),
             hide_terminal_scrollbars_in_fullscreen: false,
             terminal_transparency: 0,
@@ -165,6 +262,7 @@ impl Default for WindowSettings {
             terminal_font_family: None,
             paste_warning: paste_protection::WarningMode::default(),
             paste_large_warning_kib: 5,
+            paste_line_delay_ms: 0,
             remote_sidebar_position: RemoteSidebarPosition::Hidden,
             remote_sidebar_width: REMOTE_SIDEBAR_DEFAULT_WIDTH,
             key_bindings: Bindings::default(),
@@ -180,6 +278,26 @@ impl Default for WindowSettings {
 }
 
 impl WindowSettings {
+    pub(super) fn ssh_keepalive(&self) -> kortty_ssh::KeepAlive {
+        use kortty_ssh::KeepAlive;
+
+        KeepAlive::new(
+            self.ssh_keepalive_enabled,
+            self.ssh_keepalive_interval
+                .clamp(KeepAlive::MIN_SECONDS, KeepAlive::MAX_SECONDS),
+        )
+        .expect("bounded SSH keepalive interval")
+    }
+
+    pub(super) fn scrollback_config(&self) -> kortty_terminal::ScrollbackConfig {
+        kortty_terminal::ScrollbackConfig {
+            lines: self.scrollback_lines,
+            memory_mib: self.scrollback_memory_mib,
+            compression: self.scrollback_compression_enabled,
+        }
+        .bounded()
+    }
+
     pub(super) fn terminal_scrollbar_visible(&self, fullscreen: bool) -> bool {
         self.show_terminal_scrollbar && !(fullscreen && self.hide_terminal_scrollbars_in_fullscreen)
     }
@@ -218,6 +336,27 @@ impl WindowSettings {
             .unwrap_or(Font::MONOSPACE)
     }
 
+    pub(super) fn editor_appearance(&self) -> crate::editor_window::Appearance {
+        let scheme = self.themes.appearance();
+        let terminal = self.terminal_appearance();
+        crate::editor_window::Appearance {
+            font: self.terminal_font_face(scheme),
+            size: self
+                .themes
+                .font_size(scheme, self.terminal_font, self.terminal_font),
+            foreground: terminal.foreground,
+            background: terminal.background,
+        }
+    }
+
+    pub(super) fn snippet_editor_appearance(&self) -> crate::editor_window::Appearance {
+        self.snippet_appearance.resolve(self.editor_appearance())
+    }
+
+    pub(super) fn snippet_editor_caret(&self) -> crate::editor_window::caret::Preferences {
+        self.snippet_appearance.resolve_caret(self.editor_caret)
+    }
+
     pub(super) fn load() -> Self {
         profile::window_settings_path()
             .map_or_else(|_| Self::default(), |path| Self::read_or_default(&path))
@@ -226,15 +365,43 @@ impl WindowSettings {
     fn read_or_default(path: &Path) -> Self {
         match Self::read(path) {
             Ok(settings) => settings,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Self {
-                appearance: appearance::Preferences::fresh(),
-                ..Self::default()
-            },
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Self::fresh_at(path),
             Err(_) => Self::default(),
         }
     }
 
-    fn read(path: &Path) -> io::Result<Self> {
+    fn fresh_at(path: &Path) -> Self {
+        let mut settings = Self {
+            appearance: appearance::Preferences::fresh(),
+            ..Self::default()
+        };
+        // An older profile can have a run journal without a preferences file.
+        if [path, &path.with_file_name("jobs.json")]
+            .into_iter()
+            .all(|path| {
+                fs::symlink_metadata(path)
+                    .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+            })
+        {
+            settings.job_scheduler_journal_retention_days = DEFAULT_JOURNAL_RETENTION_DAYS;
+            match settings
+                .encoded()
+                .and_then(|bytes| profile::save_new_atomic(path, &bytes))
+            {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                    return Self::read(path).unwrap_or_default();
+                }
+                Err(error) => {
+                    eprintln!("Could not initialize run journal retention ({error})");
+                    settings.job_scheduler_journal_retention_days = 0;
+                }
+            }
+        }
+        settings
+    }
+
+    pub(super) fn read(path: &Path) -> io::Result<Self> {
         let file = profile::open_preference(path)?;
         if !file.metadata()?.is_file() {
             return Err(io::Error::other("window settings must be a regular file"));
@@ -242,22 +409,63 @@ impl WindowSettings {
         let mut bytes = Vec::new();
         file.take(PREFERENCE_LIMIT + 1).read_to_end(&mut bytes)?;
         let mut settings = Self::decode(&bytes)?;
+        settings.terminal_columns = settings
+            .terminal_columns
+            .filter(|columns| (MIN_TERMINAL_COLUMNS..=MAX_TERMINAL_COLUMNS).contains(columns));
+        settings.terminal_rows = settings
+            .terminal_rows
+            .filter(|rows| (MIN_TERMINAL_ROWS..=MAX_TERMINAL_ROWS).contains(rows));
+        let scrollback = settings.scrollback_config();
+        settings.scrollback_lines = scrollback.lines;
+        settings.scrollback_memory_mib = scrollback.memory_mib;
+        settings.ssh_keepalive_interval = settings.ssh_keepalive().seconds();
+        settings.sftp_parallel_transfers = settings
+            .sftp_parallel_transfers
+            .clamp(1, crate::sftp_window::parallel::MAX_PARALLEL);
+        settings.sftp_idle_minutes = settings
+            .sftp_idle_minutes
+            .filter(|minutes| (1..=profile::RemoteProjectTool::MAX_IDLE_MINUTES).contains(minutes));
+        if !settings.sftp_archive.valid() {
+            settings.sftp_archive = Default::default();
+        }
         settings.open_recent.normalize();
+        settings.manual_scale = settings
+            .manual_scale
+            .clamp(MIN_MANUAL_SCALE, MAX_MANUAL_SCALE);
+        settings.workflow_script_font = settings
+            .workflow_script_font
+            .clamp(MIN_WORKFLOW_FONT, MAX_WORKFLOW_FONT);
         settings.startup.fixed = settings.startup.fixed.clamped();
         settings.key_bindings.preserve_user_shortcuts();
         settings.terminal_transparency = settings.terminal_transparency.min(100);
         settings.terminal_silence_seconds = settings
             .terminal_silence_seconds
             .clamp(MIN_TERMINAL_SILENCE_SECONDS, MAX_TERMINAL_SILENCE_SECONDS);
+        settings.terminal_notifications.normalize();
+        if settings.job_scheduler_journal_retention_days > MAX_JOURNAL_RETENTION_DAYS {
+            settings.job_scheduler_journal_retention_days = 0;
+        }
+        if !settings.application_updates.valid() {
+            settings.application_updates = Default::default();
+        }
+        let lines = super::session_restore::OutputPreferences::LINES;
+        settings.restore_output.lines = settings
+            .restore_output
+            .lines
+            .clamp(*lines.start(), *lines.end());
         settings.terminal_font = settings
             .terminal_font
             .clamp(profile::MIN_TERMINAL_FONT, profile::MAX_TERMINAL_FONT);
         settings.terminal_font_family = settings.terminal_font_family.filter(|name| {
             !name.trim().is_empty() && name != MONOSPACED && !name.chars().any(char::is_control)
         });
+        settings.snippet_appearance.normalize();
         settings.paste_large_warning_kib = settings
             .paste_large_warning_kib
             .min(paste_protection::MAX_PASTE_KIB);
+        settings.paste_line_delay_ms = settings
+            .paste_line_delay_ms
+            .min(crate::connection_store::MAX_PASTE_LINE_DELAY_MS);
         if !settings.themes.valid() {
             settings.themes = Themes::default();
         }
@@ -280,11 +488,24 @@ impl WindowSettings {
 
     pub(super) fn validate_backup(bytes: &[u8]) -> io::Result<()> {
         let settings = Self::decode(bytes)?;
+        settings.validate_job_journal_retention()?;
         settings.app_logging.validate()?;
         settings.session_journal.validate()?;
         settings.journal_ai.validate()?;
         settings.quick_select.validate()?;
         settings.validate_silence_threshold()?;
+        settings.validate_application_updates()?;
+        if !super::session_restore::OutputPreferences::LINES
+            .contains(&settings.restore_output.lines)
+        {
+            return Err(io::Error::other(
+                "profile backup contains an invalid session output line limit",
+            ));
+        }
+        settings.validate_sftp()?;
+        settings.validate_initial_terminal_size()?;
+        settings.validate_scrollback()?;
+        settings.validate_ssh_keepalive()?;
         if !settings.themes.valid() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -294,7 +515,20 @@ impl WindowSettings {
         Ok(())
     }
 
-    fn decode(bytes: &[u8]) -> io::Result<Self> {
+    pub(super) fn backup_background_ids(
+        bytes: &[u8],
+    ) -> io::Result<Vec<crate::terminal_view::background_image::AssetId>> {
+        let settings = Self::decode(bytes)?;
+        if !settings.themes.valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "profile backup contains invalid terminal themes",
+            ));
+        }
+        Ok(settings.themes.background_assets().collect())
+    }
+
+    pub(super) fn decode(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() as u64 > PREFERENCE_LIMIT {
             return Err(io::Error::other("window settings exceed the size limit"));
         }
@@ -302,6 +536,12 @@ impl WindowSettings {
     }
 
     fn validate_silence_threshold(&self) -> io::Result<()> {
+        if !self.terminal_notifications.valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "command notification threshold is outside 1 to 3600 seconds",
+            ));
+        }
         if !(MIN_TERMINAL_SILENCE_SECONDS..=MAX_TERMINAL_SILENCE_SECONDS)
             .contains(&self.terminal_silence_seconds)
         {
@@ -313,7 +553,27 @@ impl WindowSettings {
         Ok(())
     }
 
+    fn validate_application_updates(&self) -> io::Result<()> {
+        if !self.application_updates.valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "application update check interval is outside 1 to 30 days",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn save(&self, path: &Path) -> io::Result<()> {
+        profile::save_atomic(path, &self.encoded()?)
+    }
+
+    fn encoded(&self) -> io::Result<Vec<u8>> {
+        self.validate_job_journal_retention()?;
+        self.validate_sftp()?;
+        self.validate_initial_terminal_size()?;
+        self.validate_scrollback()?;
+        self.validate_ssh_keepalive()?;
+        self.validate_application_updates()?;
         self.app_logging.validate()?;
         self.session_journal.validate()?;
         self.journal_ai.validate()?;
@@ -326,7 +586,63 @@ impl WindowSettings {
         if bytes.len() as u64 > PREFERENCE_LIMIT {
             return Err(io::Error::other("window settings exceed the size limit"));
         }
-        profile::save_atomic(path, &bytes)
+        Ok(bytes)
+    }
+
+    fn validate_job_journal_retention(&self) -> io::Result<()> {
+        if self.job_scheduler_journal_retention_days > MAX_JOURNAL_RETENTION_DAYS {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "run journal retention is outside 0 to 3650 days",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_sftp(&self) -> io::Result<()> {
+        if !self.sftp_archive.valid() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SFTP archive defaults require an absolute remote directory or a blank field and a compression level from 0 to 9",
+            ));
+        }
+        if !(1..=crate::sftp_window::parallel::MAX_PARALLEL).contains(&self.sftp_parallel_transfers)
+            || self.sftp_idle_minutes.is_some_and(|minutes| {
+                !(1..=profile::RemoteProjectTool::MAX_IDLE_MINUTES).contains(&minutes)
+            })
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "SFTP settings require 1 to 8 parallel transfers and 1 to 120 idle minutes",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_initial_terminal_size(&self) -> io::Result<()> {
+        profile::InitialTerminalSize {
+            columns: self.terminal_columns,
+            rows: self.terminal_rows,
+        }
+        .validate()
+    }
+
+    fn validate_scrollback(&self) -> io::Result<()> {
+        let bounded = self.scrollback_config();
+        if bounded.lines != self.scrollback_lines
+            || bounded.memory_mib != self.scrollback_memory_mib
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Scrollback requires 100 to 100000 lines and 1 to 50 MiB.",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_ssh_keepalive(&self) -> io::Result<()> {
+        kortty_ssh::KeepAlive::new(self.ssh_keepalive_enabled, self.ssh_keepalive_interval)
+            .map(|_| ())
     }
 }
 
@@ -410,6 +726,18 @@ impl Workspace {
         (automatic, connection)
     }
 
+    pub(super) fn coding_agent_tab_badge(&self, tab: &Tab) -> Option<TabAgentBadge> {
+        if !self.window_settings.coding_agent_detection_enabled {
+            return None;
+        }
+        coding_agent_badge(tab.grid.iter().filter_map(|(_, session)| {
+            let pane = self.sessions.get(session)?;
+            let status = pane.coding_agent.status?;
+            let name = pane.coding_agent.alias.as_deref().unwrap_or(status.name);
+            Some((status.state, name))
+        }))
+    }
+
     pub(super) fn automatic_tab_names(&self, tab: &Tab) -> (String, Option<String>) {
         let Some(pane) = tab
             .focused_session()
@@ -419,6 +747,10 @@ impl Workspace {
         };
         let connection = if let Some(ssh) = &pane.ssh {
             ssh.label()
+        } else if let Some(serial) = &pane.saved_serial {
+            serial.display_name()
+        } else if let Some(local) = &pane.saved_local {
+            local.display_name()
         } else if let Some(ibm) = &pane.frame.ibm {
             ibm.kind.label().into()
         } else if let Some(serial) = &pane.frame.serial {
@@ -450,9 +782,102 @@ impl Workspace {
     }
 }
 
+pub(super) struct TabAgentBadge {
+    pub(super) glyph: Option<&'static str>,
+    pub(super) description: String,
+}
+
+fn coding_agent_badge<'a>(
+    agents: impl IntoIterator<Item = (CodingAgentState, &'a str)>,
+) -> Option<TabAgentBadge> {
+    use CodingAgentState::{Blocked, Done, Idle, Unknown, Working};
+
+    let (_, glyph, state, name) = agents
+        .into_iter()
+        .map(|(state, name)| {
+            let (priority, glyph, state) = match state {
+                Blocked => (4, Some("✋"), "Waiting for you"),
+                Done => (3, Some("✓"), "Done"),
+                Working => (2, Some("⚡"), "Working"),
+                Idle => (1, None, "Idle"),
+                Unknown => (0, None, "Unknown"),
+            };
+            (priority, glyph, state, name)
+        })
+        .max_by_key(|&(priority, ..)| priority)?;
+    Some(TabAgentBadge {
+        glyph,
+        description: format!("{name} · {state}"),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sftp_preferences_default_off_and_round_trip_with_bounded_validation() {
+        let mut settings: WindowSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.sftp_parallel_transfers, 3);
+        assert_eq!(settings.sftp_idle_minutes, None);
+        settings.sftp_parallel_transfers = 8;
+        settings.sftp_idle_minutes = Some(120);
+        let encoded = serde_json::to_vec(&settings).unwrap();
+        assert!(WindowSettings::validate_backup(&encoded).is_ok());
+        assert_eq!(WindowSettings::decode(&encoded).unwrap(), settings);
+        for invalid in [0, 9, u8::MAX] {
+            settings.sftp_parallel_transfers = invalid;
+            assert!(settings.validate_sftp().is_err());
+        }
+        settings.sftp_parallel_transfers = 1;
+        for invalid in [0, 121, u16::MAX] {
+            settings.sftp_idle_minutes = Some(invalid);
+            assert!(
+                WindowSettings::validate_backup(&serde_json::to_vec(&settings).unwrap()).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn sftp_conflict_default_round_trips_and_unknown_profiles_ask() {
+        use crate::sftp_window::ConflictDefault;
+
+        let mut settings: WindowSettings = serde_json::from_str("{}").unwrap();
+        assert_eq!(settings.sftp_conflict_default, ConflictDefault::Ask);
+        settings.sftp_conflict_default = ConflictDefault::Overwrite;
+        let saved = serde_json::to_value(&settings).unwrap();
+        assert_eq!(saved["sftp_conflict_default"], "overwrite");
+        assert_eq!(
+            serde_json::from_value::<WindowSettings>(saved).unwrap(),
+            settings
+        );
+        let unknown: WindowSettings =
+            serde_json::from_str(r#"{"sftp_conflict_default":"unknown"}"#).unwrap();
+        assert_eq!(unknown.sftp_conflict_default, ConflictDefault::Ask);
+    }
+
+    #[test]
+    fn coding_agent_tab_badge_uses_the_most_urgent_split_state() {
+        use CodingAgentState::{Blocked, Done, Idle, Unknown, Working};
+
+        assert!(coding_agent_badge([]).is_none());
+        let idle = coding_agent_badge([(Idle, "Codex"), (Unknown, "Gemini CLI")]).unwrap();
+        assert_eq!(idle.glyph, None);
+        assert_eq!(idle.description, "Codex · Idle");
+        let working = coding_agent_badge([(Idle, "Codex"), (Working, "Gemini CLI")]).unwrap();
+        assert_eq!(working.glyph, Some("⚡"));
+        let done = coding_agent_badge([(Done, "Codex"), (Working, "Gemini CLI")]).unwrap();
+        assert_eq!(done.glyph, Some("✓"));
+        assert_eq!(done.description, "Codex · Done");
+        let blocked = coding_agent_badge([(Blocked, "Gemini CLI"), (Done, "Codex")]).unwrap();
+        assert_eq!(blocked.glyph, Some("✋"));
+        assert_eq!(blocked.description, "Gemini CLI · Waiting for you");
+
+        let alias = String::from("Release Agent");
+        let renamed = coding_agent_badge([(Blocked, alias.as_str()), (Done, "Codex")]).unwrap();
+        assert_eq!(renamed.glyph, Some("✋"));
+        assert_eq!(renamed.description, "Release Agent · Waiting for you");
+    }
 
     #[test]
     fn terminal_scrollbar_preferences_keep_legacy_profiles_visible() {
@@ -489,8 +914,22 @@ mod tests {
             WindowSettings::read(&path).unwrap_err().kind(),
             io::ErrorKind::NotFound
         );
+        let jobs = path.with_file_name("jobs.json");
+        fs::write(&jobs, b"existing job store").unwrap();
+        assert_eq!(
+            WindowSettings::read_or_default(&path).job_scheduler_journal_retention_days,
+            0
+        );
+        assert!(!path.exists());
+        fs::remove_file(jobs).unwrap();
         let fresh = WindowSettings::read_or_default(&path);
         assert!(fresh.job_menu_status_enabled);
+        assert_eq!(
+            WindowSettings::read(&path)
+                .unwrap()
+                .job_scheduler_journal_retention_days,
+            DEFAULT_JOURNAL_RETENTION_DAYS
+        );
         assert!(fresh.journal_ai.auto_screenshot_analysis);
         assert_eq!(
             fresh.appearance.design,
@@ -499,7 +938,9 @@ mod tests {
         assert!(fresh.appearance.animations);
         let preferences = WindowSettings {
             open_tool_windows_as_tabs: true,
+            manual_scale: 140,
             job_menu_status_enabled: false,
+            job_scheduler_journal_retention_days: MAX_JOURNAL_RETENTION_DAYS,
             connection_color_border_enabled: false,
             split_pane_focus_ring_enabled: false,
             tab_title_from_shell_enabled: false,
@@ -522,8 +963,10 @@ mod tests {
         std::fs::write(&path, r#"{"tab_title_from_shell_enabled":false}"#).unwrap();
         let old_profile = WindowSettings::read(&path).unwrap();
         assert!(old_profile.job_menu_status_enabled);
+        assert_eq!(old_profile.job_scheduler_journal_retention_days, 0);
         assert!(old_profile.journal_ai.auto_screenshot_analysis);
         assert!(!old_profile.open_tool_windows_as_tabs);
+        assert_eq!(old_profile.manual_scale, DEFAULT_MANUAL_SCALE);
         assert!(old_profile.connection_color_border_enabled);
         assert!(old_profile.split_pane_focus_ring_enabled);
         assert_eq!(old_profile.appearance.design, appearance::Design::Normal);
@@ -546,6 +989,15 @@ mod tests {
             paste_protection::WarningMode::UnlessBracketed
         );
         assert_eq!(old_profile.paste_large_warning_kib, 5);
+        let invalid_retention = br#"{"job_scheduler_journal_retention_days":3651}"#;
+        fs::write(&path, invalid_retention).unwrap();
+        assert_eq!(
+            WindowSettings::read(&path)
+                .unwrap()
+                .job_scheduler_journal_retention_days,
+            0
+        );
+        assert!(WindowSettings::validate_backup(invalid_retention).is_err());
         std::fs::write(
             &path,
             r#"{"remote_sidebar_position":"unknown","remote_sidebar_width":99999}"#,

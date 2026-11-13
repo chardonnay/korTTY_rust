@@ -330,9 +330,13 @@ impl Workspace {
             button("−").on_press_maybe(
                 (retained != Some(0)).then(|| wrap(id, Edit::StepRetention(false)))
             ),
-            text_input("0–100", &retention)
-                .width(60)
-                .on_input(move |value| wrap(id, Edit::Retention(value))),
+            dialog.reveal_input(
+                Setting::BackupRetention,
+                true,
+                text_input("0–100", &retention)
+                    .width(60)
+                    .on_input(move |value| wrap(id, Edit::Retention(value))),
+            ),
             button("+").on_press_maybe(
                 (retained != Some(MAX_RETENTION)).then(|| wrap(id, Edit::StepRetention(true)))
             ),
@@ -365,11 +369,15 @@ impl Workspace {
         .align_y(Alignment::Center);
         let folder = row![
             text("Folder").width(225),
-            text_input("Choose an existing folder", &directory).on_input_maybe(
-                policy
-                    .directory
-                    .is_none()
-                    .then_some(move |value| wrap(id, Edit::Directory(value)))
+            dialog.reveal_input(
+                Setting::AutomaticBackup,
+                policy.directory.is_none(),
+                text_input("Choose an existing folder", &directory).on_input_maybe(
+                    policy
+                        .directory
+                        .is_none()
+                        .then_some(move |value| wrap(id, Edit::Directory(value)))
+                ),
             ),
             button("Browse…")
                 .style(button::secondary)

@@ -57,6 +57,7 @@ pub(crate) fn analyze(
     STANDARD.encode_string(&png, &mut data_url);
     drop(png);
     let system = system_prompt(&context.language);
+    let system = client.render_system_prompt(&system);
     let input = context.user_prompt()?;
     let reply = Zeroizing::new(request(
         client, screenshot, &system, &input, &data_url, deadline,

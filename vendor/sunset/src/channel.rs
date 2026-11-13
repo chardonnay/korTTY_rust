@@ -250,17 +250,17 @@ impl Channels {
         Ok(())
     }
 
-    pub(crate) fn client_tracked_subsystem(
+    pub(crate) fn client_tracked_request(
         &mut self,
         num: ChanNum,
-        name: &str,
+        request: Req<'_>,
         send: &mut TrafSend,
     ) -> Result<()> {
         let channel = self.get_mut(num)?;
         if !channel.tracked_session || channel.request_reply != RequestReply::Unsent {
             return error::BadUsage.fail();
         }
-        Req::Subsystem(name).send_with_reply(channel, send, true)?;
+        request.send_with_reply(channel, send, true)?;
         channel.request_reply = RequestReply::Pending { pty: false };
         Ok(())
     }

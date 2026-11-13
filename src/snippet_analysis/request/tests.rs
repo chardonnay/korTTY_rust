@@ -79,6 +79,7 @@ fn request_sends_the_preview_once_via_shared_ai_transport() {
         "",
         r#"{"summary":"Prints a marker","dependencies":[],"improvements":[{"title":"Check exit status","line":1}]}"#,
     )]);
+    let profile = profile.with_prompt_preset(local_ai::PromptPreset::Qwen);
     let snapshot = Snapshot::snippet("marker".into(), "shell".into(), "echo marker".into())
         .with_snippet_file("marker.sh".into(), true);
     let request = Request::new(
@@ -87,22 +88,87 @@ fn request_sends_the_preview_once_via_shared_ai_transport() {
         "Review exit codes",
         "Use ShellCheck conventions",
     )
-    .unwrap();
+    .unwrap()
+    .with_profile(&profile);
     let preview = [request.system().to_owned(), request.input().to_owned()];
+    assert_eq!(preview[0].matches("<kortty_model_preset>").count(), 1);
     assert!(preview[1].contains("File: marker.sh (executable)"));
     assert!(preview[1].contains("Review exit codes"));
-    let pending = request.start(profile).unwrap();
+    let pending = request.start(profile, |_| {}).unwrap();
     let result = pending.reply.recv_blocking().unwrap().unwrap();
     assert_eq!(result.improvements[0].line, Some(1));
     assert_eq!(result.improvements[0].file, None);
     let requests = fixture.join().unwrap();
     assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["stream"], true);
+    assert_eq!(requests[0]["response_format"]["type"], "json_object");
     for (index, expected) in preview.iter().enumerate() {
         assert_eq!(
             requests[0]["messages"][index]["content"].as_str(),
             Some(expected.as_str())
         );
     }
+}
+
+#[test]
+fn masked_remote_request_preserves_references_and_rejects_another_route() {
+    let profile = |endpoint| {
+        Profile::remote(
+            endpoint,
+            "fixture-model",
+            local_ai::RemoteProtocol::OpenAi,
+            local_ai::ProfileOptions::default(),
+        )
+        .unwrap()
+    };
+    let approved = profile("https://approved.example.test/v1");
+    let different = profile("https://different.example.test/v1");
+    let snapshot = Snapshot::folder(
+        "Demo".into(),
+        vec![input("main.sh", "PASSWORD=private-value\necho second")],
+    );
+    let mask = |text: &str| Ok(text.replace("private-value", "***"));
+    let request =
+        Request::masked_remote(&snapshot, "en", "private-value", "", &approved, mask).unwrap();
+    assert!(request.input().contains("=== File: main.sh ==="));
+    assert!(
+        request
+            .input()
+            .contains("1 | PASSWORD=***\n2 | echo second")
+    );
+    assert!(!request.input().contains("private-value"));
+    assert!(request.start(different, |_| {}).is_err());
+    assert!(
+        Request::new(&snapshot, "en", "", "")
+            .unwrap()
+            .start(approved.clone(), |_| {})
+            .is_err()
+    );
+
+    let secret_path = Snapshot::folder("Demo".into(), vec![input("private-value.sh", "echo")]);
+    assert!(Request::masked_remote(&secret_path, "en", "", "", &approved, mask).is_err());
+    assert!(
+        Request::masked_remote(&snapshot, "en", "", "", &approved, |value| {
+            Ok(value.replace("private-value\necho second", "***"))
+        })
+        .is_err()
+    );
+
+    let anthropic = Profile::remote(
+        "https://approved.example.test/v1",
+        "fixture-model",
+        local_ai::RemoteProtocol::Anthropic,
+        local_ai::ProfileOptions::default(),
+    )
+    .unwrap()
+    .with_prompt_preset(local_ai::PromptPreset::Qwen);
+    let reviewed = Request::masked_remote(&snapshot, "en", "", "", &anthropic, mask).unwrap();
+    assert!(
+        reviewed
+            .system()
+            .ends_with(anthropic.structured_system_suffix().unwrap())
+    );
+    assert!(reviewed.system().contains("<kortty_model_preset>"));
 }
 
 #[test]

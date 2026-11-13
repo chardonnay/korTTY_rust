@@ -189,7 +189,9 @@ fn journal_deletion_bounds_the_tree_before_removing_entries() {
     fs::write(deep.join("keep"), b"deep data").unwrap();
     let plan = prepare(&root, &directory, "deep");
     assert!(inventory(&plan.current_directory().unwrap(), MAX_DEPTH, &mut 1).is_err());
-    assert!(plan.delete().unwrap_err().to_string().contains("nesting"));
+    let error = plan.delete().unwrap_err();
+    assert!(error.to_string().contains("nesting"), "{error}");
+    assert!(deep.join("keep").is_file(), "{error}");
     assert_eq!(fs::read(deep.join("keep")).unwrap(), b"deep data");
     assert!(directory.join(DOCUMENT).is_file());
     assert_eq!(fs::read_dir(root).unwrap().count(), 1);

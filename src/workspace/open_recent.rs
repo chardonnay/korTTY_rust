@@ -325,22 +325,8 @@ fn project_entries(settings: &Preferences, store: Option<&projects::Store>) -> V
 }
 
 fn connection_entries(store: &Connections, cutoff: u64) -> Vec<Entry> {
-    let mut recent: Vec<_> = store.recent_since(cutoff).collect();
-    recent.sort_by_key(|(connection, used_at)| {
-        let order = if *used_at == 0 {
-            0
-        } else {
-            store
-                .connections()
-                .iter()
-                .position(|saved| saved.id == connection.id)
-                .unwrap_or(usize::MAX)
-        };
-        (Reverse(*used_at), order)
-    });
-    recent
-        .into_iter()
-        .take(CONNECTION_LIMIT)
+    let mut recent: Vec<_> = store
+        .recent_since(cutoff)
         .map(|(connection, used_at)| {
             let login = &connection.login.endpoint;
             let target = format!("{}@{}", login.username, login.host);
@@ -349,12 +335,46 @@ fn connection_entries(store: &Connections, cutoff: u64) -> Vec<Entry> {
             } else {
                 menu_label(&format!("{} — {target}", connection.name))
             };
-            Entry::Connection {
-                id: connection.id,
-                label,
-                used_at,
-            }
+            let order = if used_at == 0 {
+                0
+            } else {
+                store
+                    .connections()
+                    .iter()
+                    .position(|saved| saved.id == connection.id)
+                    .unwrap_or(usize::MAX)
+            };
+            (used_at, order, connection.id, label)
         })
+        .collect();
+    recent.extend(store.recent_serial_since(cutoff).map(|(profile, used_at)| {
+        (
+            used_at,
+            store.connections().len()
+                + store
+                    .serial_profiles()
+                    .iter()
+                    .position(|saved| saved.id == profile.id)
+                    .unwrap_or_default(),
+            profile.id,
+            menu_label(&profile.display_name()),
+        )
+    }));
+    recent.extend(store.recent_local_since(cutoff).enumerate().map(
+        |(index, (profile, used_at))| {
+            (
+                used_at,
+                store.connections().len() + store.serial_profiles().len() + index,
+                profile.id,
+                menu_label(&profile.display_name()),
+            )
+        },
+    ));
+    recent.sort_by_key(|(used_at, order, ..)| (Reverse(*used_at), *order));
+    recent
+        .into_iter()
+        .take(CONNECTION_LIMIT)
+        .map(|(used_at, _, id, label)| Entry::Connection { id, label, used_at })
         .collect()
 }
 

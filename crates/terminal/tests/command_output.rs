@@ -142,6 +142,89 @@ fn shell_output_is_inactive_when_disabled_or_alternate_and_needs_a_finished_bloc
 }
 
 #[test]
+fn recent_visible_output_prefers_finished_commands_and_omits_hidden_cells() {
+    let mut terminal = Terminal::new(30, 8);
+    assert_eq!(terminal.recent_visible_output(), Err(LastOutput::NoOutput));
+    feed(
+        &mut terminal,
+        1,
+        &format!("older\r\n{A}$ {B}print\r\n{C}one\u{202e}\x1b[8m密\x1b[0m!\r\n漢{D}{A}$ "),
+    );
+    assert_eq!(
+        terminal.recent_visible_output(),
+        Ok(("one  !\n漢".into(), false))
+    );
+
+    terminal.advance(b"\x1b[?1049hfull-screen program");
+    assert_eq!(
+        terminal.recent_visible_output(),
+        Err(LastOutput::AlternateScreen)
+    );
+    terminal.advance(b"\x1b[?1049l");
+    terminal.set_prompt_navigation_enabled(false);
+    assert_eq!(
+        terminal.recent_visible_output(),
+        Ok(("older\n$ print\none  !\n漢$".into(), false))
+    );
+
+    let mut hidden = Terminal::new(8, 3);
+    hidden.advance(b"\x1b[8msecret\x1b[0m\r\n");
+    assert_eq!(hidden.recent_visible_output(), Err(LastOutput::NoOutput));
+}
+
+#[test]
+fn recent_visible_output_reads_200_physical_rows_and_rejoins_wraps() {
+    let mut terminal = Terminal::new(8, 10);
+    for number in 0..230 {
+        terminal.advance(format!("row{number:03}\r\n").as_bytes());
+    }
+    while terminal.compress_idle_scrollback(0) {}
+    let (text, truncated) = terminal.recent_visible_output().unwrap();
+    assert!(truncated);
+    assert_eq!(
+        text,
+        (30..230)
+            .map(|n| format!("row{n:03}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+
+    let mut terminal = Terminal::new(5, 4);
+    terminal.advance(b"1234567\r\nlast\r\n");
+    assert_eq!(
+        terminal.recent_visible_output(),
+        Ok(("1234567\nlast".into(), false))
+    );
+}
+
+#[test]
+fn recent_visible_output_caps_bytes_at_whole_rows_or_utf8_boundaries() {
+    let mut terminal = Terminal::new(320, 5);
+    let payload = "é".repeat(300);
+    let mut rows = Vec::new();
+    for number in 0..65 {
+        let line = format!("{number:02} {payload}");
+        terminal.advance(line.as_bytes());
+        terminal.advance(b"\r\n");
+        rows.push(line);
+    }
+    let (text, truncated) = terminal.recent_visible_output().unwrap();
+    assert!(truncated);
+    assert_eq!(text, rows[11..].join("\n"));
+
+    let mut terminal = Terminal::new(1024, 2);
+    let glyph = format!("漢{}", "\u{301}".repeat(36));
+    let long_row = format!("{}終", glyph.repeat(500));
+    terminal.advance(long_row.as_bytes());
+    let (text, truncated) = terminal.recent_visible_output().unwrap();
+    assert!(truncated);
+    assert_eq!(
+        text,
+        long_row[long_row.ceil_char_boundary(long_row.len() - 32 * 1024)..]
+    );
+}
+
+#[test]
 fn clear_buffer_keeps_only_cursor_line_appearance_and_local_state() {
     let mut terminal = Terminal::new(30, 3);
     feed(
@@ -216,7 +299,7 @@ fn clear_buffer_clamps_the_terminal_cursor_to_the_origin_mode_margin() {
     assert_eq!(kept, "current");
     assert_eq!((snapshot.cursor.row, snapshot.cursor.column), (1, 7));
     terminal.advance(b"\x1b[6n");
-    assert_eq!(terminal.take_responses(), b"\x1b[1;8R");
+    assert_eq!(terminal.take_responses(), b"\x1b[2;8R");
 }
 
 #[test]

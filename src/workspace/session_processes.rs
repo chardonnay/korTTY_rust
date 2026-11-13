@@ -11,6 +11,8 @@ use crate::workspace::dialog_placement::Kind as DialogKind;
 
 use super::{Message as Desktop, Workspace, tool_tabs};
 
+mod ssh_connections;
+
 pub(super) const TITLE: &str = "Session Processes";
 const INTERVAL: Duration = Duration::from_secs(2);
 const BUSY_CPU_PERCENT: f64 = 90.0;
@@ -25,6 +27,7 @@ const COLUMNS: [(&str, u16); 6] = [
 
 #[derive(Clone, Debug)]
 pub enum Message {
+    Page(Page),
     Select(Id),
     End(Id),
     Ended(Id, Instant, Result<(), String>),
@@ -33,13 +36,31 @@ pub enum Message {
 
 #[derive(Clone, Debug)]
 pub enum Feed {
-    Sampled(Instant, Vec<Sample>),
+    Sampled(Instant, Vec<Sample>, Option<u64>),
     SamplerFailed(Instant),
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum Page {
+    #[default]
+    Workers,
+    Connections,
+}
+
+pub(super) struct ApplicationStart(Instant);
+
+impl Default for ApplicationStart {
+    fn default() -> Self {
+        Self(Instant::now())
+    }
 }
 
 pub(super) struct Dialog {
     id: window::Id,
     owner: Option<window::Id>,
+    page: Page,
+    application_memory: Option<u64>,
+    zone: jiff::tz::TimeZone,
     rows: Vec<Row>,
     selected: Option<Id>,
     ending: Option<Id>,
@@ -58,6 +79,9 @@ impl Dialog {
         Self {
             id,
             owner,
+            page: Page::default(),
+            application_memory: None,
+            zone: jiff::tz::TimeZone::system(),
             rows: Vec::new(),
             selected: None,
             ending: None,
@@ -67,12 +91,13 @@ impl Dialog {
         }
     }
 
-    fn receive(&mut self, when: Instant, samples: &[Sample]) {
+    fn receive(&mut self, when: Instant, samples: &[Sample], application_memory: Option<u64>) {
         if when < self.minimum_sample {
             return;
         }
         self.minimum_sample = when;
         self.received_sample = true;
+        self.application_memory = application_memory;
         let previous: BTreeMap<_, _> = self
             .rows
             .drain(..)
@@ -110,7 +135,34 @@ impl Dialog {
         }
     }
 
-    fn view(&self) -> Element<'_, Desktop> {
+    fn view<'a>(&'a self, workspace: &'a Workspace) -> Element<'a, Desktop> {
+        let switch = |page, label: &'static str| {
+            button(label)
+                .style(if self.page == page {
+                    button::primary
+                } else {
+                    button::secondary
+                })
+                .on_press(Desktop::SessionProcesses(self.id, Message::Page(page)))
+        };
+        let nav = container(
+            row![
+                switch(Page::Workers, "Worker processes"),
+                switch(Page::Connections, "Live SSH connections"),
+            ]
+            .spacing(8),
+        )
+        .padding([8, 12]);
+        let content = match self.page {
+            Page::Workers => self.worker_view(),
+            Page::Connections => ssh_connections::view(self, workspace),
+        };
+        column![nav, rule::horizontal(1), content]
+            .height(Length::Fill)
+            .into()
+    }
+
+    fn worker_view(&self) -> Element<'_, Desktop> {
         let send = |message| Desktop::SessionProcesses(self.id, message);
         let mut header = row![].spacing(8);
         for (label, weight) in COLUMNS {
@@ -119,7 +171,6 @@ impl Dialog {
         let mut rows = column![].spacing(1).width(Length::Fill);
         for row in &self.rows {
             let sample = &row.sample;
-            let seconds = sample.running_for.as_secs();
             let value = [
                 sample.label.clone(),
                 sample.pid.map_or_else(|| "—".into(), |pid| pid.to_string()),
@@ -131,16 +182,11 @@ impl Dialog {
                 .into(),
                 sample.resident_bytes.map_or_else(
                     || "—".into(),
-                    |bytes| format!("{:.0} MB", bytes as f64 / 1_048_576.0),
+                    |bytes| format!("{:.0} MiB", bytes as f64 / 1_048_576.0),
                 ),
                 row.cpu_percent
                     .map_or_else(|| "—".into(), |cpu| format!("{cpu:.0} %")),
-                format!(
-                    "{}:{:02}:{:02}",
-                    seconds / 3600,
-                    seconds / 60 % 60,
-                    seconds % 60
-                ),
+                duration(sample.running_for),
             ];
             let mut cells = iced::widget::row![].spacing(8).align_y(Alignment::Center);
             for (value, (_, weight)) in value.into_iter().zip(COLUMNS) {
@@ -219,6 +265,16 @@ impl Dialog {
     }
 }
 
+fn duration(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    format!(
+        "{}:{:02}:{:02}",
+        seconds / 3600,
+        seconds / 60 % 60,
+        seconds % 60
+    )
+}
+
 fn sample_stream() -> BoxStream<'static, Desktop> {
     let (sender, receiver) = async_channel::bounded(1);
     let retry = sender.clone();
@@ -228,7 +284,8 @@ fn sample_stream() -> BoxStream<'static, Desktop> {
         .spawn(move || {
             while !sender.is_closed() {
                 let started = Instant::now();
-                let _ = sender.try_send(Feed::Sampled(started, monitor::sample()));
+                let memory = kortty_pty::current_process_usage().resident_bytes;
+                let _ = sender.try_send(Feed::Sampled(started, monitor::sample(), memory));
                 thread::sleep(INTERVAL);
             }
         })
@@ -283,9 +340,9 @@ impl Workspace {
 
     pub(super) fn update_session_process_feed(&mut self, feed: Feed) -> Task<Desktop> {
         match feed {
-            Feed::Sampled(when, samples) => {
+            Feed::Sampled(when, samples, application_memory) => {
                 for dialog in self.session_processes.values_mut() {
-                    dialog.receive(when, &samples);
+                    dialog.receive(when, &samples, application_memory);
                 }
             }
             Feed::SamplerFailed(when) => {
@@ -302,7 +359,9 @@ impl Workspace {
     }
 
     pub(super) fn session_process_view(&self, id: window::Id) -> Option<Element<'_, Desktop>> {
-        self.session_processes.get(&id).map(Dialog::view)
+        self.session_processes
+            .get(&id)
+            .map(|dialog| dialog.view(self))
     }
 
     pub(super) fn hosted_session_process_busy(&self, id: window::Id) -> bool {
@@ -360,9 +419,15 @@ impl Workspace {
             return Task::none();
         };
         match message {
-            Message::Select(process) if dialog.contains(process) => dialog.selected = Some(process),
+            Message::Page(page) => dialog.page = page,
+            Message::Select(process)
+                if dialog.page == Page::Workers && dialog.contains(process) =>
+            {
+                dialog.selected = Some(process);
+            }
             Message::End(process)
                 if !closing
+                    && dialog.page == Page::Workers
                     && dialog.ending.is_none()
                     && dialog.selected == Some(process)
                     && dialog.contains(process) =>
@@ -478,12 +543,27 @@ mod tests {
             .minimum_sample = when + Duration::from_secs(1);
 
         // Test doubles for feed arrivals. No sampler or real process is needed.
-        let _ = workspace.update_session_process_feed(Feed::Sampled(when, Vec::new()));
+        let _ = workspace.update_session_process_feed(Feed::Sampled(when, Vec::new(), Some(64)));
         assert!(workspace.session_processes[&first].received_sample);
+        assert_eq!(
+            workspace.session_processes[&first].application_memory,
+            Some(64)
+        );
         assert!(!workspace.session_processes[&second].received_sample);
-        let _ = workspace
-            .update_session_process_feed(Feed::Sampled(when + Duration::from_secs(1), Vec::new()));
+        assert_eq!(
+            workspace.session_processes[&second].application_memory,
+            None
+        );
+        let _ = workspace.update_session_process_feed(Feed::Sampled(
+            when + Duration::from_secs(1),
+            Vec::new(),
+            Some(128),
+        ));
         assert!(workspace.session_processes[&second].received_sample);
+        assert_eq!(
+            workspace.session_processes[&second].application_memory,
+            Some(128)
+        );
         let _ = workspace.update_session_process_feed(Feed::SamplerFailed(when));
         assert!(
             workspace

@@ -3,15 +3,18 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::clipboard_policy::AiMemoryPolicy;
 use crate::private_files::{Directory, FileStamp, require_single_link};
 
 use super::{Scope, format, store};
+
+pub(super) mod prompt_access;
 
 const NAME: &str = "external.json";
 const MAX_FILE_BYTES: usize = 1024 * 1024;
 const MAX_REFERENCES: usize = 256;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct Reference {
     pub(super) id: String,
@@ -68,7 +71,10 @@ pub(super) fn registry(path: &Path) -> io::Result<Registry> {
     Ok(registry)
 }
 
-pub(super) fn review(path: PathBuf) -> io::Result<Review> {
+pub(super) fn review(path: PathBuf, policy: &AiMemoryPolicy) -> io::Result<Review> {
+    if !policy.external_files_allowed() {
+        return Err(blocked_by_policy());
+    }
     if !path.is_absolute()
         || path
             .components()
@@ -76,17 +82,23 @@ pub(super) fn review(path: PathBuf) -> io::Result<Review> {
     {
         return Err(io::Error::other("Choose an absolute reference file path"));
     }
-    let parent = path
-        .parent()
-        .ok_or_else(|| io::Error::other("Choose a regular reference file"))?;
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| io::Error::other("Choose a regular UTF-8 file name"))?;
+    let (parent, name) = reference_location(&path)?;
     let root = Directory::open(parent, false)?;
     let mut file = root.open_file(name)?;
-    require_single_link(&file)?;
     let stamp = FileStamp::read(&file)?;
+    let canonical = path.canonicalize()?;
+    if !policy.external_file_filter()(&canonical) {
+        return Err(blocked_by_policy());
+    }
+    let (canonical_parent, canonical_name) = reference_location(&canonical)?;
+    let canonical_root = Directory::open(canonical_parent, false)?;
+    if !root.same_as(&canonical_root)? {
+        return Err(io::Error::other(
+            "The reference directory changed while opening it",
+        ));
+    }
+    stamp.require_unchanged(&canonical_root.open_file(canonical_name)?)?;
+    require_single_link(&file)?;
     let mut text = String::new();
     Read::by_ref(&mut file)
         .take(MAX_FILE_BYTES as u64 + 1)
@@ -110,13 +122,32 @@ pub(super) fn review(path: PathBuf) -> io::Result<Review> {
     Ok(Review { path, text, sha256 })
 }
 
+fn reference_location(path: &Path) -> io::Result<(&Path, &str)> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("Choose a regular reference file"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| io::Error::other("Choose a regular UTF-8 file name"))?;
+    Ok((parent, name))
+}
+
+fn blocked_by_policy() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "The reference file is blocked by managed policy.",
+    )
+}
+
 pub(super) fn approve(
     directory: &Path,
     scope: &Scope,
     mut registry: Registry,
     preview: Review,
+    policy: &AiMemoryPolicy,
 ) -> io::Result<Registry> {
-    if review(preview.path.clone())?.sha256 != preview.sha256 {
+    if review(preview.path.clone(), policy)?.sha256 != preview.sha256 {
         return Err(io::Error::other(
             "The reference changed. Review the new text before approving.",
         ));
@@ -169,6 +200,7 @@ pub(super) fn change(
     mut registry: Registry,
     id: &str,
     active: Option<bool>,
+    policy: &AiMemoryPolicy,
 ) -> io::Result<Registry> {
     let Some(index) = registry
         .entries
@@ -179,7 +211,7 @@ pub(super) fn change(
     };
     if let Some(active) = active {
         let entry = &mut registry.entries[index];
-        if active && review(PathBuf::from(&entry.path))?.sha256 != entry.approved_sha256 {
+        if active && review(PathBuf::from(&entry.path), policy)?.sha256 != entry.approved_sha256 {
             return Err(io::Error::other(
                 "The reference changed. Review it again before enabling it.",
             ));
@@ -223,21 +255,79 @@ mod tests {
         let name = "AGENTS.md";
         let path = base.join(name);
         let scope = Scope::connection(42, "test connection".into());
+        let policy = AiMemoryPolicy::default();
         dir.publish_copy(name, b"Review the plan before deployment.\n")?;
-        let first = review(path.clone())?;
+        let first = review(path.clone(), &policy)?;
         dir.replace_file(name, b"Review the release notes before deployment.\n")?;
-        assert!(approve(&base, &scope, registry(&base)?, first).is_err());
+        assert!(approve(&base, &scope, registry(&base)?, first, &policy).is_err());
 
-        let approved = approve(&base, &scope, registry(&base)?, review(path.clone())?)?;
+        let approved = approve(
+            &base,
+            &scope,
+            registry(&base)?,
+            review(path.clone(), &policy)?,
+            &policy,
+        )?;
         assert!(approved.entries[0].active);
         assert!(!approved.entries[0].applies_to(&Scope::global()));
         let id = approved.entries[0].id.clone();
-        let disabled = change(&base, &scope, approved, &id, Some(false))?;
+        let disabled = change(&base, &scope, approved, &id, Some(false), &policy)?;
         dir.replace_file(name, b"password: Winter2026!\n")?;
-        assert!(review(path).is_err());
-        assert!(change(&base, &scope, disabled, &id, Some(true)).is_err());
+        assert!(review(path, &policy).is_err());
+        assert!(change(&base, &scope, disabled, &id, Some(true), &policy).is_err());
         assert!(!registry(&base)?.entries[0].active);
         drop(dir);
+        Ok(())
+    }
+
+    #[test]
+    fn managed_reference_roots_apply_before_preview_approval_and_activation() -> io::Result<()> {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize()?;
+        let allowed = root.join("approved");
+        std::fs::create_dir(&allowed)?;
+        let managed_root = serde_json::to_string(allowed.to_str().unwrap())?;
+        let policy = crate::clipboard_policy::parse(&format!(
+            "[meta]\nschema-version = 1\n[[rule]]\n[rule.ai-memory]\nexternal-file-roots = [{managed_root}]\n"
+        ))?.ai_memory;
+        let allowed_file = allowed.join("allowed.md");
+        std::fs::write(&allowed_file, "Allowed content.\n")?;
+        assert_eq!(review(allowed_file, &policy)?.text, "Allowed content.\n");
+
+        let path = root.join("old-reference.md");
+        std::fs::write(&path, [0xff])?;
+        assert!(
+            matches!(review(path.clone(), &policy), Err(error) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+
+        std::fs::write(&path, "Previously approved content.\n")?;
+        let scope = Scope::global();
+        let memory = root.join("memory");
+        let previous_policy = AiMemoryPolicy::default();
+        let preview = review(path, &previous_policy)?;
+        let approved = approve(
+            &memory,
+            &scope,
+            registry(&memory)?,
+            preview.clone(),
+            &previous_policy,
+        )?;
+        let id = approved.entries[0].id.clone();
+        assert!(
+            matches!(approve(&memory, &scope, approved.clone(), preview, &policy), Err(error) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+        assert!(registry(&memory)?.entries[0].active);
+
+        let disabled = change(&memory, &scope, approved, &id, Some(false), &policy)?;
+        assert!(
+            matches!(change(&memory, &scope, disabled.clone(), &id, Some(true), &policy), Err(error) if error.kind() == io::ErrorKind::PermissionDenied)
+        );
+        assert!(!registry(&memory)?.entries[0].active);
+        assert!(
+            change(&memory, &scope, disabled, &id, None, &policy)?
+                .entries
+                .is_empty()
+        );
         Ok(())
     }
 }

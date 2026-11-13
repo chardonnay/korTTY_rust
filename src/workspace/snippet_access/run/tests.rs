@@ -140,6 +140,7 @@ fn confirmed_variable_runs_only_in_the_named_real_pty_despite_focus_and_broadcas
         id: snapshot.snippet.id(),
         target,
         stage: Stage::Loading,
+        trigger: None,
     });
     let _ =
         workspace.update_snippet_run(owner, RunMessage::Loaded(token, Ok(Arc::clone(&snapshot))));
@@ -211,6 +212,7 @@ fn resolved_multiline_clipboard_needs_its_own_confirmation_before_pty_input() {
         id: snapshot.snippet.id(),
         target,
         stage: Stage::Loading,
+        trigger: None,
     });
     let _ =
         workspace.update_snippet_run(owner, RunMessage::Loaded(token, Ok(Arc::clone(&snapshot))));
@@ -298,4 +300,98 @@ fn changing_tabs_or_losing_policy_never_retargets_a_palette_row() {
             .unwrap()
             .contains("moved or closed")
     );
+}
+
+#[test]
+fn triggered_plain_snippet_waits_for_explicit_review() {
+    let profile = snippets::tests::Profile::new();
+    let mut library = Library::open(profile.path()).unwrap();
+    let snippet = library
+        .save(
+            None,
+            snippets::Input {
+                name: "Triggered plain command".into(),
+                language: "bash".into(),
+                category: String::new(),
+                content: "echo KORTTY-TRIGGER-REVIEW".into(),
+            },
+        )
+        .unwrap();
+    let snapshot = Arc::new(Snapshot {
+        snippet: library.get(snippet).unwrap().clone(),
+        variables: Vec::new(),
+    });
+    let mut workspace = Workspace::default();
+    workspace.window_settings.paste_warning = paste_protection::WarningMode::Off;
+    let (owner, _) = workspace.open_window(false);
+    let grid = GridSize::default();
+    let session = workspace.store_session(
+        Session::start(grid, TerminalProfile::Xterm).unwrap(),
+        grid,
+        14,
+    );
+    workspace.add_tab(owner, session);
+    wait(|| workspace.sessions[&session].session.frame().status == Status::Running);
+    let target = workspace.palette_snippet_target(owner).unwrap();
+    for revocation in [
+        "managed policy",
+        "user switch",
+        "reconnect",
+        "rule revision",
+    ] {
+        workspace.clipboard.policy.terminal_triggers_allowed = true;
+        let trigger = workspace.fixture_highlight_trigger(session, snippet);
+        let _ = workspace.invoke_highlight_snippet(owner, Some(target.clone()), trigger);
+        let token = workspace.windows[&owner]
+            .pending_snippet_run
+            .as_ref()
+            .unwrap()
+            .token;
+        let _ = workspace
+            .update_snippet_run(owner, RunMessage::Loaded(token, Ok(Arc::clone(&snapshot))));
+        let run = workspace.windows[&owner]
+            .pending_snippet_run
+            .as_ref()
+            .unwrap();
+        assert!(matches!(&run.stage, Stage::Review(_)) && run.trigger.is_some());
+
+        let _ = workspace.update_snippet_run(owner, RunMessage::Confirm(token));
+        assert!(matches!(
+            &workspace.windows[&owner]
+                .pending_snippet_run
+                .as_ref()
+                .unwrap()
+                .stage,
+            Stage::Checking(..)
+        ));
+        match revocation {
+            "managed policy" => workspace.clipboard.policy.terminal_triggers_allowed = false,
+            "user switch" => workspace.disable_fixture_highlight_triggers(),
+            "reconnect" => {
+                workspace
+                    .sessions
+                    .get_mut(&session)
+                    .unwrap()
+                    .stream_generation += 1
+            }
+            "rule revision" => {
+                let _ = workspace.fixture_highlight_trigger(session, snippet);
+            }
+            _ => unreachable!(),
+        }
+        let _ = workspace
+            .update_snippet_run(owner, RunMessage::Checked(token, Ok(Arc::clone(&snapshot))));
+        assert!(
+            workspace.windows[&owner].pending_snippet_run.is_none(),
+            "{revocation}"
+        );
+        assert!(
+            workspace.windows[&owner]
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("trigger"),
+            "{revocation}"
+        );
+    }
 }

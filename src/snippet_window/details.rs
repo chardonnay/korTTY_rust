@@ -3,13 +3,14 @@ use std::fmt;
 use iced::widget::{button, column, pick_list, row, text, text_editor, text_input};
 use iced::{Element, Length};
 
-use crate::snippets::{Library, Metadata};
+use crate::snippets::{Library, MAX_OPERATING_SYSTEM_BYTES, Metadata};
 
 #[derive(Clone)]
 pub enum Message {
     Description(text_editor::Action),
     Tags(text_editor::Action),
     Folder(String),
+    OperatingSystem(String),
     FileName(String),
     Mode(FileMode),
     Apply,
@@ -89,6 +90,9 @@ impl Form {
         self.error = None;
         match message {
             Message::Folder(folder) if folder.len() <= 1024 => self.metadata.folder_path = folder,
+            Message::OperatingSystem(system) if system.len() <= MAX_OPERATING_SYSTEM_BYTES => {
+                self.metadata.operating_system = (!system.is_empty()).then_some(system);
+            }
             Message::FileName(name) if name.len() <= 255 => {
                 self.metadata.file_name = (!name.is_empty()).then_some(name);
             }
@@ -110,6 +114,12 @@ impl Form {
             }
             Message::Apply => {
                 self.metadata.folder_path = self.metadata.folder_path.trim().into();
+                self.metadata.operating_system = self
+                    .metadata
+                    .operating_system
+                    .take()
+                    .map(|system| system.trim().to_owned())
+                    .filter(|system| !system.is_empty());
                 self.metadata.file_name = self
                     .metadata
                     .file_name
@@ -160,6 +170,14 @@ impl Form {
                 pick_list(FileMode::ALL, Some(mode), Message::Mode),
             ]
             .spacing(8),
+            text_input(
+                "Optional operating system",
+                self.metadata
+                    .operating_system
+                    .as_deref()
+                    .unwrap_or_default(),
+            )
+            .on_input(Message::OperatingSystem),
             text("Description"),
             text_editor(&self.description)
                 .height(Length::Fill)

@@ -40,7 +40,12 @@ pub fn connect_transport_with_options(
             }
             result => {
                 check_cancelled(&cancelled)?;
-                return result;
+                let stream = result?;
+                if let Some(keepalive) = options.keepalive() {
+                    // A kernel that rejects the optional socket flag still uses the SSH heartbeat.
+                    let _ = kortty_pty::set_tcp_keepalive(&stream, keepalive.enabled());
+                }
+                return Ok(stream);
             }
         }
     }
@@ -180,6 +185,7 @@ mod tests {
         let listener = listener.join().unwrap();
         let socket = result.unwrap();
         assert_eq!(socket.peer_addr().unwrap(), listener.local_addr().unwrap());
+        assert_ne!(socket.local_addr().unwrap(), socket.peer_addr().unwrap());
         assert!(started.elapsed() >= listener_delay);
     }
 

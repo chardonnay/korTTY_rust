@@ -15,10 +15,13 @@ libc = "0.2"
 core-foundation-sys = "0.8"
 
 [target.'cfg(windows)'.dependencies]
+kortty-files = { path = "../files" }
 mio = { version = "1", default-features = false, features = ["os-ext", "os-poll"] }
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_Globalization",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Security_Cryptography",
     "Win32_Security_Isolation",
@@ -26,17 +29,20 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",
     "Win32_System_IO",
     "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
 ] }
-
-[target.'cfg(windows)'.dev-dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [[test]]
 name = "worker_sandbox"
+harness = false
+
+[[test]]
+name = "windows_local_sandbox"
 harness = false

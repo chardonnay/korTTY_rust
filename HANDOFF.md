@@ -268,6 +268,11 @@ Do not reintroduce a backend whose C or assembly cryptography conflicts with the
 agreed native Rust constraint. Operating-system interfaces remain allowed. Inspect
 `vendor/sunset/KORTTY-PATCH.md` and verify dependencies per target.
 
+The SSH RSA/SHA-2 provider has a specific exception for RustCrypto's `cmov`
+inline assembly on AArch64 and x86-64. This permits the constant-time selection
+primitives used by the RSA implementation patched for
+[RUSTSEC-2023-0071](https://rustsec.org/advisories/RUSTSEC-2023-0071.html).
+
 Complete Java parity for SSH authentication and host-key handling, SFTP, jump hosts,
 tunnels, serial connections, vault and backups, process isolation, and enterprise
 policies.

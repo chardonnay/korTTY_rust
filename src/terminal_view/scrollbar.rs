@@ -9,7 +9,7 @@ use kortty_terminal::SearchMatch;
 use super::{
     Metrics, SEARCH_MATCH, TerminalView, default_background, wheel_scroll_lines, with_transparency,
 };
-use crate::session::SessionId;
+use crate::session::{SessionId, inline_history};
 use crate::workspace::Message;
 
 const WIDTH: f32 = 14.0;
@@ -45,7 +45,48 @@ pub(crate) struct Scrollbar<'a> {
     background: Color,
     foreground: Color,
     matches: &'a [SearchMatch],
-    coordinates: Option<&'a kortty_terminal::ScrollbackSnapshot>,
+    coordinates: Option<Coordinates<'a>>,
+}
+
+#[derive(Clone, Copy)]
+enum Coordinates<'a> {
+    Raw(&'a kortty_terminal::ScrollbackSnapshot),
+    Inline(&'a inline_history::Frame),
+}
+
+#[derive(Clone)]
+enum Anchor {
+    Raw(kortty_terminal::ScrollbackAnchor),
+    Inline(inline_history::Anchor),
+}
+
+impl Coordinates<'_> {
+    fn anchor(self, offset: usize) -> Option<Anchor> {
+        match self {
+            Self::Raw(view) => view.anchor(offset).map(Anchor::Raw),
+            Self::Inline(view) => view.anchor(offset).map(Anchor::Inline),
+        }
+    }
+
+    fn offset(self, anchor: Option<&Anchor>) -> Option<usize> {
+        match (self, anchor) {
+            (Self::Raw(view), Some(Anchor::Raw(anchor))) => Some(view.offset(Some(anchor))),
+            (Self::Inline(view), Some(Anchor::Inline(anchor))) => {
+                Some(view.offset_of(Some(anchor)))
+            }
+            (_, None) => Some(0),
+            _ => None,
+        }
+    }
+
+    fn message(self, session: SessionId, anchor: Option<Anchor>) -> Message {
+        match anchor {
+            Some(Anchor::Raw(anchor)) => Message::ScrollTo(session, Some(anchor)),
+            Some(Anchor::Inline(anchor)) => Message::ScrollInlineTo(session, Some(anchor)),
+            None if matches!(self, Self::Inline(_)) => Message::ScrollInlineTo(session, None),
+            None => Message::ScrollTo(session, None),
+        }
+    }
 }
 
 impl<'a> Scrollbar<'a> {
@@ -53,8 +94,11 @@ impl<'a> Scrollbar<'a> {
         let frame = terminal.frame;
         Self {
             session: terminal.session,
-            history: frame.screen.scrollback_lines,
-            offset: frame.scroll_offset,
+            history: frame
+                .inline
+                .as_ref()
+                .map_or(frame.screen.scrollback_lines, |view| view.history()),
+            offset: frame.viewport_scroll_offset(),
             rows: frame.screen.rows,
             cell_height: Metrics::with_font(terminal.font_size, terminal.font).height,
             background: with_transparency(
@@ -67,7 +111,11 @@ impl<'a> Scrollbar<'a> {
                 terminal.appearance.foreground.color()
             },
             matches: terminal.search.map_or(&[], |search| search.matches),
-            coordinates: frame.scrollback.as_ref(),
+            coordinates: frame
+                .inline
+                .as_deref()
+                .map(Coordinates::Inline)
+                .or_else(|| frame.scrollback.as_ref().map(Coordinates::Raw)),
         }
     }
 
@@ -170,7 +218,7 @@ pub(crate) struct State {
 enum Press {
     Drag {
         grip: f32,
-        last_anchor: Option<kortty_terminal::ScrollbackAnchor>,
+        last_anchor: Option<Anchor>,
     },
     Repeat {
         part: Part,
@@ -232,16 +280,14 @@ impl canvas::Program<Message> for Scrollbar<'_> {
                         .position_from(bounds.position())
                         .and_then(|position| geometry.drag_offset(position.y, *grip));
                     if let Some(offset) = offset
-                        && self.coordinates.is_some_and(|coordinates| {
-                            coordinates.offset(last_anchor.as_ref()) != offset
-                        })
+                        && let Some(coordinates) = self.coordinates
+                        && coordinates.offset(last_anchor.as_ref()) != Some(offset)
                     {
-                        let anchor = self
-                            .coordinates
-                            .and_then(|coordinates| coordinates.anchor(offset));
+                        let anchor = coordinates.anchor(offset);
                         last_anchor.clone_from(&anchor);
                         return Some(
-                            Action::publish(Message::ScrollTo(self.session, anchor)).and_capture(),
+                            Action::publish(coordinates.message(self.session, anchor))
+                                .and_capture(),
                         );
                     }
                     return Some(Action::capture());
@@ -313,7 +359,11 @@ impl canvas::Program<Message> for Scrollbar<'_> {
         let mut previous_y = None;
         if total_rows > 0 && geometry.track_height >= 2.0 {
             for hit in self.matches {
-                let fraction = hit.start.row.min(total_rows - 1) as f64 / total_rows as f64;
+                let row = match self.coordinates {
+                    Some(Coordinates::Inline(view)) => view.display_of_raw(hit.start.row),
+                    _ => hit.start.row,
+                };
+                let fraction = row.min(total_rows - 1) as f64 / total_rows as f64;
                 let y = (fraction * f64::from(geometry.track_height - 2.0)).round() as f32;
                 if previous_y != Some(y) {
                     previous_y = Some(y);
@@ -425,7 +475,7 @@ mod tests {
             background: Color::BLACK,
             foreground: Color::WHITE,
             matches: &[],
-            coordinates: Some(&after),
+            coordinates: Some(Coordinates::Raw(&after)),
         };
         let bounds = Rectangle::new(Point::ORIGIN, Size::new(WIDTH, 500.0));
         let desired =
@@ -435,7 +485,7 @@ mod tests {
             session: Some(session),
             press: Some(Press::Drag {
                 grip: 0.5,
-                last_anchor: anchor,
+                last_anchor: anchor.map(Anchor::Raw),
             }),
             ..State::default()
         };

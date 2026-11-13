@@ -27,16 +27,57 @@ pub(crate) struct Directory(File);
 
 impl Directory {
     pub(crate) fn open(path: &Path, create: bool) -> io::Result<Self> {
+        Self::open_checked(path, create, |_| Ok(()))
+    }
+
+    pub(crate) fn open_owner_controlled(path: &Path) -> io::Result<Self> {
+        Self::owner_controlled(path, false)
+    }
+
+    pub(crate) fn open_administrator_controlled(path: &Path) -> io::Result<Self> {
+        Self::open_checked(path, false, require_administrator_controlled)
+    }
+
+    pub(crate) fn create_owner_controlled(path: &Path) -> io::Result<Self> {
+        Self::owner_controlled(path, true)
+    }
+
+    fn owner_controlled(path: &Path, create: bool) -> io::Result<Self> {
+        Self::open_checked(path, create, |file| {
+            let metadata = file.metadata()?;
+            let uid = metadata.uid();
+            let mode = metadata.mode();
+            let trusted_owner = uid == 0 || uid == rustix::process::geteuid().as_raw();
+            let protected_directory = mode & 0o022 == 0 || (uid == 0 && mode & 0o1000 != 0);
+            if !trusted_owner || !protected_directory {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "The path requires owner-controlled directories",
+                ));
+            }
+            #[cfg(target_os = "macos")]
+            kortty_files::require_no_granting_extended_acl(file)?;
+            Ok(())
+        })
+    }
+
+    fn open_checked(
+        path: &Path,
+        create: bool,
+        check: impl Fn(&File) -> io::Result<()>,
+    ) -> io::Result<Self> {
         let mut components = path.components();
         if components.next() != Some(Component::RootDir) {
             return Err(invalid("expected an absolute profile directory"));
         }
         let mut directory = Self(open("/", DIRECTORY, Mode::empty())?.into());
+        check(&directory.0)?;
         for component in components {
             let Component::Normal(name) = component else {
                 return Err(invalid("expected an ordinary profile directory"));
             };
             directory = directory.child(name, create)?;
+            check(&directory.0)?;
         }
         Ok(directory)
     }
@@ -123,6 +164,16 @@ impl Directory {
             }
             Ok(child)
         }
+    }
+
+    /// Opens a private directory without following links or crossing a mount.
+    pub(crate) fn private_deletion_child(&self, name: &OsStr) -> io::Result<Self> {
+        if Path::new(name).file_name() != Some(name) {
+            return Err(invalid("expected an ordinary profile directory name"));
+        }
+        let child = self.deletion_child(name)?;
+        require_private(&child.0, false)?;
+        Ok(child)
     }
 
     #[cfg(target_os = "linux")]
@@ -228,13 +279,27 @@ impl Directory {
         Ok(file)
     }
 
+    pub(crate) fn open_existing_lock(&self, name: &str) -> io::Result<File> {
+        let file: File = openat(&self.0, name, REGULAR | OFlags::RDWR, Mode::empty())?.into();
+        require_private(&file, true)?;
+        Ok(file)
+    }
+
     pub(crate) fn open_lock(&self, name: &str) -> io::Result<File> {
-        let file: File = openat(
-            &self.0,
-            name,
-            REGULAR | OFlags::RDWR | OFlags::CREATE,
-            PRIVATE_FILE,
-        )?
+        let flags = REGULAR | OFlags::RDWR;
+        let open = || openat(&self.0, name, flags, Mode::empty());
+        let file: File = match open() {
+            Err(rustix::io::Errno::NOENT) => match openat(
+                &self.0,
+                name,
+                flags | OFlags::CREATE | OFlags::EXCL,
+                PRIVATE_FILE,
+            ) {
+                Err(rustix::io::Errno::EXIST) => open(),
+                result => result,
+            },
+            result => result,
+        }?
         .into();
         require_private(&file, true)?;
         Ok(file)
@@ -258,7 +323,45 @@ impl Directory {
         write: impl FnOnce(&mut File) -> io::Result<()>,
         check: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
-        self.write_staged(write, |stage| {
+        self.publish_checked_access(name, OFlags::WRONLY, write, check)
+    }
+
+    pub(crate) fn publish_checked_readable(
+        &self,
+        name: &str,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+        check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.require_owner_controlled_publication()?;
+        self.publish_checked_access(name, OFlags::RDWR, write, || {
+            self.require_owner_controlled_publication()?;
+            check()
+        })
+    }
+
+    fn require_owner_controlled_publication(&self) -> io::Result<()> {
+        let metadata = self.0.metadata()?;
+        let uid = metadata.uid();
+        if (uid != 0 && uid != rustix::process::geteuid().as_raw()) || metadata.mode() & 0o022 != 0
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "The publication directory must be owner-controlled",
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        kortty_files::require_no_granting_extended_acl(&self.0)?;
+        Ok(())
+    }
+
+    fn publish_checked_access(
+        &self,
+        name: &str,
+        access: OFlags,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+        check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.write_staged(access, write, |stage| {
             check()?;
             Ok(renameat_with(
                 &self.0,
@@ -280,7 +383,21 @@ impl Directory {
         write: impl FnOnce(&mut File) -> io::Result<()>,
         check: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
-        self.write_staged(write, |stage| {
+        self.write_staged(OFlags::WRONLY, write, |stage| {
+            check()?;
+            Ok(renameat(&self.0, stage, &self.0, name)?)
+        })
+    }
+
+    pub(crate) fn replace_with_readable(
+        &self,
+        name: &str,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+        check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.require_owner_controlled_publication()?;
+        self.write_staged(OFlags::RDWR, write, |stage| {
+            self.require_owner_controlled_publication()?;
             check()?;
             Ok(renameat(&self.0, stage, &self.0, name)?)
         })
@@ -300,6 +417,7 @@ impl Directory {
 
     fn write_staged(
         &self,
+        access: OFlags,
         write: impl FnOnce(&mut File) -> io::Result<()>,
         publish: impl FnOnce(&str) -> io::Result<()>,
     ) -> io::Result<()> {
@@ -307,7 +425,7 @@ impl Directory {
         let mut file: File = openat(
             &self.0,
             &stage,
-            REGULAR | OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+            REGULAR | access | OFlags::CREATE | OFlags::EXCL,
             PRIVATE_FILE,
         )?
         .into();
@@ -339,6 +457,19 @@ impl Directory {
     pub(crate) fn sync(&self) -> io::Result<()> {
         self.0.sync_all()
     }
+}
+
+pub(crate) fn require_administrator_controlled(file: &File) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "A policy model must use an administrator-controlled path",
+        ));
+    }
+    #[cfg(target_os = "macos")]
+    kortty_files::require_no_granting_extended_acl(file)?;
+    Ok(())
 }
 
 fn require_private(file: &File, regular: bool) -> io::Result<()> {

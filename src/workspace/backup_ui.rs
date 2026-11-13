@@ -6,18 +6,21 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use iced::{Size, Task, window};
-use kortty_vault::{MAX_ARCHIVE_PASSWORD_BYTES, Secret};
+use kortty_ssh::{ImportReport, ImportReview};
+use kortty_vault::{MAX_ARCHIVE_PASSWORD_BYTES, MAX_MASTER_PASSWORD_BYTES, Secret, Vault};
 
 use crate::profile_backup::preferences::{EncryptionMode, Preferences, Progress};
 use crate::profile_backup::{
-    self, Exported, MIN_PASSWORD_BYTES, Preview, RestoreMode, current_name,
+    self, BackupFormat, Exported, MIN_PASSWORD_BYTES, Preview, RestoreMode, current_name,
 };
 use crate::sftp_window::{Directory, EntryKind, EntryName, Location, list_local};
 use crate::ssh_dialog::Password;
+use crate::vault_window::VaultWindow;
 use crate::workspace::dialog_placement::Kind as DialogKind;
 
 use super::{Message as Desktop, Workspace, window_lifecycle};
 
+mod host_pins;
 #[cfg(test)]
 mod tests;
 mod view;
@@ -48,6 +51,15 @@ pub enum Message {
     Submit,
     RestoreMode(RestoreMode),
     Restore(u64),
+    JavaMasterPassword(u64, Password),
+    ReviewJavaCredentials(u64, JavaCredentialReview),
+    JavaCredentialsReviewed(u64, JavaCredentialsReply),
+    ReviewHostPins(u64),
+    SelectHostPin(u64, usize, bool),
+    ApplyHostPins(u64),
+    HostPinsPage(u64, bool),
+    BackFromHostPins(u64),
+    HostPinsFinished(u64, HostPinReply),
     Finished(u64, Reply),
     Back,
     Cancel,
@@ -56,21 +68,40 @@ pub enum Message {
     Quit,
 }
 
+#[derive(Clone, Debug)]
+pub enum HostPinReply {
+    Reviewed(Result<Arc<ImportReview>, String>),
+    Imported(Result<Arc<ImportReport>, String>),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum JavaCredentialReview {
+    KeysWithoutPassphrases,
+    WithVault,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ImportFormat {
     #[default]
     Detect,
     Password,
     OpenPgp,
+    JavaPassword,
 }
 
 impl ImportFormat {
-    const ALL: [Self; 3] = [Self::Detect, Self::Password, Self::OpenPgp];
+    const ALL: [Self; 4] = [
+        Self::Detect,
+        Self::Password,
+        Self::OpenPgp,
+        Self::JavaPassword,
+    ];
 
-    fn encryption(self, detected: Option<EncryptionMode>) -> Option<EncryptionMode> {
+    fn resolved(self, detected: Option<BackupFormat>) -> Option<BackupFormat> {
         match self {
-            Self::Password => Some(EncryptionMode::Password),
-            Self::OpenPgp => Some(EncryptionMode::OpenPgp),
+            Self::Password => Some(BackupFormat::Password),
+            Self::OpenPgp => Some(BackupFormat::OpenPgp),
+            Self::JavaPassword => Some(BackupFormat::JavaPassword),
             Self::Detect => detected,
         }
     }
@@ -82,6 +113,7 @@ impl fmt::Display for ImportFormat {
             Self::Detect => formatter.write_str("Detect from file contents"),
             Self::Password => fmt::Display::fmt(&EncryptionMode::Password, formatter),
             Self::OpenPgp => fmt::Display::fmt(&EncryptionMode::OpenPgp, formatter),
+            Self::JavaPassword => fmt::Display::fmt(&BackupFormat::JavaPassword, formatter),
         }
     }
 }
@@ -91,6 +123,7 @@ impl fmt::Display for RestoreMode {
         formatter.write_str(match self {
             Self::KeepExisting => "Keep existing files",
             Self::Replace => "Replace portable profile",
+            Self::JavaAdditive => "Add Java profile data",
         })
     }
 }
@@ -105,7 +138,7 @@ impl fmt::Debug for Reply {
 }
 
 enum Outcome {
-    Detected(EncryptionMode),
+    Detected(BackupFormat),
     Exported(Exported),
     Inspected(Preview),
     Queued(Queued),
@@ -137,6 +170,7 @@ enum Work {
     Detect,
     Export,
     Inspect,
+    JavaCredentials,
     Queue,
 }
 
@@ -153,17 +187,20 @@ struct Dialog {
     export_mode: EncryptionMode,
     recipient: Option<String>,
     import_format: ImportFormat,
-    detected_format: Option<EncryptionMode>,
+    detected_format: Option<BackupFormat>,
     path: String,
     initial_path: String,
     private_key: String,
     password: Secret,
     password_valid: bool,
+    java_master_password: Secret,
     repeat: Secret,
     saved_password: Option<String>,
     use_saved_password: bool,
     restore_mode: RestoreMode,
     phase: Phase,
+    host_pins: Option<host_pins::Review>,
+    imported_host_pins: Option<Arc<ImportReport>>,
     revision: u64,
     error: Option<String>,
     discard: Option<Discard>,
@@ -182,6 +219,52 @@ struct Queued {
     count: usize,
     durable: bool,
     mode: RestoreMode,
+    scheduler_notes: Vec<String>,
+}
+
+#[derive(Clone)]
+pub struct JavaCredentialsReply(Arc<Mutex<Option<JavaCredentialsReviewed>>>);
+
+impl fmt::Debug for JavaCredentialsReply {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("JavaCredentialsReply(..)")
+    }
+}
+
+struct JavaCredentialsReviewed {
+    vault: Option<Vault>,
+    review: Option<(Preview, Result<(), &'static str>)>,
+}
+
+struct JavaCredentialJob {
+    vault: Option<Vault>,
+    preview: Preview,
+    source_password: Option<Secret>,
+    root: PathBuf,
+}
+
+impl JavaCredentialJob {
+    fn prepare(mut self) -> JavaCredentialsReviewed {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            profile_backup::prepare_java_credentials(
+                &mut self.preview,
+                self.source_password.as_ref(),
+                self.vault.as_ref(),
+                &self.root,
+            )
+        }));
+        let used_source_password = self.source_password.is_some();
+        JavaCredentialsReviewed {
+            vault: self.vault,
+            review: result.ok().map(|result| {
+                (self.preview, result.map_err(|error| match error.kind() {
+                    io::ErrorKind::PermissionDenied | io::ErrorKind::InvalidInput if used_source_password => "Could not unlock the Java SSH credentials. Check the Java master password and try again.",
+                    io::ErrorKind::InvalidData => "Could not read the Java SSH credential data.",
+                    _ => "Could not prepare the Java SSH credentials for the current profile. Try again.",
+                }))
+            }),
+        }
+    }
 }
 
 struct Browser {
@@ -212,11 +295,14 @@ impl Dialog {
             private_key: String::new(),
             password: Secret::default(),
             password_valid: true,
+            java_master_password: Secret::default(),
             repeat: Secret::default(),
             saved_password: None,
             use_saved_password: false,
             restore_mode: RestoreMode::KeepExisting,
             phase: Phase::Form,
+            host_pins: None,
+            imported_host_pins: None,
             revision: 0,
             error: None,
             discard: None,
@@ -239,22 +325,25 @@ impl Dialog {
     fn encryption(&self) -> EncryptionMode {
         match self.kind {
             Kind::Export => self.export_mode,
-            Kind::Import => self.import_encryption().unwrap_or_default(),
+            Kind::Import if self.resolved_import() == Some(BackupFormat::OpenPgp) => {
+                EncryptionMode::OpenPgp
+            }
+            Kind::Import => EncryptionMode::Password,
         }
     }
 
-    fn import_encryption(&self) -> Option<EncryptionMode> {
-        self.import_format.encryption(self.detected_format)
+    fn resolved_import(&self) -> Option<BackupFormat> {
+        self.import_format.resolved(self.detected_format)
     }
 
     fn needs_detection(&self) -> bool {
-        self.kind == Kind::Import && self.import_encryption().is_none()
+        self.kind == Kind::Import && self.resolved_import().is_none()
     }
 
     fn edit_import_format(&mut self, format: ImportFormat) {
-        let old = self.import_encryption();
+        let old = self.resolved_import();
         self.import_format = format;
-        if self.import_encryption() != old {
+        if self.resolved_import() != old {
             self.clear_import_credentials();
         }
     }
@@ -295,11 +384,17 @@ impl Dialog {
 
     fn busy(&self) -> bool {
         matches!(self.phase, Phase::Working(_))
+            || self.host_pins.as_ref().is_some_and(host_pins::Review::busy)
     }
 
     fn dirty(&self) -> bool {
         match self.phase {
-            Phase::Review(_) => true,
+            Phase::Review(ref preview) => {
+                self.imported_host_pins.is_none()
+                    || preview.count() != 0
+                    || preview.has_java_managed_keys()
+                    || preview.has_java_passwords()
+            }
             Phase::Form | Phase::Browse(_) => {
                 self.path != self.initial_path
                     || self.import_format != ImportFormat::Detect
@@ -328,10 +423,16 @@ impl Dialog {
                 self.password_valid && file_path(&self.private_key).is_some()
             }
             (kind, EncryptionMode::Password) => {
+                let minimum = if kind == Kind::Import
+                    && self.resolved_import() == Some(BackupFormat::JavaPassword)
+                {
+                    1
+                } else {
+                    MIN_PASSWORD_BYTES
+                };
                 self.selected_password().is_some()
                     || (self.password_valid
-                        && (MIN_PASSWORD_BYTES..=MAX_ARCHIVE_PASSWORD_BYTES)
-                            .contains(&self.password.len())
+                        && (minimum..=MAX_ARCHIVE_PASSWORD_BYTES).contains(&self.password.len())
                         && (kind == Kind::Import || self.password == self.repeat))
             }
         }
@@ -406,35 +507,124 @@ impl Dialog {
             (None, _) => std::mem::take(&mut self.password),
         };
         self.repeat = Secret::default();
+        let java_password = self.resolved_import() == Some(BackupFormat::JavaPassword);
         match self.kind {
             Kind::Export => self.start(Work::Export, move || {
                 profile_backup::export_profile(&path, &password, credential.as_deref())
                     .map(Outcome::Exported)
             }),
             Kind::Import => self.start(Work::Inspect, move || {
-                profile_backup::inspect_backup(&path, &password).map(Outcome::Inspected)
+                if java_password {
+                    profile_backup::inspect_java_password(&path, &password).map(Outcome::Inspected)
+                } else {
+                    profile_backup::inspect_backup(&path, &password).map(Outcome::Inspected)
+                }
             }),
         }
     }
 
     fn restore(&mut self, revision: u64) -> Task<Desktop> {
-        if revision != self.revision || !matches!(self.phase, Phase::Review(_)) {
+        if revision != self.revision
+            || !matches!(&self.phase, Phase::Review(preview) if preview.count() > 0)
+        {
             return Task::none();
         }
         let Phase::Review(preview) = std::mem::replace(&mut self.phase, Phase::Form) else {
             return Task::none();
         };
+        self.java_master_password = Secret::default();
         let count = preview.count();
         let mode = self.restore_mode;
         self.start(Work::Queue, move || {
-            profile_backup::queue_restore(preview, mode).map(|durable| {
+            profile_backup::queue_restore(preview, mode).map(|result| {
                 Outcome::Queued(Queued {
                     count,
-                    durable,
+                    durable: result.durable,
                     mode,
+                    scheduler_notes: result.scheduler_notes,
                 })
             })
         })
+    }
+
+    fn offers_java_credential_review(&self, mode: JavaCredentialReview) -> bool {
+        let Phase::Review(preview) = &self.phase else {
+            return false;
+        };
+        if preview.java_password_summary().is_some() || preview.java_key_summary().is_some() {
+            return false;
+        }
+        match mode {
+            JavaCredentialReview::KeysWithoutPassphrases => preview.has_java_managed_keys(),
+            JavaCredentialReview::WithVault => {
+                preview.has_java_passwords() || preview.has_java_managed_keys()
+            }
+        }
+    }
+
+    fn can_review_java_credentials(&self, revision: u64, mode: JavaCredentialReview) -> bool {
+        revision == self.revision
+            && self.offers_java_credential_review(mode)
+            && (mode == JavaCredentialReview::KeysWithoutPassphrases
+                || !self.java_master_password.is_empty())
+    }
+
+    fn edit_java_master_password(&mut self, revision: u64, password: Password) {
+        if revision != self.revision
+            || !self.offers_java_credential_review(JavaCredentialReview::WithVault)
+        {
+            return;
+        }
+        self.error = None;
+        if password.as_str().len() > MAX_MASTER_PASSWORD_BYTES {
+            self.java_master_password = Secret::default();
+            self.error = Some(format!(
+                "The Java master password exceeds {MAX_MASTER_PASSWORD_BYTES} UTF-8 bytes."
+            ));
+        } else {
+            self.java_master_password = Secret::new(password.into_string());
+        }
+    }
+
+    fn begin_java_credential_review(
+        &mut self,
+        vault: Option<Vault>,
+        root: PathBuf,
+    ) -> JavaCredentialJob {
+        let Phase::Review(preview) =
+            std::mem::replace(&mut self.phase, Phase::Working(Work::JavaCredentials))
+        else {
+            unreachable!("Java credential review requires a backup preview");
+        };
+        self.revision = self.revision.wrapping_add(1);
+        self.error = None;
+        let password = std::mem::take(&mut self.java_master_password);
+        let source_password = vault.is_some().then_some(password);
+        JavaCredentialJob {
+            vault,
+            preview,
+            source_password,
+            root,
+        }
+    }
+
+    fn finish_java_credential_review(
+        &mut self,
+        revision: u64,
+        review: Option<(Preview, Result<(), &'static str>)>,
+    ) {
+        if self.revision != revision || !matches!(self.phase, Phase::Working(Work::JavaCredentials))
+        {
+            return;
+        }
+        if let Some((preview, result)) = review {
+            self.error = result.err().map(str::to_owned);
+            self.phase = Phase::Review(preview);
+        } else {
+            self.error =
+                Some("The SSH credential review stopped. Open the backup again to retry.".into());
+            self.phase = Phase::Form;
+        }
     }
 
     fn start(
@@ -479,6 +669,9 @@ impl Dialog {
         let Phase::Working(work) = self.phase else {
             return None;
         };
+        if work == Work::JavaCredentials {
+            return None;
+        }
         let result = reply
             .0
             .lock()
@@ -491,7 +684,11 @@ impl Dialog {
             }
             (Work::Export, Ok(Outcome::Exported(archive))) => Phase::Exported(archive),
             (Work::Inspect, Ok(Outcome::Inspected(preview))) => {
-                self.restore_mode = RestoreMode::KeepExisting;
+                self.restore_mode = if preview.java_review().is_some() {
+                    RestoreMode::JavaAdditive
+                } else {
+                    RestoreMode::KeepExisting
+                };
                 Phase::Review(preview)
             }
             (Work::Queue, Ok(Outcome::Queued(queued))) => Phase::Queued(queued),
@@ -503,6 +700,9 @@ impl Dialog {
                         "Could not decrypt and review OpenPGP backup"
                     }
                     Work::Inspect => "Could not authenticate and review backup",
+                    Work::JavaCredentials => {
+                        unreachable!("Java credentials have a separate worker reply")
+                    }
                     Work::Queue => "Could not prepare restore",
                 };
                 self.error = Some(format!("{action} ({error})."));
@@ -644,11 +844,109 @@ impl Dialog {
             self.revision = self.revision.wrapping_add(1);
             self.phase = Phase::Form;
             self.error = None;
+            self.java_master_password = Secret::default();
+            self.imported_host_pins = None;
         }
     }
 }
 
 impl Workspace {
+    fn review_java_credentials(
+        &mut self,
+        id: window::Id,
+        revision: u64,
+        mode: JavaCredentialReview,
+    ) -> Task<Desktop> {
+        let Some(dialog) = self.backup.0.as_mut().filter(|dialog| {
+            dialog.id == id
+                && dialog.discard.is_none()
+                && dialog.host_pins.is_none()
+                && dialog.can_review_java_credentials(revision, mode)
+        }) else {
+            return Task::none();
+        };
+        let Ok(root) = crate::profile::root() else {
+            dialog.error =
+                Some("Could not open the current profile for SSH credential review.".into());
+            return Task::none();
+        };
+        let vault = match mode {
+            JavaCredentialReview::KeysWithoutPassphrases => None,
+            JavaCredentialReview::WithVault => {
+                let Some(vault) = self.vault.as_mut().and_then(VaultWindow::take_for_ssh_keys)
+                else {
+                    dialog.java_master_password = Secret::default();
+                    dialog.error = Some("Unlock the current credential vault and finish any edits before reviewing SSH credentials.".into());
+                    return Task::none();
+                };
+                self.vault_change_revision = Arc::new(());
+                Some(vault)
+            }
+        };
+        let job = Arc::new(Mutex::new(Some(
+            dialog.begin_java_credential_review(vault, root),
+        )));
+        let revision = dialog.revision;
+        let (send, receive) = async_channel::bounded(1);
+        let worker_job = Arc::clone(&job);
+        let started = std::thread::Builder::new()
+            .name("kortty-java-backup-credentials".into())
+            .spawn(move || {
+                let job = worker_job
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                    .expect("Java backup worker owns its job");
+                let _ = send.send_blocking(job.prepare());
+            });
+        if started.is_err() {
+            let job = job
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .take()
+                .expect("the unstarted Java backup job is available");
+            self.finish_java_credentials(
+                id,
+                revision,
+                JavaCredentialsReviewed {
+                    vault: job.vault,
+                    review: Some((
+                        job.preview,
+                        Err("Could not start SSH credential review. Try again."),
+                    )),
+                },
+            );
+            return Task::none();
+        }
+        Task::future(async move {
+            match receive.recv().await {
+                Ok(outcome) => wrap(
+                    id,
+                    Message::JavaCredentialsReviewed(
+                        revision,
+                        JavaCredentialsReply(Arc::new(Mutex::new(Some(outcome)))),
+                    ),
+                ),
+                Err(_) => Desktop::Noop,
+            }
+        })
+    }
+
+    fn finish_java_credentials(
+        &mut self,
+        id: window::Id,
+        revision: u64,
+        outcome: JavaCredentialsReviewed,
+    ) {
+        if let (Some(window), Some(vault)) = (&mut self.vault, outcome.vault) {
+            window.restore_after_ssh_keys(vault);
+            self.vault_change_revision = Arc::new(());
+        }
+        if let Some(dialog) = self.backup.0.as_mut().filter(|dialog| dialog.id == id) {
+            dialog.finish_java_credential_review(revision, outcome.review);
+        }
+    }
+
     fn backup_recipient_label(&self, fingerprint: &str) -> Option<String> {
         self.backup_recipient_choices()
             .into_iter()
@@ -766,6 +1064,41 @@ impl Workspace {
         match message {
             Message::OpenExport => return self.show_backup(id, Kind::Export),
             Message::OpenImport => return self.show_backup(id, Kind::Import),
+            Message::HostPinsFinished(revision, reply) => {
+                let imported = self
+                    .backup
+                    .0
+                    .as_mut()
+                    .filter(|dialog| dialog.id == id)
+                    .is_some_and(|dialog| dialog.finish_host_pins(revision, reply));
+                return if imported {
+                    self.refresh_known_hosts()
+                } else {
+                    Task::none()
+                };
+            }
+            Message::ReviewHostPins(revision) if self.clipboard.policy.problem.is_none() => {
+                return self
+                    .backup
+                    .0
+                    .as_mut()
+                    .filter(|dialog| dialog.id == id)
+                    .map_or_else(Task::none, |dialog| dialog.review_host_pins(revision));
+            }
+            Message::ReviewJavaCredentials(revision, mode) => {
+                return self.review_java_credentials(id, revision, mode);
+            }
+            Message::JavaCredentialsReviewed(revision, reply) => {
+                if let Some(outcome) = reply
+                    .0
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .take()
+                {
+                    self.finish_java_credentials(id, revision, outcome);
+                }
+                return Task::none();
+            }
             _ => {}
         }
         let saved = matches!(message, Message::Submit)
@@ -812,17 +1145,29 @@ impl Workspace {
                 _ => Task::none(),
             };
         }
+        if dialog.host_pins.is_some() {
+            return dialog.update_host_pins(message);
+        }
         match message {
             Message::Cancel => return self.finish_backup_close(true, false),
-            Message::OpenVault if dialog.selected_password().is_some() => {
+            Message::OpenVault
+                if dialog.selected_password().is_some()
+                    || dialog.offers_java_credential_review(JavaCredentialReview::WithVault) =>
+            {
                 let owner = dialog.owner;
                 return self.show_vault(owner);
+            }
+            Message::JavaMasterPassword(revision, password) => {
+                dialog.edit_java_master_password(revision, password)
             }
             Message::Back => dialog.back(),
             Message::Quit if matches!(dialog.phase, Phase::Queued(_)) => {
                 return self.finish_backup_close(false, true);
             }
-            Message::RestoreMode(mode) if matches!(dialog.phase, Phase::Review(_)) => {
+            Message::RestoreMode(mode)
+                if mode != RestoreMode::JavaAdditive
+                    && matches!(&dialog.phase, Phase::Review(preview) if preview.java_review().is_none()) =>
+            {
                 if dialog.restore_mode != mode {
                     dialog.restore_mode = mode;
                     dialog.revision = dialog.revision.wrapping_add(1);

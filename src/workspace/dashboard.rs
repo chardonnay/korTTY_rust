@@ -5,12 +5,14 @@ use iced::widget::{pane_grid, text};
 use iced::{Element, Task, window};
 
 use crate::connection_store::{Connection, Store};
-use crate::session::{SessionId, Status};
+use crate::session::{CodingAgentKey, SessionId, Status};
 use crate::session_security::IsolationLevel;
 
 use super::chrome::Navigation;
+use super::coding_agents::{FocusTarget, InputTarget};
 use super::{Message as Desktop, PaneSession, Tab, Window, Workspace, multi_exec_access, profile};
 
+mod agents;
 #[cfg(test)]
 mod tests;
 mod view;
@@ -19,9 +21,24 @@ mod view;
 pub(super) struct State {
     visible: bool,
     collapsed: HashSet<Branch>,
-    context: Option<(Target, usize)>,
+    context: Option<Context>,
     request: Option<u64>,
     catalog: Option<Arc<Catalog>>,
+}
+
+#[derive(Clone, Copy)]
+struct Context {
+    target: Target,
+    selected: usize,
+    input: Option<InputTarget>,
+}
+
+impl Context {
+    fn accepts(self, action: Action) -> bool {
+        action
+            .input_target()
+            .is_none_or(|input| Some(input) == self.input)
+    }
 }
 
 impl State {
@@ -93,6 +110,10 @@ pub enum Action {
     Sftp,
     Close,
     MultiExec,
+    ShowCodingAgent(FocusTarget),
+    SendAgentEnter(InputTarget),
+    SendAgentEscape(InputTarget),
+    InterruptAgent(InputTarget),
 }
 
 impl Action {
@@ -105,6 +126,19 @@ impl Action {
             Self::Close => "Close",
             Self::MultiExec if target.session.is_some() => "Multi-exec: Include This Pane",
             Self::MultiExec => "Multi-exec: Include All Panes of This Tab",
+            Self::ShowCodingAgent(_) => "Show in Coding Agents Panel",
+            Self::SendAgentEnter(_) => "Send Enter",
+            Self::SendAgentEscape(_) => "Send Esc",
+            Self::InterruptAgent(_) => "Interrupt (Ctrl+C)",
+        }
+    }
+
+    fn input_target(self) -> Option<InputTarget> {
+        match self {
+            Self::SendAgentEnter(target)
+            | Self::SendAgentEscape(target)
+            | Self::InterruptAgent(target) => Some(target),
+            _ => None,
         }
     }
 }
@@ -169,6 +203,8 @@ struct ConnectionRow {
     endpoint: Option<String>,
     protocol: &'static str,
     state: ConnectionState,
+    agent: Option<agents::Agent>,
+    rollup: agents::Rollup,
     panes: Vec<PaneRow>,
 }
 
@@ -176,6 +212,7 @@ struct PaneRow {
     session: SessionId,
     number: usize,
     state: ConnectionState,
+    agent: Option<agents::Agent>,
 }
 
 #[derive(Default)]
@@ -186,6 +223,7 @@ struct Tree {
     total: usize,
     connected: usize,
     preferred_width: f32,
+    agent_rollup: agents::Rollup,
 }
 
 impl Tree {
@@ -274,9 +312,27 @@ impl Workspace {
                 self.perform_dashboard_action(owner, target, action)
             }
             Message::Menu(target) => {
-                window.dashboard.context = (window.dashboard.context.map(|item| item.0)
-                    != Some(target))
-                .then_some((target, 0));
+                if window
+                    .dashboard
+                    .context
+                    .is_some_and(|menu| menu.target == target)
+                {
+                    window.dashboard.context = None;
+                } else {
+                    let input = self
+                        .dashboard_actions(owner, target)
+                        .into_iter()
+                        .find_map(Action::input_target);
+                    self.windows
+                        .get_mut(&owner)
+                        .expect("dashboard owner")
+                        .dashboard
+                        .context = Some(Context {
+                        target,
+                        selected: 0,
+                        input,
+                    });
+                }
                 Task::none()
             }
             Message::DismissMenu => {
@@ -337,10 +393,10 @@ impl Workspace {
     }
 
     fn dashboard_menu_key(&mut self, owner: window::Id, direction: Navigation) -> Task<Desktop> {
-        let Some((target, selected)) = self.windows[&owner].dashboard.context else {
+        let Some(context) = self.windows[&owner].dashboard.context else {
             return Task::none();
         };
-        let actions = self.dashboard_actions(owner, target);
+        let actions = self.dashboard_context_actions(owner, context);
         if actions.is_empty() || matches!(direction, Navigation::Escape | Navigation::Left) {
             self.windows
                 .get_mut(&owner)
@@ -348,22 +404,31 @@ impl Workspace {
                 .dashboard
                 .context = None;
         } else if matches!(direction, Navigation::Activate | Navigation::Right) {
-            if let Some(&action) = actions.get(selected) {
-                return self.perform_dashboard_action(owner, target, action);
+            if let Some(&action) = actions.get(context.selected) {
+                return self.perform_dashboard_action(owner, context.target, action);
             }
         } else {
             let index = if matches!(direction, Navigation::Previous) {
-                (selected + actions.len() - 1) % actions.len()
+                (context.selected + actions.len() - 1) % actions.len()
             } else {
-                (selected + 1) % actions.len()
+                (context.selected + 1) % actions.len()
             };
             self.windows
                 .get_mut(&owner)
                 .expect("dashboard owner")
                 .dashboard
-                .context = Some((target, index));
+                .context = Some(Context {
+                selected: index,
+                ..context
+            });
         }
         Task::none()
+    }
+
+    fn dashboard_context_actions(&self, owner: window::Id, context: Context) -> Vec<Action> {
+        let mut actions = self.dashboard_actions(owner, context.target);
+        actions.retain(|&action| context.accepts(action));
+        actions
     }
 
     pub(super) fn dashboard_actions(&self, owner: window::Id, target: Target) -> Vec<Action> {
@@ -376,11 +441,18 @@ impl Workspace {
         let mut actions = vec![Action::Focus];
         let reconnect = self.can_reconnect_tab(owner, tab.id);
         let multi_exec = self.multi_exec_available(Some(owner), target.multi_exec());
+        let agent = match target.session {
+            Some(session) => self.dashboard_agent(session),
+            None => ordered_sessions(tab)
+                .filter_map(|session| self.dashboard_agent(session))
+                .min_by_key(agents::Agent::urgency),
+        };
         if target.session.is_some() {
             if reconnect {
                 actions.push(Action::Reconnect);
             }
             actions.extend(multi_exec.then_some(Action::MultiExec));
+            actions.extend(agent.iter().flat_map(agents::Agent::actions));
             return actions;
         }
 
@@ -397,7 +469,6 @@ impl Workspace {
         if allowed {
             let minimum = self.clipboard.policy.minimum_isolation;
             if frame.status == Status::Running
-                && self.clipboard.policy.file_transfer_allowed
                 && pane
                     .ssh
                     .as_ref()
@@ -410,6 +481,7 @@ impl Workspace {
         }
         actions.push(Action::Close);
         actions.extend(multi_exec.then_some(Action::MultiExec));
+        actions.extend(agent.iter().flat_map(agents::Agent::actions));
         actions
     }
 
@@ -444,6 +516,12 @@ impl Workspace {
             window.dashboard.context = None;
         }
         if !self.dashboard_actions(owner, target).contains(&action) {
+            if action.input_target().is_some() && self.palette_can_open(owner) {
+                self.notice(
+                    owner,
+                    "The coding agent or terminal changed. Choose the action again.".into(),
+                );
+            }
             return Task::none();
         }
         let Some((tab, pane_id, pane)) = self.dashboard_target(owner, target) else {
@@ -468,6 +546,16 @@ impl Workspace {
                 selected
             }
             Action::Close => self.update(Desktop::CloseTab(owner, target.tab)),
+            Action::ShowCodingAgent(agent) => self.show_coding_agent_panel_for(owner, agent),
+            Action::SendAgentEnter(agent) => {
+                self.send_dashboard_coding_agent_key(owner, agent, CodingAgentKey::Enter)
+            }
+            Action::SendAgentEscape(agent) => {
+                self.send_dashboard_coding_agent_key(owner, agent, CodingAgentKey::Escape)
+            }
+            Action::InterruptAgent(agent) => {
+                self.send_dashboard_coding_agent_key(owner, agent, CodingAgentKey::Interrupt)
+            }
             Action::MultiExec => self.update(Desktop::MultiExec(Some(owner), target.multi_exec())),
             Action::Sftp => {
                 let select = self.update(Desktop::SelectTab(owner, target.tab));
@@ -529,14 +617,6 @@ impl Workspace {
             let status = ConnectionState::from(&pane.frame.status);
             tree.total += 1;
             tree.connected += usize::from(status == ConnectionState::Connected);
-            tree.measure(
-                &label,
-                if group.or(environment).is_some() {
-                    145.0
-                } else {
-                    128.0
-                },
-            );
             if let Some(branch) = group.or(environment) {
                 tree.measure(branch, 100.0);
             }
@@ -551,10 +631,38 @@ impl Workspace {
                             session,
                             number: index + 1,
                             state: ConnectionState::from(&pane.frame.status),
+                            agent: self.dashboard_agent(session),
                         })
                     })
                     .collect()
             };
+            let mut rollup = agents::Rollup::default();
+            let agent = if panes.is_empty() {
+                let agent = self.dashboard_agent(session);
+                if let Some(agent) = &agent {
+                    rollup.count(agent.state);
+                }
+                agent
+            } else {
+                let pane_agents = panes.iter().filter_map(|pane| pane.agent.as_ref());
+                for agent in pane_agents.clone() {
+                    rollup.count(agent.state);
+                }
+                pane_agents.min_by_key(|agent| agent.urgency()).cloned()
+            };
+            let inset = if group.or(environment).is_some() {
+                145.0
+            } else {
+                128.0
+            };
+            let chip_width = |agent: &agents::Agent| {
+                agent.chip(std::time::Instant::now()).chars().count() as f32 * 6.0 + 12.0
+            };
+            tree.measure(&label, inset + agent.as_ref().map_or(0.0, chip_width));
+            for agent in panes.iter().filter_map(|pane| pane.agent.as_ref()) {
+                tree.measure("Pane 99", inset + chip_width(agent));
+            }
+            tree.agent_rollup.merge(rollup);
             let item = ConnectionRow {
                 id: tab.id,
                 label,
@@ -573,6 +681,8 @@ impl Workspace {
                     "local"
                 },
                 state: status,
+                agent,
+                rollup,
                 panes,
             };
             if let Some(group) = group {

@@ -7,7 +7,7 @@ use std::time::Duration;
 use kortty_terminal::ScreenSnapshot;
 
 use crate::codec::{self, EVENT_HEADER, HEADER, Kind, MAX_EVENTS, MAX_FILE_BYTES};
-use crate::{CaptureOptions, Error, State};
+use crate::{CaptureOptions, Error, RecordedScreen, State};
 
 const MAX_CACHED_PANES: usize = 128;
 const MAX_CACHED_BYTES: usize = 16 * 1024 * 1024;
@@ -101,6 +101,25 @@ impl<W: Write> Recorder<W> {
             return Ok(false);
         }
         let payload = codec::encode_screen(pane, screen, pixels, self.include_style)?;
+        self.record_frame(at, pane, payload)
+    }
+
+    /// Records a detached frame from another recording format.
+    pub fn record_imported_screen(
+        &mut self,
+        at: Duration,
+        pane: u64,
+        screen: &RecordedScreen,
+    ) -> Result<bool, Error> {
+        let at = self.timestamp(at)?;
+        if !self.is_active() {
+            return Ok(false);
+        }
+        let payload = codec::encode_recorded_screen(pane, screen, self.include_style)?;
+        self.record_frame(at, pane, payload)
+    }
+
+    fn record_frame(&mut self, at: u64, pane: u64, payload: Vec<u8>) -> Result<bool, Error> {
         if self.previous.get(&pane).is_some_and(|old| old == &payload) {
             return Ok(false);
         }
@@ -126,10 +145,41 @@ impl<W: Write> Recorder<W> {
                 .idle_after
                 .is_some_and(|idle| at - self.last_activity >= idle)
         {
-            self.ensure_capacity(0, 1, 2)?;
-            self.write(Kind::Pause, at, &[])?;
-            self.state = State::AutoPaused;
+            self.pause_at(at)?;
         }
+        Ok(())
+    }
+
+    /// Records an explicitly supplied idle-pause boundary.
+    pub fn pause(&mut self, at: Duration) -> Result<(), Error> {
+        let at = self.timestamp(at)?;
+        if self.state == State::Recording {
+            self.pause_at(at)?;
+        }
+        Ok(())
+    }
+
+    fn pause_at(&mut self, at: u64) -> Result<(), Error> {
+        self.ensure_capacity(0, 1, 2)?;
+        self.write(Kind::Pause, at, &[])?;
+        self.state = State::AutoPaused;
+        Ok(())
+    }
+
+    /// Resumes an explicitly paused recording without recording any user input.
+    pub fn resume(&mut self, at: Duration) -> Result<(), Error> {
+        let at = self.timestamp(at)?;
+        if self.state == State::AutoPaused {
+            self.ensure_capacity(0, 1, 2)?;
+            self.resume_at(at)?;
+        }
+        Ok(())
+    }
+
+    fn resume_at(&mut self, at: u64) -> Result<(), Error> {
+        self.write(Kind::Resume, at, &[])?;
+        self.state = State::Recording;
+        self.last_activity = at;
         Ok(())
     }
 
@@ -179,8 +229,7 @@ impl<W: Write> Recorder<W> {
         let resume = self.state == State::AutoPaused;
         self.ensure_capacity(payload.len(), 1 + usize::from(resume), 2)?;
         if resume {
-            self.write(Kind::Resume, at, &[])?;
-            self.state = State::Recording;
+            self.resume_at(at)?;
         }
         self.write(kind, at, payload)?;
         self.last_activity = at;

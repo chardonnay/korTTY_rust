@@ -3,6 +3,8 @@ use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, TryRecvError};
 
+use crate::terminal_effects::Speed;
+
 use super::Event;
 
 const BULK_BYTES: usize = 4096;
@@ -19,15 +21,14 @@ enum Delay {
 }
 
 impl Delay {
-    fn milliseconds(self, speed: u8) -> u64 {
+    fn milliseconds(self, speed: Speed) -> u64 {
         let base = match self {
             Self::Immediate => return 0,
-            Self::Character => 28,
-            Self::Punctuation => 120,
-            Self::LineBreak => 300,
+            Self::Character => 28.0,
+            Self::Punctuation => 120.0,
+            Self::LineBreak => 300.0,
         };
-        let speed = u64::from(speed.clamp(1, 99));
-        ((base + speed / 2) / speed).max(1)
+        (base / speed.multiplier()).round().max(1.0) as u64
     }
 }
 
@@ -43,7 +44,7 @@ pub(super) struct Pacer {
     spans: VecDeque<Span>,
     arrivals: VecDeque<(usize, Instant)>,
     held: Option<Event>,
-    speed: Option<u8>,
+    speed: Option<Speed>,
     queued_millis: u64,
     anchor: Option<Instant>,
     deadline: Option<Instant>,
@@ -57,7 +58,7 @@ impl Pacer {
     pub(super) fn poll(
         &mut self,
         events: &Receiver<Event>,
-        speed: Option<u8>,
+        speed: Option<Speed>,
         now: Instant,
     ) -> Result<Event, TryRecvError> {
         if self.speed != speed {
@@ -104,7 +105,7 @@ impl Pacer {
             self.framing.track(&bytes);
             return Some(self.forward_unpaced(bytes, received));
         }
-        let speed = self.speed.unwrap_or(1);
+        let speed = self.speed.unwrap_or(Speed::DEFAULT);
         let mut immediate = false;
         for (index, &byte) in bytes.iter().enumerate() {
             // Queries must not sit behind a paced backlog awaiting their own host reply.
@@ -393,17 +394,53 @@ mod tests {
         let at = |millis| start + Duration::from_millis(millis);
         send(&send_events, "Aé!\r\n".as_bytes(), start);
         assert!(matches!(
-            pacer.poll(&events, Some(1), at(0)),
+            pacer.poll(&events, Some(Speed::DEFAULT), at(0)),
             Err(TryRecvError::Empty)
         ));
         assert_eq!(pacer.deadline(), Some(at(28)));
-        assert_eq!(output(pacer.poll(&events, Some(1), at(28))), b"A");
-        assert_eq!(output(pacer.poll(&events, Some(1), at(56))), "é".as_bytes());
-        assert_eq!(output(pacer.poll(&events, Some(1), at(176))), b"!");
-        assert_eq!(output(pacer.poll(&events, Some(1), at(476))), b"\r\n");
+        assert_eq!(
+            output(pacer.poll(&events, Some(Speed::DEFAULT), at(28))),
+            b"A"
+        );
+        assert_eq!(
+            output(pacer.poll(&events, Some(Speed::DEFAULT), at(56))),
+            "é".as_bytes()
+        );
+        assert_eq!(
+            output(pacer.poll(&events, Some(Speed::DEFAULT), at(176))),
+            b"!"
+        );
+        assert_eq!(
+            output(pacer.poll(&events, Some(Speed::DEFAULT), at(476))),
+            b"\r\n"
+        );
         assert_eq!(pacer.deadline(), None);
-        assert_eq!(Delay::Character.milliseconds(99), 1);
-        assert_eq!(Delay::LineBreak.milliseconds(10), 30);
+        assert_eq!(
+            Delay::Character.milliseconds(Speed::try_from(99.0).unwrap()),
+            1
+        );
+        assert_eq!(
+            Delay::LineBreak.milliseconds(Speed::try_from(10.0).unwrap()),
+            30
+        );
+    }
+
+    #[test]
+    fn typewriter_paces_output_at_the_fractional_effect_multiplier() {
+        let (send_events, events) = bounded(8);
+        let mut pacer = Pacer::default();
+        let speed = Some(Speed::try_from(2.5).unwrap());
+        let start = Instant::now();
+        let at = |millis| start + Duration::from_millis(millis);
+        send(&send_events, b"A!\n", start);
+        assert!(matches!(
+            pacer.poll(&events, speed, at(0)),
+            Err(TryRecvError::Empty)
+        ));
+        assert_eq!(pacer.deadline(), Some(at(11)));
+        assert_eq!(output(pacer.poll(&events, speed, at(11))), b"A");
+        assert_eq!(output(pacer.poll(&events, speed, at(59))), b"!");
+        assert_eq!(output(pacer.poll(&events, speed, at(179))), b"\n");
     }
 
     #[test]
@@ -412,31 +449,46 @@ mod tests {
         let mut pacer = Pacer::default();
         let now = Instant::now();
         send(&send_events, b"\x1b[3", now);
-        assert_eq!(output(pacer.poll(&events, Some(1), now)), b"\x1b[3");
+        assert_eq!(
+            output(pacer.poll(&events, Some(Speed::DEFAULT), now)),
+            b"\x1b[3"
+        );
         send(&send_events, b"1mX", now);
-        assert_eq!(output(pacer.poll(&events, Some(1), now)), b"1m");
+        assert_eq!(
+            output(pacer.poll(&events, Some(Speed::DEFAULT), now)),
+            b"1m"
+        );
         send(&send_events, b"\x1b]52;c;opaque", now);
         assert_eq!(
-            output(pacer.poll(&events, Some(1), now)),
+            output(pacer.poll(&events, Some(Speed::DEFAULT), now)),
             b"X\x1b]52;c;opaque"
         );
         send(&send_events, b"\x1b[invalid escape, still opaque\x1b", now);
         assert_eq!(
-            output(pacer.poll(&events, Some(1), now)),
+            output(pacer.poll(&events, Some(Speed::DEFAULT), now)),
             b"\x1b[invalid escape, still opaque\x1b"
         );
         send(&send_events, b"\\", now);
-        assert_eq!(output(pacer.poll(&events, Some(1), now)), b"\\");
+        assert_eq!(
+            output(pacer.poll(&events, Some(Speed::DEFAULT), now)),
+            b"\\"
+        );
 
         send(&send_events, b"\xc2", now);
         assert_eq!(output(pacer.poll(&events, None, now)), b"\xc2");
         send(&send_events, b"\x9fG,APC\xc2", now);
-        assert_eq!(output(pacer.poll(&events, Some(1), now)), b"\x9fG,APC\xc2");
+        assert_eq!(
+            output(pacer.poll(&events, Some(Speed::DEFAULT), now)),
+            b"\x9fG,APC\xc2"
+        );
         send(&send_events, b"\x9c", now);
-        assert_eq!(output(pacer.poll(&events, Some(1), now)), b"\x9c");
+        assert_eq!(
+            output(pacer.poll(&events, Some(Speed::DEFAULT), now)),
+            b"\x9c"
+        );
         send(&send_events, b"T", now);
         assert!(matches!(
-            pacer.poll(&events, Some(1), now),
+            pacer.poll(&events, Some(Speed::DEFAULT), now),
             Err(TryRecvError::Empty)
         ));
         assert_eq!(output(pacer.poll(&events, None, now)), b"T");
@@ -450,19 +502,22 @@ mod tests {
         send(&send_events, b"slow", now);
         assert!(send_events.try_send(Event::ViewChanged).is_ok());
         assert!(matches!(
-            pacer.poll(&events, Some(1), now),
+            pacer.poll(&events, Some(Speed::DEFAULT), now),
             Ok(Event::ViewChanged)
         ));
         assert!(send_events.try_send(Event::ReadClosed).is_ok());
-        assert_eq!(output(pacer.poll(&events, Some(1), now)), b"slow");
+        assert_eq!(
+            output(pacer.poll(&events, Some(Speed::DEFAULT), now)),
+            b"slow"
+        );
         assert!(matches!(
-            pacer.poll(&events, Some(1), now),
+            pacer.poll(&events, Some(Speed::DEFAULT), now),
             Ok(Event::ReadClosed)
         ));
 
         send(&send_events, b"slow", now);
         send(&send_events, &vec![b'x'; BULK_BYTES], now);
-        let bulk = output(pacer.poll(&events, Some(1), now));
+        let bulk = output(pacer.poll(&events, Some(Speed::DEFAULT), now));
         assert_eq!(bulk.len(), BULK_BYTES + 4);
         assert_eq!(&bulk[..4], b"slow");
         assert_eq!(pacer.deadline(), None);

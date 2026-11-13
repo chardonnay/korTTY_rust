@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<swarmChats>
+    <swarmChat>
+        <id>9012ae78-adc2-4301-8ffe-c59163856c4d</id>
+        <title>Grüße &amp; 東京</title>
+        <createdAt>1720000000000</createdAt>
+        <updatedAt>1720000003000</updatedAt>
+        <responseLanguageCode>de-DE</responseLanguageCode>
+        <activeAiProfileId>77</activeAiProfileId>
+        <activeAiProfileName>Synthetic Java provider</activeAiProfileName>
+        <targetConnectionIds>
+            <connectionId>42</connectionId>
+            <connectionId>88</connectionId>
+        </targetConnectionIds>
+        <targetGroupPaths>
+            <groupPath>synthetic-private-group</groupPath>
+        </targetGroupPaths>
+        <messages>
+            <swarmMessage>
+                <role>USER</role>
+                <content>Inspect both targets.</content>
+                <createdAt>1720000001000</createdAt>
+                <serverSummaries/>
+            </swarmMessage>
+            <swarmMessage>
+                <role>ASSISTANT</role>
+                <content># Combined result
+
+Two targets reported synthetic-private-token.</content>
+                <createdAt>1720000002000</createdAt>
+                <aiProfileId>77</aiProfileId>
+                <aiProfileName>Fixture model</aiProfileName>
+                <serverSummaries>
+                    <serverSummary>
+                        <serverDisplayName>München &amp; 1</serverDisplayName>
+                        <finalState>DONE</finalState>
+                        <summaryText>Completed successfully.</summaryText>
+                        <elapsedSeconds>17</elapsedSeconds>
+                        <totalTokens>1205</totalTokens>
+                    </serverSummary>
+                    <serverSummary>
+                        <serverDisplayName>東京 2</serverDisplayName>
+                        <finalState>SKIPPED</finalState>
+                        <summaryText>synthetic-private-token</summaryText>
+                        <elapsedSeconds>0</elapsedSeconds>
+                        <totalTokens>0</totalTokens>
+                    </serverSummary>
+                </serverSummaries>
+            </swarmMessage>
+            <swarmMessage>
+                <role>USER</role>
+                <content>Check again?</content>
+                <createdAt>1720000003000</createdAt>
+                <serverSummaries/>
+            </swarmMessage>
+        </messages>
+    </swarmChat>
+</swarmChats>

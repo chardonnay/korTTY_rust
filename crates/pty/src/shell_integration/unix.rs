@@ -8,19 +8,18 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use super::ShellIntegrationSnippet as Snippet;
+use super::{ShellIntegrationSnippet as Snippet, plan};
 
-const BASH_RC: &str = "bashrc";
-const ZSH_ENV: &str = ".zshenv";
+#[cfg(test)]
 const ZSH_RC: &str = ".zshrc";
-const FISH_SCRIPT: &str = "kortty.fish";
-const USER_ZDOTDIR: &str = "KORTTY_SI_ZDOTDIR";
 
 pub(crate) fn default_snippet(program: &OsStr) -> Option<Snippet> {
     let name = Path::new(program).file_name()?.to_str()?;
-    Snippet::ALL
-        .into_iter()
-        .find(|snippet| snippet.name() == name)
+    if name.starts_with('-') {
+        return None;
+    }
+    Snippet::from_program(name)
+        .filter(|snippet| matches!(snippet, Snippet::Bash | Snippet::Zsh | Snippet::Fish))
 }
 
 /// Only owns files created before starting an opted-in local shell. Drop uses
@@ -31,11 +30,16 @@ pub(crate) struct Startup {
 }
 
 impl Startup {
-    pub(crate) fn prepare(command: &mut Command, snippet: Snippet) -> io::Result<Self> {
+    pub(crate) fn prepare(
+        command: &mut Command,
+        snippet: Snippet,
+        arguments: &[String],
+    ) -> io::Result<Self> {
         Self::prepare_at(
             command,
             snippet,
-            Path::new("/tmp"),
+            arguments,
+            &env::temp_dir(),
             env::var_os("ZDOTDIR").as_deref(),
         )
     }
@@ -43,6 +47,7 @@ impl Startup {
     fn prepare_at(
         command: &mut Command,
         snippet: Snippet,
+        arguments: &[String],
         temp: &Path,
         zdotdir: Option<&OsStr>,
     ) -> io::Result<Self> {
@@ -69,28 +74,15 @@ impl Startup {
                     "shell startup path is not printable UTF-8",
                 )
             })?;
-        match snippet {
-            Snippet::Bash => {
-                let script = format!(
-                    "if [ -r ~/.bashrc ]; then . ~/.bashrc; fi\n\n{}",
-                    snippet.text()
-                );
-                startup.write(BASH_RC, &script)?;
-                command.arg("--rcfile").arg(startup.path.join(BASH_RC));
-            }
-            Snippet::Zsh => {
-                startup.write_zsh(&posix_quote(path))?;
-                command
-                    .env("ZDOTDIR", &startup.path)
-                    .env_remove(USER_ZDOTDIR);
-                if let Some(user) = zdotdir.filter(|value| !value.is_empty()) {
-                    command.env(USER_ZDOTDIR, user);
-                }
-            }
-            Snippet::Fish => {
-                startup.write(FISH_SCRIPT, snippet.text())?;
-                let source = format!("source {}", fish_quote(&format!("{path}/{FISH_SCRIPT}")));
-                command.arg("--init-command").arg(source);
+        let plan = plan::posix(snippet, arguments, path)?;
+        for (name, text) in plan.files {
+            startup.write(name, &text)?;
+        }
+        command.args(plan.arguments).env_remove(plan::USER_ZDOTDIR);
+        if let Some(directory) = plan.zsh_directory {
+            command.env("ZDOTDIR", directory);
+            if let Some(user) = zdotdir.filter(|value| !value.is_empty()) {
+                command.env(plan::USER_ZDOTDIR, user);
             }
         }
         Ok(startup)
@@ -114,35 +106,17 @@ impl Startup {
         // SAFETY: a successful openat returned a new owned descriptor.
         unsafe { File::from_raw_fd(fd) }.write_all(text.as_bytes())
     }
-
-    fn write_zsh(&self, wrapper: &str) -> io::Result<()> {
-        // Mirrors the reference's non-login zsh. Let the real .zshenv move
-        // ZDOTDIR, then let the real .zshrc observe and change that directory.
-        let env = format!(
-            "if [[ -n ${{{USER_ZDOTDIR}-}} ]]; then\n    export ZDOTDIR=${USER_ZDOTDIR}\nelse\n    unset ZDOTDIR\nfi\nunset {USER_ZDOTDIR}\n{}\n\
-            if [[ -o interactive && -o rcs ]]; then\n\
-                typeset -g __kortty_si_zdotdir_set=${{+ZDOTDIR}} __kortty_si_zdotdir=${{ZDOTDIR-}}\n\
-                export ZDOTDIR={wrapper}\n\
-            fi\n",
-            zsh_user_file(wrapper, ZSH_ENV),
-        );
-        let rc = format!(
-            "if (( ${{__kortty_si_zdotdir_set:-0}} )); then export ZDOTDIR=$__kortty_si_zdotdir; else unset ZDOTDIR; fi\n\
-            unset __kortty_si_zdotdir_set __kortty_si_zdotdir\n\
-            if [[ ${{HISTFILE-}} == {wrapper}/* ]]; then\n\
-                HISTFILE=${{ZDOTDIR:-$HOME}}/${{HISTFILE:t}}\n\
-            fi\n{}\n{}",
-            zsh_user_file(wrapper, ZSH_RC),
-            Snippet::Zsh.text(),
-        );
-        self.write(ZSH_ENV, &env)?;
-        self.write(ZSH_RC, &rc)
-    }
 }
 
 impl Drop for Startup {
     fn drop(&mut self) {
-        for name in [c"bashrc", c".zshenv", c".zshrc", c"kortty.fish"] {
+        for name in [
+            c"bashrc",
+            c".zshenv",
+            c".zprofile",
+            c".zshrc",
+            c"kortty.fish",
+        ] {
             // SAFETY: the directory descriptor is live and the name is a C
             // string with one component. unlinkat never follows the final link.
             unsafe { libc::unlinkat(self.directory.as_raw_fd(), name.as_ptr(), 0) };
@@ -153,20 +127,6 @@ impl Drop for Startup {
             let _ = fs::remove_dir(&self.path);
         }
     }
-}
-
-fn zsh_user_file(wrapper: &str, file: &str) -> String {
-    format!(
-        "if [[ ${{ZDOTDIR:-$HOME}} != {wrapper} && -r ${{ZDOTDIR:-$HOME}}/{file} ]]; then\n    builtin source -- \"${{ZDOTDIR:-$HOME}}/{file}\"\nfi\n"
-    )
-}
-
-fn posix_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
-}
-
-fn fish_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"))
 }
 
 fn private_directory(base: &Path) -> io::Result<PathBuf> {
@@ -202,15 +162,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn unix_selection_matches_configured_posix_shell_names() {
+        assert_eq!(
+            default_snippet(OsStr::new("/fixture/BASH")),
+            Some(Snippet::Bash)
+        );
+        assert_eq!(
+            default_snippet(OsStr::new("/fixture/Zsh")),
+            Some(Snippet::Zsh)
+        );
+        assert_eq!(default_snippet(OsStr::new("/fixture/pwsh")), None);
+        assert_eq!(default_snippet(OsStr::new("/fixture/-bash")), None);
+        assert_eq!(default_snippet(OsStr::new("/fixture/bashful")), None);
+    }
+
+    #[test]
     fn cleanup_is_anchored_to_the_created_startup_directory() {
-        let root = private_directory(Path::new("/tmp")).unwrap();
+        let root = private_directory(&env::temp_dir()).unwrap();
         let home = root.join("existing");
         fs::create_dir(&home).unwrap();
         let protected = home.join(ZSH_RC);
         fs::write(&protected, "original startup file").unwrap();
 
         let startup =
-            Startup::prepare_at(&mut Command::new("zsh"), Snippet::Zsh, &root, None).unwrap();
+            Startup::prepare_at(&mut Command::new("zsh"), Snippet::Zsh, &[], &root, None).unwrap();
         let path = startup.path.clone();
         assert_eq!(fs::metadata(&path).unwrap().mode() & 0o077, 0);
         assert_eq!(fs::metadata(path.join(ZSH_RC)).unwrap().mode() & 0o077, 0);

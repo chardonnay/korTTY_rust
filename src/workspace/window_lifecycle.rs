@@ -17,6 +17,7 @@ const SAVE_DELAY: Duration = Duration::from_millis(900);
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(default)]
 pub(super) struct StartupPreferences {
+    pub(super) require_master_password: bool,
     pub(super) remember_geometry: bool,
     pub(super) remember_dashboard: bool,
     pub(super) use_fixed_geometry: bool,
@@ -26,6 +27,7 @@ pub(super) struct StartupPreferences {
 impl Default for StartupPreferences {
     fn default() -> Self {
         Self {
+            require_master_password: false,
             remember_geometry: true,
             remember_dashboard: true,
             use_fixed_geometry: false,
@@ -89,6 +91,7 @@ pub(super) struct Geometry {
     maximized: bool,
     fullscreen: bool,
     recordable: bool,
+    connection_specific: bool,
     pending_placement: Option<PendingPlacement>,
     resized: Option<(u64, Size)>,
     // An observed None means the platform does not expose a window position.
@@ -117,12 +120,17 @@ impl Geometry {
             maximized: false,
             fullscreen: false,
             recordable: false,
+            connection_specific: false,
             pending_placement: None,
             resized: None,
             moved: None,
             revision: 0,
             checking: false,
         }
+    }
+
+    pub(super) fn mark_connection_specific(&mut self) {
+        self.connection_specific = true;
     }
 
     pub(super) fn remember_placement(&mut self, size: Size, position: Option<SavedPosition>) {
@@ -314,7 +322,10 @@ impl Lifecycle {
         preferences: StartupPreferences,
         closing: bool,
     ) {
-        if window.geometry.recordable && !preferences.use_fixed_geometry {
+        if window.geometry.recordable
+            && !window.geometry.connection_specific
+            && !preferences.use_fixed_geometry
+        {
             self.last
                 .set_placement(window.placement(), window.maximized());
         }
@@ -802,6 +813,13 @@ pub(super) fn main_window_settings(placement: WindowPlacement) -> window::Settin
         position,
         min_size: Some(MIN_SIZE),
         exit_on_close_request: false,
+        #[cfg(windows)]
+        icon: super::coding_agent_app_icon::windows_icon(0),
+        #[cfg(target_os = "linux")]
+        platform_specific: window::settings::PlatformSpecific {
+            application_id: kortty_windowing::DESKTOP_APP_ID.into(),
+            ..Default::default()
+        },
         ..window::Settings::default()
     }
 }

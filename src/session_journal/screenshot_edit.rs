@@ -147,6 +147,23 @@ impl Draft {
         &self.note
     }
 
+    pub(crate) fn require_translation_source(&self) -> io::Result<()> {
+        let check = || {
+            self.source().with_document(|_, document| {
+                let entry = find_entry(document, self.id())?;
+                self.screenshot.require_entry(entry)?;
+                if read_note(entry)? != self.note {
+                    return Err(changed());
+                }
+                Ok(())
+            })
+        };
+        match check() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => check(),
+            result => result,
+        }
+    }
+
     /// Prepares an immutable edit. PNG decoding and drawing run on the caller's worker.
     pub(crate) fn edit(
         self: &Arc<Self>,

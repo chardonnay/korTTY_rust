@@ -1,6 +1,4 @@
-use iced::widget::{
-    button, column, container, mouse_area, pick_list, row, rule, scrollable, space, text,
-};
+use iced::widget::{button, column, container, mouse_area, pick_list, row, rule, space, text};
 use iced::widget::{text_editor, text_input};
 use iced::{Alignment, Color, Element, Length, Size, Theme};
 use jiff::tz::TimeZone;
@@ -8,7 +6,7 @@ use jiff::tz::TimeZone;
 use crate::session_journal::Journal;
 use crate::workspace::local_dock::{self, Side};
 
-use super::super::{Message, body_height, label, screenshot_access};
+use super::super::{Message, body_height, journal_scrollable, label, screenshot_access};
 use super::{BASIS_POINTS, Controls, Event, Input, Selected, State};
 
 const STACKED_WIDTH: f32 = 690.0;
@@ -34,7 +32,7 @@ impl State {
                 timeline(viewport)
             } else {
                 let height = (viewport.height * 0.48).clamp(220.0, 440.0);
-                scrollable(timeline(Size::new(viewport.width, height)))
+                journal_scrollable(timeline(Size::new(viewport.width, height)))
                     .height(height)
                     .into()
             };
@@ -174,7 +172,7 @@ impl State {
             .align_y(Alignment::Center),
             container(table_row("Time", "Type", None, "Marker", "Content")).padding(5),
             rule::horizontal(1),
-            scrollable(entries).height(if compact {
+            journal_scrollable(entries).height(if compact {
                 150.0
             } else {
                 (height * 0.30).clamp(150.0, 290.0)
@@ -192,7 +190,7 @@ impl State {
         if compact {
             body.into()
         } else {
-            scrollable(body).height(Length::Fill).into()
+            journal_scrollable(body).height(Length::Fill).into()
         }
     }
 }

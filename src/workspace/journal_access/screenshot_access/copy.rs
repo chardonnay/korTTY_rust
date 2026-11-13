@@ -167,7 +167,17 @@ impl Workspace {
             Prepared::Native(png) if !self.clipboard.policy.internal => {
                 let source = pending.origin.window();
                 let native = self.hosted_tool_owner(source).unwrap_or(source);
-                publish(native, source, ticket, png.clone())
+                crate::workspace::clipboard_access::publish_png(
+                    native,
+                    png.clone(),
+                    || Ok(()),
+                    move |result| {
+                        Desktop::SessionJournal(
+                            source,
+                            Message::ScreenshotAction(Event::CopyFinished(ticket, result)),
+                        )
+                    },
+                )
             }
             _ => self.screenshot_copy_finished(ticket, Err("The clipboard mode changed.".into())),
         }
@@ -215,40 +225,4 @@ fn prepare(target: Target, internal: bool) -> std::io::Result<Prepared> {
     } else {
         ClipboardPng::prepare(png).map(Prepared::Native)
     }
-}
-
-fn publish(
-    native: window::Id,
-    source: window::Id,
-    ticket: u64,
-    png: ClipboardPng,
-) -> Task<Desktop> {
-    window::run(native, move |window| {
-        let (window, display) = window
-            .window_handle()
-            .ok()
-            .zip(window.display_handle().ok())?;
-        let (send, receive) = async_channel::bounded(1);
-        png.write(window, display, move |result| {
-            let _ = send.try_send(result.map_err(|error| error.to_string()));
-        });
-        Some(receive)
-    })
-    .collect()
-    .then(move |mut receivers| {
-        let receive = receivers.pop().flatten();
-        Task::future(async move {
-            let result = match receive {
-                Some(receive) => receive
-                    .recv()
-                    .await
-                    .unwrap_or_else(|_| Err("The clipboard stopped.".into())),
-                None => Err("The native window is no longer available.".into()),
-            };
-            Desktop::SessionJournal(
-                source,
-                Message::ScreenshotAction(Event::CopyFinished(ticket, result)),
-            )
-        })
-    })
 }

@@ -66,10 +66,8 @@ mlkem = ["dep:fips203"]
 openssh-key = ["ssh-key"]
 rsa = [
     "dep:rsa",
-    "dep:rand_core_modern",
-    "dep:sha2_modern",
+    "alloc",
     "getrandom/sys_rng",
-    "ssh-key?/rsa",
 ]
 std = [
     "snafu/std",
@@ -202,19 +200,13 @@ optional = true
 default-features = false
 
 [dependencies.rsa]
-version = "=0.10.0-rc.18"
-features = ["sha2"]
+version = "=0.10.0"
+features = ["pkcs1v15"]
 optional = true
 default-features = false
 
 [dependencies.sha2]
 version = "0.10"
-default-features = false
-
-[dependencies.sha2_modern]
-package = "sha2"
-version = "0.11"
-optional = true
 default-features = false
 
 [dependencies.snafu]
@@ -223,7 +215,7 @@ features = ["rust_1_81"]
 default-features = false
 
 [dependencies.ssh-key]
-version = "0.7.0-rc.11"
+version = "=0.6.7"
 optional = true
 default-features = false
 

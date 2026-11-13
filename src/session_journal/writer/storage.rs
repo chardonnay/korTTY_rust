@@ -226,7 +226,8 @@ impl Storage {
         if self.document_stamp.is_none() {
             self.directory.publish_file(staged, OsStr::new(DOCUMENT))?;
         } else {
-            self.directory.replace_file(staged, OsStr::new(DOCUMENT))?;
+            self.directory
+                .replace_file_with_shared_readers(staged, OsStr::new(DOCUMENT))?;
         }
         Ok(())
     }

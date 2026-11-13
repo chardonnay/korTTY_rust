@@ -1,0 +1,106 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<snippets>
+    <snippet>
+        <id>00000000-0000-0000-0000-000000000001</id>
+        <name>Deploy α</name>
+        <content># header&#13;
+printf '%s' '東京 &amp; &lt;db&gt;'&#13;
+# footer&#13;
+</content>
+        <language>bash</language>
+        <category>Ops</category>
+        <operatingSystem>FreeBSD</operatingSystem>
+        <description>Release &amp; deploy</description>
+        <folderId>00000000-0000-0000-0000-000000000102</folderId>
+        <executable>false</executable>
+        <fileName>deploy.sh</fileName>
+        <codeTextLanguageCode>de</codeTextLanguageCode>
+        <tags><tag>production</tag></tags>
+        <diagrams>
+            <diagram>
+                <id>00000000-0000-0000-0000-000000000010</id>
+                <title>Selected command</title>
+                <type>logical-structure</type>
+                <mermaidSource>flowchart TD
+a[Deploy] --&gt; b[Done]</mermaidSource>
+                <sourceContentSha256>26598b7b78c6c8c7797b61105e93e26d2dade881be5d15dd213beb4b4280c933</sourceContentSha256>
+                <customInstructions>Keep the command visible.</customInstructions>
+                <scopeStartLine>2</scopeStartLine>
+                <scopeEndLine>2</scopeEndLine>
+                <codeReferences>
+                    <codeReference><nodeId>a</nodeId><label>Deploy</label><startLine>2</startLine><endLine>2</endLine></codeReference>
+                    <codeReference><nodeId>b</nodeId><label>Done</label><startLine>3</startLine><endLine>3</endLine></codeReference>
+                    <codeReference><nodeId>missing</nodeId><startLine>2</startLine><endLine>2</endLine></codeReference>
+                </codeReferences>
+                <createdAt>1700000000000</createdAt>
+                <updatedAt>1700000001000</updatedAt>
+            </diagram>
+            <diagram>
+                <id>00000000-0000-0000-0000-000000000020</id>
+                <title>Legacy</title>
+                <plantUmlSource>@startuml&#10;Alice -&gt; Bob&#10;@enduml</plantUmlSource>
+            </diagram>
+        </diagrams>
+        <favorite>true</favorite>
+        <usageCount>1</usageCount>
+        <lastUsed>1700000003000</lastUsed>
+        <createdAt>1700000000000</createdAt>
+        <modifiedAt>1700000001000</modifiedAt>
+        <history/>
+    </snippet>
+    <snippet>
+        <id>00000000-0000-0000-0000-000000000002</id>
+        <name>Shortened</name>
+        <content>echo new</content>
+        <language>bash</language>
+        <diagrams>
+            <diagram>
+                <id>00000000-0000-0000-0000-000000000030</id>
+                <title>Historical selection</title>
+                <type>logical-structure</type>
+                <mermaidSource>flowchart TD
+a[Old] --&gt; b[Done]</mermaidSource>
+                <sourceContentSha256>26598b7b78c6c8c7797b61105e93e26d2dade881be5d15dd213beb4b4280c933</sourceContentSha256>
+                <scopeStartLine>2</scopeStartLine>
+                <scopeEndLine>2</scopeEndLine>
+                <codeReferences>
+                    <codeReference><nodeId>a</nodeId><label>Old</label><startLine>2</startLine><endLine>2</endLine></codeReference>
+                </codeReferences>
+            </diagram>
+            <diagram>
+                <id>00000000-0000-0000-0000-000000000040</id>
+                <title>Digest unavailable</title>
+                <mermaidSource>flowchart TD
+a[Unknown] --&gt; b[Done]</mermaidSource>
+                <scopeStartLine>0</scopeStartLine>
+                <scopeEndLine>0</scopeEndLine>
+            </diagram>
+        </diagrams>
+        <tags/>
+    </snippet>
+    <category>
+        <id>00000000-0000-0000-0000-000000000200</id>
+        <name>Ops</name>
+        <sortOrder>0</sortOrder>
+    </category>
+    <operatingSystems><os>FreeBSD</os></operatingSystems>
+    <folders>
+        <folder>
+            <id>00000000-0000-0000-0000-000000000102</id>
+            <name>Production</name>
+            <parentId>00000000-0000-0000-0000-000000000101</parentId>
+            <sortOrder>0</sortOrder>
+        </folder>
+        <folder>
+            <id>00000000-0000-0000-0000-000000000101</id>
+            <name>Automation</name>
+            <sortOrder>0</sortOrder>
+        </folder>
+        <folder>
+            <id>00000000-0000-0000-0000-000000000103</id>
+            <name>Empty</name>
+            <parentId>00000000-0000-0000-0000-000000000101</parentId>
+            <sortOrder>1</sortOrder>
+        </folder>
+    </folders>
+</snippets>

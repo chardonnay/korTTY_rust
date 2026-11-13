@@ -7,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use crate::clipboard_policy::ClipboardPolicy;
 use crate::ssh_connection::SftpOpener;
 use async_channel::{Receiver, Sender, bounded};
 
@@ -178,6 +179,7 @@ fn execute(
             Plan::Local(local::prepare(cwd.clone(), &layout, cancelled)?, cwd)
         }
         Source::Remote(opener, cwd) => {
+            require_remote_transfer()?;
             Plan::Remote(remote::prepare(opener, cwd, &layout, cancelled)?)
         }
     };
@@ -205,8 +207,22 @@ fn execute(
             }
             plan.run(&layout, request.choice, cancelled, &mut progress)
         }
-        Plan::Remote(plan) => plan.run(&layout, request.choice, cancelled, &mut progress),
+        Plan::Remote(plan) => {
+            require_remote_transfer()?;
+            plan.run(&layout, request.choice, cancelled, &mut progress)
+        }
     }
+}
+
+fn require_remote_transfer() -> io::Result<()> {
+    let policy = ClipboardPolicy::load();
+    if policy.problem.is_some() || !policy.file_transfer_allowed {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Copying files to SSH sessions is disabled by policy.",
+        ));
+    }
+    Ok(())
 }
 
 enum Plan {

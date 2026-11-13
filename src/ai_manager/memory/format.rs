@@ -2,8 +2,10 @@ use std::{collections::BTreeMap, ops::Range, sync::LazyLock};
 
 use pgp::crypto::hash::HashAlgorithm;
 use regex::Regex;
+use zeroize::Zeroizing;
 
 const CLOSE: &str = "<!-- /kortty:entry -->";
+const ARCHIVE_AFTER_DAYS: i64 = 180;
 
 #[derive(Clone)]
 pub(super) struct Entry {
@@ -47,6 +49,21 @@ pub(super) fn entries(document: &str) -> Vec<Entry> {
         offset = end;
     }
     entries
+}
+
+pub(super) fn archive_candidates(document: &str, today: jiff::civil::Date) -> Vec<Entry> {
+    let cutoff = today.saturating_sub(jiff::Span::new().days(ARCHIVE_AFTER_DAYS));
+    let mut candidates: Vec<_> = entries(document)
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .created
+                .parse::<jiff::civil::Date>()
+                .is_ok_and(|date| date < cutoff)
+        })
+        .collect();
+    candidates.sort_by(|a, b| a.created.cmp(&b.created));
+    candidates
 }
 
 fn entry(range: Range<usize>, raw: &str, body: String) -> Option<Entry> {
@@ -113,15 +130,19 @@ impl Entry {
             return None;
         }
         let body = format!("- {body}");
-        Some(format!(
-            "<!-- kortty:entry id={} origin={} sha256={} created={} source={} -->\n{body}\n{CLOSE}\n",
-            self.id,
-            self.origin,
-            hash(&body)?,
-            self.created,
-            self.source,
-        ))
+        fence(&self.id, &self.origin, &self.created, &self.source, &body)
     }
+}
+
+pub(super) fn new_entry(id: &str, created: &str, source: &str, body: &str) -> Option<String> {
+    fence(id, "kortty", created, source, body)
+}
+
+fn fence(id: &str, origin: &str, created: &str, source: &str, body: &str) -> Option<String> {
+    let digest = hash(body)?;
+    Some(format!(
+        "<!-- kortty:entry id={id} origin={origin} sha256={digest} created={created} source={source} -->\n{body}\n{CLOSE}\n"
+    ))
 }
 
 pub(super) fn estimate(text: &str) -> usize {
@@ -132,6 +153,26 @@ pub(super) fn estimate(text: &str) -> usize {
         .count()
         .div_ceil(4)
         .max((text.split_whitespace().count() * 135).div_ceil(100))
+}
+
+pub(crate) fn checked_reference_text(text: &str) -> Result<Zeroizing<String>, usize> {
+    let clean = Zeroizing::new(
+        text.chars()
+            .filter(|&character| !invisible(character))
+            .collect::<String>(),
+    );
+    match secret_line(&clean, "") {
+        Some(line) => Err(line),
+        None => Ok(clean),
+    }
+}
+
+pub(super) fn invisible(character: char) -> bool {
+    (character.is_control() && !matches!(character, '\r' | '\n' | '\t'))
+        || matches!(character,
+            '\u{061c}' | '\u{180e}' | '\u{200b}'..='\u{200f}' | '\u{2028}'..='\u{202e}'
+            | '\u{2060}'..='\u{206f}' | '\u{fe00}'..='\u{fe0f}' | '\u{feff}'
+            | '\u{e0000}'..='\u{e007f}' | '\u{e0100}'..='\u{e01ef}')
 }
 
 pub(super) fn secret_line(document: &str, previous: &str) -> Option<usize> {

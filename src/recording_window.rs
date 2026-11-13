@@ -5,17 +5,23 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::widget::{
-    button, canvas, column, container, image, pick_list, row, scrollable, text, text_input,
+    button, canvas, checkbox, column, container, image, pick_list, row, scrollable, text,
+    text_input,
 };
 use iced::{Element, Length, Task};
 use kortty_recording::{Replay, ReplayFrame};
 
+use crate::private_files::FileStamp;
+
 mod catalog;
+mod java_import;
 pub(crate) mod manager;
 pub(crate) mod preferences;
 pub(crate) mod render;
 pub(crate) mod screenshots;
+mod tiles;
 mod timeline;
+mod video_export;
 
 const MAX_PATH: usize = 4096;
 pub(crate) const MANAGER_TITLE: &str = "Video Manager";
@@ -36,6 +42,7 @@ pub enum Message {
     Speed(u8),
     JumpText(String),
     Jump,
+    PanePage(usize),
     Sought(Result<Option<Decoded>, String>),
     StepFrame(Duration),
     ShowPng,
@@ -44,17 +51,24 @@ pub enum Message {
     ExportPath(String),
     ExportStart(String),
     ExportEnd(String),
+    ExportFormat(video_export::Format),
+    ExportColors(bool),
     Export,
     ExportPng,
     Exported(Result<PathBuf, String>),
+    CancelRangeExport,
+    RangeProgress(u64, video_export::Progress),
+    RangeExported(u64, Result<video_export::Saved, String>),
 }
 
 #[derive(Clone)]
 pub struct Opened {
     source: Arc<Mutex<Replay>>,
+    source_stamp: Option<FileStamp>,
     first: Option<Decoded>,
     duration: Duration,
     frame_count: usize,
+    pane_count: usize,
     complete: bool,
 }
 
@@ -73,6 +87,7 @@ pub struct Decoded {
     index: usize,
     previous: Option<Duration>,
     next: Option<Duration>,
+    tiles: tiles::Page,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +117,7 @@ enum Job {
     Open,
     Seek {
         at: Duration,
+        page: usize,
         preview: bool,
         superseded: bool,
     },
@@ -110,6 +126,7 @@ enum Job {
     },
     Export,
     ExportPng,
+    ExportRange,
 }
 
 pub struct RecordingWindow {
@@ -117,11 +134,14 @@ pub struct RecordingWindow {
     path: Option<PathBuf>,
     export_only: bool,
     source: Option<Arc<Mutex<Replay>>>,
+    source_stamp: Option<FileStamp>,
     shown: Option<Decoded>,
     journal_screenshots: Option<PathBuf>,
     png: Option<PngPreview>,
     duration: Duration,
     frame_count: usize,
+    pane_count: usize,
+    pane_page: usize,
     position: Duration,
     playback: Option<(Instant, Duration)>,
     scrub_resume: Option<bool>,
@@ -130,9 +150,11 @@ pub struct RecordingWindow {
     export: String,
     export_start: String,
     export_end: String,
+    video: video_export::State,
     job: Option<Job>,
     notice: Option<String>,
     canvas: canvas::Cache,
+    tile_canvases: [canvas::Cache; tiles::PAGE_SIZE],
 }
 
 impl RecordingWindow {
@@ -142,11 +164,14 @@ impl RecordingWindow {
             path,
             export_only: false,
             source: None,
+            source_stamp: None,
             shown: None,
             journal_screenshots: None,
             png: None,
             duration: Duration::ZERO,
             frame_count: 0,
+            pane_count: 0,
+            pane_page: 0,
             position: Duration::ZERO,
             playback: None,
             scrub_resume: None,
@@ -155,9 +180,11 @@ impl RecordingWindow {
             export: String::new(),
             export_start: String::new(),
             export_end: String::new(),
+            video: video_export::State::default(),
             job: None,
             notice: None,
             canvas: canvas::Cache::new(),
+            tile_canvases: std::array::from_fn(|_| canvas::Cache::new()),
         }
     }
 
@@ -186,6 +213,26 @@ impl RecordingWindow {
 
     pub(crate) fn manager_state(&self) -> Option<&manager::Manager> {
         self.manager.as_ref()
+    }
+
+    pub(crate) fn set_video_encoder(&mut self, executable: Option<video_export::Selection>) {
+        if self.path.is_some() && self.journal_screenshots.is_none() {
+            self.video.configure(executable);
+        }
+    }
+
+    pub(crate) fn take_recording_job_done(&mut self) -> Option<async_channel::Receiver<()>> {
+        self.manager
+            .as_mut()
+            .and_then(manager::Manager::take_import_done)
+            .or_else(|| self.video.take_done())
+    }
+
+    pub(crate) fn cancel_recording_jobs(&mut self) {
+        if let Some(manager) = &mut self.manager {
+            manager.cancel_import();
+        }
+        self.video.cancel();
     }
 
     pub(crate) fn is_manager(&self) -> bool {
@@ -255,10 +302,12 @@ impl RecordingWindow {
                 match result {
                     Ok(opened) => {
                         self.source = Some(opened.source);
+                        self.source_stamp = opened.source_stamp;
                         self.shown = opened.first;
                         self.png = None;
                         self.duration = opened.duration;
                         self.frame_count = opened.frame_count;
+                        self.pane_count = opened.pane_count;
                         self.position = Duration::ZERO;
                         self.canvas.clear();
                         self.notice = if !opened.complete {
@@ -317,6 +366,14 @@ impl RecordingWindow {
                 Some(at) => return self.set_position(at),
                 None => self.notice = Some("Enter minutes or MM:SS within the recording.".into()),
             },
+            Message::PanePage(page)
+                if self.transport_available()
+                    && page < self.pane_count.div_ceil(tiles::PAGE_SIZE) =>
+            {
+                self.pane_page = page;
+                self.set_seek_target(self.position);
+                return self.seek();
+            }
             Message::Sought(result)
                 if let Some(Job::Seek {
                     preview,
@@ -325,12 +382,17 @@ impl RecordingWindow {
                 }) = self.job =>
             {
                 self.job = None;
-                if superseded && !matches!(&result, Ok(Some(frame)) if frame.covers(self.position))
-                {
+                if superseded && !matches!(&result, Ok(Some(frame)) if self.shows_target(frame)) {
                     return self.seek();
                 }
                 match result {
                     Ok(frame) => {
+                        if let Some(frame) = &frame {
+                            frame.tiles.clear_changed_caches(
+                                self.shown.as_ref().map(|shown| &shown.tiles),
+                                &self.tile_canvases,
+                            );
+                        }
                         self.shown = frame;
                         self.png = None;
                         self.canvas.clear();
@@ -375,12 +437,40 @@ impl RecordingWindow {
             Message::ExportPath(path) => self.export = bounded(path, MAX_PATH),
             Message::ExportStart(value) => self.export_start = bounded(value, 40),
             Message::ExportEnd(value) => self.export_end = bounded(value, 40),
+            Message::ExportFormat(format)
+                if self.ready() && (!format.needs_encoder() || self.video.executable.is_some()) =>
+            {
+                self.video.format = format;
+            }
+            Message::ExportColors(include_color) if self.ready() => {
+                self.video.colorless = !include_color
+            }
             Message::Export => return self.export(),
             Message::ExportPng => return self.export_png(),
             Message::Exported(result) if matches!(self.job, Some(Job::Export | Job::ExportPng)) => {
                 self.job = None;
                 self.notice = Some(match result {
                     Ok(path) => format!("Exported {}", path.display()),
+                    Err(error) => error,
+                });
+                return self.seek();
+            }
+            Message::CancelRangeExport if self.job == Some(Job::ExportRange) => self.video.cancel(),
+            Message::RangeProgress(ticket, progress) => self.video.progress(ticket, progress),
+            Message::RangeExported(ticket, result)
+                if self.job == Some(Job::ExportRange) && self.video.finish(ticket) =>
+            {
+                self.job = None;
+                self.notice = Some(match result {
+                    Ok(saved) => format!(
+                        "Exported {}.{}",
+                        saved.path.display(),
+                        if saved.sync_failed {
+                            " The export was saved, but directory synchronization failed."
+                        } else {
+                            ""
+                        },
+                    ),
                     Err(error) => error,
                 });
                 return self.seek();
@@ -406,8 +496,7 @@ impl RecordingWindow {
         .align_y(iced::Alignment::Center);
         let mut main = column![header].spacing(7).padding(12);
         if self.export_only {
-            main = main
-                .push(text("Choose a range to export as a native replay (.korttyrec)").size(15));
+            main = main.push(text("Choose a recording range to export").size(15));
             if self.source.is_some() {
                 main = main.push(
                     text(format!("Recorded duration: {}", format_time(self.duration))).size(13),
@@ -461,6 +550,22 @@ impl RecordingWindow {
         main = main.push(transport.wrap());
         if available {
             main = main.push(timeline::view(self.position, self.duration));
+            let pages = self.pane_count.div_ceil(tiles::PAGE_SIZE);
+            if pages > 1 {
+                main = main.push(
+                    row![
+                        button("Previous panes")
+                            .on_press_maybe(self.pane_page.checked_sub(1).map(Message::PanePage)),
+                        text(format!("Pane page {} / {pages}", self.pane_page + 1)).size(13),
+                        button("Next panes").on_press_maybe(
+                            (self.pane_page + 1 < pages)
+                                .then_some(Message::PanePage(self.pane_page + 1))
+                        ),
+                    ]
+                    .align_y(iced::Alignment::Center)
+                    .spacing(8),
+                );
+            }
         }
         if let Some(preview) = &self.png {
             main = main.push(
@@ -477,7 +582,11 @@ impl RecordingWindow {
                 .height(Length::Fill),
             );
         } else if let Some(shown) = &self.shown {
-            main = main.push(render::view(&shown.frame.screen, &self.canvas));
+            main = if self.pane_count > 1 {
+                main.push(shown.tiles.view(&self.tile_canvases))
+            } else {
+                main.push(render::view(&shown.frame.screen, &self.canvas))
+            };
         } else {
             main =
                 main.push(container(text("No terminal frame is available.")).height(Length::Fill));
@@ -488,8 +597,14 @@ impl RecordingWindow {
 
     fn export_controls(&self, include_png: bool) -> Element<'_, Message> {
         let ready = self.ready();
+        let path_hint = match self.video.format {
+            video_export::Format::Native => "Absolute export path",
+            video_export::Format::Java => "Absolute .korttyrec.jsonl.gz export path",
+            video_export::Format::Webm => "Absolute .webm export path",
+            video_export::Format::Mkv => "Absolute .mkv export path",
+        };
         let mut export = row![
-            text_input("Absolute export path", &self.export).on_input(Message::ExportPath),
+            text_input(path_hint, &self.export).on_input(Message::ExportPath),
             text_input("From (optional)", &self.export_start)
                 .on_input(Message::ExportStart)
                 .width(125),
@@ -506,7 +621,42 @@ impl RecordingWindow {
                     .on_press_maybe((ready && self.shown.is_some()).then_some(Message::ExportPng)),
             );
         }
-        export.wrap().into()
+        let mut controls = column![export.wrap()].spacing(5);
+        let options = if self.video.executable.is_some() {
+            video_export::Format::ALL
+        } else {
+            video_export::Format::WITHOUT_ENCODER
+        };
+        let format: Element<'_, Message> = if ready {
+            pick_list(options, Some(self.video.format), Message::ExportFormat).into()
+        } else {
+            text(self.video.format.to_string()).into()
+        };
+        let color = (self.video.format != video_export::Format::Native).then(|| {
+            checkbox(!self.video.colorless)
+                .label("Include terminal colors and styles")
+                .on_toggle_maybe(ready.then_some(Message::ExportColors))
+        });
+        controls = controls.push(
+            row![format, color]
+                .spacing(7)
+                .align_y(iced::Alignment::Center),
+        );
+        if self.video.format == video_export::Format::Java && self.pane_count > 1 {
+            controls = controls
+                .push(text("Java replay combines the recorded panes into a single grid.").size(13));
+        } else if self.video.executable.is_none() && self.export_only {
+            controls = controls.push(
+                text(
+                    "Configure a local FFmpeg executable in Video Manager to enable video export.",
+                )
+                .size(13),
+            );
+        }
+        if self.video.cancelable() {
+            controls = controls.push(button("Cancel export").on_press(Message::CancelRangeExport));
+        }
+        controls.into()
     }
 
     fn status<'a>(
@@ -524,9 +674,13 @@ impl RecordingWindow {
                     Job::Screenshot { .. } => "Opening terminal PNG…",
                     Job::Export => "Exporting recording…",
                     Job::ExportPng => "Exporting terminal PNG…",
+                    Job::ExportRange => "Exporting recording range…",
                 })
                 .size(13),
             );
+        }
+        if let Some(status) = self.video.status() {
+            main = main.push(text(status).size(13));
         }
         main
     }
@@ -539,6 +693,10 @@ impl RecordingWindow {
         self.duration != Duration::ZERO
             && self.png.is_none()
             && !matches!(self.job, Some(Job::Screenshot { .. }))
+    }
+
+    fn shows_target(&self, frame: &Decoded) -> bool {
+        frame.tiles.number == self.pane_page && frame.covers(self.position)
     }
 
     fn set_position(&mut self, at: Duration) -> Task<Message> {
@@ -558,8 +716,14 @@ impl RecordingWindow {
         self.position = position;
         // Only user navigation supersedes a decode. Regular playback ticks may advance
         // during decoding and can still display that intermediate frame.
-        if let Some(Job::Seek { at, superseded, .. }) = &mut self.job {
-            *superseded = position != *at;
+        if let Some(Job::Seek {
+            at,
+            page,
+            superseded,
+            ..
+        }) = &mut self.job
+        {
+            *superseded = position != *at || self.pane_page != *page;
         }
     }
 
@@ -572,7 +736,7 @@ impl RecordingWindow {
             || self
                 .shown
                 .as_ref()
-                .is_none_or(|frame| frame.covers(self.position))
+                .is_none_or(|frame| self.shows_target(frame))
         {
             return Task::none();
         }
@@ -580,15 +744,20 @@ impl RecordingWindow {
             return Task::none();
         };
         let at = self.position;
+        let page = self.pane_page;
+        let previous = self.shown.clone();
         self.job = Some(Job::Seek {
             at,
+            page,
             preview,
             superseded: false,
         });
         Task::future(async move {
-            Message::Sought(decode(
+            Message::Sought(decode_page(
                 &mut source.lock().unwrap_or_else(|error| error.into_inner()),
                 at,
+                page,
+                previous.as_ref(),
             ))
         })
     }
@@ -620,6 +789,36 @@ impl RecordingWindow {
         };
         self.playback = None;
         self.scrub_resume = None;
+        if self.video.format != video_export::Format::Native {
+            let (Some(source_path), Some(source_stamp)) =
+                (self.path.clone(), self.source_stamp.clone())
+            else {
+                self.notice =
+                    Some("Reopen the recording to verify its source before exporting.".into());
+                return Task::none();
+            };
+            let request = video_export::Request {
+                source,
+                source_path,
+                source_stamp,
+                output: path,
+                range: start..end,
+                format: self.video.format,
+                include_color: !self.video.colorless,
+                executable: self.video.executable.clone(),
+            };
+            return match self.video.launch(request) {
+                Ok(task) => {
+                    self.job = Some(Job::ExportRange);
+                    self.notice = None;
+                    task
+                }
+                Err(error) => {
+                    self.notice = Some(error);
+                    Task::none()
+                }
+            };
+        }
         self.job = Some(Job::Export);
         Task::future(async move {
             let result = source
@@ -678,46 +877,76 @@ impl RecordingWindow {
     }
 }
 
-fn open_source(path: &Path) -> Result<(Replay, std::fs::Metadata), String> {
+fn open_source(path: &Path) -> Result<(Replay, std::fs::Metadata, Option<FileStamp>), String> {
     let file = catalog::open_regular(path).map_err(|error| error.to_string())?;
     let metadata = file.metadata().map_err(|error| error.to_string())?;
+    let stamp = FileStamp::read(&file).ok();
     let source = Replay::from_reader(BufReader::new(file)).map_err(|error| error.to_string())?;
-    Ok((source, metadata))
+    Ok((source, metadata, stamp))
 }
 
 fn open_managed(directory: &Path, entry: &catalog::Entry) -> Result<catalog::ManagedFile, String> {
-    let (source, metadata) = open_source(&entry.path)?;
+    let (source, metadata, _) = open_source(&entry.path)?;
     entry.manage(directory, &metadata, source.is_complete())
 }
 
 fn open_file(path: &Path) -> Result<Opened, String> {
-    let (mut source, _) = open_source(path)?;
+    let (mut source, _, source_stamp) = open_source(path)?;
     let duration = source.duration();
     let frame_count = source.frame_count();
+    let pane_count = source.pane_count();
     let complete = source.is_complete();
     let first = decode(&mut source, Duration::ZERO)?;
     Ok(Opened {
         source: Arc::new(Mutex::new(source)),
+        source_stamp,
         first,
         duration,
         frame_count,
+        pane_count,
         complete,
     })
 }
 
 fn decode(source: &mut Replay, at: Duration) -> Result<Option<Decoded>, String> {
+    decode_page(source, at, 0, None)
+}
+
+fn decode_page(
+    source: &mut Replay,
+    at: Duration,
+    page: usize,
+    previous: Option<&Decoded>,
+) -> Result<Option<Decoded>, String> {
     let Some(index) = source.frame_index_at(at) else {
         return Ok(None);
     };
-    let frame = source.frame(index).map_err(|error| error.to_string())?;
-    Ok(frame.map(|frame| Decoded {
-        frame: Arc::new(frame),
+    let tiles = tiles::Page::load(source, at, page, previous.map(|frame| &frame.tiles))?;
+    let frame = tiles
+        .frame(index)
+        .or_else(|| {
+            previous
+                .filter(|frame| frame.index == index)
+                .map(|frame| Arc::clone(&frame.frame))
+        })
+        .map_or_else(|| decode_frame(source, index), Ok)?;
+    Ok(Some(Decoded {
+        frame,
         index,
         previous: index
             .checked_sub(1)
             .and_then(|previous| source.frame_time(previous)),
         next: source.frame_time(index + 1),
+        tiles,
     }))
+}
+
+fn decode_frame(source: &mut Replay, index: usize) -> Result<Arc<ReplayFrame>, String> {
+    source
+        .frame(index)
+        .map_err(|error| error.to_string())?
+        .map(Arc::new)
+        .ok_or_else(|| "Recording frame is unavailable.".into())
 }
 
 fn parse_time(text: &str, duration: Duration) -> Option<Duration> {
@@ -833,6 +1062,13 @@ mod tests {
         assert!(!result.limited);
         let images = screenshots::attachment_dir(&recording);
         let attached = fs::read(images.join("001.png")).unwrap();
+        assert!(screenshots::attach(&recording, || false).is_err());
+        assert_eq!(fs::read(images.join("001.png")).unwrap(), attached);
+        assert!(
+            !recording
+                .with_extension(&screenshots::STAGE_SUFFIX[1..])
+                .exists()
+        );
         let pixels = tiny_skia::Pixmap::decode_png(&attached).unwrap();
         let (pixels, _) = pixels.data().as_chunks::<4>();
         assert!(pixels.contains(&[7, 21, 233, 255]));
@@ -974,6 +1210,47 @@ mod tests {
         assert_eq!(viewer.shown.as_ref().unwrap().index, 1);
         assert_eq!(viewer.position, Duration::from_secs(2));
         assert!(matches!(viewer.job, Some(Job::Seek { at, .. }) if at == Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn recording_pane_page_switch_supersedes_an_in_flight_decode_at_the_same_time() {
+        let directory = TestDirectory::new();
+        let path = directory.0.join("pane-pages.korttyrec");
+        let mut recorder = capture(&path);
+        let mut terminal = Terminal::new(12, 2);
+        for pane in 2..=5 {
+            terminal.advance(b"X");
+            recorder
+                .record_screen(Duration::ZERO, pane, &terminal.snapshot(), (120, 20))
+                .unwrap();
+        }
+        let at = Duration::from_secs(1);
+        recorder
+            .record_screen(at, 1, &terminal.snapshot(), (120, 20))
+            .unwrap();
+        recorder.finish(Duration::from_secs(2)).unwrap();
+
+        let mut viewer = RecordingWindow::replay(path.clone(), false);
+        let _ = viewer.initialize();
+        let _ = viewer.update(Message::Opened(open_file(&path)));
+        assert_eq!(viewer.pane_count, 5);
+        assert_eq!(viewer.shown.as_ref().unwrap().tiles.number, 0);
+
+        let source = Arc::clone(viewer.source.as_ref().unwrap());
+        let _ = viewer.update(Message::Scrub(at.as_secs_f64()));
+        let _ = viewer.update(Message::PanePage(1));
+        let old_page = decode(&mut source.lock().unwrap(), at);
+        let _ = viewer.update(Message::Sought(old_page));
+        assert!(matches!(viewer.job, Some(Job::Seek { page: 1, .. })));
+        assert_eq!(viewer.shown.as_ref().unwrap().tiles.number, 0);
+
+        let new_page = decode_page(&mut source.lock().unwrap(), at, 1, None);
+        let _ = viewer.update(Message::Sought(new_page));
+        let shown = viewer.shown.as_ref().unwrap();
+        assert_eq!(viewer.position, at);
+        assert_eq!(shown.tiles.number, 1);
+        assert_eq!(shown.tiles.frame(4).unwrap().pane, 5);
+        assert_eq!(shown.frame.pane, 1);
     }
 
     #[test]

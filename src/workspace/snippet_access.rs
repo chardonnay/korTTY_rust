@@ -11,14 +11,19 @@ use crate::workspace::dialog_placement::Kind as DialogKind;
 
 use super::{Message, Workspace, tool_tabs::Kind};
 
+mod ai_assist;
 mod analysis;
+mod diagram_library;
 pub(super) use analysis::Event as AnalysisEvent;
 pub(crate) use analysis::SnippetReportAction;
+pub(crate) use diagram_library::Event as SnippetDiagramEvent;
 #[cfg(test)]
 mod folder_tests;
 pub(super) mod recovery;
 mod run;
 mod transfer;
+mod workflow;
+pub(super) mod workflow_headers;
 pub(super) use run::{PaletteTarget, RunMessage, RunPrompt};
 
 pub(super) const TITLE: &str = "Snippet Manager";
@@ -34,6 +39,7 @@ pub(super) struct Surface {
     pub(super) window: SnippetWindow,
     pub(super) transfer: Option<transfer::State>,
     analysis: analysis::Tabs,
+    assist: ai_assist::State,
     placement: Placement,
     focused_at: u64,
     close_after_work: bool,
@@ -50,6 +56,7 @@ impl Surface {
             window,
             transfer: None,
             analysis: analysis::Tabs::default(),
+            assist: ai_assist::State::default(),
             placement: Placement::Native { source },
             focused_at: 0,
             close_after_work: false,
@@ -58,6 +65,7 @@ impl Surface {
 
     pub(super) fn cancel_analysis(&mut self) {
         self.analysis = analysis::Tabs::default();
+        self.assist = ai_assist::State::default();
     }
 }
 
@@ -283,10 +291,19 @@ impl Workspace {
             );
         }
         self.snippets.get(&id).map(|surface| {
+            if surface.window.can_open_assist()
+                && let Some(page) = surface.assist.view(&surface.window)
+            {
+                return page.map(move |event| {
+                    Message::Snippets(id, snippet_window::Message::Assist(event))
+                });
+            }
             surface
                 .window
                 .view(
                     self.editor_content_theme(),
+                    self.window_settings.snippet_editor_appearance(),
+                    self.window_settings.snippet_editor_caret(),
                     surface.window.selected_id().is_some_and(|snippet| {
                         self.snippet_editor_elsewhere(id, snippet).is_some()
                     }),
@@ -294,7 +311,13 @@ impl Workspace {
                         enabled: self.snippet_transfer_enabled(id),
                         page: surface.transfer.as_ref().map(|state| &state.view),
                     },
-                    surface.analysis.view(),
+                    surface.analysis.view(
+                        self.window_settings.snippet_analysis_auto_diagram,
+                        self.window_settings.snippet_analysis_auto_modularization,
+                        &surface.window,
+                        self.ai_configuration().as_deref(),
+                        crate::local_ai::cli::allowed(&self.clipboard.policy, false),
+                    ),
                 )
                 .map(move |message| Message::Snippets(id, message))
         })
@@ -398,7 +421,18 @@ impl Workspace {
         id: window::Id,
         message: snippet_window::Message,
     ) -> Task<Message> {
+        if !message.is_async_completion()
+            && self
+                .snippets
+                .get(&id)
+                .is_some_and(|surface| surface.window.analysis_apply_locked())
+        {
+            return Task::none();
+        }
         let message = match message {
+            snippet_window::Message::Assist(action) => {
+                return self.update_snippet_assist(id, action);
+            }
             snippet_window::Message::Analyze(subject) => {
                 return self.open_snippet_analysis(id, subject);
             }
@@ -479,6 +513,12 @@ impl Workspace {
         };
         if matches!(
             message,
+            snippet_window::Message::Close | snippet_window::Message::HostedClose(..)
+        ) {
+            surface.assist = ai_assist::State::default();
+        }
+        if matches!(
+            message,
             snippet_window::Message::Select(_)
                 | snippet_window::Message::Open(_)
                 | snippet_window::Message::SelectTab(_)
@@ -490,6 +530,12 @@ impl Workspace {
             surface.close_after_work = false;
         }
         let snippets = &mut surface.window;
+        if matches!(message, snippet_window::Message::CopyCommand(_))
+            && (!self.clipboard.policy.write_allowed || self.clipboard.policy.problem.is_some())
+        {
+            snippets.assist_status("Managed policy blocks writing the clipboard.".into());
+            return Task::none();
+        }
         let possible_removal = matches!(
             message,
             snippet_window::Message::Confirm
@@ -538,7 +584,11 @@ impl Workspace {
         if !matches!(update, Update::Changed | Update::DeleteFolder(..)) {
             snippets.apply_pending_library();
         }
+        surface.assist.revalidate_source(snippets);
         let task = match update {
+            Update::EditorTool(job) => job
+                .task()
+                .map(move |message| Message::Snippets(id, snippet_window::Message::Tools(message))),
             Update::DeleteFolder(folder, snippets) => {
                 return self.delete_snippet_folder(id, folder, &snippets);
             }
@@ -573,10 +623,20 @@ impl Workspace {
                 Message::Snippets(id, snippet_window::Message::Copy(message))
             }),
             Update::CopyResolved(value) => self.write_clipboard(value),
+            Update::ReviewCompactCommand => {
+                if self.ai_features_enabled() {
+                    return self.update_snippet_assist(
+                        id,
+                        snippet_window::ai_assist::Message::OpenCompactCommand,
+                    );
+                }
+                Task::none()
+            }
             Update::Diagram {
                 source,
                 render_locally,
             } => self.open_diagram(Some((&source, render_locally))),
+            Update::DiagramLibrary(request) => self.open_library_diagram(id, request),
             Update::Compare(request) => self.open_snippet_comparison(id, request),
             Update::ExchangeVariables(action) => file_task(
                 move || action.run(),
@@ -798,6 +858,9 @@ impl Workspace {
         };
         let library = surface.window.shared_library();
         for (&peer, surface) in &mut self.snippets {
+            if surface.window.analysis_library().path() == library.path() {
+                surface.analysis.invalidate_knowledge_reviews();
+            }
             if peer != id {
                 surface.window.refresh_shared(library.clone());
             }
@@ -860,6 +923,13 @@ impl Workspace {
     }
 
     pub(super) fn request_snippet_close(&mut self, id: window::Id) -> Task<Message> {
+        if self
+            .snippets
+            .get(&id)
+            .is_some_and(|surface| surface.window.analysis_apply_locked())
+        {
+            return window::gain_focus(id);
+        }
         if let Some(dialog) = self.openpgp_for_source(id) {
             return window::gain_focus(dialog);
         }
@@ -884,6 +954,7 @@ impl Workspace {
             return Task::none();
         }
         surface.transfer = None;
+        surface.assist = ai_assist::State::default();
         surface.close_after_work = surface.window.busy();
         if surface.window.request_close() {
             self.close_snippets(id)
@@ -912,8 +983,10 @@ impl Workspace {
             surface.window.discard_owned_recovery();
         }
         self.flush_snippet_recovery();
+        let diagrams = self.close_snippet_analysis_diagrams(id);
         self.snippets.remove(&id);
         Task::batch([
+            diagrams,
             self.close_snippet_comparisons_for(id),
             self.close_placed_dialog(id),
         ])
@@ -984,8 +1057,25 @@ impl Workspace {
             surface.window.discard_owned_recovery();
         }
         self.flush_snippet_recovery();
+        let diagrams = self.close_snippet_analysis_diagrams(id);
         self.snippets.remove(&id);
-        self.close_snippet_comparisons_for(id)
+        Task::batch([diagrams, self.close_snippet_comparisons_for(id)])
+    }
+
+    fn close_snippet_analysis_diagrams(&mut self, id: window::Id) -> Task<Message> {
+        let ids: Vec<_> = self
+            .snippets
+            .get(&id)
+            .into_iter()
+            .flat_map(|surface| surface.analysis.diagram_windows())
+            .collect();
+        let mut tasks = Vec::new();
+        for id in ids {
+            if self.diagrams.contains_key(&id) {
+                tasks.push(self.close_window(id));
+            }
+        }
+        Task::batch(tasks)
     }
 }
 

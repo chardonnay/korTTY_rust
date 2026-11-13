@@ -1,6 +1,7 @@
 use serde_json::json;
 
 use super::*;
+use crate::local_ai::PromptPreset;
 use crate::local_ai::test_support::{
     fixture_http_response, fixture_response, listener, start_test_double,
 };
@@ -32,26 +33,36 @@ fn journal_note_translation_sends_only_the_redacted_multiline_note_and_target() 
     let answer =
         format!("<think>Reasoning unavailable to the user</think>\n```json\n{translation}\n```");
     let unsupported = json!({"error":{"param":"response_format","code":"unsupported_parameter"}});
+    let accepted = json!({
+        "choices": [{"message": {"content": answer}, "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 81, "completion_tokens": 19, "total_tokens": 100},
+    });
     let (profile, server) = start_test_double(vec![
         fixture_http_response("422 Unprocessable Entity", "", &unsupported.to_string()),
-        fixture_response("200 OK", "", &answer),
+        fixture_http_response("200 OK", "", &accepted.to_string()),
     ]);
     let secrets = Secrets::default();
     secrets.add(SECRET);
     let redactor = Redactor::for_journal(secrets.seal().unwrap(), Policy::default());
-    let result = translate(
-        &Client::new(profile),
-        &source,
-        " Español (México) ",
-        Some(&redactor),
-        256,
-    );
+    let profile = profile.with_prompt_preset(PromptPreset::Qwen);
+    let expected_system = profile.render_system_prompt(SYSTEM);
+    let client = Client::new(profile);
+    let result = translate(&client, &source, " Español (México) ", Some(&redactor), 256);
     let requests = server.join().unwrap();
     assert_eq!(result.unwrap(), expected);
+    let usage = client.take_usage().unwrap();
+    assert_eq!(
+        (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+        (Some(81), Some(19), Some(100))
+    );
     assert_eq!(requests[0]["response_format"]["type"], "json_object");
     assert!(requests[1].get("response_format").is_none());
     assert_eq!(requests[0]["messages"], requests[1]["messages"]);
     let request = &requests[0]["messages"];
+    assert_eq!(
+        request[0]["content"].as_str(),
+        Some(expected_system.as_ref())
+    );
     let user: Value = serde_json::from_str(request[1]["content"].as_str().unwrap()).unwrap();
     assert_eq!(user["target_language"], "Español (México)");
     assert_eq!(
@@ -70,9 +81,10 @@ fn journal_note_translation_rejects_truncation_without_changing_legacy_text_comp
     let client = Client::new(profile);
     let translated = translate(&client, "Partial", "de", None, 64);
     let ordinary = client.complete("fixture", "existing text caller");
-    server.join().unwrap();
+    let requests = server.join().unwrap();
     assert!(translated.unwrap_err().contains("token limit"));
     assert_eq!(ordinary.unwrap(), content);
+    assert_eq!(requests[0]["messages"][0]["content"], SYSTEM);
 }
 
 #[test]

@@ -5,13 +5,17 @@ use std::ops::Bound::{Excluded, Unbounded};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use kortty_ssh::WindowSize;
+use kortty_ssh::{MAX_REMOTE_FORWARD_LISTENERS, MAX_SESSION_CHANNELS, WindowSize};
 
 use super::wire::{CHUNK, Frame, invalid};
 use super::{closed, lock};
 
+#[path = "mux/password.rs"]
+mod password;
+pub use password::{PasswordEvent, PasswordFileEvent, PasswordSide};
+
 const WINDOW: u8 = 8;
-const MAX_STREAMS: usize = 16;
+const MAX_STREAMS: usize = MAX_SESSION_CHANNELS + MAX_REMOTE_FORWARD_LISTENERS;
 const MAX_CONTROL: usize = 64;
 
 #[derive(Clone, Default)]
@@ -32,13 +36,24 @@ struct State {
     cursor: u32,
 }
 
+impl State {
+    fn stop(&mut self) {
+        self.stopped = true;
+        for lane in self.lanes.values_mut() {
+            lane.password = None;
+        }
+    }
+}
+
 struct Lane {
+    password: Option<Box<password::Lane>>,
     inbound: VecDeque<Vec<u8>>,
     outbound: VecDeque<Vec<u8>>,
     send_credit: u8,
     receive_credit: u8,
     pending_credit: u8,
     received_end: bool,
+    received_exit_code: Option<u32>,
     outgoing_end: Option<Option<u32>>,
     sent_end: bool,
     end_ack: bool,
@@ -51,13 +66,26 @@ struct Lane {
 
 impl Lane {
     fn ready(&self) -> bool {
-        self.pending_credit != 0
-            || !self.outbound.is_empty()
-            || self.outgoing_end.is_some()
-            || self.outgoing_finish.is_some()
+        self.password.as_deref().is_some_and(password::Lane::ready)
+            || (self.data_allowed()
+                && (self.pending_credit != 0
+                    || !self.outbound.is_empty()
+                    || self.outgoing_end.is_some()
+                    || self.outgoing_finish.is_some()))
+    }
+
+    fn data_allowed(&self) -> bool {
+        self.password.as_ref().is_none_or(|lane| lane.streaming())
     }
 
     fn frame(&mut self, id: u32) -> Option<Frame> {
+        if let Some(frame) = self
+            .password
+            .as_mut()
+            .and_then(|password| password.frame(id))
+        {
+            return Some(frame);
+        }
         if self.pending_credit != 0 {
             let credit = std::mem::take(&mut self.pending_credit);
             self.receive_credit += credit;
@@ -77,6 +105,27 @@ impl Lane {
 
 impl Mux {
     pub fn add(&self, id: u32) -> io::Result<Flow> {
+        self.add_lane(id, None)
+    }
+
+    pub fn add_password(&self, id: u32, side: PasswordSide) -> io::Result<Flow> {
+        self.add_lane(
+            id,
+            Some(Box::new(password::Lane::new(
+                side,
+                password::Purpose::Status,
+            ))),
+        )
+    }
+
+    pub fn add_password_file(&self, id: u32, side: PasswordSide) -> io::Result<Flow> {
+        self.add_lane(
+            id,
+            Some(Box::new(password::Lane::new(side, password::Purpose::File))),
+        )
+    }
+
+    fn add_lane(&self, id: u32, password: Option<Box<password::Lane>>) -> io::Result<Flow> {
         let mut state = lock(&self.0.state);
         if state.stopped {
             return Err(closed());
@@ -94,12 +143,14 @@ impl Mux {
         state.lanes.insert(
             id,
             Lane {
+                password,
                 inbound: VecDeque::new(),
                 outbound: VecDeque::new(),
                 send_credit: WINDOW,
                 receive_credit: WINDOW,
                 pending_credit: 0,
                 received_end: false,
+                received_exit_code: None,
                 outgoing_end: None,
                 sent_end: false,
                 end_ack: false,
@@ -118,7 +169,7 @@ impl Mux {
     }
 
     pub fn stop(&self) {
-        lock(&self.0.state).stopped = true;
+        lock(&self.0.state).stop();
         self.0.changed.notify_all();
     }
 
@@ -137,7 +188,7 @@ impl Mux {
         }
         if state.controls.len() == MAX_CONTROL {
             // Dropping a close or open reply would leave the peer hanging.
-            state.stopped = true;
+            state.stop();
             self.0.changed.notify_all();
             return Err(io::Error::other("SSH worker control queue exhausted"));
         }
@@ -175,11 +226,18 @@ impl Mux {
                 .find_map(|(&id, lane)| lane.ready().then_some(id))
             {
                 state.cursor = id;
-                return state
+                let frame = state
                     .lanes
                     .get_mut(&id)
                     .expect("ready SSH worker stream")
                     .frame(id);
+                if matches!(
+                    frame,
+                    Some(Frame::Password(_, super::wire::PasswordFrame::Ready))
+                ) {
+                    self.0.changed.notify_all();
+                }
+                return frame;
             }
             state = self.wait(state);
         }
@@ -193,6 +251,7 @@ impl Mux {
                     if lane.receive_credit == 0
                         || lane.received_end
                         || lane.remote_finished
+                        || !lane.data_allowed()
                         || bytes.is_empty()
                     {
                         return Err(invalid());
@@ -203,6 +262,9 @@ impl Mux {
             }
             Frame::Credit(id, credit) => {
                 if let Some(lane) = state.lanes.get_mut(&id) {
+                    if !lane.data_allowed() {
+                        return Err(invalid());
+                    }
                     lane.send_credit = lane
                         .send_credit
                         .checked_add(credit)
@@ -210,17 +272,22 @@ impl Mux {
                         .ok_or_else(invalid)?;
                 }
             }
-            Frame::End(id, _) => {
+            Frame::End(id, code) => {
                 if let Some(lane) = state.lanes.get_mut(&id) {
-                    if lane.received_end {
+                    if lane.received_end || !lane.data_allowed() {
                         return Err(invalid());
                     }
                     lane.received_end = true;
+                    lane.received_exit_code = code;
                 }
             }
             Frame::EndAck(id) => {
                 if let Some(lane) = state.lanes.get_mut(&id) {
-                    if !lane.sent_end || lane.outgoing_end.is_some() || lane.end_ack {
+                    if !lane.sent_end
+                        || lane.outgoing_end.is_some()
+                        || lane.end_ack
+                        || !lane.data_allowed()
+                    {
                         return Err(invalid());
                     }
                     lane.end_ack = true;
@@ -228,7 +295,10 @@ impl Mux {
             }
             Frame::Finished(id, failure) => {
                 if let Some(lane) = state.lanes.get_mut(&id) {
-                    if (!lane.received_end && failure.is_none()) || lane.remote_finished {
+                    if (!lane.received_end && failure.is_none())
+                        || lane.remote_finished
+                        || !lane.data_allowed()
+                    {
                         return Err(invalid());
                     }
                     lane.remote_finished = true;
@@ -238,6 +308,19 @@ impl Mux {
             Frame::Close(id, failure) => {
                 if let Some(lane) = state.lanes.remove(&id) {
                     *lock(&lane.failure) = failure;
+                }
+            }
+            Frame::Password(id, frame) => {
+                if let Some(lane) = state.lanes.get_mut(&id) {
+                    let Some(password) = &mut lane.password else {
+                        return Err(invalid());
+                    };
+                    let finished = matches!(&frame, super::wire::PasswordFrame::Result(_));
+                    // A local result can overtake an in-flight credential frame.
+                    if !lane.local_finished {
+                        password.receive(frame)?;
+                        lane.remote_finished = finished;
+                    }
                 }
             }
             _ => return Err(invalid()),
@@ -286,6 +369,13 @@ impl Flow {
         self.id
     }
 
+    pub fn exit_code(&self) -> Option<u32> {
+        lock(&self.mux.0.state)
+            .lanes
+            .get(&self.id)?
+            .received_exit_code
+    }
+
     pub fn is_open(&self) -> bool {
         let state = lock(&self.mux.0.state);
         !state.stopped
@@ -315,6 +405,7 @@ impl Flow {
         if let Some(lane) = state.lanes.get_mut(&self.id)
             && (lane.sent_end || failure.is_some())
             && !lane.local_finished
+            && lane.data_allowed()
         {
             lane.local_finished = true;
             lane.outgoing_finish = Some(failure);
@@ -336,7 +427,15 @@ impl Flow {
     }
 
     pub fn acknowledge_end(&self) -> io::Result<()> {
-        self.mux.control(Frame::EndAck(self.id))
+        let mut state = lock(&self.mux.0.state);
+        if state
+            .lanes
+            .get(&self.id)
+            .is_some_and(|lane| !lane.data_allowed())
+        {
+            return Err(invalid());
+        }
+        self.mux.control_locked(&mut state, Frame::EndAck(self.id))
     }
 
     pub fn error(&self) -> io::Error {
@@ -376,7 +475,7 @@ impl Reader {
                 let Some(lane) = state.lanes.get_mut(&self.flow.id) else {
                     return Err(self.flow.error());
                 };
-                if lane.local_finished {
+                if lane.local_finished || !lane.data_allowed() {
                     return Err(closed());
                 }
                 if let Some(bytes) = lane.inbound.pop_front() {
@@ -442,6 +541,9 @@ impl Writer {
             .lanes
             .get_mut(&self.0.id)
             .ok_or_else(|| self.0.error())?;
+        if !lane.data_allowed() {
+            return Err(invalid());
+        }
         if !lane.sent_end {
             lane.sent_end = true;
             lane.outgoing_end = Some(code);
@@ -464,7 +566,8 @@ impl Writer {
                 .lanes
                 .get_mut(&self.0.id)
                 .ok_or_else(|| self.0.error())?;
-            if lane.sent_end || lane.remote_finished || lane.local_finished {
+            if lane.sent_end || lane.remote_finished || lane.local_finished || !lane.data_allowed()
+            {
                 return Err(closed());
             }
             if lane.send_credit > 0 {

@@ -6,6 +6,9 @@ use std::path::Path;
 
 use super::{Skill, Target, storable};
 
+mod export;
+pub(super) use export::write_batch;
+
 const FILE_LIMIT: u64 = 96 * 1024;
 const RULES_START: &str = "<!-- kortty:learned-rules -->";
 const RULES_END: &str = "<!-- /kortty:learned-rules -->";
@@ -33,13 +36,18 @@ pub(super) fn read(path: &Path) -> Result<Skill, String> {
 }
 
 pub(super) fn write(path: &Path, skill: &Skill) -> Result<(), String> {
+    let content = encoded(skill)?;
+    crate::profile::save_new_atomic(path, content.as_bytes())
+        .map_err(|error| format!("Could not create the Markdown file ({error})."))
+}
+
+fn encoded(skill: &Skill) -> Result<String, String> {
     skill.check()?;
     let content = skill.to_markdown();
     if content.len() as u64 > FILE_LIMIT {
         return Err("The Markdown file exceeds its size limit.".into());
     }
-    crate::profile::save_new_atomic(path, content.as_bytes())
-        .map_err(|error| format!("Could not create the Markdown file ({error})."))
+    Ok(content)
 }
 
 impl Skill {
@@ -100,7 +108,7 @@ impl Skill {
         Ok(skill)
     }
 
-    fn to_markdown(&self) -> String {
+    pub(super) fn to_markdown(&self) -> String {
         use std::fmt::Write;
         let mut output = String::from("---\nkortty-ai-skill: 1\n");
         if let Some(id) = &self.builtin {

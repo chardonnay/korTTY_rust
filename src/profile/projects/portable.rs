@@ -49,10 +49,16 @@ pub(crate) struct PreparedProject {
     previous: Option<FileStamp>,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Serialize)]
 struct Document {
     #[serde(flatten)]
     layout: WorkspaceLayout,
+    #[serde(flatten)]
+    metadata: DocumentMetadata,
+}
+
+#[derive(Deserialize, Serialize)]
+struct DocumentMetadata {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -146,9 +152,11 @@ impl ProjectFile {
             (
                 Document {
                     layout: imported.layout,
-                    name: imported.name,
-                    description: imported.description,
-                    auto_reconnect: imported.auto_reconnect,
+                    metadata: DocumentMetadata {
+                        name: imported.name,
+                        description: imported.description,
+                        auto_reconnect: imported.auto_reconnect,
+                    },
                 },
                 catalogue,
                 notes,
@@ -157,25 +165,21 @@ impl ProjectFile {
             if bytes.len() as u64 > MAX_BYTES {
                 return Err(invalid("Project exceeds the layout size limit"));
             }
-            (
-                serde_json::from_str(text).map_err(invalid)?,
-                None,
-                Vec::new(),
-            )
+            (Document::read_json(text)?, None, Vec::new())
         };
         document.validate()?;
         let source = Self::new(path, catalogue)?;
-        let name = if document.name.is_empty() {
+        let name = if document.metadata.name.is_empty() {
             source.display_name().to_owned()
         } else {
-            document.name
+            document.metadata.name
         };
         Ok(FileProject {
             source,
             layout: document.layout,
             name,
-            description: document.description,
-            auto_reconnect: document.auto_reconnect,
+            description: document.metadata.description,
+            auto_reconnect: document.metadata.auto_reconnect,
             java_notes,
         })
     }
@@ -236,12 +240,14 @@ impl ProjectFolder {
         let previous = overwrite::review(&directory, &filename, |_| Ok(()))?;
         let document = Document {
             layout,
-            name: name.trim().into(),
-            description: description.trim().into(),
-            auto_reconnect,
+            metadata: DocumentMetadata {
+                name: name.trim().into(),
+                description: description.trim().into(),
+                auto_reconnect,
+            },
         };
         document.validate()?;
-        if document.name.is_empty() {
+        if document.metadata.name.is_empty() {
             return Err(invalid("Enter a project name"));
         }
         let contents = serde_json::to_vec_pretty(&document).map_err(invalid)?;
@@ -302,36 +308,49 @@ impl PreparedProject {
 }
 
 impl Document {
+    fn read_json(text: &str) -> io::Result<Self> {
+        // Read the layout directly so serde_json decodes object keys as tab indexes.
+        // Flattened deserialization buffers them as generic strings.
+        Ok(Self {
+            layout: serde_json::from_str(text).map_err(invalid)?,
+            metadata: serde_json::from_str(text).map_err(invalid)?,
+        })
+    }
+
     fn validate(&self) -> io::Result<()> {
         self.layout.validate()?;
-        if self.name.len() > MAX_NAME
-            || unsafe_text(&self.name)
-            || self.description.len() > MAX_DESCRIPTION
-            || self.description.split(['\n', '\r', '\t']).any(unsafe_text)
+        let metadata = &self.metadata;
+        if metadata.name.len() > MAX_NAME
+            || unsafe_text(&metadata.name)
+            || metadata.description.len() > MAX_DESCRIPTION
+            || metadata
+                .description
+                .split(['\n', '\r', '\t'])
+                .any(unsafe_text)
         {
             return Err(invalid("Invalid project name or description"));
         }
         let tabs = self.layout.windows.iter().flat_map(|window| &window.tabs);
         if tabs.clone().next().is_none() {
-            return Err(invalid("Project has no terminal tabs"));
+            return Err(invalid("Project has no tabs"));
         }
-        if tabs.clone().any(has_local_directory) {
+        if tabs.clone().any(has_private_local_settings) {
             return Err(invalid(
-                "Projects with a local sandbox folder must use the private project store",
+                "Projects with a local sandbox folder or saved local shell must use the private project store",
             ));
         }
         Ok(())
     }
 }
 
-fn has_local_directory(pane: &PaneLayout) -> bool {
+fn has_private_local_settings(pane: &PaneLayout) -> bool {
     match pane {
         PaneLayout::Terminal {
             security: Some(settings),
             ..
-        } => !settings.directory.is_empty(),
+        } => !settings.directory.is_empty() || settings.saved_profile.is_some(),
         PaneLayout::Split { first, second, .. } => {
-            has_local_directory(first) || has_local_directory(second)
+            has_private_local_settings(first) || has_private_local_settings(second)
         }
         _ => false,
     }

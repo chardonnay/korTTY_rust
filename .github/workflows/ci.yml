@@ -11,7 +11,9 @@ jobs:
   native:
     name: Native checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 25
+    # A cold workspace test build and run can take over 30 minutes.
+    # Allow time for the separate release build and package staging.
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -24,6 +26,10 @@ jobs:
 
       - name: Install stable Rust
         run: rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+
+      - name: Install Linux TLS build dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libssl-dev
 
       - name: Check formatting
         run: cargo +stable fmt --all --check
@@ -45,13 +51,50 @@ jobs:
         if: runner.os == 'Windows'
         env:
           SHELL: /bin/sh
-        run: cargo +stable test --locked --workspace --all-targets
+        shell: pwsh
+        run: |
+          $scratchRoot = Get-Item -LiteralPath $env:RUNNER_TEMP
+          $scratchPath = Join-Path $scratchRoot.FullName ("kortty-tests-" + [Guid]::NewGuid().ToString("N"))
+          $scratch = New-Item -ItemType Directory -Path $scratchPath
+          try {
+            $env:TEMP = $scratch.FullName
+            $env:TMP = $scratch.FullName
+            $env:LOCALAPPDATA = $scratch.FullName
+            $env:APPDATA = Join-Path $scratch.FullName "roaming"
+            New-Item -ItemType Directory -Path $env:APPDATA | Out-Null
+            cargo +stable test --locked --workspace --all-targets
+            exit $LASTEXITCODE
+          } finally {
+            $scratch = Get-Item -LiteralPath $scratchPath
+            if ($scratch.Parent.FullName -ne $scratchRoot.FullName -or
+                ($scratch.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+              throw "Unexpected test scratch directory: $scratchPath"
+            }
+            Remove-Item -LiteralPath $scratch.FullName -Recurse -Force
+          }
 
       - name: Remove development build before release build
         run: cargo +stable clean --profile dev
 
       - name: Build native release
+        if: runner.os != 'Windows'
+        env:
+          KORTTY_AI_CATALOG_PUBLIC_KEY: ${{ vars.KORTTY_AI_CATALOG_PUBLIC_KEY }}
         run: cargo +stable build --locked --workspace --release
 
       - name: Stage native release package
+        if: runner.os != 'Windows'
         run: cargo +stable run --locked --release -p kortty-package
+
+      - name: Build and stage native Windows release
+        if: runner.os == 'Windows'
+        env:
+          RUSTFLAGS: -C target-feature=+crt-static
+          KORTTY_AI_CATALOG_PUBLIC_KEY: ${{ vars.KORTTY_AI_CATALOG_PUBLIC_KEY }}
+        run: |
+          $target = (rustc +stable -vV | Select-String '^host: ').Line.Substring(6)
+          cargo +stable build --locked --workspace --release --target $target
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $binDir = "target/$target/release"
+          & "./$binDir/kortty-package.exe" --target $target --bin-dir $binDir
+          exit $LASTEXITCODE

@@ -6,7 +6,7 @@ use iced::widget::{
     self, button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Element, Length, Task};
-use kortty_ssh::ConnectOptions;
+use kortty_ssh::{ConnectOptions, KeepAlive};
 use kortty_terminal::TerminalProfile;
 use kortty_vault::Secret;
 use serde::{Deserialize, Serialize};
@@ -15,11 +15,16 @@ use crate::connection_store::{Auth, Connection, SavedLogin};
 use crate::session_security::IsolationLevel;
 use crate::ssh_worker::sandbox_available;
 
+mod temporary_key;
+pub use temporary_key::TemporaryKey;
+
 const INLINE_LABEL_WIDTH: f32 = 115.0;
 const MAX_HOST_INPUT_BYTES: usize = 256;
 const MAX_USERNAME_BYTES: usize = 255;
 const MAX_PASSWORD_BYTES: usize = 4096;
 const MAX_KEY_PATH_BYTES: usize = 4096;
+
+type ServerAddress = (String, u16);
 
 /// An SSH connection request awaiting worker-side DNS and key-file handling.
 #[derive(Debug)]
@@ -64,6 +69,7 @@ pub enum Authentication {
     Password(Password),
     PrivateKey(PathBuf),
     KeyWithPassphrase(PathBuf, Password),
+    TemporaryKey(TemporaryKey),
     VaultPassword(String),
     VaultKey(PathBuf, String),
     StoredKey { id: u64, explicit: bool },
@@ -77,6 +83,7 @@ impl fmt::Debug for Authentication {
             Self::Password(_) => "Password([redacted])",
             Self::PrivateKey(_) => "PrivateKey([redacted])",
             Self::KeyWithPassphrase(..) => "KeyWithPassphrase([redacted])",
+            Self::TemporaryKey(_) => "TemporaryKey([redacted])",
             Self::VaultPassword(_) | Self::VaultKey(..) => "Vault reference",
             Self::StoredKey { .. } | Self::ResolvedKey(..) => "Registered SSH key",
         })
@@ -118,6 +125,7 @@ pub enum Method {
     PrivateKey,
     StoredKey,
     VaultPassword,
+    TemporaryKey,
     KeyboardInteractive,
 }
 
@@ -128,6 +136,7 @@ impl fmt::Display for Method {
             Self::PrivateKey => "SSH private key",
             Self::StoredKey => "Registered SSH key",
             Self::VaultPassword => "Vault password",
+            Self::TemporaryKey => "Temporary SSH key",
             Self::KeyboardInteractive => "Keyboard-interactive",
         })
     }
@@ -145,6 +154,7 @@ pub enum LoginMessage {
     KeyFile(String),
     StoredKey(KeyChoice),
     VaultPassword(String),
+    TemporaryLifetime(String),
 }
 
 impl fmt::Debug for LoginMessage {
@@ -161,6 +171,7 @@ impl fmt::Debug for LoginMessage {
             Self::KeyFile(_) => "KeyFile([redacted])",
             Self::StoredKey(_) => "StoredKey",
             Self::VaultPassword(_) => "VaultPassword([redacted])",
+            Self::TemporaryLifetime(_) => "TemporaryLifetime",
         })
     }
 }
@@ -204,6 +215,7 @@ pub enum Message {
     Logging(crate::terminal_logging::Edit),
     Connect,
     OpenVault,
+    PasteTemporaryKey,
     Cancel,
 }
 
@@ -226,6 +238,27 @@ pub enum StartupField {
 pub(crate) struct StartupFields {
     seconds: String,
     attempts: String,
+    keepalive: KeepAliveMode,
+    keepalive_seconds: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KeepAliveMode(Option<bool>);
+
+impl fmt::Display for KeepAliveMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self.0 {
+            None => "Use the global setting",
+            Some(true) => "Enabled",
+            Some(false) => "Disabled",
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub enum KeepAliveEdit {
+    Mode(KeepAliveMode),
+    Interval(String),
 }
 
 impl StartupFields {
@@ -233,6 +266,12 @@ impl StartupFields {
         Self {
             seconds: options.seconds().to_string(),
             attempts: options.attempts().to_string(),
+            keepalive: KeepAliveMode(options.keepalive().map(KeepAlive::enabled)),
+            keepalive_seconds: options
+                .keepalive()
+                .unwrap_or_default()
+                .seconds()
+                .to_string(),
         }
     }
 
@@ -252,7 +291,61 @@ impl StartupFields {
             .attempts
             .parse()
             .map_err(|_| ValidationError::Startup)?;
-        ConnectOptions::new(seconds, attempts).map_err(|_| ValidationError::Startup)
+        let keepalive = self
+            .keepalive
+            .0
+            .map(|enabled| {
+                let seconds = self
+                    .keepalive_seconds
+                    .parse()
+                    .map_err(|_| ValidationError::KeepAlive)?;
+                KeepAlive::new(enabled, seconds).map_err(|_| ValidationError::KeepAlive)
+            })
+            .transpose()?;
+        ConnectOptions::new(seconds, attempts)
+            .map(|options| options.with_keepalive(keepalive))
+            .map_err(|_| ValidationError::Startup)
+    }
+
+    pub(crate) fn update_keepalive(&mut self, edit: KeepAliveEdit) {
+        match edit {
+            KeepAliveEdit::Mode(mode) => self.keepalive = mode,
+            KeepAliveEdit::Interval(value)
+                if value.len() <= 3 && value.bytes().all(|byte| byte.is_ascii_digit()) =>
+            {
+                self.keepalive_seconds = value;
+            }
+            KeepAliveEdit::Interval(_) => {}
+        }
+    }
+
+    pub(crate) fn keepalive_view(&self, label_width: f32) -> Element<'_, KeepAliveEdit> {
+        let modes = [
+            KeepAliveMode(None),
+            KeepAliveMode(Some(true)),
+            KeepAliveMode(Some(false)),
+        ];
+        column![
+            labeled(
+                label_width,
+                "SSH keepalive",
+                pick_list(modes, Some(self.keepalive), KeepAliveEdit::Mode)
+            ),
+            self.keepalive.0.is_some().then(|| labeled(
+                label_width,
+                "Keepalive interval",
+                row![
+                    text_input("5–600", &self.keepalive_seconds)
+                        .width(72)
+                        .on_input(KeepAliveEdit::Interval),
+                    text("seconds").size(13),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )),
+        ]
+        .spacing(6)
+        .into()
     }
 
     pub(crate) fn view(&self, label_width: f32) -> Element<'_, (StartupField, String)> {
@@ -307,6 +400,7 @@ struct LoginForm {
     stored_key: Option<u64>,
     explicit_key: bool,
     explicit_vault: bool,
+    temporary_key: Option<temporary_key::Form>,
 }
 
 impl SshDialog {
@@ -370,6 +464,53 @@ impl SshDialog {
         self
     }
 
+    pub(crate) fn enable_teamwork_temporary_key(&mut self, selected: bool) {
+        self.target
+            .temporary_key
+            .get_or_insert_with(Default::default);
+        if selected {
+            self.target.method = Method::TemporaryKey;
+        }
+    }
+
+    pub(crate) fn temporary_key_selected(&self) -> bool {
+        self.target.method == Method::TemporaryKey
+    }
+
+    pub(crate) fn begin_temporary_key_paste(&mut self, request: u64) -> bool {
+        if self.temporary_key_selected()
+            && let Some(form) = &mut self.target.temporary_key
+        {
+            form.begin_paste(request);
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn finish_temporary_key_paste(&mut self, request: u64, value: Password) {
+        if self.temporary_key_selected()
+            && let Some(form) = &mut self.target.temporary_key
+        {
+            form.finish_paste(request, value);
+        }
+    }
+
+    pub(crate) fn expects_temporary_key_paste(&self, request: u64) -> bool {
+        self.temporary_key_selected()
+            && self
+                .target
+                .temporary_key
+                .as_ref()
+                .is_some_and(|form| form.expects_paste(request))
+    }
+
+    pub(crate) fn restore_temporary_key(&mut self, key: TemporaryKey) {
+        if let Some(form) = &mut self.target.temporary_key {
+            self.target.method = Method::TemporaryKey;
+            form.restore(key);
+        }
+    }
+
     pub(crate) fn with_startup(mut self, options: ConnectOptions) -> Self {
         self.set_startup(options);
         self
@@ -398,6 +539,12 @@ impl SshDialog {
     ) -> Self {
         self.minimum_isolation = minimum;
         self.isolation = self.isolation.max(requested).max(minimum);
+        self
+    }
+
+    pub(crate) fn with_launch_isolation(mut self, isolation: IsolationLevel) -> Self {
+        self.isolation = isolation;
+        self.minimum_isolation = isolation;
         self
     }
 
@@ -436,8 +583,11 @@ impl SshDialog {
                     jump.clear_password();
                 }
             }
-            Message::Connect | Message::OpenVault | Message::Isolation(_) | Message::UseJump(_) => {
-            }
+            Message::Connect
+            | Message::OpenVault
+            | Message::PasteTemporaryKey
+            | Message::Isolation(_)
+            | Message::UseJump(_) => {}
         }
     }
 
@@ -477,6 +627,17 @@ impl SshDialog {
         self.target.endpoint().ok()
     }
 
+    pub(crate) fn server_addresses(&self) -> Option<(ServerAddress, Option<ServerAddress>)> {
+        let target = self.target.address().ok()?;
+        let jump = self
+            .jump
+            .as_ref()
+            .map(LoginForm::address)
+            .transpose()
+            .ok()?;
+        Some((target, jump))
+    }
+
     pub fn vault_password(&self) -> Option<&str> {
         self.target.stored_password.as_deref()
     }
@@ -514,6 +675,8 @@ impl SshDialog {
             command_timestamps: None,
             tab_color: None,
             paste_warning: None,
+            window_geometry: None,
+            terminal: Default::default(),
         };
         draft.validate()?;
         Ok(draft)
@@ -685,6 +848,7 @@ impl LoginForm {
             stored_key: None,
             explicit_key: false,
             explicit_vault: false,
+            temporary_key: None,
         }
     }
 
@@ -764,7 +928,9 @@ impl LoginForm {
                 self.username = bounded(value, MAX_USERNAME_BYTES + 4);
             }
             LoginMessage::Authentication(method) => {
-                if method == Method::VaultPassword && self.stored_password.is_none() {
+                if (method == Method::VaultPassword && self.stored_password.is_none())
+                    || (method == Method::TemporaryKey && self.temporary_key.is_none())
+                {
                     return;
                 }
                 self.method = method;
@@ -802,6 +968,11 @@ impl LoginForm {
                     passphrase
                 };
             }
+            LoginMessage::TemporaryLifetime(minutes) if self.method == Method::TemporaryKey => {
+                if let Some(form) = &mut self.temporary_key {
+                    form.set_minutes(minutes);
+                }
+            }
             _ => {}
         }
     }
@@ -817,6 +988,12 @@ impl LoginForm {
                 id: self.stored_key.unwrap_or_default(),
                 explicit: self.explicit_key,
             },
+            Method::TemporaryKey => Authentication::TemporaryKey(
+                self.temporary_key
+                    .as_mut()
+                    .and_then(temporary_key::Form::take)
+                    .expect("temporary key was validated"),
+            ),
             Method::PrivateKey => {
                 let path = PathBuf::from(&self.key_file);
                 if !self.passphrase.0.is_empty() {
@@ -953,6 +1130,32 @@ impl LoginForm {
                 "Password",
                 text("Uses the selected credential from the unlocked vault.").size(13),
             ),
+            Method::TemporaryKey => {
+                let form = self
+                    .temporary_key
+                    .as_ref()
+                    .expect("enabled temporary key form");
+                labeled(
+                    label_width,
+                    "Temporary key",
+                    column![
+                        row![
+                            text_input("1–1440", &form.minutes)
+                                .id(self.credential_field.clone())
+                                .width(72)
+                                .on_input(move |value| wrap(LoginMessage::TemporaryLifetime(
+                                    value
+                                ))),
+                            text("minutes").size(13),
+                            button("Paste private key").on_press(Message::PasteTemporaryKey),
+                        ]
+                        .spacing(8)
+                        .align_y(Alignment::Center),
+                        text(form.status()).size(13),
+                    ]
+                    .spacing(4),
+                )
+            }
             Method::KeyboardInteractive => {
                 text("The server will request responses after its host key is verified.")
                     .size(13)
@@ -967,6 +1170,9 @@ impl LoginForm {
         ];
         if self.stored_password.is_some() {
             methods.push(Method::VaultPassword);
+        }
+        if self.temporary_key.is_some() {
+            methods.push(Method::TemporaryKey);
         }
         let mut form = column![
             labeled(
@@ -994,6 +1200,9 @@ impl LoginForm {
         self.password_too_long = false;
         self.passphrase = Password::default();
         self.passphrase_too_long = false;
+        if let Some(form) = &mut self.temporary_key {
+            form.clear();
+        }
     }
 
     fn clear_references(&mut self) {
@@ -1019,7 +1228,7 @@ impl LoginForm {
             || (self.method == Method::PrivateKey && self.stored_passphrase.is_some())
     }
 
-    fn endpoint(&self) -> Result<LoginTarget, ValidationError> {
+    fn address(&self) -> Result<ServerAddress, ValidationError> {
         let host = normalize_host(&self.host)?;
         let port = self.port.trim();
         let port = port
@@ -1029,6 +1238,11 @@ impl LoginForm {
             .flatten()
             .filter(|&port| port != 0)
             .ok_or(ValidationError::Port)?;
+        Ok((host, port))
+    }
+
+    fn endpoint(&self) -> Result<LoginTarget, ValidationError> {
+        let (host, port) = self.address()?;
         let username = self.username.trim();
         if !valid_username(username) {
             return Err(ValidationError::Username);
@@ -1058,6 +1272,15 @@ impl LoginForm {
             Method::StoredKey if self.stored_key.is_none_or(|id| id == 0) => {
                 return Err(ValidationError::RegisteredKey);
             }
+            Method::TemporaryKey
+                if self
+                    .temporary_key
+                    .as_ref()
+                    .and_then(temporary_key::Form::key)
+                    .is_none() =>
+            {
+                return Err(ValidationError::TemporaryKey);
+            }
             Method::PrivateKey
                 if self.key_file.len() > MAX_KEY_PATH_BYTES
                     || unsafe_text(&self.key_file)
@@ -1083,6 +1306,11 @@ impl LoginForm {
                 passphrase: self.stored_passphrase.clone(),
             },
             Method::StoredKey => Auth::StoredKey(self.stored_key.unwrap_or_default()),
+            Method::TemporaryKey => {
+                return Err(std::io::Error::other(
+                    "A temporary SSH key cannot be saved.",
+                ));
+            }
         };
         Ok(SavedLogin {
             endpoint,
@@ -1101,6 +1329,15 @@ pub struct LoginTarget {
 }
 
 impl LoginTarget {
+    pub(crate) fn servers<'a>(
+        &'a self,
+        jump: Option<&'a Self>,
+    ) -> impl Iterator<Item = (&'a str, u16)> {
+        jump.into_iter()
+            .chain(std::iter::once(self))
+            .map(|login| (login.host.as_str(), login.port))
+    }
+
     pub fn validate(&self) -> Result<(), ValidationError> {
         self.validate_saved()?;
         if self.username.is_empty() {
@@ -1141,7 +1378,9 @@ pub enum ValidationError {
     PasswordTooLong,
     PrivateKey,
     RegisteredKey,
+    TemporaryKey,
     Startup,
+    KeepAlive,
     Logging,
 }
 
@@ -1154,12 +1393,14 @@ impl ValidationError {
             Self::Password => "Enter an SSH password.",
             Self::PasswordTooLong => "The password exceeds 4096 bytes.",
             Self::PrivateKey => {
-                "Enter the absolute path to an Ed25519 or ECDSA key in OpenSSH or supported unencrypted PEM format."
+                "Enter the absolute path to an Ed25519, NIST ECDSA, or RSA key in OpenSSH or supported PEM format."
             }
             Self::RegisteredKey => "Select a registered SSH key.",
+            Self::TemporaryKey => "Paste a temporary SSH private key before connecting.",
             Self::Startup => {
                 "Enter a timeout from 1 to 300 seconds and 0 to 20 connection attempts."
             }
+            Self::KeepAlive => "Enter an SSH keepalive interval from 5 to 600 seconds.",
             Self::Logging => "Check the Terminal Logging folder, size and retention values.",
         }
     }
@@ -1210,7 +1451,7 @@ fn valid_dns_label(label: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'-')
 }
 
-fn valid_username(value: &str) -> bool {
+pub(crate) fn valid_username(value: &str) -> bool {
     !value.is_empty() && value.len() <= MAX_USERNAME_BYTES && !unsafe_text(value)
 }
 
@@ -1242,6 +1483,22 @@ fn labeled<'a, M: 'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_ssh_keepalive_edit_validates_and_can_return_to_inheritance() {
+        let mut fields = StartupFields::new(ConnectOptions::default());
+        assert_eq!(fields.options().unwrap().keepalive(), None);
+        fields.update_keepalive(KeepAliveEdit::Mode(KeepAliveMode(Some(false))));
+        fields.update_keepalive(KeepAliveEdit::Interval("120".into()));
+        assert_eq!(
+            fields.options().unwrap().keepalive(),
+            Some(KeepAlive::new(false, 120).unwrap())
+        );
+        fields.update_keepalive(KeepAliveEdit::Interval("601".into()));
+        assert_eq!(fields.options().unwrap_err(), ValidationError::KeepAlive);
+        fields.update_keepalive(KeepAliveEdit::Mode(KeepAliveMode(None)));
+        assert_eq!(fields.options().unwrap().keepalive(), None);
+    }
 
     fn password(value: &str) -> Message {
         Message::Target(LoginMessage::Password(Password::new(value.to_owned())))
@@ -1470,6 +1727,8 @@ mod tests {
             command_timestamps: None,
             tab_color: None,
             paste_warning: None,
+            window_geometry: None,
+            terminal: Default::default(),
         };
         let mut dialog = SshDialog::from_saved(TerminalProfile::Xterm, &saved);
         assert!(matches!(dialog.take_request().unwrap().target.auth,

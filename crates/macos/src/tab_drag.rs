@@ -91,6 +91,21 @@ pub fn tab_window_number(window: WindowHandle<'_>) -> Option<isize> {
     (number > 0).then_some(number)
 }
 
+/// Reads the current AppKit pointer in window-relative logical coordinates.
+pub fn file_drop_position(window: WindowHandle<'_>) -> Option<(f64, f64)> {
+    let RawWindowHandle::AppKit(handle) = window.as_raw() else {
+        return None;
+    };
+    MainThreadMarker::new()?;
+    // SAFETY: The borrowed handle supplies a live view on the AppKit main thread.
+    let view = unsafe { handle.ns_view.cast::<NSView>().as_ref() };
+    let window = view.window()?;
+    // SAFETY: AppKit reads the current pointer without consuming an event.
+    let point = unsafe { window.mouseLocationOutsideOfEventStream() };
+    let hit = client_point(&window, 0, point)?;
+    Some((hit.x, hit.y))
+}
+
 /// Observes primary-button events dispatched to this app while a main window is registered.
 pub fn track_tab_window(number: isize) -> bool {
     if MainThreadMarker::new().is_none() {

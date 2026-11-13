@@ -6,7 +6,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path};
 
 use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, mkdirat, open, openat, renameat,
+    AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, fstat, mkdirat, open, openat, renameat,
     renameat_with, statat, unlinkat,
 };
 
@@ -28,6 +28,10 @@ pub(crate) struct Directory(File);
 impl Directory {
     pub(crate) fn file(&self) -> &File {
         &self.0
+    }
+
+    pub(crate) fn metadata(&self) -> io::Result<std::fs::Metadata> {
+        self.0.metadata()
     }
 
     pub(crate) fn open_path(path: &Path) -> io::Result<Self> {
@@ -73,21 +77,61 @@ impl Directory {
 
     pub(crate) fn create_child(&self, name: &OsStr) -> io::Result<Self> {
         mkdirat(&self.0, name, Mode::RUSR | Mode::WUSR | Mode::XUSR)?;
+        let child = self.open_child(name)?;
+        #[cfg(target_os = "macos")]
+        if let Err(error) = kortty_files::clear_extended_acl(child.file()) {
+            self.require_child(name, &child)?;
+            unlinkat(&self.0, name, AtFlags::REMOVEDIR)?;
+            return Err(error);
+        }
+        Ok(child)
+    }
+
+    /// Creates a destination folder with ordinary umask and default ACL inheritance.
+    pub(crate) fn create_transfer_child(&self, name: &OsStr) -> io::Result<Self> {
+        mkdirat(&self.0, name, Mode::from_raw_mode(0o777))?;
         self.open_child(name)
     }
 
+    /// The caller keeps the payload behind a private ancestor until publication.
+    pub(crate) fn create_tree_payload(&self, name: &OsStr) -> io::Result<Self> {
+        self.create_transfer_child(name)
+    }
+
     pub(crate) fn create_file(&self, name: &OsStr) -> io::Result<File> {
-        let flags =
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        self.create_file_with_access(name, OFlags::WRONLY)
+    }
+
+    /// Creates ordinary output only beneath the caller's private tree barrier.
+    pub(crate) fn create_ordinary_file(&self, name: &OsStr) -> io::Result<File> {
         Ok(File::from(openat(
             &self.0,
             name,
-            flags,
-            Mode::RUSR | Mode::WUSR,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::from_raw_mode(0o666),
         )?))
     }
 
-    pub(in crate::sftp_window::tree) fn names(&self, limit: usize) -> io::Result<Vec<OsString>> {
+    pub(in crate::sftp_window::tree) fn create_read_write_file(
+        &self,
+        name: &OsStr,
+    ) -> io::Result<File> {
+        self.create_file_with_access(name, OFlags::RDWR)
+    }
+
+    fn create_file_with_access(&self, name: &OsStr, access: OFlags) -> io::Result<File> {
+        let flags = access | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let file = File::from(openat(&self.0, name, flags, Mode::RUSR | Mode::WUSR)?);
+        #[cfg(target_os = "macos")]
+        if let Err(error) = kortty_files::clear_extended_acl(&file) {
+            self.require_file(name, &file)?;
+            unlinkat(&self.0, name, AtFlags::empty())?;
+            return Err(error);
+        }
+        Ok(file)
+    }
+
+    pub(crate) fn names(&self, limit: usize) -> io::Result<Vec<OsString>> {
         let mut names = Vec::new();
         for entry in Dir::read_from(&self.0)? {
             let entry = entry?;
@@ -166,12 +210,11 @@ impl Directory {
     }
 
     fn require_file(&self, name: &OsStr, expected: &File) -> io::Result<()> {
-        let Entry::File(actual) = self.entry(name)? else {
-            return Err(io::Error::other("The local staging file changed"));
-        };
-        let actual = actual.metadata()?;
-        let expected = expected.metadata()?;
-        if (actual.dev(), actual.ino()) == (expected.dev(), expected.ino()) {
+        let actual = statat(&self.0, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let expected = fstat(expected)?;
+        if FileType::from_raw_mode(actual.st_mode) == FileType::RegularFile
+            && (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)
+        {
             Ok(())
         } else {
             Err(io::Error::other("The local staging file changed"))
@@ -198,5 +241,50 @@ impl Directory {
         }
         self.require_child(name, &stage)?;
         Ok(unlinkat(&self.0, name, AtFlags::REMOVEDIR)?)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::os::unix::fs::symlink;
+
+    use super::*;
+
+    #[test]
+    fn transfer_folder_uses_ordinary_creation_and_refuses_existing_names() {
+        let fixture = crate::snippets::tests::Profile::new();
+        let root = fixture.0.canonicalize().unwrap();
+        let parent = Directory::open_path(&root).unwrap();
+        let reference = root.join("ordinary");
+        fs::create_dir(&reference).unwrap();
+        let child = parent
+            .create_transfer_child(OsStr::new("transfer"))
+            .unwrap();
+        assert_eq!(
+            child.file().metadata().unwrap().mode() & 0o7777,
+            fs::metadata(&reference).unwrap().mode() & 0o7777
+        );
+        let Entry::Directory(listed) = parent.entry(OsStr::new("transfer")).unwrap() else {
+            panic!("expected the created transfer directory");
+        };
+        assert!(child.same_as(&listed).unwrap());
+        assert!(
+            parent
+                .create_transfer_child(OsStr::new("transfer"))
+                .is_err()
+        );
+        fs::write(root.join("file"), b"existing contents").unwrap();
+        assert!(parent.create_transfer_child(OsStr::new("file")).is_err());
+        assert_eq!(fs::read(root.join("file")).unwrap(), b"existing contents");
+        symlink(&reference, root.join("link")).unwrap();
+        assert!(parent.create_transfer_child(OsStr::new("link")).is_err());
+        assert!(
+            fs::symlink_metadata(root.join("link"))
+                .unwrap()
+                .is_symlink()
+        );
+        let private = parent.create_child(OsStr::new("private")).unwrap();
+        assert_eq!(private.file().metadata().unwrap().mode() & 0o077, 0);
     }
 }

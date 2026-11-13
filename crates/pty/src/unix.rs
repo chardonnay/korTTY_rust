@@ -10,13 +10,18 @@ use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::shell_integration::unix::{Startup, default_snippet};
-use crate::{LaunchOptions, Size, closed};
+use crate::{JobProcessIdentity, LaunchOptions, Size, closed};
 
+#[path = "unix/job_processes.rs"]
+mod job_processes;
+#[cfg(target_os = "macos")]
+#[path = "unix/macos_sandbox.rs"]
+mod macos_sandbox;
 #[path = "unix/shell_directory.rs"]
 mod shell_directory;
 
@@ -36,7 +41,7 @@ type SharedFile = Arc<Mutex<Option<File>>>;
 pub(crate) struct Control {
     child: Child,
     executable: Option<shell_directory::Executable>,
-    master: Option<File>,
+    master: Option<Arc<File>>,
     wake: Option<UnixStream>,
     output: SharedFile,
     input: SharedFile,
@@ -48,17 +53,76 @@ pub(crate) struct Control {
         target_endian = "little",
     ))]
     sandbox_directory: Option<linux_sandbox::SessionDirectory>,
+    #[cfg(target_os = "macos")]
+    sandbox_directory: Option<Box<macos_sandbox::SessionDirectory>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct JobProcessProbe {
+    master: Weak<File>,
+    shell: u32,
+}
+
+impl JobProcessProbe {
+    pub(crate) fn find<T>(
+        &self,
+        previous: Option<JobProcessIdentity>,
+        inspect: impl Fn(&str, &[&str]) -> Option<T>,
+    ) -> Option<(JobProcessIdentity, T)> {
+        let master = self.master.upgrade()?;
+        let running = || matches!(child_pid_running(self.shell), Ok(true));
+        if !running() {
+            return None;
+        }
+        let found = job_processes::find(&master, self.shell, previous, inspect)?;
+        running().then_some(found)
+    }
 }
 
 impl Control {
+    pub(crate) fn sandbox_backend(&self) -> Option<&'static str> {
+        #[cfg(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64"),
+            target_pointer_width = "64",
+            target_endian = "little",
+        ))]
+        {
+            self.sandbox_directory.as_ref().map(|_| "landlock")
+        }
+        #[cfg(target_os = "macos")]
+        {
+            self.sandbox_directory
+                .as_deref()
+                .map(macos_sandbox::SessionDirectory::backend)
+        }
+        #[cfg(not(any(
+            target_os = "macos",
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64"),
+                target_pointer_width = "64",
+                target_endian = "little",
+            ),
+        )))]
+        None
+    }
+
     pub(crate) fn shell_pid(&self) -> u32 {
         self.child.id()
     }
 
-    pub(crate) fn shell_directory(&mut self) -> io::Result<PathBuf> {
+    pub(crate) fn job_process_probe(&self) -> Option<JobProcessProbe> {
+        Some(JobProcessProbe {
+            master: Arc::downgrade(self.master.as_ref()?),
+            shell: self.child.id(),
+        })
+    }
+
+    pub(crate) fn shell_directory(&self) -> io::Result<PathBuf> {
         let executable = self.executable.ok_or_else(shell_directory::unverified)?;
         let master = self.master.as_ref().ok_or_else(closed)?;
-        shell_directory::resolve(&mut self.child, master, executable)
+        shell_directory::resolve(&self.child, master, executable)
     }
 
     pub(crate) fn spawn(
@@ -84,29 +148,63 @@ impl Control {
             }
             None => (None, None),
         };
+        #[cfg(target_os = "macos")]
+        let (restrictions, sandbox_directory) = match &options.sandbox {
+            Some(sandbox) => {
+                let workspace = options.working_directory.as_deref().ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "sandbox workspace required")
+                })?;
+                let (restrictions, directory) =
+                    macos_sandbox::prepare(workspace, &sandbox.profile_root)?;
+                (Some(Arc::new(restrictions)), Some(directory))
+            }
+            None => (None, None),
+        };
         let master = open_master()?;
         let master_fd = master.as_raw_fd();
         // SAFETY: the master remains open throughout both POSIX PTY calls.
         os_result(unsafe { libc::grantpt(master_fd) })?;
         // SAFETY: the granted master remains open while unlocking its slave.
         os_result(unsafe { libc::unlockpt(master_fd) })?;
+        let slave_name = slave_path(master_fd)?;
         let slave = OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_NOCTTY)
-            .open(slave_path(master_fd)?)?;
+            .open(&slave_name)?;
         set_size(master_fd, size, 0, 0)?;
 
         let (wake, signal) = UnixStream::pair()?;
         let read_signal = signal.try_clone()?;
         let output = Arc::new(Mutex::new(Some(master.try_clone()?)));
         let input = Arc::new(Mutex::new(Some(master.try_clone()?)));
-        let mut command = Command::new(default_shell());
-        let executable = shell_directory::Executable::read(Path::new(command.get_program())).ok();
+        let (program, arguments) = match &options.command {
+            Some(words) => (OsString::from(&words[0]), &words[1..]),
+            None => (default_shell(), &[][..]),
+        };
+        let executable = shell_directory::Executable::read(Path::new(&program)).ok();
+        #[cfg(target_os = "macos")]
+        let (mut command, attestation) = match restrictions.as_ref().zip(sandbox_directory.as_ref())
+        {
+            Some((restrictions, directory)) => {
+                let (command, ready) =
+                    restrictions.command(directory, &program, Path::new(&slave_name))?;
+                (command, Some(ready))
+            }
+            None => (Command::new(program), None),
+        };
+        #[cfg(not(target_os = "macos"))]
+        let mut command = Command::new(program);
         let startup = if options.shell_integration && options.sandbox.is_none() {
-            default_snippet(command.get_program())
-                .and_then(|snippet| Startup::prepare(&mut command, snippet).ok())
+            let snippet = default_snippet(command.get_program()).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    "the selected local shell does not support automatic integration",
+                )
+            })?;
+            Some(Startup::prepare(&mut command, snippet, arguments)?)
         } else {
+            command.args(arguments);
             None
         };
         if options.sandbox.is_none()
@@ -117,8 +215,13 @@ impl Control {
         command
             .env("TERM", term)
             .stdin(Stdio::from(slave.try_clone()?))
-            .stdout(Stdio::from(slave.try_clone()?))
-            .stderr(Stdio::from(slave));
+            .stdout(Stdio::from(slave.try_clone()?));
+        #[cfg(target_os = "macos")]
+        if attestation.is_none() {
+            command.stderr(Stdio::from(slave));
+        }
+        #[cfg(not(target_os = "macos"))]
+        command.stderr(Stdio::from(slave));
         #[cfg(all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64"),
@@ -136,6 +239,8 @@ impl Control {
                 .env("HISTFILE", directory.path().join("history"))
                 .env("KORTTY_SANDBOX", "landlock");
         }
+        #[cfg(target_os = "macos")]
+        let child_restrictions = restrictions.clone();
         // SAFETY: the closure runs after fork and uses only async-signal-safe
         // system calls. std sets up the slave on fd 0 before running it.
         unsafe {
@@ -155,11 +260,28 @@ impl Control {
                 if let Some(restrictions) = &restrictions {
                     restrictions.apply()?;
                 }
+                #[cfg(target_os = "macos")]
+                if let Some(restrictions) = &child_restrictions {
+                    restrictions.apply()?;
+                }
                 Ok(())
             });
         }
         let child = command.spawn()?;
         drop(command);
+        #[cfg(target_os = "macos")]
+        let child = {
+            let mut child = child;
+            if let Some((restrictions, ready)) = restrictions.as_ref().zip(attestation)
+                && let Err(error) = restrictions.attest(ready)
+            {
+                let _ = signal_group(-(child.id() as libc::pid_t), libc::SIGKILL);
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+            child
+        };
 
         let reader = PtyReader {
             file: Arc::clone(&output),
@@ -173,7 +295,7 @@ impl Control {
             Self {
                 child,
                 executable,
-                master: Some(master),
+                master: Some(Arc::new(master)),
                 wake: Some(wake),
                 output,
                 input,
@@ -185,6 +307,8 @@ impl Control {
                     target_endian = "little",
                 ))]
                 sandbox_directory,
+                #[cfg(target_os = "macos")]
+                sandbox_directory: sandbox_directory.map(Box::new),
             },
             reader,
             writer,
@@ -230,6 +354,8 @@ impl Control {
             target_pointer_width = "64",
             target_endian = "little",
         ))]
+        self.sandbox_directory.take();
+        #[cfg(target_os = "macos")]
         self.sandbox_directory.take();
         Ok(())
     }
@@ -433,9 +559,82 @@ fn os_result(status: libc::c_int) -> io::Result<()> {
     }
 }
 
+fn child_running(child: &Child) -> io::Result<bool> {
+    child_pid_running(child.id())
+}
+
+fn child_pid_running(pid: u32) -> io::Result<bool> {
+    loop {
+        let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+        // SAFETY: the child is owned by the caller and info is writable. WNOWAIT
+        // preserves the child's status and PID until the owner explicitly reaps it.
+        let status = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                pid,
+                info.as_mut_ptr(),
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        match os_result(status) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+            Ok(()) => {
+                // SAFETY: the record is zero-initialized and waitid fills it on exit.
+                return Ok(unsafe { info.assume_init() }.si_signo == 0);
+            }
+        }
+    }
+}
+
+/// Sets limits in the disposable PDF parser before it accepts any document bytes.
+pub fn limit_pdf_worker() -> io::Result<()> {
+    let limits: [(_, libc::rlim_t); 3] = [
+        (libc::RLIMIT_AS, 1024 * 1024 * 1024),
+        (libc::RLIMIT_CPU, 6),
+        (libc::RLIMIT_CORE, 0),
+    ];
+    for (resource, cap) in limits {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: The getter fills the live structure with the current worker's limits.
+        if unsafe { libc::getrlimit(resource, &mut limit) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        limit.rlim_max = limit.rlim_max.min(cap);
+        limit.rlim_cur = limit.rlim_cur.min(limit.rlim_max);
+        // SAFETY: The setter reads the valid structure and only reduces this process's limits.
+        if unsafe { libc::setrlimit(resource, &limit) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn observing_an_exited_pty_shell_leaves_it_waitable() {
+        let mut pty = crate::Pty::spawn(80, 24).expect("start a real shell");
+        let mut reader = pty.take_reader().unwrap();
+        let drain = thread::spawn(move || io::copy(&mut reader, &mut io::sink()));
+        pty.take_writer().unwrap().write_all(b"exit 47\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while child_running(&pty.control.child).unwrap() {
+            assert!(Instant::now() < deadline, "the shell did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!pty.any_job_process(|_, _| true));
+        assert!(pty.shell_directory().is_err());
+        assert!(!child_running(&pty.control.child).expect("shell is still waitable"));
+        assert_eq!(pty.try_wait().unwrap().unwrap().code(), Some(47));
+        pty.shutdown().unwrap();
+        drain.join().unwrap().unwrap();
+    }
 
     #[cfg(target_os = "macos")]
     #[test]

@@ -74,12 +74,8 @@ impl ReviewedSelection {
         self.previous.is_some()
     }
 
-    /// Publishes UTF-8 bytes, returning a warning when the file was saved but
+    /// Publishes bytes, returning a warning when the file was saved but
     /// cleanup or directory synchronization failed.
-    pub(in crate::workspace) fn publish(&self, text: &str) -> io::Result<Option<String>> {
-        self.publish_bytes(text.as_bytes())
-    }
-
     pub(in crate::workspace) fn publish_bytes(&self, bytes: &[u8]) -> io::Result<Option<String>> {
         let parent = self.selection.open_parent()?;
         let require_current = || self.selection.require_current(&parent);
@@ -142,7 +138,7 @@ mod tests {
         assert!(!empty.exists());
         fs::write(selection.path(), "Created after review")?;
         assert_eq!(
-            empty.publish("New inventory").unwrap_err().kind(),
+            empty.publish_bytes(b"New inventory").unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
         assert_eq!(
@@ -153,14 +149,14 @@ mod tests {
         let stale = selection.clone().review()?;
         assert!(stale.exists());
         fs::write(selection.path(), "Edited while the confirmation was shown")?;
-        assert!(stale.publish("New inventory").is_err());
+        assert!(stale.publish_bytes(b"New inventory").is_err());
         assert_eq!(
             fs::read_to_string(selection.path())?,
             "Edited while the confirmation was shown"
         );
 
         let confirmed = selection.review()?;
-        confirmed.publish("New inventory")?;
+        confirmed.publish_bytes(b"New inventory")?;
         assert_eq!(fs::read_to_string(confirmed.path())?, "New inventory");
         Ok(())
     }
@@ -177,7 +173,7 @@ mod tests {
         fs::rename(&selected_folder, &moved_folder)?;
         fs::create_dir(&selected_folder)?;
         assert!(selection.review().is_err());
-        assert!(reviewed.publish("New inventory").is_err());
+        assert!(reviewed.publish_bytes(b"New inventory").is_err());
         assert!(!selected_folder.join(&filename).exists());
         assert!(!moved_folder.join(&filename).exists());
         Ok(())

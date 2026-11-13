@@ -370,12 +370,21 @@ impl Workspace {
         let Some(dialog) = self.journal_screenshot_editors.dialogs.get(&id) else {
             return Task::none();
         };
-        if dialog.prompt.is_some() || !matches!(dialog.phase, Phase::Editing(_)) {
+        let Phase::Editing(form) = &dialog.phase else {
+            return Task::none();
+        };
+        if dialog.prompt.is_some() {
             return Task::none();
         }
         let owner = dialog.owner;
         let capture = self.journal_screenshot_edit_capture(&dialog.target);
-        let setup = self.journal_note_translation_setup(&event, capture.as_ref(), MAX_FIELD_BYTES);
+        let draft = Arc::clone(form.draft());
+        let source = self.journal_note_entry_source(capture.as_ref(), move || {
+            draft.require_translation_source()
+        });
+        let setup = self
+            .journal_note_translation_setup(&event, capture.as_ref(), MAX_FIELD_BYTES)
+            .with_outbound_source(source);
         let Some(Dialog {
             phase: Phase::Editing(form),
             ..

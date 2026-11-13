@@ -51,8 +51,13 @@ fn saves_replace_live_listeners_after_review_and_preserve_manual_forwards() {
 
     let mut workspace = Workspace::default();
     let (window, _) = workspace.open_window(false);
-    workspace.connections_id = Some(window::Id::unique());
-    workspace.connections = Some(ConnectionWindow::open(path).unwrap());
+    workspace.connection_managers.insert(
+        window::Id::unique(),
+        crate::workspace::profile_tools::ConnectionManager::new(
+            window,
+            ConnectionWindow::open(path).unwrap(),
+        ),
+    );
     let session = store_connected(&mut workspace, connected, &ssh.login, id);
     bind_saved(&mut workspace, session, id, &store);
     workspace.add_tab(window, session);
@@ -246,7 +251,12 @@ fn closing_an_ssh_split_moves_approved_local_and_remote_forwards_to_its_live_pee
     // interactive Split command which now opens a real SSH login.
     let offline_target = workspace.sessions[&primary].ssh.as_ref().unwrap().clone();
     let offline = workspace
-        .store_disconnected_ssh(offline_target, TerminalProfile::Xterm, DEFAULT_FONT)
+        .store_disconnected_ssh(
+            offline_target,
+            TerminalProfile::Xterm,
+            DEFAULT_FONT,
+            Default::default(),
+        )
         .unwrap();
     workspace
         .active_tab_mut(window)
@@ -418,9 +428,11 @@ fn bind_saved(workspace: &mut Workspace, session: SessionId, id: u64, store: &St
 
 fn save(workspace: &mut Workspace, store: &mut Store, profile: &Connection) {
     let id = store.save(profile.clone()).unwrap();
-    let _ = workspace.update(WorkspaceMessage::Connections(ConnectionMessage::Completed(
-        Ok(Box::new(Persisted::saved(store.clone(), id))),
-    )));
+    let manager = *workspace.connection_managers.keys().next().unwrap();
+    let _ = workspace.update(WorkspaceMessage::Connections(
+        manager,
+        ConnectionMessage::Completed(Ok(Box::new(Persisted::saved(store.clone(), id)))),
+    ));
 }
 
 fn forwarding_of(workspace: &Workspace, session: SessionId) -> &Forwarding {
@@ -572,7 +584,7 @@ fn openssh_terminal_logging_finishes_archive_before_session_stop_completes() {
         true,
         None,
         Some(Box::new(prepared)),
-        false,
+        Default::default(),
     )
     .unwrap();
     wait_for(|| session.frame().status == Status::Running);
@@ -760,6 +772,8 @@ fn openssh_reopen_closed_ssh_verifies_the_pin_and_starts_a_fresh_saved_session()
             command_timestamps: None,
             tab_color: None,
             paste_warning: None,
+            window_geometry: None,
+            terminal: Default::default(),
         })
         .unwrap();
 

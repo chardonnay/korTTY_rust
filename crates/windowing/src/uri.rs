@@ -21,20 +21,40 @@ pub fn open_desktop_directory(path: &Path) -> bool {
     }
     #[cfg(target_os = "windows")]
     {
-        use std::os::windows::ffi::OsStrExt as _;
-
-        let path: Vec<_> = path.as_os_str().encode_wide().collect();
-        if path.contains(&0) {
-            return false;
-        }
-        let mut path = path;
-        path.push(0);
-        shell_open(&path, true)
+        open_path(path, true)
     }
     #[cfg(not(target_os = "windows"))]
     {
         url::Url::from_directory_path(path).is_ok_and(|uri| open(uri.as_str()))
     }
+}
+
+/// Opens a previously verified absolute document in its registered desktop application.
+/// Call on the AppKit main thread on macOS and on a background worker elsewhere.
+pub fn open_desktop_document(path: &Path) -> bool {
+    if !path.is_absolute() || path.file_name().is_none() {
+        return false;
+    }
+    #[cfg(target_os = "windows")]
+    {
+        open_path(path, false)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        url::Url::from_file_path(path).is_ok_and(|uri| open(uri.as_str()))
+    }
+}
+
+#[cfg(target_os = "windows")]
+fn open_path(path: &Path, directory: bool) -> bool {
+    use std::os::windows::ffi::OsStrExt as _;
+
+    let mut path: Vec<_> = path.as_os_str().encode_wide().collect();
+    if path.contains(&0) {
+        return false;
+    }
+    path.push(0);
+    shell_open(&path, directory)
 }
 
 #[cfg(target_os = "macos")]

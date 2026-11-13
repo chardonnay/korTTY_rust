@@ -212,9 +212,11 @@ impl Workspace {
         selected
             .iter()
             .any(|&index| catalog.journals[index].deletion_identity.is_some())
-            && selected
-                .iter()
-                .all(|&index| !self.journal_metadata_is_live(manager, &catalog.journals[index]))
+            && selected.iter().all(|&index| {
+                let journal = &catalog.journals[index];
+                !self.journal_metadata_is_live(manager, journal)
+                    && !self.journal_summary_pending(journal)
+            })
     }
 
     pub(super) fn update_journal_actions(
@@ -474,7 +476,10 @@ impl Workspace {
         self.refresh_journal_action_managers(&operation.root)
     }
 
-    pub(super) fn refresh_journal_action_managers(&mut self, root: &Path) -> Task<Desktop> {
+    pub(in crate::workspace) fn refresh_journal_action_managers(
+        &mut self,
+        root: &Path,
+    ) -> Task<Desktop> {
         let managers: Vec<_> = self
             .journals
             .iter()

@@ -2,7 +2,7 @@ use std::path::Path;
 
 use iced::widget::{button, column, container, row, rule, scrollable, space, text, text_input};
 use iced::{Alignment, Color, Element, Font, Length, Theme, window};
-use kortty_ssh::{ImportReport, TrustedHost};
+use kortty_ssh::{ImportConflict, ImportReport, TrustedHost};
 
 use crate::sftp_window::{Directory, EntryKind, EntryName, Location};
 
@@ -285,23 +285,6 @@ impl KnownHosts {
                     .size(13),
             );
         }
-        let changes = report.added.iter().map(|host| {
-            format!(
-                "{}  {}  {}",
-                host.endpoint,
-                host.key.algorithm(),
-                host.key.fingerprint(),
-            )
-        });
-        let conflicts = report.conflicts.iter().map(|conflict| {
-            format!(
-                "Conflict at {} · source line {}\n    Trusted {}\n    In file {}",
-                conflict.endpoint,
-                conflict.line,
-                conflict.trusted.fingerprint(),
-                conflict.offered.fingerprint(),
-            )
-        });
         let revoked = report.trusted_but_revoked.iter().map(|host| {
             format!(
                 "Still trusted and marked revoked in the file · {}  {}",
@@ -310,8 +293,16 @@ impl KnownHosts {
             )
         });
         let details = column(
-            changes
-                .chain(conflicts)
+            report
+                .added
+                .iter()
+                .map(review_key_label)
+                .chain(
+                    report
+                        .conflicts
+                        .iter()
+                        .map(|conflict| review_conflict_label(conflict, true)),
+                )
                 .chain(revoked)
                 .skip(self.page * PAGE_SIZE)
                 .take(PAGE_SIZE)
@@ -359,6 +350,32 @@ impl KnownHosts {
         .align_y(Alignment::Center)
         .into()
     }
+}
+
+pub(in crate::workspace) fn review_key_label(host: &TrustedHost) -> String {
+    format!(
+        "{}  {}  {}",
+        host.endpoint,
+        host.key.algorithm(),
+        host.key.fingerprint()
+    )
+}
+
+pub(in crate::workspace) fn review_conflict_label(
+    conflict: &ImportConflict,
+    show_line: bool,
+) -> String {
+    let origin = if show_line {
+        format!(" · source line {}", conflict.line)
+    } else {
+        String::new()
+    };
+    format!(
+        "Conflict at {}{origin}\n    Trusted {}\n    In file {}",
+        conflict.endpoint,
+        conflict.trusted.fingerprint(),
+        conflict.offered.fingerprint(),
+    )
 }
 
 fn table_row<'a>(

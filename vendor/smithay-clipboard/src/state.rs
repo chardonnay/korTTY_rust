@@ -40,6 +40,8 @@ use wayland_backend::client::ObjectId;
 use crate::mime::{ALLOWED_MIME_TYPES, MimeType, normalize_to_lf};
 
 mod drag;
+mod file_drag;
+mod file_drop;
 mod selection;
 
 use selection::{Focus, Payload, Selection, Transfer};
@@ -69,6 +71,8 @@ pub struct State {
     pending_drag: Option<crate::drag::Request>,
     active_drag: Option<drag::ActiveDrag>,
     drag_activation: Option<drag::Activation>,
+    file_drag: file_drag::StateData,
+    file_drops: file_drop::StateData,
 }
 
 impl State {
@@ -116,6 +120,8 @@ impl State {
             pending_drag: None,
             active_drag: None,
             drag_activation: drag::Activation::bind(globals, queue_handle),
+            file_drag: file_drag::StateData::default(),
+            file_drops: file_drop::StateData::default(),
         })
     }
 
@@ -136,7 +142,7 @@ impl State {
         match ty {
             SelectionTarget::Clipboard => {
                 self.set_data_selection(latest, serial, Payload::Text(contents))?;
-            },
+            }
             SelectionTarget::Primary => {
                 let mgr = self.primary_selection_manager_state.as_ref()?;
                 self.primary_selection_content = contents;
@@ -144,7 +150,7 @@ impl State {
                     mgr.create_selection_source(&self.queue_handle, ALLOWED_MIME_TYPES.iter());
                 source.set_selection(seat.primary_device.as_ref()?, serial);
                 self.primary_sources.push(source);
-            },
+            }
         }
 
         Some(())
@@ -156,7 +162,10 @@ impl State {
             .latest_seat
             .as_ref()
             .ok_or_else(|| Error::other("no events received on any seat"))?;
-        let seat = self.seats.get_mut(latest).ok_or_else(|| Error::other("active seat lost"))?;
+        let seat = self
+            .seats
+            .get_mut(latest)
+            .ok_or_else(|| Error::other("active seat lost"))?;
 
         if seat.focus.is_none() {
             return Err(Error::other("client doesn't have focus"));
@@ -170,19 +179,24 @@ impl State {
                     .and_then(|data| data.data().selection_offer())
                     .ok_or_else(|| Error::other("selection is empty"))?;
 
-                let mime_type =
-                    selection.with_mime_types(MimeType::find_allowed).ok_or_else(|| {
+                let mime_type = selection
+                    .with_mime_types(MimeType::find_allowed)
+                    .ok_or_else(|| {
                         Error::new(ErrorKind::NotFound, "supported mime-type is not found")
                     })?;
 
                 (
-                    selection.receive(mime_type.to_string()).map_err(|err| match err {
-                        DataOfferError::InvalidReceive => Error::other("offer is not ready yet"),
-                        DataOfferError::Io(err) => err,
-                    })?,
+                    selection
+                        .receive(mime_type.to_string())
+                        .map_err(|err| match err {
+                            DataOfferError::InvalidReceive => {
+                                Error::other("offer is not ready yet")
+                            }
+                            DataOfferError::Io(err) => err,
+                        })?,
                     mime_type,
                 )
-            },
+            }
             SelectionTarget::Primary => {
                 let selection = seat
                     .primary_device
@@ -190,13 +204,14 @@ impl State {
                     .and_then(|data| data.data().selection_offer())
                     .ok_or_else(|| Error::other("selection is empty"))?;
 
-                let mime_type =
-                    selection.with_mime_types(MimeType::find_allowed).ok_or_else(|| {
+                let mime_type = selection
+                    .with_mime_types(MimeType::find_allowed)
+                    .ok_or_else(|| {
                         Error::new(ErrorKind::NotFound, "supported mime-type is not found")
                     })?;
 
                 (selection.receive(mime_type.to_string())?, mime_type)
-            },
+            }
         };
 
         // Mark FD as non-blocking so we won't block ourselves.
@@ -204,42 +219,46 @@ impl State {
 
         let mut reader_buffer = [0; 4096];
         let mut content = Vec::new();
-        let _ = self.loop_handle.insert_source(read_pipe, move |_, file, state| {
-            let file = unsafe { file.get_mut() };
-            loop {
-                match file.read(&mut reader_buffer) {
-                    Ok(0) => {
-                        let utf8 = String::from_utf8_lossy(&content);
-                        let content = match utf8 {
-                            Cow::Borrowed(_) => {
-                                // Don't clone the read data.
-                                let mut to_send = Vec::new();
-                                mem::swap(&mut content, &mut to_send);
-                                String::from_utf8(to_send).unwrap()
-                            },
-                            Cow::Owned(content) => content,
-                        };
+        let _ = self
+            .loop_handle
+            .insert_source(read_pipe, move |_, file, state| {
+                let file = unsafe { file.get_mut() };
+                loop {
+                    match file.read(&mut reader_buffer) {
+                        Ok(0) => {
+                            let utf8 = String::from_utf8_lossy(&content);
+                            let content = match utf8 {
+                                Cow::Borrowed(_) => {
+                                    // Don't clone the read data.
+                                    let mut to_send = Vec::new();
+                                    mem::swap(&mut content, &mut to_send);
+                                    String::from_utf8(to_send).unwrap()
+                                }
+                                Cow::Owned(content) => content,
+                            };
 
-                        // Post-process the content according to mime type.
-                        let content = match mime_type {
-                            MimeType::TextPlainUtf8 | MimeType::TextPlain => {
-                                normalize_to_lf(content)
-                            },
-                            MimeType::Utf8String => content,
-                        };
+                            // Post-process the content according to mime type.
+                            let content = match mime_type {
+                                MimeType::TextPlainUtf8 | MimeType::TextPlain => {
+                                    normalize_to_lf(content)
+                                }
+                                MimeType::Utf8String => content,
+                            };
 
-                        let _ = state.reply_tx.send(Ok(content));
-                        break PostAction::Remove;
-                    },
-                    Ok(n) => content.extend_from_slice(&reader_buffer[..n]),
-                    Err(err) if err.kind() == ErrorKind::WouldBlock => break PostAction::Continue,
-                    Err(err) => {
-                        let _ = state.reply_tx.send(Err(err));
-                        break PostAction::Remove;
-                    },
-                };
-            }
-        });
+                            let _ = state.reply_tx.send(Ok(content));
+                            break PostAction::Remove;
+                        }
+                        Ok(n) => content.extend_from_slice(&reader_buffer[..n]),
+                        Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                            break PostAction::Continue;
+                        }
+                        Err(err) => {
+                            let _ = state.reply_tx.send(Err(err));
+                            break PostAction::Remove;
+                        }
+                    };
+                }
+            });
 
         Ok(())
     }
@@ -263,20 +282,20 @@ impl SeatHandler for State {
     ) {
         let seat_state = self.seats.get_mut(&seat.id()).unwrap();
 
+        if matches!(
+            capability,
+            Capability::Keyboard | Capability::Pointer | Capability::Touch
+        ) && seat_state.data_device.is_none()
+        {
+            seat_state.data_device = self
+                .data_device_manager_state
+                .as_ref()
+                .map(|manager| manager.get_data_device(qh, &seat));
+        }
+
         match capability {
             Capability::Keyboard => {
                 seat_state.keyboard = Some(seat.get_keyboard(qh, seat.id()));
-
-                // Selection sources are tied to the keyboard, so add/remove decives
-                // when we gain/loss capability.
-
-                if seat_state.data_device.is_none() && self.data_device_manager_state.is_some() {
-                    seat_state.data_device = self
-                        .data_device_manager_state
-                        .as_ref()
-                        .map(|mgr| mgr.get_data_device(qh, &seat));
-                }
-
                 if seat_state.primary_device.is_none()
                     && self.primary_selection_manager_state.is_some()
                 {
@@ -285,10 +304,10 @@ impl SeatHandler for State {
                         .as_ref()
                         .map(|mgr| mgr.get_selection_device(qh, &seat));
                 }
-            },
+            }
             Capability::Pointer => {
                 seat_state.pointer = self.seat_state.get_pointer(qh, &seat).ok();
-            },
+            }
             _ => (),
         }
     }
@@ -300,13 +319,15 @@ impl SeatHandler for State {
         seat: WlSeat,
         capability: Capability,
     ) {
-        if matches!(capability, Capability::Keyboard | Capability::Pointer) {
+        if matches!(
+            capability,
+            Capability::Keyboard | Capability::Pointer | Capability::Touch
+        ) {
             self.cancel_drag_for_seat(&seat.id());
         }
         let seat_state = self.seats.get_mut(&seat.id()).unwrap();
         match capability {
             Capability::Keyboard => {
-                seat_state.data_device = None;
                 seat_state.primary_device = None;
                 seat_state.focus = None;
                 seat_state.latest_serial = 0;
@@ -317,7 +338,7 @@ impl SeatHandler for State {
                         keyboard.release()
                     }
                 }
-            },
+            }
             Capability::Pointer => {
                 if let Some(pointer) = seat_state.pointer.take() {
                     if pointer.version() >= 3 {
@@ -325,7 +346,7 @@ impl SeatHandler for State {
                     }
                 }
                 seat_state.left_press = None;
-            },
+            }
             _ => (),
         }
     }
@@ -362,7 +383,7 @@ impl PointerHandler for State {
                     if let Some(focus) = &mut seat_state.focus {
                         focus.pointer_input(&event.surface, serial);
                     }
-                },
+                }
                 _ => (),
             }
             seat_state.track_left_press(event);
@@ -373,6 +394,7 @@ impl PointerHandler for State {
             self.latest_seat = Some(seat_id);
         }
         self.try_start_drag();
+        self.try_start_file_drag();
     }
 }
 
@@ -386,11 +408,15 @@ impl DataDeviceHandler for State {
         _: f64,
         _: &WlSurface,
     ) {
-        self.drag_enter(device);
+        self.reset_file_drops_for(device);
+        if !self.drag_enter(device) {
+            self.file_drop_enter(device);
+        }
     }
 
     fn leave(&mut self, _: &Connection, _: &QueueHandle<Self>, device: &WlDataDevice) {
         self.drag_leave(device);
+        self.file_drop_leave(device);
     }
 
     fn motion(
@@ -402,10 +428,12 @@ impl DataDeviceHandler for State {
         _: f64,
     ) {
         self.drag_motion(device);
+        self.file_drop_motion(device);
     }
 
     fn drop_performed(&mut self, _: &Connection, _: &QueueHandle<Self>, device: &WlDataDevice) {
         self.drag_drop(device);
+        self.file_drop_performed(device);
     }
 
     // The selection is finished and ready to be used.
@@ -422,16 +450,22 @@ impl DataSourceHandler for State {
         write_pipe: WritePipe,
     ) {
         // A drag source never exposes the contents of the clipboard or a live tab.
-        if let Some(selection) =
-            self.data_sources.iter().find(|selection| selection.source.inner() == source)
+        if let Some(selection) = self
+            .data_sources
+            .iter()
+            .find(|selection| selection.source.inner() == source)
         {
             self.send_selection(selection.payload.clone(), write_pipe, &mime);
+        } else {
+            self.file_drag_write(source, &mime, write_pipe);
         }
     }
 
     fn cancelled(&mut self, _: &Connection, _: &QueueHandle<Self>, deleted: &WlDataSource) {
-        self.data_sources.retain(|selection| selection.source.inner() != deleted);
+        self.data_sources
+            .retain(|selection| selection.source.inner() != deleted);
         self.drag_finished(deleted, false);
+        self.file_drag_finished(deleted, false);
     }
 
     fn accept_mime(
@@ -451,13 +485,15 @@ impl DataSourceHandler for State {
         _: &Connection,
         _: &QueueHandle<Self>,
         source: &WlDataSource,
-        _: DndAction,
+        action: DndAction,
     ) {
         self.drag_acknowledged(source);
+        self.file_drag_action(source, action);
     }
 
     fn dnd_finished(&mut self, _: &Connection, _: &QueueHandle<Self>, source: &WlDataSource) {
         self.drag_finished(source, true);
+        self.file_drag_finished(source, true);
     }
 }
 
@@ -521,7 +557,8 @@ impl PrimarySelectionSourceHandler for State {
         _: &QueueHandle<Self>,
         deleted: &ZwpPrimarySelectionSourceV1,
     ) {
-        self.primary_sources.retain(|source| source.inner() != deleted)
+        self.primary_sources
+            .retain(|source| source.inner() != deleted)
     }
 }
 
@@ -546,20 +583,25 @@ impl Dispatch<WlKeyboard, ObjectId, State> for State {
                     focus.serial = Some(serial);
                 }
                 state.latest_seat = Some(data.clone());
-            },
+            }
             WlKeyboardEvent::Modifiers { serial, .. } => {
                 seat_state.latest_serial = serial;
                 state.latest_seat = Some(data.clone());
-            },
+            }
             // NOTE both selections rely on keyboard focus.
-            WlKeyboardEvent::Enter { serial, surface, .. } => {
+            WlKeyboardEvent::Enter {
+                serial, surface, ..
+            } => {
                 seat_state.latest_serial = serial;
-                seat_state.focus = Some(Focus { surface, serial: None });
-            },
+                seat_state.focus = Some(Focus {
+                    surface,
+                    serial: None,
+                });
+            }
             WlKeyboardEvent::Leave { .. } => {
                 seat_state.latest_serial = 0;
                 seat_state.focus = None;
-            },
+            }
             _ => (),
         }
     }

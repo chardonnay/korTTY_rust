@@ -18,11 +18,10 @@ mod layout_chat;
 mod layout_image;
 mod layout_text;
 
-use document::Font;
-use layout::{
-    AMBER, BLUE, BODY_WIDTH, BODY_X, HEADING, Layout, MARGIN, MUTED, PROSE, Panel, Style, WHITE,
-    WIDTH, check_cancelled,
-};
+pub(crate) use document::Font;
+pub(crate) use document::{Metadata, Orientation, VectorStroke};
+use layout::{AMBER, BLUE, BODY_WIDTH, BODY_X, MUTED, WHITE, check_cancelled};
+pub(crate) use layout::{HEADING, Layout, MARGIN, PROSE, PageBlock, Panel, Style, WIDTH};
 use layout_image::Screenshots;
 
 #[cfg(test)]

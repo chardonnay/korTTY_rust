@@ -1,4 +1,4 @@
-#[cfg(any(feature = "rsa", feature = "ecdsa256"))]
+#[cfg(feature = "ecdsa256")]
 use rand_core_modern::{CryptoRng, UnwrapErr};
 #[allow(unused_imports)]
 use {
@@ -6,7 +6,7 @@ use {
     log::{debug, error, info, log, trace, warn},
 };
 
-#[cfg(any(feature = "rsa", feature = "ecdsa256"))]
+#[cfg(feature = "ecdsa256")]
 pub(crate) fn rng() -> impl CryptoRng {
     UnwrapErr(getrandom::SysRng)
 }

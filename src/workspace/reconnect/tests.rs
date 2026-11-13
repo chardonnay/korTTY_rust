@@ -1,7 +1,7 @@
 use iced::widget::pane_grid;
 
 use super::*;
-use crate::terminal_effects::{Effect, Selection};
+use crate::terminal_effects::{Effect, Selection, Speed};
 use crate::workspace::TerminalProfile;
 
 #[cfg(unix)]
@@ -47,7 +47,7 @@ fn reconnect_replaces_the_primary_shell_preserving_nested_focus_and_history() {
 
     let selection = Selection {
         effect: Effect::AmberCrt90,
-        speed: 3,
+        speed: Speed::try_from(2.5).unwrap(),
     };
     workspace.select_terminal_effect(old, Some(selection.effect));
     workspace.set_terminal_effect_speed(old, selection.speed);
@@ -131,11 +131,11 @@ fn workspace_restore_keeps_primary_and_focus_after_a_pane_moves_to_first_positio
     tab.grid.swap(initial, second);
     let original_effect = Selection {
         effect: Effect::AmberCrt90,
-        speed: 3,
+        speed: Speed::try_from(3.0).unwrap(),
     };
     let extra_effect = Selection {
         effect: Effect::NeonCity,
-        speed: 7,
+        speed: Speed::try_from(7.0).unwrap(),
     };
     for (session, selection) in [(original, original_effect), (extra, extra_effect)] {
         workspace.select_terminal_effect(session, Some(selection.effect));

@@ -3,8 +3,8 @@ use std::io;
 
 use super::super::{AuthMethod, Document};
 use super::{
-    Auth, Connection, ImportedProfile, Outcome, Preview, Store, ensure_group, invalid, library,
-    same_profile,
+    Auth, Connection, ImportedLocal, ImportedProfile, ImportedSerial, LocalProfile, Outcome,
+    Preview, SerialProfile, Store, ensure_group, invalid, library, same_profile,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -84,6 +84,12 @@ impl Default for Options {
 }
 
 impl Options {
+    fn includes(&self, group: &str) -> bool {
+        self.source_groups.as_ref().is_none_or(|groups| {
+            groups.is_empty() || groups.contains(&SourceGroup::from_path(group))
+        })
+    }
+
     fn transform(&self, mut entry: ImportedProfile, destination: Option<&str>) -> ImportedProfile {
         let connection = &mut entry.connection;
         if let Some(group) = destination {
@@ -129,6 +135,8 @@ impl Options {
 /// A selection transformed from an immutable file preview using explicit local choices.
 pub(crate) struct Prepared {
     entries: Vec<ImportedProfile>,
+    local_entries: Vec<ImportedLocal>,
+    serial_entries: Vec<ImportedSerial>,
     destination: Destination,
     outcome: Outcome,
 }
@@ -139,17 +147,39 @@ impl Prepared {
         let entries = preview
             .entries
             .iter()
-            .filter(|entry| {
-                options.source_groups.as_ref().is_none_or(|groups| {
-                    groups.is_empty() || groups.contains(&SourceGroup::from_path(&entry.group))
-                })
-            })
+            .filter(|entry| options.includes(&entry.group))
             .cloned()
             .map(|entry| options.transform(entry, destination))
             .collect::<Vec<_>>();
-        let (_, outcome) = stage(store, &entries)?;
+        let local_entries = preview
+            .local_entries
+            .iter()
+            .filter(|entry| options.includes(&entry.group))
+            .cloned()
+            .map(|mut entry| {
+                if let Some(group) = destination {
+                    entry.group = group.to_owned();
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        let serial_entries = preview
+            .serial_entries
+            .iter()
+            .filter(|entry| options.includes(&entry.group))
+            .cloned()
+            .map(|mut entry| {
+                if let Some(group) = destination {
+                    entry.group = group.to_owned();
+                }
+                entry
+            })
+            .collect::<Vec<_>>();
+        let (_, outcome) = stage(store, &entries, &local_entries, &serial_entries)?;
         Ok(Self {
             entries,
+            local_entries,
+            serial_entries,
             destination: options.destination.clone(),
             outcome,
         })
@@ -160,6 +190,18 @@ impl Prepared {
         self.entries
             .iter()
             .map(|entry| (&entry.connection, entry.group.as_str()))
+    }
+
+    pub(crate) fn local_entries(&self) -> impl ExactSizeIterator<Item = (&LocalProfile, &str)> {
+        self.local_entries
+            .iter()
+            .map(|entry| (&entry.profile, entry.group.as_str()))
+    }
+
+    pub(crate) fn serial_entries(&self) -> impl ExactSizeIterator<Item = (&SerialProfile, &str)> {
+        self.serial_entries
+            .iter()
+            .map(|entry| (&entry.profile, entry.group.as_str()))
     }
 
     pub(crate) fn outcome(&self) -> Outcome {
@@ -180,7 +222,12 @@ impl Prepared {
             ));
         }
         self.destination.path(store)?;
-        let (candidate, outcome) = stage(store, &self.entries)?;
+        let (candidate, outcome) = stage(
+            store,
+            &self.entries,
+            &self.local_entries,
+            &self.serial_entries,
+        )?;
         if outcome.imported != 0 {
             store.commit(candidate)?;
         }
@@ -188,7 +235,104 @@ impl Prepared {
     }
 }
 
-fn stage(store: &Store, entries: &[ImportedProfile]) -> io::Result<(Document, Outcome)> {
+pub(super) fn portable_java_backup(preview: &Preview) -> io::Result<(Vec<u8>, usize)> {
+    let store = Store {
+        path: Default::default(),
+        document: Document::default(),
+    };
+    let selection = Prepared::new(
+        preview,
+        &Options {
+            include_password: false,
+            ..Options::default()
+        },
+        &store,
+    )?;
+    let (document, outcome) = stage(
+        &store,
+        &selection.entries,
+        &selection.local_entries,
+        &selection.serial_entries,
+    )?;
+    Ok((encode(&document)?, outcome.imported))
+}
+
+pub(super) fn merge_java_backup(
+    local: Option<&[u8]>,
+    incoming: &[u8],
+) -> io::Result<Option<Vec<u8>>> {
+    let source = super::super::decode_document(incoming)?;
+    let document = local
+        .map(super::super::decode_document)
+        .transpose()?
+        .unwrap_or_default();
+    let store = Store {
+        path: Default::default(),
+        document,
+    };
+    let group = |id: u64| {
+        source
+            .library
+            .membership
+            .get(&id)
+            .cloned()
+            .unwrap_or_default()
+    };
+    let entries: Vec<_> = source
+        .connections
+        .into_iter()
+        .map(|connection| {
+            let id = connection.id;
+            let mut entry = ImportedProfile::new(connection, group(id));
+            entry.badge = source.library.os_badges.get(&id).cloned();
+            entry
+        })
+        .collect();
+    let local_entries: Vec<_> = source
+        .local_profiles
+        .into_iter()
+        .map(|profile| ImportedLocal {
+            group: group(profile.id),
+            profile,
+        })
+        .collect();
+    let serial_entries: Vec<_> = source
+        .serial_profiles
+        .into_iter()
+        .map(|profile| ImportedSerial {
+            group: group(profile.id),
+            profile,
+        })
+        .collect();
+    let (candidate, outcome) = stage(&store, &entries, &local_entries, &serial_entries)?;
+    if outcome.imported == 0 {
+        return Ok(None);
+    }
+    encode(&candidate).map(Some)
+}
+
+pub(super) fn encode(document: &Document) -> io::Result<Vec<u8>> {
+    let bytes = serde_json::to_vec_pretty(document).map_err(invalid)?;
+    super::super::decode_document(&bytes)?;
+    Ok(bytes)
+}
+
+pub(super) fn stage(
+    store: &Store,
+    entries: &[ImportedProfile],
+    local_entries: &[ImportedLocal],
+    serial_entries: &[ImportedSerial],
+) -> io::Result<(Document, Outcome)> {
+    stage_with_insertions(store, entries, local_entries, serial_entries, |_, _| {})
+}
+
+pub(super) fn stage_with_insertions(
+    store: &Store,
+    entries: &[ImportedProfile],
+    local_entries: &[ImportedLocal],
+    serial_entries: &[ImportedSerial],
+    mut inserted: impl FnMut(&ImportedProfile, &Connection),
+) -> io::Result<(Document, Outcome)> {
     let mut candidate = store.document.clone();
     let mut outcome = Outcome::default();
     for entry in entries {
@@ -205,11 +349,7 @@ fn stage(store: &Store, entries: &[ImportedProfile]) -> io::Result<(Document, Ou
             continue;
         }
         let mut connection = entry.connection.clone();
-        connection.id = candidate.next_id;
-        candidate.next_id = candidate
-            .next_id
-            .checked_add(1)
-            .ok_or_else(|| invalid("connection ID space exhausted"))?;
+        connection.id = candidate.allocate_id()?;
         if !entry.group.is_empty() {
             ensure_group(&mut candidate.library, &entry.group)?;
             candidate
@@ -220,7 +360,52 @@ fn stage(store: &Store, entries: &[ImportedProfile]) -> io::Result<(Document, Ou
         candidate
             .library
             .set_os_badge(connection.id, entry.badge.as_deref());
+        inserted(entry, &connection);
         candidate.connections.push(connection);
+        outcome.imported += 1;
+    }
+    for entry in local_entries {
+        let mut profile = entry.profile.clone();
+        if candidate.local_profiles.iter().any(|existing| {
+            let group = candidate.library.membership.get(&existing.id);
+            profile.id = existing.id;
+            group.map_or("", String::as_str) == entry.group && *existing == profile
+        }) {
+            outcome.already_saved += 1;
+            continue;
+        }
+        profile.id = candidate.allocate_id()?;
+        if !entry.group.is_empty() {
+            ensure_group(&mut candidate.library, &entry.group)?;
+            candidate
+                .library
+                .membership
+                .insert(profile.id, entry.group.clone());
+        }
+        candidate.local_profiles.push(profile);
+        outcome.imported += 1;
+    }
+    for entry in serial_entries {
+        let mut profile = entry.profile.clone();
+        if candidate.serial_profiles.iter().any(|existing| {
+            let group = candidate.library.membership.get(&existing.id);
+            profile.id = existing.id;
+            profile.pinned = existing.pinned;
+            group.map_or("", String::as_str) == entry.group && *existing == profile
+        }) {
+            outcome.already_saved += 1;
+            continue;
+        }
+        profile.id = candidate.allocate_id()?;
+        profile.pinned = false;
+        if !entry.group.is_empty() {
+            ensure_group(&mut candidate.library, &entry.group)?;
+            candidate
+                .library
+                .membership
+                .insert(profile.id, entry.group.clone());
+        }
+        candidate.serial_profiles.push(profile);
         outcome.imported += 1;
     }
     candidate.validate()?;

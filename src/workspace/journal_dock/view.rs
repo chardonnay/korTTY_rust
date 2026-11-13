@@ -1,8 +1,7 @@
 use std::fmt::Write as _;
 
 use iced::widget::{
-    Id, button, column, container, keyed_column, pick_list, row, rule, scrollable, space, text,
-    tooltip,
+    Id, button, column, container, keyed_column, pick_list, row, rule, scrollable, text, tooltip,
 };
 use iced::{Alignment, Element, Length, window};
 use serde::{Deserialize, Serialize};
@@ -15,7 +14,7 @@ use super::super::journal_appearance_access::{
     Page as AppearancePage, Target as AppearanceTarget, page_text,
 };
 use super::super::journal_thumbnail::Key;
-use super::super::{Message as Desktop, local_dock, transparency};
+use super::super::{Message as Desktop, local_dock};
 use super::images::{self, widget as images_widget};
 use super::{Action, Message};
 
@@ -67,47 +66,7 @@ fn decode_width<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u16
         .map_or(DEFAULT_WIDTH, clamp_width))
 }
 
-pub(super) fn dock<'a>(
-    placement: Placement,
-    width: f32,
-    panel: Element<'a, Desktop>,
-    panes: Element<'a, Desktop>,
-    resize: impl Fn(f32) -> Desktop + 'a,
-    finish_resize: Desktop,
-) -> Element<'a, Desktop> {
-    let empty = || -> Element<'a, Desktop> { space::Space::new().into() };
-    let (left, right) = if let Some(side) = side(placement) {
-        let divider = local_dock::dock_divider(side, width).map(move |message| match message {
-            local_dock::Message::Resize(_, width) => resize(width),
-            local_dock::Message::FinishResize(_) => finish_resize.clone(),
-            _ => Desktop::Noop,
-        });
-        let panel = container(panel).width(width).height(Length::Fill);
-        match side {
-            local_dock::Side::Left => (
-                container(row![panel, divider])
-                    .style(transparency::opaque_chrome)
-                    .into(),
-                empty(),
-            ),
-            local_dock::Side::Right => (
-                empty(),
-                container(row![divider, panel])
-                    .style(transparency::opaque_chrome)
-                    .into(),
-            ),
-        }
-    } else {
-        (empty(), empty())
-    };
-    // Keep the terminal widget tree at the same index when the dock moves or hides.
-    row![left, panes, right]
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
-}
-
-fn side(placement: Placement) -> Option<local_dock::Side> {
+pub(super) fn side(placement: Placement) -> Option<local_dock::Side> {
     match placement {
         Placement::Hidden => None,
         Placement::Left => Some(local_dock::Side::Left),
@@ -142,6 +101,7 @@ pub(super) struct Panel<'a> {
     pub(super) notice: Option<&'a str>,
     pub(super) note_editor: Option<Element<'a, Desktop>>,
     pub(super) links: Option<LinkContext>,
+    pub(super) chat: Option<LinkContext>,
     pub(super) images: images_widget::Context<'a>,
 }
 
@@ -212,6 +172,7 @@ pub(super) fn panel<'a>(
             data.timeline,
             data.timeline_limited,
             data.links,
+            data.chat,
             appearance,
             data.images,
         ))
@@ -318,6 +279,7 @@ fn timeline<'a>(
     entries: &'a [TimelineEntry],
     limited: bool,
     links: Option<LinkContext>,
+    chat: Option<LinkContext>,
     appearance: Content,
     image_context: images_widget::Context<'a>,
 ) -> Element<'a, Desktop> {
@@ -360,6 +322,24 @@ fn timeline<'a>(
             if !value.is_empty() {
                 card = card.push(timeline_field(entry, field, value, links, appearance));
             }
+        }
+        if entry.has_agent_chat()
+            && let Some(context) = chat
+        {
+            card = card.push(super::super::journal_access::agent_chat_view::action(
+                (context.owner, context.tab, context.run, entry.id.clone()),
+                Some(Desktop::JournalDock(
+                    context.owner,
+                    Message::Bound(
+                        context.tab,
+                        context.run,
+                        Action::OpenAgentChat {
+                            entry: entry.id.clone(),
+                        },
+                    ),
+                )),
+                appearance,
+            ));
         }
         if let Some(key) = Key::for_entry(entry).filter(|key| images::contains(entries, key)) {
             card = card.push(images_widget::thumbnail(image_context, key));

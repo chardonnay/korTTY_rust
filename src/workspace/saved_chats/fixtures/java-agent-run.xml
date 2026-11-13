@@ -1,0 +1,63 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<aiChats>
+    <chat>
+        <id>20f88b8a-4070-47fd-a4a4-73b27b5cc3a2</id>
+        <title>Grüße from Agent</title>
+        <createdAt>1700000000000</createdAt>
+        <updatedAt>1700000001000</updatedAt>
+        <connectionDisplayName>Fixture SSH</connectionDisplayName>
+        <activeAiProfileId>profile-17</activeAiProfileId>
+        <activeAiProfileName>Fixture model</activeAiProfileName>
+        <origin>AGENT_RUN</origin>
+        <sourceRunId>03684aee-2b4c-4bcf-be6d-cfe70e0d025d</sourceRunId>
+        <sourceTerminalSessionId>dc13827d-c072-4b0f-a19f-fe421f3e6207</sourceTerminalSessionId>
+        <sourceConnectionId>f1aee6cb-729f-48f6-b47a-66d859947b81</sourceConnectionId>
+        <sourceJournalId>journal-fixture</sourceJournalId>
+        <sourceJournalEntryId>agent-fixture</sourceJournalEntryId>
+        <messages>
+            <message>
+                <role>USER</role>
+                <content>Inspect the build</content>
+                <createdAt>1700000000000</createdAt>
+            </message>
+            <message>
+                <role>ASSISTANT</role>
+                <content>État: &lt;failed&gt; &amp; reported.</content>
+                <createdAt>1700000001000</createdAt>
+                <aiProfileId>profile-17</aiProfileId>
+                <aiProfileName>Fixture model</aiProfileName>
+                <agentSteps>
+                    <step>
+                        <type>MESSAGE</type>
+                        <status>COMPLETED</status>
+                        <title>Inspect the destination</title>
+                        <summary>Started the fixture</summary>
+                        <elapsedSeconds>0</elapsedSeconds>
+                    </step>
+                    <step>
+                        <type>ACTION</type>
+                        <status>FAILED</status>
+                        <title>Run the test</title>
+                        <summary>Read-only check</summary>
+                        <command>printf '%s' 'local-hidden-value &amp; 東京'</command>
+                        <exitCode>-1</exitCode>
+                        <output>Grüße &amp; &lt;output&gt;
+local-hidden-value</output>
+                        <elapsedSeconds>2</elapsedSeconds>
+                        <truncated>true</truncated>
+                    </step>
+                </agentSteps>
+            </message>
+            <message>
+                <role>USER</role>
+                <content>What failed?</content>
+                <createdAt>1700000001000</createdAt>
+            </message>
+            <message>
+                <role>ASSISTANT</role>
+                <content>The fixture command.</content>
+                <createdAt>1700000001000</createdAt>
+            </message>
+        </messages>
+    </chat>
+</aiChats>

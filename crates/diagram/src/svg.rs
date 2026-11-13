@@ -66,6 +66,16 @@ impl Scene {
     /// Renders the scene as self-contained SVG. Input labels are escaped as
     /// plain text. The SVG contains no scripts, callbacks, links or resources.
     pub fn to_svg(&self, theme: Theme) -> String {
+        self.svg_with_preferred_font(theme, system_label_family())
+    }
+
+    /// Renders the same scene using a caller-provided font family. This method
+    /// performs no system font discovery. The caller supplies the font when rasterizing.
+    pub fn to_svg_with_font_family(&self, theme: Theme, family: &str) -> String {
+        self.svg_with_preferred_font(theme, Some(family))
+    }
+
+    fn svg_with_preferred_font(&self, theme: Theme, family: Option<&str>) -> String {
         let mut svg = String::new();
         let width = self.bounds.width;
         let height = self.bounds.height;
@@ -74,7 +84,7 @@ impl Scene {
             svg,
             r#"<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}" role="img" font-family=""#
         );
-        write_font_families(&mut svg, system_label_family());
+        write_font_families(&mut svg, family);
         svg.push_str("\">\n");
         let _ = writeln!(
             svg,

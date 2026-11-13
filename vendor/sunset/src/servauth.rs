@@ -101,9 +101,7 @@ impl ServAuth {
             AuthMethod::Password(_) if self.method_password => {
                 DispatchEvent::ServEvent(ServEventId::PasswordAuth)
             }
-            AuthMethod::PubKey(_) if self.method_pubkey => {
-                self.request_pubkey(p, sess_id)?
-            }
+            AuthMethod::PubKey(_) if self.method_pubkey => self.request_pubkey(p, sess_id)?,
             _ => {
                 if !self.tried_first {
                     DispatchEvent::ServEvent(ServEventId::FirstAuth)
@@ -128,7 +126,10 @@ impl ServAuth {
     fn send_failure(&self, s: &mut TrafSend) -> Result<()> {
         let methods = self.avail_methods();
         let methods = (&methods).into();
-        s.send(packets::UserauthFailure { methods, partial: false })
+        s.send(packets::UserauthFailure {
+            methods,
+            partial: false,
+        })
     }
 
     fn request_pubkey(
@@ -140,6 +141,9 @@ impl ServAuth {
         // includes the auth packet without the signature part.
         let (key, sig) = match &mut p.method {
             AuthMethod::PubKey(m) => {
+                if Signature::check_pubkey_algorithm(&m.pubkey.0, m.sig_algo).is_err() {
+                    return Ok(DispatchEvent::None);
+                }
                 let sig = m.sig.take();
                 // When we have a signature, we need to set force_sig=true so that the encoded message for verification has the boolean set correctly
                 m.force_sig = sig.is_some();
@@ -165,7 +169,9 @@ impl ServAuth {
 
         // Proceed to query the app whether login is allowed
         let real_sig = sig.is_some();
-        Ok(DispatchEvent::ServEvent(ServEventId::PubkeyAuth { real_sig }))
+        Ok(DispatchEvent::ServEvent(ServEventId::PubkeyAuth {
+            real_sig,
+        }))
     }
 
     pub fn resume_request(&mut self, allow: bool, s: &mut TrafSend) -> Result<()> {
@@ -193,12 +199,7 @@ impl ServAuth {
     }
 
     /// Must be passed a MethodPubkey packet with a signature part None
-    fn verify_sig(
-        &self,
-        p: &packets::UserauthRequest,
-        sig: &Signature,
-        sess_id: &SessId,
-    ) -> bool {
+    fn verify_sig(&self, p: &packets::UserauthRequest, sig: &Signature, sess_id: &SessId) -> bool {
         // Remove the signature from the packet - the signature message includes
         // packet without that signature part.
 
@@ -208,7 +209,7 @@ impl ServAuth {
         };
 
         let key = match &p.method {
-            AuthMethod::PubKey(m) => &m.pubkey.0,
+            AuthMethod::PubKey(m) if m.sig_algo == sig_type.algorithm_name() => &m.pubkey.0,
             _ => {
                 debug_assert!(false, "Wrong method");
                 return false;

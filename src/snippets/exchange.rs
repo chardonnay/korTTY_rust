@@ -12,6 +12,15 @@ use super::{MAX_VARIABLES, Variable, invalid, profile};
 
 const MAX_FILE_BYTES: u64 = 8 * 1024 * 1024;
 
+pub(super) fn read_java_backup(bytes: &[u8]) -> io::Result<Vec<Variable>> {
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(invalid("The variable file exceeds 8 MiB"));
+    }
+    let source =
+        std::str::from_utf8(bytes).map_err(|_| invalid("Invalid variable XML encoding"))?;
+    Format::Xml.decode(source)
+}
+
 #[derive(Clone, Copy)]
 enum Format {
     Json,

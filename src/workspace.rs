@@ -1,5 +1,5 @@
 use std::cell::OnceCell;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -18,12 +18,14 @@ use kortty_jobs::RunRequest;
 use kortty_pty::LocalShell;
 use kortty_terminal::{Hp2392Input, PromptDirection, TerminalProfile};
 
-use crate::connection_store::Store;
+use crate::connection_store::{SerialProfile, Store};
 use crate::diagram_window::{self, DiagramWindow};
 use crate::editor_window::{self, EditorWindow};
 use crate::input::{encode_ibm_key, encode_stream_key, encode_stream_paste, sanitize_paste};
 use crate::job_executor;
-use crate::profile::{self, PaneLayout, WindowLayout, WindowPlacement, WorkspaceLayout};
+use crate::profile::{
+    self, InitialTerminalSize, PaneLayout, WindowLayout, WindowPlacement, WorkspaceLayout,
+};
 use crate::scheduler_window::{self, SchedulerWindow, SshCommand};
 use crate::serial_dialog::{self, SerialDialog};
 use crate::session::{
@@ -32,10 +34,14 @@ use crate::session::{
 use crate::session_security::{IsolationLevel, LocalSettings};
 use crate::sftp_window::{self, SftpWindow};
 use crate::terminal_search::{self, TerminalSearch};
+use crate::terminal_theme::Appearance;
 use crate::terminal_view::{self, SearchHighlight, Selection, TerminalView};
+use crate::vault_window::VaultWindow;
 
 mod ai_access;
+pub(crate) mod ai_quota;
 mod appearance;
+mod application_updates;
 mod ascii_art;
 mod backup_automatic;
 pub(crate) mod backup_data;
@@ -47,14 +53,23 @@ pub(crate) use chrome::popup as native_popup;
 pub(crate) use snippet_access::SnippetReportAction;
 mod clipboard_access;
 mod close_all_dialog;
+mod coding_agent_app_badge;
+#[cfg(windows)]
+mod coding_agent_app_icon;
+mod coding_agent_dock;
+mod coding_agent_strip;
+mod coding_agents;
 mod control_access;
 mod dashboard;
 mod dialog_placement;
 mod effects;
 pub(crate) mod environment_access;
+mod highlight;
 mod journal_access;
+mod journal_agent_chat;
 mod journal_appearance;
 mod journal_appearance_access;
+mod journal_automation;
 mod journal_capture_access;
 mod journal_dock;
 mod journal_image_menu;
@@ -78,13 +93,17 @@ mod recently_closed;
 mod reconnect;
 mod recording_access;
 mod remote_dock;
+pub(crate) use remote_dock::mcp_ssh_prompt_is_verified;
+pub(crate) mod saved_chats;
 mod scheduler_access;
+mod server_access;
 mod session_processes;
 mod session_restore;
 mod session_security;
 mod settings_window;
 mod sftp_access;
 mod shell_integration;
+pub(crate) mod skill_classifier;
 mod snippet_access;
 mod split_connection;
 mod ssh_access;
@@ -93,16 +112,27 @@ mod tab_context;
 mod tab_drag;
 mod tab_titles;
 mod tab_watch;
+mod teamwork_auth;
+mod teamwork_settings;
+mod teamwork_sync;
+pub(crate) mod terminal_agent;
+mod terminal_ai;
+pub(crate) use terminal_ai::mask::prompt as mask_ai_prompt;
 mod terminal_commands;
 pub(crate) mod terminal_context;
 mod terminal_effect_access;
 mod terminal_file_access;
 pub(crate) mod terminal_link_dialog;
+mod terminal_notifications;
 mod tool_tabs;
 mod transparency;
 mod tunnel_access;
+#[cfg(target_os = "linux")]
+mod wayland_file_drop;
 mod window_lifecycle;
 mod window_navigation;
+#[cfg(target_os = "windows")]
+mod windows_file_drag;
 pub use ssh_access::SshTarget;
 
 const DEFAULT_FONT: u8 = 14;
@@ -115,7 +145,10 @@ pub enum Message {
     DialogPlacementChecked(window::Id, u64, Option<WindowPlacement>),
     #[cfg(target_os = "linux")]
     DialogOpeningRedraw(window::Id),
-    DialogPlacementClosing(window::Id, Option<WindowPlacement>),
+    DialogPlacementClosing(window::Id, Option<WindowPlacement>, Option<window::Id>),
+    OwnedDialogOpened(window::Id, window::Id, Option<Box<Message>>),
+    #[cfg(target_os = "linux")]
+    X11OwnedDialogReady(window::Id, window::Id, Option<Box<Message>>),
     MainPlacementClosing(
         window::Id,
         bool,
@@ -156,8 +189,29 @@ pub enum Message {
     SessionProcesses(window::Id, session_processes::Message),
     SessionProcessFeed(session_processes::Feed),
     SessionJournal(window::Id, journal_access::Message),
+    JournalSummary(journal_access::summaries::Worker),
     JournalCapture(journal_capture_access::Message),
+    JournalAgentChat(journal_agent_chat::Message),
     JournalDock(window::Id, journal_dock::Message),
+    CodingAgentDock(window::Id, coding_agent_dock::Message),
+    #[cfg(windows)]
+    CodingAgentBadgeIconResult {
+        id: window::Id,
+        generation: u64,
+        retry: bool,
+        applied: bool,
+    },
+    #[cfg(target_os = "linux")]
+    CodingAgentLauncherBadgeResult {
+        generation: u64,
+        applied: bool,
+    },
+    CodingAgentDockTick,
+    CodingAgentNotificationsTick,
+    TerminalNotificationActivated(terminal_notifications::Activation),
+    CodingAgentNotificationActivated(coding_agents::notifications::Activation),
+    CodingAgentPanel(window::Id, coding_agents::PanelMessage),
+    CodingAgentAlias(window::Id, coding_agents::aliases::Message),
     JournalDockTick,
     JournalViewerTick,
     JournalAppearance(
@@ -173,8 +227,11 @@ pub enum Message {
         SessionId,
         Option<crate::terminal_effects::Effect>,
     ),
-    TerminalEffectSpeed(window::Id, SessionId, u8),
+    TerminalEffectSpeed(window::Id, SessionId, crate::terminal_effects::Speed),
     Settings(settings_window::Message),
+    TeamworkAuthSaved(Result<crate::connection_store::teamwork::AuthSave, String>),
+    TeamworkSettings(window::Id, teamwork_settings::Message),
+    TeamworkSync(teamwork_sync::Event),
     ShellIntegration(window::Id, shell_integration::Message),
     TerminalContext(window::Id, terminal_context::Message),
     TabContext(window::Id, tab_context::Message),
@@ -190,14 +247,25 @@ pub enum Message {
     NewWindow,
     OpenDiagram,
     Diagram(window::Id, diagram_window::Message),
+    TerminalAgent(window::Id, terminal_agent::Message),
+    AgentCursor(terminal_view::agent_cursor::Message),
+    AgentInline(
+        terminal_view::agent_cursor::Binding,
+        crate::session::inline_history::Key,
+    ),
+    AgentShortcut(terminal_agent::shortcut::Message),
     AsciiArt(window::Id, ascii_art::Message),
     OpenEditor,
     Editor(window::Id, editor_window::Message),
+    ProjectFile(window::Id, project_access::local_files::Message),
+    ProjectSftpTick,
     TerminalFileLoaded(u64, Result<editor_window::Document, String>),
     LocalDock(window::Id, local_dock::Message),
     RemoteDock(window::Id, remote_dock::Message),
     RemoteDockTick,
     AiManager(ai_access::Message),
+    TerminalAi(window::Id, terminal_ai::Message),
+    SavedChats(window::Id, saved_chats::Message),
     Recording(recording_access::Message),
     NewTab(window::Id),
     NewWindowsShell(window::Id, LocalShell),
@@ -229,6 +297,10 @@ pub enum Message {
     ResizeSplit(window::Id, pane_grid::ResizeEvent),
     DragPane(window::Id, pane_grid::DragEvent),
     TabDrag(tab_drag::Message),
+    #[cfg(target_os = "linux")]
+    WaylandFileDrop(wayland_file_drop::Message),
+    #[cfg(target_os = "windows")]
+    WindowsFileDrag(windows_file_drag::Message),
     ToggleBroadcast(window::Id),
     ToggleCommandTimestamps(window::Id),
     ResizeCommandTimestamps(window::Id, Option<Size>),
@@ -242,6 +314,16 @@ pub enum Message {
     ReconnectHistoryReady(SessionId, bool),
     Selection(SessionId, Option<Selection>),
     SelectionFinished(window::Id, SessionId, Selection, std::sync::Weak<Frame>),
+    ProjectedSelection(
+        window::Id,
+        SessionId,
+        terminal_view::projected_selection::ProjectedSelection,
+    ),
+    ProjectedSelectionFinished(
+        window::Id,
+        SessionId,
+        terminal_view::projected_selection::ProjectedSelection,
+    ),
     OpenSearch(SessionId),
     Search(SessionId, terminal_search::Message),
     TerminalMouse(SessionId, Vec<u8>),
@@ -249,8 +331,12 @@ pub enum Message {
     Control(control_access::Message),
     SessionSecurity(session_security::Message),
     OpenConnections(window::Id),
-    Connections(crate::connection_window::Message),
+    Connections(window::Id, crate::connection_window::Message),
+    ConnectionEditor(window::Id, crate::connection_window::Message),
+    FocusConnectionEditor(window::Id),
+    ConnectionCatalogReloaded(u64, Option<crate::connection_store::Store>),
     ConnectionOverview(window::Id, profile_tools::connection_overview::Event),
+    TeamworkRestore(window::Id, profile_tools::teamwork_restore::Event),
     OsBadgeManager(window::Id, os_badge_manager::Event),
     ConnectionUsed(u64, Option<crate::connection_store::Store>),
     OpenVault(window::Id),
@@ -268,10 +354,25 @@ pub enum Message {
     SnippetRun(window::Id, snippet_access::RunMessage),
     SnippetTransfer(window::Id, u64, crate::snippet_transfer::Event),
     SnippetAnalysis(window::Id, snippet_access::AnalysisEvent),
-    JobFinished(job_executor::Completion),
+    SnippetDiagram(snippet_access::SnippetDiagramEvent),
+    JobFinished(
+        job_executor::Completion,
+        Vec<crate::session_journal::automation::Artifact>,
+    ),
+    JobAgentResend(job_executor::agent::Resend),
+    ScheduledAgent(scheduler_access::firing::Event),
+    ScheduledSwarmComparison(scheduler_access::swarm_comparison::Event),
+    SchedulerSwarmChat(scheduler_access::swarm_chat::Event),
+    JobWebhookFinished(
+        scheduler_window::webhooks::Ticket,
+        kortty_jobs::WebhookOutcome,
+    ),
+    AutomationJournal(journal_automation::Message),
     RuntimeTick,
+    ApplicationUpdates(application_updates::Event),
     Scroll(SessionId, i32),
     ScrollTo(SessionId, Option<kortty_terminal::ScrollbackAnchor>),
+    ScrollInlineTo(SessionId, Option<crate::session::inline_history::Anchor>),
     Copy(window::Id),
     Paste(window::Id),
     PasteLoaded(window::Id, u64, u64, Vec<SessionId>, Option<String>),
@@ -285,10 +386,13 @@ pub enum Message {
     Quit,
     ExitReady,
     Noop,
+    Highlight(highlight::Message),
 }
 
 #[derive(Default)]
 pub struct Workspace {
+    highlight: highlight::State,
+    application_updates: application_updates::State,
     app_logging: crate::app_logging::Runtime,
     bell: bell::Bell,
     chrome: chrome::Chrome,
@@ -297,9 +401,15 @@ pub struct Workspace {
     known_hosts: HashMap<window::Id, known_hosts::KnownHosts>,
     logfiles: logfile_access::Windows,
     session_processes: HashMap<window::Id, session_processes::Dialog>,
+    application_start: session_processes::ApplicationStart,
     journals: HashMap<window::Id, journal_access::Surface>,
     journal_edits: journal_access::metadata::Edits,
     journal_actions: journal_access::actions::Actions,
+    journal_summaries: journal_access::summaries::State,
+    journal_automation: journal_automation::State,
+    journal_questions: journal_access::questions::State,
+    journal_chat_sync: journal_agent_chat::Synchronizations,
+    journal_chat_transcripts: HashMap<window::Id, journal_agent_chat::TranscriptTab>,
     journal_entry_deletes: journal_access::EntryDeleteDialogs,
     journal_markers: journal_access::marker_dialog::State,
     journal_replacements: journal_access::replace_dialog::Dialogs,
@@ -317,6 +427,10 @@ pub struct Workspace {
     shell_integration: shell_integration::Setup,
     terminal_context: Option<terminal_context::Context>,
     tab_context: tab_context::State,
+    coding_agent_aliases: coding_agents::aliases::Dialogs,
+    coding_agent_app_badge: coding_agent_app_badge::Badge,
+    coding_agent_notifications: coding_agents::notifications::Coordinator,
+    terminal_notifications: terminal_notifications::State,
     tab_attention: tab_watch::AttentionRequests,
     close_all_dialogs: close_all_dialog::Dialogs,
     recently_closed: recently_closed::History,
@@ -324,8 +438,12 @@ pub struct Workspace {
     pending_reconnects: HashMap<SessionId, reconnect::PendingReconnect>,
     link_confirmations: HashMap<window::Id, terminal_link_dialog::Confirmation>,
     environments: environment_access::Environments,
+    teamwork_auth: teamwork_auth::State,
+    teamwork_settings: teamwork_settings::State,
+    teamwork_library: teamwork_sync::Library,
     saved_terminal_preferences: profile_tools::SavedTerminalPreferences,
     window_settings: tab_titles::WindowSettings,
+    terminal_backgrounds: terminal_view::background_image::Images,
     theme_cache: transparency::ThemeCache,
     transparency_save_pending: bool,
     journal_appearance_ui: journal_appearance_access::State,
@@ -347,26 +465,39 @@ pub struct Workspace {
     session_restore: session_restore::Restore,
     project_reconnects: project_access::ProjectReconnects,
     windows: HashMap<window::Id, Window>,
-    #[cfg(target_os = "macos")]
     native_focused_window: Option<window::Id>,
     tab_drag: tab_drag::DragState,
+    #[cfg(target_os = "linux")]
+    wayland_file_drop: wayland_file_drop::State,
+    #[cfg(target_os = "windows")]
+    windows_file_drag: windows_file_drag::State,
     multi_exec: multi_exec::Membership,
     diagrams: HashMap<window::Id, DiagramWindow>,
+    terminal_agents: terminal_agent::State,
     ascii_art: HashMap<window::Id, ascii_art::Dialog>,
     editors: HashMap<window::Id, EditorWindow>,
+    project_files: HashMap<window::Id, project_access::local_files::FileTab>,
     recording_windows: HashMap<window::Id, crate::recording_window::RecordingWindow>,
     video: recording_access::Video,
     ai_manager: ai_access::State,
+    terminal_chats: HashMap<window::Id, terminal_ai::Chat>,
+    saved_chat_browsers: HashMap<window::Id, saved_chats::Browser>,
+    saved_chat_mutations: HashMap<u64, window::Id>,
+    saved_chat_library_revision: u64,
+    terminal_chat_writes: HashMap<u64, terminal_ai::ChatWrite>,
     sftp: HashMap<window::Id, SftpWindow>,
+    retained_sftp_download: Option<crate::sftp_window::ClosedDownload>,
     sftp_logins: HashMap<window::Id, ssh_access::PendingSsh>,
-    connections: Option<crate::connection_window::ConnectionWindow>,
-    connection_overview: Option<profile_tools::connection_overview::Dialog>,
+    connection_managers: BTreeMap<window::Id, profile_tools::ConnectionManager>,
+    connection_manager_open_after_close: BTreeMap<window::Id, window::Id>,
+    connection_overview: BTreeMap<window::Id, profile_tools::connection_overview::Dialog>,
+    teamwork_restore: BTreeMap<window::Id, profile_tools::teamwork_restore::Dialog>,
     os_badge_manager: os_badge_manager::State,
-    connections_id: Option<window::Id>,
-    connection_source: Option<window::Id>,
     connection_usage: profile_tools::ConnectionUsage,
     vault: Option<crate::vault_window::VaultWindow>,
+    vault_change_revision: Arc<()>,
     vault_id: Option<window::Id>,
+    teamwork_unlock: Option<ssh_access::TeamworkUnlock>,
     ssh_keys: ssh_keys_ui::Tool,
     backup: backup_ui::Tool,
     openpgp: HashMap<window::Id, openpgp_window::Window>,
@@ -384,6 +515,11 @@ pub struct Workspace {
     scheduler_views: HashMap<window::Id, scheduler_window::SchedulerView>,
     scheduler_workers: usize,
     scheduler_queue: VecDeque<RunRequest<SshCommand>>,
+    scheduler_agent_sequences:
+        std::collections::BTreeMap<kortty_jobs::RunId, scheduler_access::firing::Sequence>,
+    scheduler_firing_retry_at: Option<std::time::Instant>,
+    scheduler_swarm_comparisons: scheduler_access::swarm_comparison::Runs,
+    scheduler_swarm_chat: scheduler_access::swarm_chat::Publisher,
     scheduler_draining: bool,
     snippets: HashMap<window::Id, snippet_access::Surface>,
     snippet_comparisons: HashMap<window::Id, snippet_access::ComparisonSurface>,
@@ -405,6 +541,7 @@ struct Window {
     transparency: transparency::WindowAlpha,
     local_files: local_dock::Browser,
     journal_dock: journal_dock::Dock,
+    coding_agent_dock: coding_agent_dock::Dock,
     remote_modifiers: Modifiers,
     dashboard: dashboard::State,
     scale_factor: f32,
@@ -482,21 +619,45 @@ struct Tab {
     tunnel_owner: Option<SessionId>,
 }
 
+struct RestoredLayout {
+    windows: Vec<window::Id>,
+    task: Task<Message>,
+    panes: Vec<SessionId>,
+}
+
 struct PaneSession {
+    restored_output: Option<zeroize::Zeroizing<String>>,
+    recovery_output_rows: Option<u16>,
     session: Session,
+    stream_generation: u64,
+    journal_config: crate::session_journal::ConnectionConfig,
+    journal_attempted: Option<u64>,
+    control_ssh_provisional: bool,
     frame: Arc<Frame>,
+    coding_agent: coding_agents::PaneState,
+    agent_shortcut: Option<terminal_agent::shortcut::Capture>,
     grid: GridSize,
+    project_initial_size: InitialTerminalSize,
+    project_initial_ssh_pending: bool,
+    project_terminal_appearance: Option<Arc<profile::ProjectTerminalAppearance>>,
     font: u8,
     font_baseline: u8,
     inherits_font_size: bool,
     selection: Option<Selection>,
+    projected_selection: Option<terminal_view::projected_selection::ProjectedSelection>,
     selected_output: Option<terminal_commands::SelectedOutput>,
     pending_split_connection: Option<split_connection::PendingSplitConnection>,
     search: Option<TerminalSearch>,
     typeahead_enabled: bool,
     strict_escapes: bool,
+    saved_strict_escapes: bool,
+    teamwork_terminal_input: Option<ssh_access::TeamworkTerminalInput>,
     local_security: Option<LocalSettings>,
+    saved_local: Option<crate::connection_store::LocalProfile>,
+    local_use_pending: bool,
     ssh: Option<SshTarget>,
+    saved_serial: Option<SerialProfile>,
+    serial_use_pending: bool,
     ibm_origin: Option<recently_closed::IbmOrigin>,
     credential_environment_source: Option<String>,
     forwarding: Option<tunnel_access::Forwarding>,
@@ -504,6 +665,15 @@ struct PaneSession {
 }
 
 impl PaneSession {
+    fn reconnect_strict_escapes(&self) -> bool {
+        self.strict_escapes && !self.saved_strict_escapes
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection = None;
+        self.projected_selection = None;
+    }
+
     fn font_size_override(&self) -> Option<u8> {
         (!self.inherits_font_size).then_some(self.font_baseline)
     }
@@ -514,6 +684,11 @@ impl PaneSession {
             && self.frame.screen.profile == TerminalProfile::Xterm
             && self.frame.status == Status::Running
     }
+}
+
+enum LocalLaunchView {
+    Initial(InitialTerminalSize, Option<Appearance>),
+    Existing(GridSize, Option<Appearance>),
 }
 
 struct PendingPaste {
@@ -539,6 +714,7 @@ struct PendingIbm {
 
 struct PendingSerial {
     form: SerialDialog,
+    saved: Option<SerialProfile>,
     replace: Option<SessionId>,
     reconnect: Option<reconnect::transport::SerialReconnect>,
     split: Option<split_connection::SplitTarget>,
@@ -595,18 +771,19 @@ impl PendingIbm {
 }
 
 #[derive(Clone)]
-struct Watch(SessionId, Receiver<()>);
+struct Watch(SessionId, u64, Receiver<()>);
 
 impl Hash for Watch {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.0.hash(state);
+        self.1.hash(state);
     }
 }
 
 fn watch(watch: &Watch) -> BoxStream<'static, Message> {
     let id = watch.0;
     watch
-        .1
+        .2
         .clone()
         .map(move |()| Message::SessionUpdate(id))
         .boxed()
@@ -715,6 +892,11 @@ impl Tab {
 }
 
 impl Workspace {
+    pub(crate) fn startup_password_requested(root: &std::path::Path) -> bool {
+        tab_titles::WindowSettings::read(&root.join("window-settings.json"))
+            .is_ok_and(|settings| settings.startup.require_master_password)
+    }
+
     pub(super) fn prepare_app_logging(
         &self,
         settings: &crate::app_logging::Settings,
@@ -751,18 +933,31 @@ impl Workspace {
         self.app_logging.discard(candidate);
     }
 
-    pub fn boot() -> (Self, Task<Message>) {
+    pub(crate) fn boot(
+        policy: crate::clipboard_policy::ClipboardPolicy,
+        unlocked_vault: Option<VaultWindow>,
+    ) -> (Self, Task<Message>) {
+        assert!(
+            policy.problem.is_none()
+                && (!policy.require_master_password
+                    || unlocked_vault
+                        .as_ref()
+                        .is_some_and(VaultWindow::is_unlocked)),
+            "desktop startup must be authorized before boot"
+        );
         let mut workspace = Self {
             video: recording_access::Video::load(),
             ai_manager: ai_access::State::load(),
+            vault: unlocked_vault,
             ..Self::default()
         };
-        workspace.clipboard.policy = crate::clipboard_policy::ClipboardPolicy::load();
+        workspace.clipboard.policy = policy;
         workspace.refresh_backup_preferences();
         workspace.refresh_backup_recipients();
         workspace.chrome = chrome::Chrome::load();
+        #[cfg(target_os = "macos")]
+        workspace.start_terminal_activity();
         workspace.lifecycle = window_lifecycle::Lifecycle::initialize();
-        workspace.dialog_placement = dialog_placement::State::initialize();
         match crate::snippets::profile_path()
             .map(|path| path.with_file_name(crate::snippet_window::session::FILE_NAME))
             .and_then(crate::snippet_window::session::Writer::start)
@@ -772,27 +967,54 @@ impl Workspace {
         }
         workspace.local_dock = local_dock::Preference::load();
         workspace.window_settings = tab_titles::WindowSettings::load();
+        workspace.refresh_terminal_backgrounds();
+        workspace.dialog_placement = dialog_placement::State::initialize(
+            workspace.window_settings.startup.remember_geometry,
+        );
         workspace.load_journal_markers();
-        if workspace.clipboard.policy.problem.is_none()
-            && let Ok(profile) = profile::root()
-        {
-            workspace.app_logging = crate::app_logging::Runtime::initialize(
-                &workspace.window_settings.app_logging,
-                &workspace.clipboard.policy.app_logging,
-                &profile,
-            );
+        if let Ok(profile) = profile::root() {
+            workspace.journal_summaries.load(&profile);
+            if workspace.clipboard.policy.problem.is_none() {
+                workspace.app_logging = crate::app_logging::Runtime::initialize(
+                    &workspace.window_settings.app_logging,
+                    &workspace.clipboard.policy.app_logging,
+                    &profile,
+                );
+            }
+            let problems = crate::session::ai_code_guard::reload_overrides(&profile);
+            if !problems.is_empty() {
+                workspace
+                    .app_logging
+                    .record(crate::app_logging::Event::CodingAgentOverrideRejected);
+                for problem in problems {
+                    eprintln!(
+                        "kortty: rejected coding-agents override {} ({})",
+                        problem.file, problem.message
+                    );
+                }
+            }
         }
         workspace.environments = environment_access::Environments::load();
         workspace.saved_terminal_preferences = profile_tools::SavedTerminalPreferences::load();
+        workspace.highlight.load();
         workspace.initialize_saved_clipboard_settings();
         workspace.security = session_security::Security::load();
-        workspace.load_vault_status();
+        workspace.control_boot();
+        if workspace.vault.is_none() {
+            workspace.load_vault_status();
+        }
         workspace.refresh_ssh_key_choices();
+        workspace.load_teamwork_auth();
         let (id, task) = workspace.boot_session_restore();
         workspace.initialize_scheduler(id, true);
         let recent = workspace.refresh_open_recent();
         let power = workspace.reconcile_sleep_prevention();
         let recovery = workspace.initialize_snippet_recovery();
+        let teamwork = workspace.start_teamwork();
+        let policy_auto_models = workspace.poll_policy_auto_profiles(false);
+        let model_catalog = workspace.start_ai_model_catalog_refresh();
+        let journal_summaries = workspace.recover_journals_at_startup();
+        workspace.initialize_automation_journals();
         (
             workspace,
             Task::batch([
@@ -800,6 +1022,10 @@ impl Workspace {
                 recent,
                 power,
                 recovery,
+                teamwork,
+                policy_auto_models,
+                model_catalog,
+                journal_summaries,
                 iced::system::theme().map(Message::JournalSystemTheme),
             ]),
         )
@@ -811,25 +1037,30 @@ impl Workspace {
         }
         if let Some(title) = self
             .quick_connect_title(id)
+            .or_else(|| self.highlight_title(id))
             .or_else(|| self.known_hosts_title(id))
             .or_else(|| self.ssh_keys_title(id))
             .or_else(|| self.backup_title(id))
             .or_else(|| self.connection_import_title(id))
             .or_else(|| self.connection_export_title(id))
             .or_else(|| self.connection_overview_title(id))
+            .or_else(|| self.teamwork_restore_title(id))
             .or_else(|| self.os_badge_manager_title(id))
             .or_else(|| {
                 self.is_openpgp_standalone(id)
                     .then_some(openpgp_window::TITLE)
             })
             .or_else(|| self.environment_title(id))
+            .or_else(|| self.teamwork_settings_title(id))
             .or_else(|| self.manual_title(id))
             .or_else(|| self.ai_manager_title(id))
+            .or_else(|| self.saved_chats_title(id))
             .or_else(|| self.chrome.title(id))
             .or_else(|| self.settings.title(id))
             .or_else(|| self.shell_integration_title(id))
             .or_else(|| self.link_confirmation_title(id))
             .or_else(|| self.rename_dialog_title(id))
+            .or_else(|| self.coding_agent_alias_dialog_title(id))
             .or_else(|| self.tab_journal_note_title(id))
             .or_else(|| self.close_all_dialog_title(id))
             .or_else(|| self.remote_dialog_title(id))
@@ -851,6 +1082,9 @@ impl Workspace {
         if self.diagrams.contains_key(&id) {
             return "kortty · Diagrams".into();
         }
+        if let Some(title) = self.terminal_agents.title(id) {
+            return title.into();
+        }
         if self.ascii_art.contains_key(&id) {
             return ascii_art::TITLE.into();
         }
@@ -869,7 +1103,10 @@ impl Workspace {
         if self.snippet_comparisons.contains_key(&id) {
             return crate::snippet_window::compare::TITLE.into();
         }
-        if self.connections_id == Some(id) {
+        if let Some(title) = self.connection_editor_title(id) {
+            return title.into();
+        }
+        if self.connection_managers.contains_key(&id) {
             return "Connection Manager".into();
         }
         if self.vault_id == Some(id) {
@@ -881,12 +1118,16 @@ impl Workspace {
         }
         self.windows.get(&id).map_or_else(
             || "kortty".into(),
-            |window| format!("kortty · Window {}", window.number),
+            |window| match self.coding_agent_app_badge.title_count() {
+                0 => format!("kortty · Window {}", window.number),
+                count => format!("({count}) kortty · Window {}", window.number),
+            },
         )
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
         let events = event::listen_with(|event, status, id| match event {
+            Event::Window(window::Event::FileDropped(_)) if status == EventStatus::Captured => None,
             Event::Window(event) => Some(Message::Window(id, event)),
             Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
@@ -922,27 +1163,45 @@ impl Workspace {
             [
                 events,
                 self.scheduler_subscription(),
+                self.application_update_subscription(),
                 self.snippet_recovery_subscription(),
                 self.snippet_structure_subscription(),
                 self.backup_subscription(),
+                self.teamwork_subscription(),
                 self.recording_subscription(),
                 self.tab_watch_subscription(),
+                self.ai_manager_subscription(),
                 self.journal_dock_subscription(),
+                self.coding_agent_dock_subscription(),
+                self.coding_agent_notification_subscription(),
+                self.highlight.subscription(),
+                self.terminal_notification_subscription(),
                 self.journal_viewer_subscription(),
+                self.journal_summary_subscription(),
                 iced::system::theme_changes().map(Message::JournalSystemTheme),
                 self.effect_subscription(),
                 self.session_process_subscription(),
                 self.lifecycle.subscription(),
                 self.session_restore.subscription(),
                 self.tab_drag.subscription(),
+                #[cfg(target_os = "linux")]
+                self.wayland_file_drop.subscription(),
+                #[cfg(target_os = "linux")]
+                self.wayland_drag_preparation_subscription(),
+                #[cfg(target_os = "windows")]
+                self.windows_file_drag_subscription(),
                 self.remote_dock_subscription(),
+                self.project_sftp_subscription(),
                 self.control.subscription(),
                 #[cfg(target_os = "linux")]
                 self.dialog_placement.opening_subscription(),
             ]
             .into_iter()
             .chain(self.sessions.iter().map(|(id, pane)| {
-                Subscription::run_with(Watch(*id, pane.session.updates()), watch)
+                Subscription::run_with(
+                    Watch(*id, pane.stream_generation, pane.session.updates()),
+                    watch,
+                )
             })),
         )
     }
@@ -950,12 +1209,19 @@ impl Workspace {
     pub fn update(&mut self, message: Message) -> Task<Message> {
         let message = match message {
             Message::RepeatedKey(id, key, location, modifiers, text) => {
-                if self.suppressed_quick_select_repeat(id, &key) {
+                if self.suppressed_quick_select_repeat(id, &key)
+                    || self.agent_cursor_repeated(&key)
+                    || self.agent_inline_repeated(&key, modifiers)
+                {
                     return Task::none();
                 }
                 Message::Key(id, key, location, modifiers, text)
             }
             message => {
+                if let Message::Key(_, key, _, modifiers, _) = &message {
+                    self.agent_cursor_fresh(key);
+                    self.agent_inline_fresh(key, *modifiers);
+                }
                 self.interrupt_quick_select(&message);
                 message
             }
@@ -966,7 +1232,16 @@ impl Workspace {
             self.native_focused_tool_tab(),
         );
         let changes_layout = session_restore::changes_layout(&message)
-            || matches!(&message, Message::MainPlacementClosing(..));
+            || matches!(
+                &message,
+                Message::MainPlacementClosing(..)
+                    | Message::CodingAgentNotificationActivated(_)
+                    | Message::CodingAgentPanel(
+                        _,
+                        coding_agents::PanelMessage::Focus(_)
+                            | coding_agents::PanelMessage::NextBlocked,
+                    )
+            );
         let sync_remote = changes_layout
             || matches!(
                 &message,
@@ -984,6 +1259,8 @@ impl Workspace {
             || matches!(&message, Message::Key(_, key, _, modifiers, _) if window_navigation::tab_step(key, *modifiers).is_some()
                 || self.window_settings.key_bindings.action_for(key, *modifiers).is_some());
         #[cfg(target_os = "macos")]
+        let sync_remote = sync_remote || matches!(&message, Message::NativeMenu(_));
+        #[cfg(target_os = "macos")]
         let changes_native_menu = changes_layout
             || matches!(
                 &message,
@@ -1000,7 +1277,9 @@ impl Workspace {
                     | Message::RecentlyClosed(_)
                     | Message::OpenRecent(_)
                     | Message::ConnectionUsed(..)
-                    | Message::Connections(_)
+                    | Message::Connections(..)
+                    | Message::ConnectionEditor(..)
+                    | Message::ConnectionCatalogReloaded(..)
                     | Message::CloseAllDialog(..)
                     | Message::ConfirmSerialClose(..)
                     | Message::Ssh(_)
@@ -1024,6 +1303,21 @@ impl Workspace {
                             | remote_dock::Message::Dialog(_)
                     )
                     | Message::Settings(_)
+                    | Message::TeamworkSettings(..)
+                    | Message::ProjectFile(
+                        _,
+                        project_access::local_files::Message::Open
+                            | project_access::local_files::Message::RemoteLoaded(..)
+                            | project_access::local_files::Message::Editor(
+                                editor_window::Message::Open
+                                    | editor_window::Message::Save
+                                    | editor_window::Message::SaveAndClose
+                                    | editor_window::Message::Opened(_)
+                                    | editor_window::Message::Saved(_)
+                                    | editor_window::Message::RequestClose
+                                    | editor_window::Message::DecideDiscard(_)
+                            )
+                    )
                     | Message::QuickConnect(_, _)
                     | Message::KnownHosts(_, _)
                     | Message::SshKeys(_, _)
@@ -1051,7 +1345,7 @@ impl Workspace {
                     | Message::Palette(..)
                     | Message::Quit
             );
-        let counts_changed = self.connections.is_some()
+        let counts_changed = !self.connection_managers.is_empty()
             && (changes_layout
                 || matches!(
                     &message,
@@ -1063,24 +1357,23 @@ impl Workspace {
                         | Message::SessionRestore(_)
                         | Message::Control(_)
                 ));
-        let update_journals = !self.journal_captures.is_empty()
-            && (changes_layout
-                || matches!(
-                    &message,
-                    Message::ReconnectHistoryReady(..)
-                        | Message::Ssh(_)
-                        | Message::Serial(..)
-                        | Message::ConnectIbm(_)
-                        | Message::ClosePane(..)
-                        | Message::JournalCapture(_)
-                )
-                || matches!(
-                    &message,
-                    Message::Control(control_access::Message::Request(request))
-                        if request.method == kortty_control::Method::Close
-                )
-                || matches!(&message, Message::SessionUpdate(id) if self.sessions.get(id)
-                    .is_some_and(|pane| pane.frame.status != Status::Running)));
+        let update_journals = changes_layout
+            || matches!(
+                &message,
+                Message::ReconnectHistoryReady(..)
+                    | Message::Ssh(_)
+                    | Message::Serial(..)
+                    | Message::ConnectIbm(_)
+                    | Message::ClosePane(..)
+                    | Message::JournalCapture(_)
+            )
+            || matches!(
+                &message,
+                Message::Control(control_access::Message::Request(request))
+                    if request.method == kortty_control::Method::Close
+            )
+            || matches!(&message, Message::SessionUpdate(id) if self.sessions.get(id)
+                    .is_some_and(|pane| pane.frame.status != Status::Running || pane.session.frame().status != Status::Running));
         let sync_journal_docks = sync_remote
             || update_journals
             || matches!(
@@ -1093,7 +1386,116 @@ impl Workspace {
                 ) | Message::Window(_, window::Event::CloseRequested | window::Event::Closed)
                     | Message::Control(_)
             );
+        let reconcile_coding_agents =
+            sync_remote || matches!(&message, Message::Window(_, window::Event::Focused));
+        let previously_seen = reconcile_coding_agents
+            .then(|| coding_agents::seen_pane(&self.windows))
+            .flatten();
+        let agent_before = if let Message::SessionUpdate(id) = &message {
+            Some((*id, self.coding_agent_status(*id)))
+        } else {
+            None
+        };
+        let reconcile_agent_docks = sync_remote
+            || matches!(
+                &message,
+                Message::Window(_, window::Event::CloseRequested | window::Event::Closed)
+            );
+        let opened = match &message {
+            Message::Window(id, window::Event::Opened { .. }) => Some(*id),
+            _ => None,
+        };
+        let settings_changed = matches!(&message, Message::Settings(_));
+        #[cfg(target_os = "linux")]
+        let badge_attention_changed = matches!(
+            &message,
+            Message::Window(_, window::Event::Focused | window::Event::Unfocused)
+        );
+        #[cfg(not(target_os = "linux"))]
+        let badge_attention_changed = false;
+        let session_output_changed = match &message {
+            Message::SessionUpdate(id) => Some(*id),
+            _ => None,
+        };
+        let notifications_were_enabled = self.coding_agent_notifications_enabled();
+        let terminal_notifications_before = self.window_settings.terminal_notifications.clone();
+        let terminal_notifications_enabled_before = self.terminal_notifications_enabled();
+        let was_exiting = self.exiting;
         let task = self.update_message(message);
+        #[cfg(target_os = "linux")]
+        self.revalidate_wayland_file_drops();
+        #[cfg(target_os = "windows")]
+        self.revalidate_windows_file_drag();
+        self.revalidate_agent_cursor();
+        self.revalidate_agent_chat_handoffs();
+        self.revalidate_agent_journal_synchronizations();
+        self.revalidate_private_agent_chats();
+        self.reconcile_automatic_knowledge();
+        self.reconcile_runtime_updates();
+        self.reconcile_application_updates();
+        self.reconcile_session_output(changes_layout, session_output_changed);
+        self.control_mcp_revalidate();
+        self.revalidate_journal_summary();
+        self.revalidate_remote_snippet_analysis();
+        self.revalidate_remote_snippet_assistance();
+        self.revalidate_journal_questions();
+        self.revalidate_manual_question();
+        self.revalidate_automation_journals();
+        self.revalidate_swarm_automation_journals();
+        self.show_ai_usage_issue();
+        if terminal_notifications_before != self.window_settings.terminal_notifications
+            || terminal_notifications_enabled_before != self.terminal_notifications_enabled()
+        {
+            self.revoke_terminal_notifications();
+        }
+        let job_notices = Task::batch([self.notify_job_results(), self.dispatch_job_webhooks()]);
+        let task = if job_notices.units() > 0 {
+            Task::batch([task, job_notices])
+        } else {
+            task
+        };
+        if reconcile_coding_agents
+            && let Some(session) = coding_agents::seen_pane(&self.windows)
+            && Some(session) != previously_seen
+            && let Some(pane) = self.sessions.get_mut(&session)
+        {
+            pane.coding_agent.acknowledge();
+            self.control_agent_updated(session);
+        }
+        let agent_change = agent_before.map(|(id, before)| (before, self.coding_agent_status(id)));
+        if let Some((session, before)) = agent_before {
+            self.observe_coding_agent_notification(session, before);
+        }
+        if reconcile_agent_docks {
+            self.coding_agent_notifications
+                .retain_sessions(|session| self.sessions.contains_key(&session));
+        }
+        let task = if notifications_were_enabled != self.coding_agent_notifications_enabled() {
+            Task::batch([task, self.coding_agent_notification_permission_changed()])
+        } else {
+            task
+        };
+        if reconcile_agent_docks
+            || agent_change.is_some_and(|(before, after)| before.is_some() != after.is_some())
+        {
+            self.reconcile_coding_agent_docks();
+        }
+        let task = if reconcile_agent_docks
+            || settings_changed
+            || badge_attention_changed
+            || cfg!(target_os = "linux")
+                && notifications_were_enabled != self.coding_agent_notifications_enabled()
+            || self.exiting != was_exiting
+            || agent_change.is_some_and(|(before, after)| before != after)
+        {
+            Task::batch([task, self.reconcile_coding_agent_app_badge(opened)])
+        } else {
+            task
+        };
+        self.reconcile_coding_agent_status_menu();
+        self.reconcile_tab_recordings();
+        #[cfg(target_os = "macos")]
+        self.reconcile_scheduler_activity();
         let power = self.reconcile_sleep_prevention();
         let task = if power.units() > 0 {
             Task::batch([task, power])
@@ -1153,7 +1555,10 @@ impl Workspace {
             && !matches!(
                 message,
                 Message::ExitReady
-                    | Message::JobFinished(_)
+                    | Message::JobFinished(..)
+                    | Message::ScheduledAgent(..)
+                    | Message::ScheduledSwarmComparison(..)
+                    | Message::JobWebhookFinished(..)
                     | Message::Chrome(chrome::Message::Power(_))
                     | Message::RuntimeTick
                     | Message::SaveLastWindow
@@ -1174,6 +1579,7 @@ impl Workspace {
                 return self.snippet_transfer_event(id, token, event);
             }
             Message::SnippetAnalysis(id, event) => return self.snippet_analysis_event(id, event),
+            Message::SnippetDiagram(event) => return self.snippet_diagram_event(event),
             Message::QuickConnect(id, message) => return self.update_quick_connect(id, message),
             Message::KnownHosts(id, message) => return self.update_known_hosts(id, message),
             Message::SshKeys(id, message) => return self.update_ssh_keys(id, message),
@@ -1189,8 +1595,44 @@ impl Workspace {
                 return self.update_session_journal(id, message);
             }
             Message::JournalCapture(message) => return self.update_journal_capture(message),
+            Message::JournalAgentChat(message) => return self.update_journal_agent_chat(message),
             Message::JournalDock(owner, message) => {
                 return self.update_journal_dock(owner, message);
+            }
+            Message::CodingAgentDock(owner, message) => {
+                return self.update_coding_agent_dock(owner, message);
+            }
+            #[cfg(windows)]
+            Message::CodingAgentBadgeIconResult {
+                id,
+                generation,
+                retry,
+                applied,
+            } => {
+                return self.finish_coding_agent_badge_icon(id, generation, retry, applied);
+            }
+            #[cfg(target_os = "linux")]
+            Message::CodingAgentLauncherBadgeResult {
+                generation,
+                applied,
+            } => {
+                self.finish_coding_agent_launcher_badge(generation, applied);
+            }
+            Message::CodingAgentDockTick => self.coding_agent_dock_tick(),
+            Message::CodingAgentNotificationsTick => {
+                return self.poll_coding_agent_notifications();
+            }
+            Message::TerminalNotificationActivated(activation) => {
+                return self.activate_terminal_notification(activation);
+            }
+            Message::CodingAgentNotificationActivated(activation) => {
+                return self.activate_coding_agent_notification(activation);
+            }
+            Message::CodingAgentPanel(owner, message) => {
+                return self.update_coding_agent_panel(owner, message);
+            }
+            Message::CodingAgentAlias(id, message) => {
+                return self.update_coding_agent_alias(id, message);
             }
             Message::JournalDockTick => return self.journal_dock_tick(),
             Message::JournalViewerTick => return self.journal_viewer_tick(),
@@ -1200,6 +1642,7 @@ impl Workspace {
             Message::JournalAppearanceSave => return self.save_journal_appearance_when_ready(),
             Message::JournalSystemTheme(theme) => self.set_journal_system_theme(theme),
             Message::TerminalEffects(message) => return self.update_terminal_effects(message),
+            Message::Highlight(message) => return self.update_highlight(message),
             Message::TerminalEffectFrame(now) => self.effect_frame = Some(now),
             Message::SetTerminalEffect(owner, session, effect) => {
                 if self.effect_target_current(owner, session) {
@@ -1212,6 +1655,12 @@ impl Workspace {
                 }
             }
             Message::Settings(message) => return self.update_settings(message),
+            Message::ApplicationUpdates(event) => return self.update_application_updates(event),
+            Message::TeamworkAuthSaved(result) => self.finish_teamwork_auth_save(result),
+            Message::TeamworkSettings(id, message) => {
+                return self.update_teamwork_settings(id, message);
+            }
+            Message::TeamworkSync(event) => return self.update_teamwork(event),
             Message::ShellIntegration(id, message) => {
                 return self.update_shell_integration(id, message);
             }
@@ -1226,6 +1675,7 @@ impl Workspace {
             Message::TerminalCommand(message) => return self.update_terminal_command(message),
             Message::TerminalLink(id, message) => return self.update_terminal_link(id, message),
             Message::Control(message) => return self.update_control(message),
+            Message::JournalSummary(message) => return self.update_journal_summary_worker(message),
             Message::SessionSecurity(message) => return self.update_session_security(message),
             Message::Window(id, window::Event::CloseRequested) => {
                 self.palette.dismiss(id);
@@ -1234,6 +1684,9 @@ impl Workspace {
                 if let Some((dialog, _)) = self.owner_dialog(id) {
                     return window::gain_focus(dialog);
                 }
+                if let Some(cancel) = self.cancel_ai_manager_form_on_window_close(id) {
+                    return cancel;
+                }
                 return self.request_close(id, SerialClose::Window);
             }
             Message::Window(id, event @ window::Event::Opened { .. }) => {
@@ -1241,6 +1694,13 @@ impl Workspace {
                 let geometry = self.observe_window_geometry(id, event);
                 let scale = window::scale_factor(id)
                     .map(move |scale| Message::Window(id, window::Event::Rescaled(scale)));
+                #[cfg(target_os = "linux")]
+                let wayland_file_drop =
+                    if self.windows.contains_key(&id) || self.sftp.contains_key(&id) {
+                        self.wayland_file_drop.register(id)
+                    } else {
+                        Task::none()
+                    };
                 return if self.windows.contains_key(&id) {
                     #[cfg(target_os = "macos")]
                     chrome::install_native_menus();
@@ -1249,11 +1709,19 @@ impl Workspace {
                         dialog,
                         scale,
                         tab_drag::DragState::register(id),
+                        #[cfg(target_os = "linux")]
+                        wayland_file_drop,
                         self.start_local_dock(id),
                         self.detect_transparent_surface(id),
                     ])
                 } else {
-                    Task::batch([geometry, dialog, scale])
+                    Task::batch([
+                        geometry,
+                        dialog,
+                        scale,
+                        #[cfg(target_os = "linux")]
+                        wayland_file_drop,
+                    ])
                 };
             }
             Message::Window(id, event @ (window::Event::Resized(_) | window::Event::Moved(_))) => {
@@ -1271,8 +1739,15 @@ impl Workspace {
             }
             #[cfg(target_os = "linux")]
             Message::DialogOpeningRedraw(id) => return self.dialog_placement.opening_redraw(id),
-            Message::DialogPlacementClosing(id, placement) => {
-                return self.finish_dialog_close(id, placement);
+            Message::DialogPlacementClosing(id, placement, focus) => {
+                return self.finish_dialog_close(id, placement, focus);
+            }
+            Message::OwnedDialogOpened(id, owner, focus) => {
+                return self.finish_owned_dialog_open(id, owner, focus.map(|focus| *focus));
+            }
+            #[cfg(target_os = "linux")]
+            Message::X11OwnedDialogReady(id, owner, focus) => {
+                return self.show_x11_owned_dialog(id, owner, focus.map(|focus| *focus));
             }
             Message::MainPlacementClosing(id, user, inspected) => {
                 if !self.main_placement_closing.remove(&id) || !self.windows.contains_key(&id) {
@@ -1293,7 +1768,25 @@ impl Workspace {
                 }
                 return self.exit_with_placement();
             }
-            Message::Window(id, window::Event::Closed) => self.dialog_placement.closed(id),
+            Message::Window(id, window::Event::Closed) => {
+                #[cfg(target_os = "linux")]
+                self.wayland_file_drop.forget(id);
+                #[cfg(target_os = "windows")]
+                self.windows_file_drag.forget(id);
+                if self.native_focused_window == Some(id) {
+                    self.native_focused_window = None;
+                }
+                self.highlight_window_closed(id);
+                self.teamwork_settings_closed(id);
+                self.teamwork_restore_closed(id);
+                self.remove_coding_agent_alias_dialogs(id);
+                self.journal_summary_progress_closed(id);
+                let placed = self.finish_placed_dialog_closed(id);
+                let manager = self.connection_window_closed(id).unwrap_or_else(Task::none);
+                let teamwork = self.resume_teamwork_after_vault(id);
+                let control = self.resume_control_ssh_after_vault(id);
+                return Task::batch([placed, manager, teamwork, control]);
+            }
             Message::SaveLastWindow => return self.lifecycle.save_if_due(),
             Message::WindowPlacementPoll(id, request) => {
                 return self.poll_restored_placement(id, request);
@@ -1321,10 +1814,7 @@ impl Workspace {
             Message::Window(id, window::Event::Focused) => {
                 self.dialog_placement.focused(id);
                 self.snippet_window_focused(id);
-                #[cfg(target_os = "macos")]
-                {
-                    self.native_focused_window = Some(id);
-                }
+                self.native_focused_window = Some(id);
                 for (window_id, window) in &mut self.windows {
                     window.focused = id == *window_id;
                     if window.focused {
@@ -1351,13 +1841,10 @@ impl Workspace {
                 self.ascii_art_modifiers(id, Modifiers::empty());
                 self.logfile_modifiers(id, Modifiers::empty());
                 self.journal_modifiers(id, Modifiers::empty());
-                if self.connections_id == Some(id)
-                    && let Some(manager) = &mut self.connections
-                {
-                    manager.set_modifiers(Modifiers::empty());
-                    manager.dismiss_tree_context();
+                if let Some(manager) = self.connection_managers.get_mut(&id) {
+                    manager.window.set_modifiers(Modifiers::empty());
+                    manager.window.dismiss_tree_context();
                 }
-                #[cfg(target_os = "macos")]
                 if self.native_focused_window == Some(id) {
                     self.native_focused_window = None;
                 }
@@ -1373,8 +1860,8 @@ impl Workspace {
                 return self.refresh_transparent_window_mode(id);
             }
             Message::Window(id, window::Event::FileDropped(path)) => {
-                if let Some(dialog) = self.vault_unlock_modal(id) {
-                    return window::gain_focus(dialog);
+                if let Some((_, focus)) = self.owner_dialog(id) {
+                    return self.update(focus);
                 }
                 return self.drop_ascii_art_image(id, path);
             }
@@ -1389,10 +1876,24 @@ impl Workspace {
             Message::NativeOpenRecent(entry) => return self.native_open_recent(entry),
             #[cfg(target_os = "macos")]
             Message::NativeOpenRecentShowing => return self.refresh_open_recent(),
-            Message::NewWindow => return self.open_window(true).1,
+            Message::NewWindow => {
+                let (id, opened) = self.open_window(true);
+                return if cfg!(target_os = "macos") {
+                    opened.chain(window::gain_focus(id))
+                } else {
+                    opened
+                };
+            }
             Message::OpenDiagram => return self.open_diagram(None),
+            Message::TerminalAgent(id, action) => return self.update_terminal_agent(id, action),
+            Message::AgentCursor(action) => return self.update_agent_cursor(action),
+            Message::AgentInline(binding, key) => return self.update_agent_inline(binding, key),
+            Message::AgentShortcut(action) => return self.update_agent_shortcut(action),
             Message::AsciiArt(id, message) => return self.update_ascii_art(id, message),
             Message::Diagram(id, diagram_window::Message::Close) => return self.close_window(id),
+            Message::Diagram(id, diagram_window::Message::SaveToSnippet) => {
+                return self.save_library_diagram(id);
+            }
             Message::Diagram(id, diagram_window::Message::CopySource) => {
                 if let Some(diagram) = self.diagrams.get(&id) {
                     return self.write_clipboard(diagram.source());
@@ -1404,6 +1905,11 @@ impl Workspace {
                 }
             }
             Message::Diagram(id, message) => {
+                if matches!(message, diagram_window::Message::JumpToSource)
+                    && let Some(jump) = self.jump_from_saved_snippet_diagram(id)
+                {
+                    return jump;
+                }
                 if let Some(diagram) = self.diagrams.get_mut(&id) {
                     return diagram
                         .update(message)
@@ -1420,10 +1926,8 @@ impl Workspace {
                     self.ascii_art_modifiers(id, *modifiers);
                     self.logfile_modifiers(id, *modifiers);
                     self.journal_modifiers(id, *modifiers);
-                    if self.connections_id == Some(id)
-                        && let Some(manager) = &mut self.connections
-                    {
-                        manager.set_modifiers(*modifiers);
+                    if let Some(manager) = self.connection_managers.get_mut(&id) {
+                        manager.window.set_modifiers(*modifiers);
                     }
                 }
                 return self.update_remote_dock(id, message);
@@ -1431,10 +1935,30 @@ impl Workspace {
             Message::RemoteDockTick => return self.remote_dock_tick(),
             Message::Recording(message) => return self.update_recording(message),
             Message::AiManager(message) => return self.update_ai_manager(message),
+            Message::TerminalAi(id, message) => return self.update_terminal_ai(id, message),
+            Message::SavedChats(id, message) => return self.update_saved_chats(id, message),
+            Message::ProjectFile(id, message) => return self.update_project_file(id, message),
+            Message::ProjectSftpTick => {
+                return self.update_project_sftp_idle(std::time::Instant::now());
+            }
             Message::Editor(id, editor_window::Message::RequestClose) => {
                 return self.close_window(id);
             }
             Message::Editor(_, editor_window::Message::RequestQuit) => return self.quit(),
+            Message::Editor(id, editor_window::Message::Cut) => {
+                let selection = self.editors.get_mut(&id).and_then(|editor| {
+                    let policy = &self.clipboard.policy;
+                    if editor.remote_editor().is_some()
+                        && (policy.problem.is_some()
+                            || policy.remote_editor
+                                != crate::clipboard_policy::RemoteEditorPolicy::Allow)
+                    {
+                        return None;
+                    }
+                    editor.cut_selection()
+                });
+                return selection.map_or_else(Task::none, |value| self.write_clipboard(value));
+            }
             Message::Editor(id, message) => {
                 let io_finished = matches!(
                     message,
@@ -1619,8 +2143,12 @@ impl Workspace {
             Message::SelectTab(id, tab_id) => {
                 self.dismiss_tab_context(id);
                 self.select_tab(id, tab_id, false);
+                return self.active_project_file(id);
             }
-            Message::CommitTabCycle(id) => self.commit_tab_cycle(id),
+            Message::CommitTabCycle(id) => {
+                self.commit_tab_cycle(id);
+                return self.active_project_file(id);
+            }
             Message::CloseTab(id, tab_id) => {
                 return self.request_close(id, SerialClose::Tab(tab_id));
             }
@@ -1641,6 +2169,10 @@ impl Workspace {
                 }
             }
             Message::TabDrag(message) => return self.update_tab_drag(message),
+            #[cfg(target_os = "linux")]
+            Message::WaylandFileDrop(message) => return self.update_wayland_file_drop(message),
+            #[cfg(target_os = "windows")]
+            Message::WindowsFileDrag(message) => return self.update_windows_file_drag(message),
             Message::Split(id, axis) => return self.split(id, axis),
             Message::CancelSplitConnection(id, session) => {
                 self.cancel_split_connection(id, session)
@@ -1722,7 +2254,7 @@ impl Workspace {
                     && pane.grid != grid
                 {
                     pane.grid = grid;
-                    pane.selection = None;
+                    pane.clear_selection();
                     pane.selected_output = None;
                     pane.session.resize(grid);
                 }
@@ -1763,11 +2295,17 @@ impl Workspace {
                             || (!self.journal_captures.is_empty()
                                 && (pane.frame.screen.alternate_screen
                                     != next.screen.alternate_screen
-                                    || (pane.frame.scroll_offset == 0)
-                                        != (next.scroll_offset == 0)));
+                                    || pane.frame.at_live_viewport() != next.at_live_viewport()));
                     }
-                    if pane.selection.is_some() && pane.frame.screen.cells != next.screen.cells {
+                    if pane.selection.is_some()
+                        && (next.inline.is_some() || pane.frame.screen.cells != next.screen.cells)
+                    {
                         pane.selection = None;
+                    }
+                    if let Some(selection) = &mut pane.projected_selection
+                        && !selection.retain(&pane.frame, &next, pane.stream_generation)
+                    {
+                        pane.projected_selection = None;
                     }
                     if pane
                         .selected_output
@@ -1782,11 +2320,32 @@ impl Workspace {
                     if let Some(effect) = &mut pane.effect {
                         effect.update_flash(&pane.frame, &next);
                     }
+                    let agent = self
+                        .window_settings
+                        .coding_agent_detection_enabled
+                        .then(|| next.coding_agent())
+                        .flatten();
+                    pane.coding_agent.observe(agent, || {
+                        coding_agents::seen_pane(&self.windows) == Some(id)
+                    });
                     pane.frame = next;
                 }
+                if self
+                    .sessions
+                    .get(&id)
+                    .is_none_or(|pane| pane.frame.status != Status::Running)
+                {
+                    self.revoke_terminal_ai_source(id);
+                    self.revoke_model_review_source(id);
+                }
                 let reconnect = self.finish_reconnect_worker(id);
+                self.control_agent_updated(id);
                 self.finish_split_connection(id);
-                self.control_finish_split(id);
+                let control_split = self.control_finish_split(id);
+                let serial_use = self.record_serial_session_used(id);
+                let local_use = self.record_local_session_used(id);
+                self.refresh_highlight(id);
+                let notifications = self.observe_terminal_notifications(id, bells);
                 #[cfg(target_os = "macos")]
                 if refresh_session_menu {
                     self.sync_native_menus();
@@ -1794,6 +2353,10 @@ impl Workspace {
                 let sidebar = self.remote_dock_session_updated(id);
                 return Task::batch([
                     reconnect,
+                    control_split,
+                    serial_use,
+                    local_use,
+                    notifications,
                     sidebar,
                     self.play_bell(id, bells),
                     self.clipboard_events(id),
@@ -1807,13 +2370,31 @@ impl Workspace {
             Message::ShellTabTitles(id, enabled) => self.change_shell_title_visibility(id, enabled),
             Message::PromptNavigation(id, enabled) => self.change_prompt_navigation(id, enabled),
             Message::Selection(id, selection) => {
-                if let Some(pane) = self.sessions.get_mut(&id) {
+                if let Some(pane) = self.sessions.get_mut(&id)
+                    && (selection.is_none() || pane.frame.inline.is_none())
+                {
                     pane.selection = selection;
+                    pane.projected_selection = None;
                     pane.selected_output = None;
                 }
             }
             Message::SelectionFinished(owner, id, selection, frame) => {
                 return self.finish_terminal_selection(owner, id, selection, &frame);
+            }
+            Message::ProjectedSelection(owner, id, selection) => {
+                if self.window_contains_visible_pane(owner, id)
+                    && let Some(pane) = self.sessions.get_mut(&id)
+                    && selection
+                        .range(&pane.frame, pane.stream_generation)
+                        .is_some()
+                {
+                    pane.clear_selection();
+                    pane.selected_output = None;
+                    pane.projected_selection = Some(selection);
+                }
+            }
+            Message::ProjectedSelectionFinished(owner, id, selection) => {
+                return self.finish_projected_selection(owner, id, selection);
             }
             Message::OpenSearch(id) => {
                 if let Some(pane) = self.sessions.get_mut(&id)
@@ -1836,14 +2417,20 @@ impl Workspace {
             }
             Message::Scroll(id, lines) => {
                 if let Some(pane) = self.sessions.get_mut(&id) {
-                    pane.selection = None;
+                    pane.clear_selection();
                     pane.session.scroll(lines);
                 }
             }
             Message::ScrollTo(id, anchor) => {
                 if let Some(pane) = self.sessions.get_mut(&id) {
-                    pane.selection = None;
+                    pane.clear_selection();
                     pane.session.scroll_to(anchor);
+                }
+            }
+            Message::ScrollInlineTo(id, anchor) => {
+                if let Some(pane) = self.sessions.get_mut(&id) {
+                    pane.clear_selection();
+                    pane.session.scroll_inline_to(anchor);
                 }
             }
             Message::TerminalMouse(id, bytes) => {
@@ -1852,6 +2439,9 @@ impl Workspace {
                 }
             }
             Message::Key(id, key, location, modifiers, text) => {
+                if let Some((dialog, _)) = self.native_application_modal(id) {
+                    return window::gain_focus(dialog);
+                }
                 if self.native_terminal_effects() == Some(id)
                     && (key == Key::Named(Named::Escape)
                         || (modifiers.command()
@@ -1873,7 +2463,26 @@ impl Workspace {
             Message::ConnectionUsed(revision, store) => {
                 return self.connection_use_finished(revision, store);
             }
-            Message::Connections(message) => return self.update_connections(message),
+            Message::Connections(id, message) => return self.update_connections(id, message),
+            Message::ConnectionEditor(id, message) => {
+                return self.update_connection_editor(id, message);
+            }
+            Message::FocusConnectionEditor(id) => {
+                if self.connection_editor_manager(id).is_some() {
+                    return window::gain_focus(id);
+                }
+            }
+            Message::ConnectionCatalogReloaded(revision, store) => {
+                if revision == self.connection_store_revision()
+                    && let Some(store) = store
+                {
+                    let tunnels = self.apply_saved_tunnel_profiles(&store);
+                    self.apply_saved_tab_groups(&store);
+                    self.update_connection_store(store);
+                    return tunnels;
+                }
+            }
+            Message::TeamworkRestore(id, event) => return self.update_teamwork_restore(id, event),
             Message::OpenVault(id) => return self.show_vault(id),
             Message::Vault(id, message) => return self.update_vault(id, message),
             Message::Ssh(message) => return self.update_ssh(message),
@@ -1890,12 +2499,29 @@ impl Workspace {
             Message::SnippetComparison(id, message) => {
                 return self.update_snippet_comparison(id, message);
             }
-            Message::JobFinished(outcome) => return self.job_finished(outcome),
+            Message::JobFinished(outcome, journals) => return self.job_finished(outcome, journals),
+            Message::JobAgentResend(resend) => {
+                self.answer_scheduler_agent_resend(resend);
+                return Task::none();
+            }
+            Message::ScheduledAgent(event) => return self.update_firing(event),
+            Message::ScheduledSwarmComparison(event) => {
+                return self.update_scheduled_swarm_comparison(event);
+            }
+            Message::SchedulerSwarmChat(event) => return self.finish_scheduler_swarm_chat(event),
+            Message::JobWebhookFinished(ticket, outcome) => {
+                if let Some(scheduler) = &mut self.scheduler {
+                    scheduler.finish_webhook(ticket, outcome);
+                }
+                return Task::none();
+            }
+            Message::AutomationJournal(message) => return self.update_automation_journals(message),
             Message::RuntimeTick => {
+                let agents = self.reconcile_terminal_agents();
                 self.prune_retired_journal_captures();
                 self.app_logging.refresh_problem();
                 self.poll_snippet_recovery(std::time::Instant::now());
-                return self.runtime_tick();
+                return Task::batch([agents, self.runtime_tick()]);
             }
             Message::Copy(id) => {
                 if let Some(session) = self
@@ -2046,6 +2672,8 @@ impl Workspace {
             Message::Notice(id, notice) => self.notice(id, notice),
             Message::Quit => return self.quit(),
             Message::ExitReady => {
+                #[cfg(target_os = "macos")]
+                self.stop_terminal_activity();
                 if window_lifecycle::reply_to_native_quit(true) {
                     return Task::none();
                 }
@@ -2142,6 +2770,9 @@ impl Workspace {
                 transparency,
                 local_files: local_dock::Browser::default(),
                 journal_dock: journal_dock::Dock::new(self.window_settings.journal_dock),
+                coding_agent_dock: coding_agent_dock::Dock::new(
+                    self.window_settings.coding_agent_dock,
+                ),
                 remote_modifiers: Modifiers::default(),
                 dashboard: dashboard::State::default(),
                 scale_factor: 1.0,
@@ -2179,78 +2810,100 @@ impl Workspace {
     }
 
     fn capture_layout_ordered(&self, first: Option<window::Id>) -> Option<WorkspaceLayout> {
+        self.capture_layout_with_panes(first, |_| {})
+    }
+
+    fn capture_layout_with_panes(
+        &self,
+        first: Option<window::Id>,
+        mut record: impl FnMut(SessionId),
+    ) -> Option<WorkspaceLayout> {
         let mut windows: Vec<_> = self.windows.iter().collect();
         windows.sort_by_key(|(id, window)| (Some(**id) != first, window.number));
         let layouts = windows
             .into_iter()
             .filter(|(id, window)| {
-                if window.terminal_tabs().next().is_none() {
+                if window
+                    .tabs
+                    .iter()
+                    .any(|entry| self.saved_project_file(entry).is_some())
+                {
+                    true
+                } else if window.terminal_tabs().next().is_none() {
                     first.is_none() || Some(**id) == first
                 } else {
                     window.terminal_tabs().any(|tab| !tab.incognito)
                 }
             })
             .map(|(_, window)| {
+                let mut tabs = Vec::new();
+                let mut tab_titles = std::collections::BTreeMap::new();
+                let mut tab_groups = std::collections::BTreeMap::new();
+                let mut tab_primary_panes = std::collections::BTreeMap::new();
                 let mut tab_terminal_effects = std::collections::BTreeMap::new();
-                let tabs = window
-                    .terminal_tabs()
-                    .filter(|tab| !tab.incognito)
-                    .enumerate()
-                    .map(|(index, tab)| {
-                        let mut panes = Vec::new();
-                        let layout = self.capture_pane(tab, tab.grid.layout(), &mut panes)?;
-                        let effects: profile::PaneEffects = panes
-                            .into_iter()
-                            .enumerate()
-                            .filter_map(|(pane, effect)| effect.map(|effect| (pane, effect)))
-                            .collect();
-                        if !effects.is_empty() {
-                            tab_terminal_effects.insert(index, effects);
-                        }
-                        Some(layout)
-                    })
-                    .collect::<Option<Vec<_>>>()?;
-                let tab_titles = window
-                    .terminal_tabs()
-                    .filter(|tab| !tab.incognito)
-                    .enumerate()
-                    .filter_map(|(index, tab)| tab.custom_title.clone().map(|title| (index, title)))
-                    .collect();
-                let tab_groups: std::collections::BTreeMap<_, _> = window
-                    .terminal_tabs()
-                    .filter(|tab| !tab.incognito)
-                    .enumerate()
-                    .filter_map(|(index, tab)| tab.group.clone().map(|group| (index, group)))
-                    .collect();
-                let has_saved_connections = window
-                    .terminal_tabs()
-                    .filter(|tab| !tab.incognito)
-                    .any(|tab| {
-                        tab.grid
-                            .get(tab.primary)
-                            .and_then(|session| self.sessions.get(session))
-                            .and_then(|pane| pane.ssh.as_ref())
-                            .and_then(SshTarget::saved_id)
-                            .is_some()
-                    });
-                let tab_primary_panes = window
-                    .terminal_tabs()
-                    .filter(|tab| !tab.incognito)
-                    .enumerate()
-                    .filter_map(|(index, tab)| {
-                        tab.primary_pane_index()
-                            .filter(|&primary| primary != 0)
-                            .map(|primary| (index, primary))
-                    })
-                    .collect();
-                let active = window
-                    .tabs
-                    .iter()
-                    .take(window.active.saturating_add(1))
-                    .filter_map(TabEntry::terminal)
-                    .filter(|tab| !tab.incognito)
-                    .count()
-                    .saturating_sub(1);
+                let mut tab_terminal_appearance = std::collections::BTreeMap::new();
+                let mut has_saved_connections = false;
+                let mut active = 0;
+                for (original, entry) in window.tabs.iter().enumerate() {
+                    let index = tabs.len();
+                    let (layout, title, group) =
+                        if let Some(tab) = entry.terminal().filter(|tab| !tab.incognito) {
+                            let mut panes = Vec::new();
+                            let layout =
+                                self.capture_pane(tab, tab.grid.layout(), &mut panes, &mut record)?;
+                            let effects: profile::PaneEffects = panes
+                                .into_iter()
+                                .enumerate()
+                                .filter_map(|(pane, effect)| effect.map(|effect| (pane, effect)))
+                                .collect();
+                            if !effects.is_empty() {
+                                tab_terminal_effects.insert(index, effects);
+                            }
+                            if let Some(primary) =
+                                tab.primary_pane_index().filter(|&primary| primary != 0)
+                            {
+                                tab_primary_panes.insert(index, primary);
+                            }
+                            if let Some(pane) = tab
+                                .grid
+                                .get(tab.primary)
+                                .and_then(|session| self.sessions.get(session))
+                            {
+                                has_saved_connections |=
+                                    pane.ssh.as_ref().and_then(SshTarget::saved_id).is_some();
+                                if let Some(appearance) = &pane.project_terminal_appearance {
+                                    let mut appearance = appearance.as_ref().clone();
+                                    if pane.font != pane.font_baseline {
+                                        appearance.font_zoom =
+                                            Some(self.pane_terminal_font(pane, false).0);
+                                    }
+                                    tab_terminal_appearance.insert(index, appearance);
+                                }
+                            }
+                            (layout, &tab.custom_title, &tab.group)
+                        } else if let Some(file) = self.saved_project_file(entry) {
+                            let TabEntry::Tool(tool) = entry else {
+                                unreachable!("checked project tool")
+                            };
+                            (
+                                file.layout(self.sftp.get(&tool.instance)),
+                                &file.title,
+                                &file.group,
+                            )
+                        } else {
+                            continue;
+                        };
+                    if let Some(title) = title {
+                        tab_titles.insert(index, title.clone());
+                    }
+                    if let Some(group) = group {
+                        tab_groups.insert(index, group.clone());
+                    }
+                    if original <= window.active {
+                        active = index;
+                    }
+                    tabs.push(layout);
+                }
                 let placement = window.placement();
                 Some(WindowLayout {
                     width: placement.width,
@@ -2265,10 +2918,23 @@ impl Workspace {
                         .then_some(tab_groups),
                     tab_primary_panes,
                     tab_terminal_effects,
+                    tab_terminal_appearance,
                 })
             })
             .collect::<Option<Vec<_>>>()?;
         Some(WorkspaceLayout::new(layouts))
+    }
+
+    fn saved_project_file(
+        &self,
+        entry: &TabEntry,
+    ) -> Option<&project_access::local_files::FileTab> {
+        let TabEntry::Tool(tool) = entry else {
+            return None;
+        };
+        self.project_files
+            .get(&tool.instance)
+            .filter(|file| file.portable())
     }
 
     fn capture_pane(
@@ -2276,11 +2942,17 @@ impl Workspace {
         tab: &Tab,
         node: &pane_grid::Node,
         effects: &mut Vec<Option<crate::terminal_effects::Selection>>,
+        record: &mut impl FnMut(SessionId),
     ) -> Option<PaneLayout> {
         match node {
             pane_grid::Node::Pane(pane) => {
-                let session = self.sessions.get(tab.grid.get(*pane)?)?;
+                let id = *tab.grid.get(*pane)?;
+                let session = self.sessions.get(&id)?;
+                if session.control_ssh_provisional {
+                    return None;
+                }
                 effects.push(session.effect.map(|active| active.selection));
+                record(id);
                 if let Some(ibm) = &session.frame.ibm {
                     return Some(PaneLayout::Ibm {
                         font: session.font,
@@ -2295,6 +2967,7 @@ impl Workspace {
                         focused: *pane == tab.focused,
                         term: profile.term_name().into(),
                         target: target.clone(),
+                        initial_size: session.project_initial_size,
                     });
                 }
                 if let Some(connection) = &session.frame.serial {
@@ -2311,15 +2984,20 @@ impl Workspace {
                     vt100: profile == TerminalProfile::Vt100,
                     term: (!matches!(profile, TerminalProfile::Vt100 | TerminalProfile::Xterm))
                         .then(|| profile.term_name().into()),
+                    initial_size: session.project_initial_size,
                     security: session
                         .local_security
                         .as_ref()
                         .filter(|settings| {
                             settings.isolation != IsolationLevel::None
                                 || !settings.shell.is_default()
+                                || settings.saved_profile.is_some()
+                                || settings.shell_integration
                         })
                         .cloned()
                         .map(|mut settings| {
+                            settings.command = None;
+                            settings.working_directory = None;
                             if settings.isolation != IsolationLevel::Sandbox {
                                 settings.directory.clear();
                             }
@@ -2332,8 +3010,8 @@ impl Workspace {
             } => Some(PaneLayout::Split {
                 vertical: *axis == pane_grid::Axis::Vertical,
                 ratio: *ratio,
-                first: Box::new(self.capture_pane(tab, a, effects)?),
-                second: Box::new(self.capture_pane(tab, b, effects)?),
+                first: Box::new(self.capture_pane(tab, a, effects, record)?),
+                second: Box::new(self.capture_pane(tab, b, effects, record)?),
             }),
         }
     }
@@ -2355,14 +3033,25 @@ impl Workspace {
     fn restore_layout_into_with_tools(
         &mut self,
         layout: &WorkspaceLayout,
-        mut reuse: Option<window::Id>,
+        reuse: Option<window::Id>,
         approved: &[tool_tabs::HostedTab],
     ) -> Result<(Vec<window::Id>, Task<Message>), String> {
+        self.restore_layout_with_panes(layout, reuse, approved)
+            .map(|restored| (restored.windows, restored.task))
+    }
+
+    fn restore_layout_with_panes(
+        &mut self,
+        layout: &WorkspaceLayout,
+        mut reuse: Option<window::Id>,
+        approved: &[tool_tabs::HostedTab],
+    ) -> Result<RestoredLayout, String> {
         layout.validate().map_err(|error| error.to_string())?;
         if reuse.is_some_and(|id| self.hosted_tools_in(id) != approved) {
             return Err("The window's tool tabs changed. Open the project again.".into());
         }
         let mut created = Vec::new();
+        let mut files = HashMap::new();
         let connections = OnceCell::new();
         // No window, including a reused empty window, changes until every pane is staged.
         let staged = layout
@@ -2374,12 +3063,49 @@ impl Workspace {
                     .iter()
                     .enumerate()
                     .map(|(index, pane)| {
+                        if pane.is_project_tool() {
+                            let instance = window::Id::unique();
+                            let id = self.allocate();
+                            let group = saved
+                                .tab_groups
+                                .as_ref()
+                                .and_then(|groups| groups.get(&index))
+                                .cloned();
+                            let title = saved.tab_titles.get(&index).cloned();
+                            let file = match pane {
+                                PaneLayout::LocalFile { path, tool } => {
+                                    project_access::local_files::FileTab::new(
+                                        path.clone(),
+                                        *tool,
+                                        title,
+                                        group,
+                                    )
+                                }
+                                PaneLayout::RemoteTool { target, tool } => {
+                                    project_access::local_files::FileTab::remote(
+                                        target.clone(),
+                                        tool.clone(),
+                                        title,
+                                        group,
+                                    )
+                                }
+                                _ => unreachable!("checked project tool"),
+                            };
+                            files.insert(instance, file);
+                            return Ok(TabEntry::Tool(tool_tabs::HostedTab {
+                                id,
+                                kind: tool_tabs::Kind::ProjectFile,
+                                instance,
+                            }));
+                        }
                         let primary = saved.tab_primary_panes.get(&index).copied().unwrap_or(0);
                         let effects = saved.tab_terminal_effects.get(&index);
+                        let appearance = saved.tab_terminal_appearance.get(&index);
                         let mut tab = self.stage_restored_tab(
                             pane,
                             primary,
                             effects,
+                            appearance,
                             &connections,
                             &mut created,
                         )?;
@@ -2388,7 +3114,7 @@ impl Workspace {
                             || tab.connection_group_baseline.clone(),
                             |groups| groups.get(&index).cloned(),
                         );
-                        Ok(tab)
+                        Ok(TabEntry::from(tab))
                     })
                     .collect::<Result<Vec<_>, _>>()
             })
@@ -2402,6 +3128,7 @@ impl Workspace {
                 return Err(error);
             }
         };
+        self.project_files.extend(files);
         let mut tasks = Vec::with_capacity(staged.len());
         let mut windows = Vec::with_capacity(staged.len());
         for (saved, tabs) in layout.windows.iter().zip(staged) {
@@ -2416,15 +3143,22 @@ impl Workspace {
             windows.push(id);
             tasks.push(task);
             let window = self.windows.get_mut(&id).expect("restored window exists");
-            window.tabs = tabs.into_iter().map(TabEntry::from).collect();
+            window.tabs = tabs;
             window.active = saved.active;
-            window.arrange_tab_groups();
+            if !saved.tabs.iter().any(PaneLayout::is_project_tool) {
+                window.arrange_tab_groups();
+            }
             window.remember_active_tab();
             if let Some(visible) = saved.dashboard_visible {
                 tasks.push(self.set_dashboard_visible(id, visible));
             }
+            tasks.push(self.active_project_file(id));
         }
-        Ok((windows, Task::batch(tasks)))
+        Ok(RestoredLayout {
+            windows,
+            task: Task::batch(tasks),
+            panes: created,
+        })
     }
 
     fn release_restored_window_tabs(&mut self, id: window::Id) {
@@ -2453,12 +3187,14 @@ impl Workspace {
         pane: &PaneLayout,
         primary: usize,
         effects: Option<&profile::PaneEffects>,
+        appearance: Option<&profile::ProjectTerminalAppearance>,
         connections: &OnceCell<Option<Store>>,
         created: &mut Vec<SessionId>,
     ) -> Result<Tab, String> {
         let first = created.len();
         let mut focused_session = None;
-        let configuration = self.restore_pane(pane, created, &mut focused_session)?;
+        let initial = appearance.map(|appearance| self.project_base_appearance(appearance));
+        let configuration = self.restore_pane(pane, created, &mut focused_session, initial)?;
         let grid = pane_grid::State::with_configuration(configuration);
         let focused = grid
             .iter()
@@ -2469,13 +3205,15 @@ impl Workspace {
             .iter()
             .find_map(|(pane, session)| (*session == primary_session).then_some(*pane))
             .ok_or_else(|| "Saved tab has no primary pane".to_owned())?;
-        for (&index, &selection) in effects.into_iter().flatten() {
-            let session = created[first + index];
-            self.sessions
-                .get_mut(&session)
-                .expect("staged pane exists")
-                .effect = Some(effects::Active::from_saved(selection));
-            self.sync_pane_appearance(session);
+        let appearance = appearance.cloned().map(Arc::new);
+        for (index, &session) in created[first..].iter().enumerate() {
+            let effect = effects.and_then(|effects| effects.get(&index)).copied();
+            if appearance.is_some() || effect.is_some() {
+                let pane = self.sessions.get_mut(&session).expect("staged pane exists");
+                pane.project_terminal_appearance.clone_from(&appearance);
+                pane.effect = effect.map(effects::Active::from_saved);
+                self.sync_pane_appearance(session);
+            }
         }
         let saved_connection = self.sessions[&primary_session]
             .ssh
@@ -2525,23 +3263,65 @@ impl Workspace {
         pane: &PaneLayout,
         created: &mut Vec<SessionId>,
         active: &mut Option<SessionId>,
+        appearance: Option<Appearance>,
     ) -> Result<pane_grid::Configuration<SessionId>, String> {
         let (id, focused) = match pane {
+            PaneLayout::LocalFile { .. } | PaneLayout::RemoteTool { .. } => {
+                return Err("A project tool cannot be a terminal split.".into());
+            }
             PaneLayout::Terminal {
                 font,
                 focused,
                 vt100,
                 term,
                 security,
+                initial_size,
             } => {
                 if self.clipboard.policy.problem.is_some() {
                     return Err("Managed policy could not be applied. Sessions are locked.".into());
                 }
                 let profile = profile::local_profile(term.as_deref(), *vt100)
                     .ok_or_else(|| "Saved local terminal profile is unsupported".to_owned())?;
-                let id = self
-                    .store_local_session(profile, Some(*font), security.clone())
-                    .map_err(|error| format!("Could not start a terminal worker ({error})"))?;
+                let id = match self.store_local_session_with_grid(
+                    profile,
+                    Some(*font),
+                    security.clone(),
+                    LocalLaunchView::Initial(*initial_size, appearance),
+                    false,
+                ) {
+                    Ok(id) => id,
+                    Err(error)
+                        if security
+                            .as_ref()
+                            .is_some_and(|settings| settings.saved_profile.is_some()) =>
+                    {
+                        let grid = self.configured_initial_grid(profile, None, *initial_size);
+                        let session = Session::closed_local(
+                            grid,
+                            profile,
+                            appearance
+                                .unwrap_or_else(|| self.window_settings.terminal_appearance()),
+                            error.to_string(),
+                        )
+                        .map_err(|error| {
+                            format!("Could not restore the saved shell pane ({error})")
+                        })?;
+                        session.set_scrollback_config(self.window_settings.scrollback_config());
+                        let id = self.store_session(session, grid, *font);
+                        self.sessions
+                            .get_mut(&id)
+                            .expect("stored shell pane")
+                            .local_security = security.clone();
+                        id
+                    }
+                    Err(error) => {
+                        return Err(format!("Could not start a terminal worker ({error})"));
+                    }
+                };
+                self.sessions
+                    .get_mut(&id)
+                    .expect("restored local pane")
+                    .project_initial_size = *initial_size;
                 (id, *focused)
             }
             PaneLayout::Ibm {
@@ -2574,11 +3354,12 @@ impl Workspace {
                 focused,
                 term,
                 target,
+                initial_size,
             } => {
                 let profile = TerminalProfile::from_term_name(term)
                     .ok_or_else(|| "Saved SSH terminal profile is unsupported".to_owned())?;
                 let id = self
-                    .store_disconnected_ssh(target.clone(), profile, *font)
+                    .store_disconnected_ssh(target.clone(), profile, *font, *initial_size)
                     .map_err(|error| format!("Could not restore the SSH pane ({error})"))?;
                 (id, *focused)
             }
@@ -2595,8 +3376,8 @@ impl Workspace {
                         pane_grid::Axis::Horizontal
                     },
                     ratio: *ratio,
-                    a: Box::new(self.restore_pane(first, created, active)?),
-                    b: Box::new(self.restore_pane(second, created, active)?),
+                    a: Box::new(self.restore_pane(first, created, active, appearance)?),
+                    b: Box::new(self.restore_pane(second, created, active, appearance)?),
                 });
             }
         };
@@ -2641,33 +3422,126 @@ impl Workspace {
         font: Option<u8>,
         saved: Option<LocalSettings>,
     ) -> std::io::Result<SessionId> {
-        self.store_local_session_in_grid(profile, font, saved, initial_grid(profile), false)
+        self.store_local_session_with_grid(
+            profile,
+            font,
+            saved,
+            LocalLaunchView::Initial(InitialTerminalSize::default(), None),
+            false,
+        )
     }
 
-    fn store_local_session_in_grid(
+    fn store_local_session_with_grid(
         &mut self,
         profile: TerminalProfile,
         font: Option<u8>,
         saved: Option<LocalSettings>,
-        grid: GridSize,
+        view: LocalLaunchView,
         strict: bool,
     ) -> std::io::Result<SessionId> {
-        let settings = self
+        let local = saved
+            .as_ref()
+            .and_then(|settings| settings.saved_profile)
+            .map(|id| {
+                Store::open(profile::connections_path()?)?
+                    .local(id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotFound,
+                            "The saved local shell profile no longer exists",
+                        )
+                    })
+            })
+            .transpose()?;
+        self.launch_local_session(profile, font, saved, view, strict, local)
+    }
+
+    fn store_saved_local_session(
+        &mut self,
+        saved: crate::connection_store::LocalProfile,
+        font: Option<u8>,
+    ) -> std::io::Result<SessionId> {
+        let terminal = saved.profile().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Unsupported local terminal emulation",
+            )
+        })?;
+        self.launch_local_session(
+            terminal,
+            font,
+            None,
+            LocalLaunchView::Initial(InitialTerminalSize::default(), None),
+            false,
+            Some(saved),
+        )
+    }
+
+    fn launch_local_session(
+        &mut self,
+        mut profile: TerminalProfile,
+        font: Option<u8>,
+        saved: Option<LocalSettings>,
+        view: LocalLaunchView,
+        strict: bool,
+        local: Option<crate::connection_store::LocalProfile>,
+    ) -> std::io::Result<SessionId> {
+        if self.clipboard.policy.problem.is_some() {
+            return Err(std::io::Error::other(
+                "Managed policy could not be applied. Sessions are locked.",
+            ));
+        }
+        let mut settings = self
             .security
             .local_settings(saved, self.clipboard.policy.minimum_isolation)?;
+        if let Some(local) = &local {
+            local.validate()?;
+            profile = local.profile().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Unsupported local terminal emulation",
+                )
+            })?;
+            settings.saved_profile = Some(local.id);
+            settings.shell = local.shell;
+            settings.command.clone_from(&local.command);
+            settings
+                .working_directory
+                .clone_from(&local.working_directory);
+            settings.shell_integration = local.shell_integration;
+        }
         let mut options = settings.launch_options()?;
         options.shell_integration = settings.shell_integration
             && settings.isolation != IsolationLevel::Sandbox
             && self.window_settings.prompt_navigation_enabled
             && shell_integration::supports_marks(profile);
+        let terminal = local.as_ref().map(|profile| &profile.terminal);
+        let saved_strict = terminal.and_then(|settings| settings.strict_terminal_mode);
+        let strict =
+            saved_strict.unwrap_or(strict || settings.isolation == IsolationLevel::Sandbox);
+        let (grid, appearance) = match view {
+            LocalLaunchView::Initial(size, appearance) => (
+                self.configured_initial_grid(profile, terminal, size),
+                appearance,
+            ),
+            LocalLaunchView::Existing(grid, appearance) => (grid, appearance),
+        };
         let session = Session::start_local_with_strict(
             grid,
             profile,
             options,
             self.window_settings.prompt_navigation_enabled,
-            self.window_settings.terminal_appearance(),
-            strict,
+            appearance.unwrap_or_else(|| self.terminal_base_appearance(terminal)),
+            crate::session::StreamOptions {
+                strict_escapes: Some(strict),
+                encoding: terminal.and_then(|settings| settings.encoding),
+                scrollback: self.terminal_scrollback(terminal),
+            },
         )?;
+        if let Some(local) = &local {
+            self.saved_terminal_preferences.remember_local(local);
+        }
         let id = self.store_session(
             session,
             grid,
@@ -2675,42 +3549,88 @@ impl Workspace {
         );
         let pane = self.sessions.get_mut(&id).expect("stored local session");
         pane.inherits_font_size = font.is_none();
-        pane.strict_escapes = strict || settings.isolation == IsolationLevel::Sandbox;
+        pane.strict_escapes = strict;
+        pane.saved_strict_escapes = saved_strict.is_some();
         pane.local_security = Some(settings);
+        pane.local_use_pending = local.is_some();
+        pane.journal_config = local
+            .as_ref()
+            .map(|profile| profile.terminal.journal)
+            .unwrap_or_default();
+        pane.saved_local = local;
         Ok(id)
+    }
+
+    fn configured_initial_grid(
+        &self,
+        profile: TerminalProfile,
+        overrides: Option<&crate::connection_store::TerminalOverrides>,
+        initial_size: InitialTerminalSize,
+    ) -> GridSize {
+        let defaults = initial_grid(profile);
+        GridSize {
+            columns: initial_size
+                .columns
+                .or_else(|| overrides.and_then(|settings| settings.terminal_columns))
+                .or(self.window_settings.terminal_columns)
+                .unwrap_or(defaults.columns),
+            rows: initial_size
+                .rows
+                .or_else(|| overrides.and_then(|settings| settings.terminal_rows))
+                .or(self.window_settings.terminal_rows)
+                .unwrap_or(defaults.rows),
+            ..defaults
+        }
     }
 
     fn store_session(&mut self, session: Session, grid: GridSize, font: u8) -> SessionId {
         let session_id = SessionId(self.allocate());
-        session.set_scrollback_compression_enabled(
-            self.window_settings.scrollback_compression_enabled,
-        );
+        session.set_coding_agent_detection(self.window_settings.coding_agent_detection_enabled);
         session.set_clipboard_paste_allowed(
             self.clipboard.read_allowed() && self.clipboard.policy.paste_events_allowed,
         );
         self.sessions.insert(
             session_id,
             PaneSession {
+                restored_output: None,
+                recovery_output_rows: None,
                 frame: session.frame(),
+                coding_agent: coding_agents::PaneState::default(),
+                agent_shortcut: None,
                 session,
+                stream_generation: 0,
+                control_ssh_provisional: false,
                 grid,
+                project_initial_size: InitialTerminalSize::default(),
+                project_initial_ssh_pending: false,
+                project_terminal_appearance: None,
                 font,
                 font_baseline: font,
                 inherits_font_size: false,
                 selection: None,
+                projected_selection: None,
                 selected_output: None,
                 pending_split_connection: None,
                 search: None,
                 typeahead_enabled: false,
                 strict_escapes: false,
+                saved_strict_escapes: false,
+                teamwork_terminal_input: None,
                 local_security: None,
+                saved_local: None,
+                journal_config: Default::default(),
+                journal_attempted: None,
+                local_use_pending: false,
                 ssh: None,
+                saved_serial: None,
+                serial_use_pending: false,
                 ibm_origin: None,
                 credential_environment_source: None,
                 forwarding: None,
                 effect: None,
             },
         );
+        self.refresh_highlight(session_id);
         session_id
     }
 
@@ -2722,9 +3642,9 @@ impl Workspace {
         font: Option<u8>,
     ) -> SessionId {
         let default = font.unwrap_or(self.window_settings.terminal_font);
-        let (font, font_baseline, inherits_font_size, effect) = replace
-            .and_then(|id| self.sessions.get(&id))
-            .map_or((default, default, font.is_none(), None), |pane| {
+        let previous = replace.and_then(|id| self.sessions.get(&id));
+        let (font, font_baseline, inherits_font_size, effect) =
+            previous.map_or((default, default, font.is_none(), None), |pane| {
                 (
                     pane.font,
                     pane.font_baseline,
@@ -2732,11 +3652,13 @@ impl Workspace {
                     pane.effect,
                 )
             });
+        let project_appearance = previous.and_then(|pane| pane.project_terminal_appearance.clone());
         let id = self.store_session(session, grid, font);
         let pane = self.sessions.get_mut(&id).expect("stored pane");
         pane.font_baseline = font_baseline;
         pane.inherits_font_size = inherits_font_size;
         pane.effect = effect;
+        pane.project_terminal_appearance = project_appearance;
         if effect.is_some() {
             self.sync_pane_appearance(id);
         }
@@ -2769,6 +3691,14 @@ impl Workspace {
         command_timestamps: Option<bool>,
         connection_group: Option<String>,
     ) {
+        if let Some(anchor) = self
+            .windows
+            .get(&id)
+            .and_then(|window| window.pending_ssh.as_ref())
+            .and_then(ssh_access::PendingSsh::control_anchor)
+        {
+            self.close_control_ssh_anchor(anchor);
+        }
         let tab_id = self.allocate();
         let origin = (!incognito)
             .then(|| {
@@ -2853,6 +3783,9 @@ impl Workspace {
         reconnect: Option<(reconnect::ReconnectTarget, bool)>,
     ) -> Task<Message> {
         let id = self.allocate();
+        let saved = replace
+            .and_then(|session| self.sessions.get(&session))
+            .and_then(|pane| pane.saved_serial.clone());
         let Some(state) = self.windows.get_mut(&window) else {
             return Task::none();
         };
@@ -2864,6 +3797,7 @@ impl Workspace {
         state.notice = None;
         state.pending_serial = Some(PendingSerial {
             form,
+            saved,
             replace,
             reconnect: reconnect.map(|(target, disconnect)| {
                 reconnect::transport::SerialReconnect::new(target, id, disconnect)
@@ -2891,6 +3825,14 @@ impl Workspace {
     }
 
     fn connect_serial(&mut self, window: window::Id) -> Task<Message> {
+        self.connect_serial_with_privacy(window, false)
+    }
+
+    fn connect_serial_with_privacy(
+        &mut self,
+        window: window::Id,
+        incognito: bool,
+    ) -> Task<Message> {
         if !self.allow_in_process_transport(window, "Serial connections") {
             return Task::none();
         }
@@ -2910,6 +3852,11 @@ impl Workspace {
         let Ok((connection, profile)) = pending.form.validated() else {
             return Task::none();
         };
+        let saved = pending
+            .saved
+            .as_ref()
+            .filter(|saved| saved.matches(&connection, profile))
+            .cloned();
         let font = pending.font;
         let split = pending.split;
         if let Some(target) = split
@@ -2930,16 +3877,25 @@ impl Workspace {
             None
         };
         let grid = initial_grid(profile);
-        let strict = replacement
-            .and_then(|(_, _, old)| self.sessions.get(&old))
-            .is_some_and(|pane| pane.strict_escapes);
-        let session = match Session::start_serial_with_strict(
+        let saved_strict = saved
+            .as_ref()
+            .and_then(|profile| profile.strict_terminal_mode);
+        let strict = saved_strict.unwrap_or_else(|| {
+            replacement
+                .and_then(|(_, _, old)| self.sessions.get(&old))
+                .is_some_and(PaneSession::reconnect_strict_escapes)
+        });
+        let session = match Session::start_serial_with_options(
             connection,
             grid,
             profile,
             self.window_settings.prompt_navigation_enabled,
             self.window_settings.terminal_appearance(),
-            strict,
+            crate::session::StreamOptions {
+                strict_escapes: Some(strict),
+                encoding: Some(self.window_settings.serial_default_encoding),
+                scrollback: self.window_settings.scrollback_config(),
+            },
         ) {
             Ok(session) => session,
             Err(error) => {
@@ -2957,6 +3913,13 @@ impl Workspace {
             self.store_connected_session(session, grid, replacement.map(|(_, _, old)| old), font);
         if let Some(pane) = self.sessions.get_mut(&new_id) {
             pane.strict_escapes = strict;
+            pane.saved_strict_escapes = saved_strict.is_some();
+            pane.serial_use_pending = saved.is_some();
+            pane.journal_config = saved
+                .as_ref()
+                .map(|profile| profile.journal)
+                .unwrap_or_default();
+            pane.saved_serial = saved;
         }
         if let Some((tab, pane, old)) = replacement {
             if let Some(slot) = self
@@ -2967,6 +3930,7 @@ impl Workspace {
                 .and_then(|tab| tab.grid.get_mut(pane))
             {
                 *slot = new_id;
+                self.rebind_coding_agent_alias(old, new_id);
                 self.stop_session(old);
             } else {
                 self.stop_session(new_id);
@@ -2974,9 +3938,57 @@ impl Workspace {
         } else if let Some(target) = split {
             self.start_split_worker(window, target, new_id);
         } else {
-            self.add_tab(window, new_id);
+            self.add_tab_with_privacy(window, new_id, incognito);
         }
-        Task::none()
+        if split.is_none() {
+            self.refresh_connection_counts();
+        }
+        self.record_serial_session_used(new_id)
+    }
+
+    fn open_saved_serial(&mut self, window: window::Id, saved: SerialProfile) -> Task<Message> {
+        self.open_saved_serial_with_privacy(window, saved, false)
+    }
+
+    fn open_saved_serial_with_privacy(
+        &mut self,
+        window: window::Id,
+        saved: SerialProfile,
+        incognito: bool,
+    ) -> Task<Message> {
+        if !self.allow_in_process_transport(window, "Serial connections") {
+            return Task::none();
+        }
+        if !self.clipboard.policy.serial_allowed {
+            self.notice(
+                window,
+                "Your organization's policy does not allow serial connections.".into(),
+            );
+            return Task::none();
+        }
+        let Some(profile) = saved.profile() else {
+            return Task::none();
+        };
+        if let Err(error) = saved.connection.validate() {
+            self.notice(
+                window,
+                format!("Could not open the saved serial connection ({error})."),
+            );
+            return Task::none();
+        }
+        let id = self.allocate();
+        let Some(state) = self.windows.get_mut(&window) else {
+            return Task::none();
+        };
+        state.pending_serial = Some(PendingSerial {
+            form: SerialDialog::new(id, saved.connection.clone(), profile),
+            saved: Some(saved),
+            replace: None,
+            reconnect: None,
+            split: None,
+            font: None,
+        });
+        self.connect_serial_with_privacy(window, incognito)
     }
 
     fn store_disconnected_serial(
@@ -2993,6 +4005,7 @@ impl Workspace {
             self.window_settings.prompt_navigation_enabled,
             self.window_settings.terminal_appearance(),
         )?;
+        session.set_scrollback_config(self.window_settings.scrollback_config());
         Ok(self.store_session(session, grid, font))
     }
 
@@ -3028,6 +4041,16 @@ impl Workspace {
         let Some((address, plaintext, device_name)) = dialog.connection() else {
             return Task::none();
         };
+        let host = address.ip().to_string();
+        if !self
+            .clipboard
+            .policy
+            .server_access()
+            .allows(&host, address.port())
+        {
+            self.notice(window, server_access::blocked_notice(&host, address.port()));
+            return self.finish_reopen_ibm(window, recently_closed::SshOutcome::Unavailable);
+        }
         let kind = dialog.kind;
         let font = dialog.font;
         let reconnect = dialog.reconnect.as_ref().map(|reconnect| reconnect.target);
@@ -3102,6 +4125,7 @@ impl Workspace {
                     *origin = ibm_origin;
                     tab.tunnel_owner = Some(session);
                 }
+                self.rebind_coding_agent_alias(old, session);
                 self.stop_session(old);
             } else {
                 self.stop_session(session);
@@ -3245,33 +4269,38 @@ impl Workspace {
         }
     }
 
-    fn open_serial(&self, session: SessionId) -> bool {
+    fn pane_needs_close_confirmation(&self, session: SessionId) -> bool {
         self.sessions.get(&session).is_some_and(|pane| {
             let frame = pane.session.frame();
-            frame.serial.is_some() && matches!(frame.status, Status::Starting | Status::Running)
+            matches!(frame.status, Status::Starting | Status::Running)
+                && (frame.serial.is_some()
+                    || self
+                        .terminal_overrides(pane)
+                        .and_then(|settings| settings.confirm_close)
+                        .unwrap_or(false))
         })
     }
 
-    fn tab_has_open_serial(&self, tab: &Tab) -> bool {
+    fn tab_needs_close_confirmation(&self, tab: &Tab) -> bool {
         tab.grid
             .iter()
-            .any(|(_, session)| self.open_serial(*session))
+            .any(|(_, session)| self.pane_needs_close_confirmation(*session))
     }
 
     fn request_close(&mut self, id: window::Id, action: SerialClose) -> Task<Message> {
         let confirm = self.windows.get(&id).is_some_and(|window| match action {
             SerialClose::Window => window
                 .terminal_tabs()
-                .any(|tab| self.tab_has_open_serial(tab)),
+                .any(|tab| self.tab_needs_close_confirmation(tab)),
             SerialClose::Tab(tab) => window
                 .terminal_tabs()
                 .find(|state| state.id == tab)
-                .is_some_and(|tab| self.tab_has_open_serial(tab)),
+                .is_some_and(|tab| self.tab_needs_close_confirmation(tab)),
             SerialClose::TabBatch(request) => {
                 self.tab_batch_all_count(id, request).is_some()
-                    || self.tab_batch_has_serial(id, request)
+                    || self.tab_batch_needs_close_confirmation(id, request)
             }
-            SerialClose::Pane { session, .. } => self.open_serial(session),
+            SerialClose::Pane { session, .. } => self.pane_needs_close_confirmation(session),
             SerialClose::Quit => false,
         });
         if confirm {
@@ -3336,8 +4365,24 @@ impl Workspace {
         user: bool,
         inspected: bool,
     ) -> Task<Message> {
+        if let Some(close) = self.close_terminal_agent(id) {
+            return close;
+        }
         if self.main_placement_closing.contains(&id) {
             return Task::none();
+        }
+        if self
+            .diagrams
+            .get(&id)
+            .is_some_and(DiagramWindow::snippet_saving)
+        {
+            return Task::none();
+        }
+        if let Some(manager) = self.connection_manager_for_owner(id) {
+            return self.focus_connection_manager(manager);
+        }
+        if let Some(close) = self.close_connection_editor(id) {
+            return close;
         }
         if let Some(close) = self.close_connection_import(id) {
             return close;
@@ -3351,7 +4396,13 @@ impl Workspace {
         if let Some(close) = self.close_manual(id) {
             return close;
         }
+        if let Some(close) = self.close_about(id) {
+            return close;
+        }
         if let Some(close) = self.close_journal_edit(id) {
+            return close;
+        }
+        if let Some(close) = self.close_journal_summary_progress(id) {
             return close;
         }
         if let Some(close) = self.close_ascii_art(id) {
@@ -3360,10 +4411,20 @@ impl Workspace {
         if let Some(close) = self.close_terminal_effects(id) {
             return close;
         }
+        if let Some(close) = self.close_highlight(id, false) {
+            return close;
+        }
+        if let Some(close) = self.close_saved_chats(id) {
+            return close;
+        }
+        if let Some(close) = self.close_native_recording_manager(id) {
+            return close;
+        }
         if let Some(dialog) = self
             .openpgp_dialog_for_owner(id)
             .or_else(|| self.hosted_ssh_keys_vault_for_owner(id))
             .or_else(|| self.vault_unlock_for_owner(id))
+            .or_else(|| self.teamwork_settings_for_owner(id))
         {
             return window::gain_focus(dialog);
         }
@@ -3376,6 +4437,9 @@ impl Workspace {
         if let Some(task) = self.guard_native_logfile_close(id) {
             return task;
         }
+        if let Some(close) = self.close_associated_logfile(id) {
+            return close;
+        }
         if let Some(task) = self.guard_native_journal_close(id) {
             return task;
         }
@@ -3385,6 +4449,9 @@ impl Workspace {
         self.palette.dismiss(id);
         self.dismiss_terminal_context(id);
         if let Some(close) = self.close_rename_dialog(id) {
+            return close;
+        }
+        if let Some(close) = self.close_coding_agent_alias_dialog(id) {
             return close;
         }
         if let Some(close) = self.close_tab_journal_note(id) {
@@ -3420,6 +4487,9 @@ impl Workspace {
         if let Some(close) = self.close_settings(id) {
             return close;
         }
+        if let Some(close) = self.close_teamwork_settings(id) {
+            return close;
+        }
         if let Some(close) = self.close_environment(id) {
             return close;
         }
@@ -3429,7 +4499,7 @@ impl Workspace {
                 .collect()
                 .map(move |mut results| Message::MainPlacementClosing(id, user, results.pop()));
         }
-        let chrome_dialog = self.chrome.window_closed(id);
+        self.chrome.window_closed(id);
         let settings_dialog = self.settings.owner_closed(id);
         if self.is_snippet_window(id) {
             return self.request_snippet_close(id);
@@ -3462,16 +4532,29 @@ impl Workspace {
         self.close_terminal_file_editor(id);
         self.diagrams.remove(&id);
         self.recording_windows.remove(&id);
+        self.remove_native_recording_manager_for_owner(id);
         self.logfiles.remove(id);
+        self.remove_native_logfiles_for_owner(id);
         let journals = self.remove_closed_journal_windows(id);
         let processes = self.close_session_process_owner(id);
-        let close_all_dialog = self.close_all_dialog_owner_closed(id);
+        self.remove_close_all_dialog_for_owner(id);
+        self.remove_rename_dialog_for_owner(id);
+        self.remove_coding_agent_alias_dialogs(id);
+        self.remove_link_confirmation_for_owner(id);
+        self.remove_terminal_effects_for_owner(id);
+        self.remove_saved_chat_browsers_for_owner(id);
+        self.remove_known_hosts_for_owner(id);
         let remote_dialog = self.remote_dialog_owner_closed(id);
         if self.windows.contains_key(&id) {
             self.preserve_closing_session_window(id);
         }
         self.flush_journal_dock_resize(id);
+        self.flush_coding_agent_dock_resize(id);
         if let Some(window) = self.windows.remove(&id) {
+            #[cfg(target_os = "linux")]
+            self.wayland_file_drop.forget(id);
+            #[cfg(target_os = "windows")]
+            self.windows_file_drag.forget(id);
             self.app_logging
                 .record(crate::app_logging::Event::WindowClosed);
             self.cancel_reopen_owner(id);
@@ -3493,6 +4576,7 @@ impl Workspace {
                 self.stop_session(pending);
             }
             self.control.close_settings(id);
+            self.control_mcp_close_owner(id);
             self.security.close(id);
             self.tab_drag.forget(id);
             self.lifecycle
@@ -3511,17 +4595,15 @@ impl Workspace {
             }
             self.session_restore.changed(clear_when_empty);
         }
+        let _ = self.take_quick_connect_for_owner(id);
+        let owner_close = self.close_placed_dialog(id);
+        let close_owner = self.close_placed_dialogs_for_owner_shutdown(id, owner_close);
         let close = Task::batch([
-            self.close_placed_dialog(id),
-            chrome_dialog.map_or_else(Task::none, |id| self.close_placed_dialog(id)),
-            settings_dialog.map_or_else(Task::none, |id| self.close_placed_dialog(id)),
-            self.quick_connect_owner_closed(id),
-            self.close_known_hosts_owner(id),
+            close_owner,
             self.close_ssh_keys_owner(id),
             self.close_backup_owner(id),
             self.close_shell_integration_owner(id),
             self.close_tab_context_owner(id),
-            close_all_dialog,
             remote_dialog,
             settings_dialog.map_or_else(Task::none, |owner| {
                 self.close_shell_integration_owner(owner)
@@ -3539,9 +4621,11 @@ impl Workspace {
     fn no_windows(&self) -> bool {
         self.windows.is_empty()
             && !self.manual_open()
+            && !self.highlight.is_open()
             && !self.connection_import_open()
             && !self.connection_export_open()
             && self.diagrams.is_empty()
+            && self.terminal_agents.is_empty()
             && self.ascii_art.is_empty()
             && self.editors.is_empty()
             && self.sftp.is_empty()
@@ -3549,11 +4633,12 @@ impl Workspace {
             && !self.ai_manager_open()
             && self.logfiles.is_empty()
             && self.journals.is_empty()
+            && !self.journal_summary_progress_open()
             && self.session_processes.is_empty()
             && self.scheduler_owners.is_empty()
             && self.snippets.is_empty()
             && self.snippet_comparisons.is_empty()
-            && self.connections_id.is_none()
+            && self.connection_managers.is_empty()
             && self.vault_id.is_none()
             && self.known_hosts.is_empty()
             && !self.ssh_keys.is_open()
@@ -3575,6 +4660,9 @@ impl Workspace {
     }
 
     fn take_session(&mut self, id: SessionId) -> Option<PaneSession> {
+        self.revoke_terminal_ai_source(id);
+        self.terminal_agents.invalidate_session(id);
+        self.control_agent_removed(id);
         self.cancel_snippet_transfers_for_session(id);
         self.forget_project_ssh(id);
         self.multi_exec.forget(id);
@@ -3610,6 +4698,24 @@ impl Workspace {
     fn quit_confirmed(&mut self, serial_confirmed: bool) -> Task<Message> {
         if self.exiting || self.scheduler_draining || self.exit_placement_pending {
             return Task::none();
+        }
+        if let Some(id) = self.terminal_agents.running_window() {
+            let cancelled = self.cancel_terminal_agent_activity(id);
+            window_lifecycle::reply_to_native_quit(false);
+            return Task::batch([cancelled, window::gain_focus(id)]);
+        }
+        if let Some(task) = self.request_highlight_quit() {
+            return task;
+        }
+        if let Some(id) = self.snippet_diagram_pending_window() {
+            window_lifecycle::reply_to_native_quit(false);
+            return self
+                .focus_hosted_tool(id)
+                .unwrap_or_else(|| window::gain_focus(id));
+        }
+        if let Some(task) = self.guard_teamwork_settings_quit() {
+            window_lifecycle::reply_to_native_quit(false);
+            return task;
         }
         if let Some(dialog) = self
             .connection_import_saving()
@@ -3660,7 +4766,7 @@ impl Workspace {
         if let Some((&id, state)) = self
             .sftp
             .iter_mut()
-            .find(|(_, state)| state.transfer_running())
+            .find(|(id, state)| !self.project_files.contains_key(*id) && state.transfer_running())
         {
             state.request_close();
             self.quit_sftp_waiting = Some(id);
@@ -3674,7 +4780,7 @@ impl Workspace {
                 .filter(|(_, window)| {
                     window
                         .terminal_tabs()
-                        .any(|tab| self.tab_has_open_serial(tab))
+                        .any(|tab| self.tab_needs_close_confirmation(tab))
                 })
                 .min_by_key(|(_, window)| window.number)
                 .map(|(id, _)| *id);
@@ -3700,7 +4806,7 @@ impl Workspace {
                 self.scheduler_draining = true;
                 self.cancel_journal_screenshot_analyses();
                 self.cancel_obsolete_journal_note_translations();
-                return Task::none();
+                return Task::batch([self.expire_firing(), self.expire_swarm_comparisons()]);
             }
         }
         self.exit_after_workers()
@@ -3732,10 +4838,22 @@ impl Workspace {
 
     fn exit_with_placement(&mut self) -> Task<Message> {
         self.flush_last_journal_dock_resize();
+        self.flush_coding_agent_dock_resizes();
         self.flush_snippet_structure_preferences();
         self.save_ascii_art_on_quit();
         self.exiting = true;
+        #[cfg(target_os = "macos")]
+        kortty_macos::remove_status_item();
+        self.cancel_ai_model_catalog_refresh();
+        self.cancel_recording_jobs();
+        self.cancel_teamwork_refresh();
+        self.reconcile_tab_recordings();
         self.cancel_journal_screenshot_analyses();
+        self.journal_summaries.cancel_startup_recovery();
+        self.journal_summaries.shutdown();
+        if let Some(done) = self.stop_automation_journals() {
+            self.pending_shutdown.push(done);
+        }
         self.cancel_obsolete_journal_note_translations();
         self.finish_all_journals();
         self.stop_all_terminal_files();
@@ -3743,8 +4861,9 @@ impl Workspace {
         self.stop_all_remote_docks();
         self.flush_transparency();
         self.flush_journal_appearance();
-        self.vault = None;
         self.finish_session_restore();
+        self.vault = None;
+        self.vault_change_revision = Arc::new(());
         let control = self.control.detach();
         if let Some(window) = self
             .windows
@@ -3781,10 +4900,16 @@ impl Workspace {
                 .map(|(_, owner)| owner.stop()),
         );
         for (_, mut state) in self.sftp.drain() {
-            if let Some(done) = state.stop() {
+            for done in state.stop() {
                 self.pending_shutdown.push(done);
             }
         }
+        for tab in self.project_files.values_mut() {
+            if let Some(worker) = tab.worker.take() {
+                self.pending_shutdown.push(worker.stop());
+            }
+        }
+        self.retained_sftp_download = None;
         let pending = std::mem::take(&mut self.pending_shutdown);
         let logging = self.app_logging.stop();
         let sleep_request = self.take_sleep_request();
@@ -3809,6 +4934,13 @@ impl Workspace {
     fn focused_session(&self, window: window::Id) -> Option<&PaneSession> {
         let id = self.windows.get(&window)?.tab()?.focused_session()?;
         self.sessions.get(&id)
+    }
+
+    fn coding_agent_status(&self, session: SessionId) -> Option<crate::session::CodingAgentStatus> {
+        if !self.window_settings.coding_agent_detection_enabled {
+            return None;
+        }
+        self.sessions.get(&session)?.coding_agent.status
     }
 
     fn toggle_command_timestamps(&mut self, id: window::Id) -> Task<Message> {
@@ -3896,17 +5028,36 @@ impl Workspace {
             return;
         }
         if let [target] = targets
+            && self
+                .sessions
+                .get(target)
+                .is_some_and(|pane| pane.session.is_pacing_paste())
+        {
+            self.notice(
+                window,
+                "A paste is in progress. Press Esc in the terminal to stop it.".into(),
+            );
+            return;
+        }
+        if let [target] = targets
+            && self.agent_shortcut_paste(window, *target, text)
+        {
+            return;
+        }
+        if let [target] = targets
             && let Some(pane) = self.sessions.get(target)
         {
             let frame = pane.session.frame();
             if frame.status == Status::Running
                 && frame.ibm.is_none()
                 && (!require_brackets || frame.bracketed_paste)
+                && (self.paste_line_delay_for(*target) == 0
+                    || text.split_inclusive('\n').nth(1).is_none())
             {
                 let fallback = encode_stream_paste(&frame.screen, text, frame.bracketed_paste);
                 if pane.session.try_clipboard_paste(text, &fallback) {
                     if let Some(pane) = self.sessions.get_mut(target) {
-                        pane.selection = None;
+                        pane.clear_selection();
                         pane.session.follow_output();
                     }
                     return;
@@ -3944,12 +5095,21 @@ impl Workspace {
     ) {
         let mut failures = Vec::new();
         for target in targets {
+            let paste_delay = match source {
+                InputSource::Paste => self.paste_line_delay_for(*target),
+                _ => 0,
+            };
             if let Some(pane) = self.sessions.get_mut(target) {
+                if pane.session.is_pacing_paste() {
+                    continue;
+                }
                 let frame = pane.session.frame();
                 if let Some(input) = encode(*target, &frame) {
                     let result = match input {
                         PaneInput::Local(bytes) => match source {
-                            InputSource::Paste => pane.session.send_paste(bytes),
+                            InputSource::Paste => {
+                                pane.session.send_paste_with_delay(bytes, paste_delay)
+                            }
                             InputSource::Keyboard {
                                 enter,
                                 shifted_enter,
@@ -3984,8 +5144,20 @@ impl Workspace {
                             InputSource::Keyboard {
                                 enter,
                                 predict: true,
+                                physical_pane,
                                 ..
-                            } => pane.session.send_keyboard(bytes, enter),
+                            } => pane.session.send_keyboard_from(
+                                bytes,
+                                enter,
+                                physical_pane == Some(*target),
+                            ),
+                            InputSource::Keyboard {
+                                enter,
+                                physical_pane: Some(physical),
+                                ..
+                            } if physical == *target && pane.session.journal_input_enabled() => {
+                                pane.session.send_keyboard(bytes, enter)
+                            }
                             InputSource::Keyboard { enter, .. } => {
                                 pane.session.send_user_input(bytes, enter)
                             }
@@ -3994,7 +5166,7 @@ impl Workspace {
                     };
                     match result {
                         Ok(()) => {
-                            pane.selection = None;
+                            pane.clear_selection();
                             pane.session.follow_output();
                         }
                         Err(error) => failures.push(error),
@@ -4031,6 +5203,14 @@ impl Workspace {
         }
         if let Some(task) = self.manual_key(id, &key, modifiers) {
             return task;
+        }
+        if self.teamwork_settings_title(id).is_some()
+            && (key == Key::Named(Named::Escape)
+                || (modifiers.command()
+                    && !modifiers.alt()
+                    && matches!(&key, Key::Character(character) if character.eq_ignore_ascii_case("w"))))
+        {
+            return self.update_teamwork_settings(id, teamwork_settings::Message::Close);
         }
         if key == Key::Named(Named::Escape) && self.chrome.title(id).is_some() {
             return self.close_window(id);
@@ -4114,6 +5294,7 @@ impl Workspace {
             || self.shell_integration_title(id).is_some()
             || self.environment_title(id).is_some()
             || self.rename_dialog_title(id).is_some()
+            || self.coding_agent_alias_dialog_title(id).is_some()
             || self.tab_journal_note_title(id).is_some()
             || self.close_all_dialog_title(id).is_some()
             || self.is_session_process_window(id))
@@ -4220,6 +5401,9 @@ impl Workspace {
             } else {
                 Task::none()
             };
+        }
+        if self.control_mcp_key(id, matches!(key, Key::Named(Named::Escape | Named::Enter))) {
+            return Task::none();
         }
         if self.control.settings == Some(id) {
             if key == Key::Named(Named::Escape) {
@@ -4334,6 +5518,13 @@ impl Workspace {
             .focused_session(id)
             .and_then(|pane| pane.frame.ibm.as_ref().map(|ibm| ibm.kind));
         let focused_ibm = focused_ibm_kind.is_some();
+        if key == Key::Named(Named::Escape)
+            && self
+                .focused_session(id)
+                .is_some_and(|pane| pane.session.cancel_paced_paste())
+        {
+            return Task::none();
+        }
         if key == Key::Named(Named::Escape) && self.terminal_only_fullscreen_active(id) {
             return self.toggle_terminal_only_fullscreen(id);
         }
@@ -4363,6 +5554,16 @@ impl Workspace {
             .window_settings
             .key_bindings
             .action_for(&key, modifiers)
+            && !(cfg!(windows)
+                && modifiers == Modifiers::CTRL | Modifiers::ALT
+                && matches!(
+                    action,
+                    chrome::Action::ToggleCodingAgents | chrome::Action::NextBlockedCodingAgent
+                )
+                && input.is_some_and(|text| {
+                    text.chars().any(|character| !character.is_control())
+                        && !matches!(&key, Key::Character(base) if text.eq_ignore_ascii_case(base))
+                }))
             && !(matches!(action, chrome::Action::Manual | chrome::Action::SaveProject)
                 && focused_ibm_kind
                     .is_some_and(|kind| encode_ibm_key(kind, &key, modifiers, input).is_some()))
@@ -4440,6 +5641,18 @@ impl Workspace {
             .and_then(Window::tab)
             .and_then(|tab| self.keyboard_targets(tab))
         {
+            if self
+                .sessions
+                .get(&route.source)
+                .is_some_and(|pane| pane.session.is_pacing_paste())
+            {
+                return Task::none();
+            }
+            if let Some(task) =
+                self.agent_shortcut_key(id, &route, &key, location, modifiers, input)
+            {
+                return task;
+            }
             let enter = key == Key::Named(Named::Enter);
             let source = InputSource::Keyboard {
                 enter,
@@ -4477,6 +5690,8 @@ impl Workspace {
             window.notice = Some(text);
         } else if let Some(window) = self.sftp.get_mut(&id) {
             window.set_status(text);
+        } else if let Some(tab) = self.project_files.get_mut(&id) {
+            tab.set_status(text);
         }
     }
 
@@ -4500,8 +5715,16 @@ impl Workspace {
             .or_else(|| self.native_snippet_modal_for_owner(owner))
     }
 
+    fn native_application_modal(&self, surface: window::Id) -> Option<(window::Id, Message)> {
+        self.terminal_effect_modal(surface)
+            .or_else(|| self.about_modal(surface))
+    }
+
     fn owner_dialog(&self, owner: window::Id) -> Option<(window::Id, Message)> {
-        if let Some(modal) = self.connection_manager_modal(owner) {
+        if let Some(modal) = self
+            .native_application_modal(owner)
+            .or_else(|| self.connection_manager_modal(owner))
+        {
             return Some(modal);
         }
         if let Some(dialog) = self.vault_unlock_modal(owner) {
@@ -4514,13 +5737,17 @@ impl Workspace {
     }
 
     fn window_owner_dialog(&self, owner: window::Id) -> Option<(window::Id, Message)> {
+        if let Some(manager) = self.connection_manager_for_owner(owner) {
+            return self
+                .connection_manager_modal(manager)
+                .or(Some((manager, Message::OpenConnections(owner))));
+        }
         if let Some(id) = self.connection_export_for_owner(owner) {
             return Some((id, chrome::connection_export::focus(id)));
         }
         self.journal_options_modal(owner)
             .or_else(|| self.journal_edit_for_owner(owner))
             .map(|id| (id, self.journal_edit_focus_message(id)))
-            .or_else(|| self.terminal_effect_modal(owner))
             .or_else(|| {
                 self.openpgp_dialog_for_owner(owner)
                     .map(|id| (id, Message::OpenPgp(id, openpgp_window::Message::Focus)))
@@ -4567,6 +5794,7 @@ impl Workspace {
                     )
                 })
             })
+            .or_else(|| self.coding_agent_alias_dialog_for_owner(owner))
             .or_else(|| {
                 self.tab_journal_note_for_owner(owner).map(|id| {
                     (
@@ -4602,21 +5830,23 @@ impl Workspace {
                     )
                 })
             })
+            .or_else(|| {
+                self.settings
+                    .for_owner(owner)
+                    .map(|id| (id, Message::Settings(settings_window::Message::Focus(id))))
+            })
+            .or_else(|| {
+                self.teamwork_settings_for_owner(owner).map(|id| {
+                    (
+                        id,
+                        Message::TeamworkSettings(id, teamwork_settings::Message::Focus),
+                    )
+                })
+            })
     }
 
     pub fn view(&self, id: window::Id) -> Element<'_, Message> {
         let element = self.view_window(id);
-        let element = if let Some((_, focus)) = self.window_owner_dialog(id) {
-            let cover = iced::widget::mouse_area(
-                container(space::vertical())
-                    .width(Length::Fill)
-                    .height(Length::Fill),
-            )
-            .on_press(focus);
-            iced::widget::stack![element, iced::widget::opaque(cover)].into()
-        } else {
-            element
-        };
         #[cfg(target_os = "macos")]
         let element = if let Some(window) = self
             .windows
@@ -4656,11 +5886,19 @@ impl Workspace {
         } else {
             element
         };
+        let modal = self
+            .native_application_modal(id)
+            .or_else(|| self.window_owner_dialog(id))
+            .map(|(_, focus)| focus);
+        let element = profile_tools::vault_modal::gate(element, modal);
         profile_tools::vault_modal::view(element, self.vault_unlock_modal(id))
     }
 
     fn view_window(&self, id: window::Id) -> Element<'_, Message> {
         if let Some(view) = self.terminal_effect_dialog_view(id) {
+            return view;
+        }
+        if let Some(view) = self.highlight_view(id) {
             return view;
         }
         if let Some(dialog) = self
@@ -4671,16 +5909,20 @@ impl Workspace {
             .or_else(|| self.connection_import_view(id))
             .or_else(|| self.connection_export_view(id))
             .or_else(|| self.connection_overview_view(id))
+            .or_else(|| self.teamwork_restore_view(id))
             .or_else(|| self.os_badge_manager_view(id))
             .or_else(|| self.openpgp_view(id))
             .or_else(|| self.environment_view(id))
+            .or_else(|| self.teamwork_settings_view(id))
             .or_else(|| self.manual_view(id))
             .or_else(|| self.ai_manager_view(id))
+            .or_else(|| self.saved_chats_view(id))
             .or_else(|| self.chrome_dialog_view(id))
             .or_else(|| self.settings_view(id))
             .or_else(|| self.shell_integration_view(id))
             .or_else(|| self.link_confirmation_view(id))
             .or_else(|| self.rename_dialog_view(id))
+            .or_else(|| self.coding_agent_alias_dialog_view(id))
             .or_else(|| self.tab_journal_note_view(id))
             .or_else(|| self.close_all_dialog_view(id))
             .or_else(|| self.remote_dialog_view(id))
@@ -4708,13 +5950,20 @@ impl Workspace {
         }
         if let Some(editor) = self.editors.get(&id) {
             return editor
-                .view(self.editor_content_theme())
+                .view(
+                    self.editor_content_theme(),
+                    self.window_settings.editor_appearance(),
+                    self.window_settings.editor_caret,
+                )
                 .map(move |message| Message::Editor(id, message));
         }
         if let Some(diagram) = self.diagrams.get(&id) {
             return diagram
                 .view(self.editor_content_theme())
                 .map(move |message| Message::Diagram(id, message));
+        }
+        if let Some(view) = self.agent_window_view(id) {
+            return view.map(move |message| Message::TerminalAgent(id, message));
         }
         let Some(window) = self.windows.get(&id) else {
             return container(text("kortty")).into();
@@ -4740,11 +5989,11 @@ impl Workspace {
             && !matches!(action, SerialClose::TabBatch(batch) if self.tab_batch_all_count(id, batch).is_some())
         {
             let prompt = match action {
-                SerialClose::Quit => "Close open serial ports and quit?",
-                SerialClose::Window => "Close this window and its open serial ports?",
-                SerialClose::Tab(_) => "Close this tab and its open serial ports?",
-                SerialClose::TabBatch(_) => "Close these tabs and their open serial ports?",
-                SerialClose::Pane { .. } => "Close the serial port?",
+                SerialClose::Quit => "Close the open terminal sessions and quit?",
+                SerialClose::Window => "Close this window and its terminal sessions?",
+                SerialClose::Tab(_) => "Close this tab and its terminal sessions?",
+                SerialClose::TabBatch(_) => "Close these tabs and their terminal sessions?",
+                SerialClose::Pane { .. } => "Close this terminal session?",
             };
             return column![
                 text(prompt).size(18),
@@ -4797,6 +6046,9 @@ impl Workspace {
         }
         if window.clipboard_settings {
             return self.clipboard_settings_view(id);
+        }
+        if let Some(view) = self.control_mcp_view(id) {
+            return view;
         }
         if self.control.settings == Some(id) {
             return self.view_control_settings(id);
@@ -4879,6 +6131,7 @@ impl Workspace {
             content = content.push(transparency::chrome(form).padding(iced::padding::bottom(5)));
         }
         let mut terminal = column![].width(Length::Fill).height(Length::Fill);
+        let [agent_width, journal_width, remote_width] = self.coding_agent_dock_widths(id, window);
         if let Some(active_tab) = window.active_entry() {
             let tabs =
                 window
@@ -4940,6 +6193,16 @@ impl Workspace {
                         let mut heading = row![].spacing(5).align_y(Alignment::Center);
                         if mirror_marker.is_some() {
                             heading = heading.push(text("⇄").size(13));
+                        }
+                        if let Some(badge) = self.coding_agent_tab_badge(tab) {
+                            if let Some(glyph) = badge.glyph {
+                                heading = heading.push(text(glyph).size(13));
+                            }
+                            let description = tooltip_text.get_or_insert_with(String::new);
+                            if !description.is_empty() {
+                                description.push('\n');
+                            }
+                            description.push_str(&badge.description);
                         }
                         if let Some(reason) = tab.watch.attention_text() {
                             heading = heading.push(text("🔔").size(13));
@@ -5018,13 +6281,17 @@ impl Workspace {
                     if let Some(bar) = self.journal_capture_bar(id, tab) {
                         body = body.push(transparency::chrome(bar).padding([3, 5]));
                     }
+                    if let Some(bar) = self.recording_bar(id, tab) {
+                        body = body.push(transparency::chrome(bar).padding([3, 5]));
+                    }
                     let color = if self.window_settings.connection_color_border_enabled {
                         self.terminal_tab_color(tab).map(|mark| mark.color())
                     } else {
                         None
                     };
                     let panes = self.panes(id, window, tab, transparency, color);
-                    let body = body.push(self.remote_dock_view(id, window, tab, panes));
+                    let body =
+                        body.push(self.remote_dock_view(id, window, tab, panes, remote_width));
                     terminal.push(transparency::connection_frame(body.into(), color))
                 }
                 TabEntry::Tool(tool) => match self.hosted_tool_view(tool) {
@@ -5042,7 +6309,8 @@ impl Workspace {
             );
         }
         let terminal = self.tab_drag.pane(id, terminal.into());
-        let terminal = self.journal_dock_view(id, window, terminal);
+        let terminal = self.coding_agent_dock_view(id, window, terminal, agent_width);
+        let terminal = self.journal_dock_view(id, window, terminal, journal_width);
         let terminal = self.local_dock_view(id, window, terminal);
         content = content.push(self.dashboard_view(id, window, terminal));
         if let Some(paste) = &window.pending_paste {
@@ -5080,12 +6348,20 @@ impl Workspace {
             .appearance
             .status_cursor(window.focused);
         let multi_exec = self.multi_exec_status();
-        if cursor.is_some() || multi_exec.is_some() || self.menu_bar_hidden(id) {
+        let coding_agents = self.coding_agent_status_strip(id, window);
+        if cursor.is_some()
+            || multi_exec.is_some()
+            || coding_agents.is_some()
+            || self.menu_bar_hidden(id)
+        {
             let mut status = row![space::horizontal()]
                 .spacing(12)
                 .align_y(Alignment::Center);
             if let Some(multi_exec) = multi_exec {
                 status = status.push(multi_exec);
+            }
+            if let Some(coding_agents) = coding_agents {
+                status = status.push(coding_agents);
             }
             if let Some(cursor) = cursor {
                 status = status.push(cursor);
@@ -5137,7 +6413,6 @@ impl Workspace {
         transparency: u8,
         tab_color: Option<iced::Color>,
     ) -> Element<'a, Message> {
-        let appearance = self.window_settings.terminal_appearance();
         let broadcast = self.tab_broadcast_active(tab);
         let pane_content = move |pane, session: &SessionId, zoomed| {
             let Some(session_state) = self.sessions.get(session) else {
@@ -5174,8 +6449,8 @@ impl Workspace {
                 let state = match &frame.status {
                     Status::Disconnected | Status::Exited(_) => "Disconnected".into(),
                     Status::Starting => "Opening".into(),
-                    Status::Running if frame.scroll_offset != 0 => {
-                        format!("Scrollback · {}", frame.scroll_offset)
+                    Status::Running if !frame.at_live_viewport() => {
+                        format!("Scrollback · {}", frame.viewport_scroll_offset())
                     }
                     Status::Running => "Connected".into(),
                     Status::Error(error) => error.clone(),
@@ -5212,10 +6487,10 @@ impl Workspace {
                     Status::Disconnected => "Disconnected".into(),
                     Status::Starting => "Starting shell".into(),
                     Status::Running => {
-                        if frame.scroll_offset == 0 {
+                        if frame.at_live_viewport() {
                             "Local shell".into()
                         } else {
-                            format!("Scrollback · {}", frame.scroll_offset)
+                            format!("Scrollback · {}", frame.viewport_scroll_offset())
                         }
                     }
                     Status::Exited(code) => code.map_or_else(
@@ -5262,6 +6537,22 @@ impl Workspace {
                     .on_press(Message::Clipboard(
                         clipboard_access::Message::Strict(session_id),
                     )),
+                );
+            }
+            if self.highlight.has_trigger(session_id) {
+                controls = controls.push(
+                    button("Review triggered snippet")
+                        .style(button::text)
+                        .on_press(Message::Highlight(highlight::Message::ReviewTrigger(
+                            id, session_id,
+                        ))),
+                );
+            }
+            if self.highlight.missed_history(session_id) {
+                controls = controls.push(
+                    button("Highlighting skipped output")
+                        .style(button::text)
+                        .on_press(Message::Highlight(highlight::Message::Open(id))),
                 );
             }
             if frame.serial.is_some() {
@@ -5342,105 +6633,138 @@ impl Workspace {
             .padding([3, 6])
             .style(transparency::opaque_chrome)
             .controls(pane_grid::Controls::new(controls));
-            let themes = &self.window_settings.themes;
-            let scheme = themes.appearance();
-            let font_size =
-                themes.font_size(scheme, session_state.font, session_state.font_baseline);
             let effect = session_state
                 .effect
                 .filter(|active| self.allowed_terminal_effect(active.selection.effect));
-            let font = self
-                .window_settings
-                .terminal_font_face(scheme.filter(|_| effect.is_none()));
-            let appearance = effect.map_or(appearance, |active| {
-                active.selection.effect.appearance(appearance)
-            });
-            let terminal = TerminalView {
-                session: *session,
-                frame,
-                font_size,
-                font,
-                appearance,
-                scale_factor: window.scale_factor,
-                background_transparency: transparency,
-                focused: focus && window.focused,
-                typeahead_enabled: session_state.typeahead_enabled && !mirrored,
-                owner: id,
-                plain_text_links: self.window_settings.terminal_link_detection_enabled,
-                selection: session_state
-                    .selection
-                    .or_else(|| session_state.selected_output.as_ref()?.visible(frame)),
-                search: session_state.search.as_ref().map(|search| SearchHighlight {
-                    matches: search.matches(frame),
-                    selected: search.selected_match(frame).map(|hit| hit.start),
-                    first_row: frame
-                        .screen
-                        .scrollback_lines
-                        .saturating_sub(frame.scroll_offset),
-                }),
-            };
-            let scrollbar = (frame.ibm.is_none()
-                && self
-                    .window_settings
-                    .terminal_scrollbar_visible(window.fullscreen()))
-            .then(|| terminal_view::Scrollbar::new(&terminal));
-            let view = terminal_view::view(terminal);
-            let view = if let Some(effect) = effect {
-                iced::widget::stack![
+            let (font_size, font) = self.pane_terminal_font(session_state, effect.is_some());
+            let appearance = self.pane_appearance(*session);
+            let background_image = self.pane_background_image(session_id);
+            let view: Element<'_, Message> = iced::widget::responsive(move |bounds| {
+                let terminal = TerminalView {
+                    session: session_id,
+                    frame: self.highlight.frame(session_id, frame),
+                    font_size,
+                    font,
+                    appearance,
+                    background_image,
+                    scale_factor: window.scale_factor,
+                    background_transparency: transparency,
+                    focused: focus && window.focused,
+                    reduced_motion: !self.window_settings.appearance.animations,
+                    typeahead_enabled: session_state.typeahead_enabled && !mirrored,
+                    owner: id,
+                    agent_cursor: self.agent_cursor_review(id, session_id, frame),
+                    inline_agent: self.agent_inline_interaction(id, session_id, frame),
+                    plain_text_links: self.window_settings.terminal_link_detection_enabled,
+                    selection: session_state
+                        .selection
+                        .or_else(|| session_state.selected_output.as_ref()?.visible(frame)),
+                    projected: frame.inline.as_ref().map(|_| {
+                        terminal_view::projected_selection::View {
+                            source: frame,
+                            stream: session_state.stream_generation,
+                            range: session_state.projected_selection.as_ref().and_then(
+                                |selection| selection.range(frame, session_state.stream_generation),
+                            ),
+                        }
+                    }),
+                    search: session_state.search.as_ref().map(|search| SearchHighlight {
+                        matches: search.matches(frame),
+                        selected: search.selected_match(frame).map(|hit| hit.start),
+                        first_row: frame
+                            .screen
+                            .scrollback_lines
+                            .saturating_sub(frame.scroll_offset),
+                    }),
+                };
+                let scrollbar = (frame.ibm.is_none()
+                    && self
+                        .window_settings
+                        .terminal_scrollbar_visible(window.fullscreen()))
+                .then(|| terminal_view::Scrollbar::new(&terminal));
+                let view = terminal_view::view(terminal);
+                let view = if let Some(effect) = effect {
+                    iced::widget::stack![
+                        view,
+                        effect.overlay(self.terminal_effect_frame(), font_size)
+                    ]
+                    .into()
+                } else {
+                    view
+                };
+                let view = self.terminal_context_view(id, session_id, view);
+                let view = terminal_view::quick_select::view(
                     view,
-                    effect.overlay(self.terminal_effect_frame(), font_size)
-                ]
-                .into()
-            } else {
-                view
-            };
-            let view = self.terminal_context_view(id, session_id, view);
-            let view = terminal_view::quick_select::view(
-                view,
-                self.quick_select_labels(id, session_id),
-                &frame.screen,
-                font_size,
-                font,
-                appearance,
-            );
-            let view = terminal_view::with_timestamp_gutter(
-                view,
-                (tab.command_timestamps && frame.ibm.is_none()).then_some(terminal_view::Gutter {
+                    self.quick_select_labels(id, session_id),
                     frame,
                     font_size,
                     font,
                     appearance,
-                }),
-            );
-            let view = if frame.ibm.is_some() {
-                let size = terminal_view::content_size(&frame.screen, font_size, font);
-                scrollable(container(view).width(size.width).height(size.height))
-                    .direction(scrollable::Direction::Both {
-                        vertical: scrollable::Scrollbar::default(),
-                        horizontal: scrollable::Scrollbar::default(),
-                    })
-                    .width(Length::Fill)
+                );
+                let view = terminal_view::with_timestamp_gutter(
+                    view,
+                    (tab.command_timestamps && frame.ibm.is_none()).then_some(
+                        terminal_view::Gutter {
+                            frame,
+                            font_size,
+                            font,
+                            appearance,
+                        },
+                    ),
+                );
+                let view = if frame.ibm.is_some() {
+                    let size = terminal_view::content_size(&frame.screen, font_size, font);
+                    scrollable(container(view).width(size.width).height(size.height))
+                        .direction(scrollable::Direction::Both {
+                            vertical: scrollable::Scrollbar::default(),
+                            horizontal: scrollable::Scrollbar::default(),
+                        })
+                        .width(Length::Fill)
+                        .height(Length::Fill)
+                        .into()
+                } else {
+                    terminal_view::with_scrollback(view, scrollbar)
+                };
+                let view = if let Some(search) = &session_state.search {
+                    column![
+                        transparency::chrome(horizontal(
+                            search
+                                .view()
+                                .map(move |message| Message::Search(session_id, message))
+                        ))
+                        .padding(iced::padding::bottom(4)),
+                        view
+                    ]
                     .height(Length::Fill)
                     .into()
-            } else {
-                terminal_view::with_scrollback(view, scrollbar)
-            };
-            let view = if let Some(search) = &session_state.search {
-                column![
-                    transparency::chrome(horizontal(
-                        search
-                            .view()
-                            .map(move |message| Message::Search(session_id, message))
-                    ))
-                    .padding(iced::padding::bottom(4)),
+                } else {
                     view
+                };
+                self.decorate_agent_terminal(
+                    session_id,
+                    session_state.stream_generation,
+                    view,
+                    bounds,
+                    terminal_view::cell_size(font_size, font),
+                    !self.window_settings.appearance.animations,
+                )
+            })
+            .into();
+            let view = if let Some(draft) = session_state.agent_shortcut_preview(id, tab.incognito)
+            {
+                iced::widget::stack![
+                    view,
+                    column![
+                        space::vertical(),
+                        transparency::chrome(horizontal(draft)).padding([2, 6]),
+                    ]
+                    .height(Length::Fill),
                 ]
-                .height(Length::Fill)
                 .into()
             } else {
                 view
             };
-            pane_grid::Content::new(view).title_bar(bar)
+            pane_grid::Content::new(self.with_restored_output(session_id, view)).title_bar(bar)
         };
         let panes = pane_grid(&tab.grid, pane_content)
             .width(Length::Fill)
@@ -5472,7 +6796,10 @@ impl Workspace {
             &tab.grid,
             window.transparency.requested,
             transparency,
-            appearance.background,
+            tab.grid.get(tab.primary).map_or_else(
+                || self.window_settings.terminal_appearance().background,
+                |session| self.pane_appearance(*session).background,
+            ),
             panes,
             focus_ring,
             connection_frames,
@@ -5503,6 +6830,124 @@ mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn initial_terminal_dimensions_inherit_each_axis() {
+        let mut workspace = Workspace::default();
+        let profile = TerminalProfile::Petscii;
+        let defaults = workspace.configured_initial_grid(profile, None, Default::default());
+        assert_eq!((defaults.columns, defaults.rows), (40, 25));
+
+        workspace.window_settings.terminal_columns = Some(110);
+        workspace.window_settings.terminal_rows = Some(37);
+        let overrides = crate::connection_store::TerminalOverrides {
+            terminal_rows: Some(44),
+            ..Default::default()
+        };
+        let grid = workspace.configured_initial_grid(profile, Some(&overrides), Default::default());
+        assert_eq!((grid.columns, grid.rows), (110, 44));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_project_launch_replies_to_startup_color_queries_with_project_palette() {
+        use std::time::{Duration, Instant};
+
+        use crate::connection_store::{LocalProfile, TerminalOverrides};
+        use crate::terminal_theme::Rgb;
+
+        let mut workspace = Workspace::default();
+        let profile = TerminalProfile::Xterm;
+        let appearance = Appearance {
+            background: Rgb::from_hex(0x2E3440),
+            ..workspace.window_settings.terminal_appearance()
+        };
+        let local = LocalProfile {
+            id: 1,
+            name: "Startup color query".into(),
+            shell: LocalShell::default(),
+            command: Some(vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                concat!(
+                    "stty -echo -icanon min 1 time 0 || exit 2; ",
+                    "want=$(printf '\\033]11;rgb:2e2e/3434/4040\\007'); ",
+                    "printf '\\033]11;?\\007'; ",
+                    "got=$(dd bs=1 count=\"${#want}\" 2>/dev/null); ",
+                    "[ \"$got\" = \"$want\" ]",
+                )
+                .into(),
+            ]),
+            working_directory: None,
+            shell_integration: false,
+            emulation: profile.term_name().into(),
+            terminal: TerminalOverrides {
+                background: Some(Rgb::from_hex(0x112233)),
+                ..TerminalOverrides::default()
+            },
+        };
+        for view in [
+            LocalLaunchView::Initial(InitialTerminalSize::default(), Some(appearance)),
+            LocalLaunchView::Existing(initial_grid(profile), Some(appearance)),
+        ] {
+            let id = workspace
+                .launch_local_session(profile, None, None, view, false, Some(local.clone()))
+                .unwrap();
+            let session = &workspace.sessions[&id].session;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let finished = loop {
+                let frame = session.frame();
+                if !matches!(frame.status, Status::Starting | Status::Running) {
+                    break frame;
+                }
+                assert!(Instant::now() < deadline, "startup query did not complete");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            assert_eq!(finished.status, Status::Exited(Some(0)));
+            let _ = session.stop().recv_blocking();
+            workspace.stop_session(id);
+        }
+    }
+
+    #[test]
+    fn restored_project_shell_keeps_explicit_dimensions_after_a_live_resize() {
+        let mut workspace = Workspace::default();
+        workspace.window_settings.terminal_columns = Some(99);
+        workspace.window_settings.terminal_rows = Some(31);
+        let initial_size = InitialTerminalSize {
+            columns: Some(132),
+            rows: None,
+        };
+        let (owner, _) = workspace.open_window(false);
+        let mut active = None;
+        let _ = workspace
+            .restore_pane(
+                &PaneLayout::Terminal {
+                    font: 14,
+                    focused: true,
+                    vt100: false,
+                    term: None,
+                    security: None,
+                    initial_size,
+                },
+                &mut Vec::new(),
+                &mut active,
+                None,
+            )
+            .unwrap();
+        let session = active.unwrap();
+        let grid = workspace.sessions[&session].grid;
+        assert_eq!((grid.columns, grid.rows), (132, 31));
+        workspace.add_tab(owner, session);
+        let measured = GridSize::default();
+        let _ = workspace.update(Message::PaneResized(session, measured));
+        assert_eq!(workspace.sessions[&session].grid, measured);
+        let layout = workspace.capture_layout().unwrap();
+        assert!(matches!(
+            layout.windows[0].tabs[0],
+            PaneLayout::Terminal { initial_size: carried, .. } if carried == initial_size
+        ));
+    }
 
     #[test]
     fn removing_a_preceding_tab_preserves_selection() {
@@ -5724,12 +7169,14 @@ mod tests {
             },
             line_ending: crate::session::SerialLineEnding::CrLf,
             local_echo: true,
+            encoding: Some(kortty_terminal::TextEncoding::Latin9),
         };
         let layout = WorkspaceLayout::new(vec![WindowLayout {
             tab_titles: Default::default(),
             tab_groups: Default::default(),
             tab_primary_panes: Default::default(),
             tab_terminal_effects: Default::default(),
+            tab_terminal_appearance: Default::default(),
             width: 920.0,
             height: 620.0,
             position: None,
@@ -6176,7 +7623,7 @@ mod tests {
                 .unwrap();
             let session = &workspace.sessions[&id].session;
             session.send(format!(
-                "stty -echo; printf '%s' '{prompt}'; IFS= read -r val; printf '\\n{label}=%s\\n' \"$val\"; stty echo\r"
+                "stty -echo; printf '\\r%s' '{prompt}'; IFS= read -r val; printf '\\n{label}=%s\\n' \"$val\"; stty echo\r"
             ).into_bytes()).unwrap();
             wait_for_terminal_line(session, prompt);
             let _ = workspace.update(Message::MultiExec(Some(owner), Action::Pane));
@@ -6245,7 +7692,6 @@ mod tests {
         }
     }
 
-    #[cfg(unix)]
     #[test]
     fn broadcast_keeps_a_second_pty_responsive_when_the_first_input_queue_is_full() {
         let mut workspace = Workspace::default();
@@ -6263,7 +7709,12 @@ mod tests {
             .focused_session()
             .unwrap();
         let first = &workspace.sessions[&stalled].session;
-        first.send(b"stty -echo -icanon min 1 time 0; printf '%s%s\\n' 'kortty_blocked_' 'ready'; sleep 12\r".to_vec()).unwrap();
+        #[cfg(unix)]
+        let block =
+            b"stty -echo -icanon min 1 time 0; printf '%s%s\\n' 'kortty_blocked_' 'ready'; sleep 12\r";
+        #[cfg(windows)]
+        let block = b"[Console]::WriteLine('kortty_blocked_'+'ready'); Start-Sleep -Seconds 12\r";
+        first.send(block.to_vec()).unwrap();
         wait_for_terminal_line(first, "kortty_blocked_ready");
 
         // The real PTY has a process that does not read. Saturate its writer
@@ -6288,6 +7739,10 @@ mod tests {
             .panes;
         targets.sort_by_key(|target| *target != stalled);
         assert_eq!(targets, [stalled, ready]);
+        #[cfg(unix)]
+        let command = b"printf '%s%s\\n' 'kortty_broadcast_' 'reached'\r";
+        #[cfg(windows)]
+        let command = b"[Console]::WriteLine('kortty_broadcast_'+'reached')\r";
         workspace.send_to(
             window,
             &targets,
@@ -6297,11 +7752,7 @@ mod tests {
                 shifted_enter: false,
                 physical_pane: None,
             },
-            |_, _| {
-                Some(PaneInput::Local(
-                    b"printf '%s%s\\n' 'kortty_broadcast_' 'reached'\r".to_vec(),
-                ))
-            },
+            |_, _| Some(PaneInput::Local(command.to_vec())),
         );
         assert!(
             workspace.windows[&window]
@@ -6322,7 +7773,41 @@ mod tests {
         let (to, _) = workspace.open_window(false);
         let tab = workspace.windows[&from].tab().expect("local shell tab");
         let tab_id = tab.id;
+        let original = tab.focused;
         let id = tab.focused_session().expect("focused shell");
+        for (action, panes) in [
+            (chrome::Action::SplitRight, 2),
+            (chrome::Action::SplitDown, 3),
+        ] {
+            let _ = workspace.invoke_chrome(from, action);
+            workspace.wait_for_test_split(from);
+            assert_eq!(workspace.windows[&from].tab().unwrap().grid.len(), panes);
+        }
+        let _ = workspace.update(Message::FocusPane(from, original));
+        let splits: Vec<_> = workspace.windows[&from]
+            .tab()
+            .unwrap()
+            .grid
+            .layout()
+            .splits()
+            .copied()
+            .collect();
+        assert_eq!(splits.len(), 2);
+        for (split, ratio) in splits.into_iter().zip([0.43, 0.62]) {
+            let _ = workspace.update(Message::ResizeSplit(
+                from,
+                pane_grid::ResizeEvent { split, ratio },
+            ));
+        }
+        let regions = |tab: &Tab| {
+            tab.grid.layout().pane_regions(
+                transparency::SPLIT_SPACING,
+                transparency::SPLIT_MIN,
+                Size::new(900.0, 600.0),
+            )
+        };
+        let layout = regions(workspace.windows[&from].tab().unwrap());
+        assert_eq!(layout.len(), 3);
         let shell = &workspace.sessions[&id].session;
         #[cfg(unix)]
         let before_command =
@@ -6334,6 +7819,7 @@ mod tests {
             .send(before_command.to_vec())
             .expect("send command before transfer");
         wait_for_terminal_line(shell, "kortty_before");
+        let pid = shell.local_shell_pid().expect("live shell PID");
         #[cfg(unix)]
         let image = {
             let image = Arc::clone(&shell.frame().screen.images[0].placement.image);
@@ -6342,12 +7828,19 @@ mod tests {
             image
         };
 
-        let _ = workspace.transfer(from, Some(to), tab_id);
-        assert_eq!(
-            workspace.windows[&to].tab().and_then(Tab::focused_session),
-            Some(id)
-        );
+        let _ = workspace.invoke_chrome(from, chrome::Action::MoveTab);
+        assert!(workspace.windows[&from].transfer_open);
+        let _ = workspace.update(Message::Transfer {
+            from,
+            to: Some(to),
+            tab: tab_id,
+        });
+        let moved = workspace.windows[&to].tab().expect("moved terminal tab");
+        assert!(workspace.windows[&from].tabs.is_empty());
+        assert_eq!(moved.focused_session(), Some(id));
+        assert_eq!(regions(moved), layout);
         let shell = &workspace.sessions[&id].session;
+        assert_eq!(shell.local_shell_pid(), Some(pid));
         #[cfg(unix)]
         let after_command = b"printf 'after=%s\\n' \"$kortty_transfer\"\r";
         #[cfg(windows)]

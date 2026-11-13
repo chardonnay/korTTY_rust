@@ -6,7 +6,7 @@ use iced::widget::{
 };
 use iced::{Alignment, Element, Length, Point, Task, Theme};
 
-use crate::connection_store::{Connection, OsBadge};
+use crate::connection_store::OsBadge;
 use crate::workspace::native_popup;
 
 use super::os_badge::Badge;
@@ -116,12 +116,12 @@ struct TagPrompt {
 }
 
 impl TagPrompt {
-    fn from_targets(targets: &[&Connection]) -> Option<Self> {
-        let first = &targets.first()?.tag;
-        let original = (!first.is_empty() && targets.iter().all(|entry| entry.tag == *first))
-            .then(|| first.clone());
+    fn from_targets(targets: &[(u64, &str)]) -> Option<Self> {
+        let first = targets.first()?.1;
+        let original = (!first.is_empty() && targets.iter().all(|(_, tag)| *tag == first))
+            .then(|| first.to_owned());
         Some(Self {
-            ids: targets.iter().map(|entry| entry.id).collect(),
+            ids: targets.iter().map(|(id, _)| *id).collect(),
             tag: original.clone().unwrap_or_default(),
             original,
         })
@@ -136,6 +136,8 @@ impl TagPrompt {
 enum Action {
     Open(Page),
     Edit,
+    Duplicate,
+    Pin,
     Favorite,
     Export,
     Overview,
@@ -144,6 +146,7 @@ enum Action {
     Delete,
     NewRootFolder,
     NewConnection,
+    NewLocal,
     RenameFolder,
     CreateSubfolder,
     FolderColor,
@@ -290,22 +293,70 @@ impl ConnectionWindow {
 
         match page {
             Page::Root => match row {
-                RowKey::Connection(_) => {
-                    let ids = self.selected_connection_ids();
-                    let any = !ids.is_empty();
-                    let tagged = ids.iter().any(|id| {
-                        self.store
-                            .get(*id)
-                            .is_some_and(|entry| !entry.tag.is_empty())
-                    });
+                RowKey::Shared(identity) => {
+                    let enabled = self.shared_entry(identity).is_some();
+                    let hide = if self.selected_profile_ids().is_empty() {
+                        "Hide locally…"
+                    } else {
+                        "Hide shared and delete local…"
+                    };
                     vec![
-                        Entry::item("Edit", A::Edit, ids.len() == 1),
+                        Entry::item("Favorite on/off", A::Favorite, enabled),
+                        Entry::item(hide, A::Delete, enabled),
+                    ]
+                }
+                RowKey::Serial(_) => {
+                    let profile = self.selected_serial();
+                    let enabled = profile.is_some();
+                    let ids = self.selected_profile_ids();
+                    let any = !ids.is_empty();
+                    let tags = any && self.selection.shared().next().is_none();
+                    let pin = if profile.is_some_and(|profile| profile.pinned) {
+                        "Unpin"
+                    } else {
+                        "Pin"
+                    };
+                    vec![
+                        Entry::item("Edit", A::Edit, enabled),
+                        Entry::item("Duplicate", A::Duplicate, enabled),
                         Entry::item("Favorite on/off", A::Favorite, any),
-                        Entry::item("OS symbol", A::Open(Page::OsSymbols), any),
-                        Entry::item("Export", A::Export, any),
-                        Entry::item("Export overview…", A::Overview, any),
+                        Entry::item(pin, A::Pin, enabled),
+                        Entry::item("Export", A::Export, self.can_export_connections()),
                         Separator,
-                        Entry::item("Assign Tag", A::AssignTag, any),
+                        Entry::item("Assign Tag", A::AssignTag, tags),
+                        Entry::item(
+                            "Remove Tag",
+                            A::RemoveTag,
+                            tags && ids
+                                .iter()
+                                .any(|id| self.profile_tag(*id).is_some_and(|tag| !tag.is_empty())),
+                        ),
+                        Separator,
+                        Entry::item("Delete", A::Delete, any),
+                    ]
+                }
+                RowKey::Local(_) => vec![
+                    Entry::item("Edit", A::Edit, self.selected_local().is_some()),
+                    Entry::item("Export", A::Export, self.can_export_connections()),
+                    Entry::item("Delete", A::Delete, self.selected_local().is_some()),
+                ],
+                RowKey::Connection(_) => {
+                    let ids = self.selected_profile_ids();
+                    let any = !ids.is_empty();
+                    let tags = any && self.selection.shared().next().is_none();
+                    let network_only = any && self.selection.serials().next().is_none();
+                    let tagged = tags
+                        && ids
+                            .iter()
+                            .any(|id| self.profile_tag(*id).is_some_and(|tag| !tag.is_empty()));
+                    vec![
+                        Entry::item("Edit", A::Edit, self.selected().is_some()),
+                        Entry::item("Favorite on/off", A::Favorite, any),
+                        Entry::item("OS symbol", A::Open(Page::OsSymbols), network_only),
+                        Entry::item("Export", A::Export, any),
+                        Entry::item("Export overview…", A::Overview, network_only),
+                        Separator,
+                        Entry::item("Assign Tag", A::AssignTag, tags),
                         Entry::item("Remove Tag", A::RemoveTag, tagged),
                         Separator,
                         Entry::item("Delete", A::Delete, any),
@@ -313,7 +364,7 @@ impl ConnectionWindow {
                 }
                 RowKey::Group(path) => {
                     let exists = self.store.has_group(path);
-                    let nonempty = self.store.in_group(path).next().is_some();
+                    let nonempty = self.folder_profile_count(path) != 0;
                     vec![
                         Entry::item("Rename Folder", A::RenameFolder, exists),
                         Entry::item("Create Subfolder", A::CreateSubfolder, exists),
@@ -324,13 +375,18 @@ impl ConnectionWindow {
                         Entry::item("Remove Tag", A::RemoveTag, exists),
                         Separator,
                         Entry::item("Export Folder", A::ExportFolder, nonempty),
-                        Entry::item("Export overview…", A::Overview, nonempty),
+                        Entry::item(
+                            "Export overview…",
+                            A::Overview,
+                            self.store.in_group(path).next().is_some(),
+                        ),
                         Entry::item("Delete Folder", A::DeleteFolder, exists),
                     ]
                 }
                 RowKey::Empty => vec![
                     Entry::item("New Folder", A::NewRootFolder, true),
                     Entry::item("New Connection", A::NewConnection, true),
+                    Entry::item("New local shell profile", A::NewLocal, true),
                 ],
             },
             Page::OsSymbols => {
@@ -524,9 +580,12 @@ impl ConnectionWindow {
         };
         match action {
             Action::Edit => self.update(ConnectionMessage::EditSelected),
+            Action::Duplicate => self.update(ConnectionMessage::Duplicate),
+            Action::Pin => self.update(ConnectionMessage::ToggleSerialPin),
             Action::Favorite => self.update(ConnectionMessage::ToggleFavorite),
             Action::Delete => self.update(ConnectionMessage::Delete),
             Action::NewConnection => self.update(ConnectionMessage::New),
+            Action::NewLocal => self.update(ConnectionMessage::NewLocal),
             Action::NewRootFolder => {
                 self.folder = Some(FolderDialog::Create {
                     parent: None,
@@ -562,7 +621,10 @@ impl ConnectionWindow {
             Action::AssignTag | Action::RemoveTag => self.apply_tree_tag(group, action),
             Action::Badge(badge) => {
                 let ids = self.selected_connection_ids();
-                if ids.is_empty() || !self.valid_os_badge(badge.as_deref()) {
+                if ids.is_empty()
+                    || self.selection.serials().next().is_some()
+                    || !self.valid_os_badge(badge.as_deref())
+                {
                     return Task::none();
                 }
                 self.persist(move |mut store| {
@@ -577,12 +639,25 @@ impl ConnectionWindow {
 
     fn apply_tree_tag(&mut self, group: Option<&str>, action: Action) -> Task<ConnectionMessage> {
         let targets: Vec<_> = match group {
-            Some(path) => self.store.in_group(path).collect(),
-            None => self
-                .selected_connection_ids()
-                .iter()
-                .filter_map(|id| self.store.get(*id))
+            Some(path) => self
+                .store
+                .in_group(path)
+                .map(|entry| (entry.id, entry.tag.as_str()))
+                .chain(
+                    self.store
+                        .serial_in_group(path)
+                        .map(|entry| (entry.id, entry.tag.as_str())),
+                )
                 .collect(),
+            None => {
+                if self.selection.shared().next().is_some() {
+                    return Task::none();
+                }
+                self.selected_profile_ids()
+                    .into_iter()
+                    .filter_map(|id| self.profile_tag(id).map(|tag| (id, tag)))
+                    .collect()
+            }
         };
         if targets.is_empty() {
             self.notice = Some("The folder has no connections.".into());
@@ -595,8 +670,8 @@ impl ConnectionWindow {
         }
         let ids: Vec<_> = targets
             .iter()
-            .filter(|entry| !entry.tag.is_empty())
-            .map(|entry| entry.id)
+            .filter(|(_, tag)| !tag.is_empty())
+            .map(|(id, _)| *id)
             .collect();
         if ids.is_empty() {
             return Task::none();

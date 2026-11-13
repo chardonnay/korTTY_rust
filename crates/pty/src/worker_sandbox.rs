@@ -18,7 +18,9 @@ pub use relay_io::{WindowsRelayIo, WindowsRelayReader, WindowsRelayWriter};
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
-pub use windows::{WindowsWorker, WindowsWorkerProcess};
+pub(crate) use windows::with_private_pipe;
+#[cfg(windows)]
+pub use windows::{WindowsCli, WindowsWorker, WindowsWorkerProcess};
 
 #[cfg(all(
     target_os = "linux",

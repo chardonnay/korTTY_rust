@@ -8,6 +8,27 @@ use super::{Format, ImportedProfile, Preview, invalid, kortty, ssh_profile};
 const MAX_NODES: u32 = 32_768;
 
 pub(super) fn parse(bytes: &[u8]) -> io::Result<Preview> {
+    decode(bytes, parse_xml)
+}
+
+pub(super) fn parse_java_binding_source(bytes: &[u8], strict_ids: bool) -> io::Result<Preview> {
+    decode(bytes, |xml| {
+        let document = parse_document(xml)
+            .map_err(|_| invalid("invalid connection XML or XML node limit exceeded"))?;
+        let root = document.root_element();
+        if !has_unqualified_tag(root, "connections") {
+            return Err(invalid("expected Java connections.xml"));
+        }
+        let source = if strict_ids {
+            kortty::Source::CredentialReview
+        } else {
+            kortty::Source::RouteLineage
+        };
+        kortty::parse(root, source)
+    })
+}
+
+pub(super) fn decode<T>(bytes: &[u8], parse: impl FnOnce(&str) -> io::Result<T>) -> io::Result<T> {
     let utf16 = bytes
         .strip_prefix(&[0xff, 0xfe])
         .map(|bytes| (bytes, u16::from_le_bytes as fn([u8; 2]) -> u16))
@@ -26,12 +47,12 @@ pub(super) fn parse(bytes: &[u8]) -> io::Result<Preview> {
         let xml = Zeroizing::new(
             String::from_utf16(&units).map_err(|_| invalid("invalid UTF-16 in connection XML"))?,
         );
-        return parse_xml(&xml);
+        return parse(&xml);
     }
     let bytes = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]).unwrap_or(bytes);
     let xml = std::str::from_utf8(bytes)
         .map_err(|_| invalid("connection XML must use UTF-8 or UTF-16 with a byte-order mark"))?;
-    parse_xml(xml)
+    parse(xml)
 }
 
 fn parse_xml(xml: &str) -> io::Result<Preview> {
@@ -39,7 +60,7 @@ fn parse_xml(xml: &str) -> io::Result<Preview> {
         .map_err(|_| invalid("invalid connection XML or XML node limit exceeded"))?;
     let root = document.root_element();
     if has_unqualified_tag(root, "connections") {
-        return kortty::parse(root);
+        return kortty::parse(root, kortty::Source::Ordinary);
     }
     let mut servers = root
         .descendants()

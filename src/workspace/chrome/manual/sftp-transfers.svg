@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" height="320" viewBox="0 0 720 320">
+  <title>SFTP transfers on a verified connection</title>
+  <desc>The browser and parallel transfer channels share one verified SSH connection. Waiting files start within the effective limit. Collisions wait for review before a transfer can complete.</desc>
+  <rect width="720" height="320" rx="12" fill="#111b27"/>
+  <g fill="#21354a" stroke="#8bafce" stroke-width="1.5">
+    <rect x="20" y="22" width="680" height="58" rx="8"/>
+    <rect x="20" y="134" width="190" height="102" rx="8"/>
+    <rect x="265" y="134" width="190" height="102" rx="8"/>
+    <rect x="510" y="134" width="190" height="102" rx="8"/>
+  </g>
+  <path d="M115 88v36m-8-8 8 8 8-8M360 88v36m-8-8 8 8 8-8M605 88v36m-8-8 8 8 8-8M219 185h36m-8-8 8 8-8 8m217-8h36m-8-8 8 8-8 8" fill="none" stroke="#90d1f9" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <g fill="#f6faff" font-family="sans-serif" font-size="17" text-anchor="middle">
+    <text x="360" y="57">One verified SSH connection</text>
+    <text x="115" y="174">Waiting files<tspan x="115" dy="25">and folders</tspan></text>
+    <text x="360" y="162">Active transfers<tspan x="360" dy="25">within the limit</tspan><tspan x="360" dy="25">1–8</tspan></text>
+    <text x="605" y="174">Review conflicts<tspan x="605" dy="25">then finish</tspan></text>
+    <text x="360" y="274" font-size="15" fill="#c6d9e9">Limit 1 uses the browser channel. Higher limits add transfer channels.</text>
+    <text x="360" y="298" font-size="15" fill="#c6d9e9">Managed policy can lower the limit. Pausing keeps queued work.</text>
+  </g>
+</svg>

@@ -14,6 +14,7 @@ use super::{Message as Desktop, Workspace};
 mod catalog;
 mod dialog;
 
+pub(crate) use catalog::java as java_backup;
 pub(crate) use catalog::{Catalog, DEFAULT_ENVIRONMENT};
 use dialog::Dialog;
 pub use dialog::Message;
@@ -468,6 +469,8 @@ mod tests {
             command_timestamps: None,
             tab_color: Rgb::parse("#123"),
             paste_warning: None,
+            window_geometry: None,
+            terminal: Default::default(),
         };
         connection.id = store
             .save_in_group(connection.clone(), Some(&nested))

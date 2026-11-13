@@ -30,6 +30,10 @@ pub struct JournalRow<'a> {
 }
 
 impl Terminal {
+    pub fn journal_input_encoding(&self) -> crate::TextEncoding {
+        self.model.text_encoding()
+    }
+
     pub fn supports_journal_output(&self) -> bool {
         matches!(self.input, Input::Xterm(_))
     }

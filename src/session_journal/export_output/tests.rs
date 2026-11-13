@@ -74,6 +74,7 @@ impl Fixture {
         let load = match format {
             Format::Pdf | Format::Markdown => export::load,
             Format::HtmlBundle => export::load_for_bundle,
+            Format::BrowserHtml => export::load_for_browser,
         };
         let snapshot = load(
             &self.root,
@@ -241,6 +242,7 @@ fn journal_pdf_export_publishes_plain_pdf_and_password_zip() {
     .unwrap();
     assert_eq!(report.exported, 1);
     assert_eq!(report.skipped_assets, 0);
+    assert!(report.document.is_some());
     assert!(fs::read(report.path).unwrap().starts_with(b"%PDF-"));
 
     let password = Protection::Password(Zeroizing::new("fixture-password".into()));
@@ -252,6 +254,7 @@ fn journal_pdf_export_publishes_plain_pdf_and_password_zip() {
         &|| false,
     )
     .unwrap();
+    assert!(report.document.is_none());
     let mut archive = ZipArchive::new(fs::File::open(report.path).unwrap()).unwrap();
     assert!(
         archive
@@ -275,6 +278,7 @@ fn journal_pdf_export_publishes_plain_pdf_and_password_zip() {
         &|| false,
     )
     .unwrap();
+    assert!(report.document.is_some());
     let mut archive = ZipArchive::new(fs::File::open(report.path).unwrap()).unwrap();
     for name in ["One_journal.pdf", "one_journal-2.pdf"] {
         let mut header = [0; 5];
@@ -361,6 +365,7 @@ fn journal_export_single_markdown_publishes_sibling_assets_and_rolls_back_confli
 
     let report = run().unwrap();
     assert_eq!(report.exported, 1);
+    assert!(report.document.is_some());
     assert!(report.skipped.is_empty());
     assert_eq!(report.skipped_assets, 0);
     let text = fs::read_to_string(&report.path).unwrap();

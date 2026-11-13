@@ -1,5 +1,5 @@
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write as _};
 use std::net::TcpListener;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _, symlink};
@@ -7,24 +7,29 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
-use kortty_jobs::{RunRequest, Scheduler};
+use kortty_jobs::{JobId, RunRequest, RunTrigger, Scheduler};
 use kortty_ssh::{Endpoint, HostKey, HostKeyStatus, TrustMode, TrustStore};
 use kortty_vault::{CredentialInput, CredentialKind, Secret, Vault};
 use serde_json::json;
 
+use crate::clipboard_policy::ServerAccess;
 use crate::connection_store::{Auth, Connection, SavedLogin, Store};
-use crate::scheduler_window::ConnectionRef;
+use crate::scheduler_window::{ConnectionRef, Message, SchedulerWindow};
 use crate::snippets::{Input, Library, Variable};
 use crate::ssh_dialog::LoginTarget;
 use crate::ssh_key_catalog::{Catalog, Edit, KeyDraft, KeyInput};
 use crate::vault_window::{Kind, resolve_credential};
 
 use super::{
-    BorrowedArchivePassword, Completion, Credentials, RunOutcome, SshCommand, batch, run,
-    run_command, scheduled_request, thread, virtual_terminal,
+    BorrowedArchivePassword, Completion, Credentials, ExecutionPolicy, RunOutcome, SshCommand,
+    batch, run, run_command, scheduled_request, thread, virtual_terminal,
 };
+
+#[cfg(target_os = "linux")]
+mod privileged_archive;
+mod scheduled_swarm;
 
 struct Profile(PathBuf);
 
@@ -209,7 +214,7 @@ impl Sshd {
             &request,
             None,
             None,
-            file_transfer_allowed,
+            &ExecutionPolicy::unrestricted(file_transfer_allowed),
             Ok(None),
             password,
             || Ok(trust),
@@ -248,6 +253,8 @@ fn scheduled_batch(
                 command_timestamps: None,
                 tab_color: None,
                 paste_warning: None,
+                window_geometry: None,
+                terminal: Default::default(),
             })
             .unwrap();
         references.push(ConnectionRef::from(store.get(id).unwrap()));
@@ -263,14 +270,374 @@ fn scheduled_batch(
     (scheduler, request, Store::open(path).unwrap())
 }
 
+#[cfg(target_os = "linux")]
+fn privileged_fixture_route() -> (Connection, Vec<(Endpoint, HostKey)>) {
+    use std::net::SocketAddr;
+
+    let required = |key| std::env::var(key).unwrap_or_else(|_| panic!("set {key} for the fixture"));
+    let address: SocketAddr = required("KORTTY_SSH_EXEC_ADDRESS").parse().unwrap();
+    assert!(address.ip().is_loopback());
+    let host = address.ip().to_string();
+    let account = Connection {
+        id: 1,
+        name: "Privileged transfer fixture".into(),
+        tag: String::new(),
+        login: SavedLogin {
+            endpoint: LoginTarget {
+                host: host.clone(),
+                port: address.port(),
+                username: required("KORTTY_SSH_EXEC_USER"),
+            },
+            auth: Auth::KeyFile {
+                path: PathBuf::from(required("KORTTY_SSH_EXEC_PRIVATE_KEY")),
+                passphrase: None,
+            },
+            keyboard_interactive: false,
+        },
+        jump: None,
+        emulation: "xterm-256color".into(),
+        tunnels: Vec::new(),
+        incognito: false,
+        isolation: Default::default(),
+        startup: Default::default(),
+        logging: Default::default(),
+        terminal_effect: None,
+        command_timestamps: None,
+        tab_color: None,
+        paste_warning: None,
+        window_geometry: None,
+        terminal: Default::default(),
+    };
+    let pins = vec![(
+        Endpoint::new(&host, address.port()).unwrap(),
+        HostKey::from_openssh(&required("KORTTY_SSH_EXEC_HOST_KEY")).unwrap(),
+    )];
+    (account, pins)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a dedicated OpenSSH fixture with private Linux mount namespace and mock sudo"]
+fn openssh_scheduled_reviewed_privileged_tree_runs_once_on_its_pinned_route() {
+    scheduled_privileged_tree(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a dedicated OpenSSH fixture with a protected source tree and mock sudo"]
+fn openssh_scheduled_reviewed_privileged_tree_download_runs_once_on_its_pinned_route() {
+    scheduled_privileged_tree(true);
+}
+
+#[cfg(target_os = "linux")]
+fn scheduled_privileged_tree(download: bool) {
+    use crate::job_executor::JobAuth;
+    use crate::scheduler_window::{Message, Page, SchedulerWindow};
+    use kortty_jobs::{Job, JobGraph, JobId, SchedulerStore};
+
+    let parent = PathBuf::from(
+        std::env::var_os("KORTTY_SSH_PRIVILEGED_TREE_HOST_PARENT")
+            .expect("supply the private host directory mounted as /fixtures"),
+    );
+    let log = PathBuf::from(
+        std::env::var_os("KORTTY_SSH_EXEC_LOG").expect("supply the dedicated fixture sshd log"),
+    );
+    let auth_count = || {
+        fs::read_to_string(&log)
+            .unwrap()
+            .matches("Accepted publickey")
+            .count()
+    };
+    let (account, pins) = privileged_fixture_route();
+    let reference = ConnectionRef::from(&account);
+    let trust = TrustStore::from_pins(pins).unwrap();
+    let profile = Profile::new();
+    let local = profile.0.join("local");
+    let body: Vec<_> = (0..196_610).map(|index| (index % 251) as u8).collect();
+    let (target, kind, direction, remote, excludes) = if download {
+        let source = parent.join("download-tree");
+        assert_eq!(fs::read(source.join("nested/data.bin")).unwrap(), body);
+        assert!(source.join("nested/empty").is_dir());
+        (
+            local.clone(),
+            "privileged_tree_download",
+            "download",
+            "/fixtures/download-tree",
+            "",
+        )
+    } else {
+        fs::create_dir(&local).unwrap();
+        fs::create_dir(local.join("nested")).unwrap();
+        fs::create_dir(local.join("nested/empty")).unwrap();
+        fs::write(local.join("excluded.tmp"), b"outside the review").unwrap();
+        fs::write(local.join("nested/data.bin"), &body).unwrap();
+        (
+            parent.join("scheduled-tree"),
+            "privileged_tree_upload",
+            "upload",
+            "/fixtures/scheduled-tree",
+            "*.tmp",
+        )
+    };
+    assert!(!target.exists(), "fixture destination must start absent");
+    let action: SshCommand = serde_json::from_value(json!({
+        "connection": reference, "sudo": "vault",
+        "remote": {"kind": kind, "direction": direction,
+                   "local": local, "remote": remote, "excludes": excludes}
+    }))
+    .unwrap();
+    let id = JobId::new("reviewed-privileged-tree").unwrap();
+    let path = profile.0.join("scheduler.json");
+    let credentials = |action: &SshCommand| {
+        let saved = Credentials::resolve(action, &account, &ServerAccess::default(), |_, _, _| {
+            Err("unexpected SSH key credential")
+        })
+        .map(Box::new);
+        let JobAuth::Saved(saved) = JobAuth::Saved(saved)
+            .with_sudo_passwords(|_| Ok(Secret::new("kortty-file-fixture".to_owned())))
+        else {
+            unreachable!();
+        };
+        *saved.unwrap()
+    };
+    let initial_credentials = credentials(&action);
+    {
+        let mut store = SchedulerStore::open(&path).unwrap();
+        let graph = JobGraph::new(vec![
+            Job::new(id, "Reviewed privileged tree", action).unwrap(),
+        ])
+        .unwrap();
+        store.commit_with_actions(&graph, &[], &[]).unwrap();
+    }
+    {
+        let mut runtime = SchedulerWindow::open(path.clone()).unwrap();
+        runtime.set_execution_allowed(true);
+        let mut view = runtime.new_view();
+        runtime.update_view(&mut view, Message::Page(Page::Action));
+        let request = runtime.begin_sync_review(&mut view).unwrap();
+        let ticket = request.ticket.clone();
+        let read_trust = trust.clone();
+        let before = auth_count();
+        let preview = super::super::remote::sync::preview_with_trust(
+            request,
+            initial_credentials,
+            move || Ok(read_trust),
+        )
+        .recv_blocking()
+        .unwrap()
+        .expect("actual privileged tree review");
+        assert_eq!(auth_count(), before + 1);
+        assert!(!target.exists());
+        assert_eq!(
+            preview.preview.paths,
+            vec![
+                (true, "nested".into()),
+                (false, "nested/data.bin".into()),
+                (true, "nested/empty".into())
+            ]
+        );
+        runtime.update_view(
+            &mut view,
+            Message::SyncPreviewed(ticket, Ok(Arc::new(preview))),
+        );
+        runtime.update_view(&mut view, Message::ApproveSync);
+        runtime.update_view(&mut view, Message::Save);
+    }
+    let mut runtime = SchedulerWindow::open(path).unwrap();
+    runtime.set_execution_allowed(true);
+    let mut view = runtime.new_view();
+    let request = runtime
+        .update_view(&mut view, Message::Run(false))
+        .pop()
+        .unwrap();
+    let policy = ExecutionPolicy {
+        sync: Some(runtime.sync_run_context(&request).unwrap()),
+        ..ExecutionPolicy::unrestricted(true)
+    };
+    let execute = || {
+        run(
+            &request,
+            None,
+            None,
+            &policy,
+            Ok(Some(credentials(&request.action))),
+            Ok(None),
+            || Ok(trust.clone()),
+        )
+    };
+    let before = auth_count();
+    let outcome = execute();
+    assert_eq!(outcome.outcome, RunOutcome::Success, "{:?}", outcome.detail);
+    assert_eq!(
+        auth_count(),
+        before + 1,
+        "run must reuse one authenticated route"
+    );
+    assert_eq!(
+        target.metadata().unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    assert_eq!(fs::read(target.join("nested/data.bin")).unwrap(), body);
+    assert!(target.join("nested/empty").is_dir());
+    assert!(!target.join("excluded.tmp").exists());
+    assert_eq!(execute().outcome, RunOutcome::Blocked);
+    assert_eq!(
+        auth_count(),
+        before + 1,
+        "consumed receipt must block before dial"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an explicit OpenSSH fixture with private Linux mount namespace and mock sudo"]
+fn openssh_scheduled_privileged_binary_transfer_reuses_pinned_route_and_never_replaces() {
+    use crate::job_executor::JobAuth;
+    use crate::scheduler_window::{RemoteAction, privileged::approve_fixture};
+
+    let remote = std::env::var("KORTTY_SSH_PRIVILEGED_TRANSFER_PATH")
+        .expect("set KORTTY_SSH_PRIVILEGED_TRANSFER_PATH for the fixture");
+    assert_eq!(remote, "/fixtures/scheduled.bin");
+    let profile = Profile::new();
+    let (account, pins) = privileged_fixture_route();
+    let reference = ConnectionRef::from(&account);
+    let trust = TrustStore::from_pins(pins.clone()).unwrap();
+    let (_, mut request) = scheduled_request();
+    let source = profile.0.join("upload");
+    let destination = profile.0.join("download");
+    let bytes: Vec<_> = (0..196_610).map(|index| (index % 256) as u8).collect();
+    fs::write(&source, &bytes).unwrap();
+    let action = |direction, local: &Path| -> SshCommand {
+        serde_json::from_value::<SshCommand>(json!({
+            "connection": reference,
+            "sudo": if direction == "upload" { "vault" } else { "passwordless" },
+            "remote": {"kind": "privileged", "direction": direction, "local": local, "remote": remote}
+        }))
+        .unwrap()
+        .validated()
+        .unwrap()
+    };
+    let credentials = |action: &SshCommand, password: Option<&str>| -> super::super::SavedAuth {
+        let credentials =
+            Credentials::resolve(action, &account, &ServerAccess::default(), |_, _, _| {
+                panic!("The plain fixture key must not read the vault")
+            })
+            .unwrap();
+        let Some(password) = password else {
+            return Ok(Some(credentials));
+        };
+        let JobAuth::Saved(resolved) = JobAuth::Saved(Ok(Box::new(credentials)))
+            .with_sudo_passwords(|_| Ok(Secret::new(password.to_owned())))
+        else {
+            unreachable!();
+        };
+        resolved.map(|value| Some(*value))
+    };
+    let exec = |request: &RunRequest<SshCommand>, policy: &ExecutionPolicy, password| {
+        run(
+            request,
+            None,
+            None,
+            policy,
+            credentials(&request.action, password),
+            Ok(None),
+            || Ok(trust.clone()),
+        )
+    };
+    let good_password = "kortty-file-fixture";
+    request.action = Arc::new(action("upload", &source));
+    let mut policy = ExecutionPolicy::unrestricted(true);
+    let blocked = run(
+        &request,
+        None,
+        None,
+        &policy,
+        credentials(&request.action, Some(good_password)),
+        Ok(None),
+        || panic!("Missing approval must block before looking up host keys"),
+    );
+    assert_eq!(blocked.outcome, RunOutcome::Blocked);
+
+    policy.privileged = Some(
+        approve_fixture(
+            &profile.0,
+            &request.job,
+            Arc::make_mut(&mut request.action),
+            &pins,
+        )
+        .unwrap(),
+    );
+    let no_vault = run(
+        &request,
+        None,
+        None,
+        &policy,
+        credentials(&request.action, None),
+        Ok(None),
+        || panic!("Missing sudo credentials must block before looking up host keys"),
+    );
+    assert_eq!(no_vault.outcome, RunOutcome::Blocked);
+    let approved = request.action.clone();
+    let Some(RemoteAction::Privileged(transfer)) = &mut Arc::make_mut(&mut request.action).remote
+    else {
+        unreachable!()
+    };
+    transfer.local = profile.0.join("changed upload");
+    assert_eq!(
+        exec(&request, &policy, Some(good_password)).outcome,
+        RunOutcome::Blocked
+    );
+    request.action = approved;
+
+    assert_eq!(
+        exec(&request, &policy, Some("wrong-fixture-password")).outcome,
+        RunOutcome::Blocked
+    );
+    let uploaded = exec(&request, &policy, Some(good_password));
+    assert_eq!(
+        uploaded.outcome,
+        RunOutcome::Success,
+        "{:?}",
+        uploaded.detail
+    );
+    fs::write(&source, b"a later job must not replace the destination").unwrap();
+    assert_ne!(
+        exec(&request, &policy, Some(good_password)).outcome,
+        RunOutcome::Success
+    );
+
+    request.action = Arc::new(action("download", &destination));
+    policy.privileged = Some(
+        approve_fixture(
+            &profile.0,
+            &request.job,
+            Arc::make_mut(&mut request.action),
+            &pins,
+        )
+        .unwrap(),
+    );
+    let downloaded = exec(&request, &policy, None);
+    assert_eq!(
+        downloaded.outcome,
+        RunOutcome::Success,
+        "{:?}",
+        downloaded.detail
+    );
+    assert_eq!(fs::read(&destination).unwrap(), bytes);
+    assert_eq!(exec(&request, &policy, None).outcome, RunOutcome::Blocked);
+    assert_eq!(fs::read(destination).unwrap(), bytes);
+}
+
 #[test]
 #[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
 fn openssh_scheduled_batch_runs_in_order_and_aggregates_failed_and_unpinned_targets() {
     let first = Sshd::new();
     let unpinned = Sshd::new();
     let last = Sshd::new();
-    let order = first.profile.0.join("target order");
-    let (_, request, store) = scheduled_batch(
+    let working_directory = first.profile.0.join("batch ' directory");
+    fs::create_dir(&working_directory).unwrap();
+    let order = working_directory.join("target order");
+    let (_, mut request, store) = scheduled_batch(
         &first.profile.0,
         &[&first, &unpinned, &last],
         r#"case "${SSH_CONNECTION##* }" in
@@ -279,17 +646,29 @@ fn openssh_scheduled_batch_runs_in_order_and_aggregates_failed_and_unpinned_targ
   *) printf '%s\n' unexpected >> "$1"; exit 39 ;;
 esac"#,
         vec![
-            order.to_str().unwrap().into(),
+            order.file_name().unwrap().to_str().unwrap().into(),
             first.port.to_string(),
             last.port.to_string(),
         ],
     );
-    let credentials = Credentials::resolve_batch(&request.action, &store, |_, _, _| {
-        panic!("plain fixture key unexpectedly required the vault")
-    });
+    Arc::make_mut(&mut request.action).working_directory =
+        Some(working_directory.to_str().unwrap().into());
+    let credentials = Credentials::resolve_batch(
+        &request.action,
+        &store,
+        &ServerAccess::default(),
+        |_, _, _| panic!("plain fixture key unexpectedly required the vault"),
+    );
     let daemons = [first.spawn(), unpinned.spawn(), last.spawn()];
     let trust = TrustStore::from_pins(vec![first.pin(), last.pin()]).unwrap();
-    let completed = batch::run(&request, None, true, credentials, Ok(None), || Ok(trust));
+    let completed = batch::run(
+        &request,
+        None,
+        &ExecutionPolicy::unrestricted(true),
+        credentials,
+        Ok(None),
+        || Ok(trust),
+    );
     assert_eq!(
         completed.outcome,
         RunOutcome::Failed {
@@ -327,11 +706,19 @@ esac"#,
         .unwrap(),
     );
     let daemons = [first.spawn(), last.spawn()];
-    let credentials = Credentials::resolve_batch(&sftp.action, &store, |_, _, _| {
-        panic!("plain fixture key unexpectedly required the vault")
-    });
+    let credentials =
+        Credentials::resolve_batch(&sftp.action, &store, &ServerAccess::default(), |_, _, _| {
+            panic!("plain fixture key unexpectedly required the vault")
+        });
     let trust = TrustStore::from_pins(vec![first.pin(), last.pin()]).unwrap();
-    let completed = batch::run(&sftp, None, false, credentials, Ok(None), || Ok(trust));
+    let completed = batch::run(
+        &sftp,
+        None,
+        &ExecutionPolicy::unrestricted(false),
+        credentials,
+        Ok(None),
+        || Ok(trust),
+    );
     assert_eq!(
         completed.outcome,
         RunOutcome::Success,
@@ -367,15 +754,25 @@ fn openssh_scheduled_batch_cancels_current_target_and_never_starts_the_next() {
         "printf 'started' > \"$1\"\nexec /bin/sleep 4",
         vec![marker.to_str().unwrap().into()],
     );
-    let credentials = Credentials::resolve_batch(&request.action, &store, |_, _, _| {
-        panic!("plain fixture key unexpectedly required the vault")
-    });
+    let credentials = Credentials::resolve_batch(
+        &request.action,
+        &store,
+        &ServerAccess::default(),
+        |_, _, _| panic!("plain fixture key unexpectedly required the vault"),
+    );
     let trust = TrustStore::from_pins(vec![first.pin(), next.pin()]).unwrap();
     let daemon = first.spawn();
     let (sender, completion) = std::sync::mpsc::sync_channel(1);
     let id = request.id;
     let worker = thread::spawn(move || {
-        let result = batch::run(&request, None, true, credentials, Ok(None), || Ok(trust));
+        let result = batch::run(
+            &request,
+            None,
+            &ExecutionPolicy::unrestricted(true),
+            credentials,
+            Ok(None),
+            || Ok(trust),
+        );
         let _ = sender.send(result);
     });
     let deadline = Instant::now() + Duration::from_secs(6);
@@ -472,6 +869,8 @@ fn openssh_scheduler_uses_copied_registered_key_and_blocks_changed_jump_before_d
         command_timestamps: None,
         tab_color: None,
         paste_warning: None,
+        window_geometry: None,
+        terminal: Default::default(),
     };
     let reference = ConnectionRef::from(&profile);
     let (_, mut request) = scheduled_request();
@@ -485,6 +884,7 @@ fn openssh_scheduler_uses_copied_registered_key_and_blocks_changed_jump_before_d
             &profile,
             false,
             &mut Some(Ok(catalog)),
+            &crate::clipboard_policy::ServerAccess::default(),
             |id, kind, endpoint| {
                 assert_eq!(id, credential);
                 assert!(matches!(kind, Kind::KeyPassphrase));
@@ -499,7 +899,15 @@ fn openssh_scheduler_uses_copied_registered_key_and_blocks_changed_jump_before_d
     assert!(ready.is_ok() && staged.is_ok());
     let daemons = [jump.spawn(), target.spawn()];
     let pins = TrustStore::from_pins(vec![target.pin(), jump.pin()]).unwrap();
-    let completed = run(&request, None, None, true, ready, Ok(None), || Ok(pins));
+    let completed = run(
+        &request,
+        None,
+        None,
+        &ExecutionPolicy::unrestricted(true),
+        ready,
+        Ok(None),
+        || Ok(pins),
+    );
     assert_eq!(
         completed.outcome,
         RunOutcome::Success,
@@ -513,9 +921,15 @@ fn openssh_scheduler_uses_copied_registered_key_and_blocks_changed_jump_before_d
     }
 
     catalog.apply(vec![Edit::Remove(jump_key)]).unwrap();
-    let completed = run(&request, None, None, true, staged, Ok(None), || {
-        TrustStore::from_pins(vec![target.pin(), jump.pin()])
-    });
+    let completed = run(
+        &request,
+        None,
+        None,
+        &ExecutionPolicy::unrestricted(true),
+        staged,
+        Ok(None),
+        || TrustStore::from_pins(vec![target.pin(), jump.pin()]),
+    );
     assert_eq!(completed.outcome, RunOutcome::Blocked);
     assert_eq!(
         completed.detail.as_deref(),
@@ -583,15 +997,20 @@ fn openssh_scheduler_uses_a_saved_jump_and_vault_key_without_bypassing_pins() {
             command_timestamps: None,
             tab_color: None,
             paste_warning: None,
+            window_geometry: None,
+            terminal: Default::default(),
         })
         .unwrap();
     let store = Store::open(connection_path).unwrap();
     let profile = store.get(id).unwrap();
     let reference = ConnectionRef::from(profile);
     let login = |action: &SshCommand| {
-        Credentials::resolve(action, profile, |id, kind, endpoint| {
-            resolve_credential(&vault, id, kind, endpoint)
-        })
+        Credentials::resolve(
+            action,
+            profile,
+            &ServerAccess::default(),
+            |id, kind, endpoint| resolve_credential(&vault, id, kind, endpoint),
+        )
         .map(Some)
     };
     let (target_endpoint, target_key) = target.pin();
@@ -612,7 +1031,7 @@ fn openssh_scheduler_uses_a_saved_jump_and_vault_key_without_bypassing_pins() {
         &request,
         None,
         None,
-        true,
+        &ExecutionPolicy::unrestricted(true),
         login(&request.action),
         Ok(None),
         || Ok(pins.clone()),
@@ -644,7 +1063,7 @@ fn openssh_scheduler_uses_a_saved_jump_and_vault_key_without_bypassing_pins() {
         &request,
         None,
         None,
-        false,
+        &ExecutionPolicy::unrestricted(false),
         login(&request.action),
         Ok(None),
         || Ok(pins),
@@ -681,7 +1100,7 @@ fn openssh_scheduler_uses_a_saved_jump_and_vault_key_without_bypassing_pins() {
         &request,
         None,
         None,
-        false,
+        &ExecutionPolicy::unrestricted(false),
         login(&request.action),
         Ok(None),
         || Ok(changed_target),
@@ -711,7 +1130,7 @@ fn openssh_scheduler_uses_a_saved_jump_and_vault_key_without_bypassing_pins() {
         &request,
         None,
         None,
-        false,
+        &ExecutionPolicy::unrestricted(false),
         login(&request.action),
         Ok(None),
         || Ok(changed_jump),
@@ -735,6 +1154,8 @@ fn openssh_executes_inline_and_linked_scripts_with_literal_argv() {
         ..
     } = &fixture;
     let recording = profile.0.join("recordings");
+    let working_directory = profile.0.join("job's literal $(directory)");
+    fs::create_dir(&working_directory).unwrap();
 
     let script = r#"cat <<'inner' >/dev/null
 KORTTY_SCRIPT
@@ -778,7 +1199,7 @@ exit 23"#;
         .unwrap();
     for pty in [false, true] {
         let daemon = fixture.spawn();
-        let output = profile.0.join(if pty { "pty-argv" } else { "exec-argv" });
+        let output = if pty { "pty-argv" } else { "exec-argv" };
         let (_, mut request) = scheduled_request();
         let arguments = json!([
             expected[0],
@@ -789,7 +1210,8 @@ exit 23"#;
         ]);
         let mut action = json!({
             "host": "127.0.0.1", "port": port, "username": user, "key_file": user_key,
-            "virtual_terminal": pty.then(virtual_terminal::Options::default)
+            "virtual_terminal": pty.then(virtual_terminal::Options::default),
+            "working_directory": working_directory,
         });
         if pty {
             action["snippet"] = json!({"id": snippet_id, "arguments": arguments});
@@ -801,8 +1223,10 @@ exit 23"#;
             &request,
             Some(recording.clone()),
             Some(&snippets_path),
+            &ExecutionPolicy::unrestricted(true),
             Ok(None),
             || Ok(trust.clone()),
+            None,
         );
         let result = daemon.join().unwrap();
         let log = String::from_utf8_lossy(&result.stderr);
@@ -815,7 +1239,7 @@ exit 23"#;
             },
             "{log}"
         );
-        let actual = fs::read(output).unwrap();
+        let actual = fs::read(working_directory.join(output)).unwrap();
         assert_eq!(
             actual
                 .strip_suffix(&[0])
@@ -831,6 +1255,32 @@ exit 23"#;
         }
         assert!(log.contains("Accepted publickey"), "{log}");
     }
+
+    let daemon = fixture.spawn();
+    let (_, mut request) = scheduled_request();
+    request.action = Arc::new(
+        serde_json::from_value(json!({
+            "host": "127.0.0.1", "port": port, "username": user, "key_file": user_key,
+            "working_directory": working_directory.join("missing"),
+            "command": "true\nexit 77",
+        }))
+        .unwrap(),
+    );
+    let completed = run_command(
+        &request,
+        None,
+        None,
+        &ExecutionPolicy::unrestricted(true),
+        Ok(None),
+        || Ok(trust.clone()),
+        None,
+    )
+    .unwrap_or_else(|failure| panic!("Failed to start working directory test: {}", failure.detail));
+    assert!(matches!(
+        completed.outcome,
+        RunOutcome::Failed { exit_code: Some(code) } if code != 77
+    ));
+    assert!(String::from_utf8_lossy(&daemon.join().unwrap().stderr).contains("Accepted publickey"));
 }
 
 #[test]
@@ -909,6 +1359,1453 @@ fn openssh_runs_scheduled_sftp_metadata_actions_with_strict_host_keys() {
 
 #[test]
 #[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
+fn openssh_scheduled_swarm_diagnostics_reports_masked_advice_and_blocked_target() {
+    use crate::local_ai::test_support::{
+        fixture_http_response, fixture_response, start_test_double,
+    };
+    use crate::scheduler_window::{Message, Page, SchedulerWindow, agent};
+    use crate::terminal_agent::swarm::headless::{Execution, Review};
+    use kortty_jobs::{Job, JobGraph, JobId, SchedulerStore};
+
+    let server = Sshd::new();
+    let blocked = Sshd::new();
+    let root = &server.profile.0;
+    let (_, seed, connections) = scheduled_batch(root, &[&server, &blocked], "true", Vec::new());
+    let references: Vec<_> = seed.action.targets().cloned().collect();
+    let trust = TrustStore::from_pins(vec![server.pin(), blocked.pin()]).unwrap();
+    let action: SshCommand = serde_json::from_value(json!({
+        "connection": references[0],
+        "additional_connections": [references[1]],
+        "working_directory": root,
+        "agent": {"kind":"swarm","probe":"system","profile":9,"goal":"Summarize the observed system. fixture-sensitive-value"}
+    })).unwrap();
+    let path = root.join("diagnostics-jobs.json");
+    {
+        let mut store = SchedulerStore::open(&path).unwrap();
+        let job = Job::new(
+            JobId::new("diagnostics").unwrap(),
+            "Swarm diagnostics",
+            action,
+        )
+        .unwrap();
+        store
+            .commit_with_actions(&JobGraph::new(vec![job]).unwrap(), &[], &[])
+            .unwrap();
+    }
+    let mut runtime = SchedulerWindow::open(path.clone()).unwrap();
+    runtime.set_execution_allowed(true);
+    let mut view = runtime.new_view();
+    runtime.update_view(&mut view, Message::Page(Page::Action));
+    let review = runtime.begin_agent_review(&view).unwrap();
+    let profile = agent::ProfileChoice {
+        id: crate::ai_manager::ProfileRef::Numeric(9),
+        name: "Fixture".into(),
+        model: "fixture:local".into(),
+        destination: "Loopback test endpoint".into(),
+        policy_model_fingerprint: None,
+        reviewed_https: false,
+        reviewed_cli: None,
+    };
+    let targets = references
+        .iter()
+        .map(|reference| {
+            agent::Target::capture(reference, connections.get(reference.id).unwrap(), &trust)
+                .unwrap()
+        })
+        .collect();
+    runtime
+        .finish_agent_review(&mut view, review, profile, targets)
+        .unwrap();
+    runtime.update_view(&mut view, Message::ApproveAgent);
+    runtime.update_view(&mut view, Message::Save);
+    drop(runtime);
+
+    let mut runtime = SchedulerWindow::open(path.clone()).unwrap();
+    runtime.set_execution_allowed(true);
+    let mut view = runtime.new_view();
+    let request = runtime
+        .update_view(&mut view, Message::Run(false))
+        .pop()
+        .unwrap();
+    assert!(runtime.agent_run_approved(&request));
+    let run = request.id;
+    let reference = &references[0];
+    let connection = connections.get(reference.id).unwrap();
+    let credentials = Credentials::resolve_directory_browser(
+        reference,
+        connection,
+        &ServerAccess::default(),
+        |_, _, _| Err("unexpected credential"),
+    )
+    .unwrap();
+    let execution = Execution {
+        review: Arc::new(
+            Review::capture(reference.clone(), root.to_str().unwrap().into(), &trust).unwrap(),
+        ),
+        current: reference.clone(),
+        credentials,
+        startup: connection.startup,
+    };
+    let answer = json!({"status":"done","summary":"System observed","userMessage":"Advisory diagnostic summary. fixture-sensitive-value"}).to_string();
+    let (transport, model) = start_test_double(vec![
+        fixture_http_response(
+            "400 Bad Request",
+            "",
+            r#"{"error":{"code":"unsupported_response_format"}}"#,
+        ),
+        fixture_response("200 OK", "", &answer),
+    ]);
+    let context = super::super::agent::Context {
+        transport,
+        context_limit: 8192,
+        targets: vec![Ok(execution), Err("Vault locked")],
+        target_vault_revisions: Vec::new(),
+        connection_store: connections.path().to_owned(),
+        trust,
+        log_policy: Default::default(),
+        mask: |redactor, input| {
+            redactor
+                .journal_text(input, Instant::now() + Duration::from_secs(1))
+                .map(|masked| masked.replace("fixture-sensitive-value", "***"))
+                .ok_or_else(|| "fixture mask failed".into())
+        },
+        proposal: None,
+        journal: None,
+    };
+    let daemon = server.spawn();
+    let (authority, resends) = async_channel::bounded(1);
+    let done = super::super::agent::spawn(request, Ok(context), authority);
+    let resend = resends.recv_blocking().unwrap();
+    assert!(runtime.active_agent_run_approved(&resend.scope.request));
+    assert_eq!(resend.scope.evidence_targets, vec![reference.id]);
+    resend.settle(Ok(()));
+    let result = done.recv_blocking().unwrap();
+    let ssh = daemon.join().unwrap();
+    let requests = model.join().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0]["messages"], requests[1]["messages"]);
+    assert!(requests[0].get("response_format").is_some());
+    assert!(requests[1].get("response_format").is_none());
+    assert_eq!(
+        result.outcome,
+        RunOutcome::Blocked,
+        "{:?}\n{}",
+        result.detail,
+        String::from_utf8_lossy(&ssh.stderr)
+    );
+    assert!(
+        requests[0]["messages"][0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("no execution capability")
+    );
+    assert!(
+        requests[0]["messages"][1]["content"]
+            .as_str()
+            .unwrap()
+            .contains(root.to_str().unwrap())
+    );
+    assert!(!requests[0].to_string().contains("fixture-sensitive-value"));
+    runtime.update_runtime(Message::Finished(result));
+    drop(runtime);
+    let store = SchedulerStore::open(&path).unwrap();
+    let detail = store.journal_detail(run).unwrap();
+    assert!(detail.contains("Probe completed"));
+    assert!(detail.contains("Vault locked"));
+    assert!(detail.contains("Advisory diagnostic summary."));
+    assert!(!detail.contains("fixture-sensitive-value"));
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
+fn openssh_scheduled_swarm_executes_only_the_exact_proposal_once() {
+    use std::io::Write as _;
+
+    use iced::futures::{StreamExt as _, executor::block_on};
+    use kortty_jobs::{Job, JobGraph, JobId, SchedulerStore};
+
+    use crate::local_ai::test_support::{
+        accept, fixture_http_response, fixture_response, listener, request as model_request,
+    };
+    use crate::scheduler_window::{Message, Page, SchedulerWindow, agent};
+    use crate::terminal_agent::swarm::headless::{Execution, Review};
+    use crate::terminal_logging::{Policy, Redactor, Secrets};
+
+    fn mask(redactor: &Redactor, input: &str) -> Result<String, String> {
+        redactor
+            .journal_text(input, Instant::now() + Duration::from_secs(1))
+            .map(|masked| masked.to_string())
+            .ok_or_else(|| "fixture mask failed".into())
+    }
+
+    fn changed_mask(redactor: &Redactor, input: &str) -> Result<String, String> {
+        mask(redactor, input).map(|masked| masked.replace("first ' value", "***"))
+    }
+
+    let first = Sshd::new();
+    let second = Sshd::new();
+    let root = &first.profile.0;
+    let cwd = root.join("proposal ' working directory");
+    fs::create_dir(&cwd).unwrap();
+    let marker = cwd.join("proposal order");
+    fs::write(cwd.join("private-output.txt"), "fixture-secret-output\n").unwrap();
+    let (_, seed, connections) = scheduled_batch(root, &[&first, &second], "true", Vec::new());
+    let references: Vec<_> = seed.action.targets().cloned().collect();
+    let trust = TrustStore::from_pins(vec![first.pin(), second.pin()]).unwrap();
+    let action: SshCommand = serde_json::from_value(json!({
+        "connection": references[0],
+        "additional_connections": [references[1]],
+        "working_directory": cwd,
+        "agent": {"kind":"swarm","probe":"proposed","profile":9,"goal":"Run the exact reviewed fixture commands."}
+    })).unwrap();
+    let path = root.join("proposed-jobs.json");
+    {
+        let mut store = SchedulerStore::open(&path).unwrap();
+        let job = Job::new(
+            JobId::new("proposal").unwrap(),
+            "Reviewed swarm proposal",
+            action,
+        )
+        .unwrap();
+        store
+            .commit_with_actions(&JobGraph::new(vec![job]).unwrap(), &[], &[])
+            .unwrap();
+    }
+    let answer = json!({"commands": [
+        {"target": references[0].id, "command": r#"printf '%s\n' "first ' value" > 'proposal order'; cat 'private-output.txt'"#, "purpose":"Write the first fixture marker"},
+        {"target": references[1].id, "command": r#"test "$(cat 'proposal order')" = "first ' value" && printf '%s\n' second >> 'proposal order'"#, "purpose":"Verify order and append the second marker"}
+    ]}).to_string();
+    let (model_listener, transport) = listener();
+    let model = thread::spawn(move || {
+        let mut first = accept(&model_listener);
+        let structured = model_request(&mut first);
+        first
+            .get_mut()
+            .write_all(
+                fixture_http_response(
+                    "400 Bad Request",
+                    "",
+                    r#"{"error":{"code":"unsupported_response_format"}}"#,
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        let mut second = accept(&model_listener);
+        let plain = model_request(&mut second);
+        second
+            .get_mut()
+            .write_all(fixture_response("200 OK", "", &answer).as_bytes())
+            .unwrap();
+        (model_listener, structured, plain)
+    });
+
+    let mut runtime = SchedulerWindow::open(path.clone()).unwrap();
+    runtime.set_execution_allowed(true);
+    let mut view = runtime.new_view();
+    runtime.update_view(&mut view, Message::Page(Page::Action));
+    let review = runtime.begin_agent_review(&view).unwrap();
+    let profile = agent::ProfileChoice {
+        id: crate::ai_manager::ProfileRef::Numeric(9),
+        name: "Fixture".into(),
+        model: "fixture:local".into(),
+        destination: "Loopback test endpoint".into(),
+        policy_model_fingerprint: None,
+        reviewed_https: false,
+        reviewed_cli: None,
+    };
+    let targets = references
+        .iter()
+        .map(|reference| {
+            agent::Target::capture(reference, connections.get(reference.id).unwrap(), &trust)
+                .unwrap()
+        })
+        .collect();
+    let prompt = agent::proposal::Prompt::new(
+        transport.clone(),
+        8192,
+        "Run the exact reviewed fixture commands.",
+        cwd.to_str().unwrap(),
+        references.iter().map(|reference| reference.id).collect(),
+        Redactor::for_journal(Secrets::default().seal().unwrap(), Policy::default()),
+        mask,
+    )
+    .unwrap();
+    runtime
+        .finish_agent_proposal_review(&mut view, review, profile, targets, prompt)
+        .unwrap();
+    assert!(!marker.exists());
+    let task = runtime.request_agent_proposal(&mut view).unwrap();
+    let mut actions = iced_runtime::task::into_stream(task).unwrap();
+    let mut negotiated = false;
+    let mut reviewed = false;
+    while let Some(action) = block_on(actions.next()) {
+        match action {
+            iced_runtime::Action::Output(Message::AgentProposalProgress(
+                ticket,
+                agent::proposal::Progress::FormatFallback(permit),
+            )) => {
+                assert!(!negotiated && !marker.exists());
+                let authority = runtime
+                    .pending_proposal_authority(&view, &ticket)
+                    .unwrap()
+                    .unwrap();
+                assert!(
+                    authority
+                        .targets
+                        .iter()
+                        .map(|target| &target.reference)
+                        .eq(&references)
+                );
+                permit.try_send(()).unwrap();
+                permit.close();
+                negotiated = true;
+            }
+            iced_runtime::Action::Output(message @ Message::AgentProposed(..)) => {
+                assert!(negotiated);
+                assert!(runtime.update_view(&mut view, message).is_empty());
+                reviewed = true;
+            }
+            _ => {}
+        }
+    }
+    assert!(reviewed);
+    let (model_listener, mut structured, plain) = model.join().unwrap();
+    assert_eq!(
+        structured
+            .as_object_mut()
+            .unwrap()
+            .remove("response_format"),
+        Some(json!({"type":"json_object"}))
+    );
+    assert_eq!(structured, plain);
+    assert!(
+        plain
+            .to_string()
+            .contains("Run the exact reviewed fixture commands.")
+    );
+    assert!(!marker.exists());
+    let ticket = view.proposal_command_ticket().unwrap().to_owned();
+    runtime.update_view(&mut view, Message::ApproveProposalCommands(ticket));
+    runtime.update_view(&mut view, Message::Save);
+    drop(runtime);
+
+    let mut runtime = SchedulerWindow::open(path).unwrap();
+    runtime.set_execution_allowed(true);
+    let mut view = runtime.new_view();
+    let request = runtime
+        .update_view(&mut view, Message::Run(false))
+        .pop()
+        .unwrap();
+    assert!(runtime.agent_run_approved(&request));
+    let replay_request = || RunRequest {
+        id: request.id,
+        job: request.job.clone(),
+        action: Arc::clone(&request.action),
+        trigger: request.trigger,
+        started_at: request.started_at,
+        cancellation: request.cancellation.clone(),
+    };
+    let context = |mask| super::super::agent::Context {
+        transport: transport.clone(),
+        context_limit: 8192,
+        target_vault_revisions: Vec::new(),
+        targets: references
+            .iter()
+            .map(|reference| {
+                let connection = connections.get(reference.id).unwrap();
+                let credentials = Credentials::resolve_directory_browser(
+                    reference,
+                    connection,
+                    &ServerAccess::default(),
+                    |_, _, _| Err("unexpected credential"),
+                )
+                .unwrap();
+                Ok(Execution {
+                    review: Arc::new(
+                        Review::capture(reference.clone(), cwd.to_str().unwrap().into(), &trust)
+                            .unwrap(),
+                    ),
+                    current: reference.clone(),
+                    credentials,
+                    startup: connection.startup,
+                })
+            })
+            .collect(),
+        connection_store: connections.path().to_owned(),
+        trust: trust.clone(),
+        log_policy: Default::default(),
+        mask,
+        proposal: runtime.agent_proposal_run(&request).unwrap(),
+        journal: None,
+    };
+    let mut invalid_order = context(mask);
+    invalid_order.proposal.as_mut().unwrap().items.swap(0, 1);
+    let run = |context| {
+        let (authority, _resends) = async_channel::bounded(1);
+        super::super::agent::spawn(replay_request(), Ok(context), authority)
+            .recv_blocking()
+            .unwrap()
+    };
+    let denied = run(invalid_order);
+    assert_eq!(denied.outcome, RunOutcome::Blocked);
+    assert!(denied.detail.unwrap().contains("ordered proposal targets"));
+    let denied = run(context(changed_mask));
+    assert_eq!(denied.outcome, RunOutcome::Blocked);
+    assert!(denied.detail.unwrap().contains("requires masking"));
+    assert!(!marker.exists());
+    for server in [&first, &second] {
+        assert_eq!(
+            server.listener.accept().unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+    }
+
+    let replay = context(mask);
+    let first_daemon = first.spawn();
+    let second_daemon = second.spawn();
+    let finished = run(context(mask));
+    let first_log = first_daemon.join().unwrap();
+    let second_log = second_daemon.join().unwrap();
+    assert_eq!(
+        finished.outcome,
+        RunOutcome::Success,
+        "{:?}\n{}\n{}",
+        finished.detail,
+        String::from_utf8_lossy(&first_log.stderr),
+        String::from_utf8_lossy(&second_log.stderr)
+    );
+    let detail = finished.detail.as_deref().unwrap();
+    assert_eq!(detail.matches("Reviewed command completed").count(), 2);
+    assert!(!detail.contains("fixture-secret-output"));
+    assert_eq!(
+        fs::read_to_string(&marker).unwrap(),
+        "first ' value\nsecond\n"
+    );
+    let consumed = run(replay);
+    assert_eq!(consumed.outcome, RunOutcome::Blocked);
+    assert!(consumed.detail.unwrap().contains("unavailable or consumed"));
+    assert!(runtime.agent_proposal_run(&request).is_err());
+    assert_eq!(
+        model_listener.accept().unwrap_err().kind(),
+        ErrorKind::WouldBlock
+    );
+    for server in [&first, &second] {
+        assert_eq!(
+            server.listener.accept().unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+    }
+    runtime.update_runtime(Message::Finished(finished));
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
+fn openssh_scheduled_rsync_download_publishes_verified_new_file() {
+    openssh_rsync_verified_transfer(false, false);
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen, local rsync and a local account"]
+fn openssh_scheduled_rsync_upload_publishes_only_the_reviewed_new_file() {
+    openssh_rsync_verified_transfer(true, false);
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen, local rsync and a local account"]
+fn openssh_scheduled_rsync_download_publishes_a_verified_new_directory() {
+    openssh_rsync_verified_transfer(false, true);
+}
+
+#[test]
+#[ignore = "requires native OpenSSH, rsync, and the current korTTY server helper"]
+fn openssh_scheduled_rsync_upload_publishes_a_verified_new_directory() {
+    openssh_rsync_verified_transfer(true, true);
+}
+
+fn openssh_rsync_verified_transfer(upload: bool, directory: bool) {
+    use crate::scheduler_window::{Message, SchedulerWindow, sync};
+    use kortty_jobs::{Job, JobGraph, JobId, SchedulerStore};
+
+    let fixture = Sshd::new();
+    let root = &fixture.profile.0;
+    let program = PathBuf::from(
+        std::env::var_os("KORTTY_RSYNC_TEST_PROGRAM").expect("set KORTTY_RSYNC_TEST_PROGRAM"),
+    )
+    .canonicalize()
+    .unwrap();
+    let bridge = PathBuf::from(
+        std::env::var_os("KORTTY_RSYNC_TEST_BRIDGE").expect("set KORTTY_RSYNC_TEST_BRIDGE"),
+    );
+    assert!(bridge.is_file());
+    if upload && directory {
+        let helper = PathBuf::from(
+            std::env::var_os("KORTTY_RSYNC_TEST_HELPER").expect("set KORTTY_RSYNC_TEST_HELPER"),
+        )
+        .canonicalize()
+        .unwrap();
+        assert!(helper.is_file());
+        let script = root.join("rsync-fixture-dispatch.sh");
+        let mut command = String::new();
+        crate::scheduler_window::script::shell_quote(&mut command, helper.to_str().unwrap());
+        let helper_command = kortty_server_archive::rsync_tree::COMMAND;
+        let sftp = [
+            "/usr/libexec/openssh/sftp-server",
+            "/usr/lib/openssh/sftp-server",
+            "/usr/libexec/sftp-server",
+        ]
+        .into_iter()
+        .find(|path| Path::new(path).is_file())
+        .expect("OpenSSH external sftp-server for the private forced-command fixture");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncase \"$SSH_ORIGINAL_COMMAND\" in\n  '{helper_command}') exec {command} --rsync-tree-v1 ;;\n  'rsync --server '*) exec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\" ;;\n  'internal-sftp') exec {sftp} ;;\n  *) exit 1 ;;\nesac\n"
+            ),
+        )
+        .unwrap();
+        let mut config = fs::OpenOptions::new()
+            .append(true)
+            .open(&fixture.config)
+            .unwrap();
+        writeln!(config, "ForceCommand /bin/sh \"{}\"", script.display()).unwrap();
+    }
+    let (_, seed, connections) = scheduled_batch(root, &[&fixture], "true", Vec::new());
+    let reference = seed.action.connection.as_ref().unwrap();
+    let profile = connections.get(reference.id).unwrap();
+    let source = root.join("rsync-source");
+    let destination = root.join("rsync-destination");
+    let expected: Vec<_> = (0..196_610).map(|index| (index % 251) as u8).collect();
+    let data = |path: &std::path::Path| {
+        if directory {
+            path.join("nested").join("payload.bin")
+        } else {
+            path.to_owned()
+        }
+    };
+    if directory {
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir(source.join("empty")).unwrap();
+        if !upload {
+            std::os::unix::fs::symlink(source.join("nested"), source.join("link")).unwrap();
+        }
+    }
+    fs::write(data(&source), &expected).unwrap();
+    let digest = super::super::rsync::program_digest(&program).unwrap();
+    let pins = sync::fingerprints(&sync::pins(reference, &fixture.trust).unwrap());
+    let (kind, local, remote) = if upload {
+        ("rsync_upload", &source, &destination)
+    } else {
+        ("rsync_download", &destination, &source)
+    };
+    let mut approval =
+        json!({ "program": program, "digest": digest, "reference": reference, "pins": pins });
+    if upload && directory {
+        let inventory = super::super::rsync::upload_tree_inventory(&source).unwrap();
+        approval["directory_upload"] =
+            json!({ "source": source, "destination": destination, "inventory": inventory });
+    } else if upload {
+        let (bytes, digest) = super::super::rsync::upload_digest(&source).unwrap();
+        approval["upload"] = json!({ "source": source, "destination": destination, "bytes": bytes, "digest": digest });
+    } else if directory {
+        approval["directory"] = json!({ "source": source, "destination": destination });
+    }
+    let action: SshCommand = serde_json::from_value(json!({
+        "connection": reference,
+        "remote": { "kind": kind, "program": program, "local": local, "remote": remote, "approval": approval, "directory": directory },
+    })).unwrap();
+    let path = root.join("rsync-jobs.json");
+    {
+        let mut store = SchedulerStore::open(&path).unwrap();
+        let graph = JobGraph::new(vec![
+            Job::new(JobId::new("rsync").unwrap(), "Reviewed rsync file", action).unwrap(),
+        ])
+        .unwrap();
+        store.commit_with_actions(&graph, &[], &[]).unwrap();
+    }
+    let mut scheduler = SchedulerWindow::open(path).unwrap();
+    scheduler.set_execution_allowed(true);
+    let mut view = scheduler.new_view();
+    let request = scheduler
+        .update_view(&mut view, Message::Run(false))
+        .pop()
+        .unwrap();
+    let execute = |allowed| {
+        run(
+            &request,
+            None,
+            None,
+            &ExecutionPolicy::unrestricted(allowed),
+            Credentials::resolve(
+                &request.action,
+                profile,
+                &ServerAccess::default(),
+                |_, _, _| Err("unexpected credential"),
+            )
+            .map(Some),
+            Ok(None),
+            || Ok(fixture.trust.clone()),
+        )
+    };
+    assert_eq!(execute(false).outcome, RunOutcome::Blocked);
+    assert!(!destination.exists());
+    if directory && !upload {
+        let server = fixture.spawn();
+        assert_ne!(execute(true).outcome, RunOutcome::Success);
+        server.join().unwrap();
+        assert!(!destination.exists());
+        fs::remove_file(source.join("link")).unwrap();
+    }
+    if upload {
+        let mut changed = expected.clone();
+        changed[0] ^= 0xff;
+        fs::write(data(&source), &changed).unwrap();
+        let server = fixture.spawn();
+        let changed = execute(true);
+        server.join().unwrap();
+        assert_eq!(changed.outcome, RunOutcome::Blocked);
+        assert!(!destination.exists());
+        fs::write(data(&source), &expected).unwrap();
+    }
+    let server = fixture.spawn();
+    let completed = execute(true);
+    let log = server.join().unwrap();
+    assert_eq!(
+        completed.outcome,
+        RunOutcome::Success,
+        "{:?}\n{}",
+        completed.detail,
+        String::from_utf8_lossy(&log.stderr)
+    );
+    assert_eq!(fs::read(data(&destination)).unwrap(), expected);
+    if directory {
+        assert!(destination.join("empty").is_dir());
+        assert!(!destination.join("link").exists());
+    }
+    fs::write(data(&destination), b"preserve destination").unwrap();
+    let server = upload.then(|| fixture.spawn());
+    assert_ne!(execute(true).outcome, RunOutcome::Success);
+    if let Some(server) = server {
+        server.join().unwrap();
+    }
+    assert_eq!(
+        fs::read(data(&destination)).unwrap(),
+        b"preserve destination"
+    );
+    assert_eq!(fs::read(data(&source)).unwrap(), expected);
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
+fn openssh_scheduled_reviewed_copy_runs_once_in_both_directions() {
+    reviewed_copy(&[
+        ("upload", ReviewedCopyStart::Manual),
+        ("download", ReviewedCopyStart::Manual),
+    ]);
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
+fn openssh_scheduled_reviewed_copy_waits_for_gate_predecessor() {
+    reviewed_copy(&[("upload", ReviewedCopyStart::Gate)]);
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
+fn openssh_scheduled_reviewed_copy_waits_for_chain_and_shares_one_use_approval() {
+    reviewed_copy(&[
+        ("upload", ReviewedCopyStart::ChainThenManual),
+        ("download", ReviewedCopyStart::ManualThenChain),
+    ]);
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
+fn openssh_scheduled_reviewed_copy_runs_in_confirmed_cascades() {
+    reviewed_copy(&[
+        ("upload", ReviewedCopyStart::CascadeMember),
+        ("download", ReviewedCopyStart::CascadeRoot),
+    ]);
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
+fn openssh_scheduled_standing_copy_uses_a_durable_calendar_budget() {
+    standing_copy("upload");
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
+fn openssh_scheduled_standing_download_uses_a_durable_calendar_budget() {
+    standing_copy("download");
+}
+
+fn standing_copy(direction: &str) {
+    use std::time::UNIX_EPOCH;
+
+    use jiff::Timestamp;
+    use kortty_jobs::{Job, JobGraph, JobSchedule, SchedulerStore, TimeZone};
+
+    let fixture = Sshd::new();
+    let root = &fixture.profile.0;
+    let (_, seed, connections) = scheduled_batch(root, &[&fixture], "true", Vec::new());
+    let reference = seed.action.connection.as_ref().unwrap();
+    let profile = connections.get(reference.id).unwrap();
+    let local = root.join("standing-local");
+    let remote = root.join("standing-remote");
+    let (source, target) = if direction == "upload" {
+        (&local, &remote)
+    } else {
+        (&remote, &local)
+    };
+    let original_local = root.join("standing-local-original");
+    for directory in [&local, &remote] {
+        fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+    }
+    fs::create_dir(source.join("nested")).unwrap();
+    fs::write(source.join("nested/first"), b"first firing bytes").unwrap();
+    fs::write(source.join("existing"), b"unapproved replacement").unwrap();
+    fs::write(source.join("excluded"), b"outside the approval").unwrap();
+    fs::write(target.join("existing"), b"preserved destination").unwrap();
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let first = UNIX_EPOCH + Duration::from_secs((now.as_secs() / 60 + 10) * 60);
+    let day = Duration::from_secs(24 * 60 * 60);
+    let firings = [0, 1, 2, 3, 4, 5].map(|offset| first + day * offset);
+    let first_utc = Timestamp::try_from(first).unwrap().to_zoned(TimeZone::UTC);
+    let last_utc = Timestamp::try_from(*firings.last().unwrap())
+        .unwrap()
+        .to_zoned(TimeZone::UTC);
+    let schedule = JobSchedule::default()
+        .with_active_dates(Some(first_utc.date()), Some(last_utc.date()))
+        .unwrap()
+        .with_fixed_times([first_utc.time()]);
+    let action: SshCommand = serde_json::from_value(json!({
+        "connection": reference,
+        "remote": {
+            "kind": "sync", "direction": direction, "local": local,
+            "remote": remote, "excludes": "excluded",
+            "standing": { "days": 7, "limits": {
+                "max_firings": 5, "max_actions": 64, "max_bytes": 1_024
+            } },
+        },
+    }))
+    .unwrap();
+    let id = JobId::new("standing-copy").unwrap();
+    let path = root.join("jobs.json");
+    {
+        let mut store = SchedulerStore::open(&path).unwrap();
+        let graph = JobGraph::new(vec![
+            Job::new(id.clone(), "Standing copy", action)
+                .unwrap()
+                .with_schedule(schedule),
+        ])
+        .unwrap();
+        store.commit_with_actions(&graph, &[], &[]).unwrap();
+    }
+
+    let open = |path: &Path, due| {
+        let mut runtime = SchedulerWindow::open(path.to_owned()).unwrap();
+        runtime.set_execution_allowed(true);
+        runtime
+            .initialize_schedules_at(TimeZone::UTC, due - Duration::from_secs(1))
+            .unwrap();
+        runtime
+    };
+    let execute = |runtime: &SchedulerWindow, request: &RunRequest<SshCommand>| {
+        let sync = runtime.sync_run_context(request);
+        run_saved_route(&fixture, profile, request, sync)
+    };
+    let assert_no_dial = || {
+        assert_eq!(
+            fixture.listener.accept().unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+    };
+    {
+        let mut runtime = open(&path, first);
+        approve_pinned_copy(&mut runtime, &id, &fixture, profile);
+    }
+    {
+        // A copied job definition on another profile has no device-local grant.
+        let restore = root.join("standing-restore");
+        fs::DirBuilder::new().mode(0o700).create(&restore).unwrap();
+        let restored_path = restore.join("jobs.json");
+        fs::copy(&path, &restored_path).unwrap();
+        let mut restored = open(&restored_path, first);
+        let request = only_copy_start(
+            restored.update_runtime_at(Message::Tick, first),
+            &id,
+            RunTrigger::Scheduled,
+        );
+        assert_eq!(execute(&restored, &request).outcome, RunOutcome::Blocked);
+        assert_no_dial();
+        assert!(!target.join("nested").exists());
+    }
+    let mut runtime = open(&path, first);
+    assert!(
+        runtime
+            .update_runtime_at(Message::Tick, first - Duration::from_secs(1))
+            .is_empty()
+    );
+    let mut runs = Vec::new();
+    for (index, due) in firings.into_iter().enumerate() {
+        match index {
+            2 => {
+                drop(runtime);
+                runtime = open(&path, due);
+                fs::write(
+                    source.join("nested/second"),
+                    b"source changed after restart",
+                )
+                .unwrap();
+                fs::write(source.join("nested/first"), b"must not replace first").unwrap();
+            }
+            3 => {
+                fs::write(
+                    source.join("nested/a-within-cap"),
+                    b"must not publish early",
+                )
+                .unwrap();
+                fs::write(source.join("nested/z-over-cap"), [0_u8; 1_025]).unwrap();
+            }
+            4 => {
+                fs::rename(&local, &original_local).unwrap();
+                fs::DirBuilder::new().mode(0o700).create(&local).unwrap();
+                fs::create_dir_all(source.join("nested")).unwrap();
+                fs::write(source.join("nested/replacement"), b"local root changed").unwrap();
+            }
+            5 => fs::write(source.join("nested/third"), b"exhausted approval").unwrap(),
+            _ => {}
+        }
+        assert_eq!(runtime.next_due(), Some(due));
+        let request = only_copy_start(
+            runtime.update_runtime_at(Message::Tick, due),
+            &id,
+            RunTrigger::Scheduled,
+        );
+        assert_eq!(request.started_at, due);
+        let outcome = if index == 5 {
+            let outcome = execute(&runtime, &request);
+            assert_eq!(outcome.outcome, RunOutcome::Blocked);
+            assert_no_dial();
+            assert!(!target.join("nested/third").exists());
+            outcome
+        } else {
+            let daemon = fixture.spawn();
+            let outcome = execute(&runtime, &request);
+            let log = daemon.join().unwrap();
+            let expected = if index >= 3 {
+                RunOutcome::Blocked
+            } else {
+                RunOutcome::Success
+            };
+            assert_eq!(
+                outcome.outcome,
+                expected,
+                "{:?}\n{}",
+                outcome.detail,
+                String::from_utf8_lossy(&log.stderr)
+            );
+            if index == 3 {
+                assert!(
+                    outcome
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("per-firing byte limit")),
+                    "{:?}",
+                    outcome.detail
+                );
+                for candidate in ["nested/a-within-cap", "nested/z-over-cap"] {
+                    assert!(!target.join(candidate).exists());
+                    fs::remove_file(source.join(candidate)).unwrap();
+                }
+            } else if index == 4 {
+                assert!(
+                    outcome
+                        .detail
+                        .as_deref()
+                        .is_some_and(|detail| detail.contains("standing copy folders changed")),
+                    "{:?}",
+                    outcome.detail
+                );
+                assert!(!target.join("nested/replacement").exists());
+                if direction == "download" {
+                    assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+                }
+                // Restore the authorized root so the final refusal tests budget alone.
+                fs::rename(&local, root.join("standing-local-rejected")).unwrap();
+                fs::rename(&original_local, &local).unwrap();
+            }
+            outcome
+        };
+        assert_eq!(
+            fs::read(target.join("nested/first")).unwrap(),
+            b"first firing bytes"
+        );
+        if index >= 2 {
+            assert_eq!(
+                fs::read(target.join("nested/second")).unwrap(),
+                b"source changed after restart"
+            );
+        }
+        let expected_files = if index >= 2 { 2 } else { 1 };
+        assert_eq!(
+            fs::read_dir(target.join("nested")).unwrap().count(),
+            expected_files
+        );
+        assert_eq!(
+            fs::read(target.join("existing")).unwrap(),
+            b"preserved destination"
+        );
+        assert!(!target.join("excluded").exists());
+        runs.push((request.id, due, outcome.outcome));
+        assert!(
+            runtime
+                .update_runtime_at(Message::Finished(outcome), due + Duration::from_secs(1))
+                .is_empty()
+        );
+    }
+    assert!(runtime.next_due().is_none());
+    drop(runtime);
+    let store = SchedulerStore::open(path).unwrap();
+    assert_eq!(store.journal().len(), firings.len());
+    for (run, due, outcome) in runs {
+        let record = store.journal_record(run).unwrap();
+        assert_eq!(record.trigger, RunTrigger::Scheduled);
+        assert_eq!(record.started_at, due);
+        assert_eq!(record.outcome, outcome);
+    }
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum ReviewedCopyStart {
+    Manual,
+    Gate,
+    ChainThenManual,
+    ManualThenChain,
+    CascadeMember,
+    CascadeRoot,
+}
+
+fn reviewed_copy(cases: &[(&str, ReviewedCopyStart)]) {
+    use std::num::NonZeroU32;
+
+    use crate::scheduler_window::RemoteAction;
+    use kortty_jobs::{DependencyMode, Job, JobGraph, JobSchedule, SchedulerStore, TimeZone};
+
+    let fixture = Sshd::new();
+    let root = &fixture.profile.0;
+    let (_, seed, connections) = scheduled_batch(root, &[&fixture], "true", Vec::new());
+    let reference = seed.action.connection.as_ref().unwrap();
+    let profile = connections.get(reference.id).unwrap();
+    let run_action =
+        |request: &RunRequest<SshCommand>, sync| run_saved_route(&fixture, profile, request, sync);
+    let run_pinned = |request: &RunRequest<SshCommand>, sync| {
+        let daemon = fixture.spawn();
+        let outcome = run_action(request, sync);
+        let log = daemon.join().unwrap();
+        assert_eq!(
+            outcome.outcome,
+            RunOutcome::Success,
+            "{:?}\n{}",
+            outcome.detail,
+            String::from_utf8_lossy(&log.stderr)
+        );
+        outcome
+    };
+    let assert_no_dial = || {
+        assert_eq!(
+            fixture.listener.accept().unwrap_err().kind(),
+            ErrorKind::WouldBlock
+        );
+    };
+    let date = "2030-05-04".parse().unwrap();
+    let time = "10:00".parse().unwrap();
+    let due: SystemTime = TimeZone::UTC
+        .to_timestamp("2030-05-04T10:00".parse().unwrap())
+        .unwrap()
+        .into();
+    let first = JobId::new("first-prerequisite").unwrap();
+    let second = JobId::new("second-prerequisite").unwrap();
+    for &(direction, start) in cases {
+        let local = root.join(format!("{direction}-local"));
+        let remote = root.join(format!("{direction}-remote"));
+        for directory in [&local, &remote] {
+            fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+            fs::write(
+                directory.join("existing"),
+                directory.as_os_str().as_encoded_bytes(),
+            )
+            .unwrap();
+        }
+        let (source, target) = if direction == "upload" {
+            (&local, &remote)
+        } else {
+            (&remote, &local)
+        };
+        let assert_no_copy = || {
+            assert_no_dial();
+            assert!(!target.join("nested/new").exists());
+        };
+        fs::create_dir(source.join("nested")).unwrap();
+        fs::write(source.join("nested/new"), b"exact reviewed bytes").unwrap();
+        fs::write(source.join("excluded"), b"not approved").unwrap();
+        let action: SshCommand = serde_json::from_value(json!({
+            "connection": reference,
+            "remote": { "kind": "sync", "direction": direction, "local": local, "remote": remote, "excludes": "excluded" },
+        })).unwrap();
+        let id = JobId::new(format!("sync-{direction}")).unwrap();
+        let path = root.join(format!("{direction}.json"));
+        {
+            let mut store = SchedulerStore::open(&path).unwrap();
+            let mut copy = Job::new(id.clone(), "Reviewed copy", action).unwrap();
+            let mut jobs = Vec::new();
+            let predecessors = match start {
+                ReviewedCopyStart::Manual => Vec::new(),
+                ReviewedCopyStart::Gate => {
+                    copy = copy.with_schedule(
+                        JobSchedule::default()
+                            .with_active_dates(Some(date), Some(date))
+                            .unwrap()
+                            .with_fixed_times([time]),
+                    );
+                    vec![first.clone()]
+                }
+                ReviewedCopyStart::ChainThenManual | ReviewedCopyStart::ManualThenChain => {
+                    vec![first.clone(), second.clone()]
+                }
+                ReviewedCopyStart::CascadeMember => vec![first.clone()],
+                ReviewedCopyStart::CascadeRoot => {
+                    jobs.push(
+                        Job::new(first.clone(), "Successor", seed.action.as_ref().clone())
+                            .unwrap()
+                            .with_dependencies(DependencyMode::Gate, vec![id.clone()], None),
+                    );
+                    Vec::new()
+                }
+            };
+            for predecessor in &predecessors {
+                jobs.push(
+                    Job::new(
+                        predecessor.clone(),
+                        predecessor.as_str(),
+                        seed.action.as_ref().clone(),
+                    )
+                    .unwrap(),
+                );
+            }
+            if !predecessors.is_empty() {
+                let mode = match start {
+                    ReviewedCopyStart::ChainThenManual | ReviewedCopyStart::ManualThenChain => {
+                        DependencyMode::Chain
+                    }
+                    _ => DependencyMode::Gate,
+                };
+                copy = copy.with_dependencies(mode, predecessors, NonZeroU32::new(5));
+            }
+            jobs.push(copy);
+            let graph = JobGraph::new(jobs).unwrap();
+            store.commit_with_actions(&graph, &[], &[]).unwrap();
+        }
+        let mut runtime = SchedulerWindow::open(path.clone()).unwrap();
+        runtime.set_execution_allowed(true);
+        if start == ReviewedCopyStart::ChainThenManual {
+            assert!(
+                complete_copy_predecessor(&mut runtime, &second, RunOutcome::Success).is_empty()
+            );
+            // Give the copy a previous run so the second predecessor's success
+            // belongs to an earlier round, without spending the upcoming approval.
+            let previous = start_copy_manually(&mut runtime, &id);
+            let outcome = run_action(&previous, runtime.sync_run_context(&previous));
+            assert_eq!(outcome.outcome, RunOutcome::Blocked);
+            assert!(
+                runtime
+                    .update_runtime(Message::Finished(outcome))
+                    .is_empty()
+            );
+            assert_no_copy();
+        }
+        approve_pinned_copy(&mut runtime, &id, &fixture, profile);
+        drop(runtime);
+
+        if start == ReviewedCopyStart::Gate {
+            assert_gate_blocks(&path, &first, &id, due);
+            assert_no_copy();
+        }
+        let mut runtime = SchedulerWindow::open(path.clone()).unwrap();
+        runtime.set_execution_allowed(true);
+        let mut request = match start {
+            ReviewedCopyStart::Gate => gated_copy_start(&mut runtime, &first, &id, due),
+            ReviewedCopyStart::ChainThenManual => {
+                assert!(
+                    complete_copy_predecessor(&mut runtime, &first, RunOutcome::Success).is_empty()
+                );
+                assert_no_copy();
+                assert!(
+                    complete_copy_predecessor(
+                        &mut runtime,
+                        &second,
+                        RunOutcome::Failed { exit_code: Some(7) },
+                    )
+                    .is_empty()
+                );
+                assert_no_copy();
+                start_chained_copy(&mut runtime, &second, &id)
+            }
+            ReviewedCopyStart::ManualThenChain => {
+                assert!(
+                    complete_copy_predecessor(&mut runtime, &second, RunOutcome::Success)
+                        .is_empty()
+                );
+                assert_no_copy();
+                start_copy_manually(&mut runtime, &id)
+            }
+            ReviewedCopyStart::Manual => start_copy_manually(&mut runtime, &id),
+            ReviewedCopyStart::CascadeMember => {
+                let root = start_confirmed_copy_cascade(&mut runtime, &first, assert_no_copy);
+                let outcome = run_pinned(&root, None);
+                assert_no_copy();
+                only_copy_start(
+                    runtime.update_runtime(Message::Finished(outcome)),
+                    &id,
+                    RunTrigger::Cascade,
+                )
+            }
+            ReviewedCopyStart::CascadeRoot => {
+                start_confirmed_copy_cascade(&mut runtime, &id, assert_no_copy)
+            }
+        };
+        let context = runtime.sync_run_context(&request).unwrap();
+        let Some(RemoteAction::Sync(copy)) = &request.action.remote else {
+            panic!("Expected the reviewed copy action");
+        };
+        let receipt = context
+            .store
+            .load(&request.job, copy.approval.as_deref(), context.scope)
+            .unwrap();
+        let forged_trigger = match start {
+            ReviewedCopyStart::ChainThenManual
+            | ReviewedCopyStart::CascadeMember
+            | ReviewedCopyStart::CascadeRoot => Some(RunTrigger::Manual),
+            ReviewedCopyStart::ManualThenChain => Some(RunTrigger::Dependency),
+            ReviewedCopyStart::Manual => Some(RunTrigger::Cascade),
+            ReviewedCopyStart::Gate => None,
+        };
+        if let Some(trigger) = forged_trigger {
+            let original = std::mem::replace(&mut request.trigger, trigger);
+            assert!(runtime.sync_run_context(&request).is_none());
+            assert_eq!(
+                run_action(&request, Some(context.clone())).outcome,
+                RunOutcome::Blocked
+            );
+            assert_no_copy();
+            request.trigger = original;
+        }
+        let outcome = run_pinned(&request, Some(context.clone()));
+        assert_eq!(
+            fs::read(target.join("nested/new")).unwrap(),
+            b"exact reviewed bytes"
+        );
+        assert_eq!(
+            fs::read(target.join("existing")).unwrap(),
+            target.as_os_str().as_encoded_bytes()
+        );
+        assert!(!target.join("excluded").exists());
+        context
+            .store
+            .require_claimed(&request.job, &receipt)
+            .unwrap();
+        assert_eq!(
+            run_action(&request, Some(context)).outcome,
+            RunOutcome::Blocked
+        );
+        assert_no_dial();
+        if start == ReviewedCopyStart::Gate {
+            assert!(
+                runtime
+                    .update_runtime_at(Message::Finished(outcome), due + Duration::from_secs(1))
+                    .is_empty()
+            );
+            assert!(runtime.next_due().is_none());
+            drop(runtime);
+            let store = SchedulerStore::open(path).unwrap();
+            let record = store.journal_record(request.id).unwrap();
+            assert_eq!(record.trigger, RunTrigger::Scheduled);
+            assert_eq!(record.outcome, RunOutcome::Success);
+            continue;
+        }
+        if start != ReviewedCopyStart::Manual {
+            let starts = runtime.update_runtime(Message::Finished(outcome));
+            if start == ReviewedCopyStart::CascadeRoot {
+                let successor = only_copy_start(starts, &first, RunTrigger::Cascade);
+                let outcome = run_pinned(&successor, None);
+                assert!(
+                    runtime
+                        .update_runtime(Message::Finished(outcome))
+                        .is_empty()
+                );
+            } else {
+                assert!(starts.is_empty());
+            }
+            let other = match start {
+                ReviewedCopyStart::ManualThenChain => {
+                    assert!(
+                        complete_copy_predecessor(&mut runtime, &first, RunOutcome::Success)
+                            .is_empty()
+                    );
+                    assert_no_dial();
+                    start_chained_copy(&mut runtime, &second, &id)
+                }
+                _ => start_copy_manually(&mut runtime, &id),
+            };
+            let context = runtime.sync_run_context(&other).unwrap();
+            let outcome = run_action(&other, Some(context));
+            assert_eq!(outcome.outcome, RunOutcome::Blocked);
+            assert_no_dial();
+            assert!(
+                runtime
+                    .update_runtime(Message::Finished(outcome))
+                    .is_empty()
+            );
+        }
+    }
+}
+
+fn approve_pinned_copy(
+    runtime: &mut SchedulerWindow,
+    job: &JobId,
+    fixture: &Sshd,
+    profile: &Connection,
+) {
+    use crate::scheduler_window::Page;
+
+    let mut view = runtime.new_view();
+    runtime.update_view(&mut view, Message::Select(job.clone()));
+    runtime.update_view(&mut view, Message::Page(Page::Action));
+    let request = runtime.begin_sync_review(&mut view).unwrap();
+    let ticket = request.ticket.clone();
+    let credentials = Credentials::resolve_directory_browser(
+        &request.connection,
+        profile,
+        &ServerAccess::default(),
+        |_, _, _| Err("unexpected credential"),
+    )
+    .unwrap();
+    let daemon = fixture.spawn();
+    let trust = fixture.trust.clone();
+    let preview =
+        super::super::remote::sync::preview_with_trust(request, credentials, move || Ok(trust))
+            .recv_blocking()
+            .unwrap();
+    let log = daemon.join().unwrap();
+    assert!(
+        preview.is_ok(),
+        "{:?}\n{}",
+        preview.err(),
+        String::from_utf8_lossy(&log.stderr)
+    );
+    runtime.update_view(
+        &mut view,
+        Message::SyncPreviewed(ticket, preview.map(Arc::new)),
+    );
+    runtime.update_view(&mut view, Message::ApproveSync);
+    runtime.update_view(&mut view, Message::Save);
+}
+
+fn run_saved_route(
+    fixture: &Sshd,
+    profile: &Connection,
+    request: &RunRequest<SshCommand>,
+    sync: Option<crate::scheduler_window::sync::RunContext>,
+) -> Completion {
+    let policy = ExecutionPolicy {
+        sync,
+        ..ExecutionPolicy::unrestricted(true)
+    };
+    run(
+        request,
+        None,
+        None,
+        &policy,
+        Credentials::resolve(
+            &request.action,
+            profile,
+            &ServerAccess::default(),
+            |_, _, _| Err("unexpected credential"),
+        )
+        .map(Some),
+        Ok(None),
+        || Ok(fixture.trust.clone()),
+    )
+}
+
+fn start_confirmed_copy_cascade(
+    runtime: &mut SchedulerWindow,
+    root: &JobId,
+    assert_no_copy: impl Fn(),
+) -> RunRequest<SshCommand> {
+    let mut view = runtime.new_view();
+    runtime.update_view(&mut view, Message::Select(root.clone()));
+    assert!(
+        runtime
+            .update_view(&mut view, Message::Run(true))
+            .is_empty()
+    );
+    assert!(!runtime.has_active_runs());
+    runtime.update_view(&mut view, Message::Dismiss);
+    assert!(runtime.update_view(&mut view, Message::Confirm).is_empty());
+    assert!(!runtime.has_active_runs());
+    assert_no_copy();
+    assert!(
+        runtime
+            .update_view(&mut view, Message::Run(true))
+            .is_empty()
+    );
+    assert!(!runtime.has_active_runs());
+    assert_no_copy();
+    only_copy_start(
+        runtime.update_view(&mut view, Message::Confirm),
+        root,
+        RunTrigger::Cascade,
+    )
+}
+
+fn start_copy_manually(runtime: &mut SchedulerWindow, job: &JobId) -> RunRequest<SshCommand> {
+    let mut view = runtime.new_view();
+    runtime.update_view(&mut view, Message::Select(job.clone()));
+    let mut starts = runtime.update_view(&mut view, Message::Run(false));
+    if starts.is_empty() {
+        starts = runtime.update_view(&mut view, Message::Confirm);
+    }
+    only_copy_start(starts, job, RunTrigger::Manual)
+}
+
+fn start_chained_copy(
+    runtime: &mut SchedulerWindow,
+    predecessor: &JobId,
+    job: &JobId,
+) -> RunRequest<SshCommand> {
+    let starts = complete_copy_predecessor(runtime, predecessor, RunOutcome::Success);
+    only_copy_start(starts, job, RunTrigger::Dependency)
+}
+
+fn only_copy_start(
+    mut starts: Vec<RunRequest<SshCommand>>,
+    job: &JobId,
+    trigger: RunTrigger,
+) -> RunRequest<SshCommand> {
+    assert_eq!(starts.len(), 1);
+    let request = starts.pop().unwrap();
+    assert_eq!(&request.job, job);
+    assert_eq!(request.trigger, trigger);
+    request
+}
+
+fn complete_copy_predecessor(
+    runtime: &mut SchedulerWindow,
+    predecessor: &JobId,
+    outcome: RunOutcome,
+) -> Vec<RunRequest<SshCommand>> {
+    let completed = copy_predecessor_finished(runtime, predecessor, outcome);
+    runtime.update_runtime(completed)
+}
+
+fn copy_predecessor_finished(
+    runtime: &mut SchedulerWindow,
+    predecessor: &JobId,
+    outcome: RunOutcome,
+) -> Message {
+    Message::Finished(Completion {
+        id: start_copy_manually(runtime, predecessor).id,
+        outcome,
+        detail: None,
+        recording: None,
+        swarm_report: None,
+    })
+}
+
+fn assert_gate_blocks(path: &Path, predecessor: &JobId, job: &JobId, due: SystemTime) {
+    use kortty_jobs::{BlockReason, Blocker, SchedulerStore, TimeZone};
+
+    // Exercise separate histories at the same occurrence with one shared receipt.
+    let blocked_path = path.with_file_name("gate-blocked.json");
+    fs::copy(path, &blocked_path).unwrap();
+    let receipts = path.with_file_name("job-sftp-reviews.json");
+    let before = fs::read(&receipts).unwrap();
+    let mut blocked = SchedulerWindow::open(blocked_path.clone()).unwrap();
+    blocked.set_execution_allowed(true);
+    blocked
+        .initialize_schedules_at(TimeZone::UTC, due - Duration::from_secs(240))
+        .unwrap();
+    assert_eq!(blocked.next_due(), Some(due));
+    let failed = RunOutcome::Failed { exit_code: Some(7) };
+    let completed = copy_predecessor_finished(&mut blocked, predecessor, failed);
+    assert!(
+        blocked
+            .update_runtime_at(completed, due - Duration::from_secs(120))
+            .is_empty()
+    );
+    assert!(blocked.update_runtime_at(Message::Tick, due).is_empty());
+    assert!(blocked.next_due().is_none());
+    drop(blocked);
+    let store = SchedulerStore::open(blocked_path).unwrap();
+    let record = store.latest_finished(job).unwrap();
+    assert_eq!(record.trigger, RunTrigger::Scheduled);
+    assert_eq!(record.outcome, RunOutcome::Blocked);
+    assert_eq!(
+        record.blockers.as_ref(),
+        [Blocker {
+            predecessor: predecessor.clone(),
+            reason: BlockReason::NotSuccessful(failed),
+        }]
+    );
+    assert!(fs::read(receipts).unwrap() == before);
+}
+
+fn gated_copy_start(
+    runtime: &mut SchedulerWindow,
+    predecessor: &JobId,
+    job: &JobId,
+    due: SystemTime,
+) -> RunRequest<SshCommand> {
+    use kortty_jobs::TimeZone;
+
+    runtime
+        .initialize_schedules_at(TimeZone::UTC, due - Duration::from_secs(240))
+        .unwrap();
+    assert_eq!(runtime.next_due(), Some(due));
+    let completed = copy_predecessor_finished(
+        runtime,
+        predecessor,
+        RunOutcome::Failed { exit_code: Some(7) },
+    );
+    assert!(
+        runtime
+            .update_runtime_at(completed, due - Duration::from_secs(120))
+            .is_empty()
+    );
+    let completed = copy_predecessor_finished(runtime, predecessor, RunOutcome::Success);
+    assert!(
+        runtime
+            .update_runtime_at(completed, due - Duration::from_secs(60))
+            .is_empty()
+    );
+    assert!(
+        runtime
+            .update_runtime_at(Message::Tick, due - Duration::from_secs(1))
+            .is_empty()
+    );
+    let request = only_copy_start(
+        runtime.update_runtime_at(Message::Tick, due),
+        job,
+        RunTrigger::Scheduled,
+    );
+    assert!(runtime.update_runtime_at(Message::Tick, due).is_empty());
+    request
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
 fn openssh_scheduled_sftp_upload_and_download_publish_complete_private_files() {
     let fixture = Sshd::new();
     let local = fixture.profile.0.join("local");
@@ -955,7 +2852,7 @@ fn openssh_scheduled_sftp_upload_and_download_publish_complete_private_files() {
     assert_eq!(fs::read(&downloaded).unwrap(), payload);
     assert_eq!(
         fs::metadata(&downloaded).unwrap().permissions().mode() & 0o777,
-        0o600
+        fs::metadata(&source).unwrap().permissions().mode() & 0o777
     );
     fs::write(&downloaded, b"keep local destination").unwrap();
     run_job(download, failed);
@@ -1393,8 +3290,12 @@ fn openssh_scheduled_sftp_transfers_private_folder_trees_without_overwriting() {
     assert!(download.join("nested/empty").is_dir());
     assert!(!download.join("skip remote link").exists());
     assert_eq!(fs::read(download.join("nested/payload")).unwrap(), bytes);
-    assert_eq!(mode(&download), 0o700);
-    assert_eq!(mode(&download.join("ordinary")), 0o600);
+    assert_eq!(mode(&download), mode(&source));
+    assert_eq!(mode(&download.join("nested")), mode(&source.join("nested")));
+    assert_eq!(
+        mode(&download.join("ordinary")),
+        mode(&source.join("ordinary"))
+    );
     fs::write(download.join("ordinary"), b"keep local collision").unwrap();
     run_job(pull, failed);
     assert_eq!(
@@ -1487,9 +3388,15 @@ fn openssh_scheduled_sftp_cancels_a_stalled_subsystem() {
     let trust = fixture.trust.clone();
     let (finished, completion) = std::sync::mpsc::sync_channel(1);
     let worker = thread::spawn(move || {
-        let _ = finished.send(run(&request, None, None, true, Ok(None), Ok(None), || {
-            Ok(trust)
-        }));
+        let _ = finished.send(run(
+            &request,
+            None,
+            None,
+            &ExecutionPolicy::unrestricted(true),
+            Ok(None),
+            Ok(None),
+            || Ok(trust),
+        ));
     });
 
     let started = subsystem.with_extension("started");
@@ -1576,9 +3483,15 @@ fn openssh_scheduled_sftp_copies_remote_folders_without_overwrite() {
             }))
             .unwrap(),
         );
-        let result = run(&request, None, None, false, Ok(None), Ok(None), || {
-            panic!("A copy to its own source tree must fail before accessing SSH trust")
-        });
+        let result = run(
+            &request,
+            None,
+            None,
+            &ExecutionPolicy::unrestricted(false),
+            Ok(None),
+            Ok(None),
+            || panic!("A copy to its own source tree must fail before accessing SSH trust"),
+        );
         assert_eq!(result.outcome, RunOutcome::Blocked);
     }
 

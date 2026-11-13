@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<aiChats>
+    <chat>
+        <id>11111111-1111-4111-8111-111111111111</id>
+        <title>Grüße 東京 &amp; &lt;review&gt; 🧪</title>
+        <createdAt>1720000000000</createdAt>
+        <updatedAt>1720000003000</updatedAt>
+        <selectedText>echo "a &amp; b &lt; c &gt; d"
+line two: café</selectedText>
+        <connectionDisplayName>Fixture SSH &amp; local</connectionDisplayName>
+        <responseLanguageCode>de-DE</responseLanguageCode>
+        <activeAiProfileId>profile-17</activeAiProfileId>
+        <activeAiProfileName>Lokal &amp; &lt;Text&gt;</activeAiProfileName>
+        <messages>
+            <message>
+                <role>ASSISTANT</role>
+                <content>État: &lt;ok&gt; &amp; ready.</content>
+                <createdAt>1720000000001</createdAt>
+                <aiProfileId>profile-17</aiProfileId>
+                <aiProfileName>Lokal &amp; &lt;Text&gt;</aiProfileName>
+            </message>
+            <message>
+                <role>USER</role>
+                <content>Was bedeutet &lt;ok&gt;?</content>
+                <createdAt>1720000000002</createdAt>
+            </message>
+            <message>
+                <role>ASSISTANT</role>
+                <content>Alles bereit.</content>
+                <createdAt>1720000000003</createdAt>
+                <aiProfileId>profile-17</aiProfileId>
+                <aiProfileName>Lokal &amp; &lt;Text&gt;</aiProfileName>
+            </message>
+        </messages>
+    </chat>
+    <chat>
+        <id>22222222-2222-4222-8222-222222222222</id>
+        <title>Unanswered question</title>
+        <createdAt>1720000000000</createdAt>
+        <updatedAt>1720000002000</updatedAt>
+        <connectionDisplayName>Fixture SSH &amp; local</connectionDisplayName>
+        <responseLanguageCode>en</responseLanguageCode>
+        <activeAiProfileId>profile-18</activeAiProfileId>
+        <activeAiProfileName>Local English</activeAiProfileName>
+        <messages>
+            <message>
+                <role>USER</role>
+                <content>Still waiting…</content>
+                <createdAt>1720000000001</createdAt>
+            </message>
+        </messages>
+    </chat>
+    <chat>
+        <id>33333333-3333-4333-8333-333333333333</id>
+        <title>Consecutive roles</title>
+        <createdAt>1720000000000</createdAt>
+        <updatedAt>1720000001000</updatedAt>
+        <connectionDisplayName>Fixture SSH &amp; local</connectionDisplayName>
+        <responseLanguageCode>ja</responseLanguageCode>
+        <activeAiProfileId>profile-19</activeAiProfileId>
+        <activeAiProfileName>Local Japanese</activeAiProfileName>
+        <messages>
+            <message>
+                <role>USER</role>
+                <content>First question</content>
+                <createdAt>1720000000001</createdAt>
+            </message>
+            <message>
+                <role>USER</role>
+                <content>Second question</content>
+                <createdAt>1720000000002</createdAt>
+            </message>
+            <message>
+                <role>ASSISTANT</role>
+                <content>一つ目の応答</content>
+                <createdAt>1720000000003</createdAt>
+                <aiProfileId>profile-17</aiProfileId>
+                <aiProfileName>Lokal &amp; &lt;Text&gt;</aiProfileName>
+            </message>
+            <message>
+                <role>ASSISTANT</role>
+                <content>二つ目の応答</content>
+                <createdAt>1720000000004</createdAt>
+                <aiProfileId>profile-17</aiProfileId>
+                <aiProfileName>Lokal &amp; &lt;Text&gt;</aiProfileName>
+            </message>
+        </messages>
+    </chat>
+</aiChats>

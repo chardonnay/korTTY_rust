@@ -7,14 +7,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use async_channel::{Receiver, Sender};
-use kortty_ssh::Endpoint;
+use kortty_ssh::{Endpoint, MAX_FORWARD_STREAMS};
 
 use crate::ssh_connection::{Abort, Channel, DirectOpener, RemoteOpener};
 
 mod remote;
 mod socks;
 
-const MAX_CLIENTS: usize = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -72,7 +71,7 @@ impl Capacity {
     fn claim(&self) -> Option<Slot> {
         self.clients
             .try_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                (count < MAX_CLIENTS).then_some(count + 1)
+                (count < MAX_FORWARD_STREAMS).then_some(count + 1)
             })
             .ok()?;
         Some(Slot(self.clone()))
@@ -86,7 +85,7 @@ impl Drop for Slot {
 }
 
 impl Listener {
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn bound_address(&self) -> SocketAddr {
         self.address
     }

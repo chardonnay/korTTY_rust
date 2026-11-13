@@ -168,8 +168,14 @@ impl<'arb: 'a, 'a> Arbitrary<'arb> for Unknown<'a> {
 
 /// Parses a [`Packet`] from a borrowed `&[u8]` byte buffer.
 pub fn packet_from_bytes<'a>(b: &'a [u8], ctx: &ParseContext) -> Result<Packet<'a>> {
-    let ctx = ParseContext { seen_unknown: false, ..ctx.clone() };
-    let mut s = DecodeBytes { input: b, parse_ctx: ctx };
+    let ctx = ParseContext {
+        seen_unknown: false,
+        ..ctx.clone()
+    };
+    let mut s = DecodeBytes {
+        input: b,
+        parse_ctx: ctx,
+    };
     let p = Packet::dec(&mut s)?;
 
     if !s.input.is_empty() && !s.ctx().seen_unknown {
@@ -188,7 +194,10 @@ pub fn read_ssh<'a, T: SSHDecode<'a>>(
     b: &'a [u8],
     ctx: Option<ParseContext>,
 ) -> Result<(T, usize)> {
-    let mut s = DecodeBytes { input: b, parse_ctx: ctx.unwrap_or_default() };
+    let mut s = DecodeBytes {
+        input: b,
+        parse_ctx: ctx.unwrap_or_default(),
+    };
     let r = T::dec(&mut s)?;
     Ok((r, b.len() - s.remaining()))
 }
@@ -227,10 +236,7 @@ pub fn hash_ser_length(
 /// Hashes the SSH wire format representation of `value`
 ///
 /// Will only fail if `value.enc()` can return an error.
-pub fn hash_ser(
-    hash_ctx: &mut impl SSHWireDigestUpdate,
-    value: &dyn SSHEncode,
-) -> Result<()> {
+pub fn hash_ser(hash_ctx: &mut impl SSHWireDigestUpdate, value: &dyn SSHEncode) -> Result<()> {
     let mut s = EncodeHash { hash_ctx };
     value.enc(&mut s)?;
     Ok(())
@@ -387,7 +393,10 @@ impl<'a> TextString<'a> {
     }
 
     pub fn to_ascii(&self) -> Result<&'a str> {
-        self.0.as_ascii_str().map_err(|_| Error::BadString).map(|s| s.as_str())
+        self.0
+            .as_ascii_str()
+            .map_err(|_| Error::BadString)
+            .map(|s| s.as_str())
     }
 }
 
@@ -686,7 +695,9 @@ impl<'de> SSHDecode<'de> for u64 {
 /// without control characters. RFC4251 section 6.
 pub fn try_as_ascii(t: &[u8]) -> WireResult<&AsciiStr> {
     let n = t.as_ascii_str().map_err(|_| WireError::BadName)?;
-    if n.chars().any(|ch| ch.is_ascii_control() || ch == AsciiChar::DEL) {
+    if n.chars()
+        .any(|ch| ch.is_ascii_control() || ch == AsciiChar::DEL)
+    {
         return Err(WireError::BadName);
     }
     Ok(n)
@@ -789,13 +800,6 @@ impl SSHWireDigestUpdate for sha2::Sha512 {
     }
 }
 
-#[cfg(feature = "rsa")]
-impl SSHWireDigestUpdate for sha2_modern::Sha256 {
-    fn digest_update(&mut self, data: &[u8]) {
-        sha2_modern::Digest::update(self, data);
-    }
-}
-
 /// For debugging serialisation and packet formats, captures hashed content
 #[cfg(feature = "std")]
 #[derive(Debug)]
@@ -816,31 +820,32 @@ impl<T: SSHWireDigestUpdate> SSHWireDigestUpdate for SSHWireDigestTrace<T> {
 #[cfg(feature = "std")]
 impl<T: SSHWireDigestUpdate> From<T> for SSHWireDigestTrace<T> {
     fn from(inner: T) -> Self {
-        Self { inner, store: Vec::new() }
+        Self {
+            inner,
+            store: Vec::new(),
+        }
     }
 }
 
 #[cfg(feature = "rsa")]
 impl SSHEncode for rsa::BoxedUint {
     fn enc(&self, s: &mut dyn SSHSink) -> WireResult<()> {
-        let b = self.to_be_bytes();
+        let b = zeroize::Zeroizing::new(self.to_be_bytes());
         Mpint::new(&b).enc(s)
     }
 }
 
 #[cfg(feature = "rsa")]
-impl<'de> SSHDecode<'de> for rsa::BoxedUint {
-    fn dec<S>(s: &mut S) -> WireResult<Self>
-    where
-        S: SSHSource<'de>,
-    {
-        let b = Mpint::dec(s)?;
-        rsa::BoxedUint::from_be_slice(b.0, packets::RSAPubKey::MAX_BITS).map_err(
-            |_| {
-                debug!("RSA too large");
-                WireError::BadNumber
-            },
-        )
+impl SSHWireDigestUpdate for rsa::sha2::Sha256 {
+    fn digest_update(&mut self, data: &[u8]) {
+        rsa::sha2::Digest::update(self, data)
+    }
+}
+
+#[cfg(feature = "rsa")]
+impl SSHWireDigestUpdate for rsa::sha2::Sha512 {
+    fn digest_update(&mut self, data: &[u8]) {
+        rsa::sha2::Digest::update(self, data)
     }
 }
 
@@ -959,7 +964,9 @@ pub(crate) mod tests {
         // an enum but that can identify its own enum variant.
         let p = Userauth60::PkOk(UserauthPkOk {
             algo: "ed25519",
-            key: Blob(PubKey::Ed25519(Ed25519PubKey { key: Blob([0x11; 32]) })),
+            key: Blob(PubKey::Ed25519(Ed25519PubKey {
+                key: Blob([0x11; 32]),
+            })),
         })
         .into();
         ctx.cli_auth_type = Some(auth::AuthType::PubKey);

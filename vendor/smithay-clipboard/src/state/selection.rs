@@ -77,8 +77,11 @@ impl State {
 
     fn publish_png(&mut self, connection: &Connection, request: &Request) -> io::Result<()> {
         let seat = self.latest_seat.clone().ok_or_else(unfocused)?;
-        let focus =
-            self.seats.get(&seat).and_then(|seat| seat.focus.as_ref()).ok_or_else(unfocused)?;
+        let focus = self
+            .seats
+            .get(&seat)
+            .and_then(|seat| seat.focus.as_ref())
+            .ok_or_else(unfocused)?;
         let serial = focus
             .serial
             .filter(|_| {
@@ -112,7 +115,11 @@ impl State {
             self.data_sources
                 .retain(|item| item.seat != seat || !matches!(item.payload, Payload::Png(_)));
         }
-        self.data_sources.push(Selection { source, seat, payload });
+        self.data_sources.push(Selection {
+            source,
+            seat,
+            payload,
+        });
         Some(())
     }
 
@@ -169,10 +176,13 @@ impl State {
 }
 
 fn unfocused() -> io::Error {
-    io::Error::new(ErrorKind::PermissionDenied, "The Wayland window has no focused clipboard input")
+    io::Error::new(
+        ErrorKind::PermissionDenied,
+        "The Wayland window has no focused clipboard input",
+    )
 }
 
-fn write_chunk(file: &mut impl Write, bytes: &[u8], written: &mut usize) -> PostAction {
+pub(super) fn write_chunk(file: &mut impl Write, bytes: &[u8], written: &mut usize) -> PostAction {
     if *written == bytes.len() {
         return PostAction::Remove;
     }
@@ -181,11 +191,15 @@ fn write_chunk(file: &mut impl Write, bytes: &[u8], written: &mut usize) -> Post
         Ok(0) => PostAction::Remove,
         Ok(count) => {
             *written += count;
-            if *written == bytes.len() { PostAction::Remove } else { PostAction::Continue }
-        },
+            if *written == bytes.len() {
+                PostAction::Remove
+            } else {
+                PostAction::Continue
+            }
+        }
         Err(error) if matches!(error.kind(), ErrorKind::WouldBlock | ErrorKind::Interrupted) => {
             PostAction::Continue
-        },
+        }
         Err(_) => PostAction::Remove,
     }
 }
@@ -209,9 +223,15 @@ mod tests {
         let bytes = vec![0xab; CHUNK_BYTES + 32];
         let mut pipe = Vec::new();
         let mut offset = 0;
-        assert!(matches!(write_chunk(&mut pipe, &bytes, &mut offset), PostAction::Continue));
+        assert!(matches!(
+            write_chunk(&mut pipe, &bytes, &mut offset),
+            PostAction::Continue
+        ));
         assert_eq!(offset, CHUNK_BYTES);
-        assert!(matches!(write_chunk(&mut pipe, &bytes, &mut offset), PostAction::Remove));
+        assert!(matches!(
+            write_chunk(&mut pipe, &bytes, &mut offset),
+            PostAction::Remove
+        ));
         assert_eq!(pipe, bytes);
     }
 }

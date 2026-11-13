@@ -26,12 +26,14 @@ use super::writer::file_identity;
 pub(super) mod bundle;
 mod live_archive;
 pub(super) mod replacement;
+pub(super) mod retrieval;
 use live_archive::ArchiveReader;
 pub(super) use live_archive::{LiveArchive, LiveArchives};
 
 const MAX_PARTS: u32 = 1000;
 const MAX_DIRECTORY_NAMES: usize = 4096;
 const MAX_PART_BYTES: u64 = 128 * 1024 * 1024;
+pub(super) const MAX_CAPTURE_BYTES: u64 = MAX_PARTS as u64 * MAX_PART_BYTES;
 // The Java writer uses zstd-jni setLong(27), even for small closed parts.
 const MAX_JAVA_ZSTD_WINDOW_BYTES: u64 = 1 << 27;
 const MAX_SCAN_BYTES: u64 = 16 * 1024 * 1024;
@@ -61,7 +63,7 @@ pub(crate) enum CaptureKind {
 }
 
 impl CaptureKind {
-    fn parse(value: &str) -> io::Result<Self> {
+    pub(super) fn parse(value: &str) -> io::Result<Self> {
         match value {
             "out" => Ok(Self::Output),
             "in" => Ok(Self::Input),

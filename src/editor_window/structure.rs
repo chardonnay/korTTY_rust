@@ -1,12 +1,24 @@
 //! Bounded lexical structure analysis with coordinates for the native editor.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
+use std::ops::Range;
 use std::path::Path;
 
 use iced::advanced::graphics::text::cosmic_text::LineIter;
+use iced::widget::text_editor;
 
 use super::{Language, SourceState, declaration, identifier, leading_keyword};
+
+mod docker;
+mod extended;
+mod python;
+mod shell;
+mod sql;
+
+pub(super) fn additional_language(path: &Path, source: &str) -> Option<&'static str> {
+    extended::detect(path, source)
+}
 
 const MAX_UTF16_UNITS: usize = 512_000;
 const MAX_ENTRIES: usize = 2_000;
@@ -45,7 +57,9 @@ pub(crate) struct Node {
 pub(crate) struct Variable {
     pub(crate) name: String,
     pub(crate) scope: String,
+    pub(crate) stage_index: Option<usize>,
     pub(crate) kind: &'static str,
+    pub(crate) container: Option<&'static str>,
     pub(crate) line: usize,
     pub(crate) column: usize,
     pub(crate) end_column: usize,
@@ -54,6 +68,7 @@ pub(crate) struct Variable {
 
 enum Syntax {
     Code(Language),
+    Extended(extended::Language),
     Markup(Markup),
 }
 
@@ -67,7 +82,15 @@ impl Syntax {
             }
             "markdown" | "md" => Self::Markup(Markup::Markdown),
             "asciidoctor" | "asciidoc" | "adoc" => Self::Markup(Markup::AsciiDoc),
+            "dockerfile" => Self::Code(Language::Dockerfile),
+            "sql" => Self::Code(Language::Sql),
+            language if extended::Language::from_name(language).is_some() => {
+                Self::Extended(extended::Language::from_name(language)?)
+            }
             "" | "plain" | "text" | "plaintext" => {
+                if let Some(language) = extended::Language::from_shebang(source) {
+                    return Some(Self::Extended(language));
+                }
                 let language = Language::detect(Path::new(""), source);
                 (language != Language::Other).then_some(Self::Code(language))?
             }
@@ -92,18 +115,30 @@ pub(crate) fn analyze(source: &str, language: &str) -> Analysis {
         };
     }
     match syntax {
+        Syntax::Extended(language) => extended::scan(source, language),
         Syntax::Markup(markup) => scan_markup(source, markup),
+        Syntax::Code(Language::Dockerfile) => docker::scan(source),
+        Syntax::Code(Language::Python) => python::scan(source, true),
+        Syntax::Code(Language::Sql) => sql::scan(source),
         Syntax::Code(language) => {
             let mut scan = Scan::default();
-            if language == Language::Python {
-                scan.indented(source);
-            } else {
-                scan.braced(source, language);
-            }
-            scan.count_uses(source, language);
+            scan.braced(source, language);
+            scan.count_uses(source, language, None);
             scan.analysis
         }
     }
+}
+
+pub(super) fn shell_outline(source: &str) -> Analysis {
+    // The file editor already bounds its source. The outline does not display
+    // use counts, so it can scan that source with the ordinary entry limit.
+    let mut scan = Scan::default();
+    scan.braced(source, Language::Shell);
+    scan.analysis
+}
+
+pub(super) fn python_outline(source: &str) -> Analysis {
+    python::scan(source, false)
 }
 
 #[derive(Default)]
@@ -111,6 +146,7 @@ struct Scan {
     analysis: Analysis,
     binding_scopes: Vec<Option<usize>>,
     binding_names: HashMap<Option<usize>, HashSet<String>>,
+    python_field_writes: Option<HashSet<(usize, usize)>>,
 }
 
 #[derive(Clone, Copy)]
@@ -174,14 +210,23 @@ impl Scan {
 
     fn binding(
         &mut self,
-        kind: &'static str,
+        (kind, container): (&'static str, Option<&'static str>),
         name: &str,
         line: usize,
         column: usize,
         scope: Option<usize>,
         language: Language,
     ) {
-        let reuse_binding = matches!(language, Language::Python | Language::Shell);
+        if kind == "field"
+            && let Some(writes) = &mut self.python_field_writes
+        {
+            // Keep repeated class assignments even when the field already has an outline row.
+            writes.insert((line, column));
+        }
+        let reuse_binding = matches!(
+            language,
+            Language::Python | Language::Shell | Language::Dockerfile | Language::Sql
+        );
         if reuse_binding
             && self
                 .binding_names
@@ -190,28 +235,47 @@ impl Scan {
         {
             return;
         }
-        if self.analysis.variables.len() == MAX_ENTRIES {
-            self.analysis.limited = true;
-            return;
-        }
-        if reuse_binding {
+        if self
+            .push_binding((kind, container), name, line, column, scope, language)
+            .is_some()
+            && reuse_binding
+        {
             self.binding_names
                 .entry(scope)
                 .or_default()
                 .insert(name.to_owned());
+        }
+    }
+
+    fn push_binding(
+        &mut self,
+        (kind, container): (&'static str, Option<&'static str>),
+        name: &str,
+        line: usize,
+        column: usize,
+        scope: Option<usize>,
+        language: Language,
+    ) -> Option<usize> {
+        let index = self.analysis.variables.len();
+        if index == MAX_ENTRIES {
+            self.analysis.limited = true;
+            return None;
         }
         self.analysis.variables.push(Variable {
             name: name.to_owned(),
             scope: scope.map_or_else(String::new, |index| {
                 self.analysis.nodes[index].qualified.clone()
             }),
+            stage_index: scope.filter(|_| language == Language::Dockerfile),
             kind,
+            container,
             line,
             column,
             end_column: column + name.len(),
             uses: 0,
         });
         self.binding_scopes.push(scope);
+        Some(index)
     }
 
     fn close_scopes(&mut self, scopes: &mut Vec<Scope>, level: usize, line: usize) {
@@ -255,7 +319,7 @@ impl Scan {
                     }
                     if let Some((name, _)) = identifier(argument) {
                         self.binding(
-                            "parameter",
+                            ("parameter", None),
                             name,
                             line,
                             column_of(code, name),
@@ -273,34 +337,8 @@ impl Scan {
         }
     }
 
-    fn indented(&mut self, source: &str) {
-        let mut lexer = SourceState::default();
-        let mut scopes: Vec<Scope> = Vec::new();
-        let mut last = 0;
-        for (line, raw) in lines(source).enumerate() {
-            last = line;
-            let (starts_in_code, code) = masked(raw, &mut lexer, Language::Python, false);
-            if !starts_in_code || code.trim().is_empty() {
-                continue;
-            }
-            let level = indentation(raw);
-            self.close_scopes(&mut scopes, level, line.saturating_sub(1));
-            let parent = scopes.last().map(|scope| scope.node);
-            if let Some((kind, name)) = declaration(raw.trim_start(), Language::Python) {
-                let column = column_of(raw, name);
-                if kind == "variable" {
-                    self.binding(kind, name, line, column, parent, Language::Python);
-                } else if let Some(node) = self.node(kind, name, line, column, parent, ".") {
-                    scopes.push(Scope { node, level });
-                    self.parameters(&code, node, Language::Python);
-                }
-            }
-        }
-        self.close_scopes(&mut scopes, 0, last);
-    }
-
     fn braced(&mut self, source: &str, language: Language) {
-        let mut lexer = SourceState::default();
+        let mut lexer = Masker::new(source, language);
         let mut scopes: Vec<Scope> = Vec::new();
         let mut header: Option<Header> = None;
         let mut depth = 0usize;
@@ -313,14 +351,46 @@ impl Scan {
             }) {
                 header = None;
             }
+            let parent = scopes.last().map(|scope| scope.node);
+            if starts_in_code && language == Language::Shell {
+                shell::bindings(raw, |binding| {
+                    if binding.scope == shell::Scope::Default
+                        && scopes.iter().rev().any(|scope| {
+                            self.binding_names
+                                .get(&Some(scope.node))
+                                .is_some_and(|names| names.contains(binding.name))
+                        })
+                    {
+                        return;
+                    }
+                    self.binding(
+                        (binding.kind, binding.container),
+                        binding.name,
+                        line,
+                        column_of(raw, binding.name),
+                        parent.filter(|_| binding.scope == shell::Scope::Local),
+                        language,
+                    );
+                });
+            }
+            let declaration_source = if language == Language::Shell {
+                &code
+            } else {
+                raw
+            };
+            let column = raw.len() - raw.trim_start().len();
             if starts_in_code
-                && let Some((kind, name)) = braced_declaration(raw.trim_start(), language)
+                && let Some((kind, name)) =
+                    braced_declaration(&declaration_source[column..], language)
             {
-                let parent = scopes.last().map(|scope| scope.node);
-                let column = column_of(raw, name);
+                let column = column_of(declaration_source, name);
                 if kind == "variable" {
-                    let kind = binding_kind(&raw[..column], language);
-                    self.binding(kind, name, line, column, parent, language);
+                    let kind = if raw[..column].split_whitespace().any(|word| word == "const") {
+                        "constant"
+                    } else {
+                        "variable"
+                    };
+                    self.binding((kind, None), name, line, column, parent, language);
                 } else {
                     let separator = if language == Language::Rust {
                         "::"
@@ -366,16 +436,48 @@ impl Scan {
         self.close_scopes(&mut scopes, 0, last);
     }
 
-    fn count_uses(&mut self, source: &str, language: Language) {
+    fn count_uses(&mut self, source: &str, language: Language, loops: Option<&python::Loops>) {
         let bindings = &self.analysis.variables;
         if bindings.is_empty() {
             return;
         }
-        let mut upcoming = (0..bindings.len()).peekable();
+        let start = |index: usize| {
+            let binding = &bindings[index];
+            if language == Language::Shell {
+                let scope = self.binding_scopes[index];
+                let line = scope.map_or(0, |scope| self.analysis.nodes[scope].line);
+                (line, 0)
+            } else {
+                (binding.line, binding.column)
+            }
+        };
+        let mut python = loops.map(|loops| {
+            python::References::new(
+                loops,
+                &self.analysis,
+                &self.binding_scopes,
+                self.python_field_writes.as_ref(),
+            )
+        });
+        let mut order: Vec<_> = (0..bindings.len())
+            .filter(|&index| {
+                python
+                    .as_ref()
+                    .is_none_or(|references| !references.special(index))
+            })
+            .collect();
+        if language == Language::Shell {
+            // The reference attributes shell expansions to their lexical function
+            // even when the expansion precedes the declaration on the page.
+            order.sort_by_key(|&index| (start(index), self.binding_scopes[index]));
+        } else if language == Language::Python {
+            order.sort_by_key(|&index| start(index));
+        }
+        let mut upcoming = order.into_iter().peekable();
         let mut active: HashMap<&str, Vec<usize>> = HashMap::new();
         let mut expiry: BinaryHeap<Reverse<(usize, usize)>> = BinaryHeap::new();
         let mut uses = vec![0; bindings.len()];
-        let mut lexer = SourceState::default();
+        let mut lexer = Masker::new(source, language);
         for (line, raw) in lines(source).enumerate() {
             while let Some(&Reverse((end, index))) = expiry.peek() {
                 if end >= line {
@@ -389,9 +491,22 @@ impl Scan {
             let (_, code) = masked(raw, &mut lexer, language, true);
             for (column, name) in references(&code, language) {
                 let site = (line, column);
+                if let Some(references) = &mut python {
+                    match references.lookup(site, &code[..column], name) {
+                        python::Reference::Plain => {}
+                        python::Reference::Binding(index) => {
+                            let binding = &bindings[index];
+                            if (binding.line, binding.column) != site {
+                                uses[index] += 1;
+                            }
+                            continue;
+                        }
+                        python::Reference::Ignored => continue,
+                    }
+                }
                 while let Some(&index) = upcoming.peek() {
                     let binding = &bindings[index];
-                    if (binding.line, binding.column) > site {
+                    if start(index) > site {
                         break;
                     }
                     upcoming.next();
@@ -445,6 +560,9 @@ impl Header {
 }
 
 fn braced_declaration(text: &str, language: Language) -> Option<(&'static str, &str)> {
+    if language == Language::Shell {
+        return shell::function(text).map(|name| ("function", name));
+    }
     declaration(text, language).or_else(|| {
         if language != Language::Rust {
             return None;
@@ -461,19 +579,6 @@ fn braced_declaration(text: &str, language: Language) -> Option<(&'static str, &
     })
 }
 
-fn binding_kind(prefix: &str, language: Language) -> &'static str {
-    let mut words = prefix.split_whitespace();
-    match language {
-        Language::Shell => match words.next() {
-            Some("export") => "exported",
-            Some("readonly") => "constant",
-            _ => "variable",
-        },
-        Language::Rust if words.any(|word| word == "const") => "constant",
-        _ => "variable",
-    }
-}
-
 fn structural_brace(line: &str, column: usize, byte: u8, language: Language) -> bool {
     if !matches!(byte, b'{' | b'}') {
         return false;
@@ -487,37 +592,100 @@ fn structural_brace(line: &str, column: usize, byte: u8, language: Language) -> 
         && bytes.get(column + 1).is_none_or(|&byte| separator(byte))
 }
 
-fn indentation(line: &str) -> usize {
-    line.bytes()
-        .take_while(|byte| matches!(byte, b' ' | b'\t'))
-        .fold(0, |width, byte| {
-            if byte == b'\t' {
-                (width / 8 + 1) * 8
-            } else {
-                width + 1
-            }
-        })
-}
-
-fn lines(source: &str) -> impl Iterator<Item = &str> {
+pub(super) fn lines(source: &str) -> impl Iterator<Item = &str> {
     LineIter::new(source).map(|(range, _)| &source[range])
 }
 
-fn column_of(line: &str, name: &str) -> usize {
-    // The declaration parser returns a subslice of the original line.
+pub(super) fn column_of(line: &str, name: &str) -> usize {
+    // The declaration parser returns a subslice of the supplied line.
     name.as_ptr().addr() - line.as_ptr().addr()
+}
+
+pub(crate) fn select_name(
+    content: &mut text_editor::Content,
+    line: usize,
+    columns: Range<usize>,
+) -> bool {
+    if columns.is_empty()
+        || content
+            .line(line)
+            .is_none_or(|line| line.text.get(columns.clone()).is_none())
+    {
+        return false;
+    }
+    content.move_to(text_editor::Cursor {
+        position: text_editor::Position {
+            line,
+            column: columns.end,
+        },
+        selection: Some(text_editor::Position {
+            line,
+            column: columns.start,
+        }),
+    });
+    true
+}
+
+#[derive(Default)]
+struct Masker<'a> {
+    source: SourceState,
+    heredocs: VecDeque<(shell::HereDocument, usize)>,
+    terminators: Option<shell::Terminators<'a>>,
+    position: usize,
+}
+
+impl<'a> Masker<'a> {
+    fn new(source: &'a str, language: Language) -> Self {
+        Self {
+            terminators: (language == Language::Shell)
+                .then(|| shell::Terminators::new(lines(source))),
+            ..Self::default()
+        }
+    }
 }
 
 fn masked(
     line: &str,
-    lexer: &mut SourceState,
+    lexer: &mut Masker<'_>,
     language: Language,
     include_shell_expansions: bool,
 ) -> (bool, String) {
+    let position = lexer.position;
+    lexer.position += 1;
+    while lexer
+        .heredocs
+        .front()
+        .is_some_and(|(_, last)| *last < position)
+    {
+        lexer.heredocs.pop_front();
+    }
+    if let Some((heredoc, _)) = lexer.heredocs.front() {
+        if !heredoc.ends_at(line) {
+            return (false, heredoc.mask_body(line, include_shell_expansions));
+        }
+        lexer.heredocs.pop_front();
+        return (false, " ".repeat(line.len()));
+    }
+
     let mut code_bytes = vec![false; line.len()];
-    let starts_in_code = lexer.scan_line(line, language, |offset, quoted| {
+    let mut delimiters = Vec::new();
+    let starts_in_code = lexer.source.scan_line(line, language, |offset, quoted| {
         code_bytes[offset] = !quoted || include_shell_expansions;
+        if !quoted
+            && let Some(terminators) = &lexer.terminators
+            && line.as_bytes()[offset..].starts_with(b"<<")
+            && let Some((heredoc, length)) = shell::HereDocument::parse(&line[offset + 2..])
+            && let Some(last) = terminators.last_after(&heredoc, position)
+        {
+            lexer.heredocs.push_back((heredoc, last));
+            delimiters.push(offset + 2..offset + 2 + length);
+        }
     });
+    if language == Language::Shell {
+        for delimiter in delimiters {
+            code_bytes[delimiter].fill(false);
+        }
+    }
     let mut code = String::with_capacity(line.len());
     for (offset, character) in line.char_indices() {
         if code_bytes[offset] {
@@ -531,15 +699,21 @@ fn masked(
 
 fn references(text: &str, language: Language) -> impl Iterator<Item = (usize, &str)> {
     let mut offset = 0;
+    let dollar_expansions = matches!(language, Language::Shell | Language::Dockerfile);
     std::iter::from_fn(move || {
         loop {
-            let start = if language == Language::Shell {
+            let start = if dollar_expansions {
                 offset += text[offset..].find('$')? + 1;
                 if text.as_bytes().get(offset) == Some(&b'$') {
                     offset += 1;
                     continue;
                 }
-                offset + usize::from(text.as_bytes().get(offset) == Some(&b'{'))
+                let braced = text.as_bytes().get(offset) == Some(&b'{');
+                let name = offset + usize::from(braced);
+                name + usize::from(
+                    (braced || language == Language::Dockerfile)
+                        && matches!(text.as_bytes().get(name), Some(b'#' | b'!')),
+                )
             } else {
                 offset += text[offset..].find(|ch: char| ch == '_' || ch.is_alphanumeric())?;
                 offset
@@ -548,7 +722,7 @@ fn references(text: &str, language: Language) -> impl Iterator<Item = (usize, &s
                 offset = start + name.len();
                 return Some((start, name));
             }
-            if language != Language::Shell {
+            if !dollar_expansions {
                 let tail = &text[start..];
                 offset += tail
                     .find(|ch: char| ch != '_' && !ch.is_alphanumeric())
@@ -786,6 +960,229 @@ mod tests {
             ("variable", "send", 1)
         );
         assert_eq!(analyze(source, "unsupported").status, Status::Unsupported);
+    }
+
+    #[test]
+    fn bash_bindings_follow_reference_scopes_and_point_at_each_argument() {
+        let source = r#"#!/bin/bash
+readonly BASE_DIR=/opt/app
+export TARGET_HOST=web01
+declare -A config=( [a]=1 )
+hosts=(a b c)
+count=0
+deploy() {
+  local target="$1"
+  local -a parts
+  declare -g FLAG=1
+  status=ok
+  echo "${target} $count"
+}
+function cleanup {
+  rm -f "$tmp"
+}
+for host in "${hosts[@]}"; do deploy "$host"; done
+"#;
+        let report = analyze(source, "bash");
+        assert_eq!(
+            report
+                .nodes
+                .iter()
+                .map(|node| (node.name.as_str(), node.line + 1, node.end_line + 1))
+                .collect::<Vec<_>>(),
+            [("deploy", 7, 13), ("cleanup", 14, 16)]
+        );
+        let bindings: Vec<_> = report
+            .variables
+            .iter()
+            .map(|var| {
+                let line = lines(source).nth(var.line).unwrap();
+                assert_eq!(&line[var.column..var.end_column], var.name);
+                (var.name.as_str(), var.kind, var.scope.as_str(), var.uses)
+            })
+            .collect();
+        assert_eq!(
+            bindings,
+            [
+                ("BASE_DIR", "constant", "", 0),
+                ("TARGET_HOST", "exported", "", 0),
+                ("config", "hash", "", 0),
+                ("hosts", "array", "", 1),
+                ("count", "variable", "", 1),
+                ("target", "variable", "deploy", 1),
+                ("parts", "array", "deploy", 0),
+                ("FLAG", "variable", "", 0),
+                ("status", "variable", "", 0),
+                ("host", "variable", "", 1),
+            ]
+        );
+    }
+
+    #[test]
+    fn bash_bindings_find_command_outputs_and_resolve_nested_references() {
+        let source = r#"value=outside
+echo "$later_global"
+outer() {
+  echo ${#value}
+  local value=outer
+  local private_value=outer
+  private_value=still_local
+  typeset -r first=one second="two names"
+  local -rA frozen=([a]=1)
+  declare -gx envname=1
+  declare -f ignored
+  later_global=new
+  inner-task() {
+    local value=inner
+    private_value=still_outer
+    echo "$value"
+  }
+  echo "$value"
+}
+echo "$value $private_value" # $value
+while IFS= read -r -p "User name:" user role; do true; done
+read -r -a columns < values
+readarray -t -n 2 -C callback -c 1 loaded
+mapfile -C another_callback
+while getopts 'ab:' flag; do true; done
+for ((counter=0; counter<3; counter++)); do true; done
+indexed[0]+=value
+"#;
+        let report = analyze(source, "bash");
+        assert_eq!(report.nodes[1].qualified, "outer.inner-task");
+        let frozen = report
+            .variables
+            .iter()
+            .find(|variable| variable.name == "frozen")
+            .unwrap();
+        assert_eq!(frozen.container, Some("hash"));
+        assert_eq!(
+            report
+                .variables
+                .iter()
+                .map(|var| (var.name.as_str(), var.kind, var.scope.as_str(), var.uses))
+                .collect::<Vec<_>>(),
+            [
+                ("value", "variable", "", 1),
+                ("value", "variable", "outer", 2),
+                ("private_value", "variable", "outer", 0),
+                ("first", "constant", "outer", 0),
+                ("second", "constant", "outer", 0),
+                ("frozen", "constant", "outer", 0),
+                ("envname", "exported", "", 0),
+                ("later_global", "variable", "", 1),
+                ("value", "variable", "outer.inner-task", 1),
+                ("user", "variable", "", 0),
+                ("role", "variable", "", 0),
+                ("columns", "array", "", 0),
+                ("loaded", "array", "", 0),
+                ("flag", "variable", "", 0),
+                ("counter", "variable", "", 0),
+                ("indexed", "array", "", 0),
+            ]
+        );
+    }
+
+    #[test]
+    fn bash_arithmetic_shift_is_not_a_here_document_with_a_later_matching_line() {
+        let source = "n=1\nshifted=$((n << SHIFT ))\nvisible=2\nSHIFT\ncat <<SHIFT\nhidden=3\nSHIFT\necho $visible\n";
+        let report = analyze(source, "bash");
+        assert_eq!(
+            report
+                .variables
+                .iter()
+                .map(|var| (var.name.as_str(), var.uses))
+                .collect::<Vec<_>>(),
+            [("n", 0), ("shifted", 0), ("visible", 1)]
+        );
+    }
+
+    #[test]
+    fn bash_unquoted_heredoc_counts_expansions_without_outline_nodes() {
+        let source = concat!(
+            "count=1\n",
+            "cat <<-EOF;\n",
+            "\tfunction hidden() { }\n",
+            "\tignored=1\n",
+            "\tcafé '$count' \\$count \\\\$count ${#count} ${!count}\n",
+            "\tEOF\n",
+            "after() {\n",
+            "  printf '%s' \"$count\"\n",
+            "}\n",
+        );
+        let result = analyze(source, "bash");
+        assert_eq!(result.status, Status::Ok);
+        let [variable] = result.variables.as_slice() else {
+            panic!("unexpected variables: {:?}", result.variables);
+        };
+        assert_eq!((variable.name.as_str(), variable.uses), ("count", 5));
+        let [after] = result.nodes.as_slice() else {
+            panic!("unexpected nodes: {:?}", result.nodes);
+        };
+        assert_eq!(
+            (after.name.as_str(), after.line, after.end_line),
+            ("after", 6, 8)
+        );
+        let line = lines(source).nth(after.line).unwrap();
+        assert_eq!(&line[after.column..after.end_column], "after");
+    }
+
+    #[test]
+    fn bash_quoted_and_backslash_heredocs_keep_body_and_delimiter_literal() {
+        let source = r#"count=1
+cat <<OPEN>/dev/null <<'SINGLE' <<"$count" <<\BACK <<MIX'ED'
+$count
+OPEN
+single() { echo "$count"; }
+SINGLE
+double() { echo "$count"; }
+$count
+backslash() { echo "$count"; }
+BACK
+mixed() { echo "$count"; }
+MIXED
+cat <<< "$count"
+cat <<< HERESTRING
+((1 << count ))
+# cat <<COMMENT
+printf '%s' '<<LITERAL'
+after() { echo "$count"; }
+"#;
+        let result = analyze(source, "bash");
+        assert_eq!(result.status, Status::Ok);
+        let [variable] = result.variables.as_slice() else {
+            panic!("unexpected variables: {:?}", result.variables);
+        };
+        assert_eq!((variable.name.as_str(), variable.uses), ("count", 3));
+        let [after] = result.nodes.as_slice() else {
+            panic!("unexpected nodes: {:?}", result.nodes);
+        };
+        assert_eq!(
+            (after.name.as_str(), after.line, after.end_line),
+            ("after", 17, 17)
+        );
+    }
+
+    #[test]
+    fn bash_heredoc_requires_a_later_terminator_with_matching_indentation() {
+        let source = concat!(
+            "count=1\n",
+            "END\n",
+            "cat <<END\n",
+            "\tEND\n",
+            "cat <<STOP <<STOP\n",
+            "$count\n",
+            "STOP\n",
+            "after() { echo \"$count\"; }\n",
+        );
+        let result = analyze(source, "bash");
+        let [variable] = result.variables.as_slice() else {
+            panic!("unexpected variables: {:?}", result.variables);
+        };
+        assert_eq!((variable.name.as_str(), variable.uses), ("count", 2));
+        let [after] = result.nodes.as_slice() else {
+            panic!("unexpected nodes: {:?}", result.nodes);
+        };
+        assert_eq!((after.name.as_str(), after.line), ("after", 7));
     }
 
     #[test]

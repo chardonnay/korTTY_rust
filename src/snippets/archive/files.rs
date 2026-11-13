@@ -9,6 +9,9 @@ use zeroize::Zeroizing;
 use zip::write::SimpleFileOptions;
 use zip::{AesMode, CompressionMethod, System, ZipWriter};
 
+#[cfg(windows)]
+use kortty_files::tree::Directory;
+
 use super::{FolderSelection, Snippet, absolute, invalid, profile};
 use crate::snippets::recipients::Choice;
 
@@ -265,16 +268,18 @@ fn create_file(path: &Path) -> io::Result<File> {
 }
 
 #[cfg(windows)]
-fn windows_parent(path: &Path) -> io::Result<(kortty_files::tree::Directory, &std::ffi::OsStr)> {
+fn windows_parent(path: &Path) -> io::Result<(Directory, &std::ffi::OsStr)> {
     let (Some(parent), Some(name)) = (path.parent(), path.file_name()) else {
         return Err(invalid("Expected an absolute snippet export path"));
     };
-    Ok((kortty_files::tree::Directory::open_path(parent)?, name))
+    Ok((Directory::open_path(parent)?, name))
 }
 
 struct StagingDirectory {
     path: PathBuf,
     published: bool,
+    #[cfg(windows)]
+    handles: Option<(Directory, Directory)>,
 }
 
 impl StagingDirectory {
@@ -283,14 +288,8 @@ impl StagingDirectory {
             let mut nonce = [0; 16];
             getrandom::fill(&mut nonce).map_err(io::Error::other)?;
             let name = format!(".kortty-export-{:032x}", u128::from_ne_bytes(nonce));
-            let path = parent.join(name);
-            match create_directory(&path) {
-                Ok(()) => {
-                    return Ok(Self {
-                        path,
-                        published: false,
-                    });
-                }
+            match Self::create(parent.join(name)) {
+                Ok(stage) => return Ok(stage),
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
                 Err(error) => return Err(error),
             }
@@ -300,17 +299,92 @@ impl StagingDirectory {
         ))
     }
 
+    fn create(path: PathBuf) -> io::Result<Self> {
+        #[cfg(unix)]
+        create_directory(&path)?;
+        #[cfg(windows)]
+        let handles = {
+            let (parent, name) = windows_parent(&path)?;
+            let stage = parent.create_child(name)?;
+            Some((parent, stage))
+        };
+        Ok(Self {
+            path,
+            published: false,
+            #[cfg(windows)]
+            handles,
+        })
+    }
+
     fn publish(mut self, target: &Path) -> io::Result<()> {
-        profile::publish_new(&self.path, target)?;
+        self.rename(target).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("Could not publish the folder export: {error}"),
+            )
+        })?;
         self.published = true;
         Ok(())
+    }
+
+    #[cfg(unix)]
+    fn rename(&self, target: &Path) -> io::Result<()> {
+        profile::publish_new(&self.path, target)
+    }
+
+    #[cfg(windows)]
+    fn rename(&self, target: &Path) -> io::Result<()> {
+        let name = target
+            .file_name()
+            .filter(|_| target.parent() == self.path.parent())
+            .ok_or_else(|| invalid("The export must be published next to its staging directory"))?;
+        let (parent, stage) = self.handles.as_ref().expect("staging handles are live");
+        parent.publish(stage, name)
     }
 }
 
 impl Drop for StagingDirectory {
     fn drop(&mut self) {
         if !self.published {
+            #[cfg(windows)]
+            drop(self.handles.take());
             let _ = fs::remove_dir_all(&self.path);
         }
     }
+}
+
+#[cfg(all(test, windows))]
+#[test]
+fn folder_export_retries_publication_while_a_descendant_is_open() {
+    use std::ffi::OsStr;
+    use std::os::windows::fs::OpenOptionsExt as _;
+    use std::time::Duration;
+
+    let profile = crate::snippets::tests::Profile::new();
+    let stage = StagingDirectory::new(&profile.0).unwrap();
+    let file = stage.path.join("fixture.txt");
+    let mut output = create_file(&file).unwrap();
+    output.write_all(b"disposable fixture").unwrap();
+    drop(output);
+    let blocker = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&file)
+        .unwrap();
+    let (parent, directory) = stage.handles.as_ref().unwrap();
+    let name = OsStr::new("published");
+    let error = parent.publish(directory, name).unwrap_err();
+    assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+    let target = profile.0.join(name);
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(40));
+            drop(blocker);
+        });
+        stage.publish(&target).unwrap();
+    });
+    assert_eq!(
+        fs::read(target.join("fixture.txt")).unwrap(),
+        b"disposable fixture"
+    );
 }

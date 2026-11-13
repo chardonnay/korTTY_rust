@@ -44,11 +44,16 @@ pub(super) fn load(path: &Path) -> io::Result<Vec<u8>> {
 }
 
 pub(super) fn validate_stored(bytes: Vec<u8>) -> io::Result<Vec<u8>> {
-    let image = raster(&bytes, ImageFormat::Png, EDGE)?;
+    stored_pixels(&bytes)?;
+    Ok(bytes)
+}
+
+pub(super) fn stored_pixels(bytes: &[u8]) -> io::Result<RgbaImage> {
+    let image = raster(bytes, ImageFormat::Png, EDGE)?;
     if image.width() != EDGE || image.height() != EDGE {
         return Err(invalid("The stored OS symbol has unexpected dimensions."));
     }
-    Ok(bytes)
+    Ok(image.into_rgba8())
 }
 
 fn raster(bytes: &[u8], format: ImageFormat, limit: u32) -> io::Result<image::DynamicImage> {
@@ -70,7 +75,7 @@ fn raster(bytes: &[u8], format: ImageFormat, limit: u32) -> io::Result<image::Dy
     image::DynamicImage::from_decoder(decoder).map_err(io::Error::other)
 }
 
-fn render_svg(bytes: &[u8]) -> io::Result<RgbaImage> {
+pub(in crate::connection_store) fn render_svg(bytes: &[u8]) -> io::Result<RgbaImage> {
     if bytes.len() > MAX_SVG_BYTES {
         return Err(invalid("The SVG exceeds 256 KiB."));
     }

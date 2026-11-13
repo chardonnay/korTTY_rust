@@ -7,9 +7,14 @@ use crate::session::SessionId;
 #[derive(Debug, Default)]
 pub(super) struct Membership {
     members: Vec<SessionId>,
+    epoch: u64,
 }
 
 impl Membership {
+    pub(super) fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     pub(super) fn contains(&self, pane: SessionId) -> bool {
         self.members.contains(&pane)
     }
@@ -27,6 +32,9 @@ impl Membership {
     pub(super) fn toggle_pane(&mut self, pane: SessionId, join_allowed: bool) -> bool {
         if self.forget(pane) || !join_allowed {
             return false;
+        }
+        if self.members.is_empty() {
+            self.epoch = self.epoch.wrapping_add(1);
         }
         self.members.push(pane);
         true
@@ -59,6 +67,9 @@ impl Membership {
             }
         } else {
             self.members.retain(|pane| !panes.contains(pane));
+        }
+        if before == 0 && !self.members.is_empty() {
+            self.epoch = self.epoch.wrapping_add(1);
         }
         self.members.len() != before
     }
@@ -98,6 +109,18 @@ mod tests {
     const SECOND: SessionId = SessionId(2);
     const THIRD: SessionId = SessionId(3);
     const REPLACEMENT: SessionId = SessionId(4);
+
+    #[test]
+    fn a_new_multi_exec_group_has_a_fresh_notification_identity() {
+        let mut membership = Membership::default();
+        membership.toggle_pane(FIRST, true);
+        let first = membership.epoch();
+        membership.toggle_pane(SECOND, true);
+        assert_eq!(membership.epoch(), first);
+        membership.stop();
+        membership.toggle_pane(FIRST, true);
+        assert_ne!(membership.epoch(), first);
+    }
 
     #[test]
     fn group_join_deduplicates_and_leaving_then_rejoining_moves_to_end() {

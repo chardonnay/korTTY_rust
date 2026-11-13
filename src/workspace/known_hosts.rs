@@ -1,5 +1,6 @@
 //! Native management of the same endpoint pins used by interactive and scheduled SSH.
 
+use std::collections::BTreeSet;
 use std::env;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ use crate::workspace::dialog_placement::Kind as DialogKind;
 use super::{Message as Desktop, Workspace, tool_tabs};
 
 mod view;
+pub(super) use view::{review_conflict_label, review_key_label};
 
 pub(super) const TITLE: &str = "Known Hosts";
 const PAGE_SIZE: usize = 96;
@@ -239,6 +241,9 @@ impl Workspace {
         if self.exiting || self.scheduler_draining || !self.windows.contains_key(&owner) {
             return Task::none();
         }
+        if let Some((_, focus)) = self.owner_dialog(owner) {
+            return self.update(focus);
+        }
         let hosted = self.window_settings.open_tool_windows_as_tabs;
         let (id, open, placement) = if hosted {
             if let Some(id) = self.hosted_tool_in(owner, tool_tabs::Kind::KnownHosts) {
@@ -246,14 +251,8 @@ impl Workspace {
             }
             (window::Id::unique(), Task::none(), Placement::Hosted)
         } else {
-            if let Some(tool) = self
-                .known_hosts
-                .values()
-                .find(|tool| matches!(tool.placement, Placement::Standalone { .. }))
-            {
-                return window::gain_focus(tool.id);
-            }
-            let (id, open) = self.open_placed_dialog(
+            let (id, open) = self.open_owned_placed_dialog(
+                owner,
                 DialogKind::KnownHosts,
                 window::Settings {
                     size: Size::new(1060.0, 480.0),
@@ -262,16 +261,13 @@ impl Workspace {
                     exit_on_close_request: false,
                     ..window::Settings::default()
                 },
+                None,
             );
             self.windows
                 .get_mut(&owner)
                 .expect("known owner window")
                 .cancel_paste();
-            (
-                id,
-                open.map(|_| Desktop::Noop),
-                Placement::Standalone { owner },
-            )
+            (id, open, Placement::Standalone { owner })
         };
         let mut tool = KnownHosts::new(id, placement);
         let load = tool.load();
@@ -310,10 +306,7 @@ impl Workspace {
             return Some(Task::none());
         }
         self.known_hosts.remove(&id);
-        Some(Task::batch([
-            self.close_placed_dialog(id),
-            window::gain_focus(owner),
-        ]))
+        Some(self.close_placed_dialog_and_focus(id, owner))
     }
 
     pub(super) fn dismiss_known_hosts(&mut self, id: window::Id) -> Option<Task<Desktop>> {
@@ -326,12 +319,10 @@ impl Workspace {
         }
     }
 
-    pub(super) fn close_known_hosts_owner(&mut self, owner: window::Id) -> Task<Desktop> {
-        let Some(id) = self.known_hosts_for_owner(owner) else {
-            return Task::none();
-        };
-        self.known_hosts.remove(&id);
-        self.close_placed_dialog(id)
+    pub(super) fn remove_known_hosts_for_owner(&mut self, owner: window::Id) {
+        if let Some(id) = self.known_hosts_for_owner(owner) {
+            self.known_hosts.remove(&id);
+        }
     }
 
     pub(super) fn hosted_known_hosts_busy(&self, id: window::Id) -> bool {
@@ -507,7 +498,7 @@ impl Workspace {
                     tool.status = None;
                     return Task::future(async move {
                         let result = read_source(&path)
-                            .and_then(|source| trust_store()?.preview_import(source))
+                            .and_then(preview_import)
                             .map(Arc::new)
                             .map_err(|error| error.to_string());
                         wrap(id, Message::Reviewed(result))
@@ -533,8 +524,7 @@ impl Workspace {
                     let review = review.clone();
                     tool.work = Some(Work::Write);
                     return Task::future(async move {
-                        let result = ensure_import_allowed()
-                            .and_then(|()| trust_store()?.import_reviewed(&review))
+                        let result = import_reviewed(&review)
                             .map(|report| Mutation::Imported(Arc::new(report)))
                             .map_err(|error| error.to_string());
                         wrap(id, Message::Mutated(result))
@@ -597,6 +587,24 @@ pub(super) fn ensure_pin_mutation_allowed() -> io::Result<()> {
     Ok(())
 }
 
+pub(super) fn preview_import(source: KnownHostsFile) -> io::Result<ImportReview> {
+    ensure_import_allowed()?;
+    trust_store()?.preview_import(source)
+}
+
+fn import_reviewed(review: &ImportReview) -> io::Result<ImportReport> {
+    ensure_import_allowed()?;
+    trust_store()?.import_reviewed(review)
+}
+
+pub(super) fn import_reviewed_selected(
+    review: &ImportReview,
+    selected: &BTreeSet<usize>,
+) -> io::Result<ImportReport> {
+    ensure_import_allowed()?;
+    trust_store()?.import_reviewed_selected(review, selected)
+}
+
 fn ensure_import_allowed() -> io::Result<()> {
     if ClipboardPolicy::load().problem.is_some() {
         return Err(io::Error::new(
@@ -648,6 +656,71 @@ mod tests {
             key: HostKey::from_openssh(FIXTURE).unwrap(),
             trusted_since: None,
         }
+    }
+
+    #[test]
+    fn standalone_known_hosts_keeps_each_native_owner() {
+        use iced::futures::{StreamExt, executor::block_on, future::ready};
+        use iced_runtime::{Action as RuntimeAction, task, window::Action as WindowAction};
+
+        let mut workspace = Workspace::default();
+        let (first, _) = workspace.open_window(false);
+        let (second, _) = workspace.open_window(false);
+        let _ = workspace.update_known_hosts(first, Message::Open);
+        let _ = workspace.update_known_hosts(second, Message::Open);
+        let first_dialog = workspace.known_hosts_for_owner(first).unwrap();
+        let second_dialog = workspace.known_hosts_for_owner(second).unwrap();
+        assert_ne!(first_dialog, second_dialog);
+        assert_eq!(workspace.placed_dialog_owner(first_dialog), Some(first));
+        assert_eq!(workspace.placed_dialog_owner(second_dialog), Some(second));
+
+        let reopen = workspace.update_known_hosts(first, Message::Open);
+        assert!(matches!(
+            block_on(task::into_stream(reopen).unwrap().next()),
+            Some(RuntimeAction::Window(WindowAction::GainFocus(id))) if id == first_dialog
+        ));
+        assert_eq!(workspace.known_hosts.len(), 2);
+
+        let blocked_close = workspace.update(Desktop::Window(first, window::Event::CloseRequested));
+        assert!(matches!(
+            block_on(task::into_stream(blocked_close).unwrap().next()),
+            Some(RuntimeAction::Window(WindowAction::GainFocus(id))) if id == first_dialog
+        ));
+        assert!(workspace.windows.contains_key(&first));
+
+        let owner_close = task::into_stream(workspace.close_window(first)).unwrap();
+        let closed: Vec<_> = block_on(
+            owner_close
+                .filter_map(|action| {
+                    ready(match action {
+                        RuntimeAction::Window(WindowAction::Close(id)) => Some(id),
+                        _ => None,
+                    })
+                })
+                .collect(),
+        );
+        assert_eq!(closed, [first_dialog, first]);
+        assert!(!workspace.known_hosts.contains_key(&first_dialog));
+        assert_eq!(workspace.placed_dialog_owner(first_dialog), None);
+        assert_eq!(workspace.known_hosts_for_owner(second), Some(second_dialog));
+        assert_eq!(workspace.placed_dialog_owner(second_dialog), Some(second));
+
+        let _ = workspace.finish_owned_dialog_open(second_dialog, second, None);
+        let dismiss = workspace.update_known_hosts(second_dialog, Message::Close);
+        let mut actions = task::into_stream(dismiss).unwrap();
+        #[cfg(any(target_os = "windows", target_os = "macos"))]
+        assert!(matches!(
+            block_on(actions.next()),
+            Some(RuntimeAction::Window(WindowAction::Run(id, _))) if id == second_dialog
+        ));
+        assert!(matches!(
+            block_on(actions.next()),
+            Some(RuntimeAction::Window(WindowAction::Close(id))) if id == second_dialog
+        ));
+        assert!(matches!(
+            block_on(actions.next()),
+            Some(RuntimeAction::Window(WindowAction::GainFocus(id))) if id == second
+        ));
     }
 
     #[test]

@@ -5,7 +5,7 @@ use iced::widget::{
     button, checkbox, column, container, pick_list, row, scrollable, text, text_input,
 };
 use iced::{Alignment, Element, Length, Task};
-use kortty_terminal::TerminalProfile;
+use kortty_terminal::{TerminalProfile, TextEncoding};
 
 use crate::session::{
     SerialConnection, SerialFlowControl, SerialLineEnding, SerialParity, SerialSettings,
@@ -38,6 +38,13 @@ const ENDINGS: [Choice<SerialLineEnding>; 3] = [
     Choice(SerialLineEnding::Lf, "LF"),
     Choice(SerialLineEnding::CrLf, "CR LF"),
 ];
+const ENCODINGS: [Choice<Option<TextEncoding>>; 5] = [
+    Choice(None, "Use default"),
+    Choice(Some(TextEncoding::Utf8), "UTF-8"),
+    Choice(Some(TextEncoding::Latin1), "ISO-8859-1"),
+    Choice(Some(TextEncoding::Latin9), "ISO-8859-15"),
+    Choice(Some(TextEncoding::Windows1252), "Windows-1252"),
+];
 
 #[derive(Clone, Copy, PartialEq)]
 struct Choice<T>(T, &'static str);
@@ -64,6 +71,7 @@ pub enum Message {
     Dtr(bool),
     Rts(bool),
     LocalEcho(bool),
+    Encoding(Option<TextEncoding>),
     Profile(TerminalProfile),
     Refresh,
     Ports(u64, Result<Vec<String>, String>),
@@ -137,6 +145,9 @@ impl SerialDialog {
                 self.connection.settings.assert_rts = assert;
             }
             Message::LocalEcho(echo) => self.connection.local_echo = echo,
+            Message::Encoding(encoding) if self.profile != TerminalProfile::Petscii => {
+                self.connection.encoding = encoding;
+            }
             Message::Profile(profile) => self.profile = profile,
             Message::Refresh => return self.refresh(),
             Message::Ports(id, result) if id == self.id => {
@@ -152,14 +163,32 @@ impl SerialDialog {
     }
 
     pub fn validated(&self) -> Result<(SerialConnection, TerminalProfile), String> {
+        let (connection, profile) = self.settings()?;
+        connection.validate().map_err(|error| error.to_string())?;
+        Ok((connection, profile))
+    }
+
+    pub(crate) fn settings(&self) -> Result<(SerialConnection, TerminalProfile), String> {
         let mut connection = self.connection.clone();
         connection.device = PathBuf::from(self.device.trim());
         connection.settings.baud_rate = self
             .baud
             .parse()
             .map_err(|_| String::from("Enter a baud rate from 1 to 20,000,000."))?;
-        connection.validate().map_err(|error| error.to_string())?;
+        kortty_serial::SerialPort::validate_settings(&connection.device, connection.settings)
+            .map_err(|error| error.to_string())?;
         Ok((connection, self.profile))
+    }
+
+    pub(crate) fn load(&mut self, connection: SerialConnection, profile: TerminalProfile) {
+        self.device = connection.device.to_string_lossy().into_owned();
+        self.baud = connection.settings.baud_rate.to_string();
+        self.connection = connection;
+        self.profile = profile;
+    }
+
+    pub(crate) fn profile(&self) -> TerminalProfile {
+        self.profile
     }
 
     fn dtr_available(&self) -> bool {
@@ -171,12 +200,28 @@ impl SerialDialog {
     }
 
     pub fn fields(&self) -> Element<'_, Message> {
-        self.connection_fields(true)
+        self.connection_fields(true, false)
     }
 
-    fn connection_fields(&self, submit: bool) -> Element<'_, Message> {
+    pub(crate) fn editor_fields(&self) -> Element<'_, Message> {
+        column![
+            self.connection_fields(false, true),
+            labeled(
+                "Emulation",
+                pick_list(TerminalProfile::ALL, Some(self.profile), Message::Profile)
+            ),
+        ]
+        .spacing(8)
+        .into()
+    }
+
+    fn connection_fields(&self, submit: bool, compact: bool) -> Element<'_, Message> {
         let settings: SerialSettings = self.connection.settings;
-        let validation = self.validated();
+        let validation = if compact {
+            self.settings()
+        } else {
+            self.validated()
+        };
         let connect = (submit && validation.is_ok()).then_some(Message::Connect);
         let selected = self.ports.iter().find(|port| *port == &self.device);
         let port_list = pick_list(self.ports.as_slice(), selected, Message::Device)
@@ -185,28 +230,31 @@ impl SerialDialog {
             } else {
                 "Detected ports"
             })
-            .width(175);
-        let port = row![
-            text_input(
-                if cfg!(windows) {
-                    "COM port"
-                } else {
-                    "/dev/… device"
-                },
-                &self.device
-            )
-            .on_input(Message::Device)
-            .on_submit_maybe(connect.clone())
-            .width(Length::Fill),
-            port_list,
-            button(if self.scanning {
-                "Scanning…"
+            .width(if compact { 135 } else { 175 });
+        let device = text_input(
+            if cfg!(windows) {
+                "COM port"
             } else {
-                "Refresh"
-            })
-            .on_press_maybe((!self.scanning).then_some(Message::Refresh)),
-        ]
-        .spacing(6);
+                "/dev/… device"
+            },
+            &self.device,
+        )
+        .on_input(Message::Device)
+        .on_submit_maybe(connect.clone())
+        .width(Length::Fill);
+        let refresh = button(if self.scanning {
+            "Scanning…"
+        } else {
+            "Refresh"
+        })
+        .on_press_maybe((!self.scanning).then_some(Message::Refresh));
+        let port: Element<'_, Message> = if compact {
+            column![device, row![port_list, refresh].spacing(6)]
+                .spacing(6)
+                .into()
+        } else {
+            row![device, port_list, refresh].spacing(6).into()
+        };
         let rate = row![
             text_input("Baud rate", &self.baud)
                 .on_input(Message::Baud)
@@ -221,7 +269,8 @@ impl SerialDialog {
             )
             .placeholder("Common rates")
         ]
-        .spacing(6);
+        .spacing(6)
+        .wrap();
         let frame = row![
             pick_list([8, 7, 6, 5], Some(settings.data_bits), Message::DataBits),
             pick_list(PARITIES, current(&PARITIES, settings.parity), |choice| {
@@ -231,12 +280,23 @@ impl SerialDialog {
                 Message::StopBits(choice.0)
             }),
         ]
-        .spacing(6);
+        .spacing(6)
+        .wrap();
         let status = self.scan_error.as_ref().cloned().or_else(|| {
             (!self.device.trim().is_empty())
                 .then(|| validation.err())
                 .flatten()
         });
+        let encoding: Element<'_, Message> = if self.profile == TerminalProfile::Petscii {
+            text("PETSCII (native)").into()
+        } else {
+            pick_list(
+                ENCODINGS,
+                current(&ENCODINGS, self.connection.encoding),
+                |choice| Message::Encoding(choice.0),
+            )
+            .into()
+        };
         column![
             labeled("Device", port),
             labeled("Speed (baud)", rate),
@@ -255,6 +315,7 @@ impl SerialDialog {
                     |choice| Message::LineEnding(choice.0)
                 )
             ),
+            labeled("Character encoding", encoding),
             row![
                 checkbox(settings.assert_dtr)
                     .label("Raise DTR on connect")
@@ -266,7 +327,8 @@ impl SerialDialog {
                     .label("Local echo")
                     .on_toggle(Message::LocalEcho),
             ]
-            .spacing(12),
+            .spacing(12)
+            .wrap(),
             text(status.unwrap_or_default()).size(13),
         ]
         .spacing(8)
@@ -296,7 +358,7 @@ impl SerialDialog {
         };
         let mut content = column![
             text(title).size(22),
-            self.connection_fields(reconnect.is_none()),
+            self.connection_fields(reconnect.is_none(), false),
             labeled(
                 "Emulation",
                 pick_list(TerminalProfile::ALL, Some(self.profile), Message::Profile)

@@ -85,6 +85,76 @@ fn snippet_archive_preserves_java_metadata_and_trailing_lines_in_all_formats() {
 }
 
 #[test]
+fn native_snippet_archives_keep_metadata_in_all_structured_formats() {
+    let profile = Profile::new();
+    let mut library = Library::open(profile.path()).unwrap();
+    let text = "echo top\r\necho selected\r\necho last\r\n";
+    let snippet = library
+        .save_with_metadata(
+            None,
+            Input {
+                name: "With diagram".into(),
+                language: "bash".into(),
+                category: String::new(),
+                content: text.into(),
+            },
+            Some(crate::snippets::Metadata {
+                operating_system: Some("FreeBSD".into()),
+                ..crate::snippets::Metadata::default()
+            }),
+        )
+        .unwrap();
+    let source =
+        diagrams::Source::capture(text, diagrams::Scope::Lines { start: 2, end: 2 }).unwrap();
+    let chart = crate::diagram_window::Chart::stored(
+        kortty_diagram::parse_mermaid("flowchart TD\na[Check] --> b[Done]").unwrap(),
+        Default::default(),
+        false,
+        None,
+    );
+    let diagram = diagrams::Saved::capture(
+        &chart,
+        &source,
+        "α & <diagram>",
+        "First line\nsecond line",
+        None,
+    )
+    .unwrap();
+    library
+        .save_diagram(snippet, &source, diagram.clone(), None)
+        .unwrap();
+    for (name, _) in FIXTURES {
+        let target = profile.0.join(name);
+        Action::Export(target.clone(), vec![library.get(snippet).unwrap().clone()])
+            .run()
+            .unwrap();
+        let mut imported_library =
+            Library::open(profile.0.join(format!("{name}-store.json"))).unwrap();
+        let imported_snippet = imported_library
+            .import_snippets(imported(vec![target]))
+            .unwrap()
+            .unwrap();
+        let entry = imported_library.get(imported_snippet).unwrap();
+        assert_eq!(entry.content(), text);
+        assert_eq!(
+            entry.metadata().operating_system.as_deref(),
+            Some("FreeBSD")
+        );
+        assert_eq!(
+            entry.metadata().diagrams.as_slice(),
+            std::slice::from_ref(&diagram)
+        );
+        assert_eq!(
+            entry.metadata().diagrams[0]
+                .restore(entry.content())
+                .unwrap()
+                .1,
+            Some("echo selected")
+        );
+    }
+}
+
+#[test]
 fn snippet_archive_imports_plain_files_like_java_and_skips_binary() {
     let profile = Profile::new();
     let first = profile.0.join("data_test.pl");
@@ -168,6 +238,145 @@ fn snippet_archive_rejects_conflicts_external_entities_and_stale_commits() {
 }
 
 #[test]
+fn java_private_snippet_library_import_preserves_owners_digests_and_stale_ranges() {
+    use kortty_diagram::SourceRange;
+
+    let profile = Profile::new();
+    let fixture = profile.0.join("snippets.xml");
+    let xml = include_str!("fixtures/java-private-library-2.26.0.xml");
+    fs::write(&fixture, xml).unwrap();
+    let imports = imported(vec![fixture.clone()]);
+    assert_eq!(imports.java_folder_count(), 3);
+    assert_eq!(imports.skipped_diagrams, 1);
+    assert_eq!(imports.skipped_references, 2);
+    let mut library = Library::open(profile.path()).unwrap();
+    let owner = library.import_snippets(imports).unwrap().unwrap();
+    assert_eq!(String::from(owner), "00000000000000000000000000000001");
+    let library = Library::open(profile.path()).unwrap();
+    let entry = library.get(owner).unwrap();
+    assert_eq!(entry.name(), "Deploy α");
+    assert_eq!(
+        entry.content(),
+        "# header\r\nprintf '%s' '東京 & <db>'\r\n# footer\r\n"
+    );
+    assert_eq!(entry.metadata().folder_path, "Automation/Production");
+    assert_eq!(
+        entry.metadata().operating_system.as_deref(),
+        Some("FreeBSD")
+    );
+    assert_eq!(entry.metadata().file_name.as_deref(), Some("deploy.sh"));
+    assert_eq!(entry.metadata().executable, Some(false));
+    let folder = |suffix| {
+        folders::Id::from_java_uuid(&format!("00000000-0000-0000-0000-000000000{suffix}")).unwrap()
+    };
+    assert_eq!(library.folder_id(entry), Some(folder("102")));
+    assert_eq!(
+        library.folder(folder("103")).unwrap().path,
+        "Automation/Empty"
+    );
+
+    let [saved] = entry.metadata().diagrams.as_slice() else {
+        panic!("one owned Mermaid record");
+    };
+    assert_eq!(saved.title, "Selected command");
+    assert_eq!(saved.instructions, "Keep the command visible.");
+    assert_eq!(
+        (saved.created_at, saved.updated_at),
+        (1700000000000, 1700000001000)
+    );
+    assert_eq!(saved.scope, diagrams::Scope::Lines { start: 2, end: 2 });
+    assert!(saved.is_current(entry.content()));
+    assert!(
+        !saved.is_current(
+            &entry
+                .content()
+                .replace("# footer", "# changed outside scope")
+        )
+    );
+    let serialized = serde_json::to_value(saved).unwrap();
+    assert_eq!(serialized["id"], "00000000000000000000000000000010");
+    assert_eq!(
+        serialized["full_sha256"],
+        "26598b7b78c6c8c7797b61105e93e26d2dade881be5d15dd213beb4b4280c933"
+    );
+    assert!(serialized.get("scoped_sha256").is_none());
+    let (chart, source) = saved.restore(entry.content()).unwrap();
+    assert_eq!(source, Some("printf '%s' '東京 & <db>'"));
+    let node = chart
+        .diagram()
+        .nodes()
+        .iter()
+        .find(|node| node.id() == "a")
+        .unwrap();
+    let relative = chart.source_range(node).unwrap();
+    assert_eq!(relative, SourceRange::new(1, 1).unwrap());
+    assert_eq!(saved.absolute_reference(relative), SourceRange::new(2, 2));
+
+    let stale = library
+        .entries()
+        .iter()
+        .find(|entry| entry.name() == "Shortened")
+        .unwrap();
+    let [historical, undated] = stale.metadata().diagrams.as_slice() else {
+        panic!("two owned stale diagrams");
+    };
+    assert_eq!(historical.scope, saved.scope);
+    assert_eq!(undated.scope, diagrams::Scope::Whole);
+    for diagram in [historical, undated] {
+        let (chart, source) = diagram.restore(stale.content()).unwrap();
+        assert!(source.is_none());
+        assert!(
+            chart
+                .diagram()
+                .nodes()
+                .iter()
+                .all(|node| chart.source_range(node).is_none())
+        );
+    }
+    assert_eq!(historical.restore(entry.content()).unwrap().1, source);
+
+    let baseline = fs::read(profile.path()).unwrap();
+    let mut library = library;
+    assert!(library.import_snippets(imported(vec![fixture])).is_err());
+    assert_eq!(fs::read(profile.path()).unwrap(), baseline);
+}
+
+#[test]
+fn java_private_snippet_library_imports_empty_folders_and_rejects_invalid_xml() {
+    let profile = Profile::new();
+    let fixture = profile.0.join("snippets.xml");
+    let folder = |parent: &str| {
+        format!(
+            r#"<snippets><folders><folder>
+        <id>00000000-0000-0000-0000-000000000101</id><name>Empty</name>{parent}
+        </folder></folders></snippets>"#
+        )
+    };
+    fs::write(&fixture, folder("")).unwrap();
+    let mut library = Library::open(profile.path()).unwrap();
+    assert!(
+        library
+            .import_snippets(imported(vec![fixture.clone()]))
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        Library::open(profile.path()).unwrap().folders()[0].path,
+        "Empty"
+    );
+    let baseline = fs::read(profile.path()).unwrap();
+    for xml in [
+        folder("<parentId>00000000-0000-0000-0000-000000000101</parentId>"),
+        folder("<parentId>00000000-0000-0000-0000-000000000102</parentId>"),
+        r#"<!DOCTYPE snippets SYSTEM "file:///etc/passwd"><snippets/>"#.into(),
+    ] {
+        fs::write(&fixture, xml).unwrap();
+        assert!(Action::Import(vec![fixture.clone()]).run().is_err());
+        assert_eq!(fs::read(profile.path()).unwrap(), baseline);
+    }
+}
+
+#[test]
 fn snippet_archive_accepts_reference_sized_text_with_latin1_expansion() {
     let profile = Profile::new();
     let source = profile.0.join("notes.txt");
@@ -208,7 +417,7 @@ fn snippet_archive_yaml_preserves_literal_backslashes_and_significant_whitespace
         .unwrap();
     let output = Format::Yaml.write(library.entries()).unwrap();
     assert!(output.contains("    content: |\n"));
-    let decoded = Format::Yaml.read(&output).unwrap();
+    let decoded = yaml::read(&output).unwrap();
     assert_eq!(
         decoded[0].content.as_deref(),
         Some(library.get(id).unwrap().content())
@@ -373,8 +582,10 @@ fn folder_export_keeps_the_selected_branch_and_empty_descendants() {
     assert_eq!(selection.snippets().len(), 2);
     let target = profile.0.join("folder-output");
     assert!(matches!(
-        Action::ExportFolder(target.clone(), selection.clone(), FolderTarget::Directory).run(),
-        Ok(Outcome::Exported(2))
+        Action::ExportFolder(target.clone(), selection.clone(), FolderTarget::Directory)
+            .run()
+            .unwrap(),
+        Outcome::Exported(2)
     ));
     assert_eq!(
         fs::read_to_string(target.join("Café/run.sh")).unwrap(),

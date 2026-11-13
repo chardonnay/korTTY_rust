@@ -18,6 +18,26 @@ const MAX_DIRECTORY_ENTRIES: usize = 4096;
 const SUFFIX: &str = ".json";
 pub(crate) const RECENT_LIMIT: usize = 10;
 
+pub(crate) fn open_local_file(path: &Path) -> io::Result<File> {
+    if !super::LocalFileTool::valid_path(path) {
+        return Err(invalid("Choose an absolute local file path"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid("Missing file folder"))?;
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| invalid("Invalid file name"))?;
+    let directory = crate::private_files::Directory::open(parent, false)?;
+    let file = directory.open_file(name)?;
+    #[cfg(windows)]
+    if !kortty_files::is_local_reference_file(&file)? {
+        return Err(invalid("Choose a file on a local Windows volume"));
+    }
+    Ok(file)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Name(String);
 
@@ -245,6 +265,29 @@ pub(crate) fn validate_backup(bytes: &[u8]) -> io::Result<()> {
     decode(bytes).map(|_| ())
 }
 
+pub(crate) fn portable_java_backup(
+    fallback_name: &str,
+    bytes: &[u8],
+    connections: Option<&[u8]>,
+) -> io::Result<(String, Vec<u8>, Vec<String>)> {
+    let java::Imported {
+        layout,
+        name,
+        notes,
+        ..
+    } = java::read_backup(bytes, connections)?;
+    let name = Name::parse(&name).or_else(|_| Name::parse(fallback_name))?;
+    let notes = notes
+        .into_iter()
+        .map(|(note, count)| format!("{} ({count})", note.description()))
+        .collect();
+    Ok((
+        format!("projects/{}", name.file_name()),
+        encode(&layout)?,
+        notes,
+    ))
+}
+
 fn decode(bytes: &[u8]) -> io::Result<WorkspaceLayout> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err(invalid("project exceeds the layout size limit"));
@@ -294,6 +337,7 @@ mod tests {
             tab_groups: Default::default(),
             tab_primary_panes: Default::default(),
             tab_terminal_effects: Default::default(),
+            tab_terminal_appearance: Default::default(),
             width,
             height: 510.0,
             position: None,

@@ -23,6 +23,18 @@ impl fmt::Display for WarningMode {
 }
 
 impl Workspace {
+    pub(super) fn paste_line_delay_for(&self, session: SessionId) -> u16 {
+        self.sessions
+            .get(&session)
+            .and_then(|pane| {
+                self.terminal_overrides(pane)
+                    .and_then(|settings| settings.paste_line_delay_ms)
+                    .or_else(|| pane.teamwork_terminal_input?.paste_line_delay_ms)
+                    .or_else(|| pane.saved_serial.as_ref()?.paste_line_delay_ms)
+            })
+            .unwrap_or(self.window_settings.paste_line_delay_ms)
+    }
+
     pub(super) fn paste_warning_for(&self, session: SessionId) -> WarningMode {
         self.sessions
             .get(&session)
@@ -191,12 +203,18 @@ mod tests {
             command_timestamps: None,
             tab_color: None,
             paste_warning: Some(WarningMode::Off),
+            window_geometry: None,
+            terminal: crate::connection_store::TerminalOverrides {
+                paste_line_delay_ms: Some(0),
+                ..Default::default()
+            },
         };
         connection.id = store.save(connection.clone()).unwrap();
         let mut target = serde_json::to_value(login).unwrap();
         target["saved"] = connection.id.into();
 
         let mut workspace = Workspace::default();
+        workspace.window_settings.paste_line_delay_ms = 125;
         workspace.window_settings.paste_warning = WarningMode::Always;
         let (owner, _) = workspace.open_window(false);
         let grid = GridSize::default();
@@ -207,6 +225,7 @@ mod tests {
         workspace.add_tab(owner, id);
         workspace.update_connection_store(store.clone());
         assert_eq!(workspace.paste_warning_for(id), WarningMode::Off);
+        assert_eq!(workspace.paste_line_delay_for(id), 0);
         let tab = workspace.windows[&owner].tab().unwrap().id;
         let paste = |workspace: &mut Workspace, value: String| {
             let _ = workspace.update(Message::Paste(owner));
@@ -234,8 +253,10 @@ mod tests {
         let request = paste(&mut workspace, format!("{}\nsecond", "a".repeat(1024)));
         assert!(workspace.windows[&owner].pending_paste.is_some());
         connection.paste_warning = Some(WarningMode::Always);
+        connection.terminal.paste_line_delay_ms = Some(250);
         store.save(connection.clone()).unwrap();
         workspace.update_connection_store(store.clone());
+        assert_eq!(workspace.paste_line_delay_for(id), 250);
         let _ = workspace.update(Message::ConfirmPaste(owner, request, true));
         assert!(workspace.windows[&owner].pending_paste.is_none());
         assert_eq!(
@@ -247,6 +268,7 @@ mod tests {
         connection.login.endpoint.port = 2222;
         store.save(connection).unwrap();
         workspace.update_connection_store(store);
+        assert_eq!(workspace.paste_line_delay_for(id), 125);
         assert_eq!(
             workspace.paste_warning_for(id),
             WarningMode::UnlessBracketed

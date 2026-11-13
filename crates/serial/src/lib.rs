@@ -97,6 +97,13 @@ impl SerialPort {
     /// Checks native path syntax and line settings without touching the device.
     pub fn validate(path: impl AsRef<Path>, settings: Settings) -> io::Result<()> {
         let path = path.as_ref();
+        Self::validate_settings(path, settings)?;
+        platform::validate(path, settings)
+    }
+
+    /// Checks saved line settings without applying host-specific device constraints.
+    pub fn validate_settings(path: impl AsRef<Path>, settings: Settings) -> io::Result<()> {
+        let path = path.as_ref();
         let bytes = path.as_os_str().as_encoded_bytes();
         if bytes.is_empty() || bytes.len() > 4096 || bytes.contains(&0) {
             return Err(io::Error::new(
@@ -104,8 +111,7 @@ impl SerialPort {
                 "invalid serial device name",
             ));
         }
-        settings.validate()?;
-        platform::validate(path, settings)
+        settings.validate()
     }
 
     /// Opens and configures a port. The driver may toggle modem signals during

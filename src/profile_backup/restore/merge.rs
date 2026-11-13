@@ -8,18 +8,20 @@ use kortty_jobs::SchedulerStore;
 use serde::{Deserialize, de::DeserializeOwned};
 use zeroize::Zeroizing;
 
+use super::data::WINDOW_SETTINGS;
 use super::{
     Directory, JOBS, PINS, RECORDINGS, Snapshot, missing, path_error, read_bounded, with_target,
 };
 use crate::connection_store::{self, Auth, Connection};
 use crate::scheduler_window::{ConnectionRef, RemoteAction, SshCommand};
-use crate::snippets::SnippetId;
+use crate::snippets::{self, FILE_NAME as SNIPPETS, SnippetId};
 use crate::ssh_key_catalog::KeyRecord;
+use crate::terminal_view::background_image::AssetId;
+use crate::workspace::backup_data;
 
 const VAULT: &str = "vault/vault.bin";
 const KEY_CATALOG: &str = "ssh-keys.json";
 const KEY_DIR: &str = "ssh-keys/";
-const SNIPPETS: &str = "snippets.json";
 const CONNECTIONS: &str = "connections.json";
 
 const LINKED: &[&str] = &[VAULT, KEY_CATALOG, SNIPPETS, CONNECTIONS, JOBS];
@@ -29,17 +31,45 @@ pub(super) fn apply(
     directory: &Directory,
     snapshot: &Snapshot,
     protect_pins: &impl Fn() -> bool,
+    allow_headers: &impl Fn() -> bool,
 ) -> io::Result<()> {
     let independent = snapshot
         .iter()
         .filter(|(path, _)| !LINKED.contains(&path.as_str()) && !path.starts_with(KEY_DIR));
     let mut new_files = Vec::new();
     let mut nested = BTreeMap::new();
+    let backgrounds = if snapshot
+        .keys()
+        .any(|path| AssetId::from_relative_path(path).is_some())
+    {
+        super::data::installed_background_ids(directory)?
+    } else {
+        None
+    };
     for (path, bytes) in independent {
         if path == PINS && protect_pins() {
             continue;
         }
-        if let Some((parent, _)) = path.split_once('/') {
+        if let Some(id) = AssetId::from_relative_path(path) {
+            if backgrounds.as_ref().is_some_and(|ids| !ids.contains(&id)) {
+                continue;
+            }
+            match existing(directory, path, Some(bytes))? {
+                Existing::Missing => new_files.push((path, bytes)),
+                Existing::Same => {}
+                Existing::Different => {
+                    return Err(path_error(
+                        path,
+                        io::Error::other("a different file occupies the terminal background path"),
+                    ));
+                }
+            }
+            if let Some((parent, _)) = path.rsplit_once('/') {
+                nested.entry(parent).or_insert(path.as_str());
+            }
+            continue;
+        }
+        if let Some((parent, _)) = path.rsplit_once('/') {
             nested.entry(parent).or_insert(path.as_str());
         }
         if !with_target(directory, path, false, Directory::has_entry)
@@ -50,16 +80,38 @@ pub(super) fn apply(
         }
     }
 
+    // Old profiles can have a run journal without a settings file. Preserve
+    // its implicit disabled retention. An exact portable copy may already have
+    // been installed by a partial replay, and contains no local history.
+    let keep_local_retention = new_files.iter().any(|(path, _)| *path == WINDOW_SETTINGS)
+        && existing(
+            directory,
+            JOBS,
+            snapshot.get(JOBS).map(|bytes| bytes.as_slice()),
+        )? == Existing::Different;
     if LINKED.iter().any(|path| snapshot.contains_key(*path)) {
         LinkedMerge {
             directory,
             snapshot,
+            allow_headers,
         }
         .apply()?;
     }
 
+    let mut ai = super::data::ai::Restore::default();
     for (path, bytes) in new_files {
         if path != PINS || !protect_pins() {
+            if !ai.may_install(directory, snapshot, path)? {
+                continue;
+            }
+            let local_settings = if keep_local_retention && path == WINDOW_SETTINGS {
+                backup_data::keep_legacy_job_journal_retention(bytes)?
+            } else {
+                ai.rebind(directory, snapshot, path)?
+            };
+            let bytes = local_settings
+                .as_deref()
+                .map_or(bytes.as_slice(), Vec::as_slice);
             publish(directory, path, bytes)?;
         }
     }
@@ -89,7 +141,10 @@ fn existing(directory: &Directory, path: &str, source: Option<&[u8]>) -> io::Res
                 }
             });
         };
-        let opened = if path == KEY_CATALOG || path.starts_with(KEY_DIR) {
+        let opened = if path == KEY_CATALOG
+            || path.starts_with(KEY_DIR)
+            || AssetId::from_relative_path(path).is_some()
+        {
             parent.open_private_file(name)
         } else {
             parent.open_file(name)
@@ -146,7 +201,7 @@ fn same_bytes(mut file: std::fs::File, bytes: &[u8]) -> io::Result<bool> {
     Ok(file.read(&mut buffer[..1])? == 0)
 }
 
-fn publish(directory: &Directory, path: &str, bytes: &[u8]) -> io::Result<bool> {
+pub(super) fn publish(directory: &Directory, path: &str, bytes: &[u8]) -> io::Result<bool> {
     let installed = with_target(directory, path, true, |parent, name| {
         match parent.publish_copy(name, bytes) {
             Ok(()) => parent.sync().map(|()| true),
@@ -158,7 +213,7 @@ fn publish(directory: &Directory, path: &str, bytes: &[u8]) -> io::Result<bool> 
     Ok(installed.unwrap_or(false))
 }
 
-fn sync_parent(directory: &Directory, path: &str) -> io::Result<()> {
+pub(super) fn sync_parent(directory: &Directory, path: &str) -> io::Result<()> {
     with_target(directory, path, false, |parent, _| parent.sync())
         .map_err(|error| path_error(path, error))?;
     Ok(())
@@ -167,6 +222,7 @@ fn sync_parent(directory: &Directory, path: &str) -> io::Result<()> {
 struct LinkedMerge<'a> {
     directory: &'a Directory,
     snapshot: &'a Snapshot,
+    allow_headers: &'a dyn Fn() -> bool,
 }
 
 impl LinkedMerge<'_> {
@@ -301,6 +357,9 @@ impl LinkedMerge<'_> {
             Existing::Same => Ok(true),
             Existing::Different => Ok(false),
             Existing::Missing if can_add => {
+                if path == SNIPPETS && !(self.allow_headers)() {
+                    snippets::check_restore_headers(None, bytes)?;
+                }
                 Ok(publish(self.directory, path, bytes)? || self.state(path)? == Existing::Same)
             }
             Existing::Missing => Ok(false),

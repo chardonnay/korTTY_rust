@@ -8,14 +8,17 @@ use kortty_ssh::TrustStore;
 use crate::scheduler_window::SshCommand;
 use crate::ssh_dialog::unsafe_text;
 
-use super::{BatchAuth, BorrowedArchivePassword, Completion, Failure, check_cancelled, remote};
+use super::{
+    BatchAuth, BorrowedArchivePassword, Completion, ExecutionPolicy, Failure, check_cancelled,
+    remote,
+};
 
 const MAX_TARGET_DETAIL: usize = 400;
 
 pub(super) fn run(
     request: &RunRequest<SshCommand>,
     snippets: Option<&Path>,
-    file_transfer_allowed: bool,
+    policy: &ExecutionPolicy,
     credentials: BatchAuth,
     archive_password: BorrowedArchivePassword<'_>,
     trust_store: impl FnOnce() -> io::Result<TrustStore>,
@@ -23,7 +26,7 @@ pub(super) fn run(
     execute(
         request,
         snippets,
-        file_transfer_allowed,
+        policy,
         credentials,
         archive_password,
         trust_store,
@@ -34,26 +37,31 @@ pub(super) fn run(
 fn execute(
     request: &RunRequest<SshCommand>,
     snippets: Option<&Path>,
-    file_transfer_allowed: bool,
+    policy: &ExecutionPolicy,
     credentials: BatchAuth,
     archive_password: BorrowedArchivePassword<'_>,
     trust_store: impl FnOnce() -> io::Result<TrustStore>,
 ) -> Result<Completion, Failure> {
     let action = &request.action;
     check_cancelled(&request.cancellation)?;
+    policy.require_target_groups(action)?;
+    policy.check_elevation(action)?;
     action
         .validate_target_selection()
         .map_err(Failure::blocked)?;
     let mut single = action.as_ref().clone();
+    let any_route_allowed = policy.any_route_allowed(action);
     if action.remote.is_some() {
         let operation = action.remote_action().map_err(Failure::blocked)?;
-        if operation.transfers_files() && !file_transfer_allowed {
+        if operation.transfers_files() && !policy.file_transfer_allowed {
             return Err(Failure::blocked(
                 "Application policy forbids scheduled file transfers",
             ));
         }
-        remote::require_archive_password(operation, archive_password)?;
-    } else {
+        if any_route_allowed {
+            remote::require_archive_password(operation, archive_password)?;
+        }
+    } else if any_route_allowed {
         // Freeze the resolved command for every target in this run.
         single.command = action
             .command_for_exec(snippets)
@@ -61,8 +69,14 @@ fn execute(
             .into_owned();
         single.script = None;
         single.snippet = None;
+        single.working_directory = None;
     }
     single.additional_connections.clear();
+    single.target_groups = None;
+    let mut scoped_policy = policy.clone();
+    if action.target_groups.is_some() {
+        scoped_policy.group_scope = Some(Arc::clone(action));
+    }
     let credentials = credentials.map_err(Failure::blocked)?;
     let total = action.targets().count();
     if total < 2 || total != credentials.len() {
@@ -70,11 +84,23 @@ fn execute(
             "Multi-target SSH authentication is unavailable",
         ));
     }
-    let trust =
-        trust_store().map_err(|_| Failure::failed("Could not access SSH host-key trust store"))?;
+    // Open the trust store only when an allowed target actually reaches SSH setup.
+    let mut open_trust = Some(trust_store);
+    let mut trust = None;
+    let mut shared_trust = || {
+        trust
+            .get_or_insert_with(|| open_trust.take().expect("first trust lookup")())
+            .as_ref()
+            .cloned()
+            .map_err(|_| io::Error::other("Could not access SSH host-key trust store"))
+    };
     let mut summary = Summary::default();
     for (target, credentials) in action.targets().zip(credentials) {
         if request.cancellation.is_requested() {
+            break;
+        }
+        if let Err(error) = scoped_policy.require_target_groups(action) {
+            summary.record(target.id, &Completion::from_result(request.id, Err(error)));
             break;
         }
         single.connection = Some(target.clone());
@@ -90,10 +116,10 @@ fn execute(
             &target_request,
             None,
             None,
-            file_transfer_allowed,
+            &scoped_policy,
             credentials.map(Some),
             archive_password,
-            || Ok(trust.clone()),
+            &mut shared_trust,
         );
         summary.record(target.id, &completed);
         if completed.outcome == RunOutcome::Cancelled {
@@ -181,6 +207,7 @@ impl Summary {
             outcome,
             detail: Some(detail),
             recording: None,
+            swarm_report: None,
         }
     }
 }

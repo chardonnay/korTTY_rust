@@ -9,7 +9,7 @@ use {
 };
 
 use ed25519_dalek as dalek;
-use ed25519_dalek::{Signer, Verifier};
+use ed25519_dalek::Signer;
 use zeroize::ZeroizeOnDrop;
 
 use crate::*;
@@ -20,15 +20,13 @@ use sshwire::{BinString, Blob, SSHDecode, SSHEncode, WireError, WireResult};
 use core::mem::discriminant;
 
 #[cfg(feature = "ecdsa-userkeys")]
-use alloc::boxed::Box;
-#[cfg(feature = "ecdsa-userkeys")]
 use crate::user_ecdsa::{EcdsaCurve, EcdsaUserKey, EcdsaUserSignature};
+#[cfg(any(feature = "ecdsa-userkeys", feature = "rsa"))]
+use alloc::boxed::Box;
 
 // RSA requires alloc.
 #[cfg(feature = "rsa")]
 use packets::RSAPubKey;
-#[cfg(feature = "rsa")]
-use rsa::signature::{DigestSigner as _, DigestVerifier as _};
 
 #[cfg(feature = "ecdsa256")]
 use crate::packets::ECDSAPubKey;
@@ -48,26 +46,17 @@ use digest::Digest;
 // TODO remove once we use byupdate.
 // signatures are for hostkey (32 byte sessiid) or pubkey (auth packet || sessid).
 // we assume a max 40 character username here.
-const MAX_ED25519_SIG_MSG: usize = 1
-    + 4
-    + 40
-    + 4
-    + 14
-    + 4
-    + 9
-    + 1
-    + 4
-    + SSH_NAME_CURVE25519_LIBSSH.len()
-    + 4
-    + 32
-    + 32;
+const MAX_ED25519_SIG_MSG: usize =
+    1 + 4 + 40 + 4 + 14 + 4 + 9 + 1 + 4 + SSH_NAME_CURVE25519_LIBSSH.len() + 4 + 32 + 32;
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy)]
 pub enum SigType {
     Ed25519,
     #[cfg(feature = "rsa")]
-    RSA,
+    RSA256,
+    #[cfg(feature = "rsa")]
+    RSA512,
     #[cfg(any(feature = "ecdsa256", feature = "ecdsa-hostkeys"))]
     ECDSA256,
     #[cfg(feature = "ecdsa-hostkeys")]
@@ -78,25 +67,29 @@ pub enum SigType {
 
 #[cfg(any(feature = "ecdsa256", feature = "ecdsa-hostkeys"))]
 pub(crate) fn copy_right_aligned(src: &[u8], dest: &mut [u8]) -> Result<(), ()> {
-    let Some(offset) = dest.len().checked_sub(src.len()) else { return Err(()) };
+    let Some(offset) = dest.len().checked_sub(src.len()) else {
+        return Err(());
+    };
     dest[offset..].copy_from_slice(src);
     Ok(())
 }
 
 impl SigType {
     /// Must be a valid name
-    pub fn from_name(name: &'static str) -> Result<Self> {
+    pub fn from_name(name: &str) -> Result<Self> {
         match name {
             SSH_NAME_ED25519 => Ok(SigType::Ed25519),
             #[cfg(feature = "rsa")]
-            SSH_NAME_RSA_SHA256 => Ok(SigType::RSA),
+            SSH_NAME_RSA_SHA256 => Ok(SigType::RSA256),
+            #[cfg(feature = "rsa")]
+            SSH_NAME_RSA_SHA512 => Ok(SigType::RSA512),
             #[cfg(any(feature = "ecdsa256", feature = "ecdsa-hostkeys"))]
             SSH_NAME_ECDSA256 => Ok(SigType::ECDSA256),
             #[cfg(feature = "ecdsa-hostkeys")]
             SSH_NAME_ECDSA384 => Ok(SigType::ECDSA384),
             #[cfg(feature = "ecdsa-hostkeys")]
             SSH_NAME_ECDSA521 => Ok(SigType::ECDSA521),
-            _ => Error::bug(),
+            _ => Err(Error::UnknownMethod { kind: "signature" }),
         }
     }
 
@@ -105,7 +98,9 @@ impl SigType {
         match self {
             SigType::Ed25519 => SSH_NAME_ED25519,
             #[cfg(feature = "rsa")]
-            SigType::RSA => SSH_NAME_RSA_SHA256,
+            SigType::RSA256 => SSH_NAME_RSA_SHA256,
+            #[cfg(feature = "rsa")]
+            SigType::RSA512 => SSH_NAME_RSA_SHA512,
             #[cfg(any(feature = "ecdsa256", feature = "ecdsa-hostkeys"))]
             SigType::ECDSA256 => SSH_NAME_ECDSA256,
             #[cfg(feature = "ecdsa-hostkeys")]
@@ -120,7 +115,7 @@ impl SigType {
         let b = match &sig {
             Signature::Ed25519(e) => e.sig.0,
             #[cfg(feature = "rsa")]
-            Signature::RSA(e) => e.sig.0,
+            Signature::RSA256(e) | Signature::RSA512(e) => e.sig.0,
             #[cfg(any(feature = "ecdsa256", feature = "ecdsa-hostkeys"))]
             Signature::ECDSA256(e) => e.0.r.as_ref(),
             #[cfg(feature = "ecdsa-hostkeys")]
@@ -128,16 +123,15 @@ impl SigType {
             Signature::Unknown(_) => panic!(),
         };
 
-        if b.get(..3) == Some(b"bad") { Err(Error::BadSig) } else { Ok(()) }
+        if b.get(..3) == Some(b"bad") {
+            Err(Error::BadSig)
+        } else {
+            Ok(())
+        }
     }
 
     /// Returns `Ok(())` on success
-    pub fn verify(
-        &self,
-        pubkey: &PubKey,
-        msg: &dyn SSHEncode,
-        sig: &Signature,
-    ) -> Result<()> {
+    pub fn verify(&self, pubkey: &PubKey, msg: &dyn SSHEncode, sig: &Signature) -> Result<()> {
         // Check that the signature type is known
         let sig_type = sig.sig_type().map_err(|_| Error::BadSig)?;
 
@@ -159,8 +153,9 @@ impl SigType {
             }
 
             #[cfg(feature = "rsa")]
-            (SigType::RSA, PubKey::RSA(k), Signature::RSA(s)) => {
-                Self::verify_rsa(k, msg, s)
+            (SigType::RSA256, PubKey::RSA(k), Signature::RSA256(s))
+            | (SigType::RSA512, PubKey::RSA(k), Signature::RSA512(s)) => {
+                crate::rsa_keys::verify(&k.key, msg, s.sig.0, *self)
             }
 
             #[cfg(feature = "ecdsa-hostkeys")]
@@ -179,11 +174,7 @@ impl SigType {
             }
 
             #[cfg(all(feature = "ecdsa256", not(feature = "ecdsa-hostkeys")))]
-            (
-                SigType::ECDSA256,
-                PubKey::ECDSA256(key),
-                Signature::ECDSA256(s),
-            ) => {
+            (SigType::ECDSA256, PubKey::ECDSA256(key), Signature::ECDSA256(s)) => {
                 let key = VerifyingKey::<NistP256>::from_sec1_bytes(&key.point)
                     .map_err(|_| Error::BadKey)?;
                 Self::verify_ecdsa(&key, msg, &s.0)
@@ -205,11 +196,7 @@ impl SigType {
         ret
     }
 
-    fn verify_ed25519(
-        k: &Ed25519PubKey,
-        msg: &dyn SSHEncode,
-        s: &Ed25519Sig,
-    ) -> Result<()> {
+    fn verify_ed25519(k: &Ed25519PubKey, msg: &dyn SSHEncode, s: &Ed25519Sig) -> Result<()> {
         let k: &[u8; 32] = &k.key.0;
         let k = dalek::VerifyingKey::from_bytes(k).map_err(|_| Error::BadKey)?;
 
@@ -228,34 +215,7 @@ impl SigType {
         let mut buf = [0; MAX_ED25519_SIG_MSG];
         let l = sshwire::write_ssh(&mut buf, msg)?;
         let buf = &buf[..l];
-        k.verify(buf, &s).map_err(|_| Error::BadSig)
-    }
-
-    #[cfg(feature = "rsa")]
-    fn verify_rsa(
-        k: &packets::RSAPubKey,
-        msg: &dyn SSHEncode,
-        s: &packets::RSASig,
-    ) -> Result<()> {
-        let verifying_key =
-            rsa::pkcs1v15::VerifyingKey::<sha2_modern::Sha256>::new(k.key.clone());
-        let signature = s.sig.0.try_into().map_err(|e| {
-            trace!("RSA bad signature: {e}");
-            Error::BadSig
-        })?;
-
-        verifying_key
-            .verify_digest(
-                |h| {
-                    sshwire::hash_ser(h, msg)
-                        .map_err(|_| rsa::signature::Error::new())
-                },
-                &signature,
-            )
-            .map_err(|e| {
-                trace!("RSA verify failed: {e}");
-                Error::BadSig
-            })
+        k.verify_strict(buf, &s).map_err(|_| Error::BadSig)
     }
 
     #[cfg(all(feature = "ecdsa256", not(feature = "ecdsa-hostkeys")))]
@@ -281,11 +241,10 @@ impl SigType {
             error::BadSig.build()
         })?;
 
-        let sig =
-            ecdsa::Signature::<C>::from_scalars(pad_r, pad_s).map_err(|_| {
-                trace!("ECDSA bad signature");
-                error::BadSig.build()
-            })?;
+        let sig = ecdsa::Signature::<C>::from_scalars(pad_r, pad_s).map_err(|_| {
+            trace!("ECDSA bad signature");
+            error::BadSig.build()
+        })?;
 
         // TODO: once ecdsa is non-rc and all the crates like digest are aligned,
         // can use verify_digest() instead of hazmat::verify_prehashed.
@@ -311,7 +270,9 @@ pub enum OwnedSig {
     // just store raw bytes here.
     Ed25519([u8; 64]),
     #[cfg(feature = "rsa")]
-    RSA(Box<[u8]>),
+    RSA256(Box<[u8]>),
+    #[cfg(feature = "rsa")]
+    RSA512(Box<[u8]>),
     #[cfg(feature = "ecdsa256")]
     ECDSA256 {
         r: [u8; 32],
@@ -319,13 +280,6 @@ pub enum OwnedSig {
     },
     #[cfg(feature = "ecdsa-userkeys")]
     PortableEcdsa(EcdsaUserSignature),
-}
-
-#[cfg(feature = "rsa")]
-impl From<rsa::pkcs1v15::Signature> for OwnedSig {
-    fn from(s: rsa::pkcs1v15::Signature) -> Self {
-        OwnedSig::RSA(s.into())
-    }
 }
 
 impl TryFrom<Signature<'_>> for OwnedSig {
@@ -337,7 +291,9 @@ impl TryFrom<Signature<'_>> for OwnedSig {
                 Ok(OwnedSig::Ed25519(s))
             }
             #[cfg(feature = "rsa")]
-            Signature::RSA(s) => Ok(OwnedSig::RSA(s.sig.0.into())),
+            Signature::RSA256(s) => Ok(OwnedSig::RSA256(s.sig.0.into())),
+            #[cfg(feature = "rsa")]
+            Signature::RSA512(s) => Ok(OwnedSig::RSA512(s.sig.0.into())),
             #[cfg(feature = "ecdsa256")]
             Signature::ECDSA256(sig) => {
                 let sig = sig.0;
@@ -395,12 +351,12 @@ pub enum SignKey {
     AgentEd25519(dalek::VerifyingKey),
 
     #[cfg(feature = "rsa")]
-    // TODO zeroize doesn't seem supported? though BigUint has Zeroize
-    RSA(rsa::RsaPrivateKey),
+    #[zeroize(skip)] // RustCrypto clears the private exponent, factors and CRT values on drop.
+    RSA(rsa::PrivateKey),
 
     #[cfg(feature = "rsa")]
     #[zeroize(skip)]
-    AgentRSA(rsa::RsaPublicKey),
+    AgentRSA(rsa::PublicKey),
 
     #[cfg(feature = "ecdsa256")]
     ECDSA256(ecdsa::SigningKey<p256::NistP256>),
@@ -415,6 +371,13 @@ pub enum SignKey {
 }
 
 impl SignKey {
+    /// Loads a consistent two-prime RSA key with a 2048..=8192-bit modulus.
+    #[cfg(feature = "rsa")]
+    pub fn rsa_private_key(key: rsa::PrivateKey) -> Result<Self> {
+        crate::rsa_keys::validate_private(&key)?;
+        Ok(Self::RSA(key))
+    }
+
     /// Loads a NIST curve scalar and verifies its associated SEC1 point.
     #[cfg(feature = "ecdsa-userkeys")]
     pub fn ecdsa_private_key(curve: EcdsaCurve, scalar: &[u8], public: &[u8]) -> Result<Self> {
@@ -449,26 +412,22 @@ impl SignKey {
             #[cfg(feature = "rsa")]
             KeyType::RSA => {
                 let bits = bits.unwrap_or(config::RSA_DEFAULT_KEYSIZE);
-                let size_range =
-                    config::RSA_MIN_KEYSIZE..=rsa::RsaPublicKey::MAX_SIZE;
+                let size_range = config::RSA_MIN_KEYSIZE..=config::RSA_MAX_KEYSIZE;
                 if !(size_range.contains(&bits) && bits.is_multiple_of(8)) {
                     return Err(Error::msg("Bad key size"));
                 }
 
-                let k = rsa::RsaPrivateKey::new(&mut random::rng(), bits).map_err(
-                    |e| {
-                        debug!("RSA key generation error {e}");
-                        // RNG shouldn't fail, keysize has been checked
-                        Error::build_bug()
-                    },
-                )?;
-                Ok(Self::RSA(k))
+                let k = rsa::PrivateKey::new(&mut getrandom::SysRng, bits).map_err(|e| {
+                    debug!("RSA key generation error {e}");
+                    // RNG shouldn't fail, keysize has been checked
+                    Error::build_bug()
+                })?;
+                Self::rsa_private_key(k)
             }
             #[cfg(feature = "ecdsa256")]
             KeyType::ECDSA256 => {
                 use ecdsa::elliptic_curve::Generate;
-                let k =
-                    p256::SecretKey::generate_from_rng(&mut crate::random::rng());
+                let k = p256::SecretKey::generate_from_rng(&mut crate::random::rng());
                 Ok(Self::ECDSA256(k.into()))
             }
         }
@@ -481,9 +440,9 @@ impl SignKey {
                 PubKey::Ed25519(Ed25519PubKey { key: Blob(pubk) })
             }
 
-            SignKey::AgentEd25519(pk) => {
-                PubKey::Ed25519(Ed25519PubKey { key: Blob(pk.to_bytes()) })
-            }
+            SignKey::AgentEd25519(pk) => PubKey::Ed25519(Ed25519PubKey {
+                key: Blob(pk.to_bytes()),
+            }),
 
             #[cfg(feature = "rsa")]
             SignKey::RSA(k) => PubKey::RSA(RSAPubKey { key: k.into() }),
@@ -548,18 +507,35 @@ impl SignKey {
 
             #[cfg(feature = "rsa")]
             SignKey::RSA(_) | SignKey::AgentRSA(_) => {
-                matches!(sig_type, SigType::RSA)
+                matches!(sig_type, SigType::RSA256 | SigType::RSA512)
             }
             #[cfg(feature = "ecdsa256")]
             SignKey::ECDSA256(_) | SignKey::AgentECDSA256(_) => {
                 matches!(sig_type, SigType::ECDSA256)
             }
             #[cfg(feature = "ecdsa-userkeys")]
-            SignKey::PortableEcdsa(key) => key.curve().sig_type().algorithm_name() == sig_type.algorithm_name(),
+            SignKey::PortableEcdsa(key) => {
+                key.curve().sig_type().algorithm_name() == sig_type.algorithm_name()
+            }
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn sign(&self, msg: &impl SSHEncode) -> Result<OwnedSig> {
+        self.sign_with_type(
+            msg,
+            SigType::from_name(Signature::sig_name_for_pubkey(&self.pubkey())?)?,
+        )
+    }
+
+    pub(crate) fn sign_with_type(
+        &self,
+        msg: &impl SSHEncode,
+        sig_type: SigType,
+    ) -> Result<OwnedSig> {
+        if !self.can_sign(sig_type) {
+            return Err(Error::BadSig);
+        }
         let sig: OwnedSig = match self {
             SignKey::Ed25519(k) => {
                 // TODO: pending merge of https://github.com/dalek-cryptography/curve25519-dalek/pull/556
@@ -582,33 +558,22 @@ impl SignKey {
             }
 
             #[cfg(feature = "rsa")]
-            SignKey::RSA(k) => {
-                let signing_key =
-                    rsa::pkcs1v15::SigningKey::<sha2_modern::Sha256>::new(k.clone());
-                let sig = signing_key
-                    .try_sign_digest(|h| {
-                        sshwire::hash_ser(h, msg)
-                            .map_err(|_| rsa::signature::Error::new())
-                    })
-                    .map_err(|e| {
-                        trace!("RSA signing failed: {e:?}");
-                        Error::build_bug()
-                    })?;
-                OwnedSig::RSA(sig.into())
-            }
+            SignKey::RSA(k) => crate::rsa_keys::sign(k, msg, sig_type)?,
 
             #[cfg(feature = "ecdsa256")]
             SignKey::ECDSA256(k) => {
                 let mut h = sha2::Sha256::new();
                 sshwire::hash_ser(&mut h, msg)?;
                 let h = h.finalize();
-                let sig: ecdsa::Signature<NistP256> =
-                    k.sign_prehash(&h).map_err(|_| {
-                        trace!("ECDSA signing failed");
-                        Error::build_bug()
-                    })?;
+                let sig: ecdsa::Signature<NistP256> = k.sign_prehash(&h).map_err(|_| {
+                    trace!("ECDSA signing failed");
+                    Error::build_bug()
+                })?;
                 let (r, s) = sig.split_bytes();
-                OwnedSig::ECDSA256 { r: r.into(), s: s.into() }
+                OwnedSig::ECDSA256 {
+                    r: r.into(),
+                    s: s.into(),
+                }
             }
 
             #[cfg(feature = "ecdsa-userkeys")]
@@ -689,13 +654,12 @@ impl sshwire::SSHEncode for SignKey {
                 use rsa::traits::{PrivateKeyParts, PublicKeyParts};
 
                 SSH_NAME_RSA.enc(s)?;
-                let [p, q]: &[_; _] =
-                    k.primes().try_into().map_err(|_| WireError::BadKey)?;
-                k.n().enc(s)?;
+                let [p, q]: &[_; _] = k.primes().try_into().map_err(|_| WireError::BadKey)?;
+                k.n().as_ref().enc(s)?;
                 k.e().enc(s)?;
                 k.d().enc(s)?;
-                p.enc(s)?;
-                q.enc(s)?;
+                p.as_ref().enc(s)?;
+                q.as_ref().enc(s)?;
             }
             #[cfg(feature = "ecdsa256")]
             SignKey::ECDSA256(k) => {
@@ -733,14 +697,20 @@ impl<'de> SSHDecode<'de> for SignKey {
             }
             #[cfg(feature = "rsa")]
             SSH_NAME_RSA => {
-                let n = SSHDecode::dec(s)?;
-                let e = SSHDecode::dec(s)?;
-                let d = SSHDecode::dec(s)?;
-                let p = SSHDecode::dec(s)?;
-                let q = SSHDecode::dec(s)?;
-                let k = rsa::RsaPrivateKey::from_components(n, e, d, vec![p, q])
-                    .map_err(|_| WireError::BadKey)?;
-                Self::RSA(k)
+                let n = sshwire::Mpint::dec(s)?;
+                let e = sshwire::Mpint::dec(s)?;
+                let d = sshwire::Mpint::dec(s)?;
+                let p = sshwire::Mpint::dec(s)?;
+                let q = sshwire::Mpint::dec(s)?;
+                let k = crate::rsa_keys::private_components(
+                    n.as_ref(),
+                    e.as_ref(),
+                    d.as_ref(),
+                    p.as_ref(),
+                    q.as_ref(),
+                )
+                .map_err(|_| WireError::BadKey)?;
+                Self::rsa_private_key(k).map_err(|_| WireError::BadKey)?
             }
             #[cfg(feature = "ecdsa256")]
             SSH_NAME_ECDSA256 => {
@@ -786,11 +756,36 @@ impl TryFrom<ssh_key::PrivateKey> for SignKey {
 
             #[cfg(feature = "rsa")]
             ssh_key::private::KeypairData::Rsa(k) => {
-                Ok(SignKey::RSA(k.try_into().map_err(|_| Error::BadKey)?))
+                use rsa::traits::PrivateKeyParts as _;
+
+                fn positive(value: &ssh_key::Mpint) -> Result<&[u8]> {
+                    value.as_positive_bytes().ok_or(Error::BadKey)
+                }
+                let key = crate::rsa_keys::private_components(
+                    positive(&k.public.n)?,
+                    positive(&k.public.e)?,
+                    positive(&k.private.d)?,
+                    positive(&k.private.p)?,
+                    positive(&k.private.q)?,
+                )?;
+                let expected = zeroize::Zeroizing::new(
+                    rsa::BoxedUint::from_be_slice(
+                        positive(&k.private.iqmp)?,
+                        key.primes()[0].bits_precision(),
+                    )
+                    .map_err(|_| Error::BadKey)?,
+                );
+                let actual = zeroize::Zeroizing::new(key.crt_coefficient().ok_or(Error::BadKey)?);
+                if *actual != *expected {
+                    return Err(Error::BadKey);
+                }
+                Self::rsa_private_key(key)
             }
             _ => {
                 debug!("Unknown ssh-key algorithm {}", k.algorithm().as_str());
-                Err(Error::NotAvailable { what: "ssh key algorithm" })
+                Err(Error::NotAvailable {
+                    what: "ssh key algorithm",
+                })
             }
         }
     }

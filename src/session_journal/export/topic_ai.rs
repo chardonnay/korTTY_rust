@@ -112,6 +112,7 @@ impl Run {
         if topic.len() > MAX_TOPIC_BYTES {
             return Ok(Outcome::Fallback(Fallback::Redaction));
         }
+        let system = self.session.client().render_system_prompt(SYSTEM);
         for (chunk_index, chunk) in candidates[..considered]
             .chunks(ENTRIES_PER_PROMPT)
             .enumerate()
@@ -130,7 +131,8 @@ impl Run {
             let Some(prompt) = prompt else {
                 return Ok(Outcome::Fallback(Fallback::Redaction));
             };
-            let ordinals = match self.ask_chunk(&prompt, chunk.len(), deadline, cancelled) {
+            let ordinals = match self.ask_chunk(&system, &prompt, chunk.len(), deadline, cancelled)
+            {
                 Ok(ordinals) => ordinals,
                 Err(ChunkError::Cancelled) => return Err(cancelled_error()),
                 Err(ChunkError::Fallback(reason)) => return Ok(Outcome::Fallback(reason)),
@@ -147,6 +149,7 @@ impl Run {
 
     fn ask_chunk(
         &self,
+        system: &str,
         input: &str,
         count: usize,
         deadline: Instant,
@@ -161,7 +164,7 @@ impl Run {
                 return Err(ChunkError::Fallback(Fallback::TimedOut));
             }
             let response_format = self.response_format.load(Ordering::Relaxed);
-            let result = client.complete_before(SYSTEM, input, response_format, deadline);
+            let result = client.complete_before(system, input, response_format, deadline);
             self.check_cancelled(cancelled)
                 .map_err(|_| ChunkError::Cancelled)?;
             if Instant::now() >= deadline {

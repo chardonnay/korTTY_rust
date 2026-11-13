@@ -223,7 +223,7 @@ fn verify_win32k_disabled(process: HANDLE) -> io::Result<()> {
     Ok(())
 }
 
-pub(super) fn with_private_pipe<T>(
+pub(crate) fn with_private_pipe<T>(
     create: impl FnOnce(&SECURITY_ATTRIBUTES) -> io::Result<T>,
 ) -> io::Result<T> {
     // SAFETY: GetCurrentProcess returns the current process pseudo-handle.

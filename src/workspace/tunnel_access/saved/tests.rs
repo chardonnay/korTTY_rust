@@ -50,6 +50,8 @@ fn connection(endpoint: LoginTarget, bind: SocketAddr, port: u16) -> Connection 
         command_timestamps: None,
         tab_color: None,
         paste_warning: None,
+        window_geometry: None,
+        terminal: Default::default(),
         tunnels: vec![TunnelConfig {
             enabled: true,
             description: "Local test service".into(),

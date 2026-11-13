@@ -1,15 +1,22 @@
-//! Handle-relative local input and publication for a single unattended transfer.
+//! Handle-relative local input and publication for a single transfer.
 
 use std::ffi::{OsStr, OsString};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::private_files::{FileStamp, require_single_link};
 use crate::sftp_window::files::{LocalStamp, nonce};
 
 use super::local::{self, Directory, Entry};
 
 const PAYLOAD: &str = "payload";
+
+mod ordinary;
+mod resume;
+mod upload_resume;
+pub(crate) use ordinary::OrdinaryDownload;
+pub(in crate::sftp_window) use upload_resume::UploadSource;
 
 pub(crate) struct LocalSource {
     path: PathBuf,
@@ -90,6 +97,32 @@ impl LocalSource {
         self.stamp.size
     }
 
+    pub(in crate::sftp_window) fn parent_identity(
+        &self,
+    ) -> io::Result<crate::sftp_window::worker::resume::persist::Identity> {
+        crate::sftp_window::worker::resume::persist::Identity::directory(&self.parent)
+    }
+
+    pub(in crate::sftp_window) fn verify_reviewed(
+        &self,
+        stamp: &LocalStamp,
+        identity: &crate::sftp_window::worker::resume::persist::Identity,
+        parent: &crate::sftp_window::worker::resume::persist::Identity,
+    ) -> io::Result<()> {
+        use crate::sftp_window::worker::resume::persist::Identity;
+
+        self.verify()?;
+        if self.stamp != *stamp || Identity::directory(&self.parent)? != *parent {
+            return Err(io::Error::other("The reviewed local source changed"));
+        }
+        let (_, name) = components(&self.path)?;
+        let Entry::File(current) = local::entry(&self.parent, name)? else {
+            return Err(io::Error::other("The reviewed local source changed"));
+        };
+        identity.require(&self.file)?;
+        identity.require(&current)
+    }
+
     pub(crate) fn verify(&self) -> io::Result<()> {
         let (parent, name) = components(&self.path)?;
         if self.parent.same_as(&Directory::open_path(parent)?)?
@@ -109,44 +142,167 @@ pub(crate) struct StagedDownload {
     name: OsString,
     stage: Option<Directory>,
     file: Option<File>,
+    keep: bool,
+    locked: bool,
+    restore_private_access: bool,
 }
 
 impl StagedDownload {
     pub(crate) fn create(destination: &Path) -> io::Result<Self> {
+        Self::create_with(destination, None, true, Directory::create_file)
+    }
+
+    pub(in crate::sftp_window) fn resumable(destination: &Path) -> io::Result<Self> {
+        #[cfg(windows)]
+        let create = Directory::create_resumable_download_file;
+        #[cfg(unix)]
+        let create = Directory::create_read_write_file;
+        let mut staged = Self::create_with(destination, None, true, create)?;
+        staged.restore_private_access = true;
+        Ok(staged)
+    }
+
+    pub(in crate::sftp_window) fn create_reviewed(
+        destination: &Path,
+        parent: &crate::sftp_window::worker::resume::persist::Identity,
+    ) -> io::Result<Self> {
+        Self::create_with(destination, Some(parent), true, Directory::create_file)
+    }
+
+    pub(in crate::sftp_window) fn stage_for_replacement(
+        destination: &Path,
+        parent: &crate::sftp_window::worker::resume::persist::Identity,
+    ) -> io::Result<Self> {
+        Self::stage_with_final_permissions(destination, parent, false)
+    }
+
+    pub(in crate::sftp_window) fn stage_new_download(
+        destination: &Path,
+        parent: &crate::sftp_window::worker::resume::persist::Identity,
+    ) -> io::Result<Self> {
+        Self::stage_with_final_permissions(destination, parent, true)
+    }
+
+    fn stage_with_final_permissions(
+        destination: &Path,
+        parent: &crate::sftp_window::worker::resume::persist::Identity,
+        require_vacant: bool,
+    ) -> io::Result<Self> {
+        #[cfg(windows)]
+        let create = Directory::create_replacement_file;
+        #[cfg(unix)]
+        let create = Directory::create_file;
+        let mut staged = Self::create_with(destination, Some(parent), require_vacant, create)?;
+        staged.restore_private_access = true;
+        Ok(staged)
+    }
+
+    fn create_with(
+        destination: &Path,
+        reviewed_parent: Option<&crate::sftp_window::worker::resume::persist::Identity>,
+        require_vacant: bool,
+        create: impl FnOnce(&Directory, &OsStr) -> io::Result<File>,
+    ) -> io::Result<Self> {
         let (parent, _) = components(destination)?;
         let parent = Directory::open_path(parent)?;
-        match fs::symlink_metadata(destination) {
-            Ok(_) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "The local download destination already exists",
-                ));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+        if let Some(reviewed) = reviewed_parent {
+            reviewed.require_directory(&parent)?;
+        }
+        if require_vacant {
+            require_absent(destination)?;
         }
         let name = OsString::from(nonce()?);
         let stage = parent.create_child(&name)?;
-        let file = match stage.create_file(OsStr::new(PAYLOAD)) {
+        let file = match create(&stage, OsStr::new(PAYLOAD)) {
             Ok(file) => file,
             Err(error) => {
                 let _ = local::discard(&parent, &name, stage);
                 return Err(error);
             }
         };
-        Ok(Self {
+        let download = Self {
             destination: destination.to_path_buf(),
             parent,
             name,
             stage: Some(stage),
             file: Some(file),
-        })
+            keep: false,
+            locked: false,
+            restore_private_access: false,
+        };
+        #[cfg(target_os = "macos")]
+        download.require_no_extended_acl()?;
+        Ok(download)
     }
 
     pub(crate) fn writer(&self) -> io::Result<&File> {
         self.file
             .as_ref()
             .ok_or_else(|| io::Error::other("The staged download has no file"))
+    }
+
+    pub(in crate::sftp_window) fn parent_identity(
+        &self,
+    ) -> io::Result<crate::sftp_window::worker::resume::persist::Identity> {
+        self.require_parent()?;
+        crate::sftp_window::worker::resume::persist::Identity::directory(&self.parent)
+    }
+
+    pub(in crate::sftp_window) fn verify_reviewed_parent(
+        &self,
+        identity: &crate::sftp_window::worker::resume::persist::Identity,
+    ) -> io::Result<()> {
+        self.require_parent()?;
+        if crate::sftp_window::worker::resume::persist::Identity::directory(&self.parent)?
+            != *identity
+        {
+            return Err(io::Error::other(
+                "The reviewed local destination folder changed",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(in crate::sftp_window) fn verify_partial(&self, stamp: &FileStamp) -> io::Result<()> {
+        self.verify_stage(stamp)?;
+        require_absent(&self.destination)
+    }
+
+    pub(in crate::sftp_window) fn verify_stage(&self, stamp: &FileStamp) -> io::Result<()> {
+        self.require_parent()?;
+        let file = self.writer()?;
+        let stage = self
+            .stage
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Missing download stage"))?;
+        let Entry::Directory(current) = local::entry(&self.parent, &self.name)? else {
+            return Err(io::Error::other("The partial download directory changed"));
+        };
+        if !stage.same_as(&current)? {
+            return Err(io::Error::other("The partial download directory changed"));
+        }
+        #[cfg(windows)]
+        {
+            stage.require_owner_only()?;
+            Directory::require_owner_only_file(file)?;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            if (stage.file().metadata()?.mode() | file.metadata()?.mode()) & 0o077 != 0 {
+                return Err(io::Error::other(
+                    "The partial download is no longer private",
+                ));
+            }
+        }
+        #[cfg(target_os = "macos")]
+        self.require_no_extended_acl()?;
+        require_single_link(file)?;
+        stamp.require_unchanged(file)?;
+        let Entry::File(current) = local::entry(stage, OsStr::new(PAYLOAD))? else {
+            return Err(io::Error::other("The partial download file changed"));
+        };
+        stamp.require_unchanged(&current)
     }
 
     pub(crate) fn shares_parent_with(&self, source: &LocalSource) -> io::Result<bool> {
@@ -164,27 +320,68 @@ impl StagedDownload {
     }
 
     pub(crate) fn publish(self, cancelled: impl Fn() -> bool) -> io::Result<()> {
+        self.publish_checked(|_| {
+            if cancelled() {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    pub(in crate::sftp_window) fn publish_checked(
+        mut self,
+        before_publish: impl FnOnce(&File) -> io::Result<()>,
+    ) -> io::Result<()> {
         let file = self.writer()?;
         file.sync_all()?;
-        let (parent, name) = components(&self.destination)?;
-        if !self.parent.same_as(&Directory::open_path(parent)?)? {
-            return Err(io::Error::other("The local download parent changed"));
-        }
+        let name = self.require_parent()?;
         let stage = self
             .stage
             .as_ref()
             .ok_or_else(|| io::Error::other("The staged download has no directory"))?;
-        if cancelled() {
-            return Err(io::ErrorKind::Interrupted.into());
+        before_publish(file)?;
+        self.require_parent()?;
+        let Entry::Directory(current) = local::entry(&self.parent, &self.name)? else {
+            return Err(io::Error::other("The local staging directory changed"));
+        };
+        if !stage.same_as(&current)? {
+            return Err(io::Error::other("The local staging directory changed"));
         }
-        local::publish_file(&self.parent, stage, OsStr::new(PAYLOAD), file, name)
+        local::publish_file(&self.parent, stage, OsStr::new(PAYLOAD), file, name)?;
+        self.restore_private_access = false;
+        self.keep = false;
+        Ok(())
+    }
+
+    fn require_parent(&self) -> io::Result<&OsStr> {
+        let (parent, name) = components(&self.destination)?;
+        if !self.parent.same_as(&Directory::open_path(parent)?)? {
+            return Err(io::Error::other("The local download parent changed"));
+        }
+        Ok(name)
     }
 }
 
 impl Drop for StagedDownload {
     fn drop(&mut self) {
+        if self.restore_private_access
+            && let Some(file) = &self.file
+        {
+            #[cfg(unix)]
+            let _ = rustix::fs::fchmod(file, rustix::fs::Mode::from_raw_mode(0o600));
+            #[cfg(target_os = "macos")]
+            let _ = kortty_files::clear_extended_acl(file);
+            #[cfg(windows)]
+            let _ = kortty_files::restore_private_file_access(file);
+        }
+        if self.locked
+            && let Some(file) = &self.file
+        {
+            let _ = file.unlock();
+        }
         drop(self.file.take());
-        if let Some(stage) = self.stage.take() {
+        if let Some(stage) = self.stage.take().filter(|_| !self.keep) {
             let _ = local::discard(&self.parent, &self.name, stage);
         }
     }
@@ -194,6 +391,17 @@ fn components(path: &Path) -> io::Result<(&Path, &OsStr)> {
     path.parent()
         .zip(path.file_name())
         .ok_or_else(|| io::Error::other("Expected a complete local file path"))
+}
+
+fn require_absent(destination: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(destination) {
+        Ok(_) => Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "The local download destination already exists",
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +432,40 @@ mod tests {
         stage.writer().unwrap().write_all(b"private data").unwrap();
         stage.publish(|| false).unwrap();
         assert_eq!(fs::read(&destination).unwrap(), b"private data");
+        assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn reviewed_replacement_stage_preserves_the_original_and_requires_vacant_publication() {
+        use crate::sftp_window::worker::resume::persist::Identity;
+
+        let fixture = crate::snippets::tests::Profile::new();
+        let parent = fixture.0.canonicalize().unwrap();
+        let destination = parent.join("existing");
+        fs::write(&destination, b"original").unwrap();
+        let identity = Identity::directory(&Directory::open_path(&parent).unwrap()).unwrap();
+        let stage = StagedDownload::stage_for_replacement(&destination, &identity).unwrap();
+        stage.writer().unwrap().write_all(b"replacement").unwrap();
+        let stamp = FileStamp::read(stage.writer().unwrap()).unwrap();
+        stage.verify_stage(&stamp).unwrap();
+        assert!(stage.verify_partial(&stamp).is_err());
+        assert_eq!(fs::read(&destination).unwrap(), b"original");
+        assert!(
+            stage
+                .publish_checked(|file| {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        file.set_permissions(fs::Permissions::from_mode(0o0))?;
+                    }
+                    #[cfg(windows)]
+                    kortty_files::ReplacementMetadata::capture(&File::open(&destination)?)?
+                        .apply_to(file)?;
+                    Ok(())
+                })
+                .is_err()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"original");
         assert_eq!(fs::read_dir(&parent).unwrap().count(), 1);
     }
 
