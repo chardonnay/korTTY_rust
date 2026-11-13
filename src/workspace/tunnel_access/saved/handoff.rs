@@ -13,7 +13,7 @@ pub(in crate::workspace) struct ClosingOwner {
 
 enum ClosingTransport {
     Draining {
-        session: Session,
+        session: Box<Session>,
         listeners: Vec<Listener>,
     },
     Stopping(Receiver<()>),
@@ -162,7 +162,10 @@ impl Workspace {
         self.closing_tunnel_owners.insert(
             source,
             ClosingOwner {
-                transport: ClosingTransport::Draining { session, listeners },
+                transport: ClosingTransport::Draining {
+                    session: Box::new(session),
+                    listeners,
+                },
                 destination,
             },
         );
