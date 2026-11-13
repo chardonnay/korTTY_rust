@@ -284,16 +284,13 @@ impl Folder {
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt as _;
-            if !self.handle.metadata().is_ok_and(|metadata| {
+            let private = self.handle.metadata().is_ok_and(|metadata| {
                 metadata.mode() & 0o077 == 0
                     && metadata.uid() == rustix::process::geteuid().as_raw()
-            }) {
-                return false;
-            }
+            });
             #[cfg(target_os = "macos")]
-            return kortty_files::require_no_extended_acl(&self.handle).is_ok();
-            #[cfg(not(target_os = "macos"))]
-            true
+            let private = private && kortty_files::require_no_extended_acl(&self.handle).is_ok();
+            private
         }
         #[cfg(windows)]
         self.handle.require_owner_only().is_ok()
