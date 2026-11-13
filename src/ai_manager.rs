@@ -271,7 +271,7 @@ impl Configuration {
 
         ClipboardPolicy::load().require_ai_runtime_downloads()?;
         let root = Directory::open(path, false)?;
-        let lock = Self::lock_mutation(&root)?;
+        let lock = Self::lock_mutation_file(&root)?;
         let file = root.open_file(FILE_NAME)?;
         require_single_link(&file)?;
         let saved = Self::read_preference(file)?;
@@ -529,7 +529,13 @@ impl Configuration {
         }
     }
 
-    fn lock_mutation(root: &crate::private_files::Directory) -> io::Result<std::fs::File> {
+    fn lock_mutation(
+        root: &crate::private_files::Directory,
+    ) -> io::Result<crate::private_files::FileLock> {
+        Self::lock_mutation_file(root).map(crate::private_files::FileLock::new)
+    }
+
+    fn lock_mutation_file(root: &crate::private_files::Directory) -> io::Result<std::fs::File> {
         let lock = root.open_lock(MUTATION_LOCK)?;
         crate::private_files::require_single_link(&lock)?;
         lock.try_lock().map_err(|error| match error {
@@ -3986,6 +3992,25 @@ mod tests {
         assert_eq!(Configuration::decode(&bytes).unwrap(), changed);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn ai_settings_mutation_unlocks_while_a_duplicate_descriptor_is_open() {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let directory = crate::private_files::Directory::open(&root, false).unwrap();
+        let lock = Configuration::lock_mutation(&directory).unwrap();
+        let inherited = lock.try_clone().unwrap();
+        let baseline = Configuration::default();
+        let mut changed = baseline.clone();
+        changed.general.timeout_minutes = 11;
+
+        let error = changed.save_against(&root, &baseline).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        drop(lock);
+        changed.save_against(&root, &baseline).unwrap();
+        drop(inherited);
+    }
+
     fn default_profile_dialog() -> (crate::snippets::tests::Profile, Dialog) {
         let scratch = crate::snippets::tests::Profile::new();
         let root = scratch.0.canonicalize().unwrap();
@@ -4156,7 +4181,10 @@ mod tests {
         let Some(iced_runtime::Action::Output(event)) = block_on(outcomes.next()) else {
             panic!("expected the default profile save result");
         };
-        assert!(matches!(event, Message::ProfileDefaultSaved(Ok(_))));
+        assert!(
+            matches!(event, Message::ProfileDefaultSaved(Ok(_))),
+            "{event:?}"
+        );
         let _ = dialog.update(event);
         assert!(!dialog.busy());
         assert_eq!(dialog.notice, "Default AI profile saved.");
@@ -4223,7 +4251,11 @@ mod tests {
         assert!(matches!(event, Message::ProfileDefaultSaved(Err(_))));
         let _ = dialog.update(event);
         assert!(!dialog.busy());
-        assert!(dialog.notice.contains("AI settings changed"));
+        assert!(
+            dialog.notice.contains("AI settings changed"),
+            "{}",
+            dialog.notice
+        );
         assert_eq!(dialog.profiles.selected().unwrap().id, 2);
         assert_eq!(dialog.profiles.catalog().default_profile().unwrap().id, 1);
         assert_eq!(
