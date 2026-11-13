@@ -7694,6 +7694,8 @@ mod tests {
 
     #[test]
     fn broadcast_keeps_a_second_pty_responsive_when_the_first_input_queue_is_full() {
+        use std::time::{Duration, Instant};
+
         let mut workspace = Workspace::default();
         let (window, _) = workspace.open_window(true);
         let stalled = workspace.windows[&window]
@@ -7712,26 +7714,11 @@ mod tests {
         // The initial prompt may arrive after the PTY echoes the command.
         #[cfg(unix)]
         let block =
-            b"stty -echo -icanon min 1 time 0; printf '\\n%s%s\\n' 'kortty_blocked_' 'ready'; sleep 12\r";
+            b"stty -echo -icanon min 1 time 0; printf '\\n%s%s\\n' 'kortty_blocked_' 'ready'; exec sleep 30\r";
         #[cfg(windows)]
-        let block = b"[Console]::WriteLine('kortty_blocked_'+'ready'); Start-Sleep -Seconds 12\r";
+        let block = b"[Console]::WriteLine('kortty_blocked_'+'ready'); Start-Sleep -Seconds 30\r";
         first.send(block.to_vec()).unwrap();
         wait_for_terminal_line(first, "kortty_blocked_ready");
-
-        // The real PTY has a process that does not read. Saturate its writer
-        // before broadcasting the command to both sessions.
-        let mut saturated = false;
-        for _ in 0..256 {
-            match first.send(vec![b'x'; 32 * 1024]) {
-                Ok(()) => {}
-                Err(InputError::Busy) => {
-                    saturated = true;
-                    break;
-                }
-                Err(error) => panic!("unexpected input failure: {error:?}"),
-            }
-        }
-        assert!(saturated, "the first PTY input queue did not fill");
 
         let _ = workspace.update(Message::ToggleBroadcast(window));
         let mut targets = workspace
@@ -7740,31 +7727,50 @@ mod tests {
             .panes;
         targets.sort_by_key(|target| *target != stalled);
         assert_eq!(targets, [stalled, ready]);
-        #[cfg(unix)]
-        let command = b"printf '\\n%s%s\\n' 'kortty_broadcast_' 'reached'\r";
-        #[cfg(windows)]
-        let command = b"[Console]::WriteLine('kortty_broadcast_'+'reached')\r";
-        workspace.send_to(
-            window,
-            &targets,
-            InputSource::Keyboard {
-                enter: true,
-                predict: false,
-                shifted_enter: false,
-                physical_pane: None,
-            },
-            |_, _| Some(PaneInput::Local(command.to_vec())),
-        );
-        assert!(
-            workspace.windows[&window]
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let mut attempt = 0;
+        let marker = loop {
+            // A full queue can briefly reopen while the writer is still
+            // feeding the PTY. Require the broadcast itself to hit backpressure.
+            while Instant::now() < deadline {
+                match workspace.sessions[&stalled]
+                    .session
+                    .send(vec![b'x'; 32 * 1024])
+                {
+                    Ok(()) => {}
+                    Err(InputError::Busy) => break,
+                    Err(error) => panic!("unexpected input failure: {error:?}"),
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "broadcast did not hit backpressure"
+            );
+            attempt += 1;
+            #[cfg(unix)]
+            let command = format!("printf '\\n%s%s\\n' 'kortty_broadcast_' '{attempt}'\r");
+            #[cfg(windows)]
+            let command = format!("[Console]::WriteLine('kortty_broadcast_'+'{attempt}')\r");
+            workspace.send_to(
+                window,
+                &targets,
+                InputSource::Keyboard {
+                    enter: true,
+                    predict: false,
+                    shifted_enter: false,
+                    physical_pane: None,
+                },
+                |_, _| Some(PaneInput::Local(command.as_bytes().to_vec())),
+            );
+            if workspace.windows[&window]
                 .notice
                 .as_deref()
                 .is_some_and(|notice| notice.contains("input queue is full"))
-        );
-        wait_for_terminal_line(
-            &workspace.sessions[&ready].session,
-            "kortty_broadcast_reached",
-        );
+            {
+                break format!("kortty_broadcast_{attempt}");
+            }
+        };
+        wait_for_terminal_line(&workspace.sessions[&ready].session, &marker);
     }
 
     #[test]
