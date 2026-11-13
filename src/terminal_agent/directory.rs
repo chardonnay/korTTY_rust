@@ -43,18 +43,14 @@ impl LocalDirectory {
 }
 
 fn valid_path(path: &Path) -> bool {
-    if !path.is_absolute() || !path.to_str().is_some_and(valid_label) {
-        return false;
-    }
+    let valid = path.is_absolute() && path.to_str().is_some_and(valid_label);
     #[cfg(windows)]
-    {
+    let valid = {
         use std::path::{Component, Prefix};
-        if !matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
-        {
-            return false;
-        }
-    }
-    true
+        valid
+            && matches!(path.components().next(), Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
+    };
+    valid
 }
 
 pub(crate) fn valid_label(text: &str) -> bool {
