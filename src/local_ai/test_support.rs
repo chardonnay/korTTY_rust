@@ -54,7 +54,14 @@ pub(crate) fn listener() -> (TcpListener, Profile) {
 }
 
 pub(crate) fn accept(listener: &TcpListener) -> BufReader<TcpStream> {
-    let deadline = Instant::now() + Duration::from_secs(4);
+    accept_with_timeout(listener, Duration::from_secs(4))
+}
+
+pub(crate) fn accept_with_timeout(
+    listener: &TcpListener,
+    timeout: Duration,
+) -> BufReader<TcpStream> {
+    let deadline = Instant::now() + timeout;
     let stream = loop {
         match listener.accept() {
             Ok((stream, _)) => break stream,

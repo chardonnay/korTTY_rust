@@ -433,7 +433,8 @@ fn large_store(profile: &Profile) -> Store {
 }
 
 fn embedding_response(listener: &TcpListener, count: usize, vector: &[f32], query: Option<&str>) {
-    let mut socket = test_support::accept(listener);
+    // The scale fixtures may hash a large corpus before making their request.
+    let mut socket = test_support::accept_with_timeout(listener, Duration::from_secs(30));
     let body = test_support::wire_request(&mut socket, "POST /api/embed HTTP/1.1");
     let request: Value = serde_json::from_slice(&body).unwrap();
     let input = request["input"].as_array().unwrap();

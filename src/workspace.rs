@@ -7623,7 +7623,7 @@ mod tests {
                 .unwrap();
             let session = &workspace.sessions[&id].session;
             session.send(format!(
-                "stty -echo; printf '%s' '{prompt}'; IFS= read -r val; printf '\\n{label}=%s\\n' \"$val\"; stty echo\r"
+                "stty -echo; printf '\\r%s' '{prompt}'; IFS= read -r val; printf '\\n{label}=%s\\n' \"$val\"; stty echo\r"
             ).into_bytes()).unwrap();
             wait_for_terminal_line(session, prompt);
             let _ = workspace.update(Message::MultiExec(Some(owner), Action::Pane));
