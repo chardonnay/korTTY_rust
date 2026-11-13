@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::fs::{self, OpenOptions};
 use std::os::windows::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_READ};
@@ -24,12 +25,14 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         let path = std::env::temp_dir().join(format!(
-            "kortty-new-file-acl-{}-{nonce}",
+            "kortty-new-file-acl-{}-{nonce}-{sequence}",
             std::process::id()
         ));
         fs::create_dir(&path).unwrap();
