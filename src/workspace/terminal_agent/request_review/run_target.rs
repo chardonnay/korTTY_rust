@@ -1,7 +1,5 @@
 //! The attached execution target described in a reviewed Run model request.
 
-use std::sync::Weak;
-
 use kortty_ssh::HostKey;
 
 use crate::session::{ShellActivity, StreamLiveness};
@@ -10,7 +8,6 @@ use crate::workspace::SshTarget;
 
 use super::super::{
     LocalDirectory, Mode, PaneSession, Purpose, Run, RunTarget, Shell, Target, Workspace, engine,
-    password,
 };
 
 const TARGET_CHANGED: &str = "The reviewed agent target changed. Start a new run.";
@@ -43,7 +40,6 @@ struct SshReview {
 struct SudoCapabilities {
     passwordless: bool,
     password: bool,
-    vault_revision: Option<Weak<()>>,
 }
 
 impl RunTargetReview {
@@ -74,7 +70,7 @@ impl RunTargetReview {
             _ => return Err(TARGET_CHANGED.into()),
         };
         let sudo = match kind {
-            engine::RunModel::Decision => Some(SudoCapabilities::capture(workspace, run)?),
+            engine::RunModel::Decision => Some(SudoCapabilities::capture(workspace, run)),
             engine::RunModel::FinalAdvice => None,
         };
         let review = Self { target, sudo };
@@ -150,14 +146,6 @@ impl RunTargetReview {
             Attached::Local { directory, .. } => directory.require_current()?,
             Attached::Ssh(reviewed) => reviewed.check_worker()?,
         }
-        if self
-            .sudo
-            .as_ref()
-            .and_then(|sudo| sudo.vault_revision.as_ref())
-            .is_some_and(|revision| revision.strong_count() == 0)
-        {
-            return Err(SUDO_CHANGED.into());
-        }
         Ok(())
     }
 }
@@ -201,24 +189,11 @@ fn same_directory_evidence(reviewed: &ShellActivity, current: &ShellActivity) ->
 }
 
 impl SudoCapabilities {
-    fn capture(workspace: &Workspace, run: &Run) -> Result<Self, String> {
-        let password = workspace.password_sudo_available(run);
-        let vault_revision = if password && !password::MANUAL_AVAILABLE {
-            Some(
-                workspace
-                    .vault
-                    .as_ref()
-                    .and_then(|vault| vault.credential_revision())
-                    .ok_or(SUDO_CHANGED)?,
-            )
-        } else {
-            None
-        };
-        Ok(Self {
+    fn capture(workspace: &Workspace, run: &Run) -> Self {
+        Self {
             passwordless: run.passwordless_sudo_target().is_some(),
-            password,
-            vault_revision,
-        })
+            password: workspace.password_sudo_available(run),
+        }
     }
 }
 

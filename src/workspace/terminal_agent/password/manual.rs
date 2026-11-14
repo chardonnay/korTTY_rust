@@ -1,21 +1,35 @@
-//! Routes a native prompt result without putting a password in an Iced message.
+//! Handles one masked password entry without putting it in an application message.
 
 use std::sync::{Arc, Mutex};
 
 use kortty_ssh::SensitiveLine;
+#[cfg(not(target_os = "windows"))]
+use kortty_vault::Secret as NativePassword;
+#[cfg(target_os = "windows")]
 use kortty_windowing::NativePassword;
 
-use super::{Authorization, Desktop, Message, RedactionSecrets, Run, Task, Workspace, window};
+#[cfg(target_os = "windows")]
+use super::Message;
+use super::{Authorization, Desktop, RedactionSecrets, Run, Task, Workspace, window};
+
+#[cfg(not(target_os = "windows"))]
+mod masked;
 
 pub(super) struct Prompt {
+    #[cfg(target_os = "windows")]
     life: Arc<()>,
+    #[cfg(not(target_os = "windows"))]
+    field: iced::widget::Id,
     result: Arc<Mutex<Option<NativePassword>>>,
 }
 
 impl Prompt {
     fn new() -> Self {
         Self {
+            #[cfg(target_os = "windows")]
             life: Arc::new(()),
+            #[cfg(not(target_os = "windows"))]
+            field: iced::widget::Id::unique(),
             result: Arc::new(Mutex::new(None)),
         }
     }
@@ -51,13 +65,51 @@ impl Workspace {
             .as_mut()
             .ok_or("The sudo password request expired.")?;
         let prompt = Prompt::new();
-        let life = Arc::downgrade(&prompt.life);
-        let callback_life = life.clone();
-        let result = Arc::downgrade(&prompt.result);
-        let cancel = run.cancel.clone();
-        let destination = pending.scope.destination.clone();
+        let task = prompt.open(id, run.epoch, &pending.scope.destination, &run.cancel);
         pending.manual = Some(prompt);
-        let epoch = run.epoch;
+        Ok(task)
+    }
+
+    pub(super) fn submit_manual_sudo_line(&self, run: &mut Run) -> Result<(), String> {
+        let pending = run
+            .password
+            .as_ref()
+            .ok_or("The sudo password request expired.")?;
+        self.revalidate_password_sudo(run, pending)?;
+        let (owner, _) = self.current_run_pane(run)?;
+        if !matches!(pending.authorization, Some(Authorization::Manual))
+            || self.owner_dialog(owner).is_some()
+        {
+            return Err("The password request no longer matches the review.".into());
+        }
+        let secret = run
+            .password
+            .as_mut()
+            .and_then(|pending| pending.manual.take())
+            .and_then(Prompt::take)
+            .ok_or("The sudo password prompt was cancelled.")?;
+        let line = SensitiveLine::new(secret.as_str())
+            .map_err(|_| "The entered sudo password is invalid.")?;
+        let overlay = RedactionSecrets::with_secret(run.learned_sudo.as_ref(), secret.as_str())
+            .map_err(|_| "The reviewed sudo password could not be safely masked.")?;
+        Self::send_sudo_line(run, line, overlay)
+    }
+}
+
+impl Prompt {
+    #[cfg(target_os = "windows")]
+    fn open(
+        &self,
+        id: window::Id,
+        epoch: u64,
+        destination: &str,
+        cancel: &super::engine::Cancel,
+    ) -> Task<Desktop> {
+        let life = Arc::downgrade(&self.life);
+        let callback_life = life.clone();
+        let result = Arc::downgrade(&self.result);
+        let cancel = cancel.clone();
+        let destination = destination.to_owned();
         let (signal, ready) = async_channel::bounded(1);
         let show = window::run(id, move |native| {
             let callback = signal.clone();
@@ -92,31 +144,11 @@ impl Workspace {
                 )
             },
         );
-        Ok(Task::batch([show, completed]))
+        Task::batch([show, completed])
     }
 
-    pub(super) fn submit_manual_sudo_line(&self, run: &mut Run) -> Result<(), String> {
-        let pending = run
-            .password
-            .as_ref()
-            .ok_or("The sudo password request expired.")?;
-        self.revalidate_password_sudo(run, pending)?;
-        let (owner, _) = self.current_run_pane(run)?;
-        if !matches!(pending.authorization, Authorization::Manual)
-            || self.owner_dialog(owner).is_some()
-        {
-            return Err("The native password request no longer matches the review.".into());
-        }
-        let secret = run
-            .password
-            .as_mut()
-            .and_then(|pending| pending.manual.take())
-            .and_then(Prompt::take)
-            .ok_or("The native sudo password prompt was cancelled.")?;
-        let line = SensitiveLine::new(secret.as_str())
-            .map_err(|_| "The native sudo password is invalid.")?;
-        let overlay = RedactionSecrets::with_secret(run.learned_sudo.as_ref(), secret.as_str())
-            .map_err(|_| "The reviewed sudo password could not be safely masked.")?;
-        Self::send_sudo_line(run, line, overlay)
+    #[cfg(not(target_os = "windows"))]
+    fn open(&self, _: window::Id, _: u64, _: &str, _: &super::engine::Cancel) -> Task<Desktop> {
+        iced::widget::operation::focus(self.field.clone())
     }
 }

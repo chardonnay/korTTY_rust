@@ -1151,10 +1151,13 @@ fn agent_password_sudo_blocks_local_targets_and_unowned_password_messages() {
         id,
         Message::Password(password::Message::Approve(epoch, password::Source::Manual)),
     ));
-    #[cfg(target_os = "windows")]
     no_task(fixture.send(
         id,
         Message::Password(password::Message::ManualReady(epoch, true)),
+    ));
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::Approve(epoch, password::Source::Ticket)),
     ));
     assert!(fixture.run(id).phase == Phase::Thinking);
     let result = Decision {
@@ -1175,4 +1178,27 @@ fn agent_password_sudo_blocks_local_targets_and_unowned_password_messages() {
     assert!(fixture.run(id).password.is_none());
     assert!(fixture.run(id).commands.is_empty());
     assert!(fixture.run(id).notice.contains("attached SSH"));
+}
+
+#[test]
+fn agent_password_sudo_completion_cannot_restore_a_cancelled_run() {
+    let mut fixture = Fixture::new(false, false);
+    let id = fixture.open(Mode::Run);
+    let epoch = fixture.run_mut(id).next(Phase::SudoRunning, "Running sudo");
+    let completed = password::Completed::new(engine::Status::Exited(0), None);
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::Finished(
+            epoch - 1,
+            Ok(completed.clone()),
+        )),
+    ));
+    assert!(fixture.run(id).phase == Phase::SudoRunning);
+    no_task(fixture.send(id, Message::Cancel));
+    no_task(fixture.send(
+        id,
+        Message::Password(password::Message::Finished(epoch, Ok(completed))),
+    ));
+    assert!(fixture.run(id).phase == Phase::Cancelled);
+    assert!(fixture.run(id).sudo_terminal.is_none());
 }

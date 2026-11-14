@@ -16,8 +16,8 @@ use kortty_ssh::sftp::{Error as SftpError, FileKind, MAX_EDIT_BYTES, Sftp};
 use kortty_ssh::{
     Authentication, Connect, ConnectError, ConnectOptions, DirectChannel, Endpoint, ExecConnection,
     HostKey, HostKeyStatus, JumpRoute, KeepAlive, KnownHostsFile, MAX_FORWARD_STREAMS,
-    MAX_SFTP_LEASES, SshReader, SshSession, SshTarget, SshWriter, StartupChannel, TrustMode,
-    TrustStore, WindowSize,
+    MAX_SFTP_LEASES, SensitiveLine, SshReader, SshSession, SshTarget, SshWriter, StartupChannel,
+    TrustMode, TrustStore, WindowSize,
 };
 
 mod support;
@@ -1250,6 +1250,117 @@ fn openssh_exec_waits_for_pty_before_running_the_command() {
     assert_eq!(session.exit_code(), Some(7));
     session.close().unwrap();
     server.join().unwrap();
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH ssh-keygen and sshd, and a usable local account"]
+fn openssh_dedicated_exec_pty_requires_confirmation_and_keeps_ordinary_exec_available() {
+    let temp = TempDirectory::new("openssh-dedicated-exec-pty");
+    let user = fixture_user();
+    generate_keys(&temp.0, &["host", "client"]);
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let target = || fixture_target(&temp.0, &user, "client", &listener);
+    let trust = TrustStore::new(temp.0.join("pins"), TrustMode::Strict);
+    pin(&trust, &target().endpoint, &temp.0, "host");
+    let allowed = write_config(&temp.0, "host", &user);
+    let denied = temp.0.join("deny-pty-config");
+    fs::write(
+        &denied,
+        fs::read_to_string(&allowed)
+            .unwrap()
+            .replace("PermitTTY yes", "PermitTTY no"),
+    )
+    .unwrap();
+    let connect = || {
+        ExecConnection::connect_preconnected(
+            TcpStream::connect(listener.local_addr().unwrap()).unwrap(),
+            (target(), Vec::new()),
+            trust.clone(),
+            ConnectOptions::default(),
+            || false,
+            || Ok(()),
+        )
+        .unwrap()
+    };
+
+    let daemon = serve(&listener, &denied);
+    let connection = connect();
+    let opener = connection.exec_opener().unwrap();
+    assert!(matches!(
+        opener.open_pty_cancellable("printf unexpected", || false),
+        Err(ConnectError::RequestRejected { request: "pty-req" })
+    ));
+    drop(connection);
+    let log = daemon.join().unwrap().stderr;
+    let log = String::from_utf8_lossy(&log);
+    assert!(log.contains("request pty-req"), "{log}");
+    assert!(!log.contains("request exec"), "{log}");
+
+    let daemon = serve(&listener, &allowed);
+    let connection = connect();
+    let opener = connection.exec_opener().unwrap();
+    let mut pty = opener
+        .open_pty_cancellable(
+            r#"test -t 0 && test -t 1 && test -t 2 || exit 91
+case " $(stty -a) " in *" -echo "*) ;; *) exit 92;; esac
+printf 'ready\n' >&2
+IFS= read -r credential && [ "$credential" = fixture ] || exit 93
+IFS= read -r frame && [ "$frame" = first ] || exit 94
+printf 'first-ok\n'
+IFS= read -r frame && [ "$frame" = second ] || exit 95
+printf 'second-ok\n'
+exit 17"#,
+            || false,
+        )
+        .unwrap();
+    assert!(pty.take_stderr().is_none());
+    let mut output = pty.take_reader().unwrap();
+    let mut ready = [0; 6];
+    let mut offset = 0;
+    while offset < ready.len() {
+        let count = output
+            .read_timeout(&mut ready[offset..], Duration::from_secs(5))
+            .unwrap();
+        assert_ne!(count, 0);
+        offset += count;
+    }
+    assert_eq!(&ready, b"ready\n");
+
+    let mut ordinary = opener
+        .open_cancellable("test ! -t 0 && printf 'ordinary\n'", || false)
+        .unwrap();
+    let mut ordinary_reader = ordinary.take_reader().unwrap();
+    assert_eq!(
+        collect_output(move || {
+            let mut bytes = Vec::new();
+            ordinary_reader.read_to_end(&mut bytes).unwrap();
+            bytes
+        }),
+        b"ordinary\n"
+    );
+    assert_eq!(ordinary.exit_code(), Some(0));
+
+    let mut writer = pty
+        .take_sensitive_exec_input()
+        .unwrap()
+        .send_then(SensitiveLine::new("fixture").unwrap(), || true)
+        .unwrap();
+    writer.write_all(b"first\nsecond\n").unwrap();
+    assert_eq!(
+        collect_output(move || {
+            let mut bytes = Vec::new();
+            output.read_to_end(&mut bytes).unwrap();
+            bytes
+        }),
+        b"first-ok\nsecond-ok\n"
+    );
+    assert_eq!(pty.exit_code(), Some(17));
+    drop(connection);
+    let log = daemon.join().unwrap().stderr;
+    let log = String::from_utf8_lossy(&log);
+    assert_eq!(log.matches("Accepted publickey").count(), 1, "{log}");
+    assert_eq!(log.matches("request pty-req").count(), 1, "{log}");
+    assert_eq!(log.matches("request exec").count(), 2, "{log}");
 }
 
 #[test]

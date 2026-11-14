@@ -260,8 +260,9 @@ impl Channels {
         if !channel.tracked_session || channel.request_reply != RequestReply::Unsent {
             return error::BadUsage.fail();
         }
+        let pty = matches!(request, Req::Pty(_));
         request.send_with_reply(channel, send, true)?;
-        channel.request_reply = RequestReply::Pending { pty: false };
+        channel.request_reply = RequestReply::Pending { pty };
         Ok(())
     }
 
@@ -750,18 +751,28 @@ impl Req<'_> {
 
     fn send_with_reply(self, ch: &Channel, s: &mut TrafSend, want_reply: bool) -> Result<()> {
         let t;
+        let mut modes = [0; 5 * termmodes::NUM_MODES + 1];
         let req = match self {
             Req::Shell => ChannelReqType::Shell,
             Req::Pty(pty) => {
-                debug!("TODO implement pty modes");
                 t = pty.term;
+                let mut length = 0;
+                for mode in pty.modes {
+                    modes[length] = mode.opcode;
+                    modes[length + 1..length + 5].copy_from_slice(&mode.arg.to_be_bytes());
+                    length += 5;
+                }
+                // Nonempty mode lists end with TTY_OP_END.
+                if length != 0 {
+                    length += 1;
+                }
                 ChannelReqType::Pty(packets::PtyReq {
                     term: TextString(t.as_bytes()),
                     cols: pty.cols,
                     rows: pty.rows,
                     width: pty.width,
                     height: pty.height,
-                    modes: BinString(&[]),
+                    modes: BinString(&modes[..length]),
                 })
             }
             Req::Exec(cmd) => {

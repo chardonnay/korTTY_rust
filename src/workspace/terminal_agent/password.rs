@@ -1,4 +1,6 @@
-//! One-use review and authorization for an attached SSH sudo password.
+//! Command review and run-scoped sudo authentication for an attached SSH session.
+
+use std::sync::{Arc, Mutex};
 
 use iced::futures::{StreamExt as _, stream};
 use kortty_ssh::SensitiveLine;
@@ -14,13 +16,13 @@ use super::{
     Workspace, engine, mask, window,
 };
 
-#[cfg(target_os = "windows")]
 mod manual;
 
 #[derive(Clone, Copy)]
 pub enum Source {
     Vault,
     Manual,
+    Ticket,
 }
 
 enum Authorization {
@@ -42,9 +44,35 @@ pub enum Message {
     Approve(u64, Source),
     Challenge(u64),
     Use(u64),
-    #[cfg(target_os = "windows")]
     ManualReady(u64, bool),
-    Finished(u64, Result<engine::Status, &'static str>),
+    #[cfg(not(target_os = "windows"))]
+    ManualEdited(u64),
+    Finished(u64, Result<Completed, &'static str>),
+}
+
+#[derive(Clone)]
+pub struct Completed {
+    status: engine::Status,
+    terminal: Arc<Mutex<Option<engine::password::Terminal>>>,
+}
+
+impl Completed {
+    pub(super) fn new(
+        status: engine::Status,
+        terminal: Option<engine::password::Terminal>,
+    ) -> Self {
+        Self {
+            status,
+            terminal: Arc::new(Mutex::new(terminal)),
+        }
+    }
+
+    fn take_terminal(&self) -> Option<engine::password::Terminal> {
+        self.terminal
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
 }
 
 pub(super) struct Review {
@@ -77,19 +105,29 @@ struct Scope {
     destination: String,
 }
 
+impl Scope {
+    fn matches(&self, opener: &ExecOpener, route: &SshTarget, directory: &str) -> bool {
+        route == &self.route && directory == self.directory && opener.same_connection(&self.opener)
+    }
+}
+
+pub(super) struct Authenticated {
+    scope: Scope,
+    terminal: engine::password::Terminal,
+}
+
 pub(super) struct Pending {
     scope: Scope,
-    authorization: Authorization,
+    authorization: Option<Authorization>,
     answer: Option<async_channel::Sender<SensitiveLine>>,
-    #[cfg(target_os = "windows")]
     manual: Option<manual::Prompt>,
 }
 
 impl Pending {
     pub(super) fn credential_label(&self) -> Option<&str> {
         match &self.authorization {
-            Authorization::Vault(credential) => Some(&credential.label),
-            Authorization::Manual => None,
+            Some(Authorization::Vault(credential)) => Some(&credential.label),
+            _ => None,
         }
     }
 
@@ -98,18 +136,9 @@ impl Pending {
     }
 
     pub(super) fn manual_open(&self) -> bool {
-        #[cfg(target_os = "windows")]
-        {
-            self.manual.is_some()
-        }
-        #[cfg(not(target_os = "windows"))]
-        {
-            false
-        }
+        self.manual.is_some()
     }
 }
-
-pub(super) const MANUAL_AVAILABLE: bool = cfg!(target_os = "windows");
 
 impl Run {
     pub(super) fn reviewed_password_sudo(&self) -> Option<&Review> {
@@ -158,13 +187,12 @@ impl Workspace {
     }
 
     pub(super) fn password_sudo_available(&self, run: &Run) -> bool {
-        self.password_target(run).is_ok_and(|(_, route, _)| {
-            MANUAL_AVAILABLE
-                || self
-                    .vault
-                    .as_ref()
-                    .is_some_and(|vault| vault.agent_sudo_credential(&login(route)).is_ok())
-        })
+        self.password_target(run)
+            .is_ok_and(|(opener, route, directory)| {
+                run.sudo_terminal.as_ref().is_none_or(|authenticated| {
+                    authenticated.scope.matches(&opener, route, directory)
+                })
+            })
     }
 
     pub(super) fn prepare_password_sudo(&self, run: &Run, command: &str) -> Result<Review, String> {
@@ -178,18 +206,22 @@ impl Workspace {
                 .ok_or("The SSH host key is unavailable.")?
                 .fingerprint(),
         );
-        let credential = self
-            .vault
-            .as_ref()
-            .ok_or("Unlock the vault to use password sudo.")
-            .and_then(|vault| vault.agent_sudo_credential(&login));
-        let credential = match credential {
-            Ok(mut credential) => {
-                credential.label = mask::prompt(&run.redactor, &credential.label)?;
-                Some(credential)
+        let credential = if let Some(authenticated) = &run.sudo_terminal {
+            if !authenticated.scope.matches(&opener, route, directory) {
+                return Err(
+                    "The sudo terminal no longer matches the current SSH connection.".into(),
+                );
             }
-            Err(_) if MANUAL_AVAILABLE => None,
-            Err(error) => return Err(error.into()),
+            None
+        } else {
+            self.vault
+                .as_ref()
+                .and_then(|vault| vault.agent_sudo_credential(&login).ok())
+                .map(|mut credential| {
+                    credential.label = mask::prompt(&run.redactor, &credential.label)?;
+                    Ok::<_, String>(credential)
+                })
+                .transpose()?
         };
         Ok(Review {
             command: engine::password::Command::new(directory, command)?,
@@ -208,27 +240,19 @@ impl Workspace {
         &self,
         run: &Run,
         scope: &Scope,
-        authorization: &Authorization,
+        authorization: Option<&Authorization>,
     ) -> Result<(), String> {
         self.agent_dispatch_policy(run)?.check()?;
         let (opener, route, directory) = self.password_target(run)?;
-        if route != &scope.route
-            || directory != scope.directory
-            || !opener.same_connection(&scope.opener)
-        {
+        if !scope.matches(&opener, route, directory) {
             return Err("The sudo approval no longer matches the current SSH connection.".into());
         }
         self.agent_transport(run)?;
-        match authorization {
-            Authorization::Vault(credential) => self
-                .vault
+        if let Some(Authorization::Vault(credential)) = authorization {
+            self.vault
                 .as_ref()
                 .ok_or("The vault is no longer available.")?
-                .check_agent_sudo_credential(&scope.login, credential)?,
-            Authorization::Manual if !MANUAL_AVAILABLE => {
-                return Err("Native password entry is unavailable on this platform.".into());
-            }
-            Authorization::Manual => {}
+                .check_agent_sudo_credential(&scope.login, credential)?;
         }
         Ok(())
     }
@@ -238,7 +262,19 @@ impl Workspace {
         run: &Run,
         pending: &Pending,
     ) -> Result<(), String> {
-        self.check_password_sudo(run, &pending.scope, &pending.authorization)
+        self.check_password_sudo(run, &pending.scope, pending.authorization.as_ref())
+    }
+
+    pub(super) fn revalidate_sudo_terminal(
+        &self,
+        run: &Run,
+        authenticated: &Authenticated,
+    ) -> Result<(), String> {
+        let (opener, route, directory) = self.password_target(run)?;
+        if !authenticated.scope.matches(&opener, route, directory) {
+            return Err("The sudo terminal no longer matches the current SSH connection.".into());
+        }
+        Ok(())
     }
 
     fn launch_password_sudo(
@@ -259,32 +295,51 @@ impl Workspace {
             scope,
             credential,
         } = *review;
-        let authorization = match source {
-            Source::Vault => Authorization::Vault(
+        if mask::prompt(&run.redactor, command.wire())? != command.wire() {
+            return Err("The effective sudo command contains text that requires masking.".into());
+        }
+        let authorization = match (source, &run.sudo_terminal) {
+            (Source::Vault, None) => Some(Authorization::Vault(
                 credential.ok_or("The reviewed vault credential is unavailable.")?,
-            ),
-            Source::Manual => Authorization::Manual,
+            )),
+            (Source::Manual, None) => Some(Authorization::Manual),
+            (Source::Ticket, Some(authenticated))
+                if authenticated
+                    .scope
+                    .matches(&scope.opener, &scope.route, &scope.directory) =>
+            {
+                None
+            }
+            _ => return Err("The sudo approval no longer matches the current run.".into()),
         };
-        self.check_password_sudo(run, &scope, &authorization)?;
+        self.check_password_sudo(run, &scope, authorization.as_ref())?;
         let credential = match &authorization {
-            Authorization::Vault(credential) => Some(credential.clone()),
-            Authorization::Manual => None,
+            Some(Authorization::Vault(credential)) => Some(credential.clone()),
+            _ => None,
         };
         let opener = scope.opener.clone();
         let policy = self.agent_dispatch_policy(run)?;
+        let terminal = run
+            .sudo_terminal
+            .take()
+            .map(|authenticated| authenticated.terminal);
+        let reuse = terminal.is_some();
         let (answer, answers) = async_channel::bounded(1);
         run.password = Some(Pending {
             scope,
             authorization,
-            answer: Some(answer),
-            #[cfg(target_os = "windows")]
+            answer: (!reuse).then_some(answer),
             manual: None,
         });
         run.record("Approved SSH sudo command. Command output is withheld.".into());
-        let epoch = run.next(
-            Phase::SudoChallenge,
-            "Waiting for the reviewed SSH sudo challenge…",
-        );
+        let epoch = if reuse {
+            run.next(Phase::SudoRunning, "Running the approved SSH sudo command…")
+        } else {
+            run.next(
+                Phase::SudoChallenge,
+                "Validating sudo in the run's SSH terminal…",
+            )
+        };
         run.final_evidence.start(epoch, &proposal);
         let cancel = run.cancel.clone();
         let events = stream::once(async move {
@@ -297,14 +352,16 @@ impl Workspace {
                         .check()
                         .map_err(|_| "Managed policy blocks the reviewed SSH sudo command.")
                         .and_then(|()| {
-                            command.run(
+                            command.run_with_terminal(
                                 opener,
+                                terminal,
                                 cancel,
                                 move || credential.as_ref().is_none_or(AgentSudoCredential::active),
                                 answers,
                                 || worker.try_send(Message::Challenge(epoch)).is_ok(),
                             )
-                        });
+                        })
+                        .map(|(status, terminal)| Completed::new(status, terminal));
                     let _ = worker.try_send(Message::Finished(epoch, result));
                 })
                 .is_err()
@@ -343,13 +400,15 @@ impl Workspace {
                     && run.phase == Phase::SudoChallenge
                     && !run.cancel.requested() =>
             {
-                if let Some(pending) = &run.password {
+                if let Some(pending) = &run.password
+                    && pending.authorization.is_some()
+                {
                     if let Err(error) = self.revalidate_password_sudo(run, pending) {
                         run.stop(&error);
                     } else {
                         run.phase = Phase::SudoPassword;
                         run.notice =
-                            "The reviewed SSH command is waiting for its sudo password.".into();
+                            "The run's SSH terminal is waiting for its sudo password.".into();
                     }
                 }
             }
@@ -359,12 +418,9 @@ impl Workspace {
                     && !run.cancel.requested()
                     && !run.paused =>
             {
-                #[cfg(target_os = "windows")]
-                if run
-                    .password
-                    .as_ref()
-                    .is_some_and(|pending| matches!(pending.authorization, Authorization::Manual))
-                {
+                if run.password.as_ref().is_some_and(|pending| {
+                    matches!(pending.authorization, Some(Authorization::Manual))
+                }) {
                     return match self.open_manual_sudo_prompt(id, run) {
                         Ok(task) => Ok(task),
                         Err(error) => {
@@ -380,7 +436,6 @@ impl Workspace {
                     run.notice = "Running the approved SSH sudo command…".into();
                 }
             }
-            #[cfg(target_os = "windows")]
             Message::ManualReady(epoch, submitted)
                 if epoch == run.epoch
                     && run.phase == Phase::SudoPassword
@@ -388,7 +443,7 @@ impl Workspace {
                     && run.password.as_ref().is_some_and(Pending::manual_open) =>
             {
                 if !submitted || run.paused {
-                    run.stop("The native sudo password prompt was cancelled.");
+                    run.stop("The sudo password prompt was cancelled.");
                 } else if let Err(error) = self.submit_manual_sudo_line(run) {
                     run.stop(&error);
                 } else {
@@ -396,6 +451,8 @@ impl Workspace {
                     run.notice = "Running the approved SSH sudo command…".into();
                 }
             }
+            #[cfg(not(target_os = "windows"))]
+            Message::ManualEdited(epoch) if epoch == run.epoch => {}
             Message::Finished(epoch, result)
                 if epoch == run.epoch
                     && matches!(
@@ -403,15 +460,20 @@ impl Workspace {
                         Phase::SudoChallenge | Phase::SudoPassword | Phase::SudoRunning
                     ) =>
             {
-                run.password = None;
-                if run.cancel.requested() || result == Ok(engine::Status::Cancelled) {
+                let pending = run.password.take();
+                if run.cancel.requested()
+                    || result
+                        .as_ref()
+                        .is_ok_and(|result| result.status == engine::Status::Cancelled)
+                {
                     run.next(
                         Phase::Cancelled,
                         "The owned SSH sudo operation was cancelled.",
                     );
                     return Ok(Task::none());
                 }
-                match result? {
+                let result = result?;
+                match result.status {
                     engine::Status::Exited(code) => {
                         run.final_evidence.record_password(epoch, code);
                         run.record(format!(
@@ -422,8 +484,32 @@ impl Workspace {
                         "The SSH sudo command ended without a confirmed exit status.".into(),
                     ),
                 }
-                if result != Ok(engine::Status::Exited(0)) {
-                    return Err("The SSH sudo command did not complete successfully.".into());
+                if result.status != engine::Status::Exited(0) {
+                    let reused = pending
+                        .as_ref()
+                        .is_some_and(|pending| pending.authorization.is_none());
+                    return Err(if reused {
+                        "The SSH sudo command failed. If the sudo ticket expired, start a new run."
+                    } else {
+                        "The SSH sudo command did not complete successfully."
+                    }
+                    .into());
+                }
+                let scope = pending
+                    .ok_or("The sudo operation no longer owns its SSH route.")?
+                    .scope;
+                let terminal = result
+                    .take_terminal()
+                    .ok_or("The run's SSH sudo terminal closed.")?;
+                let authenticated = Authenticated { scope, terminal };
+                self.revalidate_sudo_terminal(run, &authenticated)?;
+                run.sudo_terminal = Some(authenticated);
+                for reviewed in &mut run.commands {
+                    if mask::prompt(&run.redactor, reviewed.text())? != reviewed.text() {
+                        return Err("A queued command contains text that requires masking.".into());
+                    }
+                    reviewed.proposal.purpose =
+                        mask::prompt(&run.redactor, &reviewed.proposal.purpose)?;
                 }
                 if run.commands.is_empty() {
                     return self.agent_turn(id, run);
@@ -444,7 +530,7 @@ impl Workspace {
             .as_ref()
             .ok_or("The sudo password request expired.")?;
         self.revalidate_password_sudo(run, pending)?;
-        let Authorization::Vault(credential) = &pending.authorization else {
+        let Some(Authorization::Vault(credential)) = &pending.authorization else {
             return Err("The sudo password source does not match the review.".into());
         };
         let (line, overlay) = self
@@ -504,7 +590,10 @@ impl Workspace {
                 })
                 && run.password.as_ref().is_some_and(|pending| {
                     !pending.manual_open()
-                        && pending.authorization.active()
+                        && pending
+                            .authorization
+                            .as_ref()
+                            .is_some_and(Authorization::active)
                         && pending
                             .answer
                             .as_ref()

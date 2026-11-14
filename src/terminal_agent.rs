@@ -38,6 +38,7 @@ const RUN_DECISION: &str = concat!(
     "If the target reports passwordlessSudo true, a command may request elevation using the optional elevation value passwordless_sudo. ",
     "If the target reports passwordSudo true, a command may instead use elevation password_sudo, which requires separate user authorization. ",
     "For that request give the command without a sudo prefix. The user must review the elevated invocation. ",
+    "Each approved password_sudo step can reuse the SSH terminal authenticated earlier in this run. ",
     "Each command runs independently from the original working directory and requires user approval. ",
     "When turn equals turnLimit, prefer done or blocked if the available evidence is sufficient. ",
     "Never invent successful results, request credentials, or reuse a masked value. ",

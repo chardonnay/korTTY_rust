@@ -10,7 +10,7 @@ use super::profiles::java_backup;
 use super::skills::{statistics, usage};
 use super::{Configuration, FILE_NAME, MAX_BYTES};
 use crate::clipboard_policy::ClipboardPolicy;
-use crate::private_files::{Directory, FileStamp, require_single_link};
+use crate::private_files::{Directory, FileLock, FileStamp, require_single_link};
 
 pub(crate) const SETTINGS: &str = FILE_NAME;
 pub(crate) const STATISTICS: &str = statistics::BACKUP_PATH;
@@ -18,7 +18,7 @@ pub(crate) const MEMORY: &str = "memory";
 pub(crate) const MEMORY_TOP_LEVEL: [&str; 2] = ["MEMORY.md", "archive.md"];
 pub(crate) const MEMORY_DIRECTORIES: [&str; 2] = ["connections", "history"];
 
-pub(crate) fn lock_for_restore(root: &Directory) -> io::Result<std::fs::File> {
+pub(crate) fn lock_for_restore(root: &Directory) -> io::Result<FileLock> {
     Configuration::lock_mutation(root)
 }
 

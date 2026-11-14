@@ -264,6 +264,7 @@ struct Run {
     cancel: Cancel,
     ai_cancel: Option<local_ai::Cancel>,
     password: Option<password::Pending>,
+    sudo_terminal: Option<password::Authenticated>,
 }
 
 struct ReviewedCommand {
@@ -410,6 +411,7 @@ impl Run {
             cancel: Cancel::default(),
             ai_cancel: None,
             password: None,
+            sudo_terminal: None,
         }
     }
 
@@ -464,6 +466,7 @@ impl Run {
         self.phase = phase;
         if phase.finished() {
             self.model_review = None;
+            self.sudo_terminal = None;
             self.chat_handoff_notice = Some(notice.into());
         }
         self.presentation.review(phase);
@@ -488,6 +491,7 @@ impl Run {
         self.batch_commands = None;
         self.question = None;
         self.password = None;
+        self.sudo_terminal = None;
         if self.phase.working() {
             self.notice = "Cancelling the active agent operation…".into();
         } else {
@@ -1299,6 +1303,8 @@ impl Workspace {
                 }
                 let available = if let Some(password) = &run.password {
                     self.revalidate_password_sudo(run, password)
+                } else if let Some(terminal) = &run.sudo_terminal {
+                    self.revalidate_sudo_terminal(run, terminal)
                 } else if let Some(source) = run.binding.saved() {
                     self.saved_swarm_policy(source, run.mode, run.profile().is_some())
                         .map_err(str::to_owned)

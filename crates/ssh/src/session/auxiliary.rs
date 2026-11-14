@@ -14,7 +14,7 @@ struct Opener {
 
 /// Opens SFTP on a specific authenticated terminal connection.
 #[derive(Clone)]
-pub struct SftpOpener(Opener);
+pub struct SftpOpener(Opener, Opener);
 
 impl SftpOpener {
     pub fn verified_host_key(&self) -> Option<&HostKey> {
@@ -27,7 +27,7 @@ impl SftpOpener {
 
     /// Opens commands on the exact same authenticated connection as this SFTP handle.
     pub fn exec_opener(&self) -> ExecOpener {
-        ExecOpener(self.0.clone())
+        ExecOpener(self.0.clone(), self.1.clone())
     }
 
     pub fn open(&self) -> Result<SftpLease, ConnectError> {
@@ -42,9 +42,9 @@ impl SftpOpener {
     }
 }
 
-/// Opens an independently owned, non-PTY command on an authenticated connection.
+/// Opens independently owned command channels on an authenticated connection.
 #[derive(Clone)]
-pub struct ExecOpener(Opener);
+pub struct ExecOpener(Opener, Opener);
 
 impl ExecOpener {
     pub fn verified_host_key(&self) -> Option<&HostKey> {
@@ -65,7 +65,7 @@ impl ExecOpener {
         command: &str,
         cancelled: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Result<ExecLease, ConnectError> {
-        self.open_exec(command, false, cancelled, None)
+        self.open_exec(command, ExecMode::Plain, cancelled, None)
     }
 
     /// Authorizes once on the I/O worker, immediately before requesting exec.
@@ -75,7 +75,12 @@ impl ExecOpener {
         cancelled: impl Fn() -> bool + Send + Sync + 'static,
         before_exec: impl FnOnce() -> io::Result<()> + Send + 'static,
     ) -> Result<ExecLease, ConnectError> {
-        self.open_exec(command, false, cancelled, Some(Box::new(before_exec)))
+        self.open_exec(
+            command,
+            ExecMode::Plain,
+            cancelled,
+            Some(Box::new(before_exec)),
+        )
     }
 
     /// Uses a wiping output queue for a command that can echo a credential.
@@ -84,13 +89,25 @@ impl ExecOpener {
         command: &str,
         cancelled: impl Fn() -> bool + Send + Sync + 'static,
     ) -> Result<ExecLease, ConnectError> {
-        self.open_exec(command, true, cancelled, None)
+        self.open_exec(command, ExecMode::Sensitive, cancelled, None)
+    }
+
+    /// Opens a private command channel after the server confirms PTY allocation.
+    ///
+    /// Output is merged and wiped on consumption. The lease can hand off one
+    /// sensitive input line to a subsequent stream without sending EOF.
+    pub fn open_pty_cancellable(
+        &self,
+        command: &str,
+        cancelled: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> Result<ExecLease, ConnectError> {
+        self.open_exec(command, ExecMode::Pty, cancelled, None)
     }
 
     fn open_exec(
         &self,
         command: &str,
-        sensitive: bool,
+        mode: ExecMode,
         cancelled: impl Fn() -> bool + Send + Sync + 'static,
         before_exec: Option<ExecAuthorization>,
     ) -> Result<ExecLease, ConnectError> {
@@ -102,8 +119,18 @@ impl ExecOpener {
         }
         let cancelled = Arc::new(cancelled);
         let wait = Arc::clone(&cancelled);
-        self.0.open(
-            Request::Exec(command.into(), cancelled, sensitive, before_exec),
+        let opener = if mode == ExecMode::Pty {
+            &self.1
+        } else {
+            &self.0
+        };
+        opener.open(
+            Request::Exec {
+                command: command.into(),
+                cancelled,
+                mode,
+                before_exec,
+            },
             &|| wait(),
         )
     }
@@ -122,7 +149,7 @@ impl Opener {
         if self.is_closed() {
             return Err(closed().into());
         }
-        let startup = if matches!(request, Request::Exec(..)) {
+        let startup = if matches!(request, Request::Exec { .. }) {
             Startup::with_timeout(EXEC_OPEN_TIMEOUT, Some(cancelled))
         } else {
             Startup::new(Some(cancelled))
@@ -192,9 +219,12 @@ impl SessionLease {
         self.writer.take()
     }
 
-    /// Takes the one-use input of a non-PTY exec lease.
+    /// Takes the one-use credential input of an exec lease.
     pub fn take_sensitive_exec_input(&mut self) -> Option<super::SensitiveExecInput> {
-        if !matches!(self.mode, ChannelMode::Exec | ChannelMode::SensitiveExec) {
+        if !matches!(
+            self.mode,
+            ChannelMode::Exec | ChannelMode::SensitiveExec | ChannelMode::SensitiveExecPty
+        ) {
             return None;
         }
         self.take_writer().map(super::SensitiveExecInput::new)
@@ -224,20 +254,27 @@ impl Drop for SessionLease {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ExecMode {
+    Plain,
+    Sensitive,
+    Pty,
+}
+
 enum Request {
     Sftp,
-    Exec(
-        String,
-        Arc<dyn Fn() -> bool + Send + Sync>,
-        bool,
-        Option<ExecAuthorization>,
-    ),
+    Exec {
+        command: String,
+        cancelled: Arc<dyn Fn() -> bool + Send + Sync>,
+        mode: ExecMode,
+        before_exec: Option<ExecAuthorization>,
+    },
 }
 
 impl Request {
     fn authorize(&mut self) -> io::Result<bool> {
-        if let Self::Exec(_, _, _, authorization) = self
-            && let Some(authorize) = authorization.take()
+        if let Self::Exec { before_exec, .. } = self
+            && let Some(authorize) = before_exec.take()
         {
             authorize()?;
             return Ok(true);
@@ -248,16 +285,75 @@ impl Request {
     fn name(&self) -> &'static str {
         match self {
             Self::Sftp => "subsystem",
-            Self::Exec(..) => "exec",
+            Self::Exec { .. } => "exec",
         }
     }
 
-    fn send(&self, runner: &mut Runner<'_, Client>, channel: &ChanHandle) -> sunset::Result<bool> {
+    fn needs_pty(&self) -> bool {
+        matches!(
+            self,
+            Self::Exec {
+                mode: ExecMode::Pty,
+                ..
+            }
+        )
+    }
+
+    fn send(
+        &self,
+        runner: &mut Runner<'_, Client>,
+        channel: &ChanHandle,
+    ) -> Result<bool, ConnectError> {
+        Ok(match self {
+            Self::Sftp => runner.client_tracked_subsystem(channel, "sftp")?,
+            Self::Exec {
+                mode: ExecMode::Pty,
+                ..
+            } => runner.client_tracked_pty(channel, private_pty()?)?,
+            Self::Exec { command, .. } => runner.client_tracked_exec(channel, command)?,
+        })
+    }
+
+    fn send_exec_after_pty(
+        &self,
+        runner: &mut Runner<'_, Client>,
+        channel: &ChanHandle,
+    ) -> sunset::Result<bool> {
+        let Self::Exec { command, .. } = self else {
+            unreachable!("only an exec channel requests a PTY");
+        };
+        runner.client_exec_after_pty(channel, command)
+    }
+
+    fn channel_mode(&self) -> ChannelMode {
         match self {
-            Self::Sftp => runner.client_tracked_subsystem(channel, "sftp"),
-            Self::Exec(command, ..) => runner.client_tracked_exec(channel, command),
+            Self::Sftp => ChannelMode::SftpLease,
+            Self::Exec { mode, .. } => match mode {
+                ExecMode::Plain => ChannelMode::Exec,
+                ExecMode::Sensitive => ChannelMode::SensitiveExec,
+                ExecMode::Pty => ChannelMode::SensitiveExecPty,
+            },
         }
     }
+}
+
+fn private_pty() -> io::Result<Pty> {
+    let mut pty = terminal_request(
+        "dumb",
+        WindowSize {
+            columns: 80,
+            rows: 24,
+            pixel_width: 0,
+            pixel_height: 0,
+        },
+    )?;
+    // RFC 4254 terminal modes: ICANON, ECHO, ECHONL, OPOST.
+    for opcode in [51, 53, 56, 70] {
+        pty.modes
+            .push(sunset::ModePair { opcode, arg: 0 })
+            .expect("four PTY modes fit in the request");
+    }
+    Ok(pty)
 }
 
 struct Open {
@@ -272,7 +368,7 @@ impl Open {
     fn expired(&self) -> bool {
         self.abandoned.load(Ordering::Acquire)
             || Instant::now() >= self.deadline
-            || matches!(&self.request, Request::Exec(_, cancelled, _, _) if cancelled())
+            || matches!(&self.request, Request::Exec { cancelled, .. } if cancelled())
     }
 
     fn complete(self, result: Result<SessionLease, ConnectError>) {
@@ -286,14 +382,15 @@ pub(super) fn control(
 ) -> (SftpOpener, ExecOpener, Channels) {
     let (sftp, sftp_pool) = Pool::control(owner, crate::MAX_SFTP_LEASES);
     let (exec, exec_pool) = Pool::control(owner, 1 + usize::from(transfer_helper));
+    let (pty, pty_pool) = Pool::control(owner, 1);
     (
-        SftpOpener(sftp),
-        ExecOpener(exec),
-        Channels([sftp_pool, exec_pool]),
+        SftpOpener(sftp, pty.clone()),
+        ExecOpener(exec, pty),
+        Channels([sftp_pool, exec_pool, pty_pool]),
     )
 }
 
-pub(super) struct Channels([Pool; 2]);
+pub(super) struct Channels([Pool; 3]);
 
 impl Channels {
     pub(super) fn wait_time(&self) -> Option<Duration> {
@@ -322,7 +419,7 @@ impl Channels {
                         .exit_code
                         .store(u64::from(status), Ordering::Release);
                 }
-                Some(State::Negotiating(handle, request)) if handle.num() == channel => {
+                Some(State::Negotiating(handle, request, _)) if handle.num() == channel => {
                     request.status = Some(status);
                 }
                 _ => {}
@@ -339,9 +436,15 @@ struct Pool {
 
 enum State {
     Opening(ChanHandle, Open),
-    Negotiating(ChanHandle, Open),
+    Negotiating(ChanHandle, Open, Confirmation),
     Active(ChannelPump),
     Closing(ChanHandle),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Confirmation {
+    Pty,
+    Command,
 }
 
 impl Pool {
@@ -366,7 +469,7 @@ impl Pool {
             .iter()
             .flatten()
             .filter_map(|state| match state {
-                State::Opening(_, request) | State::Negotiating(_, request) => {
+                State::Opening(_, request) | State::Negotiating(_, request, _) => {
                     Some(request.deadline)
                 }
                 _ => None,
@@ -479,7 +582,14 @@ impl State {
                     return reject(channel, request, timeout());
                 }
                 match request.request.send(runner, &channel) {
-                    Ok(true) => Self::Negotiating(channel, request),
+                    Ok(true) => {
+                        let confirmation = if request.request.needs_pty() {
+                            Confirmation::Pty
+                        } else {
+                            Confirmation::Command
+                        };
+                        Self::Negotiating(channel, request, confirmation)
+                    }
                     Ok(false) if authorized_now => {
                         let error = io::Error::new(
                             io::ErrorKind::WouldBlock,
@@ -488,21 +598,40 @@ impl State {
                         return reject(channel, request, error.into());
                     }
                     Ok(false) => return (Some(Self::Opening(channel, request)), false),
-                    Err(error) => return reject(channel, request, error.into()),
+                    Err(error) => return reject(channel, request, error),
                 }
             }
-            Self::Negotiating(channel, request) => {
+            Self::Negotiating(channel, request, confirmation) => {
                 if request.expired() {
                     return reject(channel, request, timeout());
                 }
                 match runner.client_request_result(&channel) {
+                    Ok(Some(true)) if confirmation == Confirmation::Pty => {
+                        if let Some(error) = premature_data(runner, &channel) {
+                            return reject(channel, request, error);
+                        }
+                        match request.request.send_exec_after_pty(runner, &channel) {
+                            Ok(true) => Self::Negotiating(channel, request, Confirmation::Command),
+                            Ok(false) => {
+                                return (
+                                    Some(Self::Negotiating(channel, request, confirmation)),
+                                    false,
+                                );
+                            }
+                            Err(error) => return reject(channel, request, error.into()),
+                        }
+                    }
                     Ok(Some(true)) => {
                         let (pump, lease) = lease_pair(channel, owner, &request);
                         request.complete(Ok(lease));
                         Self::Active(pump)
                     }
                     Ok(Some(false)) => {
-                        let name = request.request.name();
+                        let name = if confirmation == Confirmation::Pty {
+                            "pty-req"
+                        } else {
+                            request.request.name()
+                        };
                         return reject(
                             channel,
                             request,
@@ -513,7 +642,10 @@ impl State {
                         if let Some(error) = premature_data(runner, &channel) {
                             return reject(channel, request, error);
                         }
-                        return (Some(Self::Negotiating(channel, request)), false);
+                        return (
+                            Some(Self::Negotiating(channel, request, confirmation)),
+                            false,
+                        );
                     }
                     Err(error) => return reject(channel, request, error.into()),
                 }
@@ -565,22 +697,17 @@ fn lease_pair(
 ) -> (ChannelPump, SessionLease) {
     let shared = Shared::new(Arc::clone(&owner.wake));
     let (input, commands) = mpsc::sync_channel(QUEUE_DEPTH);
-    let sensitive = matches!(request.request, Request::Exec(_, _, true, _));
+    let mode = request.request.channel_mode();
+    let sensitive = matches!(
+        mode,
+        ChannelMode::SensitiveExec | ChannelMode::SensitiveExecPty
+    );
     let (stdout, output) = output::queue_with_wipe(sensitive);
-    let (mode, stderr, errors) = match request.request {
-        Request::Sftp => (ChannelMode::SftpLease, None, None),
-        Request::Exec(..) => {
-            let (stderr, errors) = output::queue_with_wipe(sensitive);
-            (
-                if sensitive {
-                    ChannelMode::SensitiveExec
-                } else {
-                    ChannelMode::Exec
-                },
-                Some(stderr),
-                Some(SshReader::new(&shared, errors)),
-            )
-        }
+    let (stderr, errors) = if matches!(mode, ChannelMode::Exec | ChannelMode::SensitiveExec) {
+        let (stderr, errors) = output::queue_with_wipe(sensitive);
+        (Some(stderr), Some(SshReader::new(&shared, errors)))
+    } else {
+        (None, None)
     };
     if let Some(status) = request.status {
         shared.exit_code.store(u64::from(status), Ordering::Release);

@@ -19,6 +19,8 @@ use super::{closed, lock};
 mod exec;
 #[path = "server/file_exec.rs"]
 mod file_exec;
+#[path = "server/sudo_pty.rs"]
+mod sudo_pty;
 
 const ACCEPT_POLL: Duration = Duration::from_millis(100);
 // Opening a stream and starting its relay can briefly occupy two tasks.
@@ -120,7 +122,9 @@ impl Server {
     fn open(self: &Arc<Self>, id: u32, request: Open) -> io::Result<()> {
         let flow = match &request {
             Open::PasswordExec { .. } => self.mux.add_password(id, PasswordSide::Worker),
-            Open::PasswordFileExec { .. } => self.mux.add_password_file(id, PasswordSide::Worker),
+            Open::PasswordFileExec { .. } | Open::SudoPty { .. } => {
+                self.mux.add_password_file(id, PasswordSide::Worker)
+            }
             _ => self.mux.add(id),
         };
         let flow = match flow {
@@ -168,6 +172,7 @@ impl Server {
                 }
                 Open::FileExec => server.exec_file(&active),
                 Open::PasswordFileExec { nonce } => server.exec_password_file(&active, nonce),
+                Open::SudoPty { nonce } => server.open_sudo_pty(&active, nonce),
                 Open::AccountLookup { kind, name } => {
                     server.exec_account_lookup(&active, kind, &name)
                 }

@@ -115,30 +115,40 @@ impl Run {
         if let Some(command) = self.reviewed_command() {
             let password = self.reviewed_password_sudo();
             let approval: Element<'_, Message> = if let Some(review) = password {
-                row![
-                    review
-                        .credential_label()
-                        .map(|_| button("Approve with vault password").on_press_maybe(
+                if self.sudo_terminal.is_some() {
+                    button("Approve with this run's sudo ticket")
+                        .on_press_maybe((!self.paused).then_some(Message::Password(
+                            super::password::Message::Approve(
+                                self.epoch,
+                                super::password::Source::Ticket,
+                            ),
+                        )))
+                        .into()
+                } else {
+                    row![
+                        review
+                            .credential_label()
+                            .map(|_| button("Approve with vault password").on_press_maybe(
+                                (!self.paused).then_some(Message::Password(
+                                    super::password::Message::Approve(
+                                        self.epoch,
+                                        super::password::Source::Vault,
+                                    ),
+                                ))
+                            )),
+                        button("Approve with manual password").on_press_maybe(
                             (!self.paused).then_some(Message::Password(
                                 super::password::Message::Approve(
                                     self.epoch,
-                                    super::password::Source::Vault
-                                )
+                                    super::password::Source::Manual,
+                                ),
                             )),
-                        )),
-                    super::password::MANUAL_AVAILABLE.then(|| button(
-                        "Approve with manual password"
-                    )
-                    .on_press_maybe((!self.paused).then_some(Message::Password(
-                        super::password::Message::Approve(
-                            self.epoch,
-                            super::password::Source::Manual
-                        )
-                    )),)),
-                ]
-                .spacing(6)
-                .wrap()
-                .into()
+                        ),
+                    ]
+                    .spacing(6)
+                    .wrap()
+                    .into()
+                }
             } else {
                 row![
                     button(if self.phase == Phase::ProbeApproval {
@@ -160,8 +170,15 @@ impl Run {
                     password.map(|review| column![
                         text("Password sudo as root over attached SSH").size(13),
                         text(review.destination()).size(13),
-                        review.credential_label().map(|label| text(format!("Vault credential: {label}")).size(13)),
-                        text("Choose the password source when approving this command. Submitting the password requires a separate action after the SSH challenge.").size(13),
+                        (self.sudo_terminal.is_none())
+                            .then(|| review.credential_label())
+                            .flatten()
+                            .map(|label| text(format!("Vault credential: {label}")).size(13)),
+                        text(if self.sudo_terminal.is_some() {
+                            "This command will use the sudo ticket from this run."
+                        } else {
+                            "Choose the password source. The run requests it after the SSH challenge."
+                        }).size(13),
                     ].spacing(3)),
                     scrollable(text(command.1).font(iced::Font::MONOSPACE))
                         .height(Length::Fixed(84.0)),
@@ -194,6 +211,10 @@ impl Run {
                 ]
                 .spacing(6),
             );
+        }
+        #[cfg(not(target_os = "windows"))]
+        if let Some(prompt) = self.manual_password_view() {
+            page = page.push(prompt);
         }
         if let Some((question, answers)) = &self.question {
             let mut choices = row![].spacing(6);
