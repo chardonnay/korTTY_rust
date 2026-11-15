@@ -321,8 +321,10 @@ fn existing_local_rsync_refuses_stale_bytes_and_merge_that_would_remove_a_folder
     assert!(fixture.recovery().is_none());
 
     fs::remove_file(fixture.target.join("file")).unwrap();
-    fs::create_dir(fixture.target.join("file")).unwrap();
-    fs::write(fixture.target.join("file/keep"), b"kept").unwrap();
+    let parent = local_tree::open_reviewed_tree_parent(&fixture.target).unwrap();
+    let folder = local_tree::create_reviewed_tree_stage(&parent, OsStr::new("file")).unwrap();
+    write(&folder, "keep", b"kept");
+    drop((folder, parent));
     let snapshot = fixture.snapshot();
     let receiver = Receiver::prepare(&fixture.target, snapshot, &|| false).unwrap();
     let outcome = fixture.apply(receiver, fixture.inventory(), false, &|| Ok(()));

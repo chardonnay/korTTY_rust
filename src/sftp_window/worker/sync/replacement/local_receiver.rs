@@ -492,7 +492,27 @@ mod tests {
     use std::fs;
     use std::io::Write as _;
 
+    use crate::snippets::tests::Profile;
+
     use super::*;
+
+    fn fixture(bytes: &[u8]) -> (Profile, PathBuf) {
+        let profile = Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let directory = Directory::open_path(&root).unwrap();
+        let workspace = OsStr::new("workspace");
+        drop(local_tree::create_reviewed_tree_stage(&directory, workspace).unwrap());
+        let destination = root.join(workspace).join("receiver.txt");
+        write_fixture_file(&destination, bytes);
+        (profile, destination)
+    }
+
+    fn write_fixture_file(path: &Path, bytes: &[u8]) {
+        let parent = Directory::open_path(path.parent().unwrap()).unwrap();
+        let mut file =
+            local_tree::create_reviewed_tree_file(&parent, path.file_name().unwrap()).unwrap();
+        file.write_all(bytes).unwrap();
+    }
 
     fn staged(receiver: &ReviewedFileReceiver, bytes: &[u8]) -> (StagedDownload, Inventory) {
         let stage = receiver.stage().unwrap();
@@ -505,10 +525,7 @@ mod tests {
 
     #[test]
     fn checked_local_file_returns_current_successor_and_retains_original() {
-        let fixture = crate::snippets::tests::Profile::new();
-        let root = fixture.0.canonicalize().unwrap();
-        let destination = root.join("receiver.txt");
-        fs::write(&destination, b"old bytes").unwrap();
+        let (_fixture, destination) = fixture(b"old bytes");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt as _;
@@ -548,17 +565,22 @@ mod tests {
                 0o640
             );
         }
-        fs::rename(&destination, root.join("previous successor")).unwrap();
-        fs::write(&destination, b"new bytes").unwrap();
+        fs::rename(
+            &destination,
+            destination.with_file_name("previous successor"),
+        )
+        .unwrap();
+        write_fixture_file(&destination, b"new bytes");
+        let other = ReviewedFileReceiver::inspect(&destination, &|| false).unwrap();
+        assert_eq!(other.inventory, successor.inventory);
+        assert!(!other.aliases(&successor));
         assert!(ReviewedFileReceiver::prepare(&destination, successor, &|| false).is_err());
     }
 
     #[test]
     fn checked_local_file_restores_or_retains_when_publication_loses_the_name() {
         for occupant in [false, true] {
-            let fixture = crate::snippets::tests::Profile::new();
-            let destination = fixture.0.canonicalize().unwrap().join("receiver.txt");
-            fs::write(&destination, b"old").unwrap();
+            let (_fixture, destination) = fixture(b"old");
             let old = ReviewedFileReceiver::inspect(&destination, &|| false).unwrap();
             let receiver = ReviewedFileReceiver::prepare(&destination, old, &|| false).unwrap();
             let (stage, incoming) = staged(&receiver, b"new");
@@ -602,10 +624,8 @@ mod tests {
 
     #[test]
     fn checked_local_file_rejects_shared_identity_and_unverified_content_before_arming() {
-        let fixture = crate::snippets::tests::Profile::new();
-        let destination = fixture.0.canonicalize().unwrap().join("receiver.txt");
+        let (_fixture, destination) = fixture(b"old");
         let link = destination.with_file_name("second name");
-        fs::write(&destination, b"old").unwrap();
         fs::hard_link(&destination, &link).unwrap();
         assert!(ReviewedFileReceiver::inspect(&destination, &|| false).is_err());
         fs::remove_file(link).unwrap();

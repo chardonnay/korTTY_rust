@@ -1127,7 +1127,9 @@ impl Draft {
                 Source::RsyncDownloadTree | Source::RsyncUploadTree
             ),
             existing: self.rsync_existing.filter(|_| {
-                self.source == Source::RsyncUploadTree || self.supports_rsync_existing_file()
+                upload
+                    && (self.source == Source::RsyncUploadTree
+                        || self.supports_rsync_existing_file())
             }),
             existing_download: self.rsync_existing.filter(|_| {
                 matches!(

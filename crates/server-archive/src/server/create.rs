@@ -169,7 +169,10 @@ fn apply_output_metadata(file: &File, output: OutputMetadata) -> io::Result<()> 
     if uid.is_some() || gid.is_some() {
         fchown(file, uid, gid)?;
     }
-    let mode = Mode::from_raw_mode(output.mode.unwrap_or(0o600).into());
+    let mode = output.mode.unwrap_or(0o600);
+    #[cfg(target_os = "linux")]
+    let mode = u32::from(mode);
+    let mode = Mode::from_raw_mode(mode);
     make_private(file, mode)?;
     let after = fstat(file)?;
     if !same_node(&before, &after)
