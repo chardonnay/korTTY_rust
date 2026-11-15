@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt::Write as _;
+use std::time::Instant;
 
 pub(crate) mod comparison;
 pub(crate) mod headless;
@@ -9,6 +10,7 @@ pub(crate) mod journal;
 mod key;
 pub(crate) mod report;
 pub(crate) mod script;
+mod status_strip;
 pub(crate) mod workflow;
 
 pub(crate) const MAX_TARGETS: usize = 8;
@@ -17,6 +19,8 @@ const MAX_DETAIL_CHARS: usize = 512;
 const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024;
 
 pub(crate) use key::Key;
+pub(crate) use status_strip::StatusCounts;
+use status_strip::{Clock, StatusStrip};
 
 #[derive(Clone)]
 pub(crate) struct Target {
@@ -79,6 +83,14 @@ impl Status {
     fn holds_slot(self) -> bool {
         self != Self::Queued && !self.finished()
     }
+
+    fn counts_elapsed(self) -> bool {
+        self.holds_slot() && !matches!(self, Self::Paused | Self::Cancelling)
+    }
+
+    fn is_working(self) -> bool {
+        matches!(self, Self::Starting | Self::Running)
+    }
 }
 
 #[derive(Clone)]
@@ -87,13 +99,39 @@ pub(crate) struct Row {
     pub(crate) status: Status,
     pub(crate) detail: String,
     pub(crate) transcript: String,
+    pub(crate) usage_tokens: Option<u64>,
     attempt: u64,
     held: bool,
+    clock: Option<Clock>,
 }
 
 impl Row {
     pub(crate) fn attempt(&self) -> u64 {
         self.attempt
+    }
+
+    pub(crate) fn elapsed_seconds(&self, now: Instant) -> Option<u64> {
+        self.clock.as_ref().map(|clock| clock.elapsed_seconds(now))
+    }
+
+    fn sync_clock(&mut self, now: Instant, round_paused: bool) {
+        if let Some(clock) = &mut self.clock {
+            clock.set_running(
+                now,
+                !self.held && !round_paused && self.status.counts_elapsed(),
+            );
+        }
+    }
+
+    fn display_status(&self, round_paused: bool) -> Status {
+        if (self.held || (round_paused && self.status.holds_slot()))
+            && self.status != Status::Cancelling
+            && !self.status.finished()
+        {
+            Status::Paused
+        } else {
+            self.status
+        }
     }
 }
 
@@ -128,8 +166,10 @@ impl Queue {
                 status: Status::Queued,
                 detail: String::new(),
                 transcript: String::new(),
+                usage_tokens: None,
                 attempt: 1,
                 held: false,
+                clock: None,
             })
             .collect();
         Ok(Self {
@@ -149,11 +189,16 @@ impl Queue {
     }
 
     pub(crate) fn set_paused(&mut self, paused: bool) {
+        self.set_paused_at(paused, Instant::now());
+    }
+
+    fn set_paused_at(&mut self, paused: bool, now: Instant) {
         self.paused = paused;
-        if !paused {
-            for row in &mut self.rows {
+        for row in &mut self.rows {
+            if !paused {
                 row.held = false;
             }
+            row.sync_clock(now, paused);
         }
     }
 
@@ -186,12 +231,18 @@ impl Queue {
     }
 
     pub(crate) fn hold(&mut self, ticket: Ticket, held: bool) -> bool {
+        self.hold_at(ticket, held, Instant::now())
+    }
+
+    fn hold_at(&mut self, ticket: Ticket, held: bool, now: Instant) -> bool {
+        let paused = self.paused;
         let Some(row) = self.row_for(ticket).filter(|row| {
             !row.status.finished() && row.status != Status::Cancelling && row.held != held
         }) else {
             return false;
         };
         row.held = held;
+        row.sync_clock(now, paused);
         true
     }
 
@@ -207,12 +258,18 @@ impl Queue {
         row.status = Status::Queued;
         row.detail.clear();
         row.transcript.clear();
+        row.usage_tokens = None;
+        row.clock = None;
         true
     }
 
     /// Reserves slots before the caller starts workers. Awaiting user review
     /// and cancelling work still own slots until the member's result arrives.
     pub(crate) fn reserve(&mut self) -> Vec<Ticket> {
+        self.reserve_at(Instant::now())
+    }
+
+    fn reserve_at(&mut self, now: Instant) -> Vec<Ticket> {
         if self.paused {
             return Vec::new();
         }
@@ -228,6 +285,7 @@ impl Queue {
             .take(self.parallel.saturating_sub(occupied))
             .map(|(index, row)| {
                 row.status = Status::Starting;
+                row.clock = Some(Clock::start(now));
                 Ticket {
                     round: self.round,
                     index,
@@ -245,6 +303,18 @@ impl Queue {
         detail: &str,
         transcript: &str,
     ) -> bool {
+        self.change_at(ticket, status, detail, transcript, Instant::now())
+    }
+
+    fn change_at(
+        &mut self,
+        ticket: Ticket,
+        status: Status,
+        detail: &str,
+        transcript: &str,
+        now: Instant,
+    ) -> bool {
+        let paused = self.paused;
         let Some(row) = self.row_for(ticket) else {
             return false;
         };
@@ -255,6 +325,7 @@ impl Queue {
             return false;
         }
         row.status = status;
+        row.sync_clock(now, paused);
         row.detail = detail.chars().take(MAX_DETAIL_CHARS).collect();
         let cut =
             transcript.ceil_char_boundary(transcript.len().saturating_sub(MAX_TRANSCRIPT_BYTES));
@@ -274,8 +345,18 @@ impl Queue {
         }
     }
 
+    pub(crate) fn set_usage_tokens(&mut self, ticket: Ticket, tokens: Option<u64>) {
+        if let Some(row) = self.row_for(ticket) {
+            row.usage_tokens = tokens;
+        }
+    }
+
     /// Returns the ticket to cancel only when a worker already owns this row.
     pub(crate) fn cancel(&mut self, key: Key) -> Option<Ticket> {
+        self.cancel_at(key, Instant::now())
+    }
+
+    fn cancel_at(&mut self, key: Key, now: Instant) -> Option<Ticket> {
         let ticket = self.ticket(key)?;
         let row = self.row_for(ticket)?;
         match row.status {
@@ -287,6 +368,7 @@ impl Queue {
             Status::Cancelling => None,
             status if status.holds_slot() => {
                 row.status = Status::Cancelling;
+                row.sync_clock(now, false);
                 Some(ticket)
             }
             _ => None,
@@ -296,6 +378,23 @@ impl Queue {
     fn row_for(&mut self, ticket: Ticket) -> Option<&mut Row> {
         self.current(ticket)?;
         self.rows.get_mut(ticket.index)
+    }
+
+    pub(crate) fn status_strip(&self, now: Instant) -> StatusStrip<'_> {
+        StatusStrip::new(self, now)
+    }
+
+    pub(crate) fn has_clock(&self) -> bool {
+        self.rows
+            .iter()
+            .any(|row| row.clock.as_ref().is_some_and(Clock::is_running))
+    }
+
+    pub(crate) fn has_animated_target(&self) -> bool {
+        self.rows.iter().any(|row| {
+            let status = row.display_status(self.paused);
+            status.is_working() || status == Status::Review
+        })
     }
 
     pub(crate) fn report(&self) -> String {
@@ -417,5 +516,87 @@ mod tests {
         assert!(Queue::new(1, selected.clone(), 2).is_ok());
         selected[2].key = Key::Saved(id);
         assert!(Queue::new(1, selected, 2).is_err());
+    }
+
+    #[test]
+    fn swarm_status_strip_uses_successful_elapsed_and_excludes_review_from_slow() {
+        use std::time::Duration;
+
+        let mut queue = Queue::new(1, targets(), 4).unwrap();
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let tickets = queue.reserve_at(start);
+        assert!(queue.change_at(tickets[2], Status::Failed, "Failed", "", at(12)));
+        assert!(queue.change_at(tickets[0], Status::Succeeded, "Done", "", at(91)));
+        assert!(queue.change_at(tickets[3], Status::Review, "Review", "", at(100)));
+        let before = queue.status_strip(at(179));
+        assert!(!before.targets[1].slow);
+        assert_eq!(before.targets[3].elapsed_seconds, Some(179));
+        assert!(!before.targets[3].slow);
+        assert!(queue.status_strip(at(180)).targets[1].slow);
+        assert!(queue.change_at(tickets[3], Status::Succeeded, "Done", "", at(200)));
+        // Ceil((91 + 200) / 2) * 2 = 292; the failed 12-second attempt is excluded.
+        let before_threshold = queue.status_strip(at(291));
+        assert!(!before_threshold.targets[1].slow);
+        let strip = queue.status_strip(at(292));
+        assert_eq!(strip.targets[1].ticket, tickets[1]);
+        assert_eq!(strip.targets[1].row.target.label, "Target 2");
+        assert_eq!(strip.targets[1].elapsed_seconds, Some(292));
+        assert!(strip.targets[1].slow);
+        assert_eq!(strip.targets[0].elapsed_seconds, Some(91));
+        assert_eq!(strip.targets[2].elapsed_seconds, Some(12));
+    }
+
+    #[test]
+    fn swarm_status_strip_freezes_pauses_cancellation_and_resets_each_attempt() {
+        use std::time::Duration;
+
+        let mut queue = Queue::new(1, targets(), 1).unwrap();
+        let start = Instant::now();
+        let at = |seconds| start + Duration::from_secs(seconds);
+        let ticket = queue.reserve_at(start)[0];
+        assert!(queue.has_clock());
+        assert!(queue.has_animated_target());
+        let held = queue.ticket(queue.rows()[1].target.key).unwrap();
+        assert!(queue.hold_at(held, true, at(2)));
+        let strip = queue.status_strip(at(3));
+        assert_eq!(strip.targets[1].state, Status::Paused);
+        assert_eq!(strip.targets[1].elapsed_seconds, None);
+        assert!(queue.hold_at(ticket, true, at(5)));
+        assert_eq!(
+            queue.status_strip(at(40)).targets[0].elapsed_seconds,
+            Some(5)
+        );
+        assert!(!queue.has_clock());
+        assert!(!queue.has_animated_target());
+        queue.set_paused_at(true, at(45));
+        queue.set_paused_at(false, at(50));
+        assert!(queue.has_clock());
+        assert!(!queue.held(held));
+        assert!(queue.change_at(ticket, Status::Review, "Review", "", at(55)));
+        assert!(queue.has_clock());
+        assert!(queue.has_animated_target());
+        assert_eq!(
+            queue.status_strip(at(65)).targets[0].elapsed_seconds,
+            Some(20)
+        );
+        queue.set_usage_tokens(ticket, Some(42));
+        assert_eq!(queue.current(ticket).unwrap().usage_tokens, Some(42));
+        assert_eq!(queue.cancel_at(ticket.key(), at(70)), Some(ticket));
+        assert!(!queue.has_clock());
+        assert!(queue.change_at(ticket, Status::Cancelled, "Cancelled", "", at(90)));
+        assert_eq!(
+            queue.status_strip(at(100)).targets[0].elapsed_seconds,
+            Some(25)
+        );
+        assert!(queue.retry(ticket));
+        let retried = queue.reserve_at(at(100))[0];
+        queue.set_usage_tokens(ticket, Some(99));
+        let row = queue.current(retried).unwrap();
+        assert_eq!(row.elapsed_seconds(at(102)), Some(2));
+        assert_eq!(row.usage_tokens, None);
+        queue.set_usage_tokens(retried, Some(3));
+        queue.set_usage_tokens(retried, None);
+        assert_eq!(queue.current(retried).unwrap().usage_tokens, None);
     }
 }

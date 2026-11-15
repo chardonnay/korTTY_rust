@@ -11,7 +11,7 @@ use kortty_ssh::{Endpoint, HostKey, SshSession, SshTarget, TrustStore, sftp::Sft
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::job_executor::{Credentials, ExecutionPolicy, SavedAuth, connection};
 use crate::scheduler_window::{ConnectionRef, SshCommand, sync};
-use crate::sftp_window::scheduled::{Client, StandingLimits};
+use crate::sftp_window::scheduled::{Client, StandingLimits, UploadContext};
 
 use super::{CANCELLATION_POLL, Completion, Failure, check_cancelled, open_subsystem};
 
@@ -59,11 +59,15 @@ pub(in crate::job_executor) fn preview_with_trust(
         .name("kortty-job-sftp-review".into())
         .spawn(move || {
             let result = (|| {
-                if request.copy.standing.is_some() && !sync_allowed(&request.connection) {
-                    return Err(STANDING_STOPPED.into());
-                }
-                if request.copy.replace_changed && !sync_allowed(&request.connection) {
-                    return Err(REPLACEMENT_STOPPED.into());
+                let standing = request.copy.standing.is_some();
+                let guarded = standing || request.copy.replace_changed;
+                let stopped_message = if standing {
+                    STANDING_STOPPED
+                } else {
+                    REPLACEMENT_STOPPED
+                };
+                if guarded && !sync_allowed(&request.connection) {
+                    return Err(stopped_message.into());
                 }
                 let trust = trust_store().map_err(|error| error.to_string())?;
                 let pins =
@@ -73,8 +77,25 @@ pub(in crate::job_executor) fn preview_with_trust(
                 }
                 let (target, jumps) = credentials.into_route().map_err(|error| error.detail)?;
                 let cancelled = || request.cancelled.load(Ordering::Acquire);
-                let mut session =
-                    open_pinned(target, jumps, &pins, cancelled).map_err(|error| error.detail)?;
+                let authorize = || {
+                    if !sync_allowed(&request.connection)
+                        || !sync::pins(&request.connection, &trust)
+                            .is_ok_and(|current| current == pins)
+                    {
+                        return Err(Failure::blocked(stopped_message));
+                    }
+                    Ok(())
+                };
+                let mut session = if guarded {
+                    open_pinned_with(target, jumps, &pins, |target, jumps, pinned| {
+                        super::open_guarded_subsystem(
+                            target, jumps, pinned, false, cancelled, authorize,
+                        )
+                    })
+                } else {
+                    open_pinned(target, jumps, &pins, cancelled)
+                }
+                .map_err(|error| error.detail)?;
                 let scanned = supervise(&mut session, &cancelled, |client, stopped, _| {
                     let comparison = request.copy.comparison();
                     if let Some(settings) = request.copy.standing {
@@ -89,6 +110,9 @@ pub(in crate::job_executor) fn preview_with_trust(
                 })
                 .map_err(|error| error.detail)?;
                 let (preview, standing_roots) = scanned?;
+                if guarded {
+                    authorize().map_err(|error| error.detail)?;
+                }
                 Ok(sync::Review {
                     preview,
                     pins: sync::fingerprints(&pins),
@@ -149,72 +173,116 @@ pub(super) fn run(
     let saved_auth = saved_auth.map_err(Failure::blocked)?;
     let (target, jumps) = connection::route(&request.action, saved_auth, &policy.server_access)?;
     let cancelled = || request.cancellation.is_requested();
+    let standing = copy.standing.is_some();
+    let guarded = standing || copy.replace_changed;
+    let stopped_message = if standing {
+        STANDING_STOPPED
+    } else {
+        REPLACEMENT_STOPPED
+    };
+    let reserved = AtomicBool::new(false);
+    let claimed = AtomicBool::new(false);
+    let require_authority = || -> io::Result<()> {
+        if policy.require_target_groups(&request.action).is_err()
+            || !sync_allowed(reference)
+            || !sync::pins(reference, &trust).is_ok_and(|current| current == pins)
+        {
+            return Err(io::Error::other(stopped_message));
+        }
+        match &authority {
+            Authority::Standing(approval, firing) if reserved.load(Ordering::Acquire) => context
+                .store
+                .require_standing_claimed(&request.job, approval, *firing, SystemTime::now()),
+            Authority::Standing(approval, _) if !approval.active_at(SystemTime::now()) => {
+                Err(io::Error::other(STANDING_STOPPED))
+            }
+            Authority::OneUse(receipt) if claimed.load(Ordering::Acquire) => {
+                context.store.require_claimed(&request.job, receipt)
+            }
+            _ => Ok(()),
+        }
+    };
     let live_policy = Mutex::new((Instant::now(), true));
     let stopped = || {
         if cancelled() {
             return true;
         }
-        let Authority::Standing(approval, _) = &authority else {
-            return false;
-        };
-        if !approval.active_at(SystemTime::now()) {
-            return true;
+        match &authority {
+            Authority::OneUse(_) if !copy.replace_changed => return false,
+            Authority::Standing(approval, _) if !approval.active_at(SystemTime::now()) => {
+                return true;
+            }
+            _ => {}
         }
         let Ok(mut state) = live_policy.lock() else {
             return true;
         };
         if state.1 && state.0.elapsed() >= CANCELLATION_POLL {
-            *state = (
-                Instant::now(),
-                sync_allowed(reference) && policy.require_target_groups(&request.action).is_ok(),
-            );
+            *state = (Instant::now(), require_authority().is_ok());
         }
         !state.1
     };
     check_cancelled(&request.cancellation)?;
     policy.require_target_groups(&request.action)?;
     if let Authority::Standing(approval, firing) = &authority {
-        let reserved =
+        let reservation =
             context
                 .store
                 .claim_standing(&request.job, approval, *firing, 0, 0, &stopped);
         check_cancelled(&request.cancellation)?;
-        reserved.map_err(|_| {
+        reservation.map_err(|_| {
             Failure::blocked("The recurring SFTP firing could not reserve an unused approval slot.")
         })?;
-        if stopped()
-            || !sync_allowed(reference)
-            || !sync::pins(reference, &trust).is_ok_and(|current| current == pins)
-        {
-            return Err(Failure::blocked(STANDING_STOPPED));
-        }
+        reserved.store(true, Ordering::Release);
     }
-    let replacement_allowed = || {
-        policy.require_target_groups(&request.action).is_ok()
-            && sync_allowed(reference)
-            && sync::pins(reference, &trust).is_ok_and(|current| current == pins)
+    let opened = if guarded {
+        open_pinned_with(target, jumps, &pins, |target, jumps, pinned| {
+            super::open_guarded_subsystem(target, jumps, pinned, false, stopped, || {
+                require_authority().map_err(|_| Failure::blocked(stopped_message))?;
+                if let Authority::OneUse(expected) = &authority
+                    && !context
+                        .load_receipt(copy.approval.as_deref())
+                        .is_ok_and(|current| current == *expected)
+                {
+                    return Err(Failure::blocked(REPLACEMENT_STOPPED));
+                }
+                Ok(())
+            })
+        })
+    } else {
+        open_pinned_for_job(target, jumps, &pins, stopped, request, policy)
     };
-    if copy.replace_changed && !replacement_allowed() {
-        return Err(Failure::blocked(REPLACEMENT_STOPPED));
-    }
-    let opened = open_pinned_for_job(target, jumps, &pins, stopped, request, policy);
     check_cancelled(&request.cancellation)?;
     policy.require_target_groups(&request.action)?;
     if stopped() {
-        return Err(Failure::blocked(STANDING_STOPPED));
+        return Err(Failure::blocked(stopped_message));
     }
     let mut session = opened?;
-    let claimed = AtomicBool::new(false);
+    let upload = if copy.replace_changed && copy.direction == sync::Direction::Upload {
+        let route = crate::workspace::SshTarget::scheduled_route(reference);
+        let peer = session
+            .verified_host_key()
+            .cloned()
+            .ok_or_else(|| Failure::blocked(REPLACEMENT_STOPPED))?;
+        Some((route, peer))
+    } else {
+        None
+    };
     let applied = supervise(&mut session, &stopped, |client, stopped, disconnected| {
-        let comparison = copy.comparison();
+        let mut comparison = copy.comparison();
+        comparison.upload = upload.as_ref().map(|(route, peer)| UploadContext {
+            route,
+            peer,
+            profile: context.store.profile(),
+        });
         match &authority {
             Authority::OneUse(receipt) => {
                 let claim = || {
                     policy
                         .require_target_groups(&request.action)
                         .map_err(|error| io::Error::other(error.detail))?;
-                    if copy.replace_changed && !replacement_allowed() {
-                        return Err(io::Error::other(REPLACEMENT_STOPPED));
+                    if copy.replace_changed {
+                        require_authority()?;
                     }
                     context
                         .store
@@ -229,38 +297,23 @@ pub(super) fn run(
                         &stopped,
                         &disconnected,
                         claim,
-                        &|| {
-                            if !replacement_allowed() {
-                                return Err(io::Error::other(REPLACEMENT_STOPPED));
-                            }
-                            context.store.require_claimed(&request.job, receipt)
-                        },
+                        &require_authority,
                     )
                 } else {
                     comparison.apply(client, receipt.proof, &stopped, &disconnected, claim)
                 }
             }
-            Authority::Standing(approval, firing) => comparison.apply_standing(
+            Authority::Standing(approval, _) => comparison.apply_standing(
                 client,
                 approval.anchors,
                 plan_limits(approval.limits),
                 &stopped,
                 &disconnected,
                 |actions, bytes| {
-                    if stopped()
-                        || policy.require_target_groups(&request.action).is_err()
-                        || !sync_allowed(reference)
-                        || !sync::pins(reference, &trust).is_ok_and(|current| current == pins)
-                        || !approval.limits.allows(actions, bytes)
-                    {
+                    if stopped() || !approval.limits.allows(actions, bytes) {
                         return Err(io::Error::other(STANDING_STOPPED));
                     }
-                    context.store.require_standing_claimed(
-                        &request.job,
-                        approval,
-                        *firing,
-                        SystemTime::now(),
-                    )?;
+                    require_authority()?;
                     claimed.store(true, Ordering::Release);
                     Ok(())
                 },
@@ -271,9 +324,13 @@ pub(super) fn run(
         if !copy.replace_changed {
             return String::new();
         }
-        let mut detail = format!("Replaced {} local files. ", applied.replaced);
+        let side = match copy.direction {
+            sync::Direction::Upload => "server",
+            sync::Direction::Download => "local",
+        };
+        let mut detail = format!("Replaced {} {side} files. ", applied.replaced);
         if let Some(prefix) = &applied.recovery_prefix {
-            detail.push_str(&format!("Any retained originals are in sibling folders named {prefix} under the local destination. "));
+            detail.push_str(&format!("Any retained originals are in sibling folders named {prefix} under the {side} destination. "));
         }
         detail
     };
@@ -329,6 +386,7 @@ pub(super) fn run(
             id: request.id,
             outcome,
             detail: Some(detail),
+            output: None,
             recording: None,
             swarm_report: None,
         },
@@ -360,7 +418,7 @@ pub(in crate::job_executor) fn open_pinned_for_job(
     })
 }
 
-fn open_pinned_with(
+pub(in crate::job_executor) fn open_pinned_with(
     target: SshTarget,
     jumps: Vec<SshTarget>,
     pins: &[(Endpoint, HostKey)],

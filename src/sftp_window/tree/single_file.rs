@@ -147,6 +147,19 @@ pub(crate) struct StagedDownload {
     restore_private_access: bool,
 }
 
+pub(in crate::sftp_window) enum FilePublishError {
+    Before(io::Error),
+    Uncertain(io::Error),
+}
+
+impl FilePublishError {
+    fn into_error(self) -> io::Error {
+        match self {
+            Self::Before(error) | Self::Uncertain(error) => error,
+        }
+    }
+}
+
 impl StagedDownload {
     pub(crate) fn create(destination: &Path) -> io::Result<Self> {
         Self::create_with(destination, None, true, Directory::create_file)
@@ -174,6 +187,23 @@ impl StagedDownload {
         parent: &crate::sftp_window::worker::resume::persist::Identity,
     ) -> io::Result<Self> {
         Self::stage_with_final_permissions(destination, parent, false)
+    }
+
+    pub(in crate::sftp_window) fn stage_for_reviewed_file(
+        destination: &Path,
+        parent: &crate::sftp_window::worker::resume::persist::Identity,
+    ) -> io::Result<Self> {
+        #[cfg(windows)]
+        let create = Directory::create_replacement_file;
+        #[cfg(unix)]
+        let create = Directory::create_read_write_file;
+        let mut staged = Self::create_with(destination, Some(parent), false, create)?;
+        staged.restore_private_access = true;
+        Ok(staged)
+    }
+
+    pub(in crate::sftp_window) fn destination(&self) -> &Path {
+        &self.destination
     }
 
     pub(in crate::sftp_window) fn stage_new_download(
@@ -329,29 +359,62 @@ impl StagedDownload {
         })
     }
 
-    pub(in crate::sftp_window) fn publish_checked(
-        mut self,
+    pub(crate) fn publish_checked(
+        self,
         before_publish: impl FnOnce(&File) -> io::Result<()>,
     ) -> io::Result<()> {
-        let file = self.writer()?;
-        file.sync_all()?;
-        let name = self.require_parent()?;
-        let stage = self
-            .stage
-            .as_ref()
-            .ok_or_else(|| io::Error::other("The staged download has no directory"))?;
-        before_publish(file)?;
-        self.require_parent()?;
-        let Entry::Directory(current) = local::entry(&self.parent, &self.name)? else {
-            return Err(io::Error::other("The local staging directory changed"));
-        };
-        if !stage.same_as(&current)? {
-            return Err(io::Error::other("The local staging directory changed"));
+        self.publish_with_receipt(false, before_publish, |_, _, _| Ok(()))
+            .map_err(FilePublishError::into_error)
+    }
+
+    pub(in crate::sftp_window) fn publish_with_receipt<T>(
+        mut self,
+        track_identity: bool,
+        before_publish: impl FnOnce(&File) -> io::Result<()>,
+        after_publish: impl FnOnce(&Directory, &OsStr, &File) -> io::Result<T>,
+    ) -> Result<T, FilePublishError> {
+        let (name, stamp) = (|| {
+            let file = self.writer()?;
+            file.sync_all()?;
+            self.require_parent()?;
+            before_publish(file)?;
+            let name = self.require_parent()?.to_owned();
+            let stage = self
+                .stage
+                .as_ref()
+                .ok_or_else(|| io::Error::other("The staged download has no directory"))?;
+            let Entry::Directory(current) = local::entry(&self.parent, &self.name)? else {
+                return Err(io::Error::other("The local staging directory changed"));
+            };
+            if !stage.same_as(&current)? {
+                return Err(io::Error::other("The local staging directory changed"));
+            }
+            let stamp = track_identity.then(|| FileStamp::read(file)).transpose()?;
+            Ok((name, stamp))
+        })()
+        .map_err(FilePublishError::Before)?;
+        let file = self.file.as_ref().expect("checked staged file");
+        let stage = self.stage.as_ref().expect("checked staging directory");
+        if let Err(error) =
+            local::publish_file(&self.parent, stage, OsStr::new(PAYLOAD), file, &name)
+        {
+            let Some(stamp) = stamp else {
+                return Err(FilePublishError::Before(error));
+            };
+            if let Ok(Entry::File(current)) = local::entry(stage, OsStr::new(PAYLOAD))
+                && stamp.require_unchanged(&current).is_ok()
+            {
+                return Err(FilePublishError::Before(error));
+            }
+            // A filesystem error can arrive after the rename. Do not reset the
+            // access of a file that could already be at the destination.
+            self.restore_private_access = false;
+            self.keep = true;
+            return Err(FilePublishError::Uncertain(error));
         }
-        local::publish_file(&self.parent, stage, OsStr::new(PAYLOAD), file, name)?;
         self.restore_private_access = false;
         self.keep = false;
-        Ok(())
+        after_publish(&self.parent, &name, file).map_err(FilePublishError::Uncertain)
     }
 
     fn require_parent(&self) -> io::Result<&OsStr> {

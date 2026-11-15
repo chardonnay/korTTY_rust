@@ -25,6 +25,7 @@ pub(crate) mod export;
 pub(crate) mod export_branding;
 pub(crate) mod export_output;
 pub(crate) mod keywords;
+mod language;
 mod links;
 pub(crate) mod markers;
 mod metadata;
@@ -72,6 +73,13 @@ const MAX_TIMELINE_ROWS: usize = 2048;
 const MAX_PNG_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_PNG_PIXELS: u64 = 16 * 1024 * 1024;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum JournalProfileSelection {
+    Saved(kortty_jobs::ProfileRef),
+    Migrated(kortty_jobs::ProfileRef, String),
+    Java(String),
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Summary {
     pub directory: PathBuf,
@@ -109,6 +117,8 @@ pub(crate) struct Summary {
     pub duplicate_run_count: u64,
     pub usage: tree::Usage,
     pub usage_partial: bool,
+    pub usage_profile: Option<JournalProfileSelection>,
+    pub usage_profile_name: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -132,6 +142,7 @@ pub(crate) struct TimelineEntry {
     pub log_end: Option<u64>,
     pub input: Vec<String>,
     pub output: Vec<String>,
+    pub run_as_user: Option<String>,
     pub extra_details: Vec<String>,
     pub chat_details: Vec<String>,
     agent_chat_id: Option<String>,
@@ -415,11 +426,18 @@ fn summary(directory: &Path, document: &Document<'_>) -> io::Result<Summary> {
             completion_tokens: usage.completion_tokens,
             total_tokens: usage.total_tokens,
             call_count: usage.call_count,
-            cost: finite_cost(meta)?,
+            partial: usage.partial,
+            cost: usage.cost.unwrap_or_default(),
+            cost_partial: usage.cost_partial,
             currency: optional_value(meta, "aiCostCurrency")?,
             local: boolean(meta, "aiProfileLocal")?,
         },
         usage_partial: usage.partial,
+        usage_profile: summary_store::profile_selection(meta),
+        usage_profile_name: summary_store::profile_value(meta, summary_store::PROFILE_NAME)
+            .as_deref()
+            .filter(|name| name.len() <= 256)
+            .map(display_text),
     })
 }
 
@@ -437,14 +455,6 @@ fn boolean(parent: Node<'_, '_>, name: &str) -> io::Result<bool> {
         "true" | "1" => Ok(true),
         _ => Err(invalid("Invalid session journal boolean field")),
     }
-}
-
-fn finite_cost(meta: Node<'_, '_>) -> io::Result<f64> {
-    let cost = number::<f64>(meta, "aiCost")?.unwrap_or(0.0);
-    if !cost.is_finite() {
-        return Err(invalid("Invalid session journal AI cost"));
-    }
-    Ok(cost)
 }
 
 fn entries<'a, 'input>(document: &'a Document<'input>) -> impl Iterator<Item = Node<'a, 'input>> {
@@ -484,8 +494,18 @@ fn timeline_entry(
         ),
         None => (None, String::new(), None),
     };
-    let (extra_details, chat_details) =
+    let (mut extra_details, chat_details) =
         timeline_details::read(entry, &kind, screenshot.is_some(), zone, limited);
+    let run_as_user = if matches!(kind.as_ref(), "AI_SUMMARY" | "USER_NOTE")
+        && let Ok(Some(user)) = field(entry, "runAsUser")
+        && summary_plan::plausible_account(user.trim())
+    {
+        let user = user.trim().to_owned();
+        extra_details.push(format!("Run as · {user}"));
+        Some(user)
+    } else {
+        None
+    };
     let agent_chat_id = (kind == "AGENT")
         .then(|| bounded_field(entry, "chatId").ok())
         .flatten()
@@ -529,6 +549,7 @@ fn timeline_entry(
         log_end: number(entry, "logEndSeq")?,
         input: excerpt(entry, "inputExcerpt")?,
         output: excerpt(entry, "outputExcerpt")?,
+        run_as_user,
         extra_details,
         chat_details,
         agent_chat_id,
@@ -625,7 +646,7 @@ fn screenshot_reference(value: &str) -> Option<&str> {
     .then_some(value)
 }
 
-fn display_text(value: &str) -> String {
+pub(crate) fn display_text(value: &str) -> String {
     value
         .chars()
         .filter(|&character| is_display_character(character))

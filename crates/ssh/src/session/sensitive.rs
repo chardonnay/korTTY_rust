@@ -2,12 +2,15 @@
 
 use std::fmt;
 use std::io;
+use std::sync::Arc;
 
 use zeroize::Zeroizing;
 
-use super::{Command, InputBytes, SshAbort, SshWriter};
+use super::{Command, InputBytes, InputPermission, SshAbort, SshWriter, closed};
 
 const MAX_SENSITIVE_LINE_BYTES: usize = 1025;
+const MAX_SENSITIVE_FRAME_BYTES: usize = 1028;
+const MAX_COMMIT_MARKER_BYTES: usize = 64;
 
 /// A single UTF-8 line whose owned bytes are cleared when the line is dropped.
 pub struct SensitiveLine(Zeroizing<Vec<u8>>);
@@ -22,10 +25,6 @@ impl SensitiveLine {
         line.extend_from_slice(secret.as_bytes());
         line.push(b'\n');
         Ok(Self(line))
-    }
-
-    pub(super) fn as_bytes(&self) -> &[u8] {
-        &self.0
     }
 
     /// Writes a length-prefixed line to an owned credential transport.
@@ -71,6 +70,47 @@ fn invalid_line() -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, "Invalid sensitive SSH input")
 }
 
+impl SshWriter {
+    /// Sends a bounded secret frame and a separately guarded protocol commit marker.
+    /// The remote helper must require the marker because closing a channel can
+    /// also produce EOF on the helper's input.
+    pub fn send_sensitive_input(
+        mut self,
+        input: Zeroizing<Vec<u8>>,
+        commit: &'static [u8],
+        permitted: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        if self.input_closed {
+            return Err(closed());
+        }
+        let result = if !(1..=MAX_SENSITIVE_FRAME_BYTES).contains(&input.len())
+            || !(1..=MAX_COMMIT_MARKER_BYTES).contains(&commit.len())
+        {
+            Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid protected SSH input frame or commit marker",
+            ))
+        } else {
+            let permission: InputPermission = Arc::new(permitted);
+            self.queue(Command::Data(InputBytes::Sensitive(
+                input,
+                Some(Arc::clone(&permission)),
+            )))
+            .and_then(|()| {
+                self.queue(Command::Data(InputBytes::Sensitive(
+                    Zeroizing::new(commit.to_vec()),
+                    Some(permission),
+                )))
+            })
+            .and_then(|()| self.close_input())
+        };
+        if result.is_err() {
+            SshAbort(self.shared.clone()).abort();
+        }
+        result
+    }
+}
+
 /// Consumes the only input handle when sending a line or sending EOF alone.
 pub struct SensitiveExecInput(SshWriter);
 
@@ -89,7 +129,7 @@ impl SensitiveExecInput {
         line: SensitiveLine,
         permitted: impl Fn() -> bool + Send + Sync + 'static,
     ) -> io::Result<()> {
-        self.send_guarded(line, Some(Box::new(permitted)))
+        self.send_guarded(line, Some(Arc::new(permitted)))
     }
 
     /// Queues one checked credential line and hands the writer to an owned
@@ -101,8 +141,8 @@ impl SensitiveExecInput {
         permitted: impl Fn() -> bool + Send + Sync + 'static,
     ) -> io::Result<SshWriter> {
         match self.0.queue(Command::Data(InputBytes::Sensitive(
-            line,
-            Some(Box::new(permitted)),
+            line.0,
+            Some(Arc::new(permitted)),
         ))) {
             Ok(()) => Ok(self.0),
             Err(error) => {
@@ -115,11 +155,11 @@ impl SensitiveExecInput {
     fn send_guarded(
         mut self,
         line: SensitiveLine,
-        permitted: Option<Box<dyn Fn() -> bool + Send + Sync>>,
+        permitted: Option<InputPermission>,
     ) -> io::Result<()> {
         let result = self
             .0
-            .queue(Command::Data(InputBytes::Sensitive(line, permitted)))
+            .queue(Command::Data(InputBytes::Sensitive(line.0, permitted)))
             .and_then(|()| self.0.close_input());
         if result.is_err() {
             SshAbort(self.0.shared.clone()).abort();
@@ -146,7 +186,7 @@ mod tests {
     #[test]
     fn sensitive_line_accepts_only_one_bounded_utf8_line() {
         let line = SensitiveLine::new("fïxture 東京").unwrap();
-        assert_eq!(line.as_bytes(), "fïxture 東京\n".as_bytes());
+        assert_eq!(line.0.as_slice(), "fïxture 東京\n".as_bytes());
         assert_eq!(format!("{line:?}"), "Sensitive SSH input");
         for rejected in ["", "line\nbreak", "line\rbreak", "abc\0"] {
             assert!(SensitiveLine::new(rejected).is_err());
@@ -162,8 +202,9 @@ mod tests {
         assert_eq!(
             SensitiveLine::read_wire(&mut wire.as_slice())
                 .unwrap()
-                .as_bytes(),
-            line.as_bytes()
+                .0
+                .as_slice(),
+            line.0.as_slice()
         );
         assert!(SensitiveLine::read_wire(&mut &wire[..wire.len() - 1]).is_err());
         assert!(SensitiveLine::read_wire(&mut &[0, 0, 4, 2][..]).is_err());
@@ -188,7 +229,7 @@ mod tests {
                 else {
                     panic!("expected an owned sensitive line");
                 };
-                assert_eq!(line.as_bytes(), b"fixture\n");
+                assert_eq!(line.as_slice(), b"fixture\n");
                 let Ok(Command::Eof(ack)) = commands.recv_timeout(wait) else {
                     panic!("expected SSH EOF after the line");
                 };
@@ -227,5 +268,51 @@ mod tests {
         assert!(
             matches!(commands.try_recv(), Ok(Command::Data(InputBytes::Stream(bytes))) if bytes == b"frame")
         );
+    }
+
+    #[test]
+    fn sensitive_frame_checks_the_commit_marker_separately_from_the_body() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        const FRAME: &[u8] = b"\0\0\0\x04p\nw\r";
+        const COMMIT: &[u8] = b"fixture-commit\n";
+        let poll = Poll::new().unwrap();
+        let wake = Arc::new(Waker::new(poll.registry(), CONTROL).unwrap());
+        let (input, commands) = mpsc::sync_channel(3);
+        let writer = SshWriter {
+            shared: Shared::new(wake),
+            input,
+            input_closed: false,
+        };
+        let permission = Arc::new(AtomicBool::new(true));
+        let guard = Arc::clone(&permission);
+        thread::scope(|scope| {
+            let worker = scope.spawn(move || {
+                let wait = Duration::from_secs(2);
+                let Ok(Command::Data(body @ InputBytes::Sensitive(..))) =
+                    commands.recv_timeout(wait)
+                else {
+                    panic!("expected the owned secret bytes");
+                };
+                assert!(body.permitted());
+                assert_eq!(body.as_ref(), FRAME);
+                permission.store(false, Ordering::SeqCst);
+                let Ok(Command::Data(marker @ InputBytes::Sensitive(..))) =
+                    commands.recv_timeout(wait)
+                else {
+                    panic!("expected the separately guarded marker after the body");
+                };
+                assert_eq!(marker.as_ref(), COMMIT);
+                assert!(!marker.permitted());
+                // The pump must close here without sending the marker or EOF.
+            });
+            let error = writer
+                .send_sensitive_input(Zeroizing::new(FRAME.to_vec()), COMMIT, move || {
+                    guard.load(Ordering::SeqCst)
+                })
+                .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+            worker.join().unwrap();
+        });
     }
 }

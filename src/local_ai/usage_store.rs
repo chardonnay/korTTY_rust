@@ -80,6 +80,16 @@ impl Default for Budget {
 }
 
 impl Budget {
+    pub(crate) fn price_micros_per_million(units: f64) -> Option<u64> {
+        let micros = units * 1_000_000.0;
+        if !(0.0..=MAX_RATE as f64).contains(&micros) {
+            return None;
+        }
+        let rounded = micros.round() as u64;
+        // A positive price below the stored precision must not become an explicit free rate.
+        (units == 0.0 || rounded > 0).then_some(rounded)
+    }
+
     pub(crate) fn validate(&self) -> Result<(), String> {
         if self.token_limit == Some(0)
             || !(1..=3660).contains(&self.reset_days)
@@ -120,6 +130,26 @@ impl Budget {
         Some(Cost { numerator, partial })
     }
 
+    pub(crate) fn journal_cost(
+        &self,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    ) -> Option<JournalCost> {
+        let currency = self.currency.as_bytes().try_into().ok()?;
+        let cost = self.estimated_cost(Counters {
+            input_tokens: input_tokens.unwrap_or_default(),
+            output_tokens: output_tokens.unwrap_or_default(),
+            missing_input: u64::from(input_tokens.is_none()),
+            missing_output: u64::from(output_tokens.is_none()),
+            ..Counters::default()
+        })?;
+        Some(JournalCost {
+            numerator: cost.numerator,
+            currency,
+            partial: cost.partial,
+        })
+    }
+
     pub(crate) fn warning(&self, snapshot: Snapshot, additional_output: u32) -> Option<Warning> {
         self.warning_at(snapshot.projected_tokens(0, u64::from(additional_output)))
     }
@@ -146,6 +176,31 @@ pub(crate) struct Cost {
     /// One millionth of a millionth of the selected currency.
     pub(crate) numerator: u128,
     pub(crate) partial: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct JournalCost {
+    /// One trillionth of a unit in the selected currency.
+    pub(crate) numerator: u128,
+    pub(crate) currency: [u8; 3],
+    pub(crate) partial: bool,
+}
+
+impl JournalCost {
+    pub(crate) fn accumulate(&mut self, next: Self) {
+        self.partial |= next.partial;
+        if self.currency == next.currency
+            && let Some(total) = self.numerator.checked_add(next.numerator)
+        {
+            self.numerator = total;
+        } else {
+            self.partial = true;
+        }
+    }
+
+    pub(crate) fn amount(self) -> f64 {
+        self.numerator as f64 / 1_000_000_000_000.0
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -1272,6 +1327,30 @@ mod tests {
         };
         let cost = budget.estimated_cost(counts).unwrap();
         assert_eq!(cost.numerator, 12_500_000);
+        assert!(cost.partial);
+    }
+
+    #[test]
+    fn journal_cost_uses_only_observed_category_counts_and_configured_rates() {
+        assert!(Budget::default().journal_cost(Some(5), Some(10)).is_none());
+        let budget = Budget {
+            input_micros_per_million: Some(2_000_000),
+            output_micros_per_million: Some(4_000_000),
+            currency: "USD".into(),
+            ..Budget::default()
+        };
+        let mut cost = budget.journal_cost(Some(5), None).unwrap();
+        assert_eq!(cost.currency, *b"USD");
+        assert_eq!(cost.numerator, 10_000_000);
+        assert!(cost.partial);
+        cost.accumulate(budget.journal_cost(Some(0), Some(10)).unwrap());
+        assert_eq!(cost.numerator, 50_000_000);
+        cost.accumulate(JournalCost {
+            currency: *b"EUR",
+            ..cost
+        });
+        assert_eq!(cost.currency, *b"USD");
+        assert_eq!(cost.numerator, 50_000_000);
         assert!(cost.partial);
     }
 

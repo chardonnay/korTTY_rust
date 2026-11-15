@@ -72,7 +72,7 @@ fn main() -> iced::Result {
         }
         return Ok(());
     }
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     if first.as_deref() == Some(job_executor::rsync::BRIDGE_ARGUMENT.as_ref()) {
         if job_executor::rsync::serve_bridge(args).is_err() {
             std::process::exit(1);

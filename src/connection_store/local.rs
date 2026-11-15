@@ -28,6 +28,15 @@ pub(crate) struct LocalProfile {
 }
 
 impl LocalProfile {
+    pub(crate) fn same_launch(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.shell == other.shell
+            && self.command == other.command
+            && self.working_directory == other.working_directory
+            && self.emulation == other.emulation
+            && self.shell_integration == other.shell_integration
+    }
+
     pub(crate) fn profile(&self) -> Option<TerminalProfile> {
         TerminalProfile::from_term_name(&self.emulation)
     }
@@ -123,14 +132,11 @@ impl Store {
     ) -> io::Result<()> {
         let _lock = StoreLock::acquire(&self.path)?;
         let mut candidate = read_document(&self.path)?;
-        if candidate.local_profiles.iter().any(|current| {
-            current.id == original.id
-                && current.shell == original.shell
-                && current.command == original.command
-                && current.working_directory == original.working_directory
-                && current.emulation == original.emulation
-                && current.shell_integration == original.shell_integration
-        }) && candidate.library.record_use(original.id, time.max(1))
+        if candidate
+            .local_profiles
+            .iter()
+            .any(|current| current.same_launch(original))
+            && candidate.library.record_use(original.id, time.max(1))
         {
             self.write(&candidate)?;
         }

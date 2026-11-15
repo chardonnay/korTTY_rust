@@ -12,6 +12,7 @@ use pgp::crypto::hash::HashAlgorithm;
 
 use crate::private_files::FileStamp;
 use crate::sftp_window::compare::folders::Review;
+use crate::sftp_window::scheduled::UploadContext;
 use crate::sftp_window::tree::snapshot::{DirectoryStamp, Entry as SnapshotEntry, Kind, Relative};
 use crate::sftp_window::{LocalSource, Side, StagedDownload, local_tree};
 use crate::workspace::SshTarget;
@@ -21,6 +22,8 @@ use super::*;
 use super::download_access;
 mod removal;
 pub(in crate::sftp_window) mod replacement;
+pub(crate) use replacement::{LocalFileSnapshot, ReviewedFilePublication, ReviewedFileReceiver};
+mod sealed;
 
 const MAX_ACTIONS: usize = 256;
 const MAX_BYTES: u64 = 4 * 1024 * 1024 * 1024;
@@ -118,11 +121,9 @@ pub(crate) struct CopyPlan {
     files: usize,
     bytes: u64,
     origin: CopyOrigin,
-    #[cfg(windows)]
     replacements: Option<scheduled_replacement::Replacements>,
 }
 
-#[cfg(windows)]
 mod scheduled_replacement;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -340,30 +341,48 @@ impl CopyPlan {
     }
 
     pub(in crate::sftp_window) fn new_replacing(review: Arc<Review>, to: Side) -> io::Result<Self> {
-        #[cfg(windows)]
-        if to == Side::Local {
-            let mut plan = Self::build(review, to, None, true, CopyOrigin::Scheduler)?;
-            plan.replacements = Some(scheduled_replacement::Replacements::default());
-            return Ok(plan);
-        }
-        let _ = (review, to);
-        Err(io::Error::other(
-            "Reviewed scheduled replacements require a Windows download destination",
-        ))
+        let mut plan = Self::build(review, to, None, true, CopyOrigin::Scheduler)?;
+        plan.replacements = Some(scheduled_replacement::Replacements::new(to, None));
+        Ok(plan)
     }
 
     pub(in crate::sftp_window) fn new_standing(
         review: Arc<Review>,
         to: Side,
         limits: StandingLimits,
+        replace_changed: bool,
+        expected_roots: Option<[u8; 32]>,
     ) -> io::Result<Self> {
-        Self::build(review, to, Some(limits), false, CopyOrigin::Scheduler)
+        let (source, target) = review.direction(to).ok_or_else(|| {
+            io::Error::other("Directional copy requires a local and a server folder")
+        })?;
+        let (local, remote) = match to {
+            Side::Local => (target, source),
+            Side::Remote => (source, target),
+        };
+        let roots = StandingRoots::new([local.root_directory(), remote.root_directory()])?;
+        if expected_roots.is_some_and(|expected| roots.binding != expected) {
+            return Err(io::Error::other(
+                "The standing copy folders changed. Review the job again.",
+            ));
+        }
+        let mut plan = Self::build(
+            review,
+            to,
+            Some((limits, roots)),
+            false,
+            CopyOrigin::Scheduler,
+        )?;
+        if replace_changed {
+            plan.replacements = Some(scheduled_replacement::Replacements::new(to, Some(limits)));
+        }
+        Ok(plan)
     }
 
     fn build(
         review: Arc<Review>,
         to: Side,
-        standing: Option<StandingLimits>,
+        standing: Option<(StandingLimits, StandingRoots)>,
         allow_empty: bool,
         origin: CopyOrigin,
     ) -> io::Result<Self> {
@@ -371,18 +390,7 @@ impl CopyPlan {
             io::Error::other("Directional copy requires a local and a server folder")
         })?;
         let roots = [review_root(&source.root)?, review_root(&target.root)?];
-        let standing_roots = if standing.is_some() {
-            let (local, remote) = match to {
-                Side::Local => (target, source),
-                Side::Remote => (source, target),
-            };
-            Some(StandingRoots::new([
-                local.root_directory(),
-                remote.root_directory(),
-            ])?)
-        } else {
-            None
-        };
+        let (standing, standing_roots) = standing.unzip();
         let max_actions = standing.map_or(MAX_ACTIONS, |limits| limits.actions);
         let max_bytes = standing.map_or(MAX_BYTES, |limits| limits.bytes);
         let mut actions = Vec::new();
@@ -484,7 +492,6 @@ impl CopyPlan {
             files,
             bytes,
             origin,
-            #[cfg(windows)]
             replacements: None,
         })
     }
@@ -504,7 +511,6 @@ impl CopyPlan {
     }
 
     pub(in crate::sftp_window) fn bytes(&self) -> u64 {
-        #[cfg(windows)]
         if let Some(replacements) = &self.replacements {
             return self.bytes + replacements.bytes;
         }
@@ -512,7 +518,6 @@ impl CopyPlan {
     }
 
     pub(in crate::sftp_window) fn replacement_preview(&self) -> Vec<ReplacementPreview> {
-        #[cfg(windows)]
         if let Some(replacements) = &self.replacements {
             return replacements.preview();
         }
@@ -521,6 +526,14 @@ impl CopyPlan {
 
     pub(in crate::sftp_window) fn counts(&self) -> (usize, usize) {
         (self.files, self.actions.len() - self.files)
+    }
+
+    pub(in crate::sftp_window) fn action_count(&self) -> usize {
+        self.actions.len()
+            + self
+                .replacements
+                .as_ref()
+                .map_or(0, scheduled_replacement::Replacements::count)
     }
 
     fn verify_destination(&self, client: &mut Client) -> Result<()> {
@@ -581,9 +594,8 @@ impl CopyPlan {
                     *digest = Some(hash);
                 }
             }
-            #[cfg(windows)]
             if let Some(replacements) = &mut self.replacements {
-                field(b"kortty-reviewed-sftp-windows-replacement-v1");
+                field(replacements.proof_domain());
                 replacements.prepare(
                     client,
                     &self.review,
@@ -698,6 +710,7 @@ struct WriteChecks<'a> {
     standing: Option<StandingGuard<'a>>,
     combined: Option<&'a dyn Fn() -> Result<()>>,
     scheduled: Option<&'a dyn Fn() -> Result<()>>,
+    upload: Option<UploadContext<'a>>,
     origin: CopyOrigin,
 }
 
@@ -731,6 +744,13 @@ impl WriteChecks<'_> {
         self.running()?;
         if let Some(standing) = &self.standing {
             standing.roots.verify(client, false)?;
+        }
+        self.require_authority()
+    }
+
+    fn require_authority(&self) -> Result<()> {
+        self.running()?;
+        if let Some(standing) = &self.standing {
             (standing.authorize)()?;
             self.running()?;
         }
@@ -792,6 +812,7 @@ pub(in crate::sftp_window) fn apply_reviewed(
         standing: None,
         combined: None,
         scheduled: None,
+        upload: None,
         origin: plan.origin,
     };
     apply_checked(client, plan, progress, &checks, claim)
@@ -804,7 +825,7 @@ pub(in crate::sftp_window) fn apply_scheduled(
     cancelled: &impl Fn() -> bool,
     disconnected: &impl Fn() -> bool,
     claim: impl FnOnce() -> io::Result<()>,
-    authorize: &impl Fn() -> io::Result<()>,
+    (authorize, upload): (&impl Fn() -> io::Result<()>, Option<UploadContext<'_>>),
 ) -> Applied {
     let authorize = || authorize().map_err(Failure::from);
     let checks = WriteChecks {
@@ -813,6 +834,7 @@ pub(in crate::sftp_window) fn apply_scheduled(
         standing: None,
         combined: None,
         scheduled: Some(&authorize),
+        upload,
         origin: plan.origin,
     };
     apply_checked(client, plan, progress, &checks, claim)
@@ -825,6 +847,7 @@ pub(in crate::sftp_window) fn apply_standing(
     cancelled: &impl Fn() -> bool,
     disconnected: &impl Fn() -> bool,
     authorize: impl Fn() -> io::Result<()>,
+    upload: Option<UploadContext<'_>>,
 ) -> Applied {
     let Some(roots) = &plan.standing_roots else {
         return Applied {
@@ -844,6 +867,7 @@ pub(in crate::sftp_window) fn apply_standing(
         }),
         combined: None,
         scheduled: None,
+        upload,
         origin: plan.origin,
     };
     apply_checked(client, plan, progress, &checks, || Ok(()))
@@ -873,9 +897,8 @@ fn apply_checked(
         if let Some(standing) = &checks.standing {
             standing.roots.verify(client, true)?;
         }
-        #[cfg(windows)]
         if let Some(replacements) = &plan.replacements {
-            replacements.apply(client, progress, checks, &mut applied)?;
+            replacements.apply(client, progress, checks, &mut applied, &mut parents)?;
         }
         for action in &plan.actions {
             checks.running()?;
@@ -1269,6 +1292,19 @@ fn upload(
         return Err(io::Error::other("The reviewed remote destination has no folder").into());
     };
     let uid = require_private_parent(*attributes)?;
+    let sealed = if let Some(digest) = target.digest {
+        checks.before_write(client)?;
+        Some(sealed::SealedFile::from_source(
+            source,
+            digest,
+            checks.cancelled,
+        )?)
+    } else {
+        None
+    };
+    let input = sealed
+        .as_ref()
+        .map_or_else(|| Ok(source.file()), sealed::SealedFile::file)?;
     require_absent(client, target.path)?;
     target.stamp.verify(client, target.folder, true)?;
     checks.before_write(client)?;
@@ -1281,13 +1317,17 @@ fn upload(
             &stage.payload,
             source.size(),
             target.modified,
-            Counted(progress, source.file()),
+            Counted(progress, input),
             |seen, _| {
                 if seen.uid != stage.uid {
                     return Err(io::Error::other("The private upload payload owner changed"));
                 }
                 owner = Some(seen);
-                verify_source()
+                verify_source()?;
+                if let Some(sealed) = &sealed {
+                    sealed.verify()?;
+                }
+                Ok(())
             },
             checks.cancelled,
         )?;
@@ -1297,7 +1337,7 @@ fn upload(
             .digest
             .map(|_| HashAlgorithm::Sha256.new_hasher().map_err(io::Error::other))
             .transpose()?;
-        let input = ObserveInput(source.file(), |bytes: &[u8]| {
+        let checked_input = ObserveInput(input, |bytes: &[u8]| {
             if let Some(hash) = observed.as_mut() {
                 hash.update(bytes);
             }
@@ -1306,7 +1346,7 @@ fn upload(
             &stage.payload,
             owner,
             source.size(),
-            input,
+            checked_input,
             checks.cancelled,
         )? != source.size()
         {
@@ -1631,6 +1671,7 @@ mod tests {
             standing: None,
             combined: None,
             scheduled: None,
+            upload: None,
             origin: CopyOrigin::Browser,
         };
         assert!(matches!(

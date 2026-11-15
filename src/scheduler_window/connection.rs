@@ -9,7 +9,7 @@ use crate::ssh_dialog::LoginTarget;
 pub(crate) const MAX_TARGETS: usize = 8;
 pub(super) const GROUP_TARGETS_CHANGED: &str =
     "Saved connection group targets changed. Refresh the targets and review the job again.";
-const MAX_SELECTED_GROUPS: usize = 32;
+pub(crate) const MAX_SELECTED_GROUPS: usize = 32;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -42,7 +42,7 @@ impl TargetGroups {
         Ok(())
     }
 
-    pub(super) fn resolve(
+    pub(crate) fn resolve(
         &self,
         store: &Store,
         swarm: bool,

@@ -796,7 +796,7 @@ impl Workspace {
         };
         #[cfg(target_os = "linux")]
         {
-            settings.platform_specific.application_id = kortty_windowing::DESKTOP_APP_ID.into();
+            settings.platform_specific.application_id = kortty_windowing::desktop_app_id().into();
         }
         window_lifecycle::fit_dialog_settings(&mut settings, position);
         #[cfg(any(target_os = "windows", target_os = "linux"))]

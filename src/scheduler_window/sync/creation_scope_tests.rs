@@ -31,19 +31,79 @@ fn fixture(direction: Direction) -> (Copy, ConnectionRef) {
 }
 
 #[test]
-fn changed_downloads_cannot_use_missing_only_receipts_or_standing_authority() {
+fn changed_copies_bind_direction_and_separate_one_use_and_standing_authority() {
     let (mut copy, connection) = fixture(Direction::Download);
     let legacy_json = serde_json::to_value(&copy).unwrap();
     assert!(legacy_json.get("replace_changed").is_none());
     let missing = copy.scope(&connection, None).unwrap();
     copy.replace_changed = true;
-    assert_ne!(copy.scope(&connection, None).unwrap(), missing);
+    let download = copy.scope(&connection, None).unwrap();
+    assert_ne!(download, missing);
     assert!(copy.validate_replacement(true).is_err());
     copy.standing = Some(standing::Settings::default());
-    assert!(copy.scope(&connection, None).is_err());
-    copy.standing = None;
+    let action: SshCommand =
+        serde_json::from_value(serde_json::json!({ "command": "true" })).unwrap();
+    let schedule = JobSchedule::default().with_fixed_times(["12:00".parse().unwrap()]);
+    let job = Job::new(JobId::new("replacement").unwrap(), "Replacement", action)
+        .unwrap()
+        .with_schedule(schedule);
+    let standing_download = copy
+        .standing_scope(&job, &connection, &TimeZone::UTC)
+        .unwrap();
+    assert_ne!(standing_download, download);
+    copy.replace_changed = false;
+    assert_ne!(
+        standing_download,
+        copy.standing_scope(&job, &connection, &TimeZone::UTC)
+            .unwrap()
+    );
+    copy.replace_changed = true;
     copy.direction = Direction::Upload;
-    assert!(copy.scope(&connection, None).is_err());
+    let upload = copy.scope(&connection, None).unwrap();
+    assert_ne!(upload, download);
+    assert_ne!(
+        standing_download,
+        copy.standing_scope(&job, &connection, &TimeZone::UTC)
+            .unwrap()
+    );
+    assert!(copy.validate_replacement(true).is_err());
+    copy.replace_changed = false;
+    assert_ne!(upload, copy.scope(&connection, None).unwrap());
+}
+
+#[test]
+fn editor_combines_standing_and_replacement_in_either_order() {
+    use crate::scheduler_window::{RemoteAction, form::Draft};
+
+    let profile = Profile::temporary();
+    let root = profile.file().parent().unwrap().canonicalize().unwrap();
+    let action: SshCommand = serde_json::from_value(serde_json::json!({
+        "connection": {"id": 7, "target": {"host": "server.example", "port": 22, "username": "operator"}},
+        "remote": {"kind": "sync", "direction": "download", "local": root.join("local"), "remote": "/incoming", "approval": "ab".repeat(16)},
+    })).unwrap();
+    let id = JobId::new("recurring-replacement").unwrap();
+    let schedule = JobSchedule::default().with_fixed_times(["12:00".parse().unwrap()]);
+    let job = Job::new(id.clone(), "Recurring replacement", action)
+        .unwrap()
+        .with_schedule(schedule);
+    for standing_first in [true, false] {
+        let mut draft = Draft::from_job(&job);
+        if standing_first {
+            draft.set_sync_standing(true);
+            draft.set_sync_replace_changed(true);
+        } else {
+            draft.set_sync_replace_changed(true);
+            draft.set_sync_standing(true);
+        }
+        let saved = draft.build(id.clone()).unwrap();
+        let reopened = Draft::from_job(&saved).build(id.clone()).unwrap();
+        let Some(RemoteAction::Sync(copy)) = reopened.action().remote.as_ref() else {
+            panic!("expected ordinary SFTP sync");
+        };
+        assert!(copy.replace_changed);
+        assert!(copy.standing.is_some());
+        assert!(copy.approval.is_none());
+    }
 }
 
 // Exact serialized domains used before ordinary local creation semantics.

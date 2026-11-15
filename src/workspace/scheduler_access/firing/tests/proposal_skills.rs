@@ -16,7 +16,35 @@ const CLASSIFIED_GUIDANCE: &str = "Use the reviewed recovery checklist.";
 const PINNED_GUIDANCE: &str = "Keep this connection on the audited filesystem.";
 const CHAT_GUIDANCE: &str = "Chat fixture body";
 const SECRET: &str = "scheduler-proposal-fixture-token";
+const GLOBAL_MEMORY: &str = "Preserve backups before changing storage.";
+const TARGET_MEMORY: [&str; 2] = [
+    "Use the northern maintenance window.",
+    "Use the southern maintenance window.",
+];
 const COMPARISON_RESULT: &str = "| Target | Result | Errors |\n| --- | --- | --- |\n| First | Healthy | - |\n| Second | *** | - |";
+
+fn write_firing_memory(root: &Path, targets: [u64; 2]) -> crate::private_files::Directory {
+    let memory = crate::private_files::Directory::open(&root.join("memory"), true).unwrap();
+    memory
+        .publish_copy("MEMORY.md", GLOBAL_MEMORY.as_bytes())
+        .unwrap();
+    let connections = memory.private_child("connections", true).unwrap();
+    for (target, note) in targets.into_iter().zip(TARGET_MEMORY) {
+        let text = format!("{note}\nThe fixture label is {PASSWORD}.\n");
+        connections
+            .publish_copy(&format!("{target}.md"), text.as_bytes())
+            .unwrap();
+    }
+    memory
+}
+
+fn assert_target_memory(system: &str, index: usize) {
+    assert!(system.contains(GLOBAL_MEMORY));
+    assert!(system.contains(TARGET_MEMORY[index]));
+    assert!(!system.contains(TARGET_MEMORY[1 - index]));
+    assert!(system.contains("The fixture label is ***."));
+    assert!(!system.contains(PASSWORD));
+}
 
 fn quota_config(model: &TcpListener) -> Configuration {
     serde_json::from_value(json!({
@@ -175,6 +203,7 @@ fn run_swarm_comparison(
             outcome: RunOutcome::Success,
             detail: None,
             recording: None,
+            output: None,
             swarm_report: Some(Box::new(report)),
         },
         journals,
@@ -502,6 +531,7 @@ fn standing_agent_classifies_once_for_two_targets_and_reuses_the_reviewed_receip
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", FIRING_TEST_NAME, "--nocapture"])
             .env(FIRING_PROFILE_ROOT, root)
+            .env_remove("KORTTY_AI_MEMORY")
             .output()
             .unwrap();
         let output = String::from_utf8_lossy(&child.stdout);
@@ -526,6 +556,7 @@ fn standing_agent_classifies_once_for_two_targets_and_reuses_the_reviewed_receip
         .unwrap();
     let ([first, second], vault) = two_saved_targets(&ssh);
     let targets = [first.id, second.id];
+    let memory = write_firing_memory(&root, targets);
     let goal = format!("Inspect disk usage. token={SECRET}");
     let action: SshCommand = serde_json::from_value(json!({
         "connection": first,
@@ -605,6 +636,9 @@ fn standing_agent_classifies_once_for_two_targets_and_reuses_the_reviewed_receip
         CLASSIFIED_GUIDANCE,
         PINNED_GUIDANCE,
         CHAT_GUIDANCE,
+        GLOBAL_MEMORY,
+        TARGET_MEMORY[0],
+        TARGET_MEMORY[1],
     ] {
         assert!(!encoded.contains(private));
     }
@@ -673,10 +707,12 @@ fn standing_agent_classifies_once_for_two_targets_and_reuses_the_reviewed_receip
             .as_ref()
             .unwrap();
         assert_eq!(approval.firing_skill_ids(), [52]);
-        assert_eq!(
-            serde_json::to_value(approval).unwrap()["generation"]["version"],
-            "firing-skills-v2"
-        );
+        let receipt = serde_json::to_value(approval).unwrap();
+        assert_eq!(receipt["generation"]["version"], "firing-skills-v2");
+        let saved = receipt.to_string();
+        for text in [GLOBAL_MEMORY, TARGET_MEMORY[0], TARGET_MEMORY[1], PASSWORD] {
+            assert!(!saved.contains(text));
+        }
         for (index, prompt) in prompts.iter().enumerate() {
             assert!(approval.generation_matches_for(index, prompt));
             assert_eq!(
@@ -686,7 +722,7 @@ fn standing_agent_classifies_once_for_two_targets_and_reuses_the_reviewed_receip
         }
     }
 
-    let mut scheduler = SchedulerWindow::open(jobs_path).unwrap();
+    let mut scheduler = SchedulerWindow::open(jobs_path.clone()).unwrap();
     scheduler.set_execution_allowed(true);
     workspace.scheduler_views.insert(id, scheduler.new_view());
     workspace.scheduler = Some(scheduler);
@@ -710,7 +746,8 @@ fn standing_agent_classifies_once_for_two_targets_and_reuses_the_reviewed_receip
         assert_eq!(request["max_tokens"], 4096);
         let system = request["messages"][0]["content"].as_str().unwrap();
         let input = request["messages"][1]["content"].as_str().unwrap();
-        assert!(system.ends_with(prompt.firing_skill_guidance().unwrap()));
+        assert_eq!(system, prompt.firing_system());
+        assert_target_memory(system, index);
         assert_eq!(
             serde_json::from_str::<Value>(input).unwrap(),
             json!({
@@ -739,6 +776,51 @@ fn standing_agent_classifies_once_for_two_targets_and_reuses_the_reviewed_receip
         "about {estimated_input} input tokens and up to 8192 output tokens"
     )));
     assert!(workspace.scheduler_agent_sequences.is_empty());
+
+    let task = workspace.update_scheduler(id, SchedulerMessage::Run(false));
+    let mut actions = iced_runtime::task::into_stream(task).unwrap();
+    let Some(Action::Output(Message::ScheduledAgent(Event(Progress::ModelDispatch(
+        ticket,
+        permit,
+    ))))) = block_on(actions.next())
+    else {
+        panic!("the next firing must request a new model dispatch permit");
+    };
+    memory
+        .replace_file("MEMORY.md", b"An amended global policy fixture.\n")
+        .unwrap();
+    assert_eq!(
+        workspace.current_firing(&ticket, Phase::Generating).err(),
+        Some(agent::memory::CHANGED)
+    );
+    // Deliver a stale permit to exercise the worker's independent saved-state check.
+    permit.try_send(()).unwrap();
+    permit.close();
+    let Some(Action::Output(Message::ScheduledAgent(Event(Progress::Generated(
+        completed,
+        result,
+    ))))) = block_on(actions.next())
+    else {
+        panic!("changed AI memory must stop the request before dispatch");
+    };
+    assert_eq!(completed, ticket);
+    assert_eq!(
+        result.as_ref().err().map(String::as_str),
+        Some(agent::memory::CHANGED)
+    );
+    let task = workspace.update_firing(Event(Progress::Generated(completed, result)));
+    assert!(block_on(actions.next()).is_none());
+    let mut remaining = iced_runtime::task::into_stream(task).unwrap();
+    let Some(Action::Output(Message::ScheduledAgent(event @ Event(Progress::StartFailed(..))))) =
+        block_on(remaining.next())
+    else {
+        panic!("the second target must require a fresh standing review");
+    };
+    let task = workspace.update_firing(event);
+    finish(&mut workspace, task);
+    assert!(block_on(remaining.next()).is_none());
+    assert!(workspace.scheduler_agent_sequences.is_empty());
+    assert_finished(&jobs_path, &ticket, RunOutcome::Blocked, 2);
     assert_no_connection(&model);
     for listener in &ssh {
         assert_no_connection(listener);
@@ -753,6 +835,7 @@ fn standing_read_only_swarm_classifies_and_saves_isolated_advisory_requests() {
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", ADVISORY_TEST_NAME, "--nocapture"])
             .env(ADVISORY_PROFILE_ROOT, root)
+            .env_remove("KORTTY_AI_MEMORY")
             .output()
             .unwrap();
         let output = String::from_utf8_lossy(&child.stdout);
@@ -776,6 +859,7 @@ fn standing_read_only_swarm_classifies_and_saves_isolated_advisory_requests() {
         .unwrap();
     let ([first, second], vault) = two_saved_targets(&ssh);
     let targets = [first.id, second.id];
+    write_firing_memory(&root, targets);
     let action: SshCommand = serde_json::from_value(json!({
         "connection": first,
         "additional_connections": [second],
@@ -930,6 +1014,7 @@ fn standing_read_only_swarm_classifies_and_saves_isolated_advisory_requests() {
         let prompt = &prompts[index];
         assert_eq!(prompt.firing_skill_ids(), [52]);
         let system = prompt.firing_system();
+        assert_target_memory(system, index);
         assert!(system.contains("no execution capability"));
         assert!(system.contains(pin) && system.contains(CLASSIFIED_GUIDANCE));
         assert!(!system.contains(other) && !system.contains(LOCAL_GUIDANCE));
@@ -1009,6 +1094,9 @@ fn standing_read_only_swarm_classifies_and_saves_isolated_advisory_requests() {
     let receipt = serde_json::to_value(grant).unwrap();
     assert_eq!(receipt["guided"]["version"], "advisory-skills-v1");
     assert!(!receipt.to_string().contains(SECRET));
+    for text in [GLOBAL_MEMORY, TARGET_MEMORY[0], TARGET_MEMORY[1], PASSWORD] {
+        assert!(!receipt.to_string().contains(text));
+    }
     assert_eq!(
         serde_json::to_value(approval.comparison.as_ref().unwrap()).unwrap()["version"],
         "swarm-comparison-v1"

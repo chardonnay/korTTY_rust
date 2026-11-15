@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
-use kortty_jobs::{RunId, RunRequest, RunTrigger};
+use kortty_jobs::{RunId, RunRequest};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub(crate) struct Key {
@@ -143,10 +143,7 @@ impl<A, C, P> Reviews<A, C, P> {
         now: Instant,
         deadline: Instant,
     ) -> Result<Ticket, &'static str> {
-        if round == 0
-            || request.cancellation.is_requested()
-            || !matches!(request.trigger, RunTrigger::Manual | RunTrigger::Scheduled)
-        {
+        if round == 0 || request.cancellation.is_requested() {
             return Err("The scheduled Agent firing cannot begin a proposal.");
         }
         if deadline <= now {

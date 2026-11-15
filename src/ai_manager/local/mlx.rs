@@ -12,6 +12,7 @@ use crate::local_ai::{self, mlx_models, mlx_runtime, runtime_package};
 use mlx_runtime::{InstallationState, online};
 
 use super::{Dialog, Message, Output, limited};
+use crate::ai_manager::java_models::{self, Hint, Metadata};
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
 
 #[derive(Clone, Copy)]
@@ -129,6 +130,7 @@ pub(super) struct State {
     source: String,
     name: String,
     idle: String,
+    java_review: bool,
     review: Option<Review>,
     choices: Vec<Choice>,
     selected: Option<String>,
@@ -148,6 +150,26 @@ impl State {
 
     pub(super) fn has_selection(&self) -> bool {
         self.selected.is_some()
+    }
+
+    pub(super) fn java_target(&self) -> Option<&str> {
+        if !mlx_runtime::supported() || self.review.is_some() {
+            return None;
+        }
+        self.choice().map(|choice| choice.name.as_str())
+    }
+
+    pub(super) fn stage_java_settings(&mut self, hint: &Hint) -> bool {
+        let Metadata::Mlx { idle_minutes, .. } = hint.metadata else {
+            return false;
+        };
+        if self.java_target().is_none() {
+            return false;
+        }
+        self.name.clone_from(&hint.name);
+        self.idle = idle_minutes.to_string();
+        self.java_review = true;
+        true
     }
 
     pub(super) fn refresh_status(&mut self, profile: &Path) {
@@ -253,6 +275,7 @@ impl State {
     }
 
     fn select(&mut self, choice: Option<Choice>) {
+        self.java_review = false;
         self.selected = choice.as_ref().map(|choice| choice.id.clone());
         self.name = choice
             .as_ref()
@@ -632,6 +655,14 @@ impl Dialog {
                 };
                 let name = self.mlx.name.trim().to_owned();
                 let idle = self.mlx.idle_value();
+                let java_review = self.mlx.java_review;
+                if java_review
+                    && matches!(action, Action::Configure)
+                    && let Err(error) = java_models::require_review_policy()
+                {
+                    self.status = Some(error.to_string());
+                    return Task::none();
+                }
                 runtime_package::work(move |cancelled| {
                     let notice = match action {
                         Action::Start => {
@@ -655,8 +686,21 @@ impl Dialog {
                             let idle =
                                 idle.ok_or("Enter an MLX idle timeout from 0 to 1440 minutes.")?;
                             runtime_package::with_stopped_mlx_model(&profile, &choice.id, || {
-                                mlx_models::Registry::new(&profile)
-                                    .configure(&choice.id, &name, idle)
+                                let registry = mlx_models::Registry::new(&profile);
+                                if java_review {
+                                    registry.configure_checked(&choice.id, &name, idle, |current| {
+                                        java_models::require_review_policy()?;
+                                        if current.name != choice.name
+                                            || current.idle_minutes != choice.idle_minutes
+                                            || current.bytes != choice.bytes
+                                        {
+                                            return Err(std::io::Error::other("The selected MLX model changed. Refresh and review it again."));
+                                        }
+                                        Ok(())
+                                    })
+                                } else {
+                                    registry.configure(&choice.id, &name, idle)
+                                }
                             })
                             .map_err(|error| error.to_string())?;
                             "Saved the MLX model settings."

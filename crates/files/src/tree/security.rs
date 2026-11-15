@@ -133,15 +133,25 @@ pub(super) fn require_current_user_only(file: &File) -> io::Result<()> {
 
 /// Validates ownership and effective mutation grants on a model path component.
 pub(super) fn require_administrator_controlled(file: &File, ancestor: bool) -> io::Result<()> {
-    require_controlled(file, ancestor, None)
+    require_controlled(file, ancestor, None, false)
 }
 
 pub(super) fn require_user_and_administrators(file: &File) -> io::Result<()> {
     let current_user = UserSid::current()?;
-    require_controlled(file, false, Some(current_user.sid()))
+    require_controlled(file, false, Some(current_user.sid()), true)
 }
 
-fn require_controlled(file: &File, ancestor: bool, current_user: Option<PSID>) -> io::Result<()> {
+pub(super) fn require_reviewed_tree_control(file: &File) -> io::Result<()> {
+    let current_user = UserSid::current()?;
+    require_controlled(file, false, Some(current_user.sid()), false)
+}
+
+fn require_controlled(
+    file: &File,
+    ancestor: bool,
+    current_user: Option<PSID>,
+    forbid_foreign_reads: bool,
+) -> io::Result<()> {
     use windows_sys::Win32::Foundation::{GENERIC_ALL, GENERIC_WRITE};
     use windows_sys::Win32::Security::{ACE_HEADER, INHERIT_ONLY_ACE};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -159,7 +169,7 @@ fn require_controlled(file: &File, ancestor: bool, current_user: Option<PSID>) -
         | GENERIC_ALL
         | GENERIC_WRITE;
     // Creating a new, unrelated child does not permit replacement of an existing path component.
-    let forbidden = if current_user.is_some() {
+    let forbidden = if forbid_foreign_reads {
         u32::MAX
     } else if ancestor {
         PROTECTED
@@ -169,8 +179,10 @@ fn require_controlled(file: &File, ancestor: bool, current_user: Option<PSID>) -
     let denied = || {
         io::Error::new(
             io::ErrorKind::PermissionDenied,
-            if current_user.is_some() {
+            if forbid_foreign_reads {
                 "A credential file must be owned by the current user with access restricted to the user and administrators"
+            } else if current_user.is_some() {
+                "A reviewed Windows tree entry must be owned by the current user and protected from other writers"
             } else {
                 "A policy model must use an administrator-controlled path"
             },

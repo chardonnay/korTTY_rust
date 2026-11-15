@@ -8,12 +8,13 @@ use zeroize::Zeroizing;
 
 use super::super::java_migration::SchedulerSource;
 use super::{
-    CONNECTIONS, Directory, JOBS, JavaUpdates, Snapshot, data, invalid, java_credential_restore,
-    java_scheduler, missing, read_bounded, read_connections,
+    Directory, JOBS, JavaUpdates, Snapshot, data, invalid, java_credential_restore, java_scheduler,
+    missing, read_bounded,
 };
 use crate::clipboard_policy::ClipboardPolicy;
+use crate::connection_store::Store;
 use crate::connection_store::import::{
-    JavaImportedRoute, check_java_imported_routes, prepare_java_connection_import,
+    JavaImportedRoute, check_java_imported_routes, java_connection_candidate,
 };
 use crate::private_files::{FileStamp, require_single_link};
 use crate::scheduler_window::{ConnectionRef, SshCommand};
@@ -23,31 +24,13 @@ use crate::snippets;
 pub(super) fn stage(
     directory: &Directory,
     snapshot: &Snapshot,
-    connections: &mut Option<java_credential_restore::Connections>,
+    connections: Option<&java_credential_restore::Connections>,
     source: SchedulerSource,
     notes: &mut Vec<String>,
 ) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
     let policy = ClipboardPolicy::load();
     let source_omissions = source.review.omitted.clone();
-    let mut plain = None;
-    if connections.is_none() && snapshot.contains_key(CONNECTIONS) {
-        let current = read_connections(directory)?;
-        let import = prepare_java_connection_import(
-            &source.connections,
-            current.as_deref().map(Vec::as_slice),
-            policy.server_access(),
-        )?;
-        plain = import
-            .contents
-            .map(|contents| java_credential_restore::Connections {
-                before: current
-                    .as_deref()
-                    .map(|bytes| java_credential_restore::digest(bytes)),
-                contents: Zeroizing::new(contents),
-                routes: import.routes,
-            });
-    }
-    let Some(catalogue) = connections.as_ref().or(plain.as_ref()) else {
+    let Some(catalogue) = connections else {
         notes.push(format!(
             "Scheduler jobs omitted because no new SSH routes matched ({})",
             source.review.jobs.len()
@@ -64,14 +47,25 @@ pub(super) fn stage(
     } else {
         Default::default()
     };
+    let candidate = java_connection_candidate(&catalogue.contents)?;
     let bound = source.review.bind_all(
-        |id| {
-            let route = catalogue.routes.get(id)?;
-            Some(ConnectionRef {
-                id: route.id,
-                target: route.target.clone(),
-                jump: route.jump.clone(),
-            })
+        |id| catalogue.routes.get(id).map(connection_reference),
+        |group| {
+            let routes = catalogue.groups.resolve(group, &catalogue.routes)?;
+            // Check each group independently. An explicit target or overlapping group
+            // can mask a membership difference in the combined list.
+            candidate
+                .in_group(group)
+                .map(|connection| connection.id)
+                .eq(routes.iter().map(|(_, route)| route.id))
+                .then(|| {
+                    routes
+                        .into_iter()
+                        .map(|(source_id, route)| {
+                            (source_id.to_owned(), connection_reference(route))
+                        })
+                        .collect()
+                })
         },
         |id| snippets.contains(&id),
     )?;
@@ -84,7 +78,7 @@ pub(super) fn stage(
     if bound.jobs.jobs().is_empty() {
         return Ok(None);
     }
-    check_routes(&catalogue.contents, &bound.jobs, &policy)?;
+    check_routes(&candidate, &bound.jobs, &policy)?;
     let current = read_jobs(directory)?;
     let additions = prepare_additions(current.as_ref(), &bound.jobs)?;
     for (count, label) in [
@@ -117,10 +111,15 @@ pub(super) fn stage(
         additions.added
     ));
     let jobs = java_scheduler::encode(&bound.jobs)?;
-    if connections.is_none() {
-        *connections = plain;
-    }
     Ok(Some(jobs))
+}
+
+fn connection_reference(route: &JavaImportedRoute) -> ConnectionRef {
+    ConnectionRef {
+        id: route.id,
+        target: route.target.clone(),
+        jump: route.jump.clone(),
+    }
 }
 
 fn snippet_links(
@@ -158,7 +157,7 @@ fn snippet_links(
 }
 
 fn check_routes(
-    candidate: &[u8],
+    candidate: &Store,
     jobs: &JobGraph<SshCommand>,
     policy: &ClipboardPolicy,
 ) -> io::Result<()> {
@@ -172,7 +171,13 @@ fn check_routes(
             jump: route.jump.clone(),
         })
         .collect();
-    check_java_imported_routes(candidate, &routes, policy.server_access())
+    check_java_imported_routes(candidate, &routes, policy.server_access())?;
+    for job in jobs.jobs() {
+        job.action()
+            .require_current_target_groups(candidate)
+            .map_err(invalid)?;
+    }
+    Ok(())
 }
 
 fn read_jobs(directory: &Directory) -> io::Result<Option<(FileStamp, Zeroizing<Vec<u8>>)>> {
@@ -210,7 +215,7 @@ impl Pending {
         jobs: JobGraph<SshCommand>,
         policy: &ClipboardPolicy,
     ) -> io::Result<Self> {
-        check_routes(connections, &jobs, policy)?;
+        check_routes(&java_connection_candidate(connections)?, &jobs, policy)?;
         if jobs.jobs().iter().any(|job| job.action().snippet.is_some()) {
             let snippets = snippet_links(directory, snapshot, Some(updates))?;
             if jobs

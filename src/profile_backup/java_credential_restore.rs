@@ -13,7 +13,8 @@ use super::java_secrets::{
 };
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::connection_store::import::{
-    JavaConnectionBindings, JavaImportedRoute, JavaManagedKeyBinding, JavaPasswordBinding,
+    JavaConnectionBindings, JavaImportedRoute, JavaLibrarySettings, JavaManagedKeyBinding,
+    JavaPasswordBinding, JavaSourceGroups,
 };
 use crate::ssh_key_catalog::{Catalog, ManagedAddition, PreparedManagedAdditions};
 
@@ -33,6 +34,8 @@ pub(super) struct Connections {
     pub(super) before: Option<[u8; 32]>,
     pub(super) contents: Zeroizing<Vec<u8>>,
     pub(super) routes: BTreeMap<String, JavaImportedRoute>,
+    pub(super) memory_ids: BTreeMap<String, u64>,
+    pub(super) groups: JavaSourceGroups,
 }
 
 pub(super) struct Review {
@@ -48,7 +51,8 @@ pub(super) fn prepare(
     source: &SshSource,
     password: Option<&Secret>,
     vault: Option<&Vault>,
-    scheduler: bool,
+    needs_route_lineage: bool,
+    library: &JavaLibrarySettings,
 ) -> io::Result<Review> {
     if password.is_some() && vault.is_none() {
         return Err(io::Error::other(
@@ -143,7 +147,8 @@ pub(super) fn prepare(
         &password_bindings,
         &key_bindings,
         policy.server_access(),
-    )?;
+    )?
+    .with_library(library.clone());
     let omitted_passwords = omitted_passwords + routes.omitted();
     let omitted_key_routes = routes.omitted_keys();
     let needed = &routes.needed();
@@ -205,16 +210,28 @@ pub(super) fn prepare(
         .enumerate()
         .map(|(index, identity)| (index, identity.id))
         .collect();
-    let (contents, routes) = if scheduler {
+    let (contents, routes, memory_ids, groups) = if needs_route_lineage {
         let import = routes.bind_with_routes(&password_ids, &key_ids, policy.server_access())?;
-        (import.contents, import.routes)
+        (
+            import.contents,
+            import.routes,
+            import.memory_ids,
+            import.groups,
+        )
     } else {
-        (routes.bind(&password_ids, &key_ids)?, BTreeMap::new())
+        (
+            routes.bind(&password_ids, &key_ids)?,
+            BTreeMap::new(),
+            BTreeMap::new(),
+            JavaSourceGroups::default(),
+        )
     };
     let connections = contents.map(|bytes| Connections {
         before: current.as_deref().map(|bytes| digest(bytes)),
         contents: Zeroizing::new(bytes),
         routes,
+        memory_ids,
+        groups,
     });
     if connections.as_ref().is_some_and(|connections| {
         connections.contents.len() > super::data::file_limit(CONNECTIONS)

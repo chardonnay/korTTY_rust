@@ -280,7 +280,28 @@ impl Workspace {
                     self.terminal_file_error(owner, "The original SFTP channel closed.")
                 }
                 Ok(document) => {
-                    let (editor, loaded) = EditorWindow::with_document(document, line, column);
+                    let (mut editor, loaded) = EditorWindow::with_document(document, line, column);
+                    if let Some(pane) = self.terminal_file_pane(owner, session) {
+                        let incognito = self
+                            .windows
+                            .get(&owner)
+                            .and_then(|window| window.tab())
+                            .is_some_and(|tab| tab.incognito);
+                        editor.ai_origin =
+                            if let Some(target) = pane.ssh.as_ref().filter(|_| remote) {
+                                self.ssh_file_ai_origin(target, Some(session), incognito)
+                            } else {
+                                crate::editor_window::AiOrigin {
+                                    profile: self
+                                        .terminal_overrides(pane)
+                                        .and_then(|settings| settings.ai_profile.clone()),
+                                    secrets: pane.session.journal_redaction_secrets(),
+                                    incognito,
+                                    local_terminal: true,
+                                    ..Default::default()
+                                }
+                            };
+                    }
                     let (id, task) = self.insert_native_editor(editor, loaded);
                     if remote {
                         self.terminal_files.remote_editors.insert(id, session);

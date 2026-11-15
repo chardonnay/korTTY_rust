@@ -49,6 +49,7 @@ pub(in crate::workspace) struct Mask {
     redactor: Redactor,
     vault: JournalQuestionSecrets,
     credential: Option<Zeroizing<String>>,
+    target_count: Option<usize>,
 }
 
 impl Mask {
@@ -64,11 +65,19 @@ impl Mask {
                 VaultWindow::journal_question_secrets,
             ),
             credential,
+            target_count: None,
         }
     }
 
+    pub(super) fn for_targets(mut self, count: usize) -> Self {
+        self.target_count = Some(count);
+        self
+    }
+
     pub(in crate::workspace) fn apply(&self, value: &str) -> Result<String, String> {
-        let secrets = Secrets::default();
+        let secrets = self
+            .target_count
+            .map_or_else(Secrets::default, Secrets::scheduled_targets);
         self.redactor.add_known_secrets(&secrets);
         if let Some(credential) = &self.credential {
             secrets.add(credential);

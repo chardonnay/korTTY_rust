@@ -83,6 +83,281 @@ fn automation_field(artifact: &Artifact, name: &str) -> Option<String> {
         .unwrap()
 }
 
+#[test]
+fn automation_screenshot_closure_drains_the_final_frame_and_persists_exact_digests() {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+
+    let fixture = Fixture::new();
+    let recorder = fixture.start(fixture.run(0, Options::default()), "screens");
+    let mut raster = tiny_skia::Pixmap::new(2, 2).unwrap();
+    let first = raster.encode_png().unwrap();
+    raster.fill(tiny_skia::Color::WHITE);
+    let final_image = raster.encode_png().unwrap();
+    let (entered, waiting) = mpsc::channel();
+    let (resume, barrier) = mpsc::channel();
+    let checks = AtomicUsize::new(0);
+    recorder
+        .try_screenshot(first.clone(), false, move || {
+            if checks.fetch_add(1, Ordering::AcqRel) == 1 {
+                entered.send(()).unwrap();
+                barrier.recv_timeout(Duration::from_secs(6)).unwrap();
+            }
+            true
+        })
+        .unwrap();
+    waiting.recv_timeout(Duration::from_secs(6)).unwrap();
+    assert!(matches!(
+        recorder.try_screenshot(first.clone(), false, || true),
+        Err(super::super::writer::SendError::Full)
+    ));
+    recorder
+        .try_screenshot(final_image.clone(), true, || true)
+        .unwrap();
+    let pending = recorder.begin_finish(RunStatus::Success, Some(0), false);
+    resume.send(()).unwrap();
+    let artifact = pending.complete_blocking();
+    assert!(artifact.complete);
+    let journal = artifact.source.read(None).unwrap().unwrap();
+    let entries: Vec<_> = journal
+        .timeline
+        .iter()
+        .filter(|row| row.kind == "SCREENSHOT")
+        .collect();
+    assert_eq!(entries.len(), 2);
+    artifact
+        .source
+        .with_document(|_, xml| {
+            for ((row, image), caption) in entries.into_iter().zip([first, final_image]).zip([
+                "Virtual terminal screenshot",
+                "Final virtual terminal screenshot",
+            ]) {
+                assert_eq!(row.text, caption);
+                assert!(row.log_start.is_some());
+                let reference = row.screenshot.as_deref().unwrap();
+                assert_eq!(
+                    fs::read(artifact.source.directory().join(reference))?,
+                    image
+                );
+                let element = xml
+                    .descendants()
+                    .find(|node| {
+                        node.has_tag_name("entry")
+                            && super::super::field(*node, "id").unwrap().as_deref() == Some(&row.id)
+                    })
+                    .unwrap();
+                assert_eq!(
+                    super::super::field(element, "nativeAutomationScreenshotDigest")?.as_deref(),
+                    Some(identity_digest(&image)?.as_str())
+                );
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+#[test]
+fn automation_screenshot_authority_is_rechecked_on_the_writer() {
+    use std::sync::atomic::AtomicUsize;
+
+    let fixture = Fixture::new();
+    let recorder = fixture.start(fixture.run(0, Options::default()), "revoked-image");
+    let raster = tiny_skia::Pixmap::new(2, 2).unwrap();
+    let checks = AtomicUsize::new(0);
+    recorder
+        .try_screenshot(raster.encode_png().unwrap(), true, move || {
+            checks.fetch_add(1, Ordering::AcqRel) == 0
+        })
+        .unwrap();
+    recorder.system_note("Retained output after image revocation");
+    let artifact = recorder.finish(RunStatus::Success, Some(0));
+    assert!(artifact.complete);
+    let journal = artifact.source.read(None).unwrap().unwrap();
+    assert!(journal.timeline.iter().all(|row| row.kind != "SCREENSHOT"));
+    assert!(
+        journal
+            .timeline
+            .iter()
+            .any(|row| row.text == "Retained output after image revocation")
+    );
+    assert!(!artifact.source.directory().join("screenshots").exists());
+}
+
+#[test]
+fn automation_screenshot_revocation_rolls_back_prepared_png_and_capture_record() {
+    use std::sync::atomic::AtomicUsize;
+
+    let fixture = Fixture::new();
+    let recorder = fixture.start(fixture.run(0, Options::default()), "prepared-image");
+    let raster = tiny_skia::Pixmap::new(2, 2).unwrap();
+    let checks = AtomicUsize::new(0);
+    recorder
+        .try_screenshot(raster.encode_png().unwrap(), true, move || {
+            // Permit the enqueue, image and log writes, and metadata staging.
+            // Deny the actual XML publication after its staged file is synced.
+            checks.fetch_add(1, Ordering::AcqRel) < 5
+        })
+        .unwrap();
+    recorder.system_note("Capture continues after the revoked frame");
+    let artifact = recorder.finish(RunStatus::Success, Some(0));
+    assert!(artifact.complete);
+    let screenshots = artifact.source.directory().join("screenshots");
+    assert_eq!(fs::read_dir(screenshots).unwrap().count(), 0);
+
+    let page = artifact.source.capture_page(None, None, None).unwrap();
+    assert!(
+        page.records
+            .iter()
+            .all(|record| record.kind != super::super::CaptureKind::Screenshot)
+    );
+    let journal = artifact.source.read(None).unwrap().unwrap();
+    assert_eq!(journal.timeline.len(), 1);
+    assert_eq!(
+        journal.timeline[0].text,
+        "Capture continues after the revoked frame"
+    );
+    assert_eq!(journal.timeline[0].log_start, Some(1));
+}
+
+#[test]
+fn captured_journal_proofs_bind_the_budget_and_legacy_proofs_stay_compatible() {
+    use crate::session_journal::summary_job::Mode;
+    use crate::session_journal::summary_plan::EvidenceLimits;
+    use crate::session_journal::summary_queue::{
+        AutomaticApproval, ProfileBinding, Queue, Receipt, SourceReceipt,
+    };
+    use pbkdf2::hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    let fixture = Fixture::new();
+    let mut queue = Queue::load(&fixture.0).unwrap();
+    let source = AutomationSource::Job(kortty_jobs::JobId::new("nightly").unwrap());
+    let grant = AutomaticApproval {
+        since: Timestamp::UNIX_EPOCH,
+        profile: ProfileChoice {
+            id: crate::ai_manager::ProfileRef::Numeric(1),
+            model: "fixture".into(),
+            destination: "https://example.test/v1".into(),
+            policy_model_fingerprint: None,
+            https: Some(ProfileBinding {
+                root: fixture.settings().root,
+                profile_revision: [1; 32],
+                redaction_revision: [2; 32],
+            }),
+            cli: None,
+        },
+        evidence_limits: None,
+        title_since: None,
+    };
+    let limits = EvidenceLimits {
+        max_lines_per_direction: 40,
+        context_tokens: 4096,
+    };
+    let mut preferences = queue.preferences().clone();
+    preferences
+        .set_source_approval(source.clone(), Some((grant.clone(), false)))
+        .unwrap();
+    let legacy = preferences.source_approval(&source).unwrap().clone();
+    let legacy_json = serde_json::to_value(&legacy).unwrap();
+    let legacy_reopened: SourceApproval = serde_json::from_value(legacy_json.clone()).unwrap();
+    assert!(legacy_json["grant"].get("evidence_limits").is_none());
+    let legacy_receipt = legacy_reopened
+        .receipt(
+            &source,
+            "fixture-run",
+            Timestamp::UNIX_EPOCH,
+            "fixture-journal",
+        )
+        .unwrap();
+    let key: [u8; 32] = serde_json::from_value(legacy_json["key"].clone()).unwrap();
+    let mut old_mac = Hmac::<Sha256>::new_from_slice(&key).unwrap();
+    Mac::update(
+        &mut old_mac,
+        b"kortty automation journal source approval v1\0",
+    );
+    Mac::update(
+        &mut old_mac,
+        &serde_json::to_vec(&(
+            &source,
+            "fixture-run",
+            Timestamp::UNIX_EPOCH,
+            "fixture-journal",
+            &legacy.grant.profile,
+            false,
+        ))
+        .unwrap(),
+    );
+    assert!(old_mac.verify_slice(&legacy_receipt.proof).is_ok());
+    let serialized = serde_json::to_value(&legacy_receipt).unwrap();
+    assert!(serialized.get("evidence_limits").is_none());
+    let proof = serde_json::from_value::<SourceReceipt>(serialized).unwrap();
+    assert!(legacy.verifies_receipt(&proof, "fixture-journal"));
+
+    preferences.evidence_limits = Some(limits);
+    assert!(
+        preferences
+            .set_source_approval(source.clone(), Some((grant.clone(), false)))
+            .is_err()
+    );
+    let grant = AutomaticApproval {
+        evidence_limits: Some(limits),
+        ..grant
+    };
+    preferences
+        .set_source_approval(source.clone(), Some((grant.clone(), false)))
+        .unwrap();
+    let approval = preferences.source_approval(&source).unwrap().clone();
+    queue.set_preferences(preferences).unwrap();
+    let options = Options {
+        summary_profile: Some(grant.profile.clone()),
+        ..Options::default()
+    };
+    let run = fixture
+        .run(-60, options)
+        .with_summary_approval(Some(approval.clone()));
+    let recorder = fixture.start(run, "approved");
+    recorder.command("pwd");
+    let artifact = recorder.finish(RunStatus::Success, Some(0));
+    let proof: SourceReceipt =
+        serde_json::from_str(&automation_field(&artifact, SUMMARY_PROOF).unwrap()).unwrap();
+    assert_eq!(proof.evidence_limits, Some(limits));
+    assert!(approval.verifies_receipt(&proof, artifact.source.id()));
+    assert!(!legacy.verifies_receipt(&proof, artifact.source.id()));
+    let mut modified = proof.clone();
+    modified.evidence_limits = None;
+    assert!(!approval.verifies_receipt(&modified, artifact.source.id()));
+
+    let receipt = Receipt {
+        generation: "0123456789abcdef0123456789abcdef".into(),
+        batch: "0123456789abcdef0123456789abcdef".into(),
+        source: artifact.source.summary_receipt(),
+        title: "Reviewed automation".into(),
+        mode: Mode::Automation,
+        profile: Some(grant.profile),
+        source_approval: Some(proof),
+        raw_only: false,
+        automatic_title: false,
+        title_approval: None,
+        full_output: false,
+        evidence_limits: Some(limits),
+        screenshots: false,
+        automation_vision: None,
+    };
+    queue.enqueue([receipt.clone()]).unwrap();
+    let mut reopened = Queue::load(&fixture.0).unwrap();
+    assert!(reopened.authorizes_reviewed(&receipt));
+    let mut preferences = reopened.preferences().clone();
+    preferences.evidence_limits = Some(EvidenceLimits {
+        context_tokens: 2048,
+        ..limits
+    });
+    reopened.set_preferences(preferences).unwrap();
+    let revoked = Queue::load(&fixture.0).unwrap();
+    assert!(revoked.preferences().source_approval(&source).is_none());
+    assert!(revoked.pending().is_empty());
+    assert!(!revoked.authorizes_reviewed(&receipt));
+}
+
 fn ordered_fixture(
     fixture: &Fixture,
     offset: i64,

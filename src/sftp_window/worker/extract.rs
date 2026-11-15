@@ -140,7 +140,9 @@ fn prepare_checked(
             message,
             outcome_unknown,
         } => return Err(helper_failure(&message, outcome_unknown)),
-        protocol::Reply::Applied { .. } | protocol::Reply::CreationReview { .. } => {
+        protocol::Reply::Applied { .. }
+        | protocol::Reply::CreationReview { .. }
+        | protocol::Reply::CreationApplied { .. } => {
             return Err(invalid_receipt().into());
         }
     };

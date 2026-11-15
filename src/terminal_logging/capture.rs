@@ -334,6 +334,25 @@ impl Redactor {
             .any(|secret| input.contains(secret.as_str()))
     }
 
+    /// A live frame can end while the terminal is still drawing a credential.
+    pub(crate) fn ends_with_partial_secret(&self, input: &str, deadline: Instant) -> Option<bool> {
+        for secret in self.secrets.0.iter() {
+            for (start, _) in input
+                .char_indices()
+                .rev()
+                .take_while(|(start, _)| input.len() - start < secret.len())
+            {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                if secret.starts_with(&input[start..]) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
+    }
+
     fn mask(&self, text: &mut Zeroizing<String>, limit: usize) -> Option<usize> {
         let mut count = 0;
         for secret in self.secrets.0.iter() {

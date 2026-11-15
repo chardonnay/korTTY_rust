@@ -21,6 +21,7 @@ mod clipboard;
 mod desktop_notifications;
 mod dock_badge;
 mod executable_metadata;
+pub mod file_drag;
 mod owned_dialog;
 mod power;
 mod status_item;

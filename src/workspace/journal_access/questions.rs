@@ -16,6 +16,8 @@ use crate::session_journal::question::{
     self, Answer, Answering, Citation, CliAnswering, HttpsAuthority, Question, Quotation, Ranking,
     Review, Target,
 };
+use crate::session_journal::summary_ai::ObservedUsage;
+use crate::session_journal::summary_store::UsageEdit;
 use crate::session_journal::viewer::Source;
 use crate::session_journal::{CapturePage, Catalog, topic_ai_settings, tree};
 use crate::terminal_logging::{Policy, Redactor, Secrets};
@@ -23,7 +25,9 @@ use crate::vault_window::{JournalQuestionSecrets, VaultWindow};
 use crate::workspace::ai_quota;
 use crate::workspace::terminal_ai::mask;
 
-use super::{Desktop, Message as JournalMessage, Mode, Workspace, read_task};
+use super::{
+    Desktop, Message as JournalMessage, Mode, Workspace, read_task, record_journal_ai_usage,
+};
 
 const MAX_INPUT: usize = 1_024;
 
@@ -43,16 +47,24 @@ pub enum Message {
     SendHttps(u64),
     SendCli(u64),
     AnswerProgress(u64, Vec<Quotation>),
-    Answered(u64, Result<Arc<Answer>, String>),
+    Answered(u64, Result<Arc<Answer>, String>, Option<ObservedUsage>),
+    UsageSaved(u64, Result<Arc<Answer>, String>, Option<Arc<UsageSaved>>),
     Jump(usize),
     EntryChecked(u64, Result<Arc<()>, String>),
     Revise,
     Close,
 }
 
+#[derive(Debug)]
+pub struct UsageSaved {
+    root: PathBuf,
+    stamps: UsageEdit,
+}
+
 #[derive(Clone)]
 pub struct Prepared {
     review: Review,
+    usage_source: Option<Source>,
     embedding_fallback: bool,
     outbound: Option<ReviewedAnswer>,
 }
@@ -254,8 +266,9 @@ impl Workspace {
             .filter(|profile| !profile.is_remote() && !profile.is_cli())
             .map(|profile| {
                 let settings = &self.window_settings.journal_ai;
-                let label = configuration
-                    .journal_summary_default_id()
+                let label = (!self.uses_legacy_journal_profile())
+                    .then(|| configuration.journal_summary_default_id())
+                    .flatten()
                     .and_then(|selected| {
                         configuration
                             .agent_profiles()
@@ -445,6 +458,15 @@ impl Workspace {
             Message::Prepared(ticket, result) => {
                 return self.finalize_journal_question(id, ticket, result);
             }
+            Message::Answered(ticket, result, usage) => {
+                return self.finish_journal_question_answer(id, ticket, result, usage);
+            }
+            Message::UsageSaved(ticket, result, saved) => {
+                self.show_journal_question_answer(id, ticket, result, saved.as_deref());
+                if let Some(saved) = saved {
+                    return self.refresh_journal_action_managers(&saved.root);
+                }
+            }
             Message::Jump(index) => return self.open_question_citation(id, index),
             Message::EntryChecked(ticket, result) => {
                 return self.finish_question_entry(id, ticket, result);
@@ -557,12 +579,15 @@ impl Workspace {
                     let mask = |value: &str| mask.apply(value);
                     let question = Question::new(&input, &mask)?;
                     let mut review =
-                        Review::prepare(question, vec![source], false, &mask, &|| stopped(&stop))?;
+                        Review::prepare(question, vec![source.clone()], false, &mask, &|| {
+                            stopped(&stop)
+                        })?;
                     if let Some(profile) = &answer_profile {
                         review.bind_answer_profile(profile);
                     }
                     Ok(Prepared {
                         review,
+                        usage_source: Some(source),
                         embedding_fallback: false,
                         outbound: None,
                     })
@@ -654,6 +679,7 @@ impl Workspace {
                 }
                 Ok(Prepared {
                     review,
+                    usage_source: None,
                     embedding_fallback: semantic && !used,
                     outbound: None,
                 })
@@ -813,7 +839,7 @@ impl Workspace {
                             |value| mask.apply(value),
                         )
                     },
-                    move |result| JournalMessage::Question(Message::Answered(ticket, result)),
+                    move |result| JournalMessage::Question(Message::Answered(ticket, result, None)),
                 );
             }
             _ => return Task::none(),
@@ -847,11 +873,24 @@ impl Workspace {
         let complete = read_task(
             id,
             move || {
-                worker.answer(&prepared.review, &|| stopped(&stop), |quotations| {
+                let reply = worker.answer(&prepared.review, &|| stopped(&stop), |quotations| {
                     let _ = send.try_send(quotations);
-                })
+                });
+                Ok((
+                    reply
+                        .result
+                        .map(Arc::new)
+                        .map_err(|error| error.to_string()),
+                    reply.usage,
+                ))
             },
-            move |result| JournalMessage::Question(Message::Answered(ticket, result)),
+            move |reply| {
+                let (result, usage) = match reply {
+                    Ok(reply) => (reply.0.clone(), reply.1.clone()),
+                    Err(error) => (Err(error), None),
+                };
+                JournalMessage::Question(Message::Answered(ticket, result, usage))
+            },
         );
         let progress = Task::run(updates, move |quotations| {
             Desktop::SessionJournal(
@@ -860,6 +899,86 @@ impl Workspace {
             )
         });
         Task::batch([complete, progress])
+    }
+
+    fn finish_journal_question_answer(
+        &mut self,
+        id: window::Id,
+        ticket: u64,
+        result: Result<Arc<Answer>, String>,
+        usage: Option<ObservedUsage>,
+    ) -> Task<Desktop> {
+        let Some(dialog) = self.journal_questions.dialogs.get(&id) else {
+            return Task::none();
+        };
+        let Stage::Review(prepared, None) = &dialog.stage else {
+            return Task::none();
+        };
+        if !dialog
+            .work
+            .as_ref()
+            .is_some_and(|work| work.ticket == ticket)
+        {
+            return Task::none();
+        }
+        let (Some(usage), Some(source)) = (usage, prepared.usage_source.clone()) else {
+            self.show_journal_question_answer(id, ticket, result, None);
+            return Task::none();
+        };
+        let root = dialog.root.clone();
+        let capture = self.journal_usage_capture(&source);
+        let (save_ticket, _) = self.begin_question_work(id, None);
+        let (send, receive) = async_channel::bounded(1);
+        let (signal, done) = async_channel::bounded(1);
+        let worker = std::thread::Builder::new()
+            .name("kortty-journal-question-usage".into())
+            .spawn(move || {
+                let _signal = signal;
+                let stamps = record_journal_ai_usage(&source, capture.as_deref(), usage);
+                let _ = send.try_send(
+                    stamps
+                        .ok()
+                        .map(|stamps| Arc::new(UsageSaved { root, stamps })),
+                );
+            });
+        if worker.is_err() {
+            self.show_journal_question_answer(id, save_ticket, result, None);
+            return Task::none();
+        }
+        self.track_session_shutdown(done);
+        Task::future(async move {
+            let saved = receive.recv().await.ok().flatten();
+            Desktop::SessionJournal(
+                id,
+                JournalMessage::Question(Message::UsageSaved(save_ticket, result, saved)),
+            )
+        })
+    }
+
+    fn show_journal_question_answer(
+        &mut self,
+        id: window::Id,
+        ticket: u64,
+        result: Result<Arc<Answer>, String>,
+        saved: Option<&UsageSaved>,
+    ) {
+        let Some(dialog) = self.journal_questions.dialogs.get_mut(&id) else {
+            return;
+        };
+        let Stage::Review(prepared, answer @ None) = &mut dialog.stage else {
+            return;
+        };
+        if dialog.work.take_if(|work| work.ticket == ticket).is_none() {
+            return;
+        }
+        if let Some(saved) = saved {
+            let (old, new) = &saved.stamps;
+            Arc::make_mut(prepared).review.update_usage_stamp(old, new);
+        }
+        match result {
+            Ok(result) => *answer = Some(result),
+            Err(error) => dialog.error = Some(error),
+        }
     }
 
     fn begin_question_work(
@@ -1159,9 +1278,7 @@ impl Dialog {
                 }
                 return Task::none();
             }
-            Message::Ranked(ticket, _)
-            | Message::Prepared(ticket, _)
-            | Message::Answered(ticket, _) => *ticket,
+            Message::Ranked(ticket, _) | Message::Prepared(ticket, _) => *ticket,
             _ => return Task::none(),
         };
         if self.work.take_if(|work| work.ticket == ticket).is_none() {
@@ -1173,14 +1290,9 @@ impl Dialog {
                 self.stage = Stage::Review(prepared, None);
                 return self.start_quota(id, ticket);
             }
-            Message::Answered(_, Ok(result)) => {
-                if let Stage::Review(_, answer) = &mut self.stage {
-                    *answer = Some(result);
-                }
+            Message::Ranked(_, Err(error)) | Message::Prepared(_, Err(error)) => {
+                self.error = Some(error);
             }
-            Message::Ranked(_, Err(error))
-            | Message::Prepared(_, Err(error))
-            | Message::Answered(_, Err(error)) => self.error = Some(error),
             _ => {}
         }
         Task::none()

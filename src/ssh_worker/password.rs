@@ -143,14 +143,15 @@ fn read(reader: &mut SshReader, bytes: &mut [u8]) -> Result<Option<usize>, &'sta
     }
 }
 
-pub(super) struct Prompt<'a> {
+/// Recognizes an exact challenge at the start of a stderr line across SSH chunks.
+pub struct Prompt<'a> {
     marker: &'a [u8],
     matched: usize,
     line_start: bool,
 }
 
 impl<'a> Prompt<'a> {
-    pub(super) fn new(marker: &'a str) -> Self {
+    pub fn new(marker: &'a str) -> Self {
         Self {
             marker: marker.as_bytes(),
             matched: 0,
@@ -158,9 +159,11 @@ impl<'a> Prompt<'a> {
         }
     }
 
-    pub(super) fn observe(&mut self, bytes: &[u8]) -> bool {
+    pub fn observe(&mut self, bytes: &[u8]) -> bool {
         for (index, &byte) in bytes.iter().enumerate() {
-            if (self.line_start || self.matched != 0) && self.marker[self.matched] == byte {
+            if (self.line_start || self.matched != 0)
+                && self.marker.get(self.matched) == Some(&byte)
+            {
                 self.line_start = false;
                 self.matched += 1;
                 if self.matched == self.marker.len() {

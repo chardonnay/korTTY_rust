@@ -1,16 +1,16 @@
-//! One-use manual replacement of reviewed files in either sync direction.
+//! One-use replacement of reviewed files in either sync direction.
 
 use super::*;
 use crate::sftp_window::worker::resume::durable;
-use std::cell::Cell;
+use std::cell::RefCell;
 
 pub(in crate::sftp_window) mod draft;
+mod local_receiver;
 pub(in crate::sftp_window::worker) mod metadata;
 mod remote;
-#[cfg(windows)]
 mod scheduled;
-#[cfg(windows)]
-pub(in crate::sftp_window) use scheduled::ScheduledDownload;
+pub(crate) use local_receiver::{LocalFileSnapshot, ReviewedFilePublication, ReviewedFileReceiver};
+pub(in crate::sftp_window::worker) use scheduled::ScheduledReplacement;
 
 pub(crate) struct Request {
     approval: Approval,
@@ -236,9 +236,16 @@ struct Recovery<'a> {
 }
 
 #[derive(Clone, Copy)]
-struct ReplaceScope<'a> {
-    approval: &'a Approval,
-    recovery: Option<Recovery<'a>>,
+enum ReplaceScope<'a> {
+    Browser {
+        approval: &'a Approval,
+        recovery: Option<Recovery<'a>>,
+    },
+    Scheduled {
+        upload: UploadContext<'a>,
+        backup_prefix: &'a str,
+        standing_roots: Option<&'a StandingRoots>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -246,6 +253,7 @@ struct LocalReplace<'a> {
     metadata: &'a metadata::Metadata,
     strict_source: bool,
     backup_prefix: Option<&'a str>,
+    standing_roots: Option<&'a StandingRoots>,
 }
 
 #[derive(Debug)]
@@ -343,7 +351,7 @@ impl Plan {
                 self.is_batch(),
                 stopped,
                 authorize,
-                ReplaceScope {
+                ReplaceScope::Browser {
                     approval: &self.approval,
                     recovery: None,
                 },
@@ -544,7 +552,7 @@ pub(in crate::sftp_window::worker) fn apply(
     let snapshot = durable::snapshot(control).filter(|(_, context)| {
         context.route == plan.approval.route && context.host_key == plan.approval.peer
     });
-    let scope = ReplaceScope {
+    let scope = ReplaceScope::Browser {
         approval: &plan.approval,
         recovery: snapshot
             .as_ref()
@@ -582,6 +590,7 @@ pub(in crate::sftp_window::worker) fn apply(
                 standing: None,
                 combined: Some(&authorize),
                 scheduled: None,
+                upload: None,
                 origin: CopyOrigin::Browser,
             };
             combined.apply_copies(client, progress, &checks, &mut additions, &mut outcomes)?;
@@ -719,6 +728,15 @@ pub(in crate::sftp_window::worker) fn apply(
 }
 
 impl EntryPlan {
+    fn new(entry: Entry, digests: [[u8; 32]; 2], metadata: Metadata) -> Self {
+        Self {
+            entry,
+            digests,
+            digest_labels: digests.map(digest_label),
+            metadata,
+        }
+    }
+
     fn replace(
         &self,
         client: &mut Client,
@@ -738,6 +756,7 @@ impl EntryPlan {
                     metadata,
                     strict_source: !batch,
                     backup_prefix: None,
+                    standing_roots: None,
                 },
             ),
             Metadata::Remote => remote::replace(
@@ -764,6 +783,7 @@ impl EntryPlan {
             metadata,
             strict_source,
             backup_prefix,
+            standing_roots,
         } = options;
         let request = &self.entry;
         let (Location::Remote(source), SnapshotEntry::Remote(source_stamp)) =
@@ -804,58 +824,62 @@ impl EntryPlan {
         let file_stamp = FileStamp::read(file)?;
         staged.verify_stage(&file_stamp)?;
         source_parent.verify(client, source_folder, strict_source)?;
-        authorize()?;
-        let might_have_moved = Cell::new(false);
-        let before_move = |file: &File| {
+        let client = RefCell::new(client);
+        let before_mutation = || -> Result<()> {
+            if let Some(roots) = standing_roots {
+                roots.verify(&mut client.borrow_mut(), false)?;
+            }
+            authorize()
+        };
+        before_mutation()?;
+        let before_move = |file: &File, staged: &File| {
             authorize()?;
             metadata.require_matches(file)?;
-            might_have_moved.set(true);
+            #[cfg(unix)]
+            if strict_source {
+                draft::require_same_unix_access_subjects(file, staged)?;
+            }
+            #[cfg(windows)]
+            let _ = staged;
+            if standing_roots.is_some() {
+                before_mutation()?;
+            }
             Ok(())
         };
-        let backup = removal::local::quarantine_for_replacement(
-            folder,
-            name,
-            parent,
-            (&request.target_stamp, self.digests[1]),
-            &before_move,
-            stopped,
-            backup_prefix,
-        )
-        .map_err(|error| {
-            if might_have_moved.get() {
-                ReplaceFailure::uncertain(error)
-            } else {
-                error.into()
+        let finish_file = |original: &File, file: &File| {
+            authorize()?;
+            metadata.require_matches(original)?;
+            #[cfg(unix)]
+            if strict_source {
+                draft::require_same_unix_access_subjects(original, file)?;
             }
-        })?;
-        let publish = (|| -> Result<()> {
-            staged.verify_partial(&file_stamp)?;
-            backup.verify()?;
-            metadata.require_matches(backup.file())?;
-            staged.publish_checked(|file| {
-                authorize().map_err(|error| io::Error::other(error.message))?;
-                metadata.require_matches(backup.file())?;
-                metadata.apply_to(file)?;
-                file.sync_all()?;
-                metadata.require_matches(backup.file())?;
-                authorize().map_err(|error| io::Error::other(error.message))
-            })?;
-            Ok(())
-        })();
-        match publish {
-            Ok(()) => Ok(Completion {
-                backup: backup_label(&backup.retain()),
+            metadata.apply_to(file)?;
+            file.sync_all()?;
+            metadata.require_matches(original)?;
+            before_mutation()
+        };
+        match local_receiver::commit_local(
+            local_receiver::LocalTarget {
+                folder,
+                name,
+                parent,
+                original: (&request.target_stamp, self.digests[1]),
+                backup_prefix,
+            },
+            staged,
+            stopped,
+            &before_move,
+            &finish_file,
+            |_, _, _| Ok(()),
+            false,
+        )? {
+            local_receiver::LocalCommit::Published { recovery, .. } => Ok(Completion {
+                backup: backup_label(&recovery),
                 warning: None,
             }),
-            Err(error) => {
-                let path = backup_label(backup.path());
-                match backup.restore() {
-                    Ok(()) => Err(error.context(" · The original file was restored").into()),
-                    Err(restore) => Err(ReplaceFailure::uncertain(error.context(format!(
-                        " · Restore or backup cleanup failed ({}) · Recovery path {path}",
-                        restore.message
-                    )))),
-                }
+            local_receiver::LocalCommit::Restored(error) => Err(error.into()),
+            local_receiver::LocalCommit::Uncertain { error, .. } => {
+                Err(ReplaceFailure::uncertain(error))
             }
         }
     }
@@ -906,13 +930,7 @@ impl Entry {
             }
             None => Metadata::Remote,
         };
-        let digests = [source, target];
-        Ok(EntryPlan {
-            entry: self,
-            digests,
-            digest_labels: digests.map(digest_label),
-            metadata,
-        })
+        Ok(EntryPlan::new(self, [source, target], metadata))
     }
 
     fn open_local_target(&self) -> Result<LocalSource> {

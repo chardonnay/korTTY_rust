@@ -40,6 +40,7 @@ fn desktop_notices_follow_the_committed_run_and_saved_job_settings() {
         },
         detail: Some("Private output from private-host.example".into()),
         recording: None,
+        output: None,
         swarm_report: None,
     }));
     let now = Instant::now();
@@ -64,6 +65,7 @@ fn desktop_notices_follow_the_committed_run_and_saved_job_settings() {
         outcome: RunOutcome::Failed { exit_code: None },
         detail: None,
         recording: None,
+        output: None,
         swarm_report: None,
     }));
     assert!(
@@ -88,6 +90,7 @@ fn desktop_notices_follow_the_committed_run_and_saved_job_settings() {
         outcome: RunOutcome::Success,
         detail: None,
         recording: None,
+        output: None,
         swarm_report: None,
     }));
     let notices = window.take_desktop_notices(now + COOLDOWN, true);
@@ -103,6 +106,7 @@ fn desktop_notices_follow_the_committed_run_and_saved_job_settings() {
         outcome: RunOutcome::Blocked,
         detail: None,
         recording: None,
+        output: None,
         swarm_report: None,
     }));
     assert!(

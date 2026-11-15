@@ -97,8 +97,10 @@ pub(in crate::workspace::saved_chats) struct Server {
     pub(in crate::workspace::saved_chats) display_name: String,
     pub(in crate::workspace::saved_chats) state: String,
     pub(in crate::workspace::saved_chats) summary: String,
-    pub(in crate::workspace::saved_chats) elapsed_seconds: u64,
-    pub(in crate::workspace::saved_chats) total_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::workspace::saved_chats) elapsed_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::workspace::saved_chats) total_tokens: Option<u64>,
 }
 
 impl Archive {
@@ -126,15 +128,17 @@ impl Archive {
             title: self.title.clone(),
             is_draft: false,
             is_java_archive: true,
-            target_count: self
-                .messages
-                .iter()
-                .rev()
-                .find(|message| message.role == Role::Assistant)
-                .map_or(0, |message| message.servers.len()),
+            target_count: self.latest_servers().map_or(0, <[_]>::len),
             updated: self.updated,
             fingerprint: self.fingerprint,
         }
+    }
+
+    pub(in crate::workspace::saved_chats) fn latest_servers(&self) -> Option<&[Server]> {
+        self.messages.iter().rev().find_map(|message| {
+            (message.role == Role::Assistant && !message.servers.is_empty())
+                .then_some(message.servers.as_slice())
+        })
     }
 }
 
@@ -154,8 +158,12 @@ impl Server {
         metadata_valid(&self.display_name)
             && (self.state.is_empty() || valid_line(&self.state, 128))
             && (self.summary.is_empty() || super::valid_text(&self.summary, MAX_SUMMARY_BYTES))
-            && self.elapsed_seconds <= i64::MAX as u64
-            && self.total_tokens <= i64::MAX as u64
+            && self
+                .elapsed_seconds
+                .is_none_or(|value| value <= i64::MAX as u64)
+            && self
+                .total_tokens
+                .is_none_or(|value| value <= i64::MAX as u64)
     }
 }
 
@@ -319,14 +327,15 @@ fn metadata(
     )
 }
 
-fn metric(fields: &java_xml::Fields<'_, '_>, name: &str) -> io::Result<u64> {
+fn metric(fields: &java_xml::Fields<'_, '_>, name: &str) -> io::Result<Option<u64>> {
     let value = java_xml::value(fields, name)?;
     if value.trim().is_empty() {
-        return Ok(0);
+        return Ok(None);
     }
     value
         .trim()
         .parse::<u64>()
+        .map(Some)
         .map_err(|_| invalid("Invalid Java Swarm server metric."))
 }
 
@@ -385,10 +394,12 @@ mod tests {
         assert!(response.role == Role::Assistant);
         assert!(response.content.contains("# Combined result") && response.content.contains("***"));
         assert_eq!(response.servers[0].state, "DONE");
-        assert_eq!(response.servers[0].elapsed_seconds, 17);
-        assert_eq!(response.servers[0].total_tokens, 1205);
+        assert_eq!(response.servers[0].elapsed_seconds, Some(17));
+        assert_eq!(response.servers[0].total_tokens, Some(1205));
         assert_eq!(response.servers[1].state, "SKIPPED");
         assert_eq!(response.servers[1].summary, "***");
+        assert_eq!(response.servers[1].elapsed_seconds, Some(0));
+        assert_eq!(response.servers[1].total_tokens, Some(0));
         assert!(
             backup::bind_swarm_routes(name, bytes, &std::collections::HashSet::from([42, 88]))?
                 .is_none()
@@ -435,6 +446,29 @@ mod tests {
         let mut active = serde_json::from_slice::<serde_json::Value>(bytes)?;
         active["profile_id"] = serde_json::json!(77);
         assert!(backup::validate_java_swarm(name, &serde_json::to_vec(&active)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn java_swarm_archive_omits_unreported_status_metrics() -> io::Result<()> {
+        let xml = FIXTURE.replace("<elapsedSeconds>17</elapsedSeconds>", "");
+        let redactor = super::super::super::java_xml_redactor(&Policy::default())?;
+        let converted = entries(xml.as_bytes(), &redactor, |_, _| true)?;
+        let (path, bytes) = converted
+            .records
+            .first_key_value()
+            .expect("imported archive");
+        let id = path
+            .strip_prefix("swarm-conversations/")
+            .unwrap()
+            .strip_suffix(".json")
+            .unwrap();
+        let Stored::JavaArchive(archive) = super::super::decode(bytes, id)? else {
+            panic!("expected Java archive");
+        };
+        let server = &archive.messages[1].servers[0];
+        assert_eq!(server.elapsed_seconds, None);
+        assert_eq!(server.total_tokens, Some(1205));
         Ok(())
     }
 }

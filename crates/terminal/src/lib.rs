@@ -885,7 +885,11 @@ impl Terminal {
             rows: model.rows as u16,
             cells,
             wrapped_columns,
-            starts_with_continuation: start > 0 && screen.history[start - 1].wrap_length.is_some(),
+            starts_with_continuation: if start == 0 {
+                screen.history_starts_with_continuation
+            } else {
+                screen.history[start - 1].wrap_length.is_some()
+            },
             images: screen.viewport_images(start),
             cursor: Cursor {
                 column: screen.cursor.column as u16,
@@ -967,6 +971,11 @@ impl Terminal {
     /// Width of a stored row which continues onto the following physical row.
     pub fn history_wrapped_columns(&self, index: usize) -> Option<usize> {
         self.model.screen().history.get(index)?.wrap_length
+    }
+
+    /// Whether the oldest retained row follows a discarded soft-wrapped row.
+    pub fn history_starts_with_continuation(&self) -> bool {
+        self.model.screen().history_starts_with_continuation
     }
 
     /// Sets whether the primary scrollback can be packed, preserving already packed rows.

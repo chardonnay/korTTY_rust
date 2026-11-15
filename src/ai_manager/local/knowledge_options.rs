@@ -10,11 +10,10 @@ use crate::knowledge_pdf as pdf;
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
 
 use super::knowledge::source::{
-    DEFAULT_TEXT_BYTES, FileSizeLimit, MAX_TEXT_BYTES, Options, SyncMode, validate_file_size,
+    FileSizeLimit, MAX_CONFIGURED_BYTES, NEW_SOURCE_DEFAULT, Options, SyncMode, validate_file_size,
 };
 
-const KIB: usize = 1024;
-const MIB: usize = KIB * KIB;
+const MIB: usize = 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) enum Edit {
@@ -63,7 +62,8 @@ impl Draft {
     pub(super) fn options(&self) -> Result<Options, String> {
         let mut options = self.options.clone();
         if self.size_edited {
-            options.max_file_bytes = file_size(&self.max_file_bytes)?.map(FileSizeLimit::reviewed);
+            let limit = file_size(&self.max_file_bytes)?.unwrap_or(NEW_SOURCE_DEFAULT);
+            options.max_file_bytes = Some(FileSizeLimit::reviewed(limit));
         }
         let patterns = |text: &str| {
             text.split(';')
@@ -100,13 +100,12 @@ impl Draft {
                 .label("Include PDFs with a text layer")
                 .on_toggle_maybe(enabled.then_some(Edit::IncludePdf)),
             text(format!(
-                "Maximum bytes per file. Blank uses {} KiB for UTF-8 and {} MiB for PDFs. An explicit limit allows up to {} MiB for UTF-8 and {} MiB for PDFs.",
-                DEFAULT_TEXT_BYTES / KIB,
-                pdf::DEFAULT_FILE_BYTES / MIB,
-                MAX_TEXT_BYTES / MIB,
+                "Enter a per-file limit up to {} MiB. New sources default to {} MiB. A scan accepts up to {} MiB in total.",
+                MAX_CONFIGURED_BYTES / MIB as u64,
+                NEW_SOURCE_DEFAULT / MIB as u64,
                 pdf::MAX_FILE_BYTES / MIB,
             )).size(13),
-            text_input("Use format defaults", &self.max_file_bytes)
+            text_input("Default for this source", &self.max_file_bytes)
                 .on_input_maybe(enabled.then_some(Edit::MaxFileBytes)),
             legacy_size.then(|| text("Re-enter a saved size to review it against the higher format limits.").size(13)),
             text_input("Include globs separated by semicolons", &self.includes)
@@ -123,15 +122,14 @@ impl Draft {
 pub(super) fn file_size_help(path: &Path) -> String {
     if pdf::is_pdf(path) {
         format!(
-            "Maximum PDF size in bytes. Blank uses {} MiB. An explicit limit allows up to {} MiB.",
-            pdf::DEFAULT_FILE_BYTES / MIB,
+            "Maximum PDF size in bytes, configurable up to {} MiB. The scan cap is {} MiB. Clearing the field restores the 50 MiB default.",
+            MAX_CONFIGURED_BYTES / MIB as u64,
             pdf::MAX_FILE_BYTES / MIB,
         )
     } else {
         format!(
-            "Maximum UTF-8 file size in bytes. Blank uses {} KiB. An explicit limit allows up to {} MiB.",
-            DEFAULT_TEXT_BYTES / KIB,
-            MAX_TEXT_BYTES / MIB,
+            "Maximum UTF-8 file size in bytes, configurable up to {} MiB. The scan cap is 500 MiB. Clearing the field restores the 50 MiB default.",
+            MAX_CONFIGURED_BYTES / MIB as u64,
         )
     }
 }
@@ -152,6 +150,7 @@ pub(super) fn file_size_text(value: Option<u64>) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::knowledge::source::{DEFAULT_TEXT_BYTES, MAX_TEXT_BYTES};
     use super::super::knowledge::{Store, folder};
     use super::super::{Configuration, Dialog, Message, Output, State};
     use super::*;
@@ -184,6 +183,10 @@ mod tests {
         let mut store = Store::new("Source sizes").unwrap();
         store.add_source(text_path.clone()).unwrap();
         store.add_source(pdf_path.clone()).unwrap();
+        assert_eq!(
+            store.effective_file_size_limit(&pdf_path),
+            NEW_SOURCE_DEFAULT
+        );
         assert!(store.set_file_sync(text_path.clone(), SyncMode::Automatic));
 
         let limit = MIB as u64;
@@ -308,6 +311,8 @@ mod tests {
 
         let mut store = Store::new("Corpus file").unwrap();
         store.add_source(text.clone()).unwrap();
+        assert_eq!(store.effective_file_size_limit(&text), NEW_SOURCE_DEFAULT);
+        store.set_file_size_limit(text.clone(), None).unwrap();
         assert!(store.set_file_sync(text.clone(), SyncMode::Automatic));
         let saved = State {
             stores: vec![store],
@@ -351,12 +356,21 @@ mod tests {
         ] {
             std::fs::write(root.join(name), text).unwrap();
         }
-        std::fs::write(root.join("at-limit.rs"), "x".repeat(DEFAULT_TEXT_BYTES)).unwrap();
-        std::fs::write(
-            root.join("over-limit.rs"),
-            "x".repeat(DEFAULT_TEXT_BYTES + 1),
-        )
-        .unwrap();
+        let source_limit = NEW_SOURCE_DEFAULT as usize;
+        std::fs::File::create(root.join("over-limit.rs"))
+            .unwrap()
+            .set_len(NEW_SOURCE_DEFAULT + 1)
+            .unwrap();
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::File::create(root.join("at-limit.rs")).unwrap();
+            let text = vec![b'\n'; MIB];
+            for _ in 0..source_limit / MIB - 1 {
+                file.write_all(&text).unwrap();
+            }
+            file.write_all(&text[..MIB - 1]).unwrap();
+            file.write_all(b"x").unwrap();
+        }
         let saved = State {
             stores: vec![Store::new("Source options").unwrap()],
             ..State::default()
@@ -395,10 +409,7 @@ mod tests {
             row.path == "at-limit.rs"
                 && matches!(
                     row.status,
-                    folder::Status::Ready {
-                        bytes: DEFAULT_TEXT_BYTES,
-                        ..
-                    }
+                    folder::Status::Ready { bytes, .. } if bytes == source_limit
                 )
         }));
         assert!(review.rows.iter().any(|row| {

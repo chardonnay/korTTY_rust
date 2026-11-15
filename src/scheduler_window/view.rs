@@ -15,14 +15,51 @@ use kortty_jobs::{
 
 use super::journal_search::{JournalColumn, JournalSearchMode};
 use super::{
-    Confirmation, MAX_JOURNAL_RETENTION_DAYS, Message, Page, RemoteAction, RunProposalView,
-    SchedulerView, SchedulerWindow, Scope, SshCommand, sync,
+    Confirmation, JournalDetail, MAX_JOURNAL_RETENTION_DAYS, Message, Page, RemoteAction,
+    RunProposalView, SchedulerView, SchedulerWindow, Scope, SshCommand, sync,
 };
 use crate::diagram_window::Format;
 
-mod journal_details;
+pub(super) mod journal_details;
 mod run_proposal;
 mod swarm_report;
+
+pub(super) fn journal_detail_view<'a>(
+    value: JournalDetail,
+    virtual_terminal: bool,
+    allowed: bool,
+) -> Element<'a, Message> {
+    let control: Element<'a, Message> = if !allowed {
+        text("Application policy disables output capture.")
+            .size(12)
+            .into()
+    } else if virtual_terminal {
+        text("A virtual terminal combines stdout and stderr. The terminal recording contains the visible output.")
+            .size(12)
+            .into()
+    } else {
+        let help = match value {
+            JournalDetail::Off => "Keeps the run status without saving stdout and stderr.",
+            JournalDetail::LimitedRedacted => "Saves a short, redacted excerpt from each stream.",
+            JournalDetail::Full => "Saves redacted stdout and stderr up to the capture limit.",
+        };
+        column![
+            pick_list(JournalDetail::ALL, Some(value), Message::JournalDetail),
+            text(help).size(12),
+        ]
+        .spacing(4)
+        .into()
+    };
+    row![
+        container(text("Journal output").size(14))
+            .padding([5, 0])
+            .width(170),
+        control,
+    ]
+    .spacing(10)
+    .width(Length::Fill)
+    .into()
+}
 
 pub(in crate::scheduler_window) fn reviewed_cli_payload<'a>(
     request: &crate::local_ai::cli::Request,
@@ -159,6 +196,15 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
     if let Some(comparison) = &review.comparison_review {
         return comparison.view(profile);
     }
+    if let Some(model) = review.model.as_ref()
+        && let Some(skills) = model.skills.as_ref()
+        && let Some(panel) = model.web.as_ref().and_then(|web| web.state.view())
+    {
+        let preview = &skills.preview;
+        return container(panel.map(|message| Message::ProposalWeb(preview.clone(), message)))
+            .height(Length::Fixed(190.0))
+            .into();
+    }
     let initial_probe = review
         .model
         .as_ref()
@@ -197,6 +243,9 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
     }
     if let Some(parallelism) = review.swarm_parallelism {
         details = details.push(text(format!("Target parallelism limit · {parallelism}")));
+    }
+    if let Some(summary) = &review.dependency_summary {
+        details = details.push(text(summary).size(13).wrapping(text::Wrapping::WordOrGlyph));
     }
     if review.swarm_iterative() {
         details = if let Some(probe) = initial_probe {
@@ -243,7 +292,7 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
         .on_press_maybe(
             review
                 .firing_review_ticket()
-                .filter(|_| preview_ready)
+                .filter(|_| preview_ready && !review.unattended_web_draft_pending())
                 .map(str::to_owned)
                 .map(Message::ApproveFiringRequest),
         )
@@ -251,9 +300,141 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
     let model = review.model.as_ref();
     let skills = model.and_then(|model| model.skills.as_ref());
     let classification = skills.map(|skills| &skills.classification);
+    if let Some((ticket, enabled)) = review.fresh_web_choice()
+        && !review.unattended_web_draft_pending()
+    {
+        details = details.push(
+            checkbox(enabled)
+                .label("Review a fresh web lookup at each start")
+                .on_toggle(move |enabled| Message::RequireFreshWeb(ticket.to_owned(), enabled)),
+        );
+    }
+    if review.approval.requires_fresh_web() && review.approval.web_lookup().is_none() {
+        details = details.push(
+            text("Each run waits in JobScheduler for you to review the web lookup and approve the excerpts before the model request.")
+                .size(13),
+        );
+    }
+    if let Some((ticket, destination)) = review.unattended_web_review() {
+        use super::agent::web_lookup::MAX_FOLLOWUP_LOOKUPS;
+
+        let topic = review.unattended_web_topic.as_str();
+        let grant = review.approval.web_lookup();
+        let reviewed = grant.is_some() && !review.unattended_web_draft_pending();
+        let mut lookup = column![text("Automatic web lookup").size(15)].spacing(6);
+        if let Some(destination) = destination {
+            lookup = lookup
+                .push(text("Enter only public information. At each start this profile uses the topic below to choose one query for the search integration. For LM Studio MCP, LM Studio carries out the allowed tool calls. Masked excerpts are reused in this run’s reviewed model requests, including its comparison if enabled.").size(13))
+                .push(text(format!("Query planner · {} · {}", review.approval.profile.model, review.approval.profile.destination)).size(13))
+                .push(text(destination).size(13))
+                .push(text_input("Public research topic (up to 400 bytes)", topic)
+                    .on_input(move |topic| Message::EditUnattendedWebTopic(ticket.to_owned(), topic)))
+                .push(checkbox(review.unattended_web_followups)
+                    .label(format!("Allow up to {MAX_FOLLOWUP_LOOKUPS} follow-up lookups per run"))
+                    .on_toggle(move |enabled| Message::EditUnattendedWebFollowups(ticket.to_owned(), enabled)));
+            if review.unattended_web_followups {
+                let page = review.unattended_web_page_destination();
+                lookup = lookup.push(text(if page.is_some() {
+                    "After the first search, the planner receives only the public topic and masked excerpts from this run’s web results. It can search again, read a page linked in a search result from this run, or finish."
+                } else {
+                    "After the first search, the planner receives only the public topic and masked excerpts from this run’s web results. It can search again or finish."
+                }).size(13));
+                if let Some(page) = page {
+                    lookup = lookup.push(text(page).size(13));
+                }
+            }
+            if review.supports_unattended_web_environment() {
+                lookup = lookup.push(
+                    checkbox(review.unattended_web_environment)
+                        .label("Search once for each target after its SSH probe")
+                        .on_toggle(move |enabled| {
+                            Message::EditUnattendedWebEnvironment(ticket.to_owned(), enabled)
+                        }),
+                );
+                if review.unattended_web_environment {
+                    lookup = lookup.push(text("After a successful reviewed SSH probe, the planner uses the public topic, operating system family, and kernel major and minor version to choose one search query for that target. The query goes to the search provider shown above. SSH identities, paths, raw command output, and other targets’ data are excluded.").size(13));
+                }
+            }
+            if review.supports_unattended_web_rounds() {
+                lookup = lookup.push(
+                    checkbox(review.unattended_web_rounds)
+                        .label("Allow reviewed web searches after command batches")
+                        .on_toggle(move |enabled| {
+                            Message::EditUnattendedWebRounds(ticket.to_owned(), enabled)
+                        }),
+                );
+                if review.unattended_web_rounds {
+                    lookup = lookup.push(text("After a completed command batch, the diagnostic model can propose one lookup for that target in the next round. Review the exact query or page URL before sending it and approve the returned excerpts before the model uses them.").size(13));
+                    let page = review.unattended_web_page_destination();
+                    if page.is_some() || review.unattended_web_round_pages {
+                        lookup = lookup.push(
+                            checkbox(review.unattended_web_round_pages)
+                                .label("Allow reviewed webpage requests in these rounds")
+                                .on_toggle(move |enabled| {
+                                    Message::EditUnattendedWebRoundPages(ticket.to_owned(), enabled)
+                                }),
+                        );
+                    }
+                    if review.unattended_web_round_pages {
+                        lookup = lookup.push(text(page.unwrap_or_else(|| "The reviewed webpage reader is unavailable. Restore its settings or clear the webpage option.".into())).size(13));
+                    }
+                }
+            }
+            lookup = lookup.push(
+                button(if reviewed {
+                    "Review research topic again"
+                } else {
+                    "Review research topic"
+                })
+                .on_press_maybe(
+                    (!topic.is_empty())
+                        .then(|| Message::ReviewUnattendedWeb(ticket.to_owned(), topic.to_owned())),
+                ),
+            );
+        } else {
+            lookup = lookup.push(text("The approved search provider is unavailable. Restore its settings or remove automatic web lookup.").size(13));
+        }
+        if let Some(grant) = grant {
+            lookup = lookup
+                .push(text(format!("Reviewed public topic · {}", grant.public_topic())).size(13));
+            if grant.allows_followups() {
+                lookup = lookup.push(text(format!("Reviewed scope · Initial search and up to {MAX_FOLLOWUP_LOOKUPS} follow-up lookups")).size(13));
+            }
+            if grant.allows_environment_lookup() {
+                lookup = lookup.push(
+                    text("Reviewed scope · One additional search per target after its SSH probe")
+                        .size(13),
+                );
+            }
+            if grant.allows_round_lookup() {
+                lookup = lookup.push(
+                    text(if grant.allows_round_page() {
+                        "Reviewed scope · One search or webpage proposal per target in a later round after a command batch"
+                    } else {
+                        "Reviewed scope · One search proposal per target in a later round after a command batch"
+                    })
+                        .size(13),
+                );
+            }
+        }
+        if grant.is_some()
+            || !topic.is_empty()
+            || review.unattended_web_followups
+            || review.unattended_web_environment
+            || review.unattended_web_rounds
+            || review.unattended_web_round_pages
+        {
+            lookup = lookup.push(
+                button("Remove automatic lookup")
+                    .on_press(Message::RemoveUnattendedWeb(ticket.to_owned())),
+            );
+        }
+        details = details.push(lookup);
+    }
     if let (Some(model), Some(skills), Some(Classification::Closed)) =
         (model, skills, classification)
         && matches!(model.state, ModelState::Preview)
+        && !model.web_active()
         && let Some(knowledge) = &model.knowledge
     {
         if review.standing() {
@@ -268,6 +449,30 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
     if let (Some(ModelState::Preview), Some(skills), Some(Classification::Closed)) =
         (model.map(|model| &model.state), skills, classification)
     {
+        if let Some(web) = model.and_then(|model| model.web.as_ref())
+            && review.knowledge_ready()
+            && !review.unattended_web_draft_pending()
+            && review.comparison_review.is_none()
+            && !review.approval.requires_fresh_web()
+        {
+            use crate::workspace::terminal_ai::web::Message as Web;
+
+            let preview = &skills.preview;
+            if web.state.included().is_some() {
+                if review.standing() {
+                    details = details.push(text("These reviewed web excerpts are saved with this job and reused for its model requests.").size(13));
+                }
+                actions = actions.push(
+                    button("Remove web excerpts")
+                        .on_press(Message::ProposalWeb(preview.clone(), Web::Close)),
+                );
+            } else {
+                actions = actions.push(
+                    button("Web search…")
+                        .on_press(Message::ProposalWeb(preview.clone(), Web::Open)),
+                );
+            }
+        }
         if let Some(forecast) = skills.quota.label() {
             if review.standing() {
                 details = details.push(text(if review.advisory() {
@@ -280,7 +485,7 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
             }
             details = details.push(text(forecast).size(13));
         }
-        if skills.has_classifier() && review.knowledge_ready() {
+        if skills.has_classifier() && review.model_sources_ready() {
             actions = actions.push(
                 button("Review skill classification…")
                     .on_press(Message::ReviewProposalSkills(skills.preview.clone())),
@@ -345,33 +550,39 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
                     .on_press(Message::CancelProposalSkills(skills.preview.clone())),
             );
         }
-        (Some((ModelState::Preview, [prompt])), Some(skills), _) if !review.standing() => {
-            let preview_ready = match prompt.cli_review_input(false) {
-                Ok(Some(request)) => {
-                    details = details.push(reviewed_cli_payload(&request));
-                    true
+        (Some((ModelState::Preview, prompts)), Some(skills), _) if !review.standing() => {
+            let mut preview_ready = !prompts.is_empty();
+            for (target, prompt) in review.approval.targets.iter().zip(prompts) {
+                if prompts.len() > 1 {
+                    details = details.push(text(format!(
+                        "Model request for target {} · {}",
+                        target.reference.id,
+                        target.reference.target.label()
+                    )));
                 }
-                Ok(None) => {
-                    let [system, input] = prompt.messages();
-                    details = details
-                        .push(text("System instructions").size(13))
-                        .push(text(system).size(12).wrapping(text::Wrapping::WordOrGlyph))
-                        .push(text("Masked request").size(13))
-                        .push(
-                            text(input)
-                                .font(iced::Font::MONOSPACE)
-                                .wrapping(text::Wrapping::WordOrGlyph),
-                        );
-                    true
+                match prompt.cli_review_input(false) {
+                    Ok(Some(request)) => details = details.push(reviewed_cli_payload(&request)),
+                    Ok(None) => {
+                        let [system, input] = prompt.messages();
+                        details = details
+                            .push(text("System instructions").size(13))
+                            .push(text(system).size(12).wrapping(text::Wrapping::WordOrGlyph))
+                            .push(text("Masked request").size(13))
+                            .push(
+                                text(input)
+                                    .font(iced::Font::MONOSPACE)
+                                    .wrapping(text::Wrapping::WordOrGlyph),
+                            );
+                    }
+                    Err(error) => {
+                        details = details.push(text(error).size(13));
+                        preview_ready = false;
+                    }
                 }
-                Err(error) => {
-                    details = details.push(text(error).size(13));
-                    false
-                }
-            };
+            }
             actions = actions.push(
                 button("Ask model for proposal").on_press_maybe(
-                    (skills.ready() && review.knowledge_ready() && preview_ready)
+                    (skills.ready() && review.model_sources_ready() && preview_ready)
                         .then(|| Message::RequestAgentProposal(skills.preview.clone())),
                 ),
             );
@@ -379,7 +590,7 @@ fn agent_review(review: &super::agent::Review) -> Element<'_, Message> {
         (Some((ModelState::Preview, prompts)), _, _) => {
             let show_target_instructions = prompts
                 .iter()
-                .any(|prompt| prompt.firing_skill_guidance().is_some());
+                .any(|prompt| prompt.firing_skill_guidance().is_some() || prompt.has_memory());
             let cli = prompts
                 .first()
                 .is_some_and(|prompt| prompt.transport.is_cli());
@@ -699,6 +910,7 @@ impl SchedulerView {
         menu_status_visible: bool,
         privileged_allowed: bool,
         session_journal_root: Option<&Path>,
+        summary_profiles: Vec<super::AutomationSummaryProvider>,
     ) -> Element<'a, Message> {
         if let Some(confirm @ Confirmation::Close) = &self.confirm {
             return container(self.confirm_view(runtime, confirm))
@@ -709,11 +921,19 @@ impl SchedulerView {
         if let Some(browser) = &self.directory_browser {
             return browser.view();
         }
+        if let Some(review) = &self.ownership_review {
+            return review.view();
+        }
         let contents = pane_grid(&self.layout.jobs, |_, first, _| {
             pane_grid::Content::new(if *first {
                 self.jobs_view(runtime, menu_status_visible, session_journal_root)
             } else {
-                self.details_view(runtime, privileged_allowed, session_journal_root)
+                self.details_view(
+                    runtime,
+                    privileged_allowed,
+                    session_journal_root,
+                    summary_profiles.clone(),
+                )
             })
         })
         .spacing(8)
@@ -869,6 +1089,7 @@ impl SchedulerView {
         runtime: &'a SchedulerWindow,
         privileged_allowed: bool,
         session_journal_root: Option<&Path>,
+        summary_profiles: Vec<super::AutomationSummaryProvider>,
     ) -> Element<'a, Message> {
         let mut tabs = row![].spacing(4).align_y(Alignment::Center);
         for (page, label) in [
@@ -894,6 +1115,8 @@ impl SchedulerView {
             .height(Length::Fill)
             .into(),
             Page::Action => {
+                let fresh_web = self.saved_fresh_web_requirement();
+                let unattended = self.saved_unattended_web_lookup();
                 let journal_activity = runtime.selected_job(self).and_then(|job| {
                     runtime
                         .journal_stats
@@ -910,15 +1133,34 @@ impl SchedulerView {
                 });
                 let action = column![
                     journal_activity.map(|activity| container(text(activity).size(13)).padding(8)),
+                    fresh_web.then(|| {
+                        container(text("Fresh web lookup review required at every start.").size(13))
+                            .padding(8)
+                    }),
+                    unattended.map(|grant| {
+                        container(column![
+                            text(format!(
+                                "Automatic web lookup at each start · {}",
+                                grant.public_topic()
+                            ))
+                            .size(13),
+                            grant.allows_round_lookup().then(|| {
+                                text("Review each proposed search after a Swarm command batch.").size(13)
+                            }),
+                        ].spacing(4))
+                        .padding(8)
+                    }),
                     self.draft.action_view(
                         &runtime.snippet_choices,
                         &runtime.archive_passwords,
                         &runtime.webhook_choices,
                         &runtime.agent_profiles,
+                        summary_profiles,
                         super::form::ActionPermissions {
                             browse: runtime.can_browse_directory(),
                             privileged: privileged_allowed,
                             automation_journal: !self.automation_journal_denied,
+                            journal_output: runtime.journal_output_allowed,
                         },
                     ),
                 ];
@@ -1381,6 +1623,7 @@ impl SchedulerView {
             _ => String::new(),
         };
         let summary = runtime.store.journal_detail(run.id).unwrap_or_default();
+        let output = runtime.store.journal_output(run.id);
         let report_summary = runtime
             .store
             .journal_swarm_report(run.id)
@@ -1413,6 +1656,12 @@ impl SchedulerView {
                 (None, raw_finished.as_str()),
             ]
             .into_iter()
+            .chain(output.into_iter().flat_map(|output| {
+                [
+                    (Some(Stdout), output.stdout.as_str()),
+                    (Some(Stderr), output.stderr.as_str()),
+                ]
+            }))
             .chain(
                 blockers
                     .iter()
@@ -1450,8 +1699,12 @@ impl SchedulerView {
         if let Some(report) = runtime.store.journal_swarm_report(record.id) {
             details = details.push(swarm_report::view(report));
         }
-        if let Some(detail) = runtime.store.journal_detail(record.id) {
-            details = details.push(text(detail));
+        if let Some(editor) = self
+            .run_detail
+            .as_ref()
+            .filter(|editor| editor.visible(record.id, session_journal_root))
+        {
+            details = details.push(editor.view());
         }
         if let Some(root) = session_journal_root
             && runtime.store.session_journals(record.id).is_some()
@@ -1473,9 +1726,6 @@ impl SchedulerView {
                 let outcome = super::webhooks::outcome_text(*result);
                 details = details.push(text(format!("{name} · {outcome}")));
             }
-        }
-        for blocker in &record.blockers {
-            details = details.push(text(Self::blocker(runtime, blocker)));
         }
         details.into()
     }
@@ -1619,7 +1869,7 @@ impl SchedulerView {
             .into()
     }
 
-    fn blocker(runtime: &SchedulerWindow, blocker: &Blocker) -> String {
+    pub(super) fn blocker(runtime: &SchedulerWindow, blocker: &Blocker) -> String {
         let name = runtime
             .scheduler
             .graph()
@@ -1751,5 +2001,265 @@ mod tests {
             };
             assert_eq!((*axis, *ratio), (expected_axis, expected_ratio));
         }
+    }
+
+    #[test]
+    fn scheduler_view_searches_saved_stdout_and_stderr_as_separate_fields() {
+        use crate::scheduler_window::tests::Profile;
+        use kortty_jobs::{FinishedRunMetadata, Job, JobGraph, RunOutput};
+
+        let fixture = Profile::temporary();
+        let path = fixture.file();
+        let mut runtime = SchedulerWindow::open(path.clone()).unwrap();
+        let job = JobId::new("test-output").unwrap();
+        let graph =
+            JobGraph::new(vec![Job::new(job.clone(), "Saved output", ()).unwrap()]).unwrap();
+        let mut scheduler = Scheduler::new(graph);
+        let now = SystemTime::now();
+        let id = scheduler.start_manual(&job, now).unwrap().started[0].id;
+        let records = scheduler
+            .complete(id, RunOutcome::Success, now)
+            .unwrap()
+            .finished;
+        runtime
+            .store
+            .commit_finished_runs(
+                runtime.scheduler.graph(),
+                &records,
+                FinishedRunMetadata {
+                    output: &[(
+                        id,
+                        RunOutput {
+                            stdout: "Artifact ready".into(),
+                            stderr: "Stale index".into(),
+                        },
+                    )],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        drop(runtime);
+        let runtime = SchedulerWindow::open(path).unwrap();
+        let mut view = runtime.new_view();
+        view.journal_search.set_text("ARTIFACT index".into());
+        let output = runtime
+            .store
+            .journal_output(id)
+            .expect("saved command output");
+        assert_eq!(output.stdout, "Artifact ready");
+        assert_eq!(output.stderr, "Stale index");
+        assert!(view.journal_record_visible(&runtime, id));
+
+        let search = &mut view.journal_search;
+        search.set_mode(JournalSearchMode::SelectedColumns);
+        search.toggle_columns();
+        search.set_column(JournalColumn::Stdout, true);
+        assert!(!view.journal_record_visible(&runtime, id));
+        view.journal_search.set_column(JournalColumn::Stderr, true);
+        assert!(view.journal_record_visible(&runtime, id));
+    }
+
+    #[test]
+    fn scheduler_run_detail_copies_the_read_only_selection_and_rejects_hidden_runs() {
+        use crate::scheduler_window::tests::Profile;
+        use iced::widget::text_editor::{Action, Cursor, Edit, Position};
+        use kortty_jobs::{FinishedRunMetadata, Job, JobGraph, RunOutput};
+
+        let fixture = Profile::temporary();
+        let mut runtime = SchedulerWindow::open(fixture.file()).unwrap();
+        let job = JobId::new("copy-detail").unwrap();
+        let graph = JobGraph::new(vec![Job::new(job.clone(), "Copy detail", ()).unwrap()]).unwrap();
+        let mut scheduler = Scheduler::new(graph);
+        let now = SystemTime::now();
+        let id = scheduler.start_manual(&job, now).unwrap().started[0].id;
+        let records = scheduler
+            .complete(id, RunOutcome::Success, now)
+            .unwrap()
+            .finished;
+        runtime
+            .store
+            .commit_finished_runs(
+                runtime.scheduler.graph(),
+                &records,
+                FinishedRunMetadata {
+                    details: &[(id, "After processing".into())],
+                    output: &[(
+                        id,
+                        RunOutput {
+                            stdout: "prefix αlpha\nβeta suffix\n".into(),
+                            stderr: "separator\twarning".into(),
+                        },
+                    )],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut view = runtime.new_view();
+        runtime.update_view(&mut view, Message::Page(Page::Journal));
+        runtime.update_view(&mut view, Message::SelectRecord(id));
+        assert!(runtime.selected_run_detail_text(&view, id, None).is_none());
+
+        let editor = view.run_detail.as_mut().unwrap();
+        editor.content.move_to(Cursor {
+            position: Position {
+                line: 2,
+                column: "βeta".len(),
+            },
+            selection: Some(Position {
+                line: 1,
+                column: "prefix ".len(),
+            }),
+        });
+        assert_eq!(
+            runtime.selected_run_detail_text(&view, id, None).as_deref(),
+            Some("αlpha\nβeta")
+        );
+        runtime.update_view(
+            &mut view,
+            Message::SelectRunDetail(id, Action::Edit(Edit::Delete)),
+        );
+        assert_eq!(
+            runtime.selected_run_detail_text(&view, id, None).as_deref(),
+            Some("αlpha\nβeta")
+        );
+
+        runtime.update_view(&mut view, Message::SelectRunDetail(id, Action::SelectAll));
+        assert_eq!(
+            runtime.selected_run_detail_text(&view, id, None).as_deref(),
+            Some(
+                "stdout\nprefix αlpha\nβeta suffix\n\n\nstderr\nseparator\twarning\n\nDetail\nAfter processing"
+            )
+        );
+        runtime.update_view(&mut view, Message::JournalSearch("hidden-by-filter".into()));
+        assert!(runtime.selected_run_detail_text(&view, id, None).is_none());
+        assert!(view.run_detail.is_none());
+
+        runtime.update_view(&mut view, Message::JournalSearch(String::new()));
+        runtime.update_view(&mut view, Message::SelectRecord(id));
+        runtime.update_view(&mut view, Message::SelectRunDetail(id, Action::SelectAll));
+        runtime.store.delete_records(&[id]).unwrap();
+        assert!(runtime.selected_run_detail_text(&view, id, None).is_none());
+        runtime.sync_view(&mut view);
+        assert!(view.run_detail.is_none());
+    }
+
+    #[test]
+    fn scheduler_run_detail_copies_linked_labels_only_for_the_current_journal_root() {
+        use crate::scheduler_window::tests::Profile;
+        use crate::session_journal::automation::run_links::{RunJournalRow, RunJournals};
+        use iced::widget::text_editor::Action;
+        use kortty_jobs::{FinishedRunMetadata, Job, JobGraph};
+
+        let fixture = Profile::temporary();
+        let path = fixture.file();
+        let root = path.with_file_name("journals");
+        let other_root = path.with_file_name("other-journals");
+        let mut runtime = SchedulerWindow::open(path).unwrap();
+        let job = JobId::new("linked-run").unwrap();
+        let graph =
+            JobGraph::new(vec![Job::new(job.clone(), "Linked journals", ()).unwrap()]).unwrap();
+        let mut scheduler = Scheduler::new(graph);
+        let now = SystemTime::now();
+        let run = scheduler.start_manual(&job, now).unwrap().started[0].id;
+        let records = scheduler
+            .complete(run, RunOutcome::Success, now)
+            .unwrap()
+            .finished;
+        let journal = "6bb52e72-ed89-4856-a1e9-51a162f885a7";
+        runtime
+            .store
+            .commit_finished_runs(
+                runtime.scheduler.graph(),
+                &records,
+                FinishedRunMetadata {
+                    details: &[(run, "Finished".into())],
+                    session_journals: &[(run, &[journal.to_owned()])],
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let mut view = runtime.new_view();
+        runtime.update_view(&mut view, Message::Page(Page::Journal));
+        runtime.update_view(&mut view, Message::SelectRecord(run));
+        view.show_journal_details(
+            &runtime,
+            run,
+            root.clone(),
+            super::super::JournalDetails::Ready(Arc::new(RunJournals {
+                rows: vec![RunJournalRow {
+                    id: journal.to_owned(),
+                    journal: None,
+                }],
+                limited: false,
+            })),
+        );
+        runtime.update_view(&mut view, Message::SelectRunDetail(run, Action::SelectAll));
+        assert_eq!(
+            runtime.selected_run_detail_text(&view, run, Some(&root)),
+            Some(format!(
+                "Detail\nFinished\n\nSession Journals\n• Journal unavailable ({journal})"
+            ))
+        );
+        assert!(
+            runtime
+                .selected_run_detail_text(&view, run, Some(&other_root))
+                .is_none()
+        );
+        assert!(runtime.selected_run_detail_text(&view, run, None).is_none());
+
+        view.retain_run_detail_journal_root(None);
+        runtime.sync_view(&mut view);
+        assert!(runtime.selected_run_detail_text(&view, run, None).is_none());
+        runtime.update_view(&mut view, Message::SelectRunDetail(run, Action::SelectAll));
+        assert_eq!(
+            runtime
+                .selected_run_detail_text(&view, run, None)
+                .as_deref(),
+            Some("Detail\nFinished")
+        );
+    }
+
+    #[test]
+    fn scheduler_run_detail_selects_dependency_blockers_without_retained_output() {
+        use crate::scheduler_window::tests::Profile;
+        use iced::widget::text_editor::Action;
+        use kortty_jobs::{DependencyMode, FinishedRunMetadata, Job, JobGraph};
+
+        let fixture = Profile::temporary();
+        let mut runtime = SchedulerWindow::open(fixture.file()).unwrap();
+        let blocked = JobId::new("blocked").unwrap();
+        let prerequisite = JobId::new("prerequisite").unwrap();
+        let graph = JobGraph::new(vec![
+            Job::new(prerequisite.clone(), "Prerequisite", ()).unwrap(),
+            Job::new(blocked.clone(), "Blocked", ())
+                .unwrap()
+                .with_dependencies(DependencyMode::Gate, vec![prerequisite], None),
+        ])
+        .unwrap();
+        let mut scheduler = Scheduler::new(graph);
+        let batch = scheduler
+            .start_scheduled(&blocked, SystemTime::now())
+            .unwrap();
+        assert!(batch.started.is_empty());
+        let run = batch.finished[0].id;
+        runtime
+            .store
+            .commit_finished_runs(
+                runtime.scheduler.graph(),
+                &batch.finished,
+                FinishedRunMetadata::default(),
+            )
+            .unwrap();
+
+        let mut view = runtime.new_view();
+        runtime.update_view(&mut view, Message::Page(Page::Journal));
+        runtime.update_view(&mut view, Message::SelectRecord(run));
+        runtime.update_view(&mut view, Message::SelectRunDetail(run, Action::SelectAll));
+        assert_eq!(
+            runtime
+                .selected_run_detail_text(&view, run, None)
+                .as_deref(),
+            Some("Detail\nprerequisite has never run")
+        );
     }
 }

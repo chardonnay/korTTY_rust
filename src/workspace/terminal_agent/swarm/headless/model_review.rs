@@ -104,6 +104,10 @@ impl ModelReview {
         &self.pins
     }
 
+    pub(in crate::workspace::terminal_agent) fn connection_id(&self) -> u64 {
+        self.source.reference.id
+    }
+
     pub(in crate::workspace::terminal_agent) fn require_current(
         &self,
         workspace: &Workspace,

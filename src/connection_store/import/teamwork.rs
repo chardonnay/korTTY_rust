@@ -84,7 +84,8 @@ fn parse(content: &str) -> io::Result<Vec<TeamworkEntry>> {
         }
         // The interchange parser keeps the authentication method, but never
         // imports inline material or binds foreign IDs to local credentials.
-        let (profile, skipped_tunnels) = kortty::connection(node, own_settings)?;
+        let group = kortty::validated_group(xml::raw_scalar(node, "group")?.unwrap_or_default())?;
+        let (profile, skipped_tunnels) = kortty::connection(node, group, own_settings)?;
         if skipped_tunnels > 0 {
             return Err(invalid("invalid SSH forwarding in shared connection XML"));
         }

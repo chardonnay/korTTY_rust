@@ -22,7 +22,7 @@ pub(in crate::sftp_window) fn validate_depth(parts: usize, directory: bool) -> i
     Ok(())
 }
 
-pub(in crate::sftp_window) struct Destination {
+pub(crate) struct Destination {
     path: PathBuf,
     parent: Directory,
     identity: Identity,
@@ -31,7 +31,7 @@ pub(in crate::sftp_window) struct Destination {
 }
 
 impl Destination {
-    pub(in crate::sftp_window) fn inspect(path: &Path) -> io::Result<Self> {
+    pub(crate) fn inspect(path: &Path) -> io::Result<Self> {
         let parent_path = path.parent().ok_or_else(changed)?;
         let name = path.file_name().ok_or_else(changed)?;
         files::local_name(name.as_encoded_bytes())?;
@@ -58,7 +58,7 @@ impl Destination {
         self.identity.require_directory(&current)
     }
 
-    pub(in crate::sftp_window) fn stage(self) -> io::Result<Stage> {
+    pub(crate) fn stage(self) -> io::Result<Stage> {
         self.verify()?;
         require_absent(&self.path)?;
         let name = OsString::from(files::nonce()?);
@@ -74,7 +74,7 @@ impl Destination {
     }
 }
 
-pub(in crate::sftp_window) struct Stage {
+pub(crate) struct Stage {
     destination: Destination,
     name: OsString,
     root: Option<Directory>,
@@ -82,14 +82,14 @@ pub(in crate::sftp_window) struct Stage {
 }
 
 #[derive(Debug)]
-pub(in crate::sftp_window) enum PublishError {
+pub(crate) enum PublishError {
     Denied,
     Refused,
     Uncertain,
 }
 
 impl Stage {
-    fn root(&self) -> io::Result<&Directory> {
+    pub(crate) fn root(&self) -> io::Result<&Directory> {
         self.root.as_ref().ok_or_else(changed)
     }
 
@@ -123,7 +123,7 @@ impl Stage {
         Ok(file)
     }
 
-    pub(in crate::sftp_window) fn publish(
+    pub(crate) fn publish(
         mut self,
         mut permitted: impl FnMut() -> bool,
     ) -> Result<(), PublishError> {

@@ -8,6 +8,7 @@ impl Run {
     pub(in crate::workspace::terminal_agent) fn final_advice_input(
         &self,
         limit: usize,
+        web_evidence: Option<&str>,
     ) -> Result<String, String> {
         let target = self
             .target
@@ -32,6 +33,9 @@ impl Run {
             "probe": self.final_evidence.probe(&self.redactor)?,
             "commandResults": results,
         });
+        if let Some(evidence) = web_evidence {
+            input["web_evidence"] = json!(evidence);
+        }
         if let Some(encoded) = within_limit(&input, limit) {
             return Ok(encoded);
         }

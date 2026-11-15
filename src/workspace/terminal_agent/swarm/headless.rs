@@ -16,7 +16,6 @@ use crate::terminal_logging::{Redactor, Secrets};
 use super::super::{Binding, MAX_RUNS, Phase, ProfileChoice, Purpose, Run, RunSetup, mask};
 use super::{
     Desktop, Message as GroupMessage, Mode, RunMessage, SwarmMode, Workspace, ai_mode, snippet,
-    swarm_profiles,
 };
 
 mod model_review;
@@ -241,7 +240,7 @@ impl Workspace {
             let config = self
                 .ai_configuration()
                 .ok_or("AI is unavailable under the current settings.")?;
-            let profiles = swarm_profiles(&config);
+            let profiles = self.swarm_profiles(&config);
             if !profiles.contains(profile) {
                 return Err("The selected agent profile changed. Review it again.".into());
             }
@@ -524,7 +523,9 @@ mod tests {
             Review::capture(source.reference.clone(), source.directory.clone(), &trust).unwrap(),
         );
         workspace.clipboard.policy.ai_swarm_feature_allowed = false;
-        let profile = swarm_profiles(&workspace.ai_configuration().unwrap()).remove(0);
+        let profile = workspace
+            .swarm_profiles(&workspace.ai_configuration().unwrap())
+            .remove(0);
         assert!(
             matches!(workspace.new_saved_member(source.clone(), Mode::Run, Purpose::Agent(profile)), Err(error) if error.contains("blocks AI Swarm"))
         );
@@ -535,7 +536,9 @@ mod tests {
         );
         workspace.clipboard.policy.ai_swarm_feature_allowed = true;
         let open = |workspace: &Workspace| {
-            let profile = swarm_profiles(&workspace.ai_configuration().unwrap()).remove(0);
+            let profile = workspace
+                .swarm_profiles(&workspace.ai_configuration().unwrap())
+                .remove(0);
             let mut run = workspace
                 .new_saved_member(source.clone(), Mode::Run, Purpose::Agent(profile))
                 .unwrap();
@@ -546,13 +549,17 @@ mod tests {
         let (mut changed, changed_epoch) = open(&workspace);
         let (mut locked, locked_epoch) = open(&workspace);
         let saved_agent = ModelReview::capture_with_trust(&workspace, &locked, trust).unwrap();
-        let profile = swarm_profiles(&workspace.ai_configuration().unwrap()).remove(0);
+        assert_eq!(saved_agent.connection_id(), saved);
+        let profile = workspace
+            .swarm_profiles(&workspace.ai_configuration().unwrap())
+            .remove(0);
         let targetless = workspace
             .new_saved_member(source.clone(), Mode::Ask, Purpose::Agent(profile))
             .unwrap();
         assert!(targetless.target.is_none());
         let unpinned = kortty_ssh::TrustStore::from_pins(Vec::new()).unwrap();
         let advisory = ModelReview::capture_with_trust(&workspace, &targetless, unpinned).unwrap();
+        assert_eq!(advisory.connection_id(), saved);
         assert!(advisory.pins().is_empty());
         assert!(advisory.require_current(&workspace, &targetless).is_ok());
         assert!(saved_agent.require_current(&workspace, &locked).is_ok());

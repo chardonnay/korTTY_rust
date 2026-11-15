@@ -27,7 +27,7 @@ pub struct WindowsCli {
 
 impl WindowsCli {
     pub fn prepare(executable: &Path, arguments: &[String], directory: &Path) -> io::Result<Self> {
-        Self::prepare_io(executable, arguments, directory, false)
+        Self::prepare_io(executable, arguments, directory, true, false, &[])
     }
 
     /// Prepares an approved executable and separately captures its diagnostic stream.
@@ -36,14 +36,34 @@ impl WindowsCli {
         arguments: &[String],
         directory: &Path,
     ) -> io::Result<Self> {
-        Self::prepare_io(executable, arguments, directory, true)
+        Self::prepare_io(executable, arguments, directory, true, true, &[])
+    }
+
+    /// Adds explicit variables to the otherwise isolated command environment.
+    pub fn prepare_with_environment(
+        executable: &Path,
+        arguments: &[String],
+        directory: &Path,
+        variables: &[(&str, &str)],
+        capture_output: bool,
+    ) -> io::Result<Self> {
+        Self::prepare_io(
+            executable,
+            arguments,
+            directory,
+            capture_output,
+            false,
+            variables,
+        )
     }
 
     fn prepare_io(
         executable: &Path,
         arguments: &[String],
         directory: &Path,
+        capture_output: bool,
         capture_diagnostics: bool,
+        variables: &[(&str, &str)],
     ) -> io::Result<Self> {
         let path = executable.as_os_str();
         let cwd = directory.as_os_str();
@@ -58,26 +78,22 @@ impl WindowsCli {
                 "Invalid CLI paths or arguments",
             ));
         }
-        let windows = policy::Environment::read()?;
-        let mut environment: Vec<_> = "SystemRoot=".encode_utf16().collect();
-        environment.extend_from_slice(&windows.system_root);
-        for name in ["TEMP=", "TMP="] {
-            environment.extend(name.encode_utf16());
-            environment.extend(wide(cwd));
-        }
-        environment.push(0);
+        let environment = command_environment(cwd, variables)?;
         let directory = wide(cwd);
 
         let (input, child_input) = pipe::pair(pipe::DesktopEnd::Send)?;
-        let (output, child_output) = pipe::pair(pipe::DesktopEnd::Receive)?;
+        let null = || OpenOptions::new().write(true).open(r"\\.\NUL");
+        let (output, child_output) = if capture_output {
+            let (output, child_output) = pipe::pair(pipe::DesktopEnd::Receive)?;
+            (Some(output.into()), child_output)
+        } else {
+            (None, null()?.into())
+        };
         let (diagnostics, child_error) = if capture_diagnostics {
             let (diagnostics, child_error) = pipe::pair(pipe::DesktopEnd::Receive)?;
             (Some(diagnostics.into()), child_error)
         } else {
-            (
-                None,
-                OpenOptions::new().write(true).open(r"\\.\NUL")?.into(),
-            )
+            (None, null()?.into())
         };
 
         // The inheritable pipe handles only exist in this suspended parent. They cannot leak to
@@ -151,7 +167,7 @@ impl WindowsCli {
             thread: Some(child.thread),
             job: Some(lifetime),
             input: Some(input.into()),
-            output: Some(output.into()),
+            output,
             diagnostics,
         };
         drop((child_input, child_output, child_error, helper_job));
@@ -172,13 +188,39 @@ impl WindowsCli {
     }
 
     pub fn try_success(&self) -> io::Result<Option<bool>> {
+        self.try_exit_code().map(|code| code.map(|code| code == 0))
+    }
+
+    /// Reads the original process status without waiting.
+    pub fn try_exit_code(&self) -> io::Result<Option<u32>> {
         if !signaled(&self.process, 0)? {
             return Ok(None);
         }
         let mut code = 0;
         // SAFETY: the process handle and output pointer are both live.
         bool_result(unsafe { GetExitCodeProcess(self.process.as_raw_handle(), &mut code) })?;
-        Ok(Some(code == 0))
+        Ok(Some(code))
+    }
+
+    /// Stops every process owned by this command and waits for the tree to exit.
+    pub fn terminate_tree(&mut self) -> io::Result<()> {
+        if let Some(job) = self.job.take() {
+            crate::platform::terminate_job(&job)?;
+        }
+        Ok(())
+    }
+
+    /// Checks whether a live process in this command's Job owns an exact loopback socket.
+    pub fn owns_loopback_connection(
+        &self,
+        local: std::net::SocketAddrV4,
+        remote: std::net::SocketAddrV4,
+    ) -> io::Result<bool> {
+        let job = self
+            .job
+            .as_ref()
+            .ok_or_else(|| io::Error::other("The native command already exited"))?;
+        crate::platform::job_processes::owns_connection(job, local, remote)
     }
 }
 
@@ -187,6 +229,43 @@ impl Drop for WindowsCli {
         drop(self.job.take());
         let _ = wait(&self.process, REAP_TIMEOUT_MS);
     }
+}
+
+fn command_environment(directory: &OsStr, variables: &[(&str, &str)]) -> io::Result<Vec<u16>> {
+    let windows = policy::Environment::read()?;
+    let temporary = wide(directory);
+    let mut entries = std::collections::BTreeMap::from([
+        ("SYSTEMROOT", windows.system_root),
+        ("TEMP", temporary.clone()),
+        ("TMP", temporary),
+    ]);
+    for (name, value) in variables {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+            || value.contains('\0')
+            || entries.contains_key(name)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid CLI environment variable",
+            ));
+        }
+        entries.insert(name, value.encode_utf16().chain([0]).collect());
+    }
+    let mut block = Vec::new();
+    for (name, value) in entries {
+        let name = if name == "SYSTEMROOT" {
+            "SystemRoot"
+        } else {
+            name
+        };
+        block.extend(name.encode_utf16().chain([b'=' as u16]));
+        block.extend(value);
+    }
+    block.push(0);
+    Ok(block)
 }
 
 /// Escape for the standard Windows argv convention. No command interpreter is involved.

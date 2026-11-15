@@ -28,6 +28,50 @@ fn response(socket: &mut impl std::io::Write, content: &str) {
 }
 
 #[test]
+fn refresh_updates_available_swarm_providers_without_selecting_an_outbound_profile() {
+    let profile = Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let mut draft = json!({"profiles": {
+        "profiles":[{"id":1, "name":"HTTPS Swarm fixture", "model":"fixture",
+            "connection_mode":"remote-open-ai", "endpoint":"https://example.invalid/v1",
+            "trusted_remote_endpoint":true, "reviewed_agent_https":false}],
+        "default":1, "last_id":1
+    }});
+    let save = |draft: &Value, previous: &Configuration| {
+        let config: Configuration = serde_json::from_value(draft.clone()).unwrap();
+        config.save_fixture_at(&root, previous).unwrap();
+        Configuration::load_fixture_from(&root).unwrap()
+    };
+    let original = save(&draft, &Configuration::default());
+    let mut workspace = Workspace::default();
+    workspace.set_test_ai_configuration(original.clone());
+    let (owner, _) = workspace.open_window(false);
+    let _ = workspace.open_agent_swarm(owner);
+    let id = *workspace.terminal_agents.swarms.keys().next().unwrap();
+    assert!(workspace.terminal_agents.swarms[&id].profiles.is_empty());
+
+    draft["profiles"]["profiles"][0]["reviewed_agent_https"] = json!(true);
+    let enabled = save(&draft, &original);
+    workspace.set_test_ai_configuration(enabled.clone());
+    let _ = workspace.swarm_action(id, Message::RefreshProfiles);
+    let swarm = &workspace.terminal_agents.swarms[&id];
+    assert!(swarm.profile.is_none());
+    assert!(swarm.modes.contains(&SwarmMode::Advisory));
+    let choice = swarm.profiles[0].clone();
+    let _ = workspace.swarm_action(id, Message::Profile(choice.clone()));
+    let _ = workspace.swarm_action(id, Message::RefreshProfiles);
+    assert!(workspace.terminal_agents.swarms[&id].profile.as_ref() == Some(&choice));
+
+    draft["profiles"]["profiles"][0]["reviewed_agent_https"] = json!(false);
+    workspace.set_test_ai_configuration(save(&draft, &enabled));
+    let _ = workspace.swarm_action(id, Message::RefreshProfiles);
+    let swarm = &workspace.terminal_agents.swarms[&id];
+    assert!(swarm.profile.is_none());
+    assert!(swarm.profiles.is_empty());
+    assert_eq!(swarm.notice, PROFILE_UNAVAILABLE);
+}
+
+#[test]
 fn swarm_requires_explicit_https_selection_and_checks_opt_in_for_each_target() {
     let (model, _) = test_support::listener();
     let profile = Profile::new();
@@ -109,6 +153,95 @@ fn swarm_requires_explicit_https_selection_and_checks_opt_in_for_each_target() {
 }
 
 #[test]
+fn swarm_managed_https_requests_use_named_profiles_and_stop_without_installed_authority() {
+    const CREDENTIAL: &str = "managed-swarm-model-credential-fixture";
+
+    let (listener, _) = test_support::listener();
+    let encrypted = kortty_control::policy_value::encrypt(CREDENTIAL).unwrap();
+    let policy = crate::clipboard_policy::parse(&format!(
+        "[meta]\nschema-version = 1\n[[ai-profile]]\nid = 'policy-swarm-fixture'\n\
+         name = 'Managed Swarm fixture'\nprovider = 'openai-compatible'\n\
+         endpoint = 'https://{}/v1'\nmodel = 'fixture'\napi-key-encrypted = '{encrypted}'\n",
+        listener.local_addr().unwrap(),
+    ))
+    .unwrap();
+    let profile = Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let draft = json!({
+        "local": {"roles": [null, null, "policy-swarm-fixture", null]}
+    });
+    std::fs::write(
+        root.join(crate::ai_manager::FILE_NAME),
+        serde_json::to_vec(&draft).unwrap(),
+    )
+    .unwrap();
+    let configured = Configuration::load_fixture_from(&root)
+        .unwrap()
+        .with_policy_profiles(&policy)
+        .unwrap();
+    let mut workspace = Workspace::default();
+    workspace.window_settings.terminal_notifications.ai_runs = false;
+    workspace.set_test_ai_configuration(configured);
+    let (owner, _) = workspace.open_window(false);
+    local(&mut workspace, owner, false);
+    local(&mut workspace, owner, false);
+    let _ = workspace.open_agent_swarm(owner);
+    let id = *workspace.terminal_agents.swarms.keys().next().unwrap();
+    let swarm = &workspace.terminal_agents.swarms[&id];
+    assert!(swarm.profile.is_none());
+    let reference = ProfileRef::Policy("policy-swarm-fixture".into());
+    let choice = swarm
+        .profiles
+        .iter()
+        .find(|choice| choice.reference == reference)
+        .unwrap()
+        .clone();
+    assert!(choice.reviewed_https.is_some());
+    let (transport, _) = choice
+        .transport(&workspace.ai_configuration().unwrap())
+        .unwrap();
+    assert!(transport.is_remote());
+    assert_eq!(transport.policy_profile_id(), Some("policy-swarm-fixture"));
+    assert_eq!(
+        transport.completion_secret().as_deref().map(String::as_str),
+        Some(CREDENTIAL)
+    );
+    let (saved_choices, selected) = workspace.saved_swarm_profiles(&reference);
+    assert!(saved_choices.contains(&choice));
+    assert!(selected.as_ref() == Some(&choice));
+    let alias = workspace
+        .ai_configuration()
+        .unwrap()
+        .legacy_policy_alias(choice.id)
+        .unwrap();
+    let (legacy_choices, selected) = workspace.saved_swarm_profiles(&ProfileRef::Numeric(alias));
+    assert!(legacy_choices.contains(&choice));
+    assert!(selected.is_none());
+    let _ = workspace.swarm_action(id, Message::Profile(choice));
+    let _ = workspace.swarm_action(id, Message::Mode(SwarmMode::Advisory));
+    let _ = workspace.swarm_action(id, Message::Goal(format!("Inspect {CREDENTIAL}")));
+    for key in review_source(&mut workspace, id, &root) {
+        let _ = workspace.swarm_action(id, Message::Toggle(key, true));
+    }
+    let start = workspace.swarm_action(id, Message::Start);
+    drain(&mut workspace, start);
+    let swarm = &workspace.terminal_agents.swarms[&id];
+    assert!(swarm.members.is_empty());
+    let queue = swarm.queue.as_ref().unwrap();
+    assert_eq!(queue.rows().len(), 2);
+    for row in queue.rows() {
+        assert_eq!(row.status, Status::Blocked);
+        assert!(
+            row.detail.contains("policy-provided AI profile changed"),
+            "{}",
+            row.detail
+        );
+        assert!(!row.detail.contains(CREDENTIAL));
+    }
+    idle(&listener);
+}
+
+#[test]
 fn swarm_cli_sends_only_independently_reviewed_masked_payloads() {
     use super::super::comparison::Message as Compare;
     use crate::local_ai::cli::{Program, fixture_executable};
@@ -138,10 +271,22 @@ fn swarm_cli_sends_only_independently_reviewed_masked_payloads() {
     local(&mut workspace, owner, true);
     let _ = workspace.open_agent_swarm(owner);
     let id = *workspace.terminal_agents.swarms.keys().next().unwrap();
-    let swarm = &workspace.terminal_agents.swarms[&id];
-    let choice = swarm.profile.as_ref().unwrap();
+    let choice = workspace.terminal_agents.swarms[&id]
+        .profile
+        .clone()
+        .unwrap();
     assert_eq!(choice.id, 7);
     assert!(choice.reviewed_cli.is_some());
+    workspace.clipboard.policy.minimum_isolation = crate::session_security::IsolationLevel::Process;
+    let _ = workspace.swarm_action(id, Message::RefreshProfiles);
+    let swarm = &workspace.terminal_agents.swarms[&id];
+    assert!(swarm.profile.is_none());
+    assert!(swarm.profiles.is_empty());
+    let (saved_choices, selected) = workspace.saved_swarm_profiles(&choice.reference);
+    assert!(saved_choices.is_empty() && selected.is_none());
+    workspace.clipboard.policy.minimum_isolation = crate::session_security::IsolationLevel::None;
+    let _ = workspace.swarm_action(id, Message::RefreshProfiles);
+    let _ = workspace.swarm_action(id, Message::Profile(choice));
     let _ = workspace.swarm_action(id, Message::Mode(SwarmMode::Advisory));
     let _ = workspace.swarm_action(id, Message::Goal("Inspect password=fixture-secret".into()));
     let keys = review_source(&mut workspace, id, &root);
@@ -232,6 +377,9 @@ fn swarm_cli_sends_only_independently_reviewed_masked_payloads() {
 
 #[test]
 fn live_swarm_reviews_exact_masked_requests_and_scopes_pins_to_each_member() {
+    const GLOBAL_MEMORY: &str = "Observe the shared maintenance window.";
+    const FIRST_MEMORY: &str = "Check the first maintenance queue.";
+    const SECOND_MEMORY: &str = "Check the second maintenance queue.";
     let _exclusive = test_support::exclusive_run();
     let (model, _) = test_support::listener();
     let profile = Profile::new();
@@ -255,7 +403,12 @@ fn live_swarm_reviews_exact_masked_requests_and_scopes_pins_to_each_member() {
     workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
     let (owner, _) = workspace.open_window(false);
     let mut store = Store::open(crate::profile::connections_path_at(&root)).unwrap();
-    let sessions = [54, 55].map(|skill| {
+    let memory = crate::private_files::Directory::open(&root.join("memory"), true).unwrap();
+    memory
+        .publish_copy("MEMORY.md", GLOBAL_MEMORY.as_bytes())
+        .unwrap();
+    let connection_memory = memory.private_child("connections", true).unwrap();
+    let sessions = [(54, FIRST_MEMORY), (55, SECOND_MEMORY)].map(|(skill, memory)| {
         let session = local(&mut workspace, owner, false);
         let id = store
             .save_local(LocalProfile {
@@ -271,6 +424,9 @@ fn live_swarm_reviews_exact_masked_requests_and_scopes_pins_to_each_member() {
                     ..Default::default()
                 },
             })
+            .unwrap();
+        connection_memory
+            .publish_copy(&format!("{id}.md"), memory.as_bytes())
             .unwrap();
         workspace.sessions.get_mut(&session).unwrap().saved_local = store.local(id).cloned();
         session
@@ -306,11 +462,16 @@ fn live_swarm_reviews_exact_masked_requests_and_scopes_pins_to_each_member() {
             .find_map(|(&id, ticket)| (ticket.key().pane().unwrap().0 == session).then_some(id))
             .unwrap()
     });
-    for (id, pin, other) in [(first, FIRST, SECOND), (second, SECOND, FIRST)] {
+    for (id, pin, other, memory, other_memory) in [
+        (first, FIRST, SECOND, FIRST_MEMORY, SECOND_MEMORY),
+        (second, SECOND, FIRST, SECOND_MEMORY, FIRST_MEMORY),
+    ] {
         let run = &workspace.terminal_agents.runs[&id];
         assert!(run.phase == Phase::ModelReview);
         let review = run.model_review.as_ref().unwrap();
         assert!(review.system.contains(pin) && review.system.contains(LOCAL));
+        assert!(review.system.contains(GLOBAL_MEMORY) && review.system.contains(memory));
+        assert!(!review.system.contains(other_memory));
         assert!(
             !review.system.contains(other) && !review.system.contains("Excluded chat guidance")
         );
@@ -391,7 +552,16 @@ fn live_swarm_reviews_exact_masked_requests_and_scopes_pins_to_each_member() {
         .collect();
     assert_eq!(candidates, ["51", "52"]);
     let encoded = wire.to_string();
-    for private in ["private-swarm-goal", FIRST, SECOND, LOCAL, CLASSIFIED] {
+    for private in [
+        "private-swarm-goal",
+        FIRST,
+        SECOND,
+        LOCAL,
+        CLASSIFIED,
+        GLOBAL_MEMORY,
+        FIRST_MEMORY,
+        SECOND_MEMORY,
+    ] {
         assert!(!encoded.contains(private));
     }
     response(socket.get_mut(), r#"{"skillIds":["52","54"]}"#);
@@ -402,6 +572,8 @@ fn live_swarm_reviews_exact_masked_requests_and_scopes_pins_to_each_member() {
     let review = first_run.model_review.as_ref().unwrap();
     assert!(review.system.contains(FIRST) && review.system.contains(CLASSIFIED));
     assert!(!review.system.contains(SECOND) && !review.system.contains(LOCAL));
+    assert!(review.system.contains(GLOBAL_MEMORY) && review.system.contains(FIRST_MEMORY));
+    assert!(!review.system.contains(SECOND_MEMORY));
     assert!(
         review
             .quota

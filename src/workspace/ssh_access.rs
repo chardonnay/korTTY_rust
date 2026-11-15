@@ -61,6 +61,15 @@ pub struct SshTarget {
 }
 
 impl SshTarget {
+    pub(crate) fn scheduled_route(reference: &crate::scheduler_window::ConnectionRef) -> Self {
+        Self {
+            login: reference.target.clone(),
+            jump: reference.jump.clone(),
+            saved: Some(reference.id),
+            isolation: IsolationLevel::None,
+        }
+    }
+
     pub(crate) fn workflow_route_allowed(
         &self,
         policy: &crate::clipboard_policy::ClipboardPolicy,

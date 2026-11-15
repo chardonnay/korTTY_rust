@@ -15,6 +15,7 @@ use super::diagram::AnalysisDiagram;
 
 mod apply;
 pub(crate) mod hardening;
+pub(crate) mod java_history;
 pub(crate) mod modularization;
 mod verification;
 
@@ -257,6 +258,8 @@ pub(crate) struct Record {
     pub(crate) verification: Option<Verification>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) exports: Vec<ExportEntry>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) java_history: Option<java_history::Evidence>,
 }
 
 impl Record {
@@ -290,6 +293,7 @@ impl Record {
             modularization: None,
             verification: None,
             exports: Vec::new(),
+            java_history: None,
         })
     }
 }

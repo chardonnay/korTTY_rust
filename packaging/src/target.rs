@@ -24,20 +24,24 @@ impl Target {
             .iter()
             .map(|name| {
                 let path = dir.join(name);
-                let at_path = |error: io::Error| {
-                    io::Error::new(error.kind(), format!("{}: {error}", path.display()))
-                };
-                let mut binary = File::open(&path).map_err(at_path)?;
-                if !binary.metadata()?.is_file() || !self.matches(&mut binary).map_err(at_path)? {
-                    return Err(invalid(format!(
-                        "{} does not match the requested target",
-                        path.display()
-                    ))
-                    .into());
-                }
+                self.verify_binary(&path)?;
                 Ok(path)
             })
             .collect()
+    }
+
+    pub(crate) fn verify_binary(&self, path: &Path) -> Result<()> {
+        let at_path =
+            |error: io::Error| io::Error::new(error.kind(), format!("{}: {error}", path.display()));
+        let mut binary = File::open(path).map_err(at_path)?;
+        if !binary.metadata()?.is_file() || !self.matches(&mut binary).map_err(at_path)? {
+            return Err(invalid(format!(
+                "{} does not match the requested target",
+                path.display()
+            ))
+            .into());
+        }
+        Ok(())
     }
 }
 

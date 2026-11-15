@@ -132,7 +132,7 @@ pub(super) fn decode_snapshot(bytes: &[u8]) -> io::Result<Snapshot> {
 /// Reserves encoded space for validated members appended to a converted archive.
 pub(super) fn remaining_capacity(
     snapshot: &Snapshot,
-) -> io::Result<impl FnMut(&str, usize) -> bool> {
+) -> io::Result<impl FnMut(&str, usize) -> bool + use<>> {
     let mut entries = MAX_ENTRIES - snapshot.len().min(MAX_ENTRIES);
     let mut remaining = MAX_PAYLOAD_BYTES - payload_size(snapshot)?;
     Ok(move |path: &str, bytes: usize| {

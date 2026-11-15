@@ -5,6 +5,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Weak};
+use std::time::Instant;
 
 use iced::widget::{button, column, row, scrollable, text, text_input};
 use iced::{Element, Length, Task, window};
@@ -182,6 +183,7 @@ pub(super) struct Reviewed {
     profile_display: String,
     profile_revision: [u8; 32],
     redactor: Redactor,
+    web: Option<super::web_evidence::Evidence>,
     targets: Vec<ReviewedTarget>,
 }
 
@@ -269,7 +271,7 @@ impl Conversation {
             .collect()
     }
 
-    pub(super) fn history(&self) -> Element<'_, Message> {
+    pub(super) fn history(&self, show_status: bool) -> Element<'_, Message> {
         if self.record.is_draft() {
             return column![
                 text(self.record.title()).size(22),
@@ -285,6 +287,10 @@ impl Conversation {
         let searching = !self.search.trim().is_empty();
         let matches = self.search_matches();
         let current = self.search_result.min(matches.len().saturating_sub(1));
+        let status = show_status
+            .then(|| self.record.turns.last())
+            .flatten()
+            .map(saved_status_strip);
         let mut history = column![].spacing(8);
         for (index, turn) in self.record.turns.iter().enumerate() {
             if searching && matches.get(current) != Some(&index) {
@@ -337,6 +343,7 @@ impl Conversation {
                     format!("{} of {} matching turns", current + 1, matches.len())
                 }).size(13)),
             ].spacing(6).wrap(),
+            status,
             scrollable(history).height(Length::Fixed(165.0)),
             text("Saved history stays here. A follow-up sends a fresh question with the current target context after you review it.").size(13),
             text("A completed follow-up saves the masked question and final target summaries.").size(13),
@@ -566,6 +573,17 @@ impl Active {
             targets,
             comparison: None,
         });
+        let now = Instant::now();
+        turn.target_metrics = queue
+            .rows()
+            .iter()
+            .filter_map(|row| {
+                let Key::Saved(target) = row.target.key else {
+                    return None;
+                };
+                store::TargetMetrics::from_row(target, row, now)
+            })
+            .collect();
         turn.routes = Some(
             self.reviewed
                 .targets
@@ -593,6 +611,36 @@ impl Active {
         );
         Some(turn)
     }
+}
+
+fn saved_status_strip(turn: &store::Turn) -> Element<'_, Message> {
+    use super::status_strip;
+
+    let targets = turn
+        .targets
+        .iter()
+        .map(|target| {
+            let status = match target.outcome {
+                RunOutcome::Success => Status::Succeeded,
+                RunOutcome::Failed { .. } => Status::Failed,
+                RunOutcome::Blocked => Status::Blocked,
+                RunOutcome::Cancelled => Status::Cancelled,
+            };
+            let metrics = turn
+                .target_metrics
+                .iter()
+                .find(|metrics| metrics.target == target.target);
+            status_strip::Target {
+                name: target.label.clone(),
+                state: status.into(),
+                elapsed_seconds: metrics.and_then(|metrics| metrics.elapsed_seconds),
+                total_tokens: metrics.and_then(|metrics| metrics.total_tokens),
+                slow: false,
+                ticket: None,
+            }
+        })
+        .collect();
+    status_strip::static_view(targets)
 }
 
 impl Workspace {
@@ -781,6 +829,18 @@ impl Workspace {
     }
 
     pub(super) fn review_saved_swarm_follow_up(&self, group: &mut Group) -> Result<(), String> {
+        let web = self.reviewed_swarm_web(group)?;
+        self.review_saved_swarm_follow_up_with_web(group, web)
+    }
+
+    pub(super) fn review_saved_swarm_follow_up_with_web(
+        &self,
+        group: &mut Group,
+        web: Option<super::web_evidence::Evidence>,
+    ) -> Result<(), String> {
+        if let Some(evidence) = &web {
+            evidence.require_current(self)?;
+        }
         let Some(chat) = group.conversation.as_mut() else {
             return Ok(());
         };
@@ -824,6 +884,7 @@ impl Workspace {
             .ok_or("The selected AI profile is unavailable.")?;
         if Configuration::load()
             .ok()
+            .filter(Configuration::enabled)
             .filter(|saved| saved.resolve_profile_reference(&profile.reference) == Some(profile.id))
             .and_then(|saved| saved.agent_profile_reference_revision(&profile.reference))
             != Some(profile_revision)
@@ -925,6 +986,7 @@ impl Workspace {
             profile_display,
             profile_revision,
             redactor,
+            web,
             targets,
         });
         group.notice.clear();
@@ -947,6 +1009,9 @@ impl Workspace {
             return Ok(());
         }
         let review = chat.review.take().expect("current review");
+        if let Some(evidence) = &review.web {
+            evidence.require_current(self)?;
+        }
         if !self.ai_chat_enabled()
             || !review
                 .redactor
@@ -975,6 +1040,7 @@ impl Workspace {
                     .into(),
             );
         }
+        group.round_web = review.web.clone();
         chat.active = Some(Active {
             reviewed: Arc::new(review),
             conclusions: HashMap::new(),

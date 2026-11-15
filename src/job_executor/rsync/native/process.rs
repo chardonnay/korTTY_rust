@@ -1,19 +1,30 @@
 use std::io::{self, Read};
+#[cfg(unix)]
 use std::os::fd::AsFd as _;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt as _;
+#[cfg(windows)]
+use std::os::windows::process::ExitStatusExt as _;
 use std::path::Path;
-use std::process::{Child, Command, ExitStatus, Stdio};
+#[cfg(unix)]
+use std::process::{Child, Stdio};
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use rustix::{fs, process};
 
 use super::POLL;
 
+const VERSION_LIMIT: usize = 16 * 1024;
+
+#[cfg(unix)]
 pub(super) struct Process {
     child: Child,
     group: Option<process::Pid>,
 }
 
+#[cfg(unix)]
 impl Process {
     pub(super) fn start(command: &mut Command) -> io::Result<Self> {
         let child = command.process_group(0).spawn()?;
@@ -45,6 +56,7 @@ impl Process {
     }
 }
 
+#[cfg(unix)]
 impl Drop for Process {
     fn drop(&mut self) {
         self.stop_group();
@@ -53,8 +65,8 @@ impl Drop for Process {
     }
 }
 
+#[cfg(unix)]
 pub(super) fn check_version(program: &Path, cancelled: &impl Fn() -> bool) -> io::Result<()> {
-    const LIMIT: usize = 16 * 1024;
     let mut child = Process::start(
         Command::new(program)
             .env_clear()
@@ -82,7 +94,7 @@ pub(super) fn check_version(program: &Path, cancelled: &impl Fn() -> bool) -> io
             match stdout.read(&mut buffer) {
                 Ok(0) => eof = true,
                 Ok(count) => {
-                    if captured.len() + count > LIMIT {
+                    if captured.len() + count > VERSION_LIMIT {
                         return Err(unsupported());
                     }
                     captured.extend_from_slice(&buffer[..count]);
@@ -103,6 +115,112 @@ pub(super) fn check_version(program: &Path, cancelled: &impl Fn() -> bool) -> io
         }
     }
     if status.is_some_and(|status| status.success()) && supported(&captured) {
+        Ok(())
+    } else {
+        Err(unsupported())
+    }
+}
+
+#[cfg(windows)]
+pub(super) struct Process(kortty_pty::WindowsCli);
+
+#[cfg(windows)]
+impl Process {
+    pub(super) fn start(command: &mut Command) -> io::Result<Self> {
+        Self::start_with_output(command, false)
+    }
+
+    fn start_with_output(command: &mut Command, capture: bool) -> io::Result<Self> {
+        let invalid = || {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Invalid rsync process arguments",
+            )
+        };
+        let arguments = command
+            .get_args()
+            .map(|argument| argument.to_str().map(str::to_owned).ok_or_else(invalid))
+            .collect::<io::Result<Vec<_>>>()?;
+        let environment = command
+            .get_envs()
+            .map(|(name, value)| {
+                name.to_str()
+                    .zip(value.and_then(std::ffi::OsStr::to_str))
+                    .ok_or_else(invalid)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        let mut process = kortty_pty::WindowsCli::prepare_with_environment(
+            Path::new(command.get_program()),
+            &arguments,
+            command.get_current_dir().ok_or_else(invalid)?,
+            &environment,
+            capture,
+        )?;
+        drop(process.input.take());
+        process.resume()?;
+        Ok(Self(process))
+    }
+
+    pub(super) fn poll(&mut self) -> io::Result<Option<ExitStatus>> {
+        let Some(code) = self.0.try_exit_code()? else {
+            return Ok(None);
+        };
+        self.0.terminate_tree()?;
+        Ok(Some(ExitStatus::from_raw(code)))
+    }
+
+    pub(super) fn owns_bridge_peer(&self, stream: &super::bridge::Stream) -> io::Result<bool> {
+        let (std::net::SocketAddr::V4(client), std::net::SocketAddr::V4(server)) =
+            (stream.peer_addr()?, stream.local_addr()?)
+        else {
+            return Ok(false);
+        };
+        self.0.owns_loopback_connection(client, server)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Process {
+    fn drop(&mut self) {
+        let _ = self.0.terminate_tree();
+    }
+}
+
+#[cfg(windows)]
+pub(super) fn check_version(program: &Path, cancelled: &impl Fn() -> bool) -> io::Result<()> {
+    let scratch = super::Scratch::new(&std::env::temp_dir())?;
+    let mut child = Process::start_with_output(
+        Command::new(program)
+            .current_dir(&scratch.path)
+            .env("LANG", "C")
+            .arg("--version"),
+        true,
+    )?;
+    let output = child.0.output.take().ok_or_else(unsupported)?;
+    let reader = std::thread::Builder::new()
+        .name("kortty-rsync-version".into())
+        .spawn(move || {
+            let mut bytes = Vec::new();
+            output
+                .take((VERSION_LIMIT + 1) as u64)
+                .read_to_end(&mut bytes)?;
+            Ok::<_, io::Error>(bytes)
+        })?;
+    let status = (|| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if cancelled() || Instant::now() >= deadline {
+                return Err(io::Error::other("The approved rsync version check stopped"));
+            }
+            if let Some(status) = child.poll()? {
+                return Ok(status);
+            }
+            std::thread::sleep(POLL);
+        }
+    })();
+    drop(child);
+    let output = reader.join().map_err(|_| unsupported())??;
+    if status?.success() && output.len() <= VERSION_LIMIT && supported(&output) {
         Ok(())
     } else {
         Err(unsupported())

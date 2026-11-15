@@ -13,7 +13,7 @@ mod dbus;
 mod launcher;
 
 pub use activation::activate_notification_window;
-pub use launcher::{DESKTOP_APP_ID, LauncherBadge};
+pub use launcher::{DESKTOP_APP_ID, LauncherBadge, desktop_app_id};
 
 const QUEUE_LIMIT: usize = 16;
 const PENDING_LIMIT: usize = 128;

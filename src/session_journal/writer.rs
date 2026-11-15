@@ -62,6 +62,21 @@ pub(crate) struct PublishedScreenshot {
     pub(crate) reference: String,
 }
 
+struct AutomationScreenshot {
+    final_frame: bool,
+    permit: Box<dyn Fn() -> bool + Send>,
+}
+
+impl AutomationScreenshot {
+    fn caption(&self) -> &'static str {
+        if self.final_frame {
+            "Final virtual terminal screenshot"
+        } else {
+            "Virtual terminal screenshot"
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RecordKind {
     Seed,
@@ -204,7 +219,7 @@ impl Capture {
                 truncation: None,
                 received_text: false,
                 seed_sent: false,
-                screenshot_pending: false,
+                screenshots_pending: 0,
                 entry_mutation_pending: false,
                 screenshot_bytes: 0,
             }),
@@ -290,6 +305,7 @@ impl Capture {
         after: u64,
         window: super::summary_plan::Window,
         card: Option<super::summary_ai::Card>,
+        usage: Option<super::summary_ai::ObservedUsage>,
         cancelled: Arc<AtomicBool>,
         authorize: Option<super::summary_ai::Authorization>,
     ) -> io::Result<Receiver<Result<u64, String>>> {
@@ -298,11 +314,28 @@ impl Capture {
                 after,
                 window,
                 card,
+                usage,
                 cancelled,
                 authorize,
             }),
             reply,
         })
+    }
+
+    /// Called from a worker so accounting waits for space behind accepted capture records.
+    pub(crate) fn record_ai_usage(
+        &self,
+        usage: super::summary_ai::ObservedUsage,
+    ) -> io::Result<Receiver<Result<super::summary_store::UsageEdit, String>>> {
+        let (reply, result) = async_channel::bounded(1);
+        self.sink
+            .shared
+            .input
+            .send_blocking(Item::AiUsage { usage, reply })
+            .map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "The session journal is closing")
+            })?;
+        Ok(result)
     }
 
     pub(crate) fn live_tail(&self, after: Option<&LiveCursor>) -> io::Result<LivePage> {
@@ -647,7 +680,7 @@ impl Sink {
 
     /// Offers one explicit screenshot without accumulating multiple queued image buffers.
     pub(crate) fn try_screenshot(&self, png: Vec<u8>) -> Result<(), SendError> {
-        self.offer_screenshot(png, None)
+        self.offer_screenshot(png, None, None)
     }
 
     /// Returns the published row only after both the PNG and its journal entry are stored.
@@ -656,24 +689,54 @@ impl Sink {
         png: Vec<u8>,
     ) -> Result<Receiver<Result<PublishedScreenshot, String>>, SendError> {
         let (send, receive) = async_channel::bounded(1);
-        self.offer_screenshot(png, Some(send))?;
+        self.offer_screenshot(png, Some(send), None)?;
         Ok(receive)
+    }
+
+    pub(super) fn try_automation_screenshot(
+        &self,
+        png: Vec<u8>,
+        final_frame: bool,
+        permit: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), SendError> {
+        self.offer_screenshot(
+            png,
+            None,
+            Some(AutomationScreenshot {
+                final_frame,
+                permit: Box::new(permit),
+            }),
+        )
     }
 
     fn offer_screenshot(
         &self,
         png: Vec<u8>,
         receipt: Option<Sender<Result<PublishedScreenshot, String>>>,
+        automation: Option<AutomationScreenshot>,
     ) -> Result<(), SendError> {
         let png = Zeroizing::new(png);
+        if automation.as_ref().is_some_and(|frame| !(frame.permit)()) {
+            return Err(SendError::Closed);
+        }
         let mut progress = self.shared.lock();
         progress.recording()?;
-        if progress.screenshot_pending {
+        // Reserve one writer slot for the final frame even if an intermediate
+        // image is being committed when SSH finishes.
+        let limit = if automation.as_ref().is_some_and(|frame| frame.final_frame) {
+            2
+        } else {
+            1
+        };
+        if progress.screenshots_pending >= limit {
             return Err(SendError::Full);
         }
-        if !disk::valid_png(&png)
-            || png.len() > MAX_SCREENSHOT_TOTAL.saturating_sub(progress.screenshot_bytes)
-        {
+        let budget = if automation.as_ref().is_some_and(|frame| !frame.final_frame) {
+            MAX_SCREENSHOT_TOTAL - super::MAX_PNG_BYTES as usize
+        } else {
+            MAX_SCREENSHOT_TOTAL
+        };
+        if !disk::valid_png(&png) || png.len() > budget.saturating_sub(progress.screenshot_bytes) {
             return Err(SendError::TooLarge);
         }
         let size = png.len();
@@ -681,9 +744,10 @@ impl Sink {
             png,
             time: Timestamp::now(),
             receipt,
+            automation,
         }) {
             Ok(()) => {
-                progress.screenshot_pending = true;
+                progress.screenshots_pending += 1;
                 progress.screenshot_bytes += size;
                 progress.received_text = true;
                 Ok(())
@@ -730,6 +794,10 @@ enum Item {
     Summary {
         update: Box<disk::SummaryPublish>,
         reply: Sender<Result<u64, String>>,
+    },
+    AiUsage {
+        usage: super::summary_ai::ObservedUsage,
+        reply: Sender<Result<super::summary_store::UsageEdit, String>>,
     },
     AgentCard {
         card: Box<agent_chat::Card>,
@@ -785,6 +853,7 @@ enum Item {
         png: Zeroizing<Vec<u8>>,
         time: Timestamp,
         receipt: Option<Sender<Result<PublishedScreenshot, String>>>,
+        automation: Option<AutomationScreenshot>,
     },
 }
 
@@ -837,7 +906,7 @@ struct Progress {
     truncation: Option<&'static str>,
     received_text: bool,
     seed_sent: bool,
-    screenshot_pending: bool,
+    screenshots_pending: u8,
     entry_mutation_pending: bool,
     screenshot_bytes: usize,
 }

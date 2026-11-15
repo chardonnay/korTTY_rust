@@ -11,6 +11,7 @@ use std::sync::Arc;
 use pgp::crypto::hash::HashAlgorithm;
 use serde::{Deserialize, Serialize};
 
+use crate::ai_manager::java_knowledge;
 use crate::knowledge_pdf as pdf;
 use crate::local_ai::{Client, Profile};
 use crate::private_files::{Directory, FileStamp, nonce};
@@ -49,6 +50,8 @@ const EXACT_SEARCH_LIMIT: usize = 256;
 pub(super) struct Store {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) java_origin: Option<java_knowledge::Origin>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(super) embedding: Option<Embedding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -123,6 +126,7 @@ impl Store {
     pub(super) fn new(name: &str) -> io::Result<Self> {
         Ok(Self {
             id: Some(nonce()?),
+            java_origin: None,
             embedding: None,
             qdrant: None,
             coding_profile: None,
@@ -164,6 +168,10 @@ impl Store {
         {
             return Err("This source is already in the store".into());
         }
+        self.file_size_limits.insert(
+            path.clone(),
+            FileSizeLimit::reviewed_for_text(source::NEW_SOURCE_DEFAULT, !pdf::is_pdf(&path)),
+        );
         self.sources.push(path);
         Ok(())
     }
@@ -328,10 +336,13 @@ impl Store {
     pub(super) fn folder_review_options(
         &self,
         root: PathBuf,
-        options: source::Options,
+        mut options: source::Options,
     ) -> Result<(folder::ReviewReply, folder::Cancel), String> {
         options.validate()?;
         let existing = self.folder_index(&root)?;
+        if existing.is_none() && options.max_file_bytes.is_none() {
+            options.max_file_bytes = Some(FileSizeLimit::reviewed(source::NEW_SOURCE_DEFAULT));
+        }
         let previous = existing.map(|index| self.folders[index].clone());
         if previous
             .as_ref()
@@ -405,6 +416,10 @@ impl Store {
             || self.folders.len() > folder::MAX_FOLDERS
             || self.coding_profile == Some(ProfileRef::Numeric(0))
             || self.text_profile == Some(ProfileRef::Numeric(0))
+            || self
+                .java_origin
+                .as_ref()
+                .is_some_and(|origin| self.id.is_none() || !origin.valid())
             || self.id.as_ref().is_some_and(|id| {
                 id.len() != 32
                     || !id
@@ -1559,14 +1574,24 @@ fn read_source_file_capped(
     active: impl Fn() -> bool,
 ) -> io::Result<SourceDocument> {
     if pdf::is_pdf(path) {
-        let source = read_pdf(file, path, max_file_bytes)?;
-        let bytes = source.len();
-        let digest = sha256(&source)?;
-        let pages = pdf::extract(source, active)?;
+        let format_limit = source::format_file_size(path, max_file_bytes);
+        let configured = max_file_bytes.is_some_and(|limit| limit.bytes() <= format_limit as u64);
+        let source = pdf::extract(
+            file,
+            source::effective_file_size(path, max_file_bytes),
+            active,
+        )
+        .map_err(|error| {
+            if configured && pdf::input_size_exceeded(&error) {
+                io::Error::new(io::ErrorKind::InvalidData, ConfiguredFileTooLarge)
+            } else {
+                error
+            }
+        })?;
         Ok(SourceDocument {
-            text: SourceText::Pages(pages),
-            digest,
-            bytes,
+            text: SourceText::Pages(source.pages),
+            digest: source.digest,
+            bytes: source.bytes,
         })
     } else {
         let text = read_text(file, path, max_file_bytes)?;
@@ -1621,20 +1646,6 @@ fn read_source_digest(
             .try_into()
             .expect("SHA-256 has 32 bytes"))
     })
-}
-
-fn read_pdf(
-    file: &File,
-    path: &Path,
-    max_file_bytes: Option<FileSizeLimit>,
-) -> io::Result<Vec<u8>> {
-    let format_limit = source::format_file_size(path, max_file_bytes);
-    if let Some(bytes) = read_reviewed_bytes(file, max_file_bytes, format_limit)? {
-        pdf::validate_bytes(&bytes)?;
-        Ok(bytes)
-    } else {
-        pdf::read_bytes(file)
-    }
 }
 
 fn read_text(
@@ -1712,13 +1723,10 @@ fn read_reviewed_bytes(
 }
 
 fn validate_source_limit(path: &Path, limit: FileSizeLimit) -> Result<(), String> {
-    limit.validate()?;
-    if !pdf::is_pdf(path) && limit.is_reviewed() && limit.bytes() > source::MAX_TEXT_BYTES as u64 {
-        return Err(format!(
-            "Enter a maximum text file size up to {} bytes.",
-            source::MAX_TEXT_BYTES
-        ));
+    if pdf::is_pdf(path) && matches!(limit, FileSizeLimit::Source { .. }) {
+        return Err("Review the PDF size limit for this source again.".into());
     }
+    limit.validate()?;
     Ok(())
 }
 
@@ -1891,6 +1899,7 @@ mod tests {
         fs::write(&path, "éé").unwrap();
         let mut store = Store::new("Bounded source").unwrap();
         store.add_source(path.clone()).unwrap();
+        store.set_file_size_limit(path.clone(), None).unwrap();
         store.set_file_sync(path.clone(), source::SyncMode::Automatic);
         let saved = State {
             stores: vec![store],
@@ -2044,6 +2053,15 @@ mod tests {
         let mut store = Store::new("Expanded PDF").unwrap();
         store.add_source(path.clone()).unwrap();
         let scope = |store: &Store| Scope::new(store, "127.0.0.1:5678", "fixture").unwrap();
+        assert_eq!(
+            store.effective_file_size_limit(&path),
+            source::NEW_SOURCE_DEFAULT
+        );
+        assert_eq!(
+            scope(&store).read(0, &path, || true).unwrap().bytes as u64,
+            size
+        );
+        store.set_file_size_limit(path.clone(), None).unwrap();
         assert!(scope(&store).read(0, &path, || true).is_err());
         assert!(
             store

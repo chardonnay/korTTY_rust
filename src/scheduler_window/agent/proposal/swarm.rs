@@ -1,10 +1,13 @@
 //! One target's masked command evidence and strict iterative scheduler protocol.
 
 use serde::{Deserialize, Serialize};
+use zeroize::{Zeroize, Zeroizing};
+
+use crate::local_ai::web_search::PageUrl;
 
 use super::{
-    Decision, Item, MAX_FIRING_COMMANDS, MAX_RESPONSE, Prompt, valid_command, valid_text,
-    validate_firing_commands,
+    Decision, Item, MAX_FIRING_COMMANDS, MAX_RESPONSE, Prompt, WebLookup, valid_command,
+    valid_text, validate_firing_commands,
 };
 
 pub(crate) const MAX_SWARM_COMMAND_ROUNDS: u8 = 8;
@@ -67,6 +70,30 @@ struct Input<'a> {
     omitted_rounds: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     environment_probe: Option<&'a Output>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    public_research_topic: Option<&'a str>,
+}
+
+pub(super) struct Research<'a> {
+    pub(super) topic: &'a str,
+    pub(super) system: String,
+}
+
+pub(super) fn research_system(prompt: &Prompt, allows_page: bool) -> String {
+    const INSTRUCTIONS: &str = "\n\nThe following research proposal is an exception to the response rules above, including in the final round. If public documentation on public_research_topic could help interpret the most recent command batch, you may return {\"state\":\"research\",\"query\":\"one public search query\"} for human review. No tools run from this response. Never copy private server names, network addresses, accounts, paths, identifiers, masked values, or credentials into the query. Use only facts suitable for publication.";
+    const PAGE: &str = " If you already know an exact public documentation URL relevant to the topic, you may instead propose {\"state\":\"research_page\",\"url\":\"https://public.example.com/docs\"} for human review. The URL must be public and must omit query parameters and fragments. Do not invent a URL.";
+    let system = prompt.firing_system();
+    let (base, suffix) = prompt
+        .transport
+        .structured_system_suffix()
+        .and_then(|suffix| system.strip_suffix(suffix).map(|base| (base, suffix)))
+        .unwrap_or((system, ""));
+    let page = if allows_page { PAGE } else { "" };
+    format!("{base}{INSTRUCTIONS}{page}{suffix}")
+}
+
+pub(crate) fn allows_research(round: u8) -> bool {
+    (2..=MAX_SWARM_COMMAND_ROUNDS + 1).contains(&round)
 }
 
 pub(super) fn initial_round_input(prompt: &Prompt) -> Result<String, String> {
@@ -78,7 +105,7 @@ pub(super) fn initial_round_input(prompt: &Prompt) -> Result<String, String> {
         Some(_) => return Err("The reviewed Swarm preflight command is invalid.".into()),
         None => None,
     };
-    encode_input(prompt, 1, &[], probe.as_ref())
+    encode_input(prompt, 1, &[], probe.as_ref(), None)
 }
 
 pub(super) fn round_input(
@@ -86,6 +113,7 @@ pub(super) fn round_input(
     round: u8,
     prior: &[SwarmRound],
     probe: Option<&SwarmEvidence>,
+    research: Option<&Research<'_>>,
 ) -> Result<String, String> {
     if !(1..=MAX_SWARM_COMMAND_ROUNDS + 1).contains(&round)
         || prior.len() != usize::from(round - 1)
@@ -94,6 +122,13 @@ pub(super) fn round_input(
             .enumerate()
             .any(|(index, evidence)| usize::from(evidence.round) != index + 1)
         || !single_target(prompt)
+        || research.is_some_and(|research| {
+            !allows_research(round)
+                || !super::super::web_lookup::valid_input(research.topic)
+                || !prompt
+                    .knowledge_mask(research.topic)
+                    .is_ok_and(|masked| masked == research.topic)
+        })
     {
         return Err("The scheduled Swarm round or its evidence is invalid.".into());
     }
@@ -119,7 +154,7 @@ pub(super) fn round_input(
         .iter()
         .map(|round| mask_round(prompt, round))
         .collect::<Result<Vec<_>, _>>()?;
-    encode_input(prompt, round, &prior, probe.as_ref())
+    encode_input(prompt, round, &prior, probe.as_ref(), research)
 }
 
 fn single_target(prompt: &Prompt) -> bool {
@@ -135,12 +170,16 @@ fn encode_input(
     round: u8,
     prior: &[SwarmRound],
     probe: Option<&Output>,
+    research: Option<&Research<'_>>,
 ) -> Result<String, String> {
-    let base = serde_json::from_str(&prompt.input)
+    let base = serde_json::from_str(prompt.reviewed_input(true))
         .map_err(|_| "Could not prepare the scheduled Swarm request.")?;
-    let max_input = prompt
-        .context_limit
-        .saturating_sub(prompt.firing_system().chars().count());
+    let max_input = prompt.context_limit.saturating_sub(
+        research
+            .map_or_else(|| prompt.firing_system(), |research| &research.system)
+            .chars()
+            .count(),
+    );
     // A continuation must still see the result of its most recent batch.
     for omitted_rounds in 0..=prior.len().saturating_sub(1) {
         let input = serde_json::to_string(&Input {
@@ -150,6 +189,7 @@ fn encode_input(
             prior_rounds: &prior[omitted_rounds..],
             omitted_rounds,
             environment_probe: probe,
+            public_research_topic: research.map(|research| research.topic),
         })
         .map_err(|_| "Could not prepare the scheduled Swarm request.")?;
         if input.chars().count() <= max_input {
@@ -222,6 +262,8 @@ enum Answer {
     Commands { commands: Vec<Item> },
     Done { summary: String },
     Blocked { summary: String },
+    Research { query: String },
+    ResearchPage { url: String },
 }
 
 pub(super) fn parse(response: &str, prompt: &Prompt, round: u8) -> Result<Decision, String> {
@@ -243,6 +285,46 @@ pub(super) fn parse(response: &str, prompt: &Prompt, round: u8) -> Result<Decisi
         }
         Answer::Blocked { summary } => {
             summary_text(&summary, prompt).map(|summary| Decision::SwarmBlocked { summary })
+        }
+        Answer::Research { mut query } => {
+            if !prompt.offers_swarm_round_research(round, WebLookup::Search) {
+                return Err(
+                    "The scheduled Swarm did not propose an authorized public query.".into(),
+                );
+            }
+            if !super::super::web_lookup::valid_input(&query)
+                || !prompt
+                    .knowledge_mask(&query)
+                    .is_ok_and(|masked| masked == query)
+            {
+                query.zeroize();
+            }
+            Ok(Decision::SwarmResearch {
+                lookup: WebLookup::Search,
+                input: query,
+            })
+        }
+        Answer::ResearchPage { url } => {
+            if !prompt.offers_swarm_round_research(round, WebLookup::Page) {
+                return Err("The scheduled Swarm did not authorize a webpage proposal.".into());
+            }
+            let url = Zeroizing::new(url);
+            let input = PageUrl::parse(&url)
+                .ok()
+                .filter(|page| {
+                    let clean = |value: &str| {
+                        prompt
+                            .knowledge_mask(value)
+                            .is_ok_and(|masked| masked == value)
+                    };
+                    clean(page.as_str()) && page.decoded().is_ok_and(|decoded| clean(&decoded))
+                })
+                .map(|page| page.as_str().to_owned())
+                .unwrap_or_default();
+            Ok(Decision::SwarmResearch {
+                lookup: WebLookup::Page,
+                input,
+            })
         }
     }
 }

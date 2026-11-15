@@ -95,7 +95,7 @@ mod recording_access;
 mod remote_dock;
 pub(crate) use remote_dock::mcp_ssh_prompt_is_verified;
 pub(crate) mod saved_chats;
-mod scheduler_access;
+pub(crate) mod scheduler_access;
 mod server_access;
 mod session_processes;
 mod session_restore;
@@ -105,6 +105,7 @@ mod sftp_access;
 mod shell_integration;
 pub(crate) mod skill_classifier;
 mod snippet_access;
+pub(crate) use snippet_access::FileAiAssistance;
 mod split_connection;
 mod ssh_access;
 mod ssh_keys_ui;
@@ -116,8 +117,10 @@ mod teamwork_auth;
 mod teamwork_settings;
 mod teamwork_sync;
 pub(crate) mod terminal_agent;
-mod terminal_ai;
+pub(crate) mod terminal_ai;
 pub(crate) use terminal_ai::mask::prompt as mask_ai_prompt;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+mod native_file_drag;
 mod terminal_commands;
 pub(crate) mod terminal_context;
 mod terminal_effect_access;
@@ -131,8 +134,6 @@ mod tunnel_access;
 mod wayland_file_drop;
 mod window_lifecycle;
 mod window_navigation;
-#[cfg(target_os = "windows")]
-mod windows_file_drag;
 pub use ssh_access::SshTarget;
 
 const DEFAULT_FONT: u8 = 14;
@@ -248,6 +249,7 @@ pub enum Message {
     OpenDiagram,
     Diagram(window::Id, diagram_window::Message),
     TerminalAgent(window::Id, terminal_agent::Message),
+    SwarmStatusTick,
     AgentCursor(terminal_view::agent_cursor::Message),
     AgentInline(
         terminal_view::agent_cursor::Binding,
@@ -257,6 +259,7 @@ pub enum Message {
     AsciiArt(window::Id, ascii_art::Message),
     OpenEditor,
     Editor(window::Id, editor_window::Message),
+    FileAssist(window::Id, crate::snippet_window::ai_assist::Message),
     ProjectFile(window::Id, project_access::local_files::Message),
     ProjectSftpTick,
     TerminalFileLoaded(u64, Result<editor_window::Document, String>),
@@ -299,8 +302,8 @@ pub enum Message {
     TabDrag(tab_drag::Message),
     #[cfg(target_os = "linux")]
     WaylandFileDrop(wayland_file_drop::Message),
-    #[cfg(target_os = "windows")]
-    WindowsFileDrag(windows_file_drag::Message),
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    NativeFileDrag(native_file_drag::Message),
     ToggleBroadcast(window::Id),
     ToggleCommandTimestamps(window::Id),
     ResizeCommandTimestamps(window::Id, Option<Size>),
@@ -361,6 +364,7 @@ pub enum Message {
     ),
     JobAgentResend(job_executor::agent::Resend),
     ScheduledAgent(scheduler_access::firing::Event),
+    ScheduledFiringWeb(scheduler_access::firing_web::Event),
     ScheduledSwarmComparison(scheduler_access::swarm_comparison::Event),
     SchedulerSwarmChat(scheduler_access::swarm_chat::Event),
     JobWebhookFinished(
@@ -420,6 +424,7 @@ pub struct Workspace {
     journal_note_translations: journal_note_translation::Translations,
     journal_screenshot_editors: journal_access::screenshot_editor::Editors,
     journal_captures: HashMap<u64, journal_capture_access::Entry>,
+    journal_ai_starts: HashMap<u64, journal_capture_access::AiStart>,
     retired_journal_captures: Vec<Arc<crate::session_journal::Capture>>,
     effect_dialogs: HashMap<window::Id, effects::Dialog>,
     effect_frame: Option<std::time::Instant>,
@@ -469,8 +474,8 @@ pub struct Workspace {
     tab_drag: tab_drag::DragState,
     #[cfg(target_os = "linux")]
     wayland_file_drop: wayland_file_drop::State,
-    #[cfg(target_os = "windows")]
-    windows_file_drag: windows_file_drag::State,
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    native_file_drag: native_file_drag::State,
     multi_exec: multi_exec::Membership,
     diagrams: HashMap<window::Id, DiagramWindow>,
     terminal_agents: terminal_agent::State,
@@ -518,6 +523,8 @@ pub struct Workspace {
     scheduler_agent_sequences:
         std::collections::BTreeMap<kortty_jobs::RunId, scheduler_access::firing::Sequence>,
     scheduler_firing_retry_at: Option<std::time::Instant>,
+    scheduler_firing_web: scheduler_access::firing_web::State,
+    scheduler_read_only_research: scheduler_access::firing::environment_research::ReadOnlyResearch,
     scheduler_swarm_comparisons: scheduler_access::swarm_comparison::Runs,
     scheduler_swarm_chat: scheduler_access::swarm_chat::Publisher,
     scheduler_draining: bool,
@@ -1012,6 +1019,7 @@ impl Workspace {
         let recovery = workspace.initialize_snippet_recovery();
         let teamwork = workspace.start_teamwork();
         let policy_auto_models = workspace.poll_policy_auto_profiles(false);
+        let lm_studio_auto_models = workspace.poll_lm_studio_auto(false);
         let model_catalog = workspace.start_ai_model_catalog_refresh();
         let journal_summaries = workspace.recover_journals_at_startup();
         workspace.initialize_automation_journals();
@@ -1024,6 +1032,7 @@ impl Workspace {
                 recovery,
                 teamwork,
                 policy_auto_models,
+                lm_studio_auto_models,
                 model_catalog,
                 journal_summaries,
                 iced::system::theme().map(Message::JournalSystemTheme),
@@ -1171,6 +1180,7 @@ impl Workspace {
                 self.recording_subscription(),
                 self.tab_watch_subscription(),
                 self.ai_manager_subscription(),
+                self.swarm_status_subscription(),
                 self.journal_dock_subscription(),
                 self.coding_agent_dock_subscription(),
                 self.coding_agent_notification_subscription(),
@@ -1188,8 +1198,8 @@ impl Workspace {
                 self.wayland_file_drop.subscription(),
                 #[cfg(target_os = "linux")]
                 self.wayland_drag_preparation_subscription(),
-                #[cfg(target_os = "windows")]
-                self.windows_file_drag_subscription(),
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                self.native_file_drag_subscription(),
                 self.remote_dock_subscription(),
                 self.project_sftp_subscription(),
                 self.control.subscription(),
@@ -1207,6 +1217,9 @@ impl Workspace {
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
+        if matches!(message, Message::SwarmStatusTick) {
+            return Task::none();
+        }
         let message = match message {
             Message::RepeatedKey(id, key, location, modifiers, text) => {
                 if self.suppressed_quick_select_repeat(id, &key)
@@ -1424,8 +1437,8 @@ impl Workspace {
         let task = self.update_message(message);
         #[cfg(target_os = "linux")]
         self.revalidate_wayland_file_drops();
-        #[cfg(target_os = "windows")]
-        self.revalidate_windows_file_drag();
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        self.revalidate_native_file_drag();
         self.revalidate_agent_cursor();
         self.revalidate_agent_chat_handoffs();
         self.revalidate_agent_journal_synchronizations();
@@ -1701,6 +1714,12 @@ impl Workspace {
                     } else {
                         Task::none()
                     };
+                #[cfg(target_os = "macos")]
+                let appkit_drag = if self.windows.contains_key(&id) || self.sftp.contains_key(&id) {
+                    window::run(id, |_| kortty_macos::file_drag::install_monitor()).discard()
+                } else {
+                    Task::none()
+                };
                 return if self.windows.contains_key(&id) {
                     #[cfg(target_os = "macos")]
                     chrome::install_native_menus();
@@ -1711,6 +1730,8 @@ impl Workspace {
                         tab_drag::DragState::register(id),
                         #[cfg(target_os = "linux")]
                         wayland_file_drop,
+                        #[cfg(target_os = "macos")]
+                        appkit_drag,
                         self.start_local_dock(id),
                         self.detect_transparent_surface(id),
                     ])
@@ -1721,6 +1742,8 @@ impl Workspace {
                         scale,
                         #[cfg(target_os = "linux")]
                         wayland_file_drop,
+                        #[cfg(target_os = "macos")]
+                        appkit_drag,
                     ])
                 };
             }
@@ -1771,8 +1794,8 @@ impl Workspace {
             Message::Window(id, window::Event::Closed) => {
                 #[cfg(target_os = "linux")]
                 self.wayland_file_drop.forget(id);
-                #[cfg(target_os = "windows")]
-                self.windows_file_drag.forget(id);
+                #[cfg(any(target_os = "macos", target_os = "windows"))]
+                self.native_file_drag.forget(id);
                 if self.native_focused_window == Some(id) {
                     self.native_focused_window = None;
                 }
@@ -1886,6 +1909,7 @@ impl Workspace {
             }
             Message::OpenDiagram => return self.open_diagram(None),
             Message::TerminalAgent(id, action) => return self.update_terminal_agent(id, action),
+            Message::SwarmStatusTick => return Task::none(),
             Message::AgentCursor(action) => return self.update_agent_cursor(action),
             Message::AgentInline(binding, key) => return self.update_agent_inline(binding, key),
             Message::AgentShortcut(action) => return self.update_agent_shortcut(action),
@@ -1941,6 +1965,7 @@ impl Workspace {
             Message::ProjectSftpTick => {
                 return self.update_project_sftp_idle(std::time::Instant::now());
             }
+            Message::FileAssist(id, action) => return self.update_file_assist(id, action),
             Message::Editor(id, editor_window::Message::RequestClose) => {
                 return self.close_window(id);
             }
@@ -2171,8 +2196,8 @@ impl Workspace {
             Message::TabDrag(message) => return self.update_tab_drag(message),
             #[cfg(target_os = "linux")]
             Message::WaylandFileDrop(message) => return self.update_wayland_file_drop(message),
-            #[cfg(target_os = "windows")]
-            Message::WindowsFileDrag(message) => return self.update_windows_file_drag(message),
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            Message::NativeFileDrag(message) => return self.update_native_file_drag(message),
             Message::Split(id, axis) => return self.split(id, axis),
             Message::CancelSplitConnection(id, session) => {
                 self.cancel_split_connection(id, session)
@@ -2501,10 +2526,10 @@ impl Workspace {
             }
             Message::JobFinished(outcome, journals) => return self.job_finished(outcome, journals),
             Message::JobAgentResend(resend) => {
-                self.answer_scheduler_agent_resend(resend);
-                return Task::none();
+                return self.answer_scheduler_agent_resend(resend);
             }
             Message::ScheduledAgent(event) => return self.update_firing(event),
+            Message::ScheduledFiringWeb(event) => return self.update_firing_web(event),
             Message::ScheduledSwarmComparison(event) => {
                 return self.update_scheduled_swarm_comparison(event);
             }
@@ -4553,8 +4578,8 @@ impl Workspace {
         if let Some(window) = self.windows.remove(&id) {
             #[cfg(target_os = "linux")]
             self.wayland_file_drop.forget(id);
-            #[cfg(target_os = "windows")]
-            self.windows_file_drag.forget(id);
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            self.native_file_drag.forget(id);
             self.app_logging
                 .record(crate::app_logging::Event::WindowClosed);
             self.cancel_reopen_owner(id);
@@ -4806,7 +4831,11 @@ impl Workspace {
                 self.scheduler_draining = true;
                 self.cancel_journal_screenshot_analyses();
                 self.cancel_obsolete_journal_note_translations();
-                return Task::batch([self.expire_firing(), self.expire_swarm_comparisons()]);
+                return Task::batch([
+                    self.expire_pending_firing_web(),
+                    self.expire_firing(),
+                    self.expire_swarm_comparisons(),
+                ]);
             }
         }
         self.exit_after_workers()
@@ -5317,6 +5346,12 @@ impl Workspace {
             return focus;
         }
         if let Some(task) = self.ai_manager_shortcut(id, &key, modifiers) {
+            return task;
+        }
+        if key == Key::Named(Named::Tab)
+            && (modifiers.is_empty() || modifiers == Modifiers::SHIFT)
+            && let Some(task) = self.swarm_focus_next(id, modifiers.shift())
+        {
             return task;
         }
         if let Some(task) = self.snippet_shortcut(id, &key, modifiers) {
@@ -5949,13 +5984,8 @@ impl Workspace {
             return scheduler;
         }
         if let Some(editor) = self.editors.get(&id) {
-            return editor
-                .view(
-                    self.editor_content_theme(),
-                    self.window_settings.editor_appearance(),
-                    self.window_settings.editor_caret,
-                )
-                .map(move |message| Message::Editor(id, message));
+            return self
+                .assisted_file_view(id, editor, move |message| Message::Editor(id, message));
         }
         if let Some(diagram) = self.diagrams.get(&id) {
             return diagram
@@ -6290,8 +6320,10 @@ impl Workspace {
                         None
                     };
                     let panes = self.panes(id, window, tab, transparency, color);
-                    let body =
-                        body.push(self.remote_dock_view(id, window, tab, panes, remote_width));
+                    body = body.push(self.remote_dock_view(id, window, tab, panes, remote_width));
+                    if let Some(bar) = self.journal_auto_preflight_bar(id, tab) {
+                        body = body.push(transparency::chrome(bar).padding([3, 5]));
+                    }
                     terminal.push(transparency::connection_frame(body.into(), color))
                 }
                 TabEntry::Tool(tool) => match self.hosted_tool_view(tool) {

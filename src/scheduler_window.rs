@@ -21,25 +21,33 @@ use crate::ai_manager::{Configuration, ProfileRef};
 use crate::connection_store::Store as ConnectionStore;
 use crate::connection_window::CredentialChoice;
 use crate::diagram_window::{self, Format};
-use crate::job_executor::{Completion, Credentials, virtual_terminal};
+use crate::job_executor::{CapturedOutput, Completion, Credentials, virtual_terminal};
 use crate::scheduled_agent_review::Ticket as ProposalTicket;
 use crate::session_journal::automation::run_links::RunJournals;
 use crate::snippets::{self, Library, SnippetId};
 
 pub(crate) mod agent;
 mod automation_journal;
-pub(crate) use automation_journal::Estimate as AutomationEstimate;
+pub(crate) use automation_journal::SummaryProvider as AutomationSummaryProvider;
 pub(crate) use automation_journal::{Draft as SwarmJournalDraft, Event as SwarmJournalEdit};
+pub(crate) use automation_journal::{
+    Estimate as AutomationEstimate, ModelEstimate as AutomationModelEstimate,
+};
 mod connection;
 pub(crate) mod firing;
 mod form;
+pub(crate) mod imported_archive;
+pub(crate) mod imported_transfer;
 mod journal_retention_java;
 mod journal_search;
 pub(crate) mod journal_stats;
 mod notifications;
+pub(crate) mod ownership;
 pub(crate) mod privileged;
 mod remote;
 pub(crate) mod rsync;
+pub(crate) mod rsync_authority;
+mod run_detail;
 pub(crate) mod script;
 pub(crate) mod sync;
 mod view;
@@ -50,13 +58,14 @@ mod working_directory;
 mod tests;
 
 pub(crate) use connection::TargetGroups;
-pub(crate) use connection::{ConnectionChoice, ConnectionRef, MAX_TARGETS};
+pub(crate) use connection::{ConnectionChoice, ConnectionRef, MAX_SELECTED_GROUPS, MAX_TARGETS};
 use firing::RunProposalView;
 use form::{Draft, Field, Mode, Source};
 use journal_search::{JournalColumn, JournalSearchMode};
 pub(crate) use remote::{
-    Archive, ArchiveExclusions, ArchiveFormat, MAX_ARCHIVE_EXCLUDE_TEXT, MAX_ARCHIVE_SOURCES,
-    RemoteAction, RemotePath, windows_drive_ancestors,
+    Archive, ArchiveExclusions, ArchiveFormat, MAX_ARCHIVE_EXCLUDE_TEXT, MAX_ARCHIVE_EXCLUDES,
+    MAX_ARCHIVE_SOURCES, RemoteAction, RemotePath, SymbolicMode, mode_from_text,
+    owner_id_from_text, windows_drive_ancestors,
 };
 use script::{Language, MAX_COMMAND_BYTES, shell_quote};
 pub(crate) use script::{Script, SnippetLink};
@@ -95,6 +104,33 @@ impl fmt::Display for SudoMode {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JournalDetail {
+    #[default]
+    Off,
+    LimitedRedacted,
+    Full,
+}
+
+impl JournalDetail {
+    pub(super) const ALL: [Self; 3] = [Self::LimitedRedacted, Self::Full, Self::Off];
+
+    fn is_off(&self) -> bool {
+        *self == Self::Off
+    }
+}
+
+impl fmt::Display for JournalDetail {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Off => "Off",
+            Self::LimitedRedacted => "Limited, redacted",
+            Self::Full => "Full, redacted",
+        })
+    }
+}
+
 /// Persisted metadata for one unattended SSH action.
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -125,16 +161,81 @@ pub struct SshCommand {
     pub(crate) remote: Option<RemoteAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) agent: Option<agent::Action>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) imported_ai: Option<ImportedAiAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) imported_transfer: Option<Box<imported_transfer::Draft>>,
     #[serde(default, skip_serializing_if = "SudoMode::is_disabled")]
     pub(crate) sudo: SudoMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub virtual_terminal: Option<virtual_terminal::Options>,
+    #[serde(default, skip_serializing_if = "JournalDetail::is_off")]
+    pub(crate) journal_detail: JournalDetail,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) automation_journal: Option<crate::session_journal::automation::Options>,
     #[serde(default, skip_serializing_if = "notifications::Settings::is_default")]
     pub(crate) desktop_notices: notifications::Settings,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) webhook_targets: Vec<webhooks::Target>,
+}
+
+pub(crate) const IMPORTED_AI_REVIEW_REQUIRED: &str =
+    "Review the imported AI action and select a local profile before running or enabling this job.";
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ImportedAiAction {
+    pub(crate) kind: agent::Kind,
+    pub(crate) goal: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) profile_source: Option<crate::ai_manager::JavaProfileSource>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) working_directory: Option<String>,
+    pub(crate) parallelism: u8,
+    pub(crate) swarm_read_only: bool,
+}
+
+impl ImportedAiAction {
+    pub(crate) fn probe(&self) -> agent::Probe {
+        match self.kind {
+            agent::Kind::Agent => agent::Probe::PerFiring,
+            agent::Kind::Swarm if self.swarm_read_only => agent::Probe::SwarmReadOnly,
+            agent::Kind::Swarm => agent::Probe::SwarmIterative,
+        }
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        if self.goal.trim().is_empty()
+            || self.goal.len() > MAX_COMMAND_BYTES
+            || !self
+                .goal
+                .chars()
+                .all(crate::session_journal::is_display_character)
+            || self
+                .profile_id
+                .as_deref()
+                .is_some_and(|id| crate::ai_manager::JavaProfileSource::parse_id(id) != Some(id))
+            || self
+                .profile_source
+                .as_ref()
+                .is_some_and(|source| self.profile_id.as_deref() != Some(source.id()))
+            || self.working_directory.as_deref().is_some_and(|path| {
+                path.trim().is_empty()
+                    || path.len() > MAX_WORKING_DIRECTORY_BYTES
+                    || path.chars().any(char::is_control)
+                    || !path
+                        .chars()
+                        .all(crate::session_journal::is_display_character)
+            })
+            || !(1..=kortty_jobs::MAX_SWARM_PARALLELISM).contains(&usize::from(self.parallelism))
+            || self.kind == agent::Kind::Agent && (self.parallelism != 1 || !self.swarm_read_only)
+        {
+            return Err("Invalid imported AI action settings");
+        }
+        Ok(())
+    }
 }
 
 impl fmt::Debug for SshCommand {
@@ -171,7 +272,14 @@ impl SshCommand {
                 link.validate()?;
             }
             ActionSource::Remote(action) => {
-                action.validate()?;
+                action.validate_definition()?;
+                if let RemoteAction::ImportedArchive(archive) = action
+                    && (self.connection.as_ref() != Some(&archive.route)
+                        || !self.additional_connections.is_empty()
+                        || self.target_groups.is_some())
+                {
+                    return Err("Keep the exact saved SSH route for the imported archive.".into());
+                }
                 if matches!(
                     action,
                     RemoteAction::Sync(_)
@@ -179,20 +287,23 @@ impl SshCommand {
                         | RemoteAction::PrivilegedArchive(_)
                         | RemoteAction::PrivilegedTreeUpload(_)
                         | RemoteAction::PrivilegedTreeDownload(_)
-                        | RemoteAction::RsyncDownload(_)
-                        | RemoteAction::RsyncUpload(_)
                 ) && (self.connection.is_none() || !self.additional_connections.is_empty())
                 {
                     return Err(
-                        "Reviewed copy, rsync, and server-only archive actions require one saved SSH connection."
+                        "Reviewed copy and server-only archive actions require one saved SSH connection."
                             .into(),
                     );
                 }
             }
             ActionSource::Agent(agent) => agent.validate(&self)?,
+            ActionSource::ImportedAi(draft) => draft.validate()?,
+            ActionSource::ImportedTransfer(draft) => draft.validate()?,
         }
         if let Some(options) = self.virtual_terminal {
             options.validate()?;
+        }
+        if !self.journal_detail.is_off() && !self.supports_journal_output() {
+            return Err("Separate journal output requires a command, script, or snippet.".into());
         }
         if let Some(options) = &self.automation_journal {
             options.validate().map_err(|error| error.to_string())?;
@@ -206,13 +317,66 @@ impl SshCommand {
         Ok(self)
     }
 
+    pub(crate) fn require_executable(&self) -> Result<(), &'static str> {
+        self.require_resolved_action()?;
+        if let Some((transfer, _)) = self.remote.as_ref().and_then(RemoteAction::rsync_transfer)
+            && (!self.additional_connections.is_empty() || !transfer.routes.is_empty())
+        {
+            self.validate_target_selection()?;
+            transfer.require_group_review()?;
+        }
+        Ok(())
+    }
+
+    fn require_resolved_action(&self) -> Result<(), &'static str> {
+        if self.imported_ai.is_some() {
+            return Err(IMPORTED_AI_REVIEW_REQUIRED);
+        }
+        if let Some(draft) = self.imported_transfer.as_ref() {
+            return Err(draft.review_required());
+        }
+        if let Some(action) = &self.remote {
+            action.require_executable()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_definition(job: &kortty_jobs::Job<Self>) -> Result<(), String> {
+        if job.enabled() {
+            job.action().require_resolved_action()?;
+        }
+        job.action().clone().validated().map(drop)
+    }
+
     pub(crate) fn supports_automation_journal(&self) -> bool {
         self.agent
             .as_ref()
             .is_none_or(|action| action.probe.supports_target_journal(action.kind))
     }
 
+    fn supports_journal_output(&self) -> bool {
+        self.remote.is_none()
+            && self.agent.is_none()
+            && self.imported_ai.is_none()
+            && self.imported_transfer.is_none()
+    }
+
     pub(crate) fn validate_elevation(&self) -> Result<(), &'static str> {
+        if let Some((transfer, upload)) =
+            self.remote.as_ref().and_then(RemoteAction::rsync_transfer)
+            && transfer.uses_passwordless_sudo()
+        {
+            if self.sudo != SudoMode::Disabled
+                || self.connection.is_none()
+                || self.virtual_terminal.is_some()
+                || self.agent.is_some()
+            {
+                return Err(
+                    "Passwordless rsync requires saved SSH targets and its dedicated Linux helper.",
+                );
+            }
+            return transfer.validate(upload);
+        }
         if let Some(
             action @ (RemoteAction::Privileged(_)
             | RemoteAction::PrivilegedFileAction(_)
@@ -222,11 +386,6 @@ impl SshCommand {
         ) = &self.remote
         {
             action.validate()?;
-            if matches!(action, RemoteAction::PrivilegedArchive(_))
-                && self.sudo != SudoMode::Passwordless
-            {
-                return Err("Protected archives require passwordless sudo.");
-            }
             if self.sudo == SudoMode::Disabled
                 || self.connection.is_none()
                 || !self.additional_connections.is_empty()
@@ -261,14 +420,21 @@ impl SshCommand {
             .chain(self.additional_connections.iter())
     }
 
+    fn uses_swarm_targets(&self) -> bool {
+        self.agent
+            .as_ref()
+            .is_some_and(|action| action.kind == agent::Kind::Swarm)
+            || self
+                .imported_ai
+                .as_ref()
+                .is_some_and(|draft| draft.kind == agent::Kind::Swarm)
+    }
+
     pub(crate) fn validate_target_selection(&self) -> Result<(), &'static str> {
         if !self.additional_connections.is_empty() && self.connection.is_none() {
             return Err("Choose a primary saved SSH connection before adding targets");
         }
-        let swarm = self
-            .agent
-            .as_ref()
-            .is_some_and(|action| action.kind == agent::Kind::Swarm);
+        let swarm = self.uses_swarm_targets();
         if let Some(groups) = &self.target_groups {
             groups.validate(swarm)?;
             if self.connection.is_none()
@@ -292,14 +458,23 @@ impl SshCommand {
                 return Err("Choose each saved SSH connection only once");
             }
         }
+        let rsync = self.remote.as_ref().and_then(RemoteAction::rsync_transfer);
+        if let Some((transfer, upload)) = rsync {
+            let primary = self
+                .connection
+                .as_ref()
+                .ok_or("Reviewed rsync requires saved SSH connections.")?;
+            transfer.validate_routes(primary, &self.additional_connections, upload)?;
+        }
         if !self.additional_connections.is_empty() {
             if self.virtual_terminal.is_some() {
                 return Err("Virtual terminal recordings require one SSH connection");
             }
-            if self
-                .remote
-                .as_ref()
-                .is_some_and(RemoteAction::writes_local_file)
+            if rsync.is_none()
+                && self
+                    .remote
+                    .as_ref()
+                    .is_some_and(RemoteAction::writes_local_file)
             {
                 return Err("A local download destination requires one SSH connection");
             }
@@ -312,11 +487,7 @@ impl SshCommand {
         store: &ConnectionStore,
     ) -> Result<(), &'static str> {
         if let Some(groups) = &self.target_groups {
-            let swarm = self
-                .agent
-                .as_ref()
-                .is_some_and(|action| action.kind == agent::Kind::Swarm);
-            let resolved = groups.resolve(store, swarm)?;
+            let resolved = groups.resolve(store, self.uses_swarm_targets())?;
             if !resolved.iter().eq(self.targets()) {
                 return Err(connection::GROUP_TARGETS_CHANGED);
             }
@@ -369,6 +540,8 @@ impl SshCommand {
             ActionSource::Agent(_) => {
                 return Err("Diagnostics require the reviewed AI job executor");
             }
+            ActionSource::ImportedAi(_) => return Err(IMPORTED_AI_REVIEW_REQUIRED),
+            ActionSource::ImportedTransfer(draft) => return Err(draft.review_required()),
         };
         self.with_working_directory(command)
     }
@@ -420,6 +593,28 @@ impl SshCommand {
     }
 
     fn source(&self) -> Result<ActionSource<'_>, &'static str> {
+        if self.imported_ai.is_some() || self.imported_transfer.is_some() {
+            if self.connection.is_none()
+                || !self.command.is_empty()
+                || self.working_directory.is_some()
+                || self.script.is_some()
+                || self.snippet.is_some()
+                || self.remote.is_some()
+                || self.agent.is_some()
+                || self.virtual_terminal.is_some()
+                || self.sudo != SudoMode::Disabled
+                || !self.webhook_targets.is_empty()
+            {
+                return Err(
+                    "An imported action draft requires saved SSH targets and no executable action",
+                );
+            }
+            return match (&self.imported_ai, &self.imported_transfer) {
+                (Some(draft), None) => Ok(ActionSource::ImportedAi(draft)),
+                (None, Some(draft)) => Ok(ActionSource::ImportedTransfer(draft)),
+                _ => Err("Choose one action for the SSH job"),
+            };
+        }
         match (
             self.command.as_str(),
             self.script.as_ref(),
@@ -467,6 +662,8 @@ enum ActionSource<'a> {
     Snippet(&'a SnippetLink),
     Remote(&'a RemoteAction),
     Agent(&'a agent::Action),
+    ImportedAi(&'a ImportedAiAction),
+    ImportedTransfer(&'a imported_transfer::Draft),
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -547,13 +744,36 @@ pub enum Message {
     New,
     Select(JobId),
     Edit(Field, String),
+    AdoptImportedArchive,
+    AdoptImportedTransfer(imported_transfer::Mode),
+    ConfigureImportedRsync {
+        directory: bool,
+    },
+    ConfigureImportedExistingRsync,
+    ConfigureImportedExistingRsyncFile,
+    ConfigureImportedMixedRsync,
+    ConfigureImportedPasswordlessRsync {
+        directory: bool,
+        existing: bool,
+    },
+    ConfigureImportedPasswordlessMixedRsync,
     BrowseDirectory(DirectoryField),
     DirectoryBrowser(DirectoryMessage),
+    Ownership(ownership::Message),
     EditCommand(text_editor::Action),
+    EditAgentGoal(text_editor::Action),
     EditScriptArguments(text_editor::Action),
     EditArchiveSources(text_editor::Action),
     EditArchiveExcludes(text_editor::Action),
     EditSyncExcludes(text_editor::Action),
+    EditRsyncSources(text_editor::Action),
+    RsyncDestination(u64, String),
+    RsyncExisting(bool),
+    RsyncMixed(bool),
+    RsyncIncludeSourceName(bool),
+    RsyncMirror(bool),
+    RsyncPasswordless(bool),
+    RsyncStanding(bool),
     SyncStanding(bool),
     SyncReplaceChanged(bool),
     ReviewSync,
@@ -564,7 +784,7 @@ pub enum Message {
     DiscardPrivileged,
     DiscardSync,
     ReviewRsyncProgram,
-    RsyncProgramReviewed(String, Result<rsync::Approval, String>),
+    RsyncProgramReviewed(String, Result<Box<rsync::Reviewed>, String>),
     ApproveRsyncProgram,
     DiscardRsyncProgram,
     AgentProfile(agent::ProfileChoice),
@@ -581,6 +801,15 @@ pub enum Message {
         String,
         crate::workspace::terminal_agent::knowledge_review::Message,
     ),
+    ProposalWeb(String, crate::workspace::terminal_ai::web::Message),
+    RequireFreshWeb(String, bool),
+    EditUnattendedWebTopic(String, String),
+    EditUnattendedWebFollowups(String, bool),
+    EditUnattendedWebEnvironment(String, bool),
+    EditUnattendedWebRounds(String, bool),
+    EditUnattendedWebRoundPages(String, bool),
+    ReviewUnattendedWeb(String, String),
+    RemoveUnattendedWeb(String),
     ReviewSwarmComparison(String),
     ApproveSwarmComparison(String),
     CancelSwarmComparison(String),
@@ -610,6 +839,7 @@ pub enum Message {
     RecursiveDelete(bool),
     PrivilegedCopyTree(bool),
     VirtualTerminal(bool),
+    JournalDetail(JournalDetail),
     AutomationJournal(automation_journal::Event),
     EstimateAutomationJournal,
     AutomationEstimateReady(u64, AutomationEstimate),
@@ -639,6 +869,10 @@ pub enum Message {
     Dismiss,
     SelectRecord(RunId),
     MarkRecord(RunId, bool),
+    SelectRunDetail(RunId, text_editor::Action),
+    OpenRunDetailMenu(RunId, iced::Point),
+    DismissRunDetailMenu(RunId),
+    CopyRunDetail(RunId),
     OpenSessionJournals(RunId),
     OpenSessionJournal(RunId, String),
     OpenRecording(RunId),
@@ -714,6 +948,7 @@ pub(crate) struct MenuStatus<'a> {
 struct PendingRecord {
     record: RunRecord,
     detail: Option<String>,
+    output: Option<CapturedOutput>,
     recording: Option<JournalRecording>,
     session_journals: Vec<String>,
     swarm_report: Option<Box<SwarmReport>>,
@@ -724,6 +959,7 @@ struct FinishedRun {
     completion: Completion,
     swarm_chat: Option<ActiveSwarmChat>,
     session_journals: Vec<String>,
+    existing_rsync: bool,
 }
 
 enum Confirmation {
@@ -742,13 +978,17 @@ pub struct SchedulerWindow {
     zone: TimeZone,
     execution_allowed: bool,
     recording_allowed: bool,
+    journal_output_allowed: bool,
     swarm_chats_allowed: bool,
     recording_directory: PathBuf,
     snippet_path: PathBuf,
     sync_store: sync::Store,
     sync_epoch: Option<[u8; 16]>,
     sync_cascades: BTreeMap<RunId, (sync::CascadeReview, Vec<Blocker>)>,
+    agent_cascade_root_blockers: BTreeMap<RunId, Vec<Blocker>>,
     proposal_store: agent::proposal::Store,
+    rsync_runs: rsync_authority::Runs,
+    rsync_standing: rsync::standing::Store,
     snippet_choices: Vec<SnippetChoice>,
     connection_choices: Vec<ConnectionChoice>,
     connection_group_choices: Vec<String>,
@@ -782,6 +1022,7 @@ pub(crate) struct SchedulerView {
     baseline: Option<(kortty_jobs::JobDefinition, SshCommand)>,
     dirty: bool,
     selected_run: Option<RunId>,
+    run_detail: Option<run_detail::Editor>,
     journal_details: Option<(RunId, PathBuf, JournalDetails)>,
     marked_records: BTreeSet<RunId>,
     journal_search: journal_search::Search,
@@ -791,6 +1032,7 @@ pub(crate) struct SchedulerView {
     confirm: Option<Confirmation>,
     diagram: DiagramView,
     directory_browser: Option<DirectoryBrowser>,
+    ownership_review: Option<ownership::Review>,
     sync_review: sync::DraftReview,
     privileged_review: privileged::DraftReview,
     rsync_review: rsync::Editor,
@@ -819,18 +1061,51 @@ pub(crate) enum JournalDetails {
 }
 
 impl SchedulerView {
+    pub(crate) fn automation_summary_profile(
+        &self,
+    ) -> Option<&crate::session_journal::summary_queue::ProfileChoice> {
+        self.draft.automation_journal.summary_profile()
+    }
+
+    pub(crate) fn unresolved_automation_summary_profile(&self) -> bool {
+        self.draft.automation_journal.unresolved_summary_profile()
+    }
+
+    pub(crate) fn automation_summary_job(&self) -> Option<&JobId> {
+        self.draft.id.as_ref()
+    }
+
     pub(crate) fn selected_journal_run(&self) -> Option<RunId> {
         self.selected_run.filter(|_| self.page == Page::Journal)
     }
 
+    pub(crate) fn dismiss_run_detail_menu(&mut self, run: RunId) {
+        if let Some(editor) = self.run_detail.as_mut().filter(|editor| editor.run == run) {
+            editor.menu = None;
+        }
+    }
+
     pub(crate) fn show_journal_details(
         &mut self,
+        runtime: &SchedulerWindow,
         run: RunId,
         root: PathBuf,
         details: JournalDetails,
     ) {
         if self.selected_journal_run() == Some(run) {
             self.journal_details = Some((run, root, details));
+            runtime.sync_run_detail(self);
+        }
+    }
+
+    pub(crate) fn retain_run_detail_journal_root(&mut self, root: Option<&Path>) {
+        if self
+            .journal_details
+            .as_ref()
+            .is_some_and(|(_, directory, _)| Some(directory.as_path()) != root)
+        {
+            self.journal_details = None;
+            self.run_detail = None;
         }
     }
 
@@ -844,6 +1119,7 @@ impl SchedulerView {
 
     fn load_draft(&mut self, job: Option<&kortty_jobs::Job<SshCommand>>) {
         self.directory_browser = None;
+        self.ownership_review = None;
         self.sync_review = sync::DraftReview::default();
         self.privileged_review = privileged::DraftReview::default();
         self.rsync_review = rsync::Editor::default();
@@ -886,10 +1162,14 @@ impl SchedulerView {
             .finish(ticket, estimate);
     }
 
+    pub(crate) fn clear_automation_estimate(&mut self) {
+        self.draft.automation_journal.estimate.clear();
+    }
+
     pub(crate) fn set_automation_journal_allowed(&mut self, allowed: bool) {
         self.automation_journal_denied = !allowed;
         if !allowed {
-            self.draft.automation_journal.estimate.clear();
+            self.clear_automation_estimate();
         }
     }
 
@@ -936,6 +1216,7 @@ impl SchedulerView {
 
     pub(crate) fn request_close(&mut self) -> bool {
         self.directory_browser = None;
+        self.ownership_review = None;
         self.journal_retention_java.close();
         self.sync_review = sync::DraftReview::default();
         self.privileged_review = privileged::DraftReview::default();
@@ -1018,9 +1299,7 @@ impl SchedulerWindow {
             .restore_with_actions::<SshCommand>()
             .map_err(|error| error.to_string())?;
         for job in scheduler.graph().jobs() {
-            job.action()
-                .clone()
-                .validated()
+            SshCommand::validate_definition(job)
                 .map_err(|error| format!("Job {} has invalid settings ({error})", job.id()))?;
         }
         let (zone, status) = match TimeZone::try_system() {
@@ -1046,13 +1325,17 @@ impl SchedulerWindow {
             zone,
             execution_allowed: false,
             recording_allowed: false,
+            journal_output_allowed: false,
             swarm_chats_allowed: false,
             recording_directory,
             snippet_path: path.with_file_name(snippets::FILE_NAME),
             sync_store: sync::Store::new(profile),
             sync_epoch,
             sync_cascades: BTreeMap::new(),
+            agent_cascade_root_blockers: BTreeMap::new(),
             proposal_store: agent::proposal::Store::new(profile),
+            rsync_runs: rsync_authority::Runs::default(),
+            rsync_standing: rsync::standing::Store::new(profile.to_owned()),
             snippet_choices: Vec::new(),
             connection_choices: vec![ConnectionChoice::Manual],
             connection_group_choices: Vec::new(),
@@ -1133,6 +1416,7 @@ impl SchedulerWindow {
         }
         if view.graph_revision != self.graph_revision {
             view.graph_revision = self.graph_revision;
+            view.ownership_review = None;
             let stale_proposal = view
                 .agent_review
                 .as_ref()
@@ -1157,6 +1441,32 @@ impl SchedulerWindow {
         }
         if view.diagram_revision != self.diagram_revision {
             self.refresh_diagram(view);
+        }
+        self.sync_run_detail(view);
+    }
+
+    fn sync_run_detail(&self, view: &mut SchedulerView) {
+        let editor = view.selected_journal_run().and_then(|run| {
+            let record = self.store.journal_record(run)?;
+            let linked = view
+                .journal_details
+                .as_ref()
+                .filter(|(id, _, _)| *id == run)
+                .map(|(_, root, details)| (root.as_path(), details));
+            let sources = run_detail::Sources::for_run(self, record, linked)?;
+            Some((run, sources))
+        });
+        match editor {
+            Some((run, sources))
+                if !view
+                    .run_detail
+                    .as_ref()
+                    .is_some_and(|editor| editor.matches(run, &sources)) =>
+            {
+                view.run_detail = Some(run_detail::Editor::new(run, sources));
+            }
+            None => view.run_detail = None,
+            _ => {}
         }
     }
 
@@ -1278,9 +1588,10 @@ impl SchedulerWindow {
         self.webhook_choices = choices;
     }
 
-    pub(crate) fn set_agent_profiles(&mut self, config: Option<&Configuration>) {
-        self.agent_profiles =
-            config.map_or_else(agent::ProfileChoices::default, agent::ProfileChoices::new);
+    pub(crate) fn set_agent_profiles(&mut self, config: Option<&Configuration>, allow_cli: bool) {
+        self.agent_profiles = config.map_or_else(agent::ProfileChoices::default, |config| {
+            agent::ProfileChoices::new(config, allow_cli)
+        });
     }
 
     /// Applies the host application's execution policy and cancels work on revocation.
@@ -1296,6 +1607,15 @@ impl SchedulerWindow {
 
     pub fn set_recording_allowed(&mut self, allowed: bool) {
         self.recording_allowed = allowed;
+    }
+
+    pub(crate) fn set_journal_output_allowed(&mut self, allowed: bool) {
+        self.journal_output_allowed = allowed;
+        if !allowed {
+            for pending in &mut self.pending_records {
+                pending.output = None;
+            }
+        }
     }
 
     pub(crate) fn set_swarm_chats_allowed(&mut self, allowed: bool) {
@@ -1452,6 +1772,10 @@ impl SchedulerWindow {
         })
     }
 
+    pub(crate) fn cancel_firing_web_run(&self, id: RunId) {
+        let _ = self.scheduler.cancel(id);
+    }
+
     pub(crate) fn requires_awake(&self) -> bool {
         self.has_active_runs()
             || (self.execution_allowed
@@ -1483,6 +1807,7 @@ impl SchedulerWindow {
 
     fn cancel_runs(&mut self) {
         self.sync_cascades.clear();
+        self.agent_cascade_root_blockers.clear();
         for &id in self.active.keys() {
             let _ = self.scheduler.cancel(id);
         }
@@ -1513,6 +1838,7 @@ impl SchedulerWindow {
                 self.scheduler.tick(now).map_err(|error| error.to_string())
             }
             Message::Finished(completion) => {
+                let existing_rsync = self.rsync_runs.finish(completion.id);
                 match self
                     .scheduler
                     .complete(completion.id, completion.outcome, now)
@@ -1529,6 +1855,7 @@ impl SchedulerWindow {
                                 completion,
                                 swarm_chat,
                                 session_journals,
+                                existing_rsync,
                             }),
                             now,
                         );
@@ -1547,7 +1874,7 @@ impl SchedulerWindow {
         }
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn initialize_schedules_at(
         &mut self,
         zone: TimeZone,
@@ -1588,6 +1915,38 @@ impl SchedulerWindow {
         };
         self.sync_view(view);
         requests
+    }
+
+    pub(crate) fn confirmed_job_deletion<'a>(&self, view: &'a SchedulerView) -> Option<&'a JobId> {
+        let Some(Confirmation::Delete(job, _)) = &view.confirm else {
+            return None;
+        };
+        (view.graph_revision == self.graph_revision && self.can_edit() && self.draft_matches(view))
+            .then_some(job)
+    }
+
+    pub(crate) fn selected_run_detail_text(
+        &self,
+        view: &SchedulerView,
+        run: RunId,
+        session_journal_root: Option<&Path>,
+    ) -> Option<String> {
+        if self.draining
+            || view.confirm.is_some()
+            || view.hosted_close.is_some()
+            || view.selected_journal_run() != Some(run)
+            || !view.journal_record_visible(self, run)
+        {
+            return None;
+        }
+        let record = self.store.journal_record(run)?;
+        let linked =
+            session_journal_root.and_then(|root| Some((root, view.journal_details(run, root)?)));
+        let sources = run_detail::Sources::for_run(self, record, linked)?;
+        view.run_detail
+            .as_ref()
+            .filter(|editor| editor.matches(run, &sources))?
+            .selection()
     }
 
     fn apply_view(&mut self, view: &mut SchedulerView, message: Message, now: SystemTime) {
@@ -1640,9 +1999,105 @@ impl SchedulerWindow {
                 view.draft.set(field, value);
                 view.dirty = true;
             }
+            Message::AdoptImportedArchive
+                if self.can_edit()
+                    && view.page == Page::Action
+                    && view.draft.has_imported_archive() =>
+            {
+                let result = self.current_connection_store().and_then(|store| {
+                    let trust = crate::ssh_connection::trust_store()
+                        .map_err(|_| "Could not access the SSH host-key trust store.")?;
+                    let policy = crate::clipboard_policy::ClipboardPolicy::load();
+                    view.draft
+                        .adopt_imported_archive(&store, &trust, &policy, &self.archive_passwords)
+                        .map_err(str::to_owned)
+                });
+                match result {
+                    Ok(()) => {
+                        view.dirty = true;
+                        let status = if view.draft.sudo != SudoMode::Disabled {
+                            "Review and approve the exact privileged archive before saving."
+                        } else {
+                            "Review the native archive settings and save the job."
+                        };
+                        view.status = Some(status.into());
+                    }
+                    Err(error) => view.status = Some(error),
+                }
+            }
+            Message::AdoptImportedTransfer(mode)
+                if self.can_edit() && view.page == Page::Action =>
+            {
+                match self.require_current_draft_groups(view).and_then(|()| {
+                    view.draft
+                        .adopt_imported_transfer(mode)
+                        .map_err(str::to_owned)
+                }) {
+                    Ok(()) => {
+                        view.dirty = true;
+                        view.status =
+                            Some("Review the native transfer settings and save the job.".into());
+                    }
+                    Err(error) => view.status = Some(error),
+                }
+            }
+            Message::ConfigureImportedRsync { .. }
+            | Message::ConfigureImportedExistingRsync
+            | Message::ConfigureImportedExistingRsyncFile
+            | Message::ConfigureImportedMixedRsync
+            | Message::ConfigureImportedPasswordlessRsync { .. }
+            | Message::ConfigureImportedPasswordlessMixedRsync
+                if self.can_edit() && view.page == Page::Action =>
+            {
+                let existing = matches!(
+                    message,
+                    Message::ConfigureImportedExistingRsync
+                        | Message::ConfigureImportedExistingRsyncFile
+                        | Message::ConfigureImportedPasswordlessRsync { existing: true, .. }
+                );
+                let mixed = matches!(
+                    message,
+                    Message::ConfigureImportedMixedRsync
+                        | Message::ConfigureImportedPasswordlessMixedRsync
+                );
+                let directory = matches!(
+                    message,
+                    Message::ConfigureImportedExistingRsync
+                        | Message::ConfigureImportedRsync { directory: true }
+                        | Message::ConfigureImportedPasswordlessRsync {
+                            directory: true,
+                            ..
+                        }
+                );
+                let elevation = if matches!(
+                    message,
+                    Message::ConfigureImportedPasswordlessRsync { .. }
+                        | Message::ConfigureImportedPasswordlessMixedRsync
+                ) {
+                    rsync::Elevation::Passwordless
+                } else {
+                    rsync::Elevation::Ordinary
+                };
+                match self.require_current_draft_groups(view).and_then(|()| {
+                    view.draft
+                        .configure_imported_rsync(directory, existing, mixed, elevation)
+                        .map_err(str::to_owned)
+                }) {
+                    Ok(()) => {
+                        view.dirty = true;
+                        view.status = Some(
+                            "Choose the executable and paths, then review the rsync routes.".into(),
+                        );
+                    }
+                    Err(error) => view.status = Some(error),
+                }
+            }
             Message::EditCommand(action) => {
                 view.dirty |= action.is_edit();
                 view.draft.edit_command(action);
+            }
+            Message::EditAgentGoal(action) => {
+                view.dirty |= view.draft.edit_agent_goal(action);
             }
             Message::EditScriptArguments(action) => {
                 view.dirty |= action.is_edit();
@@ -1659,6 +2114,46 @@ impl SchedulerWindow {
             Message::EditSyncExcludes(action) => {
                 view.dirty |= action.is_edit();
                 view.draft.edit_sync_excludes(action);
+            }
+            Message::EditRsyncSources(action) => {
+                view.dirty |= view.draft.edit_rsync_sources(action);
+            }
+            Message::RsyncDestination(profile, destination) => {
+                view.dirty |= view.draft.set_rsync_destination(profile, destination);
+            }
+            Message::RsyncExisting(enabled) => {
+                view.dirty |= view.draft.choose_existing_rsync_destination(enabled);
+            }
+            Message::RsyncMixed(enabled) => {
+                view.dirty |= view.draft.change_rsync_mixed(enabled);
+            }
+            Message::RsyncIncludeSourceName(include_source_name) => {
+                view.dirty |= view.draft.change_rsync_existing(|settings| {
+                    settings.map(|settings| rsync::ExistingDestination {
+                        include_source_name,
+                        ..settings
+                    })
+                });
+            }
+            Message::RsyncMirror(delete) => {
+                view.dirty |= view.draft.change_rsync_existing(|settings| {
+                    settings.map(|settings| rsync::ExistingDestination { delete, ..settings })
+                });
+            }
+            Message::RsyncPasswordless(enabled) if self.can_edit() && view.page == Page::Action => {
+                match view.draft.set_rsync_elevation(enabled) {
+                    Ok(true) => {
+                        view.rsync_review = rsync::Editor::default();
+                        view.dirty = true;
+                    }
+                    Ok(false) => {}
+                    Err(error) => view.status = Some(error.into()),
+                }
+            }
+            Message::RsyncStanding(enabled) => {
+                view.draft.set_rsync_standing(enabled);
+                view.rsync_review = rsync::Editor::default();
+                view.dirty = true;
             }
             Message::SyncStanding(enabled) => {
                 view.draft.set_sync_standing(enabled);
@@ -1692,25 +2187,16 @@ impl SchedulerWindow {
                 view.status = None;
             }
             Message::RsyncProgramReviewed(ticket, result) => {
-                if let Some(status) = view.rsync_review.complete(&ticket, result) {
+                if let Some(status) = view
+                    .rsync_review
+                    .complete(&ticket, result.map(|value| *value))
+                {
                     view.status = Some(status);
                 }
             }
             Message::ApproveRsyncProgram => {
-                if let Err(error) = self.require_current_draft_groups(view) {
-                    view.rsync_review = rsync::Editor::default();
+                if let Err(error) = self.approve_rsync(view) {
                     view.status = Some(error);
-                    return;
-                }
-                if let Some(approval) = view.rsync_review.take() {
-                    if view.draft.approve_rsync(approval) {
-                        view.dirty = true;
-                        view.status = Some("Rsync executable and route approved. Save the job to keep the approval.".into());
-                    } else {
-                        view.status = Some(
-                            "The rsync executable or saved route changed. Review again.".into(),
-                        );
-                    }
                 }
             }
             Message::DiscardRsyncProgram => {
@@ -1721,9 +2207,49 @@ impl SchedulerWindow {
                 view.draft.select_agent_profile(profile.id);
                 view.dirty = true;
             }
-            Message::AgentProbe(probe) => {
+            Message::AgentProbe(probe) if view.draft.can_edit_agent_workflow() => {
                 view.draft.agent_probe = probe;
                 view.dirty = true;
+            }
+            Message::RequireFreshWeb(ticket, enabled) => {
+                if let Err(error) = self.set_fresh_web_requirement(view, &ticket, enabled) {
+                    view.status = Some(error);
+                }
+            }
+            Message::EditUnattendedWebTopic(ticket, topic) => {
+                if let Err(error) = self.edit_unattended_web_topic(view, &ticket, topic) {
+                    view.status = Some(error);
+                }
+            }
+            Message::EditUnattendedWebFollowups(ticket, enabled) => {
+                if let Err(error) = self.edit_unattended_web_followups(view, &ticket, enabled) {
+                    view.status = Some(error);
+                }
+            }
+            Message::EditUnattendedWebEnvironment(ticket, enabled) => {
+                if let Err(error) = self.edit_unattended_web_environment(view, &ticket, enabled) {
+                    view.status = Some(error);
+                }
+            }
+            Message::EditUnattendedWebRounds(ticket, enabled) => {
+                if let Err(error) = self.edit_unattended_web_rounds(view, &ticket, enabled) {
+                    view.status = Some(error);
+                }
+            }
+            Message::EditUnattendedWebRoundPages(ticket, enabled) => {
+                if let Err(error) = self.edit_unattended_web_round_pages(view, &ticket, enabled) {
+                    view.status = Some(error);
+                }
+            }
+            Message::ReviewUnattendedWeb(ticket, topic) => {
+                if let Err(error) = self.review_unattended_web(view, &ticket, &topic) {
+                    view.status = Some(error);
+                }
+            }
+            Message::RemoveUnattendedWeb(ticket) => {
+                if let Err(error) = self.remove_unattended_web(view, &ticket) {
+                    view.status = Some(error);
+                }
             }
             Message::AgentProposed(ticket, result) => {
                 if let Err(error) = self.finish_agent_proposal(view, &ticket, result) {
@@ -1755,20 +2281,25 @@ impl SchedulerWindow {
                     .iter()
                     .any(|entry| entry.id == choice.id)
                 {
-                    view.draft.archive_password = Some(choice.id);
-                    view.dirty = true;
+                    view.dirty |= view.draft.select_archive_password(choice.id);
                 }
             }
             Message::OpenCredentialVault => {}
-            Message::Sudo(mode) => {
+            Message::Sudo(mode) if !view.draft.has_imported_archive() => {
                 view.draft.select_sudo(mode);
                 view.dirty = true;
             }
             Message::CommandSource(source) => {
                 view.draft.select_source(source);
+                if view.baseline.is_none() && source.is_agent() {
+                    view.draft
+                        .suggest_agent_profile(self.agent_profiles.default.as_ref());
+                }
                 view.dirty = true;
             }
-            Message::ConnectionSelected(connection) if !view.draft.has_connection_groups() => {
+            Message::ConnectionSelected(connection)
+                if !view.draft.has_connection_groups() && !view.draft.has_imported_archive() =>
+            {
                 view.draft.select_connection(connection);
                 view.dirty = true;
             }
@@ -1789,7 +2320,7 @@ impl SchedulerWindow {
             Message::ConnectionRemoved(id) => {
                 view.dirty |= view.draft.remove_connection(id);
             }
-            Message::ConnectionGroupAdded(group) => {
+            Message::ConnectionGroupAdded(group) if !view.draft.has_unresolved_imported_ai() => {
                 self.change_connection_groups(view, |draft, store| {
                     group_change(draft.add_connection_group(group, store))
                 });
@@ -1812,7 +2343,7 @@ impl SchedulerWindow {
                 view.draft.snippet_id = Some(choice.id);
                 view.dirty = true;
             }
-            Message::Enabled(enabled) => {
+            Message::Enabled(enabled) if !enabled || !view.draft.requires_import_review() => {
                 view.draft.enabled = enabled;
                 view.dirty = true;
             }
@@ -1832,6 +2363,14 @@ impl SchedulerWindow {
                 view.draft.virtual_terminal.enabled = enabled;
                 view.dirty = true;
             }
+            Message::JournalDetail(detail)
+                if !view.automation_journal_denied
+                    && self.journal_output_allowed
+                    && view.draft.supports_journal_output() =>
+            {
+                view.draft.journal_detail = detail;
+                view.dirty = true;
+            }
             Message::AutomationJournal(event) => {
                 if view.automation_journal_denied {
                     return;
@@ -1843,7 +2382,7 @@ impl SchedulerWindow {
                 view.draft.desktop_notices = settings;
                 view.dirty = true;
             }
-            Message::AddWebhook(choice) => {
+            Message::AddWebhook(choice) if !view.draft.has_unresolved_imported_ai() => {
                 let targets = &mut view.draft.webhook_targets;
                 if targets.len() < webhooks::MAX_TARGETS
                     && self
@@ -1960,6 +2499,19 @@ impl SchedulerWindow {
                 view.selected_run = Some(id);
                 view.marked_records.clear();
             }
+            Message::SelectRunDetail(run, action)
+                if !action.is_edit() && view.confirm.is_none() =>
+            {
+                if let Some(editor) = view.run_detail.as_mut().filter(|editor| editor.run == run) {
+                    editor.content.perform(action);
+                }
+            }
+            Message::OpenRunDetailMenu(run, point) if view.confirm.is_none() => {
+                if let Some(editor) = view.run_detail.as_mut().filter(|editor| editor.run == run) {
+                    editor.menu = Some(point);
+                }
+            }
+            Message::DismissRunDetailMenu(run) => view.dismiss_run_detail_menu(run),
             Message::DeleteRecord if view.page == Page::Journal && self.can_edit() => {
                 let ids: Vec<_> = view.marked_records.iter().copied().collect();
                 if view.journal_deletion_matches(self, &ids) {
@@ -2005,6 +2557,9 @@ impl SchedulerWindow {
         let Some(id) = view.draft.id.clone() else {
             return Ok(RunBatch::default());
         };
+        if let Some(job) = self.scheduler.graph().job(&id) {
+            job.action().require_executable()?;
+        }
         if self.scheduler.graph().job(&id).is_some_and(|job| {
             matches!(&job.action().remote, Some(RemoteAction::Sync(copy)) if copy.standing.is_some())
         }) {
@@ -2025,7 +2580,7 @@ impl SchedulerWindow {
             }
         }
         if blockers.is_empty() {
-            self.start(&id, cascade, now)
+            self.start(&id, cascade, &blockers, now)
         } else {
             view.confirm = Some(Confirmation::Run(id, cascade, blockers));
             Ok(RunBatch::default())
@@ -2072,18 +2627,59 @@ impl SchedulerWindow {
             .is_ok_and(|blockers| blockers.iter().all(|blocker| accepted.contains(blocker)))
     }
 
+    pub(crate) fn agent_predecessors_current(
+        &self,
+        request: &RunRequest<SshCommand>,
+        now: SystemTime,
+    ) -> bool {
+        match request.trigger {
+            RunTrigger::Manual => true,
+            RunTrigger::Scheduled | RunTrigger::Dependency => self
+                .scheduler
+                .active_predecessor_blockers(request, now)
+                .is_some_and(|blockers| blockers.is_empty()),
+            RunTrigger::Cascade => {
+                let Some(origin) = self.scheduler.active_cascade_origin(request) else {
+                    return false;
+                };
+                if origin.is_root {
+                    self.agent_cascade_root_blockers
+                        .get(&origin.root_run)
+                        .is_some_and(|accepted| {
+                            self.cascade_root_conditions_match(&request.job, accepted, now)
+                        })
+                } else {
+                    self.scheduler
+                        .active_cascade_blockers(request, now)
+                        .is_some_and(|blockers| blockers.is_empty())
+                }
+            }
+        }
+    }
+
     fn start(
         &mut self,
         id: &JobId,
         cascade: bool,
+        accepted_blockers: &[Blocker],
         now: SystemTime,
     ) -> Result<RunBatch<SshCommand>, String> {
+        let job = self.scheduler.graph().job(id);
+        if let Some(job) = job {
+            job.action().require_executable()?;
+        }
+        let track_cascade = cascade && job.is_some_and(|job| job.action().agent.is_some());
         let result = if cascade {
             self.scheduler.start_cascade(id, now)
         } else {
             self.scheduler.start_manual(id, now)
         };
-        result.map_err(|error| error.to_string())
+        let batch = result.map_err(|error| error.to_string())?;
+        if track_cascade && let Some(request) = batch.started.first() {
+            self.agent_cascade_root_blockers
+                .insert(request.id, accepted_blockers.to_vec());
+        }
+        Ok(batch)
     }
 
     fn confirm(
@@ -2112,7 +2708,7 @@ impl SchedulerWindow {
                         Some("The cascade changed. Review it again before starting.".into());
                     return Ok(RunBatch::default());
                 }
-                let batch = self.start(root, true, now)?;
+                let batch = self.start(root, true, &current_blockers, now)?;
                 if let Some(request) = batch.started.first() {
                     self.sync_cascades
                         .insert(request.id, (reviewed, current_blockers));
@@ -2128,7 +2724,7 @@ impl SchedulerWindow {
                     view.confirm = Some(Confirmation::Run(id, cascade, current));
                     return Ok(RunBatch::default());
                 }
-                return self.start(&id, cascade, now);
+                return self.start(&id, cascade, &current, now);
             }
             Some(Confirmation::Delete(id, _)) if self.can_edit() && self.draft_matches(view) => {
                 self.delete(view, &id, now)?;
@@ -2145,6 +2741,7 @@ impl SchedulerWindow {
                     .map_err(|error| error.to_string())?;
                 next.set_chain_enabled(&id, enabled, now)
                     .map_err(|error| error.to_string())?;
+                Self::require_resolved_enabled_jobs(next.graph())?;
                 self.store
                     .commit(next.graph(), &[])
                     .map_err(|error| error.to_string())?;
@@ -2216,6 +2813,38 @@ impl SchedulerWindow {
         view.confirm = Some(Confirmation::Delete(id, dependents));
     }
 
+    fn approve_rsync(&self, view: &mut SchedulerView) -> Result<(), String> {
+        let Some((approval, intent)) = view.rsync_review.take() else {
+            return Ok(());
+        };
+        self.require_current_draft_groups(view)?;
+        if !self.draft_matches(view)
+            || view.draft.rsync_standing_intent()? != intent
+            || intent
+                .as_ref()
+                .is_some_and(|intent| self.zone.iana_name() != Some(intent.zone.as_str()))
+            || !view.draft.approve_rsync(approval)
+        {
+            return Err(
+                "The rsync settings or saved routes changed. Review the transfer again.".into(),
+            );
+        }
+        let status = if intent.is_some() {
+            let id = view.draft.id.clone().map_or_else(new_id, Ok)?;
+            let job = self.build_current_draft(view, id.clone())?;
+            let grant = rsync::standing::Grant::new(&job, &self.zone, SystemTime::now())
+                .map_err(|error| error.to_string())?;
+            view.draft.set_rsync_standing_id(grant.approval.clone());
+            view.rsync_review.grant = Some((id, grant));
+            "Recurring rsync approved. Save the job to keep the approval."
+        } else {
+            "Rsync executable and routes approved. Save the job to keep the approval."
+        };
+        view.dirty = true;
+        view.status = Some(status.into());
+        Ok(())
+    }
+
     fn save(&mut self, view: &mut SchedulerView, now: SystemTime) -> Result<String, String> {
         if !self.draft_matches(view) {
             return Err("This job changed in another view. Select it again before saving.".into());
@@ -2227,6 +2856,7 @@ impl SchedulerWindow {
             .or_else(|| view.sync_review.approved_job())
             .or_else(|| view.privileged_review.approved_job())
             .or_else(|| view.agent_approval.as_ref().map(|approval| &approval.id))
+            .or_else(|| view.rsync_review.grant.as_ref().map(|(id, _)| id))
         {
             Some(id) => id.clone(),
             None => new_id()?,
@@ -2235,6 +2865,30 @@ impl SchedulerWindow {
         let (replacement, sync_receipt) = self.sync_save(view, replacement)?;
         let (replacement, privileged_receipt) = self.save_privileged(view, replacement)?;
         let replacement = self.agent_save(view, replacement)?;
+        let mut standing = None;
+        if let Some(config) = replacement
+            .action()
+            .remote
+            .as_ref()
+            .and_then(RemoteAction::rsync_transfer)
+            .and_then(|(transfer, _)| transfer.standing.as_ref())
+        {
+            if let Some((approved_job, grant)) = &view.rsync_review.grant {
+                if *approved_job != id
+                    || config.approval.as_deref() != Some(&grant.approval)
+                    || !grant.matches(&replacement, &self.zone, now)
+                {
+                    return Err(
+                        "The recurring rsync settings changed. Review the transfer again.".into(),
+                    );
+                }
+                standing = Some(grant.clone());
+            } else if replacement.enabled() {
+                self.rsync_standing
+                    .saved(&replacement, &self.zone, now)
+                    .map_err(|error| error.to_string())?;
+            }
+        }
         let mut jobs = self
             .scheduler
             .graph()
@@ -2252,7 +2906,28 @@ impl SchedulerWindow {
             jobs.push(replacement);
         }
         let graph = JobGraph::new(jobs).map_err(|error| error.to_string())?;
-        if let Some(approval) =
+        if let Some(grant) = standing {
+            if self.scheduler.is_running(&id) {
+                return Err(
+                    "Wait for the active rsync firing to finish before replacing its approval."
+                        .into(),
+                );
+            }
+            let approval = grant.approval.clone();
+            let prior = self
+                .rsync_standing
+                .swap(&id, grant, |id| self.scheduler.graph().job(id).is_some())
+                .map_err(|error| error.to_string())?;
+            if let Err(error) = self.replace_graph(graph, now) {
+                return if self.rsync_standing.restore(&id, &approval, prior).is_ok() {
+                    Err(error)
+                } else {
+                    Err(format!(
+                        "{error}. The previous recurring rsync approval could not be restored."
+                    ))
+                };
+            }
+        } else if let Some(approval) =
             sync_receipt.or_else(|| privileged_receipt.map(sync::SaveApproval::OneUse))
         {
             let rollback = self
@@ -2308,6 +2983,7 @@ impl SchedulerWindow {
         graph: JobGraph<SshCommand>,
         now: SystemTime,
     ) -> Result<(), String> {
+        Self::require_resolved_enabled_jobs(&graph)?;
         let mut next = Scheduler::new(graph);
         next.initialize_schedules(self.zone.clone(), now)
             .map_err(|error| error.to_string())?;
@@ -2317,6 +2993,15 @@ impl SchedulerWindow {
         self.store.apply_history(&mut next);
         self.scheduler = next;
         self.graph_changed();
+        Ok(())
+    }
+
+    fn require_resolved_enabled_jobs(graph: &JobGraph<SshCommand>) -> Result<(), String> {
+        for job in graph.jobs().iter().filter(|job| job.enabled()) {
+            job.action()
+                .require_resolved_action()
+                .map_err(|error| format!("Job {}: {error}", job.id()))?;
+        }
         Ok(())
     }
 
@@ -2347,6 +3032,15 @@ impl SchedulerWindow {
         self.scheduler.graph().job(id).map(kortty_jobs::Job::name)
     }
 
+    pub(crate) fn automation_journal_jobs(&self) -> impl Iterator<Item = (&JobId, &str)> {
+        self.scheduler
+            .graph()
+            .jobs()
+            .iter()
+            .filter(|job| job.action().supports_automation_journal())
+            .map(|job| (job.id(), job.name()))
+    }
+
     fn can_run(&self) -> bool {
         self.execution_allowed && !self.draining && self.pending_records.is_empty()
     }
@@ -2359,7 +3053,7 @@ impl SchedulerWindow {
                 action.probe,
                 agent::Probe::SwarmReadOnly | agent::Probe::SwarmIterative
             )
-            || !matches!(request.trigger, RunTrigger::Manual | RunTrigger::Scheduled)
+            || !action.probe.allows_trigger(request.trigger)
             || approval.profile.id != action.profile
             || !request
                 .action
@@ -2377,6 +3071,8 @@ impl SchedulerWindow {
 
     fn can_request_run(&self, view: &SchedulerView) -> bool {
         self.can_run()
+            && !view.draft.has_imported_archive()
+            && !view.draft.has_imported_transfer()
             && if view.dirty {
                 self.can_edit()
             } else {
@@ -2432,11 +3128,14 @@ impl SchedulerWindow {
         let changed = !batch.finished.is_empty() || !batch.started.is_empty();
         self.sync_cascades
             .retain(|&root, _| self.scheduler.has_cascade(root));
+        self.agent_cascade_root_blockers
+            .retain(|&root, _| self.scheduler.has_cascade(root));
         self.pending_records
             .extend(batch.finished.into_iter().map(|record| {
                 let mut pending = PendingRecord {
                     record,
                     detail: None,
+                    output: None,
                     recording: None,
                     session_journals: Vec::new(),
                     swarm_report: None,
@@ -2446,6 +3145,7 @@ impl SchedulerWindow {
                     completion: mut result,
                     swarm_chat,
                     session_journals,
+                    existing_rsync,
                 }) = completion.take_if(|run| run.completion.id == pending.record.id)
                 {
                     let expected_report = result.swarm_report.is_some()
@@ -2493,7 +3193,26 @@ impl SchedulerWindow {
                     } else if !session_journals.is_empty() {
                         result.append_detail("Could not link the target Session Journals");
                     }
-                    pending.detail = result.detail.as_deref().and_then(safe_detail);
+                    pending.detail = result
+                        .detail
+                        .as_deref()
+                        .and_then(|detail| safe_detail(detail, existing_rsync));
+                    if self.journal_output_allowed
+                        && pending.record.outcome != RunOutcome::Cancelled
+                        && pending.record.blockers.is_empty()
+                        && self
+                            .scheduler
+                            .graph()
+                            .job(&pending.record.job)
+                            .is_some_and(|job| {
+                                let action = job.action();
+                                !action.journal_detail.is_off()
+                                    && action.virtual_terminal.is_none()
+                                    && action.supports_journal_output()
+                            })
+                    {
+                        pending.output = result.output;
+                    }
                     pending.recording = result.recording;
                     pending.swarm_report = report;
                 }
@@ -2529,6 +3248,18 @@ impl SchedulerWindow {
         let has_records = !self.pending_records.is_empty();
         let mut skipped_swarm_chat = false;
         while !self.pending_records.is_empty() {
+            let output: Vec<_> = self
+                .pending_records
+                .iter_mut()
+                .take(MAX_JOURNAL_RECORDS)
+                .filter_map(|item| {
+                    let output = item.output.as_ref()?.current(None).cloned();
+                    if output.is_none() {
+                        item.output = None;
+                    }
+                    Some((item.record.id, output?))
+                })
+                .collect();
             let chunk = self.pending_records.iter().take(MAX_JOURNAL_RECORDS);
             let records: Vec<_> = chunk.clone().map(|item| item.record.clone()).collect();
             let details: Vec<_> = chunk
@@ -2562,6 +3293,7 @@ impl SchedulerWindow {
                 &records,
                 FinishedRunMetadata {
                     details: &details,
+                    output: &output,
                     recordings: &recordings,
                     session_journals: &session_journals,
                     swarm_reports: &swarm_reports,
@@ -2749,6 +3481,7 @@ impl SchedulerWindow {
                     .extend(batch.finished.into_iter().map(|record| PendingRecord {
                         record,
                         detail: None,
+                        output: None,
                         recording: None,
                         session_journals: Vec::new(),
                         swarm_report: None,
@@ -2761,6 +3494,7 @@ impl SchedulerWindow {
     }
 
     fn graph_changed(&mut self) {
+        self.rsync_runs.retain_current(self.scheduler.graph());
         self.graph_revision = self.graph_revision.wrapping_add(1);
         self.diagram_changed();
     }
@@ -2826,7 +3560,12 @@ fn journal_cutoff(now: SystemTime, zone: &TimeZone, days: u16) -> Result<SystemT
     Ok(SystemTime::from(cutoff.timestamp()))
 }
 
-fn safe_detail(detail: &str) -> Option<String> {
+fn safe_detail(detail: &str, existing_rsync: bool) -> Option<String> {
+    let max_bytes = if existing_rsync {
+        kortty_jobs::MAX_JOURNAL_DETAIL_BYTES
+    } else {
+        1024
+    };
     let mut safe = String::new();
     for ch in detail.chars() {
         if ch.is_control()
@@ -2834,7 +3573,7 @@ fn safe_detail(detail: &str) -> Option<String> {
         {
             continue;
         }
-        if safe.len() + ch.len_utf8() > 1024 {
+        if safe.len() + ch.len_utf8() > max_bytes {
             break;
         }
         safe.push(ch);

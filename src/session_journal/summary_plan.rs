@@ -8,14 +8,19 @@ use std::time::Duration;
 use jiff::Timestamp;
 use regex::Regex;
 use rsa::signature::digest::DynDigest;
-use serde::{Serialize, Serializer};
+use serde::{Deserialize, Serialize, Serializer};
 use zeroize::Zeroizing;
+
+use crate::local_ai::Tokenizer;
 
 use super::{CaptureKind, CaptureRecord, Cursor, is_display_character};
 
 pub(super) mod filters;
 mod replay;
+pub(super) mod shell_prompt;
 pub(super) use replay::LongOutput;
+use shell_prompt::AccountEvidence;
+pub(super) use shell_prompt::plausible_account;
 
 const LOOKAHEAD: usize = 3;
 const MAX_SOURCE_LINE_BYTES: usize = 4096;
@@ -28,7 +33,87 @@ const REPLY_CONTEXT: usize = 3;
 const MAX_REPLY_CONTEXT: usize = 6;
 pub(super) const SAMPLE_LINE_BYTES: usize = 384;
 pub(super) const COMMAND_FINISHED: &str = "shell integration: command finished";
-const RUNNING_AFTER: Duration = Duration::from_secs(15 * 60);
+pub(crate) const RUNNING_AFTER: Duration = Duration::from_secs(15 * 60);
+const MAX_PLANNED_BYTES: usize = 24_000;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct EvidenceLimits {
+    pub(crate) max_lines_per_direction: u32,
+    pub(crate) context_tokens: u32,
+}
+
+impl Default for EvidenceLimits {
+    fn default() -> Self {
+        Self {
+            max_lines_per_direction: 100,
+            context_tokens: 130_000,
+        }
+    }
+}
+
+impl EvidenceLimits {
+    pub(crate) fn valid(self) -> bool {
+        self.max_lines_per_direction <= 1_000_000
+            && (1_000..=10_000_000).contains(&self.context_tokens)
+    }
+
+    pub(crate) fn input_token_budget(self) -> u64 {
+        let tokens = u64::from(self.context_tokens);
+        tokens - tokens / 4
+    }
+
+    pub(super) fn lines_allow(self, count: usize) -> bool {
+        self.max_lines_per_direction == 0 || count <= self.max_lines_per_direction as usize
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct PlanningLimits {
+    limits: EvidenceLimits,
+    tokenizer: Tokenizer,
+}
+
+impl PlanningLimits {
+    pub(super) fn new(limits: EvidenceLimits, tokenizer: Tokenizer) -> Self {
+        Self { limits, tokenizer }
+    }
+
+    pub(super) fn accepts(self, cost: EvidenceCost) -> bool {
+        cost.bytes <= MAX_PLANNED_BYTES
+            && cost.tokens <= self.limits.input_token_budget().saturating_sub(256)
+            && self.limits.lines_allow(cost.lines[0])
+            && self.limits.lines_allow(cost.lines[1])
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct EvidenceCost {
+    bytes: usize,
+    tokens: u64,
+    lines: [usize; 2],
+}
+
+impl EvidenceCost {
+    pub(super) fn add(&mut self, line: &Line, planning: PlanningLimits) {
+        let input = line.kind == Kind::Input;
+        self.lines[usize::from(input)] += 1;
+        let text = &line.text;
+        self.bytes += 96 + text.len();
+        self.tokens += 32 + planning.tokenizer.count_text(text);
+    }
+
+    pub(super) fn combined(self, other: Self) -> Self {
+        Self {
+            bytes: self.bytes + other.bytes,
+            tokens: self.tokens + other.tokens,
+            lines: [
+                self.lines[0] + other.lines[0],
+                self.lines[1] + other.lines[1],
+            ],
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +163,12 @@ pub(crate) struct Window {
     pub(super) skipped: bool,
     #[serde(skip)]
     pub(super) long_output: Option<LongOutput>,
+    #[serde(skip)]
+    pub(super) complete_evidence: bool,
+    #[serde(skip)]
+    pub(super) capture_chars: usize,
+    #[serde(skip)]
+    pub(super) account_evidence: AccountEvidence,
 }
 
 fn timestamp<S: Serializer>(value: &Timestamp, serializer: S) -> Result<S::Ok, S::Error> {
@@ -85,27 +176,72 @@ fn timestamp<S: Serializer>(value: &Timestamp, serializer: S) -> Result<S::Ok, S
 }
 
 impl Window {
+    pub(crate) fn is_skipped(&self) -> bool {
+        self.skipped
+    }
+
     pub(crate) fn checkpoint(&self) -> Option<u64> {
         (self.end != End::Running).then_some(self.last)
     }
+
+    pub(super) fn prompt_chars(&self, full_output: bool) -> usize {
+        if full_output && self.long_output.is_some() {
+            self.capture_chars
+        } else {
+            self.evidence
+                .iter()
+                .map(|line| prompt_line_chars(&line.text))
+                .sum()
+        }
+    }
+}
+
+fn prompt_line_chars(text: &str) -> usize {
+    text.encode_utf16().count() + 1
 }
 
 #[derive(Default)]
 struct Evidence {
+    planning: Option<PlanningLimits>,
+    whole: Option<(EvidenceCost, Vec<Line>)>,
     first: Vec<Line>,
     notable: Vec<Line>,
     reply_context: Vec<Line>,
     tail: VecDeque<Line>,
     total: u64,
+    capture_chars: usize,
     clipped: bool,
 }
 
 impl Evidence {
-    fn record(&mut self, mut line: Line) {
+    fn new(planning: Option<PlanningLimits>) -> Self {
+        Self {
+            planning,
+            whole: planning.map(|_| (EvidenceCost::default(), Vec::new())),
+            ..Self::default()
+        }
+    }
+
+    fn record(&mut self, mut line: Line, retains_full_output: bool) {
         self.total = self.total.saturating_add(1);
+        if retains_full_output {
+            self.capture_chars = self
+                .capture_chars
+                .saturating_add(prompt_line_chars(&line.text));
+        }
         self.clipped |= line.text.len() > SAMPLE_LINE_BYTES;
         if line.text.len() > MAX_SOURCE_LINE_BYTES {
             line.text = "(long capture record omitted)".into();
+        }
+        if let Some(planning) = self.planning
+            && let Some((cost, lines)) = &mut self.whole
+        {
+            cost.add(&line, planning);
+            if planning.accepts(*cost) {
+                lines.push(line.clone());
+            } else {
+                self.whole = None;
+            }
         }
         if line.kind == Kind::Input && self.total > 1 {
             for prior in self.tail.iter().rev().take(REPLY_CONTEXT) {
@@ -136,14 +272,31 @@ impl Evidence {
     }
 
     fn snapshot(&self) -> (Vec<Line>, u64) {
-        let by_sequence: BTreeMap<_, _> = self
+        if let Some((_, lines)) = &self.whole {
+            return (lines.clone(), 0);
+        }
+        let lines = self
             .first
             .iter()
             .chain(&self.notable)
             .chain(&self.reply_context)
-            .chain(&self.tail)
-            .map(|line| (line.sequence, line.clone()))
-            .collect();
+            .chain(self.tail.iter().rev());
+        let mut by_sequence = BTreeMap::new();
+        let mut cost = EvidenceCost::default();
+        for line in lines {
+            if by_sequence.contains_key(&line.sequence) {
+                continue;
+            }
+            if let Some(planning) = self.planning {
+                let mut next = cost;
+                next.add(line, planning);
+                if !planning.accepts(next) {
+                    continue;
+                }
+                cost = next;
+            }
+            by_sequence.insert(line.sequence, line.clone());
+        }
         let omitted = self.total.saturating_sub(by_sequence.len() as u64);
         (by_sequence.into_values().collect(), omitted)
     }
@@ -161,10 +314,15 @@ struct Block {
     output_lines: usize,
     failed_start: bool,
     replay: Option<replay::Builder>,
+    account_evidence: AccountEvidence,
 }
 
 impl Block {
-    fn new(record: &Observation, command: Option<String>) -> Self {
+    fn new(
+        record: &Observation,
+        command: Option<String>,
+        planning: Option<PlanningLimits>,
+    ) -> Self {
         Self {
             first: record.sequence,
             last: record.sequence,
@@ -175,7 +333,7 @@ impl Block {
                 text,
                 exit: None,
             }),
-            evidence: Evidence::default(),
+            evidence: Evidence::new(planning),
             idle: true,
             help_heading: false,
             output_lines: 0,
@@ -184,6 +342,7 @@ impl Block {
                 .replay
                 .as_ref()
                 .map(|start| replay::Builder::new(Arc::clone(start))),
+            account_evidence: AccountEvidence::default(),
         }
     }
 
@@ -197,6 +356,9 @@ impl Block {
 
     fn record(&mut self, record: Observation, kind: Kind) {
         self.progress(&record);
+        if let Some((sequence, prompt)) = record.account_prompt() {
+            self.account_evidence.record(sequence, prompt);
+        }
         let idle = match kind {
             Kind::Output => filters::idle(&record.text),
             Kind::Input => record.text.trim().is_empty(),
@@ -211,7 +373,8 @@ impl Block {
                     .as_ref()
                     .is_some_and(|command| filters::failed_start(&command.text, &record.text));
         }
-        self.evidence.record(record.line(kind));
+        self.evidence
+            .record(record.line(kind), self.replay.is_some());
     }
 
     fn window(&self, end: End) -> Window {
@@ -241,6 +404,9 @@ impl Block {
             omitted,
             skipped,
             long_output,
+            complete_evidence: end != End::Running && omitted == 0 && !self.evidence.clipped,
+            capture_chars: self.evidence.capture_chars,
+            account_evidence: self.account_evidence.clone(),
         }
     }
 }
@@ -308,6 +474,17 @@ impl Observation {
         }
     }
 
+    fn account_prompt(&self) -> Option<(u64, &str)> {
+        (matches!(self.kind, ObservationKind::Line(Kind::Output))
+            && !self.redacted
+            && self.text.len() <= SAMPLE_LINE_BYTES)
+            .then_some(self.text.as_str())
+            .filter(|text| {
+                shell_prompt::account(text).is_some() && (!self.partial || filters::idle(text))
+            })
+            .map(|text| (self.sequence, text))
+    }
+
     fn fingerprint(&self, hash: &mut dyn DynDigest) {
         hash.update(&self.sequence.to_le_bytes());
         hash.update(&self.timestamp.as_second().to_le_bytes());
@@ -328,32 +505,44 @@ impl Observation {
 /// Lookahead and the still-running command retain bounded evidence even across long captures.
 pub(crate) struct Planner {
     newest: u64,
+    newest_skipped_sequence: u64,
     incoming: VecDeque<Observation>,
     block: Option<Block>,
     prompt_line: Option<(String, bool)>,
+    account_prompt: Option<(u64, Zeroizing<String>)>,
     prompts: Vec<String>,
     shell_finished: bool,
     sensitive: SensitiveBlocks,
     replay: Option<Arc<replay::Start>>,
+    planning: Option<PlanningLimits>,
 }
 
 impl Planner {
+    #[cfg(test)]
     pub(crate) fn resume(after: u64) -> Self {
+        Self::resume_with_limits(after, None)
+    }
+
+    pub(super) fn resume_with_limits(after: u64, planning: Option<PlanningLimits>) -> Self {
         Self {
             newest: after,
+            newest_skipped_sequence: 0,
             incoming: VecDeque::with_capacity(LOOKAHEAD + 1),
             block: None,
             prompt_line: None,
+            account_prompt: None,
             prompts: Vec::new(),
             // A persisted checkpoint ends before the next command starts.
             shell_finished: true,
             sensitive: SensitiveBlocks::default(),
             replay: None,
+            planning,
         }
     }
 
     pub(crate) fn capture_gap(&mut self) {
         self.sensitive.uncertain = true;
+        self.account_prompt = None;
     }
 
     pub(super) fn begin_page(&mut self, cursor: Option<Cursor>, full_output: bool) {
@@ -370,6 +559,14 @@ impl Planner {
         let record = self.sensitive.mask(record);
         let mut observation = Observation::from_record(record, self.replay.is_some())?;
         if observation.sequence <= self.newest {
+            // The first new command can follow a prompt at the prior checkpoint.
+            if self.incoming.is_empty()
+                && self.block.is_none()
+                && observation.sequence > self.newest_skipped_sequence
+            {
+                self.newest_skipped_sequence = observation.sequence;
+                self.remember_account_prompt(&observation);
+            }
             return None;
         }
         observation.replay.clone_from(&self.replay);
@@ -382,11 +579,22 @@ impl Planner {
 
     /// Flush ready output for this periodic pass. A running card is a replaceable preview and
     /// carries no durable checkpoint. Closing turns the unfinished tail into permanent evidence.
+    #[cfg(test)]
     pub(crate) fn finish_pass(
         &mut self,
         closing: bool,
         quiet: bool,
         now: Timestamp,
+    ) -> Vec<Window> {
+        self.finish_pass_with_running_preview(closing, quiet, now, false)
+    }
+
+    pub(super) fn finish_pass_with_running_preview(
+        &mut self,
+        closing: bool,
+        quiet: bool,
+        now: Timestamp,
+        force_running: bool,
     ) -> Vec<Window> {
         let mut ready = Vec::new();
         while !self.incoming.is_empty() {
@@ -416,8 +624,8 @@ impl Planner {
         if !closing
             && let Some(block) = &self.block
             && block.command.is_some()
-            && now.as_second().saturating_sub(block.started.as_second())
-                >= RUNNING_AFTER.as_secs() as i64
+            && (force_running
+                || now.duration_since(block.started).as_secs() >= RUNNING_AFTER.as_secs() as i64)
         {
             let preview = block.window(End::Running);
             if !preview.skipped {
@@ -453,6 +661,7 @@ impl Planner {
             .then(|| self.command_prompt(&record.text).map(str::to_owned))
             .flatten();
         if typed && (self.shell_finished || prompt.is_some()) {
+            let current_prompt = self.account_prompt.take();
             if let Some(block) = self.block.take() {
                 ready = Some(block.window(End::Complete));
             }
@@ -462,16 +671,38 @@ impl Planner {
             {
                 self.prompts.push(prompt);
             }
-            self.block = Some(Block::new(&record, Some(record.text.trim().to_owned())));
+            let mut block = Block::new(&record, Some(record.text.trim().to_owned()), self.planning);
+            if let Some((sequence, line)) = &current_prompt {
+                block.account_evidence.record(*sequence, line);
+            }
+            self.block = Some(block);
             self.prompt_line = None;
             self.shell_finished = false;
         }
+        self.remember_account_prompt(&record);
         if kind == Kind::Output {
             self.prompt_line = Some((record.text.clone(), record.partial));
         }
-        let block = self.block.get_or_insert_with(|| Block::new(&record, None));
+        let block = self
+            .block
+            .get_or_insert_with(|| Block::new(&record, None, self.planning));
         block.record(record, kind);
         ready
+    }
+
+    fn remember_account_prompt(&mut self, record: &Observation) {
+        // An output record immediately before the input can identify its shell.
+        // Discard hints across input and leave shell integration end markers transparent.
+        if let ObservationKind::Line(kind) = record.kind {
+            self.account_prompt = (kind == Kind::Output)
+                .then(|| {
+                    record
+                        .account_prompt()
+                        .filter(|(_, line)| filters::idle(line))
+                })
+                .flatten()
+                .map(|(sequence, line)| (sequence, Zeroizing::new(line.to_owned())));
+        }
     }
 
     fn command_prompt(&self, typed: &str) -> Option<&str> {

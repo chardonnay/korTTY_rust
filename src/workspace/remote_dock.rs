@@ -17,7 +17,7 @@ use super::tab_titles::{
 };
 use super::{Message as Desktop, PaneSession, Tab, Window, Workspace};
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(super) mod desktop_drag;
 mod dialog;
 mod follow;
@@ -42,7 +42,7 @@ pub(super) struct Dock {
     page: usize,
     keyboard_focus: bool,
     pending_drop: Option<PendingDrop>,
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     desktop_drag: desktop_drag::State,
 }
 
@@ -85,7 +85,7 @@ pub enum Message {
     ManagerReturned(SessionId),
     ManagerAfterBrowser(SessionId, Option<Vec<u8>>),
     Dialog(dialog::Message),
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     DesktopDragPrepared(desktop_drag::Scope, u64, desktop_drag::PreparationResult),
 }
 
@@ -104,9 +104,9 @@ pub enum Action {
     Download(u64, u64),
     Dropped(u64, u64, PathBuf),
     Resolve(u64, u64, ConflictChoice),
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     PrepareDesktopDrag(desktop_drag::Scope),
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     StartDesktopDrag(desktop_drag::Scope, iced::Point),
 }
 
@@ -825,7 +825,7 @@ impl Workspace {
         message: Message,
     ) -> Task<Desktop> {
         match message {
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             Message::DesktopDragPrepared(scope, ticket, result) => {
                 self.finish_sidebar_file_drag_preparation(owner, scope, ticket, result);
             }
@@ -929,7 +929,7 @@ impl Workspace {
         tab_id: u64,
         action: Action,
     ) -> Task<Desktop> {
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         match action {
             Action::PrepareDesktopDrag(scope) if scope.tab() == tab_id => {
                 return self.prepare_sidebar_file_drag(owner, scope);

@@ -1,8 +1,9 @@
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::io::{self, Read, Write};
 use std::net::Shutdown;
-use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::net::SocketAddr;
+use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -10,8 +11,15 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) const ARGUMENT: &str = "--job-rsync-bridge";
 pub(super) const TOKEN_ENV: &str = "KORTTY_JOB_RSYNC_TOKEN";
+#[cfg(windows)]
+pub(super) const OWNER_ENV: &str = "KORTTY_JOB_RSYNC_OWNER_PID";
 pub(super) const HOST: &str = "kortty-rsync";
 const MAX_FRAME: usize = 4096;
+
+#[cfg(windows)]
+pub(super) use std::net::{TcpListener as Listener, TcpStream as Stream};
+#[cfg(unix)]
+pub(super) use std::os::unix::net::{UnixListener as Listener, UnixStream as Stream};
 
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -21,7 +29,7 @@ struct Invocation {
 }
 
 pub(crate) fn serve(mut arguments: impl Iterator<Item = OsString>) -> io::Result<()> {
-    let socket = arguments.next().map(PathBuf::from).ok_or_else(invalid)?;
+    let endpoint = arguments.next().ok_or_else(invalid)?;
     let token = std::env::var(TOKEN_ENV).map_err(|_| invalid())?;
     let argv = arguments
         .take(12)
@@ -29,24 +37,97 @@ pub(crate) fn serve(mut arguments: impl Iterator<Item = OsString>) -> io::Result
         .collect::<io::Result<Vec<_>>>()?;
     let request = Invocation { token, argv };
     let bytes = serde_json::to_vec(&request)?;
-    if !socket.is_absolute() || bytes.len() > MAX_FRAME || request.token.len() != 32 {
+    if bytes.len() > MAX_FRAME || request.token.len() != 32 {
         return Err(invalid());
     }
-    let mut stream = UnixStream::connect(socket)?;
+    // MSYS2 passes overlapped pipes to the remote shell helper.
+    #[cfg(windows)]
+    let (mut standard_input, standard_output) = kortty_pty::inherited_bridge_pipes()?;
+    #[cfg(unix)]
+    let standard_output = io::stdout().lock();
+    let mut stream = connect(&endpoint)?;
     stream.write_all(&(bytes.len() as u16).to_be_bytes())?;
     stream.write_all(&bytes)?;
     let mut input = stream.try_clone()?;
-    // The helper is a disposable process in rsync's owned process group. Return
+    // The helper is a disposable process in rsync's owned process tree. Return
     // on remote EOF so rsync sees its stdout close even if stdin is still open.
     let _writer = thread::Builder::new()
         .name("kortty-rsync-bridge-input".into())
         .spawn(move || {
-            let _ = io::copy(&mut io::stdin().lock(), &mut input);
+            #[cfg(unix)]
+            let mut standard_input = io::stdin().lock();
+            let _ = io::copy(&mut standard_input, &mut input);
             let _ = input.shutdown(Shutdown::Write);
         })?;
-    let result = forward_output(&mut stream, io::stdout().lock());
+    let result = forward_output(&mut stream, standard_output);
     let _ = stream.shutdown(Shutdown::Both);
     result
+}
+
+#[cfg(unix)]
+pub(super) fn bind(folder: &Path) -> io::Result<(Listener, String)> {
+    let path = folder.join("s");
+    let address = SocketAddr::from_pathname(&path)?;
+    let endpoint = path
+        .to_str()
+        .filter(|value| !value.contains('"') && !value.chars().any(char::is_control))
+        .ok_or_else(invalid)?;
+    Ok((Listener::bind_addr(&address)?, endpoint.to_owned()))
+}
+
+#[cfg(windows)]
+pub(super) fn bind(_: &Path) -> io::Result<(Listener, String)> {
+    let listener = Listener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
+    let endpoint = listener.local_addr()?.port().to_string();
+    Ok((listener, endpoint))
+}
+
+#[cfg(unix)]
+fn connect(endpoint: &OsStr) -> io::Result<Stream> {
+    let socket = Path::new(endpoint);
+    if !socket.is_absolute() {
+        return Err(invalid());
+    }
+    Stream::connect(socket)
+}
+
+#[cfg(windows)]
+fn connect(endpoint: &OsStr) -> io::Result<Stream> {
+    let port = endpoint
+        .to_str()
+        .and_then(|port| port.parse::<u16>().ok())
+        .filter(|port| *port != 0)
+        .ok_or_else(invalid)?;
+    let owner = std::env::var(OWNER_ENV)
+        .ok()
+        .and_then(|owner| owner.parse::<u32>().ok())
+        .filter(|owner| *owner != 0)
+        .ok_or_else(invalid)?;
+    connect_owned_loopback(port, owner)
+}
+
+#[cfg(windows)]
+fn connect_owned_loopback(port: u16, owner: u32) -> io::Result<Stream> {
+    use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+
+    let server = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    if !kortty_pty::owns_loopback_listener(owner, server)? {
+        return Err(invalid());
+    }
+    let stream = Stream::connect_timeout(&server.into(), Duration::from_secs(2))?;
+    let SocketAddr::V4(client) = stream.local_addr()? else {
+        return Err(invalid());
+    };
+    // Check the connected server before transmitting the capability or any bytes.
+    let deadline = Instant::now() + Duration::from_millis(250);
+    while !kortty_pty::owns_loopback_connection(owner, server, client)? {
+        if Instant::now() >= deadline {
+            return Err(invalid());
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    stream.set_nodelay(true)?;
+    Ok(stream)
 }
 
 fn forward_output(mut input: impl Read, mut output: impl Write) -> io::Result<()> {
@@ -66,7 +147,7 @@ fn forward_output(mut input: impl Read, mut output: impl Write) -> io::Result<()
 }
 
 pub(super) fn command(
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     token: &str,
     remote: &str,
     mode: Mode,
@@ -114,7 +195,7 @@ pub(super) enum Mode {
 }
 
 fn read_handshake(
-    stream: &mut UnixStream,
+    stream: &mut Stream,
     mut bytes: &mut [u8],
     deadline: Instant,
     stopped: &impl Fn() -> bool,
@@ -188,7 +269,7 @@ fn sender(argv: &[String], remote: &str, directory: bool) -> io::Result<String> 
     Ok(command)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn receiver(argv: &[String], remote: &str) -> io::Result<(String, Vec<u8>)> {
     receiver_with_directory(argv, remote, false)
 }
@@ -233,28 +314,29 @@ fn valid_compatibility(value: &str) -> bool {
     !value.is_empty() && value.len() <= 20 && value.bytes().all(|byte| b"iLsfxCIvu".contains(&byte))
 }
 
-pub(super) fn shell(executable: &Path, socket: &Path) -> io::Result<String> {
-    let argument = |path: &Path| {
-        path.to_str()
-            .filter(|value| {
-                path.is_absolute() && !value.contains('"') && !value.chars().any(char::is_control)
-            })
-            .map(|value| format!("\"{value}\""))
-            .ok_or_else(invalid)
-    };
-    Ok(format!(
-        "{} {ARGUMENT} {}",
-        argument(executable)?,
-        argument(socket)?
-    ))
+pub(super) fn shell(executable: &Path, endpoint: &str) -> io::Result<String> {
+    let executable = executable
+        .to_str()
+        .filter(|value| {
+            executable.is_absolute() && !value.contains('"') && !value.chars().any(char::is_control)
+        })
+        .ok_or_else(invalid)?;
+    #[cfg(windows)]
+    let executable = executable
+        .strip_prefix(r"\\?\")
+        .unwrap_or(executable)
+        .replace('\\', "/");
+    Ok(format!("\"{executable}\" {ARGUMENT} \"{endpoint}\""))
 }
 
 fn invalid() -> io::Error {
     io::Error::other("The native rsync bridge received unsupported arguments")
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
+    use std::os::unix::net::UnixStream;
+
     use super::*;
 
     #[test]
@@ -344,5 +426,39 @@ mod tests {
                 assert_eq!(result.unwrap(), (remote_command.clone(), preamble.clone()));
             }
         }
+    }
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+
+    #[test]
+    fn rsync_bridge_uses_an_exact_owned_ipv4_loopback_connection() {
+        let (listener, port) = bind(Path::new("")).unwrap();
+        let port = port.parse().unwrap();
+        let owner = std::process::id();
+        assert!(connect_owned_loopback(port, owner.wrapping_add(1)).is_err());
+        let peer = thread::spawn(move || {
+            let (mut client, _) = listener.accept().unwrap();
+            let mut byte = [0];
+            client.read_exact(&mut byte).unwrap();
+            assert_eq!(byte, [23]);
+        });
+        let mut stream = connect_owned_loopback(port, owner).unwrap();
+        stream.write_all(&[23]).unwrap();
+        peer.join().unwrap();
+    }
+
+    #[test]
+    fn rsync_bridge_quote_preserves_a_windows_program_path_with_spaces() {
+        assert_eq!(
+            shell(
+                Path::new(r"\\?\C:\Program Files\kortty\kortty.exe"),
+                "43210"
+            )
+            .unwrap(),
+            r#""C:/Program Files/kortty/kortty.exe" --job-rsync-bridge "43210""#
+        );
     }
 }

@@ -152,7 +152,7 @@ impl AnalysisFlowchartRequest {
     pub(crate) fn complete_reviewed_guarded(
         &self,
         client: &Client,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        mut before_dispatch: impl FnMut() -> Result<(), String>,
         mask_diagram: impl FnOnce(&str) -> Result<String, String>,
     ) -> Result<Chart, String> {
         let source = Source::new(&self.script)?;

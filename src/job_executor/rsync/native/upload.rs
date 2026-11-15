@@ -12,18 +12,26 @@ use crate::sftp_window::scheduled::{CheckedRemoteFolder, Client};
 use super::*;
 
 pub(crate) fn digest(path: &Path) -> io::Result<(u64, [u8; 32])> {
-    copy_reviewed(&LocalSource::open(path)?, io::sink(), &|| false)
+    checked_digest(path, &|| false)
+}
+
+pub(super) fn checked_digest(
+    path: &Path,
+    stopped: &impl Fn() -> bool,
+) -> io::Result<(u64, [u8; 32])> {
+    copy_reviewed(&LocalSource::open(path)?, io::sink(), stopped)
 }
 
 pub(super) fn apply<C: Fn() -> bool>(
     client: &mut Client,
     transfer: Transfer<'_, C>,
-    listener: UnixListener,
-    socket: &Path,
+    listener: Listener,
+    bridge_endpoint: &str,
     reference: &ConnectionRef,
 ) -> Result<String, Failure> {
     let action = transfer.action;
     let stopped = transfer.stopped;
+    let guard = transfer.execution_guard.clone();
     let cancellation = transfer.cancellation.clone();
     let review = action
         .approval
@@ -88,7 +96,7 @@ pub(super) fn apply<C: Fn() -> bool>(
                 ));
             }
             authorize(reference)?;
-            transfer.run(listener, socket, payload, true)?;
+            transfer.run(listener, bridge_endpoint, payload, true)?;
             current_parent(client)?;
             let attrs = remote::verify_entry(client, payload)?;
             if attrs.kind() != FileKind::File
@@ -125,6 +133,7 @@ pub(super) fn apply<C: Fn() -> bool>(
                 .verify()
                 .map_err(|_| Failure::blocked("The reviewed local rsync source changed."))?;
             authorize(reference)?;
+            require_authority(guard.as_ref())?;
             require_running(stopped).map_err(|_| transfer_stopped())
         },
         |client, from, to| {
@@ -159,7 +168,7 @@ fn same_metadata(left: Attributes, right: Attributes) -> bool {
     }
 }
 
-fn copy_reviewed(
+pub(super) fn copy_reviewed(
     source: &LocalSource,
     mut output: impl Write,
     stopped: &impl Fn() -> bool,

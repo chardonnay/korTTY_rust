@@ -1,6 +1,6 @@
 use std::fs;
 use std::io::{ErrorKind, Write as _};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
@@ -27,8 +27,18 @@ use super::{
     batch, run, run_command, scheduled_request, thread, virtual_terminal,
 };
 
+mod changed_upload;
 #[cfg(target_os = "linux")]
 mod privileged_archive;
+#[cfg(target_os = "linux")]
+mod rsync_existing;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod rsync_existing_download;
+#[cfg(target_os = "linux")]
+mod rsync_mixed;
+#[cfg(target_os = "linux")]
+mod rsync_privileged;
+mod rsync_routes;
 mod scheduled_swarm;
 
 struct Profile(PathBuf);
@@ -148,18 +158,22 @@ impl Sshd {
                     Err(error) => panic!("No scheduled SSH connection: {error}"),
                 }
             };
-            stream.set_nonblocking(false).unwrap();
-            let input: OwnedFd = stream.into();
-            let output = input.try_clone().unwrap();
-            Command::new("/usr/sbin/sshd")
-                .args(["-ie", "-f"])
-                .arg(config)
-                .stdin(Stdio::from(input))
-                .stdout(Stdio::from(output))
-                .stderr(Stdio::piped())
-                .output()
-                .unwrap()
+            Self::serve_stream(&config, stream)
         })
+    }
+
+    fn serve_stream(config: &Path, stream: TcpStream) -> Output {
+        stream.set_nonblocking(false).unwrap();
+        let input: OwnedFd = stream.into();
+        let output = input.try_clone().unwrap();
+        Command::new("/usr/sbin/sshd")
+            .args(["-ie", "-f"])
+            .arg(config)
+            .stdin(Stdio::from(input))
+            .stdout(Stdio::from(output))
+            .stderr(Stdio::piped())
+            .output()
+            .unwrap()
     }
 
     fn pin(&self) -> (Endpoint, HostKey) {
@@ -641,8 +655,8 @@ fn openssh_scheduled_batch_runs_in_order_and_aggregates_failed_and_unpinned_targ
         &first.profile.0,
         &[&first, &unpinned, &last],
         r#"case "${SSH_CONNECTION##* }" in
-  "$2") printf '%s\n' first > "$1"; printf '%s\n' 'secret fixture output'; exit 37 ;;
-  "$3") [ "$(cat "$1")" = first ] || exit 38; printf '%s\n' last >> "$1" ;;
+  "$2") printf '%s\n' first > "$1"; printf '%s\n' 'fixture first output'; printf '%s\n' 'fixture first error' >&2; exit 37 ;;
+  "$3") [ "$(cat "$1")" = first ] || exit 38; printf '%s\n' last >> "$1"; printf '%s\n' 'fixture last output' ;;
   *) printf '%s\n' unexpected >> "$1"; exit 39 ;;
 esac"#,
         vec![
@@ -653,6 +667,8 @@ esac"#,
     );
     Arc::make_mut(&mut request.action).working_directory =
         Some(working_directory.to_str().unwrap().into());
+    Arc::make_mut(&mut request.action).journal_detail =
+        crate::scheduler_window::JournalDetail::LimitedRedacted;
     let credentials = Credentials::resolve_batch(
         &request.action,
         &store,
@@ -685,7 +701,17 @@ esac"#,
     assert!(detail.contains("Profile 1 failed (exit 37)"), "{detail}");
     assert!(detail.contains("Profile 2 blocked"), "{detail}");
     assert!(detail.contains("Profile 3 success"), "{detail}");
-    assert!(!detail.contains("secret fixture output"));
+    assert!(!detail.contains("fixture first output"));
+    let captured = completed
+        .output
+        .as_ref()
+        .and_then(|output| output.current(None))
+        .unwrap();
+    assert_eq!(
+        captured.stdout,
+        "[Profile 1]\nfixture first output\n\n[Profile 3]\nfixture last output"
+    );
+    assert_eq!(captured.stderr, "[Profile 1]\nfixture first error");
     assert_eq!(fs::read(&order).unwrap(), b"first\nlast\n");
     for (index, daemon) in daemons.into_iter().enumerate() {
         let log = String::from_utf8(daemon.join().unwrap().stderr).unwrap();
@@ -1169,6 +1195,7 @@ else
 fi
 printf '%s\0' "$1" "$2" "$3" > "$4"
 printf '%s\n' 'scheduler-script-output'
+printf '%s\n' 'scheduler-script-error' >&2
 exit 23"#;
     let expected = [
         "two words",
@@ -1197,7 +1224,7 @@ exit 23"#;
             },
         )
         .unwrap();
-    for pty in [false, true] {
+    for (pty, linked) in [(false, false), (false, true), (true, true)] {
         let daemon = fixture.spawn();
         let output = if pty { "pty-argv" } else { "exec-argv" };
         let (_, mut request) = scheduled_request();
@@ -1212,26 +1239,25 @@ exit 23"#;
             "host": "127.0.0.1", "port": port, "username": user, "key_file": user_key,
             "virtual_terminal": pty.then(virtual_terminal::Options::default),
             "working_directory": working_directory,
+            "journal_detail": "limited-redacted",
         });
-        if pty {
+        if linked {
             action["snippet"] = json!({"id": snippet_id, "arguments": arguments});
         } else {
             action["script"] = json!({"language": "bash", "body": script, "arguments": arguments});
         }
         request.action = Arc::new(serde_json::from_value::<SshCommand>(action).unwrap());
-        let completed = run_command(
+        let completed = run(
             &request,
             Some(recording.clone()),
             Some(&snippets_path),
             &ExecutionPolicy::unrestricted(true),
             Ok(None),
+            Ok(None),
             || Ok(trust.clone()),
-            None,
         );
         let result = daemon.join().unwrap();
         let log = String::from_utf8_lossy(&result.stderr);
-        let completed = completed
-            .unwrap_or_else(|failure| panic!("Scheduled script failed: {}\n{log}", failure.detail));
         assert_eq!(
             completed.outcome,
             RunOutcome::Failed {
@@ -1249,6 +1275,17 @@ exit 23"#;
             expected.map(str::as_bytes)
         );
         assert_eq!(completed.recording.is_some(), pty);
+        if pty {
+            assert!(completed.output.is_none());
+        } else {
+            let captured = completed
+                .output
+                .as_ref()
+                .and_then(|output| output.current(None))
+                .unwrap();
+            assert_eq!(captured.stdout, "scheduler-script-output\n");
+            assert_eq!(captured.stderr, "scheduler-script-error\n");
+        }
         if let Some(token) = completed.recording {
             let path = virtual_terminal::path_for(&recording, request.id, token);
             assert!(kortty_recording::Replay::open(&path).unwrap().is_complete());
@@ -1273,7 +1310,7 @@ exit 23"#;
         &ExecutionPolicy::unrestricted(true),
         Ok(None),
         || Ok(trust.clone()),
-        None,
+        (None, None),
     )
     .unwrap_or_else(|failure| panic!("Failed to start working directory test: {}", failure.detail));
     assert!(matches!(
@@ -1355,6 +1392,155 @@ fn openssh_runs_scheduled_sftp_metadata_actions_with_strict_host_keys() {
         RunOutcome::Failed { exit_code: None },
     );
     assert!(!folder.join("escaped").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an ordinary Linux account, private XDG config, OpenSSH and the freshly built archive helper"]
+fn openssh_scheduled_server_archive_saves_a_verified_local_copy_on_the_pinned_session() {
+    scheduled_server_archive_local_copy(None);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an ordinary Linux account, private XDG config, OpenSSH and the freshly built archive helper"]
+fn openssh_scheduled_password_zip_uses_the_vault_and_saves_a_verified_local_copy() {
+    scheduled_server_archive_local_copy(Some("fixture 東京 password\0\nfor server ZIP"));
+}
+
+#[cfg(target_os = "linux")]
+fn scheduled_server_archive_local_copy(password: Option<&str>) {
+    use std::io::Read as _;
+
+    let helper = PathBuf::from(
+        std::env::var_os("KORTTY_SERVER_ARCHIVE_TEST_HELPER")
+            .expect("set KORTTY_SERVER_ARCHIVE_TEST_HELPER"),
+    )
+    .canonicalize()
+    .unwrap();
+    assert!(helper.is_file());
+    let config = crate::profile::root().unwrap();
+    let config_parent = config.parent().unwrap().canonicalize().unwrap();
+    assert!(config_parent.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    fs::DirBuilder::new().mode(0o700).create(&config).unwrap();
+    let profile = Profile(config);
+
+    let fixture = Sshd::new();
+    let root = &fixture.profile.0;
+    let script = root.join("archive-dispatch.sh");
+    let mut command = String::new();
+    crate::scheduler_window::script::shell_quote(&mut command, helper.to_str().unwrap());
+    let helper_command = kortty_server_archive::protocol::COMMAND;
+    let sftp = [
+        "/usr/libexec/openssh/sftp-server",
+        "/usr/lib/openssh/sftp-server",
+        "/usr/libexec/sftp-server",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).is_file())
+    .expect("OpenSSH external sftp-server for the private forced-command fixture");
+    fs::write(&script, format!(
+        "#!/bin/sh\ncase \"$SSH_ORIGINAL_COMMAND\" in\n  '{helper_command}') exec {command} --stdio-v1 ;;\n  'internal-sftp') exec {sftp} ;;\n  *) exit 1 ;;\nesac\n"
+    )).unwrap();
+    let mut daemon_config = fs::OpenOptions::new()
+        .append(true)
+        .open(&fixture.config)
+        .unwrap();
+    writeln!(
+        daemon_config,
+        "ForceCommand /bin/sh \"{}\"",
+        script.display()
+    )
+    .unwrap();
+
+    let (_, mut request, connections) =
+        scheduled_batch(&profile.0, &[&fixture], "true", Vec::new());
+    let reference = request.action.connection.clone().unwrap();
+    let source = root.join("source.txt");
+    let remote = root.join("remote.zip");
+    let local = root.join("local.zip");
+    let payload = b"checked bytes from the helper's published archive";
+    fs::write(&source, payload).unwrap();
+    let mut vault =
+        Vault::create(profile.0.join("vault.bin"), b"test-only vault password").unwrap();
+    let password_id = password.map(|password| {
+        vault
+            .save(
+                CredentialInput {
+                    label: "Fixture archive password".into(),
+                    kind: CredentialKind::ArchivePassword,
+                    ..Default::default()
+                },
+                Secret::new(password.into()),
+            )
+            .unwrap()
+    });
+    let remote_action = json!({
+        "kind": "server_archive", "sources": [source], "target": remote, "download": local, "level": 6,
+        "format": if password_id.is_some() { "zip_password" } else { "zip" },
+        "password_credential": password_id,
+    });
+    request.action = Arc::new(
+        serde_json::from_value(json!({
+            "connection": reference,
+            "remote": remote_action,
+        }))
+        .unwrap(),
+    );
+    let denied = run(
+        &request,
+        None,
+        None,
+        &ExecutionPolicy::unrestricted(false),
+        Ok(None),
+        Ok(None),
+        || panic!("a denied copy must stop before SSH trust lookup"),
+    );
+    assert_eq!(denied.outcome, RunOutcome::Blocked);
+    assert!(!remote.exists() && !local.exists());
+
+    let saved = connections.get(reference.id).unwrap();
+    let credentials = Credentials::resolve(
+        &request.action,
+        saved,
+        &ServerAccess::default(),
+        |_, _, _| panic!("fixture key has no password"),
+    )
+    .unwrap();
+    let daemon = fixture.spawn();
+    let completion = run(
+        &request,
+        None,
+        None,
+        &ExecutionPolicy::unrestricted(true),
+        Ok(Some(credentials)),
+        Ok(password_id
+            .as_deref()
+            .and_then(|id| vault.archive_password(id))),
+        || Ok(fixture.trust.clone()),
+    );
+    let log = String::from_utf8_lossy(&daemon.join().unwrap().stderr).into_owned();
+    assert_eq!(
+        completion.outcome,
+        RunOutcome::Success,
+        "{:?}\n{log}",
+        completion.detail
+    );
+    assert_eq!(log.matches("Accepted publickey").count(), 1, "{log}");
+    assert_eq!(fs::read(&local).unwrap(), fs::read(&remote).unwrap());
+    let mut zip = zip::ZipArchive::new(fs::File::open(local).unwrap()).unwrap();
+    let mut contents = Vec::new();
+    let mut member = if let Some(password) = password {
+        assert!(!log.contains(password));
+        assert!(zip.by_name("source.txt").is_err());
+        assert!(zip.by_name_decrypt("source.txt", b"incorrect").is_err());
+        zip.by_name_decrypt("source.txt", password.as_bytes())
+            .unwrap()
+    } else {
+        zip.by_name("source.txt").unwrap()
+    };
+    member.read_to_end(&mut contents).unwrap();
+    assert_eq!(contents, payload);
 }
 
 #[test]
@@ -1471,11 +1657,14 @@ fn openssh_scheduled_swarm_diagnostics_reports_masked_advice_and_blocked_target(
         },
         proposal: None,
         journal: None,
+        fresh_web: None,
     };
     let daemon = server.spawn();
     let (authority, resends) = async_channel::bounded(1);
     let done = super::super::agent::spawn(request, Ok(context), authority);
-    let resend = resends.recv_blocking().unwrap();
+    let super::super::agent::Resend::Model(resend) = resends.recv_blocking().unwrap() else {
+        panic!("The diagnostics worker must request model authority");
+    };
     assert!(runtime.active_agent_run_approved(&resend.scope.request));
     assert_eq!(resend.scope.evidence_targets, vec![reference.id]);
     resend.settle(Ok(()));
@@ -1631,7 +1820,7 @@ fn openssh_scheduled_swarm_executes_only_the_exact_proposal_once() {
     )
     .unwrap();
     runtime
-        .finish_agent_proposal_review(&mut view, review, profile, targets, prompt)
+        .finish_agent_proposal_review(&mut view, review, profile, targets, vec![prompt])
         .unwrap();
     assert!(!marker.exists());
     let task = runtime.request_agent_proposal(&mut view).unwrap();
@@ -1737,6 +1926,7 @@ fn openssh_scheduled_swarm_executes_only_the_exact_proposal_once() {
         mask,
         proposal: runtime.agent_proposal_run(&request).unwrap(),
         journal: None,
+        fresh_web: None,
     };
     let mut invalid_order = context(mask);
     invalid_order.proposal.as_mut().unwrap().items.swap(0, 1);
@@ -1801,28 +1991,95 @@ fn openssh_scheduled_swarm_executes_only_the_exact_proposal_once() {
 #[test]
 #[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
 fn openssh_scheduled_rsync_download_publishes_verified_new_file() {
-    openssh_rsync_verified_transfer(false, false);
+    openssh_rsync_verified_transfer(false, false, false);
 }
 
 #[test]
 #[ignore = "requires installed OpenSSH sshd and ssh-keygen, local rsync and a local account"]
 fn openssh_scheduled_rsync_upload_publishes_only_the_reviewed_new_file() {
-    openssh_rsync_verified_transfer(true, false);
+    openssh_rsync_verified_transfer(true, false, false);
 }
 
 #[test]
 #[ignore = "requires installed OpenSSH sshd and ssh-keygen, local rsync and a local account"]
 fn openssh_scheduled_rsync_download_publishes_a_verified_new_directory() {
-    openssh_rsync_verified_transfer(false, true);
+    openssh_rsync_verified_transfer(false, true, false);
 }
 
 #[test]
 #[ignore = "requires native OpenSSH, rsync, and the current korTTY server helper"]
 fn openssh_scheduled_rsync_upload_publishes_a_verified_new_directory() {
-    openssh_rsync_verified_transfer(true, true);
+    openssh_rsync_verified_transfer(true, true, false);
 }
 
-fn openssh_rsync_verified_transfer(upload: bool, directory: bool) {
+#[test]
+#[ignore = "requires native OpenSSH, rsync, and a local account"]
+fn openssh_scheduled_rsync_file_batches_preflight_all_members() {
+    openssh_rsync_verified_transfer(true, false, true);
+    openssh_rsync_verified_transfer(false, false, true);
+}
+
+#[test]
+#[ignore = "requires native OpenSSH, rsync, and the current kortty server helper"]
+fn openssh_scheduled_rsync_directory_batches_preflight_all_members() {
+    openssh_rsync_verified_transfer(true, true, true);
+    openssh_rsync_verified_transfer(false, true, true);
+}
+
+fn configure_rsync_fixture(fixture: &Sshd, existing_marker: Option<&Path>) {
+    let helper = PathBuf::from(
+        std::env::var_os("KORTTY_RSYNC_TEST_HELPER").expect("set KORTTY_RSYNC_TEST_HELPER"),
+    )
+    .canonicalize()
+    .unwrap();
+    assert!(helper.is_file());
+    let script = fixture.profile.0.join("rsync-fixture-dispatch.sh");
+    let mut command = String::new();
+    crate::scheduler_window::script::shell_quote(&mut command, helper.to_str().unwrap());
+    let helper_command = kortty_server_archive::rsync_tree::COMMAND;
+    let existing = existing_marker.map_or_else(String::new, |marker| {
+        let mut marker_quoted = String::new();
+        crate::scheduler_window::script::shell_quote(&mut marker_quoted, marker.to_str().unwrap());
+        use kortty_server_archive::rsync_tree::{
+            EXISTING_ARGUMENT, EXISTING_COMMAND, EXISTING_V2_ARGUMENT, EXISTING_V2_COMMAND,
+            EXISTING_V3_ARGUMENT, EXISTING_V3_COMMAND,
+        };
+        [
+            (EXISTING_COMMAND, EXISTING_ARGUMENT),
+            (EXISTING_V2_COMMAND, EXISTING_V2_ARGUMENT),
+            (EXISTING_V3_COMMAND, EXISTING_V3_ARGUMENT),
+        ]
+        .into_iter()
+        .map(|(protocol, argument)| {
+            format!(
+                "  '{protocol}') test -f {marker_quoted} || exit 1; exec {command} {argument} ;;\n"
+            )
+        })
+        .collect()
+    });
+    let sftp = [
+        "/usr/libexec/openssh/sftp-server",
+        "/usr/lib/openssh/sftp-server",
+        "/usr/libexec/sftp-server",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).is_file())
+    .expect("OpenSSH external sftp-server for the private forced-command fixture");
+    fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\ncase \"$SSH_ORIGINAL_COMMAND\" in\n  '{helper_command}') exec {command} --rsync-tree-v1 ;;\n{existing}  'rsync --server '*) exec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\" ;;\n  'internal-sftp') exec {sftp} ;;\n  *) exit 1 ;;\nesac\n"
+        ),
+    )
+    .unwrap();
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(&fixture.config)
+        .unwrap();
+    writeln!(config, "ForceCommand /bin/sh \"{}\"", script.display()).unwrap();
+}
+
+fn openssh_rsync_verified_transfer(upload: bool, directory: bool, batch: bool) {
     use crate::scheduler_window::{Message, SchedulerWindow, sync};
     use kortty_jobs::{Job, JobGraph, JobId, SchedulerStore};
 
@@ -1838,42 +2095,21 @@ fn openssh_rsync_verified_transfer(upload: bool, directory: bool) {
     );
     assert!(bridge.is_file());
     if upload && directory {
-        let helper = PathBuf::from(
-            std::env::var_os("KORTTY_RSYNC_TEST_HELPER").expect("set KORTTY_RSYNC_TEST_HELPER"),
-        )
-        .canonicalize()
-        .unwrap();
-        assert!(helper.is_file());
-        let script = root.join("rsync-fixture-dispatch.sh");
-        let mut command = String::new();
-        crate::scheduler_window::script::shell_quote(&mut command, helper.to_str().unwrap());
-        let helper_command = kortty_server_archive::rsync_tree::COMMAND;
-        let sftp = [
-            "/usr/libexec/openssh/sftp-server",
-            "/usr/lib/openssh/sftp-server",
-            "/usr/libexec/sftp-server",
-        ]
-        .into_iter()
-        .find(|path| Path::new(path).is_file())
-        .expect("OpenSSH external sftp-server for the private forced-command fixture");
-        fs::write(
-            &script,
-            format!(
-                "#!/bin/sh\ncase \"$SSH_ORIGINAL_COMMAND\" in\n  '{helper_command}') exec {command} --rsync-tree-v1 ;;\n  'rsync --server '*) exec /bin/sh -c \"$SSH_ORIGINAL_COMMAND\" ;;\n  'internal-sftp') exec {sftp} ;;\n  *) exit 1 ;;\nesac\n"
-            ),
-        )
-        .unwrap();
-        let mut config = fs::OpenOptions::new()
-            .append(true)
-            .open(&fixture.config)
-            .unwrap();
-        writeln!(config, "ForceCommand /bin/sh \"{}\"", script.display()).unwrap();
+        configure_rsync_fixture(&fixture, None);
     }
     let (_, seed, connections) = scheduled_batch(root, &[&fixture], "true", Vec::new());
     let reference = seed.action.connection.as_ref().unwrap();
     let profile = connections.get(reference.id).unwrap();
     let source = root.join("rsync-source");
-    let destination = root.join("rsync-destination");
+    let destination_root = root.join("rsync-destination");
+    let source_second = root.join("rsync-source-second");
+    let destination_second = destination_root.join(source_second.file_name().unwrap());
+    let destination = if batch {
+        fs::create_dir(&destination_root).unwrap();
+        destination_root.join(source.file_name().unwrap())
+    } else {
+        destination_root.clone()
+    };
     let expected: Vec<_> = (0..196_610).map(|index| (index % 251) as u8).collect();
     let data = |path: &std::path::Path| {
         if directory {
@@ -1890,28 +2126,64 @@ fn openssh_rsync_verified_transfer(upload: bool, directory: bool) {
         }
     }
     fs::write(data(&source), &expected).unwrap();
+    if batch {
+        if directory {
+            fs::create_dir_all(source_second.join("nested")).unwrap();
+        }
+        fs::write(data(&source_second), b"second source").unwrap();
+    }
     let digest = super::super::rsync::program_digest(&program).unwrap();
     let pins = sync::fingerprints(&sync::pins(reference, &fixture.trust).unwrap());
     let (kind, local, remote) = if upload {
-        ("rsync_upload", &source, &destination)
+        ("rsync_upload", &source, &destination_root)
     } else {
-        ("rsync_download", &destination, &source)
+        ("rsync_download", &destination_root, &source)
     };
     let mut approval =
         json!({ "program": program, "digest": digest, "reference": reference, "pins": pins });
-    if upload && directory {
+    let additional_sources = if batch {
+        let second_source = source_second.to_str().unwrap().to_owned();
+        let items = [
+            (&source, &destination),
+            (&source_second, &destination_second),
+        ]
+        .into_iter()
+        .map(|(source, destination)| {
+            let (local, remote) = if upload {
+                (source, destination)
+            } else {
+                (destination, source)
+            };
+            let mut member = json!({ "paths": { "local": local, "remote": remote } });
+            if upload && directory {
+                let inventory = super::super::rsync::upload_tree_inventory(source).unwrap();
+                member["contents"] = json!({ "kind": "directory", "inventory": inventory });
+            } else if upload {
+                let (bytes, digest) = super::super::rsync::upload_digest(source).unwrap();
+                member["contents"] = json!({ "kind": "file", "bytes": bytes, "digest": digest });
+            }
+            member
+        })
+        .collect::<Vec<_>>();
+        approval["batch"] = json!({ "upload": upload, "directory": directory, "members": items });
+        vec![second_source]
+    } else {
+        Vec::new()
+    };
+    if !batch && upload && directory {
         let inventory = super::super::rsync::upload_tree_inventory(&source).unwrap();
         approval["directory_upload"] =
             json!({ "source": source, "destination": destination, "inventory": inventory });
-    } else if upload {
+    } else if !batch && upload {
         let (bytes, digest) = super::super::rsync::upload_digest(&source).unwrap();
         approval["upload"] = json!({ "source": source, "destination": destination, "bytes": bytes, "digest": digest });
-    } else if directory {
+    } else if !batch && directory {
         approval["directory"] = json!({ "source": source, "destination": destination });
     }
     let action: SshCommand = serde_json::from_value(json!({
         "connection": reference,
-        "remote": { "kind": kind, "program": program, "local": local, "remote": remote, "approval": approval, "directory": directory },
+        "remote": { "kind": kind, "program": program, "local": local, "remote": remote, "approval": approval,
+            "directory": directory, "additional_sources": additional_sources },
     })).unwrap();
     let path = root.join("rsync-jobs.json");
     {
@@ -1948,6 +2220,33 @@ fn openssh_rsync_verified_transfer(upload: bool, directory: bool) {
     };
     assert_eq!(execute(false).outcome, RunOutcome::Blocked);
     assert!(!destination.exists());
+    if batch {
+        if directory {
+            fs::create_dir_all(destination_second.join("nested")).unwrap();
+        }
+        fs::write(
+            data(&destination_second),
+            b"preserve occupied second target",
+        )
+        .unwrap();
+        let server = upload.then(|| fixture.spawn());
+        assert_ne!(execute(true).outcome, RunOutcome::Success);
+        if let Some(server) = server {
+            server.join().unwrap();
+        }
+        assert!(!destination.exists());
+        assert_eq!(
+            fs::read(data(&destination_second)).unwrap(),
+            b"preserve occupied second target"
+        );
+        if directory {
+            fs::remove_file(data(&destination_second)).unwrap();
+            fs::remove_dir(destination_second.join("nested")).unwrap();
+            fs::remove_dir(&destination_second).unwrap();
+        } else {
+            fs::remove_file(&destination_second).unwrap();
+        }
+    }
     if directory && !upload {
         let server = fixture.spawn();
         assert_ne!(execute(true).outcome, RunOutcome::Success);
@@ -1956,15 +2255,21 @@ fn openssh_rsync_verified_transfer(upload: bool, directory: bool) {
         fs::remove_file(source.join("link")).unwrap();
     }
     if upload {
-        let mut changed = expected.clone();
+        let reviewed = if batch { &source_second } else { &source };
+        let reviewed_data = if batch {
+            &b"second source"[..]
+        } else {
+            &expected
+        };
+        let mut changed = reviewed_data.to_vec();
         changed[0] ^= 0xff;
-        fs::write(data(&source), &changed).unwrap();
+        fs::write(data(reviewed), &changed).unwrap();
         let server = fixture.spawn();
         let changed = execute(true);
         server.join().unwrap();
         assert_eq!(changed.outcome, RunOutcome::Blocked);
         assert!(!destination.exists());
-        fs::write(data(&source), &expected).unwrap();
+        fs::write(data(reviewed), reviewed_data).unwrap();
     }
     let server = fixture.spawn();
     let completed = execute(true);
@@ -1977,6 +2282,19 @@ fn openssh_rsync_verified_transfer(upload: bool, directory: bool) {
         String::from_utf8_lossy(&log.stderr)
     );
     assert_eq!(fs::read(data(&destination)).unwrap(), expected);
+    if batch {
+        assert!(
+            completed
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("Published all 2")
+        );
+        assert_eq!(
+            fs::read(data(&destination_second)).unwrap(),
+            b"second source"
+        );
+    }
     if directory {
         assert!(destination.join("empty").is_dir());
         assert!(!destination.join("link").exists());
@@ -2030,21 +2348,37 @@ fn openssh_scheduled_reviewed_copy_runs_in_confirmed_cascades() {
 #[test]
 #[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
 fn openssh_scheduled_standing_copy_uses_a_durable_calendar_budget() {
-    standing_copy("upload");
+    standing_copy("upload", false);
 }
 
 #[test]
 #[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
 fn openssh_scheduled_standing_download_uses_a_durable_calendar_budget() {
-    standing_copy("download");
+    standing_copy("download", false);
 }
 
-fn standing_copy(direction: &str) {
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
+fn openssh_scheduled_standing_upload_replaces_within_the_combined_byte_budget() {
+    standing_copy("upload", true);
+}
+
+#[test]
+#[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
+fn openssh_scheduled_standing_download_replaces_within_the_combined_action_budget() {
+    standing_copy("download", true);
+}
+
+fn standing_copy(direction: &str, replace: bool) {
     use std::time::UNIX_EPOCH;
 
     use jiff::Timestamp;
     use kortty_jobs::{Job, JobGraph, JobSchedule, SchedulerStore, TimeZone};
 
+    const FIRST: &[u8] = b"first firing bytes";
+    const UPDATED: &[u8] = b"source changed after restart";
+    const INCOMING: &[u8] = b"incoming existing file";
+    const ORIGINAL: &[u8] = b"original existing file";
     let fixture = Sshd::new();
     let root = &fixture.profile.0;
     let (_, seed, connections) = scheduled_batch(root, &[&fixture], "true", Vec::new());
@@ -2062,10 +2396,16 @@ fn standing_copy(direction: &str) {
         fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
     }
     fs::create_dir(source.join("nested")).unwrap();
-    fs::write(source.join("nested/first"), b"first firing bytes").unwrap();
-    fs::write(source.join("existing"), b"unapproved replacement").unwrap();
+    fs::write(source.join("nested/first"), FIRST).unwrap();
+    fs::write(source.join("existing"), INCOMING).unwrap();
     fs::write(source.join("excluded"), b"outside the approval").unwrap();
-    fs::write(target.join("existing"), b"preserved destination").unwrap();
+    fs::write(target.join("existing"), ORIGINAL).unwrap();
+    fs::set_permissions(target.join("existing"), fs::Permissions::from_mode(0o600)).unwrap();
+    let action_cap = if direction == "download" && replace {
+        3
+    } else {
+        64
+    };
 
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
     let first = UNIX_EPOCH + Duration::from_secs((now.as_secs() / 60 + 10) * 60);
@@ -2083,9 +2423,9 @@ fn standing_copy(direction: &str) {
         "connection": reference,
         "remote": {
             "kind": "sync", "direction": direction, "local": local,
-            "remote": remote, "excludes": "excluded",
+            "remote": remote, "excludes": "excluded", "replace_changed": replace,
             "standing": { "days": 7, "limits": {
-                "max_firings": 5, "max_actions": 64, "max_bytes": 1_024
+                "max_firings": 5, "max_actions": action_cap, "max_bytes": 1_024
             } },
         },
     }))
@@ -2153,12 +2493,18 @@ fn standing_copy(direction: &str) {
             2 => {
                 drop(runtime);
                 runtime = open(&path, due);
-                fs::write(
-                    source.join("nested/second"),
-                    b"source changed after restart",
-                )
-                .unwrap();
-                fs::write(source.join("nested/first"), b"must not replace first").unwrap();
+                fs::write(source.join("nested/second"), UPDATED).unwrap();
+                fs::write(source.join("nested/first"), UPDATED).unwrap();
+            }
+            3 if replace && direction == "upload" => {
+                fs::write(source.join("nested/a-within-cap"), [0_u8; 400]).unwrap();
+                fs::write(source.join("nested/first"), [1_u8; 650]).unwrap();
+            }
+            3 if replace => {
+                fs::write(source.join("nested/a-within-cap"), b"missing first").unwrap();
+                fs::write(source.join("nested/z-over-cap"), b"missing second").unwrap();
+                fs::write(source.join("existing"), b"changed existing").unwrap();
+                fs::write(source.join("nested/first"), b"changed first").unwrap();
             }
             3 => {
                 fs::write(
@@ -2207,18 +2553,27 @@ fn standing_copy(direction: &str) {
                 String::from_utf8_lossy(&log.stderr)
             );
             if index == 3 {
+                let diagnostic = if replace && direction == "download" {
+                    "per-firing file and folder limit"
+                } else {
+                    "per-firing byte limit"
+                };
                 assert!(
                     outcome
                         .detail
                         .as_deref()
-                        .is_some_and(|detail| detail.contains("per-firing byte limit")),
+                        .is_some_and(|detail| detail.contains(diagnostic)),
                     "{:?}",
                     outcome.detail
                 );
                 for candidate in ["nested/a-within-cap", "nested/z-over-cap"] {
                     assert!(!target.join(candidate).exists());
-                    fs::remove_file(source.join(candidate)).unwrap();
+                    if source.join(candidate).exists() {
+                        fs::remove_file(source.join(candidate)).unwrap();
+                    }
                 }
+                fs::write(source.join("existing"), INCOMING).unwrap();
+                fs::write(source.join("nested/first"), UPDATED).unwrap();
             } else if index == 4 {
                 assert!(
                     outcome
@@ -2240,23 +2595,47 @@ fn standing_copy(direction: &str) {
         };
         assert_eq!(
             fs::read(target.join("nested/first")).unwrap(),
-            b"first firing bytes"
+            if index >= 2 && replace {
+                UPDATED
+            } else {
+                FIRST
+            }
         );
         if index >= 2 {
-            assert_eq!(
-                fs::read(target.join("nested/second")).unwrap(),
-                b"source changed after restart"
-            );
+            assert_eq!(fs::read(target.join("nested/second")).unwrap(), UPDATED);
         }
         let expected_files = if index >= 2 { 2 } else { 1 };
         assert_eq!(
-            fs::read_dir(target.join("nested")).unwrap().count(),
+            fs::read_dir(target.join("nested"))
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| entry.file_type().unwrap().is_file())
+                .count(),
             expected_files
         );
         assert_eq!(
             fs::read(target.join("existing")).unwrap(),
-            b"preserved destination"
+            if replace { INCOMING } else { ORIGINAL }
         );
+        if replace && (index == 0 || index == 2) {
+            let (folder, name, contents) = if index == 0 {
+                (target.to_path_buf(), "existing", ORIGINAL)
+            } else {
+                (target.join("nested"), "first", FIRST)
+            };
+            let backup = fs::read_dir(folder)
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .find(|entry| {
+                    entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(b".kortty-")
+                })
+                .unwrap();
+            assert_eq!(fs::read(backup.path().join(name)).unwrap(), contents);
+            assert_eq!(backup.metadata().unwrap().mode() & 0o7777, 0o700);
+        }
         assert!(!target.join("excluded").exists());
         runs.push((request.id, due, outcome.outcome));
         assert!(
@@ -2719,6 +3098,7 @@ fn copy_predecessor_finished(
         id: start_copy_manually(runtime, predecessor).id,
         outcome,
         detail: None,
+        output: None,
         recording: None,
         swarm_report: None,
     })

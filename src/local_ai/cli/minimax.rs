@@ -132,6 +132,15 @@ impl Program {
 }
 
 impl MiniMax {
+    pub(super) fn verify_module(&self) -> Result<(), Error> {
+        let module = read(&self.module, "mmx.mjs", MAX_MODULE, false)
+            .map_err(|_| Error::Review(module_changed()))?;
+        if digest(&module).map_err(|_| Error::Service)? != self.package {
+            return Err(Error::Review(module_changed()));
+        }
+        Ok(())
+    }
+
     pub(super) fn destination(&self) -> String {
         format!("{}/anthropic/v1/messages", self.region.base(self.version))
     }
@@ -206,7 +215,7 @@ impl MiniMax {
         Ok(())
     }
 
-    fn read_key(&self) -> Result<Zeroizing<String>, Error> {
+    pub(super) fn read_key(&self) -> Result<Zeroizing<String>, Error> {
         let login_error = || {
             Error::Review(
             "Could not read a private MiniMax login. Run mmx auth login and verify the selected region and config path.".into(),

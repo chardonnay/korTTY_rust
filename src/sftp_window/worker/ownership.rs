@@ -19,6 +19,8 @@ pub(in crate::sftp_window) mod recursive;
 pub(super) mod local;
 pub(in crate::sftp_window) mod principals;
 
+pub(crate) use principals::remote::resolve_scheduler_account;
+
 pub(super) fn resolve_archive_selection(
     selection: &principals::Selection,
     opener: Option<&ExecOpener>,

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=kortty
+Comment=Terminal emulator and SSH client
+Exec=kortty
+Icon=io.github.chardonnay.korTTY
+Terminal=false
+Categories=Network;RemoteAccess;System;TerminalEmulator;
+Keywords=ssh;terminal;sftp;
+StartupWMClass=io.github.chardonnay.korTTY

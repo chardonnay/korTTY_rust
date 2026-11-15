@@ -145,7 +145,7 @@ fn target(address: &str) -> Option<LinkTarget> {
         .then(|| LinkTarget(Arc::from(uri)))
 }
 
-fn trim_punctuation(address: &str) -> &str {
+pub(super) fn trim_punctuation(address: &str) -> &str {
     let mut parentheses = address.bytes().fold(0_i32, |count, byte| match byte {
         b'(' => count - 1,
         b')' => count + 1,

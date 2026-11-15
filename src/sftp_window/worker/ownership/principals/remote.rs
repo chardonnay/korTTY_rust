@@ -43,7 +43,10 @@ struct Gate {
     deadline: Instant,
     stopped: Arc<AtomicBool>,
     wait_for_session: bool,
+    before_exec: Option<ExecCheck>,
 }
+
+type ExecCheck = Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
 
 impl Gate {
     fn timeout(&self) -> io::Result<Duration> {
@@ -104,6 +107,40 @@ pub(in crate::sftp_window::worker) fn resolve(
     wait_for_session: bool,
     guard: &impl Fn() -> Result<()>,
 ) -> Result<u32> {
+    resolve_with(opener, kind, name, wait_for_session, guard, None)
+}
+
+pub(crate) fn resolve_scheduler_account(
+    opener: kortty_ssh::ExecOpener,
+    kind: Kind,
+    name: &str,
+    cancelled: impl Fn() -> bool,
+    before_exec: ExecCheck,
+) -> Result<u32> {
+    resolve_with(
+        &ExecOpener::Direct(opener),
+        kind,
+        name,
+        false,
+        &|| {
+            if cancelled() {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "Account lookup cancelled.").into())
+            } else {
+                Ok(())
+            }
+        },
+        Some(before_exec),
+    )
+}
+
+fn resolve_with(
+    opener: &ExecOpener,
+    kind: Kind,
+    name: &str,
+    wait_for_session: bool,
+    guard: &impl Fn() -> Result<()>,
+    before_exec: Option<ExecCheck>,
+) -> Result<u32> {
     guard()?;
     if opener.is_closed() || opener.verified_host_key().is_none() {
         return Err(io::Error::other(
@@ -122,6 +159,7 @@ pub(in crate::sftp_window::worker) fn resolve(
         deadline: Instant::now() + DEADLINE,
         stopped: Arc::new(AtomicBool::new(false)),
         wait_for_session,
+        before_exec,
     };
     let (exit, bytes) = thread::scope(|scope| -> Result<_> {
         let runner_gate = gate.clone();
@@ -170,6 +208,7 @@ pub(in crate::sftp_window) fn display_names(
         deadline: Instant::now() + DISPLAY_DEADLINE,
         stopped,
         wait_for_session: false,
+        before_exec: None,
     };
     let (exit, bytes) = run(opener, Query::Display(query), &gate).ok()?;
     gate.timeout().ok()?;
@@ -204,7 +243,13 @@ fn run(opener: &ExecOpener, query: Query<'_>, gate: &Gate) -> Result<(u32, Zeroi
                     opener.open_guarded(
                         &command,
                         move || opening.timeout().is_err(),
-                        move || before_exec.timeout().map(|_| ()),
+                        move || {
+                            before_exec.timeout()?;
+                            if let Some(check) = &before_exec.before_exec {
+                                check()?;
+                            }
+                            before_exec.timeout().map(|_| ())
+                        },
                     )
                 })
                 .map_err(|_| unavailable("could not open the SSH command"))?;
@@ -420,6 +465,7 @@ mod tests {
             deadline: Instant::now(),
             stopped: Arc::new(AtomicBool::new(false)),
             wait_for_session: false,
+            before_exec: None,
         };
         assert_eq!(gate.timeout().unwrap_err().kind(), io::ErrorKind::TimedOut);
         gate.stopped.store(true, Ordering::Release);
@@ -435,6 +481,7 @@ mod tests {
             deadline: Instant::now() + Duration::from_secs(2),
             stopped: Arc::new(AtomicBool::new(false)),
             wait_for_session: true,
+            before_exec: None,
         };
         for refusal in [
             ConnectError::RequestRejected { request: "session" },

@@ -240,6 +240,7 @@ pub(crate) fn save_fixtures(root: &std::path::Path) -> io::Result<()> {
             }],
             comparison: None,
             routes: Some(Vec::new()),
+            target_metrics: Vec::new(),
         },
         || Ok(()),
     )?;
@@ -429,11 +430,78 @@ mod tests {
             panic!("expected a saved Swarm conversation");
         };
         assert_eq!(restored.turns[0].targets, report.targets);
+        assert!(restored.turns[0].target_metrics.is_empty());
         assert_eq!(restored.target_ids().collect::<Vec<_>>(), retained);
         assert_eq!(
             restored.turns[0].routes.as_ref().unwrap().len(),
             retained.len()
         );
+        Ok(())
+    }
+
+    #[test]
+    fn saved_swarm_status_metrics_survive_portable_route_revocation() -> io::Result<()> {
+        use kortty_jobs::{ProfileRef, RunOutcome, SwarmTargetReport};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let record = swarm::save_interactive(
+            &profile.0,
+            ProfileRef::Numeric(1),
+            "Fixture model",
+            swarm::Turn {
+                question: "Inspect the build".into(),
+                targets: vec![
+                    SwarmTargetReport {
+                        target: 1,
+                        label: "Build server".into(),
+                        outcome: RunOutcome::Success,
+                        detail: "The build passed.".into(),
+                    },
+                    SwarmTargetReport {
+                        target: 2,
+                        label: "Package server".into(),
+                        outcome: RunOutcome::Cancelled,
+                        detail: "Cancelled before starting.".into(),
+                    },
+                ],
+                comparison: None,
+                routes: Some(vec![swarm::SavedRoute {
+                    target: 1,
+                    connection: 42,
+                    directory: None,
+                    group: None,
+                }]),
+                target_metrics: vec![swarm::TargetMetrics {
+                    target: 1,
+                    elapsed_seconds: Some(0),
+                    total_tokens: Some(720),
+                }],
+            },
+            || Ok(()),
+        )?;
+        let name = format!("{}.json", record.id);
+        let bytes = std::fs::read(profile.0.join(SWARM_DIRECTORY).join(&name))?;
+        let rebound = bind_swarm_routes(&name, &bytes, &HashSet::new())?.expect("route revoked");
+        let swarm::Stored::Conversation(restored) = swarm::decode(&rebound, &record.id)? else {
+            panic!("expected a saved Swarm conversation");
+        };
+        assert_eq!(restored.target_ids().count(), 0);
+        let metrics = &restored.turns[0].target_metrics;
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(metrics[0].target, 1);
+        assert_eq!(metrics[0].elapsed_seconds, Some(0));
+        assert_eq!(metrics[0].total_tokens, Some(720));
+
+        for bad_metrics in [
+            serde_json::json!([{"target": 42, "elapsed_seconds": 1}]),
+            serde_json::json!([{"target": 1, "elapsed_seconds": 1}, {"target": 1, "total_tokens": 2}]),
+            serde_json::json!([{"target": 1}]),
+        ] {
+            let mut invalid: serde_json::Value = serde_json::from_slice(&rebound)?;
+            invalid["turns"][0]["target_metrics"] = bad_metrics;
+            let invalid = serde_json::to_vec(&invalid)?;
+            assert!(swarm::decode(&invalid, &record.id).is_err());
+        }
         Ok(())
     }
 }

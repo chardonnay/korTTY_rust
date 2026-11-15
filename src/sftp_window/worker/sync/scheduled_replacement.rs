@@ -1,13 +1,27 @@
-use super::replacement::ScheduledDownload;
+use super::replacement::ScheduledReplacement;
 use super::*;
 
-#[derive(Default)]
 pub(super) struct Replacements {
-    entries: Vec<ScheduledDownload>,
+    to: Side,
+    standing: Option<StandingLimits>,
+    entries: Vec<(Option<Relative>, ScheduledReplacement)>,
     pub(super) bytes: u64,
 }
 
 impl Replacements {
+    pub(super) fn new(to: Side, standing: Option<StandingLimits>) -> Self {
+        Self {
+            to,
+            standing,
+            entries: Vec::new(),
+            bytes: 0,
+        }
+    }
+
+    pub(super) fn proof_domain(&self) -> &'static [u8] {
+        ScheduledReplacement::proof_domain(self.to)
+    }
+
     pub(super) fn prepare(
         &mut self,
         client: &mut Client,
@@ -17,8 +31,8 @@ impl Replacements {
         field: &mut impl FnMut(&[u8]),
         cancelled: &impl Fn() -> bool,
     ) -> Result<()> {
-        let (source, target) = review.direction(Side::Local).ok_or_else(|| {
-            io::Error::other("Scheduled replacement requires a server source and local target")
+        let (source, target) = review.direction(self.to).ok_or_else(|| {
+            io::Error::other("Scheduled replacement requires a local and a server folder")
         })?;
         let mut scanned = [new_bytes, 0];
         let mut entries = Vec::new();
@@ -50,14 +64,29 @@ impl Replacements {
                         io::Error::other("Scheduled replacement review exceeds 256 MiB on one side")
                     })?;
             }
-            let entry = ScheduledDownload::prepare(client, review, path, cancelled)?;
+            let entry = ScheduledReplacement::prepare(client, review, path, self.to, cancelled)?;
             field(path.bytes());
             entry.bind(field)?;
             if entry.differs() {
-                if new_actions + entries.len() == MAX_ACTIONS {
-                    return Err(
-                        io::Error::other("Scheduled copy exceeds 256 files and folders").into(),
-                    );
+                if new_actions + entries.len()
+                    >= self.standing.map_or(MAX_ACTIONS, |limits| limits.actions)
+                {
+                    return Err(io::Error::other(if self.standing.is_some() {
+                        "Standing copy exceeds the per-firing file and folder limit"
+                    } else {
+                        "Scheduled copy exceeds 256 files and folders"
+                    })
+                    .into());
+                }
+                bytes += source_size;
+                if self
+                    .standing
+                    .is_some_and(|limits| new_bytes + bytes > limits.bytes)
+                {
+                    return Err(io::Error::other(
+                        "Standing copy exceeds the per-firing byte limit",
+                    )
+                    .into());
                 }
                 for label in entry.labels() {
                     labels += label.len();
@@ -68,14 +97,18 @@ impl Replacements {
                         .into());
                     }
                 }
-                entries.push(entry);
-                bytes += source_size;
+                entries.push((path.parent(), entry));
             }
         }
-        if new_actions == 0 && entries.is_empty() {
-            return Err(io::Error::other(
-                "There are no missing or changed regular files to download",
-            )
+        if new_actions == 0 && entries.is_empty() && self.standing.is_none() {
+            let direction = if self.to == Side::Local {
+                "download"
+            } else {
+                "upload"
+            };
+            return Err(io::Error::other(format!(
+                "There are no missing or changed regular files to {direction}"
+            ))
             .into());
         }
         self.entries = entries;
@@ -86,7 +119,7 @@ impl Replacements {
     pub(super) fn preview(&self) -> Vec<ReplacementPreview> {
         self.entries
             .iter()
-            .map(|entry| {
+            .map(|(_, entry)| {
                 let [source, target] = entry.labels();
                 let [source_sha256, target_sha256] = entry.digests();
                 ReplacementPreview {
@@ -99,12 +132,17 @@ impl Replacements {
             .collect()
     }
 
+    pub(super) fn count(&self) -> usize {
+        self.entries.len()
+    }
+
     pub(super) fn apply(
         &self,
         client: &mut Client,
         progress: &Progress,
         checks: &WriteChecks<'_>,
         applied: &mut Applied,
+        parents: &mut BTreeMap<Option<Relative>, DirectoryStamp>,
     ) -> Result<()> {
         if self.entries.is_empty() {
             return Ok(());
@@ -112,21 +150,19 @@ impl Replacements {
         let nonce = crate::private_files::nonce()?;
         let prefix = &nonce[..16];
         applied.recovery_prefix = Some(format!(".kortty-{prefix}????????????????.kortty-part"));
-        let authorize = || {
-            checks.running()?;
-            checks.scheduled.map_or(Ok(()), |authorize| authorize())
-        };
-        for entry in &self.entries {
-            entry
-                .apply(
-                    client,
-                    progress,
-                    &|| (checks.cancelled)(),
-                    &authorize,
-                    prefix,
-                )
+        for (parent, entry) in &self.entries {
+            checks.before_write(client)?;
+            let warning = entry
+                .apply(client, progress, checks, prefix)
                 .map_err(|error| error.context(format!(" · {}", entry.labels()[1])))?;
             applied.replaced += 1;
+            if let Some(warning) = warning {
+                return Err(warning.context(format!(" · {}", entry.labels()[1])));
+            }
+            if self.to == Side::Remote {
+                let current = entry.refreshed_remote_parent(client)?;
+                parents.insert(parent.clone(), current);
+            }
         }
         Ok(())
     }

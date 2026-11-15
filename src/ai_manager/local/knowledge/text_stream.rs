@@ -155,3 +155,85 @@ fn knowledge_corpus_stream_matches_whole_file_chunks_and_cancels() {
         .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
+
+#[cfg(test)]
+#[test]
+fn knowledge_extended_source_stream_keeps_its_review_and_line_citation() {
+    use std::io::Write as _;
+
+    use super::source::{MAX_CONFIGURED_BYTES, MAX_CORPUS_BYTES, NEW_SOURCE_DEFAULT, SyncMode};
+    use super::{Cache, Index, Passage, Scope, Store, read_source_digest, scan_source};
+
+    let profile = crate::snippets::tests::Profile::new();
+    let path = profile.0.join("large.txt");
+    let mut file = File::create(&path).unwrap();
+    let row_bytes = 1024 * 1024;
+    let newline_block = vec![b'\n'; row_bytes];
+    for _ in 0..NEW_SOURCE_DEFAULT as usize / row_bytes {
+        file.write_all(&newline_block).unwrap();
+    }
+    file.write_all(b"Last passage").unwrap();
+    drop(file);
+
+    let mut store = Store::new("Extended file").unwrap();
+    store.add_source(path.clone()).unwrap();
+    let scope = |store: &Store| Scope::new(store, "127.0.0.1:1234", "embedding").unwrap();
+    let baseline = scope(&store);
+    assert!(scan_source(&path, baseline.size_limits[0], || true, |_, _| Ok(())).is_err());
+    store.set_file_sync(path.clone(), SyncMode::Automatic);
+    store
+        .set_file_size_limit(path.clone(), Some(MAX_CONFIGURED_BYTES))
+        .unwrap();
+    assert_eq!(store.file_sync(&path), SyncMode::Manual);
+    assert_eq!(
+        store.effective_file_size_limit(&path) as usize,
+        MAX_CORPUS_BYTES
+    );
+
+    let saved: Store = serde_json::from_slice(&serde_json::to_vec(&store).unwrap()).unwrap();
+    saved.validate().unwrap();
+    let extended = scope(&saved);
+    assert!(!extended.same_snapshot(&baseline));
+    let mut passages = Vec::new();
+    let summary = scan_source(
+        &path,
+        extended.size_limits[0],
+        || true,
+        |location, text| {
+            passages.push((location, text.to_owned()));
+            Ok(())
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        passages,
+        [(
+            Location::Line(NEW_SOURCE_DEFAULT as usize + 1),
+            "Last passage".into()
+        )]
+    );
+    assert_eq!(
+        read_source_digest(&path, extended.size_limits[0], || Ok(())).unwrap(),
+        summary.digest
+    );
+    let (location, text) = passages.pop().unwrap();
+    let index = Index::from_parts(
+        extended.digest,
+        vec![Some(summary.digest)],
+        vec![(
+            Passage {
+                source: 0,
+                location,
+                text,
+            },
+            vec![1.0],
+        )],
+        1,
+        None,
+    )
+    .unwrap();
+    let cache = Cache::new(profile.0.clone());
+    cache.save(&index, || Ok(())).unwrap();
+    let reopened = cache.load(&extended).unwrap();
+    assert_eq!(reopened.entries[0].0.location, location);
+}

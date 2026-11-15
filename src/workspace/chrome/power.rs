@@ -308,6 +308,7 @@ mod tests {
                 outcome: RunOutcome::Cancelled,
                 detail: None,
                 recording: None,
+                output: None,
                 swarm_report: None,
             }),
             due,

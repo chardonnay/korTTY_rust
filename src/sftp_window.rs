@@ -27,11 +27,11 @@ pub(crate) use compare::Message as ComparisonMessage;
 pub(crate) use compare::ai as comparison_ai;
 mod conflicts;
 mod drag;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) use drag::external::{Request as ExternalFileDrag, file_drag_grip};
 #[cfg(target_os = "linux")]
 pub(crate) use drag::{DesktopDestination, WaylandDrop, desktop_drop_target};
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) use worker::drag_out::Prepared as PreparedFileDrag;
 pub(crate) mod external_edit;
 mod extract;
@@ -57,23 +57,31 @@ mod workbench;
 pub(crate) mod worker;
 
 pub use conflicts::ConflictDefault;
+#[cfg(windows)]
+pub(crate) use files::local_name as checked_local_component;
 pub(crate) use files::nonce as staging_name;
 pub(crate) use files::{LocalStamp as LocalFileStamp, list_local, validate_transfer_name};
 pub use listing::SortColumn;
 pub(crate) use resume_settings::ResumePreferences;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use tree::VerifiedTreeStage;
 pub(crate) use tree::local as local_tree;
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+pub(crate) use tree::privileged_download::{
+    Destination as PrivateTreeDestination, PublishError as PrivateTreePublishError,
+};
 pub(crate) use tree::single_file::OrdinaryDownload;
 pub(crate) use tree::single_file::{LocalSource, StagedDownload};
 pub(crate) use tree::{FolderError, FolderTransfer, copy_scheduled as copy_scheduled_folder};
 pub(crate) use worker::RemoteEditor;
 pub(crate) use worker::extract::transport::exchange as exchange_server_archive;
+pub(crate) use worker::extract::transport::exchange_password_creation as exchange_server_password_archive;
 pub(crate) use worker::extract::transport::{
     PrivilegedArchiveFailure, exchange_privileged as exchange_privileged_server_archive,
 };
 #[cfg(test)]
 pub(crate) use worker::folder_usage::tests::exercise_live_folder_sizes;
+pub(crate) use worker::sync::{LocalFileSnapshot, ReviewedFilePublication, ReviewedFileReceiver};
 
 const PAGE_SIZE: usize = 160;
 const SERVER_COPY_PAGE_SIZE: usize = 16;
@@ -352,11 +360,11 @@ pub enum Message {
     DesktopDrop(drag::DesktopDrop),
     #[cfg(target_os = "linux")]
     WaylandDesktopDrop(drag::WaylandDrop),
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     ExternalFileDrag(ExternalFileDrag),
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     PrepareExternalFileDrag,
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     ExternalFileDragPrepared(u64, Result<Arc<PreparedFileDrag>, Arc<str>>),
     DesktopDropReady(drag::DesktopDropReply),
     DesktopLocalCopyDone(drag::local_copy::Reply),
@@ -499,7 +507,7 @@ pub struct SftpWindow {
     history: VecDeque<String>,
     workbench: workbench::Workbench,
     desktop_drop: drag::DesktopDrops,
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     desktop_drag: drag::external::State,
     local_listing_request: Option<u64>,
     parallel: parallel::Transfers,
@@ -707,7 +715,7 @@ impl SftpWindow {
             history: VecDeque::new(),
             workbench: workbench::Workbench::default(),
             desktop_drop: drag::DesktopDrops::default(),
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             desktop_drag: drag::external::State::default(),
             local_listing_request: None,
             parallel: parallel::Transfers::default(),
@@ -909,7 +917,7 @@ impl SftpWindow {
         self.transfer_allowed = allowed;
         if !allowed {
             self.cancel_remote_desktop_drop();
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             self.cancel_prepared_desktop_drag();
             if let Some(busy) = self.busy.as_mut().filter(|busy| busy.requires_transfer) {
                 if busy.sync_cancel.is_some() {
@@ -1455,9 +1463,9 @@ impl SftpWindow {
             Message::DesktopDrop(drop) => return self.begin_desktop_drop(drop),
             #[cfg(target_os = "linux")]
             Message::WaylandDesktopDrop(drop) => return self.begin_wayland_desktop_drop(drop),
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             Message::PrepareExternalFileDrag => return self.prepare_remote_desktop_drag(),
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             Message::ExternalFileDragPrepared(ticket, result) => {
                 self.remote_desktop_drag_prepared(ticket, result)
             }
@@ -2626,7 +2634,8 @@ impl SftpWindow {
 
     pub fn view(
         &self,
-        #[cfg(any(target_os = "linux", target_os = "windows"))] desktop_drag: bool,
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        desktop_drag: bool,
     ) -> Element<'_, Message> {
         if let Some(comparison) = &self.comparison {
             return comparison.view();
@@ -2726,13 +2735,13 @@ impl SftpWindow {
                 self.panel_view(
                     Side::Local,
                     zone.clone(),
-                    #[cfg(any(target_os = "linux", target_os = "windows"))]
+                    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                     desktop_drag
                 ),
                 self.panel_view(
                     Side::Remote,
                     zone,
-                    #[cfg(any(target_os = "linux", target_os = "windows"))]
+                    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                     desktop_drag
                 )
             ]
@@ -2844,7 +2853,8 @@ impl SftpWindow {
         &'a self,
         side: Side,
         zone: drag::Zone,
-        #[cfg(any(target_os = "linux", target_os = "windows"))] desktop_drag: bool,
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        desktop_drag: bool,
     ) -> Element<'a, Message> {
         let panel = self.panel(side);
         let online = self
@@ -2949,7 +2959,7 @@ impl SftpWindow {
                 Side::Remote => Message::CreateServerArchive,
             }),
         ));
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         if side == Side::Local
             && desktop_drag
             && self.desktop_drop_available(side)
@@ -2978,7 +2988,7 @@ impl SftpWindow {
             }
         }
         if side == Side::Remote {
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             if desktop_drag && let Some(control) = self.remote_drag_control(zone.clone()) {
                 actions = actions.push(control);
             }

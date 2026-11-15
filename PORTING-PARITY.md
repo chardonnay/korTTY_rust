@@ -16,6 +16,1313 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## Scheduler rsync downloads replacing existing local files
+
+An ordinary or passwordless single-file rsync download can replace a
+reviewed existing local file on Windows, Linux and macOS. Each grouped route
+requires an explicit non-overlapping local file path. Review binds the saved
+SSH route and host pins, rsync executable, literal server and local paths,
+receiver identity, contents, and supported metadata. The passwordless
+route also binds the Linux helper policy and protected source scope.
+
+The local publisher verifies the staged file and rechecks the receiver
+before quarantining the original. Publication carries supported receiver
+metadata to the replacement and retains the original in a private recovery
+location recorded in the run journal. One-use approval requires a fresh
+review before another replacement. Calendar and Chain approvals advance
+the exact receiver identity only after confirmed publication. Each firing
+charges one entry and the source bytes, with zero removals because the
+receiver path remains present. A changed receiver or an unconfirmed result
+requires review. Initially vacant recurring receivers remain open.
+
+Existing-file adoption for a single-target Java download prefills the
+original local destination folder and server basename. Grouped drafts
+require a local file path for each route. The imported job and schedule
+start disabled. Portable backups retain mode and paths, discard saved
+proofs, and restore the affected replacement jobs as disabled drafts.
+The Windows app and test targets passed a compile check before the final
+Windows program-library guard. Fedora app and test targets passed strict
+Clippy. The native test builds were stopped before execution. Native runtime
+verification of the new direct file receiver remains pending.
+
+## Scheduler passwordless rsync for protected Linux paths
+
+The Scheduler can explicitly review a single file or directory per saved SSH
+route using the fixed Linux helper. The approval binds the local executable,
+host pins, selected operation, exact paths and current server rules. The
+helper matches the sudo UID and GID and holds the administrator-configured
+source, creation, replacement and handoff roots. Native rsync moves the
+bytes under the SSH login. The helper seals protected downloads and copies
+incoming bytes into a root-owned stage before publishing them. Existing
+directory uploads can merge or mirror and retain the original for recovery.
+
+The Java adoption path requires explicit passwordless selection. Supported
+single-source drafts retain source placement and the deletion option.
+Portable backups keep the mode and disable the restored jobs pending review.
+
+The Fedora ARM64 server-archive component passed 53 tests, including bounded
+wire frames, exact sudo IDs, sealed-download checks and existing publication
+compatibility. In an isolated native Fedora fixture, the Scheduler used
+pinned OpenSSH and real sudo to upload and download a file, a new directory
+and an existing directory. The fixture checked scope denial, no-replace
+publication and directory recovery. The helper also restored the original
+after abort, EOF and a changed policy after quarantine. Fedora ARM64 passed
+3,549 app tests and all five selected ordinary OpenSSH rsync regressions.
+Windows ARM64 passed 3,443 app tests and strict app Clippy. The app and
+tests cross-checked for Apple Silicon, and the Linux x86-64 helper and tests
+cross-checked with strict Clippy.
+Combined passwordless rsync keeps the ordered placement and per-source
+inventories of the ordinary mixed transfer. A protected upload checks one
+exact Linux receiver and publishes the verified combined tree. A protected
+download streams a bounded, read-only inventory for each allowed source in
+the review. During execution it verifies every sealed handoff before local
+publication and validates the combined projection again, including shadowed
+inputs. New local destinations use the owner-private publication path.
+Java combined drafts retain the original order and directory syntax when
+passwordless mode is explicitly selected.
+
+Fedora ARM64 used real sudo and pinned OpenSSH to check combined uploads
+and downloads to vacant, merge and scoped mirror receivers. The tests
+checked original recovery, scoped deletion, owner-private downloads and
+refusal of stale or unauthorized shadowed inputs. The existing privileged
+single-source fixture and five ordinary OpenSSH rsync regressions passed.
+The Fedora helper passed 55 tests, the Fedora app passed 3,551 tests and the
+Windows ARM64 app passed 3,445 tests. Strict Clippy passed on both native
+platforms, and the app and tests passed the Apple Silicon cross-check.
+Native macOS editor acceptance remains open. Forced helper termination can leave
+a protected handoff directory for administrative cleanup.
+[Combined transfer verification](target/verification/20261115-mixed-sudo-acceptance.md).
+
+## Scheduler passwordless replacement of a protected file
+
+The upload form can bind an existing regular file on each saved route.
+The helper verifies the original inode, content and metadata under the
+configured replacement roots. It copies the reviewed local bytes through
+the ordinary login's handoff and prepares the successor with the original
+mode, group and supported attributes. Shared ancestor locks keep an
+overlapping directory publication from moving the checked parent. The
+helper quarantines the original and publishes the successor with no-replace
+rename. A failed or revoked attempt restores the original if the target
+remains vacant. A late arrival is left in place and the original stays in
+the private recovery directory. [Linux rename operations](https://man7.org/linux/man-pages/man2/rename.2.html).
+
+Java drafts retain the original file name below a directory target and
+keep explicit file targets. Adoption remains disabled until local bytes,
+server paths and receiver identities have been reviewed. Direct protected
+directory downloads to a new local path now publish an owner-private tree.
+
+The Fedora ARM64 helper passed 61 component tests. The Fedora app passed
+3,553 tests, including the grouped Java review, and five ordinary pinned
+rsync regressions. Five native sudo and OpenSSH tests covered the original
+single-source and mixed paths, exact file replacement, stale-byte and
+same-byte inode substitution refusal, the retained original and private
+new local downloads. Windows ARM64 passed 3,447 app tests. Strict Clippy
+passed on both native platforms. The app and tests passed the Apple Silicon
+cross-check. Native macOS and configured-deployment editor acceptance remain
+open.
+[Verification](target/verification/20261115-protected-file-rsync-acceptance.md).
+
+## Scheduler recurring passwordless rsync
+
+Calendar and Chain standing approvals now support protected uploads to
+reviewed existing regular files and directories, including combined
+directory projections. Downloads can update a reviewed existing local
+directory from a direct or combined set of protected sources. The saved
+approval binds the logical server paths, types, configured root identities,
+policy revision and handoff root. Each firing obtains fresh bounded source
+inventories. Combined limits count shadowed inputs as well as visible output.
+
+A confirmed remote upload returns a held post-move receiver proof and the
+recovery slot. A local receiver returns its held successor snapshot. Before
+publication the scheduler records the pending attempt and removal charge.
+An unconfirmed result requires a new review before the next firing. Grants
+reject overlapping destinations on the same reviewed SSH route. The store
+preserves the replay watermark across predecessor changes and reapprovals.
+Native macOS editor acceptance and creation-to-replacement grants remain
+open. The [direct local file workflow](#scheduler-rsync-downloads-replacing-existing-local-files)
+extends the existing receivers.
+
+The Fedora ARM64 helper passed 66 tests and strict Clippy, including bounded
+source scans and the verified file and directory successor receipts. Fedora
+passed 3,556 application tests and five ordinary pinned rsync regressions.
+Seven real sudo and OpenSSH fixtures included two successive firings for
+direct file and directory uploads, a Chain download and mixed scoped mirrors
+in both directions. They checked policy denial, changed receiver refusal and
+the shared budget for shadowed inputs. The Windows ARM64 app passed 3,450
+tests on retry. Strict app Clippy passed on both native platforms. The app
+and tests passed the Apple Silicon cross-check.
+[Verification](target/verification/20261115-recurring-sudo-rsync-acceptance.md).
+[Verification records](target/verification/20261115-privileged-rsync-acceptance.md).
+
+## Scheduler recurring rsync for existing directories
+
+Explicit approval binds the rsync executable, saved routes and host pins,
+ordered source placement, current protected destinations, calendar time zone
+and predecessor rules. The private grant is limited by time, firings and
+combined source byte, entry and removal counts. Native backup restores keep
+the configuration as a disabled draft requiring new approval.
+
+The Scheduler captures the nominal UTC calendar occurrence or exact
+predecessor round when it dispatches the run. The private grant consumes
+those identities independently of journal retention. A firing checks current
+sources within the reviewed scope and records a pending publication before
+the first receiver rename. The local receiver and Linux v3 helper return a
+snapshot of the actual published directory. The next firing rejects an
+externally changed receiver. An unconfirmed publication suspends automatic
+execution until a new review binds the current destination. One-off Linux
+uploads use the existing v1 and v2 commands.
+
+The Windows Jobs tests checked nominal dates and admitted predecessor
+rounds. The native Fedora helper suite passed all 13 existing-tree tests,
+including two successive exact receipts, exact removal counts and rejection
+of a same-content directory replacement. The final Fedora ARM64 runtime
+passed 3,546 app tests and all five separately selected OpenSSH tests. The
+recurring fixture exercised calendar uploads, Chain downloads, limit denial
+and cleanup of a nonempty read-only source transfer. Windows ARM64 passed
+3,440 app tests, strict app Clippy and three selected cases for read-only
+stage cleanup, recurring calendar downloads and mixed downloads over pinned
+SSH. The app and tests cross-checked for Apple Silicon. Native macOS and
+manual Scheduler editor acceptance remain open.
+[Verification records](target/verification/20261115-rsync-recurring-acceptance.md).
+
+## Scheduler rsync with mixed file and folder sources
+
+The Scheduler reviews one ordered list of file, named folder and folder
+contents sources for each pinned route. A single projected tree binds the
+checked source contents and the receiver. The review shows overlaps and the
+projected placement. Directories combine and take priority over same-path
+files. Among files at the same path, the first listed source is retained.
+Java drafts preserve raw source order, trailing slash placement and deletion
+when adopted. Each adopted job and its calendar start disabled.
+
+One verified tree is published per route. A vacant receiver uses no-replace
+publication. An existing protected receiver is checked again and kept in a
+private recovery folder after publication. A named-folder mirror prunes only
+under the actual incoming directory with that name. A folder contents source
+includes the entire target in the mirror scope. File-only mixed mirrors allow
+exact reviewed type replacements while preserving unrelated entries. The
+Linux helper uses a bounded v2 request for named scopes and continues to
+accept previous v1 clients. [rsync manual](https://download.samba.org/pub/rsync/rsync.1#opt--delete).
+
+SSH pin lookups share the trust-store sidecar lock so a foreground review
+and the guarded SSH writer can read the pinned route concurrently. Host key
+changes and imports still hold the lock exclusively.
+
+Fedora ARM64 passed 3,539 app tests and both previous existing-tree SSH
+cases. Both mixed-source OpenSSH cases passed in 24 consecutive runs after
+the trust-store change. Windows ARM64 passed 3,432 app tests and the pinned
+mixed download test against Fedora. The nine trust-store tests passed on
+each system. The app and tests cross-checked for Apple Silicon. Native macOS
+acceptance remains open.
+[Verification records](target/verification/20261115-rsync-mixed-acceptance.md).
+
+## Scheduler rsync downloads into existing folders and Java connection libraries
+
+The Scheduler can merge one verified remote directory into an existing protected
+local folder on Windows, Linux, and macOS. Named placement and contents placement
+are supported. Explicit mirror mode removes unmatched entries within the reviewed
+folder. Grouped runs review distinct local destinations per saved pinned route.
+The native rsync bridge stages incoming data, and SFTP on the same SSH session
+checks the complete source inventory and every file. The local receiver checks
+its held identity, contents, permissions, and available metadata before replacing
+the directory. It rechecks job authority, route, host pins and policy around
+quarantine and publication. An original remains available under a private
+recovery name after publication. Run history preserves the recovery paths for
+eight routes even when the approval or job is removed. Reuse requires a fresh
+receiver review. Java single-directory download drafts retain their named or
+contents layout and merge or mirror option through native adoption.
+
+Java backup restore maps favorites onto new SSH, local shell and serial profiles
+using unique source IDs. Exact group colors apply to newly imported folders.
+The ordinary and credential restore paths both preserve existing native choices.
+The same archive can fill individually missing Rust display preferences for
+manager tabs, connection borders, split focus, tab order, scrollbars, workflow
+font size, manual UI scale and remote sidebar width. The Java manual percentage
+applies when its automatic scale is off. Themes and display fields merge in one
+transaction and repeat imports preserve the current Rust values.
+
+Fedora ARM64 passed 3,537 app tests and both selected native OpenSSH download
+cases. Windows ARM64 passed 3,430 app tests and the selected pinned
+existing-folder case against Fedora with MSYS2 rsync. Apple Silicon passed
+the app and test cross-check. Native macOS acceptance remains open.
+[Verification records](target/verification/20261115-local-rsync-and-java-display-settings.md).
+
+## Scheduler rsync uploads to existing Linux folders and Java skill statistics
+
+One reviewed local directory can be merged into an existing protected Linux
+folder or mirrored with explicitly selected deletion. The Scheduler handles
+named and contents layouts and reviews every saved route independently. The
+target witness includes the exact receiver and its filesystem and contents.
+Job authority, current route, host pins and managed policy gate quarantine
+and publication. The SSH worker checks outbound control frames before
+delivery. Publication keeps the displaced receiver as recovery; an uncertain
+result reports the known recovery location. The helper serializes publication
+for the held receiver inode. Java single-directory drafts can adopt these
+layouts and remain disabled pending review and explicit activation.
+
+Java statistics for custom and deleted skills now appear in native reports
+under their original string IDs. This history keeps its own usage periods,
+pinned buckets and tokenizer measurements. A Java numeric ID can coexist
+with the same native ID. The encrypted restore keeps existing observations
+on repeated import and carries the historical records in native backups.
+Earlier built-in imports without Java ID provenance need a readable original
+catalogue to establish that binding on a subsequent restore.
+The final app suites passed 3,420 tests on Windows ARM64 and 3,526 on
+Fedora ARM64. The two selected Fedora OpenSSH rsync cases passed, including
+the original vacant-folder upload. The app and tests cross-checked for
+Apple Silicon.
+[Verification records](target/verification/20261115-scheduler-existing-rsync-and-java-skill-statistics.md).
+
+## Existing rsync receiver helper, archive sudo credentials, and Java apply history
+
+The ordinary Linux rsync receiver helper binds a reviewed protected target
+to its exact path, mount, identities, metadata and contents. It composes a
+private successor from the checked incoming tree and the reviewed receiver.
+Merge mode keeps receiver-only entries. Mirror mode drops them inside the
+selected tree. Compatible existing permissions, group, modification times and supported
+attributes are preserved. The helper rechecks both trees and quarantines the
+original before it requests a separate publication decision. Abort or EOF
+restores the original to a still-vacant path. A successful publication
+retains the original in a private recovery directory. Fedora stdio tests
+cover stale same-length changes, protected metadata, a foreign receiver,
+aborted publication, recovery and the selected mirror scope. This checkpoint
+preceded the Scheduler integration. [Verification records](target/verification/20261115-existing-rsync-archive-sudo-and-java-history.md).
+
+Scheduler server archives can select an explicitly reviewed vault-backed sudo
+credential for the installed Linux helper. The fixed V2 command accepts one
+bounded nonce challenge on stderr and acknowledges readiness before it
+receives archive input. A separate guarded publication marker prevents EOF
+from committing an ordinary V2 archive. The ZIP password retains its own
+review and publication marker. The V1 passwordless rule stays available.
+The installed helper and its administrator rules constrain reads, output and
+optional verified downloads. The native Fedora OpenSSH fixture verified the
+pinned client transport and withdrawn approval. A disposable Fedora namespace
+verified the installed helper through actual sudo and PAM for both a plain
+archive and a separately password-protected AES-256 ZIP.
+
+Migrated Java snippet and folder analysis histories retain bounded read-only
+apply options, checklist and completion state, checkpoint metrics, retries,
+failure codes and model provenance. Supported fields appear in native report
+exports and survive native backup and restore. Free-form instruction and
+embedded header bodies from the Java run request are omitted. Native views
+for remaining historical snapshots and diagram families are still open.
+
+Native app suites passed 3,406 tests on Windows ARM64 and 3,512 on Fedora
+ARM64. Windows app and Fedora component Clippy passed with warnings denied.
+The archive helper cross-checked for Apple Silicon.
+
+## Anthropic fallback, recurring SFTP replacement, and Java rsync drafts
+
+Anthropic Messages applies the legacy extended-thinking budgets to compatible
+older Claude models, with reserved answer space. Modern models retain adaptive
+thinking. A bounded invalid-request response can adjust the thinking mode
+or lower the output limit before JSON or streaming delivery. The original
+credential, endpoint, request content, and deadline cover all attempts.
+Terminal Chat revalidates its attached files, knowledge, and Memory before
+each dispatch. [Claude thinking compatibility](https://platform.claude.com/docs/en/build-with-claude/extended-thinking).
+
+An ordinary SFTP recurring approval can explicitly include changed-file
+replacement. Each calendar firing recomputes and checks exact file hashes
+under the pinned roots. Replacements and new entries share the per-firing
+limits. Live approval, policy, and route checks gate publication. Eligible
+originals are retained in guarded recovery folders in either direction.
+
+Java Scheduler rsync definitions import as disabled drafts with route and
+dependency mapping. The draft retains source order and the original
+merge, delete, sudo, and path-suffix intent. Native adoption configures and
+reviews the exact executable, sources, and destinations on this device.
+
+Windows rsync runs a reviewed PE executable and its adjacent DLLs from a
+private staged bundle. The native bridge checks the loopback server owner,
+accepts peers from the owned process job, and carries binary protocol data
+over the app's pinned SSH session. The Windows ARM64 acceptance fixture
+uses MSYS2 rsync under the system's x64 compatibility support and a private
+Fedora OpenSSH endpoint. It exercises regular files and nested directory trees
+in both directions. [Verification details](target/verification/20261115-provider-sync-and-rsync.md).
+
+The native app suites passed on Windows ARM64 and Fedora ARM64. The Fedora
+OpenSSH fixtures covered recurring replacement in both directions, combined
+action and byte limits, a swapped destination root, and recovery after
+revocation. The Windows tests used the regular application executable as
+the rsync bridge. Apple Silicon passed the cross-check.
+
+## Reviewed HTTPS Messages routes and Scheduler workflows
+
+AI Manager can review an exact Anthropic Messages HTTPS URL. The endpoint
+preserves the gateway path spelling and uses the native Messages request and
+authentication headers. Java restore applies Messages dispatch before model
+selection and retains the explicit model as a Manual draft. Changing the
+destination invalidates trust and clears its credential reference. The
+existing Anthropic base URL and earlier Java import identities remain valid.
+
+Scheduler rsync supports saved target lists and connection groups on Unix.
+Each saved route records its own pinned host keys and destination, including
+local destination separation for downloads. The normal batch runner reports
+per-target outcomes and checks the current review at publication.
+
+One-use ordinary Scheduler SFTP folder uploads can replace reviewed changed
+regular files owned by the remote login in private mode. The worker reviews
+and rechecks source and target hashes, ownership and permissions. It holds
+the original under a private server-side recovery name and restores it if
+authority is withdrawn before guarded publication. SFTP v3 cannot verify
+arbitrary remote extended ACLs, so the unattended path uses private access
+modes and preserves the ordinary metadata.
+
+Java privileged archive jobs restore as disabled drafts for the exact saved
+routes. Adoption explicitly selects the installed passwordless helper and
+requires its current sudo policy and a fresh action approval. Local output
+paths and ZIP vault entries need separate adoption. Existing dependency
+expansion applies to every matched target.
+
+Native app tests passed on Windows ARM64 and Fedora ARM64. The Windows TLS
+fixture verified the exact route, native credential header, JSON, SSE and
+HTTP status handling. Fedora OpenSSH verified grouped rsync with separate
+destinations and SFTP replacement, replay refusal and recovery after
+revocation. [Verification details](target/verification/20261115-reviewed-provider-and-scheduler.md).
+
+## Scheduled transfer batches, protected archive copies, and Java archive targets
+
+Unix rsync Scheduler actions accept several regular files or several
+directories on one pinned route. The review binds each literal source,
+its derived destination, the executable and applicable source inventory.
+The run checks all destinations and reviewed sources before publication.
+Each item uses the existing guarded no-replace operation. Results identify
+how many publications were confirmed before a failure.
+
+Ordinary one-use SFTP folder download replacement now runs on Linux and
+macOS with exact source and destination evidence. The Unix publication
+checks held ownership, ordinary access permissions and extended ACLs,
+and retains the original under a private per-run recovery name.
+
+Privileged Linux server archives can supply an optional verified local
+copy from the same SSH command channel. The administrator must enable the
+destination in `download_roots`. Client approval binds the exact local
+path and file-transfer policy. The helper streams from the held file that
+it published. The client checks the frame, size, SHA-256 and successful
+completion before publishing at a vacant local path.
+
+The Java backup importer splits ordinary multi-target archive jobs into
+independent disabled drafts for the exact mapped SSH routes. Source IDs
+keep the split stable across imports. Dependent jobs require all split
+members. Each draft reviews the local destination and vault choice afresh.
+An unavailable route omits the original archive action and its dependents.
+
+Native Fedora ARM64 checks passed for both rsync batch modes, protected archive
+streaming and revocation, and Unix changed-file replacement and recovery. The
+native Windows ARM64 app suite passed all 3,387 runnable tests, including the
+corrected Java archive import fixture. The Fedora app suite had used the earlier
+fixture. [Verification details](target/verification/20261115-scheduler-transfer-and-archive.md).
+
+## MSI and Flatpak staging and native Java Pacman downgrade
+
+The Windows and Linux packager accepts `--windows-msi` and `--linux-flatpak`
+alongside the ordinary portable archives. MSI stages the app, CLI, SSH
+worker and license files with a separate installer identity from Java.
+Flatpak preserves the Java application ID and checks both executables in
+the target Freedesktop 25.08 runtime. Packaged local shells run inside the
+runtime. Reviewed host-shell parity remains open.
+
+The Fedora ARM64 Flatpak built against the Freedesktop 25.08 SDK using
+verified upstream Rust 1.99.1. It replaced the signature-verified Java
+v2.26.0 deployment on the same `stable` ref and preserved the isolated
+profile canary. The app opened under X11 and native Wayland, where its CLI
+found a connected local shell. X11 reported the expected `WM_CLASS`, the
+exported AppStream metadata validated, and uninstall preserved the private
+profile. Publisher signing and x86-64 verification remain release gates.
+[Native Flatpak verification](target/verification/20261115-flatpak-native-release-verified.log).
+
+WiX 6 on Windows ARM64 generated MSI packages for ARM64 and x64 using the
+retained release binaries. The native Windows Installer database and cabinet
+checks confirmed both shortcut entries, upgrade sequencing, retained install
+directory, and all 25 files for each architecture against their companion
+ZIP payload. Each extracted CLI reported version 0.1.0. Clean Windows product
+registration, upgrade and removal, Authenticode, and a rebuild from current
+desktop sources remain release gates.
+
+The retained ARM64 Pacman candidate passed an actual downgrade from the Java
+v2.26.0 release package. The Java asset matched the published SHA-256 and
+detached signature. Java opened its X11 window. After `pacman -U`, the Rust
+app answered its control CLI and exposed a connected local shell. The
+Java-created theme configuration, a profile canary and the local policy
+retained their checksums through downgrade and Rust removal. The Rust
+candidate was signed with a disposable key in the private test container.
+[Native downgrade verification](target/verification/20261115-pacman-java-downgrade-verified.log).
+
+New knowledge source reviews support PDF and UTF-8 size settings through
+1 GiB with a 500 MiB scan ceiling. The large-PDF path writes the reviewed
+bytes to a private temporary file, then parses a read-only mapping inside the
+existing bounded worker. Older approval records keep their format ceilings.
+Windows ARM64 passed 3,383 app tests and three separately invoked native
+PDF-worker tests, including exact 500 MiB input, cancellation and worker
+cleanup. Both the native Fedora process and the installed Flatpak worker
+extracted the exact 500 MiB fixture. The Flatpak worker rejected one extra
+byte and cleaned up the spool. The [verification record](target/verification/20261115-native-packages-and-pdf.md)
+records these checks with their tested sources.
+
+## Java knowledge and archive drafts, protected ZIP and Pacman packaging
+
+Java RAG restore adds inactive Knowledge Store and source suggestions, keyed
+by their original IDs. An explicit review can create a native store and
+prefill compatible folder rules. The user selects the native source,
+embedding model and backend. Qdrant settings are reference metadata for a
+fresh native index. Archived credentials, full local paths and index data
+stay in the Java backup.
+
+Single-route Java Scheduler archive jobs can restore as disabled drafts,
+including ZIP, password ZIP, TAR and TAR.BZ2. Adoption reviews the saved
+server and jump route against current SSH pins, the archive layout and
+exclusions, and an optional new local path. The archive password comes from
+an explicitly chosen Rust vault entry. The adopted job is saved disabled.
+Privileged Java archive jobs and fan-out need their own import review.
+
+The installed Linux privileged archive helper now supports password ZIP on
+the passwordless sudo route. The reviewed ZIP and vault reference are bound
+to the local approval. The helper validates its one-use source inventory and
+requires a guarded password commit before writing AES-256 output. The output
+uses a vacant root-owned private server path.
+
+The native Linux packager supports `--linux-pacman` on Arch Linux and Arch
+Linux ARM. It checks the ABI requirements of both executables, the package
+name, architecture and version, and generates an ALPM archive and SHA-256
+sidecar. The package shares Java's name and uses a numeric Rust release version.
+
+Windows ARM64 passed 3,382 app tests and Fedora ARM64 passed 3,491.
+Both dedicated OpenSSH password ZIP tests passed on Fedora. The installed
+helper passed its passwordless `sudo` test in an isolated Arch Linux ARM
+userspace, including AES ZIP validation and root-private output permissions.
+The native `makepkg` fixture passed in the same environment. The Apple Silicon
+cross-check passed. The [verification record](target/verification/20261115-rag-archive-pacman.md)
+lists the tested snapshots and platform coverage.
+
+The ARM64 Pacman release candidate passed installation into a fresh Arch Linux
+ARM userspace, upgrade from a synthetic earlier Rust version, X11 startup
+with a connected local terminal, and removal. Pacman rejected the unsigned
+fixture and accepted the same package after disposable test signing. It
+installed the expected OpenSSL 3 ABI next to the existing OpenSSL 4 package.
+The retained archive has a SHA-256 sidecar. Publisher signing and native
+x86_64 verification remain open. The later checkpoint records the real Java
+package downgrade on ARM64.
+
+## Exact HTTPS routes, Java model metadata and password ZIP
+
+The reviewed OpenAI-compatible HTTPS completion URL preserves a supported
+tenant path, case and trailing slash. Java Manual and DEFAULT imports retain
+these request targets. Manual sends the model ID. Server default omits the
+model in an explicitly reviewed Terminal Chat. A destination edit revokes
+trust and clears the credential reference. Model discovery uses the existing
+canonical API route.
+
+Java backup restore can add GGUF and MLX registry metadata without any AI
+profiles in the archive. Exact runtime type and Java ID identify the inactive
+entries for restart and subsequent portable backups. In the AI Manager,
+reviewed metadata can prefill supported settings of a separately registered
+native model. Saving checks current policy and the same native registration.
+Local paths and runtime selection require local registration.
+
+An ordinary Scheduler server-only ZIP can use a vault archive password.
+The helper proves protocol support before receiving the password over the
+pinned SSH channel. It requires a separate authorization marker before
+creating the archive. The SSH worker rechecks policy and route authority for
+the marker. Optional local copies retain byte-count and digest verification.
+The configured sudo helper still supports its existing unencrypted formats.
+
+Knowledge Store PDF extraction streams the checked source in 64 KiB blocks
+after acquiring the worker permit. The client hashes the same stream used by
+the parser. Existing source and path checks still guard index updates. The
+50 MiB PDF cap stays in place pending native memory measurements for a larger
+tier. A read blocked by the source filesystem can delay returning the result.
+
+Fedora 44 ARM64 passed 3,485 application tests and all seven archive helper
+stdio tests. Two separate pinned OpenSSH cases verified ordinary ZIP and AES
+ZIP, including same-session verified local copies. The password case checked
+the exact extracted content and wrong-password rejection. An isolated TLS
+fixture verified the requests to `/tenant/V1/Chat/Completions/`, the Manual
+JSON response, the server-default SSE response and rejection without the
+private fixture CA.
+
+The Fedora worker checks used the freshly built desktop executable. A PDF
+just below 50 MiB returned the expected physical page text and exact source
+digest. A separate run verified cancellation during transfer and reaping the
+helper process. Windows ARM64 passed 3,376 application tests and all 50 SSH
+library unit tests. Strict application Clippy and workspace formatting passed.
+The Apple Silicon application and test cross-check passed from Windows ARM64.
+See the [verification record](target/verification/20261115-provider-registry-archive.md).
+
+## Local Messages profiles, analysis histories and verified archive copies
+
+AI Manager accepts exact loopback HTTP and HTTPS Anthropic Messages routes
+with an explicit model. Java selected the Anthropic protocol before looking
+at its model mode, so an imported AUTO or DEFAULT profile still uses its
+original explicit model. Review the exact destination before enabling it.
+Endpoint changes or revoked trust clear its saved credential reference.
+[LM Studio Messages API](https://lmstudio.ai/docs/developer/anthropic-compat/messages)
+
+Java profile archives can include saved snippet and folder analysis histories.
+The importer checks Java UUIDs, the matching source library entry, source
+and apply snapshot hashes, and native record and size limits. Reopening
+an imported report exposes its native findings, dependencies, available
+flowchart and past workflow evidence. A JSON report with code includes the
+retained historical snapshots. Java profile IDs, pending states and old
+decisions carry no native execution authority. Analysis history files use
+create-only restore with the current managed stored-content limit. Native
+encrypted backups preserve the portable view of these histories. Remaining
+Java workflow details and access to other diagram families stay in M1.
+
+The Scheduler can save an optional local copy after ordinary server-only
+archive creation. The updated helper issues a receipt for the exact staged
+archive byte count and digest. The job verifies bytes over the same
+authenticated SSH session and publishes the copy at a vacant local name
+under current transfer authority. If local delivery fails after confirmed
+remote publication, the result records the remote archive. The privileged
+archive route retains its existing root-private contract.
+
+On 2026-11-15, Windows ARM64 passed 3,368 application tests with 63 ignored.
+Formatting, application Clippy with `-D warnings`, and the Apple Silicon
+application and test cross-check passed. Native Windows coverage includes
+exact route review and revocation, Java backup round trips, history source
+verification, and the local archive copy's size, digest and transfer authority.
+
+Fedora 44 ARM64 passed 3,477 application tests with 158 ignored and six
+server archive helper tests. The full retry used a disk-backed checkout,
+one compiler job, no app-test debug information and reduced memory overhead
+for the test link after the initial run hit the host's memory limit. The
+retry source archive's SHA-256 is
+`496dab1f6047f50cf8f0cea90598cdd6a8942caf6913431a6df2c62473482fce`.
+A separate native test used the reviewed HTTP Messages profile and a private
+loopback llama.cpp process from the signed Linux ARM64 CPU runtime. It
+received nonempty answers with the expected model alias in JSON and SSE.
+Native UI review and live HTTPS provider acceptance remain open.
+
+The dedicated Fedora OpenSSH test verified an archive and its byte-identical
+local copy with one pinned public-key authentication. Transfer denial stopped
+before opening the SSH connection. The private fixture moved to an
+account-owned directory to satisfy OpenSSH `StrictModes`. Fedora test
+directories and owned processes were removed. See the
+[verification record](target/verification/20261115-anthropic-analysis-and-archive.md).
+
+## Java skill history, file AI routing and native file operations
+
+The Java backup importer maps a unique built-in skill key from the reviewed
+archive to the current native skill on restart. It rechecks managed statistics
+policy and publishes only to a vacant ledger path. Usage buckets include Chat,
+Agent, Workflow and pinned counts. Java size fingerprints, tokenizer and
+counts remain separate from native growth baselines. Custom, deleted and
+ambiguous Java skill identities appear in the omission report.
+
+Snippet and native file assistance keep a manually selected profile across
+actions. Otherwise security actions prefer the dedicated security profile,
+then the originating connection, workload and default. Other actions begin
+with the originating connection when present. SFTP and Terminal file opens
+capture the actual source route. File assistance reuses the masked request
+and proposal reviews. The proposed replacement follows the file editor's
+selected or uniform line ending before the diff is shown. Applying a
+proposal updates the editable buffer. Publication uses the existing file
+Save workflow.
+
+AppKit can start a native copy drag from SFTP Manager and the terminal
+sidebar. Both use the originating left-button gesture and the existing
+transfer permits. macOS provides file URLs on the drag pasteboard and keeps
+remote staging through completion and the bounded copy grace period. Native
+Finder delivery, cancellation and revocation remain in T3/T4.
+[AppKit pasteboard data provider](https://developer.apple.com/documentation/appkit/nspasteboarditemdataprovider)
+
+Ordinary server-only archives can bind an output UID, GID and ordinary octal
+mode to inventory review. The updated helper applies metadata before publishing
+the held private output at a new name. With the default options, the wire
+format and private mode remain compatible. Privileged Scheduler archives
+retain the root-owned private output contract. Java applies optional archive
+metadata in the ordinary SFTP workflow.
+
+The application suites passed 3,359 tests on Windows ARM64 and 3,468 on
+Fedora ARM64. The two native OpenSSH `sftp-server` archive
+regressions passed on the final application test executable. Five ordinary
+helper tests and one protected helper test in an isolated Linux user, mount
+and PID namespace passed. Strict Windows application Clippy and the Apple
+Silicon application and test cross-check passed.
+[Verification record](target/verification/20261115-skill-history-file-ai-and-archives.txt)
+
+## Java profile roles, legacy Memory scopes and symbolic sudo
+
+Java backup previews report default, text, coding, Agent and snippet security
+role suggestions. Each resolves only through the exact imported source
+identity. AI Manager requires a saved, eligible profile and a separate role
+assignment saved by the user. Additive restore preserves existing active
+roles and defaults. Snippet security uses the dedicated role, then coding
+and default candidates. Remote Agent use requires its existing HTTPS opt-in
+and request review. The follow-up below records explicit picker choices and the connection profile
+order in native file editors.
+
+Connection Memory now restores for exact newly added SSH and local shell
+profiles. Canonical UUIDs and Java's legacy filename suffixes are checked
+against all source connections, including omitted or unsupported connection
+types. History and mixed archives require an unambiguous mapping. Existing
+local data remains authoritative. Mapping to existing and serial profiles
+remains open.
+
+Validated LM Studio exact chat paths preserve supported prefixes, case and
+an optional trailing slash on loopback. Manual and Server default can use
+noncanonical chat paths. Automatic model resolution and inventory require
+supported canonical routes. OpenAI-compatible HTTPS also preserves validated
+version aliases. Wider Java endpoint formats remain in B1.
+
+A reviewed Linux Scheduler sudo action accepts explicit-class symbolic
+permissions. Rust computes the ordinary permission bits from the device's
+held target mode and file type. The helper rechecks the path, identity and
+metadata before applying the new mode through the held descriptor. Live
+authorized sudo over the pinned Scheduler SSH route remains in Q2.
+
+The application suite passed 3,355 tests on Windows ARM64 and 3,464 on
+Fedora ARM64, with 62 and 156 ignored respectively and no failures. The
+separate Linux symbolic chmod fixture passed in a private root-mapped user and
+mount namespace. It checked changes to ordinary files and directories and
+rejected stale modes, hard links, incorrect tokens and special mode bits.
+[Verification record](target/verification/20261115-java-roles-memory-sudo-dmg.txt)
+
+## macOS disk image packaging
+
+`kortty-package --macos-dmg` uses an explicitly supplied signed app of the
+workspace version. It validates the desktop, CLI and nested SSH worker
+architectures and signatures, stages the bundle with its existing ticket,
+then creates a read-only image with licenses and an Applications link.
+The command checks the generated image and publishes a SHA-256 file alongside
+it. U4 and V7 track native image mounting, separate disk image signing and
+notarization, and Gatekeeper and app launch after installation.
+
+Nine packager tests and strict packager Clippy passed on Windows ARM64.
+Cross-target checks for the application and packager passed for Apple Silicon.
+
+## Server-selected chat model and Java scoped restore
+
+Java HTTP DEFAULT becomes an inactive Server default profile for canonical
+supported loopback chat and OpenAI-compatible HTTPS routes. A retrieved model
+name can describe usage after sending. The actual request omits `model` and
+performs no model inventory lookup. Terminal Chat and native MCP search
+reviews state who chooses the model. Workflows that require a verified model
+identifier continue to require Manual or resolved Automatic mode. Explicit
+Java reasoning overrides on DEFAULT profiles appear in the restore omission
+report. A server can reject omission, as the native LM Studio API documents.
+[LM Studio streaming errors](https://lmstudio.ai/docs/developer/rest/streaming-events#error)
+
+The release-signed llama.cpp b11727 server on Fedora ARM64 returned HTTP 200
+for model-less `/v1/chat/completions` requests with a pinned small GGUF model.
+JSON and SSE returned the same text, and SSE finished with `[DONE]`. This was
+a direct HTTP server check. Native desktop review and provider configuration
+remain in the acceptance matrix.
+[Provider verification](target/verification/20261114-server-default-fedora-provider.txt)
+
+Java AI Memory documents and dated snapshots rebind canonical Java UUIDs to
+newly added, exactly matched SSH profiles. Case or Java whitespace aliases
+are excluded even when a colliding profile type cannot be imported. A mixed
+archive is published only when every connection scope maps. Replay checks the
+reviewed catalogue revision, scoped file digests and current policy, and
+publishes only missing files. Previously saved profiles, local or serial
+profiles and custom IDs still need mapping or a separate review.
+
+Java Scheduler upload, download and sync restore as disabled transfer drafts.
+The Action editor preserves the reviewed remote path and displays the Java
+local path as context. Adoption uses a freshly entered local path, one saved
+SSH target and an explicit file, new folder or reviewed comparison action.
+Folder comparison starts without an automatic schedule or standing approval.
+
+The application suites passed 3,456 tests on Fedora ARM64 and 3,347 on
+Windows ARM64, with 155 and 62 ignored respectively and no failures. Coverage
+included the foreground chat send and exact wire body, rejection of ambiguous
+Memory scopes, and deferred Scheduler file transfer adoption after replay.
+Strict Windows ARM64 application Clippy, formatting and the Apple Silicon
+application/test cross-check passed.
+[Verification record](target/verification/20261114-server-default-and-scoped-restore.txt)
+
+## Java AI Memory and LM Studio Toolpack migration
+
+The additive Java backup import accepts `memory/MEMORY.md`, valid
+global history names, and archives that contain only global scopes. It
+preserves Markdown bytes and line endings, applies Rust's memory validation,
+and rechecks managed AI Memory policy at startup. Existing destination files
+take precedence. Connection-scoped files and mixed-scope archives still need
+exact ID mapping. Java digest state and external reference grants are excluded.
+
+Java stores the LM Studio Toolpack plugin identifier without an allowlist.
+Compatible native endpoint profiles restore the identifier as an inactive
+hint. An unchanged pending draft can gain the hint on additive replay without
+changing its import fingerprint. AI Manager requires current endpoint trust,
+a local credential environment name, one to eight exact tool names, and
+explicit adoption. Turning off endpoint trust or exporting a backup drops
+the active tool grant and retains the hint. An endpoint or protocol edit
+clears the hint. Live adoption and invocation remain in the native matrix.
+
+## Java Scheduler SFTP migration and named ownership
+
+Supported Java jobs for remote directory creation, rename, octal and
+explicit-class symbolic permissions, numeric ownership, server-side copy
+and recursive deletion import as disabled drafts. Paths and saved targets
+must pass native validation. Copy uses native guarded publication at a vacant
+destination and its native permissions. An imported deletion requires the
+exact path to be typed before enabling or running the job. Sudo or staged Java
+actions, local-path transfers, archive variants and rsync still need review
+and conversion for their supported cases.
+
+The ownership editor can look up a user or group on one saved SSH route.
+It shows the target and the current pins, opens a read-only command channel,
+and applies the numeric ID only after explicit selection. Changing the
+route or its pins requires another review or explicit numeric entry. The
+saved job retains the numeric ownership fields. The Fedora ARM64 OpenSSH
+fixture accepted one public-key login and received only the permitted exec
+request. The denied attempt sent no exec and no SFTP subsystem opened.
+Native desktop dialog acceptance remains open.
+
+The Windows ARM64 application suite passed 3,336 tests with 62 ignored and
+zero failures. The suite includes the encrypted Java Scheduler restore,
+the numeric review and rejection of changed routes and host pins, and the
+global Memory and Toolpack regressions above. Strict application Clippy,
+formatting, and the Apple Silicon application/test cross-check passed.
+The native Fedora ARM64 application suite passed 3,445 tests with 155
+ignored and zero failures. The Fedora run used a test-local `/bin/sh` with
+prompt hooks cleared so the system prompt could not replace the PTY title
+under test. The OpenSSH fixture passed separately.
+[Verification record](target/verification/20261114-java-import-scheduler-verification.txt)
+
+## LM Studio migration and HTTPS MCP, MLX reasoning, and knowledge limits
+
+The renewed porting goal continues the Java v2.26.0 comparison. Supported
+Manual LM Studio imports cover HTTP localhost, native loopback HTTPS and
+compatible bare HTTPS origins. An omitted selection mode with a blank
+model follows Java's Auto rule. Earlier source identities and stored endpoint
+representations are preserved. Model-less HTTP DEFAULT has different wire
+semantics and remains a separate item.
+
+Ordinary native LM Studio HTTPS profiles can review and invoke the five MCP
+modes with exact credentials and allowed tools. The endpoint connector checks
+the certificate and keeps network access on loopback. Automatic model
+selection rechecks the loaded model before sending the query. Import never
+grants tool authority. The Toolpack follow-up above adds explicit allowlist
+entry before adoption of a Java plugin hint.
+
+Managed MLX checks exact reviewed GPT-OSS and Qwen3 templates. GPT-OSS
+provides Low, Medium and High. Qwen3 provides On and None. The signed
+mlx-lm 0.31.3 and 0.32.2 runtime combinations pass the choice as
+`chat_template_kwargs`. Check the [0.31.3](https://github.com/ml-explore/mlx-lm/blob/v0.31.3/mlx_lm/server.py#L502)
+and [0.32.2](https://github.com/ml-explore/mlx-lm/blob/v0.32.2/mlx_lm/server.py#L598)
+server paths. Mapping an imported Java profile can expose a supported
+suggestion for explicit selection. Runtime/template mismatches stop an
+explicit setting before model input. Rendering the three reviewed upstream
+templates verified their expected controls. Physical Apple Silicon
+inference remains open.
+
+New file and folder sources default to 50 MiB. An explicitly reviewed UTF-8
+or folder limit accepts up to 1 GiB and processing keeps the 500 MiB scan
+limit. Streaming, cancellation, byte digests and line citations keep bounded
+paths. PDF input retains the 50 MiB parser limit. Existing source definitions
+and automatic approvals keep their original scope until reviewed again.
+
+The Windows ARM64 focused run passed 146 tests with 10 ignored. A separate
+native TLS fixture passed with a private synthetic CA and API token. Its
+unknown-CA and wrong-host attempts sent no HTTP. Exactly two authenticated
+inventory requests and one reviewed Brave MCP request arrived. The response
+contained one usable excerpt and a synthetic credential echo, which the
+client discarded. These results precede the final MLX and Scheduler changes.
+
+The integrated Windows ARM64 application run passed 3,328 tests, with
+62 ignored and zero failures. It includes the profile and migration
+regressions, MLX request encoding, large text snapshot reopening, symbolic
+permission wire checks and Java OpenPGP startup replay. Strict application
+Clippy passed after correcting an unnecessary borrow. The Apple Silicon
+application-test cross-compilation check passed. Installed provider, native
+desktop and runtime acceptance remain open.
+[Verification record](target/verification/20261114-resumed-porting-verification.txt)
+
+## Scheduler symbolic SFTP permissions
+
+The Scheduler accepts symbolic permission clauses such as `u+rw,o-w` on
+ordinary SFTP jobs. Rules require an explicit user, group, other or all
+class. The worker reads the canonical entry and its current mode, evaluates
+the clauses in order, rechecks the entry and uses no-follow
+`lsetstat@openssh.com` before verifying the resulting metadata. The
+protocol still has a race between the final check and a remote path
+mutation. Numeric permissions retain their existing route. The named
+ownership editor is recorded above. Symbolic sudo modes remain Q2 work.
+
+## Java OpenPGP recipient references
+
+Java `gpg-keys.xml` archives names and key identifiers. Java does not include
+the associated certificates. The additive backup importer displays supported
+full fingerprints as inactive recipient references and reports invalid,
+duplicate and short-ID-only entries. Imported paths and keyring references
+never become active. The OpenPGP Manager requires a locally selected public
+certificate matching the complete fingerprint and independent fingerprint
+confirmation before enrollment. Previously verified recipients and pending
+references survive additive replay.
+
+The Windows UI regression rejected a mismatched certificate and required
+independent fingerprint input before activating the matching one. The
+verification record above includes the successful focused run.
+
+## Java v2.26.0 remaining-work review — 2026-11-14
+
+This is the historical review before the implementation checkpoints above.
+
+This documentation-only review uses Java tag `v2.26.0` at
+`b235d91f20356f8a9b33ad5398550a043cc21ed2` and the current Rust working tree
+based on `a76c8f5b945bc17bd567f584a447a505cc260adc`. The tagged release
+metadata and documentation manifest were checked; the newer Java checkout
+HEAD was not used as the parity baseline. No implementation, build, native
+desktop test, provider invocation or package verification ran in this review.
+The implementation goal remains paused.
+
+The [current plan](PORTING-PLAN.md#current-result-and-actionable-backlog)
+now separates concrete implementation gaps, native acceptance, scope
+decisions and external prerequisites. It retains the existing implementations
+and replaces the stale instruction to repeat completed checkpoints.
+
+Source traces confirm these remaining differences:
+
+- Java Manual LM Studio import covers fewer loopback routes than the new
+  explicit Auto importer. Omitted model-selection mode also fails to infer
+  Java's Auto fallback when the model is absent. HTTPS MCP is still rejected
+  by the separate native MCP dispatcher.
+- Managed MLX accepts only default reasoning. Knowledge sources still have
+  different defaults and a 50 MiB maximum, compared with Java's configurable
+  range up to 1 GiB under its aggregate scan limits.
+- Outbound desktop file drags compile for Windows/Linux only. Scheduler
+  rsync, existing-target/sudo transfers and server-only archive options
+  retain their documented narrower scopes. Scheduler permission input is
+  octal only, and ownership input accepts numeric UID/GID rather than Java's
+  named lookup controls.
+- Java backup recognition does not yet convert model/RAG definitions,
+  snippet analysis histories, AI Memory, skill statistics or the GPG public
+  key catalogue. Other global settings/roles and Scheduler file/rsync
+  action imports remain partial. M1 tracks migration independently from
+  native persistence.
+- MSI, DMG, Flatpak and Pacman are missing packaging implementations, now
+  tracked as U4 rather than only as package acceptance.
+
+The earlier interrupted 2,351-test run is superseded by completed later runs.
+The latest recorded checkpoint below passed 3,320 application tests and two
+separate TLS fixtures; it is not a new all-platform workspace result. Older
+notarized Mac and size-optimized Windows packages do not include the current
+uncommitted source. GitHub now reports the Rust repository public with no
+releases, superseding the earlier private-repository 404. The locked
+dependency generations and current advisory ranges still leave V6 open;
+this review did not rerun the complete dependency audit.
+
+Documentation validation passed `git diff --check`, 106 local file-link
+checks (excluding historical `target/` records) and 66 cross-document anchor
+checks. An outdated README link to the replacement-permission checkpoint was
+corrected. No build caches, test profiles or package artifacts were created.
+
+## LM Studio Auto over localhost and loopback HTTPS
+
+Previously saved numeric HTTP Auto profiles retain their request bindings.
+`localhost` connects directly to loopback and retains its name in the HTTP
+authority and TLS certificate check. Both LM Studio chat protocols use the
+native inventory to resolve the model and check it again before sending.
+Java Auto backups keep the chat protocol and optional preferred model.
+The endpoint and the workflow each retain their existing review requirements.
+HTTPS Swarm, Scheduler and journal approvals bind the resolved model. Native
+LM Studio MCP remains an HTTP integration.
+
+Windows ARM64 passed 3,320 application tests with 61 ignored in the ordinary
+run. Both isolated TLS cases passed separately. They verified model inventory
+and chat over both protocols, rejection of untrusted roots and mismatched
+hostnames, Scheduler and Swarm profile review, and the saved automatic journal
+grant. The grant and Scheduler revision ceased to resolve after the loaded
+model changed. Interactive acceptance with installed LM Studio remains open.
+[Verification record](target/verification/20261114-lm-studio-loopback-windows-arm64.txt)
+
+## Java Scheduler connection group restore
+
+Java v2.26.0's `JobSchedulerConnectionResolver` expands explicit connection
+IDs before the selected folders in their saved order. Each folder includes
+its descendants, with saved connection order retained and repeated targets
+collapsed. Native restore preserves the original selection on disabled
+command, snippet-script, Agent and Swarm jobs. The Scheduler can review and
+refresh those targets using its existing folder controls.
+
+Restore requires an exact match between each selected source folder and the
+candidate native SSH destinations. Ambiguous, missing, unsupported or
+policy-blocked source members, and additional native SSH members, cause the
+affected job to be omitted. Startup revalidates the sealed candidate before
+publishing the jobs. Importing an AI job still requires a native profile and
+an action review before execution.
+
+Windows ARM64 passed 38 focused tests and 3,308 application tests, with 59
+ignored in the full suite. The encrypted Java ZIP fixtures covered exact
+membership, omission of unresolved groups and startup replay. The native
+Scheduler test covered keeping a group through AI profile adoption. Clippy
+and the Apple Silicon cross-target check passed. Interactive desktop review
+with a migrated library remains open.
+[Verification record](target/verification/20261114-java-scheduler-group-restore-windows-arm64.txt)
+
+## Automatic selection of loaded LM Studio models
+
+Native LM Studio Auto selects a sole loaded chat model, or the saved exact
+preferred key when multiple models are loaded. The loaded selection stays in
+memory, while the saved profile keeps the preference. The worker resolves the
+selection again before request dispatch. If the reviewed model is replaced,
+the request ends before sending model input. Model and endpoint admission are
+bound to the Scheduler and Swarm approval revision. Journal receipts preserve
+the resolved identity on resume. Native Java Auto backups retain optional
+preferences and require review of the endpoint before use.
+
+The explicitly selected OpenAI-compatible LM Studio mode reads the same
+loaded inventory and submits through `/v1/chat/completions`. Its authority
+binds the compatible transport. Java Auto imports from supported numeric
+loopback HTTP destinations preserve the protocol and go through endpoint
+review. Generic local profiles retain their current model selection rules.
+
+The compatible route passed 38 focused Windows ARM64 tests, including the
+private encrypted startup restore, editor connection test, model change,
+Scheduler approval and the durable Journal receipt. The application suite
+passed 3,300 tests with 59 ignored. Clippy and the Apple Silicon cross-target
+compilation check passed. An installed LM Studio desktop test remains open.
+[Compatible-route verification record](target/verification/20261114-lm-studio-compatible-windows-arm64.txt)
+
+Windows ARM64 passed 3,293 application tests with 59 ignored. The focused
+loopback tests covered exact model selection, revision invalidation, the
+native Java import, Scheduler approval and persisted Journal model binding.
+A separate managed-policy loopback test passed. Clippy and the Apple Silicon
+cross-target compilation check passed. Live installed LM Studio acceptance
+remains open.
+[Verification record](target/verification/20261114-lm-studio-auto-windows-arm64.txt)
+
+## LM Studio model capabilities
+
+The AI Manager reads LM Studio model metadata from the approved endpoint and
+associates it with the exact model key or loaded instance ID. The Reasoning
+picker shows the reported native choices and provider default. An explicit
+unsupported setting is reported before model input is sent. The model default
+omits the reasoning parameter.
+
+Automatic journal vision uses the exact model's reported capability before
+preparing or sending image data. When metadata cannot identify the capability,
+the known model-name patterns provide a fallback. The explicit vision choices
+override automatic detection. The runtime reuses bounded metadata results for
+the exact endpoint, model and current credential. The legacy native inventory
+is used when the server does not implement the v1 inventory.
+
+The [model inventory](https://lmstudio.ai/docs/developer/rest/list) and
+[native chat request](https://lmstudio.ai/docs/developer/rest/chat) describe
+the model and transport fields used here.
+
+Windows ARM64 passed 3,284 application tests with 59 ignored. The focused
+loopback tests verified exact model and loaded-instance matching, reasoning
+request bodies, stale editor replies, early rejection of text-only models,
+explicit overrides and cancellation before image transmission. Clippy and
+the Apple Silicon cross-target compilation check passed. A desktop run using
+an installed LM Studio model remains open.
+[Verification record](target/verification/20261114-lm-studio-capabilities-windows-arm64.txt)
+
+## Weighted journal summary progress
+
+The journal manager and its progress dialog use the same estimate for the
+active pass. The plan includes retained command evidence, approved images, the
+closing summary, and an eligible title. Re-evaluation and catch-up also plan
+later journals from the same reviewed batch. The progress worker checks the
+exact saved journal identities and reads the evidence locally to plan the
+work. Only execution can send a model request.
+
+The model rate uses completed requests and can be reused with the same
+profile in the running application. When automation uses a separate image
+profile, image and text rates are measured separately. A slow active step
+reaches at most 95 percent of its planned weight. Native long-output windows
+combine the measured time of their constituent requests into one command
+estimate. The actual output chunk boundaries may change with the prior reply
+and context budget.
+
+Windows ARM64 passed 3,275 application tests with 59 ignored. The focused
+loopback tests verified remaining time during the closing summary and
+carryover across two journals. Clippy and the Apple Silicon cross-target
+compilation check passed. Manual desktop and live provider verification
+remain open.
+[Verification record](target/verification/20261114-journal-weighted-progress-windows-arm64.txt)
+
+## Interactive and saved Swarm status
+
+The interactive Swarm status strip shows the current state and available
+measurements for each target. Selecting a marker opens that target's
+transcript. Target selection checks the round and attempt, including when a
+retry replaced a previously rendered marker. The compact layout retains
+every target through horizontal scrolling.
+
+The slow indicator starts at 180 seconds and adapts after two successful
+targets to twice their median duration, with a 60-second minimum. Approval
+waits are excluded from the indicator while elapsed time continues. An
+explicit pause or cancellation stops the native target clock immediately.
+The Java reference stops counting pause time when the target actually parks.
+Native markers pulse during active work and approval. Native saved
+conversations and imported Java archives show static states and any recorded
+elapsed seconds and token counts.
+
+On native Windows ARM64, 18 focused tests covered the Iced layout and
+transcript reveal, retry identity, timing, and backward-compatible saved
+data. The full application run passed 3,271 tests with 59 ignored. A
+separate Swarm cancellation check passed over pinned SSH to Fedora.
+Clippy and the Apple Silicon cross-target compilation check passed.
+Manual desktop interaction remains open.
+[Verification record](target/verification/20261114-swarm-status-windows-arm64.txt)
+
+## Journal AI connection checks
+
+Manual journal startup checks the effective AI route before starting the
+writer, then attaches the available terminal scrollback. Automatic startup
+records immediately and checks the same route in the background. The native
+actions can retry, keep raw recording, or cancel the requested start or
+ongoing capture. Probe replies remain bound to the original terminal stream.
+
+The connection test sends a fixed readiness exchange. Successful checks are
+remembered for ten minutes in the running application and are reused after
+validating the route, approval and available credential state. Scheduled and
+Swarm journals share a result for the same run and approved route. A failed
+check stores a fixed diagnostic on the automation timeline and preserves
+the raw evidence for later re-evaluation.
+
+Windows ARM64 passed 3,262 application tests. A native loopback HTTPS fixture
+verified the fixed readiness request and rejected revoked authority. Both
+pinned Fedora SSH checks, Clippy and the Apple Silicon compilation check
+passed. [Verification record](target/verification/20261114-journal-ai-connection-check-windows-arm64.txt)
+
+## Scheduler detail selection and journal closing titles
+
+The Scheduler run detail area supports selecting and copying the separate
+stdout, stderr, detail, blocker and linked-journal text. The keyboard shortcut,
+context menu and copy button all use the application's clipboard handling.
+The view checks the current saved run and authorized journal location before
+copying. Linked journals also retain individual Open actions.
+
+A closing pass saves the wrap-up before requesting a separate journal title.
+The request uses the saved language and masked connection and entry evidence.
+Local title changes follow the rename policy and preserve custom titles.
+Reviewed HTTPS and CLI routes require explicit additional consent, with
+separate scopes for recording, automation and one-use review. A saved
+interrupted title attempt can continue without recreating the wrap-up.
+
+Native command cards show alternate accounts from recognized masked shell
+prompts and store the Java-compatible `runAsUser` field. The closing summary
+lists distinct accounts. Managed masking can withhold an account when the
+retained context does not establish that it can be displayed safely.
+
+Windows ARM64 passed 3,255 application tests. The reviewed CLI and private
+HTTPS fixtures verified separate title requests and approval scope. Both
+pinned Fedora SSH checks, Clippy and Apple Silicon cross-compilation passed.
+[Verification record](target/verification/20261114-scheduler-selection-journal-title-windows-arm64.txt)
+
+## Scheduler command output
+
+Ordinary SSH commands, inline scripts and snippets can save separate masked
+stdout and stderr. Limited capture keeps up to 4,000 UTF-16 units per stream.
+Full capture keeps up to 64 KiB per stream. The bounded reader continues
+draining both channels when the capture is full. The run journal shows output
+and outcome separately and searches each stream independently. Managed
+recording and redaction rules apply before dispatch and publication. The
+output budget expires old stream text ahead of run metadata.
+
+The Java import maps `LIMITED_REDACTED` and `FULL`. Existing native jobs that
+pre-date the choice use Off. A virtual terminal continues to use its own
+combined terminal recording. The per-target Session Journal remains an
+independent setting.
+
+Windows ARM64 passed 3,244 application tests and 28 Scheduler store tests.
+The Scheduler worker passed both command output and virtual terminal checks
+against pinned Fedora OpenSSH. Clippy and the Apple Silicon cross-target
+compile passed.
+[Verification record](target/verification/20261114-scheduler-journal-output-windows-arm64.txt)
+
+## Interactive AI Memory, journal language and Scheduler backup PTY
+
+Agent Ask, planning, and command proposals include masked organization and
+personal memory for the reviewed target. Saved local profiles and verified
+SSH routes use their own connection memory. Swarm script generation and
+comparison use organization and global memory. These requests recheck memory
+and masking before dispatch and before accepting a result.
+
+Journal summaries use the validated `appLanguageCode` in their prompt and
+budget. A persisted native summary generation retains its language when
+resumed. Reviewed HTTPS and CLI prompts use a supported primary code. New
+native journals record English. Re-evaluation retains the saved language.
+
+Java backup restore preserves the virtual terminal options of compatible
+single-target command and snippet jobs. The restored jobs remain disabled.
+The importer applies Java's numeric limits to active options and native
+validation to the restored action.
+
+Windows ARM64 passed 3,236 application tests. The focused tests covered exact
+model requests, memory revocation, language on resume and encrypted backup
+restore. The native Scheduler worker also passed the pinned Fedora OpenSSH
+PTY check. Clippy and the Apple Silicon cross-target compile passed.
+[Verification record](target/verification/20261114-interactive-memory-journal-language-pty-windows-arm64.txt)
+
+## Scheduled AI Memory and journal fact checks
+
+Scheduled Agent and Swarm reviews include masked organization, global and
+connection memory in each applicable model request. A one-use proposal splits
+the requests when it needs connection-specific memory and keeps the command
+review in saved target order. The standing grants record a revision digest.
+The Scheduler checks the private sources again before sending model requests.
+
+Activity, chunked and closing journal summaries check paths, links and quoted
+commands against the masked text sent to the model. The original capture
+remains available when the generated summary is unusable. Local closing
+summaries include user notes and saved screenshot descriptions, including
+descriptions generated earlier in the same pass. Reviewed HTTPS and CLI
+summaries use their approved masked terminal evidence and summary cards.
+
+The native Windows ARM64 app suite passed 3,227 tests. The focused tests
+checked separate model payloads, memory changes before dispatch, original
+evidence after summary rejection, and the same-pass screenshot description.
+The Scheduler and terminal suites, Clippy, and the Apple Silicon compilation
+check passed. [Verification record](target/verification/20261114-scheduler-memory-journal-facts-windows-arm64.txt)
+
+## Scheduler screenshots and local vision
+
+When a job enables the virtual terminal and automation journal, the journal
+writer saves redacted images from the interval, changed-screen and final
+captures. It records the PNG and its capture-log position in the timeline.
+Soft wraps are included in the redaction check. Ambiguous multiline matches
+or a revoked recording policy suppress the affected frame. The final image
+has a reserved slot and unchanged images are skipped.
+
+The closing pass can describe original saved frames with the selected job's
+local vision profile or the local Journal profile. Consent is recorded with
+the run and checked again against the current settings, policy, profile,
+journal and image. The existing text summary can continue when image analysis
+is unavailable. Re-evaluation can analyze an edited image after user review.
+
+The native Windows ARM64 worker passed the pinned Fedora OpenSSH PTY test.
+A loopback model fixture verified image descriptions, retained text summaries
+after image opt-out, and guarded publication. The app, Scheduler and terminal
+suites passed along with Clippy and the Apple Silicon cross-target check.
+[Verification record](target/verification/20261114-scheduler-journal-vision-windows-arm64.txt)
+
+## MiniMax HTTP requests and Java profile destinations
+
+The shared OpenAI-compatible transport applies MiniMax's `thinking` setting
+when a compatible model uses default or disabled reasoning. MiniMax M3.1-Flash
+uses its own default thinking level and requires an enabled level when set
+explicitly. [MiniMax thinking settings](https://platform.minimax.io/docs/guides/text-generation.md)
+
+Buffered and streamed requests can retry once after a clear
+pre-generation rejection of that field. The retry uses the same payload,
+deadline, destination and credential, and checks the workflow's current
+authorization again. Native MiniMax HTTP 200 error envelopes use fixed
+diagnostics. Requests with reported token usage and errors within an active
+stream do not trigger the compatibility retry.
+The native stream can finish with a cumulative message. The decoder emits
+only the suffix of the text already received and rejects contradictory
+snapshots.
+
+The Java importer retains the exact native completion path on the three
+MiniMax hosts recognized by the Java release. Imported endpoints need fresh
+review. The AI Manager offers the Java-compatible native mode and the existing
+OpenAI-compatible preset. Saved OpenAI-compatible profiles retain their
+previous completion destination. Live provider and regional account acceptance
+are pending.
+
+[Windows ARM64 verification](target/verification/20261114-minimax-http-windows-arm64.txt)
+records 133 focused checks, 3,202 native app tests, 39 Scheduler tests,
+Clippy, and the Apple Silicon cross-target compile check.
+
+## Journal usage and configured profile prices
+
+Summary requests, single-journal answers and screenshot descriptions record
+observed token usage in the source journal. Live writers serialize accounting
+with capture edits. A stopped journal uses the existing metadata lock. A
+journal answer's exact entry citations remain usable after its own accounting
+write when the reviewed document version still matches the prior version.
+
+Journal costs use the configured input and output rates for reported counts.
+An incomplete estimate is labeled in the manager and omitted from the
+Scheduler's complete-cost totals. Grouped journal amounts use one currency
+with an incomplete label if other currencies contribute. Local provider
+fixtures cover single-journal answers and screenshot failures with usage.
+Questions spanning several journals and CLI answers are outside per-journal
+attribution. Native desktop acceptance with configured providers is pending.
+See the [verification record](target/verification/20261114-journal-provider-usage-windows-arm64.txt).
+
+The Java profile importer retains supported input and output prices per million
+tokens with their currency, including explicitly free rates. The report lists
+unrepresentable prices. Fresh imports preserve existing profiles and still
+require the relevant endpoint, executable or model review. Previously imported
+profiles keep their current settings.
+
+Journal usage stores the identity and display name of the last saved profile
+that reported usage or completed a request. The re-evaluation dialog suggests
+that profile for the first eligible selection when it is available in the
+current choices. Original Java IDs resolve through unique imported profile
+provenance. Explicit approval and request authorization still apply.
+Windows ARM64 fixtures verify price import and queued restore, publication of
+profile data, a colliding native ID and unavailable-profile fallback. See the
+[verification record](target/verification/20261114-java-pricing-journal-profile-windows-arm64.txt).
+
+## Running journal previews and reported summary tokens
+
+The journal worker waits until a command has run for 15 minutes and waits
+at least 15 minutes after successfully publishing a preview for the same
+command before refreshing it. These checks precede AI connection preflight.
+The eligible live viewer's **Summarize now** action uses the configured
+summary approval and bypasses the two delays. The closing pass still turns
+the last running command into a final card.
+
+Live and stopped summary publications store provider-reported prompt,
+completion and total tokens with the corresponding cards and checkpoints.
+Missing counts are marked partial. A replay of the same completed receipt
+keeps its stored usage. A new re-evaluation adds newly observed usage. The
+journal keeps existing token fields through closing and can distinguish
+usage from a local model and a reviewed external profile.
+
+The Windows ARM64 fixture drives periodic passes and the viewer action against
+a loopback model. Controlled times exercise the two boundaries, and a writer
+fixture checks usage on both sides of a possible metadata replacement failure.
+See the [verification record](target/verification/20261114-journal-cadence-usage-windows-arm64.txt).
+
+## Reviewed webpages in later scheduled Swarm rounds
+
+Guided iterative Swarm jobs with a configured reader can separately authorize
+public page proposals after a command batch. The approval binds the new option
+to the saved model, web integration and redaction policy. A page request belongs
+to one run, target and round. The Scheduler removes query parameters and
+fragments and checks the canonical and decoded URL for masked data and
+credentials. The exact URL and the resulting excerpts each require approval.
+The target can resume the same round after including the excerpts or skipping
+the lookup. Existing search-only grants retain their original authority.
+
+The Windows ARM64 fixture drives the independently configured SearXNG page
+reader over loopback and replaces the SSH result at the reviewed execution
+boundary. Acceptance with configured services and a live SSH target remains
+open. See the [verification record](target/verification/20261114-swarm-round-page-windows-arm64.txt).
+
+## Web searches in later Agent and Swarm requests
+
+The interactive Agent Ask and Run model review can request a public web search
+or a page from a supported reader. Swarm members can use the same review after
+an approved command completes. The provider receives the reviewed query or page
+URL. Including masked excerpts refreshes the exact request for that member and
+requires a separate model approval.
+
+Guided iterative Scheduler Swarm jobs can authorize a public research proposal
+after each command batch. The diagnostic model can request human review of one
+query in that round. The Scheduler checks the run, target, round, policy and
+provider before sending the approved query and before accepting the results.
+Including the excerpts or skipping the search resumes the current target and
+round. The option is stored independently of the initial SSH environment search.
+Native Windows ARM64 fixtures verify review and dispatch with loopback providers
+and controlled command results. Native acceptance with configured web services
+and a live SSH target remains open. See the
+[verification record](target/verification/20261114-swarm-round-web-windows-arm64.txt).
+
+## Scheduled read-only Swarm environment research
+
+A guided read-only Swarm can authorize one web search per target after its
+fixed SSH probe. The query planner receives the approved public topic, the
+operating system family and the numeric kernel major and minor version.
+Each target's diagnostic request receives its own masked excerpts and the
+shared excerpts for the run. The optional comparison uses the shared excerpts
+as its web references. An unsupported probe response skips the target lookup.
+
+The native Windows ARM64 test drives the saved review, worker authorization,
+research and masked diagnostic requests through loopback endpoints. It supplies
+a fixture response to the checked SSH probe and verifies rejection of stale and
+wrong-target permits. Acceptance with configured services and a live SSH target
+remains open. See the [verification record](target/verification/20261114-readonly-swarm-environment-web-windows-arm64.txt).
+
 ## Java snippet migration, password commands and rsync directory upload
 
 The ordinary snippet import accepts the private Java `snippets.xml` library.

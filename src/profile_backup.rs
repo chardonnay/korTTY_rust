@@ -66,11 +66,13 @@ impl Preview {
     pub(crate) fn count(&self) -> usize {
         self.snapshot.len()
             + usize::from(self.java_credentials.is_some())
-            + usize::from(
-                self.java
-                    .as_ref()
-                    .is_some_and(|report| report.scheduler.is_some()),
-            )
+            + self.java.as_ref().map_or(0, |report| {
+                usize::from(report.scheduler.is_some())
+                    + report
+                        .scoped_memory
+                        .as_ref()
+                        .map_or(0, |source| source.files.len())
+            })
     }
 
     pub(crate) fn entries(&self) -> impl Iterator<Item = &str> {
@@ -175,7 +177,7 @@ pub(crate) fn inspect_openpgp(
 fn validate_java_preview(
     (snapshot, report): (Snapshot, java_migration::Report),
 ) -> io::Result<Preview> {
-    data::validate(&snapshot)?;
+    data::validate_java(&snapshot)?;
     Ok(Preview {
         snapshot,
         java: Some(Box::new(report)),
@@ -218,13 +220,22 @@ pub(crate) fn queue_restore(preview: Preview, mode: RestoreMode) -> io::Result<Q
 
 fn queue_restore_at(root: &Path, preview: Preview, mode: RestoreMode) -> io::Result<QueuedRestore> {
     let is_java = preview.java.is_some();
-    let scheduler = preview.java.and_then(|report| report.scheduler);
-    if preview.java_credentials.is_some() || scheduler.is_some() {
+    let (scheduler, scoped_memory, connection_library) =
+        preview.java.map_or_else(Default::default, |report| {
+            (
+                report.scheduler,
+                report.scoped_memory,
+                report.connection_library,
+            )
+        });
+    if preview.java_credentials.is_some() || scheduler.is_some() || scoped_memory.is_some() {
         return restore::queue_java_transaction(
             root,
             preview.snapshot,
             preview.java_credentials.map(|prepared| *prepared),
             scheduler,
+            scoped_memory,
+            connection_library,
         );
     }
     check_snapshot(&preview.snapshot)?;
@@ -259,7 +270,8 @@ pub(crate) fn prepare_java_credentials(
         source,
         source_password,
         vault,
-        report.scheduler.is_some(),
+        report.scheduler.is_some() || report.scoped_memory.is_some(),
+        &report.connection_library,
     )?;
     if source.has_passwords && review.passwords.is_none() {
         report

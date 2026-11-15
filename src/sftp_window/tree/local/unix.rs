@@ -1,5 +1,6 @@
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
-use std::fs::File;
+use std::fs::{File, FileTimes};
 use std::io;
 use std::os::unix::ffi::OsStringExt as _;
 use std::os::unix::fs::MetadataExt as _;
@@ -9,7 +10,9 @@ use rustix::fs::{
     AtFlags, Dir, FileType, Mode, OFlags, RenameFlags, fstat, mkdirat, open, openat, renameat,
     renameat_with, statat, unlinkat,
 };
+use sha2::{Digest, Sha256};
 
+use super::reviewed::{ReviewedStamp, ReviewedVolume, changed};
 use super::{Entry, limit};
 use crate::sftp_window::files::LocalStamp;
 
@@ -242,6 +245,242 @@ impl Directory {
         self.require_child(name, &stage)?;
         Ok(unlinkat(&self.0, name, AtFlags::REMOVEDIR)?)
     }
+}
+
+pub(super) fn hold_reviewed_child(parent: &Directory, name: &OsStr) -> io::Result<Directory> {
+    let child = parent.open_child(name)?;
+    rustix::fs::flock(
+        &child.0,
+        rustix::fs::FlockOperation::NonBlockingLockExclusive,
+    )?;
+    parent.require_child(name, &child)?;
+    Ok(child)
+}
+
+pub(super) fn hold_reviewed_file_ancestors(path: &Path) -> io::Result<Vec<Directory>> {
+    use rustix::fs::{FlockOperation, flock};
+
+    let mut components = path.components();
+    if components.next() != Some(Component::RootDir) {
+        return Err(changed());
+    }
+    let mut held = vec![Directory::open_path(Path::new("/"))?];
+    for component in components {
+        let Component::Normal(name) = component else {
+            return Err(changed());
+        };
+        let child = held
+            .last()
+            .expect("held filesystem root")
+            .open_child(name)?;
+        flock(child.file(), FlockOperation::NonBlockingLockShared)?;
+        held.push(child);
+    }
+    Ok(held)
+}
+
+pub(super) fn move_directory(
+    source: &Directory,
+    name: &OsStr,
+    destination: &Directory,
+    target: &OsStr,
+) -> io::Result<()> {
+    Ok(renameat_with(
+        &source.0,
+        name,
+        &destination.0,
+        target,
+        RenameFlags::NOREPLACE,
+    )?)
+}
+
+pub(super) fn remove_empty_stage(
+    parent: &Directory,
+    name: &OsStr,
+    stage: Directory,
+) -> io::Result<()> {
+    let metadata = stage.file().metadata()?;
+    if metadata.mode() & 0o7777 != 0o700 || metadata.uid() != rustix::process::geteuid().as_raw() {
+        return Err(changed());
+    }
+    #[cfg(target_os = "macos")]
+    kortty_files::require_no_extended_acl(stage.file())?;
+    parent.require_child(name, &stage)?;
+    Ok(unlinkat(&parent.0, name, AtFlags::REMOVEDIR)?)
+}
+
+pub(super) fn remove_reviewed_entry(
+    parent: &Directory,
+    name: &OsStr,
+    expected: &ReviewedStamp,
+    directory: bool,
+) -> io::Result<()> {
+    match parent.entry(name) {
+        Ok(Entry::Directory(opened)) if directory => {
+            let current = reviewed_stamp(opened.file(), true, false)?;
+            if !expected.same_identity(&current) {
+                return Err(changed());
+            }
+            parent.require_child(name, &opened)?;
+            // This descriptor-relative removal refuses a nonempty directory.
+            Ok(unlinkat(&parent.0, name, AtFlags::REMOVEDIR)?)
+        }
+        Ok(Entry::File(opened)) if !directory => {
+            let current = reviewed_stamp(&opened, false, false)?;
+            if !expected.same_identity(&current) {
+                return Err(changed());
+            }
+            parent.require_file(name, &opened)?;
+            Ok(unlinkat(&parent.0, name, AtFlags::empty())?)
+        }
+        Err(error) => Err(error),
+        _ => Err(changed()),
+    }
+}
+
+pub(super) fn reviewed_volume(file: &File) -> io::Result<ReviewedVolume> {
+    #[cfg(target_os = "linux")]
+    let mount = {
+        use rustix::fs::{StatxFlags, statx};
+        let info = statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
+        if info.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
+            return Err(changed());
+        }
+        info.stx_mnt_id
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mount = 0;
+    Ok(ReviewedVolume(file.metadata()?.dev(), mount))
+}
+
+pub(super) fn reviewed_stamp(
+    file: &File,
+    directory: bool,
+    parent: bool,
+) -> io::Result<ReviewedStamp> {
+    let before = file.metadata()?;
+    let uid = rustix::process::geteuid().as_raw();
+    let mode = before.mode();
+    if (before.uid() != uid && !(parent && before.uid() == 0))
+        || mode & 0o7022 != 0
+        || if directory {
+            !before.is_dir()
+        } else {
+            !before.is_file() || before.nlink() != 1
+        }
+    {
+        return Err(changed());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        kortty_files::require_no_extended_acl(file)?;
+        if fstat(file)?.st_flags != 0 {
+            return Err(changed());
+        }
+    }
+    let mut attributes = Sha256::new();
+    for (name, value) in reviewed_xattrs(file)? {
+        attributes.update((name.len() as u32).to_be_bytes());
+        attributes.update(name.as_bytes());
+        attributes.update((value.len() as u32).to_be_bytes());
+        attributes.update(value);
+    }
+    let mut identity = [0; 16];
+    identity[..8].copy_from_slice(&before.ino().to_be_bytes());
+    let stamp = ReviewedStamp {
+        volume: reviewed_volume(file)?,
+        identity,
+        permissions: mode,
+        owner: before.uid(),
+        group: before.gid(),
+        attributes: attributes.finalize().into(),
+        size: before.len(),
+        created: 0,
+        modified: (before.mtime(), before.mtime_nsec()),
+        changed: (before.ctime(), before.ctime_nsec()),
+    };
+    let after = file.metadata()?;
+    if before.ctime() != after.ctime() || before.ctime_nsec() != after.ctime_nsec() {
+        return Err(changed());
+    }
+    Ok(stamp)
+}
+
+pub(super) fn copy_reviewed_metadata(from: &File, to: &File, directory: bool) -> io::Result<()> {
+    use rustix::fs::{XattrFlags, fchown, fremovexattr, fsetxattr};
+
+    let expected = reviewed_stamp(from, directory, false)?;
+    let desired = reviewed_xattrs(from)?;
+    let current = reviewed_xattrs(to)?;
+    if to.metadata()?.gid() != expected.group {
+        fchown(
+            to,
+            None,
+            Some(rustix::process::Gid::from_raw(expected.group)),
+        )?;
+    }
+    for name in current.keys().filter(|name| !desired.contains_key(*name)) {
+        fremovexattr(to, name.as_str())?;
+    }
+    for (name, value) in desired
+        .iter()
+        .filter(|(name, value)| current.get(*name) != Some(*value))
+    {
+        fsetxattr(to, name.as_str(), value, XattrFlags::empty())?;
+    }
+    let source_metadata = from.metadata()?;
+    to.set_permissions(source_metadata.permissions())?;
+    to.set_times(FileTimes::new().set_modified(source_metadata.modified()?))?;
+    let actual = reviewed_stamp(to, directory, false)?;
+    if actual.permissions != expected.permissions
+        || actual.owner != expected.owner
+        || actual.group != expected.group
+        || actual.attributes != expected.attributes
+        || actual.modified != expected.modified
+        || reviewed_stamp(from, directory, false)? != expected
+    {
+        return Err(changed());
+    }
+    Ok(())
+}
+
+fn reviewed_xattrs(file: &File) -> io::Result<BTreeMap<String, Vec<u8>>> {
+    use rustix::fs::{fgetxattr, fgetxattr_query, flistxattr};
+
+    const MAX_ATTRIBUTES: usize = 128;
+    const MAX_BYTES: usize = 128 * 1024;
+    let mut names = [0; 4096];
+    let length = match flistxattr(file, &mut names) {
+        Ok(length) => length,
+        Err(rustix::io::Errno::NOTSUP) => return Ok(BTreeMap::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let names = names[..length]
+        .split(|name| *name == 0)
+        .filter(|name| !name.is_empty());
+    let mut result = BTreeMap::new();
+    let mut available = MAX_BYTES;
+    for name in names {
+        let name = std::str::from_utf8(name).map_err(|_| changed())?;
+        #[cfg(target_os = "linux")]
+        if name != "security.selinux" && !name.starts_with("user.") {
+            return Err(changed());
+        }
+        if result.len() == MAX_ATTRIBUTES {
+            return Err(changed());
+        }
+        let size = fgetxattr_query(file, name)?;
+        available = available
+            .checked_sub(size + name.len())
+            .ok_or_else(changed)?;
+        let mut value = vec![0; size.max(1)];
+        if fgetxattr(file, name, value.as_mut_slice())? != size {
+            return Err(changed());
+        }
+        value.truncate(size);
+        result.insert(name.to_owned(), value);
+    }
+    Ok(result)
 }
 
 #[cfg(test)]

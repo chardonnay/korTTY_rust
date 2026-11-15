@@ -1,14 +1,16 @@
 use std::io::Write as _;
+use std::sync::Arc;
 
 use kortty_jobs::{MAX_SWARM_COMPARISON_BYTES, RunOutcome, SwarmReport, SwarmTargetReport};
 use serde_json::{Value, json};
 
-use super::{apply_comparison, cancel_completion};
+use super::{ComparisonWeb, apply_comparison, cancel_completion};
 use crate::job_executor::Completion;
 use crate::local_ai::test_support;
 use crate::terminal_agent::swarm::comparison::{ScheduledScope, ScheduledTemplate};
 use crate::terminal_logging::{Policy, Redactor, Secrets};
 use crate::workspace::terminal_ai::mask::prompt as mask;
+use crate::workspace::terminal_ai::web;
 
 const SECRET: &str = "scheduler-comparison-fixture-value";
 
@@ -18,6 +20,7 @@ fn completion() -> Completion {
         outcome: RunOutcome::Blocked,
         detail: Some("Target 14 was blocked.".into()),
         recording: None,
+        output: None,
         swarm_report: Some(Box::new(SwarmReport {
             question: "Compare the results for ***".into(),
             targets: vec![
@@ -48,29 +51,43 @@ fn scheduled_comparison_keeps_the_completed_targets_and_attaches_masked_model_re
     let redactor = Redactor::for_journal(secrets.seal().unwrap(), Policy::default());
     let mut completion = completion();
     let original = completion.swarm_report.as_deref().unwrap().clone();
-    let template = ScheduledTemplate::prepare(
-        ScheduledScope {
-            profile: &profile,
-            profile_revision: [47; 32],
-            context_limit: 8192,
-            targets: &[31, 14],
-        },
-        &format!("Compare the results for {SECRET}"),
-        None,
-        &redactor,
-        mask,
-    )
-    .unwrap();
+    let web = Arc::new(web::Evidence::fixture(
+        "This release adds a new diagnostic flag.",
+    ));
+    let scope = ScheduledScope {
+        profile: &profile,
+        profile_revision: [47; 32],
+        context_limit: 8192,
+        targets: &[31, 14],
+    };
+    let goal = format!("Compare the results for {SECRET}");
+    let base = ScheduledTemplate::prepare(scope, &goal, None, &redactor, mask).unwrap();
+    let (template, standing) =
+        ScheduledTemplate::prepare_with_fresh_web(scope, &goal, None, None, &web, &redactor, mask)
+            .unwrap();
+    assert!(standing.matches(&base));
+    assert!(!standing.matches(&template));
     let request = template.fill(&original.targets, &redactor, mask).unwrap();
     let [system, input] = request.messages().map(str::to_owned);
     let pending = request.start(profile, redactor, mask, || Ok(())).unwrap();
     let mut socket = test_support::accept(&listener);
     let wire = test_support::request(&mut socket);
     assert_eq!(wire["max_tokens"], 2048);
+    assert!(wire.get("tools").is_none());
+    assert!(wire.get("integrations").is_none());
     assert_eq!(wire["messages"][0]["content"], system);
     assert_eq!(wire["messages"][1]["content"], input);
     let parsed: Value = serde_json::from_str(&input).unwrap();
     assert_eq!(parsed["question"], original.question);
+    assert!(system.contains(web::GUIDANCE));
+    let preview: Value = serde_json::from_str(template.messages()[1]).unwrap();
+    assert_eq!(parsed["web_evidence"], preview["web_evidence"]);
+    assert!(
+        parsed["web_evidence"]
+            .as_str()
+            .unwrap()
+            .contains("https://example.com/notes\nThis release adds a new diagnostic flag.")
+    );
     assert_eq!(
         parsed["targets"],
         json!([
@@ -95,6 +112,26 @@ fn scheduled_comparison_keeps_the_completed_targets_and_attaches_masked_model_re
     assert_eq!(report.targets, original.targets);
     assert_eq!(report.question, original.question);
     assert_eq!(completion.outcome, RunOutcome::Blocked);
+}
+
+#[test]
+fn scheduled_comparison_requires_the_exact_fresh_evidence_for_its_run() {
+    let approved = Arc::new(web::Evidence::fixture("Verified release note."));
+    assert!(
+        ComparisonWeb::for_run(None, None, false)
+            .unwrap()
+            .evidence()
+            .is_none()
+    );
+    assert!(ComparisonWeb::for_run(None, None, true).is_err());
+    assert!(ComparisonWeb::for_run(None, Some(Arc::clone(&approved)), false).is_err());
+    assert!(ComparisonWeb::for_run(Some(&approved), Some(Arc::clone(&approved)), true).is_err());
+    let fresh = ComparisonWeb::for_run(None, Some(Arc::clone(&approved)), true).unwrap();
+    assert!(Arc::ptr_eq(fresh.evidence().unwrap(), &approved));
+    let standing = ComparisonWeb::for_run(Some(&approved), None, false).unwrap();
+    assert!(fresh != standing);
+    let changed = Arc::new(web::Evidence::fixture("Changed release note."));
+    assert!(fresh != ComparisonWeb::for_run(None, Some(changed), true).unwrap());
 }
 
 #[test]

@@ -12,7 +12,7 @@ use super::{Location, parent};
 
 pub(crate) mod local;
 pub(super) mod ordinary_download;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use ordinary_download::Stage as VerifiedTreeStage;
 pub(super) mod privileged_download;
 pub(super) mod single_file;

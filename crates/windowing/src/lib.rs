@@ -6,6 +6,8 @@ use raw_window_handle::{DisplayHandle, RawDisplayHandle, RawWindowHandle, Window
 #[cfg(target_os = "linux")]
 mod bell;
 mod clipboard;
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+pub mod file_drag;
 #[cfg(target_os = "linux")]
 mod linux_notifications;
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
@@ -53,7 +55,8 @@ pub use clipboard::{ClipboardPng, shutdown_clipboard};
 pub use kortty_macos::TabPress;
 #[cfg(target_os = "linux")]
 pub use linux_notifications::{
-    DESKTOP_APP_ID, LauncherBadge, activate_notification_window, send_desktop_notification,
+    DESKTOP_APP_ID, LauncherBadge, activate_notification_window, desktop_app_id,
+    send_desktop_notification,
 };
 #[cfg(any(target_os = "windows", target_os = "linux", test))]
 pub use placement::{DesktopPoint, DialogWorkArea};

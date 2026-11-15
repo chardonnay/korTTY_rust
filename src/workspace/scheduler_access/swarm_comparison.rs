@@ -10,6 +10,7 @@ use async_channel::{Sender, TryRecvError};
 use iced::{Task, window};
 use kortty_jobs::{Cancellation, RunId, RunOutcome, RunRequest, valid_swarm_comparison};
 
+use crate::ai_manager::reviewed_memory::Memory;
 use crate::clipboard_policy::AiMemoryPolicy;
 use crate::job_executor::Completion;
 use crate::local_ai;
@@ -19,7 +20,7 @@ use crate::terminal_agent::swarm::comparison::{
     Report, ScheduledGrant, ScheduledScope, ScheduledTemplate,
 };
 use crate::terminal_logging::Redactor;
-use crate::workspace::terminal_ai::mask;
+use crate::workspace::terminal_ai::{mask, web};
 
 use super::{
     ClipboardPolicy, Configuration, ConnectionStore, Message, SshCommand, Workspace, agent,
@@ -111,32 +112,83 @@ struct Authority {
     targets: Vec<agent::Target>,
     goal: String,
     grant: ScheduledGrant,
+    standing_grant: ScheduledGrant,
     redactor: Redactor,
     vault_revision: Option<Weak<()>>,
     memory_policy: AiMemoryPolicy,
     knowledge: Option<Arc<knowledge::Grant>>,
+    web: ComparisonWeb,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum ComparisonWeb {
+    None,
+    Standing(Arc<web::Evidence>),
+    Fresh(Arc<web::Evidence>),
+}
+
+impl ComparisonWeb {
+    fn standing(evidence: Option<&Arc<web::Evidence>>) -> Self {
+        evidence.cloned().map_or(Self::None, Self::Standing)
+    }
+
+    fn for_run(
+        standing: Option<&Arc<web::Evidence>>,
+        fresh: Option<Arc<web::Evidence>>,
+        requires_fresh: bool,
+    ) -> Result<Self, &'static str> {
+        match (standing, fresh, requires_fresh) {
+            (None, Some(evidence), true) => Ok(Self::Fresh(evidence)),
+            (standing, None, false) => Ok(Self::standing(standing)),
+            _ => Err(CHANGED),
+        }
+    }
+
+    fn evidence(&self) -> Option<&Arc<web::Evidence>> {
+        match self {
+            Self::None => None,
+            Self::Standing(evidence) | Self::Fresh(evidence) => Some(evidence),
+        }
+    }
 }
 
 fn prepare_template(
     config: &Configuration,
     scope: ScheduledScope<'_>,
     goal: &str,
-    root: &std::path::Path,
     memory_policy: &AiMemoryPolicy,
     redactor: &Redactor,
     knowledge: Option<&knowledge::Grant>,
-) -> Result<ScheduledTemplate, String> {
-    let memory = config.load_memory(Some(root), memory_policy, None, false, |text| {
-        mask::prompt(redactor, text)
-    })?;
-    ScheduledTemplate::prepare_with_knowledge(
+    web: &ComparisonWeb,
+) -> Result<(ScheduledTemplate, ScheduledGrant), String> {
+    let memory = Memory::global(config, memory_policy, redactor)?;
+    let knowledge = knowledge.map(knowledge::Grant::context);
+    if let ComparisonWeb::Fresh(evidence) = web {
+        let (mut template, mut standing) = ScheduledTemplate::prepare_with_fresh_web(
+            scope,
+            goal,
+            memory.text(),
+            knowledge,
+            evidence,
+            redactor,
+            mask::prompt,
+        )?;
+        template.bind_memory(memory.binding())?;
+        standing.bind_memory(memory.binding())?;
+        return Ok((template, standing));
+    }
+    let mut template = ScheduledTemplate::prepare_with_context(
         scope,
         goal,
-        memory.as_ref().map(|memory| memory.text()),
-        knowledge.map(knowledge::Grant::context),
+        memory.text(),
+        knowledge,
+        web.evidence(),
         redactor,
         mask::prompt,
-    )
+    )?;
+    template.bind_memory(memory.binding())?;
+    let grant = template.grant();
+    Ok((template, grant))
 }
 
 impl Authority {
@@ -170,6 +222,9 @@ impl Authority {
             return Err(CHANGED.into());
         }
         self.provider_mask.check(&self.transport)?;
+        if let Some(web) = self.web.evidence() {
+            web.require_current()?;
+        }
         if let Some(knowledge) = &self.knowledge {
             knowledge.require_current(&config, &self.profile.id, &self.profile_root, || {
                 if cancellation.is_requested()
@@ -207,7 +262,7 @@ impl Authority {
             .iter()
             .map(|target| target.reference.id)
             .collect();
-        let template = prepare_template(
+        let (template, standing_grant) = prepare_template(
             &config,
             ScheduledScope {
                 profile: &self.transport,
@@ -216,12 +271,12 @@ impl Authority {
                 targets: &ids,
             },
             &self.goal,
-            &self.profile_root,
             &policy.ai_memory,
             &self.redactor,
             self.knowledge.as_deref(),
+            &self.web,
         )?;
-        if !self.grant.matches(&template) {
+        if self.standing_grant != standing_grant || !self.grant.matches(&template) {
             return Err(CHANGED.into());
         }
         Ok(())
@@ -235,6 +290,7 @@ impl Workspace {
         targets: &[agent::Target],
         goal: &str,
         knowledge: Option<&Arc<knowledge::Grant>>,
+        web: ComparisonWeb,
     ) -> Result<(ScheduledTemplate, Authority), String> {
         let installed = ClipboardPolicy::load();
         let config = self.scheduler_agent_policy(agent::Kind::Swarm, &installed)?;
@@ -260,6 +316,15 @@ impl Workspace {
         let (secrets, mut vault_revision) = self.firing_secrets(targets, &store)?;
         if let Some(knowledge) = knowledge {
             super::proposal_knowledge::require_current_vault_mask(self.vault.as_ref(), knowledge)?;
+        }
+        if let Some(web) = web.evidence() {
+            if !self.clipboard.policy.ai_web_search_allowed {
+                return Err(CHANGED.into());
+            }
+            web.require_current()?;
+            super::proposal_web::require_current_vault_mask(self.vault.as_ref(), web)?;
+        }
+        if knowledge.is_some() || web.evidence().is_some() {
             vault_revision = Some(self.vault_change_revision());
         }
         let provider_mask = ProviderMask::capture(&transport);
@@ -268,7 +333,7 @@ impl Workspace {
             self.clipboard.policy.terminal_logging.clone(),
         ))?;
         let ids: Vec<_> = targets.iter().map(|target| target.reference.id).collect();
-        let template = prepare_template(
+        let (template, standing_grant) = prepare_template(
             &saved,
             ScheduledScope {
                 profile: &transport,
@@ -277,10 +342,10 @@ impl Workspace {
                 targets: &ids,
             },
             goal,
-            &root,
             &policy.ai_memory,
             &redactor,
             knowledge.map(Arc::as_ref),
+            &web,
         )?;
         let authority = Authority {
             profile: profile.clone(),
@@ -291,10 +356,12 @@ impl Workspace {
             targets: targets.to_vec(),
             goal: goal.into(),
             grant: template.grant(),
+            standing_grant,
             redactor,
             vault_revision,
             memory_policy: policy.ai_memory,
             knowledge: knowledge.cloned(),
+            web,
         };
         Ok((template, authority))
     }
@@ -326,6 +393,7 @@ impl Workspace {
                 authority.targets,
                 &action.goal,
                 authority.knowledge,
+                ComparisonWeb::standing(authority.web),
             )?;
             let view = self.scheduler_views.get_mut(&id).ok_or(CHANGED)?;
             if approving {
@@ -365,6 +433,7 @@ impl Workspace {
             authority.targets,
             &action.goal,
             authority.knowledge,
+            ComparisonWeb::standing(authority.web),
         )?;
         if !grant.matches(&template) {
             return Err(CHANGED.into());
@@ -400,10 +469,10 @@ impl Workspace {
     fn swarm_comparison_active(&self, request: &RunRequest<SshCommand>) -> bool {
         !self.exiting
             && !self.scheduler_draining
-            && self
-                .scheduler
-                .as_ref()
-                .is_some_and(|scheduler| scheduler.active_swarm_comparison_approved(request))
+            && self.scheduler.as_ref().is_some_and(|scheduler| {
+                scheduler.active_swarm_comparison_approved(request)
+                    && scheduler.agent_predecessors_current(request, std::time::SystemTime::now())
+            })
     }
 
     fn check_swarm_comparison_authority(
@@ -415,13 +484,29 @@ impl Workspace {
             return Err(CHANGED.into());
         }
         request.action.require_installed_target_groups()?;
-        let (template, current) = self.prepare_scheduler_comparison(
+        let approval = request
+            .action
+            .agent
+            .as_ref()
+            .and_then(|action| action.approval.as_deref())
+            .ok_or(CHANGED)?;
+        let web = ComparisonWeb::for_run(
+            approval.web.as_ref(),
+            self.require_firing_web_evidence(request)?,
+            approval.requires_fresh_web(),
+        )?;
+        if web != authority.web {
+            return Err(CHANGED.into());
+        }
+        let (_, current) = self.prepare_scheduler_comparison(
             &authority.profile,
             &authority.targets,
             &authority.goal,
             authority.knowledge.as_ref(),
+            web,
         )?;
-        if !authority.grant.matches(&template)
+        if authority.grant != current.grant
+            || approval.comparison.as_ref() != Some(&current.standing_grant)
             || authority.profile_root != current.profile_root
             || authority.transport != current.transport
             || authority.memory_policy != current.memory_policy
@@ -478,13 +563,19 @@ impl Workspace {
         let action = request.action.agent.as_ref().ok_or(CHANGED)?;
         let approval = action.approval.as_ref().ok_or(CHANGED)?;
         let grant = approval.comparison.as_ref().ok_or(CHANGED)?;
+        let web = ComparisonWeb::for_run(
+            approval.web.as_ref(),
+            self.require_firing_web_evidence(request)?,
+            approval.requires_fresh_web(),
+        )?;
         let (template, authority) = self.prepare_scheduler_comparison(
             &approval.profile,
             &approval.targets,
             &action.goal,
             approval.knowledge.as_ref(),
+            web,
         )?;
-        if !grant.matches(&template) {
+        if grant != &authority.standing_grant {
             return Err(CHANGED.into());
         }
         let report = pending.completion.swarm_report.as_ref().ok_or(CHANGED)?;
@@ -495,7 +586,9 @@ impl Workspace {
         let action = Arc::clone(&request.action);
         let id = request.id;
         let (permits, requests) = async_channel::bounded(1);
-        let reviewed_https = (authority.knowledge.is_some() && authority.transport.is_remote())
+        let reviewed_https = authority
+            .transport
+            .is_remote()
             .then(|| authority.transport.completion_secret());
         let local_ai::Pending { reply, cancel } = model.start_checked(
             authority.transport.clone(),

@@ -1,6 +1,6 @@
 use std::cell::Cell;
 use std::io;
-use std::sync::atomic::Ordering;
+use std::sync::{Arc, atomic::Ordering};
 use std::time::{Duration, Instant};
 
 use kortty::ssh_runtime::password_file::{DEADLINE, TRANSFER_DEADLINE};
@@ -44,8 +44,10 @@ pub(super) fn run_archive(
     archive: &privileged::PrivilegedArchive,
     saved_auth: SavedAuth,
     trust_store: impl FnOnce() -> io::Result<TrustStore>,
+    password: Option<&str>,
 ) -> Result<Completion, Failure> {
     let spec = archive.archive.server_spec().map_err(Failure::blocked)?;
+    let copies_archive = spec.report_payload;
     let reference = request
         .action
         .connection
@@ -53,44 +55,82 @@ pub(super) fn run_archive(
         .ok_or_else(|| Failure::blocked(ARCHIVE_REVIEW))?;
     let context = policy
         .privileged
-        .as_ref()
+        .clone()
         .ok_or_else(|| Failure::blocked(ARCHIVE_REVIEW))?;
-    if !policy.sudo_allowed || !privileged_allowed_now(reference, false) {
+    if !policy.sudo_allowed
+        || (copies_archive && !policy.file_transfer_allowed)
+        || !privileged_allowed_now(reference, copies_archive)
+    {
         return Err(Failure::blocked(ARCHIVE_DENIED));
     }
     let trust = trust_store().map_err(|_| Failure::blocked(ARCHIVE_REVIEW))?;
     let pins = sync::pins(reference, &trust).map_err(|_| Failure::blocked(ARCHIVE_REVIEW))?;
-    let review_current = || {
-        policy.require_target_groups(&request.action).is_ok()
+    let review_action = Arc::clone(&request.action);
+    let review_policy = policy.clone();
+    let review_reference = reference.clone();
+    let review_archive = archive.clone();
+    let review_pins = pins.clone();
+    let review_current = move || {
+        review_policy.require_target_groups(&review_action).is_ok()
             && profile::connections_path()
                 .and_then(ConnectionStore::open)
                 .is_ok_and(|store| {
-                    store.get(reference.id).map(ConnectionRef::from).as_ref() == Some(reference)
+                    store
+                        .get(review_reference.id)
+                        .map(ConnectionRef::from)
+                        .as_ref()
+                        == Some(&review_reference)
                 })
-            && sync::pins(reference, &trust).is_ok_and(|current| current == pins)
+            && sync::pins(&review_reference, &trust).is_ok_and(|current| current == review_pins)
             && context
-                .authorize_archive(archive, reference, request.action.sudo, &pins)
+                .authorize_archive(
+                    &review_archive,
+                    &review_reference,
+                    review_action.sudo,
+                    &review_pins,
+                )
                 .is_ok()
     };
     if !review_current() {
         return Err(Failure::blocked(ARCHIVE_REVIEW));
     }
     check_cancelled(&request.cancellation)?;
+    let mut saved_auth = saved_auth.map_err(Failure::blocked)?;
+    let sudo_password = match authorization(request.action.sudo, saved_auth.as_mut())? {
+        file::Auth::Passwordless => None,
+        file::Auth::Password(line) => Some(line),
+    };
+    let local = archive
+        .archive
+        .download
+        .as_deref()
+        .map(StagedDownload::create)
+        .transpose()
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                Failure::failed("The local archive destination already exists.")
+            } else {
+                Failure::failed("Could not create a private local archive stage.")
+            }
+        })?;
+    let writer = local
+        .as_ref()
+        .map(StagedDownload::writer)
+        .transpose()
+        .map_err(|_| Failure::failed("The private local archive stage was unavailable."))?;
     let deadline = Instant::now() + ARCHIVE_TIMEOUT;
     let checked_reference = reference.clone();
     let cancellation = request.cancellation.clone();
     let stopped = move || {
         cancellation.is_requested()
             || Instant::now() >= deadline
-            || !privileged_allowed_now(&checked_reference, false)
+            || !privileged_allowed_now(&checked_reference, copies_archive)
     };
-    let (target, jumps) = connection::route(
-        &request.action,
-        saved_auth.map_err(Failure::blocked)?,
-        &policy.server_access,
-    )?;
-    let authorize = || {
-        if review_current() && privileged_allowed_now(reference, false) {
+    let (target, jumps) = connection::route(&request.action, saved_auth, &policy.server_access)?;
+    let reviewed = review_current.clone();
+    let authorized_reference = reference.clone();
+    let authorize = move || {
+        if reviewed() && privileged_allowed_now(&authorized_reference, copies_archive) {
             Ok(())
         } else {
             Err(io::Error::new(
@@ -112,27 +152,65 @@ pub(super) fn run_archive(
         pinned,
         ConnectOptions::default(),
         &stopped,
-        authorize,
+        &authorize,
     )
     .map_err(super::connect_failure)?;
     let result = connection
         .exec_opener()
         .ok_or(PrivilegedArchiveFailure::BeforeCommit)
-        .and_then(|opener| exchange_privileged_server_archive(&opener, &spec, stopped, authorize));
+        .and_then(|opener| {
+            exchange_privileged_server_archive(
+                &opener,
+                &spec,
+                sudo_password,
+                password,
+                writer,
+                stopped.clone(),
+                authorize.clone(),
+            )
+        });
     drop(connection);
     match result {
         Ok(()) => {
+            if let Some(stage) = local {
+                let result = stage.publish_checked(|_| {
+                    if stopped() {
+                        return Err(io::Error::other("The archive copy stopped."));
+                    }
+                    authorize()
+                });
+                let result = result.map_err(|error| {
+                    if error.kind() == io::ErrorKind::AlreadyExists {
+                        Failure::failed("The local archive destination already exists.")
+                    } else {
+                        copy_failure(
+                            &request.cancellation,
+                            &authorize,
+                            "The verified copy could not be published. Check the local destination before retrying.",
+                        )
+                    }
+                });
+                return Ok(super::server_archive::copy_completion(request, result));
+            }
             let mut completion = Completion::from_result(request.id, Ok(0));
             completion.detail =
                 Some("Created the reviewed privileged archive on the server.".into());
             Ok(completion)
         }
+        Err(PrivilegedArchiveFailure::CopyFailed) => Ok(super::server_archive::copy_completion(
+            request,
+            Err(copy_failure(
+                &request.cancellation,
+                &authorize,
+                "The server did not return a complete verified local copy.",
+            )),
+        )),
         Err(PrivilegedArchiveFailure::Uncertain) => Err(Failure::failed(
             "The server may have published the privileged archive. Check the destination before retrying.",
         )),
         Err(error) => {
             check_cancelled(&request.cancellation)?;
-            if !privileged_allowed_now(reference, false) {
+            if !privileged_allowed_now(reference, copies_archive) {
                 return Err(Failure::blocked(ARCHIVE_DENIED));
             }
             if !review_current() {
@@ -146,11 +224,25 @@ pub(super) fn run_archive(
                     "The privileged helper refused the archive. Check the configured roots, source and destination.",
                 ),
                 _ => Failure::blocked(
-                    "Could not review the privileged archive. Check the installed helper and passwordless sudo rule.",
+                    "Could not review the privileged archive. Check the installed helper and sudo rule for the selected mode.",
                 ),
             })
         }
     }
+}
+
+fn copy_failure(
+    cancellation: &Cancellation,
+    authorize: &impl Fn() -> io::Result<()>,
+    detail: &'static str,
+) -> Failure {
+    if let Err(error) = check_cancelled(cancellation) {
+        return error;
+    }
+    if authorize().is_err() {
+        return Failure::blocked("The local archive copy is no longer authorized.");
+    }
+    Failure::failed(detail)
 }
 
 pub(super) fn run_file_action(

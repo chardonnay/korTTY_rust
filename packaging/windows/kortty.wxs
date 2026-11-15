@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+    <!-- The Rust installer has its own product family and default folder. -->
+    <Package Name="kortty Rust" Manufacturer="Daniel Mengel" Language="1033"
+             Version="$(ReleaseVersion)" UpgradeCode="ee3ea680-3e3b-4bbd-bfa5-58b132310477"
+             Scope="perMachine">
+        <MajorUpgrade AllowSameVersionUpgrades="yes" Schedule="afterInstallInitialize"
+                      DowngradeErrorMessage="A newer version of kortty Rust is already installed." />
+        <MediaTemplate EmbedCab="yes" />
+
+        <!-- The icon comes from the Java v2.26.0 release source. -->
+        <Icon Id="KorttyIcon.exe" SourceFile="!(bindpath.kortty_resources)kortty.ico" />
+        <Property Id="ARPPRODUCTICON" Value="KorttyIcon.exe" />
+        <Property Id="ARPURLINFOABOUT" Value="https://github.com/chardonnay/korTTY_rust" />
+        <Property Id="INSTALLFOLDER" Secure="yes" />
+        <Property Id="PREVIOUSINSTALLFOLDER" Secure="yes">
+            <RegistrySearch Id="FindKorttyInstallFolder" Root="HKLM" Key="Software\kortty Rust"
+                            Name="InstallFolder" Type="raw" Bitness="always64" />
+        </Property>
+        <SetProperty Id="INSTALLFOLDER" Value="[PREVIOUSINSTALLFOLDER]" After="AppSearch"
+                     Sequence="both" Condition="PREVIOUSINSTALLFOLDER AND NOT INSTALLFOLDER" />
+        <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+
+        <StandardDirectory Id="ProgramFiles6432Folder">
+            <Directory Id="INSTALLFOLDER" Name="kortty Rust" />
+        </StandardDirectory>
+        <StandardDirectory Id="ProgramMenuFolder" />
+        <StandardDirectory Id="DesktopFolder" />
+        <Feature Id="Kortty" Title="kortty Rust" Level="1">
+            <ComponentGroupRef Id="KorttyPayload" />
+        </Feature>
+    </Package>
+
+    <Fragment>
+        <ComponentGroup Id="KorttyPayload">
+@PAYLOAD_COMPONENTS@
+        </ComponentGroup>
+    </Fragment>
+</Wix>

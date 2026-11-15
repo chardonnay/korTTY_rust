@@ -18,6 +18,7 @@ pub(super) struct Round {
     mode: SwarmMode,
     profile: ProfileChoice,
     goal: String,
+    web: Option<super::web_evidence::Evidence>,
     choices: Vec<Choice>,
     saved: bool,
 }
@@ -53,6 +54,7 @@ impl Round {
             prepared: None,
             goal: &self.goal,
             continuation: None,
+            web: self.web.as_ref(),
         }
     }
 
@@ -153,6 +155,7 @@ impl Group {
                 goal: active
                     .map_or(self.goal.as_str(), |active| &active.reviewed.question)
                     .to_owned(),
+                web: self.round_web.clone(),
                 choices: self
                     .choices
                     .iter()
@@ -209,6 +212,12 @@ impl Workspace {
             group.notice = error.into();
             return;
         }
+        if let Some(evidence) = &last.web
+            && let Err(error) = evidence.require_current(self)
+        {
+            group.notice = error;
+            return;
+        }
         group.restarts.targets.clear();
         group.restarts.round = true;
         group.batch_review = None;
@@ -255,9 +264,16 @@ impl Workspace {
                 "The previous AI profile is unavailable. Choose a current profile.".into();
             return;
         }
+        if let Some(evidence) = &last.web
+            && let Err(error) = evidence.require_current(self)
+        {
+            group.notice = error;
+            return;
+        }
         group.mode = last.mode;
         group.profile = Some(last.profile.clone());
         group.goal.clone_from(&last.goal);
+        group.round_web.clone_from(&last.web);
         group.selected = last
             .choices
             .iter()
@@ -276,7 +292,9 @@ impl Workspace {
         }
         if let Some(chat) = &mut group.conversation {
             chat.profile_selection = last.profile.reference.clone();
-            group.notice = match self.review_saved_swarm_follow_up(group) {
+            group.clear_web_search();
+            let web = group.round_web.clone();
+            group.notice = match self.review_saved_swarm_follow_up_with_web(group, web) {
                 Ok(()) => "Review the current saved targets before restarting the Swarm.".into(),
                 Err(error) => error,
             };

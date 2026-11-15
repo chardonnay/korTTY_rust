@@ -2,8 +2,8 @@ use std::num::NonZeroU32;
 use std::time::SystemTime;
 
 use kortty_jobs::{
-    BlockReason, Date, DependencyMode, Job, JobGraph, JobId, JobSchedule, RunOutcome, RunTrigger,
-    ScheduleError, Scheduler, Time, TimeZone, Weekday,
+    BlockReason, Date, DependencyMode, FiringOccurrence, Job, JobGraph, JobId, JobSchedule,
+    RunOutcome, RunTrigger, ScheduleError, Scheduler, Time, TimeZone, Weekday,
 };
 
 fn time(value: &str) -> Time {
@@ -188,6 +188,10 @@ fn timer_initialization_skips_past_runs_and_rearms_after_completion() {
     let delayed = scheduler.tick(at("2026-05-04T09:47", &zone)).unwrap();
     assert_eq!(delayed.started.len(), 1);
     assert_eq!(delayed.started[0].trigger, RunTrigger::Scheduled);
+    assert_eq!(
+        scheduler.active_firing_occurrence(&delayed.started[0]),
+        Some(&FiringOccurrence::Calendar(at("2026-05-04T09:30", &zone)))
+    );
     assert_eq!(scheduler.next_due(), None);
     assert!(
         scheduler

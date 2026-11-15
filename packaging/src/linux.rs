@@ -14,16 +14,21 @@ const MAINTAINER: &str = "korTTY maintainers <chardonnay@users.noreply.github.co
 const DEB_RUNTIME: &str = "ca-certificates, fontconfig, fonts-dejavu-mono | fonts-dejavu-core, libwayland-client0, libwayland-cursor0, libx11-6, libx11-xcb1, libxcb1, libxcursor1, libxi6, libxkbcommon0, libxkbcommon-x11-0, libxrandr2, xkb-data";
 const RPM_RUNTIME: &str = "ca-certificates, fontconfig, dejavu-sans-mono-fonts, libwayland-client.so.0()(64bit), libwayland-cursor.so.0()(64bit), libX11.so.6()(64bit), libX11-xcb.so.1()(64bit), libxcb.so.1()(64bit), libXcursor.so.1()(64bit), libXi.so.6()(64bit), libxkbcommon.so.0()(64bit), libxkbcommon-x11.so.0()(64bit), libXrandr.so.2()(64bit), xkeyboard-config";
 
+mod flatpak;
+mod pacman;
+
 #[derive(Default)]
 pub(crate) struct Packages {
     pub(crate) zip: bool,
     pub(crate) deb: bool,
     pub(crate) rpm: bool,
+    pub(crate) pacman: bool,
+    pub(crate) flatpak: bool,
 }
 
 impl Packages {
     pub(crate) fn selected(&self) -> bool {
-        self.zip || self.deb || self.rpm
+        self.zip || self.deb || self.rpm || self.pacman || self.flatpak
     }
 
     pub(crate) fn option(&self) -> &'static str {
@@ -31,13 +36,17 @@ impl Packages {
             "--linux-deb"
         } else if self.rpm {
             "--linux-rpm"
+        } else if self.pacman {
+            "--linux-pacman"
+        } else if self.flatpak {
+            "--linux-flatpak"
         } else {
             "--linux-zip"
         }
     }
 
     pub(crate) fn require_host(&self, triple: &str) -> Result<()> {
-        if self.deb || self.rpm {
+        if self.deb || self.rpm || self.pacman || self.flatpak {
             if !cfg!(target_os = "linux") || target::native()? != triple {
                 return Err(
                     invalid("Native Linux packages require a matching Linux build host").into(),
@@ -59,6 +68,14 @@ impl Packages {
                 output(tool("rpmbuild").arg("--version"))?;
                 output(tool("rpm").arg("--version"))?;
             }
+            if self.pacman {
+                let (arch, _) = architectures(triple)?;
+                pacman::require_tools(arch)?;
+            }
+            if self.flatpak {
+                let (arch, _) = architectures(triple)?;
+                flatpak::require_tools(arch)?;
+            }
         }
         Ok(())
     }
@@ -71,28 +88,38 @@ impl Packages {
         staging: &Path,
         release: &Path,
     ) -> Result<Vec<String>> {
-        if !self.deb && !self.rpm {
+        if !self.deb && !self.rpm && !self.pacman && !self.flatpak {
             return Ok(Vec::new());
         }
         let (rpm_arch, deb_arch) = architectures(triple)?;
-        let (deb_version, rpm_version) = versions(version)?;
         let mut artifacts = Vec::new();
-        if self.deb {
-            artifacts.push(build_deb(
-                staging,
-                release,
-                payload,
-                &deb_version,
-                deb_arch,
-            )?);
+        if self.deb || self.rpm {
+            let (deb_version, rpm_version) = versions(version)?;
+            if self.deb {
+                artifacts.push(build_deb(
+                    staging,
+                    release,
+                    payload,
+                    &deb_version,
+                    deb_arch,
+                )?);
+            }
+            if self.rpm {
+                artifacts.push(build_rpm(
+                    staging,
+                    release,
+                    payload,
+                    &rpm_version,
+                    rpm_arch,
+                )?);
+            }
         }
-        if self.rpm {
-            artifacts.push(build_rpm(
-                staging,
-                release,
-                payload,
-                &rpm_version,
-                rpm_arch,
+        if self.pacman {
+            artifacts.push(pacman::build(staging, release, payload, version, rpm_arch)?);
+        }
+        if self.flatpak {
+            artifacts.push(flatpak::build(
+                staging, release, payload, version, rpm_arch,
             )?);
         }
         Ok(artifacts)
@@ -305,11 +332,11 @@ cp -a "$KORTTY_RPM_SOURCE/." "$RPM_BUILD_ROOT/"
     Ok(name)
 }
 
-fn stage_install(payload: &Path, package: &Path, rpm: bool) -> Result<u64> {
+fn stage_install(payload: &Path, package: &Path, system_license: bool) -> Result<u64> {
     let usr = package.join("usr");
     copy_tree(&payload.join("bin"), &usr.join("bin"))?;
     copy_tree(&payload.join("share"), &usr.join("share"))?;
-    let license = usr.join(if rpm {
+    let license = usr.join(if system_license {
         "share/licenses/kortty"
     } else {
         "share/doc/kortty"
@@ -317,7 +344,11 @@ fn stage_install(payload: &Path, package: &Path, rpm: bool) -> Result<u64> {
     copy_tree(&payload.join("licenses"), &license.join("third-party"))?;
     fs::copy(
         payload.join("license.txt"),
-        license.join(if rpm { "LICENSE" } else { "copyright" }),
+        license.join(if system_license {
+            "LICENSE"
+        } else {
+            "copyright"
+        }),
     )?;
     let bytes = normalize(package)?;
     Ok(bytes.div_ceil(1024))

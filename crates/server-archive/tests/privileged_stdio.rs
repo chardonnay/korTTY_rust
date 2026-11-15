@@ -1,14 +1,17 @@
 #![cfg(all(feature = "decoder", target_os = "linux"))]
 
 use std::fs;
-use std::io::{self, Write as _};
-use std::os::unix::fs::{PermissionsExt as _, symlink};
+use std::io::{self, Read as _, Write as _};
+use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use kortty_server_archive::protocol::{
-    CreateFormat, CreateSpec, PRIVILEGED_ARGUMENT, PRIVILEGED_PATH, PrivilegedReply,
-    PrivilegedRequest, read_privileged_reply, write_privileged_request,
+    CreateFormat, CreateSpec, OutputMetadata, PASSWORD_COMMIT, PRIVILEGED_ARGUMENT,
+    PRIVILEGED_PASSWORD_ARGUMENT, PRIVILEGED_PASSWORD_COMMIT, PRIVILEGED_PASSWORD_READY,
+    PRIVILEGED_PATH, PrivilegedReply, PrivilegedRequest, creation_password_body,
+    read_privileged_reply, write_privileged_request,
 };
+use sha2::{Digest, Sha256};
 
 const CONFIG: &str = "/etc/kortty/privileged-archive.json";
 const RULES: &str = r#"{"source_roots":["/data/source"],"destination_roots":["/data/output"]}"#;
@@ -43,8 +46,45 @@ fn privileged_archive_stdio_scopes_one_commit_and_preserves_existing_paths() {
         format,
         level: 3,
         excludes: vec![],
+        output: None,
+        report_payload: false,
     };
     let zip = spec("zip", CreateFormat::Zip);
+
+    if std::env::var_os("KORTTY_ARCHIVE_TEST_USE_SUDO").is_none() {
+        let separate = spec("greeting.tar", CreateFormat::Tar);
+        let mut disconnected = Helper::open_password_protocol();
+        let token = disconnected.review(&separate);
+        assert_failed(disconnected.complete(&PrivilegedRequest::Commit { token }));
+        assert!(!std::path::Path::new(&separate.destination).exists());
+        let mut helper = Helper::open_password_protocol();
+        let token = helper.review(&separate);
+        helper.send(&PrivilegedRequest::Commit { token });
+        helper
+            .input
+            .as_mut()
+            .unwrap()
+            .write_all(PRIVILEGED_PASSWORD_COMMIT)
+            .unwrap();
+        assert!(matches!(
+            helper.finish(),
+            PrivilegedReply::Applied { destination } if destination == separate.destination
+        ));
+        fs::remove_file(&separate.destination).unwrap();
+    }
+
+    let mut output = zip.clone();
+    output.output = Some(OutputMetadata {
+        uid: Some(1),
+        gid: None,
+        mode: Some(0o644),
+    });
+    assert_failed(Helper::open().complete(&PrivilegedRequest::Review { spec: output }));
+    assert!(!std::path::Path::new(&zip.destination).exists());
+    let mut download = zip.clone();
+    download.report_payload = true;
+    assert_failed(Helper::open().complete(&PrivilegedRequest::Review { spec: download }));
+    assert!(!std::path::Path::new(&zip.destination).exists());
 
     let mut outside = zip.clone();
     outside.sources = vec!["/data/source-other/blocked.txt".into()];
@@ -144,7 +184,129 @@ fn privileged_archive_stdio_scopes_one_commit_and_preserves_existing_paths() {
                 .any(|member| member.path == "source/empty")
         );
     }
-    assert_eq!(fs::read_dir("/data/output").unwrap().count(), 4);
+    let mut protected = spec("zip", CreateFormat::ZipPassword);
+    protected.destination = "/data/output/password.zip".into();
+    const PASSWORD: &str = "fixture password\n東京";
+    let body = creation_password_body(PASSWORD).unwrap();
+    for marker in [
+        &[][..],
+        &PASSWORD_COMMIT[..PASSWORD_COMMIT.len() - 1],
+        b"wrong",
+    ] {
+        let mut helper = Helper::open();
+        let token = helper.review(&protected);
+        helper.send(&PrivilegedRequest::Commit { token });
+        let input = helper.input.as_mut().unwrap();
+        input.write_all(&body).unwrap();
+        input.write_all(marker).unwrap();
+        assert_failed(helper.finish());
+        assert!(!std::path::Path::new(&protected.destination).exists());
+    }
+    let mut helper = Helper::open();
+    let token = helper.review(&protected);
+    helper.send(&PrivilegedRequest::Commit { token });
+    helper.input.as_mut().unwrap().write_all(&body).unwrap();
+    helper
+        .input
+        .as_mut()
+        .unwrap()
+        .write_all(PASSWORD_COMMIT)
+        .unwrap();
+    assert!(
+        matches!(helper.finish(), PrivilegedReply::Applied { destination } if destination == protected.destination)
+    );
+    let metadata = fs::metadata(&protected.destination).unwrap();
+    assert_eq!(metadata.uid(), 0);
+    assert_eq!(metadata.mode() & 0o777, 0o600);
+    let mut archive =
+        zip::ZipArchive::new(fs::File::open(&protected.destination).unwrap()).unwrap();
+    assert!(archive.by_name("source/example.txt").is_err());
+    assert!(
+        archive
+            .by_name_decrypt("source/example.txt", b"incorrect")
+            .is_err()
+    );
+    let mut contents = Vec::new();
+    archive
+        .by_name_decrypt("source/example.txt", PASSWORD.as_bytes())
+        .unwrap()
+        .read_to_end(&mut contents)
+        .unwrap();
+    assert_eq!(contents, b"changed");
+    assert_eq!(fs::read_dir("/data/output").unwrap().count(), 5);
+
+    let download_rules = r#"{"source_roots":["/data/source"],"destination_roots":["/data/output"],"download_roots":["/data/output/downloadable"]}"#;
+    fs::create_dir("/data/output/downloadable").unwrap();
+    fs::write(CONFIG, download_rules).unwrap();
+    let mut copy = protected;
+    copy.report_payload = true;
+    copy.destination = "/data/output/not-downloadable.zip".into();
+    assert_failed(Helper::open().complete(&PrivilegedRequest::Review { spec: copy.clone() }));
+    assert!(!std::path::Path::new(&copy.destination).exists());
+
+    copy.destination = "/data/output/downloadable/bytes.zip".into();
+    let mut revoked = Helper::open();
+    let token = revoked.review(&copy);
+    fs::write(CONFIG, RULES).unwrap();
+    revoked.send(&PrivilegedRequest::Commit { token });
+    revoked.input.as_mut().unwrap().write_all(&body).unwrap();
+    revoked
+        .input
+        .as_mut()
+        .unwrap()
+        .write_all(PASSWORD_COMMIT)
+        .unwrap();
+    assert_failed(revoked.finish());
+    assert!(!std::path::Path::new(&copy.destination).exists());
+
+    fs::write(CONFIG, download_rules).unwrap();
+    let mut helper = Helper::open();
+    let token = helper.review(&copy);
+    helper.send(&PrivilegedRequest::Commit { token });
+    helper.input.as_mut().unwrap().write_all(&body).unwrap();
+    helper
+        .input
+        .as_mut()
+        .unwrap()
+        .write_all(PASSWORD_COMMIT)
+        .unwrap();
+    helper.input.take();
+    let PrivilegedReply::AppliedCopy {
+        destination,
+        payload,
+    } = read_privileged_reply(&mut helper.output).unwrap()
+    else {
+        panic!("expected the verified contents of the newly published archive");
+    };
+    assert_eq!(destination, copy.destination);
+    payload.validate().unwrap();
+    let mut actual = vec![0; payload.bytes as usize];
+    helper.output.read_exact(&mut actual).unwrap();
+    assert_eq!(io::copy(&mut helper.output, &mut io::sink()).unwrap(), 0);
+    assert!(helper.child.wait().unwrap().success());
+    assert_eq!(payload.sha256, <[u8; 32]>::from(Sha256::digest(&actual)));
+    assert_eq!(actual, fs::read(&destination).unwrap());
+    let metadata = fs::metadata(&destination).unwrap();
+    assert_eq!(
+        (metadata.uid(), metadata.mode() & 0o777, metadata.nlink()),
+        (0, 0o600, 1)
+    );
+
+    fs::write("/data/source/large.bin", vec![9; 256 * 1024]).unwrap();
+    copy.destination = "/data/output/downloadable/revoked.tar".into();
+    copy.format = CreateFormat::Tar;
+    let mut helper = Helper::open();
+    let token = helper.review(&copy);
+    helper.send(&PrivilegedRequest::Commit { token });
+    helper.input.take();
+    assert!(matches!(
+        read_privileged_reply(&mut helper.output).unwrap(),
+        PrivilegedReply::AppliedCopy { .. }
+    ));
+    fs::write(CONFIG, RULES).unwrap();
+    io::copy(&mut helper.output, &mut io::sink()).unwrap();
+    assert!(!helper.child.wait().unwrap().success());
+    assert!(fs::metadata(&copy.destination).unwrap().len() >= 256 * 1024);
 }
 
 struct Helper {
@@ -155,8 +317,38 @@ struct Helper {
 
 impl Helper {
     fn open() -> Self {
-        let mut child = Command::new(PRIVILEGED_PATH)
-            .arg(PRIVILEGED_ARGUMENT)
+        Self::open_with_argument(PRIVILEGED_ARGUMENT)
+    }
+
+    fn open_password_protocol() -> Self {
+        let mut helper = Self::open_with_argument(PRIVILEGED_PASSWORD_ARGUMENT);
+        let mut greeting = [0; PRIVILEGED_PASSWORD_READY.len()];
+        helper.output.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting.as_slice(), PRIVILEGED_PASSWORD_READY);
+        helper
+    }
+
+    fn open_with_argument(argument: &str) -> Self {
+        let mut command = if std::env::var_os("KORTTY_ARCHIVE_TEST_USE_SUDO").is_some() {
+            let mut command = Command::new("/usr/bin/runuser");
+            command.args([
+                "-u",
+                "packager",
+                "--",
+                "/usr/bin/sudo",
+                "-k",
+                "-n",
+                "-u",
+                "root",
+                "--",
+                PRIVILEGED_PATH,
+            ]);
+            command
+        } else {
+            Command::new(PRIVILEGED_PATH)
+        };
+        let mut child = command
+            .arg(argument)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()

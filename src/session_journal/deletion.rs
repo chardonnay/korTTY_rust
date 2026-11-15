@@ -27,6 +27,17 @@ pub(crate) struct DeletionIdentity {
 }
 
 impl DeletionIdentity {
+    pub(super) fn from_document_stamp(
+        (root, directory): (EntryIdentity, EntryIdentity),
+        document: FileStamp,
+    ) -> Self {
+        Self {
+            root,
+            directory,
+            document,
+        }
+    }
+
     pub(super) fn location(&self) -> (EntryIdentity, EntryIdentity) {
         (self.root, self.directory)
     }
@@ -45,11 +56,10 @@ impl DeletionIdentity {
         };
         #[cfg(windows)]
         let directory = source.parent_directory().identity()?;
-        Ok(Self {
-            root: root.identity()?,
-            directory,
-            document: FileStamp::read(source.file())?,
-        })
+        Ok(Self::from_document_stamp(
+            (root.identity()?, directory),
+            FileStamp::read(source.file())?,
+        ))
     }
 
     pub(crate) fn require_document(&self, file: &File) -> io::Result<()> {

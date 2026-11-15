@@ -516,7 +516,10 @@ fn subject<'a>(
     ))
 }
 
-fn standing_schedule(schedule: &JobSchedule, zone: &TimeZone) -> String {
+pub(in crate::scheduler_window) fn standing_schedule(
+    schedule: &JobSchedule,
+    zone: &TimeZone,
+) -> String {
     let (from, until) = schedule.active_dates();
     let (start, end) = schedule.window();
     let weekdays = schedule
@@ -550,7 +553,7 @@ fn standing_schedule(schedule: &JobSchedule, zone: &TimeZone) -> String {
     };
     let zone = zone.iana_name().unwrap_or("Scheduler time zone");
     format!(
-        "Calendar only · {zone}\n{dates} · {weekdays}\nWindow · {start}–{end}\n{}",
+        "Calendar · {zone}\n{dates} · {weekdays}\nWindow · {start}–{end}\n{}",
         triggers.join("\n")
     )
 }
@@ -622,8 +625,14 @@ impl DraftReview {
             text(match (privileged, subject.direction, standing.is_some()) {
                 (true, Direction::Upload, _) => "One-use privileged folder upload review",
                 (true, Direction::Download, _) => "One-use privileged folder download review",
+                (_, _, true) if subject.replace_changed => "Recurring SFTP replacement review",
                 (_, _, true) => "Recurring SFTP copy review",
-                _ if subject.replace_changed => "One-use SFTP download and replacement review",
+                (_, Direction::Upload, _) if subject.replace_changed => {
+                    "One-use SFTP upload and replacement review"
+                }
+                (_, Direction::Download, _) if subject.replace_changed => {
+                    "One-use SFTP download and replacement review"
+                }
                 _ => "One-use SFTP copy review",
             })
             .size(17),
@@ -645,8 +654,15 @@ impl DraftReview {
         if !privileged && matches!(subject.direction, Direction::Download) {
             details = details.push(text("New local files and folders use normal destination permissions and inherited access. New files use their local write time.").size(12));
         }
-        if !review.preview.replacements.is_empty() {
-            details = details.push(text("Replacement preserves existing local access permissions and uses the source timestamp. Each original remains in a private sibling folder. The run result gives the shared recovery pattern.").size(12));
+        if subject.replace_changed {
+            let access = if subject.direction == Direction::Upload {
+                "Server replacements require login-owned files with owner-only permissions. The server must preserve the owner, group and mode."
+            } else if cfg!(unix) {
+                "Replacement preserves the owner, group and ordinary POSIX permissions. Special permission bits are cleared. Files with extended ACLs are ineligible."
+            } else {
+                "Replacement preserves existing local access permissions."
+            };
+            details = details.push(text(access).size(12)).push(text("The new file uses the source timestamp. Each original remains in a private sibling folder. The run result gives the shared recovery pattern.").size(12));
         }
         if !subject.predecessors.is_empty() {
             if subject.mode == DependencyMode::Chain {
@@ -684,7 +700,11 @@ impl DraftReview {
                     "Up to {} calendar attempts · {} actions and {} bytes per attempt",
                     settings.limits.max_firings, settings.limits.max_actions, settings.limits.max_bytes,
                 )).size(12))
-                .push(text("The approval covers future eligible source content under these folder roots. It allows creation of missing regular files and folders only.").size(12))
+                .push(text(if subject.replace_changed {
+                    "Approve future eligible source content and replacement of eligible existing files under these roots. Each calendar firing verifies its own source and destination bytes before writing."
+                } else {
+                    "The approval covers future eligible source content under these folder roots. It allows creation of missing regular files and folders only."
+                }).size(12))
                 .push(text("The calendar window selects due times. A queued or overdue run can start later while the approval is active.").size(12))
                 .push(text("An admitted calendar attempt uses one allowance, including a failed connection or an empty copy plan.").size(12));
         } else if privileged {
@@ -724,9 +744,13 @@ impl DraftReview {
             details = details.push(text(format!("{verb} · {path}")).font(iced::Font::MONOSPACE));
         }
         for replacement in &review.preview.replacements {
+            let side = match subject.direction {
+                Direction::Upload => "server",
+                Direction::Download => "local",
+            };
             details = details.push(
                 column![
-                    text(format!("Replace local file · {}", replacement.target))
+                    text(format!("Replace {side} file · {}", replacement.target))
                         .font(iced::Font::MONOSPACE),
                     text(format!("Source · {}", replacement.source)).size(12),
                     text(format!("Current SHA-256 · {}", replacement.target_sha256)).size(12),
@@ -740,7 +764,9 @@ impl DraftReview {
                 scrollable(details).height(Length::Fixed(225.0)),
                 row![
                     button("Discard review").on_press(Message::DiscardSync),
-                    button(if standing.is_some() {
+                    button(if standing.is_some() && subject.replace_changed {
+                        "Approve recurring replacements"
+                    } else if standing.is_some() {
                         "Approve recurring runs"
                     } else {
                         "Approve one run"

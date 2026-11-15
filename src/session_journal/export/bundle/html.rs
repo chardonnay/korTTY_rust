@@ -404,6 +404,9 @@ impl Page<'_> {
         if !label.is_empty() {
             write!(html, "<span class=\"badge\">{label}</span>")?;
         }
+        if entry.run_as_root {
+            html.write_str("<span class=\"badge\" title=\"Root shell observed\">ROOT</span>")?;
+        }
         html.write_str("</div>\n")?;
         if !strip(&entry.title).is_empty() {
             writeln!(html, "<h3 data-search>{}</h3>", Escaped(&entry.title))?;

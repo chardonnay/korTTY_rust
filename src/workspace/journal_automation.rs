@@ -16,6 +16,7 @@ use crate::job_executor::automation::Plan;
 use crate::scheduler_window::SshCommand;
 use crate::session_journal::automation::retention::{ResultSet, Sweep};
 use crate::session_journal::automation::{Artifact, Caps, CaptureSettings, Kind, Options, Run};
+use crate::session_journal::summary_queue::AutomationSource;
 use crate::session_journal::tree::SourceKind;
 use crate::session_journal::{LogFormat, Summary};
 
@@ -137,6 +138,10 @@ impl Workspace {
 
     fn apply_automation_journal_policy(&mut self) {
         let capture_allowed = self.automation_journal_capture_allowed();
+        let journal_output_allowed = self.scheduler_journal_output_allowed();
+        if let Some(scheduler) = &mut self.scheduler {
+            scheduler.set_journal_output_allowed(journal_output_allowed);
+        }
         for view in self.scheduler_views.values_mut() {
             view.set_automation_journal_allowed(capture_allowed);
         }
@@ -217,6 +222,8 @@ impl Workspace {
                 "Automation journals are unavailable",
             )
         })?;
+        let approval = AutomationSource::from_kind(kind, &source_id)
+            .and_then(|source| self.automation_summary_run_approval(&source, &options, started));
         let run = Run::new(
             kind,
             source_id,
@@ -225,7 +232,8 @@ impl Workspace {
             started,
             options,
             scope.caps,
-        )?;
+        )?
+        .with_summary_approval(approval);
         Ok((
             CaptureSettings {
                 root: scope.root.clone(),
@@ -289,6 +297,13 @@ impl Workspace {
         };
         let started = Timestamp::try_from(request.started_at)
             .map_err(|_| "Automation journal could not read the job start time.")?;
+        let vision = if action.virtual_terminal.is_some()
+            && options.closing != crate::session_journal::automation::Closing::Off
+        {
+            self.automation_screenshot_vision(options.summary_profile.as_ref())
+        } else {
+            None
+        };
         let (capture, run) = self
             .automation_capture(
                 Kind::Job,
@@ -299,7 +314,11 @@ impl Workspace {
                 options,
             )
             .map_err(|error| format!("Automation journal could not start ({error})."))?;
-        let plan = Plan::new(capture, run, self.clipboard.policy.terminal_logging.clone());
+        let plan = Plan::new(
+            capture,
+            run.with_vision(vision),
+            self.clipboard.policy.terminal_logging.clone(),
+        );
         self.journal_automation.scheduler_writers.insert(request.id);
         Ok(Some(plan))
     }

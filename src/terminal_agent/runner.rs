@@ -42,6 +42,19 @@ pub(crate) struct Outcome {
     pub(crate) stderr: Captured,
 }
 
+#[cfg(test)]
+impl Outcome {
+    pub(crate) fn successful_probe_fixture(stdout: &str) -> Self {
+        let mut captured = Captured::default();
+        captured.push(stdout.as_bytes());
+        Self {
+            status: Status::Exited(0),
+            stdout: captured,
+            stderr: Captured::default(),
+        }
+    }
+}
+
 impl fmt::Debug for Outcome {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter

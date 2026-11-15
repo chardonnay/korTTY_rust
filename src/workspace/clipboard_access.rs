@@ -47,6 +47,18 @@ pub(super) fn publish_png<M: Send + 'static>(
     })
 }
 
+pub(super) fn write_value(
+    clipboard: &clip::TerminalClipboard,
+    value: String,
+) -> Task<WorkspaceMessage> {
+    if clipboard.policy.internal {
+        clipboard.buffer.set(value);
+        Task::none()
+    } else {
+        iced::clipboard::write(value)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
     ShowSettings(window::Id, bool),
@@ -420,12 +432,7 @@ impl Workspace {
     }
 
     pub(super) fn write_clipboard(&self, value: String) -> Task<WorkspaceMessage> {
-        if self.clipboard.policy.internal {
-            self.clipboard.buffer.set(value);
-            Task::none()
-        } else {
-            clipboard::write(value)
-        }
+        write_value(&self.clipboard, value)
     }
 
     pub(super) fn window_clipboard_prompt(

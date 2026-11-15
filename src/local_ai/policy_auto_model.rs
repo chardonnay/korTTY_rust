@@ -1,18 +1,232 @@
 //! Bounded model selection through LM Studio's native loopback inventory.
 
+use std::fmt;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Deserializer};
 use serde_json::value::RawValue;
+use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
-use super::{Connection, Error, bearer_header, response_bytes, transport_error, valid_model};
+use crate::clipboard_policy::ClipboardPolicy;
+
+use super::{
+    Connection, Error, LmStudioEndpoint, Pending, WORKERS_BUSY, WorkerPermit, bearer_header,
+    credential_value, lm_studio_credential_digest, response_bytes, start_worker, transport_error,
+    valid_model, validate_credential,
+};
 
 const TIMEOUT: Duration = Duration::from_secs(5);
 const INVALID_INVENTORY: &str = "invalid LM Studio model inventory";
+const AUTO_CREDENTIAL_CHANGED: &str =
+    "The LM Studio model credential changed. Resolve the profile and review the request again.";
+const AUTO_MODEL_CHANGED: &str =
+    "The loaded LM Studio model changed. Resolve the profile and review the request again.";
+
+pub(super) fn require_lm_studio_auto_allowed(policy: &ClipboardPolicy) -> Result<(), Error> {
+    if policy.problem.is_none() && policy.ai_allowed {
+        Ok(())
+    } else {
+        Err(Error::Review(
+            "Managed policy blocks LM Studio automatic model selection.".into(),
+        ))
+    }
+}
+
+/// The concrete model selected by a successful native LM Studio inventory read.
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct LmStudioAutoModel {
+    endpoint: LmStudioEndpoint,
+    preferred: String,
+    credential_env: Option<String>,
+    credential: Option<[u8; 32]>,
+    model: String,
+}
+
+impl fmt::Debug for LmStudioAutoModel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("LmStudioAutoModel")
+            .finish_non_exhaustive()
+    }
+}
+
+impl LmStudioAutoModel {
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub(crate) fn matches(
+        &self,
+        endpoint: &str,
+        preferred: &str,
+        credential_env: Option<&str>,
+        native: bool,
+    ) -> bool {
+        LmStudioEndpoint::parse(endpoint, native).is_ok_and(|endpoint| endpoint == self.endpoint)
+            && preferred.trim() == self.preferred
+            && credential_env == self.credential_env.as_deref()
+            && read_credential(credential_env).is_ok_and(|credential| {
+                self.require_credential(credential.as_deref().map(String::as_str))
+                    .is_ok()
+            })
+    }
+
+    pub(super) fn binding(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"kortty reviewed LM Studio automatic model v1\0");
+        // Preserve existing review references for numeric HTTP on either wire.
+        let destination = self.endpoint.canonical_http_address().map_or_else(
+            || self.endpoint.destination(),
+            |address| address.to_string(),
+        );
+        for value in [
+            destination.as_str(),
+            &self.preferred,
+            &self.model,
+            self.credential_env.as_deref().unwrap_or_default(),
+        ] {
+            digest.update((value.len() as u64).to_le_bytes());
+            digest.update(value.as_bytes());
+        }
+        let binding = digest.finalize();
+        if self.endpoint.uses_native_protocol() {
+            binding.into()
+        } else {
+            let mut digest = Sha256::new();
+            digest.update(b"kortty reviewed LM Studio OpenAI-compatible model v1\0");
+            digest.update(binding);
+            digest.finalize().into()
+        }
+    }
+
+    pub(super) fn require_credential(&self, credential: Option<&str>) -> Result<(), Error> {
+        if lm_studio_credential_digest(credential) == self.credential {
+            Ok(())
+        } else {
+            Err(Error::Review(AUTO_CREDENTIAL_CHANGED.into()))
+        }
+    }
+
+    pub(super) fn require_current_model(
+        &self,
+        connection: &Connection,
+        credential: Option<&str>,
+        deadline: Option<Instant>,
+        require_current: impl Fn() -> Result<(), Error>,
+    ) -> Result<(), Error> {
+        let model = resolve_with_preference(
+            connection,
+            Some(&self.preferred),
+            credential,
+            deadline,
+            require_current,
+        )
+        .map_err(|error| match error {
+            Error::Invalid(_) | Error::Service | Error::Status(_) => Error::Review(format!(
+                "{}. Resolve the profile and review the request again.",
+                error.message()
+            )),
+            error => error,
+        })?;
+        if self.model == model {
+            Ok(())
+        } else {
+            Err(Error::Review(AUTO_MODEL_CHANGED.into()))
+        }
+    }
+}
+
+pub(crate) fn resolve_lm_studio_auto(
+    endpoint: &str,
+    preferred: &str,
+    credential_env: Option<String>,
+    native: bool,
+) -> Result<Pending<LmStudioAutoModel>, String> {
+    let endpoint = LmStudioEndpoint::parse(endpoint, native)?;
+    if !endpoint.supports_metadata() {
+        return Err("Automatic model selection requires a standard LM Studio chat path.".into());
+    }
+    let connection = endpoint.connection(TIMEOUT);
+    resolve_lm_studio_auto_at(endpoint, connection, preferred, credential_env)
+}
+
+#[cfg(test)]
+pub(crate) fn resolve_lm_studio_auto_with_test_root(
+    endpoint: &str,
+    preferred: &str,
+    credential_env: Option<String>,
+    native: bool,
+    ca_der: &[u8],
+) -> Result<Pending<LmStudioAutoModel>, String> {
+    let endpoint = LmStudioEndpoint::parse(endpoint, native)?;
+    if !endpoint.is_https() {
+        return Err("Choose a loopback HTTPS test route.".into());
+    }
+    let cert = ureq::tls::Certificate::from_der(ca_der).to_owned();
+    let roots = ureq::tls::RootCerts::new_with_certs(&[cert]);
+    let connection = endpoint
+        .connect(
+            super::connection_config_with_roots(TIMEOUT, roots),
+            Default::default(),
+        )
+        .map_err(Error::message)?;
+    resolve_lm_studio_auto_at(endpoint, connection, preferred, credential_env)
+}
+
+fn resolve_lm_studio_auto_at(
+    endpoint: LmStudioEndpoint,
+    connection: Connection,
+    preferred: &str,
+    credential_env: Option<String>,
+) -> Result<Pending<LmStudioAutoModel>, String> {
+    let preferred = preferred.trim();
+    if !preferred.is_empty() && !valid_model(preferred) {
+        return Err("Enter a valid preferred LM Studio model identifier.".into());
+    }
+    validate_credential(credential_env.as_deref())?;
+    require_lm_studio_auto_allowed(&ClipboardPolicy::load()).map_err(Error::message)?;
+    let preferred = preferred.to_owned();
+    let permit = WorkerPermit::acquire().ok_or(WORKERS_BUSY)?;
+    start_worker(connection.cancel_handle(), move || {
+        let _permit = permit;
+        let credential = read_credential(credential_env.as_deref()).map_err(Error::message)?;
+        let secret = credential.as_deref().map(String::as_str);
+        let model = resolve_with_preference(&connection, Some(&preferred), secret, None, || {
+            require_lm_studio_auto_allowed(&ClipboardPolicy::load())?;
+            if read_credential(credential_env.as_deref())? == credential {
+                Ok(())
+            } else {
+                Err(Error::Review(AUTO_CREDENTIAL_CHANGED.into()))
+            }
+        })
+        .map_err(Error::message)?;
+        Ok(LmStudioAutoModel {
+            endpoint,
+            preferred,
+            credential_env,
+            credential: lm_studio_credential_digest(secret),
+            model,
+        })
+    })
+}
+
+fn read_credential(reference: Option<&str>) -> Result<Option<Zeroizing<String>>, Error> {
+    reference.map(credential_value).transpose()
+}
 
 pub(super) fn resolve(
     connection: &Connection,
+    credential: Option<&str>,
+    deadline: Option<Instant>,
+    require_current: impl Fn() -> Result<(), Error>,
+) -> Result<String, Error> {
+    resolve_with_preference(connection, None, credential, deadline, require_current)
+}
+
+fn resolve_with_preference(
+    connection: &Connection,
+    preferred: Option<&str>,
     credential: Option<&str>,
     deadline: Option<Instant>,
     require_current: impl Fn() -> Result<(), Error>,
@@ -41,7 +255,7 @@ pub(super) fn resolve(
             .call()
             .map_err(|error| transport_error(error, true))?;
         let bytes = response_bytes(&mut response, true)?;
-        select_loaded_model(&bytes, credential)
+        select_loaded_model(&bytes, credential, preferred)
     })();
     checkpoint(connection, deadline, &require_current)?;
     result
@@ -118,7 +332,11 @@ fn present_instances<'de, D: Deserializer<'de>>(
     <&RawValue>::deserialize(deserializer).map(Some)
 }
 
-fn select_loaded_model(bytes: &[u8], credential: Option<&str>) -> Result<String, Error> {
+fn select_loaded_model(
+    bytes: &[u8],
+    credential: Option<&str>,
+    preferred: Option<&str>,
+) -> Result<String, Error> {
     if bytes.trim_ascii_start().first() != Some(&b'{') {
         return Err(Error::Invalid(INVALID_INVENTORY));
     }
@@ -132,6 +350,7 @@ fn select_loaded_model(bytes: &[u8], credential: Option<&str>) -> Result<String,
         })?;
     let mut selected: Option<String> = None;
     let mut ambiguous = false;
+    let mut preferred_is_loaded = false;
 
     for row in models {
         if !row.get().starts_with('{') {
@@ -173,6 +392,7 @@ fn select_loaded_model(bytes: &[u8], credential: Option<&str>) -> Result<String,
         {
             return Err(Error::Invalid("a loaded LM Studio model has no valid key"));
         }
+        preferred_is_loaded |= preferred == Some(key.as_str());
         if let Some(current) = &selected {
             ambiguous |= current != key.as_str();
         } else {
@@ -181,6 +401,13 @@ fn select_loaded_model(bytes: &[u8], credential: Option<&str>) -> Result<String,
     }
 
     if ambiguous {
+        if let Some(preferred) = preferred {
+            return if preferred_is_loaded {
+                Ok(preferred.into())
+            } else {
+                Err(Error::Review("Multiple local LM Studio chat models are loaded. Choose a loaded preferred model or leave only one model loaded.".into()))
+            };
+        }
         return Err(Error::Review(
             "Multiple local LM Studio chat models are loaded. Leave exactly one model loaded."
                 .into(),
@@ -197,7 +424,10 @@ mod tests {
     use std::io::{BufRead as _, Write as _};
     use std::thread;
 
-    use super::super::test_support::{accept, fixture_http_response, listener, wire_request};
+    use super::super::test_support::{
+        accept, exclusive_run, fixture_http_response, listener, wire_request,
+    };
+    use super::super::{Client, Profile, ProfileOptions, lm_studio_compatible_endpoint};
     use super::*;
 
     const LOADED: &str = r#"{"models":[{"type":"llm","key":"reviewed-model","loaded_instances":[{"id":"instance"}]}]}"#;
@@ -213,9 +443,445 @@ mod tests {
             {"type":"llm","key":"reviewed\u002dmodel","loaded_instances":[{"id":"second"}]}
         ]}"#;
         assert_eq!(
-            select_loaded_model(inventory, None).unwrap(),
+            select_loaded_model(inventory, None, None).unwrap(),
             "reviewed-model"
         );
+    }
+
+    #[test]
+    fn lm_studio_auto_prefers_a_sole_loaded_model_or_an_exact_loaded_key() {
+        let inventory = br#"{"models":[
+            {"type":"llm","key":"Unloaded","loaded_instances":[]},
+            {"type":"llm","key":"Text-A","loaded_instances":[{"id":"active-text"}]},
+            {"type":"vlm","key":"Vision-B","loaded_instances":[{"id":"active-vision"}]}
+        ]}"#;
+        assert_eq!(
+            select_loaded_model(LOADED.as_bytes(), None, Some("Unloaded")).unwrap(),
+            "reviewed-model"
+        );
+        for preferred in ["Text-A", "Vision-B"] {
+            assert_eq!(
+                select_loaded_model(inventory, None, Some(preferred)).unwrap(),
+                preferred
+            );
+        }
+        for preferred in ["", "Unloaded", "vision-b", "active-vision"] {
+            assert!(matches!(
+                select_loaded_model(inventory, None, Some(preferred)),
+                Err(Error::Review(message)) if message.contains("loaded preferred model")
+            ));
+        }
+    }
+
+    #[test]
+    fn lm_studio_auto_checks_the_loaded_pin_before_streaming_and_nonstreaming_requests() {
+        let _exclusive = exclusive_run();
+        let (listener, _) = listener();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = thread::spawn(move || {
+            for (index, model) in [
+                "reviewed-model",
+                "reviewed-model",
+                "replacement",
+                "replacement",
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut inventory = accept(&listener);
+                let _ = wire_request(&mut inventory, "GET /api/v1/models HTTP/1.1");
+                let inventory_json = serde_json::json!({"models":[{
+                    "type":"llm", "key":model, "loaded_instances":[{"id":"instance"}]
+                }]})
+                .to_string();
+                inventory
+                    .get_mut()
+                    .write_all(fixture_http_response("200 OK", "", &inventory_json).as_bytes())
+                    .unwrap();
+                drop(inventory);
+                if index == 1 {
+                    let mut chat = accept(&listener);
+                    let body: serde_json::Value = serde_json::from_slice(&wire_request(
+                        &mut chat,
+                        "POST /api/v1/chat HTTP/1.1",
+                    ))
+                    .unwrap();
+                    assert_eq!(body["model"], "reviewed-model");
+                    assert_eq!(body["store"], false);
+                    chat.get_mut()
+                        .write_all(
+                            fixture_http_response(
+                                "200 OK",
+                                "",
+                                r#"{"output":[{"type":"message","content":"answer"}]}"#,
+                            )
+                            .as_bytes(),
+                        )
+                        .unwrap();
+                }
+            }
+            listener
+        });
+        let pending = resolve_lm_studio_auto(&address, "previous-model", None, true).unwrap();
+        let resolved = pending.reply.recv_blocking().unwrap().unwrap();
+        assert_eq!(resolved.model(), "reviewed-model");
+        assert!(resolved.matches(
+            &format!("http://{address}/api/v1/chat"),
+            "previous-model",
+            None,
+            true,
+        ));
+        assert!(!resolved.matches(&address, "another-preference", None, true));
+        assert!(!resolved.matches(&address, "previous-model", None, false));
+        let profile = Profile::lm_studio_with_auto_model(
+            &address,
+            "previous-model",
+            ProfileOptions::default(),
+            &resolved,
+        )
+        .unwrap();
+        assert_eq!(profile.model(), "reviewed-model");
+        assert_eq!(profile.lm_studio_auto_binding(), Some(resolved.binding()));
+        let client = Client::new(profile);
+        assert_eq!(
+            client.complete("System", "First reviewed input").unwrap(),
+            "answer"
+        );
+        assert!(
+            matches!(client.complete("System", "Private input"), Err(Error::Review(message)) if message == AUTO_MODEL_CHANGED)
+        );
+        assert!(
+            matches!(client.stream_structured("System", "Private input", true, None, || Ok(()), |_| {}), Err(Error::Review(message)) if message == AUTO_MODEL_CHANGED)
+        );
+        assert!(
+            matches!(server.join().unwrap().accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn lm_studio_compatible_auto_preserves_the_openai_wire_and_checks_the_loaded_key() {
+        let _exclusive = exclusive_run();
+        let (listener, _) = listener();
+        let address = listener.local_addr().unwrap();
+        let endpoint = format!("http://{address}/v1/chat/completions");
+        let server = thread::spawn(move || {
+            let inventory = |model| {
+                let mut response = accept(&listener);
+                let _ = wire_request(&mut response, "GET /api/v1/models HTTP/1.1");
+                let body = serde_json::json!({"models":[{
+                    "type":"llm", "key":model, "loaded_instances":[{"id":"slot"}],
+                    "capabilities":{"vision":true}
+                }]});
+                response
+                    .get_mut()
+                    .write_all(fixture_http_response("200 OK", "", &body.to_string()).as_bytes())
+                    .unwrap();
+            };
+            let chat = |streaming, image| {
+                let mut response = accept(&listener);
+                let body: serde_json::Value = serde_json::from_slice(&wire_request(
+                    &mut response,
+                    "POST /v1/chat/completions HTTP/1.1",
+                ))
+                .unwrap();
+                assert_eq!(body["model"], "reviewed-model");
+                assert_eq!(body["stream"], streaming);
+                assert!(body.get("store").is_none());
+                if image {
+                    assert_eq!(body["messages"][1]["content"][1]["type"], "image_url");
+                    assert_eq!(
+                        body["messages"][1]["content"][1]["image_url"]["url"],
+                        "data:image/png;base64,fixture"
+                    );
+                } else {
+                    assert_eq!(body["messages"][1]["content"], "Reviewed input");
+                }
+                let fixture = if streaming {
+                    fixture_http_response(
+                        "200 OK",
+                        "Content-Type: text/event-stream\r\n",
+                        "data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"answer\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                    )
+                } else {
+                    fixture_http_response(
+                        "200 OK",
+                        "Content-Type: application/json\r\n",
+                        r#"{"choices":[{"message":{"content":"answer"},"finish_reason":"stop"}]}"#,
+                    )
+                };
+                response.get_mut().write_all(fixture.as_bytes()).unwrap();
+            };
+            inventory("reviewed-model");
+            inventory("reviewed-model");
+            chat(true, false);
+            inventory("reviewed-model");
+            inventory("reviewed-model");
+            chat(false, true);
+            inventory("replacement");
+            listener
+        });
+        let pending = resolve_lm_studio_auto(&address.to_string(), "", None, false).unwrap();
+        let resolved = pending.reply.recv_blocking().unwrap().unwrap();
+        let profile = Profile::lm_studio_compatible_with_auto_model(
+            &endpoint,
+            "",
+            ProfileOptions {
+                timeout: Some(TIMEOUT),
+                ..ProfileOptions::default()
+            },
+            &resolved,
+        )
+        .unwrap();
+        let same_route = Profile::lm_studio_compatible_with_auto_model(
+            &format!("http://{address}/v1"),
+            "",
+            ProfileOptions::default(),
+            &resolved,
+        )
+        .unwrap();
+        assert_eq!(
+            profile.lm_studio_auto_binding(),
+            same_route.lm_studio_auto_binding()
+        );
+        assert_eq!(profile.lm_studio_auto_binding(), Some(resolved.binding()));
+        assert!(!profile.is_remote());
+        let client = Client::new(profile);
+        assert_eq!(
+            client
+                .stream_chat("System", &[], "Reviewed input", || Ok(()), |_| {})
+                .unwrap(),
+            "answer"
+        );
+        assert_eq!(
+            client
+                .complete_vision_before_guarded(
+                    "System",
+                    "Reviewed image",
+                    "data:image/png;base64,fixture",
+                    true,
+                    Instant::now() + TIMEOUT,
+                    || Ok(())
+                )
+                .unwrap(),
+            "answer"
+        );
+        assert!(
+            matches!(client.complete("System", "Private input"), Err(Error::Review(message)) if message == AUTO_MODEL_CHANGED)
+        );
+        assert!(
+            matches!(server.join().unwrap().accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
+    }
+
+    #[test]
+    fn lm_studio_compatible_endpoint_accepts_only_numeric_loopback_chat_paths() {
+        for endpoint in [
+            "[::1]:1234",
+            "http://[::1]:1234/v1",
+            "http://[::1]:1234/v1/chat/completions/",
+        ] {
+            assert_eq!(
+                lm_studio_compatible_endpoint(endpoint).unwrap(),
+                "[::1]:1234".parse().unwrap()
+            );
+        }
+        for endpoint in [
+            "http://localhost:1234/v1",
+            "http://192.0.2.10:1234/v1/chat/completions",
+            "http://user@127.0.0.1:1234/v1/chat/completions",
+            "http://127.0.0.1:1234/v1/chat/completions?route=custom",
+            "http://127.0.0.1:1234/api/v1/chat",
+            "http://127.0.0.1:1234/tenant/v1",
+            "https://127.0.0.1:1234/v1",
+        ] {
+            assert!(
+                lm_studio_compatible_endpoint(endpoint).is_err(),
+                "{endpoint}"
+            );
+        }
+    }
+
+    #[test]
+    fn lm_studio_auto_rejects_credential_changes_without_storing_them_in_the_review_binding() {
+        let mut first = LmStudioAutoModel {
+            endpoint: LmStudioEndpoint::parse("127.0.0.1:1234", true).unwrap(),
+            preferred: String::new(),
+            credential_env: Some("LM_STUDIO_FIXTURE_CREDENTIAL".into()),
+            credential: lm_studio_credential_digest(Some("first-fixture-key")),
+            model: "reviewed-model".into(),
+        };
+        assert!(first.require_credential(Some("first-fixture-key")).is_ok());
+        assert!(
+            matches!(first.require_credential(Some("new-fixture-key")), Err(Error::Review(message)) if message == AUTO_CREDENTIAL_CHANGED)
+        );
+        let persisted = first.binding();
+        first.credential = lm_studio_credential_digest(Some("new-fixture-key"));
+        assert_eq!(first.binding(), persisted);
+        first.model = "replacement".into();
+        assert_ne!(first.binding(), persisted);
+    }
+
+    #[test]
+    fn lm_studio_auto_binds_exact_origin_and_wire_and_keeps_legacy_numeric_receipts() {
+        let endpoint = "127.0.0.1:1234";
+        let mut selection = LmStudioAutoModel {
+            endpoint: LmStudioEndpoint::parse(endpoint, true).unwrap(),
+            preferred: "preferred".into(),
+            credential_env: None,
+            credential: None,
+            model: "model".into(),
+        };
+        let mut legacy = Sha256::new();
+        legacy.update(b"kortty reviewed LM Studio automatic model v1\0");
+        for value in [endpoint, "preferred", "model", ""] {
+            legacy.update((value.len() as u64).to_le_bytes());
+            legacy.update(value.as_bytes());
+        }
+        let legacy_native: [u8; 32] = legacy.finalize().into();
+        assert_eq!(selection.binding(), legacy_native);
+        let mut legacy = Sha256::new();
+        legacy.update(b"kortty reviewed LM Studio OpenAI-compatible model v1\0");
+        legacy.update(legacy_native);
+        let legacy_compatible: [u8; 32] = legacy.finalize().into();
+        selection.endpoint = LmStudioEndpoint::parse(endpoint, false).unwrap();
+        assert_eq!(selection.binding(), legacy_compatible);
+        let exact_trailing = format!("http://{endpoint}/v1/chat/completions/");
+        assert!(!selection.matches(&exact_trailing, "preferred", None, false));
+        selection.endpoint = LmStudioEndpoint::parse(&exact_trailing, false).unwrap();
+        assert_ne!(selection.binding(), legacy_compatible);
+        assert!(selection.matches(&exact_trailing, "preferred", None, false));
+
+        selection.endpoint =
+            LmStudioEndpoint::parse("https://localhost:1234/api/v1/chat", true).unwrap();
+        assert!(selection.matches("HTTPS://LOCALHOST:1234/", "preferred", None, true));
+        for (changed, native) in [
+            ("http://localhost:1234", true),
+            ("https://127.0.0.1:1234", true),
+            ("https://localhost:4312", true),
+            ("https://localhost:1234", false),
+        ] {
+            assert!(!selection.matches(changed, "preferred", None, native));
+            let changed = LmStudioAutoModel {
+                endpoint: LmStudioEndpoint::parse(changed, native).unwrap(),
+                ..selection.clone()
+            };
+            assert_ne!(changed.binding(), selection.binding());
+        }
+    }
+
+    #[test]
+    fn lm_studio_auto_localhost_http_pins_both_inventory_and_chat() {
+        let _exclusive = exclusive_run();
+        let (listener, _) = listener();
+        let endpoint = format!(
+            "http://localhost:{}/api/v1/chat",
+            listener.local_addr().unwrap().port()
+        );
+        let host = format!("localhost:{}", listener.local_addr().unwrap().port());
+        let server = thread::spawn(move || {
+            for _ in 0..2 {
+                let mut stream = accept(&listener);
+                let mut line = String::new();
+                stream.read_line(&mut line).unwrap();
+                assert_eq!(line.trim_end(), "GET /api/v1/models HTTP/1.1");
+                let mut seen_host = false;
+                loop {
+                    line.clear();
+                    assert!(stream.read_line(&mut line).unwrap() > 0);
+                    if line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':')
+                        && name.eq_ignore_ascii_case("host")
+                    {
+                        seen_host = value.trim() == host;
+                    }
+                }
+                assert!(seen_host);
+                stream
+                    .get_mut()
+                    .write_all(fixture_http_response("200 OK", "", LOADED).as_bytes())
+                    .unwrap();
+            }
+            let mut stream = accept(&listener);
+            let body: serde_json::Value =
+                serde_json::from_slice(&wire_request(&mut stream, "POST /api/v1/chat HTTP/1.1"))
+                    .unwrap();
+            assert_eq!(body["model"], "reviewed-model");
+            stream
+                .get_mut()
+                .write_all(
+                    fixture_http_response(
+                        "200 OK",
+                        "",
+                        r#"{"output":[{"type":"message","content":"answer"}]}"#,
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        });
+        let model = resolve_lm_studio_auto(&endpoint, "", None, true)
+            .unwrap()
+            .reply
+            .recv_blocking()
+            .unwrap()
+            .unwrap();
+        let profile =
+            Profile::lm_studio_with_auto_model(&endpoint, "", ProfileOptions::default(), &model)
+                .unwrap();
+        assert_eq!(
+            Client::new(profile).complete("system", "request").unwrap(),
+            "answer"
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires an isolated loopback HTTPS fixture with a DNS localhost certificate"]
+    fn lm_studio_auto_https_pins_the_host_and_verifies_the_certificate() {
+        let _exclusive = exclusive_run();
+        let endpoint = std::env::var("KORTTY_TEST_LM_STUDIO_HTTPS_ENDPOINT").unwrap();
+        assert!(endpoint.starts_with("https://localhost:"));
+        let ca = std::fs::read(std::env::var_os("KORTTY_TEST_LM_STUDIO_CA_DER").unwrap()).unwrap();
+        let resolve = |endpoint: &str, native| {
+            resolve_lm_studio_auto_with_test_root(endpoint, "", None, native, &ca)
+                .unwrap()
+                .reply
+                .recv_blocking()
+                .unwrap()
+        };
+        assert!(
+            resolve_lm_studio_auto(&endpoint, "", None, true)
+                .unwrap()
+                .reply
+                .recv_blocking()
+                .unwrap()
+                .is_err()
+        );
+        assert!(resolve(&endpoint.replace("localhost", "127.0.0.1"), true).is_err());
+
+        let compatible = endpoint.replace("/api/v1/chat", "/v1/chat/completions");
+        for (endpoint, native) in [(&endpoint, true), (&compatible, false)] {
+            let model = resolve(endpoint, native).unwrap();
+            assert_eq!(model.model(), "reviewed-model");
+            let options = ProfileOptions {
+                timeout: Some(TIMEOUT),
+                ..ProfileOptions::default()
+            };
+            let profile = if native {
+                Profile::lm_studio_with_auto_model(endpoint, "", options, &model)
+            } else {
+                Profile::lm_studio_compatible_with_auto_model(endpoint, "", options, &model)
+            }
+            .unwrap();
+            assert!(profile.is_remote());
+            let (mut session, _cancel) = super::super::Session::begin(profile).unwrap();
+            session.trust_test_server(&ca).unwrap();
+            assert_eq!(
+                session.client().complete("system", "request").unwrap(),
+                "answer"
+            );
+        }
     }
 
     #[test]
@@ -233,7 +899,7 @@ mod tests {
             ),
         ] {
             assert!(matches!(
-                select_loaded_model(body.as_bytes(), None),
+                select_loaded_model(body.as_bytes(), None, None),
                 Err(Error::Review(message)) if message.contains(diagnostic)
             ));
         }
@@ -254,14 +920,16 @@ mod tests {
             let body = format!(
                 "{{\"models\":[{{\"type\":\"llm\",\"key\":\"valid\",\"loaded_instances\":[{{}}]}},{row}]}}"
             );
-            let error = select_loaded_model(body.as_bytes(), Some("synthetic-key")).unwrap_err();
+            let error =
+                select_loaded_model(body.as_bytes(), Some("synthetic-key"), None).unwrap_err();
             assert!(matches!(&error, Error::Invalid(_)));
             assert!(!error.message().contains("synthetic-key"));
         }
         assert!(matches!(
             select_loaded_model(
                 br#"[[{"type":"llm","key":"first","loaded_instances":[{}]}]]"#,
-                None
+                None,
+                None,
             ),
             Err(Error::Invalid(_))
         ));

@@ -500,6 +500,7 @@ mod tests {
             password_credential: None,
             excludes: vec!["*.tmp".to_owned()],
             download: None,
+            server_output: None,
         }
     }
 

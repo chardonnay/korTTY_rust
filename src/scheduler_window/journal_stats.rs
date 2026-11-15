@@ -200,8 +200,11 @@ impl Activity {
         let mut price = 0.0;
         for &index in &node.journals {
             let usage = &catalog.journals[index].usage;
-            if usage.local
-                || (usage.call_count == 0 && usage.total_tokens == 0 && usage.cost == 0.0)
+            if usage.cost_partial {
+                return None;
+            }
+            if usage.cost == 0.0
+                && (usage.local || (usage.call_count == 0 && usage.total_tokens == 0))
             {
                 continue;
             }
@@ -250,7 +253,7 @@ mod tests {
         id: &str,
         (kind, job): (&str, &str),
         (run, day): (&str, u8),
-        (tokens, cost, currency, partial): (u64, f64, &str, bool),
+        (tokens, cost, currency, flags): (u64, f64, &str, &str),
     ) {
         let folder = root.join(id);
         fs::create_dir(&folder).unwrap();
@@ -264,7 +267,7 @@ mod tests {
                    <aiCallCount>1</aiCallCount><aiPromptTokens>{tokens}</aiPromptTokens>
                    <aiCompletionTokens>0</aiCompletionTokens><aiTotalTokens>{tokens}</aiTotalTokens>
                    <aiCost>{cost}</aiCost><aiCostCurrency>{currency}</aiCostCurrency>
-                   <aiUsagePartial>{partial}</aiUsagePartial>
+                   {flags}
                    </meta><entries/></session-journal>"#,
             ),
         )
@@ -280,35 +283,35 @@ mod tests {
             "old",
             ("JOB", "backup"),
             ("a", 1),
-            (100, 0.1, "USD", false),
+            (100, 0.1, "USD", ""),
         );
         write_journal(
             &root,
             "new1",
             ("JOB", "backup"),
             ("b", 2),
-            (200, 0.2, "EUR", false),
+            (200, 0.2, "EUR", ""),
         );
         write_journal(
             &root,
             "new2",
             ("JOB", "backup"),
             ("b", 2),
-            (300, 0.3, "EUR", false),
+            (300, 0.3, "EUR", ""),
         );
         write_journal(
             &root,
             "other",
             ("JOB", "backup-copy"),
             ("b", 2),
-            (900, 0.9, "USD", false),
+            (900, 0.9, "USD", ""),
         );
         write_journal(
             &root,
             "swarm",
             ("SWARM", "backup"),
             ("b", 2),
-            (900, 0.9, "USD", false),
+            (900, 0.9, "USD", ""),
         );
         let mut cache = Cache::default();
         let request = cache.begin(Some(root), Instant::now()).unwrap();
@@ -333,7 +336,7 @@ mod tests {
             "partial",
             ("JOB", "backup"),
             ("a", 1),
-            (7, 0.1, "USD", true),
+            (7, 0.1, "USD", "<aiUsagePartial>true</aiUsagePartial>"),
         );
         let broken = root.join("broken");
         fs::create_dir(&broken).unwrap();
@@ -353,6 +356,42 @@ mod tests {
         );
         assert!(report.cell(&empty, true).is_empty());
         assert!(report.details(&empty, true).is_none());
+    }
+
+    #[test]
+    fn scheduler_journal_stats_omits_incomplete_cost_without_marking_tokens_partial() {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        write_journal(
+            &root,
+            "old",
+            ("JOB", "backup"),
+            ("a", 1),
+            (100, 0.1, "EUR", "<aiCostPartial>true</aiCostPartial>"),
+        );
+        write_journal(
+            &root,
+            "new",
+            ("JOB", "backup"),
+            ("b", 2),
+            (200, 0.2, "EUR", "<aiProfileLocal>true</aiProfileLocal>"),
+        );
+        write_journal(
+            &root,
+            "free",
+            ("JOB", "backup"),
+            ("b", 2),
+            (300, 0.0, "", "<aiProfileLocal>true</aiProfileLocal>"),
+        );
+        let mut cache = Cache::default();
+        let request = cache.begin(Some(root), Instant::now()).unwrap();
+        let report = request.read().unwrap();
+        let job = JobId::new("backup").unwrap();
+        assert_eq!(report.cell(&job, true), "600");
+        assert_eq!(
+            report.details(&job, true).unwrap(),
+            "Last retained run · 2 journals · 500 AI tokens · ≈ 0.2000 EUR\nKept · 2 runs · 600 AI tokens · 3.0 MiB"
+        );
     }
 
     #[test]

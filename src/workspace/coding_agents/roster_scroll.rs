@@ -14,19 +14,36 @@ pub(super) fn row_id(owner: window::Id, session: SessionId) -> Id {
 }
 
 pub(super) fn reveal(owner: window::Id, session: SessionId) -> Task<Desktop> {
-    iced_runtime::task::effect(iced_runtime::Action::widget(Reveal {
-        list: list_id(owner),
-        row: row_id(owner, session),
-        viewport: None,
-        row_bounds: None,
-    }))
+    reveal_row(list_id(owner), row_id(owner, session))
+}
+
+pub(in crate::workspace) fn reveal_row(list: Id, row: Id) -> Task<Desktop> {
+    iced_runtime::task::effect(iced_runtime::Action::widget(Reveal::new(list, Some(row))))
+}
+
+pub(in crate::workspace) fn reveal_focused(scope: Id, list: Id) -> Task<Desktop> {
+    iced_runtime::task::effect(iced_runtime::Action::widget(operation::scope(
+        scope,
+        Reveal::new(list, None),
+    )))
 }
 
 struct Reveal {
     list: Id,
-    row: Id,
+    row: Option<Id>,
     viewport: Option<(Rectangle, Rectangle, Vector)>,
     row_bounds: Option<Rectangle>,
+}
+
+impl Reveal {
+    fn new(list: Id, row: Option<Id>) -> Self {
+        Self {
+            list,
+            row,
+            viewport: None,
+            row_bounds: None,
+        }
+    }
 }
 
 impl Operation for Reveal {
@@ -35,7 +52,18 @@ impl Operation for Reveal {
     }
 
     fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-        if id == Some(&self.row) {
+        if id.is_some() && id == self.row.as_ref() {
+            self.row_bounds = Some(bounds);
+        }
+    }
+
+    fn focusable(
+        &mut self,
+        _: Option<&Id>,
+        bounds: Rectangle,
+        state: &mut dyn operation::Focusable,
+    ) {
+        if self.row.is_none() && state.is_focused() {
             self.row_bounds = Some(bounds);
         }
     }

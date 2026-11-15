@@ -7,6 +7,51 @@ use super::*;
 
 const PAYLOAD: &str = "payload";
 
+#[cfg(target_os = "linux")]
+mod existing;
+#[cfg(target_os = "linux")]
+mod existing_file;
+#[cfg(target_os = "linux")]
+pub(super) use existing::{
+    Published as ExistingPublication, Recovery as ExistingRecovery, Target as ExistingTarget,
+};
+#[cfg(target_os = "linux")]
+pub(crate) use existing::{
+    serve as serve_existing, serve_v2 as serve_existing_v2, serve_v3 as serve_existing_v3,
+};
+#[cfg(target_os = "linux")]
+pub(super) use existing_file::{FILE as RECEIVED_FILE, Target as ExistingFile};
+
+#[cfg(target_os = "linux")]
+fn lock_receiver_ancestors(path: &str, expected: &Directory) -> io::Result<Vec<Directory>> {
+    use rustix::fs::{FlockOperation, flock};
+
+    let mut held = vec![Directory::open_parent("/")?];
+    for name in path[1..].split('/').filter(|name| !name.is_empty()) {
+        let anchor = held.last().expect("held root directory");
+        anchor.require_protected(true)?;
+        let directory = anchor.child(name)?;
+        match flock(&directory.fd, FlockOperation::NonBlockingLockShared) {
+            Ok(()) => held.push(directory),
+            Err(Errno::WOULDBLOCK) => {
+                return Err(invalid(
+                    "Another rsync publication holds an ancestor receiver",
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    let parent = held.last().expect("held receiver parent");
+    parent.require_protected(false)?;
+    if !same_node(&parent.stat, &expected.stat)
+        || super::draft_replace::mount_id(&parent.fd)?
+            != super::draft_replace::mount_id(&expected.fd)?
+    {
+        return Err(invalid("The reviewed rsync receiver parent changed"));
+    }
+    Ok(held)
+}
+
 pub(crate) fn serve(mut input: impl Read, mut output: impl io::Write) -> io::Result<()> {
     let result = (|| -> Result<Reply, Failure> {
         if getuid() != geteuid() || getgid() != getegid() {
@@ -36,7 +81,7 @@ pub(crate) fn serve(mut input: impl Read, mut output: impl io::Write) -> io::Res
                 write_frame(&mut output, &Reply::Verified)?;
                 match read_frame(&mut input)? {
                     Decision::Commit => {
-                        stage.publish(path, name, &witness)?;
+                        stage.publish(path, name, &witness, || Ok(()))?;
                         Ok(Reply::Published {
                             destination: destination.clone(),
                             inventory: expected,
@@ -65,17 +110,17 @@ pub(crate) fn serve(mut input: impl Read, mut output: impl io::Write) -> io::Res
     write_frame(output, &reply)
 }
 
-struct UploadStage<'a> {
+pub(super) struct UploadStage<'a> {
     parent: &'a Directory,
     name: String,
     directory: Directory,
-    payload: Directory,
+    pub(super) payload: Directory,
     owned: bool,
-    published: bool,
+    pub(super) published: bool,
 }
 
 impl<'a> UploadStage<'a> {
-    fn create(parent: &'a Directory) -> io::Result<Self> {
+    pub(super) fn create(parent: &'a Directory) -> io::Result<Self> {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(io::Error::other)?;
         let name = format!(".kortty-{}.kortty-part", hex::encode(nonce));
@@ -142,8 +187,12 @@ impl<'a> UploadStage<'a> {
     fn verify_inventory(&self, path: &str, name: &str, expected: Inventory) -> io::Result<Witness> {
         self.verify(path)?;
         require_absent(&self.parent.fd, name)?;
+        self.verify_received(expected)
+    }
+
+    pub(super) fn verify_received(&self, expected: Inventory) -> io::Result<Witness> {
         let mut manifest = Manifest::default();
-        let witness = scan(&self.payload, "", 0, &mut manifest)?;
+        let witness = scan(&self.payload, "", 0, &mut manifest, Scan::Received)?;
         if manifest.finish() != expected {
             return Err(invalid(
                 "The received rsync tree differs from the reviewed inventory",
@@ -152,9 +201,16 @@ impl<'a> UploadStage<'a> {
         Ok(witness)
     }
 
-    fn publish(&mut self, path: &str, name: &str, witness: &Witness) -> io::Result<()> {
+    pub(super) fn publish(
+        &mut self,
+        path: &str,
+        name: &str,
+        witness: &Witness,
+        permit: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
         witness.require_current(&self.payload)?;
         self.verify(path)?;
+        permit()?;
         match renameat_with(
             &self.directory.fd,
             PAYLOAD,
@@ -180,7 +236,7 @@ impl<'a> UploadStage<'a> {
         Ok(())
     }
 
-    fn discard(&mut self) -> io::Result<()> {
+    pub(super) fn discard(&mut self) -> io::Result<()> {
         if !self.owned {
             return Ok(());
         }
@@ -233,43 +289,160 @@ fn require_private(file: &File, mode: u32) -> io::Result<()> {
     Ok(())
 }
 
-struct Witness {
+pub(super) struct Witness {
     stamp: Stamp,
     children: Vec<(String, Node)>,
+    #[cfg(target_os = "linux")]
+    attributes: Option<[u8; 32]>,
 }
 
 enum Node {
     Directory(Witness),
-    File(Stamp),
+    File {
+        stamp: Stamp,
+        // The existing-target transaction binds each retained or incoming file.
+        #[cfg(target_os = "linux")]
+        digest: [u8; 32],
+    },
 }
 
 impl Witness {
     fn require_current(&self, directory: &Directory) -> io::Result<()> {
-        if Stamp::of(&directory.fd.metadata()?) != self.stamp {
+        self.require_tree(directory, Scan::Received, false)
+    }
+
+    fn require_tree(&self, directory: &Directory, scan: Scan, moved: bool) -> io::Result<()> {
+        scan.require_mount(&directory.fd)?;
+        if !self.stamp.matches(&directory.fd, moved)? {
             return Err(invalid(
                 "The received rsync directory changed before publication",
             ));
         }
+        #[cfg(target_os = "linux")]
+        if moved && self.attributes != scan.directory_attributes(&directory.fd)? {
+            return Err(invalid("The renamed rsync directory attributes changed"));
+        }
+        #[cfg(target_os = "linux")]
+        if matches!(scan, Scan::Existing { .. }) {
+            self.require_names(directory)?;
+        }
         for (name, node) in &self.children {
             match node {
-                Node::Directory(child) => child.require_current(&directory.child(name)?)?,
-                Node::File(expected) => {
+                Node::Directory(child) => {
+                    child.require_tree(&directory.child(name)?, scan, false)?;
+                }
+                Node::File {
+                    stamp,
+                    #[cfg(target_os = "linux")]
+                    digest,
+                } => {
                     let file =
                         File::from(openat(&directory.fd, name.as_str(), SOURCE, Mode::empty())?);
-                    if Stamp::of(&file.metadata()?) != *expected {
+                    scan.require_mount(&file)?;
+                    if !stamp.matches(&file, false)? {
                         return Err(invalid(
                             "The received rsync file changed before publication",
                         ));
                     }
+                    #[cfg(target_os = "linux")]
+                    if matches!(scan, Scan::Existing { .. })
+                        && (hash(&file, stamp.size)? != *digest || !stamp.matches(&file, false)?)
+                    {
+                        return Err(invalid("The reviewed rsync file bytes changed"));
+                    }
                 }
             }
         }
-        if Stamp::of(&directory.fd.metadata()?) != self.stamp {
+        #[cfg(target_os = "linux")]
+        if matches!(scan, Scan::Existing { .. }) {
+            self.require_names(directory)?;
+        }
+        if !self.stamp.matches(&directory.fd, moved)? {
             return Err(invalid(
                 "The received rsync directory changed before publication",
             ));
         }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn require_names(&self, directory: &Directory) -> io::Result<()> {
+        let names = names(directory, self.children.len())?;
+        if !names.iter().eq(self.children.iter().map(|(name, _)| name)) {
+            return Err(invalid("The reviewed rsync directory entries changed"));
+        }
+        Ok(())
+    }
+}
+
+impl Stamp {
+    fn matches(&self, file: &File, moved: bool) -> io::Result<bool> {
+        let mut current = Stamp::of(&file.metadata()?);
+        // Renames update the moved directory's ctime. Descendants stay exact.
+        if moved {
+            current.ctime = self.ctime;
+            current.ctime_ns = self.ctime_ns;
+        }
+        Ok(current == *self)
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Scan {
+    Received,
+    #[cfg(target_os = "linux")]
+    Existing {
+        mount: u64,
+    },
+}
+
+impl Scan {
+    fn require_mount(self, _file: &File) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let Self::Existing { mount } = self
+            && super::draft_replace::mount_id(_file)? != mount
+        {
+            return Err(invalid("The reviewed rsync tree crosses a mount boundary"));
+        }
+        Ok(())
+    }
+
+    fn require_entry(self, file: &File, mode: u32) -> io::Result<()> {
+        match self {
+            Self::Received => require_private(file, mode),
+            #[cfg(target_os = "linux")]
+            Self::Existing { .. } => {
+                self.require_mount(file)?;
+                let metadata = file.metadata()?;
+                if metadata.uid() != geteuid().as_raw()
+                    || metadata.mode() & 0o7022 != 0
+                    || metadata.is_dir() && metadata.mode() & 0o700 != 0o700
+                {
+                    return Err(invalid(
+                        "The rsync destination contains an unprotected entry",
+                    ));
+                }
+                if metadata.is_file() {
+                    super::draft_replace::read_xattrs(file)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn directory_attributes(self, file: &File) -> io::Result<Option<[u8; 32]>> {
+        if matches!(self, Self::Received) {
+            return Ok(None);
+        }
+        let mut digest = Sha256::new();
+        for (name, value) in super::draft_replace::read_xattrs(file)? {
+            digest.update((name.len() as u32).to_be_bytes());
+            digest.update(name.as_bytes());
+            digest.update((value.len() as u32).to_be_bytes());
+            digest.update(value);
+        }
+        Ok(Some(digest.finalize().into()))
     }
 }
 
@@ -278,26 +451,16 @@ fn scan(
     prefix: &str,
     depth: usize,
     manifest: &mut Manifest,
+    purpose: Scan,
 ) -> io::Result<Witness> {
     if depth > MAX_DEPTH {
         return Err(invalid("Rsync directory exceeds its depth limit"));
     }
     let before = Stamp::of(&directory.fd.metadata()?);
-    let mut names = Vec::new();
-    for entry in Dir::read_from(&directory.fd)? {
-        let entry = entry?;
-        let name = entry.file_name().to_str().map_err(io::Error::other)?;
-        if matches!(name, "." | "..") {
-            continue;
-        }
-        if !valid_name(name) || names.len() == manifest.remaining_entries() {
-            return Err(invalid(
-                "The rsync directory contains an unsafe name or too many entries",
-            ));
-        }
-        names.push(name.to_owned());
-    }
-    names.sort_unstable();
+    purpose.require_entry(&directory.fd, 0o700)?;
+    #[cfg(target_os = "linux")]
+    let attributes = purpose.directory_attributes(&directory.fd)?;
+    let names = names(directory, manifest.remaining_entries())?;
     let mut children = Vec::with_capacity(names.len());
     for name in names {
         let path = if prefix.is_empty() {
@@ -312,13 +475,12 @@ fn scan(
         let node = match FileType::from_raw_mode(info.st_mode) {
             FileType::Directory => {
                 let child = directory.child(&name)?;
-                require_private(&child.fd, 0o700)?;
                 directory.require_child(&name, &child.stat)?;
                 if !same_node(&child.stat, &info) {
                     return Err(invalid("The received rsync directory changed"));
                 }
                 manifest.add(&path, None)?;
-                let child_witness = scan(&child, &path, depth + 1, manifest)?;
+                let child_witness = scan(&child, &path, depth + 1, manifest, purpose)?;
                 directory.require_child(&name, &child.stat)?;
                 Node::Directory(child_witness)
             }
@@ -332,16 +494,22 @@ fn scan(
                 {
                     return Err(invalid("The received rsync file is invalid"));
                 }
-                require_private(&file, 0o600)?;
                 let before = Stamp::of(&file.metadata()?);
+                purpose.require_entry(&file, 0o600)?;
                 let digest = hash(&file, size)?;
                 if Stamp::of(&file.metadata()?) != before {
                     return Err(invalid("The received rsync file changed"));
                 }
                 directory.require_child(&name, &held)?;
-                fsync(&file)?;
+                if matches!(purpose, Scan::Received) {
+                    fsync(&file)?;
+                }
                 manifest.add(&path, Some((size, digest)))?;
-                Node::File(before)
+                Node::File {
+                    stamp: before,
+                    #[cfg(target_os = "linux")]
+                    digest,
+                }
             }
             _ => return Err(invalid("The rsync directory contains an unsupported entry")),
         };
@@ -350,11 +518,34 @@ fn scan(
     if Stamp::of(&directory.fd.metadata()?) != before {
         return Err(invalid("The received rsync directory changed"));
     }
-    fsync(&directory.fd)?;
+    if matches!(purpose, Scan::Received) {
+        fsync(&directory.fd)?;
+    }
     Ok(Witness {
         stamp: before,
         children,
+        #[cfg(target_os = "linux")]
+        attributes,
     })
+}
+
+fn names(directory: &Directory, limit: usize) -> io::Result<Vec<String>> {
+    let mut names = Vec::new();
+    for entry in Dir::read_from(&directory.fd)? {
+        let entry = entry?;
+        let name = entry.file_name().to_str().map_err(io::Error::other)?;
+        if matches!(name, "." | "..") {
+            continue;
+        }
+        if !valid_name(name) || names.len() == limit {
+            return Err(invalid(
+                "The rsync directory contains an unsafe name or too many entries",
+            ));
+        }
+        names.push(name.to_owned());
+    }
+    names.sort_unstable();
+    Ok(names)
 }
 
 fn discard(directory: &Directory, device: u64, depth: usize, limit: &mut usize) -> io::Result<()> {
@@ -441,7 +632,7 @@ mod tests {
         let target = root.0.join("late");
         fs::create_dir(&target).unwrap();
         let identity = fs::metadata(&target).unwrap().ino();
-        assert!(stage.publish(path, "late", &witness).is_err());
+        assert!(stage.publish(path, "late", &witness, || Ok(())).is_err());
         assert_eq!(fs::metadata(&target).unwrap().ino(), identity);
         stage.discard().unwrap();
         assert!(!root.0.join(&stage.name).exists());
@@ -479,11 +670,11 @@ mod tests {
         let expected = expected.finish();
         let witness = stage.verify_inventory(path, "target", expected).unwrap();
         fs::write(&file, b"test\0changed").unwrap();
-        assert!(stage.publish(path, "target", &witness).is_err());
+        assert!(stage.publish(path, "target", &witness, || Ok(())).is_err());
         assert!(!root.0.join("target").exists());
         fs::write(&file, payload).unwrap();
         let witness = stage.verify_inventory(path, "target", expected).unwrap();
-        stage.publish(path, "target", &witness).unwrap();
+        stage.publish(path, "target", &witness, || Ok(())).unwrap();
         stage.discard().unwrap();
         assert_eq!(
             fs::read(root.0.join("target").join("sample")).unwrap(),

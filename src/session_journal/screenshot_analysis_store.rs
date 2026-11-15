@@ -28,6 +28,24 @@ pub(crate) struct Outcome {
 
 /// Stores only analysis fields in the latest stopped journal document.
 pub(crate) fn apply(asset: &Screenshot, analysis: &Analysis) -> io::Result<Outcome> {
+    apply_impl(asset, analysis, false, || Ok(()))
+}
+
+/// Only describes a still-unprocessed screenshot, with authority checked at publication.
+pub(super) fn apply_automatic(
+    asset: &Screenshot,
+    analysis: &Analysis,
+    authorize: impl Fn() -> io::Result<()>,
+) -> io::Result<Outcome> {
+    apply_impl(asset, analysis, true, authorize)
+}
+
+fn apply_impl(
+    asset: &Screenshot,
+    analysis: &Analysis,
+    automatic: bool,
+    authorize: impl Fn() -> io::Result<()>,
+) -> io::Result<Outcome> {
     validate(analysis)?;
     let source = asset.source();
     let lock = lock_source(source)?;
@@ -38,15 +56,31 @@ pub(crate) fn apply(asset: &Screenshot, analysis: &Analysis) -> io::Result<Outco
     }
     let entry = find_entry(&document, asset.id())?;
     asset.require_entry(entry)?;
+    if automatic && described(entry)? {
+        return Ok(Outcome::default());
+    }
     let updated = patch(&xml, entry, analysis)?;
     lock.publish_document(&stamp, updated.as_deref(), |journal| {
-        asset.require_image_current_in(journal)
+        asset.require_image_current_in(journal)?;
+        authorize()
     })?;
     let changed = updated.is_some();
     Ok(Outcome {
         changed,
         durability_warning: changed && lock.directory().sync().is_err(),
     })
+}
+
+pub(super) fn described(entry: Node<'_, '_>) -> io::Result<bool> {
+    require_java_fields(entry, &[DESCRIPTION, TAGS, MODEL])?;
+    Ok(
+        field(entry, DESCRIPTION)?.is_some_and(|value| !value.trim().is_empty())
+            || entry
+                .children()
+                .filter(|node| node.has_tag_name(TAGS))
+                .any(|wrapper| wrapper.children().any(|node| node.has_tag_name("tag")))
+            || field(entry, MODEL)?.is_some_and(|value| !value.trim().is_empty()),
+    )
 }
 
 pub(super) fn validate(analysis: &Analysis) -> io::Result<()> {

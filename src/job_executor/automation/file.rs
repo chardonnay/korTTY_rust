@@ -19,6 +19,9 @@ pub(super) fn record_action(recorder: &Recorder, action: &RemoteAction) {
                 path.as_str()
             )
         }
+        RemoteAction::ChmodSymbolic { path, mode } => {
+            format!("Change remote permissions by {mode} · {}", path.as_str())
+        }
         RemoteAction::Chown { path, uid, gid } => {
             let mut label = format!("Change remote ownership · {}", path.as_str());
             for (value, field) in [(uid, "UID"), (gid, "GID")] {
@@ -32,9 +35,15 @@ pub(super) fn record_action(recorder: &Recorder, action: &RemoteAction) {
         RemoteAction::CopyRemote { from, to } => {
             format!("Copy on server · {} → {}", from.as_str(), to.as_str())
         }
-        RemoteAction::Archive(archive) => {
+        RemoteAction::ImportedArchive(_) => return,
+        RemoteAction::Archive(archive) | RemoteAction::ServerArchive(archive) => {
+            let source = if matches!(action, RemoteAction::ServerArchive(_)) {
+                "Server-only"
+            } else {
+                "SFTP"
+            };
             let mut label = format!(
-                "SFTP archive ({}, level {}) · {}",
+                "{source} archive ({}, level {}) · {}",
                 archive.format,
                 archive.level,
                 archive.target.as_str(),
@@ -45,18 +54,20 @@ pub(super) fn record_action(recorder: &Recorder, action: &RemoteAction) {
             }
             label
         }
-        RemoteAction::ServerArchive(archive) => format!(
-            "Server-only archive ({}, level {}) · {}",
-            archive.format,
-            archive.level,
-            archive.target.as_str(),
-        ),
-        RemoteAction::PrivilegedArchive(action) => format!(
-            "Privileged archive ({}, level {}) · {}",
-            action.archive.format,
-            action.archive.level,
-            action.archive.target.as_str(),
-        ),
+        RemoteAction::PrivilegedArchive(action) => {
+            let archive = &action.archive;
+            let mut label = format!(
+                "Privileged archive ({}, level {}) · {}",
+                archive.format,
+                archive.level,
+                archive.target.as_str(),
+            );
+            if let Some(local) = &archive.download {
+                use std::fmt::Write as _;
+                let _ = write!(label, " → {}", local.display());
+            }
+            label
+        }
         RemoteAction::Delete {
             path, recursive, ..
         } => {
@@ -143,6 +154,20 @@ pub(super) fn record_action(recorder: &Recorder, action: &RemoteAction) {
             transfer_label(name, &upload.local, &upload.remote, true)
         }
     };
+    if let RemoteAction::RsyncDownload(transfer) | RemoteAction::RsyncUpload(transfer) = action {
+        let upload = matches!(action, RemoteAction::RsyncUpload(_));
+        if let Ok(Some(plan)) = transfer.batch_plan(upload) {
+            for (local, remote) in plan.paths() {
+                recorder.command(&Zeroizing::new(transfer_label(
+                    "Rsync batch item",
+                    local,
+                    remote,
+                    upload,
+                )));
+            }
+            return;
+        }
+    }
     recorder.command(&Zeroizing::new(label));
 
     let archive = match action {

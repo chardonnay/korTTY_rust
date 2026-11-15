@@ -288,6 +288,12 @@ fn saved_swarm_reviews_fresh_targets_and_appends_only_the_new_masked_turn() {
     assert_eq!(initial.title(), "Advisory review");
     assert_eq!(initial.turns[0].question, "Fresh advisory ***");
     assert_eq!(initial.turns[0].targets[0].detail, "Fresh advisory answer.");
+    let [metrics] = initial.turns[0].target_metrics.as_slice() else {
+        panic!("expected one target's saved status metrics");
+    };
+    assert_eq!(metrics.target, initial.turns[0].targets[0].target);
+    assert!(metrics.elapsed_seconds.is_some());
+    assert_eq!(metrics.total_tokens, Some(11));
     assert_eq!(
         initial.target_route(target).unwrap().group.as_deref(),
         Some(folder.as_str())
@@ -450,6 +456,12 @@ fn saved_swarm_reviews_fresh_targets_and_appends_only_the_new_masked_turn() {
     assert_eq!(saved.turns[1].targets.len(), 1);
     assert_eq!(saved.turns[1].targets[0].target, target);
     assert_eq!(saved.turns[1].targets[0].detail, "Final reviewed answer.");
+    let [metrics] = saved.turns[1].target_metrics.as_slice() else {
+        panic!("expected one follow-up target's saved status metrics");
+    };
+    assert_eq!(metrics.target, target);
+    assert!(metrics.elapsed_seconds.is_some());
+    assert_eq!(metrics.total_tokens, Some(11));
     assert_idle();
 
     let preview = act(
@@ -687,19 +699,37 @@ fn send_model_review(
 
 fn reply_reviewed(model: &std::net::TcpListener, messages: &[String; 2], answer: &str) -> Value {
     let response = json!({"status":"done","summary":"Done","userMessage":answer});
-    reply_content(model, messages, &response.to_string())
+    let wire = json!({
+        "choices": [{"message": {"content": response.to_string()}}],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 4, "total_tokens": 11},
+    });
+    let mut client = test_support::accept(model);
+    let request = assert_reviewed_request(&mut client, messages);
+    client
+        .get_mut()
+        .write_all(test_support::fixture_http_response("200 OK", "", &wire.to_string()).as_bytes())
+        .unwrap();
+    request
 }
 
 fn reply_content(model: &std::net::TcpListener, messages: &[String; 2], content: &str) -> Value {
     let mut client = test_support::accept(model);
-    let request = test_support::request(&mut client);
-    assert_eq!(request["max_tokens"], 2048);
-    assert_eq!(request["messages"][0]["content"], messages[0]);
-    assert_eq!(request["messages"][1]["content"], messages[1]);
+    let request = assert_reviewed_request(&mut client, messages);
     client
         .get_mut()
         .write_all(test_support::fixture_response("200 OK", "", content).as_bytes())
         .unwrap();
+    request
+}
+
+fn assert_reviewed_request(
+    client: &mut std::io::BufReader<std::net::TcpStream>,
+    messages: &[String; 2],
+) -> Value {
+    let request = test_support::request(client);
+    assert_eq!(request["max_tokens"], 2048);
+    assert_eq!(request["messages"][0]["content"], messages[0]);
+    assert_eq!(request["messages"][1]["content"], messages[1]);
     request
 }
 

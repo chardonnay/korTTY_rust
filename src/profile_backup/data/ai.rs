@@ -238,7 +238,7 @@ pub(in crate::profile_backup) fn validate_java_chat(path: &str, bytes: &[u8]) ->
     }
 }
 
-fn policy_allows(path: &str, policy: &ClipboardPolicy) -> bool {
+pub(in crate::profile_backup) fn policy_allows(path: &str, policy: &ClipboardPolicy) -> bool {
     match entry(path) {
         Some(Entry::Manager) => {
             policy.ai_allowed

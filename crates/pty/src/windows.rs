@@ -13,8 +13,9 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use windows_sys::Win32::Foundation::{
-    ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA, ERROR_PIPE_NOT_CONNECTED, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    DUPLICATE_SAME_ACCESS, DuplicateHandle, ERROR_BROKEN_PIPE, ERROR_IO_PENDING, ERROR_NO_DATA,
+    ERROR_PIPE_NOT_CONNECTED, GENERIC_READ, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Globalization::{
     CP_OEMCP, CSTR_EQUAL, CompareStringOrdinal, MultiByteToWideChar,
@@ -23,11 +24,12 @@ use windows_sys::Win32::Security::Cryptography::{
     BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
 };
 use windows_sys::Win32::Storage::FileSystem::{
-    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, OPEN_EXISTING,
-    PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND, ReadFile, WriteFile,
+    CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OVERLAPPED, FILE_TYPE_PIPE, GetFileType,
+    OPEN_EXISTING, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND, ReadFile, WriteFile,
 };
 use windows_sys::Win32::System::Console::{
-    COORD, ClosePseudoConsole, CreatePseudoConsole, HPCON, ResizePseudoConsole,
+    COORD, ClosePseudoConsole, CreatePseudoConsole, GetStdHandle, HPCON, ResizePseudoConsole,
+    STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
 };
 use windows_sys::Win32::System::IO::{CancelIoEx, GetOverlappedResult, OVERLAPPED};
 use windows_sys::Win32::System::JobObjects::{
@@ -43,8 +45,8 @@ use windows_sys::Win32::System::Pipes::{
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateEventW, CreateProcessW,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess, INFINITE,
-    InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
+    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetCurrentProcess,
+    GetExitCodeProcess, INFINITE, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
     PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, PROCESS_INFORMATION, ResetEvent, ResumeThread,
     STARTF_USESTDHANDLES, STARTUPINFOEXW, SetEvent, TerminateProcess, UpdateProcThreadAttribute,
     WaitForMultipleObjects, WaitForSingleObject,
@@ -54,7 +56,7 @@ use crate::shell_integration::windows::{self as shell_integration, Startup};
 use crate::{JobProcessIdentity, LaunchOptions, LocalShell, Size, closed};
 
 #[path = "windows/job_processes.rs"]
-mod job_processes;
+pub(crate) mod job_processes;
 #[path = "windows/sandbox.rs"]
 mod sandbox;
 #[path = "windows/sandbox_broker.rs"]
@@ -277,6 +279,44 @@ impl Write for PtyWriter {
     }
 }
 
+/// Opens the inherited protocol pipes of a short-lived Windows bridge process.
+pub fn inherited_bridge_pipes() -> io::Result<(PtyReader, PtyWriter)> {
+    let stop = Arc::new(event()?);
+    let input = HostPipe::from_handle(duplicate_standard_pipe(STD_INPUT_HANDLE)?, stop.clone())?;
+    let output = HostPipe::from_handle(duplicate_standard_pipe(STD_OUTPUT_HANDLE)?, stop)?;
+    Ok((PtyReader(input), PtyWriter(output)))
+}
+
+fn duplicate_standard_pipe(which: u32) -> io::Result<OwnedHandle> {
+    // SAFETY: the caller selects a standard handle owned by this process.
+    let handle = unsafe { GetStdHandle(which) };
+    if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+        return Err(closed());
+    }
+    // SAFETY: GetFileType only queries the live standard handle.
+    if unsafe { GetFileType(handle) } != FILE_TYPE_PIPE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "The bridge requires inherited input and output pipes",
+        ));
+    }
+    let mut duplicate = null_mut();
+    // SAFETY: the standard handle stays open and the destination receives a new owned handle.
+    bool_result(unsafe {
+        let current = GetCurrentProcess();
+        DuplicateHandle(
+            current,
+            handle,
+            current,
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    })?;
+    owned_handle(duplicate)
+}
+
 enum PipeDirection {
     Input,
     Output,
@@ -322,14 +362,15 @@ impl HostPipe {
                 null_mut(),
             )
         })?;
-        Ok((
-            Self {
-                handle: Arc::new(Mutex::new(Some(host))),
-                stop,
-                completed: event()?,
-            },
-            console,
-        ))
+        Ok((Self::from_handle(host, stop)?, console))
+    }
+
+    fn from_handle(handle: OwnedHandle, stop: Arc<OwnedHandle>) -> io::Result<Self> {
+        Ok(Self {
+            handle: Arc::new(Mutex::new(Some(handle))),
+            stop,
+            completed: event()?,
+        })
     }
 
     fn transfer(&self, start: impl FnOnce(HANDLE, &mut OVERLAPPED) -> i32) -> io::Result<usize> {
@@ -889,7 +930,7 @@ fn kill_on_close_job() -> io::Result<OwnedHandle> {
     limited_job(None)
 }
 
-fn terminate_job(job: &OwnedHandle) -> io::Result<()> {
+pub(crate) fn terminate_job(job: &OwnedHandle) -> io::Result<()> {
     // SAFETY: job is the caller's live, private job object.
     bool_result(unsafe { TerminateJobObject(job.as_raw_handle(), 1) })?;
     // Process termination is asynchronous. Keep the policy and temporary

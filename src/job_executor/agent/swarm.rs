@@ -7,12 +7,16 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 
 use crate::ai_manager::SkillUsageSurface;
+use crate::workspace::scheduler_access::firing::environment_research::{
+    Environment, from_probe_output,
+};
 
 use super::{
-    AdviceInput, ClipboardPolicy, DispatchCheck, Failure, Kind, Mask, ModelAuthority, Outcome,
-    Redactor, Resend, ResendScope, RunOutcome, Store, Target, TrustStore, advise, advisory,
-    await_model_authority, check_cancelled, current_route_policy, probe_evidence, request_advice,
-    require_current_route, send_model_permit,
+    AdviceInput, ClipboardPolicy, DispatchCheck, EnvironmentResearch, Failure, Kind, Mask,
+    ModelAuthority, Outcome, Probe, Redactor, Resend, ResendScope, RunOutcome, Status, Store,
+    Target, TrustStore, advise, advisory, await_model_authority, check_cancelled,
+    current_route_policy, probe_evidence, request_advice, request_authority, require_current_route,
+    send_model_permit, wait_authority,
 };
 
 // Read-only Swarms share the scheduler's model pool and a bounded probe pool.
@@ -52,6 +56,7 @@ impl Drop for ProbePermit {
 }
 
 const WIRE_PERMIT_LIMIT: Duration = Duration::from_secs(5);
+const ENVIRONMENT_RESEARCH_LIMIT: Duration = Duration::from_secs(120);
 // The journal allows 4096 bytes, including labels for all supported targets.
 pub(super) const MAX_SUMMARY_BYTES: usize = 384;
 
@@ -70,6 +75,57 @@ pub(super) fn check_target(
         .map_err(|error| error.detail)
 }
 
+fn research_environment(
+    scope: &Arc<ResendScope>,
+    target: &Target,
+    environment: Environment,
+    resends: &async_channel::Sender<Resend>,
+) -> Result<Arc<ResendScope>, Failure> {
+    let index = scope
+        .request
+        .action
+        .targets()
+        .position(|reference| &target.reference == reference)
+        .ok_or_else(|| Failure::blocked("The reviewed environment research target changed."))?;
+    let prompt = scope
+        .advisory_prompt
+        .as_ref()
+        .filter(|prompt| prompt.fresh_web().is_some())
+        .ok_or_else(|| {
+            Failure::blocked("The reviewed environment research request is unavailable.")
+        })?;
+    let deadline = Instant::now() + ENVIRONMENT_RESEARCH_LIMIT;
+    let (reply, result) = async_channel::bounded(1);
+    request_authority(
+        resends,
+        Resend::Environment(EnvironmentResearch {
+            scope: Arc::clone(scope),
+            index,
+            environment,
+            reply,
+            deadline,
+        }),
+        &scope.request.cancellation,
+        deadline,
+    )?;
+    let evidence = wait_authority(&result, &scope.request.cancellation, deadline)?;
+    evidence
+        .require_current()
+        .map_err(|_| Failure::blocked("The reviewed environment web settings changed."))?;
+    let prompt = prompt
+        .as_ref()
+        .clone()
+        .with_environment_web(evidence)
+        .map_err(|_| {
+            Failure::blocked(
+                "The reviewed environment evidence no longer fits the diagnostic request.",
+            )
+        })?;
+    let mut updated = scope.as_ref().clone();
+    updated.advisory_prompt = Some(Arc::new(prompt));
+    Ok(Arc::new(updated))
+}
+
 pub(super) fn advise_target(
     outcome: Outcome,
     approved: &Target,
@@ -82,10 +138,32 @@ pub(super) fn advise_target(
     ),
 ) -> (RunOutcome, String) {
     let target = approved.reference.id;
-    let cancellation = &scope.request.cancellation;
-    let (status, note, output) = probe_evidence(outcome, cancellation, redactor, mask);
+    let cancellation = scope.request.cancellation.clone();
+    let environment = if matches!(outcome.status, Status::Exited(0))
+        && !outcome.stdout.truncated()
+        && !outcome.stderr.truncated()
+        && scope.request.action.agent.as_ref().is_some_and(|agent| {
+            agent.probe == Probe::SwarmReadOnly
+                && agent
+                    .approval
+                    .as_ref()
+                    .and_then(|approval| approval.web_lookup())
+                    .is_some_and(|grant| grant.allows_environment_lookup())
+        }) {
+        from_probe_output(&outcome.stdout.text(), &outcome.stderr.text())
+    } else {
+        None
+    };
+    let (status, note, output) = probe_evidence(outcome, &cancellation, redactor, mask);
     let Some(output) = output else {
         return (status, note.into());
+    };
+    let scope = match environment {
+        Some(environment) => match research_environment(&scope, approved, environment, resends) {
+            Ok(scope) => scope,
+            Err(failure) => return (failure.outcome, format!("AI: {}", failure.detail)),
+        },
+        None => scope,
     };
     let reviewed = approved.clone();
     let trust = trust.clone();
@@ -136,6 +214,7 @@ pub(super) fn advise_target(
                 grant,
                 index,
                 prompt,
+                &policy.ai_memory,
                 || {
                     check_cancelled(&dispatch_scope.request.cancellation)
                         .map_err(|error| error.detail.to_owned())?;
@@ -181,7 +260,7 @@ pub(super) fn advise_target(
         );
         let authorize = |permit, _deadline| {
             // The format/repair handshake can advance only to another guarded send.
-            check_cancelled(cancellation)?;
+            check_cancelled(&cancellation)?;
             check_dispatch().map_err(Failure::blocked)?;
             send_model_permit(permit)
         };
@@ -195,7 +274,7 @@ pub(super) fn advise_target(
                     system: prompt.firing_system().into(),
                     input,
                 },
-                cancellation,
+                &cancellation,
                 redactor,
                 mask,
                 authorize,
@@ -205,13 +284,13 @@ pub(super) fn advise_target(
                 model,
                 goal.to_owned(),
                 &mut vec![json!({"target": target, "output": output})],
-                cancellation,
+                &cancellation,
                 redactor,
                 mask,
                 |_, permit, deadline| authorize(permit, deadline),
             )
         }?;
-        check_cancelled(cancellation)?;
+        check_cancelled(&cancellation)?;
         check_dispatch().map_err(Failure::blocked)?;
         if scope
             .request
@@ -219,6 +298,10 @@ pub(super) fn advise_target(
             .agent
             .as_ref()
             .is_some_and(|agent| agent.swarm_parallelism.is_some())
+            || scope
+                .advisory_prompt
+                .as_deref()
+                .is_some_and(|prompt| prompt.fresh_web().is_some())
         {
             await_model_authority(
                 resends,

@@ -4,9 +4,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use zeroize::Zeroizing;
 
+use crate::session_journal::deletion::DeletionIdentity;
 use crate::session_journal::entry_edit::MarkerSource;
-use crate::session_journal::summary_ai::{Card, State};
+use crate::session_journal::summary_ai::{Card, ObservedUsage, State};
 use crate::session_journal::summary_plan::{End, Window};
+use crate::session_journal::summary_store::{TokenUsage, UsageEdit};
 
 use super::{Entry, MAX_TIMELINE, MAX_TIMELINE_TEXT_BYTES, Writer, element, invalid};
 
@@ -16,21 +18,33 @@ pub(crate) struct Publish {
     pub(crate) after: u64,
     pub(crate) window: Window,
     pub(crate) card: Option<Card>,
+    pub(crate) usage: Option<ObservedUsage>,
     pub(crate) cancelled: Arc<AtomicBool>,
     pub(crate) authorize: Option<crate::session_journal::summary_ai::Authorization>,
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub(super) struct Checkpoint {
     cursor: u64,
     last_ai: u64,
     raw: bool,
+    usage: Option<TokenUsage>,
 }
 
 impl Checkpoint {
-    pub(super) fn write(self, xml: &mut String) {
+    pub(super) fn write(&self, xml: &mut String) -> io::Result<()> {
+        if let Some(usage) = &self.usage {
+            for (name, value) in usage.fields() {
+                element(xml, name, &value);
+            }
+            for (name, value) in usage.profile_fields()?.into_iter().flatten() {
+                if let Some(value) = value {
+                    element(xml, name, &value);
+                }
+            }
+        }
         if self.cursor == 0 && !self.raw {
-            return;
+            return Ok(());
         }
         element(xml, "nativeSummaryCursor", &self.cursor.to_string());
         element(xml, "lastSummarizedSeq", &self.last_ai.to_string());
@@ -39,6 +53,7 @@ impl Checkpoint {
             "nativeSummaryRawFallback",
             if self.raw { "true" } else { "false" },
         );
+        Ok(())
     }
 }
 
@@ -50,6 +65,7 @@ pub(super) struct SummaryEntry {
     state: State,
     input: Vec<String>,
     output: Vec<String>,
+    run_as_user: Option<String>,
 }
 
 impl SummaryEntry {
@@ -61,6 +77,7 @@ impl SummaryEntry {
             state: card.state,
             input: card.input.clone(),
             output: card.output.clone(),
+            run_as_user: card.run_as_user.clone(),
         }
     }
 
@@ -86,6 +103,9 @@ impl SummaryEntry {
         }
         element(xml, "logStartSeq", &self.first.to_string());
         element(xml, "logEndSeq", &self.last.to_string());
+        if let Some(user) = &self.run_as_user {
+            element(xml, "runAsUser", user);
+        }
         for (wrapper, lines) in [
             ("inputExcerpt", &self.input),
             ("outputExcerpt", &self.output),
@@ -104,6 +124,26 @@ impl SummaryEntry {
 }
 
 impl Writer {
+    pub(super) fn record_ai_usage(&mut self, observed: ObservedUsage) -> io::Result<UsageEdit> {
+        let stamp = self.directory.document_stamp()?;
+        let previous = self.document.summary.usage.clone();
+        self.document.summary.observe_usage(observed);
+        let result = self
+            .document
+            .save(&mut self.directory, self.log.number, self.sequence, None);
+        if result.as_ref().is_err_and(|error| !error.published) {
+            self.document.summary.usage = previous;
+        } else {
+            self.advance_timeline();
+        }
+        result?;
+        let current = self.directory.document_stamp()?;
+        Ok((
+            DeletionIdentity::from_document_stamp(self.location, stamp),
+            DeletionIdentity::from_document_stamp(self.location, current),
+        ))
+    }
+
     pub(super) fn publish_summary(&mut self, update: Publish) -> io::Result<u64> {
         let require_active = || {
             crate::session_journal::summary_ai::authorize_publication(update.authorize.as_ref())?;
@@ -167,7 +207,10 @@ impl Writer {
         if let Some(entry) = replacement {
             self.document.entries.insert(position, entry);
         }
-        let old_checkpoint = self.document.summary;
+        let old_checkpoint = self.document.summary.clone();
+        if let Some(observed) = update.usage {
+            self.document.summary.observe_usage(observed);
+        }
         if let Some(last) = update.window.checkpoint() {
             self.document.summary.cursor = last;
             self.document.summary.raw |= update
@@ -202,6 +245,14 @@ impl Writer {
         result
             .map(|()| self.document.summary.cursor)
             .map_err(io::Error::from)
+    }
+}
+
+impl Checkpoint {
+    fn observe_usage(&mut self, observed: ObservedUsage) {
+        self.usage
+            .get_or_insert_with(TokenUsage::default)
+            .observe(observed);
     }
 }
 

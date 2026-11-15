@@ -84,7 +84,7 @@ fn linux_zip_rejects_non_linux_targets_before_publication() {
 fn native_linux_flags_reject_non_linux_targets_before_publication() {
     let fixture = Fixture::new();
     let output = fixture.0.join("output");
-    for flag in ["--linux-deb", "--linux-rpm"] {
+    for flag in ["--linux-deb", "--linux-rpm", "--linux-pacman"] {
         let result = package_command("aarch64-pc-windows-msvc", &fixture.0, &output)
             .arg(flag)
             .output()
@@ -155,6 +155,64 @@ fn native_rpm_contains_runnable_binaries_and_versioned_dependencies() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires unprivileged native Arch packaging with makepkg, pacman and readelf"]
+fn native_pacman_contains_runnable_binaries_and_versioned_dependencies() {
+    let fixture = Fixture::new();
+    let package = native_package(&fixture, "--linux-pacman", "zst");
+    let arch = std::env::consts::ARCH;
+    let metadata = |name: &str| stdout(Command::new("bsdtar").arg("-xOf").arg(&package).arg(name));
+    let info = metadata(".PKGINFO");
+    assert!(info.lines().any(|line| line == "pkgname = kortty"));
+    assert!(info.lines().any(|line| line == format!("arch = {arch}")));
+    assert!(info.lines().any(|line| line == "license = MIT"));
+    assert!(
+        info.lines()
+            .any(|line| line.starts_with("depend = glibc>=2."))
+    );
+    assert!(!info.lines().any(|line| {
+        line.starts_with("depend = openssl")
+            || line.starts_with("depend = libssl.so=")
+            || line.starts_with("depend = libcrypto.so=")
+    }));
+    assert!(info.lines().any(|line| line == "depend = libxkbcommon-x11"));
+    let version = info
+        .lines()
+        .find_map(|line| line.strip_prefix("pkgver = "))
+        .unwrap();
+    assert!(version.ends_with("-1"));
+    assert_eq!(
+        package.file_name().unwrap().to_str().unwrap(),
+        format!("kortty-{version}-{arch}.pkg.tar.zst")
+    );
+    assert!(
+        metadata(".BUILDINFO")
+            .lines()
+            .any(|line| line == format!("pkgarch = {arch}"))
+    );
+    let files = stdout(
+        Command::new("bsdtar")
+            .args(["--numeric-owner", "-tvf"])
+            .arg(&package),
+    );
+    assert_payload(&files, "/usr/share/licenses/kortty/LICENSE");
+    assert!(files.lines().any(|line| line.ends_with(" .MTREE")));
+    assert!(files.contains("usr/share/licenses/kortty/third-party/"));
+    assert_eq!(
+        stdout(Command::new("pacman").arg("-Qp").arg(&package)).trim(),
+        format!("kortty {version}")
+    );
+    let vercmp = |first: &str, second: &str| {
+        stdout(Command::new("vercmp").args([first, second]))
+            .trim()
+            .parse::<i32>()
+            .unwrap()
+    };
+    assert!(vercmp("0.1.0-1", "2.26.0-1") < 0);
+    assert!(vercmp("0.1.1-1", "0.1.0-1") > 0);
+}
+
+#[cfg(target_os = "linux")]
 fn native_package(fixture: &Fixture, flag: &str, extension: &str) -> PathBuf {
     let binaries = fixture.0.join("binaries");
     fs::create_dir(&binaries).unwrap();
@@ -182,32 +240,34 @@ fn native_package(fixture: &Fixture, flag: &str, extension: &str) -> PathBuf {
     };
     let package = create("first");
     assert_checksum(&package);
-    let repeated = create("second");
-    assert_eq!(fs::read(&package).unwrap(), fs::read(repeated).unwrap());
+    // makepkg preserves the real build and start paths in .BUILDINFO.
+    if flag != "--linux-pacman" {
+        let repeated = create("second");
+        assert_eq!(fs::read(&package).unwrap(), fs::read(repeated).unwrap());
+    }
     package
 }
 
 #[cfg(target_os = "linux")]
 fn assert_payload(files: &str, license: &str) {
+    let contains = |mode: &str, path: &str| {
+        files.lines().any(|line| {
+            line.starts_with(mode)
+                && line.split_whitespace().last().is_some_and(|name| {
+                    name.trim_start_matches("./").trim_start_matches('/')
+                        == path.trim_start_matches('/')
+                })
+        })
+    };
     for path in ["/usr/bin/kortty", "/usr/bin/kortty-cli"] {
-        assert!(
-            files
-                .lines()
-                .any(|line| line.starts_with("-rwxr-xr-x") && line.ends_with(path)),
-            "{files}"
-        );
+        assert!(contains("-rwxr-xr-x", path), "{files}");
     }
     for path in [
         "/usr/share/applications/kortty.desktop",
         "/usr/share/pixmaps/kortty.png",
         license,
     ] {
-        assert!(
-            files
-                .lines()
-                .any(|line| line.starts_with("-rw-r--r--") && line.ends_with(path)),
-            "{files}"
-        );
+        assert!(contains("-rw-r--r--", path), "{files}");
     }
 }
 

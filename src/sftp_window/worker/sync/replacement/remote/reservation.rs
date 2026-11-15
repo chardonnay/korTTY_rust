@@ -16,10 +16,17 @@ pub(super) struct Reservation {
 
 impl Reservation {
     pub(super) fn claim(scope: ReplaceScope<'_>, path: &[u8]) -> io::Result<Self> {
-        let key = key(&scope.approval.route, &scope.approval.peer, path)?;
-        let profile = scope
-            .recovery
-            .map(|recovery| recovery.snapshot.1.profile.as_path());
+        let (route, peer, profile) = match scope {
+            ReplaceScope::Browser { approval, recovery } => (
+                &approval.route,
+                &approval.peer,
+                recovery.map(|recovery| recovery.snapshot.1.profile.as_path()),
+            ),
+            ReplaceScope::Scheduled { upload, .. } => {
+                (upload.route, upload.peer, Some(upload.profile))
+            }
+        };
+        let key = key(route, peer, path)?;
         Self::acquire(key, profile)
     }
 

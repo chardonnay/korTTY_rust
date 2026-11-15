@@ -23,6 +23,8 @@ mod create;
 pub(super) mod draft_replace;
 #[cfg(target_os = "linux")]
 pub(super) mod privileged_archive;
+#[cfg(target_os = "linux")]
+pub(super) mod privileged_rsync;
 pub(super) mod rsync_tree;
 
 const DIRECTORY: OFlags = OFlags::RDONLY
@@ -38,7 +40,7 @@ const PRIVATE_DIRECTORY: Mode = Mode::RUSR.union(Mode::WUSR).union(Mode::XUSR);
 const PRIVATE_FILE: Mode = Mode::RUSR.union(Mode::WUSR);
 const TARGET_COUNT: usize = 100;
 
-pub(super) fn handle(request: Request) -> Reply {
+pub(super) fn handle(request: Request, password: Option<&[u8]>) -> Reply {
     if getuid() != geteuid() || getgid() != getegid() {
         return Failure::from(invalid(
             "The archive helper requires ordinary account privileges",
@@ -59,8 +61,14 @@ pub(super) fn handle(request: Request) -> Reply {
             .map_or_else(Failure::reply, |destination| Reply::Applied { destination }),
         Request::ReviewCreation { spec } => create::review(spec)
             .map_or_else(Failure::reply, |review| Reply::CreationReview { review }),
-        Request::ApplyCreation { spec, token } => create::apply(spec, &token)
-            .map_or_else(Failure::reply, |destination| Reply::Applied { destination }),
+        Request::ApplyCreation { spec, token } => create::apply(spec, &token, password)
+            .map_or_else(Failure::reply, |(destination, payload)| match payload {
+                Some(payload) => Reply::CreationApplied {
+                    destination,
+                    payload,
+                },
+                None => Reply::Applied { destination },
+            }),
     }
 }
 

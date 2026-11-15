@@ -1,15 +1,20 @@
 //! The standing request for a comparison of one scheduled Swarm firing.
 
+use std::sync::Arc;
+
 use kortty_jobs::{MAX_SWARM_COMPARISON_BYTES, MAX_SWARM_TARGETS, RunOutcome, SwarmTargetReport};
 use pgp::crypto::hash::HashAlgorithm;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::{
     MAX_GOAL_BYTES, MAX_RESULT_CHARS, Mask, Redactor, Request, SYSTEM, append_memory,
     is_display_character, local_ai, transport,
 };
+use crate::ai_manager::reviewed_memory::Binding;
 use crate::terminal_agent::usage::fits_context;
+use crate::workspace::terminal_ai::web;
 
 const SCHEDULED_SYSTEM: &str = concat!(
     "\n\nThe user message contains a JSON object for the completed scheduled round. ",
@@ -21,6 +26,7 @@ const CONTEXT_EXCEEDED: &str =
 const MASK_FAILED: &str = "The scheduled Swarm comparison could not be safely masked.";
 const COMPLETED: &str = "Completed";
 
+#[derive(Clone, Copy)]
 pub(crate) struct ScheduledScope<'a> {
     pub(crate) profile: &'a local_ai::Profile,
     pub(crate) profile_revision: [u8; 32],
@@ -50,6 +56,19 @@ impl ScheduledGrant {
     pub(crate) fn profile_revision(&self) -> [u8; 32] {
         self.profile_revision
     }
+
+    pub(crate) fn bind_memory(&mut self, memory: Option<Binding>) -> Result<(), String> {
+        if let Some(memory) = memory {
+            let revision = serde_json::to_vec(&(
+                "kortty-swarm-comparison-memory-v1",
+                self.fingerprint,
+                memory,
+            ))
+            .map_err(|_| "Could not encode the reviewed Swarm comparison memory.")?;
+            self.fingerprint = Sha256::digest(revision).into();
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone)]
@@ -59,6 +78,7 @@ pub(crate) struct ScheduledTemplate {
     preview: String,
     goal: String,
     targets: Vec<u64>,
+    web_evidence: Option<Arc<web::Evidence>>,
     detail_limit: usize,
     context_limit: usize,
 }
@@ -72,14 +92,15 @@ impl ScheduledTemplate {
         redactor: &Redactor,
         mask: Mask,
     ) -> Result<Self, String> {
-        Self::prepare_with_knowledge(scope, goal, memory, None, redactor, mask)
+        Self::prepare_with_context(scope, goal, memory, None, None, redactor, mask)
     }
 
-    pub(crate) fn prepare_with_knowledge(
+    pub(crate) fn prepare_with_context(
         scope: ScheduledScope<'_>,
         goal: &str,
         memory: Option<&str>,
         knowledge: Option<&str>,
+        web: Option<&Arc<web::Evidence>>,
         redactor: &Redactor,
         mask: Mask,
     ) -> Result<Self, String> {
@@ -110,8 +131,17 @@ impl ScheduledTemplate {
             )
             .into_owned();
         }
+        if let Some(evidence) = web {
+            evidence.require_mask(|text| mask(redactor, text))?;
+            system = web::system_with_guidance(&system, None);
+        }
         let system = profile.render_system_prompt(&system).into_owned();
-        let preview = render(&goal, targets, std::iter::repeat((None, None)));
+        let preview = render(
+            &goal,
+            targets,
+            std::iter::repeat((None, None)),
+            web.map(Arc::as_ref),
+        );
         if !wire_mask_current(redactor, &system) || !wire_mask_current(redactor, &preview) {
             return Err(MASK_FAILED.into());
         }
@@ -120,6 +150,7 @@ impl ScheduledTemplate {
             &goal,
             targets,
             std::iter::repeat((Some(COMPLETED), Some(""))),
+            web.map(Arc::as_ref),
         );
         let fixed_chars = system.chars().count() + fixed.chars().count();
         let detail_limit =
@@ -132,7 +163,7 @@ impl ScheduledTemplate {
             .redaction_policy()
             .redaction_revision()
             .ok_or("Could not identify the reviewed Swarm comparison mask.")?;
-        let reviewed = serde_json::to_vec(&(
+        let reviewed = (
             version,
             profile_revision,
             redaction_revision,
@@ -142,7 +173,13 @@ impl ScheduledTemplate {
             detail_limit,
             transport(profile).effective_output_limit(),
             MAX_SWARM_COMPARISON_BYTES,
-        ))
+        );
+        let reviewed = match web {
+            Some(evidence) => {
+                serde_json::to_vec(&("kortty-swarm-comparison-web-v1", reviewed, evidence))
+            }
+            None => serde_json::to_vec(&reviewed),
+        }
         .map_err(|_| "Could not encode the reviewed Swarm comparison.")?;
         let fingerprint = HashAlgorithm::Sha256
             .digest(&reviewed)
@@ -159,9 +196,26 @@ impl ScheduledTemplate {
             preview,
             goal,
             targets: targets.to_vec(),
+            web_evidence: web.cloned(),
             detail_limit,
             context_limit,
         })
+    }
+
+    pub(crate) fn prepare_with_fresh_web(
+        scope: ScheduledScope<'_>,
+        goal: &str,
+        memory: Option<&str>,
+        knowledge: Option<&str>,
+        web: &Arc<web::Evidence>,
+        redactor: &Redactor,
+        mask: Mask,
+    ) -> Result<(Self, ScheduledGrant), String> {
+        let standing =
+            Self::prepare_with_context(scope, goal, memory, knowledge, None, redactor, mask)?;
+        let firing =
+            Self::prepare_with_context(scope, goal, memory, knowledge, Some(web), redactor, mask)?;
+        Ok((firing, standing.grant))
     }
 
     pub(crate) fn messages(&self) -> [&str; 2] {
@@ -170,6 +224,10 @@ impl ScheduledTemplate {
 
     pub(crate) fn grant(&self) -> ScheduledGrant {
         self.grant.clone()
+    }
+
+    pub(crate) fn bind_memory(&mut self, memory: Option<Binding>) -> Result<(), String> {
+        self.grant.bind_memory(memory)
     }
 
     pub(crate) fn detail_limit(&self) -> usize {
@@ -184,6 +242,7 @@ impl ScheduledTemplate {
             &self.goal,
             &self.targets,
             std::iter::repeat((Some(COMPLETED), Some(worst.as_str()))),
+            self.web_evidence.as_deref(),
         )
     }
 
@@ -237,6 +296,7 @@ impl ScheduledTemplate {
             results
                 .iter()
                 .map(|(status, detail)| (Some(*status), Some(detail.as_str()))),
+            self.web_evidence.as_deref(),
         );
         if !wire_mask_current(redactor, &self.system) || !wire_mask_current(redactor, &input) {
             return Err(MASK_FAILED.into());
@@ -267,6 +327,7 @@ fn render<'a>(
     goal: &str,
     targets: &[u64],
     fields: impl Iterator<Item = (Option<&'a str>, Option<&'a str>)>,
+    web_evidence: Option<&web::Evidence>,
 ) -> String {
     let rows = targets
         .iter()
@@ -280,7 +341,11 @@ fn render<'a>(
             })
         })
         .collect::<Vec<_>>();
-    json!({"question": goal, "targets": rows}).to_string()
+    let mut input = json!({"question": goal, "targets": rows});
+    if let Some(evidence) = web_evidence {
+        evidence.append_to_json(&mut input);
+    }
+    input.to_string()
 }
 
 fn fit_detail(detail: &str, limit: usize) -> &str {
@@ -497,6 +562,7 @@ mod tests {
             &initial.goal,
             &initial.targets,
             std::iter::repeat((Some(COMPLETED), Some(""))),
+            None,
         );
         let limit = initial.system.chars().count() + filled_empty.chars().count() + 60;
         let limited = template(&profile, &redactor, &[72, 11], limit, None);
@@ -564,5 +630,72 @@ mod tests {
         ];
         assert_eq!(mask(&managed, &rows[0].detail).unwrap(), rows[0].detail);
         assert!(reviewed.fill(&rows, &managed, mask).is_err());
+    }
+
+    #[test]
+    fn scheduled_comparison_binds_reviewed_web_content_and_provenance() {
+        let profile = local_ai::Profile::new("127.0.0.1:12345", "fixture").unwrap();
+        let redactor = redactor();
+        let prepare = |web: Option<&Arc<web::Evidence>>| {
+            ScheduledTemplate::prepare_with_context(
+                ScheduledScope {
+                    profile: &profile,
+                    profile_revision: [31; 32],
+                    context_limit: 4096,
+                    targets: &[72],
+                },
+                "Compare other-target-secret",
+                None,
+                None,
+                web,
+                &redactor,
+                mask,
+            )
+        };
+        let evidence = Arc::new(web::Evidence::fixture("Verified release notes."));
+        let reviewed = prepare(Some(&evidence)).unwrap();
+        let legacy = template(&profile, &redactor, &[72], 4096, None);
+        assert!(legacy.grant().matches(&prepare(None).unwrap()));
+        assert!(!reviewed.grant().matches(&legacy));
+        assert!(
+            !reviewed.grant().matches(
+                &prepare(Some(&Arc::new(web::Evidence::fixture(
+                    "New release notes."
+                ))))
+                .unwrap()
+            )
+        );
+        let mut stored = serde_json::to_value(&evidence).unwrap();
+        let reopened = serde_json::from_value(stored.clone()).unwrap();
+        assert!(reviewed.grant().matches(&prepare(Some(&reopened)).unwrap()));
+        stored["profile_revision"] = json!(vec![9_u8; 32]);
+        let changed = serde_json::from_value(stored).unwrap();
+        let changed = prepare(Some(&changed)).unwrap();
+        assert_eq!(reviewed.messages(), changed.messages());
+        assert!(!reviewed.grant().matches(&changed));
+        let unauthorized = Arc::new(web::Evidence::fixture("Contains other-target-secret."));
+        assert!(prepare(Some(&unauthorized)).is_err());
+        let request = reviewed
+            .fill(
+                &[row(72, RunOutcome::Success, "Verified status.")],
+                &redactor,
+                mask,
+            )
+            .unwrap();
+        let [system, input] = request.messages();
+        assert_eq!(system, reviewed.messages()[0]);
+        assert!(system.contains(web::GUIDANCE));
+        assert!(!system.contains("https://example.com/notes"));
+        let input: Value = serde_json::from_str(input).unwrap();
+        let preview: Value = serde_json::from_str(reviewed.messages()[1]).unwrap();
+        let forecast: Value = serde_json::from_str(&reviewed.forecast_input()).unwrap();
+        assert_eq!(input["web_evidence"], preview["web_evidence"]);
+        assert_eq!(input["web_evidence"], forecast["web_evidence"]);
+        assert!(
+            input["web_evidence"]
+                .as_str()
+                .unwrap()
+                .contains("https://example.com/notes\nVerified release notes.")
+        );
     }
 }

@@ -23,6 +23,7 @@ use super::{ConnectionRef, RemotePath, SshCommand, SudoMode};
 pub(crate) mod standing;
 mod ui;
 pub(crate) use ui::PreviewRequest;
+pub(super) use ui::standing_schedule;
 pub(super) use ui::{CascadeReview, DraftReview};
 
 const FILE: &str = "job-sftp-reviews.json";
@@ -57,10 +58,8 @@ pub(crate) struct Copy {
 
 impl Copy {
     pub(super) fn validate_replacement(&self, privileged: bool) -> Result<(), &'static str> {
-        if self.replace_changed
-            && (self.direction != Direction::Download || privileged || self.standing.is_some())
-        {
-            return Err("Changed-file replacement requires an ordinary one-use SFTP download.");
+        if self.replace_changed && privileged {
+            return Err("Changed-file replacement requires an ordinary SFTP copy.");
         }
         Ok(())
     }
@@ -122,6 +121,7 @@ impl Copy {
             remote: self.remote.as_str().as_bytes().to_vec(),
             excludes: &self.excludes,
             replace_changed: self.replace_changed,
+            upload: None,
             to: match self.direction {
                 Direction::Upload => Side::Remote,
                 Direction::Download => Side::Local,
@@ -406,6 +406,10 @@ type Index = BTreeMap<JobId, Receipt>;
 impl Store {
     pub(super) fn new(profile: &Path) -> Self {
         Self(profile.to_owned())
+    }
+
+    pub(crate) fn profile(&self) -> &Path {
+        &self.0
     }
 
     pub(super) fn save_approval(

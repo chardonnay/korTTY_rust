@@ -100,6 +100,14 @@ pub struct RunRequest<A> {
     pub cancellation: Cancellation,
 }
 
+/// Durable identity of a calendar occurrence or an exact successful predecessor round.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FiringOccurrence {
+    Calendar(SystemTime),
+    Predecessors(Vec<(JobId, RunId, SystemTime)>),
+}
+
 /// Identifies the original root of an active cascade request.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CascadeOrigin<'a> {
@@ -202,6 +210,7 @@ struct ActiveRun {
     trigger: RunTrigger,
     started_at: SystemTime,
     cancellation: Cancellation,
+    occurrence: Option<FiringOccurrence>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -342,10 +351,43 @@ impl<A> Scheduler<A> {
         (index != cascade.root).then(|| self.cascade_blockers(cascade, index, now))
     }
 
+    /// Rechecks the predecessors of an exact, active calendar or dependency run.
+    pub fn active_predecessor_blockers(
+        &self,
+        request: &RunRequest<A>,
+        now: SystemTime,
+    ) -> Option<Vec<Blocker>> {
+        let chain = match request.trigger {
+            RunTrigger::Scheduled => false,
+            RunTrigger::Dependency => true,
+            RunTrigger::Manual | RunTrigger::Cascade => return None,
+        };
+        let index = self.active_request_index(request)?;
+        Some(self.check(
+            index,
+            self.graph.predecessors[index].iter().copied(),
+            now,
+            chain,
+        ))
+    }
+
+    /// Returns the occurrence captured when this exact automatic run was dispatched.
+    /// The identity stays fixed if a predecessor finishes another run while waiting.
+    pub fn active_firing_occurrence(&self, request: &RunRequest<A>) -> Option<&FiringOccurrence> {
+        let index = self.active_request_index(request)?;
+        self.states[index].active.as_ref()?.occurrence.as_ref()
+    }
+
     fn active_cascade(&self, request: &RunRequest<A>) -> Option<(usize, RunId, &Cascade)> {
         if request.trigger != RunTrigger::Cascade {
             return None;
         }
+        let index = self.active_request_index(request)?;
+        let root_run = self.states[index].reserved_by?;
+        Some((index, root_run, self.cascades.get(&root_run)?))
+    }
+
+    fn active_request_index(&self, request: &RunRequest<A>) -> Option<usize> {
         let index = *self.active.get(&request.id)?;
         let job = &self.graph.jobs[index];
         let state = &self.states[index];
@@ -361,8 +403,7 @@ impl<A> Scheduler<A> {
         {
             return None;
         }
-        let root_run = state.reserved_by?;
-        Some((index, root_run, self.cascades.get(&root_run)?))
+        Some(index)
     }
 
     /// Whether the root's cascade still has running or waiting work.
@@ -635,12 +676,32 @@ impl<A> Scheduler<A> {
         let id = next_run();
         let cancellation = Cancellation::default();
         let job = &self.graph.jobs[index];
+        let occurrence = match trigger {
+            RunTrigger::Scheduled => self.states[index]
+                .next_due
+                .filter(|due| *due <= now)
+                .map(FiringOccurrence::Calendar),
+            RunTrigger::Dependency => self.graph.predecessors[index]
+                .iter()
+                .map(|predecessor| {
+                    let result = self.states[*predecessor].dependency_result?;
+                    Some((
+                        self.graph.jobs[*predecessor].id().clone(),
+                        result.id,
+                        result.finished_at,
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()
+                .map(FiringOccurrence::Predecessors),
+            RunTrigger::Manual | RunTrigger::Cascade => None,
+        };
         self.active.insert(id, index);
         self.states[index].active = Some(ActiveRun {
             id,
             trigger,
             started_at: now,
             cancellation: cancellation.clone(),
+            occurrence,
         });
         batch.started.push(RunRequest {
             id,

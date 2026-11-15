@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use async_channel::Receiver;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use ureq::tls::{RootCerts, TlsConfig, TlsProvider};
 use ureq::{Agent, config::Config};
 use zeroize::Zeroizing;
@@ -18,7 +19,10 @@ use zeroize::Zeroizing;
 use crate::clipboard_policy::{ClipboardPolicy, PolicyModelRuntime, valid_policy_model_id};
 
 pub(crate) mod cli;
+mod lm_studio_endpoint;
 pub(crate) mod managed_models;
+#[cfg(test)]
+mod minimax_tests;
 pub(crate) mod mlx_models;
 pub(crate) mod mlx_runtime;
 pub(crate) mod model_catalog;
@@ -39,29 +43,38 @@ mod usage_store;
 pub(crate) mod web_search;
 #[cfg(windows)]
 mod windows_transport;
+pub(crate) use lm_studio_endpoint::LmStudioEndpoint;
 use managed_models::Purpose;
 pub(crate) use models::discover_policy_profile;
 pub(crate) use models::{
-    LocalModelServer, MAX_LOCAL_SCAN_ENDPOINTS, discover_lm_studio, discover_remote,
-    scan_local_models,
+    LmStudioCapabilities, LmStudioCatalog, LmStudioReasoningOption, LocalModelServer,
+    MAX_LOCAL_SCAN_ENDPOINTS, discover_lm_studio_catalog, discover_policy_lm_studio_catalog,
+    discover_remote, scan_local_models,
 };
 pub(crate) use models::{discover, discover_with_credential};
 pub(crate) use policy_authority::PolicyModelAuthority;
+#[cfg(test)]
+pub(crate) use policy_auto_model::resolve_lm_studio_auto_with_test_root;
+pub(crate) use policy_auto_model::{LmStudioAutoModel, resolve_lm_studio_auto};
 use policy_profile::PolicyProfileAuthority;
 pub(crate) use policy_profile::{PolicyAutoModel, resolve_policy_auto_model};
 pub(crate) use prompt_preset::PromptPreset;
-pub(crate) use providers::{RemoteProtocol, remote_api_base, remote_destination};
+pub(crate) use providers::{
+    MINIMAX_NATIVE_ENDPOINT, MINIMAX_NATIVE_PATH, RemoteProtocol, is_messages_path,
+    remote_api_base, remote_destination,
+};
 use runtime_package::BackendUse;
 pub(crate) use streaming::StreamDelta;
 pub(crate) use tokenizer::Tokenizer;
 pub(crate) use usage::Usage;
 pub(crate) use usage_store::take_notice as take_usage_notice;
 pub(crate) use usage_store::{
-    Account as UsageAccount, Budget as UsageBudget, Counters as UsageCounters,
+    Account as UsageAccount, Budget as UsageBudget, Counters as UsageCounters, JournalCost,
     Snapshot as UsageSnapshot, Warning as UsageWarning,
 };
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "127.0.0.1:11434";
+pub(crate) const ANTHROPIC_LOOPBACK_ENDPOINT: &str = "http://localhost:1234/v1/messages";
 
 pub(crate) fn start_mlx_model(
     profile: &std::path::Path,
@@ -104,15 +117,42 @@ pub(crate) struct Profile {
     options: ProfileOptions,
     prompt_preset: PromptPreset,
     usage_account: Option<UsageAccount>,
+    journal_identity: Option<Arc<JournalProfileIdentity>>,
+    vision_mode: VisionMode,
+    lm_studio_auto: Option<Arc<LmStudioAutoModel>>,
     policy_model: Option<PolicyModelAuthority>,
     policy_profile: Option<PolicyProfileAuthority>,
 }
 
+#[derive(Clone, Copy, Default, Eq, PartialEq)]
+pub(crate) enum VisionMode {
+    #[default]
+    Auto,
+    Enabled,
+    Disabled,
+}
+
+#[derive(Debug)]
+pub(crate) struct JournalProfileIdentity {
+    pub(crate) reference: kortty_jobs::ProfileRef,
+    pub(crate) name: String,
+    pub(crate) java_id: Option<String>,
+}
+
+impl PartialEq for JournalProfileIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        // A label edit does not change in-flight transport authority.
+        self.reference == other.reference
+    }
+}
+
+impl Eq for JournalProfileIdentity {}
+
 #[derive(Clone, Eq, PartialEq)]
 enum Target {
     External(SocketAddr),
-    LmStudio(SocketAddr),
-    PolicyAuto(policy_profile::AutoModelTarget),
+    LmStudio(LmStudioEndpoint),
+    LoopbackAnthropic(LmStudioEndpoint),
     Remote(String, RemoteProtocol),
     Managed(PathBuf, Purpose, BackendUse),
     ManagedMlx(PathBuf),
@@ -120,6 +160,69 @@ enum Target {
 }
 
 impl Profile {
+    pub(crate) fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub(crate) fn uses_server_default_model(&self) -> bool {
+        // Only the server-default constructors permit an empty HTTP chat model.
+        self.model.is_empty()
+            && match self.target {
+                Target::External(_) | Target::LmStudio(_) => true,
+                Target::Remote(_, protocol) => protocol.is_openai(),
+                _ => false,
+            }
+    }
+
+    fn requested_chat_model(&self) -> Option<&str> {
+        (!self.uses_server_default_model()).then_some(self.model())
+    }
+
+    pub(crate) fn with_vision_mode(mut self, mode: VisionMode) -> Self {
+        self.vision_mode = mode;
+        self
+    }
+
+    pub(crate) fn journal_name(&self) -> &str {
+        self.journal_identity
+            .as_ref()
+            .map_or(&self.model, |identity| identity.name.as_str())
+    }
+
+    pub(crate) fn probe_credential(&self) -> Result<Option<Zeroizing<String>>, Error> {
+        if let Target::Cli(program, _) = &self.target {
+            return program.probe_credential();
+        }
+        self.current_probe_credential()
+    }
+
+    pub(crate) fn current_probe_credential(&self) -> Result<Option<Zeroizing<String>>, Error> {
+        if let Target::Cli(program, _) = &self.target {
+            return program.current_probe_credential();
+        }
+        if self.starts_sidecar() {
+            return Ok(None);
+        }
+        if let Some(credential) = self.policy_credential()? {
+            return Ok(Some(credential));
+        }
+        let credential = self
+            .options
+            .credential_env
+            .as_deref()
+            .map(credential_value)
+            .transpose()?;
+        if let Some(resolved) = &self.lm_studio_auto {
+            resolved.require_credential(credential.as_deref().map(String::as_str))?;
+        }
+        Ok(credential)
+    }
+
+    pub(crate) fn with_journal_identity(mut self, identity: JournalProfileIdentity) -> Self {
+        self.journal_identity = Some(Arc::new(identity));
+        self
+    }
+
     pub(crate) fn with_prompt_preset(mut self, configured: PromptPreset) -> Self {
         self.prompt_preset = configured.resolve(&self.model);
         self
@@ -188,12 +291,40 @@ impl Profile {
 
     pub(crate) fn is_remote(&self) -> bool {
         matches!(self.target, Target::Remote(..))
-            || matches!(&self.target, Target::PolicyAuto(target) if target.is_https())
+            || matches!(&self.target, Target::LmStudio(endpoint) | Target::LoopbackAnthropic(endpoint) if endpoint.is_https())
+    }
+
+    fn uses_anthropic_protocol(&self) -> bool {
+        match self.target {
+            Target::Remote(_, protocol) => protocol.is_anthropic(),
+            Target::LoopbackAnthropic(_) => true,
+            _ => false,
+        }
+    }
+
+    fn is_loopback_anthropic(&self) -> bool {
+        matches!(self.target, Target::LoopbackAnthropic(_))
+    }
+
+    fn require_loopback_anthropic_allowed(policy: &ClipboardPolicy) -> Result<(), Error> {
+        if policy.problem.is_some() || !policy.ai_allowed {
+            return Err(Error::Review(
+                "Managed policy blocks the loopback Anthropic Messages endpoint.".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn uses_lm_studio_protocol(&self) -> bool {
+        matches!(&self.target, Target::LmStudio(endpoint) if endpoint.uses_native_protocol())
+    }
+
+    fn supports_lm_studio_metadata(&self) -> bool {
         matches!(self.target, Target::LmStudio(_))
-            || matches!(&self.target, Target::PolicyAuto(target) if target.uses_native_protocol())
+            || self
+                .policy_profile
+                .as_ref()
+                .is_some_and(|authority| authority.is_lm_studio())
     }
 
     pub(crate) fn is_cli(&self) -> bool {
@@ -215,6 +346,9 @@ impl Profile {
             },
             prompt_preset: PromptPreset::Generic,
             usage_account: None,
+            journal_identity: None,
+            vision_mode: VisionMode::Auto,
+            lm_studio_auto: None,
             policy_model: None,
             policy_profile: None,
         }
@@ -272,16 +406,21 @@ impl Profile {
     }
 
     pub(crate) fn with_output_limit(mut self, limit: u32) -> Self {
-        self.options.max_output_tokens = Some(
-            self.options
-                .max_output_tokens
-                .map_or(limit, |configured| configured.min(limit)),
-        );
+        let configured = if self.uses_anthropic_protocol() {
+            Some(self.anthropic_output_limit())
+        } else {
+            self.options.max_output_tokens
+        };
+        self.options.max_output_tokens = Some(configured.map_or(limit, |value| value.min(limit)));
         self
     }
 
     pub(crate) fn effective_output_limit(&self) -> u32 {
-        self.options.max_output_tokens.unwrap_or(4096)
+        if self.uses_anthropic_protocol() {
+            self.anthropic_output_limit()
+        } else {
+            self.options.max_output_tokens.unwrap_or(4096)
+        }
     }
 
     pub(crate) fn new(endpoint: &str, model: &str) -> Result<Self, String> {
@@ -306,12 +445,120 @@ impl Profile {
         model: &str,
         options: ProfileOptions,
     ) -> Result<Self, String> {
-        Self::validate_options(&options)?;
-        let mut profile = Self::from_address(lm_studio_endpoint(endpoint)?, model, options)?;
-        if let Target::External(address) = profile.target {
-            profile.target = Target::LmStudio(address);
+        Self::lm_studio_profile(endpoint, model, options, true)
+    }
+
+    pub(crate) fn lm_studio_compatible(
+        endpoint: &str,
+        model: &str,
+        options: ProfileOptions,
+    ) -> Result<Self, String> {
+        Self::lm_studio_profile(endpoint, model, options, false)
+    }
+
+    pub(crate) fn lm_studio_with_server_default(
+        endpoint: &str,
+        options: ProfileOptions,
+        native: bool,
+    ) -> Result<Self, String> {
+        let endpoint = LmStudioEndpoint::parse(endpoint, native)?;
+        Self::with_server_default(Target::LmStudio(endpoint), options)
+    }
+
+    pub(crate) fn configured_with_server_default(
+        endpoint: &str,
+        options: ProfileOptions,
+    ) -> Result<Self, String> {
+        let address = numeric_loopback_endpoint(endpoint)?;
+        Self::with_server_default(Target::External(address), options)
+    }
+
+    pub(crate) fn openai_with_server_default(
+        endpoint: &str,
+        protocol: RemoteProtocol,
+        options: ProfileOptions,
+    ) -> Result<Self, String> {
+        if !protocol.is_openai() {
+            return Err(
+                "Choose an OpenAI-compatible HTTPS endpoint for provider model selection.".into(),
+            );
         }
+        let base = providers::remote_api_base(endpoint, protocol)?;
+        Self::with_server_default(Target::Remote(base, protocol), options)
+    }
+
+    fn with_server_default(target: Target, options: ProfileOptions) -> Result<Self, String> {
+        Self::validate_options(&options)?;
+        if options.reasoning_effort.is_some() {
+            return Err(
+                "Choose Model default for reasoning when the AI server selects the model.".into(),
+            );
+        }
+        Ok(Self::for_target(target, String::new(), options))
+    }
+
+    fn lm_studio_profile(
+        endpoint: &str,
+        model: &str,
+        options: ProfileOptions,
+        native: bool,
+    ) -> Result<Self, String> {
+        Self::validate_options(&options)?;
+        if !native && options.reasoning_effort.as_deref() == Some("on") {
+            return Err(
+                "Explicit reasoning On is available only for native LM Studio profiles.".into(),
+            );
+        }
+        let endpoint = LmStudioEndpoint::parse(endpoint, native)?;
+        Self::with_target(Target::LmStudio(endpoint), model, options)
+    }
+
+    pub(crate) fn lm_studio_with_auto_model(
+        endpoint: &str,
+        preferred: &str,
+        options: ProfileOptions,
+        resolved: &LmStudioAutoModel,
+    ) -> Result<Self, String> {
+        if !resolved.matches(endpoint, preferred, options.credential_env.as_deref(), true) {
+            return Err(
+                "The automatic LM Studio model selection changed. Resolve it again.".into(),
+            );
+        }
+        let mut profile = Self::lm_studio(endpoint, resolved.model(), options)?;
+        profile.lm_studio_auto = Some(Arc::new(resolved.clone()));
         Ok(profile)
+    }
+
+    pub(crate) fn lm_studio_compatible_with_auto_model(
+        endpoint: &str,
+        preferred: &str,
+        options: ProfileOptions,
+        resolved: &LmStudioAutoModel,
+    ) -> Result<Self, String> {
+        if !resolved.matches(
+            endpoint,
+            preferred,
+            options.credential_env.as_deref(),
+            false,
+        ) {
+            return Err(
+                "The automatic LM Studio model selection changed. Resolve it again.".into(),
+            );
+        }
+        let mut profile = Self::lm_studio_compatible(endpoint, resolved.model(), options)?;
+        profile.lm_studio_auto = Some(Arc::new(resolved.clone()));
+        Ok(profile)
+    }
+
+    pub(crate) fn lm_studio_auto_binding(&self) -> Option<[u8; 32]> {
+        self.lm_studio_auto
+            .as_deref()
+            .map(LmStudioAutoModel::binding)
+    }
+
+    pub(crate) fn reviewed_model_fingerprint(&self) -> Option<[u8; 32]> {
+        self.policy_authority_fingerprint()
+            .or_else(|| self.lm_studio_auto_binding())
     }
 
     pub(crate) fn remote(
@@ -325,15 +572,18 @@ impl Profile {
         if !valid_model(model) {
             return Err("Enter a valid model identifier".into());
         }
-        Ok(Self {
-            target: Target::Remote(providers::remote_api_base(endpoint, protocol)?, protocol),
-            model: model.into(),
-            options,
-            prompt_preset: PromptPreset::Generic,
-            usage_account: None,
-            policy_model: None,
-            policy_profile: None,
-        })
+        let target = Target::Remote(providers::remote_api_base(endpoint, protocol)?, protocol);
+        Ok(Self::for_target(target, model.into(), options))
+    }
+
+    pub(crate) fn loopback_anthropic(
+        endpoint: &str,
+        model: &str,
+        options: ProfileOptions,
+    ) -> Result<Self, String> {
+        Self::validate_options(&options)?;
+        let endpoint = LmStudioEndpoint::parse_anthropic(endpoint)?;
+        Self::with_target(Target::LoopbackAnthropic(endpoint), model, options)
     }
 
     pub(crate) fn managed(
@@ -366,6 +616,9 @@ impl Profile {
             options,
             prompt_preset: PromptPreset::Generic,
             usage_account: None,
+            journal_identity: None,
+            vision_mode: VisionMode::Auto,
+            lm_studio_auto: None,
             policy_model,
             policy_profile: None,
         })
@@ -403,6 +656,9 @@ impl Profile {
             options,
             prompt_preset: PromptPreset::Generic,
             usage_account: None,
+            journal_identity: None,
+            vision_mode: VisionMode::Auto,
+            lm_studio_auto: None,
             policy_model,
             policy_profile: None,
         })
@@ -435,7 +691,7 @@ impl Profile {
         if options.reasoning_effort.as_deref().is_some_and(|effort| {
             !matches!(
                 effort,
-                "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+                "none" | "on" | "minimal" | "low" | "medium" | "high" | "xhigh"
             )
         }) {
             return Err("Select a supported reasoning effort".into());
@@ -448,25 +704,37 @@ impl Profile {
         model: &str,
         options: ProfileOptions,
     ) -> Result<Self, String> {
+        Self::with_target(Target::External(address), model, options)
+    }
+
+    fn with_target(target: Target, model: &str, options: ProfileOptions) -> Result<Self, String> {
         let model = model.trim();
         if !valid_model(model) {
             return Err("Enter the installed model name".into());
         }
-        Ok(Self {
-            target: Target::External(address),
-            model: model.into(),
+        Ok(Self::for_target(target, model.into(), options))
+    }
+
+    fn for_target(target: Target, model: String, options: ProfileOptions) -> Self {
+        Self {
+            target,
+            model,
             options,
             prompt_preset: PromptPreset::Generic,
             usage_account: None,
+            journal_identity: None,
+            vision_mode: VisionMode::Auto,
+            lm_studio_auto: None,
             policy_model: None,
             policy_profile: None,
-        })
+        }
     }
 
     #[cfg(test)]
     fn external_address(&self) -> SocketAddr {
         match &self.target {
-            Target::External(address) | Target::LmStudio(address) => *address,
+            Target::External(address) => *address,
+            Target::LmStudio(endpoint) => endpoint.http_address().expect("numeric HTTP test route"),
             _ => panic!("expected a loopback test profile"),
         }
     }
@@ -495,6 +763,16 @@ pub(crate) fn lm_studio_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
         .or_else(|| endpoint.strip_suffix("/api/v1"))
         .unwrap_or(endpoint);
     numeric_loopback_endpoint(endpoint)
+}
+
+pub(crate) fn lm_studio_compatible_endpoint(endpoint: &str) -> Result<SocketAddr, String> {
+    let endpoint = endpoint.trim().trim_end_matches('/');
+    let endpoint = endpoint.strip_prefix("http://").unwrap_or(endpoint);
+    let endpoint = endpoint
+        .strip_suffix("/v1/chat/completions")
+        .or_else(|| endpoint.strip_suffix("/v1"))
+        .unwrap_or(endpoint);
+    parse_loopback(endpoint)
 }
 
 fn parse_loopback(endpoint: &str) -> Result<SocketAddr, String> {
@@ -565,7 +843,7 @@ fn remote_header(
     value: &str,
     protocol: RemoteProtocol,
 ) -> Result<(&'static str, ureq::http::HeaderValue), Error> {
-    if protocol == RemoteProtocol::OpenAi {
+    if !protocol.is_anthropic() {
         return Ok(("authorization", bearer_header(value)?));
     }
     let mut header = ureq::http::HeaderValue::from_str(value).map_err(|_| Error::Credential)?;
@@ -639,10 +917,7 @@ pub(crate) struct Session {
 impl Session {
     pub(crate) fn begin(profile: Profile) -> Option<(Self, Cancel)> {
         let permit = WorkerPermit::acquire()?;
-        let client = Client::new(profile);
-        let cancel = Cancel {
-            activity: Arc::clone(&client.activity),
-        };
+        let (client, cancel) = Client::new_cancellable(profile);
         Some((
             Self {
                 client,
@@ -658,15 +933,6 @@ impl Session {
 
     #[cfg(test)]
     pub(crate) fn trust_test_server(&mut self, certificate_der: &[u8]) -> Result<(), Error> {
-        let Target::Remote(base, _) = &self.client.profile.target else {
-            return Err(Error::Service);
-        };
-        let url = url::Url::parse(base).map_err(|_| Error::Service)?;
-        if !matches!(url.host(), Some(url::Host::Ipv4(address)) if address.is_loopback())
-            && !matches!(url.host(), Some(url::Host::Ipv6(address)) if address.is_loopback())
-        {
-            return Err(Error::Service);
-        }
         let certificate = ureq::tls::Certificate::from_der(certificate_der).to_owned();
         let roots = RootCerts::new_with_certs(&[certificate]);
         let timeout = self
@@ -675,9 +941,25 @@ impl Session {
             .options
             .timeout
             .unwrap_or(DEFAULT_TIMEOUT);
-        let agent = connection_agent(connection_config_with_roots(timeout, roots));
-        let connection =
-            Connection::attach(base.clone(), agent, Arc::clone(&self.client.activity))?;
+        let config = connection_config_with_roots(timeout, roots);
+        let activity = Arc::clone(&self.client.activity);
+        let connection = match &self.client.profile.target {
+            Target::LmStudio(endpoint) | Target::LoopbackAnthropic(endpoint)
+                if endpoint.is_https() =>
+            {
+                endpoint.connect(config, activity)
+            }
+            Target::Remote(base, _) => {
+                let url = url::Url::parse(base).map_err(|_| Error::Service)?;
+                if !matches!(url.host(), Some(url::Host::Ipv4(address)) if address.is_loopback())
+                    && !matches!(url.host(), Some(url::Host::Ipv6(address)) if address.is_loopback())
+                {
+                    return Err(Error::Service);
+                }
+                Connection::attach(base.clone(), connection_agent(config), activity)
+            }
+            _ => Err(Error::Service),
+        }?;
         self.client
             .transport
             .get_mut()
@@ -855,6 +1137,75 @@ pub(crate) struct Client {
     usage: Mutex<Option<Usage>>,
 }
 
+const LM_STUDIO_METADATA_TIMEOUT: Duration = Duration::from_secs(5);
+const LM_STUDIO_METADATA_TTL: Duration = Duration::from_secs(10 * 60);
+const LM_STUDIO_METADATA_CACHE_SIZE: usize = 64;
+
+#[derive(PartialEq, Eq)]
+struct LmStudioMetadataKey {
+    endpoint: String,
+    model: String,
+    credential: Option<[u8; 32]>,
+}
+
+struct LmStudioMetadata {
+    key: LmStudioMetadataKey,
+    capabilities: Option<LmStudioCapabilities>,
+    checked: Instant,
+}
+
+static LM_STUDIO_METADATA: Mutex<Vec<LmStudioMetadata>> = Mutex::new(Vec::new());
+
+fn lm_studio_credential_digest(credential: Option<&str>) -> Option<[u8; 32]> {
+    credential.map(|value| {
+        let mut digest = Sha256::new();
+        digest.update(b"kortty LM Studio metadata credential v1\0");
+        digest.update(value.as_bytes());
+        digest.finalize().into()
+    })
+}
+
+fn lm_studio_model_suggests_vision(model: &str) -> bool {
+    let model = model.to_ascii_lowercase();
+    let bare = model.rsplit('/').next().unwrap_or_default();
+    [
+        "vision",
+        "multimodal",
+        "-vl",
+        "vlm",
+        "gemini-",
+        "gemma-3",
+        "gemma3",
+        "pixtral",
+        "llava",
+        "internvl",
+        "minicpm-v",
+        "molmo",
+        "glm-4v",
+        "llama-4",
+        "llama4",
+    ]
+    .iter()
+    .any(|part| model.contains(part))
+        || [
+            "chatgpt-4o",
+            "gpt-4o",
+            "gpt-4.1",
+            "gpt-4-turbo",
+            "gpt-5",
+            "o4",
+            "minimax-m3",
+        ]
+        .iter()
+        .any(|prefix| bare.starts_with(prefix))
+        || bare.starts_with("o3") && !bare.starts_with("o3-mini")
+        || bare.starts_with("o1") && !bare.starts_with("o1-mini")
+        || bare.starts_with("claude-")
+            && !["claude-1", "claude-2", "claude-instant"]
+                .iter()
+                .any(|prefix| bare.starts_with(prefix))
+}
+
 struct Transport {
     connection: Connection,
     lease: Option<runtime_package::Lease>,
@@ -881,6 +1232,10 @@ struct UsageAttempt {
 }
 
 impl Client {
+    pub(crate) fn profile(&self) -> &Profile {
+        &self.profile
+    }
+
     pub(crate) fn render_system_prompt<'a>(&self, system: &'a str) -> Cow<'a, str> {
         self.profile.render_system_prompt(system)
     }
@@ -889,10 +1244,10 @@ impl Client {
         let transport = OnceLock::new();
         let timeout = profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
         let connection = match &profile.target {
-            Target::External(address) | Target::LmStudio(address) => {
-                Some(Connection::new(*address, timeout))
+            Target::External(address) => Some(Connection::new(*address, timeout)),
+            Target::LmStudio(endpoint) | Target::LoopbackAnthropic(endpoint) => {
+                Some(endpoint.connection(timeout))
             }
-            Target::PolicyAuto(target) => Some(target.connection(timeout)),
             Target::Remote(base, _) => Some(Connection::with_base(base.clone(), timeout)),
             Target::Managed(..) | Target::ManagedMlx(_) | Target::Cli(..) => None,
         };
@@ -914,11 +1269,39 @@ impl Client {
         }
     }
 
+    pub(crate) fn new_cancellable(profile: Profile) -> (Self, Cancel) {
+        let client = Self::new(profile);
+        let cancel = Cancel {
+            activity: Arc::clone(&client.activity),
+        };
+        (client, cancel)
+    }
+
     pub(crate) fn take_usage(&self) -> Option<Usage> {
         self.usage
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take()
+    }
+
+    pub(crate) fn estimated_usage_cost(
+        &self,
+        input_tokens: Option<u64>,
+        output_tokens: Option<u64>,
+    ) -> Option<JournalCost> {
+        self.profile
+            .usage_account
+            .as_ref()?
+            .budget()
+            .journal_cost(input_tokens, output_tokens)
+    }
+
+    pub(crate) fn is_local_usage(&self) -> bool {
+        !self.profile.is_remote() && !self.profile.is_cli()
+    }
+
+    pub(crate) fn journal_identity(&self) -> Option<Arc<JournalProfileIdentity>> {
+        self.profile.journal_identity.clone()
     }
 
     fn record_usage(&self, usage: Usage) {
@@ -988,10 +1371,20 @@ impl Client {
         read_policy: impl FnOnce() -> ClipboardPolicy,
     ) -> Result<(), Error> {
         let embedded = self.profile.starts_sidecar();
-        if !embedded && self.profile.policy_profile.is_none() {
+        if !embedded
+            && self.profile.policy_profile.is_none()
+            && self.profile.lm_studio_auto.is_none()
+            && !self.profile.is_loopback_anthropic()
+        {
             return Ok(());
         }
         let policy = read_policy();
+        if self.profile.is_loopback_anthropic() {
+            Profile::require_loopback_anthropic_allowed(&policy)?;
+        }
+        if self.profile.lm_studio_auto.is_some() {
+            policy_auto_model::require_lm_studio_auto_allowed(&policy)?;
+        }
         if let Some(authority) = &self.profile.policy_profile {
             authority.require_current(&policy)?;
         }
@@ -1167,7 +1560,14 @@ impl Client {
     }
 
     pub(crate) fn complete(&self, system: &str, input: &str) -> Result<String, Error> {
-        self.complete_request(system, RequestContent::Text(input), true, None, false)
+        self.complete_request(
+            system,
+            RequestContent::Text(input),
+            true,
+            None,
+            false,
+            || Ok(()),
+        )
     }
 
     #[cfg(test)]
@@ -1178,7 +1578,7 @@ impl Client {
         input: &str,
     ) -> Result<String, Error> {
         let messages = chat_messages(system, history, input);
-        self.complete_messages(&messages, false, None, false)
+        self.complete_messages(&messages, false, None, false, || Ok(()))
     }
 
     pub(crate) fn complete_before(
@@ -1197,7 +1597,7 @@ impl Client {
         input: &str,
         response_format: bool,
         deadline: Instant,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> Result<String, Error> {
         self.complete_text_request(
             system,
@@ -1227,7 +1627,7 @@ impl Client {
         input: &str,
         response_format: bool,
         deadline: Instant,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> (Result<String, Error>, Option<CompletionLimit>) {
         let mut stop = None;
         let result = self.with_completion(|attempt| {
@@ -1269,7 +1669,7 @@ impl Client {
         input: &str,
         response_format: bool,
         deadline: Instant,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> Result<String, Error> {
         self.complete_text_request(
             system,
@@ -1288,7 +1688,7 @@ impl Client {
         input: &str,
         deadline: Instant,
         credential: Option<Zeroizing<String>>,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> Result<String, Error> {
         self.complete_reviewed_https_before(
             system,
@@ -1306,7 +1706,7 @@ impl Client {
         input: &str,
         deadline: Instant,
         credential: Option<Zeroizing<String>>,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> Result<String, Error> {
         self.complete_reviewed_https_before(
             system,
@@ -1318,14 +1718,14 @@ impl Client {
         )
     }
 
-    fn complete_reviewed_https_before(
+    pub(crate) fn complete_reviewed_https_before(
         &self,
         system: &str,
         input: &str,
         response_format: bool,
         deadline: Instant,
         credential: Option<Zeroizing<String>>,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> Result<String, Error> {
         if !self.profile.is_remote() {
             return Err(Error::Invalid("choose a reviewed HTTPS profile"));
@@ -1353,7 +1753,7 @@ impl Client {
         response_format: bool,
         deadline: Instant,
         require_complete: bool,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> Result<String, Error> {
         self.with_completion(|attempt| {
             self.complete_messages_inner(
@@ -1371,17 +1771,166 @@ impl Client {
     }
 
     pub(crate) fn model(&self) -> &str {
-        &self.profile.model
+        self.profile.model()
     }
 
-    pub(crate) fn complete_vision_before(
+    pub(crate) fn tokenizer(&self) -> Tokenizer {
+        self.profile.tokenizer()
+    }
+
+    pub(crate) fn prepare_cli_payload(
+        &self,
+        system: &str,
+        input: &str,
+    ) -> Result<cli::Request, Error> {
+        self.profile.prepare_cli_chat(system, &[], input)
+    }
+
+    pub(crate) fn require_vision_supported(
+        &self,
+        deadline: Instant,
+        authorize: impl Fn() -> Result<(), String>,
+    ) -> Result<(), Error> {
+        let guard = || authorize().map_err(Error::Review);
+        guard()?;
+        if !self.active() {
+            return Err(Error::Cancelled);
+        }
+        if self.profile.vision_mode == VisionMode::Disabled {
+            return Err(Error::Review(
+                "Vision is disabled for the selected AI profile.".into(),
+            ));
+        }
+        if self.profile.vision_mode == VisionMode::Enabled {
+            return Ok(());
+        }
+        if self.profile.uses_server_default_model() {
+            return Err(Error::Review(
+                "The AI server selects the model. Enable vision explicitly after checking the server's model before sending images.".into(),
+            ));
+        }
+        if !self.profile.supports_lm_studio_metadata() {
+            return Ok(());
+        }
+        let capabilities = self.lm_studio_capabilities(Some(deadline), guard)?;
+        match capabilities.and_then(|capabilities| capabilities.vision) {
+            Some(true) => Ok(()),
+            Some(false) => Err(Error::Review("The selected LM Studio model does not support image input.".into())),
+            None if lm_studio_model_suggests_vision(&self.profile.model) => Ok(()),
+            None => Err(Error::Review("Image support for the selected LM Studio model could not be determined. Choose a vision-capable model or enable vision in the profile.".into())),
+        }
+    }
+
+    fn lm_studio_capabilities(
+        &self,
+        deadline: Option<Instant>,
+        authorize: impl Fn() -> Result<(), Error>,
+    ) -> Result<Option<LmStudioCapabilities>, Error> {
+        if matches!(&self.profile.target, Target::LmStudio(endpoint) if !endpoint.supports_metadata())
+        {
+            return Ok(None);
+        }
+        let limit = Instant::now()
+            + self
+                .profile
+                .options
+                .timeout
+                .unwrap_or(LM_STUDIO_METADATA_TIMEOUT)
+                .min(LM_STUDIO_METADATA_TIMEOUT);
+        let deadline = deadline.map_or(limit, |deadline| deadline.min(limit));
+        if deadline <= Instant::now() {
+            return Err(Error::TimedOut);
+        }
+        let transport = self.transport(Some(deadline))?;
+        let credential = self.profile.current_probe_credential()?;
+        let secret = credential.as_deref().map(String::as_str);
+        let key = LmStudioMetadataKey {
+            endpoint: transport.connection.base.clone(),
+            model: self.profile.model.clone(),
+            credential: lm_studio_credential_digest(secret),
+        };
+        let require_current = || {
+            self.validate_transport(transport)?;
+            authorize()?;
+            if self.profile.current_probe_credential()? != credential {
+                return Err(Error::Review(
+                    "The model credential changed. Review the request again.".into(),
+                ));
+            }
+            Ok(())
+        };
+        require_current()?;
+        {
+            let mut cache = LM_STUDIO_METADATA
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            cache.retain(|entry| entry.checked.elapsed() < LM_STUDIO_METADATA_TTL);
+            if let Some(entry) = cache.iter().find(|entry| entry.key == key) {
+                return Ok(entry.capabilities.clone());
+            }
+        }
+        let response = models::lm_studio_catalog_guarded(
+            &transport.connection,
+            secret,
+            deadline,
+            require_current,
+        );
+        require_current()?;
+        let capabilities = match response {
+            Ok(catalog) => catalog.capability(&self.profile.model).cloned(),
+            Err(Error::Service | Error::Status(_) | Error::Invalid(_)) => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        let mut cache = LM_STUDIO_METADATA
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        cache.retain(|entry| entry.key != key);
+        if cache.len() == LM_STUDIO_METADATA_CACHE_SIZE {
+            cache.remove(0);
+        }
+        cache.push(LmStudioMetadata {
+            key,
+            capabilities: capabilities.clone(),
+            checked: Instant::now(),
+        });
+        Ok(capabilities)
+    }
+
+    fn require_lm_studio_reasoning(&self, deadline: Option<Instant>) -> Result<(), Error> {
+        let Some(option) = self
+            .profile
+            .options
+            .reasoning_effort
+            .as_deref()
+            .map(providers::lm_reasoning)
+        else {
+            return Ok(());
+        };
+        let available = self
+            .lm_studio_capabilities(deadline, || Ok(()))?
+            .and_then(|capabilities| capabilities.reasoning);
+        if available.is_some_and(|reasoning| {
+            !reasoning
+                .allowed
+                .iter()
+                .any(|allowed| allowed.as_str() == option)
+        }) {
+            return Err(Error::Review("The selected LM Studio model does not support this reasoning setting. Select a supported setting or Model default in AI Manager.".into()));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete_vision_before_guarded(
         &self,
         system: &str,
         input: &str,
         png_data_url: &str,
         response_format: bool,
         deadline: Instant,
+        before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> Result<String, Error> {
+        drop(self.take_usage());
+        self.require_vision_supported(deadline, || Ok(()))?;
         self.complete_request(
             system,
             RequestContent::Vision([
@@ -1393,6 +1942,7 @@ impl Client {
             response_format,
             Some(deadline),
             true,
+            before_dispatch,
         )
     }
 
@@ -1403,6 +1953,7 @@ impl Client {
         response_format: bool,
         deadline: Option<Instant>,
         require_complete: bool,
+        before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> Result<String, Error> {
         self.complete_messages(
             &[
@@ -1415,6 +1966,7 @@ impl Client {
             response_format,
             deadline,
             require_complete,
+            before_dispatch,
         )
     }
 
@@ -1424,6 +1976,7 @@ impl Client {
         response_format: bool,
         deadline: Option<Instant>,
         require_complete: bool,
+        before_dispatch: impl FnMut() -> Result<(), String>,
     ) -> Result<String, Error> {
         self.with_completion(|attempt| {
             self.complete_messages_inner(
@@ -1431,7 +1984,7 @@ impl Client {
                 response_format,
                 deadline,
                 require_complete,
-                || Ok(()),
+                before_dispatch,
                 attempt,
             )
         })
@@ -1443,7 +1996,7 @@ impl Client {
         response_format: bool,
         deadline: Option<Instant>,
         require_complete: bool,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        mut before_dispatch: impl FnMut() -> Result<(), String>,
         attempt: &mut UsageAttempt,
     ) -> Result<String, Error> {
         if !self.active() {
@@ -1465,8 +2018,11 @@ impl Client {
         };
         self.require_text_for_mlx(messages)?;
         let transport = self.transport(deadline)?;
+        if self.profile.uses_lm_studio_protocol() {
+            self.require_lm_studio_reasoning(deadline)?;
+        }
         let deadline =
-            self.before_completion_dispatch(transport, deadline, before_dispatch, attempt)?;
+            self.before_completion_dispatch(transport, deadline, &mut before_dispatch, attempt)?;
         if transport
             .lease
             .as_ref()
@@ -1490,16 +2046,15 @@ impl Client {
                 &mut attempt.usage,
                 attempt.agent_completion.as_mut(),
             )
-        } else if matches!(
-            self.profile.target,
-            Target::Remote(_, RemoteProtocol::Anthropic)
-        ) {
-            let body = providers::anthropic_request(self, messages, response_format, false)?;
-            let mut response = self.completion_response(transport, &body, deadline, attempt)?;
-            let bytes = self.cancellable_response_bytes(
-                &mut response,
-                deadline.is_some() || self.profile.options.timeout.is_some(),
+        } else if self.profile.uses_anthropic_protocol() {
+            let (mut response, _) = self.anthropic_completion(
+                transport,
+                (messages, response_format, false),
+                deadline,
+                before_dispatch,
+                attempt,
             )?;
+            let bytes = self.cancellable_response_bytes(&mut response, true)?;
             providers::anthropic_response_with_stop(
                 &bytes,
                 require_complete,
@@ -1509,15 +2064,14 @@ impl Client {
             .map(|(answer, _)| answer)
         } else {
             let response_format = response_format && !self.profile.is_mlx();
-            let body = self.openai_request(messages, response_format, false)?;
-            self.read_completion(
-                transport,
-                &body,
+            let request = self.openai_payload(
+                messages,
                 response_format,
-                deadline,
-                require_complete,
-                attempt,
-            )
+                false,
+                self.openai_reasoning(transport)?,
+            )?;
+            self.openai_response(transport, request, deadline, before_dispatch, attempt)
+                .and_then(|response| self.read_completion(response, require_complete, attempt))
         };
         if let Err(error) = self.validate_transport(transport) {
             attempt.agent_completion = None;
@@ -1539,7 +2093,7 @@ impl Client {
         requires_intact_answer: bool,
     ) -> Result<String, Error> {
         if requires_intact_answer
-            && self.profile.is_remote()
+            && (self.profile.is_remote() || self.profile.is_loopback_anthropic())
             && credential.is_some_and(|secret| credential_echo(&answer, secret))
         {
             // A redacted command or generated artifact must not become a new proposal.
@@ -1551,18 +2105,62 @@ impl Client {
         Ok(policy_profile::redact_echo(answer, credential))
     }
 
+    #[cfg(test)]
     fn openai_request(
         &self,
         messages: &[RequestMessage<'_>],
         response_format: bool,
         stream: bool,
     ) -> Result<Zeroizing<Vec<u8>>, Error> {
-        let openai = matches!(&self.profile.target, Target::Remote(base, RemoteProtocol::OpenAi)
-            if base.starts_with("https://api.openai.com/"));
+        self.openai_payload(
+            messages,
+            response_format,
+            stream,
+            mlx_models::ReasoningControls::DefaultOnly,
+        )?
+        .encode()
+    }
+
+    fn openai_payload<'a>(
+        &'a self,
+        messages: &'a [RequestMessage<'a>],
+        response_format: bool,
+        stream: bool,
+        mlx_reasoning: mlx_models::ReasoningControls,
+    ) -> Result<Request<'a>, Error> {
+        let openai = matches!(&self.profile.target, Target::Remote(base, protocol)
+            if protocol.is_openai() && base.starts_with("https://api.openai.com/"));
         let limit = self.profile.effective_output_limit();
         let mlx = self.profile.is_mlx();
-        serde_json::to_vec(&Request {
-            model: (!mlx).then_some(self.model()),
+        let effort = self.profile.options.reasoning_effort.as_deref();
+        let chat_template_kwargs = if mlx {
+            effort
+                .map(|effort| mlx_reasoning.arguments(effort))
+                .transpose()
+                .map_err(Error::Invalid)?
+        } else {
+            None
+        };
+        let reasoning_effort = if mlx { None } else { effort };
+        let is_minimax_flash = self
+            .model()
+            .rsplit('/')
+            .next()
+            .and_then(|model| model.split(':').next())
+            .is_some_and(|model| model.eq_ignore_ascii_case("MiniMax-M3.1-Flash"));
+        if is_minimax_flash && reasoning_effort == Some("none") {
+            return Err(Error::Invalid(
+                "MiniMax-M3.1-Flash does not support the None reasoning setting. Choose Model default or another reasoning level.",
+            ));
+        }
+        let thinking = !mlx
+            && !self.profile.uses_server_default_model()
+            && !is_minimax_flash
+            && matches!(reasoning_effort, None | Some("none"))
+            && (contains_minimax(self.model())
+                || matches!(&self.profile.target, Target::Remote(base, _) if contains_minimax(base)));
+        Ok(Request {
+            model: self.profile.requested_chat_model().filter(|_| !mlx),
             stream,
             temperature: (!openai).then_some(0),
             max_tokens: (!openai).then_some(limit),
@@ -1571,16 +2169,14 @@ impl Client {
             stream_options: (openai && stream).then_some(StreamOptions {
                 include_usage: true,
             }),
-            reasoning_effort: (!mlx)
-                .then_some(self.profile.options.reasoning_effort.as_deref())
-                .flatten(),
+            reasoning_effort,
+            chat_template_kwargs,
+            thinking: thinking.then_some(Thinking { kind: "disabled" }),
             messages,
             response_format: (response_format && !mlx).then_some(ResponseFormat {
                 kind: "json_object",
             }),
         })
-        .map(Zeroizing::new)
-        .map_err(|_| Error::Service)
     }
 
     fn require_text_for_mlx(&self, messages: &[RequestMessage<'_>]) -> Result<(), Error> {
@@ -1592,6 +2188,23 @@ impl Client {
             return Err(Error::Invalid("managed MLX profiles accept text only"));
         }
         Ok(())
+    }
+
+    fn openai_reasoning(
+        &self,
+        transport: &Transport,
+    ) -> Result<mlx_models::ReasoningControls, Error> {
+        if !self.profile.is_mlx() || self.profile.options.reasoning_effort.is_none() {
+            return Ok(mlx_models::ReasoningControls::DefaultOnly);
+        }
+        // Recheck the leased model and signed runtime immediately before using capabilities.
+        self.validate_lease(transport)?;
+        Ok(transport
+            .lease
+            .as_ref()
+            .map_or(mlx_models::ReasoningControls::DefaultOnly, |lease| {
+                lease.sidecar().mlx_reasoning_controls()
+            }))
     }
 
     fn validate_transport(&self, transport: &Transport) -> Result<(), Error> {
@@ -1622,7 +2235,21 @@ impl Client {
         before_dispatch: impl FnOnce() -> Result<(), String>,
         attempt: &UsageAttempt,
     ) -> Result<Option<Instant>, Error> {
-        let deadline = if let Some(resolved) = self
+        let deadline = if let Some(resolved) = &self.profile.lm_studio_auto {
+            let limit = Instant::now() + self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
+            let deadline = Some(deadline.map_or(limit, |deadline| deadline.min(limit)));
+            let credential = self.completion_credential(attempt)?;
+            resolved.require_current_model(
+                &transport.connection,
+                credential.as_deref().map(String::as_str),
+                deadline,
+                || {
+                    self.require_transport_policy(ClipboardPolicy::load)?;
+                    self.completion_credential(attempt).map(drop)
+                },
+            )?;
+            deadline
+        } else if let Some(resolved) = self
             .profile
             .policy_profile
             .as_ref()
@@ -1664,7 +2291,7 @@ impl Client {
         attempt: &UsageAttempt,
     ) -> Result<Option<Zeroizing<String>>, Error> {
         let mut credential = self.profile.policy_credential()?;
-        if credential.is_none() && matches!(self.profile.target, Target::Remote(..)) {
+        if credential.is_none() && !self.profile.starts_sidecar() {
             credential = self
                 .profile
                 .options
@@ -1679,25 +2306,107 @@ impl Client {
             .is_some_and(|reviewed| *reviewed != credential)
         {
             return Err(Error::Review(
-                "The HTTPS credential changed. Review the request again.".into(),
+                if self.profile.is_remote() {
+                    "The HTTPS credential changed. Review the request again."
+                } else {
+                    "The model credential changed. Review the request again."
+                }
+                .into(),
             ));
+        }
+        if let Some(resolved) = &self.profile.lm_studio_auto {
+            resolved.require_credential(credential.as_deref().map(String::as_str))?;
         }
         Ok(credential)
     }
 
-    fn read_completion(
+    fn openai_response(
         &self,
         transport: &Transport,
-        body: &[u8],
-        response_format: bool,
+        mut request: Request<'_>,
         deadline: Option<Instant>,
+        before_retry: impl FnMut() -> Result<(), String>,
+        attempt: &mut UsageAttempt,
+    ) -> Result<OpenAiResponse, Error> {
+        let detect_format = deadline.is_some() && request.response_format.is_some();
+        let limit = self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
+        let deadline = if request.thinking.is_some() {
+            let cutoff = Instant::now() + limit;
+            Some(deadline.map_or(cutoff, |deadline| deadline.min(cutoff)))
+        } else {
+            deadline
+        };
+        let mut response =
+            self.completion_response(transport, &request.encode()?, deadline, attempt)?;
+        let mut buffered = None;
+        let mut retry = false;
+        if request.thinking.is_some() {
+            if response.status().as_u16() == 400 {
+                let error = completion_error_bytes(&mut response).ok();
+                if let Some(bytes) = &error {
+                    retry = unsupported_thinking(bytes, &mut attempt.usage);
+                }
+                if !retry {
+                    return Err(
+                        if detect_format
+                            && error
+                                .as_ref()
+                                .is_some_and(|bytes| unsupported_response_format(bytes))
+                        {
+                            Error::UnsupportedResponseFormat
+                        } else {
+                            Error::Status(400)
+                        },
+                    );
+                }
+            } else if response.status().is_success() && !is_event_stream(&response) {
+                let bytes = self.cancellable_response_bytes(&mut response, true)?;
+                retry = providers::minimax_thinking_rejected_envelope(&bytes);
+                buffered = Some(bytes);
+            }
+        }
+        if retry {
+            self.validate_transport(transport)?;
+            if deadline.is_some_and(|deadline| deadline <= Instant::now()) {
+                return Err(Error::TimedOut);
+            }
+            // Never replay with another credential, even for unreviewed loopback requests.
+            attempt.reviewed_https_credential = Some(attempt.credential.clone());
+            self.before_completion_dispatch(transport, deadline, before_retry, attempt)?;
+            request.thinking = None;
+            response =
+                self.completion_response(transport, &request.encode()?, deadline, attempt)?;
+            buffered = None;
+        }
+        let status = response.status().as_u16();
+        if detect_format && matches!(status, 400 | 422) {
+            if let Ok(bytes) = completion_error_bytes(&mut response) {
+                let _ = observe_openai_error_usage(&bytes, &mut attempt.usage);
+                if unsupported_response_format(&bytes) {
+                    return Err(Error::UnsupportedResponseFormat);
+                }
+            }
+            return Err(Error::Status(status));
+        }
+        completion_status(&response)?;
+        Ok(OpenAiResponse {
+            response,
+            buffered,
+            deadline,
+        })
+    }
+
+    fn read_completion(
+        &self,
+        mut response: OpenAiResponse,
         require_complete: bool,
         attempt: &mut UsageAttempt,
     ) -> Result<String, Error> {
-        let mut response = self.completion_response(transport, body, deadline, attempt)?;
-        let bounded = deadline.is_some() || self.profile.options.timeout.is_some();
-        completion_status(&mut response, deadline.is_some() && response_format)?;
-        let bytes = response_bytes(&mut response, bounded)?;
+        let bounded = response.deadline.is_some() || self.profile.options.timeout.is_some();
+        let bytes = match response.buffered {
+            Some(bytes) => bytes,
+            None => response_bytes(&mut response.response, bounded)?,
+        };
         let answer = if !require_complete {
             let choice = first_choice::<String>(&bytes, &mut attempt.usage)?;
             if let Some(metadata) = &mut attempt.agent_completion
@@ -1736,8 +2445,9 @@ impl Client {
         attempt: &mut UsageAttempt,
     ) -> Result<ureq::http::Response<ureq::Body>, Error> {
         let endpoint = transport.connection.url(match &self.profile.target {
-            Target::LmStudio(_) => "/api/v1/chat",
-            Target::PolicyAuto(target) => target.completion_path(),
+            Target::LmStudio(endpoint) | Target::LoopbackAnthropic(endpoint) => {
+                endpoint.completion_path()
+            }
             Target::Remote(_, protocol) => protocol.completion_path(),
             _ => "/v1/chat/completions",
         });
@@ -1747,8 +2457,13 @@ impl Client {
             .post(endpoint)
             .content_type("application/json");
         attempt.credential = self.completion_credential(attempt)?;
-        if let Target::Remote(_, protocol) = self.profile.target {
-            if protocol == RemoteProtocol::Anthropic {
+        let credential_protocol = match self.profile.target {
+            Target::Remote(_, protocol) => Some(protocol),
+            Target::LoopbackAnthropic(_) => Some(RemoteProtocol::Anthropic),
+            _ => None,
+        };
+        if let Some(protocol) = credential_protocol {
+            if protocol.is_anthropic() {
                 request = request.header("anthropic-version", ANTHROPIC_VERSION);
             }
             if let Some(secret) = &attempt.credential {
@@ -1833,25 +2548,80 @@ impl Client {
     }
 }
 
-fn completion_status(
-    response: &mut ureq::http::Response<ureq::Body>,
-    detect_unsupported_format: bool,
-) -> Result<(), Error> {
+fn completion_status(response: &ureq::http::Response<ureq::Body>) -> Result<(), Error> {
     if response.status().is_success() {
         return Ok(());
     }
-    let status = response.status().as_u16();
-    if detect_unsupported_format && matches!(status, 400 | 422) {
-        let error = response
-            .body_mut()
-            .with_config()
-            .limit(MAX_ERROR_RESPONSE_BYTES)
-            .read_to_vec();
-        if error.as_deref().is_ok_and(unsupported_response_format) {
-            return Err(Error::UnsupportedResponseFormat);
-        }
+    Err(Error::Status(response.status().as_u16()))
+}
+
+fn completion_error_bytes(
+    response: &mut ureq::http::Response<ureq::Body>,
+) -> Result<Zeroizing<Vec<u8>>, ureq::Error> {
+    response
+        .body_mut()
+        .with_config()
+        .limit(MAX_ERROR_RESPONSE_BYTES)
+        .read_to_vec()
+        .map(Zeroizing::new)
+}
+
+fn contains_minimax(value: &str) -> bool {
+    value
+        .as_bytes()
+        .windows(b"minimax".len())
+        .any(|part| part.eq_ignore_ascii_case(b"minimax"))
+}
+
+fn is_event_stream(response: &ureq::http::Response<ureq::Body>) -> bool {
+    response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(';').next())
+        .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream"))
+}
+
+fn unsupported_thinking(bytes: &[u8], usage: &mut Usage) -> bool {
+    let Some(metadata) = observe_openai_error_usage(bytes, usage) else {
+        return false;
+    };
+    if metadata.usage.is_some()
+        || metadata
+            .choices
+            .as_ref()
+            .is_some_and(|choices| choices.as_array().is_none_or(|choices| !choices.is_empty()))
+    {
+        return false;
     }
-    Err(Error::Status(status))
+    let Ok(response) = serde_json::from_slice::<ErrorResponse>(bytes) else {
+        return false;
+    };
+    let error = response.error;
+    let explicit = matches!(error.param.as_deref(), Some("thinking" | "thinking.type"));
+    if error.param.is_some() && !explicit {
+        return false;
+    }
+    error.code.as_deref() == Some("unsupported_thinking")
+        || explicit
+            && matches!(
+                error.code.as_deref(),
+                Some("unsupported_parameter" | "unknown_parameter" | "unsupported_value")
+            )
+        || error
+            .message
+            .as_deref()
+            .is_some_and(providers::thinking_rejection_message)
+}
+
+fn observe_openai_error_usage(bytes: &[u8], usage: &mut Usage) -> Option<CompletionMetadata> {
+    let metadata: CompletionMetadata = serde_json::from_slice(bytes).ok()?;
+    usage.observe_openai(
+        metadata.usage.as_ref(),
+        metadata.model.as_ref(),
+        metadata.id.as_ref(),
+    );
+    Some(metadata)
 }
 
 fn response_bytes(
@@ -1944,6 +2714,17 @@ fn first_choice<T: DeserializeOwned>(bytes: &[u8], usage: &mut Usage) -> Result<
                     metadata.model.as_ref(),
                     metadata.id.as_ref(),
                 );
+                if let Some(error) = providers::openai_provider_error(
+                    metadata.error.as_ref(),
+                    metadata.base_resp.as_ref(),
+                    metadata
+                        .choices
+                        .as_ref()
+                        .and_then(Value::as_array)
+                        .is_some_and(|choices| !choices.is_empty()),
+                ) {
+                    return Err(error);
+                }
             }
             return Err(Error::Invalid("invalid chat response"));
         }
@@ -1953,6 +2734,13 @@ fn first_choice<T: DeserializeOwned>(bytes: &[u8], usage: &mut Usage) -> Result<
         completion.model.as_ref(),
         completion.id.as_ref(),
     );
+    if let Some(error) = providers::openai_provider_error(
+        completion.error.as_ref(),
+        completion.base_resp.as_ref(),
+        !completion.choices.is_empty(),
+    ) {
+        return Err(error);
+    }
     completion
         .choices
         .into_iter()
@@ -1966,6 +2754,8 @@ struct Completion<T> {
     usage: Option<Value>,
     model: Option<Value>,
     id: Option<Value>,
+    error: Option<Value>,
+    base_resp: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -1973,6 +2763,9 @@ struct CompletionMetadata {
     usage: Option<Value>,
     model: Option<Value>,
     id: Option<Value>,
+    error: Option<Value>,
+    base_resp: Option<Value>,
+    choices: Option<Value>,
 }
 
 #[derive(Deserialize)]
@@ -2003,9 +2796,33 @@ struct Request<'a> {
     stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning_effort: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    chat_template_kwargs: Option<mlx_models::TemplateArguments<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<Thinking>,
     messages: &'a [RequestMessage<'a>],
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
+}
+
+impl Request<'_> {
+    fn encode(&self) -> Result<Zeroizing<Vec<u8>>, Error> {
+        serde_json::to_vec(self)
+            .map(Zeroizing::new)
+            .map_err(|_| Error::Service)
+    }
+}
+
+struct OpenAiResponse {
+    response: ureq::http::Response<ureq::Body>,
+    buffered: Option<Zeroizing<Vec<u8>>>,
+    deadline: Option<Instant>,
+}
+
+#[derive(Serialize)]
+struct Thinking {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 #[derive(Serialize)]
@@ -2253,30 +3070,66 @@ fn agent_completion_observes_openai_length_without_changing_ordinary_completion(
 
 #[cfg(test)]
 #[test]
-fn mlx_openai_request_keeps_the_pinned_model_out_of_the_wire_payload() {
+fn mlx_openai_request_keeps_the_pinned_model_and_unsupported_fields_out_of_the_payload() {
+    use mlx_models::ReasoningControls::{DefaultOnly, GptOssEffort, QwenThinking};
+
     let root = crate::snippets::tests::Profile::new();
     let profile = Profile::managed_mlx(
         root.0.clone(),
         "0123456789abcdef0123456789abcdef",
         ProfileOptions {
             max_output_tokens: Some(256),
-            reasoning_effort: Some("low".into()),
             ..Default::default()
         },
     )
     .unwrap();
     assert!(!profile.is_remote());
-    let client = Client::new(profile);
     let messages = [RequestMessage::text("user", "fixture")];
-    for stream in [false, true] {
-        let payload: Value =
-            serde_json::from_slice(&client.openai_request(&messages, true, stream).unwrap())
-                .unwrap();
-        assert!(payload.get("model").is_none());
-        assert!(payload.get("response_format").is_none());
-        assert!(payload.get("reasoning_effort").is_none());
-        assert_eq!(payload["stream"], stream);
-        assert_eq!(payload["max_tokens"], 256);
-        assert_eq!(payload["messages"][0]["content"], "fixture");
+    for (effort, controls, expected) in [
+        (None, DefaultOnly, Value::Null),
+        (
+            Some("low"),
+            GptOssEffort,
+            serde_json::json!({"reasoning_effort": "low"}),
+        ),
+        (
+            Some("none"),
+            QwenThinking,
+            serde_json::json!({"enable_thinking": false}),
+        ),
+        (
+            Some("on"),
+            QwenThinking,
+            serde_json::json!({"enable_thinking": true}),
+        ),
+    ] {
+        let mut profile = profile.clone();
+        profile.options.reasoning_effort = effort.map(str::to_owned);
+        let client = Client::new(profile);
+        for stream in [false, true] {
+            let payload: Value = serde_json::from_slice(
+                &client
+                    .openai_payload(&messages, true, stream, controls)
+                    .unwrap()
+                    .encode()
+                    .unwrap(),
+            )
+            .unwrap();
+            assert!(payload.get("model").is_none());
+            assert!(payload.get("response_format").is_none());
+            assert!(payload.get("reasoning_effort").is_none());
+            assert!(payload.get("thinking").is_none());
+            assert_eq!(payload["chat_template_kwargs"], expected);
+            assert_eq!(payload["stream"], stream);
+            assert_eq!(payload["max_tokens"], 256);
+            assert_eq!(payload["messages"][0]["content"], "fixture");
+        }
     }
+    let mut profile = profile;
+    profile.options.reasoning_effort = Some("high".into());
+    let client = Client::new(profile);
+    assert!(matches!(
+        client.openai_payload(&messages, false, true, DefaultOnly),
+        Err(Error::Invalid(_)),
+    ));
 }

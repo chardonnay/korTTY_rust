@@ -9,16 +9,48 @@ use zeroize::{Zeroize, Zeroizing};
 
 use crate::local_ai::StreamDelta;
 
-use super::{MAX_KEYWORDS, MAX_RESPONSE_BYTES, verified_keyword};
+use super::{MAX_KEYWORDS, MAX_RESPONSE_BYTES, Reply, verified_keyword};
 
 const UPDATE_INTERVAL: Duration = Duration::from_millis(75);
 
-#[derive(Clone, Copy, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum Stage {
     Checking,
     Window,
     Closing,
+    Title,
     Screenshot,
+}
+
+impl Stage {
+    pub(crate) fn weight(self, prompt_chars: usize) -> f64 {
+        match self {
+            Self::Checking => 0.0,
+            Self::Window => 1.0 + prompt_chars as f64 / 12_000.0,
+            Self::Closing => 1.3,
+            Self::Title => 1.0,
+            Self::Screenshot => 1.5,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Work {
+    Plan {
+        stage: Stage,
+        weight: f64,
+    },
+    Started {
+        stage: Stage,
+        weight: f64,
+        at: Instant,
+    },
+    Finished {
+        stage: Stage,
+        weight: f64,
+        at: Instant,
+        elapsed: Duration,
+    },
 }
 
 #[derive(Clone)]
@@ -30,11 +62,98 @@ pub(crate) struct Preview {
 
 #[derive(Default)]
 pub(crate) struct Reporter<'a> {
-    pub(crate) show_keywords: bool,
-    pub(crate) update: Option<&'a mut dyn FnMut(Option<Preview>)>,
+    show_keywords: bool,
+    update: Option<&'a mut dyn FnMut(Option<Preview>)>,
+    work: Option<&'a mut dyn FnMut(Work)>,
+    window: Option<WindowWork>,
 }
 
-impl Reporter<'_> {
+struct WindowWork {
+    weight: f64,
+    started: bool,
+    elapsed: Duration,
+}
+
+impl<'a> Reporter<'a> {
+    pub(crate) fn new(
+        show_keywords: bool,
+        update: Option<&'a mut dyn FnMut(Option<Preview>)>,
+        work: Option<&'a mut dyn FnMut(Work)>,
+    ) -> Self {
+        Self {
+            show_keywords,
+            update,
+            work,
+            window: None,
+        }
+    }
+
+    pub(crate) fn tracks_work(&self) -> bool {
+        self.work.is_some()
+    }
+
+    pub(crate) fn plan(&mut self, stage: Stage, weight: f64) {
+        self.publish_work(Work::Plan { stage, weight });
+    }
+
+    pub(crate) fn start_work(&mut self, stage: Stage, weight: f64) -> Instant {
+        let at = Instant::now();
+        self.publish_work(Work::Started { stage, weight, at });
+        at
+    }
+
+    pub(in crate::session_journal) fn finish_elapsed(
+        &mut self,
+        stage: Stage,
+        weight: f64,
+        elapsed: Duration,
+    ) {
+        self.publish_work(Work::Finished {
+            stage,
+            weight,
+            at: Instant::now(),
+            elapsed,
+        });
+    }
+
+    /// A window may require several consecutive model requests before its card is ready.
+    pub(crate) fn with_window<T>(
+        &mut self,
+        weight: f64,
+        execute: impl FnOnce(&mut Self) -> Reply<T>,
+    ) -> Reply<T> {
+        if !self.tracks_work() {
+            return execute(self);
+        }
+        self.window = Some(WindowWork {
+            weight,
+            started: false,
+            elapsed: Duration::ZERO,
+        });
+        let reply = execute(self);
+        if let Some(window) = self.window.take().filter(|window| window.started) {
+            self.finish_elapsed(Stage::Window, window.weight, window.elapsed);
+        }
+        reply
+    }
+
+    pub(super) fn start_window(&mut self) -> Option<Instant> {
+        let window = self.window.as_mut()?;
+        Some(if window.started {
+            Instant::now()
+        } else {
+            window.started = true;
+            let weight = window.weight;
+            self.start_work(Stage::Window, weight)
+        })
+    }
+
+    pub(super) fn add_window_elapsed(&mut self, elapsed: Duration) {
+        if let Some(window) = &mut self.window {
+            window.elapsed = window.elapsed.saturating_add(elapsed);
+        }
+    }
+
     pub(crate) fn begin(&mut self, stage: Stage) {
         self.publish(Some(Preview {
             stage,
@@ -50,6 +169,12 @@ impl Reporter<'_> {
     fn publish(&mut self, preview: Option<Preview>) {
         if let Some(update) = &mut self.update {
             update(preview);
+        }
+    }
+
+    fn publish_work(&mut self, work: Work) {
+        if let Some(update) = &mut self.work {
+            update(work);
         }
     }
 }

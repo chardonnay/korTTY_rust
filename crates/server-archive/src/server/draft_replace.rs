@@ -559,7 +559,7 @@ fn require_plain_directory(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-fn read_xattrs(file: &File) -> io::Result<BTreeMap<String, Vec<u8>>> {
+pub(super) fn read_xattrs(file: &File) -> io::Result<BTreeMap<String, Vec<u8>>> {
     let mut names = [0; 4096];
     let length = match flistxattr(file, &mut names) {
         Ok(length) => length,
@@ -594,7 +594,7 @@ fn read_xattrs(file: &File) -> io::Result<BTreeMap<String, Vec<u8>>> {
     Ok(attributes)
 }
 
-fn mount_id(file: &File) -> io::Result<u64> {
+pub(super) fn mount_id(file: &File) -> io::Result<u64> {
     let info = statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::MNT_ID)?;
     if info.stx_mask & StatxFlags::MNT_ID.bits() == 0 {
         return Err(invalid("The server cannot verify the mount boundary"));

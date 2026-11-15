@@ -1811,16 +1811,18 @@ enum Command {
     Eof(SyncSender<()>),
 }
 
+type InputPermission = Arc<dyn Fn() -> bool + Send + Sync>;
+
 enum InputBytes {
     Stream(Vec<u8>),
-    Sensitive(SensitiveLine, Option<Box<dyn Fn() -> bool + Send + Sync>>),
+    Sensitive(Zeroizing<Vec<u8>>, Option<InputPermission>),
 }
 
 impl AsRef<[u8]> for InputBytes {
     fn as_ref(&self) -> &[u8] {
         match self {
             Self::Stream(bytes) => bytes,
-            Self::Sensitive(line, _) => line.as_bytes(),
+            Self::Sensitive(bytes, _) => bytes,
         }
     }
 }
@@ -1865,6 +1867,36 @@ impl SshWriter {
         }
         self.input
             .try_send(Command::Data(InputBytes::Stream(bytes[..count].to_vec())))
+            .map_err(|error| match error {
+                TrySendError::Full(_) => io::ErrorKind::WouldBlock.into(),
+                TrySendError::Disconnected(_) => closed(),
+            })?;
+        self.shared.wake.wake()?;
+        Ok(count)
+    }
+
+    /// Queues a bounded control-frame chunk only while its authorization is current.
+    /// The SSH worker checks the same authorization again before sending the bytes.
+    pub fn write_guarded_nonblocking(
+        &mut self,
+        bytes: &[u8],
+        permitted: Arc<dyn Fn() -> bool + Send + Sync>,
+    ) -> io::Result<usize> {
+        let count = CHUNK_BYTES.min(bytes.len());
+        if count == 0 {
+            return Ok(0);
+        }
+        if self.input_closed || self.shared.closed.load(Ordering::Acquire) {
+            return Err(closed());
+        }
+        if !permitted() {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        self.input
+            .try_send(Command::Data(InputBytes::Sensitive(
+                Zeroizing::new(bytes[..count].to_vec()),
+                Some(permitted),
+            )))
             .map_err(|error| match error {
                 TrySendError::Full(_) => io::ErrorKind::WouldBlock.into(),
                 TrySendError::Disconnected(_) => closed(),

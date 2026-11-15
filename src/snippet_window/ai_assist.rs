@@ -98,6 +98,10 @@ impl Action {
             _ => Some(Target::Source),
         }
     }
+
+    pub(crate) fn edits_file(self) -> bool {
+        matches!(self.target(), Some(Target::Source))
+    }
 }
 
 impl fmt::Display for Action {
@@ -142,6 +146,12 @@ pub enum Message {
     Fix,
 }
 
+impl fmt::Debug for Message {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("AI assistance action")
+    }
+}
+
 #[derive(Clone, Default)]
 pub(crate) struct Recipe {
     pub(crate) action: Action,
@@ -156,18 +166,50 @@ pub(crate) struct Recipe {
 
 #[derive(Clone)]
 pub(crate) struct Snapshot {
-    tab: tabs::Id,
+    tab: Option<tabs::Id>,
     id: Option<SnippetId>,
     revision: u64,
     pub(crate) name: String,
     pub(crate) language: String,
     pub(crate) source: Arc<str>,
+    pub(crate) connection_profile: Option<crate::ai_manager::ProfileRef>,
+    replacement_ending: Option<text_editor::LineEnding>,
     description: String,
-    selection: Range<usize>,
+    pub(crate) selection: Range<usize>,
     pinned_selection: bool,
 }
 
 impl Snapshot {
+    pub(crate) fn file(
+        revision: u64,
+        name: String,
+        language: String,
+        source: String,
+        selection: Range<usize>,
+        connection_profile: Option<crate::ai_manager::ProfileRef>,
+        replacement_ending: Option<text_editor::LineEnding>,
+    ) -> Self {
+        Self {
+            tab: None,
+            id: None,
+            revision,
+            name,
+            language,
+            source: source.into(),
+            connection_profile,
+            replacement_ending,
+            description: String::new(),
+            selection,
+            pinned_selection: false,
+        }
+    }
+
+    fn target(&self, action: Action) -> Option<Target> {
+        action
+            .target()
+            .filter(|target| self.tab.is_some() || matches!(target, Target::Source))
+    }
+
     pub(crate) fn description(&self) -> &str {
         &self.description
     }
@@ -192,7 +234,7 @@ impl Snapshot {
         Ok(0..self.source.len())
     }
 
-    fn value(&self, target: Target) -> &str {
+    pub(crate) fn value(&self, target: Target) -> &str {
         match target {
             Target::Source => &self.source,
             Target::Description => &self.description,
@@ -211,6 +253,8 @@ impl Snapshot {
             && self.name == next.name
             && self.language == next.language
             && self.source == next.source
+            && self.connection_profile == next.connection_profile
+            && self.replacement_ending == next.replacement_ending
             && self.description == next.description
     }
 }
@@ -225,7 +269,7 @@ pub(crate) enum Target {
 pub struct Outcome {
     pub(crate) text: Arc<str>,
     pub(crate) change: Option<(Target, Arc<compare::Comparison>)>,
-    selection: Option<Range<usize>>,
+    pub(crate) selection: Option<Range<usize>>,
 }
 
 impl Outcome {
@@ -242,6 +286,27 @@ pub(crate) struct Change {
     pub(crate) target: Target,
     pub(crate) diff: Arc<compare::Comparison>,
     pub(crate) recipe: Recipe,
+}
+
+pub(crate) trait Editor {
+    fn assist_status(&mut self, error: String);
+    fn assist_snapshot(&self) -> Result<Snapshot, String>;
+    fn last_ai_change(&self) -> Option<Arc<Change>>;
+    fn accept_ai_change(
+        &mut self,
+        before: Snapshot,
+        recipe: Recipe,
+        outcome: &Outcome,
+    ) -> Result<(), String>;
+    fn undo_ai_change(&mut self, change: &Arc<Change>) -> Result<(), String>;
+
+    fn supports_ai_action(&self, _action: Action) -> bool {
+        true
+    }
+
+    fn assistant_title(&self) -> &'static str {
+        "Snippet AI assistance"
+    }
 }
 
 impl Change {
@@ -382,7 +447,7 @@ impl Request {
             ..normalize(&snapshot.source[..range.end]).len();
         let masked = mask(&normalized)?;
         let description = mask(&snapshot.description)?;
-        let masked_target = match recipe.action.target() {
+        let masked_target = match snapshot.target(recipe.action) {
             Some(Target::Source) => masked != normalized,
             Some(Target::Description) if recipe.action == Action::CorrectDescription => {
                 description != snapshot.description
@@ -443,7 +508,7 @@ impl Request {
     pub(crate) fn start(
         self,
         profile: Profile,
-        before_dispatch: impl FnOnce() -> Result<(), String> + Send + 'static,
+        before_dispatch: impl FnMut() -> Result<(), String> + Send + 'static,
     ) -> Result<Pending<Outcome>, String> {
         local_ai::start(profile, move |client| {
             let raw = client
@@ -479,7 +544,7 @@ impl Request {
         })
     }
 
-    fn parse(&self, raw: &str) -> Result<Outcome, String> {
+    pub(crate) fn parse(&self, raw: &str) -> Result<Outcome, String> {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct Response {
@@ -516,7 +581,7 @@ impl Request {
                 selection: None,
             });
         }
-        let Some(target) = self.action.target() else {
+        let Some(target) = self.snapshot.target(self.action) else {
             if masked.trim().is_empty() {
                 return Err("The AI report has no visible text after masking.".into());
             }
@@ -536,26 +601,30 @@ impl Request {
             Target::Source => &self.snapshot.source[self.range.clone()],
             Target::Description => &self.snapshot.description,
         };
+        let replacement = match self.snapshot.replacement_ending {
+            Some(ending) => normalized.replace('\n', ending.as_str()),
+            None => response.text,
+        };
         if self.masked_target
-            && response.text.matches("***").count() > edited_text.matches("***").count()
+            && replacement.matches("***").count() > edited_text.matches("***").count()
         {
             return Err(
                 "The proposed edit includes a masking placeholder. Review another request.".into(),
             );
         }
         if self.action == Action::CorrectDescription
-            && !crate::snippets::resolve::same_placeholders(edited_text, &response.text)
+            && !crate::snippets::resolve::same_placeholders(edited_text, &replacement)
         {
             return Err(
                 "The proposal changes description placeholders. Review another request.".into(),
             );
         }
         let selection = matches!(target, Target::Source)
-            .then(|| self.range.start..self.range.start + response.text.len());
+            .then(|| self.range.start..self.range.start + replacement.len());
         let after = match target {
             Target::Source => {
                 let mut after = self.snapshot.source.to_string();
-                after.replace_range(self.range.clone(), &response.text);
+                after.replace_range(self.range.clone(), &replacement);
                 if after.len() > MAX_CONTENT_BYTES {
                     return Err("The proposed snippet exceeds the editor limit.".into());
                 }
@@ -566,7 +635,7 @@ impl Request {
                 }
                 after
             }
-            Target::Description if response.text.len() <= 16 * 1024 => response.text,
+            Target::Description if replacement.len() <= 16 * 1024 => replacement,
             Target::Description => {
                 return Err("The proposed description exceeds the metadata limit.".into());
             }
@@ -590,8 +659,8 @@ impl Request {
 }
 
 impl SnippetWindow {
-    pub(crate) fn assist_status(&mut self, error: String) {
-        self.status = Some(error);
+    pub(crate) fn set_assist_connection(&mut self, profile: Option<crate::ai_manager::ProfileRef>) {
+        self.draft.assist_connection = profile;
     }
 
     pub(crate) fn can_open_assist(&self) -> bool {
@@ -606,30 +675,38 @@ impl SnippetWindow {
             && self.details.is_none()
             && !self.folders.modal()
     }
+}
 
-    pub(crate) fn assist_snapshot(&self) -> Result<Snapshot, String> {
+impl Editor for SnippetWindow {
+    fn assist_status(&mut self, error: String) {
+        self.status = Some(error);
+    }
+
+    fn assist_snapshot(&self) -> Result<Snapshot, String> {
         if !self.can_open_assist() {
             return Err("Open an editable snippet before using AI assistance.".into());
         }
         let (source, selection) = crate::editor_window::source_selection(&self.draft.content)?;
         Ok(Snapshot {
-            tab: self.tabs.active(),
+            tab: Some(self.tabs.active()),
             id: self.draft.id,
             revision: self.draft.structure.generation(),
             name: self.draft.name.clone(),
             language: self.draft.language.clone(),
             source: source.into(),
+            connection_profile: self.draft.assist_connection.clone(),
+            replacement_ending: None,
             description: self.draft.metadata.description.clone(),
             selection,
             pinned_selection: false,
         })
     }
 
-    pub(crate) fn last_ai_change(&self) -> Option<Arc<Change>> {
+    fn last_ai_change(&self) -> Option<Arc<Change>> {
         self.draft.last_ai.clone()
     }
 
-    pub(crate) fn accept_ai_change(
+    fn accept_ai_change(
         &mut self,
         before: Snapshot,
         recipe: Recipe,
@@ -659,7 +736,7 @@ impl SnippetWindow {
         Ok(())
     }
 
-    pub(crate) fn undo_ai_change(&mut self, change: &Arc<Change>) -> Result<(), String> {
+    fn undo_ai_change(&mut self, change: &Arc<Change>) -> Result<(), String> {
         if self
             .draft
             .last_ai
@@ -673,7 +750,9 @@ impl SnippetWindow {
         self.draft.last_ai = None;
         Ok(())
     }
+}
 
+impl SnippetWindow {
     fn replace_ai_value(&mut self, target: Target, value: &str) -> Result<(), String> {
         match target {
             Target::Source => {

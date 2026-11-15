@@ -9,9 +9,7 @@ use kortty_jobs::{Cancellation, RunOutcome, RunRequest};
 use kortty_ssh::sftp::{Attributes, Error, FileKind, Sftp};
 use kortty_ssh::{SshSession, SshTarget, TrustStore};
 
-use crate::scheduler_window::{
-    Archive, ArchiveFormat, RemoteAction, SshCommand, windows_drive_ancestors,
-};
+use crate::scheduler_window::{ArchiveFormat, RemoteAction, SshCommand, windows_drive_ancestors};
 use crate::sftp_window::FolderTransfer;
 use crate::ssh_connection;
 
@@ -63,8 +61,16 @@ pub(super) fn run(
             .map(|completion| (completion, None));
     }
     if let RemoteAction::PrivilegedArchive(archive) = action {
-        return privileged::run_archive(request, policy, archive, saved_auth, trust_store)
-            .map(|completion| (completion, None));
+        let password = require_archive_password(action, archive_password)?;
+        return privileged::run_archive(
+            request,
+            policy,
+            archive,
+            saved_auth,
+            trust_store,
+            password,
+        )
+        .map(|completion| (completion, None));
     }
     if let RemoteAction::PrivilegedTreeUpload(copy) | RemoteAction::PrivilegedTreeDownload(copy) =
         action
@@ -83,8 +89,16 @@ pub(super) fn run(
     policy.require_target_groups(&request.action)?;
     let cancelled = || cancellation.is_requested();
     if let RemoteAction::ServerArchive(archive) = action {
-        return server_archive::run(request, archive, policy, target, jumps, &trust)
-            .map(|completion| (completion, None));
+        return server_archive::run(
+            request,
+            archive,
+            policy,
+            target,
+            jumps,
+            &trust,
+            archive_password,
+        )
+        .map(|completion| (completion, None));
     }
     if let RemoteAction::RsyncDownload(transfer) | RemoteAction::RsyncUpload(transfer) = action {
         return super::rsync::run(
@@ -121,10 +135,23 @@ fn open_group_subsystem(
     if !transfer_helper && !policy.has_target_groups(action) {
         return open_subsystem(target, jumps, trust, cancelled);
     }
-    policy.require_target_groups(action)?;
+    open_guarded_subsystem(target, jumps, trust, transfer_helper, cancelled, || {
+        policy.require_target_groups(action)
+    })
+}
+
+pub(super) fn open_guarded_subsystem(
+    target: SshTarget,
+    jumps: Vec<SshTarget>,
+    trust: TrustStore,
+    transfer_helper: bool,
+    cancelled: impl Fn() -> bool,
+    authorize: impl Fn() -> Result<(), Failure>,
+) -> Result<SshSession, Failure> {
+    authorize()?;
     let tcp =
         ssh_connection::connect_transport(&jumps.first().unwrap_or(&target).endpoint, &cancelled);
-    policy.require_target_groups(action)?;
+    authorize()?;
     let opened = SshSession::connect_preconnected_guarded(
         tcp.map_err(|error| connect_failure(error.into()))?,
         (target, jumps),
@@ -136,12 +163,11 @@ fn open_group_subsystem(
         },
         cancelled,
         || {
-            policy
-                .require_target_groups(action)
+            authorize()
                 .map_err(|failure| io::Error::new(io::ErrorKind::PermissionDenied, failure.detail))
         },
     );
-    policy.require_target_groups(action)?;
+    authorize()?;
     opened.map_err(connect_failure)
 }
 
@@ -168,13 +194,12 @@ pub(super) fn require_archive_password<'a>(
     action: &RemoteAction,
     password: BorrowedArchivePassword<'a>,
 ) -> Result<Option<&'a str>, Failure> {
-    if matches!(
-        action,
-        RemoteAction::Archive(Archive {
-            format: ArchiveFormat::ZipPassword,
-            ..
-        })
-    ) {
+    let archive = match action {
+        RemoteAction::Archive(archive) | RemoteAction::ServerArchive(archive) => archive,
+        RemoteAction::PrivilegedArchive(archive) => &archive.archive,
+        _ => return Ok(None),
+    };
+    if archive.format == ArchiveFormat::ZipPassword {
         let password = password
             .map_err(Failure::blocked)?
             .filter(|secret| kortty_vault::valid_archive_password(secret))
@@ -395,6 +420,54 @@ fn execute(
             }
             "Remote permissions changed"
         }
+        RemoteAction::ChmodSymbolic { path, mode } => {
+            before_change(cancellation)?;
+            if !client.supports_lsetstat() {
+                return Err(Failure::blocked(
+                    "The SFTP server does not advertise no-follow permission changes",
+                ));
+            }
+            let path = path.as_str();
+            let before = verify_entry(client, path)?;
+            let bits = before.permissions.ok_or_else(|| {
+                Failure::failed("The SFTP server did not report the existing permissions")
+            })?;
+            let adjusted = mode
+                .adjust(bits, before.kind() == FileKind::Directory)
+                .map_err(Failure::blocked)?;
+            if bits & 0o7777 == adjusted {
+                "Remote permissions already match"
+            } else {
+                let current = verify_entry(client, path)?;
+                if !same_entry(before, current) {
+                    return Err(Failure::failed("The remote entry changed before chmod"));
+                }
+                before_change(cancellation)?;
+                // SFTP v3 has no conditional metadata update. This extension
+                // prevents following a replaced final symlink.
+                client
+                    .set_permissions_no_follow(path, adjusted)
+                    .map_err(|error| {
+                        if error.connection_lost() {
+                            Failure::failed(
+                                "Connection lost during chmod. Verify the remote path before retrying.",
+                            )
+                        } else {
+                            Failure::failed("The server could not change the remote permissions")
+                        }
+                    })?;
+                let expected = Attributes {
+                    permissions: Some((bits & !0o7777) | adjusted),
+                    ..before
+                };
+                if !verify_entry(client, path).is_ok_and(|after| same_entry(expected, after)) {
+                    return Err(Failure::failed(
+                        "The server did not verify the requested permissions and entry metadata",
+                    ));
+                }
+                "Remote permissions changed"
+            }
+        }
         RemoteAction::Chown { path, uid, gid } => {
             if !client.supports_lsetstat() {
                 return Err(Failure::blocked(
@@ -444,6 +517,11 @@ fn execute(
         RemoteAction::ServerArchive(_) => {
             return Err(Failure::blocked(
                 "Server-only archive creation requires its verified command channel.",
+            ));
+        }
+        RemoteAction::ImportedArchive(_) => {
+            return Err(Failure::blocked(
+                crate::scheduler_window::imported_archive::REVIEW_REQUIRED,
             ));
         }
         RemoteAction::Delete {
@@ -529,6 +607,14 @@ fn verify_directory(client: &mut Sftp<impl Read, impl Write>, path: &str) -> Res
     verify_directory_metadata(client, path, metadata)
 }
 
+fn same_entry(left: Attributes, right: Attributes) -> bool {
+    left.size == right.size
+        && left.uid == right.uid
+        && left.gid == right.gid
+        && left.permissions == right.permissions
+        && left.modified == right.modified
+}
+
 fn verify_directory_metadata(
     client: &mut Sftp<impl Read, impl Write>,
     path: &str,
@@ -605,6 +691,116 @@ fn verify_canonical_with<E: From<Failure>>(
 mod tests {
     use super::*;
     use crate::job_executor::tests::scheduled_request;
+
+    #[test]
+    fn symbolic_permissions_compare_remote_mode_and_require_no_follow_write() {
+        use std::io::Cursor;
+
+        const TARGET: &[u8] = b"/review/file";
+        const EXTENSION: &[u8] = b"lsetstat@openssh.com";
+        fn frame(bytes: &mut Vec<u8>, body: &[u8]) {
+            bytes.extend((body.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(body);
+        }
+        fn reply(bytes: &mut Vec<u8>, kind: u8, id: u32, body: &[u8]) {
+            let mut packet = vec![kind];
+            packet.extend(id.to_be_bytes());
+            packet.extend_from_slice(body);
+            frame(bytes, &packet);
+        }
+        fn entry(bytes: &mut Vec<u8>, id: u32, mode: u32) {
+            let mut attrs = 15u32.to_be_bytes().to_vec();
+            attrs.extend(9u64.to_be_bytes());
+            for field in [1000u32, 1001, mode, 0, 24] {
+                attrs.extend(field.to_be_bytes());
+            }
+            reply(bytes, 105, id, &attrs);
+            let mut name = 1u32.to_be_bytes().to_vec();
+            frame(&mut name, TARGET);
+            frame(&mut name, b"");
+            name.extend(0u32.to_be_bytes());
+            reply(bytes, 104, id + 1, &name);
+        }
+
+        let (_, request) = scheduled_request();
+        let action: RemoteAction = serde_json::from_value(serde_json::json!({
+            "kind": "chmod_symbolic", "path": "/review/file", "mode": "u+rw,o-w"
+        }))
+        .unwrap();
+
+        for (supported, before_write, after_write, expected) in [
+            (true, 0o100426, 0o100624, Ok("Remote permissions changed")),
+            (
+                true,
+                0o100427,
+                0,
+                Err("The remote entry changed before chmod"),
+            ),
+            (
+                true,
+                0o100426,
+                0o100426,
+                Err("The server did not verify the requested permissions and entry metadata"),
+            ),
+            (
+                false,
+                0,
+                0,
+                Err("The SFTP server does not advertise no-follow permission changes"),
+            ),
+        ] {
+            let mut version = vec![2];
+            version.extend(3u32.to_be_bytes());
+            if supported {
+                frame(&mut version, EXTENSION);
+                frame(&mut version, b"1");
+            }
+            let mut response = Vec::new();
+            frame(&mut response, &version);
+            if supported {
+                entry(&mut response, 1, 0o100426);
+                entry(&mut response, 3, before_write);
+                if after_write != 0 {
+                    reply(&mut response, 101, 5, &[0; 12]);
+                    entry(&mut response, 6, after_write);
+                }
+            }
+            let mut output = Vec::new();
+            let mut client = Sftp::new(Cursor::new(response), &mut output).unwrap();
+            let result = execute(
+                &mut client,
+                &action,
+                None,
+                &request.cancellation,
+                &mut Effects::default(),
+            );
+            assert_eq!(
+                result.as_deref().map_err(|failure| failure.detail),
+                expected,
+            );
+            let mut changes = Vec::new();
+            let mut remaining = output.as_slice();
+            while !remaining.is_empty() {
+                let size = u32::from_be_bytes(remaining[..4].try_into().unwrap()) as usize;
+                let (packet, rest) = remaining[4..].split_at(size);
+                assert_ne!(packet[0], 9, "SETSTAT must never follow a symlink");
+                if packet[0] == 200 {
+                    changes.push(&packet[5..]);
+                }
+                remaining = rest;
+            }
+            if after_write != 0 {
+                let mut expected = Vec::new();
+                frame(&mut expected, EXTENSION);
+                frame(&mut expected, TARGET);
+                expected.extend(4u32.to_be_bytes());
+                expected.extend(0o624u32.to_be_bytes());
+                assert_eq!(changes, [expected.as_slice()]);
+            } else {
+                assert!(changes.is_empty());
+            }
+        }
+    }
 
     #[cfg(windows)]
     #[test]

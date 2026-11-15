@@ -27,21 +27,27 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Security::SECURITY_DESCRIPTOR;
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, FILE_ATTRIBUTE_NORMAL, FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_FLAG_DELETE,
-    FILE_DISPOSITION_FLAG_POSIX_SEMANTICS, FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ,
-    FILE_GENERIC_WRITE, FILE_ID_BOTH_DIR_INFO, FILE_ID_INFO, FILE_READ_ATTRIBUTES,
-    FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_STANDARD_INFO, FILE_TRAVERSE,
-    FileDispositionInfo, FileDispositionInfoEx, FileIdBothDirectoryInfo,
-    FileIdBothDirectoryRestartInfo, FileIdInfo, FileStandardInfo, GetFileInformationByHandleEx,
-    SECURITY_IDENTIFICATION, SYNCHRONIZE, SetFileInformationByHandle, WRITE_DAC,
+    FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_FLAG_BACKUP_SEMANTICS,
+    FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_READ, FILE_GENERIC_WRITE, FILE_ID_BOTH_DIR_INFO,
+    FILE_ID_INFO, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    FILE_STANDARD_INFO, FILE_TRAVERSE, FILE_WRITE_ATTRIBUTES, FileDispositionInfo,
+    FileDispositionInfoEx, FileIdBothDirectoryInfo, FileIdBothDirectoryRestartInfo, FileIdInfo,
+    FileStandardInfo, GetFileInformationByHandleEx, SECURITY_IDENTIFICATION, SYNCHRONIZE,
+    SetFileInformationByHandle, WRITE_DAC,
 };
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 mod lease;
 mod owners;
+mod reviewed;
 mod security;
 pub use lease::{ExternalLease, SmbReadLease};
 pub use owners::FileOwnerNames;
+pub use reviewed::{
+    ReviewedTreeMetadata, copy_reviewed_tree_file_metadata, require_reviewed_file_basename,
+    reviewed_tree_file_metadata,
+};
 pub use security::restore_private_file_access;
 
 const DIRECTORY_READ: u32 = FILE_GENERIC_READ | FILE_TRAVERSE;
@@ -112,7 +118,21 @@ impl Directory {
         Self::open_path_with_share(path, FILE_SHARE_READ | FILE_SHARE_WRITE)
     }
 
+    /// Holds every canonical ancestor without delete sharing during a checked rename.
+    pub fn hold_reviewed_removal_ancestors(path: &Path) -> io::Result<Vec<Self>> {
+        let mut held = Vec::new();
+        let directory = Self::walk_path(path, FILE_SHARE_READ | FILE_SHARE_WRITE, |directory| {
+            held.push(directory);
+        })?;
+        held.push(directory);
+        Ok(held)
+    }
+
     fn open_path_with_share(path: &Path, share: u32) -> io::Result<Self> {
+        Self::walk_path(path, share, drop)
+    }
+
+    fn walk_path(path: &Path, share: u32, mut visit: impl FnMut(Self)) -> io::Result<Self> {
         let mut components = path.components();
         let (Some(Component::Prefix(prefix)), Some(Component::RootDir)) =
             (components.next(), components.next())
@@ -133,7 +153,7 @@ impl Directory {
             let Component::Normal(name) = component else {
                 return Err(invalid("Expected a canonical Windows directory"));
             };
-            directory = Self::from_file(directory.open_with_share(
+            let child = Self::from_file(directory.open_with_share(
                 name,
                 DIRECTORY_READ,
                 FILE_OPEN,
@@ -141,6 +161,8 @@ impl Directory {
                 None,
                 share,
             )?)?;
+            visit(directory);
+            directory = child;
         }
         Ok(directory)
     }
@@ -634,7 +656,28 @@ impl Directory {
     /// Opens an entry inside an owned private stage, allowing a short wait for
     /// a scanner that opened it without sharing delete access.
     pub fn child_for_stage_cleanup(&self, name: &OsStr) -> io::Result<File> {
-        retry_stage_cleanup(|| self.child_for_removal(name), false)
+        retry_stage_cleanup(
+            || {
+                let file = self.child_for_removal(name)?;
+                if !file.metadata()?.permissions().readonly() {
+                    return Ok(file);
+                }
+                // The disposition flag requires attribute-write access, even
+                // though it leaves the attributes unchanged on any other link.
+                let writable = self.open(
+                    name,
+                    DIRECTORY_READ | DELETE | FILE_WRITE_ATTRIBUTES,
+                    FILE_OPEN,
+                    0,
+                    None,
+                )?;
+                if file_identity(&file)? != file_identity(&writable)? {
+                    return Err(invalid("The private stage entry changed before removal"));
+                }
+                Ok(writable)
+            },
+            false,
+        )
     }
 
     /// Holds the exact ordinary child without sharing writes or deletion.
@@ -693,9 +736,11 @@ impl Directory {
 /// Removes an opened private stage entry from the directory namespace when this
 /// handle closes, even while another compatible reader still holds the file.
 pub fn discard_stage_entry(file: File) -> io::Result<()> {
-    let info = FILE_DISPOSITION_INFO_EX {
-        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
-    };
+    let mut flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+    if file.metadata()?.permissions().readonly() {
+        flags |= FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
+    }
+    let info = FILE_DISPOSITION_INFO_EX { Flags: flags };
     let result = retry_stage_cleanup(
         || {
             // SAFETY: file and initialized disposition record remain live through this call.

@@ -33,9 +33,11 @@ pub(super) fn apply(
     protect_pins: &impl Fn() -> bool,
     allow_headers: &impl Fn() -> bool,
 ) -> io::Result<()> {
-    let independent = snapshot
-        .iter()
-        .filter(|(path, _)| !LINKED.contains(&path.as_str()) && !path.starts_with(KEY_DIR));
+    let independent = snapshot.iter().filter(|(path, _)| {
+        !LINKED.contains(&path.as_str())
+            && !path.starts_with(KEY_DIR)
+            && super::data::analysis::filename(path).is_none()
+    });
     let mut new_files = Vec::new();
     let mut nested = BTreeMap::new();
     let backgrounds = if snapshot
@@ -120,6 +122,7 @@ pub(super) fn apply(
     for path in nested.into_values() {
         sync_parent(directory, path)?;
     }
+    super::data::analysis::install(directory, snapshot, super::data::analysis::managed_limit)?;
     directory.sync()
 }
 
@@ -480,8 +483,15 @@ struct JobLinks {
 
 impl JobLinks {
     fn for_action(action: &SshCommand) -> Self {
+        let archive = match &action.remote {
+            Some(RemoteAction::Archive(archive) | RemoteAction::ServerArchive(archive)) => {
+                Some(archive)
+            }
+            Some(RemoteAction::PrivilegedArchive(archive)) => Some(&archive.archive),
+            _ => None,
+        };
         Self {
-            vault: matches!(&action.remote, Some(RemoteAction::Archive(archive)) if archive.password_credential.is_some()),
+            vault: archive.is_some_and(|archive| archive.password_credential.is_some()),
             connections: action.targets().next().is_some(),
             snippets: action.snippet.is_some(),
         }
@@ -500,5 +510,29 @@ impl JobLinks {
         })
         .ok()?;
         Some(links.get())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn password_zip_backup_requires_the_vault_for_each_native_archive_route() {
+        for kind in ["archive", "server_archive", "privileged_archive"] {
+            let mut archive = json!({
+                "sources": ["/source"], "target": "/target.zip", "level": 6,
+                "format": "zip_password", "password_credential": "0123456789abcdef0123456789abcdef",
+            });
+            let remote = if kind == "privileged_archive" {
+                json!({"kind": kind, "archive": archive})
+            } else {
+                archive["kind"] = kind.into();
+                archive
+            };
+            let action = serde_json::from_value::<SshCommand>(json!({"remote": remote})).unwrap();
+            assert!(JobLinks::for_action(&action).vault, "{kind}");
+        }
     }
 }

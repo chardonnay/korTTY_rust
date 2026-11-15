@@ -24,24 +24,31 @@ pub(super) fn prepare(
     targets: &[Target],
     goal: &str,
     redactor: &Redactor,
-    prompt: Prompt,
-) -> Result<(Prompt, ProposalSkillSetup, bool), String> {
+    prompts: Vec<Prompt>,
+) -> Result<(Vec<Prompt>, ProposalSkillSetup, bool), String> {
     let pins = target_pins(store, targets)?;
     let context = mask::prompt(redactor, goal)?;
     let assigned = combined_pins(&pins);
     let selection = config.agent_skill_selection(&context, &assigned);
-    let guidance = render_guidance(&config, &pins, selection.reviewed_automatic_guidance(&[]));
-    let (prompt, guidance, omitted) = match prompt.with_skill_guidance(&guidance.text) {
-        Ok(prompt) => (prompt, guidance, false),
-        Err(_) => (
-            prompt.with_skill_guidance("")?,
-            SkillGuidance::default(),
-            true,
-        ),
-    };
-    let mut setup = setup(config, pins, context, redactor, &prompt);
+    let automatic = selection.reviewed_automatic_guidance(&[]);
+    let (prompts, guidance, omitted) =
+        match bind_one_use_prompts(&config, &pins, &prompts, automatic) {
+            Ok((prompts, guidance)) => (prompts, guidance, false),
+            Err(_) => (
+                prompts
+                    .iter()
+                    .map(|prompt| prompt.with_skill_guidance(""))
+                    .collect::<Result<Vec<_>, _>>()?,
+                SkillGuidance::default(),
+                true,
+            ),
+        };
+    let first = prompts
+        .first()
+        .ok_or("The reviewed model request is unavailable.")?;
+    let mut setup = setup(config, pins, context, redactor, first);
     setup.one_use_guidance = guidance;
-    Ok((prompt, setup, omitted))
+    Ok((prompts, setup, omitted))
 }
 
 pub(super) fn prepare_standing(
@@ -127,12 +134,35 @@ pub(super) fn classified_prompts(
             one_use_guidance: SkillGuidance::default(),
         })
     } else {
-        let guidance = render_guidance(&setup.config, &setup.pins, automatic);
+        let (prompts, guidance) =
+            bind_one_use_prompts(&setup.config, &setup.pins, authority.prompts, automatic).ok()?;
         Some(ClassifiedPrompts {
-            prompts: vec![authority.prompt.with_skill_guidance(&guidance.text).ok()?],
+            prompts,
             one_use_guidance: guidance,
         })
     }
+}
+
+fn bind_one_use_prompts<P: std::borrow::Borrow<Prompt>>(
+    config: &Configuration,
+    pins: &[(u64, Vec<u64>)],
+    prompts: &[P],
+    automatic: SkillGuidance,
+) -> Result<(Vec<Prompt>, SkillGuidance), String> {
+    let reviewed = prompts
+        .iter()
+        .map(|prompt| {
+            let prompt = prompt.borrow();
+            let guidance = match prompt.target_ids() {
+                [target] if prompts.len() > 1 => {
+                    render_firing_guidance(config, pins, *target, &automatic)?
+                }
+                _ => render_guidance(config, pins, automatic.clone()),
+            };
+            prompt.with_skill_guidance(&guidance.text)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((reviewed, render_guidance(config, pins, automatic)))
 }
 
 fn bind_standing_prompts(
@@ -284,7 +314,9 @@ struct DispatchGuard {
     connection_path: PathBuf,
     trust: kortty_ssh::TrustStore,
     vault_revision: Option<Weak<()>>,
+    prompts: Vec<Arc<Prompt>>,
     knowledge: Option<crate::scheduler_window::agent::knowledge::Grant>,
+    web: Option<crate::workspace::terminal_ai::web::Evidence>,
 }
 
 impl DispatchGuard {
@@ -324,6 +356,12 @@ impl DispatchGuard {
             knowledge.require_current(&self.config, &self.profile.id, root, || {
                 require_vault_revision(self.vault_revision.as_ref()).map_err(str::to_owned)
             })?;
+        }
+        if let Some(evidence) = &self.web {
+            evidence.require_current()?;
+        }
+        for prompt in &self.prompts {
+            prompt.require_current_memory(&self.config, &policy.ai_memory)?;
         }
         Ok(())
     }
@@ -373,7 +411,7 @@ impl FiringDispatchGuard {
                 require_vault_revision(self.vault_revision.as_ref()).map_err(str::to_owned)
             })?;
         }
-        Ok(())
+        prompt.require_current_memory(&config, &policy.ai_memory)
     }
 }
 
@@ -433,7 +471,9 @@ pub(super) fn dispatch_guard(
                 trust: crate::ssh_connection::trust_store()
                     .map_err(|_| "The SSH host-key store is unavailable.")?,
                 vault_revision,
+                prompts: authority.prompts.to_vec(),
                 knowledge: authority.prompt.knowledge().cloned(),
+                web: authority.prompt.web().cloned(),
             })
         })
         .transpose()?;

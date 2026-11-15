@@ -1,9 +1,10 @@
 //! Saved AI profiles and the draft owned by the native manager.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
@@ -12,18 +13,19 @@ pub(super) use kortty_jobs::ProfileRef;
 use serde::{Deserialize, Serialize};
 
 use crate::clipboard_policy::{
-    ClipboardPolicy, PolicyAiProfile, PolicyModelRuntime, valid_policy_ai_profile_id,
-    valid_policy_model_id,
+    ClipboardPolicy, PolicyAiProfile, PolicyAiProvider, PolicyModelRuntime,
+    valid_policy_ai_profile_id, valid_policy_model_id,
 };
 use crate::local_ai::{
     self, ProfileOptions, managed_models, mlx_models, mlx_runtime, policy_models,
 };
 
-use super::ProfileId;
 use super::model_inventory::ModelInventory;
+use super::{JavaProfileSource, ProfileId};
 
 mod cli_profile;
 mod cloud;
+mod imported_model;
 pub(super) mod java_backup;
 mod managed;
 pub(super) mod picker;
@@ -71,6 +73,23 @@ impl PartialEq for Catalog {
 impl Eq for Catalog {}
 
 impl Catalog {
+    pub(super) fn refresh_lm_studio_auto(
+        &mut self,
+        lookup: impl Fn(&Profile) -> Option<Result<local_ai::LmStudioAutoModel, String>>,
+    ) -> bool {
+        let mut changed = false;
+        for profile in &mut self.profiles {
+            let result = profile
+                .ordinary_lm_studio_auto()
+                .then(|| lookup(profile))
+                .flatten();
+            let previous = profile.lm_studio_auto.0.as_ref().map(|entry| &entry.result);
+            changed |= previous != result.as_ref();
+            profile.set_lm_studio_auto_projection(result);
+        }
+        changed
+    }
+
     pub(super) fn ensure_guided_model_profile(
         &mut self,
         model: &managed_models::Model,
@@ -128,7 +147,12 @@ impl Catalog {
             profile.reviewed_agent_https = false;
             profile.credential_env.clear();
             profile.clear_web_search();
-            profile.restore_review = profile.remote_protocol().is_some() || profile.is_cli();
+            profile.restore_review = profile.restore_review
+                || profile.remote_protocol().is_some()
+                || profile.is_cli()
+                || profile.requires_endpoint_review()
+                || profile.java_embedded_model.is_some();
+            profile.clear_unreviewed_embedded_model();
             if let Some(cli) = &mut profile.cli {
                 cli.clear_approval();
             }
@@ -155,6 +179,15 @@ impl Catalog {
                 .map(|profile| (profile.id, format!("{} · CLI", profile.name))),
         );
         choices
+    }
+
+    pub(super) fn https_role_choices(
+        &self,
+        role: super::local::Role,
+    ) -> impl Iterator<Item = (ProfileId, String)> + '_ {
+        self.entries()
+            .filter(move |profile| profile.remote_protocol().is_some() && profile.allows_role(role))
+            .map(|profile| (profile.id, format!("{} · HTTPS", profile.name)))
     }
 
     pub(super) fn profile(&self, id: ProfileId) -> Option<&Profile> {
@@ -188,6 +221,7 @@ impl Catalog {
             .or_else(|| {
                 self.default
                     .and_then(|id| self.user_profile(ProfileId::from(id)))
+                    .filter(|profile| !profile.uses_server_default_model())
             })
             .or_else(|| self.policy_profiles.first())
     }
@@ -285,10 +319,14 @@ impl Catalog {
     pub(super) fn validate(&self) -> Result<(), String> {
         let valid_default = match self.default {
             Some(id) => self.user_profile(ProfileId::from(id)).is_some(),
-            None => self
-                .profiles
-                .iter()
-                .all(|profile| profile.remote_protocol().is_some()),
+            None => self.profiles.iter().all(|profile| {
+                profile.remote_protocol().is_some()
+                    || profile.is_cli()
+                    || profile.uses_server_default_model()
+                    || profile.java_embedded_model.is_some()
+                    || (profile.is_loopback()
+                        && (profile.restore_review || profile.java_source.is_some()))
+            }),
         };
         if self.profiles.len() > MAX_PROFILES
             || !valid_default
@@ -300,12 +338,30 @@ impl Catalog {
             return Err("Invalid AI profile catalog".into());
         }
         let mut ids = BTreeSet::new();
+        let mut sources = HashSet::new();
         for profile in &self.profiles {
             if profile.id == 0
                 || profile.id > ProfileId::from(self.last_id)
                 || !ids.insert(profile.id)
             {
                 return Err("Invalid AI profile identifier".into());
+            }
+            if profile
+                .java_source
+                .as_ref()
+                .is_some_and(|source| !sources.insert(source))
+            {
+                return Err("Multiple AI profiles have the same Java source".into());
+            }
+            if profile.java_embedded_model.is_some() && profile.java_source.is_none() {
+                return Err(
+                    "An imported embedded model requires its Java profile identity.".into(),
+                );
+            }
+            if profile.java_web_hint.is_some() && profile.java_source.is_none() {
+                return Err(
+                    "An imported web integration requires its Java profile identity.".into(),
+                );
             }
             profile.validate()?;
         }
@@ -335,6 +391,8 @@ pub(super) struct Profile {
     policy: Option<std::sync::Arc<PolicyAiProfile>>,
     #[serde(skip)]
     policy_auto_model: Option<Result<local_ai::PolicyAutoModel, String>>,
+    #[serde(skip)]
+    lm_studio_auto: LmStudioAutoProjection,
     #[serde(skip_serializing_if = "ConnectionMode::is_external")]
     pub(super) connection_mode: ConnectionMode,
     pub(super) endpoint: String,
@@ -346,6 +404,12 @@ pub(super) struct Profile {
     pub(super) trusted_remote_endpoint: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(super) restore_review: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) java_source: Option<JavaProfileSource>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) java_embedded_model: Option<java_backup::JavaEmbeddedModel>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) java_web_hint: Option<java_backup::JavaWebHint>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(super) reviewed_agent_https: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -364,6 +428,32 @@ pub(super) struct Profile {
     pub(super) tokenizer: local_ai::Tokenizer,
     #[serde(skip_serializing_if = "local_ai::UsageBudget::is_default")]
     pub(super) usage_budget: local_ai::UsageBudget,
+}
+
+#[derive(Clone, Default)]
+struct LmStudioAutoProjection(Option<LmStudioAutoObservation>);
+
+#[derive(Clone)]
+struct LmStudioAutoObservation {
+    settings: LmStudioAutoSettings,
+    result: Result<local_ai::LmStudioAutoModel, String>,
+}
+
+// An observed model changes runtime authority without editing the saved profile.
+impl PartialEq for LmStudioAutoProjection {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for LmStudioAutoProjection {}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct LmStudioAutoSettings {
+    pub(super) mode: ConnectionMode,
+    pub(super) endpoint: String,
+    pub(super) preferred: String,
+    pub(super) credential_env: Option<String>,
 }
 
 fn serialize_user_profile_id<S: serde::Serializer>(
@@ -387,6 +477,7 @@ impl Default for Profile {
             name: String::new(),
             policy: None,
             policy_auto_model: None,
+            lm_studio_auto: LmStudioAutoProjection::default(),
             connection_mode: ConnectionMode::External,
             endpoint: local_ai::DEFAULT_ENDPOINT.into(),
             model: String::new(),
@@ -395,6 +486,9 @@ impl Default for Profile {
             trusted_local_endpoint: false,
             trusted_remote_endpoint: false,
             restore_review: false,
+            java_source: None,
+            java_embedded_model: None,
+            java_web_hint: None,
             reviewed_agent_https: false,
             tavily_search: false,
             lm_web: None,
@@ -412,6 +506,82 @@ impl Default for Profile {
 }
 
 impl Profile {
+    pub(super) fn uses_server_default_model(&self) -> bool {
+        self.model_mode == ModelMode::ServerDefault
+    }
+
+    pub(super) fn ordinary_lm_studio_auto(&self) -> bool {
+        self.policy_definition().is_none()
+            && self.connection_mode.uses_lm_studio_inventory()
+            && self.model_mode == ModelMode::Auto
+    }
+
+    pub(super) fn supports_model_discovery(&self) -> bool {
+        !self.uses_server_default_model()
+            && self.connection_mode.allows_automatic_model_selection()
+            && (!self.connection_mode.uses_lm_studio_inventory()
+                || self
+                    .lm_studio_endpoint()
+                    .is_ok_and(|endpoint| endpoint.supports_metadata()))
+    }
+
+    pub(super) fn lm_studio_auto_settings(&self) -> Option<Result<LmStudioAutoSettings, String>> {
+        self.ordinary_lm_studio_auto().then(|| {
+            self.validate_connection()?;
+            self.validate_model()?;
+            Ok(LmStudioAutoSettings {
+                mode: self.connection_mode,
+                endpoint: self.lm_studio_endpoint()?.destination(),
+                preferred: self.model.trim().into(),
+                credential_env: self.credential()?,
+            })
+        })
+    }
+
+    pub(super) fn set_lm_studio_auto_projection(
+        &mut self,
+        result: Option<Result<local_ai::LmStudioAutoModel, String>>,
+    ) {
+        self.lm_studio_auto.0 = self
+            .lm_studio_auto_settings()
+            .and_then(Result::ok)
+            .zip(result)
+            .map(|(settings, result)| LmStudioAutoObservation { settings, result });
+    }
+
+    pub(super) fn lm_studio_auto_projection(
+        &self,
+    ) -> Option<&Result<local_ai::LmStudioAutoModel, String>> {
+        let settings = self.lm_studio_auto_settings()?.ok()?;
+        let LmStudioAutoObservation {
+            settings: checked,
+            result,
+        } = self.lm_studio_auto.0.as_ref()?;
+        (checked == &settings
+            && result.as_ref().ok().is_none_or(|pin| {
+                pin.matches(
+                    &settings.endpoint,
+                    &settings.preferred,
+                    settings.credential_env.as_deref(),
+                    settings.mode.uses_native_lm_studio(),
+                )
+            }))
+        .then_some(result)
+    }
+
+    pub(super) fn effective_model(&self) -> &str {
+        if self.ordinary_lm_studio_auto() {
+            return self
+                .lm_studio_auto_projection()
+                .and_then(|result| result.as_ref().ok())
+                .map_or("", local_ai::LmStudioAutoModel::model);
+        }
+        self.policy_auto_model
+            .as_ref()
+            .and_then(|result| result.as_ref().ok())
+            .map_or(self.model.trim(), local_ai::PolicyAutoModel::model)
+    }
+
     #[cfg(test)]
     pub(super) fn effective_prompt_preset(&self) -> local_ai::PromptPreset {
         self.effective_prompt_preset_in(None, None)
@@ -422,14 +592,7 @@ impl Profile {
         catalog: Option<&local_ai::model_catalog::Catalog>,
         managed_name: Option<&str>,
     ) -> local_ai::PromptPreset {
-        let model = self
-            .policy_auto_model
-            .as_ref()
-            .and_then(|result| result.as_ref().ok())
-            .map_or(
-                managed_name.unwrap_or(&self.model),
-                local_ai::PolicyAutoModel::model,
-            );
+        let model = managed_name.unwrap_or_else(|| self.effective_model());
         let preset = self.prompt_preset.unwrap_or_default();
         match catalog {
             Some(catalog) => preset.resolve_in(model, catalog),
@@ -481,6 +644,16 @@ impl Profile {
     pub(super) fn validate(&self) -> Result<(), String> {
         if self.name.trim().is_empty() || !plain_text(&self.name, MAX_NAME_BYTES) {
             return Err("Enter a profile name of up to 160 bytes".into());
+        }
+        if self.java_web_hint.as_ref().is_some_and(|hint| {
+            self.policy_definition().is_some() || !self.supports_java_web_hint(hint)
+        }) {
+            return Err("The imported web integration does not match this AI profile.".into());
+        }
+        if self.java_embedded_model.as_ref().is_some_and(|model| {
+            !self.is_managed() || (!self.is_mlx() && model.has_mlx_reasoning())
+        }) {
+            return Err("An imported embedded model requires its original model runtime.".into());
         }
         if self.restore_review {
             self.validate_restored_connection()?;
@@ -534,8 +707,15 @@ impl Profile {
                     "Managed profiles use the installed runtime without a custom endpoint".into(),
                 );
             }
-        } else if let Some(protocol) = self.remote_protocol() {
-            local_ai::remote_destination(&self.endpoint, protocol)?;
+        } else if self.connection_mode == ConnectionMode::LoopbackAnthropic {
+            let endpoint = self.loopback_anthropic_endpoint()?;
+            if (self.trusted_local_endpoint, self.trusted_remote_endpoint)
+                != (!endpoint.is_https(), endpoint.is_https())
+            {
+                return Err("Review and trust this loopback Messages destination first.".into());
+            }
+        } else if self.remote_protocol().is_some() {
+            self.destination()?;
             if !self.trusted_remote_endpoint || self.trusted_local_endpoint {
                 return Err(
                     "Review and trust the HTTPS destination before using this profile".into(),
@@ -545,20 +725,19 @@ impl Profile {
             if !plain_text(&self.endpoint, MAX_ENDPOINT_BYTES) {
                 return Err("Enter a valid local API endpoint".into());
             }
-            self.local_address()?;
+            if self.connection_mode.uses_lm_studio_inventory() {
+                self.lm_studio_endpoint()?;
+            } else {
+                self.local_address()?;
+            }
             if self.trusted_remote_endpoint {
                 return Err("Local profiles require local endpoint trust settings".into());
             }
         }
         let credential = self.credential()?;
         if let Some(settings) = &self.lm_web {
-            if self.connection_mode != ConnectionMode::LmStudio
-                || !self.trusted_local_endpoint
-                || self.tavily_search
-            {
-                return Err(
-                    "Choose one search mode and trust the local LM Studio endpoint.".into(),
-                );
+            if !self.allows_lm_studio_mcp() || !self.trusts_credential() || self.tavily_search {
+                return Err("Choose one search mode and trust the LM Studio endpoint.".into());
             }
             settings.validate()?;
             if settings.mode.uses_plugin() && credential.is_none() {
@@ -580,6 +759,12 @@ impl Profile {
         {
             return Err("An unreviewed restored AI profile cannot contain approvals.".into());
         }
+        if self.connection_mode.uses_lm_studio_inventory() && self.cli.is_none() {
+            return self.lm_studio_endpoint().map(drop);
+        }
+        if self.connection_mode == ConnectionMode::LoopbackAnthropic && self.cli.is_none() {
+            return self.loopback_anthropic_endpoint().map(drop);
+        }
         if let Some(protocol) = self.remote_protocol().filter(|_| self.cli.is_none()) {
             return local_ai::remote_destination(&self.endpoint, protocol).map(drop);
         }
@@ -590,14 +775,65 @@ impl Profile {
                 .ok_or("The restored CLI settings are missing.")?
                 .validate_restored(&self.model);
         }
+        if self.is_loopback() && self.cli.is_none() {
+            return self.local_address().map(drop);
+        }
+        if self.is_managed()
+            && self.java_embedded_model.is_some()
+            && self.cli.is_none()
+            && self.endpoint.is_empty()
+            && self.model.is_empty()
+        {
+            return Ok(());
+        }
         Err("Invalid unreviewed restored AI profile.".into())
     }
 
     fn validate_model(&self) -> Result<(), String> {
+        if matches!(
+            self.connection_mode,
+            ConnectionMode::LoopbackAnthropic | ConnectionMode::AnthropicExact
+        ) && (self.model_mode != ModelMode::Manual || !local_ai::valid_model(self.model.trim()))
+        {
+            return Err("Enter the model identifier for this Anthropic Messages endpoint.".into());
+        }
+        if self.uses_server_default_model() {
+            return if self.server_default_available()
+                && self.model.is_empty()
+                && self.reasoning == Reasoning::Default
+            {
+                Ok(())
+            } else {
+                Err("The server-selected model requires a compatible chat endpoint and default reasoning.".into())
+            };
+        }
+        if self.connection_mode == ConnectionMode::RemoteOpenAiExact
+            && (self.model_mode != ModelMode::Manual || !local_ai::valid_model(self.model.trim()))
+        {
+            return Err("Choose Manual with a model identifier or Server default.".into());
+        }
+        if self.ordinary_lm_studio_auto() && !self.supports_model_discovery() {
+            return Err(
+                "Automatic model selection requires a canonical LM Studio metadata route.".into(),
+            );
+        }
+        if self.reasoning == Reasoning::On
+            && self.connection_mode != ConnectionMode::LmStudio
+            && !self.is_mlx()
+        {
+            return Err(
+                "Explicit reasoning On requires a compatible native LM Studio or MLX profile."
+                    .into(),
+            );
+        }
         if self.is_cli() {
             if self.model_mode != ModelMode::Manual
                 || self.vision != Vision::Disabled
                 || self.reasoning != Reasoning::Default
+                    && !self
+                        .cli
+                        .as_ref()
+                        .is_some_and(cli_profile::Settings::uses_reasoning)
                 || self.max_output_tokens.is_some()
                 || (!self.model.is_empty() && !local_ai::valid_model(&self.model))
             {
@@ -609,21 +845,27 @@ impl Profile {
                 self.cli_program()?;
             }
         } else if self.is_managed() {
-            if !(managed_models::valid_id(&self.model) || valid_policy_model_id(&self.model))
+            let imported_draft = self.restore_review && self.java_embedded_model.is_some();
+            if !(imported_draft
+                || managed_models::valid_id(&self.model)
+                || valid_policy_model_id(&self.model))
                 || self.model_mode != ModelMode::Manual
             {
                 return Err("Choose a managed model".into());
             }
-            if self.is_mlx()
-                && (self.vision != Vision::Disabled || self.reasoning != Reasoning::Default)
+            if self.is_mlx() && self.vision != Vision::Disabled {
+                return Err("Managed MLX profiles require text-only requests".into());
+            }
+            if self.is_mlx() && matches!(self.reasoning, Reasoning::Minimal | Reasoning::ExtraHigh)
             {
-                return Err("Managed MLX profiles require text-only requests and default reasoning settings".into());
+                return Err(mlx_models::UNSUPPORTED_REASONING.into());
             }
             if !self.is_mlx() && self.vision == Vision::Auto {
                 return Err("Choose a vision setting for the managed GGUF model".into());
             }
-        } else if !plain_text(&self.model, local_ai::MAX_MODEL_BYTES)
-            || self.model.trim().chars().any(char::is_whitespace)
+        } else if !(self.ordinary_lm_studio_auto() && self.model.trim().is_empty())
+            && (!plain_text(&self.model, local_ai::MAX_MODEL_BYTES)
+                || self.model.trim().chars().any(char::is_whitespace))
         {
             return Err("Enter a valid model identifier".into());
         }
@@ -638,26 +880,77 @@ impl Profile {
         self.connection_mode == ConnectionMode::Cli
     }
 
-    fn can_be_default(&self) -> bool {
-        !self.restore_review && (!self.is_cli() || self.validate_connection().is_ok())
+    pub(super) fn can_be_default(&self) -> bool {
+        !self.restore_review
+            && !self.uses_server_default_model()
+            && (!self.is_cli() || self.validate_connection().is_ok())
     }
 
     pub(super) fn allows_local_roles(&self) -> bool {
-        !self.is_cli() && self.remote_protocol().is_none()
+        !self.restore_review
+            && !self.is_cli()
+            && !self.uses_server_default_model()
+            && self.remote_protocol().is_none()
+    }
+
+    pub(super) fn allows_role(&self, role: super::local::Role) -> bool {
+        use super::local::Role;
+
+        if self.validate_connection().is_err() || self.uses_server_default_model() {
+            return false;
+        }
+        if self.is_cli() || self.allows_local_roles() {
+            return true;
+        }
+        self.remote_protocol().is_some()
+            && match role {
+                Role::Text | Role::Coding | Role::Security => true,
+                Role::Agent => self.allows_reviewed_agent_https(),
+                Role::Journal => false,
+            }
+    }
+
+    fn server_default_available(&self) -> bool {
+        self.policy_definition().is_none()
+            && matches!(
+                self.connection_mode,
+                ConnectionMode::External
+                    | ConnectionMode::LmStudio
+                    | ConnectionMode::LmStudioCompatible
+                    | ConnectionMode::RemoteOpenAi
+                    | ConnectionMode::RemoteOpenAiExact
+            )
+    }
+
+    fn is_loopback(&self) -> bool {
+        matches!(
+            self.connection_mode,
+            ConnectionMode::External
+                | ConnectionMode::LmStudio
+                | ConnectionMode::LmStudioCompatible
+                | ConnectionMode::LoopbackAnthropic
+        ) && self.policy_definition().is_none()
+    }
+
+    fn requires_endpoint_review(&self) -> bool {
+        self.connection_mode.is_exact_https()
+            || self.is_loopback()
+                && (self.java_source.is_some()
+                    || self.connection_mode == ConnectionMode::LoopbackAnthropic)
     }
 
     pub(super) fn allows_reviewed_agent_https(&self) -> bool {
-        self.policy.is_none()
-            && self.reviewed_agent_https
-            && self.trusted_remote_endpoint
+        !self.uses_server_default_model()
             && self.remote_protocol().is_some()
+            && (self.policy_definition().is_some()
+                || (self.reviewed_agent_https && self.trusted_remote_endpoint))
     }
 
     fn cli_program(&self) -> Result<local_ai::cli::Program, String> {
         self.cli
             .as_ref()
             .ok_or_else(|| "Review and approve the CLI executable first.".to_owned())?
-            .program(&self.model)
+            .program(&self.model, self.reasoning)
     }
 
     pub(super) fn is_mlx(&self) -> bool {
@@ -668,12 +961,19 @@ impl Profile {
         if self
             .policy_definition()
             .is_some_and(local_ai::Profile::policy_auto_model_uses_https)
+            || self.lm_studio_https()
         {
             return Some(local_ai::RemoteProtocol::OpenAi);
         }
         match self.connection_mode {
             ConnectionMode::RemoteOpenAi => Some(local_ai::RemoteProtocol::OpenAi),
+            ConnectionMode::RemoteOpenAiExact => Some(local_ai::RemoteProtocol::OpenAiExact),
+            ConnectionMode::MiniMaxNative => Some(local_ai::RemoteProtocol::MiniMaxNative),
             ConnectionMode::Anthropic => Some(local_ai::RemoteProtocol::Anthropic),
+            ConnectionMode::AnthropicExact => Some(local_ai::RemoteProtocol::AnthropicExact),
+            ConnectionMode::LoopbackAnthropic if self.loopback_anthropic_https() => {
+                Some(local_ai::RemoteProtocol::Anthropic)
+            }
             _ => None,
         }
     }
@@ -687,10 +987,59 @@ impl Profile {
     }
 
     pub(super) fn local_address(&self) -> Result<std::net::SocketAddr, String> {
-        if self.connection_mode == ConnectionMode::LmStudio {
-            local_ai::lm_studio_endpoint(&self.endpoint)
+        match self.connection_mode {
+            ConnectionMode::LmStudio => local_ai::lm_studio_endpoint(&self.endpoint),
+            ConnectionMode::LmStudioCompatible => {
+                local_ai::lm_studio_compatible_endpoint(&self.endpoint)
+            }
+            _ => local_ai::numeric_loopback_endpoint(&self.endpoint),
+        }
+    }
+
+    pub(super) fn lm_studio_endpoint(&self) -> Result<local_ai::LmStudioEndpoint, String> {
+        local_ai::LmStudioEndpoint::parse(
+            &self.endpoint,
+            self.connection_mode.uses_native_lm_studio(),
+        )
+    }
+
+    fn loopback_anthropic_endpoint(&self) -> Result<local_ai::LmStudioEndpoint, String> {
+        local_ai::LmStudioEndpoint::parse_anthropic(&self.endpoint)
+    }
+
+    fn loopback_anthropic_https(&self) -> bool {
+        self.loopback_anthropic_endpoint()
+            .is_ok_and(|endpoint| endpoint.is_https())
+    }
+
+    fn lm_studio_https(&self) -> bool {
+        self.policy_definition().is_none()
+            && self.connection_mode.uses_lm_studio_inventory()
+            && self
+                .lm_studio_endpoint()
+                .is_ok_and(|endpoint| endpoint.is_https())
+    }
+
+    fn allows_lm_studio_mcp(&self) -> bool {
+        self.policy_definition().is_none()
+            && self.connection_mode.uses_native_lm_studio()
+            && self.lm_studio_endpoint().is_ok()
+    }
+
+    fn supports_java_web_hint(&self, hint: &java_backup::JavaWebHint) -> bool {
+        hint.supports(self.connection_mode)
+            && (*hint == java_backup::JavaWebHint::Tavily || self.allows_lm_studio_mcp())
+    }
+
+    pub(super) fn local_endpoint_is_valid(&self) -> bool {
+        if self.connection_mode == ConnectionMode::LoopbackAnthropic {
+            self.loopback_anthropic_endpoint()
+                .is_ok_and(|endpoint| !endpoint.is_https())
+        } else if self.connection_mode.uses_lm_studio_inventory() {
+            self.lm_studio_endpoint()
+                .is_ok_and(|endpoint| !endpoint.is_https())
         } else {
-            local_ai::numeric_loopback_endpoint(&self.endpoint)
+            self.local_address().is_ok()
         }
     }
 
@@ -706,16 +1055,16 @@ impl Profile {
                 MANAGED_DESTINATION
             }
             .into())
+        } else if self.connection_mode.uses_lm_studio_inventory() {
+            self.lm_studio_endpoint()
+                .map(|endpoint| endpoint.destination())
+        } else if self.connection_mode == ConnectionMode::LoopbackAnthropic {
+            self.loopback_anthropic_endpoint()
+                .map(|endpoint| endpoint.destination())
         } else if let Some(protocol) = self.remote_protocol() {
             local_ai::remote_destination(&self.endpoint, protocol)
         } else {
-            self.local_address().map(|address| {
-                if self.connection_mode == ConnectionMode::LmStudio {
-                    format!("http://{address}/api/v1/chat")
-                } else {
-                    address.to_string()
-                }
-            })
+            self.local_address().map(|address| address.to_string())
         }
     }
 
@@ -764,6 +1113,18 @@ impl Profile {
         catalog: Option<&local_ai::model_catalog::Catalog>,
         root: Option<&Path>,
     ) -> Result<local_ai::Profile, String> {
+        if self.restore_review {
+            return Err("Review this AI profile before using it after backup restore.".into());
+        }
+        if self.reasoning == Reasoning::On
+            && self.connection_mode != ConnectionMode::LmStudio
+            && !self.is_mlx()
+        {
+            return Err(
+                "Explicit reasoning On requires a compatible native LM Studio or MLX profile."
+                    .into(),
+            );
+        }
         let minutes = self.timeout_minutes.unwrap_or(u32::from(default_timeout));
         let timeout = (minutes != 0).then(|| Duration::from_secs(u64::from(minutes) * 60));
         let root_path = || {
@@ -787,7 +1148,8 @@ impl Profile {
                 timeout,
             )
             .with_tokenizer(self.tokenizer)
-            .with_prompt_preset(preset));
+            .with_prompt_preset(preset)
+            .with_vision_mode(self.vision.runtime()));
         }
         let options = ProfileOptions {
             tokenizer: self.tokenizer,
@@ -796,7 +1158,21 @@ impl Profile {
             reasoning_effort: self.reasoning.api_value().map(str::to_owned),
             credential_env: self.credential()?,
         };
-        if let Some(definition) = self.policy_definition() {
+        if self.uses_server_default_model() {
+            self.validate_connection()?;
+            self.validate_model()?;
+            if self.connection_mode.uses_lm_studio_inventory() {
+                local_ai::Profile::lm_studio_with_server_default(
+                    &self.endpoint,
+                    options,
+                    self.connection_mode.uses_native_lm_studio(),
+                )
+            } else if let Some(protocol) = self.remote_protocol() {
+                local_ai::Profile::openai_with_server_default(&self.endpoint, protocol, options)
+            } else {
+                local_ai::Profile::configured_with_server_default(&self.endpoint, options)
+            }
+        } else if let Some(definition) = self.policy_definition() {
             if self.policy_auto_candidate().is_some() {
                 match &self.policy_auto_model {
                     Some(Ok(model)) => local_ai::Profile::policy_profile_with_auto_model(
@@ -819,53 +1195,120 @@ impl Profile {
             } else {
                 local_ai::Profile::managed(root_path()?, &self.model, options)
             }
+        } else if self.ordinary_lm_studio_auto() {
+            self.validate_connection()?;
+            self.validate_model()?;
+            match self.lm_studio_auto_projection() {
+                Some(Ok(model)) if self.connection_mode == ConnectionMode::LmStudioCompatible => {
+                    local_ai::Profile::lm_studio_compatible_with_auto_model(
+                        &self.endpoint,
+                        self.model.trim(),
+                        options,
+                        model,
+                    )
+                }
+                Some(Ok(model)) => local_ai::Profile::lm_studio_with_auto_model(
+                    &self.endpoint,
+                    self.model.trim(),
+                    options,
+                    model,
+                ),
+                Some(Err(error)) => Err(error.clone()),
+                None => Err("Waiting for the loaded model on the LM Studio endpoint.".into()),
+            }
+        } else if self.connection_mode.uses_native_lm_studio() {
+            self.validate_connection()?;
+            self.validate_model()?;
+            local_ai::Profile::lm_studio(&self.endpoint, &self.model, options)
+        } else if self.connection_mode == ConnectionMode::LmStudioCompatible {
+            self.validate_connection()?;
+            self.validate_model()?;
+            local_ai::Profile::lm_studio_compatible(&self.endpoint, &self.model, options)
+        } else if self.connection_mode == ConnectionMode::LoopbackAnthropic {
+            self.validate_connection()?;
+            self.validate_model()?;
+            local_ai::Profile::loopback_anthropic(&self.endpoint, &self.model, options)
         } else if let Some(protocol) = self.remote_protocol() {
             self.validate_connection()?;
             local_ai::Profile::remote(&self.endpoint, &self.model, protocol, options)
-        } else if self.connection_mode == ConnectionMode::LmStudio {
-            local_ai::Profile::lm_studio(&self.endpoint, &self.model, options)
         } else {
             local_ai::Profile::configured(&self.endpoint, &self.model, options)
         }
-        .map(|profile| profile.with_prompt_preset(preset))
+        .map(|profile| {
+            profile
+                .with_prompt_preset(preset)
+                .with_vision_mode(self.vision.runtime())
+        })
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum ConnectionMode {
     #[default]
     External,
     LmStudio,
+    LmStudioCompatible,
     RemoteOpenAi,
+    RemoteOpenAiExact,
+    #[serde(rename = "minimax-native")]
+    MiniMaxNative,
     Anthropic,
+    AnthropicExact,
+    LoopbackAnthropic,
     Managed,
     ManagedMlx,
     Cli,
 }
 
 impl ConnectionMode {
-    const ALL: [Self; 6] = [
+    const ALL: [Self; 11] = [
         Self::External,
         Self::Managed,
         Self::LmStudio,
+        Self::LmStudioCompatible,
         Self::RemoteOpenAi,
+        Self::RemoteOpenAiExact,
+        Self::MiniMaxNative,
         Self::Anthropic,
+        Self::AnthropicExact,
+        Self::LoopbackAnthropic,
         Self::Cli,
     ];
 
-    const WITH_MLX: [Self; 7] = [
+    const WITH_MLX: [Self; 12] = [
         Self::External,
         Self::Managed,
         Self::ManagedMlx,
         Self::LmStudio,
+        Self::LmStudioCompatible,
         Self::RemoteOpenAi,
+        Self::RemoteOpenAiExact,
+        Self::MiniMaxNative,
         Self::Anthropic,
+        Self::AnthropicExact,
+        Self::LoopbackAnthropic,
         Self::Cli,
     ];
 
     fn is_managed(self) -> bool {
         matches!(self, Self::Managed | Self::ManagedMlx)
+    }
+
+    pub(super) fn uses_lm_studio_inventory(self) -> bool {
+        matches!(self, Self::LmStudio | Self::LmStudioCompatible)
+    }
+
+    pub(super) fn uses_native_lm_studio(self) -> bool {
+        self == Self::LmStudio
+    }
+
+    fn allows_automatic_model_selection(self) -> bool {
+        self != Self::LoopbackAnthropic && !self.is_exact_https()
+    }
+
+    fn is_exact_https(self) -> bool {
+        matches!(self, Self::RemoteOpenAiExact | Self::AnthropicExact)
     }
 
     fn is_external(&self) -> bool {
@@ -878,8 +1321,13 @@ impl fmt::Display for ConnectionMode {
         f.write_str(match self {
             Self::External => "Local OpenAI-compatible API",
             Self::LmStudio => "LM Studio native API",
+            Self::LmStudioCompatible => "LM Studio (OpenAI-compatible)",
             Self::RemoteOpenAi => "Remote OpenAI-compatible HTTPS API",
+            Self::RemoteOpenAiExact => "OpenAI-compatible HTTPS completion URL",
+            Self::MiniMaxNative => "MiniMax native HTTPS API",
             Self::Anthropic => "Anthropic Messages HTTPS API",
+            Self::AnthropicExact => "Anthropic Messages HTTPS URL",
+            Self::LoopbackAnthropic => "Loopback Anthropic Messages API",
             Self::Managed => "Managed llama.cpp model",
             Self::ManagedMlx => "Managed Apple MLX model",
             Self::Cli => "Configured local CLI",
@@ -905,10 +1353,11 @@ fn valid_env_name(name: &str) -> bool {
 pub(crate) enum ModelMode {
     Manual,
     Auto,
+    ServerDefault,
 }
 
 impl ModelMode {
-    const ALL: [Self; 2] = [Self::Manual, Self::Auto];
+    const ALL: [Self; 3] = [Self::Manual, Self::Auto, Self::ServerDefault];
 }
 
 impl fmt::Display for ModelMode {
@@ -916,6 +1365,7 @@ impl fmt::Display for ModelMode {
         f.write_str(match self {
             Self::Manual => "Manual",
             Self::Auto => "Automatic",
+            Self::ServerDefault => "Server default",
         })
     }
 }
@@ -930,6 +1380,14 @@ pub(crate) enum Vision {
 
 impl Vision {
     const ALL: [Self; 3] = [Self::Auto, Self::Enabled, Self::Disabled];
+
+    fn runtime(self) -> local_ai::VisionMode {
+        match self {
+            Self::Auto => local_ai::VisionMode::Auto,
+            Self::Enabled => local_ai::VisionMode::Enabled,
+            Self::Disabled => local_ai::VisionMode::Disabled,
+        }
+    }
 }
 
 impl fmt::Display for Vision {
@@ -952,6 +1410,7 @@ pub(crate) enum Reasoning {
     Medium,
     High,
     ExtraHigh,
+    On,
 }
 
 impl Reasoning {
@@ -974,6 +1433,35 @@ impl Reasoning {
             Self::Medium => Some("medium"),
             Self::High => Some("high"),
             Self::ExtraHigh => Some("xhigh"),
+            Self::On => Some("on"),
+        }
+    }
+
+    fn from_mlx_controls(controls: mlx_models::ReasoningControls) -> Vec<Self> {
+        [
+            Self::Default,
+            Self::None,
+            Self::On,
+            Self::Low,
+            Self::Medium,
+            Self::High,
+        ]
+        .into_iter()
+        .filter(|choice| controls.supports(choice.api_value()))
+        .collect()
+    }
+
+    fn from_lm_studio(option: local_ai::LmStudioReasoningOption) -> Self {
+        use local_ai::LmStudioReasoningOption as Option;
+
+        match option {
+            Option::Off => Self::None,
+            Option::On => Self::On,
+            Option::Minimal => Self::Minimal,
+            Option::Low => Self::Low,
+            Option::Medium => Self::Medium,
+            Option::High => Self::High,
+            Option::XHigh => Self::ExtraHigh,
         }
     }
 }
@@ -988,6 +1476,7 @@ impl fmt::Display for Reasoning {
             Self::Medium => "Medium",
             Self::High => "High",
             Self::ExtraHigh => "Extra high",
+            Self::On => "On",
         })
     }
 }
@@ -1033,6 +1522,8 @@ pub(crate) enum Message {
     CloudProvider(cloud::Provider),
     Cli(CliAction),
     ManagedModel(String),
+    ConfirmImportedModel(ProfileId, String),
+    ImportedModelChecked(Arc<()>, Result<bool, String>),
     RefreshManagedModels,
     ManagedModelsLoaded(PolicyModelRuntime, ManagedModels),
     TrustLocal(bool),
@@ -1064,6 +1555,7 @@ struct ManagedChoice {
     id: String,
     name: String,
     vision: bool,
+    mlx_reasoning: mlx_models::ReasoningControls,
 }
 
 impl fmt::Display for ManagedChoice {
@@ -1113,11 +1605,20 @@ impl ManagedModels {
             if cancelled.load(Ordering::Acquire) {
                 break;
             }
-            if policy_models::available(model, root, cancelled) {
+            let available = if runtime == PolicyModelRuntime::Mlx {
+                mlx_runtime::supported()
+                    .then(|| policy_models::mlx_reasoning(model, cancelled).ok())
+                    .flatten()
+            } else {
+                policy_models::available(model, root, cancelled)
+                    .then_some(mlx_models::ReasoningControls::DefaultOnly)
+            };
+            if let Some(mlx_reasoning) = available {
                 result.choices.push(ManagedChoice {
                     id: model.id.clone(),
                     name: model.name.clone(),
                     vision: false,
+                    mlx_reasoning,
                 });
             } else {
                 result.policy_model_unavailable = true;
@@ -1138,19 +1639,27 @@ impl ManagedModels {
                                 id: model.id,
                                 name: model.name,
                                 vision: model.projector_bytes.is_some(),
+                                mlx_reasoning: mlx_models::ReasoningControls::DefaultOnly,
                             })
                             .collect()
                     }),
-                PolicyModelRuntime::Mlx => mlx_models::Registry::new(root).list().map(|models| {
-                    models
-                        .into_iter()
-                        .map(|model| ManagedChoice {
-                            id: model.id,
-                            name: model.name,
-                            vision: false,
-                        })
-                        .collect()
-                }),
+                PolicyModelRuntime::Mlx => {
+                    let registry = mlx_models::Registry::new(root);
+                    registry.list().map(|models| {
+                        models
+                            .into_iter()
+                            .take_while(|_| !cancelled.load(Ordering::Acquire))
+                            .map(|model| ManagedChoice {
+                                mlx_reasoning: registry
+                                    .reasoning_controls(&model.id)
+                                    .unwrap_or_default(),
+                                id: model.id,
+                                name: model.name,
+                                vision: false,
+                            })
+                            .collect()
+                    })
+                }
             };
         match registered {
             Ok(registered) => result.choices.extend(registered),
@@ -1171,18 +1680,82 @@ pub(super) struct Editor {
     invalid: BTreeMap<(ProfileId, Number), String>,
     usage: usage_view::Editor,
     models: Vec<String>,
+    lm_studio_catalog: Option<LmStudioDiscovery>,
     managed_models: ManagedModels,
     managed_models_load: Option<ModelInventory>,
     mlx_models: ManagedModels,
     mlx_models_load: Option<ModelInventory>,
+    imported_model_review: Option<imported_model::Review>,
     status: Option<String>,
     deleting: bool,
     reserved_id: u64,
     wizard: Option<Wizard>,
     web_search_denied: bool,
+    imported_toolpack_names: String,
     cli_review: cli_profile::Review,
     cli_catalog: Option<cli_profile::CatalogState>,
     cli_discovery: Option<cli_profile::DiscoveryState>,
+}
+
+#[derive(Clone, Eq, PartialEq)]
+enum LmStudioRoute {
+    User {
+        endpoint: local_ai::LmStudioEndpoint,
+        credential_env: Option<String>,
+    },
+    Policy([u8; 32]),
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(super) struct LmStudioDiscoveryKey {
+    profile: ProfileId,
+    route: LmStudioRoute,
+}
+
+struct LmStudioDiscovery {
+    key: LmStudioDiscoveryKey,
+    catalog: std::sync::Arc<local_ai::LmStudioCatalog>,
+    observed: std::time::Instant,
+}
+
+impl Profile {
+    pub(super) fn lm_studio_discovery_key(&self) -> Option<LmStudioDiscoveryKey> {
+        if !self.supports_model_discovery() {
+            return None;
+        }
+        let route = if let Some(definition) = self.policy_definition() {
+            if definition.provider != PolicyAiProvider::LmStudio
+                && !local_ai::Profile::supports_policy_auto_model(definition)
+            {
+                return None;
+            }
+            LmStudioRoute::Policy(definition.fingerprint())
+        } else if self.connection_mode.uses_lm_studio_inventory() {
+            LmStudioRoute::User {
+                endpoint: self.lm_studio_endpoint().ok()?,
+                credential_env: self.credential().ok()?,
+            }
+        } else {
+            return None;
+        };
+        self.validate_connection().ok()?;
+        Some(LmStudioDiscoveryKey {
+            profile: self.id,
+            route,
+        })
+    }
+
+    fn is_lm_studio(&self) -> bool {
+        self.connection_mode.uses_lm_studio_inventory()
+            || self.policy_definition().is_some_and(|definition| {
+                definition.provider == PolicyAiProvider::LmStudio
+                    || local_ai::Profile::supports_policy_auto_model(definition)
+            })
+    }
+
+    pub(super) fn lm_studio_reference(&self) -> &str {
+        self.effective_model()
+    }
 }
 
 impl Editor {
@@ -1232,8 +1805,39 @@ impl Editor {
         }
     }
 
+    pub(super) fn refresh_saved_lm_studio_auto(&mut self, catalog: &Catalog) {
+        self.catalog.refresh_lm_studio_auto(|profile| {
+            let source = catalog.profile(profile.id)?;
+            if source.lm_studio_auto_settings() == profile.lm_studio_auto_settings() {
+                source.lm_studio_auto_projection().cloned()
+            } else {
+                profile.lm_studio_auto_projection().cloned()
+            }
+        });
+    }
+
+    pub(super) fn set_selected_lm_studio_auto(
+        &mut self,
+        result: Result<local_ai::LmStudioAutoModel, String>,
+    ) {
+        let catalog_outdated = self.selected().is_some_and(|profile| {
+            self.lm_studio_auto_preview(profile).is_some_and(|preview| {
+                preview.ok() != result.as_ref().ok().map(local_ai::LmStudioAutoModel::model)
+            })
+        });
+        if catalog_outdated {
+            self.lm_studio_catalog = None;
+        }
+        if let Some(profile) = self.selected_mut() {
+            profile.set_lm_studio_auto_projection(Some(result));
+        }
+    }
+
     pub(super) fn deny_web_search(&mut self, denied: bool) {
         self.web_search_denied = denied;
+        if denied {
+            self.imported_toolpack_names.clear();
+        }
     }
 
     pub(super) fn wizard_open(&self) -> bool {
@@ -1271,6 +1875,7 @@ impl Editor {
         }
         let mut catalog = self.catalog.clone();
         for profile in &mut catalog.profiles {
+            profile.clear_unreviewed_embedded_model();
             if !read_only.is_some_and(|saved| saved.profile(profile.id) == Some(&*profile)) {
                 profile.name = profile.name.trim().into();
                 profile.endpoint = profile.endpoint.trim().into();
@@ -1326,6 +1931,10 @@ impl Editor {
             .clone_from(&saved.policy_default);
     }
 
+    pub(super) fn stage_default(&mut self, id: ProfileId) {
+        self.catalog.set_default(id);
+    }
+
     fn selected_mut(&mut self) -> Option<&mut Profile> {
         if let Some(wizard) = &mut self.wizard {
             return Some(&mut wizard.profile);
@@ -1352,6 +1961,7 @@ impl Editor {
             });
             if let Some(profile) = self.selected_mut()
                 && profile.model_mode == ModelMode::Auto
+                && !profile.ordinary_lm_studio_auto()
             {
                 profile.model = models.first().cloned().unwrap_or_default();
             }
@@ -1360,6 +1970,95 @@ impl Editor {
             models.truncate(512);
             self.models = models;
         }
+    }
+
+    pub(super) fn model_section_open(&self) -> bool {
+        self.wizard.as_ref().map_or_else(
+            || {
+                self.section == Section::Model
+                    || self
+                        .selected()
+                        .is_some_and(|profile| profile.policy_definition().is_some())
+            },
+            Wizard::model_step_open,
+        )
+    }
+
+    pub(super) fn lm_studio_catalog_is_fresh(&self, key: &LmStudioDiscoveryKey) -> bool {
+        self.lm_studio_catalog.as_ref().is_some_and(|discovery| {
+            &discovery.key == key && discovery.observed.elapsed() < Duration::from_secs(30)
+        })
+    }
+
+    pub(super) fn set_lm_studio_catalog(
+        &mut self,
+        key: LmStudioDiscoveryKey,
+        catalog: std::sync::Arc<local_ai::LmStudioCatalog>,
+        explicit: bool,
+    ) {
+        let Some(profile) = self
+            .selected()
+            .filter(|profile| profile.lm_studio_discovery_key().as_ref() == Some(&key))
+        else {
+            return;
+        };
+        if explicit || profile.model_mode == ModelMode::Manual || profile.ordinary_lm_studio_auto()
+        {
+            let id = profile.id;
+            let endpoint = profile.endpoint.trim().to_owned();
+            self.set_models(id, &endpoint, catalog.names());
+        }
+        self.lm_studio_catalog = Some(LmStudioDiscovery {
+            key,
+            catalog,
+            observed: std::time::Instant::now(),
+        });
+    }
+
+    pub(super) fn lm_studio_capability(
+        &self,
+        profile: &Profile,
+    ) -> Option<&local_ai::LmStudioCapabilities> {
+        let key = profile.lm_studio_discovery_key()?;
+        let catalog = &self
+            .lm_studio_catalog
+            .as_ref()
+            .filter(|discovery| discovery.key == key)?
+            .catalog;
+        let reference = if profile.ordinary_lm_studio_auto() {
+            catalog.resolve_loaded(&profile.model).ok()?
+        } else {
+            profile.lm_studio_reference()
+        };
+        catalog.capability(reference)
+    }
+
+    fn lm_studio_auto_preview<'a>(
+        &'a self,
+        profile: &Profile,
+    ) -> Option<Result<&'a str, &'static str>> {
+        let key = profile.lm_studio_discovery_key()?;
+        self.lm_studio_catalog
+            .as_ref()
+            .filter(|discovery| discovery.key == key)
+            .map(|discovery| discovery.catalog.resolve_loaded(&profile.model))
+    }
+
+    fn lm_studio_reasoning_options(&self, profile: &Profile) -> Option<Vec<Reasoning>> {
+        if profile.connection_mode == ConnectionMode::LmStudioCompatible {
+            return None;
+        }
+        let reasoning = self.lm_studio_capability(profile)?.reasoning.as_ref()?;
+        let mut options = vec![Reasoning::Default];
+        options.extend(
+            reasoning
+                .allowed
+                .iter()
+                .copied()
+                .map(Reasoning::from_lm_studio)
+                .filter(|choice| !matches!(choice, Reasoning::Minimal | Reasoning::ExtraHigh)),
+        );
+        Some(options)
     }
 
     pub(super) fn refresh_managed_models(&mut self, root: PathBuf) -> Task<Message> {
@@ -1398,6 +2097,16 @@ impl Editor {
             .iter()
             .find(|choice| choice.id == profile.model)
             .map(|choice| choice.name.as_str())
+    }
+
+    fn mlx_reasoning_controls(&self, profile: &Profile) -> mlx_models::ReasoningControls {
+        self.mlx_models
+            .choices
+            .iter()
+            .find(|choice| choice.id == profile.model)
+            .map_or(mlx_models::ReasoningControls::DefaultOnly, |choice| {
+                choice.mlx_reasoning
+            })
     }
 
     pub(super) fn set_status(&mut self, status: impl Into<String>) {
@@ -1452,6 +2161,7 @@ impl Editor {
             }
             Message::Section(section) => {
                 self.section = section;
+                self.imported_toolpack_names.clear();
                 self.cancel_cli_catalog();
                 self.cli_discovery = None;
                 return;
@@ -1467,6 +2177,10 @@ impl Editor {
                         self.mlx_models_load = None;
                     }
                 }
+                return;
+            }
+            Message::ImportedModelChecked(ticket, result) => {
+                self.finish_imported_model_review(&ticket, result, editable);
                 return;
             }
             _ => {}
@@ -1485,10 +2199,9 @@ impl Editor {
             Message::Number(field, input) => self.edit_number(field, input),
             Message::Override(field, enabled) => self.toggle_override(field, enabled),
             Message::ReviewedAgentHttps(allow) if self.wizard.is_none() => {
-                if let Some(profile) = self
-                    .selected_mut()
-                    .filter(|profile| profile.remote_protocol().is_some())
-                {
+                if let Some(profile) = self.selected_mut().filter(|profile| {
+                    profile.remote_protocol().is_some() && !profile.uses_server_default_model()
+                }) {
                     profile.reviewed_agent_https = allow && profile.trusted_remote_endpoint;
                 }
             }
@@ -1514,20 +2227,40 @@ impl Editor {
             Message::TrustLocal(trusted) => {
                 if let Some(profile) = self
                     .selected_mut()
-                    .filter(|profile| !profile.is_managed() && profile.allows_local_roles())
+                    .filter(|profile| profile.is_loopback())
+                    .filter(|profile| {
+                        !trusted && profile.connection_mode != ConnectionMode::LoopbackAnthropic
+                            || profile.local_endpoint_is_valid()
+                    })
                 {
                     profile.trusted_local_endpoint = trusted;
-                    if profile.model_mode == ModelMode::Auto {
+                    if trusted {
+                        profile.restore_review = false;
+                    } else if profile.requires_endpoint_review() {
+                        profile.restore_review = true;
+                    }
+                    if profile.model_mode == ModelMode::Auto && !profile.ordinary_lm_studio_auto() {
                         profile.model.clear();
                     }
                     if !trusted {
                         profile.credential_env.clear();
-                        profile.lm_web = None;
+                        if profile.java_web_hint.is_some() || profile.requires_endpoint_review() {
+                            profile.clear_web_search();
+                        } else {
+                            profile.lm_web = None;
+                        }
                     }
                 }
                 self.clear_selection_feedback();
             }
-            Message::Web(action) if !self.web_search_denied => self.update_web_search(action),
+            Message::Web(action)
+                if !self.web_search_denied
+                    && self
+                        .selected()
+                        .is_some_and(|profile| !profile.restore_review) =>
+            {
+                self.update_web_search(action)
+            }
             Message::TrustRemote(trusted) => {
                 if let Some(profile) = self.selected_mut().filter(|profile| {
                     profile.remote_protocol().is_some() && profile.destination().is_ok()
@@ -1537,9 +2270,17 @@ impl Editor {
                         profile.restore_review = false;
                     }
                     if !trusted {
+                        if profile.requires_endpoint_review() {
+                            profile.restore_review = true;
+                        }
                         profile.reviewed_agent_https = false;
+                        if profile.java_web_hint.is_some() || profile.requires_endpoint_review() {
+                            profile.clear_web_search();
+                        } else {
+                            profile.lm_web = None;
+                        }
                     }
-                    if profile.model_mode == ModelMode::Auto {
+                    if profile.model_mode == ModelMode::Auto && !profile.ordinary_lm_studio_auto() {
                         profile.model.clear();
                     }
                     if !trusted {
@@ -1553,12 +2294,23 @@ impl Editor {
                     && !profile.is_managed()
                     && !profile.is_cli()
                     && profile.model_mode != mode
+                    && (mode != ModelMode::ServerDefault || profile.server_default_available())
+                    && (mode != ModelMode::Auto
+                        || profile.connection_mode.allows_automatic_model_selection()
+                            && (!profile.connection_mode.uses_lm_studio_inventory()
+                                || profile
+                                    .lm_studio_endpoint()
+                                    .is_ok_and(|endpoint| endpoint.supports_metadata())))
                 {
                     profile.model_mode = mode;
-                    if mode == ModelMode::Auto {
+                    if mode == ModelMode::ServerDefault {
+                        profile.model.clear();
+                        profile.reasoning = Reasoning::Default;
+                        profile.reviewed_agent_https = false;
+                    } else if mode == ModelMode::Auto && !profile.ordinary_lm_studio_auto() {
                         profile.model.clear();
                     }
-                    self.status = None;
+                    self.clear_selection_feedback();
                 }
             }
             Message::Vision(vision) => {
@@ -1577,11 +2329,37 @@ impl Editor {
                 }
             }
             Message::Reasoning(reasoning) => {
-                if let Some(profile) = self
-                    .selected_mut()
-                    .filter(|profile| !profile.is_mlx() && !profile.is_cli())
+                let supported = self.selected().is_some_and(|profile| {
+                    if profile.uses_server_default_model() {
+                        reasoning == Reasoning::Default
+                    } else if profile.is_mlx() {
+                        !profile.restore_review
+                            && self
+                                .mlx_reasoning_controls(profile)
+                                .supports(reasoning.api_value())
+                    } else if profile.connection_mode != ConnectionMode::LmStudio {
+                        reasoning != Reasoning::On
+                    } else {
+                        self.lm_studio_reasoning_options(profile)
+                            .map_or(reasoning != Reasoning::On, |options| {
+                                options.contains(&reasoning)
+                            })
+                    }
+                });
+                if supported
+                    && let Some(profile) = self.selected_mut().filter(|profile| {
+                        !profile.is_cli()
+                            || profile
+                                .cli
+                                .as_ref()
+                                .is_some_and(cli_profile::Settings::uses_reasoning)
+                    })
+                    && profile.reasoning != reasoning
                 {
                     profile.reasoning = reasoning;
+                    if let Some(settings) = &mut profile.cli {
+                        settings.clear_approval();
+                    }
                 }
                 self.status = None;
             }
@@ -1611,14 +2389,19 @@ impl Editor {
         if mode == ConnectionMode::ManagedMlx && !mlx_runtime::supported() {
             return;
         }
-        let Some(profile) = self
-            .selected_mut()
-            .filter(|profile| profile.connection_mode != mode)
-        else {
+        let Some(profile) = self.selected_mut().filter(|profile| {
+            profile.connection_mode != mode
+                && !(profile.restore_review && profile.java_embedded_model.is_some())
+        }) else {
             return;
         };
         profile.connection_mode = mode;
-        profile.restore_review = false;
+        profile.restore_review = mode == ConnectionMode::LoopbackAnthropic || mode.is_exact_https();
+        profile.java_source = None;
+        profile.java_embedded_model = None;
+        if profile.java_web_hint.take().is_some() {
+            profile.clear_web_search();
+        }
         profile.trusted_local_endpoint = false;
         profile.trusted_remote_endpoint = false;
         profile.reviewed_agent_https = false;
@@ -1627,6 +2410,9 @@ impl Editor {
         profile.lm_web = None;
         profile.model.clear();
         profile.model_mode = ModelMode::Manual;
+        if profile.reasoning == Reasoning::On && mode != ConnectionMode::LmStudio {
+            profile.reasoning = Reasoning::Default;
+        }
         if mode == ConnectionMode::Cli {
             profile.endpoint.clear();
             profile.tavily_search = false;
@@ -1644,9 +2430,12 @@ impl Editor {
             }
         } else {
             profile.endpoint = match mode {
-                ConnectionMode::LmStudio => "127.0.0.1:1234",
+                ConnectionMode::LmStudio | ConnectionMode::LmStudioCompatible => "127.0.0.1:1234",
                 ConnectionMode::RemoteOpenAi => cloud::Provider::OpenAi.endpoint(),
+                ConnectionMode::RemoteOpenAiExact | ConnectionMode::AnthropicExact => "",
+                ConnectionMode::MiniMaxNative => local_ai::MINIMAX_NATIVE_ENDPOINT,
                 ConnectionMode::Anthropic => cloud::Provider::Anthropic.endpoint(),
+                ConnectionMode::LoopbackAnthropic => local_ai::ANTHROPIC_LOOPBACK_ENDPOINT,
                 _ => local_ai::DEFAULT_ENDPOINT,
             }
             .into();
@@ -1678,28 +2467,44 @@ impl Editor {
     }
 
     fn select_managed_model(&mut self, model: String) {
-        if let Some(vision) = self
+        if let Some((vision, mlx_reasoning)) = self
             .selected()
             .and_then(|profile| {
                 let catalog = self.managed_catalog(profile);
-                if catalog.loading {
+                if catalog.loading
+                    || (profile.java_embedded_model.is_some()
+                        && profile.is_mlx()
+                        && !mlx_runtime::supported())
+                {
                     return None;
                 }
                 catalog.choices.iter().find(|choice| choice.id == model)
             })
-            .map(|choice| choice.vision)
-            && let Some(profile) = self.selected_mut().filter(|profile| profile.is_managed())
+            .map(|choice| (choice.vision, choice.mlx_reasoning))
+            && let Some(profile) = self
+                .selected_mut()
+                .filter(|profile| profile.is_managed() && profile.model != model)
         {
             profile.model = model;
+            if profile.java_embedded_model.is_some() {
+                profile.restore_review = true;
+            }
             if !vision {
                 profile.vision = Vision::Disabled;
             }
+            if profile.is_mlx() && !mlx_reasoning.supports(profile.reasoning.api_value()) {
+                profile.reasoning = Reasoning::Default;
+            }
             self.status = None;
+            self.imported_model_review = None;
         }
     }
 
     fn clear_selection_feedback(&mut self) {
+        self.imported_model_review = None;
+        self.imported_toolpack_names.clear();
         self.models.clear();
+        self.lm_studio_catalog = None;
         self.cancel_cli_catalog();
         self.cli_discovery = None;
         self.status = None;
@@ -1768,7 +2573,7 @@ impl Editor {
                 .catalog
                 .profiles
                 .iter()
-                .find(|profile| !profile.restore_review)
+                .find(|profile| !profile.restore_review && profile.java_embedded_model.is_none())
                 .and_then(|profile| u64::try_from(profile.id).ok());
         }
         if self.selected.is_none() {
@@ -1784,10 +2589,13 @@ impl Editor {
         if (profile.is_managed() && !matches!(field, Field::Name))
             || (profile.is_cli() && !matches!(field, Field::Name | Field::Model))
             || (matches!(field, Field::Credential) && !profile.trusts_credential())
-            || (matches!(field, Field::Model) && profile.model_mode == ModelMode::Auto)
+            || (matches!(field, Field::Model)
+                && profile.model_mode != ModelMode::Manual
+                && !profile.ordinary_lm_studio_auto())
         {
             return;
         }
+        let was_lm_studio_https = matches!(field, Field::Endpoint) && profile.lm_studio_https();
         let (value, max, destination) = match field {
             Field::Name => (value, MAX_NAME_BYTES, &mut profile.name),
             Field::Endpoint => (value, MAX_ENDPOINT_BYTES, &mut profile.endpoint),
@@ -1802,16 +2610,28 @@ impl Editor {
                 settings.clear_approval();
             }
             if matches!(field, Field::Endpoint) {
+                let imported_web = profile.java_web_hint.take().is_some();
+                let review_endpoint = profile.requires_endpoint_review();
+                if review_endpoint {
+                    profile.restore_review = true;
+                }
+                if imported_web || review_endpoint || profile.lm_studio_https() {
+                    profile.clear_web_search();
+                } else if was_lm_studio_https {
+                    profile.lm_web = None;
+                }
                 profile.trusted_local_endpoint = false;
                 profile.trusted_remote_endpoint = false;
                 profile.reviewed_agent_https = false;
                 profile.credential_env.clear();
             }
             if matches!(field, Field::Endpoint | Field::Credential) {
-                if profile.model_mode == ModelMode::Auto {
+                if profile.model_mode == ModelMode::Auto && !profile.ordinary_lm_studio_auto() {
                     profile.model.clear();
                 }
+                self.imported_toolpack_names.clear();
                 self.models.clear();
+                self.lm_studio_catalog = None;
             }
             if matches!(field, Field::Model) {
                 self.cancel_cli_catalog();

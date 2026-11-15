@@ -80,11 +80,12 @@ pub(crate) enum Event {
 
 pub(crate) struct Analyzed {
     asset: Arc<Screenshot>,
-    analysis: Arc<Analysis>,
+    analysis: screenshot_ai::Analyzed,
 }
 
 pub(crate) struct Saved {
-    outcome: Outcome,
+    outcome: Result<Outcome, String>,
+    usage_saved: bool,
     document: Option<Arc<Journal>>,
 }
 
@@ -245,7 +246,9 @@ impl Workspace {
             );
             return Task::none();
         }
-        let capture = self.screenshot_analysis_capture(&source);
+        let capture = self
+            .journal_usage_capture(&source)
+            .filter(|capture| matches!(capture.status(), Status::Recording | Status::Finishing));
         let redactor = match self.journal_entry_redactor(capture.as_ref()) {
             Ok(redactor) => redactor,
             Err(error) => {
@@ -257,11 +260,8 @@ impl Workspace {
         let pending = local_ai::start(profile.clone(), move |client| {
             let _signal = signal;
             let asset = target.review().map_err(|error| error.to_string())?;
-            let analysis = screenshot_ai::analyze(client, &asset, redactor.as_ref())?;
-            Ok(Analyzed {
-                asset,
-                analysis: Arc::new(analysis),
-            })
+            let analysis = screenshot_ai::analyze(client, &asset, redactor.as_ref());
+            Ok(Analyzed { asset, analysis })
         });
         let local_ai::Pending { reply, cancel } = match pending {
             Ok(pending) => pending,
@@ -338,15 +338,14 @@ impl Workspace {
             Err(error) => return self.finish_screenshot_analysis(ticket, Err(error)),
         };
         let window = request.window;
-        let capture = self.screenshot_analysis_capture(&request.source);
+        let capture = self.journal_usage_capture(&request.source);
         let (send, receive) = async_channel::bounded(1);
         let (signal, done) = async_channel::bounded(1);
         let worker = thread::Builder::new()
             .name("kortty-journal-screenshot-analysis-save".into())
             .spawn(move || {
                 let _signal = signal;
-                let result = publish(&analyzed, capture).map_err(|error| error.to_string());
-                let _ = send.try_send(result.map(Arc::new));
+                let _ = send.try_send(Arc::new(publish(&analyzed, capture.as_deref())));
             });
         if let Err(error) = worker {
             return self.finish_screenshot_analysis(ticket, Err(error.to_string()));
@@ -359,7 +358,7 @@ impl Workspace {
             let result = receive
                 .recv()
                 .await
-                .unwrap_or_else(|_| Err("The screenshot analysis writer stopped.".into()));
+                .map_err(|_| "The screenshot analysis writer stopped.".into());
             message(window, Event::Saved(ticket, result))
         })
     }
@@ -382,16 +381,37 @@ impl Workspace {
                 return Task::none();
             }
         };
-        let status = if saved.outcome.durability_warning {
+        let refresh_usage = if saved.usage_saved && self.journal_allowed() && !self.exiting {
+            request
+                .source
+                .directory()
+                .parent()
+                .map_or_else(Task::none, |root| {
+                    self.refresh_journal_action_managers(root)
+                })
+        } else {
+            Task::none()
+        };
+        let outcome = match &saved.outcome {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.screenshot_analysis_failed(
+                    request.trigger,
+                    format!("Screenshot analysis failed ({error})."),
+                );
+                return refresh_usage;
+            }
+        };
+        let status = if outcome.durability_warning {
             "Screenshot analysis saved. Storage could not confirm a durable save."
         } else {
             "Screenshot analysis saved."
         };
         self.screenshot_analysis_notice(request.trigger, status.into());
-        if !saved.outcome.changed || !self.journal_allowed() || self.exiting {
-            return Task::none();
+        if !outcome.changed || !self.journal_allowed() || self.exiting {
+            return refresh_usage;
         }
-        let mut tasks = Vec::new();
+        let mut tasks = vec![refresh_usage];
         if let Some(document) = &saved.document
             && let Some((_, analyzed)) = unique_entry(document, &request.entry_id)
         {
@@ -409,15 +429,6 @@ impl Workspace {
         }
         tasks.push(self.refresh_journal_entry_docks(&request.source));
         Task::batch(tasks)
-    }
-
-    fn screenshot_analysis_capture(&self, source: &ViewerSource) -> Option<Arc<Capture>> {
-        self.journal_metadata_captures()
-            .into_iter()
-            .find(|capture| {
-                matches!(capture.status(), Status::Recording | Status::Finishing)
-                    && ViewerSource::capture(capture).same_journal(source)
-            })
     }
 
     fn screenshot_analysis_failed(&mut self, trigger: Trigger, notice: String) {
@@ -481,25 +492,41 @@ fn merge_analysis(current: &Arc<Journal>, analyzed: &TimelineEntry) -> Option<Ar
     Some(document)
 }
 
-fn publish(analyzed: &Analyzed, capture: Option<Arc<Capture>>) -> io::Result<Saved> {
-    let outcome = store(analyzed, capture)?;
-    let document = analyzed
-        .asset
-        .source()
-        .read(None)
+fn publish(analyzed: &Analyzed, capture: Option<&Capture>) -> Saved {
+    let source = analyzed.asset.source();
+    let usage_saved = analyzed
+        .analysis
+        .usage
+        .clone()
+        .is_some_and(|usage| super::record_journal_ai_usage(source, capture, usage).is_ok());
+    let outcome = analyzed
+        .analysis
+        .result
+        .as_ref()
+        .map_err(ToOwned::to_owned)
+        .and_then(|analysis| {
+            store(&analyzed.asset, analysis, capture).map_err(|error| error.to_string())
+        });
+    let document = outcome
+        .as_ref()
         .ok()
-        .flatten()
-        .map(Arc::new);
-    Ok(Saved { outcome, document })
+        .filter(|outcome| outcome.changed)
+        .and_then(|_| source.read(None).ok().flatten().map(Arc::new));
+    Saved {
+        outcome,
+        usage_saved,
+        document,
+    }
 }
 
-fn store(analyzed: &Analyzed, capture: Option<Arc<Capture>>) -> io::Result<Outcome> {
+fn store(
+    asset: &Arc<Screenshot>,
+    analysis: &Analysis,
+    capture: Option<&Capture>,
+) -> io::Result<Outcome> {
     if let Some(capture) = capture {
         if capture.status() == Status::Recording {
-            match capture.store_screenshot_analysis(
-                Arc::clone(&analyzed.asset),
-                Arc::clone(&analyzed.analysis),
-            ) {
+            match capture.store_screenshot_analysis(Arc::clone(asset), Arc::new(analysis.clone())) {
                 Ok(reply) => {
                     return reply
                         .recv_blocking()
@@ -514,5 +541,5 @@ fn store(analyzed: &Analyzed, capture: Option<Arc<Capture>>) -> io::Result<Outco
         }
         let _ = capture.done().recv_blocking();
     }
-    screenshot_analysis_store::apply(&analyzed.asset, &analyzed.analysis)
+    screenshot_analysis_store::apply(asset, analysis)
 }

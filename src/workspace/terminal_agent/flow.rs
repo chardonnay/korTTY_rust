@@ -752,6 +752,7 @@ impl Run {
         &self,
         password_sudo: bool,
         limit: usize,
+        web_evidence: Option<&str>,
     ) -> Result<String, String> {
         let target = self
             .target
@@ -781,9 +782,12 @@ impl Run {
             .collect::<Result<Vec<_>, _>>()?;
         steps.reverse();
         let data = |steps: &[Cow<'_, str>]| {
-            json!({"goal":goal,"target":target,"context":context,"acceptedPlan":plan,"steps":steps,
-                "turn":self.turns + 1,"turnLimit":engine::MAX_TURNS})
-            .to_string()
+            let mut request = json!({"goal":goal,"target":target,"context":context,"acceptedPlan":plan,"steps":steps,
+                "turn":self.turns + 1,"turnLimit":engine::MAX_TURNS});
+            if let Some(evidence) = web_evidence {
+                request["web_evidence"] = json!(evidence);
+            }
+            request.to_string()
         };
         let mut input = data(&steps);
         while input.chars().count() > limit && !steps.is_empty() {

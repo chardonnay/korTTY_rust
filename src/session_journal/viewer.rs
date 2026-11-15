@@ -15,7 +15,7 @@ use super::metadata::require_single_link;
 use super::{
     Capture, CapturePage, Cursor, Journal, MAX_DOCUMENT_BYTES, Summary, check_path, child,
     document_id, document_text, invalid, journal, number, open_document, parse_document,
-    source_text,
+    source_text, value,
 };
 
 pub(super) mod screenshot;
@@ -84,8 +84,19 @@ impl Source {
         self.location.0 == root
     }
 
+    pub(super) fn has_location(&self, location: (EntryIdentity, EntryIdentity)) -> bool {
+        self.location == location
+    }
+
     pub(crate) fn matches_location(&self, identity: &DeletionIdentity) -> bool {
         self.location == identity.location()
+    }
+
+    pub(super) fn document_identity(
+        &self,
+        stamp: crate::private_files::FileStamp,
+    ) -> DeletionIdentity {
+        DeletionIdentity::from_document_stamp(self.location, stamp)
     }
 
     pub(crate) fn require_location(&self, path: &Path, opened: &Directory) -> io::Result<()> {
@@ -128,6 +139,14 @@ impl Source {
                 .ok_or_else(|| invalid("Missing session journal metadata"))?;
             let parts = number::<u32>(meta, "logParts")?.unwrap_or(1);
             capture_page_in(source, self.id(), parts, after, range, query)
+        })
+    }
+
+    pub(super) fn login_user(&self) -> io::Result<String> {
+        self.with_document(|_, document| {
+            let meta = child(document.root_element(), "meta")
+                .ok_or_else(|| invalid("Missing session journal metadata"))?;
+            value(meta, "username")
         })
     }
 

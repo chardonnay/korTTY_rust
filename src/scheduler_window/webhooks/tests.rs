@@ -50,6 +50,7 @@ fn webhook_selection_waits_for_commit_and_is_independent_of_desktop() {
         },
         detail: Some("Private stdout; secret=do-not-send".into()),
         recording: None,
+        output: None,
         swarm_report: None,
     }));
     assert!(scheduler.next_webhook().is_none());

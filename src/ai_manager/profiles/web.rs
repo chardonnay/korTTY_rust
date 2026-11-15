@@ -3,11 +3,15 @@
 use std::fmt;
 
 use iced::Element;
-use iced::widget::{column, text, text_input};
+use iced::widget::{button, checkbox, column, text, text_input};
 
-use crate::local_ai::web_search::{McpMode, McpSettings};
+use crate::local_ai::web_search::{
+    MAX_PAGE_URL_BYTES, McpMode, McpSettings, PageProvider, SearxngPageSettings, page_provider,
+};
 
-use super::{ConnectionMode, Editor, Message, Profile, view::choice};
+use super::{Editor, Message, Profile, java_backup::JavaWebHint, view::choice};
+
+const MAX_TOOL_NAMES_BYTES: usize = 520;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
 pub(crate) enum Choice {
@@ -42,8 +46,13 @@ impl fmt::Display for Choice {
 #[derive(Clone)]
 pub(crate) enum Action {
     Select(Choice),
+    UseImported,
+    ImportedToolpackNames(String),
     Plugin(String),
     Tools(String),
+    SearxngPages(bool),
+    SearxngEndpoint(String),
+    SearxngBearerEnv(String),
 }
 
 impl Profile {
@@ -65,21 +74,70 @@ impl Profile {
             Choice::Disabled
         }
     }
+
+    fn imported_web_hint(&self) -> Option<&JavaWebHint> {
+        self.java_web_hint.as_ref().filter(|hint| {
+            !self.restore_review && !self.has_web_search() && self.supports_java_web_hint(hint)
+        })
+    }
 }
 
 impl Editor {
     pub(super) fn update_web_search(&mut self, action: Action) {
+        if let Action::ImportedToolpackNames(names) = action {
+            if self.selected().is_some_and(|profile| {
+                matches!(
+                    profile.imported_web_hint(),
+                    Some(JavaWebHint::Toolpack { .. })
+                ) && profile.credential().ok().flatten().is_some()
+            }) {
+                self.imported_toolpack_names = if names.len() <= MAX_TOOL_NAMES_BYTES
+                    && !names.chars().any(char::is_control)
+                {
+                    names
+                } else {
+                    String::new()
+                };
+                self.status = None;
+            }
+            return;
+        }
+        let names = if matches!(action, Action::UseImported) {
+            self.imported_toolpack_names.clone()
+        } else {
+            String::new()
+        };
         let Some(profile) = self.selected_mut().filter(|profile| !profile.is_cli()) else {
             return;
         };
         match action {
+            Action::UseImported => {
+                let Some(hint) = profile.imported_web_hint() else {
+                    return;
+                };
+                let mut settings = hint.mcp_settings();
+                if let Some(toolpack) = settings
+                    .as_mut()
+                    .filter(|settings| settings.mode == McpMode::Toolpack)
+                {
+                    toolpack.tool_names = names;
+                }
+                let mut updated = profile.clone();
+                updated.tavily_search = settings.is_none();
+                updated.lm_web = settings;
+                if let Err(error) = updated.validate_connection() {
+                    self.set_status(error);
+                    return;
+                }
+                *profile = updated;
+            }
             Action::Select(mode) if mode != profile.web_choice() => match mode {
                 Choice::Disabled => profile.clear_web_search(),
                 Choice::Tavily => {
                     profile.clear_web_search();
                     profile.tavily_search = true;
                 }
-                Choice::Mcp(mode) if profile.connection_mode == ConnectionMode::LmStudio => {
+                Choice::Mcp(mode) if profile.allows_lm_studio_mcp() => {
                     profile.clear_web_search();
                     profile.lm_web = Some(McpSettings::new(mode));
                 }
@@ -94,15 +152,59 @@ impl Editor {
                     settings.plugin = plugin;
                 }
             }
-            Action::Tools(tools) if tools.len() <= 520 && !tools.chars().any(char::is_control) => {
+            Action::Tools(tools)
+                if tools.len() <= MAX_TOOL_NAMES_BYTES && !tools.chars().any(char::is_control) =>
+            {
                 if let Some(settings) = &mut profile.lm_web
                     && settings.mode == McpMode::Toolpack
                 {
                     settings.tool_names = tools;
                 }
             }
+            Action::SearxngPages(enabled) => {
+                if let Some(settings) = profile
+                    .lm_web
+                    .as_mut()
+                    .filter(|settings| settings.mode == McpMode::Searxng)
+                {
+                    if enabled {
+                        settings
+                            .searxng_page
+                            .get_or_insert_with(|| SearxngPageSettings {
+                                endpoint: String::new(),
+                                bearer_env: None,
+                            });
+                    } else {
+                        settings.searxng_page = None;
+                    }
+                }
+            }
+            Action::SearxngEndpoint(endpoint)
+                if endpoint.len() <= MAX_PAGE_URL_BYTES
+                    && !endpoint.chars().any(char::is_control) =>
+            {
+                if let Some(page) = profile
+                    .lm_web
+                    .as_mut()
+                    .and_then(|settings| settings.searxng_page.as_mut())
+                {
+                    page.endpoint = endpoint;
+                }
+            }
+            Action::SearxngBearerEnv(name)
+                if name.len() <= 128 && !name.chars().any(char::is_control) =>
+            {
+                if let Some(page) = profile
+                    .lm_web
+                    .as_mut()
+                    .and_then(|settings| settings.searxng_page.as_mut())
+                {
+                    page.bearer_env = (!name.is_empty()).then_some(name);
+                }
+            }
             _ => return,
         }
+        self.imported_toolpack_names.clear();
         self.status = None;
     }
 
@@ -116,20 +218,71 @@ impl Editor {
         }
         let mode = profile.web_choice();
         let select = |mode| Message::Web(Action::Select(mode));
-        let picker = if profile.connection_mode == ConnectionMode::LmStudio {
+        let picker = if profile.allows_lm_studio_mcp() {
             choice(Choice::LM_STUDIO, mode, editable, select)
         } else {
             choice(Choice::STANDARD, mode, editable, select)
         };
-        let mut fields = column![text("Terminal Chat web search"), picker].spacing(6);
+        let mut fields = column![text("Web search"), picker].spacing(6);
+        if let Some(JavaWebHint::Toolpack { plugin }) = profile.imported_web_hint() {
+            let has_token_name = profile.credential().ok().flatten().is_some();
+            fields = fields
+                .push(text(format!("Imported LM Studio Toolpack · {plugin}")).size(13))
+                .push(text(if has_token_name {
+                    "Enter one to eight exact tool names from this installed plugin."
+                } else {
+                    "Set the LM Studio API token environment variable in this profile to review the imported plugin."
+                }).size(13))
+                .push(
+                    text_input("Allowed Toolpack names, separated by spaces", &self.imported_toolpack_names)
+                        .on_input_maybe((editable && has_token_name).then_some(|tools| {
+                            Message::Web(Action::ImportedToolpackNames(tools))
+                        })),
+                )
+                .push(button("Use imported Toolpack").on_press_maybe(
+                    (editable && has_token_name && !self.imported_toolpack_names.trim().is_empty())
+                        .then_some(Message::Web(Action::UseImported)),
+                ));
+        } else if let Some(hint) = profile.imported_web_hint() {
+            let label = hint.mcp_settings().map_or_else(
+                || "Tavily · direct search".into(),
+                |settings| format!("{}\n{}", settings.mode, settings.review()),
+            );
+            fields = fields.push(text(format!("Imported web integration · {label}")).size(13));
+            fields = fields.push(
+                button("Use imported integration")
+                    .on_press_maybe(editable.then_some(Message::Web(Action::UseImported))),
+            );
+        }
         match mode {
             Choice::Disabled => {}
             Choice::Tavily => {
-                fields = fields.push(text("Direct search sends the separately reviewed query to api.tavily.com using TAVILY_API_KEY.").size(13));
+                fields = fields.push(
+                    text(
+                        "Direct search and page extraction use api.tavily.com and TAVILY_API_KEY.",
+                    )
+                    .size(13),
+                );
             }
             Choice::Mcp(mode) => {
                 let settings = profile.lm_web.as_ref().expect("selected MCP mode");
                 fields = fields.push(text(mode.setup()).size(13));
+                if mode == McpMode::Searxng {
+                    fields = fields.push(searxng_page_fields(settings, editable));
+                } else if let Some(provider) = page_provider(Some(settings)) {
+                    let detail = match provider {
+                        PageProvider::Tavily => {
+                            "Read a webpage submits the reviewed URL to Tavily Extract using TAVILY_API_KEY."
+                        }
+                        PageProvider::BrightData => {
+                            "Read a webpage submits the reviewed URL to the Bright Data MCP server using BRIGHT_DATA_API_TOKEN."
+                        }
+                        PageProvider::Searxng(_) => {
+                            "Read a webpage submits the reviewed URL to the configured SearXNG MCP endpoint."
+                        }
+                    };
+                    fields = fields.push(text(detail).size(13));
+                }
                 if mode.uses_plugin() {
                     fields = fields.push(
                         text_input("Installed plugin ID (mcp/server-name)", &settings.plugin)
@@ -152,5 +305,386 @@ impl Editor {
             }
         }
         fields.into()
+    }
+}
+
+fn searxng_page_fields(settings: &McpSettings, editable: bool) -> Element<'_, Message> {
+    let mut fields = column![
+        checkbox(settings.searxng_page.is_some())
+            .label("Read webpages through a SearXNG MCP endpoint")
+            .on_toggle_maybe(
+                editable.then_some(|enabled| Message::Web(Action::SearxngPages(enabled)))
+            )
+    ]
+    .spacing(6);
+    if let Some(page) = &settings.searxng_page {
+        fields = fields
+            .push(
+                text("Page requests call web_url_read at the full MCP endpoint you enter.")
+                    .size(13),
+            )
+            .push(
+                text_input("SearXNG MCP endpoint URL", &page.endpoint).on_input_maybe(
+                    editable.then_some(|url| Message::Web(Action::SearxngEndpoint(url))),
+                ),
+            )
+            .push(
+                text_input(
+                    "Bearer token environment variable (optional)",
+                    page.bearer_env.as_deref().unwrap_or_default(),
+                )
+                .on_input_maybe(
+                    editable.then_some(|name| Message::Web(Action::SearxngBearerEnv(name))),
+                ),
+            );
+        if !page.endpoint.is_empty() {
+            let destination = page.review_destination().map_or_else(
+                |error| error,
+                |url| format!("Page request destination · {url}"),
+            );
+            fields = fields.push(text(destination).size(13));
+        }
+    }
+    fields.into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai_manager::profiles::{ConnectionMode, Field, java_backup};
+
+    #[test]
+    fn searxng_page_settings_are_explicit_and_scoped_to_the_selected_web_integration() {
+        let (catalog, _) = java_backup::decode(
+            br#"<globalSettings><aiSearxngMcpPluginId>mcp/searxng</aiSearxngMcpPluginId>
+                <aiSearxngUrl>https://example.com/search</aiSearxngUrl><aiProfiles>
+                <profile><id>java-local</id><name>Local MCP</name><model>chat-model</model>
+                  <apiUrl>http://127.0.0.1:1234/api/v1/chat</apiUrl>
+                  <internetAccessMode>SEARXNG_MCP</internetAccessMode></profile>
+                </aiProfiles></globalSettings>"#,
+        )
+        .unwrap();
+        let mut editor = Editor::new(catalog);
+        editor.update(Message::TrustLocal(true), true);
+        editor.update(
+            Message::Edit(Field::Credential, "KORTTY_LM_STUDIO_FIXTURE_TOKEN".into()),
+            true,
+        );
+        editor.update(Message::Web(Action::UseImported), true);
+        let settings = editor.selected().unwrap().lm_web.as_ref().unwrap();
+        assert_eq!(settings.mode, McpMode::Searxng);
+        assert!(settings.searxng_page.is_none());
+        editor.update(Message::Web(Action::SearxngPages(true)), false);
+        assert!(
+            editor
+                .selected()
+                .unwrap()
+                .lm_web
+                .as_ref()
+                .unwrap()
+                .searxng_page
+                .is_none()
+        );
+        editor.update(Message::Web(Action::SearxngPages(true)), true);
+        assert!(editor.validated_catalog().is_err());
+        editor.update(
+            Message::Web(Action::SearxngEndpoint(
+                "https://MCP.example.com/custom-mcp".into(),
+            )),
+            true,
+        );
+        editor.update(
+            Message::Web(Action::SearxngBearerEnv(
+                "KORTTY_SEARXNG_FIXTURE_TOKEN".into(),
+            )),
+            true,
+        );
+        let catalog = editor.validated_catalog().unwrap();
+        let profile = catalog.profile(1).unwrap();
+        let page = profile
+            .lm_web
+            .as_ref()
+            .unwrap()
+            .searxng_page
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            page.review_destination().unwrap(),
+            "https://mcp.example.com/custom-mcp"
+        );
+        assert_eq!(
+            page.bearer_env.as_deref(),
+            Some("KORTTY_SEARXNG_FIXTURE_TOKEN")
+        );
+
+        editor.update(Message::Web(Action::SearxngPages(false)), true);
+        assert!(editor.validated_catalog().is_ok());
+        assert!(
+            editor
+                .selected()
+                .unwrap()
+                .lm_web
+                .as_ref()
+                .unwrap()
+                .searxng_page
+                .is_none()
+        );
+        editor.update(
+            Message::Web(Action::Select(Choice::Mcp(McpMode::Brave))),
+            true,
+        );
+        editor.update(Message::Web(Action::SearxngPages(true)), true);
+        assert!(
+            editor
+                .selected()
+                .unwrap()
+                .lm_web
+                .as_ref()
+                .unwrap()
+                .searxng_page
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn imported_web_integration_requires_endpoint_trust_and_explicit_selection() {
+        let (catalog, _) = java_backup::decode(
+            br#"<globalSettings><aiProfiles>
+                <profile><id>java-local</id><name>Local MCP</name><model>chat-model</model>
+                  <apiUrl>http://127.0.0.1:1234/api/v1/chat</apiUrl>
+                  <internetAccessMode>BRIGHT_DATA_WEB_MCP</internetAccessMode></profile>
+            </aiProfiles></globalSettings>"#,
+        )
+        .unwrap();
+        let mut editor = Editor::new(catalog);
+        let use_imported = Message::Web(Action::UseImported);
+        editor.update(use_imported.clone(), true);
+        assert!(!editor.selected().unwrap().has_web_search());
+        editor.update(Message::TrustLocal(true), true);
+        editor.update(use_imported.clone(), false);
+        assert!(!editor.selected().unwrap().has_web_search());
+        editor.update(use_imported.clone(), true);
+        let active = editor.selected().unwrap();
+        assert_eq!(active.lm_web.as_ref().unwrap().mode, McpMode::BrightData);
+        let mut portable = editor.catalog().clone();
+        portable.prepare_backup();
+        let pending = portable.profile(1).unwrap();
+        assert!(pending.restore_review);
+        assert!(!pending.has_web_search());
+        assert!(pending.java_web_hint.is_some());
+
+        editor.update(Message::Web(Action::Select(Choice::Tavily)), true);
+        editor.update(use_imported.clone(), true);
+        assert!(editor.selected().unwrap().tavily_search);
+        editor.update(Message::TrustLocal(false), true);
+        let revoked = editor.selected().unwrap();
+        assert!(revoked.restore_review);
+        assert!(!revoked.has_web_search());
+        assert!(revoked.validate().is_ok());
+        editor.update(Message::TrustLocal(true), true);
+        editor.update(use_imported.clone(), true);
+        assert!(editor.selected().unwrap().has_web_search());
+        editor.update(
+            Message::Edit(Field::Endpoint, "127.0.0.1:4321".into()),
+            true,
+        );
+        editor.update(Message::TrustLocal(true), true);
+        editor.update(use_imported, true);
+        let changed = editor.selected().unwrap();
+        assert!(!changed.has_web_search());
+        assert!(changed.java_web_hint.is_none());
+    }
+
+    #[test]
+    fn imported_web_integration_is_cleared_on_https_endpoint_or_transport_changes() {
+        let (catalog, _) = java_backup::decode(
+            br#"<globalSettings><aiProfiles>
+                <profile><id>java-remote</id><name>Remote AI</name><model>chat-model</model>
+                  <apiUrl>https://api.openai.com/v1/chat/completions</apiUrl>
+                  <internetAccessMode>KORTTY_TAVILY_TOOL</internetAccessMode></profile>
+            </aiProfiles></globalSettings>"#,
+        )
+        .unwrap();
+        let mut editor = Editor::new(catalog);
+        editor.update(Message::TrustRemote(true), true);
+        editor.update(Message::Web(Action::UseImported), true);
+        assert!(editor.selected().unwrap().tavily_search);
+        editor.update(Message::TrustRemote(false), true);
+        assert!(!editor.selected().unwrap().has_web_search());
+        editor.update(Message::TrustRemote(true), true);
+        assert!(!editor.selected().unwrap().has_web_search());
+        editor.update(Message::Web(Action::UseImported), true);
+        assert!(editor.selected().unwrap().tavily_search);
+
+        let mut changed_transport = Editor::new(editor.catalog().clone());
+        changed_transport.update(Message::ConnectionMode(ConnectionMode::External), true);
+        let changed = changed_transport.selected().unwrap();
+        assert!(!changed.has_web_search());
+        assert!(changed.java_web_hint.is_none());
+
+        editor.update(
+            Message::Edit(Field::Endpoint, "https://example.com/v1".into()),
+            true,
+        );
+        editor.update(Message::TrustRemote(true), true);
+        let changed = editor.selected().unwrap();
+        assert!(!changed.has_web_search());
+        assert!(changed.java_web_hint.is_none());
+    }
+
+    #[test]
+    fn imported_lm_studio_https_mcp_requires_trust_and_has_to_be_selected_again_after_revocation() {
+        let endpoint = "https://localhost:1234/api/v1/chat";
+        let (catalog, _) = java_backup::decode(
+            format!(
+                r#"<globalSettings><aiProfiles>
+                    <profile><id>java-local</id><name>HTTPS MCP</name>
+                      <apiUrl>{endpoint}</apiUrl><modelSelectionMode>AUTO</modelSelectionMode>
+                      <internetAccessMode>LM_STUDIO_TAVILY_MCP</internetAccessMode></profile>
+                    </aiProfiles></globalSettings>"#
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        let mut editor = Editor::new(catalog);
+        let use_imported = Message::Web(Action::UseImported);
+        editor.update(Message::TrustLocal(true), true);
+        editor.update(use_imported.clone(), true);
+        assert!(editor.selected().unwrap().restore_review);
+        assert!(!editor.selected().unwrap().has_web_search());
+
+        editor.update(Message::TrustRemote(true), true);
+        assert!(!editor.selected().unwrap().has_web_search());
+        editor.update(use_imported.clone(), true);
+        let active = editor.validated_catalog().unwrap();
+        assert_eq!(
+            active.profile(1).unwrap().lm_web.as_ref().unwrap().mode,
+            McpMode::Tavily
+        );
+        assert_eq!(active.profile(1).unwrap().destination().unwrap(), endpoint);
+        assert!(!active.profile(1).unwrap().reviewed_agent_https);
+
+        editor.update(Message::TrustRemote(false), true);
+        assert!(editor.selected().unwrap().restore_review);
+        assert!(!editor.selected().unwrap().has_web_search());
+        editor.update(Message::TrustRemote(true), true);
+        assert!(!editor.selected().unwrap().has_web_search());
+        editor.update(use_imported, true);
+        assert!(editor.selected().unwrap().has_web_search());
+
+        editor.update(
+            Message::Edit(Field::Endpoint, "https://127.0.0.1:1234/api/v1/chat".into()),
+            true,
+        );
+        let changed = editor.selected().unwrap();
+        assert!(!changed.has_web_search());
+        assert!(!changed.trusted_remote_endpoint);
+        assert!(changed.java_web_hint.is_none());
+    }
+
+    #[test]
+    fn imported_toolpack_requires_a_trusted_endpoint_token_and_exact_user_entered_tools() {
+        for endpoint in [
+            "http://127.0.0.1:1234/api/v1/chat",
+            "https://localhost:1234/api/v1/chat",
+        ] {
+            let (catalog, _) = java_backup::decode(
+                format!(
+                    r#"<globalSettings>
+                      <aiLmStudioToolpackMcpPluginId>mcp/installed-tools</aiLmStudioToolpackMcpPluginId>
+                      <aiProfiles><profile><id>toolpack</id><name>Toolpack</name>
+                        <apiUrl>{endpoint}</apiUrl><model>fixture</model>
+                        <encryptedApiKey>omitted-token</encryptedApiKey>
+                        <internetAccessMode>LM_STUDIO_TOOLPACK</internetAccessMode>
+                      </profile></aiProfiles></globalSettings>"#
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+            let mut editor = Editor::new(catalog);
+            let source = editor.selected().unwrap().java_source.clone();
+            let trust = if endpoint.starts_with("https:") {
+                Message::TrustRemote
+            } else {
+                Message::TrustLocal
+            };
+            let names = |value: &str| Message::Web(Action::ImportedToolpackNames(value.into()));
+            let adopt = Message::Web(Action::UseImported);
+            let token = || Message::Edit(Field::Credential, "KORTTY_TOOLPACK_TOKEN".into());
+            editor.update(names("before_trust"), true);
+            editor.update(adopt.clone(), true);
+            assert!(editor.selected().unwrap().restore_review);
+            assert!(editor.selected().unwrap().credential_env.is_empty());
+            assert!(!editor.selected().unwrap().has_web_search());
+
+            editor.update(trust(true), true);
+            editor.update(names("before_token"), true);
+            editor.update(adopt.clone(), true);
+            assert!(editor.imported_toolpack_names.is_empty());
+            assert!(!editor.selected().unwrap().has_web_search());
+            editor.update(token(), true);
+            editor.update(names("from_read_only_editor"), false);
+            assert!(editor.imported_toolpack_names.is_empty());
+            for invalid in ["", "*", "search search", "a b c d e f g h i", "bad/tool"] {
+                editor.update(names(invalid), true);
+                editor.update(adopt.clone(), true);
+                assert!(!editor.selected().unwrap().has_web_search());
+                assert!(editor.status.is_some());
+            }
+
+            editor.update(names("Search page.read"), true);
+            editor.update(adopt.clone(), false);
+            assert!(!editor.selected().unwrap().has_web_search());
+            let draft = editor.validated_catalog().unwrap();
+            let serialized = serde_json::to_string(&draft).unwrap();
+            assert!(!serialized.contains("Search page.read"));
+            assert!(serialized.contains("mcp/installed-tools"));
+            editor.update(adopt.clone(), true);
+            let active = editor.validated_catalog().unwrap();
+            let profile = active.profile(1).unwrap();
+            let settings = profile.lm_web.as_ref().unwrap();
+            assert_eq!(settings.mode, McpMode::Toolpack);
+            assert_eq!(settings.plugin, "mcp/installed-tools");
+            assert_eq!(settings.tool_names, "Search page.read");
+            assert_eq!(profile.java_source, source);
+            assert_eq!(profile.destination().unwrap(), endpoint);
+
+            let mut portable = active;
+            portable.prepare_backup();
+            let draft = portable.profile(1).unwrap();
+            assert!(draft.restore_review && !draft.has_web_search());
+            assert!(draft.java_web_hint.is_some());
+            assert!(draft.credential_env.is_empty());
+
+            editor.update(trust(false), true);
+            editor.update(trust(true), true);
+            editor.update(token(), true);
+            editor.update(adopt.clone(), true);
+            assert!(!editor.selected().unwrap().has_web_search());
+            editor.update(names("previous_credential"), true);
+            editor.update(
+                Message::Edit(Field::Credential, "SECOND_TOOLPACK_TOKEN".into()),
+                true,
+            );
+            editor.update(adopt.clone(), true);
+            assert!(!editor.selected().unwrap().has_web_search());
+            editor.update(names("previous_policy"), true);
+            editor.deny_web_search(true);
+            editor.update(names("blocked_by_policy"), true);
+            editor.deny_web_search(false);
+            editor.update(adopt.clone(), true);
+            assert!(!editor.selected().unwrap().has_web_search());
+            editor.update(names("previous_endpoint"), true);
+            editor.update(
+                Message::Edit(Field::Endpoint, endpoint.replace(":1234", ":4321")),
+                true,
+            );
+            editor.update(trust(true), true);
+            editor.update(token(), true);
+            editor.update(adopt, true);
+            let changed = editor.selected().unwrap();
+            assert!(!changed.has_web_search());
+            assert!(changed.java_web_hint.is_none());
+        }
     }
 }

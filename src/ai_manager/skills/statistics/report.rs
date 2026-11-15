@@ -6,6 +6,8 @@ use std::fmt;
 
 use jiff::{Span, Zoned, civil::Date};
 
+use crate::local_ai::Tokenizer;
+
 use super::{Bucket, Ledger, Observation, SkillRecord, day, display_name, month, month_key, year};
 
 const MIN_DATE: Date = Date::constant(1, 1, 1);
@@ -91,7 +93,7 @@ pub(crate) struct Report {
 
 #[derive(Clone, Debug)]
 pub(crate) struct Row {
-    pub(crate) id: u64,
+    pub(crate) id: SkillKey,
     pub(crate) name: String,
     pub(crate) current: bool,
     pub(crate) enabled: bool,
@@ -103,12 +105,19 @@ pub(crate) struct Row {
     pub(crate) last_used: Option<String>,
     pub(crate) learned_rules: usize,
     pub(crate) history: Vec<Point>,
+    pub(crate) java_size_history: Vec<(Tokenizer, Vec<Point>)>,
     pub(crate) hints: Vec<Hint>,
+}
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(crate) enum SkillKey {
+    Native(u64),
+    Java(String),
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Series {
-    pub(crate) id: Option<u64>,
+    pub(crate) id: Option<SkillKey>,
     pub(crate) name: String,
     pub(crate) automatic: Vec<u64>,
     pub(crate) pinned: Vec<u64>,
@@ -142,13 +151,21 @@ impl Ledger {
         self.report_at(range, current, Zoned::now().date())
     }
 
-    pub(crate) fn skill_series(&self, id: u64, range: Range) -> Option<Series> {
-        let record = self.skills.get(&id)?;
+    pub(crate) fn skill_series(&self, id: &SkillKey, range: Range) -> Option<Series> {
+        let record = match id {
+            SkillKey::Native(id) => self.skills.get(id),
+            SkillKey::Java(id) => self.java_history.get(id),
+        }?;
         let today = Zoned::now().date();
         let dates = periods(self, range, today);
         let (first, last) = (*dates.first()?, *dates.last()?);
         let buckets = period_buckets(record, range.granularity, first, last);
-        Some(series_of(Some(id), record.name.clone(), &buckets, &dates))
+        Some(series_of(
+            Some(id.clone()),
+            record.name.clone(),
+            &buckets,
+            &dates,
+        ))
     }
 
     pub(super) fn report_at(&self, range: Range, current: &[Current], today: Date) -> Report {
@@ -161,10 +178,20 @@ impl Ledger {
             .map(|skill| (skill.skill.id, skill))
             .collect();
         let ids: BTreeSet<_> = self.skills.keys().chain(current.keys()).copied().collect();
-        let mut entries = Vec::with_capacity(ids.len());
+        let mut entries = Vec::with_capacity(ids.len() + self.java_history.len());
+        let native = ids.into_iter().map(|id| {
+            (
+                SkillKey::Native(id),
+                self.skills.get(&id),
+                current.get(&id).copied(),
+            )
+        });
+        let java = self
+            .java_history
+            .iter()
+            .map(|(id, record)| (SkillKey::Java(id.clone()), Some(record), None));
         let mut total = Bucket::default();
-        for id in ids {
-            let record = self.skills.get(&id);
+        for (id, record, live) in native.chain(java) {
             let buckets = record.map_or_else(BTreeMap::new, |record| {
                 period_buckets(record, unit, from, to)
             });
@@ -173,7 +200,6 @@ impl Ledger {
                 usage.add(bucket);
             }
             total.add(&usage);
-            let live = current.get(&id).copied();
             let history = record.map_or_else(BTreeMap::new, |record| {
                 record
                     .snapshots
@@ -212,6 +238,7 @@ impl Ledger {
                         tokens,
                     })
                     .collect(),
+                java_size_history: record.map_or_else(Vec::new, java_size_history),
                 hints,
             };
             entries.push((row, buckets));
@@ -222,7 +249,7 @@ impl Ledger {
             (
                 Reverse(row.usage.automatic),
                 row.name.to_lowercase(),
-                row.id,
+                row.id.clone(),
             )
         });
         let (mut size_sum, mut size_count, mut growth_sum, mut growth_count) = (0.0, 0, 0.0, 0);
@@ -236,7 +263,7 @@ impl Ledger {
                 growth_count += 1;
             }
         }
-        let has_usage = self.skills.values().any(|record| {
+        let has_usage = self.records().any(|record| {
             record
                 .daily
                 .values()
@@ -256,6 +283,32 @@ impl Ledger {
     }
 }
 
+fn java_size_history(record: &SkillRecord) -> Vec<(Tokenizer, Vec<Point>)> {
+    Tokenizer::ALL
+        .into_iter()
+        .filter_map(|tokenizer| {
+            let points: BTreeMap<_, _> = record
+                .java_sizes
+                .iter()
+                .filter(|point| point.tokenizer == tokenizer)
+                .map(|point| (&point.date, point.tokens))
+                .collect();
+            (!points.is_empty()).then(|| {
+                (
+                    tokenizer,
+                    points
+                        .into_iter()
+                        .map(|(date, tokens)| Point {
+                            date: date.clone(),
+                            tokens,
+                        })
+                        .collect(),
+                )
+            })
+        })
+        .collect()
+}
+
 fn periods(ledger: &Ledger, range: Range, today: Date) -> Vec<Date> {
     let unit = range.granularity;
     let today = unit.start(today.max(MIN_DATE));
@@ -264,8 +317,7 @@ fn periods(ledger: &Ledger, range: Range, today: Date) -> Vec<Date> {
         (Granularity::Month, 0) => 12,
         (Granularity::Year, 0) => {
             let earliest = ledger
-                .skills
-                .values()
+                .records()
                 .flat_map(|record| {
                     record
                         .daily
@@ -322,17 +374,17 @@ fn series(entries: &[(Row, BTreeMap<Date, Bucket>)], periods: &[Date]) -> Vec<Se
         .iter()
         .filter(|(row, _)| row.usage.uses() != 0)
         .collect();
-    ranked.sort_by_key(|(row, _)| {
+    ranked.sort_by_cached_key(|(row, _)| {
         (
             Reverse(row.usage.automatic),
             Reverse(row.usage.pinned),
-            row.id,
+            row.id.clone(),
         )
     });
     let mut result: Vec<_> = ranked
         .iter()
         .take(TOP_SERIES)
-        .map(|(row, buckets)| series_of(Some(row.id), row.name.clone(), buckets, periods))
+        .map(|(row, buckets)| series_of(Some(row.id.clone()), row.name.clone(), buckets, periods))
         .collect();
     if ranked.len() > TOP_SERIES {
         let mut others = BTreeMap::<Date, Bucket>::new();
@@ -347,7 +399,7 @@ fn series(entries: &[(Row, BTreeMap<Date, Bucket>)], periods: &[Date]) -> Vec<Se
 }
 
 fn series_of(
-    id: Option<u64>,
+    id: Option<SkillKey>,
     name: String,
     buckets: &BTreeMap<Date, Bucket>,
     periods: &[Date],

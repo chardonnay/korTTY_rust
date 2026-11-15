@@ -1,5 +1,6 @@
 //! The literal argv and masked input approved for one configured CLI request.
 
+use std::borrow::Cow;
 use std::io::{self, Read as _, Write as _};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
@@ -48,63 +49,166 @@ impl FileRole {
 #[derive(Clone, Eq, PartialEq)]
 pub(super) enum Argument {
     Literal(String),
-    File(FileRole),
+    Template(Vec<Part>),
 }
 
 impl Argument {
-    pub(super) fn review(&self) -> &str {
+    pub(super) fn review(&self) -> Cow<'_, str> {
         match self {
-            Self::Literal(value) => value,
-            Self::File(role) => role.placeholder(),
+            Self::Literal(value) => Cow::Borrowed(value),
+            Self::Template(parts) => Cow::Owned(parts.iter().map(Part::review).collect()),
         }
     }
 
     fn resolve(&self, directory: &Path) -> Result<String, Error> {
         match self {
             Self::Literal(value) => Ok(value.clone()),
-            Self::File(role) => directory
-                .join(role.name())
-                .into_os_string()
-                .into_string()
-                .map_err(|_| {
-                    Error::Review("The private CLI prompt file path is not UTF-8.".into())
-                }),
+            Self::Template(parts) => {
+                let mut argument = String::new();
+                for part in parts {
+                    match part {
+                        Part::Literal(value) => argument.push_str(value),
+                        Part::File(role) => argument.push_str(
+                            directory.join(role.name()).to_str().ok_or_else(|| {
+                                Error::Review(
+                                    "The private CLI prompt file path is not UTF-8.".into(),
+                                )
+                            })?,
+                        ),
+                    }
+                }
+                Ok(argument)
+            }
         }
     }
 }
 
-pub(super) fn mode(arguments: &[String]) -> Option<Mode> {
-    let mut counts = [0_usize; 4];
-    for argument in arguments {
-        match argument.as_str() {
-            "{stdinPrompt}" => counts[0] += 1,
-            "{promptFile}" => counts[1] += 1,
-            "{systemPromptFile}" => counts[2] += 1,
-            "{userPromptFile}" => counts[3] += 1,
-            "{model}" => {}
-            literal
-                if [
-                    "{stdinPrompt}",
-                    "{promptFile}",
-                    "{systemPromptFile}",
-                    "{userPromptFile}",
-                    "{prompt}",
-                    "{reasoning}",
-                    "{model}",
-                ]
-                .iter()
-                .any(|placeholder| literal.contains(placeholder)) =>
-            {
-                return None;
-            }
-            _ => {}
+#[derive(Clone, Eq, PartialEq)]
+pub(super) enum Part {
+    Literal(String),
+    File(FileRole),
+}
+
+impl Part {
+    fn review(&self) -> &str {
+        match self {
+            Self::Literal(value) => value,
+            Self::File(role) => role.placeholder(),
         }
     }
-    match counts {
-        [0 | 1, 0, 0, 0] => Some(Mode::Stdin),
-        [0, 1, 0, 0] => Some(Mode::Combined),
-        [0, 0, 1, 1] => Some(Mode::Split),
-        _ => None,
+}
+
+#[derive(Clone, Copy)]
+enum Atom<'a> {
+    Literal(&'a str),
+    Model,
+    Reasoning,
+    File(FileRole),
+    Unsupported,
+}
+
+fn atoms(argument: &str) -> impl Iterator<Item = Atom<'_>> {
+    argument.split_inclusive('}').flat_map(|chunk| {
+        let token = chunk.rfind('{').and_then(|start| {
+            let atom = match &chunk[start..] {
+                super::MODEL => Atom::Model,
+                super::REASONING => Atom::Reasoning,
+                "{promptFile}" => Atom::File(FileRole::Combined),
+                "{systemPromptFile}" => Atom::File(FileRole::System),
+                "{userPromptFile}" => Atom::File(FileRole::User),
+                "{stdinPrompt}" | "{prompt}" => Atom::Unsupported,
+                _ => return None,
+            };
+            Some((start, atom))
+        });
+        if let Some((start, atom)) = token {
+            [
+                (start > 0).then(|| Atom::Literal(&chunk[..start])),
+                Some(atom),
+            ]
+        } else {
+            [Some(Atom::Literal(chunk)), None]
+        }
+        .into_iter()
+        .flatten()
+    })
+}
+
+pub(super) struct Template {
+    pub(super) mode: Mode,
+    pub(super) uses_model: bool,
+    pub(super) uses_reasoning: bool,
+    pub(super) explicit_prompt: bool,
+}
+
+impl Template {
+    pub(super) fn uses_reasoning(arguments: &[String]) -> bool {
+        arguments
+            .iter()
+            .flat_map(|argument| atoms(argument))
+            .any(|atom| matches!(atom, Atom::Reasoning))
+    }
+
+    pub(super) fn parse(arguments: &[String]) -> Option<Self> {
+        let mut counts = [0_usize; 4];
+        let mut uses_model = false;
+        let mut uses_reasoning = false;
+        for argument in arguments {
+            if argument == "{stdinPrompt}" {
+                counts[0] += 1;
+                continue;
+            }
+            for atom in atoms(argument) {
+                match atom {
+                    Atom::Model => uses_model = true,
+                    Atom::Reasoning => uses_reasoning = true,
+                    Atom::File(FileRole::Combined) => counts[1] += 1,
+                    Atom::File(FileRole::System) => counts[2] += 1,
+                    Atom::File(FileRole::User) => counts[3] += 1,
+                    Atom::Unsupported => return None,
+                    Atom::Literal(_) | Atom::File(FileRole::EditorScript) => {}
+                }
+            }
+        }
+        let mode = match counts {
+            [0 | 1, 0, 0, 0] => Mode::Stdin,
+            [0, combined, 0, 0] if combined > 0 => Mode::Combined,
+            [0, 0, system, user] if system > 0 && user > 0 => Mode::Split,
+            _ => return None,
+        };
+        Some(Self {
+            mode,
+            uses_model,
+            uses_reasoning,
+            explicit_prompt: counts != [0; 4],
+        })
+    }
+
+    pub(super) fn expand(arguments: &[String], model: &str, reasoning: &str) -> Vec<Argument> {
+        arguments
+            .iter()
+            .filter(|argument| argument.as_str() != "{stdinPrompt}")
+            .map(|argument| {
+                let mut file = false;
+                let parts: Vec<_> = atoms(argument)
+                    .map(|atom| match atom {
+                        Atom::Literal(value) => Part::Literal(value.into()),
+                        Atom::Model => Part::Literal(model.into()),
+                        Atom::Reasoning => Part::Literal(reasoning.into()),
+                        Atom::File(role) => {
+                            file = true;
+                            Part::File(role)
+                        }
+                        Atom::Unsupported => unreachable!("validated CLI template"),
+                    })
+                    .collect();
+                if file {
+                    Argument::Template(parts)
+                } else {
+                    Argument::Literal(parts.iter().map(Part::review).collect())
+                }
+            })
+            .collect()
     }
 }
 

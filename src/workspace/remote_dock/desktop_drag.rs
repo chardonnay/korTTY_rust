@@ -13,10 +13,10 @@ use crate::sftp_window::worker::drag_out::{self, Candidate, Preparation, Prepare
 use crate::sftp_window::{Entry, EntryKind, EntryName, Location, file_drag_grip};
 
 use super::{Action, Binding, Desktop, Dock, Message, Target, Window, Workspace};
+#[cfg(any(target_os = "macos", target_os = "windows"))]
+use crate::workspace::native_file_drag::DragSource;
 #[cfg(target_os = "linux")]
 use crate::workspace::wayland_file_drop::DragSource;
-#[cfg(target_os = "windows")]
-use crate::workspace::windows_file_drag::DragSource;
 
 pub type PreparationResult = Result<Arc<Prepared>, Arc<str>>;
 
@@ -44,7 +44,7 @@ impl Scope {
     }
 }
 
-#[cfg(all(test, windows))]
+#[cfg(all(test, any(windows, target_os = "macos")))]
 pub(in crate::workspace) fn test_scope(session: crate::session::SessionId) -> Scope {
     Scope {
         target: Target {
@@ -171,8 +171,8 @@ impl Workspace {
     ) -> bool {
         #[cfg(target_os = "linux")]
         let native = self.wayland_file_drop.can_drag(owner);
-        #[cfg(target_os = "windows")]
-        let native = self.windows_drag_owner_available(owner);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let native = self.native_drag_owner_available(owner);
         native
             && !self.exiting
             && !self.scheduler_draining
@@ -348,11 +348,11 @@ impl Workspace {
         let installed = ClipboardPolicy::load();
         #[cfg(target_os = "linux")]
         let native = &self.wayland_file_drop;
-        #[cfg(target_os = "windows")]
-        let native = &self.windows_file_drag;
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        let native = &self.native_file_drag;
         #[cfg(target_os = "linux")]
         let can_start = native.can_start_drag(owner);
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let can_start = native.can_start_drag();
         if !self.sidebar_drag_current(owner, &scope, &installed) || !can_start {
             return Task::none();
@@ -383,7 +383,7 @@ impl Workspace {
         let Some(prepared) = prepared else {
             return Task::none();
         };
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         let incognito = self
             .windows
             .get(&owner)
@@ -398,9 +398,17 @@ impl Workspace {
             self.start_native_file_drag(owner, source, _origin, &[], Some(prepared));
             Task::none()
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         {
-            self.start_windows_file_drag(owner, source, Vec::new(), Some(prepared), incognito)
+            self.start_native_file_drag(
+                owner,
+                source,
+                Vec::new(),
+                Some(prepared),
+                incognito,
+                #[cfg(target_os = "macos")]
+                _origin,
+            )
         }
     }
 

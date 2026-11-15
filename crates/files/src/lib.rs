@@ -2,6 +2,11 @@
 
 #![deny(unsafe_code)]
 
+#[allow(unsafe_code)]
+mod spooled_input;
+
+pub use spooled_input::with_spooled_input;
+
 #[cfg(unix)]
 #[allow(unsafe_code)]
 pub mod unix_accounts;

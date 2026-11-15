@@ -16,7 +16,7 @@ use super::{DRAG_DISTANCE, Zone};
 
 #[derive(Clone)]
 pub struct Request {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(crate) origin: Point,
     side: Side,
     listing: Arc<Directory>,
@@ -356,11 +356,11 @@ pub(in crate::sftp_window) fn grip<'a>(
         (side, Arc::clone(listing), names),
         #[cfg(target_os = "linux")]
         move |_| _zone.0.borrow().pointer,
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         mouse::Cursor::position,
         |(side, listing, names), _origin| {
             Message::ExternalFileDrag(Request {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", target_os = "macos"))]
                 origin: _origin,
                 side,
                 listing,

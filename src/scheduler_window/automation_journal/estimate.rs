@@ -10,6 +10,7 @@ use kortty_jobs::JobSchedule;
 
 use crate::local_ai::{UsageBudget, UsageCounters};
 use crate::session_journal::automation::{Closing, Keep};
+use crate::session_journal::summary_plan::EvidenceLimits;
 use crate::session_journal::{self, Summary, tree::SourceKind};
 
 use super::super::Message;
@@ -21,6 +22,16 @@ const MONTH_DAYS: u64 = 30;
 // tokens) and one closing prompt. Each example answer is 400 tokens.
 const FALLBACK_INPUT: u64 = 4_200;
 const FALLBACK_OUTPUT: u64 = 800;
+const PROMPT_OVERHEAD: u64 = 1_500;
+const FALLBACK_ACTIVITY_LINES: u64 = 48;
+const ESTIMATED_LINE_TOKENS: u64 = 25;
+
+#[derive(Clone, Copy)]
+pub(crate) struct ModelEstimate<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) budget: Option<&'a UsageBudget>,
+    pub(crate) evidence_limits: Option<EvidenceLimits>,
+}
 
 #[derive(Clone, Eq, PartialEq)]
 pub(in crate::scheduler_window) struct Subject {
@@ -28,6 +39,9 @@ pub(in crate::scheduler_window) struct Subject {
     pub(in crate::scheduler_window) schedule: Option<JobSchedule>,
     pub(in crate::scheduler_window) targets: usize,
     pub(in crate::scheduler_window) mode: (Closing, Keep),
+    pub(in crate::scheduler_window) profile:
+        Option<crate::session_journal::summary_queue::ProfileChoice>,
+    pub(in crate::scheduler_window) unresolved_profile: bool,
 }
 
 #[derive(Clone)]
@@ -109,7 +123,7 @@ impl Panel {
 
 impl Estimate {
     pub(crate) fn unavailable() -> Self {
-        Self(vec!["Journal summary usage is unavailable. Enable an allowed local journal AI profile to estimate it.".into()])
+        Self(vec!["Journal summary usage is unavailable. Configure an allowed journal summary profile to estimate it.".into()])
     }
 
     pub(crate) fn worker_stopped() -> Self {
@@ -121,8 +135,7 @@ impl Estimate {
         source: &str,
         targets: usize,
         mode: (Closing, Keep),
-        model: &str,
-        budget: Option<&UsageBudget>,
+        model: ModelEstimate<'_>,
     ) -> Self {
         let (_, lines) = per_run(
             root,
@@ -130,7 +143,6 @@ impl Estimate {
             targets,
             mode,
             model,
-            budget,
         );
         Self(lines)
     }
@@ -141,12 +153,7 @@ impl Estimate {
 }
 
 impl Request {
-    pub(crate) fn calculate(
-        self,
-        root: &Path,
-        model: &str,
-        budget: Option<&UsageBudget>,
-    ) -> Estimate {
+    pub(crate) fn calculate(self, root: &Path, model: ModelEstimate<'_>) -> Estimate {
         let (counts, mut lines) = per_run(
             root,
             self.subject
@@ -156,7 +163,6 @@ impl Request {
             self.subject.targets,
             self.subject.mode,
             model,
-            budget,
         );
         if let Some(weekly) = self
             .subject
@@ -170,7 +176,7 @@ impl Request {
                 "{weekly} scheduled starts in the next seven calendar days. At that cadence, about {} tokens per 30 days if every run is summarized.",
                 projected.total(),
             ));
-            if let Some(cost) = cost(budget, projected) {
+            if let Some(cost) = cost(model.budget, projected) {
                 lines.push(format!("Estimated cost per 30 days · {cost}."));
             }
         }
@@ -183,8 +189,7 @@ fn per_run(
     source: Option<(SourceKind, &str)>,
     targets: usize,
     mode: (Closing, Keep),
-    model: &str,
-    budget: Option<&UsageBudget>,
+    model: ModelEstimate<'_>,
 ) -> (Counts, Vec<String>) {
     let historical = source.and_then(|(kind, source)| {
         let catalog = session_journal::catalog(root).ok()?;
@@ -201,23 +206,53 @@ fn per_run(
         ),
         None => (
             Counts {
-                input: FALLBACK_INPUT * targets,
+                input: fallback_input(model.evidence_limits) * targets,
                 output: FALLBACK_OUTPUT * targets,
             },
             "rough estimate for one activity window and one closing summary per target".into(),
         ),
     };
     let mut lines = vec![format!(
-        "Journal model {model} · about {} tokens per summarized run ({basis}).",
+        "Journal model {} · about {} tokens per summarized run ({basis}).",
+        model.name,
         counts.total(),
     )];
+    if let Some(limits) = model.evidence_limits {
+        let lines_limit = if limits.max_lines_per_direction == 0 {
+            "context-only".to_owned()
+        } else {
+            format!(
+                "up to {} input and {} output lines per window",
+                limits.max_lines_per_direction, limits.max_lines_per_direction
+            )
+        };
+        lines.push(format!(
+            "Current summary limits · {lines_limit}, {} input tokens per request.",
+            limits.input_token_budget()
+        ));
+    }
     if matches!(mode, (Closing::Failures, _) | (_, Keep::Failures)) {
         lines.push("Only kept unsuccessful runs are eligible for these summaries.".into());
     }
-    if let Some(cost) = cost(budget, counts) {
+    if let Some(cost) = cost(model.budget, counts) {
         lines.push(format!("Estimated cost per summarized run · {cost}."));
     }
     (counts, lines)
+}
+
+fn fallback_input(limits: Option<EvidenceLimits>) -> u64 {
+    let Some(limits) = limits else {
+        return FALLBACK_INPUT;
+    };
+    let budget = limits.input_token_budget();
+    // The sample represents one short command line and up to 47 lines of output.
+    let activity_lines = if limits.max_lines_per_direction == 0 {
+        FALLBACK_ACTIVITY_LINES
+    } else {
+        (1 + u64::from(limits.max_lines_per_direction)).min(FALLBACK_ACTIVITY_LINES)
+    };
+    let activity = (PROMPT_OVERHEAD + activity_lines * ESTIMATED_LINE_TOKENS).min(budget);
+    activity + PROMPT_OVERHEAD.min(budget)
 }
 
 #[derive(Clone, Copy, Default, Debug, Eq, PartialEq)]
@@ -442,5 +477,28 @@ mod tests {
         assert!(cost(Some(&budget), counts).is_none());
         budget.output_micros_per_million = Some(2_000_000);
         assert_eq!(cost(Some(&budget), counts).as_deref(), Some("0.0040 EUR"));
+    }
+
+    #[test]
+    fn estimate_bounds_its_sample_by_the_reviewed_line_and_token_limits() {
+        assert_eq!(fallback_input(None), FALLBACK_INPUT);
+        assert_eq!(
+            fallback_input(Some(EvidenceLimits::default())),
+            FALLBACK_INPUT
+        );
+        assert_eq!(
+            fallback_input(Some(EvidenceLimits {
+                max_lines_per_direction: 0,
+                context_tokens: 1_000
+            })),
+            1_500
+        );
+        assert_eq!(
+            fallback_input(Some(EvidenceLimits {
+                max_lines_per_direction: 10,
+                context_tokens: 130_000
+            })),
+            3_275
+        );
     }
 }

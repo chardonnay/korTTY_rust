@@ -1,18 +1,33 @@
-//! The held-object Windows replacement path for a durable Scheduler review.
+//! Bind one-use Scheduler reviews to the exact files and publication method.
 
 use super::*;
 
-pub(in crate::sftp_window) struct ScheduledDownload(EntryPlan);
+#[cfg(windows)]
+const SCHEDULED_DOWNLOAD_PROOF: &[u8] = b"kortty-reviewed-sftp-windows-replacement-v1";
+#[cfg(unix)]
+const SCHEDULED_DOWNLOAD_PROOF: &[u8] = b"kortty-reviewed-sftp-unix-replacement-v1";
 
-impl ScheduledDownload {
-    pub(in crate::sftp_window) fn prepare(
+const SCHEDULED_UPLOAD_PROOF: &[u8] = b"kortty-reviewed-sftp-server-replacement-v1";
+
+pub(in crate::sftp_window::worker) struct ScheduledReplacement(EntryPlan);
+
+impl ScheduledReplacement {
+    pub(in crate::sftp_window::worker::sync) fn proof_domain(to: Side) -> &'static [u8] {
+        match to {
+            Side::Local => SCHEDULED_DOWNLOAD_PROOF,
+            Side::Remote => SCHEDULED_UPLOAD_PROOF,
+        }
+    }
+
+    pub(in crate::sftp_window::worker) fn prepare(
         client: &mut Client,
         review: &Review,
         path: &Relative,
+        to: Side,
         stopped: &impl Fn() -> bool,
     ) -> Result<Self> {
         require_running(stopped)?;
-        let (source, target) = review.direction(Side::Local).ok_or_else(invalid)?;
+        let (source, target) = review.direction(to).ok_or_else(invalid)?;
         let entry = Entry::new(source, target, path)?;
         if entry
             .sizes
@@ -21,25 +36,69 @@ impl ScheduledDownload {
         {
             return Err(io::Error::other("Scheduled replacement review exceeds 256 MiB").into());
         }
-        entry.prepare(client, false, stopped).map(Self)
+        if to == Side::Remote {
+            let source = source_digest(
+                client,
+                &entry.source,
+                &entry.source_stamp,
+                &entry.source_parent,
+                stopped,
+            )?;
+            let target = source_digest(
+                client,
+                &entry.target,
+                &entry.target_stamp,
+                &entry.target_parent,
+                stopped,
+            )?;
+            if source != target {
+                remote::prepare_scheduled(client, &entry, stopped)?;
+            }
+            return Ok(Self(EntryPlan::new(
+                entry,
+                [source, target],
+                Metadata::Remote,
+            )));
+        }
+        let plan = entry.prepare(client, false, stopped)?;
+        #[cfg(unix)]
+        if plan.digests[0] != plan.digests[1] {
+            let original = plan.entry.open_local_target()?;
+            draft::require_no_extended_acl(original.file())?;
+        }
+        Ok(Self(plan))
     }
 
-    pub(in crate::sftp_window) fn labels(&self) -> [&str; 2] {
+    pub(in crate::sftp_window::worker) fn labels(&self) -> [&str; 2] {
         self.0.labels()
     }
 
-    pub(in crate::sftp_window) fn digests(&self) -> [&str; 2] {
+    pub(in crate::sftp_window::worker) fn digests(&self) -> [&str; 2] {
         self.0.digests()
     }
 
-    pub(in crate::sftp_window) fn differs(&self) -> bool {
+    pub(in crate::sftp_window::worker::sync) fn differs(&self) -> bool {
         self.0.digests[0] != self.0.digests[1]
     }
 
-    pub(in crate::sftp_window) fn bind(&self, field: &mut impl FnMut(&[u8])) -> io::Result<()> {
+    pub(in crate::sftp_window::worker) fn bind(
+        &self,
+        field: &mut impl FnMut(&[u8]),
+    ) -> io::Result<()> {
+        if matches!(self.0.metadata, Metadata::Remote) {
+            self.bind_upload(field)?;
+        } else {
+            self.bind_download(field)?;
+        }
+        field(&self.0.digests[0]);
+        field(&self.0.digests[1]);
+        Ok(())
+    }
+
+    fn bind_download(&self, field: &mut impl FnMut(&[u8])) -> io::Result<()> {
         let EntryPlan {
             entry,
-            digests,
+            #[cfg(windows)]
             metadata,
             ..
         } = &self.0;
@@ -50,7 +109,6 @@ impl ScheduledDownload {
             Location::Local(target),
             SnapshotEntry::LocalFile { stamp, identity },
             (Location::Local(target_folder), DirectoryStamp::Local(target_parent)),
-            Metadata::Local(metadata),
         ) = (
             &entry.source,
             &entry.source_stamp,
@@ -58,20 +116,10 @@ impl ScheduledDownload {
             &entry.target,
             &entry.target_stamp,
             &entry.target_parent,
-            metadata,
         )
         else {
             return Err(invalid());
         };
-        fn remote(attributes: &kortty_ssh::sftp::Attributes) -> impl serde::Serialize {
-            (
-                attributes.size,
-                attributes.uid,
-                attributes.gid,
-                attributes.permissions,
-                attributes.modified,
-            )
-        }
         field(source);
         field(source_folder);
         field(target.as_os_str().as_encoded_bytes());
@@ -83,44 +131,110 @@ impl ScheduledDownload {
             identity,
             target_parent,
         ))?);
-        field(&metadata.review_bytes());
-        field(&digests[0]);
-        field(&digests[1]);
+        #[cfg(windows)]
+        {
+            let Metadata::Local(metadata) = metadata else {
+                return Err(invalid());
+            };
+            field(&metadata.review_bytes());
+        }
         Ok(())
     }
 
-    pub(in crate::sftp_window) fn apply(
+    fn bind_upload(&self, field: &mut impl FnMut(&[u8])) -> io::Result<()> {
+        let entry = &self.0.entry;
+        let (
+            Location::Local(source),
+            SnapshotEntry::LocalFile { stamp, identity },
+            (Location::Local(source_folder), DirectoryStamp::Local(source_parent)),
+            Location::Remote(target),
+            SnapshotEntry::Remote(target_stamp),
+            (Location::Remote(target_folder), DirectoryStamp::Remote(target_parent)),
+        ) = (
+            &entry.source,
+            &entry.source_stamp,
+            &entry.source_parent,
+            &entry.target,
+            &entry.target_stamp,
+            &entry.target_parent,
+        )
+        else {
+            return Err(invalid());
+        };
+        field(source.as_os_str().as_encoded_bytes());
+        field(source_folder.as_os_str().as_encoded_bytes());
+        field(target);
+        field(target_folder);
+        field(&serde_json::to_vec(&(
+            stamp.review_fields(),
+            identity,
+            source_parent,
+            remote(target_stamp),
+            remote(target_parent),
+        ))?);
+        Ok(())
+    }
+
+    pub(in crate::sftp_window::worker::sync) fn refreshed_remote_parent(
+        &self,
+        client: &mut Client,
+    ) -> Result<DirectoryStamp> {
+        let (location, reviewed) = &self.0.entry.target_parent;
+        reviewed.verify(client, location, false)
+    }
+
+    pub(in crate::sftp_window::worker::sync) fn apply(
         &self,
         client: &mut Client,
         progress: &Progress,
-        stopped: &impl Fn() -> bool,
-        authorize: &impl Fn() -> Result<()>,
+        checks: &WriteChecks<'_>,
         backup_prefix: &str,
-    ) -> Result<String> {
-        let Metadata::Local(metadata) = &self.0.metadata else {
-            return Err(invalid().into());
-        };
+    ) -> Result<Option<Failure>> {
         if !self.differs() {
             return Err(invalid().into());
         }
-        let authorize = || {
-            require_running(stopped)?;
-            authorize()
-        };
+        let stopped = || (checks.cancelled)();
+        let authorize = || checks.require_authority();
+        let standing_roots = checks.standing.as_ref().map(|standing| standing.roots);
         authorize()?;
-        self.0
-            .replace_local(
+        match &self.0.metadata {
+            Metadata::Local(metadata) => self.0.replace_local(
                 client,
                 progress,
-                stopped,
+                &stopped,
                 &authorize,
                 LocalReplace {
                     metadata,
                     strict_source: true,
                     backup_prefix: Some(backup_prefix),
+                    standing_roots,
                 },
-            )
-            .map(|completion| completion.backup)
-            .map_err(|failure| failure.error)
+            ),
+            Metadata::Remote => remote::replace(
+                client,
+                &self.0.entry,
+                self.0.digests,
+                progress,
+                &stopped,
+                &authorize,
+                ReplaceScope::Scheduled {
+                    upload: checks.upload.ok_or_else(invalid)?,
+                    backup_prefix,
+                    standing_roots,
+                },
+            ),
+        }
+        .map(|completion| completion.warning)
+        .map_err(|failure| failure.error)
     }
+}
+
+fn remote(attributes: &kortty_ssh::sftp::Attributes) -> impl serde::Serialize {
+    (
+        attributes.size,
+        attributes.uid,
+        attributes.gid,
+        attributes.permissions,
+        attributes.modified,
+    )
 }

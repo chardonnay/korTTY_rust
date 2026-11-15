@@ -1,8 +1,8 @@
-use kortty_jobs::{Job, JobGraph, JobId, SchedulerStore};
+use kortty_jobs::{DependencyMode, Job, JobGraph, JobId, SchedulerStore};
 
 use super::*;
 use crate::ai_manager::Configuration;
-use crate::job_executor::agent::{self as worker, Context, Resend};
+use crate::job_executor::agent::{self as worker, Context, ModelResend, Resend};
 use crate::job_executor::automation::Plan;
 use crate::local_ai::{self, test_support};
 use crate::scheduler_window::{Message, Page, SchedulerWindow, agent, agent::proposal::Prompt};
@@ -32,10 +32,10 @@ struct SwarmFixture {
 
 impl SwarmFixture {
     fn new() -> Self {
-        Self::with_guidance(None)
+        Self::with_guidance(None, false)
     }
 
-    fn with_guidance(model: Option<&TcpListener>) -> Self {
+    fn with_guidance(model: Option<&TcpListener>, dependency_start: bool) -> Self {
         let servers = [Sshd::new(), Sshd::new()];
         let root = &servers[0].profile.0;
         let (_, seed, mut connections) =
@@ -51,19 +51,34 @@ impl SwarmFixture {
         }))
         .unwrap();
         let jobs = root.join("read-only-swarm-jobs.json");
-        let job = Job::new(
-            JobId::new("read-only-swarm").unwrap(),
-            "Read-only Swarm",
-            action,
-        )
-        .unwrap();
+        let swarm = JobId::new("read-only-swarm").unwrap();
+        let predecessor = JobId::new("swarm-fixture-predecessor").unwrap();
+        let mut job = Job::new(swarm.clone(), "Read-only Swarm", action).unwrap();
+        let mut jobs_to_save = Vec::new();
+        if dependency_start {
+            jobs_to_save.push(
+                Job::new(
+                    predecessor.clone(),
+                    "Predecessor",
+                    seed.action.as_ref().clone(),
+                )
+                .unwrap(),
+            );
+            job = job.with_dependencies(
+                DependencyMode::Chain,
+                vec![predecessor.clone()],
+                std::num::NonZeroU32::new(5),
+            );
+        }
+        jobs_to_save.push(job);
         SchedulerStore::open(&jobs)
             .unwrap()
-            .commit_with_actions(&JobGraph::new(vec![job]).unwrap(), &[], &[])
+            .commit_with_actions(&JobGraph::new(jobs_to_save).unwrap(), &[], &[])
             .unwrap();
         let mut runtime = SchedulerWindow::open(jobs.clone()).unwrap();
         runtime.set_execution_allowed(true);
         let mut view = runtime.new_view();
+        runtime.update_view(&mut view, Message::Select(swarm.clone()));
         runtime.update_view(&mut view, Message::Page(Page::Action));
         let review = runtime.begin_agent_review(&view).unwrap();
         let profile = agent::ProfileChoice {
@@ -162,11 +177,11 @@ impl SwarmFixture {
 
         let mut runtime = SchedulerWindow::open(jobs.clone()).unwrap();
         runtime.set_execution_allowed(true);
-        let mut view = runtime.new_view();
-        let request = runtime
-            .update_view(&mut view, Message::Run(false))
-            .pop()
-            .unwrap();
+        let request = if dependency_start {
+            start_chained_copy(&mut runtime, &predecessor, &swarm)
+        } else {
+            start_copy_manually(&mut runtime, &swarm)
+        };
         assert!(runtime.active_agent_run_approved(&request));
         if model.is_none() {
             let grant = request
@@ -232,6 +247,7 @@ impl SwarmFixture {
             mask: fixture_mask,
             proposal: None,
             journal: None,
+            fresh_web: None,
         }
     }
 
@@ -289,7 +305,8 @@ fn fixture_policy() -> crate::clipboard_policy::ClipboardPolicy {
 #[test]
 #[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
 fn openssh_scheduled_read_only_swarm_isolates_target_evidence_and_rejects_model_commands() {
-    let mut fixture = SwarmFixture::new();
+    let mut fixture = SwarmFixture::with_guidance(None, true);
+    assert_eq!(fixture.request.trigger, RunTrigger::Dependency);
     let targets = fixture
         .request
         .action
@@ -384,6 +401,10 @@ fn openssh_scheduled_read_only_swarm_isolates_target_evidence_and_rejects_model_
         .update_runtime(Message::Finished(completion));
     drop(fixture.runtime);
     let store = SchedulerStore::open(&fixture.jobs).unwrap();
+    assert_eq!(
+        store.journal_record(run).unwrap().trigger,
+        RunTrigger::Dependency
+    );
     let report = store.journal_swarm_report(run).unwrap();
     assert_eq!(report.question, MASKED_GOAL);
     assert_eq!(
@@ -463,7 +484,7 @@ fn openssh_scheduled_read_only_swarm_isolates_target_evidence_and_rejects_model_
 #[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
 fn openssh_scheduled_guided_swarm_preserves_each_review_and_revokes_stale_repair() {
     let (model, _) = test_support::listener();
-    let mut fixture = SwarmFixture::with_guidance(Some(&model));
+    let mut fixture = SwarmFixture::with_guidance(Some(&model), false);
     let targets = fixture
         .request
         .action
@@ -663,7 +684,7 @@ fn logged_probe(server: &Sshd, evidence: &str) -> PathBuf {
 }
 
 enum Event {
-    Permit(Resend),
+    Permit(ModelResend),
     Done(Completion),
 }
 
@@ -677,6 +698,11 @@ fn next_event(
             return Event::Done(completion);
         }
         if let Ok(permit) = permits.try_recv() {
+            let Resend::Model(permit) = permit else {
+                panic!(
+                    "Read-only Swarm without environment research must only request model authority"
+                );
+            };
             return Event::Permit(permit);
         }
         assert!(

@@ -57,6 +57,10 @@ impl State {
         self.preferred = Some(conversion);
     }
 
+    pub(super) fn replacement_ending(self) -> Option<LineEnding> {
+        self.preferred.map(Conversion::ending).or(self.uniform)
+    }
+
     pub(super) fn selected(self, line_count: usize) -> Option<Conversion> {
         match self.uniform {
             Some(LineEnding::Lf) => Some(Conversion::Lf),

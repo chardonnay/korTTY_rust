@@ -42,7 +42,7 @@ mod planning;
 mod policy;
 mod request_review;
 pub(super) mod shortcut;
-mod swarm;
+pub(in crate::workspace) mod swarm;
 mod view;
 mod workflow;
 
@@ -234,6 +234,7 @@ struct Run {
     profile_pending: bool,
     purpose: Purpose,
     swarm: bool,
+    swarm_web: Option<swarm::web_evidence::Evidence>,
     design: AgentLayout,
     presentation: design::Presentation,
     started_order: u64,
@@ -381,6 +382,7 @@ impl Run {
             profile_pending: false,
             purpose: setup.purpose,
             swarm: setup.swarm,
+            swarm_web: None,
             design: setup.design,
             presentation: design::Presentation::default(),
             started_order: 0,
@@ -647,7 +649,10 @@ impl State {
         &self,
         id: window::Id,
         palette: Option<palette::Palette>,
+        swarm_animation: bool,
         batch_allowed: bool,
+        web_available: bool,
+        summary_profiles: impl FnOnce() -> Vec<crate::scheduler_window::AutomationSummaryProvider>,
     ) -> Option<Element<'_, Message>> {
         use iced::widget::container;
 
@@ -655,7 +660,14 @@ impl State {
             dialog.view().map(Message::Workflow)
         } else if let Some(run_id) = self.pip_run_for_window(id) {
             return Some(design::pip::detached_view(self, run_id, palette));
-        } else if let Some(view) = self.swarm_view(id, palette, batch_allowed) {
+        } else if let Some(view) = self.swarm_view(
+            id,
+            swarm_animation,
+            palette,
+            batch_allowed,
+            web_available,
+            summary_profiles,
+        ) {
             view.map(Message::Swarm)
         } else {
             self.runs.get(&id).filter(|run| !run.swarm)?.view(palette)
@@ -678,8 +690,11 @@ impl Workspace {
         self.terminal_agents.view(
             id,
             self.agent_window_palette(id),
+            self.swarm_status_animated(id),
             self.clipboard.policy.ai_agent_execution
                 == crate::clipboard_policy::AiAgentExecution::Allow,
+            self.swarm_web_available(id),
+            || self.automation_summary_providers(),
         )
     }
 
@@ -922,6 +937,7 @@ impl Workspace {
                         profiles.extend(cli_profile_choices(&config));
                     }
                 }
+                let role_https = config.preferred_agent_https_id();
                 let preferred = profile_override.or_else(|| {
                     let connection_id = connection
                         .and_then(|reference| config.resolve_profile_reference(reference));
@@ -932,13 +948,17 @@ impl Workspace {
                         config
                             .agent_profile_id()
                             .or_else(|| config.preferred_agent_cli_id())
+                            .or(role_https)
                     }
                 });
                 let cli_fallback = preferred.is_some_and(|id| config.is_terminal_cli_profile(id));
                 let preferred = preferred.and_then(|id| {
                     profiles.iter().find(|profile| {
                         profile.id == id
-                            && (profile.reviewed_https.is_none() || profile_override.is_some())
+                            && (profile.reviewed_https.is_none()
+                                || profile_override.is_some()
+                                || role_https == Some(id)
+                                || matches!(profile.reference, ProfileRef::Policy(_)))
                     })
                 });
                 let fallback_allowed = profile_override.is_none()
@@ -950,6 +970,8 @@ impl Workspace {
                     }
                     profile
                 } else if let Some(profile) = preferred {
+                    profile_pending =
+                        profile.reviewed_https.is_some() && profile_override.is_none();
                     profile.clone()
                 } else if fallback_allowed
                     && cli_fallback

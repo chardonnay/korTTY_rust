@@ -127,7 +127,7 @@ impl Review {
         })
     }
 
-    #[cfg(windows)]
+    #[cfg(any(windows, unix))]
     pub(in crate::sftp_window) fn paired_regular_files(&self) -> impl Iterator<Item = &Relative> {
         let manifests = self.direction(crate::sftp_window::Side::Local);
         self.rows.iter().filter_map(move |(path, _)| {

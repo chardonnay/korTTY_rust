@@ -2,7 +2,7 @@
 
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, FileTimes, OpenOptions};
-use std::io::{self, Cursor, Write as _};
+use std::io::{self, Cursor, Read as _, Write as _};
 use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -10,9 +10,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use kortty_server_archive::manifest::{Manifest, Member, MemberKind};
 use kortty_server_archive::protocol::{
-    CreateFormat, CreateSpec, MAX_REQUEST_BYTES, Reply, Request, Review, read_reply, write_request,
+    CreateFormat, CreateSpec, MAX_REQUEST_BYTES, OutputMetadata, PASSWORD_COMMIT, PASSWORD_READY,
+    Reply, Request, Review, creation_password_body, read_reply, write_request,
 };
 use sevenz_rust2::{ArchiveReader, EncoderMethod, Password};
+use sha2::{Digest, Sha256};
 
 const DIRECTORY: &str = "資料";
 const FILE: &str = "資料/δ.bin";
@@ -41,6 +43,8 @@ fn stdio_creates_private_archive_after_review_and_preserves_late_collisions() {
             format,
             level,
             excludes: vec!["*.log".into()],
+            output: None,
+            report_payload: false,
         };
         let review = || {
             let Reply::CreationReview { review } =
@@ -74,7 +78,7 @@ fn stdio_creates_private_archive_after_review_and_preserves_late_collisions() {
         let bytes = fs::read(destination).unwrap();
         let mut found = Vec::new();
         let decoded_format = match format {
-            CreateFormat::Zip => kortty_server_archive::Format::Zip,
+            CreateFormat::Zip | CreateFormat::ZipPassword => kortty_server_archive::Format::Zip,
             CreateFormat::Tar => kortty_server_archive::Format::Tar,
             CreateFormat::TarBzip2 => kortty_server_archive::Format::TarBzip2,
             CreateFormat::SevenZip => kortty_server_archive::Format::SevenZip,
@@ -114,6 +118,232 @@ fn stdio_creates_private_archive_after_review_and_preserves_late_collisions() {
             .iter()
             .any(|name| name.to_string_lossy().starts_with(".kortty-"))
     );
+}
+
+#[test]
+fn stdio_binds_archive_output_metadata_to_review_and_applies_it_before_publication() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("source.txt");
+    let destination = fixture.0.join("reviewed.zip");
+    write_private(&source, PAYLOAD);
+    let uid = rustix::process::geteuid().as_raw();
+    let gid = rustix::process::getegid().as_raw();
+    let spec = |uid, gid, mode| CreateSpec {
+        sources: vec![source.to_str().unwrap().into()],
+        destination: destination.to_str().unwrap().into(),
+        format: CreateFormat::Zip,
+        level: 6,
+        excludes: Vec::new(),
+        output: Some(OutputMetadata { uid, gid, mode }),
+        report_payload: false,
+    };
+    let review = |spec: &CreateSpec| {
+        let Reply::CreationReview { review } =
+            invoke(&Request::ReviewCreation { spec: spec.clone() })
+        else {
+            panic!("expected archive output review");
+        };
+        review.validate_for(spec).unwrap();
+        review
+    };
+    let apply = |spec: CreateSpec, token| invoke(&Request::ApplyCreation { spec, token });
+
+    for invalid in [
+        spec(Some(u32::MAX), None, None),
+        spec(None, None, Some(0o4755)),
+    ] {
+        assert_failed(
+            invoke(&Request::ReviewCreation { spec: invalid }),
+            "ownership IDs",
+        );
+    }
+    let selected = spec(Some(uid), Some(gid), Some(0o644));
+    let approved = review(&selected);
+    let changed = spec(Some(uid), Some(gid), Some(0o000));
+    assert!(approved.validate_for(&changed).is_err());
+    assert_failed(apply(changed.clone(), approved.token), "changed");
+    assert!(!destination.exists());
+
+    if uid != 0 {
+        let unauthorized = spec(Some(0), None, Some(0o644));
+        let approved = review(&unauthorized);
+        assert!(matches!(
+            apply(unauthorized, approved.token),
+            Reply::Failed {
+                outcome_unknown: false,
+                ..
+            }
+        ));
+        assert!(!destination.exists());
+    }
+
+    for (spec, expected) in [(selected, 0o644), (changed, 0o000)] {
+        let approved = review(&spec);
+        assert_applied(apply(spec, approved.token), &destination);
+        let actual = fs::metadata(&destination).unwrap();
+        assert_eq!(
+            (
+                actual.uid(),
+                actual.gid(),
+                actual.mode() & 0o7777,
+                actual.nlink()
+            ),
+            (uid, gid, expected, 1)
+        );
+        fs::remove_file(&destination).unwrap();
+    }
+    assert_eq!(names(&fixture.0), [OsString::from("source.txt")]);
+}
+
+#[test]
+fn stdio_returns_a_bounded_digest_receipt_for_the_exact_published_archive() {
+    let fixture = Fixture::new();
+    let source = fixture.0.join("source.txt");
+    let destination = fixture.0.join("reviewed.zip");
+    write_private(&source, PAYLOAD);
+    let mut spec = CreateSpec {
+        sources: vec![source.to_str().unwrap().into()],
+        destination: destination.to_str().unwrap().into(),
+        format: CreateFormat::Zip,
+        level: 6,
+        excludes: Vec::new(),
+        output: None,
+        report_payload: false,
+    };
+    let review = |spec: &CreateSpec| {
+        let Reply::CreationReview { review } =
+            invoke(&Request::ReviewCreation { spec: spec.clone() })
+        else {
+            panic!("expected archive review");
+        };
+        review.validate_for(spec).unwrap();
+        review
+    };
+    let legacy = review(&spec);
+    assert!(
+        !serde_json::to_value(&legacy.spec)
+            .unwrap()
+            .as_object()
+            .unwrap()
+            .contains_key("report_payload")
+    );
+    spec.report_payload = true;
+    assert_failed(
+        invoke(&Request::ApplyCreation {
+            spec: spec.clone(),
+            token: legacy.token,
+        }),
+        "changed",
+    );
+    assert!(!destination.exists());
+
+    let approved = review(&spec);
+    let Reply::CreationApplied {
+        destination: actual,
+        payload,
+    } = invoke(&Request::ApplyCreation {
+        spec,
+        token: approved.token,
+    })
+    else {
+        panic!("expected publication with payload receipt");
+    };
+    payload.validate().unwrap();
+    assert_eq!(Path::new(&actual), destination);
+    let bytes = fs::read(destination).unwrap();
+    assert_eq!(payload.bytes, bytes.len() as u64);
+    assert_eq!(payload.sha256, <[u8; 32]>::from(Sha256::digest(bytes)));
+}
+
+#[test]
+fn stdio_password_zip_requires_a_separate_commit_and_encrypts_the_exact_payload() {
+    const PASSWORD: &str = "fixture 東京\0\nZIP password";
+    let fixture = Fixture::new();
+    let source = fixture.0.join("source.txt");
+    let destination = fixture.0.join("reviewed.zip");
+    write_private(&source, PAYLOAD);
+    let spec = CreateSpec {
+        sources: vec![source.to_str().unwrap().into()],
+        destination: destination.to_str().unwrap().into(),
+        format: CreateFormat::ZipPassword,
+        level: 6,
+        excludes: Vec::new(),
+        output: None,
+        report_payload: true,
+    };
+    let Reply::CreationReview { review } = invoke(&Request::ReviewCreation { spec: spec.clone() })
+    else {
+        panic!("expected password ZIP review");
+    };
+    review.validate_for(&spec).unwrap();
+    let mut request = Vec::new();
+    write_request(
+        &mut request,
+        &Request::ApplyCreation {
+            spec,
+            token: review.token,
+        },
+    )
+    .unwrap();
+    let body = creation_password_body(PASSWORD).unwrap();
+    assert!(
+        !request
+            .windows(PASSWORD.len())
+            .any(|window| window == PASSWORD.as_bytes())
+    );
+    for suffix in [
+        Vec::new(),
+        (1025_u32).to_be_bytes().to_vec(),
+        body.to_vec(),
+        [body.as_slice(), b"not a commit marker here!"].concat(),
+        [body.as_slice(), PASSWORD_COMMIT, b"trailing input"].concat(),
+    ] {
+        let output = run(&[request.as_slice(), &suffix].concat());
+        assert!(!output.status.success());
+        assert_eq!(output.stdout, PASSWORD_READY);
+        assert!(
+            !output
+                .stderr
+                .windows(PASSWORD.len())
+                .any(|window| window == PASSWORD.as_bytes())
+        );
+        assert!(!destination.exists());
+    }
+    let wire = [request.as_slice(), body.as_slice(), PASSWORD_COMMIT].concat();
+    write_private(&destination, b"late destination");
+    let late = run(&wire);
+    assert!(late.status.success());
+    assert_failed(
+        read_reply(late.stdout.strip_prefix(PASSWORD_READY).unwrap()).unwrap(),
+        "already exists",
+    );
+    assert_eq!(fs::read(&destination).unwrap(), b"late destination");
+    fs::remove_file(&destination).unwrap();
+    let output = run(&wire);
+    assert!(output.status.success() && output.stderr.is_empty());
+    let Reply::CreationApplied {
+        destination: actual,
+        payload,
+    } = read_reply(output.stdout.strip_prefix(PASSWORD_READY).unwrap()).unwrap()
+    else {
+        panic!("expected password ZIP payload receipt");
+    };
+    assert_eq!(Path::new(&actual), destination);
+    let bytes = fs::read(destination).unwrap();
+    assert_eq!(payload.bytes, bytes.len() as u64);
+    assert_eq!(payload.sha256, <[u8; 32]>::from(Sha256::digest(&bytes)));
+    let mut zip = zip::ZipArchive::new(Cursor::new(bytes)).unwrap();
+    assert!(zip.by_name("source.txt").is_err());
+    assert!(
+        zip.by_name_decrypt("source.txt", b"wrong password")
+            .is_err()
+    );
+    let mut decoded = Vec::new();
+    zip.by_name_decrypt("source.txt", PASSWORD.as_bytes())
+        .unwrap()
+        .read_to_end(&mut decoded)
+        .unwrap();
+    assert_eq!(decoded, PAYLOAD);
 }
 
 #[test]

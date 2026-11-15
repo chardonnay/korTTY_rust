@@ -73,7 +73,7 @@ impl SkillReview {
         let preview = self.preview.clone();
         let finish = move |forecast| Message::ProposalQuotaFinished(preview, token, forecast);
         let transport = prompt.quota_transport();
-        if !standing {
+        if !standing && prompts.len() == 1 {
             return Ok(self
                 .quota
                 .start_messages(token, &transport, prompt.messages(), finish));
@@ -87,13 +87,17 @@ impl SkillReview {
         for prompt in prompts {
             let target = prompt.quota_transport();
             output += u64::from(target.effective_output_limit());
-            requests.push((
-                target,
+            let parts = if standing {
                 [
                     Zeroizing::new(prompt.firing_system().to_owned()),
                     Zeroizing::new(prompt.firing_input_preview()?),
-                ],
-            ));
+                ]
+            } else {
+                prompt
+                    .messages()
+                    .map(|part| Zeroizing::new(part.to_owned()))
+            };
+            requests.push((target, parts));
         }
         Ok(self.quota.start_forecast_with(
             token,
@@ -144,7 +148,7 @@ impl SkillReview {
     pub(super) fn request(
         &mut self,
         prompt: &Prompt,
-        before_dispatch: impl FnOnce() -> Result<(), String> + Send + 'static,
+        before_dispatch: impl FnMut() -> Result<(), String> + Send + 'static,
     ) -> Result<Task<Message>, String> {
         let Classification::Preview { quota, .. } = &self.classification else {
             return Ok(Task::none());

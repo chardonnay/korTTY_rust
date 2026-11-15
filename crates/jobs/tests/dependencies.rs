@@ -3,8 +3,8 @@ use std::time::{Duration, SystemTime};
 
 use kortty_diagram::{Direction, EdgeStyle, NodeTone, Theme, parse_mermaid};
 use kortty_jobs::{
-    BlockReason, DependencyMode, DiagramScope, GraphError, Job, JobGraph, JobId, RunBatch,
-    RunOutcome, RunTrigger, Scheduler, SchedulerError,
+    BlockReason, DependencyMode, DiagramScope, FiringOccurrence, GraphError, Job, JobGraph, JobId,
+    RunBatch, RunOutcome, RunTrigger, Scheduler, SchedulerError,
 };
 
 fn id(value: &str) -> JobId {
@@ -179,6 +179,72 @@ fn chain_releases_once_per_round_of_successful_predecessors() {
     assert_eq!(
         names(&run(&mut scheduler, "two", RunOutcome::Success, 9)),
         ["join"]
+    );
+}
+
+#[test]
+fn active_chain_occurrence_keeps_the_admitted_predecessor_round() {
+    use DependencyMode::{Chain, Gate};
+    let mut scheduler = scheduler(vec![
+        job("one", Gate, &[]),
+        job("two", Gate, &[]),
+        job("join", Chain, &["one", "two"]),
+    ]);
+    let one = run(&mut scheduler, "one", RunOutcome::Success, 3);
+    let two = run(&mut scheduler, "two", RunOutcome::Success, 4);
+    let joined = &two.started[0];
+    let predecessor = |batch: &RunBatch<()>| {
+        let run = &batch.finished[0];
+        (run.job.clone(), run.id, run.finished_at)
+    };
+    let expected = FiringOccurrence::Predecessors(vec![predecessor(&one), predecessor(&two)]);
+    assert_eq!(scheduler.active_firing_occurrence(joined), Some(&expected));
+    let _ = run(&mut scheduler, "one", RunOutcome::Success, 6);
+    assert_eq!(scheduler.active_firing_occurrence(joined), Some(&expected));
+    let _ = scheduler.complete(joined.id, RunOutcome::Success, at(7));
+    assert_eq!(scheduler.active_firing_occurrence(joined), None);
+}
+
+#[test]
+fn active_dependency_recheck_uses_previous_run_and_exact_ticket() {
+    use DependencyMode::{Chain, Gate};
+    let mut scheduler = scheduler(vec![
+        job("upstream", Gate, &[]),
+        Job::new(id("dependent"), "dependent", ())
+            .unwrap()
+            .with_dependencies(Chain, vec![id("upstream")], NonZeroU32::new(1)),
+    ]);
+    let _ = run(&mut scheduler, "dependent", RunOutcome::Success, 1);
+    let mut batch = run(&mut scheduler, "upstream", RunOutcome::Success, 2);
+    let request = &mut batch.started[0];
+    assert_eq!(request.trigger, RunTrigger::Dependency);
+    assert!(
+        scheduler
+            .active_predecessor_blockers(request, at(2))
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        scheduler
+            .active_predecessor_blockers(request, at(122))
+            .unwrap()[0]
+            .reason,
+        BlockReason::TooOld
+    );
+    let cancellation = std::mem::take(&mut request.cancellation);
+    assert!(
+        scheduler
+            .active_predecessor_blockers(request, at(2))
+            .is_none()
+    );
+    request.cancellation = cancellation;
+    let _ = scheduler
+        .complete(request.id, RunOutcome::Success, at(3))
+        .unwrap();
+    assert!(
+        scheduler
+            .active_predecessor_blockers(request, at(3))
+            .is_none()
     );
 }
 

@@ -15,6 +15,7 @@ use crate::private_files::Directory;
 use crate::session_journal::capture::retrieval;
 use crate::session_journal::deletion::Deletion;
 use crate::session_journal::entry_edit::{apply_patches, lock_source, patch_scalars};
+use crate::session_journal::summary_queue::{AutomationSource, AutomationVision, SourceReceipt};
 use crate::session_journal::summary_store::{self, Progress};
 use crate::session_journal::tree::{RunStatus, SourceKind};
 use crate::session_journal::{
@@ -24,7 +25,7 @@ use crate::session_journal::{
 
 use super::{
     Artifact, COMMAND_DIGEST, COMPLETE, Caps, DECISION, DIGEST, DUPLICATE_OF, DUPLICATE_RECEIPTS,
-    OPTIONS, Options, TARGET, is_native_path, outcome_key,
+    OPTIONS, Options, SUMMARY_PROOF, TARGET, is_native_path, outcome_key,
 };
 
 const MAX_HASH_BYTES: u64 = 64 * 1024 * 1024;
@@ -44,6 +45,8 @@ struct Stored {
     source: Source,
     row: Summary,
     options: Options,
+    summary_approval: Option<SourceReceipt>,
+    vision: Option<AutomationVision>,
     target: String,
     complete: bool,
     command_digest: Option<String>,
@@ -69,9 +72,18 @@ pub(crate) struct Sweep<'a> {
 
 #[derive(Default, Debug)]
 pub(crate) struct ResultSet {
-    pub(crate) closing: Vec<Summary>,
+    pub(crate) closing: Vec<ClosingSummary>,
     pub(crate) removed: usize,
     pub(crate) warnings: usize,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ClosingSummary {
+    pub(crate) journal: Summary,
+    pub(crate) profile: Option<crate::session_journal::summary_queue::ProfileChoice>,
+    pub(crate) unresolved_profile: bool,
+    pub(crate) source_approval: Option<SourceReceipt>,
+    pub(crate) vision: Option<AutomationVision>,
 }
 
 impl Sweep<'_> {
@@ -127,7 +139,13 @@ impl Sweep<'_> {
                 && Progress::read(&item.source).is_ok_and(|progress| !progress.finished)
             {
                 closing.insert(item.row.id.clone());
-                report.closing.push(item.row.clone());
+                report.closing.push(ClosingSummary {
+                    journal: item.row.clone(),
+                    profile: item.options.summary_profile.clone(),
+                    unresolved_profile: item.options.unresolved_summary_profile.is_some(),
+                    source_approval: item.summary_approval.clone(),
+                    vision: item.vision.clone(),
+                });
             }
         }
         self.expire(retained, &closing, &directory, &mut report)?;
@@ -266,6 +284,12 @@ impl Sweep<'_> {
             && original.row.source_id == item.row.source_id
             && original.row.automation_action == item.row.automation_action
             && original.row.run_status == item.row.run_status
+            && original.options.closing == item.options.closing
+            && original.options.summary_profile == item.options.summary_profile
+            && original.options.unresolved_summary_profile
+                == item.options.unresolved_summary_profile
+            && original.options.java_profile_source == item.options.java_profile_source
+            && original.summary_approval.is_some() == item.summary_approval.is_some()
             && original.row.run_id != item.row.run_id
             && original.target == item.target
             && original.command_digest == item.command_digest
@@ -425,6 +449,30 @@ impl Stored {
             };
             let options: Options = serde_json::from_str(&options)?;
             options.validate()?;
+            let summary_approval = field(meta, SUMMARY_PROOF)?
+                .map(|value| serde_json::from_str::<SourceReceipt>(&value))
+                .transpose()?;
+            if let Some(approval) = &summary_approval {
+                let kind = match row.source_kind {
+                    SourceKind::Job => super::Kind::Job,
+                    SourceKind::Swarm => super::Kind::Swarm,
+                    SourceKind::Interactive => return Err(changed()),
+                };
+                if row
+                    .source_id
+                    .as_deref()
+                    .and_then(|id| AutomationSource::from_kind(kind, id))
+                    .as_ref()
+                    != Some(&approval.source)
+                    || row.run_id.as_deref() != Some(approval.run.as_str())
+                    || row.run_started_at != Some(approval.started)
+                    || approval
+                        .evidence_limits
+                        .is_some_and(|limits| !limits.valid())
+                {
+                    return Err(changed());
+                }
+            }
             let target = field(meta, TARGET)?.ok_or_else(changed)?.into_owned();
             if target.is_empty() || row.run_id.as_ref().is_none_or(|value| value.is_empty()) {
                 return Err(changed());
@@ -437,10 +485,15 @@ impl Stored {
                 Some(_) => return Err(changed()),
             };
             let receipts = duplicate_receipts(meta)?;
+            let vision = (row.source_kind == SourceKind::Job)
+                .then(|| super::stored_vision(meta, &source))
+                .flatten();
             Ok(Some(Self {
                 source,
                 row,
                 options,
+                summary_approval,
+                vision,
                 target,
                 complete: boolean(meta, COMPLETE)?,
                 command_digest: field(meta, COMMAND_DIGEST)?.map(|value| value.into_owned()),

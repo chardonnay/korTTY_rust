@@ -38,7 +38,7 @@ pub(super) use entry_edit_access::deletion::Dialogs as EntryDeleteDialogs;
 pub(super) mod export_dialog;
 mod export_options;
 mod keyword_chips;
-mod link_text;
+pub(super) mod link_text;
 mod manager_tree;
 pub(super) mod marker_dialog;
 pub(super) mod metadata;
@@ -720,7 +720,7 @@ impl Workspace {
             Mode::Viewer(viewer) => {
                 let appearance = self.journal_appearance_page(AppearanceTarget::Viewer(id));
                 let keyboard = self.viewer_navigation_interactive(id) && !appearance.open;
-                let screenshot_interactive = keyboard && !self.hosted_close_locks(id);
+                let viewer_interactive = keyboard && !self.hosted_close_locks(id);
                 let entry_enabled = appearance.enabled
                     && viewer.can_edit_entries()
                     && viewer.entry_flow.input_enabled();
@@ -728,19 +728,27 @@ impl Workspace {
                     enabled: entry_enabled,
                     delete_allowed: self.journal_delete_allowed(),
                     translation: self.journal_note_translation_view(
-                        entry_enabled
-                            && screenshot_interactive
-                            && viewer.entry_editor.can_translate(),
+                        entry_enabled && viewer_interactive && viewer.entry_editor.can_translate(),
                     ),
                 };
                 column![
-                    self.journal_question_button(id, false),
+                    row![
+                        self.journal_question_button(id, false),
+                        self.journal_summary_live_ready(&viewer.source).then(|| {
+                            button("Summarize now").on_press_maybe(
+                                viewer_interactive
+                                    .then_some(Message::Summary(summaries::Event::SummarizeNow)),
+                            )
+                        }),
+                    ]
+                    .spacing(6)
+                    .wrap(),
                     viewer_keys::wrap(
                         viewer.view(
                             self.journal_links_allowed(),
                             self.journal_rename_allowed() && !self.journal_edit_busy(id),
                             entry_controls,
-                            screenshot_interactive,
+                            viewer_interactive,
                             self.journal_screenshot_analysis_available(),
                             appearance,
                         ),
@@ -2599,6 +2607,45 @@ fn catalog_task(id: window::Id, revision: u64, root: PathBuf) -> Task<Desktop> {
         move || session_journal::catalog(&root),
         move |result| Message::CatalogLoaded(revision, source, result),
     )
+}
+
+impl Workspace {
+    pub(super) fn journal_usage_capture(
+        &self,
+        source: &ViewerSource,
+    ) -> Option<Arc<session_journal::Capture>> {
+        self.journal_metadata_captures()
+            .into_iter()
+            .find(|capture| source.same_journal(&ViewerSource::capture(capture)))
+    }
+}
+
+pub(super) fn record_journal_ai_usage(
+    source: &ViewerSource,
+    capture: Option<&session_journal::Capture>,
+    usage: session_journal::summary_ai::ObservedUsage,
+) -> io::Result<session_journal::summary_store::UsageEdit> {
+    if let Some(capture) = capture {
+        if !source.same_journal(&ViewerSource::capture(capture)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "The selected session journal identity changed",
+            ));
+        }
+        match capture.record_ai_usage(usage.clone()) {
+            Ok(reply) => {
+                return reply
+                    .recv_blocking()
+                    .map_err(io::Error::other)?
+                    .map_err(io::Error::other);
+            }
+            Err(error) if error.kind() == io::ErrorKind::BrokenPipe => {
+                let _ = capture.done().recv_blocking();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    source.record_ai_usage(usage)
 }
 
 fn read_task<T: Send + Sync + 'static>(

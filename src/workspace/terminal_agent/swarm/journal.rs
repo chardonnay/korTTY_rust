@@ -7,13 +7,16 @@ use iced::widget::{button, column, row, text};
 use iced::{Element, Task, window};
 
 use crate::private_files::{Directory, FileStamp, require_single_link};
-use crate::scheduler_window::{AutomationEstimate, SwarmJournalDraft, SwarmJournalEdit};
+use crate::scheduler_window::{
+    AutomationEstimate, AutomationModelEstimate, AutomationSummaryProvider, SwarmJournalDraft,
+    SwarmJournalEdit,
+};
 use crate::session_journal::automation::{Options, Retention};
 use crate::session_journal::viewer::Source;
 
 use super::{ClipboardPolicy, Desktop, Message, RunMessage, Workspace, snippet};
 
-pub(super) const SOURCE: &str = "interactive-swarm";
+pub(super) use crate::session_journal::automation::INTERACTIVE_SWARM_SOURCE as SOURCE;
 const SETTINGS: &str = "swarm-journal-settings.json";
 const MAX_SETTINGS_BYTES: u64 = 4096;
 
@@ -62,9 +65,13 @@ impl State {
         .map_err(|error| error.to_string())
     }
 
-    pub(super) fn view(&self, targets: usize) -> Element<'_, Message> {
+    pub(super) fn view(
+        &self,
+        targets: usize,
+        profiles: Vec<AutomationSummaryProvider>,
+    ) -> Element<'_, Message> {
         let mut controls = column![
-            self.draft.swarm_view().map(Message::Journal),
+            self.draft.swarm_view(profiles).map(Message::Journal),
             row![
                 button("Save journal defaults").on_press(Message::SaveJournalDefaults),
                 self.draft.estimate_mode().map(|_| {
@@ -124,14 +131,22 @@ impl State {
         else {
             return Task::none();
         };
-        let profile = workspace
-            .journal_summaries_allowed()
-            .then(|| workspace.configured_journal_ai(false))
+        let profile = (!self.draft.unresolved_summary_profile())
+            .then(|| {
+                workspace.automation_summary_estimate_profile(
+                    Some(&crate::session_journal::summary_queue::AutomationSource::Swarm),
+                    self.draft.summary_profile(),
+                )
+            })
             .flatten();
         let Some((profile, root)) = profile.zip(workspace.journal_directory().ok()) else {
             self.estimate = Some(AutomationEstimate::unavailable());
             return Task::none();
         };
+        let evidence_limits = workspace.automation_summary_evidence_limits(
+            Some(&crate::session_journal::summary_queue::AutomationSource::Swarm),
+            self.draft.summary_profile(),
+        );
         self.epoch += 1;
         self.pending = true;
         let epoch = self.epoch;
@@ -139,8 +154,18 @@ impl State {
             "kortty-swarm-journal-estimate",
             move || {
                 let estimate = if ClipboardPolicy::load().automation_journal_allowed() {
-                    let (model, budget) = profile.usage_estimate_profile();
-                    AutomationEstimate::swarm(&root, SOURCE, targets, mode, model, budget)
+                    let (name, budget) = profile.usage_estimate_profile();
+                    AutomationEstimate::swarm(
+                        &root,
+                        SOURCE,
+                        targets,
+                        mode,
+                        AutomationModelEstimate {
+                            name,
+                            budget,
+                            evidence_limits,
+                        },
+                    )
                 } else {
                     AutomationEstimate::unavailable()
                 };

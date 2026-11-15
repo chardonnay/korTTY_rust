@@ -9,7 +9,7 @@ use zeroize::Zeroizing;
 use super::policy_profile::{EchoMask, redact_echo};
 use super::{
     Client, DEFAULT_TIMEOUT, Error, MAX_RESPONSE_BYTES, RemoteProtocol, RequestMessage, Target,
-    Usage, UsageAttempt, chat_messages, completion_status, providers,
+    Usage, UsageAttempt, chat_messages, completion_status, is_event_stream, providers,
 };
 
 const MAX_WIRE_BYTES: u64 = 4 * 1024 * 1024;
@@ -31,6 +31,8 @@ enum Protocol {
 #[derive(Clone, Copy)]
 enum Mode {
     Chat,
+    #[cfg(test)]
+    SseFixture,
     Structured {
         response_format: bool,
         deadline: Option<Instant>,
@@ -46,7 +48,7 @@ impl Client {
         system: &str,
         history: &[(&str, &str)],
         input: &str,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
         mut emit: impl FnMut(StreamDelta),
     ) -> Result<String, Error> {
         let messages = chat_messages(system, history, input);
@@ -55,12 +57,20 @@ impl Client {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn stream_sse_fixture(&self, input: &str) -> Result<String, Error> {
+        let messages = chat_messages("", &[], input);
+        self.with_completion(|attempt| {
+            self.stream_messages(&messages, Mode::SseFixture, || Ok(()), &mut |_| {}, attempt)
+        })
+    }
+
     /// Streams a structured analysis response while retaining the JSON-object request mode.
     pub(crate) fn stream_analysis(
         &self,
         system: &str,
         input: &str,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
         emit: impl FnMut(StreamDelta),
     ) -> Result<String, Error> {
         self.stream_structured(system, input, true, None, before_dispatch, emit)
@@ -72,7 +82,7 @@ impl Client {
         input: &str,
         response_format: bool,
         deadline: Option<Instant>,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
         mut emit: impl FnMut(StreamDelta),
     ) -> Result<String, Error> {
         let messages = chat_messages(system, &[], input);
@@ -96,12 +106,12 @@ impl Client {
         [system, input]: [&str; 2],
         deadline: Instant,
         credential: Option<Zeroizing<String>>,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
         mut emit: impl FnMut(StreamDelta),
     ) -> Result<String, Error> {
         let messages = chat_messages(system, &[], input);
         self.with_completion(|attempt| {
-            if self.profile.is_remote() {
+            if self.profile.is_remote() || self.profile.is_loopback_anthropic() {
                 attempt.reviewed_https_credential = Some(credential);
             }
             self.stream_messages(
@@ -118,7 +128,7 @@ impl Client {
         &self,
         messages: &[RequestMessage<'_>],
         mode: Mode,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        mut before_dispatch: impl FnMut() -> Result<(), String>,
         emit: &mut impl FnMut(StreamDelta),
         attempt: &mut UsageAttempt,
     ) -> Result<String, Error> {
@@ -135,16 +145,15 @@ impl Client {
         }
         let protocol = if self.profile.uses_lm_studio_protocol() {
             Protocol::LmStudio
-        } else if matches!(
-            self.profile.target,
-            Target::Remote(_, RemoteProtocol::Anthropic)
-        ) {
+        } else if self.profile.uses_anthropic_protocol() {
             Protocol::Anthropic
         } else {
             Protocol::OpenAi
         };
         let (structured, response_format, deadline) = match mode {
             Mode::Chat => (false, false, None),
+            #[cfg(test)]
+            Mode::SseFixture => (false, false, None),
             Mode::Structured {
                 response_format,
                 deadline,
@@ -153,13 +162,6 @@ impl Client {
         };
         self.require_text_for_mlx(messages)?;
         let response_format = response_format && !self.profile.is_mlx();
-        let body = match protocol {
-            Protocol::LmStudio => providers::lm_request(self, messages, response_format, true)?,
-            Protocol::Anthropic => {
-                providers::anthropic_request(self, messages, response_format, true)?
-            }
-            Protocol::OpenAi => self.openai_request(messages, response_format, true)?,
-        };
         let deadline = if structured && self.profile.starts_sidecar() {
             let limit = Instant::now() + self.profile.options.timeout.unwrap_or(DEFAULT_TIMEOUT);
             Some(deadline.map_or(limit, |deadline| deadline.min(limit)))
@@ -167,27 +169,52 @@ impl Client {
             deadline
         };
         let transport = self.transport(deadline)?;
+        if protocol == Protocol::LmStudio {
+            self.require_lm_studio_reasoning(deadline)?;
+        }
         let deadline =
-            self.before_completion_dispatch(transport, deadline, before_dispatch, attempt)?;
-        let mut response = self.completion_response(transport, &body, deadline, attempt)?;
+            self.before_completion_dispatch(transport, deadline, &mut before_dispatch, attempt)?;
+        let (mut response, buffered, deadline) = if protocol == Protocol::OpenAi {
+            let request = self.openai_payload(
+                messages,
+                response_format,
+                true,
+                self.openai_reasoning(transport)?,
+            )?;
+            let response = self
+                .openai_response(transport, request, deadline, before_dispatch, attempt)
+                .or_else(|error| {
+                    self.validate_transport(transport)?;
+                    Err(error)
+                })?;
+            (response.response, response.buffered, response.deadline)
+        } else if protocol == Protocol::Anthropic {
+            let (response, deadline) = self.anthropic_completion(
+                transport,
+                (messages, response_format, true),
+                deadline,
+                before_dispatch,
+                attempt,
+            )?;
+            (response, None, Some(deadline))
+        } else {
+            let body = providers::lm_request(self, messages, response_format, true)?;
+            let response = self.completion_response(transport, &body, deadline, attempt)?;
+            completion_status(&response)?;
+            (response, None, deadline)
+        };
+        #[cfg(test)]
+        if matches!(mode, Mode::SseFixture) && !is_event_stream(&response) {
+            return Err(Error::Invalid("fixture did not return an event stream"));
+        }
         let credential = attempt.credential.as_deref().map(String::as_str);
-        completion_status(
-            &mut response,
-            protocol == Protocol::OpenAi && deadline.is_some() && response_format,
-        )?;
-        let streaming = response
-            .headers()
-            .get("content-type")
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| {
-                value
-                    .split(';')
-                    .next()
-                    .is_some_and(|kind| kind.trim().eq_ignore_ascii_case("text/event-stream"))
-            });
-        let result = if streaming {
+        let result = if is_event_stream(&response) {
             let mut state = State {
                 require_openai_stop: matches!(mode, Mode::ReviewedText { .. }),
+                native_minimax: matches!(
+                    self.profile.target,
+                    Target::Remote(_, RemoteProtocol::MiniMaxNative)
+                ),
                 ..State::default()
             };
             let mut text = EchoMask::default();
@@ -215,10 +242,13 @@ impl Client {
             attempt.usage.absorb(state.usage);
             result
         } else {
-            let bytes = self.cancellable_response_bytes(
-                &mut response,
-                deadline.is_some() || self.profile.options.timeout.is_some(),
-            )?;
+            let bytes = match buffered {
+                Some(bytes) => bytes,
+                None => self.cancellable_response_bytes(
+                    &mut response,
+                    deadline.is_some() || self.profile.options.timeout.is_some(),
+                )?,
+            };
             let answer = match protocol {
                 Protocol::LmStudio => providers::lm_response(
                     &bytes,
@@ -341,8 +371,8 @@ fn read_stream(
             if !data.is_empty() {
                 state.event(&data, protocol, limit, emit)?;
             }
-            return if state.finished {
-                Ok(state.answer.to_string())
+            return if state.finished || state.native_minimax && state.openai_stopped {
+                state.final_answer()
             } else {
                 Err(Error::Invalid("stream ended before completion"))
             };
@@ -355,7 +385,7 @@ fn read_stream(
                 state.event(&data, protocol, limit, emit)?;
                 data.clear();
                 if state.finished {
-                    return Ok(state.answer.to_string());
+                    return state.final_answer();
                 }
             }
         } else if let Some(value) = line.strip_prefix("data:") {
@@ -377,6 +407,7 @@ struct State {
     finished: bool,
     require_openai_stop: bool,
     openai_stopped: bool,
+    native_minimax: bool,
     anthropic: Anthropic,
     usage: Usage,
 }
@@ -397,6 +428,13 @@ enum Block {
 }
 
 impl State {
+    fn final_answer(&self) -> Result<String, Error> {
+        if self.native_minimax && self.answer.trim().is_empty() {
+            return Err(Error::Invalid("missing MiniMax stream answer"));
+        }
+        Ok(self.answer.to_string())
+    }
+
     fn append(
         &mut self,
         text: &str,
@@ -479,18 +517,27 @@ impl State {
             }
             return Ok(());
         }
-        if value.get("error").is_some() {
-            return Err(Error::Invalid("server reported a streaming error"));
-        }
         self.usage
             .observe_openai(value.get("usage"), value.get("model"), value.get("id"));
-        let Some(choices) = value.get("choices").and_then(Value::as_array) else {
+        let choices = value.get("choices").and_then(Value::as_array);
+        if let Some(error) = providers::openai_provider_error(
+            value.get("error"),
+            value.get("base_resp"),
+            choices.is_some_and(|choices| !choices.is_empty()),
+        ) {
+            return Err(error);
+        }
+        let Some(choices) = choices else {
             return Err(Error::Invalid("missing streamed choices"));
         };
         for choice in choices {
+            if self.native_minimax && !choice.is_object() {
+                return Err(Error::Invalid("invalid MiniMax stream choice"));
+            }
             if choice.get("index").and_then(Value::as_u64).unwrap_or(0) != 0 {
                 continue;
             }
+            let already_stopped = self.native_minimax && self.openai_stopped;
             if let Some(reason) = choice.get("finish_reason").and_then(Value::as_str) {
                 if reason == "length" {
                     return Err(Error::Invalid("model output reached its token limit"));
@@ -501,20 +548,62 @@ impl State {
                 self.openai_stopped = true;
             }
             let delta = &choice["delta"];
-            for (key, reasoning) in [
+            let message = &choice["message"];
+            if openai_tool_call(delta) || self.native_minimax && openai_tool_call(message) {
+                return Err(Error::Invalid("unexpected tool call in chat stream"));
+            }
+            const CONTENT_FIELDS: [(&str, bool); 3] = [
                 ("content", false),
                 ("reasoning_content", true),
                 ("reasoning", true),
-            ] {
-                if let Some(content) = delta.get(key).filter(|value| !value.is_null()) {
+            ];
+            let cumulative = self.native_minimax
+                && message.is_object()
+                && !CONTENT_FIELDS.iter().any(|(key, _)| {
+                    delta
+                        .get(*key)
+                        .is_some_and(|value| !value.is_null() && value.as_str() != Some(""))
+                });
+            let parts = if cumulative { message } else { delta };
+            let mut received = [None, None];
+            for (key, reasoning) in CONTENT_FIELDS {
+                if let Some(content) = parts.get(key).filter(|value| !value.is_null()) {
                     let text = content
                         .as_str()
                         .ok_or(Error::Invalid("invalid streamed content"))?;
-                    self.append(text, reasoning, emit)?;
+                    // MiniMax native sends cumulative messages, including a final snapshot
+                    // after ordinary deltas. Never display the same text twice or revise it.
+                    let text = if cumulative {
+                        let previous = if reasoning {
+                            self.reasoning.as_str()
+                        } else {
+                            self.answer.as_str()
+                        };
+                        text.strip_prefix(previous).ok_or(Error::Invalid(
+                            "MiniMax stream changed previously received content",
+                        ))?
+                    } else {
+                        text
+                    };
+                    if already_stopped && !text.is_empty() {
+                        return Err(Error::Invalid(
+                            "MiniMax stream sent content after completion",
+                        ));
+                    }
+                    if cumulative {
+                        // Accept either reasoning field, with reasoning_content preferred.
+                        received[usize::from(reasoning)].get_or_insert(text);
+                    } else {
+                        self.append(text, reasoning, emit)?;
+                    }
                 }
             }
-            if delta.get("tool_calls").is_some() || delta.get("function_call").is_some() {
-                return Err(Error::Invalid("unexpected tool call in chat stream"));
+            if cumulative {
+                for (text, reasoning) in received.into_iter().zip([false, true]) {
+                    if let Some(text) = text {
+                        self.append(text, reasoning, emit)?;
+                    }
+                }
             }
         }
         Ok(())
@@ -615,6 +704,10 @@ impl State {
     }
 }
 
+fn openai_tool_call(part: &Value) -> bool {
+    part.get("tool_calls").is_some() || part.get("function_call").is_some()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,6 +744,194 @@ mod tests {
             decode(&wire[..], Protocol::OpenAi, None, || false, &mut |_| {}),
             Err(Error::Cancelled)
         ));
+    }
+
+    #[test]
+    fn minimax_native_stream_emits_only_new_text_from_cumulative_messages() {
+        let wire = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Grü\",\"reasoning_content\":\"check\"}}]}\n\n",
+            "data: {\"choices\":[{\"message\":{\"content\":\"Grü\",\"reasoning_content\":\"check\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\",\"content\":\"\"},\"message\":{\"content\":\"Grüße\",\"reasoning\":\"check done\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":4,\"total_tokens\":16}}\n\n",
+            "data: [DONE]\n\n"
+        );
+        for complete in [wire, wire.strip_suffix("data: [DONE]\n\n").unwrap()] {
+            let mut state = State {
+                native_minimax: true,
+                require_openai_stop: true,
+                ..State::default()
+            };
+            let mut text = String::new();
+            let mut reasoning = String::new();
+            let answer = read_stream(
+                complete.as_bytes(),
+                Protocol::OpenAi,
+                None,
+                || true,
+                &mut |delta| match delta {
+                    StreamDelta::Text(delta) => text.push_str(&delta),
+                    StreamDelta::Reasoning(delta) => reasoning.push_str(&delta),
+                },
+                &mut state,
+            )
+            .unwrap();
+            assert_eq!(answer, "Grüße");
+            assert_eq!(text, "Grüße");
+            assert_eq!(reasoning, "check done");
+            assert_eq!(state.usage.total_tokens, Some(16));
+        }
+        assert_eq!(
+            decode(
+                wire.as_bytes(),
+                Protocol::OpenAi,
+                None,
+                || true,
+                &mut |_| {}
+            )
+            .unwrap()
+            .0,
+            "Grü"
+        );
+        let without_stop = wire.replacen(",\"finish_reason\":\"stop\"", "", 1);
+        let mut state = State {
+            native_minimax: true,
+            require_openai_stop: true,
+            ..State::default()
+        };
+        assert!(matches!(
+            read_stream(
+                without_stop
+                    .strip_suffix("data: [DONE]\n\n")
+                    .unwrap()
+                    .as_bytes(),
+                Protocol::OpenAi,
+                None,
+                || true,
+                &mut |_| {},
+                &mut state,
+            ),
+            Err(Error::Invalid("stream ended before completion"))
+        ));
+    }
+
+    #[test]
+    fn minimax_native_stream_rejects_rewritten_content_and_message_tool_calls() {
+        for (change, reason) in [
+            (
+                r#"{"content":"changed"}"#,
+                "MiniMax stream changed previously received content",
+            ),
+            (
+                r#"{"content":"prefix and tool","tool_calls":[]}"#,
+                "unexpected tool call in chat stream",
+            ),
+        ] {
+            let wire = format!(
+                "data: {{\"choices\":[{{\"message\":{{\"content\":\"prefix\"}}}}]}}\n\n\
+                data: {{\"choices\":[{{\"message\":{change},\"finish_reason\":\"stop\"}}],\"usage\":{{\"total_tokens\":7}}}}\n\n\
+                data: [DONE]\n\n"
+            );
+            let mut state = State {
+                native_minimax: true,
+                ..State::default()
+            };
+            let mut text = String::new();
+            let result = read_stream(
+                wire.as_bytes(),
+                Protocol::OpenAi,
+                None,
+                || true,
+                &mut |delta| {
+                    if let StreamDelta::Text(delta) = delta {
+                        text.push_str(&delta);
+                    }
+                },
+                &mut state,
+            );
+            assert!(matches!(result, Err(Error::Invalid(actual)) if actual == reason));
+            assert_eq!(text, "prefix");
+            assert_eq!(state.usage.total_tokens, Some(7));
+        }
+    }
+
+    #[test]
+    fn minimax_native_stream_allows_usage_and_exact_repeats_after_stop() {
+        let initial = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer\",\"reasoning_content\":\"check\"},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: {\"choices\":[{\"message\":{\"content\":\"answer\",\"reasoning_content\":\"check\"}}]}\n\n"
+        );
+        for (post_stop, allowed) in [
+            (r#"{"choices":[],"usage":{"total_tokens":7}}"#, true),
+            (
+                r#"{"choices":[{"delta":{"content":" late"}}],"usage":{"total_tokens":7}}"#,
+                false,
+            ),
+            (
+                r#"{"choices":[{"message":{"reasoning":"check more"}}],"usage":{"total_tokens":7}}"#,
+                false,
+            ),
+        ] {
+            let wire = format!("{initial}data: {post_stop}\n\n");
+            let mut state = State {
+                native_minimax: true,
+                ..State::default()
+            };
+            let mut text = String::new();
+            let mut reasoning = String::new();
+            let result = read_stream(
+                wire.as_bytes(),
+                Protocol::OpenAi,
+                None,
+                || true,
+                &mut |delta| match delta {
+                    StreamDelta::Text(delta) => text.push_str(&delta),
+                    StreamDelta::Reasoning(delta) => reasoning.push_str(&delta),
+                },
+                &mut state,
+            );
+            if allowed {
+                assert_eq!(result.unwrap(), "answer");
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(Error::Invalid(
+                        "MiniMax stream sent content after completion"
+                    ))
+                ));
+            }
+            assert_eq!(text, "answer");
+            assert_eq!(reasoning, "check");
+            assert_eq!(state.usage.total_tokens, Some(7));
+        }
+    }
+
+    #[test]
+    fn minimax_native_stream_requires_valid_choices_and_an_answer() {
+        for (choices, reason) in [
+            (
+                r#"[false,{"finish_reason":"stop","message":{"content":"answer"}}]"#,
+                "invalid MiniMax stream choice",
+            ),
+            (
+                r#"[{"finish_reason":"stop","message":{"reasoning_content":"check"}}]"#,
+                "missing MiniMax stream answer",
+            ),
+        ] {
+            let wire = format!("data: {{\"choices\":{choices}}}\n\n");
+            let mut state = State {
+                native_minimax: true,
+                ..State::default()
+            };
+            let result = read_stream(
+                wire.as_bytes(),
+                Protocol::OpenAi,
+                None,
+                || true,
+                &mut |_| {},
+                &mut state,
+            );
+            assert!(matches!(result, Err(Error::Invalid(actual)) if actual == reason));
+        }
     }
 
     #[test]

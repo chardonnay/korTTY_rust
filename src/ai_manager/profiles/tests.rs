@@ -1,6 +1,77 @@
 use super::*;
 
 #[test]
+fn mlx_reasoning_can_adopt_a_java_setting_after_a_compatible_model_is_reviewed() {
+    use mlx_models::ReasoningControls::{GptOssEffort, QwenThinking};
+
+    let (catalog, _) = java_backup::decode(
+        br#"<globalSettings><aiProfiles><profile>
+          <id>java-mlx</id><name>Imported local model</name>
+          <connectionMode>EMBEDDED_MLX</connectionMode><embeddedModelId>previous-mlx</embeddedModelId>
+          <reasoningEffort>HIGH</reasoningEffort>
+        </profile></aiProfiles></globalSettings>"#,
+    )
+    .unwrap();
+    let mut editor = Editor::new(catalog);
+    let first = "a".repeat(32);
+    let second = "b".repeat(32);
+    editor.mlx_models.choices = vec![
+        ManagedChoice {
+            id: first.clone(),
+            name: "GPT-OSS".into(),
+            vision: false,
+            mlx_reasoning: GptOssEffort,
+        },
+        ManagedChoice {
+            id: second.clone(),
+            name: "Qwen3".into(),
+            vision: false,
+            mlx_reasoning: QwenThinking,
+        },
+    ];
+    assert_eq!(
+        editor
+            .selected()
+            .unwrap()
+            .java_embedded_model
+            .as_ref()
+            .unwrap()
+            .mlx_reasoning(),
+        Some(Reasoning::High),
+    );
+    editor.update(Message::Reasoning(Reasoning::High), true);
+    assert_eq!(editor.selected().unwrap().reasoning, Reasoning::Default);
+
+    let profile = editor.selected_mut().unwrap();
+    profile.model.clone_from(&first);
+    profile.restore_review = false;
+    let source = profile.java_source.clone();
+    editor.update(Message::Reasoning(Reasoning::High), true);
+    editor.update(Message::Reasoning(Reasoning::None), true);
+    let catalog = editor.validated_catalog().unwrap();
+    let encoded = serde_json::to_vec(&catalog).unwrap();
+    let saved: Catalog = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(saved.profiles[0].reasoning, Reasoning::High);
+    assert_eq!(saved.profiles[0].java_source, source);
+
+    let profile = editor.selected_mut().unwrap();
+    profile.model = second;
+    profile.reasoning = Reasoning::Default;
+    editor.update(Message::Reasoning(Reasoning::High), true);
+    assert_eq!(editor.selected().unwrap().reasoning, Reasoning::Default);
+    editor.update(Message::Reasoning(Reasoning::None), true);
+    assert_eq!(
+        editor.validated_catalog().unwrap().profiles[0].reasoning,
+        Reasoning::None
+    );
+    editor.update(Message::Reasoning(Reasoning::On), true);
+    assert_eq!(
+        editor.validated_catalog().unwrap().profiles[0].reasoning,
+        Reasoning::On
+    );
+}
+
+#[test]
 fn model_prompt_preset_persists_and_legacy_profiles_keep_generic_requests() {
     use local_ai::PromptPreset;
 
@@ -439,6 +510,7 @@ fn managed_profile_selects_registry_id_without_retaining_external_route() -> Res
                     id: MODEL_ID.into(),
                     name: "GGUF fixture".into(),
                     vision: false,
+                    mlx_reasoning: mlx_models::ReasoningControls::DefaultOnly,
                 }],
                 ..ManagedModels::default()
             },
@@ -504,6 +576,7 @@ fn policy_managed_profile_alias_requires_a_choice_and_survives_refresh() {
         id: alias.into(),
         name: "Office model".into(),
         vision: false,
+        mlx_reasoning: mlx_models::ReasoningControls::DefaultOnly,
     };
     assert_eq!(
         administrative.to_string(),
@@ -567,11 +640,13 @@ fn managed_vision_follows_the_registered_projector_choice() {
             id: vision_id.clone(),
             name: "Vision".into(),
             vision: true,
+            mlx_reasoning: mlx_models::ReasoningControls::DefaultOnly,
         },
         ManagedChoice {
             id: text_id.clone(),
             name: "Text".into(),
             vision: false,
+            mlx_reasoning: mlx_models::ReasoningControls::DefaultOnly,
         },
     ];
     editor.update(Message::ConnectionMode(ConnectionMode::Managed), true);
@@ -620,6 +695,159 @@ fn lm_studio_native_profile_preserves_mode_and_uses_the_native_destination() {
 }
 
 #[test]
+fn lm_studio_auto_preserves_preference_in_editor_and_serializes_without_resolution() {
+    let mut editor = Editor::default();
+    editor.update(Message::Add, true);
+    editor.update(Message::ConnectionMode(ConnectionMode::LmStudio), true);
+    editor.update(Message::Edit(Field::Model, "preferred-key".into()), true);
+    editor.update(Message::ModelMode(ModelMode::Auto), true);
+    let profile = editor.selected().unwrap();
+    let id = profile.id;
+    let endpoint = profile.endpoint.clone();
+    editor.set_models(id, &endpoint, vec!["other-key".into()]);
+    let preference = |editor: &Editor| editor.selected().unwrap().model.clone();
+    assert_eq!(preference(&editor), "preferred-key");
+    assert!(editor.selected().unwrap().effective_model().is_empty());
+
+    let saved = editor.validated_catalog().unwrap();
+    editor.set_selected_lm_studio_auto(Err("one temporary read error".into()));
+    assert!(editor.validated_catalog().unwrap() == saved);
+    let body = serde_json::to_value(editor.validated_catalog().unwrap()).unwrap();
+    assert_eq!(body["profiles"][0]["model"], "preferred-key");
+    assert!(body["profiles"][0].get("lm_studio_auto").is_none());
+    assert!(editor.selected().unwrap().transport(1).is_err());
+
+    editor.update(Message::Edit(Field::Model, String::new()), true);
+    assert!(
+        editor
+            .selected()
+            .unwrap()
+            .lm_studio_auto_projection()
+            .is_none()
+    );
+    assert!(editor.validated_catalog().is_ok());
+    assert!(preference(&editor).is_empty());
+}
+
+#[test]
+fn lm_studio_compatible_profile_keeps_its_wire_route_and_exact_preference() {
+    let mut editor = Editor::default();
+    editor.update(Message::Add, true);
+    editor.update(
+        Message::ConnectionMode(ConnectionMode::LmStudioCompatible),
+        true,
+    );
+    editor.update(
+        Message::Edit(
+            Field::Endpoint,
+            "http://127.0.0.1:1234/v1/chat/completions".into(),
+        ),
+        true,
+    );
+    editor.update(Message::Edit(Field::Model, "preferred/model".into()), true);
+    editor.update(Message::ModelMode(ModelMode::Auto), true);
+    let profile = editor.selected().unwrap();
+    let settings = profile.lm_studio_auto_settings().unwrap().unwrap();
+    let previous_key = profile.lm_studio_discovery_key().unwrap();
+    assert_eq!(settings.mode, ConnectionMode::LmStudioCompatible);
+    assert_eq!(
+        settings.endpoint,
+        "http://127.0.0.1:1234/v1/chat/completions"
+    );
+    assert_eq!(settings.preferred, "preferred/model");
+    assert_eq!(
+        profile.destination().unwrap(),
+        "http://127.0.0.1:1234/v1/chat/completions"
+    );
+    let id = profile.id;
+    let endpoint = profile.endpoint.clone();
+    editor.set_models(id, &endpoint, vec!["unloaded/model".into()]);
+    editor.update(Message::Reasoning(Reasoning::On), true);
+    let profile = editor.selected().unwrap();
+    assert_eq!(profile.model, "preferred/model");
+    assert_eq!(profile.reasoning, Reasoning::Default);
+    assert!(profile.transport(1).is_err());
+    let saved = serde_json::to_value(editor.validated_catalog().unwrap()).unwrap();
+    assert_eq!(
+        saved["profiles"][0]["connection_mode"],
+        "lm-studio-compatible"
+    );
+    assert_eq!(saved["profiles"][0]["model"], "preferred/model");
+
+    let mut native = profile.clone();
+    native.connection_mode = ConnectionMode::LmStudio;
+    native.endpoint = "127.0.0.1:1234".into();
+    assert!(native.lm_studio_discovery_key().unwrap() != previous_key);
+    assert_ne!(native.lm_studio_auto_settings().unwrap().unwrap(), settings);
+    let mut generic = native.clone();
+    generic.connection_mode = ConnectionMode::External;
+    assert!(generic.lm_studio_discovery_key().is_none());
+    assert!(generic.lm_studio_auto_settings().is_none());
+}
+
+#[test]
+fn lm_studio_https_auto_requires_https_review_and_preserves_the_preference() {
+    let (catalog, _) = java_backup::decode(
+        br#"<globalSettings><aiProfiles><profile>
+            <id>lm-studio-tls</id><name>Studio TLS fixture</name>
+            <apiUrl>https://localhost:1234/api/v1/chat</apiUrl>
+            <modelSelectionMode>AUTO</modelSelectionMode><model>fixture/chat</model>
+            <internetAccessMode>LM_STUDIO_TAVILY_MCP</internetAccessMode>
+        </profile></aiProfiles></globalSettings>"#,
+    )
+    .unwrap();
+    let mut editor = Editor::new(catalog);
+    editor.update(Message::TrustLocal(true), true);
+    editor.update(Message::ReviewedAgentHttps(true), true);
+    let profile = editor.selected().unwrap();
+    assert!(profile.restore_review && !profile.trusted_local_endpoint);
+    assert!(profile.lm_studio_discovery_key().is_none());
+    assert!(!profile.allows_reviewed_agent_https());
+
+    editor.update(Message::TrustRemote(true), true);
+    let profile = editor.selected().unwrap();
+    assert!(!profile.restore_review && profile.trusted_remote_endpoint);
+    assert!(!profile.allows_local_roles() && !profile.allows_reviewed_agent_https());
+    assert!(profile.lm_studio_discovery_key().is_some());
+    assert_eq!(profile.model, "fixture/chat");
+    editor.update(Message::ReviewedAgentHttps(true), true);
+    editor.update(
+        Message::Edit(Field::Credential, "FIXTURE_LM_STUDIO_KEY".into()),
+        true,
+    );
+    let profile = editor.selected().unwrap();
+    assert!(profile.allows_reviewed_agent_https());
+    assert!(
+        profile
+            .lm_studio_auto_settings()
+            .unwrap()
+            .is_ok_and(|settings| {
+                settings.endpoint == "https://localhost:1234/api/v1/chat"
+                    && settings.preferred == "fixture/chat"
+                    && settings.credential_env.as_deref() == Some("FIXTURE_LM_STUDIO_KEY")
+            })
+    );
+
+    editor.update(Message::TrustRemote(false), true);
+    let profile = editor.selected().unwrap();
+    assert!(profile.restore_review && profile.lm_studio_discovery_key().is_none());
+    assert!(!profile.allows_reviewed_agent_https());
+    assert!(profile.credential_env.is_empty());
+    assert_eq!(profile.model, "fixture/chat");
+    editor.update(Message::TrustRemote(true), true);
+    editor.update(
+        Message::Edit(Field::Endpoint, "http://localhost:1234/api/v1/chat".into()),
+        true,
+    );
+    assert!(editor.selected().unwrap().restore_review);
+    editor.update(Message::TrustLocal(true), true);
+    let profile = editor.selected().unwrap();
+    assert!(profile.allows_local_roles() && !profile.allows_reviewed_agent_https());
+    assert!(profile.lm_studio_discovery_key().is_some());
+    assert_eq!(profile.model, "fixture/chat");
+}
+
+#[test]
 fn remote_profile_requires_separate_trust_and_endpoint_edits_clear_credential_reference() {
     let profile = Profile {
         id: 1,
@@ -662,6 +890,233 @@ fn remote_profile_requires_separate_trust_and_endpoint_edits_clear_credential_re
     assert!(changed.credential_env.is_empty());
     assert!(!changed.trusted_remote_endpoint);
     assert!(changed.transport(1).is_err());
+}
+
+#[test]
+#[ignore = "requires a private loopback Anthropic Messages server with the synthetic test alias"]
+fn loopback_anthropic_live_provider_returns_json_and_sse_after_review() {
+    const MODEL: &str = "kortty-anthropic-acceptance";
+    const INPUT: &str = "Once upon a time there was";
+    let endpoint = std::env::var("KORTTY_TEST_ANTHROPIC_ENDPOINT")
+        .expect("set KORTTY_TEST_ANTHROPIC_ENDPOINT to the private loopback Messages URL");
+    let profile = Profile {
+        id: 1,
+        name: "Messages provider fixture".into(),
+        connection_mode: ConnectionMode::LoopbackAnthropic,
+        endpoint,
+        model: MODEL.into(),
+        max_output_tokens: Some(256),
+        restore_review: true,
+        ..Profile::default()
+    };
+    let mut editor = Editor::new(Catalog {
+        profiles: vec![profile],
+        default: Some(1),
+        last_id: 1,
+        ..Catalog::default()
+    });
+    assert!(editor.selected().unwrap().transport(1).is_err());
+    editor.update(Message::TrustLocal(true), true);
+    let catalog = editor.validated_catalog().unwrap();
+    let client = local_ai::Client::new(catalog.default_profile().unwrap().transport(1).unwrap());
+    let response = client.complete_chat("", &[], INPUT).unwrap();
+    assert!(!response.trim().is_empty());
+    assert_eq!(client.take_usage().unwrap().model.as_deref(), Some(MODEL));
+    let streamed = client.stream_sse_fixture(INPUT).unwrap();
+    assert!(!streamed.trim().is_empty());
+    assert_eq!(client.take_usage().unwrap().model.as_deref(), Some(MODEL));
+}
+
+#[test]
+fn loopback_anthropic_requires_fresh_exact_trust_across_scheme_and_path_edits() {
+    let profile = Profile {
+        id: 1,
+        name: "Local Messages".into(),
+        connection_mode: ConnectionMode::LoopbackAnthropic,
+        endpoint: local_ai::ANTHROPIC_LOOPBACK_ENDPOINT.into(),
+        model: "fixture".into(),
+        ..Profile::default()
+    };
+    let mut editor = Editor::new(Catalog {
+        profiles: vec![profile],
+        default: Some(1),
+        last_id: 1,
+        ..Catalog::default()
+    });
+    assert!(editor.selected().unwrap().transport(1).is_err());
+    editor.update(Message::TrustRemote(true), true);
+    assert!(editor.selected().unwrap().transport(1).is_err());
+    editor.update(Message::TrustLocal(true), true);
+    editor.update(
+        Message::Edit(Field::Credential, "MESSAGES_FIXTURE_API_KEY".into()),
+        true,
+    );
+    let local = editor.selected().unwrap();
+    let approved = local.transport(1).unwrap();
+    assert!(!approved.is_remote());
+    assert!(!local.supports_model_discovery());
+    assert!(!local.allows_lm_studio_mcp());
+    assert_eq!(
+        local.destination().unwrap(),
+        local_ai::ANTHROPIC_LOOPBACK_ENDPOINT
+    );
+    let mut backup = editor.validated_catalog().unwrap();
+    backup.prepare_backup();
+    backup.validate().unwrap();
+    assert!(backup.default_profile().unwrap().restore_review);
+    editor.update(Message::TrustLocal(false), true);
+    let revoked = editor.validated_catalog().unwrap();
+    assert!(revoked.default_profile().unwrap().transport(1).is_err());
+
+    editor.update(
+        Message::Edit(
+            Field::Endpoint,
+            "https://localhost:8443/proxy/V1/Messages".into(),
+        ),
+        true,
+    );
+    editor.update(Message::TrustLocal(true), true);
+    let revised = editor.selected().unwrap();
+    assert!(revised.credential_env.is_empty());
+    assert!(revised.transport(1).is_err());
+    editor.update(Message::TrustRemote(true), true);
+    editor.update(Message::ModelMode(ModelMode::Auto), true);
+    editor.update(Message::ModelMode(ModelMode::ServerDefault), true);
+    let tls = editor.selected().unwrap();
+    assert_eq!(tls.model_mode, ModelMode::Manual);
+    assert_eq!(
+        tls.destination().unwrap(),
+        "https://localhost:8443/proxy/V1/Messages"
+    );
+    assert!(tls.transport(1).unwrap().is_remote());
+    assert!(tls.transport(1).unwrap() != approved);
+    editor.update(
+        Message::Edit(
+            Field::Endpoint,
+            "https://outside.example.test/v1/messages".into(),
+        ),
+        true,
+    );
+    editor.update(Message::TrustRemote(true), true);
+    assert!(editor.selected().unwrap().transport(1).is_err());
+}
+
+#[test]
+fn openai_exact_https_requires_fresh_trust_for_the_case_sensitive_destination() {
+    let route = "https://gateway.example/tenant/v1/Chat/Completions/";
+    let profile = Profile {
+        id: 1,
+        name: "Gateway completions".into(),
+        connection_mode: ConnectionMode::RemoteOpenAiExact,
+        endpoint: route.into(),
+        model: "fixture/exact".into(),
+        restore_review: true,
+        ..Profile::default()
+    };
+    let mut editor = Editor::new(Catalog {
+        profiles: vec![profile],
+        default: Some(1),
+        last_id: 1,
+        ..Catalog::default()
+    });
+    assert!(editor.selected().unwrap().transport(1).is_err());
+    editor.update(Message::TrustRemote(true), true);
+    editor.update(Message::ModelMode(ModelMode::Auto), true);
+    editor.update(
+        Message::Edit(Field::Credential, "EXACT_ENDPOINT_FIXTURE_KEY".into()),
+        true,
+    );
+    let reviewed = editor.selected().unwrap();
+    assert_eq!(reviewed.model_mode, ModelMode::Manual);
+    assert_eq!(reviewed.destination().unwrap(), route);
+    assert!(!reviewed.supports_model_discovery());
+    let original = reviewed.transport(1).unwrap();
+    assert!(original.is_remote() && !original.uses_server_default_model());
+
+    let changed_route = "https://gateway.example/tenant/v1/chat/completions";
+    editor.update(Message::Edit(Field::Endpoint, changed_route.into()), true);
+    let revised = editor.selected().unwrap();
+    assert!(revised.restore_review && revised.credential_env.is_empty());
+    assert!(revised.transport(1).is_err());
+    editor.update(Message::TrustRemote(true), true);
+    assert!(editor.selected().unwrap().transport(1).unwrap() != original);
+    editor.update(Message::ModelMode(ModelMode::ServerDefault), true);
+    let default = editor.selected().unwrap();
+    assert_eq!(default.destination().unwrap(), changed_route);
+    assert!(!default.supports_model_discovery());
+    assert!(default.transport(1).unwrap().uses_server_default_model());
+    editor.update(Message::TrustRemote(false), true);
+    let revoked = editor.validated_catalog().unwrap();
+    assert!(revoked.default_profile().is_none());
+    assert!(revoked.profiles[0].restore_review);
+}
+
+#[test]
+fn saved_generic_minimax_shaped_endpoints_keep_the_reviewed_routes() {
+    for base in [
+        local_ai::MINIMAX_NATIVE_ENDPOINT,
+        "https://gateway.example.test/v1/text/chatcompletion_v2",
+    ] {
+        let endpoint = format!("{base}/chat/completions");
+        for supplied in [base, &endpoint] {
+            let profile: Profile = serde_json::from_value(serde_json::json!({
+                "id": 1,
+                "name": "Existing HTTPS model",
+                "connection_mode": "remote-open-ai",
+                "endpoint": supplied,
+                "model": "MiniMax-M3",
+                "credential_env": "MINIMAX_API_KEY",
+                "trusted_remote_endpoint": true,
+                "reviewed_agent_https": true,
+            }))
+            .unwrap();
+            assert_eq!(profile.destination().unwrap(), endpoint);
+            assert!(profile.allows_reviewed_agent_https());
+            let actual = profile.transport(1).unwrap();
+            let expected = local_ai::Profile::remote(
+                base,
+                "MiniMax-M3",
+                local_ai::RemoteProtocol::OpenAi,
+                local_ai::ProfileOptions {
+                    timeout: Some(std::time::Duration::from_secs(60)),
+                    credential_env: Some("MINIMAX_API_KEY".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert!(actual == expected);
+        }
+    }
+}
+
+#[test]
+fn selecting_minimax_native_mode_requires_reviewing_its_distinct_route() {
+    let profile = Profile {
+        id: 1,
+        name: "Remote model".into(),
+        connection_mode: ConnectionMode::RemoteOpenAi,
+        endpoint: local_ai::MINIMAX_NATIVE_ENDPOINT.into(),
+        model: "MiniMax-M3".into(),
+        trusted_remote_endpoint: true,
+        reviewed_agent_https: true,
+        credential_env: "OLD_API_KEY".into(),
+        ..Profile::default()
+    };
+    let mut editor = Editor::new(Catalog {
+        profiles: vec![profile],
+        default: Some(1),
+        last_id: 1,
+        ..Catalog::default()
+    });
+    editor.update(Message::ConnectionMode(ConnectionMode::MiniMaxNative), true);
+    let profile = editor.selected().unwrap();
+    assert_eq!(
+        profile.destination().unwrap(),
+        local_ai::MINIMAX_NATIVE_ENDPOINT
+    );
+    assert!(!profile.trusted_remote_endpoint && !profile.reviewed_agent_https);
+    assert!(profile.credential_env.is_empty());
+    assert!(profile.transport(1).is_err());
 }
 
 #[test]

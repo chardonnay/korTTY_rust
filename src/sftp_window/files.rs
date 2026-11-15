@@ -121,7 +121,7 @@ pub(super) fn remote_name(name: &OsStr) -> io::Result<Vec<u8>> {
     Ok(bytes.to_vec())
 }
 
-pub(super) fn local_name(bytes: &[u8]) -> io::Result<OsString> {
+pub(crate) fn local_name(bytes: &[u8]) -> io::Result<OsString> {
     validate_remote_name(bytes)?;
     #[cfg(unix)]
     let name = {

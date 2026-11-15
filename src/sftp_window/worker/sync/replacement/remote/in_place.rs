@@ -64,17 +64,15 @@ pub(super) fn replace(
             size: upload.file.size(),
             modified: upload.modified,
         },
-        original.stage.writer()?,
-        replacement.stage.writer()?,
+        original.file()?,
+        replacement.file()?,
         upload.stopped,
         |bytes| {
             acknowledged.set(bytes);
             upload.progress.set_position(progress_at_start + bytes)?;
             (upload.authorize)().map_err(|error| io::Error::other(error.message))?;
-            original.stamp.require_unchanged(original.stage.writer()?)?;
-            replacement
-                .stamp
-                .require_unchanged(replacement.stage.writer()?)?;
+            original.verify()?;
+            replacement.verify()?;
             attempted.set(true);
             Ok(())
         },
@@ -132,7 +130,7 @@ fn save_backup(
         &backup.payload,
         UploadStage::Create,
         size,
-        original.stage.writer()?,
+        original.file()?,
         |observed, _| {
             if observed.uid != backup.uid {
                 return Err(io::Error::other(
@@ -140,7 +138,7 @@ fn save_backup(
                 ));
             }
             owner = Some(observed);
-            original.stamp.require_unchanged(original.stage.writer()?)?;
+            original.verify()?;
             (upload.authorize)().map_err(|error| io::Error::other(error.message))
         },
         upload.stopped,
@@ -150,7 +148,7 @@ fn save_backup(
         &backup.payload,
         owner,
         size,
-        original.stage.writer()?,
+        original.file()?,
         upload.stopped,
     )? != size
     {
@@ -169,41 +167,4 @@ fn save_backup(
         return Err(io::Error::other("The private backup changed before replacement").into());
     }
     Ok(stamp)
-}
-
-struct SealedFile {
-    stage: StagedDownload,
-    stamp: FileStamp,
-}
-
-impl SealedFile {
-    fn new(
-        size: u64,
-        expected: [u8; 32],
-        stopped: &dyn Fn() -> bool,
-        write: impl FnOnce(&mut dyn Write) -> Result<u64>,
-    ) -> Result<Self> {
-        require_running(&stopped)?;
-        let path = std::env::temp_dir().canonicalize()?.join(files::nonce()?);
-        let stage = StagedDownload::resumable(&path)?;
-        let file = stage.writer()?;
-        let mut digest = HashAlgorithm::Sha256
-            .new_hasher()
-            .map_err(io::Error::other)?;
-        let mut output = ObserveOutput(CheckedOutput(file, &stopped), |bytes: &[u8]| {
-            digest.update(bytes);
-        });
-        if write(&mut output)? != size || hash_bytes(digest.finalize()) != expected {
-            return Err(changed_bytes().into());
-        }
-        file.sync_all()?;
-        let stamp = FileStamp::read(file)?;
-        let sealed = Self { stage, stamp };
-        sealed.verify()?;
-        Ok(sealed)
-    }
-
-    fn verify(&self) -> Result<()> {
-        Ok(self.stage.verify_stage(&self.stamp)?)
-    }
 }
