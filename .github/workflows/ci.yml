@@ -11,9 +11,8 @@ jobs:
   native:
     name: Native checks (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    # A cold workspace test build and run can take over 30 minutes.
-    # Allow time for the separate release build and package staging.
-    timeout-minutes: 60
+    # macOS can exceed an hour across the cold test and release builds.
+    timeout-minutes: ${{ matrix.os == 'macos-15' && 90 || 60 }}
     strategy:
       fail-fast: false
       matrix:
