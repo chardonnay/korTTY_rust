@@ -288,6 +288,21 @@ impl Redactor {
             .map(|(text, _)| text)
     }
 
+    pub(crate) fn journal_output_text(
+        &self,
+        input: &str,
+        deadline: Instant,
+    ) -> Option<Zeroizing<String>> {
+        // The observer already bounds each line. Simple display filtering can
+        // finish even if the terminal parser exhausted the chunk's masking budget.
+        if self.secrets.is_empty() && !self.policy.has_redactions() && input.len() <= MAX_REDACTED {
+            let mut text = Zeroizing::new(input.to_owned());
+            text.retain(crate::session_journal::is_display_character);
+            return Some(text);
+        }
+        self.journal_text(input, deadline)
+    }
+
     pub(crate) fn outbound_text(
         &self,
         input: &str,
