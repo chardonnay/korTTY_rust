@@ -40,10 +40,17 @@ original local destination folder and server basename. Grouped drafts
 require a local file path for each route. The imported job and schedule
 start disabled. Portable backups retain mode and paths, discard saved
 proofs, and restore the affected replacement jobs as disabled drafts.
-The Windows app and test targets passed a compile check before the final
-Windows program-library guard. Fedora app and test targets passed strict
-Clippy. The native test builds were stopped before execution. Native runtime
-verification of the new direct file receiver remains pending.
+
+The initial local Windows and Fedora runs stopped before application tests.
+PR #4 fixed the transfer direction in the Scheduler and gave private Windows
+rsync stages explicit current-user ownership. On `590acff`, Windows, Ubuntu
+and macOS CI passed the local publication/recovery, Java draft and portable
+restore regressions, along with workspace Clippy, release builds and package
+staging. The ordinary and passwordless pinned OpenSSH fixtures require an
+explicit test environment. Those fixtures and native Scheduler editor
+acceptance remain open for the direct file receiver.
+[PR workflow](https://github.com/chardonnay/korTTY_rust/actions/runs/43733461845)
+and [Push workflow](https://github.com/chardonnay/korTTY_rust/actions/runs/43733458752).
 
 ## Scheduler passwordless rsync for protected Linux paths
 
