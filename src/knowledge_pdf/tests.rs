@@ -108,6 +108,57 @@ pub(crate) fn large_fixture(min_bytes: usize) -> Vec<u8> {
     bytes
 }
 
+fn write_corpus_fixture(file: File) -> io::Result<()> {
+    use std::fmt::Write as _;
+    use std::io::{BufWriter, Seek as _};
+
+    let mut output = BufWriter::new(file);
+    output.write_all(b"%PDF-1.5\n%\xff\xff\xff\xff\n")?;
+    let mut offsets = Vec::new();
+    for body in [
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Count 1 /Kids [3 0 R] /MediaBox [0 0 612 792] >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> /XObject << /Sample 6 0 R >> >> >>",
+        "<< /Length 53 >>\nstream\nBT /F1 12 Tf (Corpus boundary text.) Tj ET /Sample Do\nendstream",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+    ] {
+        offsets.push(output.stream_position()?);
+        writeln!(output, "{} 0 obj\n{body}\nendobj", offsets.len())?;
+    }
+
+    // Leave room for the document structure. The image bytes are streamed to
+    // disk so the test can measure the actual worker without a 500 MiB fixture Vec.
+    let pixels = vec![127; FIXTURE_IMAGE_BYTES];
+    for _ in 0..(MAX_FILE_BYTES / FIXTURE_IMAGE_BYTES - 2) {
+        offsets.push(output.stream_position()?);
+        writeln!(
+            output,
+            "{} 0 obj\n<< /Type /XObject /Subtype /Image /Width 1024 /Height 512 /BitsPerComponent 8 /ColorSpace /DeviceGray /Length {} >>\nstream",
+            offsets.len(),
+            pixels.len()
+        )?;
+        output.write_all(&pixels)?;
+        output.write_all(b"\nendstream\nendobj\n")?;
+    }
+
+    let size = offsets.len() + 1;
+    let mut xref = format!("xref\n0 {size}\n0000000000 65535 f \n");
+    for offset in offsets {
+        writeln!(&mut xref, "{offset:010} 00000 n ").unwrap();
+    }
+    write!(
+        &mut xref,
+        "trailer\n<< /Size {size} /Root 1 0 R >>\nstartxref\n"
+    )
+    .unwrap();
+    let offset = (MAX_FILE_BYTES - xref.len() - 10 - b"\n%%EOF\n".len()) as u64;
+    let padding = offset.checked_sub(output.stream_position()?).unwrap();
+    io::copy(&mut io::repeat(b' ').take(padding), &mut output)?;
+    write!(output, "{xref}{offset:010}\n%%EOF\n")?;
+    assert_eq!(output.stream_position()?, MAX_FILE_BYTES as u64);
+    output.flush()
+}
+
 #[test]
 fn pdf_input_reader_applies_the_default_and_explicit_byte_limits() {
     let profile = crate::snippets::tests::Profile::new();
@@ -115,38 +166,61 @@ fn pdf_input_reader_applies_the_default_and_explicit_byte_limits() {
     let bytes = large_fixture(DEFAULT_FILE_BYTES + 1);
     std::fs::write(&path, &bytes).unwrap();
     let open = || File::open(&path).unwrap();
-    for result in [
-        read_bytes(&open()),
-        read_bytes_with_limit(&open(), bytes.len() as u64 - 1),
-    ] {
-        assert_eq!(
-            failure_message(&result.unwrap_err()),
-            Some(Failure::Limit.message())
-        );
+    for limit in [DEFAULT_FILE_BYTES as u64, bytes.len() as u64 - 1] {
+        let error = extract(&open(), limit, || true).err().unwrap();
+        assert!(input_size_exceeded(&error));
+        let error = copy_source(read_header(open(), limit).unwrap(), io::sink(), || Ok(()))
+            .err()
+            .unwrap();
+        assert!(input_size_exceeded(&error));
     }
-    let reviewed = read_bytes_with_limit(&open(), bytes.len() as u64).unwrap();
-    assert_eq!(reviewed, bytes);
-    let pages = parse(&reviewed).unwrap();
+    let reviewed = extract(&open(), bytes.len() as u64, || true).unwrap();
+    assert_eq!(reviewed.bytes, bytes.len());
+    assert_eq!(reviewed.digest, <[u8; 32]>::from(Sha256::digest(&bytes)));
     assert_eq!(
-        pages.iter().map(|page| page.trim()).collect::<Vec<_>>(),
+        reviewed
+            .pages
+            .iter()
+            .map(|page| page.trim())
+            .collect::<Vec<_>>(),
         ["Large PDF fixture text.", "", "Last PDF fixture page."]
     );
 
-    // The input guard accepts the absolute boundary and clamps a higher caller limit.
+    // A source that changes length after the metadata check stays bounded by the pipe writer.
     let mut absolute_boundary = bytes;
-    absolute_boundary.resize(MAX_FILE_BYTES, b' ');
+    absolute_boundary.resize(PREVIOUS_MAX_FILE_BYTES, b' ');
     std::fs::write(&path, &absolute_boundary).unwrap();
     assert_eq!(
-        read_bytes_with_limit(&open(), u64::MAX).unwrap().len(),
-        MAX_FILE_BYTES
+        copy_source(
+            read_header(open(), PREVIOUS_MAX_FILE_BYTES as u64).unwrap(),
+            io::sink(),
+            || Ok(()),
+        )
+        .unwrap()
+        .len,
+        PREVIOUS_MAX_FILE_BYTES
     );
-    absolute_boundary.push(b' ');
-    std::fs::write(&path, &absolute_boundary).unwrap();
+    File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_len(MAX_FILE_BYTES as u64 + 1)
+        .unwrap();
     assert_eq!(
-        failure_message(&read_bytes_with_limit(&open(), u64::MAX).unwrap_err()),
+        failure_message(&extract(&open(), u64::MAX, || true).err().unwrap()),
         Some(Failure::Limit.message())
     );
-    assert_eq!(parse(&absolute_boundary).unwrap_err(), Failure::Limit);
+    let invalid = run_worker(
+        &profile.0.join("unavailable-worker"),
+        &b"Not a PDF"[..],
+        50,
+        Instant::now() + TIMEOUT,
+        &|| true,
+    );
+    assert_eq!(
+        failure_message(&invalid.err().unwrap()),
+        Some(Failure::Malformed.message())
+    );
 }
 
 #[test]
@@ -208,13 +282,20 @@ fn native_pdf_worker_bounds_output_and_reaps_on_cancellation() {
         std::env::var_os("KORTTY_PDF_WORKER_EXE").expect("desktop executable"),
     );
     let bytes = fixture(&["First", "", "Third"]);
-    let extracted = run_worker(&exe, bytes.clone(), Instant::now() + TIMEOUT, &|| true).unwrap();
-    assert_eq!(extracted[2].trim(), "Third");
+    let profile = crate::snippets::tests::Profile::new();
+    let path = profile.0.join("reviewed.pdf");
+    std::fs::write(&path, &bytes).unwrap();
+    let open = || File::open(&path).unwrap();
+    let limit = bytes.len() as u64;
+    let extracted = run_worker(&exe, open(), limit, Instant::now() + TIMEOUT, &|| true).unwrap();
+    assert_eq!(extracted.pages[2].trim(), "Third");
+    assert_eq!(extracted.digest, <[u8; 32]>::from(Sha256::digest(&bytes)));
     let calls = std::sync::atomic::AtomicUsize::new(0);
-    let error = run_worker(&exe, bytes, Instant::now() + TIMEOUT, &|| {
-        calls.fetch_add(1, Ordering::Relaxed) == 0
+    let error = run_worker(&exe, open(), limit, Instant::now() + TIMEOUT, &|| {
+        calls.fetch_add(1, Ordering::Relaxed) < 2
     })
-    .unwrap_err();
+    .err()
+    .unwrap();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
 }
 
@@ -224,16 +305,69 @@ fn native_pdf_worker_accepts_larger_reviewed_pdf_and_cancels_while_transferring_
     let exe = std::path::PathBuf::from(
         std::env::var_os("KORTTY_PDF_WORKER_EXE").expect("desktop executable"),
     );
-    let bytes = large_fixture(MAX_FILE_BYTES - FIXTURE_IMAGE_BYTES);
-    assert!(bytes.len() < MAX_FILE_BYTES);
-    let pages = run_worker(&exe, bytes.clone(), Instant::now() + TIMEOUT, &|| true).unwrap();
+    let bytes = large_fixture(PREVIOUS_MAX_FILE_BYTES + 16 * 1024 * 1024);
+    assert!(bytes.len() > PREVIOUS_MAX_FILE_BYTES && bytes.len() < MAX_FILE_BYTES);
+    let profile = crate::snippets::tests::Profile::new();
+    let path = profile.0.join("reviewed-large.pdf");
+    std::fs::write(&path, &bytes).unwrap();
+    let open = || File::open(&path).unwrap();
+    let limit = bytes.len() as u64;
+    let extracted = run_worker(&exe, open(), limit, Instant::now() + TIMEOUT, &|| true).unwrap();
     assert_eq!(
-        pages.iter().map(|page| page.trim()).collect::<Vec<_>>(),
+        extracted
+            .pages
+            .iter()
+            .map(|page| page.trim())
+            .collect::<Vec<_>>(),
         ["Large PDF fixture text.", "", "Last PDF fixture page."]
     );
-    let checks = std::sync::atomic::AtomicUsize::new(0);
-    let cancelled = run_worker(&exe, bytes, Instant::now() + TIMEOUT, &|| {
-        checks.fetch_add(1, Ordering::Relaxed) == 0
+    assert_eq!(extracted.bytes, bytes.len());
+    assert_eq!(extracted.digest, <[u8; 32]>::from(Sha256::digest(&bytes)));
+
+    struct FixtureSource {
+        file: File,
+        reading_body: Arc<AtomicBool>,
+    }
+    impl Read for FixtureSource {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            if buffer.len() > PDF_HEADER.len() {
+                self.reading_body.store(true, Ordering::Release);
+                // Allow the worker owner to cancel while a read is in flight.
+                thread::sleep(POLL * 3);
+            }
+            self.file.read(buffer)
+        }
+    }
+    let reading_body = Arc::new(AtomicBool::new(false));
+    let source = FixtureSource {
+        file: open(),
+        reading_body: Arc::clone(&reading_body),
+    };
+    let cancelled = run_worker(&exe, source, limit, Instant::now() + TIMEOUT, &|| {
+        !reading_body.load(Ordering::Acquire)
     });
-    assert_eq!(cancelled.unwrap_err().kind(), io::ErrorKind::Interrupted);
+    assert!(reading_body.load(Ordering::Acquire));
+    assert_eq!(cancelled.err().unwrap().kind(), io::ErrorKind::Interrupted);
+}
+
+#[test]
+#[ignore = "requires native kortty executable and space for two 500 MiB temporary files"]
+fn native_pdf_worker_accepts_the_exact_corpus_boundary() {
+    let exe = std::path::PathBuf::from(
+        std::env::var_os("KORTTY_PDF_WORKER_EXE").expect("desktop executable"),
+    );
+    let profile = crate::snippets::tests::Profile::new();
+    let path = profile.0.join("corpus-boundary.pdf");
+    write_corpus_fixture(File::create(&path).unwrap()).unwrap();
+    let source = File::open(&path).unwrap();
+    let extracted = run_worker(
+        &exe,
+        source,
+        MAX_FILE_BYTES as u64,
+        Instant::now() + TIMEOUT,
+        &|| true,
+    )
+    .unwrap();
+    assert_eq!(extracted.bytes, MAX_FILE_BYTES);
+    assert_eq!(extracted.pages[0].trim(), "Corpus boundary text.");
 }

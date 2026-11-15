@@ -16,12 +16,14 @@ const PREVIOUS_REVIEWED_TEXT_BYTES: usize = 2 * 1024 * 1024;
 const PREVIOUS_EXTENDED_TEXT_BYTES: usize = 16 * 1024 * 1024;
 pub(super) const PREVIOUS_LARGE_TEXT_BYTES: usize = 32 * 1024 * 1024;
 pub(in crate::ai_manager::local) const MAX_TEXT_BYTES: usize = 50 * 1024 * 1024;
-pub(in crate::ai_manager::local) const MAX_FILE_BYTES: u64 = pdf::MAX_FILE_BYTES as u64;
+pub(in crate::ai_manager::local) const NEW_SOURCE_DEFAULT: u64 = 50 * 1024 * 1024;
+pub(in crate::ai_manager::local) const MAX_CONFIGURED_BYTES: u64 = 1024 * 1024 * 1024;
+pub(super) const MAX_CORPUS_BYTES: usize = 500 * 1024 * 1024;
 
 pub(in crate::ai_manager::local) fn validate_file_size(limit: Option<u64>) -> Result<(), String> {
-    if limit.is_some_and(|bytes| !(1..=MAX_FILE_BYTES).contains(&bytes)) {
+    if limit.is_some_and(|bytes| !(1..=MAX_CONFIGURED_BYTES).contains(&bytes)) {
         return Err(format!(
-            "Enter a maximum file size from 1 to {MAX_FILE_BYTES} bytes, or leave it blank."
+            "Enter a maximum file size from 1 to {MAX_CONFIGURED_BYTES} bytes, or leave it blank."
         ));
     }
     Ok(())
@@ -36,15 +38,31 @@ pub(in crate::ai_manager::local) enum FileSizeLimit {
     Extended { extended_bytes: u64 },
     LargeText { large_text_bytes: u64 },
     CorpusText { corpus_text_bytes: u64 },
+    Source { source_bytes: u64 },
+    PdfCorpus { pdf_corpus_bytes: u64 },
 }
 
 impl FileSizeLimit {
     pub(in crate::ai_manager::local) fn reviewed(bytes: u64) -> Self {
-        Self::reviewed_for_text(bytes, true)
+        if bytes > pdf::PREVIOUS_MAX_FILE_BYTES as u64 {
+            Self::PdfCorpus {
+                pdf_corpus_bytes: bytes,
+            }
+        } else {
+            Self::reviewed_for_text(bytes, true)
+        }
     }
 
     pub(in crate::ai_manager::local) fn reviewed_for_text(bytes: u64, text: bool) -> Self {
-        if text && bytes > PREVIOUS_LARGE_TEXT_BYTES as u64 {
+        if !text && bytes > pdf::PREVIOUS_MAX_FILE_BYTES as u64 {
+            Self::PdfCorpus {
+                pdf_corpus_bytes: bytes,
+            }
+        } else if text && bytes > MAX_TEXT_BYTES as u64 {
+            Self::Source {
+                source_bytes: bytes,
+            }
+        } else if text && bytes > PREVIOUS_LARGE_TEXT_BYTES as u64 {
             Self::CorpusText {
                 corpus_text_bytes: bytes,
             }
@@ -75,6 +93,12 @@ impl FileSizeLimit {
             }
             | Self::CorpusText {
                 corpus_text_bytes: bytes,
+            }
+            | Self::Source {
+                source_bytes: bytes,
+            }
+            | Self::PdfCorpus {
+                pdf_corpus_bytes: bytes,
             } => bytes,
         }
     }
@@ -93,7 +117,8 @@ impl FileSizeLimit {
             Self::LargeText { large_text_bytes } => {
                 large_text_bytes > PREVIOUS_LARGE_TEXT_BYTES as u64
             }
-            Self::CorpusText { .. } => false,
+            Self::Source { .. } => true,
+            Self::CorpusText { .. } | Self::PdfCorpus { .. } => false,
         }
     }
 
@@ -103,15 +128,21 @@ impl FileSizeLimit {
             Self::Reviewed { bytes } => (DEFAULT_TEXT_BYTES as u64 + 1
                 ..=pdf::PREVIOUS_REVIEWED_FILE_BYTES as u64)
                 .contains(&bytes),
-            Self::Extended { extended_bytes } => {
-                (PREVIOUS_REVIEWED_TEXT_BYTES as u64 + 1..=MAX_FILE_BYTES).contains(&extended_bytes)
-            }
+            Self::Extended { extended_bytes } => (PREVIOUS_REVIEWED_TEXT_BYTES as u64 + 1
+                ..=pdf::PREVIOUS_MAX_FILE_BYTES as u64)
+                .contains(&extended_bytes),
             Self::LargeText { large_text_bytes } => (PREVIOUS_EXTENDED_TEXT_BYTES as u64 + 1
-                ..=MAX_FILE_BYTES)
+                ..=pdf::PREVIOUS_MAX_FILE_BYTES as u64)
                 .contains(&large_text_bytes),
-            Self::CorpusText { corpus_text_bytes } => {
-                (PREVIOUS_LARGE_TEXT_BYTES as u64 + 1..=MAX_FILE_BYTES).contains(&corpus_text_bytes)
+            Self::CorpusText { corpus_text_bytes } => (PREVIOUS_LARGE_TEXT_BYTES as u64 + 1
+                ..=MAX_TEXT_BYTES as u64)
+                .contains(&corpus_text_bytes),
+            Self::Source { source_bytes } => {
+                (MAX_TEXT_BYTES as u64 + 1..=MAX_CONFIGURED_BYTES).contains(&source_bytes)
             }
+            Self::PdfCorpus { pdf_corpus_bytes } => (pdf::PREVIOUS_MAX_FILE_BYTES as u64 + 1
+                ..=MAX_CONFIGURED_BYTES)
+                .contains(&pdf_corpus_bytes),
         };
         if !valid {
             return Err("Invalid saved knowledge source size limit.".into());
@@ -122,16 +153,21 @@ impl FileSizeLimit {
 
 pub(super) fn format_file_size(path: &Path, limit: Option<FileSizeLimit>) -> usize {
     match (pdf::is_pdf(path), limit) {
+        (true, Some(FileSizeLimit::PdfCorpus { .. })) => pdf::MAX_FILE_BYTES,
         (
             true,
             Some(
                 FileSizeLimit::Extended { .. }
                 | FileSizeLimit::LargeText { .. }
-                | FileSizeLimit::CorpusText { .. },
+                | FileSizeLimit::CorpusText { .. }
+                | FileSizeLimit::Source { .. },
             ),
-        ) => pdf::MAX_FILE_BYTES,
+        ) => pdf::PREVIOUS_MAX_FILE_BYTES,
         (true, Some(FileSizeLimit::Reviewed { .. })) => pdf::PREVIOUS_REVIEWED_FILE_BYTES,
         (true, _) => pdf::DEFAULT_FILE_BYTES,
+        (false, Some(FileSizeLimit::Source { .. } | FileSizeLimit::PdfCorpus { .. })) => {
+            MAX_CORPUS_BYTES
+        }
         (false, Some(FileSizeLimit::CorpusText { .. })) => MAX_TEXT_BYTES,
         (false, Some(FileSizeLimit::LargeText { .. })) => PREVIOUS_LARGE_TEXT_BYTES,
         (false, Some(FileSizeLimit::Extended { .. })) => PREVIOUS_EXTENDED_TEXT_BYTES,
@@ -206,6 +242,37 @@ fn explicitly_reviewed_corpus_text_limit_preserves_the_old_32_mib_boundary() {
     assert_eq!(
         serde_json::to_value(approved).unwrap(),
         serde_json::json!({"corpus_text_bytes": bytes})
+    );
+}
+
+#[cfg(test)]
+#[test]
+fn a_large_pdf_requires_a_current_source_approval() {
+    let bytes = MAX_CONFIGURED_BYTES;
+    let older: FileSizeLimit =
+        serde_json::from_value(serde_json::json!({"source_bytes": bytes})).unwrap();
+    let reviewed = FileSizeLimit::reviewed(bytes);
+    let pdf_path = Path::new("manual.pdf");
+    let text_path = Path::new("notes.txt");
+    assert_eq!(
+        effective_file_size(pdf_path, Some(older)),
+        pdf::PREVIOUS_MAX_FILE_BYTES as u64
+    );
+    assert_eq!(
+        effective_file_size(pdf_path, Some(reviewed)),
+        MAX_CORPUS_BYTES as u64
+    );
+    assert_eq!(
+        effective_file_size(text_path, Some(older)),
+        effective_file_size(text_path, Some(reviewed))
+    );
+    assert_eq!(FileSizeLimit::reviewed_for_text(bytes, true), older);
+    assert_eq!(FileSizeLimit::reviewed_for_text(bytes, false), reviewed);
+    assert!(older.uses_previous_boundary());
+    assert!(!reviewed.uses_previous_boundary());
+    assert_eq!(
+        serde_json::to_value(reviewed).unwrap(),
+        serde_json::json!({"pdf_corpus_bytes": bytes})
     );
 }
 

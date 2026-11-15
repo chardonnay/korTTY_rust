@@ -91,14 +91,74 @@ fn windows_release_requires_the_matching_worker_and_archives_it_with_the_app() {
 }
 
 fn package(binaries: &Path, output: &Path) -> Output {
-    Command::new(env!("CARGO_BIN_EXE_kortty-package"))
-        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
-        .args(["--target", "aarch64-pc-windows-msvc", "--bin-dir"])
-        .arg(binaries)
-        .arg("--output-dir")
-        .arg(output)
+    package_command("aarch64-pc-windows-msvc", binaries, output)
         .output()
         .unwrap()
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "requires Windows with WiX Toolset 4 or later and its matching UI extension"]
+fn native_windows_msi_preserves_the_zip_and_accepts_long_staging_paths() {
+    use sha2::{Digest, Sha256};
+
+    let fixture = Fixture::new();
+    let binaries = fixture.0.join("native programs");
+    fs::create_dir(&binaries).unwrap();
+    let executable = std::env::current_exe().unwrap();
+    for name in ["kortty.exe", "kortty-cli.exe", "kortty-ssh-worker.exe"] {
+        fs::copy(&executable, binaries.join(name)).unwrap();
+    }
+    let triple = if cfg!(target_arch = "aarch64") {
+        "aarch64-pc-windows-msvc"
+    } else {
+        "x86_64-pc-windows-msvc"
+    };
+    let output = fixture
+        .0
+        .join("long output directory ".repeat(7).trim_end())
+        .join("a second level to exceed the legacy Windows path limit");
+    let temporary = fixture
+        .0
+        .join("long temporary directory ".repeat(7).trim_end())
+        .join("a second level to exceed the legacy Windows path limit");
+    fs::create_dir_all(&temporary).unwrap();
+    let result = package_command(triple, &binaries, &output)
+        .env("TEMP", &temporary)
+        .env("TMP", &temporary)
+        .arg("--windows-msi")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let zip = PathBuf::from(String::from_utf8(result.stdout).unwrap().trim());
+    assert!(zip.is_file());
+    assert!(zip.with_extension("zip.sha256").is_file());
+    let msi = zip.with_extension("msi");
+    let bytes = fs::read(&msi).unwrap();
+    assert!(bytes.starts_with(&[0xd0, 0xcf, 0x11, 0xe0, 0xa1, 0xb1, 0x1a, 0xe1]));
+    assert_eq!(
+        fs::read_to_string(msi.with_extension("msi.sha256")).unwrap(),
+        format!(
+            "{:x}  {}\n",
+            Sha256::digest(bytes),
+            msi.file_name().unwrap().to_str().unwrap()
+        )
+    );
+}
+
+fn package_command(triple: &str, binaries: &Path, output: &Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kortty-package"));
+    command
+        .current_dir(Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap())
+        .args(["--target", triple, "--bin-dir"])
+        .arg(binaries)
+        .arg("--output-dir")
+        .arg(output);
+    command
 }
 
 fn executable(machine: u16, characteristics: u16, payload: &[u8]) -> Vec<u8> {

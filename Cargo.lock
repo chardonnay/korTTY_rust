@@ -2654,6 +2654,7 @@ dependencies = [
  "subtle",
  "svgtypes 0.16.2",
  "tar",
+ "tempfile",
  "tiktoken-rs",
  "tiny-skia 0.11.4",
  "toml_edit",
@@ -2698,7 +2699,9 @@ name = "kortty-files"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "memmap2",
  "rustix 1.1.6",
+ "tempfile",
  "windows-sys 0.61.2",
  "zeroize",
 ]
@@ -2719,6 +2722,7 @@ dependencies = [
  "kortty-diagram",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
 ]
 
 [[package]]
@@ -2792,6 +2796,8 @@ dependencies = [
  "sevenz-rust2",
  "sha2 0.10.9",
  "tar",
+ "unicode-normalization",
+ "zeroize",
  "zip",
 ]
 

@@ -166,6 +166,26 @@ pub(crate) fn available(definition: &PolicyModel, root: &Path, cancelled: &Atomi
     }
 }
 
+pub(crate) fn mlx_reasoning(
+    definition: &PolicyModel,
+    cancelled: &AtomicBool,
+) -> io::Result<mlx_models::ReasoningControls> {
+    require_runtime(definition, PolicyModelRuntime::Mlx)?;
+    #[cfg(unix)]
+    {
+        let Source::Local(path) = source(definition)? else {
+            return Err(remote_gguf_only());
+        };
+        mlx_models::open_policy_model(definition, path, cancelled)
+            .map(|model| model.reasoning_controls())
+    }
+    #[cfg(windows)]
+    {
+        let _ = cancelled;
+        Err(mlx_unsupported())
+    }
+}
+
 fn open_protected_cache(
     definition: &PolicyModel,
     path: &Path,

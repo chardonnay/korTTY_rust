@@ -1,14 +1,20 @@
 //! The exact read-only request shared by the Scheduler review and firing.
 
 use std::path::Path;
+use std::sync::Arc;
 
 use crate::ai_manager::{Configuration, SkillGuidance};
+use crate::clipboard_policy::AiMemoryPolicy;
 use crate::connection_store::Store;
+use crate::scheduler_window::agent::memory;
 use crate::scheduler_window::agent::{AdvisoryGrant, ProfileChoice, proposal::Prompt};
+use crate::workspace::terminal_ai::web;
 use crate::{local_ai, terminal_agent};
 
 const GUIDANCE_CHANGED: &str =
     "The reviewed read-only Swarm skill guidance changed. Review the job again.";
+const PROFILE_CHANGED: &str =
+    "The reviewed read-only Swarm AI profile changed. Review the job again.";
 
 pub(crate) fn system(profile: &local_ai::Profile, masked_guidance: &str) -> String {
     terminal_agent::ask_system(profile, masked_guidance)
@@ -32,11 +38,31 @@ pub(crate) fn transport(profile: &local_ai::Profile) -> local_ai::Profile {
     terminal_agent::reviewed_transport(profile)
 }
 
+fn profile_root(connection_store: &Path) -> Result<&Path, &'static str> {
+    connection_store
+        .parent()
+        .filter(|root| crate::profile::connections_path_at(root).as_path() == connection_store)
+        .ok_or(PROFILE_CHANGED)
+}
+
+pub(super) fn bind_saved_memory(
+    prompt: Prompt,
+    connection_store: &Path,
+    target: u64,
+    policy: &AiMemoryPolicy,
+) -> Result<Prompt, String> {
+    let config =
+        Configuration::load_from(profile_root(connection_store)?).map_err(|_| PROFILE_CHANGED)?;
+    let memory = prompt.capture_memory(&config, policy, target)?;
+    prompt.with_memory(memory)
+}
+
 pub(crate) fn reviewed_prompt(
     grant: &AdvisoryGrant,
     index: usize,
     prompt: Prompt,
-    knowledge: Option<std::sync::Arc<crate::scheduler_window::agent::knowledge::Grant>>,
+    approval: &crate::scheduler_window::agent::Approval,
+    fresh_web: Option<&Arc<web::Evidence>>,
 ) -> Result<Prompt, String> {
     let guidance = grant.skill_guidance_for(index).ok_or(GUIDANCE_CHANGED)?;
     let mut prompt = prompt
@@ -46,13 +72,22 @@ pub(crate) fn reviewed_prompt(
     if !ids.is_empty() {
         prompt = prompt.with_firing_skill_classification(ids)?;
     }
-    if knowledge.is_some() {
-        prompt = prompt.with_knowledge(knowledge, true)?;
+    if approval.knowledge.is_some() {
+        prompt = prompt.with_knowledge(approval.knowledge.clone(), true)?;
+    }
+    if approval.web.is_some() {
+        prompt = prompt.with_web(approval.web.clone(), true)?;
     }
     if !grant.matches_prompt(index, &prompt) {
         return Err(GUIDANCE_CHANGED.into());
     }
-    Ok(prompt)
+    if approval.requires_fresh_web() != fresh_web.is_some() {
+        return Err("The read-only Swarm's reviewed web excerpts are unavailable.".into());
+    }
+    match fresh_web {
+        Some(evidence) => prompt.with_fresh_web(Arc::clone(evidence)),
+        None => Ok(prompt),
+    }
 }
 
 pub(crate) fn automatic_guidance(
@@ -94,7 +129,7 @@ pub(crate) fn require_current_guidance(
     index: usize,
     prompt: &Prompt,
 ) -> Result<SkillGuidance, &'static str> {
-    if !grant.matches_prompt(index, prompt) {
+    if !grant.matches_prompt(index, &prompt.base_for_standing_review()) {
         return Err(GUIDANCE_CHANGED);
     }
     let pins = grant.reviewed_pins().ok_or(GUIDANCE_CHANGED)?;
@@ -120,34 +155,40 @@ pub(super) fn require_saved_guidance(
     grant: &AdvisoryGrant,
     index: usize,
     prompt: &Prompt,
+    memory_policy: &AiMemoryPolicy,
     check: impl Fn() -> Result<(), String>,
 ) -> Result<(Configuration, SkillGuidance), &'static str> {
-    let profile_changed = "The reviewed read-only Swarm AI profile changed. Review the job again.";
     prompt.require_provider_credential(
         prompt.firing_system(),
-        &prompt.advisory_input(None).map_err(|_| profile_changed)?,
+        &prompt.advisory_input(None).map_err(|_| PROFILE_CHANGED)?,
     )?;
-    let root = connection_store
-        .parent()
-        .filter(|root| crate::profile::connections_path_at(root).as_path() == connection_store)
-        .ok_or(profile_changed)?;
-    let config = Configuration::load_from(root).map_err(|_| profile_changed)?;
+    let root = profile_root(connection_store)?;
+    let config = Configuration::load_from(root).map_err(|_| PROFILE_CHANGED)?;
     if !config.enabled()
         || profile.revision(&config, prompt.redaction_policy()) != Some(grant.profile_revision())
         || !profile.transport(&config).is_ok_and(|(transport, limit)| {
             transport == prompt.transport && limit == prompt.context_limit
         })
     {
-        return Err(profile_changed);
+        return Err(PROFILE_CHANGED);
     }
     let store = Store::open(connection_store.to_owned())
         .map_err(|_| "The saved SSH connections are unavailable.")?;
     let guidance = require_current_guidance(&config, &store, grant, index, prompt)?;
+    if let Some(evidence) = prompt.web() {
+        check().map_err(|_| "The reviewed web evidence authorization changed.")?;
+        evidence
+            .require_current()
+            .map_err(|_| "The web search profile or policy changed. Review this job again.")?;
+    }
     if let Some(knowledge) = prompt.knowledge() {
         knowledge
             .require_current(&config, &profile.id, root, check)
             .map_err(|_| "The scheduled knowledge store changed. Review this job again.")?;
     }
+    prompt
+        .require_current_memory(&config, memory_policy)
+        .map_err(|_| memory::CHANGED)?;
     Ok((config, guidance))
 }
 
@@ -222,5 +263,47 @@ mod tests {
         };
         assert_eq!(request["messages"][0]["content"], system);
         assert_eq!(request["messages"][1]["content"], input);
+    }
+
+    #[test]
+    fn fresh_advisory_evidence_does_not_replace_the_standing_review() {
+        let profile = local_ai::Profile::new("127.0.0.1:12345", "fixture").unwrap();
+        let redactor = Redactor::for_journal(Secrets::default().seal().unwrap(), Policy::default());
+        let base = Prompt::new_advisory(
+            profile,
+            8192,
+            "Check the server",
+            "/srv/example",
+            42,
+            redactor,
+            |redactor, text| {
+                redactor
+                    .outbound_text(
+                        text,
+                        std::time::Instant::now() + std::time::Duration::from_secs(1),
+                    )
+                    .map(|(text, _)| text.to_string())
+                    .ok_or_else(|| "Could not mask fixture text.".into())
+            },
+        )
+        .unwrap()
+        .bind_profile([3; 32])
+        .with_reviewed_firing_skill_guidance("Prefer the reviewed diagnostic facts.")
+        .unwrap();
+        let evidence = Arc::new(web::Evidence::fixture("Verified service change."));
+        let fresh = base.clone().with_fresh_web(Arc::clone(&evidence)).unwrap();
+        let standing = fresh.base_for_standing_review();
+        assert_eq!(standing.firing_system(), base.firing_system());
+        assert_eq!(standing.advisory_input(None), base.advisory_input(None));
+        assert!(standing.web().is_none());
+        assert_eq!(fresh.fresh_web(), Some(evidence.as_ref()));
+        assert!(fresh.firing_system().contains(web::GUIDANCE));
+        let input: Value =
+            serde_json::from_str(&fresh.advisory_input(Some("Linux")).unwrap()).unwrap();
+        let mut expected: Value =
+            serde_json::from_str(&base.advisory_input(Some("Linux")).unwrap()).unwrap();
+        evidence.append_to_json(&mut expected);
+        assert_eq!(input, expected);
+        assert!(fresh.with_fresh_web(evidence).is_err());
     }
 }

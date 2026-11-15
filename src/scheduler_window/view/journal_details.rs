@@ -4,7 +4,7 @@ use iced::widget::{button, column, row, text};
 use iced::{Alignment, Element, Length};
 use kortty_jobs::RunId;
 
-use crate::session_journal::automation::run_links::{LinkedJournal, MAX_BULK_OPEN};
+use crate::session_journal::automation::run_links::{LinkedJournal, MAX_BULK_OPEN, RunJournalRow};
 use crate::session_journal::tree::RunStatus;
 
 use super::super::{JournalDetails, Message, SchedulerWindow};
@@ -21,10 +21,11 @@ pub(super) fn view<'a>(
                 details = details.push(text("Open an individual journal below.").size(13));
             }
             for row in &report.rows {
-                if let Some(journal) = &row.journal {
+                let label = text(row_label(row, scheduler)).width(Length::Fill);
+                if row.journal.is_some() {
                     details = details.push(
                         row![
-                            text(label(journal, scheduler)).width(Length::Fill),
+                            label,
                             button("Open")
                                 .style(button::secondary)
                                 .on_press(Message::OpenSessionJournal(run, row.id.clone())),
@@ -33,7 +34,7 @@ pub(super) fn view<'a>(
                         .align_y(Alignment::Center),
                     );
                 } else {
-                    details = details.push(text(format!("Journal unavailable ({})", row.id)));
+                    details = details.push(label);
                 }
             }
             if report.limited {
@@ -53,6 +54,16 @@ pub(super) fn view<'a>(
         }
     }
     details.into()
+}
+
+pub(in crate::scheduler_window) fn row_label(
+    row: &RunJournalRow,
+    scheduler: &SchedulerWindow,
+) -> String {
+    row.journal.as_ref().map_or_else(
+        || format!("Journal unavailable ({})", row.id),
+        |journal| label(journal, scheduler),
+    )
 }
 
 fn label(journal: &LinkedJournal, scheduler: &SchedulerWindow) -> String {

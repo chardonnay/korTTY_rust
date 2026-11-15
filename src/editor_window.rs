@@ -28,7 +28,9 @@ use crate::profile::{MAX_TERMINAL_FONT as MAX_FONT_SIZE, MIN_TERMINAL_FONT as MI
 use crate::sftp_window::RemoteEditor;
 use crate::terminal_theme::Rgb;
 
+mod assistant;
 pub(crate) mod caret;
+pub(crate) use assistant::AiOrigin;
 mod line_endings;
 pub(crate) mod lua;
 mod search;
@@ -202,10 +204,14 @@ pub struct EditorWindow {
     discard: Option<Discard>,
     close_ready: bool,
     revision: u64,
+    revision_token: Arc<()>,
     outline: Outline,
     outline_revision: Option<u64>,
     lua_completion: Option<lua::Completion>,
     tools: tools::Panel,
+    pub(crate) ai_assist: crate::workspace::FileAiAssistance,
+    pub(crate) ai_origin: AiOrigin,
+    last_ai_change: Option<Arc<crate::snippet_window::ai_assist::Change>>,
 }
 
 impl Default for EditorWindow {
@@ -326,10 +332,14 @@ impl EditorWindow {
             discard: None,
             close_ready: false,
             revision: 0,
+            revision_token: Arc::new(()),
             outline: Outline::default(),
             outline_revision: Some(0),
             lua_completion: None,
             tools: tools::Panel::default(),
+            ai_assist: crate::workspace::FileAiAssistance::default(),
+            ai_origin: AiOrigin::default(),
+            last_ai_change: None,
         }
     }
 
@@ -400,7 +410,7 @@ impl EditorWindow {
             Message::SetPath(path) if self.can_set_path() => {
                 self.lua_completion = None;
                 self.path = path;
-                self.revision = self.revision.wrapping_add(1);
+                self.advance_revision();
             }
             Message::Open if self.available() && !self.is_remote() && self.writable() => {
                 if let Some(path) = self.typed_path() {
@@ -658,7 +668,12 @@ impl EditorWindow {
 
     fn mark_edited(&mut self) {
         self.dirty = true;
+        self.advance_revision();
+    }
+
+    fn advance_revision(&mut self) {
         self.revision = self.revision.wrapping_add(1);
+        self.revision_token = Arc::new(());
     }
 
     fn restore(&mut self, snapshot: Snapshot) {
@@ -679,7 +694,7 @@ impl EditorWindow {
             |document| snapshot.text.as_str() != &*document.original,
         );
         self.edit_group = None;
-        self.revision = self.revision.wrapping_add(1);
+        self.advance_revision();
     }
 
     fn find(&mut self, direction: SearchDirection) -> bool {
@@ -878,6 +893,11 @@ impl EditorWindow {
 
     fn install(&mut self, document: Document, action: &str) {
         self.lua_completion = None;
+        if action == "Opened" {
+            self.last_ai_change = None;
+            self.ai_assist = crate::workspace::FileAiAssistance::default();
+            self.ai_origin = AiOrigin::default();
+        }
         self.path = match &document.source {
             DocumentSource::Local(path) => path.to_string_lossy().into_owned(),
             DocumentSource::Remote { label, .. } => label.clone(),
@@ -886,7 +906,7 @@ impl EditorWindow {
         self.document = Some(document);
         self.dirty = false;
         self.edit_group = None;
-        self.revision = self.revision.wrapping_add(1);
+        self.advance_revision();
         self.outline = Outline::default();
         self.outline_revision = None;
     }

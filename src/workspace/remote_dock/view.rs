@@ -81,7 +81,7 @@ impl Workspace {
             .map_or_else(
                 || manager_placeholder(width),
                 |binding| {
-                    #[cfg(any(target_os = "linux", target_os = "windows"))]
+                    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                     let desktop_drag = self
                         .sidebar_drag_available(owner, tab_id, binding)
                         .then(|| tab.remote_files.desktop_drag_controls(tab_id, binding))
@@ -92,7 +92,11 @@ impl Workspace {
                         eligible,
                         transfer_allowed,
                         manager,
-                        #[cfg(any(target_os = "linux", target_os = "windows"))]
+                        #[cfg(any(
+                            target_os = "linux",
+                            target_os = "macos",
+                            target_os = "windows"
+                        ))]
                         desktop_drag,
                     )
                 },
@@ -169,10 +173,8 @@ impl Dock {
         eligible: bool,
         transfer_allowed: bool,
         manager: bool,
-        #[cfg(any(target_os = "linux", target_os = "windows"))] desktop_drag: Option<(
-            Element<'a, Action>,
-            Option<&'a str>,
-        )>,
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        desktop_drag: Option<(Element<'a, Action>, Option<&'a str>)>,
     ) -> Element<'a, Action> {
         let browser = &binding.browser;
         let connected = eligible && browser.connected() && !manager;
@@ -243,7 +245,7 @@ impl Dock {
             format!("Following the SSH pane · {path}")
         };
         let mut panel = column![header, text(banner).size(12)].spacing(5);
-        #[cfg(any(target_os = "linux", target_os = "windows"))]
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
         if let Some((control, error)) = desktop_drag {
             panel = panel.push(control);
             if let Some(error) = error {

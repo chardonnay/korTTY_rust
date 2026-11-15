@@ -12,6 +12,7 @@ impl Workspace {
         &mut self,
         source: window::Id,
         content: std::sync::Arc<str>,
+        profile: Option<crate::ai_manager::ProfileRef>,
     ) -> Task<Message> {
         self.open_generated_snippet(source, |editor| {
             let input = snippets::Input {
@@ -27,6 +28,7 @@ impl Workspace {
                     ..Default::default()
                 },
             );
+            editor.set_assist_connection(profile);
             Ok(())
         })
     }

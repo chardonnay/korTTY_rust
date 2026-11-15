@@ -266,7 +266,7 @@ fn configure(workspace: &mut Workspace, id: window::Id, endpoint: std::net::Sock
     let source = viewer.source.clone();
     let journal_id = source.id();
     fs::write(path.join("journal.xml"), format!(
-        "<session-journal formatVersion=\"1\" id=\"{journal_id}\"><meta><title>Fixture</title><logParts>2</logParts></meta>\
+        "<session-journal formatVersion=\"1\" id=\"{journal_id}\"><meta><title>Fixture</title><endedAt>2026-10-01T08:01:00Z</endedAt><logParts>2</logParts></meta>\
          <entries><entry><id>screen</id><kind>USER_NOTE</kind><title>Observed failure</title><text>Build failure note</text></entry></entries></session-journal>"
     )).unwrap();
     for (part, name, text) in [
@@ -852,6 +852,37 @@ fn journal_question_reviews_the_capped_quota_and_requires_approval_after_refresh
     server.join().unwrap();
     let dialog = &workspace.journal_questions.dialogs[&id];
     assert!(matches!(&dialog.stage, Stage::Review(_, Some(answer)) if answer.ai_used));
+    let source = prepared(&workspace, id).usage_source.as_ref().unwrap();
+    let journal = session_journal::read(source.directory()).unwrap();
+    assert_eq!(journal.summary.usage.call_count, 1);
+    assert_eq!(journal.summary.usage.prompt_tokens, 9);
+    assert_eq!(journal.summary.usage.completion_tokens, 4);
+    assert_eq!(journal.summary.usage.total_tokens, 13);
+    assert_eq!(
+        journal.summary.usage_profile_name.as_deref(),
+        Some("Journal fixture")
+    );
+    assert_eq!(
+        journal.summary.usage_profile,
+        Some(session_journal::JournalProfileSelection::Saved(
+            crate::ai_manager::ProfileRef::Numeric(7)
+        ))
+    );
+
+    let index = prepared(&workspace, id)
+        .review
+        .citations
+        .iter()
+        .position(|citation| matches!(&citation.target, Target::Entry(entry) if entry == "screen"))
+        .unwrap();
+    let jump = dispatch(&mut workspace, id, Message::Jump(index));
+    drain(&mut workspace, jump);
+    let Mode::Viewer(viewer) = &workspace.journals[&id].mode else {
+        panic!("expected journal viewer");
+    };
+    assert!(viewer.error.is_none());
+    assert_eq!(viewer.selected_entry, Some(0));
+
     prepare(&mut workspace, id);
     assert!(
         workspace.journal_questions.dialogs[&id]
@@ -962,7 +993,8 @@ fn journal_question_stream_previews_exact_quotes_and_closes_on_cancel() {
     );
     assert!(matches!(dialog.stage, Stage::Review(_, None)));
     finish.send(()).unwrap();
-    let _ = workspace.update(next(&mut actions));
+    let saved = workspace.update(next(&mut actions));
+    drain(&mut workspace, saved);
     let dialog = &workspace.journal_questions.dialogs[&id];
     assert!(dialog.work.is_none());
     assert!(matches!(&dialog.stage, Stage::Review(_, Some(answer)) if !answer.ai_used));

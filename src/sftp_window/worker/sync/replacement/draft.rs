@@ -358,7 +358,7 @@ fn digest(bytes: &[u8]) -> io::Result<[u8; 32]> {
 }
 
 #[cfg(unix)]
-fn require_same_unix_access_subjects(
+pub(super) fn require_same_unix_access_subjects(
     original: &std::fs::File,
     staged: &std::fs::File,
 ) -> io::Result<()> {
@@ -377,10 +377,10 @@ fn require_same_unix_access_subjects(
 }
 
 #[cfg(target_os = "macos")]
-use kortty_files::require_no_extended_acl;
+pub(super) use kortty_files::require_no_extended_acl;
 
 #[cfg(target_os = "linux")]
-fn require_no_extended_acl(file: &std::fs::File) -> io::Result<()> {
+pub(super) fn require_no_extended_acl(file: &std::fs::File) -> io::Result<()> {
     use rustix::io::Errno;
 
     match rustix::fs::fgetxattr_query(file, "system.posix_acl_access") {

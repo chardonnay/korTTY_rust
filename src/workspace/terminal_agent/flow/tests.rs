@@ -505,6 +505,73 @@ fn finish_agent_task(fixture: &mut Fixture, first: Task<Desktop>) {
 }
 
 #[test]
+fn agent_memory_masks_learned_credentials_and_blocks_changed_or_new_memory() {
+    use crate::local_ai::test_support::{exclusive_run, listener};
+    use crate::private_files::Directory;
+    use crate::terminal_logging::RedactionSecrets;
+
+    const SECRET: &str = r#"private-agent-"credential\value"#;
+    let _exclusive = exclusive_run();
+    let (model, _) = listener();
+    let mut fixture =
+        Fixture::with_endpoint(false, false, &model.local_addr().unwrap().to_string());
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let memory = Directory::open(&root.join("memory"), true).unwrap();
+    let start_review = |fixture: &mut Fixture| {
+        let id = fixture.open(Mode::Ask);
+        let _ = fixture.send(id, Message::Goal("Inspect disk usage".into()));
+        let run = fixture.run_mut(id);
+        let learned = RedactionSecrets::with_secret(None, SECRET).unwrap();
+        run.redactor = run.redactor.with_overlay(&learned).unwrap();
+        run.learned_sudo = Some(learned);
+        let task = fixture.send(id, Message::Start);
+        finish_agent_task(fixture, task);
+        assert!(fixture.run(id).phase == Phase::ModelReview);
+        id
+    };
+
+    let absent = start_review(&mut fixture);
+    memory
+        .publish_copy(
+            "MEMORY.md",
+            format!("Wait for {SECRET} before checking disk usage.").as_bytes(),
+        )
+        .unwrap();
+    let stale_epoch = fixture.run(absent).epoch;
+    let stale = fixture.send(
+        absent,
+        Message::ReviewModel(request_review::Message::Send(stale_epoch)),
+    );
+    finish_agent_task(&mut fixture, stale);
+    assert!(fixture.run(absent).phase == Phase::Blocked);
+
+    let id = start_review(&mut fixture);
+    let run = fixture.run(id);
+    let review = run.model_review.as_ref().unwrap();
+    assert!(
+        review
+            .system
+            .contains("Wait for *** before checking disk usage.")
+    );
+    assert!(!review.system.contains("private-agent-"));
+    let epoch = run.epoch;
+    memory
+        .replace_file("MEMORY.md", b"Do not check usage until Friday.")
+        .unwrap();
+    let stale = fixture.send(
+        id,
+        Message::ReviewModel(request_review::Message::Send(epoch)),
+    );
+    finish_agent_task(&mut fixture, stale);
+    assert!(fixture.run(id).phase == Phase::Blocked);
+    assert!(fixture.run(id).notice.contains("AI memory changed"));
+    assert_eq!(
+        model.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
 fn learned_sudo_password_is_masked_before_decision_json_escapes_it() {
     use crate::terminal_logging::RedactionSecrets;
 
@@ -526,14 +593,14 @@ fn learned_sudo_password_is_masked_before_decision_json_escapes_it() {
         "turnLimit": engine::MAX_TURNS,
     });
     assert_eq!(
-        run.decision_input(false, 4096).unwrap(),
+        run.decision_input(false, 4096, None).unwrap(),
         original.to_string()
     );
 
     let learned = RedactionSecrets::with_secret(None, SECRET).unwrap();
     run.redactor = run.redactor.with_overlay(&learned).unwrap();
     run.learned_sudo = Some(learned);
-    let reviewed = run.decision_input(false, 4096).unwrap();
+    let reviewed = run.decision_input(false, 4096, None).unwrap();
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(&reviewed).unwrap(),
         json!({
@@ -605,6 +672,71 @@ fn standalone_https_agent_requires_explicit_selection_and_rechecks_saved_opt_in(
     );
     assert!(fixture.run(id).phase == Phase::Blocked);
     assert!(fixture.run(id).notice.contains("changed"));
+}
+
+#[test]
+fn managed_https_agent_role_requires_selection_and_rechecks_installed_policy() {
+    use crate::ai_manager::ProfileRef;
+
+    let (listener, _) = crate::local_ai::test_support::listener();
+    let mut fixture = Fixture::new(false, false);
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let baseline = Configuration::load_fixture_from(&root).unwrap();
+    let mut draft = serde_json::to_value(&baseline).unwrap();
+    draft["local"]["roles"] = json!([null, null, "policy-agent-fixture", null]);
+    // The test projects an in-memory policy without changing the installed one.
+    std::fs::write(
+        root.join(crate::ai_manager::FILE_NAME),
+        serde_json::to_vec(&draft).unwrap(),
+    )
+    .unwrap();
+    let policy = crate::clipboard_policy::parse(&format!(
+        "[meta]\nschema-version = 1\n[[ai-profile]]\nid = 'policy-agent-fixture'\n\
+         name = 'Managed agent fixture'\nprovider = 'openai-compatible'\n\
+         endpoint = 'https://{}/v1'\nmodel = 'fixture'\n",
+        listener.local_addr().unwrap(),
+    ))
+    .unwrap();
+    fixture.workspace.set_test_ai_configuration(
+        Configuration::load_fixture_from(&root)
+            .unwrap()
+            .with_policy_profiles(&policy)
+            .unwrap(),
+    );
+
+    let id = fixture.open(Mode::Ask);
+    assert!(fixture.run(id).profile().is_none());
+    let selected = fixture
+        .run(id)
+        .profiles
+        .iter()
+        .find(|choice| choice.reference == ProfileRef::Policy("policy-agent-fixture".into()))
+        .unwrap()
+        .clone();
+    assert!(selected.reviewed_https.is_some());
+    let _ = fixture.send(id, Message::Goal("Inspect password=fixture-secret".into()));
+    no_task(fixture.send(id, Message::Start));
+    assert!(fixture.run(id).phase == Phase::Setup);
+    let (transport, _) = selected
+        .transport(&fixture.workspace.ai_configuration().unwrap())
+        .unwrap();
+    assert!(transport.is_remote());
+    assert_eq!(transport.policy_profile_id(), Some("policy-agent-fixture"));
+    let _ = fixture.send(id, Message::Profile(selected));
+
+    // Only the fixture projection contains this policy profile.
+    no_task(fixture.send(id, Message::Start));
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::Blocked);
+    assert!(run.model_review.is_none());
+    assert!(
+        run.notice.contains("policy-provided AI profile changed"),
+        "{}",
+        run.notice
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
 }
 
 #[test]

@@ -5,7 +5,7 @@ use std::process::Command;
 
 use iced::futures::{StreamExt as _, executor::block_on};
 use iced_runtime::Action;
-use kortty_jobs::{Job, JobGraph, JobId, SchedulerStore};
+use kortty_jobs::{DependencyMode, Job, JobGraph, JobId, RunTrigger, SchedulerStore};
 use kortty_ssh::{Endpoint, HostKey};
 use kortty_vault::{CredentialInput, Secret, Vault};
 use serde_json::json;
@@ -19,9 +19,11 @@ use crate::snippets::tests::Profile;
 use crate::ssh_dialog::LoginTarget;
 use crate::vault_window::VaultWindow;
 
+mod environment_web;
 #[cfg(unix)]
 mod openssh;
 mod proposal_skills;
+mod proposal_web;
 
 const HOME_MARKER: &str = "KORTTY_SCHEDULED_AGENT_REVIEW_FIXTURE";
 const TEST_NAME: &str = "workspace::scheduler_access::firing::tests::scheduled_agent_firings_wait_for_exact_review_and_finish_once";
@@ -311,6 +313,112 @@ fn scheduled_agent_firings_wait_for_exact_review_and_finish_once() {
     );
     assert_no_connection(&model);
     assert_no_connection(&ssh);
+    let path = profile::vault_path().unwrap();
+    let vault = Vault::unlock(&path, b"scheduled-agent-fixture-master").unwrap();
+    workspace.vault = Some(VaultWindow::with_unlocked_fixture(path, vault));
+    exercise_dependency_firings(&mut workspace, id, &model, &ssh, reference, &jobs);
+}
+
+fn exercise_dependency_firings(
+    workspace: &mut Workspace,
+    view: window::Id,
+    model: &TcpListener,
+    ssh: &TcpListener,
+    target: ConnectionRef,
+    jobs: &Path,
+) {
+    drop(workspace.scheduler.take());
+    let mut store = SchedulerStore::open(jobs).unwrap();
+    let graph = store.restore_with_actions::<SshCommand>().unwrap();
+    let previous = &graph.graph().jobs()[0];
+    let mut action = previous.action().clone();
+    action.agent.as_mut().unwrap().approval = None;
+    let dependent = previous.id().clone();
+    let precursor = JobId::new("prerequisite").unwrap();
+    let precursor_action: SshCommand = serde_json::from_value(json!({
+        "connection": target,
+        "command": "true"
+    }))
+    .unwrap();
+    let precursor_job =
+        Job::new(precursor.clone(), "Prerequisite fixture", precursor_action).unwrap();
+    let dependent_job = Job::new(dependent.clone(), previous.name(), action)
+        .unwrap()
+        .with_dependencies(DependencyMode::Chain, vec![precursor.clone()], None);
+    let graph = JobGraph::new(vec![dependent_job, precursor_job]).unwrap();
+    store.commit_with_actions(&graph, &[], &[]).unwrap();
+    drop(store);
+
+    let mut scheduler = SchedulerWindow::open(jobs.to_path_buf()).unwrap();
+    scheduler.set_execution_allowed(true);
+    workspace.scheduler_views.insert(view, scheduler.new_view());
+    workspace.scheduler = Some(scheduler);
+    let _ = workspace.update_scheduler(view, SchedulerMessage::Page(Page::Action));
+    let _ = workspace.update_scheduler(view, SchedulerMessage::ReviewAgent);
+    let ticket = workspace.scheduler_views[&view]
+        .firing_review_ticket()
+        .unwrap()
+        .to_owned();
+    let _ = workspace.update_scheduler(view, SchedulerMessage::ApproveFiringRequest(ticket));
+    let _ = workspace.update_scheduler(view, SchedulerMessage::Save);
+    let scheduler = workspace.scheduler.as_ref().unwrap();
+    scheduler.select_journal_job(
+        workspace.scheduler_views.get_mut(&view).unwrap(),
+        &precursor,
+    );
+    let _ = workspace.update_scheduler(view, SchedulerMessage::Page(Page::Journal));
+
+    for (cascade, trigger, count) in [
+        (false, RunTrigger::Dependency, 7),
+        (true, RunTrigger::Cascade, 9),
+    ] {
+        let scheduler = workspace.scheduler.as_mut().unwrap();
+        let view_state = workspace.scheduler_views.get_mut(&view).unwrap();
+        let mut requests = scheduler.update_view(view_state, SchedulerMessage::Run(cascade));
+        if requests.is_empty() {
+            requests = scheduler.update_view(view_state, SchedulerMessage::Confirm);
+        }
+        assert_eq!(requests.len(), 1);
+        let request = requests.pop().unwrap();
+        assert_eq!(request.job, precursor);
+        assert_no_connection(model);
+        assert_no_connection(ssh);
+        // Complete the prerequisite at the actual scheduler boundary. The
+        // dependent run must come from a reservation made by the scheduler.
+        let task = workspace.update_scheduler_runtime(SchedulerMessage::Finished(
+            job_executor::Completion {
+                id: request.id,
+                outcome: RunOutcome::Success,
+                detail: None,
+                recording: None,
+                output: None,
+                swarm_report: None,
+            },
+        ));
+        let firing = receive_proposal(workspace, task, model, ssh, target.id, "pwd -P");
+        let scheduler = workspace.scheduler.as_ref().unwrap();
+        let review = scheduler
+            .firing_reviews
+            .get(&firing, Instant::now())
+            .unwrap();
+        assert_eq!(review.request().job, dependent);
+        assert_eq!(review.request().trigger, trigger);
+        assert_eq!(review.phase(), Phase::AwaitingReview);
+        select(workspace, view, &firing);
+        let _ =
+            workspace.update_scheduler(view, SchedulerMessage::RejectRunProposal(firing.clone()));
+        assert_finished(jobs, &firing, RunOutcome::Cancelled, count);
+        let journal = persisted_journal(jobs);
+        let record = journal["journal"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|record| record["id"] == firing.run().value())
+            .unwrap();
+        assert_eq!(record["trigger"], serde_json::to_value(trigger).unwrap());
+        assert_no_connection(model);
+        assert_no_connection(ssh);
+    }
 }
 
 fn saved_target(port: u16) -> (ConnectionRef, VaultWindow) {
@@ -381,6 +489,17 @@ fn generate(
     command: &str,
 ) -> Ticket {
     let task = workspace.update_scheduler(id, SchedulerMessage::Run(false));
+    receive_proposal(workspace, task, model, ssh, target, command)
+}
+
+fn receive_proposal(
+    workspace: &mut Workspace,
+    task: Task<Message>,
+    model: &TcpListener,
+    ssh: &TcpListener,
+    target: u64,
+    command: &str,
+) -> Ticket {
     let mut stream = iced_runtime::task::into_stream(task).unwrap();
     let Some(Action::Output(Message::ScheduledAgent(Event(Progress::ModelDispatch(
         ticket,

@@ -249,6 +249,114 @@ fn private_workflow_sends_only_reviewed_commands_and_keeps_editing_scoped() {
 }
 
 #[test]
+fn workflow_rechecks_absent_and_changed_memory_before_dispatch_and_before_result() {
+    use crate::private_files::Directory;
+    use crate::terminal_logging::{RedactionSecrets, Secrets};
+
+    let _exclusive = exclusive_run();
+    let (listener, _) = listener();
+    let mut fixture =
+        Fixture::with_endpoint(false, false, &listener.local_addr().unwrap().to_string());
+    let config = fixture.workspace.ai_configuration().unwrap();
+    let root = config.saved_root().unwrap();
+    let memory = Directory::open(&root.join("memory"), true).unwrap();
+    let run_id = fixture.open(Mode::Run);
+    let run = fixture.run_mut(run_id);
+    run.goal = "Inspect the worker".into();
+    run.epoch = 1;
+    run.phase = Phase::Finished;
+    let secrets = Secrets::default();
+    secrets.add("workflow-known-one");
+    secrets.add("workflow-known-two");
+    let learned: RedactionSecrets = secrets.seal().unwrap();
+    run.learned_sudo = Some(learned);
+    run.final_evidence.start(
+        1,
+        &Command {
+            command: "printf observation".into(),
+            purpose: "Read worker status".into(),
+            risk: engine::Risk::ReadOnly,
+            elevation: Elevation::None,
+        },
+    );
+    run.final_evidence.record_output(
+        1,
+        Phase::Running,
+        &Outcome {
+            status: engine::Status::Exited(0),
+            stdout: Default::default(),
+            stderr: Default::default(),
+        },
+        "Worker is ready".into(),
+        String::new(),
+    );
+    drop(send(&mut fixture, run_id, Message::Open(1)));
+    let id = *fixture
+        .workspace
+        .terminal_agents
+        .workflows
+        .keys()
+        .next()
+        .unwrap();
+    no_task(send(&mut fixture, id, Message::Header(HeaderChoice::None)));
+    no_task(send(&mut fixture, id, Message::Review));
+    memory
+        .publish_copy(
+            "MEMORY.md",
+            b"Observe workflow-known-one before making changes.",
+        )
+        .unwrap();
+    no_task(send(&mut fixture, id, Message::Generate));
+    let dialog = &fixture.workspace.terminal_agents.workflows[&id];
+    assert!(matches!(dialog.stage, Stage::Setup));
+    assert_eq!(dialog.notice, reviewed_memory::CHANGED);
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+
+    no_task(send(&mut fixture, id, Message::Review));
+    let dialog = &fixture.workspace.terminal_agents.workflows[&id];
+    let Stage::Review(review) = &dialog.stage else {
+        panic!("review failed: {}", dialog.notice);
+    };
+    let expected = review.requests[0].system.clone();
+    assert!(expected.contains("Observe *** before making changes."));
+    let review = Arc::clone(review);
+    let change = |value| {
+        std::fs::write(
+            root.join("memory/MEMORY.md"),
+            format!("Observe {value} before making changes."),
+        )
+        .unwrap();
+    };
+    change("workflow-known-two");
+    assert_eq!(
+        review
+            .require_dispatch(&review.requests[0], &ClipboardPolicy::load())
+            .unwrap_err(),
+        reviewed_memory::CHANGED
+    );
+    change("workflow-known-one");
+    let server = std::thread::spawn(move || {
+        let mut socket = accept(&listener);
+        let body = request(&mut socket);
+        assert_eq!(body["messages"][0]["content"], expected);
+        socket
+            .get_mut()
+            .write_all(fixture_response("200 OK", "", "#!/usr/bin/env bash\necho ready").as_bytes())
+            .unwrap();
+    });
+    let result = reply(send(&mut fixture, id, Message::Generate), id);
+    server.join().unwrap();
+    change("workflow-known-two");
+    no_task(send(&mut fixture, id, result));
+    let dialog = &fixture.workspace.terminal_agents.workflows[&id];
+    assert!(matches!(dialog.stage, Stage::Setup));
+    assert_eq!(dialog.notice, reviewed_memory::CHANGED);
+}
+
+#[test]
 fn reviewed_workflow_header_is_applied_after_the_wire_request() {
     let _exclusive = exclusive_run();
     let (listener, transport) = listener();
@@ -302,6 +410,7 @@ fn reviewed_workflow_header_is_applied_after_the_wire_request() {
                 destination: String::new(),
                 goal: "Check worker".into(),
                 policy: Policy::default(),
+                memory: None,
             }),
             completed: 0,
             total: 1,

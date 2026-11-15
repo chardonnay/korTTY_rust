@@ -14,7 +14,7 @@ pub(super) mod aliases;
 mod explain;
 pub(super) mod notifications;
 mod panel;
-mod roster_scroll;
+pub(super) mod roster_scroll;
 mod view;
 pub use panel::InputTarget;
 pub(super) use panel::PanelState;

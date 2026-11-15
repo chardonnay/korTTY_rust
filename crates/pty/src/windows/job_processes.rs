@@ -1,3 +1,5 @@
+use std::io;
+use std::net::SocketAddrV4;
 use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
 use std::ptr::null_mut;
 
@@ -45,6 +47,28 @@ pub(super) fn only_process(job: &OwnedHandle, pid: u32) -> bool {
     processes(job).is_some_and(|processes| {
         processes.assigned == 1 && processes.listed == 1 && processes.pids[0] == pid as usize
     })
+}
+
+pub(crate) fn owns_connection(
+    job: &OwnedHandle,
+    local: SocketAddrV4,
+    remote: SocketAddrV4,
+) -> io::Result<bool> {
+    let processes = processes(job)
+        .ok_or_else(|| io::Error::other("Could not read the native job's process list"))?;
+    for pid in processes
+        .pids
+        .iter()
+        .take(processes.listed as usize)
+        .filter_map(|&pid| u32::try_from(pid).ok())
+    {
+        if crate::owns_loopback_connection(pid, local, remote)?
+            && examine(job, pid, &|_, _| Some(())).is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn processes(job: &OwnedHandle) -> Option<JobProcesses> {

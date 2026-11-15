@@ -33,7 +33,8 @@ use crate::vault_window::{Kind as VaultKind, VaultWindow};
 
 use super::profiles::{Catalog, ProfileRef, picker::DismissOnEscape as _};
 use super::{
-    Configuration, ProfileId,
+    Configuration, ProfileId, java_knowledge,
+    java_models::{self, Hint, Hints, Metadata},
     model_inventory::ModelInventory,
     search::{Reveal, Setting},
 };
@@ -41,7 +42,7 @@ use super::{
 use knowledge::folder;
 use knowledge::qdrant::{VaultKey, require_vault_revision};
 pub(super) use knowledge::retrieval;
-use knowledge::source::{DEFAULT_TEXT_BYTES, SyncMode};
+use knowledge::source::{DEFAULT_TEXT_BYTES, NEW_SOURCE_DEFAULT, SyncMode};
 pub(crate) use knowledge::sync as knowledge_sync;
 use knowledge::{
     Cache, Embedding, Index, Scope, SourceKind, SourceMask, Store, UpdateSummary, remote_index,
@@ -55,9 +56,9 @@ fn valid_embedding_model_id(id: &str) -> bool {
     managed_models::valid_id(id) || valid_policy_model_id(id)
 }
 
-pub(super) enum Page {
-    Models(Vec<CredentialChoice>),
-    Knowledge(Vec<CredentialChoice>),
+pub(super) enum Page<'a> {
+    Models(Vec<CredentialChoice>, &'a Hints),
+    Knowledge(Vec<CredentialChoice>, &'a java_knowledge::Hints, &'a Hints),
     Preferences,
 }
 
@@ -67,10 +68,17 @@ pub(crate) enum Role {
     Coding,
     Agent,
     Journal,
+    Security,
 }
 
 impl Role {
-    pub(super) const ALL: [Self; 4] = [Self::Text, Self::Coding, Self::Agent, Self::Journal];
+    pub(super) const ALL: [Self; 5] = [
+        Self::Text,
+        Self::Coding,
+        Self::Agent,
+        Self::Journal,
+        Self::Security,
+    ];
 
     pub(super) fn label(self) -> &'static str {
         match self {
@@ -78,6 +86,7 @@ impl Role {
             Self::Coding => "Coding profile",
             Self::Agent => "Terminal agent profile",
             Self::Journal => "Session journal profile",
+            Self::Security => "Snippet security profile",
         }
     }
 }
@@ -86,6 +95,8 @@ impl Role {
 #[serde(default, deny_unknown_fields)]
 pub(super) struct State {
     roles: [Option<ProfileRef>; 4],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    security_profile: Option<ProfileRef>,
     endpoint: String,
     embedding: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -101,6 +112,7 @@ impl Default for State {
     fn default() -> Self {
         Self {
             roles: [const { None }; 4],
+            security_profile: None,
             endpoint: local_ai::DEFAULT_ENDPOINT.into(),
             embedding: String::new(),
             managed_embedding: None,
@@ -113,7 +125,15 @@ impl Default for State {
 
 impl State {
     pub(super) fn set_guided_profile(&mut self, role: Role, reference: ProfileRef) {
-        self.roles[role as usize] = Some(reference);
+        self.set_profile(role, Some(reference));
+    }
+
+    pub(super) fn set_profile(&mut self, role: Role, reference: Option<ProfileRef>) {
+        if role == Role::Security {
+            self.security_profile = reference;
+        } else {
+            self.roles[role as usize] = reference;
+        }
     }
 
     pub(super) fn set_guided_embedding(&mut self, model: String) {
@@ -132,7 +152,11 @@ impl State {
     }
 
     pub(super) fn profile(&self, role: Role) -> Option<&ProfileRef> {
-        self.roles[role as usize].as_ref()
+        if role == Role::Security {
+            self.security_profile.as_ref()
+        } else {
+            self.roles[role as usize].as_ref()
+        }
     }
 
     pub(super) fn journal_embedding(&self, root: Option<&Path>) -> Option<(Profile, String)> {
@@ -148,7 +172,11 @@ impl State {
     }
 
     pub(super) fn retain_profiles(&mut self, has_profile: impl Fn(&ProfileRef) -> bool) {
-        for role in &mut self.roles {
+        for role in self
+            .roles
+            .iter_mut()
+            .chain(std::iter::once(&mut self.security_profile))
+        {
             if role
                 .as_ref()
                 .is_some_and(|reference| !has_profile(reference))
@@ -172,10 +200,12 @@ impl State {
         &'a self,
         previous: &'a Self,
     ) -> impl Iterator<Item = &'a ProfileRef> + 'a {
-        self.roles
-            .iter()
-            .zip(&previous.roles)
-            .filter_map(|(next, old)| (next != old).then_some(next.as_ref()).flatten())
+        Role::ALL
+            .into_iter()
+            .filter_map(|role| {
+                let next = self.profile(role)?;
+                (Some(next) != previous.profile(role)).then_some(next)
+            })
             .chain(self.stores.iter().flat_map(|store| {
                 let old = previous.stores.iter().find(|old| match store.id() {
                     Some(id) => old.id() == Some(id),
@@ -211,7 +241,7 @@ impl State {
             let bound = match role {
                 Role::Text => store.text_profile.as_ref(),
                 Role::Coding => store.coding_profile.as_ref(),
-                Role::Agent | Role::Journal => None,
+                Role::Agent | Role::Journal | Role::Security => None,
             };
             bound.and_then(resolve) == Some(id)
         })
@@ -268,7 +298,14 @@ impl State {
         for (index, store) in self.stores.iter().enumerate() {
             store.validate()?;
             if self.stores[..index].iter().any(|other| {
-                other.name == store.name || store.id().is_some_and(|id| other.id() == Some(id))
+                other.name == store.name
+                    || store.id().is_some_and(|id| other.id() == Some(id))
+                    || store.java_origin.as_ref().is_some_and(|origin| {
+                        other
+                            .java_origin
+                            .as_ref()
+                            .is_some_and(|other| other.id == origin.id)
+                    })
             }) {
                 return Err("Knowledge store names and identifiers must be unique".into());
             }
@@ -282,6 +319,19 @@ impl State {
             Some(id) => Scope::managed(store, root, id),
             None => Scope::new(store, endpoint, model),
         }
+    }
+
+    pub(super) fn new_java_knowledge_origins<'a>(
+        &'a self,
+        current: &'a Self,
+    ) -> impl Iterator<Item = &'a java_knowledge::Origin> + 'a {
+        self.stores.iter().filter_map(move |store| {
+            let origin = store.java_origin.as_ref()?;
+            (!current.stores.iter().any(|existing| {
+                existing.id() == store.id() && existing.java_origin.as_ref() == Some(origin)
+            }))
+            .then_some(origin)
+        })
     }
 
     fn embedding_fields<'a>(&'a self, store: &'a Store) -> (&'a str, &'a str, Option<&'a str>) {
@@ -418,6 +468,7 @@ pub(super) struct Dialog {
     generation: u64,
     selected: Option<usize>,
     store_name: String,
+    java_store_origin: Option<java_knowledge::Origin>,
     source: String,
     knowledge_backend: knowledge_backend::Editor,
     folder_options: knowledge_options::Draft,
@@ -494,6 +545,10 @@ pub(crate) enum Message {
     CloseBackendRepair,
     Managed(managed::Message),
     Mlx(mlx::Action),
+    ReviewJavaModel(java_models::Kind, String),
+    ReviewJavaKnowledgeStore(String),
+    ReviewJavaKnowledgeSource(String, String),
+    CancelJavaKnowledgeStore,
     Role(Role, Option<ProfileRef>),
     Embedding(String),
     EmbeddingSource(EmbeddingScope, Option<String>),
@@ -676,6 +731,125 @@ impl Dialog {
 
     pub(super) fn has_managed_model_selection(&self) -> bool {
         self.managed.has_selection() || self.mlx.has_selection()
+    }
+
+    pub(super) fn stage_java_model(&mut self, hint: &Hint) {
+        if self.busy() || self.runtime_removal_review_open() || self.backend_repair_open() {
+            return;
+        }
+        if let Err(error) = java_models::require_review_policy() {
+            self.status = Some(error.to_string());
+            return;
+        }
+        let staged = match hint.kind() {
+            java_models::Kind::Gguf => self.managed.stage_java_settings(hint),
+            java_models::Kind::Mlx => self.mlx.stage_java_settings(hint),
+        };
+        if staged {
+            self.status = Some("Review the proposed values in the selected model’s settings, then save to apply them.".into());
+        }
+    }
+
+    pub(super) fn stage_java_knowledge_store(
+        &mut self,
+        state: &State,
+        store: &java_knowledge::Store,
+    ) {
+        if self.busy() || !super::backup::java_ai_hints_allowed(&ClipboardPolicy::load()) {
+            return;
+        }
+        let origin = match store.origin() {
+            Ok(origin) => origin,
+            Err(error) => {
+                self.status = Some(error.to_string());
+                return;
+            }
+        };
+        if let Some((index, existing)) =
+            state.stores.iter().enumerate().find_map(|(index, native)| {
+                native
+                    .java_origin
+                    .as_ref()
+                    .filter(|existing| existing.id == origin.id)
+                    .map(|existing| (index, existing))
+            })
+        {
+            if *existing == origin {
+                self.select_store(Some(index));
+                self.status = Some(
+                    "Select and review local sources and an embedding model for this store.".into(),
+                );
+            } else {
+                self.status = Some(
+                    "A native store already uses a different definition of this Java store.".into(),
+                );
+            }
+            return;
+        }
+        self.select_store(None);
+        self.store_name = limited(&store.name, 128).trim().into();
+        self.java_store_origin = Some(origin);
+        self.status = Some("Review the name, then choose Create store. Select the embedding model, backend and local sources before indexing.".into());
+    }
+
+    pub(super) fn stage_java_knowledge_source(
+        &mut self,
+        state: &State,
+        store: &java_knowledge::Store,
+        source_id: &str,
+    ) {
+        if self.busy() || !super::backup::java_ai_hints_allowed(&ClipboardPolicy::load()) {
+            return;
+        }
+        let active = self
+            .selected
+            .and_then(|index| state.stores.get(index))
+            .and_then(|native| native.java_origin.as_ref());
+        if store.origin().ok().as_ref() != active || active.is_none() {
+            return;
+        }
+        let Some(source) = store.sources.iter().find(|source| source.id == source_id) else {
+            return;
+        };
+        let mut options = knowledge_options::Draft::default();
+        let notice = match source.kind {
+            java_knowledge::Kind::File => {
+                "Choose the local file and add it. Review its file-size limit separately."
+            }
+            java_knowledge::Kind::Directory => {
+                let includes = source.includes.join("; ");
+                let excludes = source.excludes.join("; ");
+                if includes.len() > 4096
+                    || excludes.len() > 4096
+                    || source
+                        .includes
+                        .iter()
+                        .chain(&source.excludes)
+                        .any(|pattern| pattern.contains(';'))
+                {
+                    self.status =
+                        Some("Some Java globs need manual entry in the folder options.".into());
+                    return;
+                }
+                use knowledge_options::Edit;
+                options.update(Edit::Recursive(source.recursive));
+                options.update(Edit::GitIgnore(source.respect_gitignore));
+                options.update(Edit::MaxFileBytes(source.max_file_bytes.to_string()));
+                options.update(Edit::Includes(includes));
+                options.update(Edit::Excludes(excludes));
+                if let Err(error) = options.options() {
+                    self.status = Some(format!(
+                        "Review the Java globs in the folder options ({error})."
+                    ));
+                    return;
+                }
+                "Choose the local folder, then review and approve the resulting file list."
+            }
+        };
+        self.source.clear();
+        self.folder_review = None;
+        self.folder_options = options;
+        self.status = Some(notice.into());
     }
 
     pub(super) fn refresh_managed_model_status(&mut self) {
@@ -996,7 +1170,7 @@ impl Dialog {
                     return self.run(pending, |()| Output::ModelTest);
                 }
             }
-            Message::Role(role, profile) => state.roles[role as usize] = profile,
+            Message::Role(role, profile) => state.set_profile(role, profile),
             Message::Embedding(model) => {
                 state.embedding = limited(&model, local_ai::MAX_MODEL_BYTES).into();
                 self.invalidate_index();
@@ -1028,7 +1202,20 @@ impl Dialog {
                 self.policy_embeddings = Some(models);
             }
             Message::StoreName(name) => self.store_name = limited(&name, 128).into(),
+            Message::CancelJavaKnowledgeStore => {
+                if self.java_store_origin.take().is_some() {
+                    self.store_name.clear();
+                    self.status = None;
+                }
+            }
             Message::CreateStore => {
+                if self.java_store_origin.is_some()
+                    && !super::backup::java_ai_hints_allowed(&ClipboardPolicy::load())
+                {
+                    self.status =
+                        Some("Managed policy prevents adopting Java knowledge stores.".into());
+                    return Task::none();
+                }
                 let name = self.store_name.trim();
                 if !name.is_empty()
                     && !name.chars().any(char::is_control)
@@ -1037,7 +1224,16 @@ impl Dialog {
                 {
                     match Store::new(name) {
                         Ok(mut store) => {
-                            store.embedding = Some(state.default_embedding());
+                            store.java_origin = self.java_store_origin.take();
+                            store.embedding = Some(if store.java_origin.is_some() {
+                                Embedding {
+                                    endpoint: local_ai::DEFAULT_ENDPOINT.into(),
+                                    model: String::new(),
+                                    managed_model: None,
+                                }
+                            } else {
+                                state.default_embedding()
+                            });
                             state.stores.push(store);
                         }
                         Err(error) => {
@@ -1110,7 +1306,7 @@ impl Dialog {
                     match role {
                         Role::Text => store.text_profile = binding,
                         Role::Coding => store.coding_profile = binding,
-                        Role::Agent | Role::Journal => {}
+                        Role::Agent | Role::Journal | Role::Security => {}
                     }
                 }
             }
@@ -1246,8 +1442,12 @@ impl Dialog {
                 {
                     let automatic = store.file_sync(&path) == SyncMode::Automatic;
                     let result = if edit.edited {
-                        knowledge_options::file_size(&edit.input)
-                            .and_then(|limit| store.set_file_size_limit(path, limit))
+                        knowledge_options::file_size(&edit.input).and_then(|limit| {
+                            store.set_file_size_limit(
+                                path,
+                                Some(limit.unwrap_or(NEW_SOURCE_DEFAULT)),
+                            )
+                        })
                     } else {
                         Ok(false)
                     };
@@ -2114,6 +2314,9 @@ impl Dialog {
     fn select_store(&mut self, index: Option<usize>) {
         self.invalidate_index();
         self.selected = index;
+        if self.java_store_origin.take().is_some() {
+            self.store_name.clear();
+        }
         self.confirm_remove = false;
         self.clear_consent();
         self.status = None;
@@ -2126,7 +2329,7 @@ impl Dialog {
 
     pub(super) fn view<'a>(
         &'a self,
-        page: Page,
+        page: Page<'a>,
         state: &'a State,
         profiles: &Catalog,
         editable: bool,
@@ -2161,7 +2364,7 @@ impl Dialog {
         ]
         .spacing(8)
         .align_y(Alignment::Center);
-        if matches!(page, Page::Models(_))
+        if matches!(page, Page::Models(..))
             && let Some(repair) = &self.backend_repair
         {
             return column![
@@ -2171,7 +2374,7 @@ impl Dialog {
             .spacing(10)
             .into();
         }
-        let inventory_status: Option<Element<'_, Message>> = if matches!(page, Page::Models(_)) {
+        let inventory_status: Option<Element<'_, Message>> = if matches!(page, Page::Models(..)) {
             None
         } else if self.policy_embedding_load.is_some() {
             Some(text("Loading embedding models…").size(13).into())
@@ -2198,9 +2401,11 @@ impl Dialog {
             None
         };
         let page = match page {
-            Page::Models(tokens) => self.models_view(state, can_edit, can_request, tokens),
-            Page::Knowledge(vault_keys) => {
-                self.knowledge_view(state, profiles, can_request, vault_keys)
+            Page::Models(tokens, hints) => {
+                self.models_view(state, can_edit, can_request, tokens, hints)
+            }
+            Page::Knowledge(vault_keys, hints, models) => {
+                self.knowledge_view(state, profiles, can_request, vault_keys, hints, models)
             }
             Page::Preferences => preferences(
                 state,
@@ -2230,6 +2435,7 @@ impl Dialog {
         can_edit: bool,
         can_request: bool,
         hub_tokens: Vec<CredentialChoice>,
+        hints: &'a Hints,
     ) -> Element<'a, Message> {
         let models = pick_list(self.models.as_slice(), self.model.as_ref(), Message::Model)
             .placeholder("Select an installed model")
@@ -2294,6 +2500,7 @@ impl Dialog {
                 self.runtime_removal.is_none(),
                 self.runtime_downloads_allowed,
             ),
+            self.java_models_view(hints, can_request),
             self.hf.view(
                 can_request && self.runtime_removal.is_none(),
                 self.model_downloads_allowed,
@@ -2303,6 +2510,55 @@ impl Dialog {
         .spacing(10)
         .width(Length::Fill)
         .into()
+    }
+
+    fn java_models_view<'a>(
+        &'a self,
+        hints: &'a Hints,
+        can_request: bool,
+    ) -> Option<Element<'a, Message>> {
+        if hints.is_empty() {
+            return None;
+        }
+        let mut view = column![
+            text("Imported Java Model Settings").size(17),
+            text("Register and select a local model above to review these settings before saving.")
+                .size(13)
+                .wrapping(text::Wrapping::WordOrGlyph),
+        ]
+        .spacing(8);
+        let can_request = can_request && !self.runtime_removal_review_open();
+        for hint in hints.iter() {
+            let target = match hint.metadata {
+                Metadata::Gguf { purpose, .. } => self
+                    .managed
+                    .java_target(purpose)
+                    .map(|model| model.name.as_str()),
+                Metadata::Mlx { .. } => self.mlx.java_target(),
+            };
+            view = view.push(
+                column![
+                    text(format!(
+                        "{} · {} · {}",
+                        hint.name,
+                        hint.kind().label(),
+                        hint.id
+                    ))
+                    .wrapping(text::Wrapping::WordOrGlyph),
+                    text(hint.details())
+                        .size(13)
+                        .wrapping(text::Wrapping::WordOrGlyph),
+                    target.map(|target| button(
+                        text(format!("Review for {target}…")).wrapping(text::Wrapping::WordOrGlyph)
+                    )
+                    .on_press_maybe(
+                        can_request.then(|| Message::ReviewJavaModel(hint.kind(), hint.id.clone()))
+                    )),
+                ]
+                .spacing(4),
+            );
+        }
+        Some(view.into())
     }
 
     fn backend_repair_view<'a>(
@@ -2394,6 +2650,8 @@ impl Dialog {
         profiles: &Catalog,
         can_request: bool,
         vault_keys: Vec<CredentialChoice>,
+        hints: &'a java_knowledge::Hints,
+        models: &'a Hints,
     ) -> Element<'a, Message> {
         let selected = self
             .selected
@@ -2420,6 +2678,10 @@ impl Dialog {
                 .on_input(Message::StoreName)
                 .on_submit(Message::CreateStore),
             button("Create store").on_press(Message::CreateStore),
+            self.java_store_origin
+                .as_ref()
+                .map(|_| button("Cancel Java store review")
+                    .on_press(Message::CancelJavaKnowledgeStore)),
             stores,
         ]
         .spacing(8)
@@ -2722,11 +2984,163 @@ impl Dialog {
         }
         column![
             text("Knowledge Stores").size(20),
-            row![sidebar, details].spacing(16)
+            row![sidebar, details].spacing(16),
+            self.java_knowledge_view(hints, models, selected.map(|(_, store)| store), can_request),
         ]
         .spacing(12)
         .width(Length::Fill)
         .into()
+    }
+
+    fn java_knowledge_view<'a>(
+        &'a self,
+        hints: &'a java_knowledge::Hints,
+        models: &Hints,
+        selected: Option<&Store>,
+        can_review: bool,
+    ) -> Option<Element<'a, Message>> {
+        if hints.is_empty() {
+            return None;
+        }
+        let native_origin = selected.and_then(|store| store.java_origin.as_ref());
+        let review_origin = self.java_store_origin.as_ref().or(native_origin);
+        let mut rows = column![text("Imported Java Knowledge Stores").size(17)].spacing(10);
+        for store in hints.iter() {
+            let backend = match store.backend {
+                java_knowledge::Backend::LocalHnsw => "Local HNSW",
+                java_knowledge::Backend::Qdrant => "Qdrant",
+            };
+            let selected = review_origin
+                .filter(|origin| origin.id == store.id)
+                .is_some_and(|origin| store.origin().as_ref().is_ok_and(|value| value == origin));
+            let mut details = column![
+                text(format!(
+                    "{} · {backend} · {} sources",
+                    store.name,
+                    store.sources.len()
+                ))
+                .wrapping(text::Wrapping::WordOrGlyph),
+                button("Review store…").on_press_maybe(
+                    can_review.then(|| Message::ReviewJavaKnowledgeStore(store.id.clone()))
+                ),
+            ]
+            .spacing(5);
+            if let Some(model_id) = &store.embedding_model_id {
+                let label = models
+                    .get(java_models::Kind::Gguf, model_id)
+                    .filter(|hint| {
+                        matches!(
+                            hint.metadata,
+                            Metadata::Gguf {
+                                purpose: managed_models::Purpose::Embedding,
+                                ..
+                            }
+                        )
+                    })
+                    .map_or_else(
+                        || model_id.clone(),
+                        |hint| format!("{} ({model_id})", hint.name),
+                    );
+                details = details.push(
+                    text(format!(
+                        "Java embedding model · {label} · {} dimensions",
+                        store.embedding_dimensions
+                    ))
+                    .size(13)
+                    .wrapping(text::Wrapping::WordOrGlyph),
+                );
+            }
+            if store.backend == java_knowledge::Backend::Qdrant {
+                let destination = [store.qdrant_origin.as_deref(), store.collection.as_deref()]
+                    .into_iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                if !destination.is_empty() {
+                    details = details.push(
+                        text(format!("Java Qdrant destination · {destination}"))
+                            .size(13)
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                    );
+                }
+                details = details.push(
+                    text(
+                        "Review a Qdrant destination and use a new collection for the Rust index.",
+                    )
+                    .size(13),
+                );
+            }
+            if selected {
+                let roles = [
+                    (store.text_enabled, "Text"),
+                    (store.coding_enabled, "Coding"),
+                    (store.autonomous_enabled, "Autonomous"),
+                ]
+                .into_iter()
+                .filter_map(|(enabled, label)| enabled.then_some(label))
+                .collect::<Vec<_>>();
+                if !roles.is_empty() {
+                    details =
+                        details.push(text(format!("Java uses · {}", roles.join(", "))).size(13));
+                }
+                for source in &store.sources {
+                    let kind = match source.kind {
+                        java_knowledge::Kind::File => "File",
+                        java_knowledge::Kind::Directory => "Folder",
+                    };
+                    let sync = match source.sync {
+                        java_knowledge::Sync::Manual => "Manual",
+                        java_knowledge::Sync::Automatic => "Automatic",
+                    };
+                    let label = source
+                        .basename
+                        .as_deref()
+                        .filter(|name| *name != source.name)
+                        .map_or_else(
+                            || source.name.clone(),
+                            |name| format!("{} ({name})", source.name),
+                        );
+                    details = details.push(
+                        column![
+                            text(format!(
+                                "{label} · {kind} · {sync} · {} · {} bytes per file",
+                                if source.enabled {
+                                    "Enabled"
+                                } else {
+                                    "Disabled"
+                                },
+                                source.max_file_bytes
+                            ))
+                            .size(13)
+                            .wrapping(text::Wrapping::WordOrGlyph),
+                            (!source.includes.is_empty()).then(|| text(format!(
+                                "Include · {}",
+                                source.includes.join(", ")
+                            ))
+                            .size(13)
+                            .wrapping(text::Wrapping::WordOrGlyph)),
+                            (!source.excludes.is_empty()).then(|| text(format!(
+                                "Exclude · {}",
+                                source.excludes.join(", ")
+                            ))
+                            .size(13)
+                            .wrapping(text::Wrapping::WordOrGlyph)),
+                            (review_origin == native_origin && native_origin.is_some()).then(
+                                || button("Review source…").on_press_maybe(can_review.then(|| {
+                                    Message::ReviewJavaKnowledgeSource(
+                                        store.id.clone(),
+                                        source.id.clone(),
+                                    )
+                                }))
+                            ),
+                        ]
+                        .spacing(4),
+                    );
+                }
+            }
+            rows = rows.push(details);
+        }
+        Some(rows.into())
     }
 }
 
@@ -3002,6 +3416,12 @@ fn preferences(
     .spacing(10)
     .width(Length::Fill);
     for role in Role::ALL {
+        let mut options = options.clone();
+        options.extend(
+            profiles
+                .https_role_choices(role)
+                .filter_map(|(id, name)| Some(Choice(Some(profiles.profile_reference(id)?), name))),
+        );
         let selected = match state.profile(role) {
             None => options.first().cloned(),
             Some(reference) => profiles
@@ -3019,7 +3439,7 @@ fn preferences(
                 Setting::Role(role),
                 field(
                     role.label(),
-                    pick_list(options.clone(), selected, move |choice| {
+                    pick_list(options, selected, move |choice| {
                         Message::Role(role, choice.0)
                     })
                     .placeholder("Selected profile unavailable")
@@ -3217,6 +3637,89 @@ fn limited(value: &str, bytes: usize) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn java_knowledge_adoption_requires_explicit_store_and_exact_source_review() {
+        let scratch = crate::snippets::tests::Profile::new();
+        let root = scratch.0.canonicalize().unwrap();
+        let imported = java_knowledge::import(java_knowledge::FIXTURE).unwrap();
+        let mut saved = Configuration {
+            java_knowledge_hints: imported.hints,
+            ..Configuration::default()
+        };
+        saved
+            .local
+            .stores
+            .push(Store::new("Existing native store").unwrap());
+        saved
+            .save_fixture_at(&root, &Configuration::default())
+            .unwrap();
+
+        let mut state = saved.local.clone();
+        let mut dialog = Dialog::new(root.clone());
+        let hint = saved.java_knowledge_hints.get("local-store").unwrap();
+        dialog.stage_java_knowledge_store(&state, hint);
+        assert_eq!(state.stores, saved.local.stores);
+        assert_eq!(dialog.store_name, "Project notes");
+        assert!(dialog.selected.is_none());
+
+        let _ = dialog.update(Message::CreateStore, &mut state, &saved.local, true);
+        assert_eq!(dialog.selected, Some(1));
+        assert_eq!(state.stores[0], saved.local.stores[0]);
+        let native = &state.stores[1];
+        assert_eq!(native.java_origin, Some(hint.origin().unwrap()));
+        assert_ne!(native.id(), Some(hint.id.as_str()));
+        assert!(native.sources.is_empty() && native.folders.is_empty());
+        assert!(native.qdrant.is_none() && native.embedding.as_ref().unwrap().model.is_empty());
+        assert!(native.text_profile.is_none() && native.coding_profile.is_none());
+        assert!(!native.autonomous_enabled && !native.has_automatic_sources());
+
+        dialog.source = "Manual path draft".into();
+        let other = saved.java_knowledge_hints.get("remote-store").unwrap();
+        dialog.stage_java_knowledge_source(&state, other, "tree");
+        assert_eq!(dialog.source, "Manual path draft");
+        dialog.stage_java_knowledge_source(&state, hint, "tree");
+        assert!(dialog.source.is_empty());
+        let options = dialog.folder_options.options().unwrap();
+        assert_eq!(options.sync, SyncMode::Manual);
+        assert_eq!(options.includes, ["**/*.md"]);
+        assert_eq!(options.excludes, ["draft/**"]);
+        assert_eq!(options.max_file_bytes.unwrap().bytes(), 1_048_576);
+        assert!(!options.recursive && options.respect_gitignore && !options.include_pdf);
+        assert!(state.stores[1].folders.is_empty());
+
+        let next = Configuration {
+            local: state,
+            ..saved.clone()
+        };
+        let checks = std::cell::Cell::new(0);
+        let denied = next
+            .save_with_policy(&root, &saved, None, None, || {
+                let check = checks.get();
+                checks.set(check + 1);
+                ClipboardPolicy {
+                    ai_allowed: check == 0,
+                    ..ClipboardPolicy::default()
+                }
+            })
+            .unwrap_err();
+        assert_eq!(denied.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            Configuration::load_fixture_from(&root)
+                .unwrap()
+                .local
+                .stores
+                .len(),
+            1
+        );
+
+        next.save_fixture_at(&root, &saved).unwrap();
+        let reloaded = Configuration::load_fixture_from(&root).unwrap();
+        assert_eq!(
+            reloaded.local.stores[1].java_origin,
+            Some(hint.origin().unwrap())
+        );
+    }
 
     pub(super) fn profile_catalog(ids: &[u64]) -> Catalog {
         let profiles: Vec<_> = ids

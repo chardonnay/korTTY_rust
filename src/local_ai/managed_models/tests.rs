@@ -30,7 +30,7 @@ fn string(file: &mut Vec<u8>, value: &str) {
 }
 
 // A minimal GGUF fixture with a metadata array and one F32 tensor.
-pub(super) fn fixture(context: u32, split: u16) -> Vec<u8> {
+pub(crate) fn fixture(context: u32, split: u16) -> Vec<u8> {
     let mut file = b"GGUF".to_vec();
     file.extend_from_slice(&3_u32.to_le_bytes());
     file.extend_from_slice(&1_u64.to_le_bytes());

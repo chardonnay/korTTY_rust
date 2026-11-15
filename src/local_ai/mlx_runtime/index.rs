@@ -53,7 +53,7 @@ pub(super) struct Package {
     launcher_path: String,
     pub(super) size_bytes: u64,
     pub(super) sha256: String,
-    requirements_lock_sha256: String,
+    pub(super) requirements_lock_sha256: String,
     pub(super) download_url: String,
 }
 

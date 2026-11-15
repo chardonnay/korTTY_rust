@@ -1,6 +1,6 @@
 use std::fmt::Write as _;
 use std::fs::File;
-use std::io::{self, BufWriter, Write as _};
+use std::io::{self, BufWriter, Seek as _, SeekFrom, Write as _};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::RecvTimeoutError;
@@ -18,6 +18,7 @@ use super::super::entry_edit::delete::{Deletion, Outcome};
 use super::super::entry_edit::{
     Changes, Edit, EntryState, Fields, LegacyMarker, MarkerOutcome, MarkerSource, MarkerState,
 };
+use super::super::language;
 use super::super::markers::Compiled;
 use super::super::screenshot_ai::Analysis;
 use super::super::screenshot_analysis_store;
@@ -28,7 +29,7 @@ use super::super::{
     command_count, display_text, invalid,
 };
 use super::storage::{DirectoryIdentity, MetadataError, Storage, file_identity};
-use super::{Item, Metadata, PublishedScreenshot, RecordKind, Shared, uuid};
+use super::{AutomationScreenshot, Item, Metadata, PublishedScreenshot, RecordKind, Shared, uuid};
 
 mod agent_chat;
 mod compression;
@@ -112,8 +113,10 @@ impl Writer {
         let root_identity = root.identity()?;
         let name = format!("journal-{id}");
         let mut directory = root.child(&name)?;
+        let directory_identity = directory.identity()?;
         let document = Document {
             id,
+            location: (root_identity, directory_identity),
             metadata,
             pinned: false,
             started: Timestamp::now(),
@@ -125,7 +128,6 @@ impl Writer {
             automation,
         };
         let initialized = directory.lock_metadata().and_then(|()| {
-            let directory_identity = directory.identity()?;
             let log = Part::new(&directory, &document, 1)?;
             document.save(&mut directory, 1, 0, None)?;
             Ok((log, directory_identity))
@@ -248,6 +250,13 @@ impl Writer {
                     .publish_summary(*update)
                     .map_err(|error| error.to_string());
                 shared.lock().entry_mutation_pending = false;
+                self.publish(shared);
+                let _ = reply.try_send(result);
+            }
+            Item::AiUsage { usage, reply } => {
+                let result = self
+                    .record_ai_usage(usage)
+                    .map_err(|error| error.to_string());
                 self.publish(shared);
                 let _ = reply.try_send(result);
             }
@@ -400,8 +409,13 @@ impl Writer {
                     }
                 }
             }
-            Item::Screenshot { png, time, receipt } => {
-                return self.save_screenshot(&png, time, receipt, shared);
+            Item::Screenshot {
+                png,
+                time,
+                receipt,
+                automation,
+            } => {
+                return self.save_screenshot(&png, time, receipt, automation.as_ref(), shared);
             }
         }
         Ok(None)
@@ -412,13 +426,20 @@ impl Writer {
         png: &[u8],
         time: Timestamp,
         receipt: Option<Sender<Result<PublishedScreenshot, String>>>,
+        automation: Option<&AutomationScreenshot>,
         shared: &Shared,
     ) -> io::Result<Option<&'static str>> {
-        let result = self.write_screenshot(png, time, shared);
-        shared.lock().screenshot_pending = false;
+        let result = self.write_screenshot(png, time, automation, shared);
+        {
+            let mut progress = shared.lock();
+            progress.screenshots_pending -= 1;
+            if !matches!(&result, Ok(ScreenshotWrite::Saved)) {
+                progress.screenshot_bytes -= png.len();
+            }
+        }
         if let Some(receipt) = receipt {
             let published = match &result {
-                Ok(None) => {
+                Ok(ScreenshotWrite::Saved) => {
                     self.publish(shared);
                     self.document
                         .entries
@@ -431,46 +452,130 @@ impl Writer {
                         })
                         .ok_or_else(|| "The saved screenshot entry is unavailable.".to_owned())
                 }
-                Ok(Some(reason)) => {
+                Ok(ScreenshotWrite::Limit(reason)) => {
                     Err(format!("Could not save the journal screenshot ({reason})."))
+                }
+                Ok(ScreenshotWrite::Revoked) => {
+                    Err("The journal screenshot was not saved.".to_owned())
                 }
                 Err(error) => Err(format!("Could not save the journal screenshot ({error}).")),
             };
             let _ = receipt.try_send(published);
         }
-        result
+        result.map(|status| match status {
+            ScreenshotWrite::Limit(reason) if automation.is_none() => Some(reason),
+            _ => None,
+        })
     }
 
     fn write_screenshot(
         &mut self,
         png: &[u8],
         time: Timestamp,
+        automation: Option<&AutomationScreenshot>,
         shared: &Shared,
-    ) -> io::Result<Option<&'static str>> {
-        if self.document.entries.len() >= MAX_TIMELINE {
-            return Ok(Some(TIMELINE_LIMIT));
+    ) -> io::Result<ScreenshotWrite> {
+        if automation.is_some_and(|frame| !(frame.permit)()) {
+            return Ok(ScreenshotWrite::Revoked);
+        }
+        let caption = automation.map_or("", AutomationScreenshot::caption);
+        if self.document.entries.len() >= MAX_TIMELINE
+            || self.timeline_text_bytes + caption.len() > MAX_TIMELINE_TEXT_BYTES
+        {
+            return Ok(ScreenshotWrite::Limit(TIMELINE_LIMIT));
         }
         let mut entry = Entry::new("SCREENSHOT", time)?;
+        if automation.is_some() {
+            entry.automation_screenshot_digest =
+                Some(super::super::automation::identity_digest(png)?);
+        }
         let filename = format!("shot-{:06}.png", self.sequence + 1);
         let reference = format!("{SCREENSHOTS}/{filename}");
-        let bytes = self.encode_log(time, "screenshot", "", false, Some(&reference))?;
+        let bytes = self.encode_log(time, "screenshot", caption, false, Some(&reference))?;
         if !self.reserve(bytes.len() as u64)? && !self.reserve_retained(bytes.len() as u64) {
-            return Ok(Some(LOG_LIMIT));
+            return Ok(ScreenshotWrite::Limit(LOG_LIMIT));
         }
         if self.screenshots.is_none() {
             self.screenshots = Some(self.directory.child(SCREENSHOTS)?);
         }
-        self.screenshots
+        if automation.is_some_and(|frame| !(frame.permit)()) {
+            return Ok(ScreenshotWrite::Revoked);
+        }
+        let screenshots = self
+            .screenshots
             .as_ref()
-            .expect("screenshot directory prepared")
-            .save_new(&filename, png)?;
-        self.append_log(&bytes)?;
-        self.command_count
-            .push(CaptureKind::Screenshot, "", false, false);
+            .expect("screenshot directory prepared");
+        let identity = screenshots.save_new(&filename, png)?;
+        if automation.is_some_and(|frame| !(frame.permit)()) {
+            screenshots.remove_created_file(&filename, identity);
+            return Ok(ScreenshotWrite::Revoked);
+        }
+        let log_offset = self.log.bytes;
+        let previous_sequence = self.sequence;
         entry.screenshot = Some(reference);
+        entry.fields.text = Zeroizing::new(caption.to_owned());
+        let append = self.append_log(&bytes).and_then(|()| self.log.sync());
+        if let Err(error) = append {
+            self.rollback_screenshot(&filename, identity, log_offset, previous_sequence)?;
+            return Err(error);
+        }
+        entry.anchor = Some((self.log.number, self.sequence));
+        let previous_markers = self.document.markers.clone();
+        self.apply_new_marker(&mut entry, shared);
+        self.document.entries.push(entry);
         self.document.screenshot_count += 1;
-        self.commit_entry(entry, shared)?;
-        Ok(None)
+        let revoked = std::cell::Cell::new(false);
+        let result = self.document.save_checked(
+            &mut self.directory,
+            self.log.number,
+            self.sequence,
+            None,
+            || {
+                if automation.is_some_and(|frame| !(frame.permit)()) {
+                    revoked.set(true);
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
+                Ok(())
+            },
+        );
+        match result {
+            Ok(()) => (),
+            Err(error) if error.published => return Err(error.into()),
+            Err(error) => {
+                self.document.entries.pop();
+                self.document.screenshot_count -= 1;
+                self.document.markers = previous_markers;
+                self.rollback_screenshot(&filename, identity, log_offset, previous_sequence)?;
+                return if revoked.get() {
+                    Ok(ScreenshotWrite::Revoked)
+                } else {
+                    Err(error.into())
+                };
+            }
+        }
+        self.timeline_text_bytes += caption.len();
+        self.command_count
+            .push(CaptureKind::Screenshot, caption, false, false);
+        self.advance_timeline();
+        Ok(ScreenshotWrite::Saved)
+    }
+
+    fn rollback_screenshot(
+        &mut self,
+        filename: &str,
+        identity: DirectoryIdentity,
+        log_offset: u64,
+        sequence: u64,
+    ) -> io::Result<()> {
+        if let Some(screenshots) = &self.screenshots {
+            screenshots.remove_created_file(filename, identity);
+        }
+        self.log.output.seek(SeekFrom::Start(log_offset))?;
+        self.log.output.get_ref().set_len(log_offset)?;
+        self.log.output.get_ref().sync_all()?;
+        self.log.bytes = log_offset;
+        self.sequence = sequence;
+        Ok(())
     }
 
     fn edit_metadata(&mut self, mut edit: MetadataEdit) -> io::Result<()> {
@@ -910,6 +1015,12 @@ struct Part {
     identity: DirectoryIdentity,
 }
 
+enum ScreenshotWrite {
+    Saved,
+    Revoked,
+    Limit(&'static str),
+}
+
 impl Part {
     fn new(directory: &Storage, document: &Document, number: u32) -> io::Result<Self> {
         let format = document.metadata.log_format;
@@ -945,6 +1056,7 @@ impl Part {
 
 struct Document {
     id: String,
+    location: (DirectoryIdentity, DirectoryIdentity),
     metadata: Metadata,
     pinned: bool,
     started: Timestamp,
@@ -965,6 +1077,7 @@ struct Entry {
     marker: Option<Assignment>,
     edited_at: Option<Timestamp>,
     screenshot: Option<String>,
+    automation_screenshot_digest: Option<String>,
     annotations: Vec<Annotation>,
     analysis: Option<Arc<Analysis>>,
     anchor: Option<(u32, u64)>,
@@ -983,6 +1096,7 @@ impl Entry {
             marker: None,
             edited_at: None,
             screenshot: None,
+            automation_screenshot_digest: None,
             annotations: Vec::new(),
             analysis: None,
             anchor: None,
@@ -1030,6 +1144,9 @@ impl Entry {
             element(xml, "markerSource", marker.source.xml());
         }
         element(xml, "createdAt", &self.time.to_string());
+        if let Some(digest) = self.automation_screenshot_digest.as_deref() {
+            element(xml, "nativeAutomationScreenshotDigest", digest);
+        }
         if let Some(edited_at) = self.edited_at {
             element(xml, "editedAt", &edited_at.to_string());
         }
@@ -1126,6 +1243,7 @@ impl Document {
             ("host", &self.metadata.host),
             ("username", &self.metadata.username),
             ("appVersion", env!("CARGO_PKG_VERSION")),
+            (language::APP_LANGUAGE, language::DEFAULT),
         ] {
             element(&mut xml, name, value);
         }
@@ -1139,7 +1257,9 @@ impl Document {
             element(&mut xml, "endedAt", &ended.to_string());
         }
         if let Some(automation) = &self.automation {
-            automation.write(ended, |name, value| element(&mut xml, name, value))?;
+            automation.write(&self.id, self.location, ended, |name, value| {
+                element(&mut xml, name, value)
+            })?;
         }
         element(
             &mut xml,
@@ -1181,7 +1301,7 @@ impl Document {
             "aiSummariesOff",
             if summaries { "false" } else { "true" },
         );
-        self.summary.write(&mut xml);
+        self.summary.write(&mut xml)?;
         if self.metadata.title_manually_set {
             element(&mut xml, super::super::summary_store::MANUAL_TITLE, "true");
         }

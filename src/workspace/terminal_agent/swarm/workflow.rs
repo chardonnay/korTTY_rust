@@ -1,14 +1,14 @@
 //! A separate generation review. Generated code is returned as an unsaved snippet.
 
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use iced::widget::{
     button, checkbox, column, pick_list, row, scrollable, text, text_editor, text_input,
 };
 use iced::{Element, Length, Task, window};
 
-use crate::ai_manager::Configuration;
+use crate::ai_manager::{Configuration, reviewed_memory::Memory};
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::local_ai;
 use crate::snippet_analysis::model::hardening::{MAX_FILE_SIZE_MIB, Preferences};
@@ -18,6 +18,7 @@ use crate::terminal_agent::swarm::workflow::{
 };
 use crate::terminal_logging::{Policy, Redactor, Secrets};
 
+use super::super::knowledge_review;
 use super::super::request_review::{CliPresentation, OutboundAuthority};
 use super::{
     Desktop, Group, Message as GroupMessage, ProfileChoice, RunMessage, SwarmMode, Workspace, mask,
@@ -96,7 +97,7 @@ enum Stage {
     Setup,
     Review {
         profile_display: String,
-        authority: Authority,
+        authority: Arc<Authority>,
         system: String,
         input: String,
         cli: Option<Box<CliPresentation>>,
@@ -104,12 +105,11 @@ enum Stage {
     },
     Waiting {
         _cancel: local_ai::Cancel,
-        authority: Authority,
+        authority: Arc<Authority>,
     },
     Generated(Draft),
 }
 
-#[derive(Clone)]
 pub(super) struct Authority {
     configuration: Arc<Configuration>,
     profile: ProfileChoice,
@@ -117,10 +117,53 @@ pub(super) struct Authority {
     limit: usize,
     redactions: Policy,
     outbound: Option<OutboundAuthority>,
+    memory: Memory,
+    memory_mask: knowledge_review::Mask,
+    vault_revision: Weak<()>,
+    credential: Option<zeroize::Zeroizing<String>>,
+    sources: Sources,
+}
+
+#[derive(Default)]
+struct Sources {
+    saved: Vec<super::headless::Source>,
+    live: Vec<LiveSource>,
+}
+
+struct LiveSource {
+    route: crate::workspace::ssh_access::SshTarget,
+    stream: crate::session::StreamLiveness,
+}
+
+struct Context {
+    targets: Vec<LoginTarget>,
+    redactors: Vec<Redactor>,
+    sources: Sources,
+}
+
+impl Sources {
+    fn require_current(&self, policy: &ClipboardPolicy) -> Result<(), String> {
+        if self
+            .saved
+            .iter()
+            .any(|source| !source.route_allowed(policy) || !source.revision_current())
+            || self.live.iter().any(|source| {
+                !source.route.workflow_route_allowed(policy) || !source.stream.running()
+            })
+        {
+            return Err("A selected SSH source changed. Review the workflow again.".into());
+        }
+        Ok(())
+    }
 }
 
 impl Authority {
-    fn require_current(&self, live: &Configuration, workspace: &Workspace) -> Result<(), String> {
+    fn require_current(
+        &self,
+        live: &Configuration,
+        workspace: &Workspace,
+        redactors: &[Redactor],
+    ) -> Result<(), String> {
         if self.configuration.saved_root() != live.saved_root()
             || !self
                 .redactions
@@ -138,6 +181,11 @@ impl Authority {
         if let Some(outbound) = &self.outbound {
             outbound.check_policy(&workspace.clipboard.policy)?;
         }
+        let mask = memory_mask(redactors, self.credential.clone(), workspace)?;
+        self.memory
+            .require_current_with(live, &workspace.clipboard.policy.ai_memory, |text| {
+                mask.apply(text)
+            })?;
         self.require_dispatch()
     }
 
@@ -159,20 +207,26 @@ impl Authority {
         if let Some(outbound) = &self.outbound {
             outbound.check_policy(&policy)?;
         }
+        self.sources.require_current(&policy)?;
+        if self.vault_revision.strong_count() == 0
+            || self.transport.completion_secret() != self.credential
+        {
+            return Err("The workflow credential mask changed. Review the request again.".into());
+        }
+        let changed =
+            "The saved workflow profile or redaction rules changed. Review the request again.";
+        let saved = self.configuration.reload_saved().map_err(|_| changed)?;
         if !self
             .redactions
             .equivalent_redactions(&policy.terminal_logging)
-            || !self
-                .configuration
-                .reload_saved()
-                .is_ok_and(|saved| self.matches_profile(&saved))
+            || !self.matches_profile(&saved)
         {
-            return Err(
-                "The saved workflow profile or redaction rules changed. Review the request again."
-                    .into(),
-            );
+            return Err(changed.into());
         }
-        Ok(())
+        self.memory
+            .require_current_with(&saved, &policy.ai_memory, |text| {
+                self.memory_mask.apply(text)
+            })
     }
 
     fn mask_text(
@@ -299,7 +353,7 @@ impl Form {
         self.epoch += 1;
         self.stage = Stage::Review {
             profile_display,
-            authority,
+            authority: Arc::new(authority),
             system,
             input,
             cli,
@@ -315,9 +369,17 @@ impl Form {
                 input,
                 header,
                 ..
-            } if epoch == self.epoch => Some((authority, input, header)),
+            } if epoch == self.epoch => Some((authority.as_ref(), input, header)),
             _ => None,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn reviewed_system(&self) -> &str {
+        let Stage::Review { system, .. } = &self.stage else {
+            panic!("expected a reviewed workflow request");
+        };
+        system
     }
 
     fn generate(
@@ -326,6 +388,7 @@ impl Form {
         epoch: u64,
         config: &Configuration,
         workspace: &Workspace,
+        redactors: &[Redactor],
     ) -> Result<Task<Desktop>, String> {
         let Stage::Review {
             authority,
@@ -340,8 +403,8 @@ impl Form {
         if epoch != self.epoch {
             return Err("The workflow review is no longer current.".into());
         }
-        authority.require_current(config, workspace)?;
-        let dispatch = authority.clone();
+        authority.require_current(config, workspace, redactors)?;
+        let dispatch = Arc::clone(authority);
         let pending = engine::generate(
             authority.transport.clone(),
             system.clone(),
@@ -352,7 +415,7 @@ impl Form {
         )?;
         self.stage = Stage::Waiting {
             _cancel: pending.cancel,
-            authority: authority.clone(),
+            authority: Arc::clone(authority),
         };
         let generation = self.generation;
         Ok(Task::perform(
@@ -379,7 +442,7 @@ impl Form {
 
     fn waiting(&self, epoch: u64) -> Option<&Authority> {
         match &self.stage {
-            Stage::Waiting { authority, .. } if epoch == self.epoch => Some(authority),
+            Stage::Waiting { authority, .. } if epoch == self.epoch => Some(authority.as_ref()),
             _ => None,
         }
     }
@@ -629,6 +692,20 @@ impl Workspace {
                     .ok_or("The selected workflow profile is unavailable.")?;
                 let (transport, limit) = profile.transport(&config)?;
                 let outbound = OutboundAuthority::capture(profile, &transport, self.vault.as_ref());
+                let Context {
+                    targets,
+                    redactors,
+                    sources,
+                } = self.swarm_workflow_context(group)?;
+                let credential = transport.completion_secret();
+                let memory_mask = memory_mask(&redactors, credential.clone(), self)?;
+                let memory = Memory::masked(
+                    &config,
+                    &self.clipboard.policy.ai_memory,
+                    None,
+                    true,
+                    |text| memory_mask.apply(text),
+                )?;
                 let authority = Authority {
                     configuration: Arc::clone(&config),
                     profile: profile.clone(),
@@ -636,11 +713,16 @@ impl Workspace {
                     limit,
                     redactions: self.clipboard.policy.terminal_logging.clone(),
                     outbound,
+                    memory,
+                    memory_mask,
+                    vault_revision: self.vault_change_revision(),
+                    credential,
+                    sources,
                 };
-                let (input, redactors) = self.swarm_workflow_input(group, form, &authority)?;
+                let mask = |text: &str| authority.mask_text(&redactors, text, self);
+                let input = form.request(group.goal.clone(), targets, mask)?;
                 let goal = engine::reviewed_goal(&input)?;
                 let creator = kortty_pty::local_username().unwrap_or_else(|| "unknown".into());
-                let mask = |text: &str| authority.mask_text(&redactors, text, self);
                 let name = mask(name)?;
                 let header = Header::automatic(
                     form.language,
@@ -654,7 +736,13 @@ impl Workspace {
                 );
                 check_header(&redactors, &header)?;
                 let system = engine::system(form.language, &header);
+                let system = authority.memory.system(&system, None);
                 let system = mask(&authority.transport.render_system_prompt(&system))?;
+                if authority.memory.text().is_some()
+                    && authority.memory_mask.apply(&system)? != system
+                {
+                    return Err("The workflow AI memory could not be safely included.".into());
+                }
                 if system.chars().count() + input.chars().count() > limit {
                     return Err(
                         "The workflow request exceeds the selected profile's context limit.".into(),
@@ -673,7 +761,12 @@ impl Workspace {
                 let Some((authority, reviewed, header)) = form.reviewed(epoch) else {
                     return Ok(Task::none());
                 };
-                let (current, redactors) = self.swarm_workflow_input(group, form, authority)?;
+                let Context {
+                    targets, redactors, ..
+                } = self.swarm_workflow_context(group)?;
+                let current = form.request(group.goal.clone(), targets, |text| {
+                    authority.mask_text(&redactors, text, self)
+                })?;
                 if current != reviewed {
                     return Err("The workflow input changed. Review it again.".into());
                 }
@@ -681,7 +774,7 @@ impl Workspace {
                 let config = self
                     .ai_configuration()
                     .ok_or("AI is unavailable under the current settings.")?;
-                return form.generate(id, epoch, &config, self);
+                return form.generate(id, epoch, &config, self, &redactors);
             }
             Message::Reply(epoch, result) => {
                 let Some(authority) = form.waiting(epoch) else {
@@ -692,9 +785,10 @@ impl Workspace {
                     let config = self
                         .ai_configuration()
                         .ok_or("AI is unavailable under the current settings.")?;
-                    authority.require_current(&config, self)?;
+                    let Context { redactors, .. } = self.swarm_workflow_context(group)?;
+                    authority.require_current(&config, self, &redactors)?;
                     let draft = result.as_ref().as_ref().map_err(Clone::clone)?;
-                    self.check_swarm_workflow_draft(group, draft, Some(authority))?;
+                    self.check_swarm_workflow_draft(&redactors, draft, Some(authority))?;
                     Ok(draft.clone())
                 })();
                 form.update(Message::Reply(epoch, Arc::new(checked)))?;
@@ -702,7 +796,8 @@ impl Workspace {
             Message::OpenSnippet(epoch) => {
                 if let Some(draft) = form.draft(epoch) {
                     self.swarm_ai_policy(super::Mode::Ask)?;
-                    self.check_swarm_workflow_draft(group, draft, None)?;
+                    let Context { redactors, .. } = self.swarm_workflow_context(group)?;
+                    self.check_swarm_workflow_draft(&redactors, draft, None)?;
                     return Ok(self.open_workflow_snippet(
                         id,
                         draft.clone().snippet(form.language),
@@ -719,15 +814,14 @@ impl Workspace {
 
     fn check_swarm_workflow_draft(
         &self,
-        group: &Group,
+        redactors: &[Redactor],
         draft: &Draft,
         authority: Option<&Authority>,
     ) -> Result<(), String> {
-        let (_, redactors) = self.swarm_workflow_context(group)?;
         for value in [draft.name(), draft.code(), draft.goal()] {
             let masked = match authority {
-                Some(authority) => authority.mask_text(&redactors, value, self)?,
-                None => mask_text(&redactors, value)?,
+                Some(authority) => authority.mask_text(redactors, value, self)?,
+                None => mask_text(redactors, value)?,
             };
             if masked != value {
                 return Err("The generated workflow contains text that requires masking.".into());
@@ -736,23 +830,7 @@ impl Workspace {
         Ok(())
     }
 
-    fn swarm_workflow_input(
-        &self,
-        group: &Group,
-        form: &Form,
-        authority: &Authority,
-    ) -> Result<(String, Vec<Redactor>), String> {
-        let (targets, redactors) = self.swarm_workflow_context(group)?;
-        let input = form.request(group.goal.clone(), targets, |text| {
-            authority.mask_text(&redactors, text, self)
-        })?;
-        Ok((input, redactors))
-    }
-
-    fn swarm_workflow_context(
-        &self,
-        group: &Group,
-    ) -> Result<(Vec<LoginTarget>, Vec<Redactor>), String> {
+    fn swarm_workflow_context(&self, group: &Group) -> Result<Context, String> {
         let policy = self.swarm_policy_for(SwarmMode::Advisory)?;
         let managed = Redactor::for_journal(
             Secrets::default()
@@ -762,6 +840,7 @@ impl Workspace {
         );
         let mut redactors = vec![managed];
         let mut targets = Vec::new();
+        let mut sources = Sources::default();
         for choice in &group.choices {
             let key = choice.target.key;
             if !group.selected.contains(&key) {
@@ -772,6 +851,7 @@ impl Workspace {
                 let (_, redactor) = self.saved_swarm_credentials(source, &current)?;
                 redactors.push(redactor);
                 targets.push(source.reference.target.clone());
+                sources.saved.push(source.clone());
                 continue;
             }
             let (session, stream) = key.pane().ok_or("A selected terminal is unavailable.")?;
@@ -791,6 +871,14 @@ impl Workspace {
             }
             redactors.push(self.agent_source_redactor(pane)?);
             if let Some(ssh) = &pane.ssh {
+                let stream = pane
+                    .session
+                    .stream_liveness()
+                    .ok_or("Could not verify the workflow credential mask.")?;
+                sources.live.push(LiveSource {
+                    route: ssh.clone(),
+                    stream,
+                });
                 targets.push(LoginTarget {
                     host: ssh.host().into(),
                     port: ssh.port(),
@@ -798,8 +886,33 @@ impl Workspace {
                 });
             }
         }
-        Ok((targets, redactors))
+        Ok(Context {
+            targets,
+            redactors,
+            sources,
+        })
     }
+}
+
+fn memory_mask(
+    redactors: &[Redactor],
+    credential: Option<zeroize::Zeroizing<String>>,
+    workspace: &Workspace,
+) -> Result<knowledge_review::Mask, String> {
+    let count = redactors.len().saturating_sub(1);
+    let secrets = Secrets::scheduled_targets(count);
+    for redactor in redactors {
+        redactor.add_known_secrets(&secrets);
+    }
+    let secrets = secrets
+        .seal()
+        .map_err(|_| "Could not verify the workflow credential mask.")?;
+    let redactor =
+        Redactor::for_journal(secrets, workspace.clipboard.policy.terminal_logging.clone());
+    Ok(
+        knowledge_review::Mask::new(redactor, credential, workspace.vault.as_ref())
+            .for_targets(count),
+    )
 }
 
 fn check_header(redactors: &[Redactor], header: &Header) -> Result<(), String> {

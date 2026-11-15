@@ -806,7 +806,7 @@ impl State {
             };
             let selected = self.selected.contains(&node.key);
             let focused = self.focused.as_ref() == Some(&node.key);
-            let cells = row_cells(columns, Some(title));
+            let cells = row_cells(columns, Some(title), usage_details(node, catalog));
             let row = container(cells)
                 .height(ROW_HEIGHT)
                 .width(Length::Fill)
@@ -911,22 +911,32 @@ fn summary_badge<'a>(status: RowStatus) -> Element<'a, Event> {
 }
 
 fn cells(labels: [String; 8]) -> Element<'static, Event> {
-    row_cells(labels, None)
+    row_cells(labels, None, None)
 }
 
-fn row_cells<'a>(labels: [String; 8], title: Option<Element<'a, Event>>) -> Element<'a, Event> {
+fn row_cells<'a>(
+    labels: [String; 8],
+    title: Option<Element<'a, Event>>,
+    usage: Option<String>,
+) -> Element<'a, Event> {
     let mut title = title;
+    let mut usage = usage;
     row(labels
         .into_iter()
         .zip([6, 3, 2, 5, 4, 2, 3, 3])
         .enumerate()
         .map(|(index, (label, weight))| {
             let value = title.take().filter(|_| index == 0).unwrap_or_else(|| {
+                let details = if index == 6 {
+                    usage.take().map(|details| format!("{label}\n{details}"))
+                } else {
+                    None
+                };
                 tooltip(
                     text(super::label(&label, 100))
                         .size(12)
                         .wrapping(text::Wrapping::None),
-                    text(label).size(13),
+                    text(details.unwrap_or(label)).size(13),
                     tooltip::Position::Top,
                 )
                 .into()
@@ -939,6 +949,27 @@ fn row_cells<'a>(labels: [String; 8], title: Option<Element<'a, Event>>) -> Elem
     .spacing(5)
     .height(Length::Fill)
     .into()
+}
+
+fn usage_details(node: &Node, catalog: &Catalog) -> Option<String> {
+    let usage = &node.usage;
+    if usage.call_count == 0 {
+        return None;
+    }
+    let mut details = format!(
+        "{} input tokens · {} output tokens · {} calls",
+        usage.prompt_tokens, usage.completion_tokens, usage.call_count
+    );
+    if let Some(name) = node
+        .journal_index()
+        .and_then(|index| catalog.journals.get(index))
+        .and_then(|journal| journal.usage_profile_name.as_deref())
+        .filter(|name| !name.trim().is_empty())
+    {
+        details.push('\n');
+        details.push_str(name);
+    }
+    Some(details)
 }
 
 fn row_labels(node: &Node, catalog: &Catalog) -> [String; 8] {
@@ -999,14 +1030,24 @@ fn row_labels(node: &Node, catalog: &Catalog) -> [String; 8] {
     let mut usage = String::new();
     if node.usage.call_count > 0 {
         usage = node.usage.total_tokens.to_string();
+        if node.usage.partial {
+            usage.push_str(" (partial)");
+        }
         if node.usage.cost > 0.0 {
-            usage.push_str(&format!(
-                " · ≈ {:.4} {}",
-                node.usage.cost,
-                node.usage.currency.as_deref().unwrap_or_default()
-            ));
+            if node.usage.cost < 0.00005 {
+                usage.push_str(" · < 0.0001");
+            } else {
+                usage.push_str(&format!(" · ≈ {:.4}", node.usage.cost));
+            }
+            if let Some(currency) = node.usage.currency.as_deref() {
+                usage.push(' ');
+                usage.push_str(currency);
+            }
         } else if node.usage.local {
             usage.push_str(" · local");
+        }
+        if node.usage.cost_partial {
+            usage.push_str(" · cost incomplete");
         }
     }
     let expiry = if node.source_kind == SourceKind::Interactive {

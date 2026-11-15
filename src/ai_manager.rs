@@ -13,6 +13,7 @@ use iced::{Alignment, Element, Length, Task};
 use serde::{Deserialize, Serialize};
 
 use crate::connection_window::CredentialChoice;
+use crate::session_journal::summary_plan::EvidenceLimits;
 use crate::terminal_agent::shortcut;
 use crate::vault_window::VaultWindow;
 use crate::{
@@ -26,6 +27,11 @@ pub(crate) mod backup;
 mod chat_terminal_actions;
 mod code_text_language;
 mod document_find;
+pub(crate) mod java_knowledge;
+pub(crate) mod java_models;
+mod java_roles;
+mod lm_studio;
+pub(crate) mod lm_studio_auto;
 mod local;
 mod memory;
 mod model_inventory;
@@ -37,6 +43,7 @@ mod profile_policy_tests;
 mod profiles;
 #[cfg(test)]
 mod provisioned_profile_tests;
+pub(crate) mod reviewed_memory;
 mod search;
 pub(crate) mod setup;
 mod skills;
@@ -48,6 +55,121 @@ pub(crate) use code_text_language::CodeTextLanguage;
 pub(crate) use kortty_jobs::ProfileRef;
 /// Runtime profile identifiers also accommodate provisioned profiles.
 pub(crate) type ProfileId = u128;
+
+/// Identifies the imported draft a Java reference described. It grants no access.
+#[derive(Clone, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JavaProfileSource {
+    #[serde(deserialize_with = "deserialize_java_profile_source_id")]
+    id: String,
+    fingerprint: [u8; 32],
+}
+
+impl JavaProfileSource {
+    pub(crate) fn parse_id(value: &str) -> Option<&str> {
+        let id = value.trim();
+        (!id.is_empty()
+            && id.len() <= 256
+            && id.chars().all(|character| {
+                !character.is_control() && crate::session_journal::is_display_character(character)
+            }))
+        .then_some(id)
+    }
+
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    fn for_draft(id: &str, profile: &profiles::Profile) -> io::Result<Self> {
+        use sha2::{Digest as _, Sha256};
+
+        let mut draft = profile.clone();
+        draft.id = 0;
+        draft.java_source = None;
+        draft.java_web_hint = None;
+        let source = serde_json::to_vec(&("kortty Java AI profile draft v1", id, draft))?;
+        Ok(Self {
+            id: id.into(),
+            fingerprint: Sha256::digest(source).into(),
+        })
+    }
+}
+
+/// A Journal profile selection from a Java backup, pending native review.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct JavaJournalProfileHint {
+    #[serde(deserialize_with = "deserialize_java_profile_source_id")]
+    id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    source: Option<JavaProfileSource>,
+}
+
+impl JavaJournalProfileHint {
+    pub(crate) fn id(&self) -> &str {
+        &self.id
+    }
+
+    pub(crate) fn source(&self) -> Option<&JavaProfileSource> {
+        self.source.as_ref()
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct JavaJournalProfiles {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recording: Option<JavaJournalProfileHint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    automation: Option<JavaJournalProfileHint>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<JavaJournalEvidence>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JavaJournalEvidence {
+    limits: EvidenceLimits,
+    chunking: bool,
+}
+
+impl JavaJournalProfiles {
+    fn is_empty(&self) -> bool {
+        self.recording.is_none() && self.automation.is_none() && self.evidence.is_none()
+    }
+
+    fn hints(&self) -> impl Iterator<Item = &JavaJournalProfileHint> {
+        self.recording.iter().chain(&self.automation)
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self
+            .hints()
+            .any(|hint| hint.source().is_some_and(|source| source.id() != hint.id()))
+        {
+            return Err(invalid(
+                "Java Journal profile provenance has a different identity",
+            ));
+        }
+        if self
+            .evidence
+            .is_some_and(|evidence| !evidence.limits.valid())
+        {
+            return Err(invalid("Invalid imported Java Journal evidence limits"));
+        }
+        Ok(())
+    }
+}
+
+fn deserialize_java_profile_source_id<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let id = String::deserialize(deserializer)?;
+    if JavaProfileSource::parse_id(&id) != Some(id.as_str()) {
+        return Err(serde::de::Error::custom("Invalid Java AI profile identity"));
+    }
+    Ok(id)
+}
 pub(crate) use local::knowledge_sync;
 pub(crate) use local::retrieval::{
     Citation as KnowledgeCitation, KnowledgeAuthority,
@@ -139,6 +261,14 @@ pub(crate) struct Configuration {
     local: local::State,
     skills: skills::Store,
     memory: memory::Settings,
+    #[serde(skip_serializing_if = "JavaJournalProfiles::is_empty")]
+    java_journal_profiles: JavaJournalProfiles,
+    #[serde(skip_serializing_if = "java_roles::Hints::is_empty")]
+    java_roles: java_roles::Hints,
+    #[serde(skip_serializing_if = "java_models::Hints::is_empty")]
+    java_model_hints: java_models::Hints,
+    #[serde(skip_serializing_if = "java_knowledge::Hints::is_empty")]
+    java_knowledge_hints: java_knowledge::Hints,
     #[serde(skip)]
     origin: Option<PathBuf>,
     #[serde(skip)]
@@ -152,6 +282,7 @@ enum ProfileRoute {
     ReviewedHttps,
     ReviewedCli,
     TerminalChat,
+    InteractiveChat,
 }
 
 pub(crate) struct ReviewedLocalAiProfile<'a> {
@@ -171,12 +302,15 @@ pub(crate) struct JournalNoteProfile {
 
 impl ProfileRoute {
     fn allows(self, profile: &profiles::Profile) -> bool {
+        if profile.uses_server_default_model() {
+            return matches!(self, Self::InteractiveChat);
+        }
         match self {
             Self::Local => profile.allows_local_roles(),
             Self::ReviewedHttp => !profile.is_cli(),
             Self::ReviewedHttps => profile.remote_protocol().is_some(),
             Self::ReviewedCli => profile.is_cli() && !profile.restore_review,
-            Self::TerminalChat => true,
+            Self::TerminalChat | Self::InteractiveChat => true,
         }
     }
 }
@@ -210,6 +344,10 @@ impl Default for Configuration {
             local: local::State::default(),
             skills: skills::Store::default(),
             memory: memory::Settings::default(),
+            java_journal_profiles: JavaJournalProfiles::default(),
+            java_roles: java_roles::Hints::default(),
+            java_model_hints: java_models::Hints::default(),
+            java_knowledge_hints: java_knowledge::Hints::default(),
             origin: None,
             model_catalog: None,
         }
@@ -342,7 +480,53 @@ impl Configuration {
 
     pub(crate) fn with_policy_profiles(mut self, policy: &ClipboardPolicy) -> io::Result<Self> {
         self.profiles.project_policy_profiles(policy)?;
+        self.refresh_lm_studio_auto(policy);
         Ok(self)
+    }
+
+    pub(crate) fn lm_studio_auto_selections(
+        &self,
+    ) -> impl Iterator<Item = lm_studio_auto::Selection> + '_ {
+        self.profiles.entries().filter_map(|profile| {
+            Some(lm_studio_auto::Selection {
+                root: self.saved_root()?.to_owned(),
+                id: profile.id,
+                settings: profile.lm_studio_auto_settings()?.ok()?,
+            })
+        })
+    }
+
+    pub(crate) fn refresh_lm_studio_auto(&mut self, policy: &ClipboardPolicy) -> bool {
+        let root = self
+            .origin
+            .as_deref()
+            .filter(|_| policy.problem.is_none() && policy.ai_allowed);
+        self.profiles.refresh_lm_studio_auto(|profile| {
+            let selection = lm_studio_auto::Selection {
+                root: root?.to_owned(),
+                id: profile.id,
+                settings: match profile.lm_studio_auto_settings()? {
+                    Ok(settings) => settings,
+                    Err(error) => return Some(Err(error)),
+                },
+            };
+            lm_studio_auto::cached(&selection)
+        })
+    }
+
+    pub(crate) fn lm_studio_auto_profiles_changed(&self, other: &Self) -> bool {
+        self.profiles
+            .entries()
+            .chain(other.profiles.entries())
+            .any(|profile| {
+                let projection = |catalog: &profiles::Catalog| {
+                    catalog
+                        .profile(profile.id)
+                        .and_then(profiles::Profile::lm_studio_auto_projection)
+                        .cloned()
+                };
+                projection(&self.profiles) != projection(&other.profiles)
+            })
     }
 
     pub(crate) fn policy_profiles_changed(&self, other: &Self) -> bool {
@@ -355,6 +539,78 @@ impl Configuration {
 
     pub(crate) fn resolve_profile_reference(&self, reference: &ProfileRef) -> Option<ProfileId> {
         self.profiles.resolve_profile_reference(reference)
+    }
+
+    pub(crate) fn java_profile_source(&self, profile: &ProfileRef) -> Option<&JavaProfileSource> {
+        self.profiles
+            .profile_for_reference(profile)?
+            .java_source
+            .as_ref()
+    }
+
+    pub(crate) fn resolve_journal_profile_selection(
+        &self,
+        selection: &crate::session_journal::JournalProfileSelection,
+    ) -> Option<ProfileId> {
+        use crate::session_journal::JournalProfileSelection;
+
+        match selection {
+            JournalProfileSelection::Saved(reference) => self.resolve_profile_reference(reference),
+            JournalProfileSelection::Migrated(reference, java_id) => self
+                .bound_profile(reference)
+                .filter(|profile| {
+                    profile
+                        .java_source
+                        .as_ref()
+                        .is_some_and(|source| source.id() == java_id)
+                })
+                .map(|profile| profile.id)
+                .or_else(|| self.resolve_journal_java_profile(java_id)),
+            JournalProfileSelection::Java(id) => self.resolve_journal_java_profile(id),
+        }
+    }
+
+    fn resolve_journal_java_profile(&self, id: &str) -> Option<ProfileId> {
+        let mut matches = self.profiles.entries().filter(|profile| {
+            profile
+                .java_source
+                .as_ref()
+                .is_some_and(|source| source.id() == id)
+        });
+        let id = matches.next()?.id;
+        matches.next().is_none().then_some(id)
+    }
+
+    pub(crate) fn imported_journal_summary_profile(
+        &self,
+        automation: bool,
+    ) -> Option<&JavaJournalProfileHint> {
+        if automation {
+            self.java_journal_profiles.automation.as_ref()
+        } else {
+            self.java_journal_profiles.recording.as_ref()
+        }
+    }
+
+    pub(crate) fn imported_journal_evidence_limits(&self) -> Option<(EvidenceLimits, bool)> {
+        self.java_journal_profiles
+            .evidence
+            .map(|evidence| (evidence.limits, evidence.chunking))
+    }
+
+    pub(crate) fn resolve_imported_journal_summary_profile(
+        &self,
+        automation: bool,
+    ) -> Option<ProfileId> {
+        let source = self
+            .imported_journal_summary_profile(automation)?
+            .source()?;
+        let mut profiles = self
+            .profiles
+            .entries()
+            .filter(|profile| profile.java_source.as_ref() == Some(source));
+        let matched = profiles.next()?.id;
+        profiles.next().is_none().then_some(matched)
     }
 
     pub(crate) fn legacy_policy_alias(&self, id: ProfileId) -> Option<u64> {
@@ -373,6 +629,22 @@ impl Configuration {
         self.profiles
             .profile(id)
             .is_some_and(profiles::Profile::policy_auto_pending)
+    }
+
+    pub(crate) fn ai_model_resolution_pending(&self, id: ProfileId) -> bool {
+        self.policy_auto_model_pending(id)
+            || self.profiles.profile(id).is_some_and(|profile| {
+                profile
+                    .lm_studio_auto_settings()
+                    .is_some_and(|settings| settings.is_ok())
+                    && profile.lm_studio_auto_projection().is_none()
+            })
+    }
+
+    pub(crate) fn is_lm_studio_auto(&self, id: ProfileId) -> bool {
+        self.profiles
+            .profile(id)
+            .is_some_and(profiles::Profile::ordinary_lm_studio_auto)
     }
 
     fn read_preference(file: std::fs::File) -> io::Result<Self> {
@@ -403,6 +675,10 @@ impl Configuration {
         self.profiles.validate().map_err(invalid)?;
         self.general.agent_shortcut.validate().map_err(invalid)?;
         self.local.validate().map_err(invalid)?;
+        self.java_journal_profiles.validate()?;
+        self.java_roles.validate()?;
+        self.java_model_hints.validate()?;
+        self.java_knowledge_hints.validate()?;
         self.skills.validate().map_err(invalid)
     }
 
@@ -486,13 +762,40 @@ impl Configuration {
             .new_profile_bindings(&current.local)
             .filter(|reference| self.profiles.is_policy_profile_reference(reference))
             .collect();
+        let new_java_stores: Vec<_> = self
+            .local
+            .new_java_knowledge_origins(&current.local)
+            .collect();
+        for origin in &new_java_stores {
+            let reviewed = current
+                .java_knowledge_hints
+                .get(&origin.id)
+                .map(java_knowledge::Store::origin)
+                .transpose()?;
+            if reviewed.as_ref() != Some(*origin) {
+                return Err(invalid(
+                    "The imported Java knowledge definition changed. Review it again before saving.",
+                ));
+            }
+        }
         let require_profile_changes = || -> io::Result<()> {
-            if self.profiles == current.profiles && new_policy_references.is_empty() {
+            if self.profiles == current.profiles
+                && new_policy_references.is_empty()
+                && new_java_stores.is_empty()
+            {
                 return Ok(());
             }
             let policy = load_policy();
+            if !new_java_stores.is_empty() && !backup::java_ai_hints_allowed(&policy) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Managed policy prevents adopting Java knowledge stores.",
+                ));
+            }
             self.profiles
                 .require_policy_changes(&current.profiles, &policy)?;
+            self.profiles
+                .require_imported_model_changes(path, &current.profiles, &policy)?;
             for reference in &new_policy_references {
                 self.profiles
                     .require_current_profile_reference(reference, &policy)?;
@@ -588,6 +891,20 @@ impl Configuration {
         selected.or_else(|| self.profiles.default_profile())
     }
 
+    fn default_or_first_profile(&self) -> Option<&profiles::Profile> {
+        self.profiles.default_profile().or_else(|| {
+            self.profiles
+                .entries()
+                .find(|profile| profile.can_be_default() && profile.java_embedded_model.is_none())
+        })
+    }
+
+    pub(crate) fn default_ai_profile_reference(&self) -> Option<ProfileRef> {
+        self.default_or_first_profile()
+            .filter(|profile| profile.can_be_default())
+            .map(profiles::Profile::reference)
+    }
+
     fn profile_for(
         &self,
         role: local::Role,
@@ -600,7 +917,11 @@ impl Configuration {
         if matches!(reference, Some(ProfileRef::Policy(_))) {
             return selected;
         }
-        selected.or_else(|| self.profiles.entries().find(|profile| allows(profile)))
+        selected.or_else(|| {
+            self.profiles
+                .entries()
+                .find(|profile| profile.java_embedded_model.is_none() && allows(profile))
+        })
     }
 
     fn local_profile_for(&self, role: local::Role) -> Option<&profiles::Profile> {
@@ -608,7 +929,7 @@ impl Configuration {
     }
 
     fn transport_for(&self, profile: &profiles::Profile) -> Result<local_ai::Profile, String> {
-        if let Some(root) = &self.origin {
+        let transport = if let Some(root) = &self.origin {
             let transport = profile.transport_in(
                 self.general.timeout_minutes,
                 root,
@@ -625,7 +946,17 @@ impl Configuration {
             }
         } else {
             profile.transport(self.general.timeout_minutes)
-        }
+        }?;
+        Ok(
+            transport.with_journal_identity(local_ai::JournalProfileIdentity {
+                reference: profile.reference(),
+                name: crate::session_journal::display_text(&profile.name),
+                java_id: profile
+                    .java_source
+                    .as_ref()
+                    .map(|source| source.id().to_owned()),
+            }),
+        )
     }
 
     pub(crate) fn drawing_profile(&self, code: bool) -> Option<ManagedProfile> {
@@ -641,20 +972,16 @@ impl Configuration {
                     .destination()
                     .unwrap_or_else(|_| entry.endpoint.clone())
             }),
-            model: entry.model.clone(),
+            model: entry.effective_model().to_owned(),
             transport: self.transport_for(entry),
             selection_limit: entry.selection_limit as usize,
         })
     }
 
     pub(crate) fn journal_profile_name(&self) -> Option<&str> {
-        let reference = self.local.profile(local::Role::Journal)?;
-        Some(
-            &self
-                .bound_profile(reference)
-                .filter(|profile| profile.allows_local_roles())?
-                .name,
-        )
+        self.bound_profile(self.local.profile(local::Role::Journal)?)
+            .filter(|profile| profile.allows_local_roles())
+            .map(|profile| profile.name.as_str())
     }
 
     pub(crate) fn journal_note_translation_profile(
@@ -686,7 +1013,7 @@ impl Configuration {
                 destination: format!(
                     "{} · {} · {}",
                     profile.name,
-                    profile.model,
+                    profile.effective_model(),
                     profile.destination()?
                 ),
             })
@@ -697,9 +1024,25 @@ impl Configuration {
         self.local.journal_embedding(self.saved_root())
     }
 
+    fn selected_journal_profile(&self) -> Option<&profiles::Profile> {
+        let role = self.local.profile(local::Role::Journal);
+        let selected = role.and_then(|reference| self.bound_profile(reference));
+        if matches!(role, Some(ProfileRef::Policy(_))) {
+            return selected;
+        }
+        selected.or_else(|| self.default_or_first_profile())
+    }
+
+    pub(crate) fn journal_profile_is_explicit(&self) -> bool {
+        self.local
+            .profile(local::Role::Journal)
+            .is_some_and(|role| {
+                matches!(role, ProfileRef::Policy(_)) || self.bound_profile(role).is_some()
+            })
+    }
+
     pub(crate) fn journal_summary_default_id(&self) -> Option<ProfileId> {
-        let reference = self.local.profile(local::Role::Journal)?;
-        self.bound_profile(reference)
+        self.selected_journal_profile()
             .filter(|profile| profile.allows_local_roles())
             .map(|profile| profile.id)
     }
@@ -720,24 +1063,18 @@ impl Configuration {
         &self,
         vision: bool,
     ) -> Option<Result<local_ai::Profile, String>> {
-        let reference = self.local.profile(local::Role::Journal)?;
-        if self
-            .bound_profile(reference)
-            .is_some_and(profiles::Profile::is_cli)
-        {
-            return None;
+        let profile = match self.selected_journal_profile() {
+            Some(profile) if profile.is_cli() => return None,
+            Some(profile) => profile,
+            None if self.journal_profile_is_explicit() => {
+                return Some(Err("The selected journal AI profile was removed.".into()));
+            }
+            None => return None,
+        };
+        if !profile.allows_local_roles() {
+            return Some(Err("Journal analysis requires a local AI profile.".into()));
         }
-        Some(
-            self.bound_profile(reference)
-                .ok_or_else(|| "The selected journal AI profile was removed.".into())
-                .and_then(|profile| {
-                    if !profile.allows_local_roles() {
-                        return Err("Journal analysis requires a local AI profile.".into());
-                    }
-                    require_journal_vision(profile, vision)?;
-                    self.transport_for(profile)
-                }),
-        )
+        Some(require_journal_vision(profile, vision).and_then(|()| self.transport_for(profile)))
     }
 
     #[cfg(test)]
@@ -975,6 +1312,14 @@ impl Configuration {
         self.reviewed_cli_preference(self.profile_or_default(self.agent_profile_binding()))
     }
 
+    pub(crate) fn preferred_agent_https_id(&self) -> Option<ProfileId> {
+        let reference = self.agent_profile_binding()?;
+        let profile = self.bound_profile(reference)?;
+        self.reviewed_agent_https_transport(reference, &profile.destination().ok()?)
+            .ok()?;
+        Some(profile.id)
+    }
+
     pub(crate) fn agent_profiles(&self) -> impl Iterator<Item = (ProfileId, &str, &str, String)> {
         self.available_ai_profiles(ProfileRoute::Local)
     }
@@ -998,21 +1343,15 @@ impl Configuration {
         destination: &str,
     ) -> Result<(local_ai::Profile, usize), String> {
         let changed = || "The reviewed HTTPS agent profile changed. Start a new review.".to_owned();
-        let id = self
-            .resolve_profile_reference(reference)
-            .ok_or_else(changed)?;
+        let profile = self.bound_profile(reference).ok_or_else(changed)?;
         if self.saved_root().is_none()
-            || !matches!(reference, ProfileRef::Numeric(_))
-            || !self.profiles.profile(id).is_some_and(|profile| {
-                profile.allows_reviewed_agent_https()
-                    && profile
-                        .destination()
-                        .is_ok_and(|value| value == destination)
-            })
+            || profile.reference() != *reference
+            || !profile.allows_reviewed_agent_https()
+            || profile.destination().as_deref() != Ok(destination)
         {
             return Err(changed());
         }
-        self.selected_transport(id, ProfileRoute::ReviewedHttps)
+        self.selected_transport(profile.id, ProfileRoute::ReviewedHttps)
     }
 
     pub(crate) fn reviewed_agent_cli_profiles(
@@ -1088,9 +1427,9 @@ impl Configuration {
                 Some(ReviewedLocalAiProfile {
                     id: profile.id,
                     name: &profile.name,
-                    model: &profile.model,
+                    model: profile.effective_model(),
                     destination: profile.destination().ok()?,
-                    policy_model_fingerprint: transport.policy_authority_fingerprint(),
+                    policy_model_fingerprint: transport.reviewed_model_fingerprint(),
                 })
             })
     }
@@ -1103,7 +1442,7 @@ impl Configuration {
     ) -> bool {
         self.profiles.profile(id).is_some_and(|profile| {
             ProfileRoute::Local.allows(profile)
-                && profile.model == model
+                && profile.effective_model() == model
                 && profile
                     .destination()
                     .is_ok_and(|value| value == destination)
@@ -1140,6 +1479,15 @@ impl Configuration {
                 .policy_authority_fingerprint()
         })?;
         let profile = self.profiles.profile(id)?;
+        let base = if profile.ordinary_lm_studio_auto() {
+            let binding = self.transport_for(profile).ok()?.lm_studio_auto_binding()?;
+            let bytes =
+                serde_json::to_vec(&("kortty LM Studio automatic review v1", base, binding))
+                    .ok()?;
+            hash_agent_profile_revision(&bytes)?
+        } else {
+            base
+        };
         bind_prompt_preset_revision(
             base,
             profile.resolved_prompt_preset(self.model_catalog.as_deref(), self.saved_root()),
@@ -1156,7 +1504,17 @@ impl Configuration {
             }
             ProfileRef::Policy(name) => {
                 let profile = self.bound_profile(reference)?;
-                let (transport, _) = self.agent_transport_for_reference(reference).ok()?;
+                let route = if profile.allows_local_roles() {
+                    ProfileRoute::Local
+                } else if profile.allows_reviewed_agent_https() {
+                    ProfileRoute::ReviewedHttps
+                } else {
+                    return None;
+                };
+                let (transport, _) = self.selected_transport(profile.id, route).ok()?;
+                if transport.policy_profile_id() != Some(name.as_str()) {
+                    return None;
+                }
                 let authority = transport.policy_authority_fingerprint()?;
                 let base = named_agent_profile_revision(name, profile, authority)?;
                 bind_prompt_preset_revision(base, transport.prompt_preset())
@@ -1188,8 +1546,20 @@ impl Configuration {
         } else {
             None
         };
-        let mut bytes =
-            serde_json::to_vec(authority.map_or(profile, |(serialized, _)| serialized)).ok()?;
+        let serialized = authority.map_or(profile, |(serialized, _)| serialized);
+        let without_import_metadata;
+        let serialized = if serialized.java_source.is_some() || serialized.java_web_hint.is_some() {
+            without_import_metadata = {
+                let mut copy = serialized.clone();
+                copy.java_source = None;
+                copy.java_web_hint = None;
+                copy
+            };
+            &without_import_metadata
+        } else {
+            serialized
+        };
+        let mut bytes = serde_json::to_vec(serialized).ok()?;
         if let Some((_, fingerprint)) = authority {
             bytes.extend_from_slice(b"\0kortty agent policy model v1\0");
             bytes.extend_from_slice(&fingerprint);
@@ -1198,8 +1568,10 @@ impl Configuration {
     }
 
     pub(crate) fn terminal_chat_profile_id(&self) -> Option<ProfileId> {
-        self.profile_for(local::Role::Text, |profile| !profile.is_cli())
-            .map(|profile| profile.id)
+        self.profile_for(local::Role::Text, |profile| {
+            !profile.is_cli() && !profile.restore_review && !profile.uses_server_default_model()
+        })
+        .map(|profile| profile.id)
     }
 
     pub(crate) fn preferred_terminal_chat_cli_id(&self) -> Option<ProfileId> {
@@ -1266,40 +1638,66 @@ impl Configuration {
         self.reviewed_cli_revision(id, "kortty snippet analysis CLI profile v1")
     }
 
-    pub(crate) fn preferred_snippet_analysis_cli_id(&self) -> Option<ProfileId> {
-        self.reviewed_cli_preference(
-            self.profile_or_default(self.local.profile(local::Role::Coding)),
-        )
+    pub(crate) fn preferred_snippet_analysis_profile_id(&self) -> Option<ProfileId> {
+        let coding = self.local.profile(local::Role::Coding);
+        coding
+            .and_then(|reference| self.bound_profile(reference))
+            .and_then(|profile| self.usable_snippet_profile_id(profile))
+            .or_else(|| self.reviewed_cli_preference(self.profile_or_default(coding)))
     }
 
-    pub(crate) fn preferred_snippet_assistance_profile_id(&self, text: bool) -> Option<ProfileId> {
-        let role = if text {
+    pub(crate) fn preferred_snippet_assistance_profile_id(
+        &self,
+        action: crate::snippet_window::ai_assist::Action,
+        connection: Option<&ProfileRef>,
+        available: impl Fn(ProfileId) -> bool,
+    ) -> Option<ProfileId> {
+        use crate::snippet_window::ai_assist::Action;
+
+        let workload = if action.uses_text_profile() {
             local::Role::Text
         } else {
             local::Role::Coding
         };
-        self.profile_or_default(self.local.profile(role))
-            .filter(|profile| {
-                if profile.is_cli() {
-                    self.reviewed_cli_transport(profile.id).is_ok()
-                } else {
-                    self.snippet_analysis_transport(profile.id).is_ok()
-                }
-            })
-            .map(|profile| profile.id)
+        let security = matches!(action, Action::SecurityReview | Action::SecurityFix)
+            .then(|| self.local.profile(local::Role::Security))
+            .flatten();
+        [security, connection, self.local.profile(workload)]
+            .into_iter()
+            .flatten()
+            .filter_map(|reference| self.bound_profile(reference))
+            .chain(self.profiles.default_profile())
+            .filter_map(|profile| self.usable_snippet_profile_id(profile))
+            .find(|&id| available(id))
             .or_else(|| {
-                if text {
+                if workload == local::Role::Text {
                     self.terminal_chat_profile_id()
                 } else {
                     self.code_analysis_profile_id()
                 }
+                .filter(|&id| available(id))
             })
+    }
+
+    fn usable_snippet_profile_id(&self, profile: &profiles::Profile) -> Option<ProfileId> {
+        let available = if profile.is_cli() {
+            self.reviewed_cli_transport(profile.id).is_ok()
+        } else {
+            self.snippet_analysis_transport(profile.id).is_ok()
+        };
+        available.then_some(profile.id)
     }
 
     pub(crate) fn terminal_chat_profiles(
         &self,
     ) -> impl Iterator<Item = (ProfileId, &str, &str, String)> {
         self.available_ai_profiles(ProfileRoute::TerminalChat)
+    }
+
+    pub(crate) fn interactive_chat_profiles(
+        &self,
+    ) -> impl Iterator<Item = (ProfileId, &str, &str, String)> {
+        self.available_ai_profiles(ProfileRoute::InteractiveChat)
     }
 
     pub(crate) fn journal_question_https_profiles(
@@ -1327,9 +1725,7 @@ impl Configuration {
     }
 
     pub(crate) fn preferred_journal_question_cli_id(&self) -> Option<ProfileId> {
-        self.reviewed_cli_preference(
-            self.profile_or_default(self.local.profile(local::Role::Journal)),
-        )
+        self.reviewed_cli_preference(self.selected_journal_profile())
     }
 
     fn available_ai_profiles(
@@ -1341,7 +1737,7 @@ impl Configuration {
                 Some((
                     entry.id,
                     entry.name.as_str(),
-                    entry.model.as_str(),
+                    entry.effective_model(),
                     entry.destination().ok()?,
                 ))
             })
@@ -1401,9 +1797,7 @@ impl Configuration {
     }
 
     pub(crate) fn preferred_journal_summary_cli_id(&self) -> Option<ProfileId> {
-        self.reviewed_cli_preference(
-            self.profile_or_default(self.local.profile(local::Role::Journal)),
-        )
+        self.reviewed_cli_preference(self.selected_journal_profile())
     }
 
     pub(crate) fn journal_summary_cli_transport(
@@ -1423,6 +1817,13 @@ impl Configuration {
         id: ProfileId,
     ) -> Result<(local_ai::Profile, usize), String> {
         self.selected_transport(id, ProfileRoute::TerminalChat)
+    }
+
+    pub(crate) fn interactive_chat_transport(
+        &self,
+        id: ProfileId,
+    ) -> Result<(local_ai::Profile, usize), String> {
+        self.selected_transport(id, ProfileRoute::InteractiveChat)
     }
 
     pub(crate) fn require_current_terminal_cli(
@@ -1447,6 +1848,7 @@ impl Configuration {
     pub(crate) fn web_search_profile(
         &self,
         id: ProfileId,
+        interactive_chat: bool,
     ) -> Option<(
         local_ai::Profile,
         String,
@@ -1457,7 +1859,12 @@ impl Configuration {
             .profile(id)
             .filter(|entry| entry.has_web_search() && !entry.is_cli())?;
         entry.validate_connection().ok()?;
-        let (profile, _) = self.terminal_chat_transport(id).ok()?;
+        let (profile, _) = if interactive_chat {
+            self.interactive_chat_transport(id)
+        } else {
+            self.terminal_chat_transport(id)
+        }
+        .ok()?;
         Some((profile, entry.destination().ok()?, entry.lm_web.clone()))
     }
 
@@ -1474,7 +1881,10 @@ impl Configuration {
             .profile(id)
             .ok_or("The selected AI profile was removed.")?;
         if !route.allows(entry) {
-            return Err(if matches!(route, ProfileRoute::ReviewedHttps) {
+            return Err(if entry.uses_server_default_model() {
+                "This workflow requires a reviewed model. Select a Manual or Automatic profile."
+                    .into()
+            } else if matches!(route, ProfileRoute::ReviewedHttps) {
                 "Choose a saved, trusted HTTPS profile for this request.".into()
             } else if entry.is_cli() {
                 "This workflow does not support a configured CLI profile.".into()
@@ -1547,6 +1957,7 @@ fn named_agent_profile_revision(
 ) -> Option<[u8; 32]> {
     let mut profile = profile.clone();
     profile.id = 0;
+    profile.java_source = None;
     let bytes =
         serde_json::to_vec(&("kortty named agent profile v1", name, &profile, authority)).ok()?;
     hash_agent_profile_revision(&bytes)
@@ -1664,11 +2075,15 @@ pub(crate) enum Message {
     Skills(skills::Message),
     Memory(memory::Message),
     Local(local::Message),
+    AdoptJavaRole(java_roles::Role),
     Setup(setup::Message),
     SetupSaved(u64, Result<Arc<Configuration>, String>),
     ManagedModelStatusTick,
     RequestDone(u64, Result<Reply, String>),
+    LmStudioMetadataDue(u64),
+    LmStudioMetadataReady(u64, Result<Arc<local_ai::LmStudioCatalog>, String>),
     AutoTestResolved(u64, Instant, Result<local_ai::PolicyAutoModel, String>),
+    OrdinaryAutoTestResolved(u64, Result<local_ai::LmStudioAutoModel, String>),
     CancelRequest,
     Save,
     Saved(Result<(Arc<Configuration>, Option<String>), String>),
@@ -1684,6 +2099,7 @@ pub(crate) enum Message {
 #[derive(Clone, Debug)]
 pub(crate) enum Reply {
     Models(Vec<String>),
+    LmStudioModels(Arc<local_ai::LmStudioCatalog>),
     Tested(String, Option<String>),
 }
 
@@ -1822,6 +2238,7 @@ pub(crate) struct Dialog {
     saving: bool,
     skill_rule_writing: bool,
     request: Option<Request>,
+    lm_studio_metadata: Option<lm_studio::Lookup>,
     next_request: u64,
     close_token: Option<u64>,
 }
@@ -1873,6 +2290,7 @@ impl Dialog {
             saving: false,
             skill_rule_writing: false,
             request: None,
+            lm_studio_metadata: None,
             next_request: 0,
             close_token: None,
         }
@@ -1984,6 +2402,9 @@ impl Dialog {
 
     pub(crate) fn prompt_close(&mut self, token: Option<u64>) {
         self.close_token = token;
+        if token.is_some() {
+            self.lm_studio_metadata = None;
+        }
     }
 
     pub(crate) fn close_token(&self) -> Option<u64> {
@@ -2216,8 +2637,12 @@ impl Dialog {
             &message,
             Message::Page(Page::Profiles)
                 | Message::Profiles(_)
+                | Message::AdoptJavaRole(_)
                 | Message::RequestDone(..)
+                | Message::LmStudioMetadataDue(..)
+                | Message::LmStudioMetadataReady(..)
                 | Message::AutoTestResolved(..)
+                | Message::OrdinaryAutoTestResolved(..)
         ) {
             self.profile_policy = load_policy();
         }
@@ -2274,8 +2699,13 @@ impl Dialog {
                     iced::widget::operation::RelativeOffset::START,
                 );
                 return if was_searching && self.search.trim().is_empty() {
-                    Task::batch([scroll, self.load_profile_usage()])
+                    Task::batch([
+                        scroll,
+                        self.load_profile_usage(),
+                        self.refresh_lm_studio_metadata(),
+                    ])
                 } else {
+                    self.lm_studio_metadata = None;
                     scroll
                 };
             }
@@ -2297,7 +2727,7 @@ impl Dialog {
             Message::SearchEscape => {
                 self.search.clear();
                 self.search_selection = 0;
-                return self.load_profile_usage();
+                return Task::batch([self.load_profile_usage(), self.refresh_lm_studio_metadata()]);
             }
             Message::Reveal(target) => return self.open_page(target),
             Message::Find => return iced::widget::operation::focus(self.search_id.clone()),
@@ -2307,9 +2737,11 @@ impl Dialog {
                     self.profiles.cancel_cli_discovery();
                     self.profiles.cancel_cli_catalog();
                     self.request = None;
+                    self.lm_studio_metadata = None;
                     self.local.suspend();
                     self.memory.invalidate_cleanup();
                 }
+                return self.refresh_lm_studio_metadata();
             }
             Message::Timeout(value) if editable => {
                 self.timeout = value.chars().filter(char::is_ascii_digit).take(4).collect();
@@ -2363,6 +2795,14 @@ impl Dialog {
             Message::Profiles(profiles::Message::RefreshManagedModels) if profile_editable => {
                 return self.refresh_managed_models();
             }
+            Message::Profiles(profiles::Message::ConfirmImportedModel(id, model))
+                if profile_editable =>
+            {
+                return self
+                    .profiles
+                    .review_imported_model(self.profile_dir.clone(), id, &model)
+                    .map(Message::Profiles);
+            }
             Message::Profiles(profiles::Message::Wizard(profiles::WizardAction::Scan)) => {
                 if profile_editable && self.general.features_enabled && self.request.is_none() {
                     return self.profiles.scan_wizard_servers().map(Message::Profiles);
@@ -2399,6 +2839,7 @@ impl Dialog {
                             self.saved = Arc::new(current);
                             return Task::batch([
                                 self.load_profile_usage(),
+                                self.refresh_lm_studio_metadata(),
                                 if self.saved.policy_auto_definitions().next().is_some() {
                                     Task::done(Message::RefreshPolicyAutoModels)
                                 } else {
@@ -2436,11 +2877,33 @@ impl Dialog {
                         self.notice.clear();
                     }
                     self.profiles.update(event, editable);
-                    return self.load_profile_usage();
+                    return Task::batch([
+                        self.load_profile_usage(),
+                        self.refresh_lm_studio_metadata(),
+                    ]);
                 }
             }
             Message::Profiles(event) => {
                 let previous_usage = self.profile_usage_key();
+                let refresh = matches!(
+                    event,
+                    profiles::Message::Section(_)
+                        | profiles::Message::Select(_)
+                        | profiles::Message::ConnectionMode(_)
+                        | profiles::Message::ModelMode(_)
+                        | profiles::Message::TrustLocal(_)
+                        | profiles::Message::Wizard(
+                            profiles::WizardAction::Next
+                                | profiles::WizardAction::Back
+                                | profiles::WizardAction::Finish
+                        )
+                        | profiles::Message::Edit(
+                            profiles::Field::Endpoint
+                                | profiles::Field::Model
+                                | profiles::Field::Credential,
+                            _
+                        )
+                );
                 let event_editable = match event {
                     profiles::Message::Add
                     | profiles::Message::Wizard(profiles::WizardAction::Open) => {
@@ -2450,9 +2913,16 @@ impl Dialog {
                     _ => profile_editable,
                 };
                 self.profiles.update(event, event_editable);
-                if self.profile_usage_key() != previous_usage {
-                    return self.load_profile_usage();
-                }
+                let usage = if self.profile_usage_key() != previous_usage {
+                    self.load_profile_usage()
+                } else {
+                    Task::none()
+                };
+                return if refresh {
+                    usage.chain(self.refresh_lm_studio_metadata())
+                } else {
+                    usage
+                };
             }
             Message::Skills(event) if editable || event.completes_work() => {
                 let profile = matches!(event, skills::Message::Shorten)
@@ -2480,6 +2950,39 @@ impl Dialog {
                         vault,
                     )
                     .map(Message::Memory);
+            }
+            Message::AdoptJavaRole(role) => return self.adopt_java_role(role),
+            Message::Local(local::Message::ReviewJavaModel(kind, id)) => {
+                if editable
+                    && self.general.features_enabled
+                    && self.page == Page::LocalModels
+                    && self.search.trim().is_empty()
+                    && let Some(hint) = self.saved.java_model_hints.get(kind, &id)
+                {
+                    self.local.stage_java_model(hint);
+                }
+            }
+            Message::Local(local::Message::ReviewJavaKnowledgeStore(id)) => {
+                if editable
+                    && self.general.features_enabled
+                    && self.page == Page::Knowledge
+                    && self.search.trim().is_empty()
+                    && let Some(hint) = self.saved.java_knowledge_hints.get(&id)
+                {
+                    self.local
+                        .stage_java_knowledge_store(&self.local_state, hint);
+                }
+            }
+            Message::Local(local::Message::ReviewJavaKnowledgeSource(store, source)) => {
+                if editable
+                    && self.general.features_enabled
+                    && self.page == Page::Knowledge
+                    && self.search.trim().is_empty()
+                    && let Some(hint) = self.saved.java_knowledge_hints.get(&store)
+                {
+                    self.local
+                        .stage_java_knowledge_source(&self.local_state, hint, &source);
+                }
             }
             Message::Local(event)
                 if editable
@@ -2537,8 +3040,15 @@ impl Dialog {
                 self.request = None;
                 self.notice = "Request cancelled.".into();
             }
+            Message::LmStudioMetadataDue(ticket) => return self.start_lm_studio_metadata(ticket),
+            Message::LmStudioMetadataReady(ticket, result) => {
+                self.finish_lm_studio_metadata(ticket, result);
+            }
             Message::AutoTestResolved(ticket, started, result) => {
                 return self.finish_auto_model_test(ticket, started, result);
+            }
+            Message::OrdinaryAutoTestResolved(ticket, result) => {
+                return self.finish_ordinary_auto_model_test(ticket, result);
             }
             Message::RequestDone(ticket, result) => {
                 if self
@@ -2557,6 +3067,20 @@ impl Dialog {
                         return Task::none();
                     }
                     self.notice = match result {
+                        Ok(Reply::LmStudioModels(catalog)) => {
+                            let count = catalog.names().len();
+                            if let Some(key) = request.profile.lm_studio_discovery_key() {
+                                self.profiles.set_lm_studio_catalog(key, catalog, true);
+                            }
+                            if request.test_after_discovery && count > 0 {
+                                return self.request(false);
+                            }
+                            if count == 1 {
+                                "Found one model.".into()
+                            } else {
+                                format!("Found {count} models.")
+                            }
+                        }
                         Ok(Reply::Models(models)) => {
                             let count = models.len();
                             self.profiles.set_models(
@@ -2612,7 +3136,10 @@ impl Dialog {
                     Err(error) => format!("Could not save AI settings ({error})."),
                 };
                 if refresh_usage {
-                    return self.load_profile_usage();
+                    return Task::batch([
+                        self.load_profile_usage(),
+                        self.refresh_lm_studio_metadata(),
+                    ]);
                 }
             }
             Message::ProfileDefaultSaved(result) => {
@@ -2678,7 +3205,12 @@ impl Dialog {
             }
             _ => Task::none(),
         };
-        Task::batch([scroll, load, self.load_profile_usage()])
+        Task::batch([
+            scroll,
+            load,
+            self.load_profile_usage(),
+            self.refresh_lm_studio_metadata(),
+        ])
     }
 
     fn set_default_profile(&mut self, id: ProfileId) -> Task<Message> {
@@ -2743,6 +3275,10 @@ impl Dialog {
                 local: self.local_state.clone(),
                 skills: self.skill_store.clone(),
                 memory: self.memory.settings().clone(),
+                java_journal_profiles: self.saved.java_journal_profiles.clone(),
+                java_roles: self.saved.java_roles.clone(),
+                java_model_hints: self.saved.java_model_hints.clone(),
+                java_knowledge_hints: self.saved.java_knowledge_hints.clone(),
                 origin: Some(self.profile_dir.clone()),
                 model_catalog: self.saved.model_catalog.clone(),
             }))
@@ -2835,6 +3371,20 @@ impl Dialog {
             .install_policy_profiles(&configuration.profiles);
     }
 
+    pub(crate) fn install_lm_studio_auto_projection(&mut self, configuration: &Configuration) {
+        self.profiles
+            .refresh_saved_lm_studio_auto(&configuration.profiles);
+        let mut saved = self.saved.as_ref().clone();
+        saved.profiles.refresh_lm_studio_auto(|profile| {
+            let candidate = configuration.profiles.profile(profile.id)?;
+            if candidate.lm_studio_auto_settings() != profile.lm_studio_auto_settings() {
+                return None;
+            }
+            candidate.lm_studio_auto_projection().cloned()
+        });
+        self.saved = Arc::new(saved);
+    }
+
     fn finish_auto_model_test(
         &mut self,
         ticket: u64,
@@ -2902,6 +3452,52 @@ impl Dialog {
             self.notice = "Enable AI features and finish the current request first.".into();
             return Task::none();
         }
+        self.lm_studio_metadata = None;
+        if resolve_auto
+            && !discover
+            && let Some(profile) = self.profiles.selected()
+            && let Some(settings) = profile.lm_studio_auto_settings()
+        {
+            let installed = ClipboardPolicy::load();
+            if installed.problem.is_some() || !installed.ai_allowed {
+                self.notice = "Managed policy blocks AI model discovery.".into();
+                return Task::none();
+            }
+            let pending = settings.and_then(|settings| {
+                local_ai::resolve_lm_studio_auto(
+                    &settings.endpoint,
+                    &settings.preferred,
+                    settings.credential_env,
+                    settings.mode.uses_native_lm_studio(),
+                )
+            });
+            let pending = match pending {
+                Ok(pending) => pending,
+                Err(error) => {
+                    self.notice = error;
+                    return Task::none();
+                }
+            };
+            let ticket = self.next_request;
+            self.next_request = self.next_request.wrapping_add(1);
+            self.request = Some(Request {
+                ticket,
+                profile: profile.clone(),
+                test_after_discovery: false,
+                _cancel: pending.cancel,
+            });
+            self.notice = "Checking the loaded LM Studio model…".into();
+            return Task::perform(
+                async move {
+                    pending
+                        .reply
+                        .recv()
+                        .await
+                        .unwrap_or_else(|_| Err("The model metadata worker stopped.".into()))
+                },
+                move |result| Message::OrdinaryAutoTestResolved(ticket, result),
+            );
+        }
         if resolve_auto
             && !discover
             && let Some(profile) = self.profiles.selected()
@@ -2948,38 +3544,56 @@ impl Dialog {
                         "Configured CLI profiles use an optional explicit model argument.".into(),
                     );
                 }
+                if discover && !profile.supports_model_discovery() {
+                    return Err(
+                        "Model discovery is unavailable for this profile configuration.".into(),
+                    );
+                }
                 profile.validate_connection()?;
                 let endpoint = profile.endpoint.trim().to_owned();
                 let test_after_discovery = !profile.is_managed()
                     && !discover
                     && profile.model_mode == profiles::ModelMode::Auto
+                    && !profile.ordinary_lm_studio_auto()
                     && profile.model.trim().is_empty();
                 let pending = if discover || test_after_discovery {
-                    let pending = if let Some(definition) = profile.policy_definition() {
-                        local_ai::discover_policy_profile(definition)?
-                    } else if let Some(protocol) = profile.remote_protocol() {
-                        local_ai::discover_remote(&endpoint, protocol, profile.credential()?)?
-                    } else if profile.connection_mode == profiles::ConnectionMode::LmStudio {
-                        local_ai::discover_lm_studio(&endpoint, profile.credential()?)?
+                    if profile.lm_studio_discovery_key().is_some() {
+                        let local_ai::Pending { reply, cancel } = lm_studio::discover(profile)?;
+                        (
+                            Task::future(async move {
+                                reply
+                                    .recv()
+                                    .await
+                                    .unwrap_or_else(|_| Err("The worker stopped.".into()))
+                                    .map(|catalog| Reply::LmStudioModels(Arc::new(catalog)))
+                            }),
+                            cancel,
+                        )
                     } else {
-                        match profile.credential()? {
-                            Some(name) => {
-                                local_ai::discover_with_credential(&endpoint, Some(name))?
+                        let pending = if let Some(definition) = profile.policy_definition() {
+                            local_ai::discover_policy_profile(definition)?
+                        } else if let Some(protocol) = profile.remote_protocol() {
+                            local_ai::discover_remote(&endpoint, protocol, profile.credential()?)?
+                        } else {
+                            match profile.credential()? {
+                                Some(name) => {
+                                    local_ai::discover_with_credential(&endpoint, Some(name))?
+                                }
+                                None => local_ai::discover(&endpoint)?,
                             }
-                            None => local_ai::discover(&endpoint)?,
-                        }
-                    };
-                    let local_ai::Pending { reply, cancel } = pending;
-                    (
-                        Task::future(async move {
-                            reply
-                                .recv()
-                                .await
-                                .unwrap_or_else(|_| Err("The worker stopped.".into()))
-                                .map(Reply::Models)
-                        }),
-                        cancel,
-                    )
+                        };
+                        let local_ai::Pending { reply, cancel } = pending;
+                        (
+                            Task::future(async move {
+                                reply
+                                    .recv()
+                                    .await
+                                    .unwrap_or_else(|_| Err("The worker stopped.".into()))
+                                    .map(Reply::Models)
+                            }),
+                            cancel,
+                        )
+                    }
                 } else {
                     let timeout = self
                         .timeout
@@ -3203,11 +3817,17 @@ impl Dialog {
                 Page::Skills => text("AI skill editing is unavailable.").into(),
                 Page::LocalModels | Page::Knowledge | Page::LocalPreferences => {
                     let page = match self.page {
-                        Page::LocalModels => local::Page::Models(hub_tokens),
-                        Page::Knowledge => local::Page::Knowledge(qdrant_keys),
+                        Page::LocalModels => {
+                            local::Page::Models(hub_tokens, &self.saved.java_model_hints)
+                        }
+                        Page::Knowledge => local::Page::Knowledge(
+                            qdrant_keys,
+                            &self.saved.java_knowledge_hints,
+                            &self.saved.java_model_hints,
+                        ),
                         _ => local::Page::Preferences,
                     };
-                    let content = self
+                    let mut content = self
                         .local
                         .view(
                             page,
@@ -3218,6 +3838,11 @@ impl Dialog {
                             &self.revealed,
                         )
                         .map(Message::Local);
+                    if self.page == Page::LocalPreferences
+                        && let Some(roles) = self.java_roles_view()
+                    {
+                        content = column![roles, content].spacing(10).into();
+                    }
                     let setup_role = match self.page {
                         Page::LocalModels => Some(None),
                         Page::LocalPreferences if self.local_state.needs_guided_embedding() => {
@@ -3593,6 +4218,68 @@ mod tests {
             config.journal_summary_transport(2, true),
             Err(error) if error.contains("Vision is disabled")
         ));
+    }
+
+    #[test]
+    fn java_profile_provenance_does_not_change_transport_revisions() {
+        let mut config: Configuration = serde_json::from_value(serde_json::json!({
+            "profiles": {"profiles": [{"id": 1, "name": "Personal", "model": "fixture"}],
+                         "default": 1, "last_id": 1}
+        }))
+        .unwrap();
+        let revision = config.agent_profile_revision(1).unwrap();
+        let source =
+            JavaProfileSource::for_draft("java-id", config.profiles.profile(1).unwrap()).unwrap();
+        let mut stored = serde_json::to_value(&config).unwrap();
+        stored["profiles"]["profiles"][0]["java_source"] = serde_json::to_value(&source).unwrap();
+        stored["profiles"]["profiles"][0]["java_web_hint"] = serde_json::json!({"mode": "tavily"});
+        config = serde_json::from_value(stored).unwrap();
+        assert_eq!(
+            config.java_profile_source(&ProfileRef::Numeric(1)),
+            Some(&source)
+        );
+        let profile = config.profiles.profile(1).unwrap();
+        assert!(profile.java_web_hint.is_some());
+        assert!(!profile.has_web_search());
+        assert_eq!(config.agent_profile_revision(1), Some(revision));
+    }
+
+    #[test]
+    fn journal_profile_falls_back_to_the_global_default_before_the_first_profile() {
+        let mut fixture = serde_json::json!({
+            "profiles": {
+                "profiles": [
+                    {"id": 1, "name": "Text", "model": "text"},
+                    {"id": 2, "name": "Default", "model": "default"},
+                    {"id": 3, "name": "Journal", "model": "journal"},
+                    {"id": 4, "name": "Remote", "model": "remote",
+                        "connection_mode": "remote-open-ai",
+                        "endpoint": "https://example.invalid/v1",
+                        "trusted_remote_endpoint": true}
+                ],
+                "default": 2,
+                "last_id": 4
+            }
+        });
+        for (role, chosen, expected, explicit) in [
+            (serde_json::json!(null), Some(2), Some(2), false),
+            (serde_json::json!(99), Some(2), Some(2), false),
+            (serde_json::json!(3), Some(2), Some(3), true),
+            (serde_json::json!(4), Some(2), None, true),
+            (serde_json::json!("policy-missing"), Some(2), None, true),
+            (serde_json::json!(null), Some(4), None, false),
+            (serde_json::json!(null), None, Some(1), false),
+        ] {
+            fixture["local"] = serde_json::json!({"roles": [1, null, null, role]});
+            fixture["profiles"]["default"] = serde_json::json!(chosen);
+            let config: Configuration = serde_json::from_value(fixture.clone()).unwrap();
+            assert_eq!(config.journal_summary_default_id(), expected);
+            assert_eq!(config.journal_profile_is_explicit(), explicit);
+            assert_eq!(
+                config.journal_profile(false).unwrap().is_ok(),
+                expected.is_some()
+            );
+        }
     }
 
     #[test]
@@ -4796,6 +5483,14 @@ mod tests {
         let mut catalog = saved.profiles.clone();
         assert!(catalog.set_default(2));
         assert_eq!(catalog.default_profile().unwrap().id, 2);
+
+        value["profiles"]["default"] = serde_json::json!(2);
+        value["local"]["roles"] = serde_json::json!([1, 1, null, null]);
+        let mut default_cli: Configuration = serde_json::from_value(value.clone()).unwrap();
+        default_cli.origin = Some(root.clone());
+        assert_eq!(default_cli.preferred_journal_summary_cli_id(), Some(2));
+        assert!(default_cli.journal_summary_default_id().is_none());
+        assert!(default_cli.journal_profile(false).is_none());
 
         value["local"]["roles"] = serde_json::json!([1, 2, "policy-named", 1]);
         let mut without_policy: Configuration = serde_json::from_value(value).unwrap();

@@ -4,14 +4,15 @@ use std::{borrow::Cow, io};
 
 use iced::{Element, Size, Subscription, Task, window};
 
-use crate::snippet_window::compare;
 use crate::snippet_window::{self, SnippetWindow, Update};
+use crate::snippet_window::{ai_assist::Editor as _, compare};
 use crate::snippets;
 use crate::workspace::dialog_placement::Kind as DialogKind;
 
 use super::{Message, Workspace, tool_tabs::Kind};
 
 mod ai_assist;
+pub(crate) use ai_assist::State as FileAiAssistance;
 mod analysis;
 mod diagram_library;
 pub(super) use analysis::Event as AnalysisEvent;

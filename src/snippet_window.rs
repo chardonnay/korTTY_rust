@@ -225,6 +225,7 @@ struct Draft {
     structure: structure::Editor,
     lua_completion: Option<lua::Completion>,
     last_ai: Option<Arc<ai_assist::Change>>,
+    assist_connection: Option<crate::ai_manager::ProfileRef>,
 }
 
 impl Draft {
@@ -251,6 +252,7 @@ impl Draft {
             structure: structure::Editor::default(),
             lua_completion: None,
             last_ai: None,
+            assist_connection: None,
         }
     }
 

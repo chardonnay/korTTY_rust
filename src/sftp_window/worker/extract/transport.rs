@@ -1,42 +1,65 @@
 //! Bounded request/reply exchange on the fixed archive helper exec channel.
 
+use std::cell::Cell;
+use std::fs::File;
 use std::io::{self, Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use kortty::ssh_runtime::password::{Prompt, marker};
 use kortty_server_archive::draft_replace;
 use kortty_server_archive::protocol::{
-    self, CreateSpec, PrivilegedReply, PrivilegedRequest, Reply, Request,
+    self, CreateSpec, CreatedPayload, PrivilegedReply, PrivilegedRequest, Reply, Request,
 };
-use kortty_ssh::{ExecOpener as DirectExecOpener, SshReader};
+use kortty_ssh::{ExecLease, ExecOpener as DirectExecOpener, SensitiveLine, SshReader, SshWriter};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::ssh_connection::ExecOpener;
 use crate::ssh_worker;
 
 const POLL: Duration = Duration::from_millis(25);
 const MAX_DIAGNOSTICS: usize = 8 * 1024;
+const COPY_POLICY_POLL: Duration = Duration::from_millis(250);
+const SUDO_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PrivilegedArchiveFailure {
     BeforeCommit,
     Refused,
     Uncertain,
+    CopyFailed,
 }
 
 pub(crate) fn exchange_privileged(
     opener: &DirectExecOpener,
     spec: &CreateSpec,
+    sudo_password: Option<SensitiveLine>,
+    password: Option<&str>,
+    copy: Option<&File>,
     stopped: impl Fn() -> bool + Clone + Send + Sync + 'static,
-    authorize: impl Fn() -> io::Result<()>,
+    authorize: impl Fn() -> io::Result<()> + Clone + Send + Sync + 'static,
 ) -> Result<(), PrivilegedArchiveFailure> {
-    use PrivilegedArchiveFailure::{BeforeCommit, Refused, Uncertain};
+    use PrivilegedArchiveFailure::{BeforeCommit, CopyFailed, Refused, Uncertain};
 
-    let command = format!(
-        "exec /usr/bin/sudo -k -n -u root -- {} {}",
-        protocol::PRIVILEGED_PATH,
-        protocol::PRIVILEGED_ARGUMENT,
-    );
+    if (spec.format == protocol::CreateFormat::ZipPassword) != password.is_some()
+        || spec.report_payload != copy.is_some()
+    {
+        return Err(BeforeCommit);
+    }
+    let password = password
+        .map(protocol::creation_password_body)
+        .transpose()
+        .map_err(|_| BeforeCommit)?;
+    let challenge = if sudo_password.is_some() {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(|_| BeforeCommit)?;
+        Some(marker(nonce))
+    } else {
+        None
+    };
+    let command = privileged_command(challenge.as_deref());
     let mut frame = Vec::new();
     protocol::write_privileged_request(
         &mut frame,
@@ -44,22 +67,48 @@ pub(crate) fn exchange_privileged(
     )
     .map_err(|_| BeforeCommit)?;
     authorize().map_err(|_| BeforeCommit)?;
-    let mut lease = opener
-        .open_cancellable(&command, stopped.clone())
-        .map_err(|_| BeforeCommit)?;
-    let mut input = lease.take_writer().ok_or(BeforeCommit)?;
+    let opening_authorize = authorize.clone();
+    let opening_stopped = stopped.clone();
+    let stop_opening = move || opening_stopped() || opening_authorize().is_err();
+    let mut lease = if sudo_password.is_some() || password.is_some() {
+        opener.open_sensitive_cancellable(&command, stop_opening)
+    } else {
+        opener.open_cancellable(&command, stop_opening)
+    }
+    .map_err(|_| BeforeCommit)?;
     let mut stdout = lease.take_reader().ok_or(BeforeCommit)?;
-    // Close the diagnostic reader so unexpected stderr cannot backpressure stdout.
-    drop(lease.take_stderr());
-    let abort = lease.abort_handle();
-    authorize().map_err(|_| BeforeCommit)?;
-    running(&stopped).map_err(|_| BeforeCommit)?;
-    send(&stopped, move || abort.abort(), || input.write_all(&frame)).map_err(|_| BeforeCommit)?;
-    let mut reader = PrivilegedReader {
-        stdout: &mut stdout,
-        stopped: &stopped,
+    let mut input = if let Some((line, challenge)) = sudo_password.zip(challenge.as_deref()) {
+        authenticate_privileged(
+            &mut lease,
+            &mut stdout,
+            line,
+            challenge,
+            stopped.clone(),
+            authorize.clone(),
+        )
+        .map_err(|_| BeforeCommit)?
+    } else {
+        // Without a challenge, discard stderr so it cannot backpressure stdout.
+        drop(lease.take_stderr());
+        lease.take_writer().ok_or(BeforeCommit)?
     };
-    let review = match protocol::read_privileged_reply(&mut reader).map_err(|_| BeforeCommit)? {
+    let abort = lease.abort_handle();
+    let before_commit = || stopped() || authorize().is_err();
+    send(
+        &before_commit,
+        move || abort.abort(),
+        || {
+            running(&before_commit)?;
+            input.write_all(&frame)
+        },
+    )
+    .map_err(|_| BeforeCommit)?;
+    let review = match protocol::read_privileged_reply(PrivilegedReader {
+        stdout: &mut stdout,
+        stopped: &before_commit,
+    })
+    .map_err(|_| BeforeCommit)?
+    {
         PrivilegedReply::Review { review } => review,
         _ => return Err(Refused),
     };
@@ -75,30 +124,207 @@ pub(crate) fn exchange_privileged(
     authorize().map_err(|_| BeforeCommit)?;
     running(&stopped).map_err(|_| BeforeCommit)?;
     let abort = lease.abort_handle();
+    let check_cancel = stopped.clone();
+    let commit_authority = authorize.clone();
+    let password_protocol = challenge.is_some();
+    let mut submitted = false;
     send(
-        &stopped,
+        &before_commit,
         move || abort.abort(),
         || {
-            input.write_all(&frame)?;
-            input.close_input()
+            running(&before_commit)?;
+            submitted = true;
+            let permitted = move || !check_cancel() && commit_authority().is_ok();
+            match password {
+                Some(password) => {
+                    input.write_all(&frame)?;
+                    input.send_sensitive_input(password, protocol::PASSWORD_COMMIT, permitted)
+                }
+                None if password_protocol => input.send_sensitive_input(
+                    Zeroizing::new(frame),
+                    protocol::PRIVILEGED_PASSWORD_COMMIT,
+                    permitted,
+                ),
+                None => {
+                    input.write_all(&frame)?;
+                    input.close_input()
+                }
+            }
         },
     )
-    .map_err(|_| Uncertain)?;
+    .map_err(|_| if submitted { Uncertain } else { BeforeCommit })?;
+    let mut reader = PrivilegedReader {
+        stdout: &mut stdout,
+        stopped: &stopped,
+    };
     let reply = protocol::read_privileged_reply(&mut reader).map_err(|_| Uncertain)?;
-    let mut trailing = [0; 1];
-    if reader.read(&mut trailing).map_err(|_| Uncertain)? != 0
-        || exit_code(|| lease.exit_code(), &stopped).map_err(|_| Uncertain)? != 0
-    {
-        return Err(Uncertain);
-    }
-    match reply {
-        PrivilegedReply::Applied { destination } if destination == spec.destination => Ok(()),
+    let finishing = match reply {
+        PrivilegedReply::AppliedCopy {
+            destination,
+            payload,
+        } if destination == spec.destination && spec.report_payload => {
+            let mut copy = copy.ok_or(CopyFailed)?;
+            authorize().map_err(|_| CopyFailed)?;
+            let checked_at = Cell::new(Instant::now());
+            let stopped_copy = || {
+                if stopped() {
+                    return true;
+                }
+                let now = Instant::now();
+                if now.duration_since(checked_at.get()) >= COPY_POLICY_POLL {
+                    checked_at.set(now);
+                    return authorize().is_err();
+                }
+                false
+            };
+            let mut copy_reader = PrivilegedReader {
+                stdout: &mut *reader.stdout,
+                stopped: &stopped_copy,
+            };
+            receive_archive_copy(&mut copy_reader, &mut copy, payload).map_err(|_| CopyFailed)?;
+            CopyFailed
+        }
+        PrivilegedReply::Applied { destination } if destination == spec.destination => {
+            if spec.report_payload {
+                require_privileged_eof(&mut reader, || lease.exit_code(), &stopped)
+                    .map_err(|_| Uncertain)?;
+                return Err(CopyFailed);
+            }
+            Uncertain
+        }
         PrivilegedReply::Failed {
             outcome_unknown: false,
             ..
-        } => Err(Refused),
-        _ => Err(Uncertain),
+        } => {
+            require_privileged_eof(&mut reader, || lease.exit_code(), &stopped)
+                .map_err(|_| Uncertain)?;
+            return Err(Refused);
+        }
+        _ => return Err(Uncertain),
+    };
+    require_privileged_eof(&mut reader, || lease.exit_code(), &stopped).map_err(|_| finishing)?;
+    if spec.report_payload {
+        authorize().map_err(|_| CopyFailed)?;
     }
+    Ok(())
+}
+
+fn privileged_command(challenge: Option<&str>) -> String {
+    let mut command = String::from("exec /usr/bin/sudo -k ");
+    let argument = if let Some(challenge) = challenge {
+        command.push_str("-S -p ");
+        crate::scheduler_window::script::shell_quote(&mut command, challenge);
+        command.push(' ');
+        protocol::PRIVILEGED_PASSWORD_ARGUMENT
+    } else {
+        command.push_str("-n ");
+        protocol::PRIVILEGED_ARGUMENT
+    };
+    command.push_str("-u root -- ");
+    command.push_str(protocol::PRIVILEGED_PATH);
+    command.push(' ');
+    command.push_str(argument);
+    command
+}
+
+fn authenticate_privileged(
+    lease: &mut ExecLease,
+    stdout: &mut SshReader,
+    line: SensitiveLine,
+    challenge: &str,
+    stopped: impl Fn() -> bool + Clone + Send + Sync + 'static,
+    authorize: impl Fn() -> io::Result<()> + Clone + Send + Sync + 'static,
+) -> io::Result<SshWriter> {
+    let deadline = Instant::now() + SUDO_TIMEOUT;
+    let stopped = move || stopped() || Instant::now() >= deadline || authorize().is_err();
+    let mut line = Some(line);
+    let mut input = None;
+    let mut stderr = lease.take_stderr();
+    let mut prompt = Prompt::new(challenge);
+    let mut diagnostics = Zeroizing::new([0; MAX_DIAGNOSTICS]);
+    let mut diagnostic_bytes = 0;
+    let expected = protocol::PRIVILEGED_PASSWORD_READY;
+    let mut greeting = [0; protocol::PRIVILEGED_PASSWORD_READY.len()];
+    let mut offset = 0;
+    while offset < greeting.len() {
+        running(&stopped)?;
+        // NOPASSWD rules can start the helper without requesting the saved password.
+        match stdout.read_timeout(&mut greeting[offset..], POLL) {
+            Ok(0) => return Err(invalid_output()),
+            Ok(count) => {
+                offset += count;
+                if greeting[..offset] != expected[..offset] {
+                    return Err(invalid_output());
+                }
+                continue;
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(error),
+        }
+        let Some(diagnostic) = &mut stderr else {
+            continue;
+        };
+        match diagnostic.read_timeout(&mut diagnostics[..], Duration::ZERO) {
+            Ok(0) => stderr = None,
+            Ok(count) => {
+                diagnostic_bytes += count;
+                if diagnostic_bytes > MAX_DIAGNOSTICS {
+                    return Err(invalid_output());
+                }
+                if prompt.observe(&diagnostics[..count]) {
+                    running(&stopped)?;
+                    let line = line.take().ok_or_else(invalid_output)?;
+                    let writer = lease.take_sensitive_exec_input().ok_or_else(closed)?;
+                    let abort = lease.abort_handle();
+                    let guard = stopped.clone();
+                    input = Some(send(
+                        &stopped,
+                        move || abort.abort(),
+                        || writer.send_then(line, move || !guard()),
+                    )?);
+                }
+            }
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
+            Err(error) => return Err(error),
+        }
+    }
+    running(&stopped)?;
+    input.or_else(|| lease.take_writer()).ok_or_else(closed)
+}
+
+fn require_privileged_eof(
+    input: &mut impl Read,
+    exit_status: impl Fn() -> Option<u32>,
+    stopped: &impl Fn() -> bool,
+) -> io::Result<()> {
+    let mut trailing = [0; 1];
+    if input.read(&mut trailing)? != 0 || exit_code(exit_status, stopped)? != 0 {
+        return Err(invalid_output());
+    }
+    Ok(())
+}
+
+fn receive_archive_copy(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    payload: CreatedPayload,
+) -> io::Result<()> {
+    payload.validate()?;
+    let mut hash = Sha256::new();
+    let mut remaining = payload.bytes;
+    let mut buffer = [0; 64 * 1024];
+    while remaining != 0 {
+        let count = remaining.min(buffer.len() as u64) as usize;
+        let bytes = &mut buffer[..count];
+        input.read_exact(bytes)?;
+        hash.update(&*bytes);
+        output.write_all(bytes)?;
+        remaining -= count as u64;
+    }
+    if <[u8; 32]>::from(hash.finalize()) != payload.sha256 {
+        return Err(invalid_output());
+    }
+    Ok(())
 }
 
 struct PrivilegedReader<'a, F> {
@@ -137,6 +363,89 @@ pub(crate) fn exchange(
         authorize,
         |output, code| output.reply(code),
     )
+}
+
+pub(crate) fn exchange_password_creation(
+    opener: &ExecOpener,
+    request: &Request,
+    password: &str,
+    cancelled: impl Fn() -> bool + Clone + Send + Sync + 'static,
+    authorize: impl Fn() -> io::Result<()> + Clone + Send + Sync + 'static,
+) -> io::Result<Reply> {
+    let ExecOpener::Direct(opener) = opener else {
+        return Err(io::Error::other(
+            "Password ZIP requires the direct SSH route",
+        ));
+    };
+    if !request.needs_password() {
+        return Err(io::Error::other(
+            "The archive creation does not use a password",
+        ));
+    }
+    let body = protocol::creation_password_body(password)?;
+    let mut frame = Vec::new();
+    protocol::write_request(&mut frame, request)?;
+    let deadline = Instant::now() + Duration::from_secs(1800);
+    let greeting_deadline = Instant::now() + Duration::from_secs(30);
+    let stopped = move || cancelled() || Instant::now() >= deadline;
+    let greeting_stop = stopped.clone();
+    let awaiting_greeting = move || greeting_stop() || Instant::now() >= greeting_deadline;
+
+    authorize()?;
+    let mut lease = opener
+        .open_sensitive_cancellable(protocol::COMMAND, awaiting_greeting.clone())
+        .map_err(io::Error::other)?;
+    let mut input = lease.take_writer().ok_or_else(closed)?;
+    let mut stdout = lease.take_reader().ok_or_else(closed)?;
+    drop(lease.take_stderr());
+    let abort = lease.abort_handle();
+    authorize()?;
+    running(&awaiting_greeting)?;
+    send(
+        &awaiting_greeting,
+        move || abort.abort(),
+        || input.write_all(&frame),
+    )?;
+    let mut greeting = Zeroizing::new([0; protocol::PASSWORD_READY.len()]);
+    PrivilegedReader {
+        stdout: &mut stdout,
+        stopped: &awaiting_greeting,
+    }
+    .read_exact(greeting.as_mut())?;
+    if greeting.as_slice() != protocol::PASSWORD_READY {
+        return Err(io::Error::other(
+            "The server helper did not accept password ZIP",
+        ));
+    }
+
+    authorize()?;
+    running(&stopped)?;
+    let abort = lease.abort_handle();
+    let authorized = authorize.clone();
+    let guard = stopped.clone();
+    let result = (|| {
+        send(
+            &stopped,
+            move || abort.abort(),
+            || {
+                input.send_sensitive_input(body, protocol::PASSWORD_COMMIT, move || {
+                    !guard() && authorized().is_ok()
+                })
+            },
+        )?;
+        let reader = PrivilegedReader {
+            stdout: &mut stdout,
+            stopped: &stopped,
+        };
+        let reply = protocol::read_reply(reader)?;
+        if exit_code(|| lease.exit_code(), &stopped)? != 0 {
+            return Err(invalid_output());
+        }
+        Ok(reply)
+    })();
+    result.map_err(|_: io::Error| io::Error::other(
+        "The server archive publication outcome is unknown. Check the reviewed destination before retrying.",
+    ))
 }
 
 pub(crate) fn exchange_draft_replace(
@@ -273,11 +582,11 @@ fn exchange_fixed<T>(
     })
 }
 
-fn send(
+fn send<T>(
     stopped: &(impl Fn() -> bool + Sync),
     abort: impl FnOnce() + Send,
-    submit: impl FnOnce() -> io::Result<()>,
-) -> io::Result<()> {
+    submit: impl FnOnce() -> io::Result<T>,
+) -> io::Result<T> {
     // Both writers can block until the original exec lane accepts EOF.
     let complete = AtomicBool::new(false);
     thread::scope(|scope| {

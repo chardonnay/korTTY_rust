@@ -14,6 +14,7 @@ use crate::local_ai::runtime_package::{self, ModelStatus};
 
 use super::Message::Managed;
 use super::{BackendRepair, Dialog, Message as LocalMessage, Output, field, limited};
+use crate::ai_manager::java_models::{self, Hint, Metadata};
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
 
 mod preference;
@@ -98,6 +99,7 @@ struct Configuration {
     purpose: Purpose,
     idle_minutes: String,
     never_unload: bool,
+    java_review: bool,
 }
 
 impl Configuration {
@@ -116,6 +118,7 @@ impl Configuration {
             purpose: model.purpose,
             idle_minutes: idle_minutes.to_string(),
             never_unload: model.idle_timeout_minutes == 0,
+            java_review: false,
         }
     }
 
@@ -220,6 +223,50 @@ impl Configuration {
         ]
         .spacing(8)
         .into()
+    }
+}
+
+impl Models {
+    pub(super) fn java_target(&self, purpose: Purpose) -> Option<&Model> {
+        let model = &self.selected.as_ref()?.model;
+        (!self.has_action()
+            && model.purpose == purpose
+            && !matches!(self.status, Some(ModelStatus::Starting | ModelStatus::Busy)))
+        .then_some(model)
+    }
+
+    pub(super) fn stage_java_settings(&mut self, hint: &Hint) -> bool {
+        let Metadata::Gguf {
+            backend,
+            purpose,
+            context,
+            threads,
+            gpu_layers,
+            idle_minutes,
+        } = hint.metadata
+        else {
+            return false;
+        };
+        let Some(model) = self.java_target(purpose) else {
+            return false;
+        };
+        let mut draft = Configuration::new(model);
+        draft.name.clone_from(&hint.name);
+        if backend.available(self.active_backend) {
+            draft.backend = backend;
+        }
+        if context != 0 {
+            draft.context = context.to_string();
+        }
+        draft.cpu_threads = threads.to_string();
+        draft.gpu_layers = gpu_layers.to_string();
+        draft.never_unload = idle_minutes == 0;
+        if idle_minutes != 0 {
+            draft.idle_minutes = idle_minutes.to_string();
+        }
+        draft.java_review = true;
+        self.action = Some(Action::Configure(draft));
+        true
     }
 }
 
@@ -668,12 +715,27 @@ impl Dialog {
                 if let (Some(Action::Configure(draft)), Some(Choice { model, .. })) =
                     (&self.managed.action, &self.managed.selected)
                 {
+                    let java_review = draft.java_review;
+                    if java_review && let Err(error) = java_models::require_review_policy() {
+                        self.status = Some(error.to_string());
+                        return Task::none();
+                    }
                     match draft.settings(model) {
                         Ok(model) => {
                             return self.modify_model(
                                 "Saving managed model settings…",
-                                move |registry, _| {
-                                    let updated = registry.configure(model)?;
+                                move |registry, expected| {
+                                    let updated = if java_review {
+                                        registry.configure_checked(model, |current| {
+                                            java_models::require_review_policy()?;
+                                            if current != expected {
+                                                return Err(io::Error::other("The selected GGUF model changed. Refresh and review it again."));
+                                            }
+                                            Ok(())
+                                        })?
+                                    } else {
+                                        registry.configure(model)?
+                                    };
                                     Ok(format!("Saved settings for {}.", updated.name))
                                 },
                             );
@@ -840,6 +902,55 @@ mod tests {
             external: None,
             projector_bytes: None,
         }
+    }
+
+    #[test]
+    fn java_model_suggestions_only_stage_for_a_selected_matching_gguf_purpose() {
+        let mut models = Models::default();
+        let hint = Hint {
+            id: "source-model".into(),
+            name: "Java suggestion".into(),
+            published_at: None,
+            metadata: Metadata::Gguf {
+                backend: ModelBackend::Metal,
+                purpose: Purpose::Embedding,
+                context: 0,
+                threads: 16,
+                gpu_layers: 5,
+                idle_minutes: 0,
+            },
+        };
+        assert!(!models.stage_java_settings(&hint));
+        let chat = model("0123456789abcdef0123456789abcdef", "Chat", Purpose::Chat);
+        models.selected = Some(Choice {
+            model: chat,
+            is_default: false,
+        });
+        assert!(!models.stage_java_settings(&hint));
+        let embedding = model(
+            "123456789abcdef0123456789abcdef0",
+            "Native embeddings",
+            Purpose::Embedding,
+        );
+        models.selected = Some(Choice {
+            model: embedding.clone(),
+            is_default: false,
+        });
+        assert!(models.stage_java_settings(&hint));
+        let Some(Action::Configure(draft)) = models.action.as_ref() else {
+            panic!("expected a reviewable draft");
+        };
+        assert!(draft.java_review);
+        let proposed = draft.settings(&embedding).unwrap();
+        assert_eq!(proposed.id, embedding.id);
+        assert_eq!(proposed.backend, embedding.backend);
+        assert_eq!(proposed.context_tokens, embedding.context_tokens);
+        assert_eq!(proposed.purpose, embedding.purpose);
+        assert_eq!(proposed.name, hint.name);
+        assert_eq!(proposed.cpu_threads, 16);
+        assert_eq!(proposed.gpu_layers, 5);
+        assert_eq!(proposed.idle_timeout_minutes, 0);
+        assert_eq!(models.selected.as_ref().unwrap().model, embedding);
     }
 
     fn loaded(models: Vec<Model>, root: &Path) -> ManagerMessage {

@@ -140,20 +140,22 @@ impl Request {
         [&self.system, &self.input]
     }
 
-    pub(crate) fn with_system(
+    pub(crate) fn with_messages(
         &self,
         system: String,
+        input: String,
         limit: usize,
         redactor: &Redactor,
     ) -> Result<Self, String> {
         if redactor.contains_known_secret(&system)
-            || !super::super::usage::fits_context(&system, &self.input, limit)
+            || redactor.contains_known_secret(&input)
+            || !super::super::usage::fits_context(&system, &input, limit)
         {
-            return Err("The Swarm comparison with knowledge could not be safely masked or exceeds the selected profile's context limit.".into());
+            return Err("The Swarm comparison with additional evidence could not be safely masked or exceeds the selected profile's context limit.".into());
         }
         Ok(Self {
             system,
-            input: self.input.clone(),
+            input,
             target_count: self.target_count,
             max_markdown_bytes: self.max_markdown_bytes,
         })

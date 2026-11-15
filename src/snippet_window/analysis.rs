@@ -999,6 +999,34 @@ fn report<'a>(
             .then(|| text(&analysis.summary).wrapping(Wrapping::WordOrGlyph)),
     ]
     .spacing(8);
+    if let Some(history) = &record.java_history {
+        body = body.push(text("Imported Java history").size(16));
+        for run in &history.apply_runs {
+            body = body.push(
+                column![
+                    text(run.outcome.label(run.saved_to_snippet_at)).size(13),
+                    (!run.summary.is_empty())
+                        .then(|| text(&run.summary).size(13).wrapping(Wrapping::WordOrGlyph)),
+                ]
+                .spacing(3),
+            );
+        }
+        if let Some(verification) = &history.verification {
+            body = body.push(
+                text(format!(
+                    "Verification · {} resolved, {} persisting, {} new",
+                    verification.resolved_previous_ids.len(),
+                    verification.persisting_current_to_previous.len(),
+                    verification.new_ids.len()
+                ))
+                .size(13),
+            );
+        }
+        if !history.attachments.is_empty() {
+            body =
+                body.push(text("Export JSON with code to view the historical snapshots.").size(13));
+        }
+    }
     if !provenance.knowledge_citations.is_empty() {
         body = body.push(text("Knowledge citations").size(16));
         for (index, citation) in provenance.knowledge_citations.iter().enumerate() {

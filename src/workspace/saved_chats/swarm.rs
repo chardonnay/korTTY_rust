@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::io::{self, Read, Write};
 use std::path::Path;
+use std::time::Instant;
 
 use kortty_jobs::{
     MAX_SWARM_QUESTION_BYTES, MAX_SWARM_TARGET_DETAIL_BYTES, MAX_SWARM_TARGET_LABEL_BYTES,
@@ -13,8 +14,8 @@ use zeroize::Zeroizing;
 
 use crate::private_files::{Directory, FileStamp, require_single_link};
 use crate::session_journal::is_display_character;
-use crate::terminal_agent::swarm::MAX_TARGETS;
 use crate::terminal_agent::swarm::comparison::MAX_MARKDOWN_BYTES;
+use crate::terminal_agent::swarm::{MAX_TARGETS, Row};
 
 use super::store::{fingerprint, lock, valid_id};
 
@@ -65,6 +66,34 @@ pub(in crate::workspace) struct Turn {
     // as the report ID. An explicit route list allows archived live targets.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(in crate::workspace) routes: Option<Vec<SavedRoute>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(in crate::workspace) target_metrics: Vec<TargetMetrics>,
+}
+
+/// Presentation data from a completed target attempt, keyed by the report's target ID.
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::workspace) struct TargetMetrics {
+    pub(in crate::workspace) target: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::workspace) elapsed_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(in crate::workspace) total_tokens: Option<u64>,
+}
+
+impl TargetMetrics {
+    pub(in crate::workspace) fn from_row(target: u64, row: &Row, now: Instant) -> Option<Self> {
+        let metrics = Self {
+            target,
+            elapsed_seconds: row.elapsed_seconds(now),
+            total_tokens: row.usage_tokens,
+        };
+        metrics.present().then_some(metrics)
+    }
+
+    fn present(&self) -> bool {
+        self.elapsed_seconds.is_some() || self.total_tokens.is_some()
+    }
 }
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
@@ -83,6 +112,7 @@ impl From<SwarmReport> for Turn {
             targets: report.targets,
             comparison: report.comparison,
             routes: None,
+            target_metrics: Vec::new(),
         }
     }
 }
@@ -380,6 +410,7 @@ fn seed_turn(
                     initial.question == turn.question
                         && initial.targets == turn.targets
                         && initial.routes == turn.routes
+                        && initial.target_metrics == turn.target_metrics
                         && turn
                             .comparison
                             .as_ref()
@@ -823,6 +854,11 @@ fn valid_turn(turn: &Turn) -> bool {
                         && valid_route(route)
                 })
         })
+        && turn.target_metrics.len() <= ids.len()
+        && turn
+            .target_metrics
+            .iter()
+            .all(|metrics| metrics.present() && ids.remove(&metrics.target))
 }
 
 fn valid_route(route: &SavedRoute) -> bool {

@@ -308,6 +308,29 @@ impl Run {
         let active = !self.closing && !self.cancel.requested();
         let ready = active && !self.paused;
         let back = active.then_some(Review::CancelClassification(self.epoch));
+        if review.web_active() {
+            if ready {
+                return review.web_view(self.epoch).map(|view| {
+                    column![view]
+                        .height(match request_height {
+                            Length::Fixed(_) => Length::Fixed(320.0),
+                            height => height,
+                        })
+                        .into()
+                });
+            }
+            return Some(
+                row![
+                    text("Web search paused"),
+                    button("Close web review").on_press_maybe(active.then_some(Review::Web(
+                        self.epoch,
+                        super::request_review::WebMessage::Close,
+                    ))),
+                ]
+                .spacing(6)
+                .into(),
+            );
+        }
         Some(match &review.classification {
             Classification::Closed => column![
                 text(review.title()).size(15),
@@ -332,6 +355,17 @@ impl Run {
                 })
                 .height(request_height),
                 row![
+                    review.web_available().then(|| {
+                        let (label, message) = if review.web_included() {
+                            ("Remove web excerpts", request_review::WebMessage::Close)
+                        } else {
+                            ("Search web…", request_review::WebMessage::Open)
+                        };
+                        button(label).on_press_maybe(
+                            (ready && !review.knowledge_busy())
+                                .then_some(Review::Web(self.epoch, message)),
+                        )
+                    }),
                     review.classifier.as_ref().map(|_| {
                         button("Review skill classification…").on_press_maybe(
                             (ready && !review.knowledge_busy())

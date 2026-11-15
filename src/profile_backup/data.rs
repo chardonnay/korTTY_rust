@@ -19,6 +19,7 @@ use crate::{connection_store, profile, scheduler_window::SshCommand, snippets, s
 use super::Snapshot;
 
 pub(super) mod ai;
+pub(super) mod analysis;
 #[cfg(test)]
 mod tests;
 
@@ -93,12 +94,19 @@ pub(super) fn collect(root: &Path) -> io::Result<Snapshot> {
         }
     }
     ai::collect(&directory, &mut snapshot, &mut total)?;
+    analysis::collect(&directory, &mut snapshot, &mut total)?;
     validate(&snapshot)?;
     Ok(snapshot)
 }
 
 pub(super) fn portable_jobs(bytes: &[u8]) -> io::Result<Vec<u8>> {
-    SchedulerStore::portable_backup_with(bytes, |action| {
+    SchedulerStore::portable_backup_project(bytes, |definition, action| {
+        if let Some(journal) = action
+            .get_mut("automation_journal")
+            .and_then(serde_json::Value::as_object_mut)
+        {
+            journal.remove("summary_profile");
+        }
         if let Some(agent) = action
             .get_mut("agent")
             .and_then(serde_json::Value::as_object_mut)
@@ -123,6 +131,37 @@ pub(super) fn portable_jobs(bytes: &[u8]) -> io::Result<Vec<u8>> {
             )
         {
             remote.remove("approval");
+            if matches!(
+                remote.get("kind").and_then(serde_json::Value::as_str),
+                Some("rsync_download" | "rsync_upload")
+            ) {
+                if remote.get("elevation").and_then(serde_json::Value::as_str)
+                    == Some("passwordless")
+                    || ["existing", "existing_download", "mixed"]
+                        .into_iter()
+                        .any(|field| remote.get(field).is_some_and(|value| !value.is_null()))
+                {
+                    definition.enabled = false;
+                }
+                if let Some(standing) = remote
+                    .get_mut("standing")
+                    .and_then(serde_json::Value::as_object_mut)
+                {
+                    standing.remove("approval");
+                    definition.enabled = false;
+                }
+                if let Some(routes) = remote
+                    .get_mut("routes")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for route in routes
+                        .iter_mut()
+                        .filter_map(serde_json::Value::as_object_mut)
+                    {
+                        route.remove("approval");
+                    }
+                }
+            }
         }
     })
     .map_err(invalid)
@@ -182,6 +221,14 @@ pub(super) fn installed_background_ids(
 }
 
 pub(super) fn validate(snapshot: &Snapshot) -> io::Result<()> {
+    validate_entries(snapshot, false)
+}
+
+pub(super) fn validate_java(snapshot: &Snapshot) -> io::Result<()> {
+    validate_entries(snapshot, true)
+}
+
+fn validate_entries(snapshot: &Snapshot, java: bool) -> io::Result<()> {
     if snapshot.len() > MAX_ENTRIES {
         return Err(invalid("too many files in a profile backup"));
     }
@@ -196,19 +243,31 @@ pub(super) fn validate(snapshot: &Snapshot) -> io::Result<()> {
     let allowed_keys = expected_keys.clone();
     let mut expected_backgrounds = background_ids(snapshot)?;
     for (path, bytes) in snapshot {
-        if !allowed_path(path) || bytes.len() > file_limit(path) {
+        let java_statistics = java && path == crate::ai_manager::backup::JAVA_STATISTICS;
+        let limit = if java_statistics {
+            crate::ai_manager::backup::MAX_STATISTICS_BYTES
+        } else {
+            file_limit(path)
+        };
+        if (!java_statistics && !allowed_path(path)) || bytes.len() > limit {
             return Err(invalid("unsupported or oversized profile backup entry"));
         }
         total += bytes.len();
         if total > MAX_TOTAL_BYTES {
             return Err(invalid("profile backup data exceed 128 MiB"));
         }
+        if java_statistics {
+            crate::ai_manager::backup::validate_java_statistics(bytes)?;
+            continue;
+        }
         match path.as_str() {
             "connections.json" => connection_store::validate_backup(bytes)?,
-            "jobs.json" => SchedulerStore::validate_backup(bytes, |action: SshCommand| {
-                action.validated().is_ok()
-            })
-            .map_err(invalid)?,
+            "jobs.json" => {
+                let graph = SchedulerStore::decode_backup::<SshCommand>(bytes).map_err(invalid)?;
+                for job in graph.jobs() {
+                    SshCommand::validate_definition(job).map_err(invalid)?;
+                }
+            }
             markers::FILE => markers::validate_backup(bytes)?,
             "environments.json" | "toolbar.json" | WINDOW_SETTINGS => {
                 backup_data::validate(path, bytes)?;
@@ -219,6 +278,7 @@ pub(super) fn validate(snapshot: &Snapshot) -> io::Result<()> {
             "vault/vault.bin" => Vault::validate_backup_envelope(bytes).map_err(invalid)?,
             KEY_CATALOG => {}
             path if ai::file_limit(path).is_some() => ai::validate(path, bytes)?,
+            path if analysis::filename(path).is_some() => {}
             _ => {
                 if let Some(id) = AssetId::from_relative_path(path) {
                     if !expected_backgrounds.remove(&id) {
@@ -258,12 +318,14 @@ pub(super) fn validate(snapshot: &Snapshot) -> io::Result<()> {
             "terminal theme settings are missing a background image",
         ));
     }
+    analysis::validate(snapshot)?;
     Ok(())
 }
 
 pub(super) fn allowed_path(path: &str) -> bool {
     STATIC_PATHS.contains(&path)
         || ai::file_limit(path).is_some()
+        || analysis::filename(path).is_some()
         || AssetId::from_relative_path(path).is_some()
         || path
             .strip_prefix("projects/")
@@ -285,6 +347,9 @@ pub(super) fn file_limit(path: &str) -> usize {
         "vault/vault.bin" => 4 * 1024 * 1024,
         _ if AssetId::from_relative_path(path).is_some() => background_image::MAX_STORED_BYTES,
         _ if path.starts_with("projects/") => 256 * 1024,
+        _ if analysis::filename(path).is_some() => {
+            crate::snippet_analysis::store::java::MAX_BACKUP_BYTES
+        }
         _ => ai::file_limit(path).unwrap_or(1024 * 1024),
     }
 }

@@ -7,6 +7,9 @@ use std::sync::Arc;
 use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Element, Length};
 
+use crate::terminal_agent::swarm::Status;
+use crate::workspace::terminal_agent::swarm::status_strip;
+
 use super::{Message, TITLE, cell, date, swarm};
 
 pub(super) enum Request {
@@ -287,6 +290,9 @@ impl Library {
 }
 
 fn archive_view(archive: &swarm::java_archive::Archive) -> Element<'_, Message> {
+    let status = archive
+        .latest_servers()
+        .map(|servers| status_strip::static_view(servers.iter().map(archive_status).collect()));
     let messages = column(archive.messages.iter().map(|message| {
         let heading = if message.profile_name.is_empty() {
             format!("{} · {}", message.role.label(), date(message.created))
@@ -299,13 +305,16 @@ fn archive_view(archive: &swarm::java_archive::Archive) -> Element<'_, Message> 
             )
         };
         let servers = column(message.servers.iter().map(|server| {
+            let metrics = server
+                .elapsed_seconds
+                .map(|seconds| format!("{seconds} s"))
+                .into_iter()
+                .chain(server.total_tokens.map(|tokens| format!("{tokens} tokens")))
+                .collect::<Vec<_>>()
+                .join(" · ");
             column![
                 text(format!("{} · {}", server.display_name, server.state)),
-                text(format!(
-                    "{} s · {} tokens",
-                    server.elapsed_seconds, server.total_tokens
-                ))
-                .size(12),
+                (!metrics.is_empty()).then(|| text(metrics).size(12)),
                 (!server.summary.is_empty()).then(|| text(&server.summary).size(13)),
             ]
             .spacing(3)
@@ -330,6 +339,7 @@ fn archive_view(archive: &swarm::java_archive::Archive) -> Element<'_, Message> 
             .response_language
             .as_ref()
             .map(|language| text(format!("Response language · {language}")).size(13)),
+        status,
         scrollable(column![
             archive
                 .messages
@@ -344,6 +354,28 @@ fn archive_view(archive: &swarm::java_archive::Archive) -> Element<'_, Message> 
     .padding(14)
     .height(Length::Fill)
     .into()
+}
+
+fn archive_status(server: &swarm::java_archive::Server) -> status_strip::Target {
+    let state = match server.state.trim().to_ascii_uppercase().as_str() {
+        "QUEUED" => Status::Queued.into(),
+        "CONNECTING" | "PROBING" => Status::Starting.into(),
+        "RUNNING" => Status::Running.into(),
+        "AWAITING_APPROVAL" => Status::Review.into(),
+        "PAUSED" => Status::Paused.into(),
+        "DONE" => Status::Succeeded.into(),
+        "FAILED" => Status::Failed.into(),
+        "CANCELLED" => Status::Cancelled.into(),
+        _ => status_strip::State::Skipped,
+    };
+    status_strip::Target {
+        name: server.display_name.clone(),
+        state,
+        elapsed_seconds: server.elapsed_seconds,
+        total_tokens: server.total_tokens.filter(|&tokens| tokens != 0),
+        slow: false,
+        ticket: None,
+    }
 }
 
 #[cfg(test)]

@@ -817,7 +817,7 @@ pub(super) fn main_window_settings(placement: WindowPlacement) -> window::Settin
         icon: super::coding_agent_app_icon::windows_icon(0),
         #[cfg(target_os = "linux")]
         platform_specific: window::settings::PlatformSpecific {
-            application_id: kortty_windowing::DESKTOP_APP_ID.into(),
+            application_id: kortty_windowing::desktop_app_id().into(),
             ..Default::default()
         },
         ..window::Settings::default()

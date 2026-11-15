@@ -20,7 +20,7 @@ pub(super) const MAX_FOLDERS: usize = MAX_SNIPPETS * MAX_DEPTH + 1024;
 pub(crate) struct Id(SnippetId);
 
 impl Id {
-    pub(super) fn from_java_uuid(text: &str) -> io::Result<Self> {
+    pub(crate) fn from_java_uuid(text: &str) -> io::Result<Self> {
         SnippetId::from_java_uuid(text).map(Self)
     }
 

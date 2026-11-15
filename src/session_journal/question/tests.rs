@@ -9,8 +9,7 @@ use crate::ai_manager::Configuration;
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::local_ai::Client;
 use crate::local_ai::test_support::{
-    accept, exclusive_run, fixture_http_response, fixture_response, listener, start_test_double,
-    wire_request,
+    accept, exclusive_run, fixture_http_response, listener, start_test_double, wire_request,
 };
 use crate::session_journal::{catalog, tree};
 
@@ -160,20 +159,34 @@ fn journal_answer_transmits_only_the_review_and_rejects_invented_quotes() {
             "",
             r#"{"error":{"code":"unsupported_response_format"}}"#,
         ),
-        fixture_response(
+        fixture_http_response(
             "200 OK",
             "",
-            r#"{"findings":[{"citation":1,"quote":"The deploy failed with exit 7."}]}"#,
+            &json!({
+                "choices": [{"message": {"content": r#"{"findings":[{"citation":1,"quote":"The deploy failed with exit 7."}]}"#}}],
+                "usage": {"prompt_tokens": 8, "completion_tokens": 5}
+            })
+            .to_string(),
         ),
-        fixture_response(
+        fixture_http_response(
             "200 OK",
-            "",
-            r#"{"findings":[{"citation":1,"quote":"The deploy succeeded."}]}"#,
+            "Content-Type: text/event-stream\r\n",
+            "data: {\"choices\":[],\"usage\":{\"total_tokens\":17}}\n\ndata: {\"error\":\"invalid answer\"}\n\n",
         ),
     ]);
     let (worker, _cancel) = Answering::begin(profile).unwrap();
-    assert!(worker.answer(&review, &|| false, |_| {}).unwrap().ai_used);
-    assert!(!worker.answer(&review, &|| false, |_| {}).unwrap().ai_used);
+    let answer = worker.answer(&review, &|| false, |_| {});
+    assert!(answer.result.unwrap().ai_used);
+    let usage = answer.usage.unwrap();
+    assert_eq!(usage.calls, 1);
+    assert_eq!(usage.total_tokens, Some(13));
+    assert!(!usage.partial);
+    let invalid = worker.answer(&review, &|| false, |_| {});
+    assert!(!invalid.result.unwrap().ai_used);
+    let usage = invalid.usage.unwrap();
+    assert_eq!(usage.calls, 1);
+    assert_eq!(usage.total_tokens, Some(17));
+    assert!(usage.partial);
     let requests = server.join().unwrap();
     assert_eq!(requests[0]["response_format"]["type"], "json_object");
     assert!(requests[1].get("response_format").is_none());
@@ -186,12 +199,14 @@ fn journal_answer_transmits_only_the_review_and_rejects_invented_quotes() {
 
     let (endpoint, profile) = listener();
     let (worker, _cancel) = Answering::begin(profile).unwrap();
+    let cancelled = worker.answer(&review, &|| true, |_| {});
     assert_eq!(
-        worker.answer(&review, &|| true, |_| {}).unwrap_err().kind(),
+        cancelled.result.unwrap_err().kind(),
         io::ErrorKind::Interrupted
     );
+    assert!(cancelled.usage.is_none());
     write_document(&path, "source", "Changed", 1, "New note");
-    assert!(worker.answer(&review, &|| false, |_| {}).is_err());
+    assert!(worker.answer(&review, &|| false, |_| {}).result.is_err());
     assert_eq!(
         endpoint.accept().unwrap_err().kind(),
         io::ErrorKind::WouldBlock
@@ -225,7 +240,7 @@ fn journal_native_answer_transmits_the_bound_system_once() {
     )
     .unwrap();
     let (worker, _cancel) = Answering::begin(profile.clone()).unwrap();
-    assert!(worker.answer(&review, &|| false, |_| {}).is_err());
+    assert!(worker.answer(&review, &|| false, |_| {}).result.is_err());
     assert_eq!(
         endpoint.accept().unwrap_err().kind(),
         io::ErrorKind::WouldBlock
@@ -262,7 +277,13 @@ fn journal_native_answer_transmits_the_bound_system_once() {
             )
             .unwrap();
     });
-    assert!(worker.answer(&review, &|| false, |_| {}).unwrap().ai_used);
+    assert!(
+        worker
+            .answer(&review, &|| false, |_| {})
+            .result
+            .unwrap()
+            .ai_used
+    );
     server.join().unwrap();
 }
 
@@ -323,7 +344,7 @@ fn journal_https_answer_rejects_an_unreviewed_or_stale_payload_before_tls() {
     };
     let mut original = review();
     assert!(!original.citations.is_empty());
-    assert!(worker.answer(&original, &|| false, |_| {}).is_err());
+    assert!(worker.answer(&original, &|| false, |_| {}).result.is_err());
     let mut too_small = original.clone();
     assert!(too_small.mask_for_https(&profile, 1, &masked).is_err());
     assert_eq!(too_small.answer_messages(), original.answer_messages());
@@ -342,10 +363,11 @@ fn journal_https_answer_rejects_an_unreviewed_or_stale_payload_before_tls() {
 
     let mut edited = original.clone();
     edited.citations[0].excerpt.push_str(" added after review");
-    assert!(worker.answer(&edited, &|| false, |_| {}).is_err());
+    assert!(worker.answer(&edited, &|| false, |_| {}).result.is_err());
     assert_eq!(
         worker
             .answer(&original, &|| true, |_| {})
+            .result
             .unwrap_err()
             .kind(),
         io::ErrorKind::Interrupted
@@ -361,6 +383,7 @@ fn journal_https_answer_rejects_an_unreviewed_or_stale_payload_before_tls() {
     assert!(
         worker
             .answer(&original, &|| false, |_| {})
+            .result
             .unwrap_err()
             .to_string()
             .contains("journal changed")
@@ -373,6 +396,7 @@ fn journal_https_answer_rejects_an_unreviewed_or_stale_payload_before_tls() {
     assert!(
         worker
             .answer(&fresh, &|| false, |_| {})
+            .result
             .unwrap_err()
             .to_string()
             .contains("saved HTTPS profile")
@@ -443,7 +467,7 @@ fn journal_https_native_tls_transmits_only_the_reviewed_answer() {
         assert!(!review.answer_messages()[1].contains(key.as_str()));
         let (mut worker, _cancel) = Answering::begin_reviewed_https(profile, authority).unwrap();
         worker.session.trust_test_server(&ca).unwrap();
-        let answer = worker.answer(&review, &|| false, |_| {}).unwrap();
+        let answer = worker.answer(&review, &|| false, |_| {}).result.unwrap();
         assert!(answer.ai_used, "expected an HTTPS answer from {mode}");
         assert_eq!(answer.findings.len(), 1);
         assert_eq!(answer.findings[0].quote, "The deploy failed with exit 7.");

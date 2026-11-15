@@ -8,7 +8,7 @@ use iced::{Element, Size, Task, window};
 
 use crate::profile;
 use crate::snippets::recipients::{
-    Action, CertificateInfo, Choice, FILE_NAME, inspect_certificate,
+    Action, CertificateInfo, Choice, FILE_NAME, Management, inspect_certificate,
 };
 use crate::workspace::dialog_placement::Kind as DialogKind;
 
@@ -25,7 +25,7 @@ pub enum Message {
     Focus,
     Escape,
     Page(PageMessage),
-    Finished(u64, Result<Vec<Choice>, String>),
+    Finished(u64, Result<Management, String>),
     CacheRefreshed(u64, Result<Vec<Choice>, String>),
     Previewed(u64, Result<CertificateInfo, String>),
     Browser(browser::Message),
@@ -452,7 +452,7 @@ impl Window {
 
 fn action_task(id: window::Id, token: u64, action: Action) -> Task<Desktop> {
     file_task(
-        move || action.run(),
+        move || action.run_management(),
         move |result| wrap(id, Message::Finished(token, result)),
     )
 }
@@ -501,6 +501,13 @@ mod tests {
         .unwrap()
     }
 
+    fn management(choices: Vec<Choice>) -> Management {
+        Management {
+            choices,
+            pending_java: Vec::new(),
+        }
+    }
+
     #[test]
     fn only_the_current_window_and_worker_can_refresh_backup_recipients() {
         let mut workspace = Workspace::default();
@@ -512,22 +519,32 @@ mod tests {
 
         let _ = workspace.update_openpgp(
             window::Id::unique(),
-            Message::Finished(work, Ok(vec![choice("Closed window")])),
+            Message::Finished(work, Ok(management(vec![choice("Closed window")]))),
         );
         let _ = workspace.update_openpgp(
             id,
-            Message::Finished(work.wrapping_add(1), Ok(vec![choice("Obsolete work")])),
+            Message::Finished(
+                work.wrapping_add(1),
+                Ok(management(vec![choice("Obsolete work")])),
+            ),
         );
         let _ = workspace.update_openpgp(
             id,
-            Message::Page(PageMessage::Finished(Ok(vec![choice("Unstamped")]))),
+            Message::Page(PageMessage::Finished(Ok(management(vec![choice(
+                "Unstamped",
+            )])))),
         );
         assert_eq!(workspace.backup_recipients, [choice("Cached")]);
 
-        let _ = workspace.update_openpgp(id, Message::Finished(work, Ok(vec![choice("Current")])));
+        let _ = workspace.update_openpgp(
+            id,
+            Message::Finished(work, Ok(management(vec![choice("Current")]))),
+        );
         let refresh = workspace.openpgp_cache_refresh.unwrap();
-        let _ =
-            workspace.update_openpgp(id, Message::Finished(work, Ok(vec![choice("Duplicate")])));
+        let _ = workspace.update_openpgp(
+            id,
+            Message::Finished(work, Ok(management(vec![choice("Duplicate")]))),
+        );
         assert_eq!(workspace.openpgp_cache_refresh, Some(refresh));
         let _ = workspace.update_openpgp(
             id,
@@ -565,12 +582,12 @@ mod tests {
         let second_work = workspace.openpgp[&second].work.unwrap();
         let _ = workspace.update_openpgp(
             first,
-            Message::Finished(first_work, Ok(vec![choice("First view")])),
+            Message::Finished(first_work, Ok(management(vec![choice("First view")]))),
         );
         let stale_refresh = workspace.openpgp_cache_refresh.unwrap();
         let _ = workspace.update_openpgp(
             second,
-            Message::Finished(second_work, Ok(vec![choice("Second view")])),
+            Message::Finished(second_work, Ok(management(vec![choice("Second view")]))),
         );
         let current_refresh = workspace.openpgp_cache_refresh.unwrap();
         let _ = workspace.update_openpgp(
@@ -594,7 +611,7 @@ mod tests {
             .hosted_tool_in(source, tool_tabs::Kind::OpenPgp)
             .unwrap();
         let work = workspace.openpgp[&id].work.unwrap();
-        let _ = workspace.update_openpgp(id, Message::Finished(work, Ok(Vec::new())));
+        let _ = workspace.update_openpgp(id, Message::Finished(work, Ok(management(Vec::new()))));
         let _ = workspace.update_openpgp(id, Message::Page(PageMessage::New));
         let _ = workspace.update_openpgp(
             id,
@@ -625,7 +642,8 @@ mod tests {
                     .unwrap();
                 let tab = workspace.windows[&owner].tabs[0].id();
                 let work = workspace.openpgp[&id].work.unwrap();
-                let _ = workspace.update_openpgp(id, Message::Finished(work, Ok(Vec::new())));
+                let _ = workspace
+                    .update_openpgp(id, Message::Finished(work, Ok(management(Vec::new()))));
                 let _ = workspace.update_openpgp(id, Message::Page(PageMessage::New));
                 let _ = workspace.update_openpgp(id, Message::Page(PageMessage::Name(name.into())));
                 assert!(workspace.hosted_openpgp_dirty(id));
@@ -681,7 +699,7 @@ mod tests {
             workspace.hosted_tool_in(destination, tool_tabs::Kind::OpenPgp),
             Some(id)
         );
-        let _ = workspace.update_openpgp(id, Message::Finished(work, Ok(Vec::new())));
+        let _ = workspace.update_openpgp(id, Message::Finished(work, Ok(management(Vec::new()))));
         assert!(!workspace.hosted_openpgp_busy(id));
         let _ = workspace.update_openpgp(id, Message::Page(PageMessage::New));
         let _ =
@@ -701,7 +719,7 @@ mod tests {
         let _ = workspace.show_openpgp(source);
         let id = workspace.openpgp_for_source(source).unwrap();
         let work = workspace.openpgp[&id].work.unwrap();
-        let _ = workspace.update_openpgp(id, Message::Finished(work, Ok(Vec::new())));
+        let _ = workspace.update_openpgp(id, Message::Finished(work, Ok(management(Vec::new()))));
         let _ = workspace.update(Desktop::Window(id, window::Event::Focused));
 
         let _ = workspace.native_menu(Action::CloseWindow as u16);
@@ -732,7 +750,7 @@ mod tests {
         let _ = workspace.show_openpgp(source);
         let id = workspace.openpgp_for_source(source).unwrap();
         let work = workspace.openpgp[&id].work.unwrap();
-        let _ = workspace.update_openpgp(id, Message::Finished(work, Ok(Vec::new())));
+        let _ = workspace.update_openpgp(id, Message::Finished(work, Ok(management(Vec::new()))));
         assert_eq!(workspace.owner_dialog(source).map(|(id, _)| id), Some(id));
 
         let _ = workspace.quit();

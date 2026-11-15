@@ -3,12 +3,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Instant;
 
 use iced::widget::{button, column, row, scrollable, text};
 use iced::{Element, Length, Task, window};
 use zeroize::Zeroizing;
 
-use crate::ai_manager::{Configuration, MemoryPrompt, RetrievedKnowledge};
+use crate::ai_manager::reviewed_memory::Memory;
+use crate::ai_manager::{Configuration, RetrievedKnowledge};
 use crate::clipboard_policy::AiMemoryPolicy;
 use crate::local_ai;
 use crate::terminal_agent::Cancel;
@@ -16,6 +18,7 @@ use crate::terminal_agent::swarm::comparison::{Evidence, Report, Request, transp
 use crate::terminal_logging::{Redactor, Secrets};
 use crate::workspace::ai_quota;
 use crate::workspace::saved_chats::swarm::{self as store, Record};
+use crate::workspace::terminal_ai::web;
 
 use super::super::knowledge_review::{self, system_with_excerpts};
 use super::super::policy::Dispatch;
@@ -102,12 +105,14 @@ struct Authority {
     transport: (local_ai::Profile, usize),
     redactor: Redactor,
     memory_policy: AiMemoryPolicy,
-    memory: Option<MemoryPrompt>,
+    memory: Memory,
+    memory_mask: knowledge_review::Mask,
     outbound: Option<OutboundAuthority>,
     routes: Vec<Arc<Dispatch>>,
     saved: Option<SavedRound>,
     vault_revision: std::sync::Weak<()>,
     knowledge_credential: Option<Zeroizing<String>>,
+    web: Option<super::web_evidence::Evidence>,
 }
 
 impl State {
@@ -226,6 +231,8 @@ impl State {
         let mut routes = Vec::new();
         let mut connections = std::collections::HashSet::new();
         let mut targets = Vec::new();
+        let mut target_metrics = Vec::new();
+        let now = Instant::now();
         for (index, row) in queue.rows().iter().enumerate() {
             let target = index as u64 + 1;
             let source = round.sources.get(&row.target.key);
@@ -259,6 +266,7 @@ impl State {
                     detail
                 },
             });
+            target_metrics.extend(store::TargetMetrics::from_row(target, row, now));
             if let Some(selected) = group
                 .choices
                 .iter()
@@ -296,6 +304,7 @@ impl State {
                 targets,
                 comparison,
                 routes: Some(routes),
+                target_metrics,
             },
         })
     }
@@ -412,7 +421,12 @@ impl Round {
             .is_none_or(|saved| saved.record.is_some())
     }
 
-    fn prepare(&self, workspace: &Workspace, queue: &Queue) -> Result<Review, String> {
+    fn prepare(
+        &self,
+        workspace: &Workspace,
+        queue: &Queue,
+        web_evidence: Option<&super::web_evidence::Evidence>,
+    ) -> Result<Review, String> {
         let policy = workspace.swarm_policy_for(self.mode)?;
         let configuration = workspace.ai_configuration().ok_or(PROFILE_CHANGED)?;
         if configuration.saved_root() != self.configuration.saved_root()
@@ -433,13 +447,16 @@ impl Round {
             mask_evidence(redactor, value, outbound.as_ref(), workspace)
         };
         let memory_policy = workspace.clipboard.policy.ai_memory.clone();
-        let memory = configuration.load_memory(
-            configuration.saved_root(),
-            &memory_policy,
-            None,
-            false,
-            |text| mask_text(&redactor, text),
-        )?;
+        let knowledge_credential = self.transport.0.completion_secret();
+        let memory_mask = knowledge_review::Mask::new(
+            redactor.clone(),
+            knowledge_credential.clone(),
+            workspace.vault.as_ref(),
+        )
+        .for_targets(queue.rows().len());
+        let memory = Memory::masked(&configuration, &memory_policy, None, true, |text| {
+            memory_mask.apply(text)
+        })?;
         let (name, model, endpoint) = swarm_profile_entries(&configuration)
             .find_map(|(candidate, name, model, endpoint)| {
                 (candidate == self.profile.id).then_some((name, model, endpoint))
@@ -460,18 +477,31 @@ impl Round {
                 }
             })
             .collect::<Vec<_>>();
-        let request = Request::prepare(
+        let mut request = Request::prepare(
             &self.transport.0,
             &self.question,
             &rows,
-            memory.as_ref().map(MemoryPrompt::text),
+            memory.text(),
             self.transport.1,
             &redactor,
             mask_text,
         )?;
+        if let Some(evidence) = web_evidence {
+            evidence.require_current(workspace)?;
+            let masking = knowledge_review::Mask::new(
+                redactor.clone(),
+                self.transport.0.completion_secret(),
+                workspace.vault.as_ref(),
+            );
+            let [system, input] = request.messages();
+            let system =
+                web::system_with_guidance(system, self.transport.0.structured_system_suffix());
+            let mut input = input.to_owned();
+            input.push_str(&evidence.prompt_context(&masking)?);
+            request = request.with_messages(system, input, self.transport.1, &redactor)?;
+        }
         let [system, input] = request.messages();
         let cli = CliPresentation::prepare(&self.transport.0, system, input)?;
-        let knowledge_credential = self.transport.0.completion_secret();
         let knowledge = configuration.saved_root().and_then(|root| {
             let masking = knowledge_review::Mask::new(
                 redactor.clone(),
@@ -494,6 +524,7 @@ impl Round {
             redactor,
             memory_policy,
             memory,
+            memory_mask,
             outbound,
             routes: self
                 .sources
@@ -503,6 +534,7 @@ impl Round {
             saved: self.saved.clone(),
             vault_revision: workspace.vault_change_revision(),
             knowledge_credential,
+            web: web_evidence.cloned(),
         });
         authority.check_policy(&policy)?;
         authority.check_dispatch()?;
@@ -573,9 +605,16 @@ impl Authority {
         for route in &self.routes {
             route.check_with(policy)?;
         }
-        if let Some(memory) = &self.memory {
-            memory.require_current(&policy.ai_memory)?;
+        if self.memory.text().is_some()
+            && (self.vault_revision.strong_count() == 0
+                || self.knowledge_credential != self.transport.0.completion_secret())
+        {
+            return Err(crate::ai_manager::reviewed_memory::CHANGED.into());
         }
+        self.memory
+            .require_current_with(&self.configuration, &policy.ai_memory, |text| {
+                self.memory_mask.apply(text)
+            })?;
         if let Some(saved) = &self.saved {
             saved
                 .continuation
@@ -586,6 +625,9 @@ impl Authority {
     }
 
     fn check_profile_and_policy(&self) -> Result<(), String> {
+        if let Some(evidence) = &self.web {
+            evidence.check()?;
+        }
         self.transport.0.require_current_policy_authority()?;
         if let Some(outbound) = &self.outbound {
             outbound.check(&self.transport.0)?;
@@ -623,6 +665,9 @@ impl Authority {
     }
 
     fn require_current(&self, workspace: &Workspace) -> Result<(), String> {
+        if let Some(evidence) = &self.web {
+            evidence.require_current(workspace)?;
+        }
         let configuration = workspace.ai_configuration().ok_or(PROFILE_CHANGED)?;
         if *configuration != *self.configuration
             || self.profile.transport(&configuration)? != self.transport
@@ -649,7 +694,7 @@ impl Review {
         &mut self,
         retrieved: Option<(&RetrievedKnowledge, &knowledge_review::Mask)>,
     ) -> Result<(), String> {
-        let [base_system, _] = self.base.messages();
+        let [base_system, base_input] = self.base.messages();
         let transport = &self.authority.transport;
         let request = if let Some((retrieved, masking)) = retrieved {
             let system = system_with_excerpts(
@@ -659,8 +704,12 @@ impl Review {
             )
             .into_owned();
             masking.require_current(&system)?;
-            self.base
-                .with_system(system, transport.1, &self.authority.redactor)?
+            self.base.with_messages(
+                system,
+                base_input.into(),
+                transport.1,
+                &self.authority.redactor,
+            )?
         } else {
             self.base.clone()
         };
@@ -765,7 +814,7 @@ impl Workspace {
                 else {
                     return Ok(Task::none());
                 };
-                let mut review = Box::new(round.prepare(self, queue)?);
+                let mut review = Box::new(round.prepare(self, queue, group.round_web.as_ref())?);
                 state.epoch += 1;
                 let task = review.forecast(id, state.epoch);
                 state.stage = Stage::Review(review);
@@ -964,7 +1013,10 @@ impl State {
         let masking = knowledge
             .as_ref()
             .map(|_| authority.knowledge_mask(workspace));
-        let reviewed_https = (knowledge.is_some() && authority.transport.0.is_remote())
+        let reviewed_https = authority
+            .transport
+            .0
+            .is_remote()
             .then(|| authority.knowledge_credential.clone());
         let cancel = Cancel::default();
         let worker_cancel = cancel.clone();

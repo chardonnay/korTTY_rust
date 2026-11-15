@@ -35,10 +35,12 @@ pub(crate) enum JournalColumn {
     Trigger,
     RunId,
     ExitCode,
+    Stdout,
+    Stderr,
 }
 
 impl JournalColumn {
-    pub(super) const ALL: [Self; 9] = [
+    pub(super) const ALL: [Self; 11] = [
         Self::Started,
         Self::Finished,
         Self::Status,
@@ -48,6 +50,8 @@ impl JournalColumn {
         Self::Trigger,
         Self::RunId,
         Self::ExitCode,
+        Self::Stdout,
+        Self::Stderr,
     ];
 
     pub(super) fn label(self) -> &'static str {
@@ -61,6 +65,8 @@ impl JournalColumn {
             Self::Trigger => "Trigger",
             Self::RunId => "Run ID",
             Self::ExitCode => "Exit code",
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
         }
     }
 
@@ -211,6 +217,32 @@ mod tests {
         }
         assert!(!search.matches(fields));
         search.set_text(" ".into());
+        assert!(search.matches(fields));
+    }
+
+    #[test]
+    fn scheduler_journal_search_scopes_stdout_and_stderr_independently() {
+        let fields = [
+            (Some(JournalColumn::Stdout), "Published artifact"),
+            (Some(JournalColumn::Stderr), "Warning: stale index"),
+        ];
+        let mut search = Search::default();
+        search.set_text("pub*artifact warning".into());
+        assert!(search.matches(fields));
+        search.set_mode(JournalSearchMode::SelectedColumns);
+        search.toggle_columns();
+        assert!(!search.matches(fields));
+        search.set_column(JournalColumn::Stdout, true);
+        search.set_text("pub*artifact".into());
+        assert!(search.matches(fields));
+        search.set_text("warning".into());
+        assert!(!search.matches(fields));
+        search.set_column(JournalColumn::Stdout, false);
+        search.set_column(JournalColumn::Stderr, true);
+        assert!(search.matches(fields));
+        search.set_text("pub*artifact warning".into());
+        assert!(!search.matches(fields));
+        search.set_column(JournalColumn::Stdout, true);
         assert!(search.matches(fields));
     }
 }

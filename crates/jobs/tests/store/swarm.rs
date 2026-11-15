@@ -1,7 +1,7 @@
 use kortty_jobs::{
     FinishedRunMetadata, MAX_SWARM_COMPARISON_BYTES, MAX_SWARM_QUESTION_BYTES,
     MAX_SWARM_TARGET_DETAIL_BYTES, MAX_SWARM_TARGET_LABEL_BYTES, MAX_SWARM_TARGETS, ProfileRef,
-    RunId, RunRecord, SwarmChatOrigin, SwarmChatSeed, SwarmReport, SwarmTargetReport,
+    RunId, RunRecord, RunTrigger, SwarmChatOrigin, SwarmChatSeed, SwarmReport, SwarmTargetReport,
 };
 
 use super::*;
@@ -128,6 +128,71 @@ fn single_target_swarm_report_and_chat_seed_survive_reopen() {
             report: singleton,
         })
     );
+}
+
+#[test]
+fn dependency_and_cascade_swarm_reports_and_chat_seeds_survive_reopen() {
+    for trigger in [RunTrigger::Dependency, RunTrigger::Cascade] {
+        let directory = TestDirectory::new();
+        let path = directory.profile();
+        let predecessor = id("predecessor");
+        let swarm = id("swarm");
+        let jobs = JobGraph::new(vec![
+            Job::new(predecessor.clone(), "Predecessor", ()).unwrap(),
+            Job::new(swarm.clone(), "Swarm", ())
+                .unwrap()
+                .with_dependencies(DependencyMode::Chain, vec![predecessor.clone()], None),
+        ])
+        .unwrap();
+        let mut scheduler = Scheduler::new(jobs);
+        let started = if trigger == RunTrigger::Cascade {
+            scheduler.start_cascade(&predecessor, at(1))
+        } else {
+            scheduler.start_manual(&predecessor, at(1))
+        }
+        .unwrap();
+        let predecessor_finished = scheduler
+            .complete(started.started[0].id, RunOutcome::Success, at(2))
+            .unwrap();
+        let [started] = predecessor_finished.started.as_slice() else {
+            panic!("the predecessor must release exactly one Swarm firing");
+        };
+        assert_eq!(started.job, swarm);
+        assert_eq!(started.trigger, trigger);
+        let record = scheduler
+            .complete(started.id, RunOutcome::Success, at(3))
+            .unwrap()
+            .finished
+            .remove(0);
+        let mut store = SchedulerStore::open(&path).unwrap();
+        store
+            .commit(scheduler.graph(), &predecessor_finished.finished)
+            .unwrap();
+        let report = report(RunOutcome::Success);
+        let origin = origin(20);
+        commit_chat(
+            &mut store,
+            &scheduler,
+            &record,
+            report.clone(),
+            origin.clone(),
+        )
+        .unwrap();
+        drop(store);
+
+        let store = SchedulerStore::open(&path).unwrap();
+        assert_eq!(store.journal_record(record.id), Some(&record));
+        assert_eq!(store.journal_swarm_report(record.id), Some(&report));
+        assert_eq!(store.journal_swarm_chat_origin(record.id), Some(&origin));
+        assert_eq!(
+            store.pending_swarm_chat_seed(record.id),
+            Some(&SwarmChatSeed {
+                run: record.id,
+                origin,
+                report,
+            })
+        );
+    }
 }
 
 #[test]

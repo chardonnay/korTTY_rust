@@ -621,9 +621,9 @@ impl Page {
                 .profile_for_reference(config, reference)
                 .filter(|choice| !choice.cli || cli_allowed);
         }
-        cli_allowed
-            .then(|| config.preferred_snippet_analysis_cli_id())
-            .flatten()
+        config
+            .preferred_snippet_analysis_profile_id()
+            .filter(|id| cli_allowed || !config.is_terminal_cli_profile(*id))
             .or_else(|| config.code_analysis_profile_id())
             .and_then(|id| self.profiles.iter().find(|choice| choice.id == id))
             .or_else(|| {
@@ -704,7 +704,9 @@ impl Workspace {
         previous: &Arc<Configuration>,
     ) {
         let Some(current) = self.ai_configuration().filter(|current| {
-            previous.as_ref() == current.as_ref() && previous.policy_profiles_changed(current)
+            previous.as_ref() == current.as_ref()
+                && (previous.policy_profiles_changed(current)
+                    || previous.lm_studio_auto_profiles_changed(current))
         }) else {
             return;
         };

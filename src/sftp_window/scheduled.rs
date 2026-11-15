@@ -1,17 +1,18 @@
 //! Read-only proofs and bounded execution of reviewed folder-copy plans.
 
 use std::io::{self, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use kortty_ssh::sftp::Sftp;
+use kortty_ssh::{HostKey, sftp::Sftp};
 
 use super::compare::folders::{self, Request};
 use super::worker::Progress;
 use super::worker::sync::{self, CopyPlan};
 use super::{Location, Side};
+use crate::workspace::SshTarget;
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 pub(crate) use super::worker::server_copy::Folder as CheckedRemoteFolder;
 pub(crate) use super::worker::sync::{
     MAX_STANDING_ACTIONS, MAX_STANDING_BYTES, ReplacementPreview, StandingLimits,
@@ -57,6 +58,14 @@ pub(crate) struct Comparison<'a> {
     pub(crate) excludes: &'a str,
     pub(crate) replace_changed: bool,
     pub(crate) to: Side,
+    pub(crate) upload: Option<UploadContext<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct UploadContext<'a> {
+    pub(crate) route: &'a SshTarget,
+    pub(crate) peer: &'a HostKey,
+    pub(crate) profile: &'a Path,
 }
 
 impl Comparison<'_> {
@@ -64,12 +73,9 @@ impl Comparison<'_> {
         self,
         client: &mut Client,
         cancelled: &impl Fn() -> bool,
-        standing: Option<StandingLimits>,
+        standing: Option<(StandingLimits, Option<[u8; 32]>)>,
     ) -> Result<CopyPlan, String> {
-        if let Some(limits) = standing {
-            if self.replace_changed {
-                return Err("Standing approvals only create missing files and folders.".into());
-            }
+        if let Some((limits, _)) = standing {
             if !limits.valid() {
                 return Err("The standing copy limits are invalid.".into());
             }
@@ -85,7 +91,13 @@ impl Comparison<'_> {
         let review = folders::read(client, request, cancelled).map_err(|error| error.message)?;
         let review = Arc::new(review);
         match standing {
-            Some(limits) => CopyPlan::new_standing(review, self.to, limits),
+            Some((limits, expected_roots)) => CopyPlan::new_standing(
+                review,
+                self.to,
+                limits,
+                self.replace_changed,
+                expected_roots,
+            ),
             None if self.replace_changed => CopyPlan::new_replacing(review, self.to),
             None => CopyPlan::new(review, self.to),
         }
@@ -110,7 +122,7 @@ impl Comparison<'_> {
         limits: StandingLimits,
         cancelled: &impl Fn() -> bool,
     ) -> Result<StandingPreview, String> {
-        let mut plan = self.plan(client, cancelled, Some(limits))?;
+        let mut plan = self.plan(client, cancelled, Some((limits, None)))?;
         let root_binding = plan
             .standing_binding()
             .ok_or("The standing copy folders could not be verified")?;
@@ -143,6 +155,10 @@ impl Comparison<'_> {
         claim: impl FnOnce() -> io::Result<()>,
         authorize: &impl Fn() -> io::Result<()>,
     ) -> Result<Applied, String> {
+        let upload = self.upload;
+        if self.replace_changed && self.to == Side::Remote && upload.is_none() {
+            return Err("Reviewed uploads require a pinned saved SSH route.".into());
+        }
         let mut plan = self.plan(client, cancelled, None)?;
         let proof = plan
             .prove(client, cancelled)
@@ -160,7 +176,7 @@ impl Comparison<'_> {
             cancelled,
             disconnected,
             claim,
-            authorize,
+            (authorize, upload),
         )
         .into())
     }
@@ -174,21 +190,27 @@ impl Comparison<'_> {
         disconnected: &impl Fn() -> bool,
         authorize: impl Fn(usize, u64) -> io::Result<()>,
     ) -> Result<Applied, String> {
-        let mut plan = self.plan(client, cancelled, Some(limits))?;
-        if plan.standing_binding() != Some(expected_roots) {
-            return Err("The standing copy folders changed. Review the job again.".into());
+        let upload = self.upload;
+        if self.replace_changed && self.to == Side::Remote && upload.is_none() {
+            return Err("Reviewed uploads require a pinned saved SSH route.".into());
         }
+        let mut plan = self.plan(client, cancelled, Some((limits, Some(expected_roots))))?;
         // Keep fresh source hashes on the exact in-memory plan for this firing.
         plan.prove(client, cancelled)
             .map_err(|error| error.message)?;
-        let actions = plan.paths().count();
-        let progress = Progress::new(Some(plan.bytes()));
-        Ok(
-            sync::apply_standing(client, &plan, &progress, cancelled, disconnected, || {
-                authorize(actions, plan.bytes())
-            })
-            .into(),
+        let actions = plan.action_count();
+        let bytes = plan.bytes();
+        let progress = Progress::new(Some(bytes));
+        Ok(sync::apply_standing(
+            client,
+            &plan,
+            &progress,
+            cancelled,
+            disconnected,
+            || authorize(actions, bytes),
+            upload,
         )
+        .into())
     }
 }
 

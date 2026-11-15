@@ -87,7 +87,7 @@ impl PrivilegedFileAction {
             return Err(if destination.is_some() {
                 "Choose a distinct canonical Linux destination path outside any copied folder."
             } else {
-                "Choose valid numeric ownership or permissions without special bits."
+                "Choose valid numeric ownership or octal or symbolic permissions without special bits."
             });
         }
         if self
@@ -121,6 +121,9 @@ pub(crate) struct PrivilegedArchive {
 
 impl PrivilegedArchive {
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if self.archive.server_output.is_some() {
+            return Err("Privileged archives create root-owned private output.");
+        }
         self.archive.server_spec()?;
         if self.archive.target.root() != "/"
             || self
@@ -145,6 +148,25 @@ impl PrivilegedArchive {
 
     fn scope(&self, reference: &ConnectionRef, sudo: SudoMode) -> io::Result<[u8; 32]> {
         let spec = self.archive.server_spec().map_err(io::Error::other)?;
+        if let Some(download) = &self.archive.download {
+            return scope_digest(&(
+                "kortty-scheduled-privileged-archive-copy-v1",
+                reference,
+                spec,
+                sudo,
+                download,
+                &self.archive.password_credential,
+            ));
+        }
+        if let Some(password) = &self.archive.password_credential {
+            return scope_digest(&(
+                "kortty-scheduled-privileged-password-archive-v1",
+                reference,
+                spec,
+                sudo,
+                password,
+            ));
+        }
         scope_digest(&(
             "kortty-scheduled-privileged-archive-v1",
             reference,
@@ -214,9 +236,6 @@ impl RunContext {
         sudo: SudoMode,
         pins: &[(Endpoint, HostKey)],
     ) -> io::Result<()> {
-        if sudo != SudoMode::Passwordless {
-            return Err(review_required());
-        }
         archive.validate().map_err(io::Error::other)?;
         self.require_scope(
             archive.scope(reference, sudo)?,
@@ -348,6 +367,7 @@ impl DraftReview {
                         "Create one root-owned directory with mode 0700".into()
                     }
                     ProtectedOperation::Chmod { mode } => format!("Set permissions to {mode:04o}"),
+                    ProtectedOperation::ChmodSymbolic { mode } => format!("Change permissions using {mode}"),
                     ProtectedOperation::Chown { uid, gid } => format!(
                         "Set owner UID {} and group GID {}",
                         uid.map_or_else(|| "unchanged".into(), |id| id.to_string()),
@@ -377,7 +397,7 @@ impl DraftReview {
             ),
             RemoteAction::PrivilegedArchive(archive) => (
                 format!("Create a new root-owned {} archive", archive.archive.format),
-                None,
+                archive.archive.download.as_ref(),
                 None,
                 Some(archive.archive.target.as_str()),
             ),
@@ -395,6 +415,15 @@ impl DraftReview {
         .spacing(5);
         if let RemoteAction::PrivilegedArchive(action) = &review.action {
             let archive = &action.archive;
+            if archive.download.is_some() {
+                detail = detail.push(text("Save a verified local copy of the newly created archive if its server download root is enabled.").size(12));
+            }
+            if archive.password_credential.is_some() {
+                detail = detail.push(
+                    text("Encrypt file contents using the selected vault archive password.")
+                        .size(12),
+                );
+            }
             if archive.format != super::ArchiveFormat::Tar {
                 detail = detail.push(text(format!("Compression level {}", archive.level)));
             }

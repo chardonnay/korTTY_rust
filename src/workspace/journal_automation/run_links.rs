@@ -261,8 +261,12 @@ impl Workspace {
     }
 
     fn set_scheduler_journal_details(&mut self, request: &Request, details: JournalDetails) {
-        if let Some(view) = self.scheduler_views.get_mut(&request.view) {
-            view.show_journal_details(request.run, request.root.clone(), details);
+        if let Some((scheduler, view)) = self
+            .scheduler
+            .as_ref()
+            .zip(self.scheduler_views.get_mut(&request.view))
+        {
+            view.show_journal_details(scheduler, request.run, request.root.clone(), details);
         }
     }
 

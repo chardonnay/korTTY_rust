@@ -60,6 +60,28 @@ impl MemoryPrompt {
         self.user.is_some()
     }
 
+    pub(crate) fn reviewed_revision(&self, connection: Option<u64>) -> Result<[u8; 32], String> {
+        use sha2::{Digest, Sha256};
+
+        let sources: Vec<_> = self
+            .user
+            .iter()
+            .flat_map(|user| &user.sources)
+            .map(|(scope, digest)| (scope.id, digest))
+            .collect();
+        let encoded = Zeroizing::new(
+            serde_json::to_vec(&(
+                "kortty-scheduled-memory-v1", // Keep existing scheduled approvals readable.
+                connection,
+                &self.organization_digest,
+                sources,
+                self.text.as_str(),
+            ))
+            .map_err(|_| "Could not verify the scheduled AI memory.")?,
+        );
+        Ok(Sha256::digest(&encoded).into())
+    }
+
     pub(crate) fn require_current(&self, policy: &AiMemoryPolicy) -> Result<(), String> {
         if !policy.feature_allowed {
             return Err("AI memory is disabled. Review the request again.".into());

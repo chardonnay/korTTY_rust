@@ -9,6 +9,7 @@ use iced::{Task, window};
 use kortty_jobs::{RunId, RunOutcome, RunRequest};
 
 use crate::ai_manager::{Configuration, ProfileRef, SkillUsageSurface};
+use crate::clipboard_policy::ClipboardPolicy;
 use crate::job_executor::agent::{FiringPermit, FiringResult, FiringWork};
 use crate::job_executor::automation::IterativeCapture;
 use crate::job_executor::{self, Completion};
@@ -17,8 +18,10 @@ use crate::scheduler_window::{SshCommand, agent, firing};
 use crate::terminal_logging::{RedactionSecrets, Redactor, Secrets};
 
 use super::{ConnectionStore, Message, Workspace, profile, proposal_skills};
+use crate::workspace::terminal_ai::web;
 use agent::proposal::{Decision, Item, Prompt};
 
+pub(crate) mod environment_research;
 mod sequence;
 pub(in crate::workspace) use sequence::Sequence;
 
@@ -44,6 +47,7 @@ enum Progress {
     Generated(Ticket, Result<Decision, String>),
     ExecutionPermit(Ticket, FiringPermit, Permit),
     Executed(Ticket, FiringResult),
+    EnvironmentLookup(RunId, usize, u64, environment_research::Progress),
     JournalClosed(RunId, usize, RunOutcome, String, bool),
 }
 
@@ -259,6 +263,10 @@ impl Workspace {
                 prompt = prompt.with_swarm_probe(&command);
             }
         }
+        let memory =
+            prompt.capture_memory(&saved_config, &policy.ai_memory, target.reference.id)?;
+        prompt = prompt.with_memory(memory)?;
+        self.require_scheduler_prompt_memory(&prompt, &policy, &saved_config)?;
         if let Some(guidance) = approval.firing_skill_guidance_for(target_index) {
             prompt = prompt.with_reviewed_firing_skill_guidance(guidance)?;
             let ids = approval.firing_skill_ids();
@@ -271,6 +279,15 @@ impl Workspace {
             vault_revision = Some(self.vault_change_revision());
             prompt = prompt.with_knowledge(Some(Arc::clone(knowledge)), true)?;
         }
+        if let Some(evidence) = &approval.web {
+            if !self.scheduler_web_allowed() {
+                return Err("Managed policy blocks use of the approved web excerpts.".into());
+            }
+            evidence.require_current()?;
+            super::proposal_web::require_current_vault_mask(self.vault.as_ref(), evidence)?;
+            vault_revision = Some(self.vault_change_revision());
+            prompt = prompt.with_web(Some(Arc::clone(evidence)), true)?;
+        }
         let guidance = proposal_skills::require_firing_guidance(
             &saved_config,
             &store,
@@ -280,6 +297,19 @@ impl Workspace {
         )?;
         if !approval.generation_matches_for(target_index, &prompt) {
             return Err("The exact masked model request changed. Review this job again.".into());
+        }
+        if let Some(evidence) = self.require_firing_web_evidence(&request)? {
+            vault_revision = Some(self.vault_change_revision());
+            prompt = prompt.with_fresh_web(evidence)?;
+        }
+        if let Some(evidence) =
+            self.scheduler_agent_sequences[&request.id].environment_web(target_index)
+        {
+            prompt = prompt.with_environment_web(Arc::clone(evidence))?;
+        }
+        if let Some(evidence) = self.scheduler_agent_sequences[&request.id].round_web(target_index)
+        {
+            prompt = prompt.with_round_web(evidence)?;
         }
         let mut initial_probe = false;
         if prompt.is_swarm_iterative() {
@@ -297,16 +327,41 @@ impl Workspace {
                 .swarm_prior(target_index)
                 .ok_or("The Swarm target history is unavailable.")?;
             let environment = sequence.swarm_environment(target_index);
+            let research_scope = approval
+                .web_lookup()
+                .filter(|grant| {
+                    grant.allows_round_lookup()
+                        && agent::proposal::allows_swarm_round_research(round)
+                        && !sequence.round_web_decided(target_index)
+                })
+                .map(|grant| {
+                    let supports_page = grant.allows_round_page()
+                        && saved_config
+                            .resolve_profile_reference(grant.profile())
+                            .and_then(|id| web::Scope::new(Some(&saved_config), id, true))
+                            .is_some_and(|scope| {
+                                scope.page_review().is_some()
+                                    && scope.page_credential_env().is_none_or(|name| {
+                                        crate::local_ai::credential_value(name).is_ok()
+                                    })
+                            });
+                    (grant.public_topic(), supports_page)
+                });
             if prompt.swarm_probe_command().is_some() {
                 if environment.is_some() {
-                    prompt = prompt.with_swarm_round_and_probe(round, prior, environment)?;
+                    prompt = prompt.with_swarm_round_research(
+                        round,
+                        prior,
+                        environment,
+                        research_scope,
+                    )?;
                 } else if round == 1 && prior.is_empty() {
                     initial_probe = true;
                 } else {
                     return Err("The reviewed Swarm environment evidence is unavailable.".into());
                 }
             } else {
-                prompt = prompt.with_swarm_round(round, prior)?;
+                prompt = prompt.with_swarm_round_research(round, prior, None, research_scope)?;
             }
         }
         context
@@ -355,6 +410,9 @@ impl Workspace {
                 )?;
             return Ok(Task::none());
         }
+        if let Some(task) = self.start_environment_lookup(&request, target_index, round)? {
+            return Ok(task);
+        }
         let (dispatches, updates) = async_channel::bounded(1);
         review_context.skill_usage = saved_config.skill_usage(
             &guidance,
@@ -362,9 +420,7 @@ impl Workspace {
             SkillUsageSurface::Agent,
             false,
         );
-        let guard = (review_context.prompt.firing_skill_guidance().is_some()
-            || review_context.prompt.knowledge().is_some())
-        .then(|| proposal_skills::FiringDispatchGuard {
+        let guard = proposal_skills::FiringDispatchGuard {
             targets: approval.targets.clone(),
             target_index,
             profile: approval.profile.clone(),
@@ -372,14 +428,12 @@ impl Workspace {
             trust: context.trust,
             vault_revision: review_context.vault_revision.clone(),
             cancellation: request.cancellation.clone(),
-        });
+        };
         let pending = Arc::clone(&review_context.prompt).start_firing(dispatches, {
             let action = Arc::clone(&request.action);
             move |prompt, policy| {
                 action.require_installed_target_groups()?;
-                guard
-                    .as_ref()
-                    .map_or(Ok(()), |guard| guard.verify(prompt, policy))
+                guard.verify(prompt, policy)
             }
         })?;
         review_context._cancel = Some(pending.cancel);
@@ -427,6 +481,23 @@ impl Workspace {
         self.firing_authority(ticket, phase, false)
     }
 
+    pub(super) fn require_scheduler_prompt_memory(
+        &self,
+        prompt: &Prompt,
+        policy: &ClipboardPolicy,
+        saved_config: &Configuration,
+    ) -> Result<(), &'static str> {
+        let current = self
+            .ai_configuration()
+            .ok_or("AI is unavailable under the current settings.")?;
+        prompt
+            .require_current_memory(saved_config, &policy.ai_memory)
+            .and_then(|()| {
+                prompt.require_current_memory(&current, &self.clipboard.policy.ai_memory)
+            })
+            .map_err(|_| agent::memory::CHANGED)
+    }
+
     fn firing_authority(
         &self,
         ticket: &Ticket,
@@ -461,6 +532,11 @@ impl Workspace {
         if self.exiting || !approved {
             return Err("The scheduled Agent run changed or ended.");
         }
+        if !for_journal
+            && !scheduler.agent_predecessors_current(review.request(), std::time::SystemTime::now())
+        {
+            return Err("The job prerequisites changed before dispatch. Review the run again.");
+        }
         let action = review
             .request()
             .action
@@ -494,7 +570,9 @@ impl Workspace {
             .targets
             .get(ticket.target_index())
             .ok_or("The reviewed SSH target is unavailable.")?;
-        if !approved.generation_matches_for(ticket.target_index(), prompt) {
+        if !approved
+            .generation_matches_for(ticket.target_index(), &prompt.base_for_standing_review())
+        {
             return Err("The exact masked model request changed. Review this job again.");
         }
         if Some(self.firing_profile_revision(&action.profile)?) != prompt.profile_revision() {
@@ -522,6 +600,25 @@ impl Workspace {
             .map_err(|_| "The SSH host-key store is unavailable.")?;
         self.scheduler_reviewed_agent_target(target, &store, &trust, &policy)?;
         if !for_journal {
+            self.require_scheduler_prompt_memory(prompt, &policy, &saved_config)?;
+            if self
+                .require_firing_web_evidence(review.request())?
+                .as_deref()
+                != prompt.fresh_web()
+            {
+                return Err("The web excerpts reviewed for this run changed.");
+            }
+            self.require_target_environment_web(ticket, prompt)?;
+            self.require_swarm_round_web(ticket, prompt)?;
+            if let Some(evidence) = prompt.web().filter(|_| prompt.fresh_web().is_none()) {
+                if !self.scheduler_web_allowed() {
+                    return Err("Managed policy blocks use of the approved web excerpts.");
+                }
+                evidence.require_current().map_err(
+                    |_| "The web search profile or policy changed. Review this job again.",
+                )?;
+                super::proposal_web::require_current_vault_mask(self.vault.as_ref(), evidence)?;
+            }
             proposal_skills::require_firing_guidance(
                 &saved_config,
                 &store,
@@ -576,6 +673,9 @@ impl Workspace {
                 Task::none()
             }
             Progress::Executed(ticket, completion) => self.firing_executed(&ticket, completion),
+            Progress::EnvironmentLookup(run, index, nonce, progress) => {
+                self.update_environment_lookup(run, index, nonce, progress)
+            }
             Progress::JournalClosed(id, index, outcome, detail, complete) => {
                 if !self
                     .scheduler_agent_sequences
@@ -670,6 +770,22 @@ impl Workspace {
             Ok(Decision::SwarmBlocked { summary }) => {
                 self.settle_firing(&ticket, Phase::Generating, RunOutcome::Blocked, summary)
             }
+            Ok(Decision::SwarmResearch { lookup, input }) => {
+                if review
+                    .context()
+                    .prompt
+                    .offers_swarm_round_research(ticket.round(), lookup)
+                {
+                    self.request_swarm_round_web(&ticket, lookup, input)
+                } else {
+                    self.settle_firing(
+                        &ticket,
+                        Phase::Generating,
+                        RunOutcome::Blocked,
+                        "This Swarm round did not allow a web research request.".into(),
+                    )
+                }
+            }
             Err(error) => self.settle_firing(
                 &ticket,
                 Phase::Generating,
@@ -681,6 +797,123 @@ impl Workspace {
             usage.record();
         }
         Task::batch([expiry, task])
+    }
+
+    fn request_swarm_round_web(
+        &mut self,
+        ticket: &Ticket,
+        lookup: web::Lookup,
+        input: String,
+    ) -> Task<Message> {
+        let id = ticket.run();
+        let index = ticket.target_index();
+        if self
+            .scheduler
+            .as_mut()
+            .and_then(|scheduler| scheduler.firing_reviews.settle(ticket, Phase::Generating))
+            .is_none()
+        {
+            return Task::none();
+        }
+        if !self
+            .scheduler_agent_sequences
+            .get_mut(&id)
+            .is_some_and(|run| run.wait_for_round_web(ticket))
+        {
+            return self.finish_firing_target(
+                id,
+                index,
+                RunOutcome::Blocked,
+                "The scheduled Swarm research round changed.".into(),
+            );
+        }
+        match self.begin_swarm_round_web(ticket, lookup, input) {
+            Ok(task) => {
+                if self.scheduler_views.is_empty()
+                    && let Some((&owner, _)) = self
+                        .windows
+                        .iter()
+                        .find(|(_, window)| window.focused)
+                        .or_else(|| self.windows.iter().next())
+                {
+                    self.notice(
+                        owner,
+                        "JobScheduler is waiting for a Swarm web review.".into(),
+                    );
+                }
+                Task::batch([task, self.enqueue_jobs(Vec::new())])
+            }
+            Err(error) => self.fail_swarm_round_web(ticket, error),
+        }
+    }
+
+    pub(in crate::workspace::scheduler_access) fn swarm_round_web_request(
+        &self,
+        ticket: &Ticket,
+    ) -> Option<&Arc<RunRequest<SshCommand>>> {
+        self.scheduler_agent_sequences
+            .get(&ticket.run())?
+            .round_web_request(ticket)
+    }
+
+    pub(in crate::workspace::scheduler_access) fn finish_swarm_round_web(
+        &mut self,
+        ticket: &Ticket,
+        evidence: Option<Arc<web::Evidence>>,
+    ) -> Task<Message> {
+        if !self
+            .scheduler_agent_sequences
+            .get_mut(&ticket.run())
+            .is_some_and(|run| run.accept_round_web(ticket, evidence))
+        {
+            return Task::none();
+        }
+        self.sync_scheduler_views();
+        self.enqueue_jobs(Vec::new())
+    }
+
+    pub(in crate::workspace::scheduler_access) fn fail_swarm_round_web(
+        &mut self,
+        ticket: &Ticket,
+        error: String,
+    ) -> Task<Message> {
+        if self.swarm_round_web_request(ticket).is_none() {
+            return Task::none();
+        }
+        self.finish_firing_target(
+            ticket.run(),
+            ticket.target_index(),
+            RunOutcome::Blocked,
+            error,
+        )
+    }
+
+    fn require_swarm_round_web(
+        &self,
+        ticket: &Ticket,
+        prompt: &Prompt,
+    ) -> Result<(), &'static str> {
+        const CHANGED: &str = "The scheduled Swarm round's reviewed web excerpts changed.";
+        let evidence =
+            self.scheduler_agent_sequences[&ticket.run()].round_web(ticket.target_index());
+        let expected = evidence
+            .map(|evidence| {
+                prompt
+                    .environment_web()
+                    .or_else(|| prompt.fresh_web())
+                    .ok_or(CHANGED)?
+                    .merged(evidence)
+                    .map_err(|_| CHANGED)
+            })
+            .transpose()?;
+        if expected.as_ref() != prompt.round_web() {
+            return Err(CHANGED);
+        }
+        if let Some(expected) = expected {
+            expected.require_current().map_err(|_| CHANGED)?;
+            super::proposal_web::require_current_vault_mask(self.vault.as_ref(), &expected)?;
+        }
+        Ok(())
     }
 
     pub(super) fn decide_firing(
@@ -879,6 +1112,7 @@ impl Workspace {
                         outcome: RunOutcome::Failed { exit_code: None },
                         detail: Some("The scheduled Agent worker ended without a result.".into()),
                         recording: None,
+                        output: None,
                         swarm_report: None,
                     },
                     evidence: None,
@@ -889,8 +1123,10 @@ impl Workspace {
     }
 
     pub(in crate::workspace) fn expire_firing(&mut self) -> Task<Message> {
+        let environment = self.expire_environment_lookups();
+        let round_web = self.expire_swarm_round_web();
         let Some(scheduler) = &mut self.scheduler else {
-            return Task::none();
+            return Task::batch([environment, round_web]);
         };
         let ended = scheduler.firing_reviews.settle_inactive(Instant::now());
         let open_cancelled = self
@@ -907,7 +1143,7 @@ impl Workspace {
             .values_mut()
             .filter_map(Sequence::cancel_ready)
             .collect::<Vec<_>>();
-        let mut tasks = Vec::new();
+        let mut tasks = vec![environment, round_web];
         for completion in cancelled {
             tasks.push(self.complete_firing_run(completion));
         }

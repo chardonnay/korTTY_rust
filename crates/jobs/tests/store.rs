@@ -10,6 +10,8 @@ use kortty_jobs::{
     MAX_STORE_BYTES, RunBatch, RunOutcome, Scheduler, SchedulerStore, StoreError, Weekday,
 };
 
+#[path = "store/output.rs"]
+mod output;
 #[path = "store/session_journals.rs"]
 mod session_journals;
 #[path = "store/swarm.rs"]

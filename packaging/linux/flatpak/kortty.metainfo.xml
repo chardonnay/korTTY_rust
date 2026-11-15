@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>io.github.chardonnay.korTTY</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>MIT</project_license>
+  <name>kortty</name>
+  <summary>Terminal emulator and SSH client</summary>
+  <developer id="io.github.chardonnay">
+    <name>kortty maintainers</name>
+  </developer>
+  <description>
+    <p>Manage local terminals, SSH connections, SFTP transfers, snippets, session journals, and scheduled jobs in a native desktop workspace.</p>
+    <p>Local shells start inside the Flatpak runtime. The application can access host files and serial devices that the current user can open.</p>
+  </description>
+  <launchable type="desktop-id">io.github.chardonnay.korTTY.desktop</launchable>
+  <url type="homepage">https://github.com/chardonnay/korTTY_rust</url>
+  <url type="bugtracker">https://github.com/chardonnay/korTTY_rust/issues</url>
+  <content_rating type="oars-1.1"/>
+</component>

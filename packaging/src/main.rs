@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use toml_edit::DocumentMut;
 
 mod archive;
+mod dmg;
 mod linux;
+mod msi;
 #[path = "../../src/native_executable.rs"]
 mod native_executable;
 mod target;
@@ -23,20 +25,37 @@ type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 const USAGE: &str = "usage: kortty-package [--target <rust-target>] [--bin-dir <directory>]
                       [--output-dir <directory> | --stage-app <kortty.app>]
-                      [--linux-zip] [--linux-deb] [--linux-rpm]
+                      [--linux-zip] [--linux-deb] [--linux-rpm] [--linux-pacman] [--linux-flatpak]
+                      [--windows-msi]
+       kortty-package --macos-dmg <kortty.app> [--target <apple-target>] [--output-dir <directory>]
 
 Run from the kortty workspace root.
 Defaults to the native Rust target, target/release, and target/dist.
 For Linux releases, --linux-zip also creates a portable ZIP and its checksum.
 Use --linux-deb on a matching Debian build host with dpkg-dev and dpkg-deb.
 Use --linux-rpm on a matching Linux build host with rpmbuild and ELF dependency generators.
-The macOS --stage-app mode creates a signed local app bundle instead of an archive.";
+Use --linux-pacman on matching Arch Linux or Arch Linux ARM with makepkg and readelf.
+Use --linux-flatpak on a matching Linux host with Flatpak and Freedesktop Platform and SDK 25.08.
+Pacman packages use numeric release versions and package name kortty. Switching from a
+newer-numbered Java kortty package requires explicitly installing the Rust package with pacman -U.
+Use --windows-msi on Windows with the WiX CLI and UI extension to add an installer and checksum.
+The macOS --stage-app mode creates a signed local app bundle instead of an archive.
+Use --macos-dmg on macOS to create a read-only disk image and checksum from an existing
+signed bundle. The bundle must match the workspace version and requested architecture.
+The packager preserves the app signature and writes a separate <release-stem>-dmg directory.";
 
 struct Options {
     target: Option<String>,
     bin_dir: PathBuf,
+    macos_dmg: Option<PathBuf>,
     destination: Destination,
+    packages: ArchivePackages,
+}
+
+#[derive(Default)]
+struct ArchivePackages {
     linux: linux::Packages,
+    windows_msi: bool,
 }
 
 enum Destination {
@@ -48,8 +67,9 @@ impl Options {
     fn parse(root: &Path, mut args: impl Iterator<Item = OsString>) -> Result<Option<Self>> {
         let mut target = None;
         let mut bin_dir = None;
+        let mut macos_dmg = None;
         let mut destination = None;
-        let mut linux = linux::Packages::default();
+        let mut packages = ArchivePackages::default();
         while let Some(flag) = args.next() {
             if flag == "--help" || flag == "-h" {
                 return Ok(None);
@@ -77,9 +97,15 @@ impl Options {
                         args.next().ok_or_else(value)?,
                     )));
                 }
-                Some("--linux-zip") if !linux.zip => linux.zip = true,
-                Some("--linux-deb") if !linux.deb => linux.deb = true,
-                Some("--linux-rpm") if !linux.rpm => linux.rpm = true,
+                Some("--macos-dmg") if macos_dmg.is_none() => {
+                    macos_dmg = Some(PathBuf::from(args.next().ok_or_else(value)?));
+                }
+                Some("--linux-zip") if !packages.linux.zip => packages.linux.zip = true,
+                Some("--linux-deb") if !packages.linux.deb => packages.linux.deb = true,
+                Some("--linux-rpm") if !packages.linux.rpm => packages.linux.rpm = true,
+                Some("--linux-pacman") if !packages.linux.pacman => packages.linux.pacman = true,
+                Some("--linux-flatpak") if !packages.linux.flatpak => packages.linux.flatpak = true,
+                Some("--windows-msi") if !packages.windows_msi => packages.windows_msi = true,
                 _ => {
                     return Err(invalid(format!(
                         "unknown, repeated, or conflicting option {}",
@@ -89,12 +115,23 @@ impl Options {
                 }
             }
         }
+        if macos_dmg.is_some()
+            && (bin_dir.is_some()
+                || matches!(destination, Some(Destination::App(_)))
+                || packages.linux.selected()
+                || packages.windows_msi)
+        {
+            return Err(
+                invalid("--macos-dmg requires an existing app bundle and archive output").into(),
+            );
+        }
         Ok(Some(Self {
             target,
             bin_dir: bin_dir.unwrap_or_else(|| root.join("target/release")),
+            macos_dmg,
             destination: destination
                 .unwrap_or_else(|| Destination::Archive(root.join("target/dist"))),
-            linux,
+            packages,
         }))
     }
 }
@@ -148,18 +185,32 @@ fn run() -> Result<()> {
         None => target::native()?,
     };
     let target = Target::parse(&triple)?;
-    if options.linux.selected()
+    if options.packages.linux.selected()
         && (target.platform != Platform::Linux
             || !matches!(&options.destination, Destination::Archive(_)))
     {
         return Err(invalid(format!(
             "{} requires Linux archive output",
-            options.linux.option()
+            options.packages.linux.option()
         ))
         .into());
     }
-    options.linux.require_host(&triple)?;
+    if options.packages.windows_msi
+        && (target.platform != Platform::Windows
+            || !matches!(&options.destination, Destination::Archive(_)))
+    {
+        return Err(invalid("--windows-msi requires Windows archive output").into());
+    }
+    options.packages.linux.require_host(&triple)?;
     let version = version(&root)?;
+    if options.packages.windows_msi {
+        msi::require_host(&target, &version)?;
+    }
+    if let (Some(app), Destination::Archive(output)) = (&options.macos_dmg, &options.destination) {
+        let image = dmg::package(&root, output, &target, &triple, &version, app)?;
+        println!("{}", image.display());
+        return Ok(());
+    }
     let binaries = target.binaries(&options.bin_dir)?;
     match options.destination {
         Destination::Archive(directory) => {
@@ -170,7 +221,7 @@ fn run() -> Result<()> {
                 &triple,
                 &version,
                 &binaries,
-                options.linux,
+                options.packages,
             )?;
             println!("{}", release.display());
         }
@@ -231,7 +282,7 @@ fn package(
     triple: &str,
     version: &str,
     binaries: &[PathBuf],
-    linux: linux::Packages,
+    packages: ArchivePackages,
 ) -> Result<PathBuf> {
     let stem = format!("kortty-{version}-{triple}");
     let final_dir = output.join(&stem);
@@ -269,10 +320,17 @@ fn package(
         archive::Format::Zip
     };
     let name = write_archive(format, &stem, &release, &payload)?;
-    if linux.zip {
+    if packages.linux.zip {
         write_archive(archive::Format::Zip, &stem, &release, &payload)?;
     }
-    for native in linux.write(triple, version, &payload, &staging.0, &release)? {
+    for native in packages
+        .linux
+        .write(triple, version, &payload, &staging.0, &release)?
+    {
+        checksum(&release, &native)?;
+    }
+    if packages.windows_msi {
+        let native = msi::write(triple, version, &payload, &release, &stem)?;
         checksum(&release, &native)?;
     }
     fs::rename(release, &final_dir)?;
@@ -441,12 +499,7 @@ fn macos_bundle(root: &Path, app: &Path, version: &str, binaries: &[PathBuf]) ->
             "sign macOS bundle",
         )?;
     }
-    command(
-        Command::new("/usr/bin/codesign")
-            .args(["--verify", "--strict", "--deep"])
-            .arg(app),
-        "verify macOS bundle",
-    )
+    verify_macos_signature(app)
 }
 
 fn command(command: &mut Command, action: &str) -> Result<()> {
@@ -455,6 +508,15 @@ fn command(command: &mut Command, action: &str) -> Result<()> {
         return Err(io::Error::other(format!("{action} failed ({status})")).into());
     }
     Ok(())
+}
+
+fn verify_macos_signature(path: &Path) -> Result<()> {
+    command(
+        Command::new("/usr/bin/codesign")
+            .args(["--verify", "--strict", "--deep"])
+            .arg(path),
+        "verify macOS signature",
+    )
 }
 
 fn ensure_new(path: &Path) -> io::Result<()> {
@@ -470,4 +532,68 @@ fn ensure_new(path: &Path) -> io::Result<()> {
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message.into())
+}
+
+#[cfg(test)]
+mod options_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Option<Options>> {
+        Options::parse(
+            Path::new("checkout"),
+            args.iter().copied().map(OsString::from),
+        )
+    }
+
+    #[test]
+    fn dmg_options_select_a_prepared_bundle_and_separate_archive_output() {
+        let options = parse(&[
+            "--output-dir",
+            "release folder",
+            "--macos-dmg",
+            "signed app/kortty.app",
+            "--target",
+            "aarch64-apple-darwin",
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            options.macos_dmg.as_deref(),
+            Some(Path::new("signed app/kortty.app"))
+        );
+        assert_eq!(options.target.as_deref(), Some("aarch64-apple-darwin"));
+        assert!(
+            matches!(options.destination, Destination::Archive(path) if path == Path::new("release folder"))
+        );
+        assert!(!options.packages.linux.selected());
+
+        let options = parse(&["--output-dir", "portable"]).unwrap().unwrap();
+        assert!(options.macos_dmg.is_none());
+        assert!(
+            matches!(options.destination, Destination::Archive(path) if path == Path::new("portable"))
+        );
+    }
+
+    #[test]
+    fn dmg_options_reject_missing_values_and_conflicting_packaging_modes() {
+        for args in [
+            &["--macos-dmg"][..],
+            &["--macos-dmg", "kortty.app", "--macos-dmg", "kortty.app"],
+            &["--macos-dmg", "kortty.app", "--bin-dir", "binaries"],
+            &[
+                "--stage-app",
+                "generated/kortty.app",
+                "--macos-dmg",
+                "kortty.app",
+            ],
+            &["--macos-dmg", "kortty.app", "--linux-deb"],
+            &["--macos-dmg", "kortty.app", "--linux-flatpak"],
+            &["--macos-dmg", "kortty.app", "--windows-msi"],
+        ] {
+            assert!(
+                parse(args).is_err(),
+                "accepted conflicting arguments {args:?}"
+            );
+        }
+    }
 }

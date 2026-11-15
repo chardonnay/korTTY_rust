@@ -55,9 +55,12 @@ fn complete_round(
                 .0
         })
         .collect();
+    let has_web = swarm.round_web.is_some();
     for (member, (status, answer)) in members.into_iter().zip(answers) {
         let run = &workspace.terminal_agents.runs[&member];
         assert!(run.phase == Phase::ModelReview);
+        let preview = run.model_review.as_ref().unwrap();
+        let expected = [preview.system.clone(), preview.input.clone()];
         let epoch = run.epoch;
         let task = workspace.swarm_action(
             group,
@@ -67,7 +70,21 @@ fn complete_round(
             ),
         );
         let mut socket = test_support::accept(model);
-        let _ = test_support::request(&mut socket);
+        let wire = test_support::request(&mut socket);
+        for (index, message) in expected.iter().enumerate() {
+            assert_eq!(wire["messages"][index]["content"], message.as_str());
+        }
+        if has_web {
+            let input: serde_json::Value = serde_json::from_str(&expected[1]).unwrap();
+            assert!(expected[0].contains("untrusted reference data"));
+            assert!(!expected[0].contains("Public evidence"));
+            assert!(
+                input["web_evidence"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Public evidence. token=***")
+            );
+        }
         let body = json!({"status":status,"summary":"Target fixture","userMessage":answer});
         reply(socket.get_mut(), &body.to_string());
         drop(socket);
@@ -385,7 +402,7 @@ fn swarm_comparison_reviews_exact_masked_round_and_keeps_local_fallback() {
     let saved = save_report(&mut workspace, group, &root.join("comparison.md"));
     assert!(saved.contains("Comparison fixture answer"));
     let usage = local_ai::UsageAccount::new(
-        root,
+        root.clone(),
         1,
         local_ai::UsageBudget {
             token_limit: Some(12000),
@@ -420,5 +437,102 @@ fn swarm_comparison_reviews_exact_masked_round_and_keeps_local_fallback() {
     assert!(messages[1].contains("New target evidence B."));
     assert!(!messages[1].contains("Alpha uses the expected port"));
     assert_eq!(usage.snapshot().unwrap().counts.requests, 6);
+    let memory = crate::private_files::Directory::open(&root.join("memory"), true).unwrap();
+    memory
+        .publish_copy("MEMORY.md", b"Prioritize confirmed comparison outcomes.")
+        .unwrap();
+    let stale = workspace.swarm_action(group, Message::Comparison(Compare::Send(next)));
+    drain(&mut workspace, stale);
+    assert!(
+        workspace.terminal_agents.swarms[&group]
+            .notice
+            .contains("AI memory changed")
+    );
+    let (_, refreshed, _) = reviewed(&mut workspace, group, &model);
+    assert!(refreshed[0].contains("Prioritize confirmed comparison outcomes."));
     idle(&model);
+}
+
+#[test]
+fn swarm_web_excerpts_require_inclusion_and_current_web_policy() {
+    use crate::workspace::terminal_ai::web::{self, Message as Web};
+
+    let _exclusive = test_support::exclusive_run();
+    let (model, _) = test_support::listener();
+    let profile = Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let config: Configuration = serde_json::from_value(json!({"profiles": {
+        "profiles":[{"id":1,"name":"Web fixture","endpoint":model.local_addr().unwrap().to_string(),
+            "model":"fixture","tavily_search":true,"usage_budget":{"token_limit":12000}}],
+        "default":1,"last_id":1
+    }}))
+    .unwrap();
+    config
+        .save_fixture_at(&root, &Configuration::default())
+        .unwrap();
+    let mut workspace = Workspace::default();
+    workspace.window_settings.terminal_notifications.ai_runs = false;
+    workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
+    let (owner, _) = workspace.open_window(false);
+    local(&mut workspace, owner, false);
+    local(&mut workspace, owner, false);
+    let _ = workspace.open_agent_swarm(owner);
+    let group = *workspace.terminal_agents.swarms.keys().next().unwrap();
+    let _ = workspace.swarm_action(group, Message::Mode(SwarmMode::Advisory));
+    for key in review_source(&mut workspace, group, &root) {
+        let _ = workspace.swarm_action(group, Message::Toggle(key, true));
+    }
+    workspace.active_tab_mut(owner).unwrap().incognito = true;
+    assert!(!workspace.swarm_web_available(group));
+    let _ = workspace.swarm_action(group, Message::Web(Web::Open));
+    assert!(!workspace.terminal_agents.swarms[&group].web_search.active());
+    workspace.active_tab_mut(owner).unwrap().incognito = false;
+    let _ = workspace.swarm_action(group, Message::Web(Web::Open));
+    let _ = workspace.swarm_action(
+        group,
+        Message::Web(Web::Edit("Network API_KEY=private-query".into())),
+    );
+    let _ = workspace.swarm_action(group, Message::Web(Web::Review));
+    let swarm = workspace.terminal_agents.swarms.get_mut(&group).unwrap();
+    let web::State::Reviewed(scope, query, _) = &swarm.web_search else {
+        panic!("No web review")
+    };
+    assert_eq!(query, "Network API_KEY=***");
+    let results: web::Results = serde_json::from_value(json!({
+        "hits": [[{"title":"Public policy","url":"https://example.test/policy"}, "Public evidence. token=***"]],
+        "tools": []
+    })).unwrap();
+    swarm.web_search = web::State::Results(scope.clone(), Arc::new(results));
+    assert!(swarm.web_search.included().is_none());
+    idle(&model);
+    let _ = workspace.swarm_action(group, Message::Web(Web::Include));
+    assert!(
+        workspace.terminal_agents.swarms[&group]
+            .web_search
+            .included()
+            .is_some()
+    );
+    complete_round(
+        &mut workspace,
+        group,
+        &model,
+        GOAL,
+        [("done", FIRST_ANSWER), ("blocked", SECOND_ANSWER)],
+    );
+    let (review, messages, _) = reviewed(&mut workspace, group, &model);
+    assert!(messages[0].contains("untrusted reference data"));
+    assert!(!messages[0].contains("Public evidence"));
+    assert!(messages[1].contains("Public evidence. token=***"));
+    assert!(messages[1].contains("https://example.test/policy"));
+    assert!(!messages[1].contains("private-query"));
+
+    workspace.clipboard.policy.ai_web_search_allowed = false;
+    let task = workspace.swarm_action(group, Message::Comparison(Compare::Send(review)));
+    drain(&mut workspace, task);
+    idle(&model);
+    assert!(
+        workspace.terminal_agents.swarms[&group]
+            .notice
+            .contains("web search settings changed")
+    );
 }

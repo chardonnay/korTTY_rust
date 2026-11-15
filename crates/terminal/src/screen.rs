@@ -284,6 +284,7 @@ impl HistoryLine {
 pub(crate) struct Screen {
     pub(crate) lines: VecDeque<Line>,
     pub(crate) history: VecDeque<HistoryLine>,
+    pub(crate) history_starts_with_continuation: bool,
     pub(crate) cursor: Position,
     pub(crate) wrap_pending: bool,
     pub(crate) commands: CommandMarks,
@@ -325,6 +326,7 @@ impl Screen {
                 .map(|_| Line::blank(columns, Style::default()))
                 .collect(),
             history: VecDeque::new(),
+            history_starts_with_continuation: false,
             cursor: Position::default(),
             wrap_pending: false,
             commands: CommandMarks::default(),
@@ -620,11 +622,14 @@ impl Screen {
         for _ in 0..count.min(bottom - top + 1) {
             let removed = self.lines.remove(top);
             self.lines.insert(bottom, Line::blank(columns, style));
-            if record_history
-                && top == 0
+            if top == 0
                 && let Some(line) = removed
             {
-                self.push_history(line);
+                if record_history && self.keeps_history {
+                    self.push_history(line);
+                } else if self.history.is_empty() {
+                    self.history_starts_with_continuation = line.wrap_length.is_some();
+                }
             }
         }
     }
@@ -740,6 +745,7 @@ impl Screen {
     pub(crate) fn take_history_from(&mut self, other: &mut Self) {
         self.output_epoch = crate::output::next_epoch();
         self.history = std::mem::take(&mut other.history);
+        self.history_starts_with_continuation = other.history_starts_with_continuation;
         self.history_bytes = std::mem::take(&mut other.history_bytes);
         self.history_prompt_rows = std::mem::take(&mut other.history_prompt_rows);
         self.history_timestamp_rows = std::mem::take(&mut other.history_timestamp_rows);
@@ -754,12 +760,20 @@ impl Screen {
 
     pub(crate) fn clear_history(&mut self) {
         self.scrollback.invalidate();
+        let continuation = self
+            .history
+            .back()
+            .map_or(self.history_starts_with_continuation, |line| {
+                line.wrap_length.is_some()
+            });
         self.clear_history_contents();
+        self.history_starts_with_continuation = continuation;
     }
 
     fn clear_history_contents(&mut self) {
         self.output_epoch = crate::output::next_epoch();
         self.history.clear();
+        self.history_starts_with_continuation = false;
         self.history_bytes = 0;
         self.history_prompt_rows.clear();
         self.history_timestamp_rows.clear();
@@ -832,6 +846,9 @@ impl Screen {
 
     pub(crate) fn clear_display(&mut self, style: Style) {
         self.prompt_epoch = self.prompt_epoch.wrapping_add(1);
+        if self.history.is_empty() {
+            self.history_starts_with_continuation = false;
+        }
         let blank = Cell::blank(style);
         for line in &mut self.lines {
             line.cells.fill(blank.clone());
@@ -1056,6 +1073,7 @@ impl Screen {
                 break;
             };
             self.history_bytes -= line.bytes;
+            self.history_starts_with_continuation = line.wrap_length.is_some();
             if line.has_prompt() {
                 self.history_prompt_rows.pop_front();
             }

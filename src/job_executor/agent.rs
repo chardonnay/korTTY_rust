@@ -10,9 +10,7 @@ use std::sync::{
 use std::thread;
 use std::time::{Duration, Instant};
 
-use kortty_jobs::{
-    Cancellation, RunOutcome, RunRequest, RunTrigger, SwarmReport, SwarmTargetReport,
-};
+use kortty_jobs::{Cancellation, RunOutcome, RunRequest, SwarmReport, SwarmTargetReport};
 use kortty_ssh::TrustStore;
 use serde_json::json;
 use zeroize::Zeroizing;
@@ -30,11 +28,15 @@ use crate::terminal_agent::{
     self, Action, Cancel, Outcome, Status, swarm::headless::Execution, usage::Progress,
 };
 use crate::terminal_logging::{Policy, RedactionSecrets, Redactor, Secrets};
+use crate::workspace::scheduler_access::firing::environment_research::Environment;
+use crate::workspace::terminal_ai::web::Evidence;
 
 use super::{Completion, Failure, automation, check_cancelled, connection::reference_allowed};
 
 pub(crate) mod advisory;
 mod firing;
+#[cfg(test)]
+pub(crate) mod probe_fixture;
 mod swarm;
 pub(crate) use firing::{FiringPermit, FiringResult, FiringWork, spawn as spawn_firing};
 
@@ -75,8 +77,10 @@ pub(crate) struct Context {
     pub(crate) log_policy: Policy,
     pub(crate) mask: Mask,
     pub(crate) proposal: Option<proposal::Run>,
+    pub(crate) fresh_web: Option<Arc<Evidence>>,
 }
 
+#[derive(Clone)]
 pub(crate) struct ResendScope {
     pub(crate) request: Arc<RunRequest<SshCommand>>,
     pub(crate) transport: local_ai::Profile,
@@ -88,12 +92,28 @@ pub(crate) struct ResendScope {
     pub(crate) advisory_prompt: Option<Arc<proposal::Prompt>>,
 }
 
+#[derive(Clone)]
+pub enum Resend {
+    Model(ModelResend),
+    Environment(EnvironmentResearch),
+}
+
 /// Carries the original job scope while the model worker awaits authority.
 #[derive(Clone)]
-pub struct Resend {
+pub struct ModelResend {
     pub(crate) scope: Arc<ResendScope>,
     purpose: ModelAuthority,
     approval: async_channel::Sender<Result<(), &'static str>>,
+}
+
+/// Requests one scoped lookup for typed context from an approved read-only probe.
+#[derive(Clone)]
+pub struct EnvironmentResearch {
+    pub(crate) scope: Arc<ResendScope>,
+    pub(crate) index: usize,
+    pub(crate) environment: Environment,
+    pub(crate) reply: async_channel::Sender<Result<Arc<Evidence>, &'static str>>,
+    pub(crate) deadline: Instant,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -104,15 +124,22 @@ enum ModelAuthority {
 
 impl std::fmt::Debug for Resend {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_tuple("ScheduledAgentResend")
-            .field(&self.scope.request.id)
-            .field(&self.purpose)
-            .finish()
+        match self {
+            Self::Model(resend) => formatter
+                .debug_tuple("ScheduledAgentResend")
+                .field(&resend.scope.request.id)
+                .field(&resend.purpose)
+                .finish(),
+            Self::Environment(research) => formatter
+                .debug_tuple("ScheduledSwarmEnvironmentResearch")
+                .field(&research.scope.request.id)
+                .field(&research.index)
+                .finish(),
+        }
     }
 }
 
-impl Resend {
+impl ModelResend {
     pub(crate) fn settle(self, result: Result<(), &'static str>) {
         let _ = self.approval.try_send(result);
     }
@@ -135,9 +162,13 @@ pub(super) fn spawn_with_policy(
     let (sender, receiver) = async_channel::bounded(1);
     let id = request.id;
     let worker = sender.clone();
+    #[cfg(test)]
+    let fixture = probe_fixture::take();
     if thread::Builder::new()
         .name("kortty-scheduled-diagnostics".into())
         .spawn(move || {
+            #[cfg(test)]
+            probe_fixture::attach(fixture);
             let completed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 run(Arc::new(request), context, resends, load_policy)
             }))
@@ -163,22 +194,26 @@ fn run(
     load_policy: impl Fn() -> ClipboardPolicy + Clone + Send + Sync + 'static,
 ) -> Result<Completion, Failure> {
     check_cancelled(&request.cancellation)?;
-    if !matches!(request.trigger, RunTrigger::Manual | RunTrigger::Scheduled) {
-        return Err(Failure::blocked(
-            "Scheduled diagnostics require Run Now or a calendar start.",
-        ));
-    }
     let agent = request
         .action
         .agent
         .as_ref()
         .ok_or_else(|| Failure::blocked("The diagnostics action is unavailable."))?;
+    if !agent.probe.allows_trigger(request.trigger) {
+        return Err(Failure::blocked(
+            "This diagnostics workflow requires Run Now or a calendar start.",
+        ));
+    }
     agent.validate(&request.action).map_err(Failure::blocked)?;
-    if agent
-        .approval
-        .as_ref()
-        .is_some_and(|approval| approval.profile.id != agent.profile)
-    {
+    let approval = agent.approval.as_ref().ok_or_else(|| {
+        Failure::blocked("Review the exact scheduled diagnostics before running.")
+    })?;
+    if !approval.allows_trigger(agent.probe, request.trigger) {
+        return Err(Failure::blocked(
+            "Review the diagnostics workflow before using a dependency or cascade start.",
+        ));
+    }
+    if approval.profile.id != agent.profile {
         return Err(Failure::blocked(
             "The reviewed scheduled AI profile changed. Review the job again.",
         ));
@@ -193,6 +228,8 @@ fn run(
             "This scheduled Agent firing requires its own exact command review.",
         ));
     }
+    #[cfg(test)]
+    let fixture = probe_fixture::take();
     let Context {
         transport,
         context_limit,
@@ -203,13 +240,11 @@ fn run(
         trust,
         log_policy,
         mask,
+        fresh_web,
         ..
     } = context;
     require_target_groups(&request.action, &connection_store)?;
     let references: Vec<_> = request.action.targets().collect();
-    let approval = agent.approval.as_ref().ok_or_else(|| {
-        Failure::blocked("Review the exact scheduled diagnostics before running.")
-    })?;
     require_approved_profile(&approval.profile, &transport).map_err(Failure::blocked)?;
     if targets.len() != references.len() || approval.targets.len() != references.len() {
         return Err(Failure::blocked(
@@ -287,6 +322,7 @@ fn run(
                     guided.ok_or("The reviewed read-only Swarm request is unavailable.")?,
                     index,
                     prompt,
+                    &policy.ai_memory,
                     || {
                         check_cancelled(&request.cancellation)
                             .map_err(|error| error.detail.to_owned())?;
@@ -305,6 +341,10 @@ fn run(
             None
         };
         authorize().map_err(Failure::blocked)?;
+        #[cfg(test)]
+        if let Some(fixture) = &fixture {
+            return fixture.complete(reference.id, agent.probe, target.review.directory());
+        }
         probe(
             target,
             agent.probe,
@@ -336,7 +376,15 @@ fn run(
                         mask,
                     );
                     prompt
-                        .and_then(|prompt| advisory::reviewed_prompt(grant, index, prompt, approval.knowledge.clone()))
+                        .and_then(|prompt| {
+                            let policy = current_route_policy(agent.kind, &[reference], &load_policy)?;
+                            advisory::bind_saved_memory(
+                                prompt, &connection_store, reference.id, &policy.ai_memory,
+                            )
+                        })
+                        .and_then(|prompt| {
+                            advisory::reviewed_prompt(grant, index, prompt, approval, fresh_web.as_ref())
+                        })
                         .map(Arc::new)
                         .map_err(|_| "The reviewed read-only Swarm request changed. Review the job again.")
                 })
@@ -655,6 +703,7 @@ fn run(
                 report.detail
             },
         ),
+        output: None,
         recording: None,
         swarm_report: swarm_question
             .filter(|_| outcome != RunOutcome::Cancelled)
@@ -699,18 +748,28 @@ fn await_model_authority(
 ) -> Result<(), Failure> {
     check_cancelled(&scope.request.cancellation)?;
     let (approval, response) = async_channel::bounded(1);
-    let mut request = Resend {
+    let request = Resend::Model(ModelResend {
         scope: Arc::clone(scope),
         purpose,
         approval,
-    };
+    });
+    request_authority(resends, request, &scope.request.cancellation, deadline)?;
+    wait_authority(&response, &scope.request.cancellation, deadline)
+}
+
+fn request_authority(
+    resends: &async_channel::Sender<Resend>,
+    mut request: Resend,
+    cancellation: &Cancellation,
+    deadline: Instant,
+) -> Result<(), Failure> {
     loop {
-        check_cancelled(&scope.request.cancellation)?;
+        check_cancelled(cancellation)?;
         if Instant::now() >= deadline {
             return Err(Failure::failed("The diagnostic AI summary timed out."));
         }
         match resends.try_send(request) {
-            Ok(()) => break,
+            Ok(()) => return Ok(()),
             Err(async_channel::TrySendError::Full(retry)) => {
                 request = retry;
                 thread::sleep(POLL);
@@ -720,15 +779,23 @@ fn await_model_authority(
             }
         }
     }
+}
+
+fn wait_authority<T>(
+    response: &async_channel::Receiver<Result<T, &'static str>>,
+    cancellation: &Cancellation,
+    deadline: Instant,
+) -> Result<T, Failure> {
     loop {
-        check_cancelled(&scope.request.cancellation)?;
+        check_cancelled(cancellation)?;
         if Instant::now() >= deadline {
             return Err(Failure::failed("The diagnostic AI summary timed out."));
         }
         match response.try_recv() {
             Ok(result) => {
-                result.map_err(Failure::blocked)?;
-                return check_cancelled(&scope.request.cancellation);
+                let result = result.map_err(Failure::blocked)?;
+                check_cancelled(cancellation)?;
+                return Ok(result);
             }
             Err(async_channel::TryRecvError::Closed) => {
                 return Err(Failure::blocked(MODEL_AUTHORITY_UNAVAILABLE));
@@ -927,6 +994,7 @@ fn run_proposal(
         id: request.id,
         outcome,
         detail: Some(report.detail),
+        output: None,
         recording: None,
         swarm_report: None,
     };
@@ -947,7 +1015,7 @@ fn require_approved_profile(
     if matches_identity
         && reviewed.reviewed_https == transport.is_remote()
         && reviewed.reviewed_cli.is_some() == transport.is_cli()
-        && reviewed.policy_model_matches(transport.policy_authority_fingerprint())
+        && reviewed.matches_transport_model(transport)
         && transport.require_current_policy_authority().is_ok()
     {
         Ok(())
@@ -1477,6 +1545,78 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_lm_studio_auto_approval_requires_the_exact_resolved_model() {
+        use local_ai::test_support::wire_request;
+
+        let _exclusive = exclusive_run();
+        let (server, _) = listener();
+        let endpoint = format!("http://localhost:{}", server.local_addr().unwrap().port());
+        let worker = std::thread::spawn(move || {
+            for model in ["first", "first", "second", "second"] {
+                let mut stream = accept(&server);
+                assert!(wire_request(&mut stream, "GET /api/v1/models HTTP/1.1").is_empty());
+                let body = serde_json::json!({"models":[{"type":"llm","key":model,"loaded_instances":[{"id":model}]}]});
+                stream
+                    .get_mut()
+                    .write_all(
+                        fixture_http_response(
+                            "200 OK",
+                            "Content-Type: application/json\r\n",
+                            &body.to_string(),
+                        )
+                        .as_bytes(),
+                    )
+                    .unwrap();
+            }
+        });
+        let resolve = |native| {
+            let pending = local_ai::resolve_lm_studio_auto(&endpoint, "", None, native).unwrap();
+            let model = pending.reply.recv_blocking().unwrap().unwrap();
+            let transport = if native {
+                local_ai::Profile::lm_studio_with_auto_model
+            } else {
+                local_ai::Profile::lm_studio_compatible_with_auto_model
+            };
+            transport(&endpoint, "", local_ai::ProfileOptions::default(), &model).unwrap()
+        };
+        let first = resolve(true);
+        let first_compatible = resolve(false);
+        let second = resolve(true);
+        let second_compatible = resolve(false);
+        worker.join().unwrap();
+
+        let mut choice = crate::scheduler_window::agent::ProfileChoice {
+            id: ProfileRef::Numeric(7),
+            name: "Fixture".into(),
+            model: "first".into(),
+            destination: format!("{endpoint}/api/v1/chat"),
+            policy_model_fingerprint: None,
+            reviewed_https: false,
+            reviewed_cli: None,
+        };
+        assert!(require_approved_profile(&choice, &first).is_err());
+        choice.policy_model_fingerprint = first.lm_studio_auto_binding();
+        assert!(require_approved_profile(&choice, &first).is_ok());
+        assert!(require_approved_profile(&choice, &second).is_err());
+        assert!(require_approved_profile(&choice, &first_compatible).is_err());
+        let mut compatible_choice = choice.clone();
+        compatible_choice.destination = format!("{endpoint}/v1/chat/completions");
+        compatible_choice.policy_model_fingerprint = first_compatible.lm_studio_auto_binding();
+        assert!(require_approved_profile(&compatible_choice, &first_compatible).is_ok());
+        assert!(require_approved_profile(&compatible_choice, &second_compatible).is_err());
+        assert!(require_approved_profile(&compatible_choice, &first).is_err());
+        choice.model = "second".into();
+        assert!(require_approved_profile(&choice, &first).is_err());
+        assert!(
+            require_approved_profile(
+                &choice,
+                &local_ai::Profile::lm_studio(&endpoint, "first", Default::default()).unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn scheduled_swarm_requires_both_features_and_unattended_execution() {
         let swarm_denied = fixture_policy("ai-swarm = 'deny'");
         assert!(require_policy(&swarm_denied, Kind::Agent).is_ok());
@@ -1491,6 +1631,49 @@ mod tests {
             assert!(require_policy(&policy, Kind::Swarm).is_err());
         }
         assert!(require_policy(&ClipboardPolicy::default(), Kind::Swarm).is_ok());
+    }
+
+    #[test]
+    fn dependency_and_cascade_triggers_respect_the_standing_workflow_scope() {
+        use kortty_jobs::RunTrigger;
+
+        for trigger in [RunTrigger::Dependency, RunTrigger::Cascade] {
+            for (kind, probe, expected) in [
+                (
+                    Kind::Swarm,
+                    Probe::SwarmReadOnly,
+                    "Review the exact scheduled diagnostics before running.",
+                ),
+                (
+                    Kind::Agent,
+                    Probe::Proposed,
+                    "This diagnostics workflow requires Run Now or a calendar start.",
+                ),
+                (
+                    Kind::Agent,
+                    Probe::System,
+                    "This diagnostics workflow requires Run Now or a calendar start.",
+                ),
+            ] {
+                let (_, mut request) = crate::job_executor::tests::scheduled_request();
+                request.trigger = trigger;
+                request.action = Arc::new(serde_json::from_value(json!({
+                    "connection": {"id": 1, "target": {"host": "fixture.invalid", "port": 22, "username": "operator"}},
+                    "working_directory": "/srv",
+                    "agent": {"kind": kind, "probe": probe, "profile": 9, "goal": "Inspect the fixture"},
+                })).unwrap());
+                let (resends, _) = async_channel::bounded(1);
+                let failure = run(
+                    Arc::new(request),
+                    Err("No reviewed fixture context"),
+                    resends,
+                    ClipboardPolicy::default,
+                )
+                .expect_err("the trigger must not supply review authority");
+                assert_eq!(failure.outcome, RunOutcome::Blocked);
+                assert_eq!(failure.detail, expected);
+            }
+        }
     }
 
     struct DiagnosticFixture {
@@ -1617,6 +1800,7 @@ mod tests {
                 targets: vec![Ok(execution)],
                 target_vault_revisions: Vec::new(),
                 journal: None,
+                fresh_web: None,
                 connection_store: connections,
                 trust,
                 log_policy: Policy::default(),
@@ -1681,6 +1865,44 @@ mod tests {
             .expect_err("the original numeric approval must not authorize the new named selection");
         assert_eq!(failure.outcome, RunOutcome::Blocked);
         assert!(failure.detail.contains("profile changed"));
+        assert_eq!(
+            socket.accept().unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn dependency_worker_rejects_a_legacy_receipt_before_opening_ssh() {
+        let DiagnosticFixture {
+            profile: _profile,
+            socket,
+            mut request,
+            context,
+        } = scheduled_diagnostic_fixture(false);
+        let request_mut = Arc::get_mut(&mut request).unwrap();
+        request_mut.trigger = kortty_jobs::RunTrigger::Dependency;
+        let agent = Arc::make_mut(&mut request_mut.action)
+            .agent
+            .as_mut()
+            .unwrap();
+        agent.kind = Kind::Swarm;
+        agent.probe = Probe::SwarmReadOnly;
+        // Older receipts omit the new trigger authorization.
+        let mut approval = serde_json::to_value(agent.approval.as_ref().unwrap()).unwrap();
+        approval
+            .as_object_mut()
+            .unwrap()
+            .remove("dependency_triggers");
+        agent.approval = Some(serde_json::from_value(approval).unwrap());
+
+        let (resends, _) = async_channel::bounded(1);
+        let failure = run(request, Ok(context), resends, ClipboardPolicy::default)
+            .expect_err("a legacy receipt does not authorize the new trigger");
+        assert_eq!(failure.outcome, RunOutcome::Blocked);
+        assert_eq!(
+            failure.detail,
+            "Review the diagnostics workflow before using a dependency or cascade start."
+        );
         assert_eq!(
             socket.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock

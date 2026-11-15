@@ -1,15 +1,23 @@
 //! Explicit, bounded web requests with their own approval.
 
 use super::{
-    Activity, Agent, Cancel, Connection, Error, Pending, WorkerPermit, bearer_header,
+    Activity, Cancel, Connection, Error, Pending, WorkerPermit, bearer_header, connection_agent,
     connection_config, credential_value, response_bytes, start_worker,
 };
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod bright_data;
+mod direct_mcp;
 mod mcp;
-pub(crate) use mcp::{Mode as McpMode, Settings as McpSettings, ToolOutput};
+mod page;
+mod searxng;
+pub(crate) use mcp::{
+    Credentials as McpCredentials, Mode as McpMode, SearxngPageSettings, Settings as McpSettings,
+    ToolOutput,
+};
+pub(crate) use page::{MAX_PAGE_URL_BYTES, PageUrl};
 
 const BASE: &str = "https://api.tavily.com";
 pub(crate) const DESTINATION: &str = "https://api.tavily.com/search";
@@ -17,6 +25,63 @@ const KEY: &str = "TAVILY_API_KEY";
 pub(crate) const MAX_QUERY_BYTES: usize = 400;
 pub(crate) const MAX_RESULTS: usize = 5;
 const TIMEOUT: Duration = Duration::from_secs(20);
+
+#[derive(Clone, Copy)]
+pub(crate) enum PageProvider<'a> {
+    Tavily,
+    BrightData,
+    Searxng(&'a SearxngPageSettings),
+}
+
+pub(crate) fn page_provider(settings: Option<&McpSettings>) -> Option<PageProvider<'_>> {
+    match settings.map(|settings| settings.mode) {
+        None | Some(McpMode::Tavily) => Some(PageProvider::Tavily),
+        Some(McpMode::BrightData) => Some(PageProvider::BrightData),
+        Some(McpMode::Searxng) => settings?.searxng_page.as_ref().map(PageProvider::Searxng),
+        Some(McpMode::Brave | McpMode::Toolpack) => None,
+    }
+}
+
+impl<'a> PageProvider<'a> {
+    pub(crate) fn destination(self) -> Option<String> {
+        match self {
+            Self::Tavily => Some(page::EXTRACT_DESTINATION.into()),
+            Self::BrightData => Some(bright_data::DESTINATION.into()),
+            Self::Searxng(settings) => settings.review_destination().ok(),
+        }
+    }
+
+    pub(crate) fn operation(self) -> &'static str {
+        match self {
+            Self::Tavily => "Tavily Extract",
+            Self::BrightData => bright_data::TOOL,
+            Self::Searxng(_) => searxng::TOOL,
+        }
+    }
+}
+
+pub(crate) fn search_credential_env(settings: Option<&McpSettings>) -> Option<&'static str> {
+    settings.map_or(Some(KEY), McpSettings::search_credential_env)
+}
+
+pub(crate) fn start_page<T: Send + 'static>(
+    provider: PageProvider<'_>,
+    url: PageUrl,
+    before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
+    finish: impl FnOnce(Vec<Hit>) -> T + Send + 'static,
+) -> Result<Pending<T>, String> {
+    match provider {
+        PageProvider::Tavily => page::start_extract(url, before_dispatch, finish),
+        PageProvider::BrightData => bright_data::start(url, before_dispatch, finish),
+        PageProvider::Searxng(settings) => searxng::start(
+            &settings.endpoint,
+            settings.bearer_env.as_deref(),
+            url,
+            before_dispatch,
+            finish,
+        ),
+    }
+}
 
 #[derive(Deserialize)]
 struct Response {
@@ -45,6 +110,20 @@ pub(crate) fn start<T: Send + 'static>(
     before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
     finish: impl FnOnce(Vec<Hit>) -> T + Send + 'static,
 ) -> Result<Pending<T>, String> {
+    start_tavily(
+        TIMEOUT,
+        before_dispatch,
+        move |connection, key| search(connection, &query, key),
+        finish,
+    )
+}
+
+fn start_tavily<R, T: Send + 'static>(
+    timeout: Duration,
+    before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
+    request: impl FnOnce(&Connection, &str) -> Result<R, Error> + Send + 'static,
+    finish: impl FnOnce(R) -> T + Send + 'static,
+) -> Result<Pending<T>, String> {
     let permit = WorkerPermit::acquire().ok_or("AI workers are busy.")?;
     let activity = Arc::new(Activity::default());
     let cancel = Cancel {
@@ -53,12 +132,12 @@ pub(crate) fn start<T: Send + 'static>(
     start_worker(cancel, move || {
         let _permit = permit;
         require_policy()?;
-        let key = credential_value(KEY).map_err(|_| "Set TAVILY_API_KEY to use web search.")?;
-        let agent = Agent::new_with_config(connection_config(TIMEOUT));
+        let key = credential_value(KEY).map_err(|_| "Set TAVILY_API_KEY to use Tavily.")?;
+        let agent = connection_agent(connection_config(timeout));
         let connection = Connection::attach(BASE.into(), agent, activity)
             .map_err(|_| "Web search was canceled.")?;
         before_dispatch()?;
-        let result = search(&connection, &query, &key).map_err(message)?;
+        let result = request(&connection, &key).map_err(message)?;
         before_dispatch()?;
         Ok(finish(result))
     })
@@ -68,18 +147,27 @@ pub(crate) fn start_mcp<T: Send + 'static>(
     profile: super::Profile,
     settings: McpSettings,
     query: String,
+    structured_sources: bool,
+    reviewed_credentials: Option<McpCredentials>,
     before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
     finish: impl FnOnce(Vec<ToolOutput>) -> T + Send + 'static,
 ) -> Result<Pending<T>, String> {
     super::start(profile, move |client| {
-        let result = mcp::search(client, &settings, &query, before_dispatch)?;
+        let result = mcp::search(
+            client,
+            &settings,
+            &query,
+            structured_sources,
+            reviewed_credentials.as_ref(),
+            before_dispatch,
+        )?;
         Ok(finish(result))
     })
 }
 
 pub(crate) fn require_policy() -> Result<(), String> {
     let policy = crate::clipboard_policy::ClipboardPolicy::load();
-    if policy.ai_allowed && policy.ai_chat_allowed && policy.ai_web_search_allowed {
+    if policy.ai_allowed && policy.ai_web_search_allowed {
         Ok(())
     } else {
         Err("Managed policy blocks web search.".into())
@@ -105,27 +193,7 @@ fn search(connection: &Connection, query: &str, key: &str) -> Result<Vec<Hit>, E
         include_raw_content: false,
         include_images: false,
     };
-    let request = zeroize::Zeroizing::new(
-        serde_json::to_vec(&request).map_err(|_| Error::Invalid("invalid search query"))?,
-    );
-    #[cfg(target_os = "macos")]
-    let _power = kortty_macos::AppNapActivity::begin();
-    let mut response = connection
-        .agent
-        .post(connection.url("/search"))
-        .header("Authorization", bearer_header(key)?)
-        .header("Content-Type", "application/json")
-        .send(request.as_slice())
-        .map_err(|error| match error {
-            ureq::Error::StatusCode(status) => Error::Status(status),
-            _ => super::transport_error(error, true),
-        })?;
-    let bytes = response_bytes(&mut response, true)?;
-    if !connection.active() {
-        return Err(Error::Cancelled);
-    }
-    let response: Response =
-        serde_json::from_slice(&bytes).map_err(|_| Error::Invalid("invalid search result"))?;
+    let response: Response = tavily_json(connection, "/search", key, &request)?;
     Ok(response
         .results
         .into_iter()
@@ -138,13 +206,41 @@ fn search(connection: &Connection, query: &str, key: &str) -> Result<Vec<Hit>, E
         .collect())
 }
 
+fn tavily_json<T: serde::de::DeserializeOwned>(
+    connection: &Connection,
+    path: &str,
+    key: &str,
+    request: &impl Serialize,
+) -> Result<T, Error> {
+    let request = zeroize::Zeroizing::new(
+        serde_json::to_vec(request).map_err(|_| Error::Invalid("invalid Tavily request"))?,
+    );
+    #[cfg(target_os = "macos")]
+    let _power = kortty_macos::AppNapActivity::begin();
+    let mut response = connection
+        .agent
+        .post(connection.url(path))
+        .header("Authorization", bearer_header(key)?)
+        .header("Content-Type", "application/json")
+        .send(request.as_slice())
+        .map_err(|error| match error {
+            ureq::Error::StatusCode(status) => Error::Status(status),
+            _ => super::transport_error(error, true),
+        })?;
+    let bytes = response_bytes(&mut response, true)?;
+    if !connection.active() {
+        return Err(Error::Cancelled);
+    }
+    serde_json::from_slice(&bytes).map_err(|_| Error::Invalid("invalid Tavily result"))
+}
+
 fn message(error: Error) -> String {
     match error {
         Error::Status(status) => format!("Tavily returned HTTP {status}."),
         Error::TimedOut => "The Tavily request timed out.".into(),
-        Error::Cancelled => "Web search was canceled.".into(),
-        Error::Invalid(reason) => format!("Tavily search was rejected ({reason})."),
-        _ => "Could not complete the Tavily search.".into(),
+        Error::Cancelled => "The Tavily request was canceled.".into(),
+        Error::Invalid(reason) => format!("The Tavily request was rejected ({reason})."),
+        _ => "Could not complete the Tavily request.".into(),
     }
 }
 

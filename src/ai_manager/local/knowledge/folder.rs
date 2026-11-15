@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::private_files::{Directory, FileStamp};
 
-use super::source::{Filter, Ignore, Options, SyncMode};
+use super::source::{Filter, Ignore, MAX_CORPUS_BYTES, Options, SyncMode};
 use super::{
     ConfiguredFileTooLarge, LEGACY_MAX_SOURCES, MAX_SOURCES, pdf, saved_source_name, scan_source,
     scan_source_file, source_name,
@@ -23,7 +23,6 @@ use approval::Approval;
 
 const LEGACY_MAX_VISITED: usize = 512;
 const MAX_VISITED: usize = 2 * MAX_SOURCES;
-const MAX_CORPUS_BYTES: u64 = 500 * 1024 * 1024;
 const CORPUS_LIMIT: &str = "The reviewed folder exceeds 500 MiB of eligible source files. Refine the source filters and review it again.";
 const MAX_DEPTH: usize = 8;
 pub(in crate::ai_manager::local) const MAX_FOLDERS: usize = 8;
@@ -472,7 +471,7 @@ impl Scan<'_> {
                         )
                 {
                     self.corpus_bytes += bytes;
-                    if self.corpus_bytes > MAX_CORPUS_BYTES {
+                    if self.corpus_bytes > MAX_CORPUS_BYTES as u64 {
                         return Err(io::Error::other(CORPUS_LIMIT));
                     }
                 }
@@ -487,7 +486,7 @@ impl Scan<'_> {
                 stamp.require_unchanged(&directory.open_file(name)?)?;
                 Ok(document)
             });
-            if self.corpus_bytes > MAX_CORPUS_BYTES {
+            if self.corpus_bytes > MAX_CORPUS_BYTES as u64 {
                 return Err(CORPUS_LIMIT.into());
             }
             match contents {

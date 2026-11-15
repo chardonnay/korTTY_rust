@@ -14,6 +14,11 @@ use crate::private_files::{Directory, EntryIdentity, FileStamp, nonce, require_s
 
 use super::managed_models::valid_id;
 
+mod reasoning;
+pub(crate) use reasoning::Controls as ReasoningControls;
+pub(in crate::local_ai) use reasoning::TemplateArguments;
+pub(crate) use reasoning::UNSUPPORTED as UNSUPPORTED_REASONING;
+
 pub(crate) const BACKUP_DIRECTORY: &str = "mlx-models";
 const ROOT: &str = BACKUP_DIRECTORY;
 const STAGING: &str = "staging";
@@ -136,6 +141,15 @@ impl<'a> Registry<'a> {
         Ok(models)
     }
 
+    pub(crate) fn reasoning_controls(&self, id: &str) -> io::Result<ReasoningControls> {
+        require_id(id)?;
+        let root = self.root(false)?;
+        let _lock = lock(&root, LOCK, true)?;
+        let directory = root.private_child(id, false)?;
+        let _lease = lock(&directory, LEASE, true)?;
+        ReasoningControls::read(&directory)
+    }
+
     pub(crate) fn import(&self, review: &Review, cancelled: &AtomicBool) -> io::Result<Model> {
         let source = Directory::open(&review.source, false)?;
         if source.identity()? != review.identity {
@@ -200,8 +214,10 @@ impl<'a> Registry<'a> {
         }
         let stamps = stamps(&files)?;
         validate_assets(&model, &mut files)?;
+        let reasoning_controls = ReasoningControls::from_files(&mut files).unwrap_or_default();
         let opened = Opened {
             model,
+            reasoning_controls,
             path: self.0.join(ROOT).join(id),
             directory,
             files,
@@ -213,6 +229,16 @@ impl<'a> Registry<'a> {
     }
 
     pub(crate) fn configure(&self, id: &str, name: &str, idle_minutes: u16) -> io::Result<Model> {
+        self.configure_checked(id, name, idle_minutes, |_| Ok(()))
+    }
+
+    pub(crate) fn configure_checked(
+        &self,
+        id: &str,
+        name: &str,
+        idle_minutes: u16,
+        check: impl FnOnce(&Model) -> io::Result<()>,
+    ) -> io::Result<Model> {
         require_id(id)?;
         let name = name.trim();
         require_name(name)?;
@@ -223,13 +249,14 @@ impl<'a> Registry<'a> {
         let _lock = lock(&root, LOCK, false)?;
         let directory = root.private_child(id, false)?;
         let _lease = lock(&directory, LEASE, false)?;
-        let mut model = read_model(&directory, id)?;
-        model.name = name.to_owned();
-        model.idle_minutes = idle_minutes;
-        directory.replace_file(
-            MANIFEST,
-            &serde_json::to_vec(&model).map_err(io::Error::other)?,
-        )?;
+        let stored = read_model(&directory, id)?;
+        let model = Model {
+            name: name.to_owned(),
+            idle_minutes,
+            ..stored.clone()
+        };
+        let bytes = serde_json::to_vec(&model).map_err(io::Error::other)?;
+        directory.replace_with(MANIFEST, |file| file.write_all(&bytes), || check(&stored))?;
         directory.sync()?;
         Ok(model)
     }
@@ -256,6 +283,7 @@ impl<'a> Registry<'a> {
 
 pub(crate) struct Opened {
     pub(crate) model: Model,
+    reasoning_controls: ReasoningControls,
     pub(crate) path: PathBuf,
     directory: Directory,
     files: BTreeMap<String, File>,
@@ -264,6 +292,10 @@ pub(crate) struct Opened {
 }
 
 impl Opened {
+    pub(crate) fn reasoning_controls(&self) -> ReasoningControls {
+        self.reasoning_controls
+    }
+
     pub(crate) fn revalidate(&self) -> io::Result<()> {
         #[cfg(unix)]
         if self._lease.is_none() {
@@ -365,9 +397,11 @@ pub(super) fn open_policy_model(
     };
     let stamps = stamps(&files)?;
     validate_assets(&model, &mut files)?;
+    let reasoning_controls = ReasoningControls::from_files(&mut files).unwrap_or_default();
     check_cancelled(cancelled)?;
     let opened = Opened {
         model,
+        reasoning_controls,
         path: path.to_owned(),
         directory,
         files,
@@ -684,10 +718,13 @@ fn invalid(message: &'static str) -> io::Error {
 }
 
 #[cfg(test)]
+pub(crate) use tests::fixture as test_fixture;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fixture(root: &Path) -> PathBuf {
+    pub(crate) fn fixture(root: &Path) -> PathBuf {
         let source = root.join("Tiny MLX fixture");
         std::fs::create_dir(&source).unwrap();
         std::fs::write(source.join("config.json"), br#"{"model_type":"llama"}"#).unwrap();

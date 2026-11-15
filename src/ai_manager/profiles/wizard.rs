@@ -46,6 +46,12 @@ pub(super) struct Wizard {
     scan: Option<Scan>,
 }
 
+impl Wizard {
+    pub(super) fn model_step_open(&self) -> bool {
+        matches!(self.step, Step::Model)
+    }
+}
+
 enum Scan {
     Pending {
         ticket: Arc<()>,
@@ -146,11 +152,10 @@ impl Editor {
             if addresses.len() >= local_ai::MAX_LOCAL_SCAN_ENDPOINTS {
                 break;
             }
-            if let Ok(address) = match profile.connection_mode {
-                ConnectionMode::External => local_ai::numeric_loopback_endpoint(&profile.endpoint),
-                ConnectionMode::LmStudio => local_ai::lm_studio_endpoint(&profile.endpoint),
-                _ => continue,
-            } && !addresses.contains(&address)
+            if (profile.connection_mode == ConnectionMode::External
+                || profile.connection_mode.uses_lm_studio_inventory())
+                && let Ok(address) = profile.local_address()
+                && !addresses.contains(&address)
             {
                 addresses.push(address);
             }
@@ -205,19 +210,20 @@ impl Editor {
         }) else {
             return;
         };
-        let native_lm_studio = self
+        let known_lm_studio = self
             .selected()
             .into_iter()
             .chain(self.catalog.entries())
-            .any(|profile| {
-                profile.connection_mode == ConnectionMode::LmStudio
-                    && local_ai::lm_studio_endpoint(&profile.endpoint).ok() == Some(endpoint)
-            });
-        let mode = if native_lm_studio || endpoint.port() == 1234 {
+            .find(|profile| {
+                profile.connection_mode.uses_lm_studio_inventory()
+                    && profile.local_address().ok() == Some(endpoint)
+            })
+            .map(|profile| profile.connection_mode);
+        let mode = known_lm_studio.unwrap_or(if endpoint.port() == 1234 {
             ConnectionMode::LmStudio
         } else {
             ConnectionMode::External
-        };
+        });
         self.select_connection_mode(mode);
         let endpoint = endpoint.to_string();
         self.edit(Field::Endpoint, endpoint.clone());
@@ -254,7 +260,9 @@ impl Editor {
                         .unwrap_or_else(|_| profile.endpoint.clone())
                 )
                 .size(13),
-                text(if profile.model_mode == ModelMode::Auto {
+                text(if profile.ordinary_lm_studio_auto() && !profile.effective_model().is_empty() {
+                    profile.effective_model()
+                } else if profile.model_mode == ModelMode::Auto {
                     "Automatic model selection"
                 } else {
                     &profile.model

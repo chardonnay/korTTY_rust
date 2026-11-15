@@ -875,6 +875,10 @@ impl Runtime {
         &self.checked.payload
     }
 
+    pub(crate) fn supports_template_reasoning(&self) -> bool {
+        self.checked.template_reasoning
+    }
+
     pub(crate) fn revalidate(&self) -> io::Result<()> {
         if !self.root.same_as(&root(&self.profile, false)?)? {
             return Err(invalid("The private MLX runtime directory changed"));
@@ -1033,6 +1037,7 @@ impl Drop for KeyFile {
 struct Checked {
     payload: PathBuf,
     directory: Directory,
+    template_reasoning: bool,
     executable: PathBuf,
     executable_stamp: FileStamp,
     launcher: PathBuf,
@@ -1103,6 +1108,10 @@ fn verified_installation(
         launcher: payload.join(LAUNCHER),
         payload,
         directory,
+        template_reasoning: crate::local_ai::mlx_models::ReasoningControls::runtime_supported(
+            &package.mlx_lm_version,
+            &package.requirements_lock_sha256,
+        ),
         executable_stamp,
         launcher_stamp,
     };

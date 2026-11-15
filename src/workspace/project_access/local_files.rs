@@ -188,7 +188,7 @@ impl FileTab {
         }
     }
 
-    fn editor(&mut self) -> Option<&mut EditorWindow> {
+    pub(in crate::workspace) fn editor(&mut self) -> Option<&mut EditorWindow> {
         match &mut self.content {
             Content::Editor(editor) => Some(editor),
             _ => None,
@@ -381,6 +381,9 @@ impl Workspace {
         result: Result<RemoteFile, String>,
     ) -> Task<Desktop> {
         let denial = self.project_remote_denial(id);
+        let origin = self
+            .project_remote_target(id)
+            .map(|target| self.ssh_file_ai_origin(target, None, false));
         let Some(tab) = self.project_files.get_mut(&id).filter(
             |tab| matches!(tab.content, Content::LoadingRemote(active) if active == ticket),
         ) else {
@@ -392,7 +395,8 @@ impl Workspace {
                 match tab.worker.as_ref().and_then(Worker::editor) {
                     Some(remote) => {
                         let label = tab.label().to_owned();
-                        let (editor, task) = EditorWindow::with_remote(document, remote, label);
+                        let (mut editor, task) = EditorWindow::with_remote(document, remote, label);
+                        editor.ai_origin = origin.unwrap_or_default();
                         loaded = task
                             .map(move |message| Desktop::ProjectFile(id, Message::Editor(message)));
                         Content::Editor(Box::new(editor))
@@ -796,15 +800,9 @@ impl Workspace {
             return Some(self.view_sftp(id, state));
         }
         if let Content::Editor(editor) = &tab.content {
-            return Some(
-                editor
-                    .view(
-                        self.editor_content_theme(),
-                        self.window_settings.editor_appearance(),
-                        self.window_settings.editor_caret,
-                    )
-                    .map(move |message| Desktop::ProjectFile(id, Message::Editor(message))),
-            );
+            return Some(self.assisted_file_view(id, editor, move |event| {
+                Desktop::ProjectFile(id, Message::Editor(event))
+            }));
         }
         let body: Element<'_, Message> = match &tab.content {
             Content::Unopened | Content::Failed(_) if tab.remote_review => column![

@@ -39,6 +39,260 @@ fn grouped_connection(host: &str) -> crate::connection_store::Connection {
 }
 
 #[test]
+fn imported_archive_adoption_requires_its_route_pins_local_path_and_vault_choice() {
+    use kortty_ssh::{HostKey, TrustStore};
+    use serde_json::json;
+
+    let profile = Profile::temporary();
+    let path = profile.file();
+    let mut connections = ConnectionStore::open(profile.0.join("connections.json")).unwrap();
+    let saved_id = connections
+        .save(grouped_connection("archive.example"))
+        .unwrap();
+    let saved = connections.get(saved_id).unwrap().clone();
+    let route = ConnectionRef::from(&saved);
+    let action = serde_json::from_value::<SshCommand>(json!({
+        "connection": route,
+        "remote": {"kind": "imported_archive", "route": route, "settings": {
+            "sources": ["/input/東京", "/etc/hosts"], "target": "/output/archive.zip",
+            "format": "zip_password", "level": 8, "java_excludes": ["original*"],
+            "local_hint": r"C:\Java path\archive.zip",
+        }}
+    }))
+    .unwrap();
+    let job_id = JobId::new("java-00000000000040009000000000000006").unwrap();
+    let job = Job::new(job_id.clone(), "Imported archive", action.clone())
+        .unwrap()
+        .with_enabled(false);
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&JobGraph::new(vec![job]).unwrap(), &[], &[])
+        .unwrap();
+    let mut app = TestWindow::open(path).unwrap();
+    app.runtime.set_execution_allowed(true);
+    app.update(Message::Select(job_id));
+    app.update(Message::Page(Page::Action));
+    app.update(Message::Enabled(true));
+    app.update(Message::ArchiveServerOnly(false));
+    app.update(Message::ArchiveFormat(ArchiveFormat::Zip));
+    app.update(Message::CommandSource(Source::Command));
+    assert!(app.update(Message::Run(false)).is_empty());
+    app.update(Message::Save);
+    assert_eq!(app.selected_job().unwrap().action(), &action);
+
+    let policy = crate::clipboard_policy::ClipboardPolicy::default();
+    let untrusted = TrustStore::from_pins(Vec::new()).unwrap();
+    let key = HostKey::from_openssh(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBm/RAlphM3+hUG6wWfcO5bIUIaqMLa2ywxcOK1wMWbh",
+    )
+    .unwrap();
+    let trust =
+        TrustStore::from_pins(vec![(Endpoint::new("archive.example", 22).unwrap(), key)]).unwrap();
+    assert!(
+        app.view
+            .draft
+            .adopt_imported_archive(&connections, &untrusted, &policy, &[])
+            .unwrap_err()
+            .contains("host keys")
+    );
+    let mut changed = saved.clone();
+    changed.login.endpoint.port = 2222;
+    connections.save(changed).unwrap();
+    assert!(
+        app.view
+            .draft
+            .adopt_imported_archive(&connections, &trust, &policy, &[])
+            .unwrap_err()
+            .contains("no longer matches")
+    );
+    connections.save(saved).unwrap();
+    assert!(
+        app.view
+            .draft
+            .adopt_imported_archive(&connections, &trust, &policy, &[])
+            .unwrap_err()
+            .contains("local archive destination")
+    );
+    let local = profile.0.join("reviewed copy.zip");
+    app.update(Message::Edit(
+        Field::ArchiveDownload,
+        local.to_str().unwrap().into(),
+    ));
+    assert!(
+        app.view
+            .draft
+            .adopt_imported_archive(&connections, &trust, &policy, &[])
+            .unwrap_err()
+            .contains("from the vault")
+    );
+
+    let denied = crate::clipboard_policy::ClipboardPolicy {
+        file_transfer_allowed: false,
+        ..crate::clipboard_policy::ClipboardPolicy::default()
+    };
+    let choice = CredentialChoice {
+        id: "ba".repeat(16),
+        label: "Archive password".into(),
+        username: String::new(),
+    };
+    app.runtime.set_archive_passwords(vec![choice.clone()]);
+    app.update(Message::ArchivePassword(choice.clone()));
+    assert!(
+        app.view
+            .draft
+            .adopt_imported_archive(&connections, &trust, &denied, std::slice::from_ref(&choice))
+            .unwrap_err()
+            .contains("policy")
+    );
+    app.update(Message::EditArchiveExcludes(text_editor::Action::Edit(
+        text_editor::Edit::Paste(Arc::new(".tmp/".into())),
+    )));
+    app.view
+        .draft
+        .adopt_imported_archive(&connections, &trust, &policy, std::slice::from_ref(&choice))
+        .unwrap();
+    app.update(Message::Save);
+    let job = app.selected_job().unwrap();
+    assert!(!job.enabled());
+    assert!(job.action().require_executable().is_ok());
+    assert_eq!(job.action().connection.as_ref(), Some(&route));
+    let RemoteAction::ServerArchive(archive) = job.action().remote_action().unwrap() else {
+        panic!("expected adopted archive")
+    };
+    assert_eq!(
+        archive
+            .sources
+            .iter()
+            .map(RemotePath::as_str)
+            .collect::<Vec<_>>(),
+        ["/input/東京", "/etc/hosts"]
+    );
+    assert_eq!(archive.target.as_str(), "/output/archive.zip");
+    assert_eq!(archive.format, ArchiveFormat::ZipPassword);
+    assert_eq!(archive.level, 8);
+    assert_eq!(archive.download.as_ref(), Some(&local));
+    assert_eq!(
+        archive.password_credential.as_deref(),
+        Some(choice.id.as_str())
+    );
+    assert!(archive.excludes.join("\n").contains(".tmp/"));
+}
+
+#[test]
+fn imported_privileged_archive_needs_native_approval_for_its_exact_local_copy() {
+    use kortty_ssh::{HostKey, TrustStore};
+    use serde_json::json;
+
+    let profile = Profile::temporary();
+    let path = profile.file();
+    let mut connections = ConnectionStore::open(profile.0.join("connections.json")).unwrap();
+    let saved_id = connections
+        .save(grouped_connection("protected.example"))
+        .unwrap();
+    let route = ConnectionRef::from(connections.get(saved_id).unwrap());
+    let action: SshCommand = serde_json::from_value(json!({
+        "connection": route,
+        "remote": {"kind": "imported_archive", "route": route, "settings": {
+            "sources": ["/protected/records"], "target": "/backups/archive.tar",
+            "format": "tar", "level": 6, "java_excludes": [], "java_sudo": true,
+            "local_hint": "/java-only/archive.tar"
+        }}
+    }))
+    .unwrap();
+    let id = JobId::new("java-00000000000040009000000000000007").unwrap();
+    let job = Job::new(id.clone(), "Imported protected archive", action)
+        .unwrap()
+        .with_enabled(false);
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&JobGraph::new(vec![job]).unwrap(), &[], &[])
+        .unwrap();
+
+    let key = HostKey::from_openssh(
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBm/RAlphM3+hUG6wWfcO5bIUIaqMLa2ywxcOK1wMWbh",
+    )
+    .unwrap();
+    let pins = vec![(Endpoint::new("protected.example", 22).unwrap(), key)];
+    let trust = TrustStore::from_pins(pins.clone()).unwrap();
+    let policy = crate::clipboard_policy::ClipboardPolicy::default();
+    let denied = crate::clipboard_policy::ClipboardPolicy {
+        scheduler_sudo_allowed: false,
+        ..Default::default()
+    };
+    let mut app = TestWindow::open(path.clone()).unwrap();
+    app.runtime.set_execution_allowed(true);
+    app.update(Message::Select(id.clone()));
+    app.update(Message::Page(Page::Action));
+    app.update(Message::Sudo(SudoMode::Vault));
+    assert_eq!(app.view.draft.sudo, SudoMode::Disabled);
+    assert!(app.update(Message::Run(false)).is_empty());
+    assert!(
+        app.view
+            .draft
+            .adopt_imported_archive(&connections, &trust, &denied, &[])
+            .unwrap_err()
+            .contains("forbids Scheduler sudo")
+    );
+    assert!(
+        app.view
+            .draft
+            .adopt_imported_archive(&connections, &trust, &policy, &[])
+            .unwrap_err()
+            .contains("local archive destination")
+    );
+    let local = profile.0.join("reviewed archive.tar");
+    app.update(Message::Edit(
+        Field::ArchiveDownload,
+        local.to_str().unwrap().into(),
+    ));
+    app.view
+        .draft
+        .adopt_imported_archive(&connections, &trust, &policy, &[])
+        .unwrap();
+    assert_eq!(app.view.draft.sudo, SudoMode::Passwordless);
+    app.update(Message::Save);
+    assert!(app.status().is_some_and(|s| s.contains("Review the exact")));
+    assert!(matches!(
+        app.selected_job().unwrap().action().remote,
+        Some(RemoteAction::ImportedArchive(_))
+    ));
+    app.runtime
+        .review_privileged(&mut app.view, |reference| {
+            assert_eq!(reference, &route);
+            Ok(sync::fingerprints(&pins))
+        })
+        .unwrap();
+    app.update(Message::ApprovePrivileged);
+    app.update(Message::Save);
+    assert_eq!(app.status(), Some("Job saved"));
+    assert!(!app.selected_job().unwrap().enabled());
+    drop(app);
+
+    let mut reopened = TestWindow::open(path).unwrap();
+    reopened.runtime.set_execution_allowed(true);
+    reopened.update(Message::Select(id));
+    let request = reopened.update(Message::Run(false)).pop().unwrap();
+    let context = reopened.runtime.privileged_run_context(&request).unwrap();
+    let RemoteAction::PrivilegedArchive(archive) = request.action.remote_action().unwrap() else {
+        panic!("expected an approved protected archive");
+    };
+    assert_eq!(archive.archive.download.as_ref(), Some(&local));
+    assert_eq!(request.action.sudo, SudoMode::Passwordless);
+    assert!(
+        context
+            .authorize_archive(archive, &route, SudoMode::Passwordless, &pins)
+            .is_ok()
+    );
+    let mut changed = archive.clone();
+    changed.archive.download = Some(profile.0.join("changed archive.tar"));
+    assert!(
+        context
+            .authorize_archive(&changed, &route, SudoMode::Passwordless, &pins)
+            .is_err()
+    );
+}
+
+#[test]
 fn scheduler_target_groups_persist_source_and_block_changed_membership_until_refresh() {
     let scratch = Profile::temporary();
     let path = scratch.file();
@@ -143,6 +397,61 @@ fn scheduler_target_groups_allow_group_only_and_refuse_empty_or_oversized_groups
     }
     assert!(draft.refresh_connection_groups(&store).is_err());
     assert_eq!(draft.build(job_id).unwrap().action(), &action);
+}
+
+#[test]
+fn scheduler_target_groups_keep_imported_swarm_selection_when_adopting_profile() {
+    let scratch = Profile::temporary();
+    let mut store = ConnectionStore::open(scratch.0.join("connections.json")).unwrap();
+    let group = store.create_group(None, "Fleet").unwrap();
+    let targets = (0..=MAX_TARGETS)
+        .map(|number| {
+            let id = store
+                .save_in_group(
+                    grouped_connection(&format!("host-{number}.example.test")),
+                    Some(&group),
+                )
+                .unwrap();
+            store.get(id).unwrap().into()
+        })
+        .collect::<Vec<ConnectionRef>>();
+    let selection = TargetGroups {
+        groups: vec![group],
+        explicit: Vec::new(),
+    };
+    let action: SshCommand = serde_json::from_value(serde_json::json!({
+        "connection": targets[0],
+        "additional_connections": targets[1..],
+        "target_groups": selection,
+        "imported_ai": {
+            "kind": "swarm", "goal": "Inspect the fleet", "working_directory": "/srv",
+            "parallelism": 4, "swarm_read_only": true
+        }
+    }))
+    .unwrap();
+    let id = JobId::new("java-imported-group-swarm").unwrap();
+    let job = Job::new(id.clone(), "Imported Swarm", action)
+        .unwrap()
+        .with_enabled(false);
+    assert!(SshCommand::validate_definition(&job).is_ok());
+    assert!(job.action().require_current_target_groups(&store).is_ok());
+    assert_eq!(
+        job.action().require_executable(),
+        Err(IMPORTED_AI_REVIEW_REQUIRED)
+    );
+
+    let mut draft = Draft::from_job(&job);
+    draft.select_agent_profile(ProfileRef::Numeric(1));
+    let converted = draft.build(id).unwrap();
+    assert!(!converted.enabled());
+    let action = converted.action();
+    assert!(action.imported_ai.is_none());
+    let agent = action.agent.as_ref().unwrap();
+    assert_eq!(agent.probe, agent::Probe::SwarmReadOnly);
+    assert!(agent.approval.is_none());
+    assert_eq!(action.target_groups.as_ref(), Some(&selection));
+    assert!(action.targets().eq(&targets));
+    assert!(action.require_current_target_groups(&store).is_ok());
 }
 
 #[test]
@@ -327,6 +636,130 @@ impl TestWindow {
     }
 }
 
+#[test]
+fn scheduler_journal_output_uses_saved_mode_and_respects_capture_policy() {
+    use crate::clipboard_policy::ClipboardPolicy;
+    use kortty_jobs::RunOutput;
+
+    let legacy: SshCommand = serde_json::from_value(serde_json::json!({
+        "host": "example.test", "port": 22, "username": "operator", "command": "true"
+    }))
+    .unwrap();
+    assert_eq!(legacy.journal_detail, JournalDetail::Off);
+    assert_eq!(
+        Draft::default().journal_detail,
+        JournalDetail::LimitedRedacted
+    );
+
+    let scratch = Profile::temporary();
+    let path = scratch.file();
+    let mut app = TestWindow::open(path.clone()).unwrap();
+    app.runtime.set_execution_allowed(true);
+    app.runtime.set_journal_output_allowed(true);
+    app.update(Message::Edit(Field::Name, "Output fixture".into()));
+    app.update(Message::Edit(Field::Host, "example.test".into()));
+    app.update(Message::Edit(Field::Username, "operator".into()));
+    app.update(Message::Edit(
+        Field::KeyFile,
+        scratch.0.join("fixture-key").to_string_lossy().into_owned(),
+    ));
+    app.update(Message::EditCommand(text_editor::Action::Edit(
+        text_editor::Edit::Paste(Arc::new("printf ready".into())),
+    )));
+    app.update(Message::JournalDetail(JournalDetail::Full));
+    app.update(Message::Save);
+    assert_eq!(
+        app.selected_job().unwrap().action().journal_detail,
+        JournalDetail::Full
+    );
+
+    let output = RunOutput {
+        stdout: "Service ready".into(),
+        stderr: "Retained diagnostic".into(),
+    };
+    let policy = ClipboardPolicy::load();
+    assert!(policy.automation_journal_allowed());
+    let mut ids = Vec::new();
+    for (allowed, outcome) in [
+        (true, RunOutcome::Failed { exit_code: None }),
+        (false, RunOutcome::Success),
+        (true, RunOutcome::Cancelled),
+    ] {
+        app.runtime.set_journal_output_allowed(allowed);
+        let request = app.update(Message::Run(false)).pop().unwrap();
+        app.update(Message::Finished(Completion {
+            id: request.id,
+            outcome,
+            detail: None,
+            recording: None,
+            output: Some(CapturedOutput::fixture(output.clone(), &policy)),
+            swarm_report: None,
+        }));
+        ids.push(request.id);
+    }
+    drop(app);
+    let restored = TestWindow::open(path).unwrap();
+    assert_eq!(
+        restored.selected_job().unwrap().action().journal_detail,
+        JournalDetail::Full
+    );
+    assert_eq!(restored.runtime.store.journal_output(ids[0]), Some(&output));
+    assert!(restored.runtime.store.journal_output(ids[1]).is_none());
+    assert!(restored.runtime.store.journal_output(ids[2]).is_none());
+    assert_eq!(restored.runtime.store.journal().len(), 3);
+}
+
+#[test]
+fn new_scheduler_ai_draft_suggests_the_default_without_review_or_replacement() {
+    let profile = Profile::temporary();
+    let mut store = ConnectionStore::open(profile.0.join("connections.json")).unwrap();
+    let connection = store
+        .save(grouped_connection("fleet.example.test"))
+        .unwrap();
+    let config: Configuration = serde_json::from_value(serde_json::json!({
+        "profiles": {
+            "profiles": [
+                {"id": 1, "name": "Alternative", "model": "alternate"},
+                {"id": 2, "name": "Default", "model": "default"}
+            ],
+            "default": 2,
+            "last_id": 2
+        }
+    }))
+    .unwrap();
+    let mut app = TestWindow::open(profile.file()).unwrap();
+    app.runtime.set_connections(Some(&store));
+    app.runtime.set_agent_profiles(Some(&config), true);
+    app.update(Message::Edit(Field::Name, "Fleet diagnostics".into()));
+    app.update(Message::Edit(Field::WorkingDirectory, "/srv".into()));
+    app.update(Message::EditAgentGoal(text_editor::Action::Edit(
+        text_editor::Edit::Paste(Arc::new("Inspect system state".into())),
+    )));
+    app.update(Message::ConnectionSelected(ConnectionChoice::Saved {
+        reference: store.get(connection).unwrap().into(),
+        name: "Fleet".into(),
+    }));
+    app.update(Message::CommandSource(Source::AgentDiagnostics));
+    let id = JobId::new("default-ai").unwrap();
+    let job = app.view.draft.build(id.clone()).unwrap();
+    let action = job.action().agent.as_ref().unwrap();
+    assert_eq!(action.profile, ProfileRef::Numeric(2));
+    assert!(action.approval.is_none());
+
+    let alternate = app
+        .runtime
+        .agent_profiles
+        .selected(&ProfileRef::Numeric(1))
+        .unwrap()
+        .clone();
+    app.update(Message::AgentProfile(alternate));
+    app.update(Message::CommandSource(Source::SwarmDiagnostics));
+    let job = app.view.draft.build(id).unwrap();
+    let action = job.action().agent.as_ref().unwrap();
+    assert_eq!(action.profile, ProfileRef::Numeric(1));
+    assert!(action.approval.is_none());
+}
+
 pub(super) struct Profile(PathBuf);
 
 impl Profile {
@@ -437,16 +870,24 @@ fn reviewed_sftp_approval_round_trips_through_editor_and_claims_once() {
     assert!(context.store.load(&id, approval, context.scope).is_err());
 }
 
-#[cfg(windows)]
 #[test]
 fn scheduler_changed_download_edit_and_reopen_use_the_new_exact_approval() {
+    scheduler_changed_copy_edit_and_reopen("download");
+}
+
+#[test]
+fn scheduler_changed_upload_edit_and_reopen_use_the_new_exact_approval() {
+    scheduler_changed_copy_edit_and_reopen("upload");
+}
+
+fn scheduler_changed_copy_edit_and_reopen(direction: &str) {
     let profile = Profile::temporary();
     let root = profile.0.canonicalize().unwrap();
     let path = root.join("scheduler.json");
     let id = JobId::new("reviewed-replacement").unwrap();
     let action: SshCommand = serde_json::from_value(serde_json::json!({
         "connection": {"id": 1, "target": {"host": "server.example", "port": 22, "username": "operator"}},
-        "remote": {"kind": "sync", "direction": "download", "local": root.join("local"), "remote": "/reviewed"}
+        "remote": {"kind": "sync", "direction": direction, "local": root.join("local"), "remote": "/reviewed"}
     })).unwrap();
     let graph = JobGraph::new(vec![
         Job::new(id.clone(), "Reviewed replacement", action).unwrap(),
@@ -471,6 +912,11 @@ fn scheduler_changed_download_edit_and_reopen_use_the_new_exact_approval() {
     app.update(Message::SyncReplaceChanged(true));
     let pending = app.runtime.begin_sync_review(&mut app.view).unwrap();
     assert!(pending.copy.replace_changed && pending.copy.approval.is_none());
+    let [source, target] = if direction == "download" {
+        ["/reviewed/changed.txt", "local/changed.txt"]
+    } else {
+        ["local/changed.txt", "/reviewed/changed.txt"]
+    };
     app.update(Message::SyncPreviewed(
         pending.ticket,
         Ok(Arc::new(sync::Review {
@@ -479,8 +925,8 @@ fn scheduler_changed_download_edit_and_reopen_use_the_new_exact_approval() {
                 roots: ["Remote reviewed".into(), "Local reviewed".into()],
                 paths: vec![],
                 replacements: vec![crate::sftp_window::scheduled::ReplacementPreview {
-                    source: "/reviewed/changed.txt".into(),
-                    target: "local/changed.txt".into(),
+                    source: source.into(),
+                    target: target.into(),
                     source_sha256: "a".repeat(64),
                     target_sha256: "b".repeat(64),
                 }],
@@ -710,6 +1156,7 @@ fn reviewed_sftp_cascade_refreshes_a_spent_receipt_and_keeps_the_other_branch() 
             outcome: RunOutcome::Success,
             detail: None,
             recording: None,
+            output: None,
             swarm_report: None,
         })
     };
@@ -737,6 +1184,7 @@ fn reviewed_sftp_cascade_refreshes_a_spent_receipt_and_keeps_the_other_branch() 
             outcome: RunOutcome::Failed { exit_code: Some(1) },
             detail: None,
             recording: None,
+            output: None,
             swarm_report: None,
         }))
         .is_empty()
@@ -1009,6 +1457,7 @@ fn privileged_file_action_review_persists_and_binds_the_typed_operation() {
     for operation in [
         json!({"kind": "mkdir"}),
         json!({"kind": "chmod", "mode": 416}),
+        json!({"kind": "chmod_symbolic", "mode": "g=u,o-r"}),
         json!({"kind": "chown", "uid": null, "gid": 42}),
         json!({"kind": "copy", "to": "/approved/copied"}),
         json!({"kind": "copy_tree", "to": "/approved/copied-tree"}),
@@ -1073,7 +1522,7 @@ fn privileged_file_action_review_persists_and_binds_the_typed_operation() {
         app.runtime
             .review_privileged(&mut app.view, |_| Ok(sync::fingerprints(&pins)))
             .unwrap();
-        app.update(Message::Edit(Field::RemoteMode, "0600".into()));
+        app.update(Message::Edit(Field::RemoteMode, "g=u,o-r".into()));
         app.update(Message::ApprovePrivileged);
         assert!(
             app.status()
@@ -1097,7 +1546,9 @@ fn privileged_file_action_review_persists_and_binds_the_typed_operation() {
     };
     assert_eq!(
         metadata.operation,
-        ProtectedOperation::Chmod { mode: 0o600 }
+        ProtectedOperation::ChmodSymbolic {
+            mode: SymbolicMode::try_from("g=u,o-r".to_owned()).unwrap()
+        }
     );
     assert!(metadata.approval.is_some());
     let route = request.action.connection.as_ref().unwrap();
@@ -1117,7 +1568,9 @@ fn privileged_file_action_review_persists_and_binds_the_typed_operation() {
             .is_err()
     );
     let mut changed = metadata.clone();
-    changed.operation = ProtectedOperation::Chmod { mode: 0o640 };
+    changed.operation = ProtectedOperation::ChmodSymbolic {
+        mode: SymbolicMode::try_from("g=u,o+x".to_owned()).unwrap(),
+    };
     assert!(
         context
             .authorize_file_action(&changed, route, SudoMode::Passwordless, &pins)
@@ -1170,7 +1623,7 @@ fn privileged_archive_review_binds_saved_spec_route_and_pins() {
     app.update(Message::Page(Page::Action));
     assert!(app.view.editing_privileged_file_action());
     app.update(Message::Sudo(SudoMode::Vault));
-    assert_eq!(app.view.draft.sudo, SudoMode::Disabled);
+    assert_eq!(app.view.draft.sudo, SudoMode::Vault);
     app.update(Message::Sudo(SudoMode::Passwordless));
     app.update(Message::Save);
     assert!(
@@ -1194,7 +1647,7 @@ fn privileged_archive_review_binds_saved_spec_route_and_pins() {
     assert_eq!(app.status(), Some("Job saved"));
     drop(app);
 
-    let mut reopened = TestWindow::open(path).unwrap();
+    let mut reopened = TestWindow::open(path.clone()).unwrap();
     reopened.runtime.set_execution_allowed(true);
     reopened.update(Message::Select(id.clone()));
     let request = reopened.update(Message::Run(false)).pop().unwrap();
@@ -1245,13 +1698,112 @@ fn privileged_archive_review_binds_saved_spec_route_and_pins() {
         draft.build(id.clone()).unwrap().action(),
         request.action.as_ref()
     );
-    assert!(!draft.select_archive_format(ArchiveFormat::ZipPassword));
+    assert!(draft.select_archive_format(ArchiveFormat::ZipPassword));
+    assert!(draft.select_archive_format(ArchiveFormat::TarBz2));
     assert!(draft.set_archive_server_only(false));
     assert_eq!(draft.sudo, SudoMode::Disabled);
     assert!(matches!(
-        draft.build(id).unwrap().action().remote_action(),
+        draft.build(id.clone()).unwrap().action().remote_action(),
         Ok(RemoteAction::Archive(_))
     ));
+
+    drop(reopened);
+    let mut reopened = TestWindow::open(path.clone()).unwrap();
+    reopened.runtime.set_execution_allowed(true);
+    reopened.update(Message::Select(id.clone()));
+    reopened.update(Message::Page(Page::Action));
+    reopened.update(Message::Sudo(SudoMode::Vault));
+    reopened.update(Message::Save);
+    assert!(
+        reopened
+            .status()
+            .is_some_and(|status| status.contains("Review the exact"))
+    );
+    reopened.update(Message::ArchiveFormat(ArchiveFormat::ZipPassword));
+    reopened.update(Message::Edit(
+        Field::RemotePath,
+        "/backups/snapshot.zip".into(),
+    ));
+    let password = |digit: &str| CredentialChoice {
+        id: digit.repeat(32),
+        label: "Archive password".into(),
+        username: String::new(),
+    };
+    let original = password("a");
+    let replacement = password("b");
+    let local_copy = profile.0.join("protected copy.zip");
+    reopened.update(Message::Edit(
+        Field::ArchiveDownload,
+        local_copy.to_str().unwrap().into(),
+    ));
+    reopened
+        .runtime
+        .set_archive_passwords(vec![original.clone(), replacement.clone()]);
+    reopened.update(Message::ArchivePassword(original.clone()));
+    reopened
+        .runtime
+        .review_privileged(&mut reopened.view, |_| Ok(sync::fingerprints(&pins)))
+        .unwrap();
+    reopened.update(Message::ArchivePassword(replacement.clone()));
+    reopened.update(Message::ApprovePrivileged);
+    assert!(
+        reopened
+            .status()
+            .is_some_and(|status| status.contains("changed"))
+    );
+    reopened
+        .runtime
+        .review_privileged(&mut reopened.view, |_| Ok(sync::fingerprints(&pins)))
+        .unwrap();
+    reopened.update(Message::ApprovePrivileged);
+    reopened.update(Message::Save);
+    assert_eq!(reopened.status(), Some("Job saved"));
+    drop(reopened);
+    let mut reopened = TestWindow::open(path).unwrap();
+    reopened.runtime.set_execution_allowed(true);
+    reopened.update(Message::Select(id));
+    let encrypted = reopened.update(Message::Run(false)).pop().unwrap();
+    let RemoteAction::PrivilegedArchive(archive) = encrypted.action.remote_action().unwrap() else {
+        panic!("expected a protected password archive");
+    };
+    let pinned = encrypted.action.connection.as_ref().unwrap();
+    let review = reopened.runtime.privileged_run_context(&encrypted).unwrap();
+    let remote = encrypted.action.remote_action().unwrap();
+    assert_eq!(encrypted.action.sudo, SudoMode::Vault);
+    assert!(remote.transfers_files() && remote.writes_local_file());
+    assert_eq!(
+        archive.archive.download.as_deref(),
+        Some(local_copy.as_path())
+    );
+    assert!(archive.archive.server_spec().unwrap().report_payload);
+    assert_eq!(
+        archive.archive.password_credential.as_ref(),
+        Some(&replacement.id)
+    );
+    assert!(
+        review
+            .authorize_archive(archive, pinned, SudoMode::Vault, &pins)
+            .is_ok()
+    );
+    assert!(
+        review
+            .authorize_archive(archive, pinned, SudoMode::Passwordless, &pins)
+            .is_err()
+    );
+    let mut changed_password = archive.clone();
+    changed_password.archive.password_credential = Some(original.id);
+    assert!(
+        review
+            .authorize_archive(&changed_password, pinned, SudoMode::Vault, &pins)
+            .is_err()
+    );
+    let mut changed_copy = archive.clone();
+    changed_copy.archive.download = Some(profile.0.join("different copy.zip"));
+    assert!(
+        review
+            .authorize_archive(&changed_copy, pinned, SudoMode::Vault, &pins)
+            .is_err()
+    );
 }
 
 #[test]
@@ -1394,7 +1946,20 @@ fn rsync_program_approval_is_bound_to_the_saved_editor_executable_and_route() {
         upload: None,
         directory: None,
         directory_upload: None,
+        existing: None,
+        existing_download: None,
+        existing_file_download: None,
+        mixed: None,
+        batch: None,
+        download: None,
+        privileged: None,
     };
+    let Some(RemoteAction::RsyncDownload(transfer)) = &action.remote else {
+        panic!("expected rsync download");
+    };
+    let mut reviewed = transfer.clone();
+    reviewed.approval = Some(approval);
+    let reviewed = rsync::Reviewed::restore(&reviewed).unwrap();
     {
         let mut store = SchedulerStore::open(&path).unwrap();
         let graph = JobGraph::new(vec![
@@ -1407,8 +1972,11 @@ fn rsync_program_approval_is_bound_to_the_saved_editor_executable_and_route() {
     app.runtime.set_execution_allowed(true);
     app.update(Message::Select(id.clone()));
     app.update(Message::Page(Page::Action));
-    app.view.rsync_review.begin("first".into());
-    app.update(Message::RsyncProgramReviewed("first".into(), Ok(approval)));
+    app.view.rsync_review.begin("first".into(), None);
+    app.update(Message::RsyncProgramReviewed(
+        "first".into(),
+        Ok(Box::new(reviewed)),
+    ));
     app.update(Message::ApproveRsyncProgram);
     app.update(Message::Save);
     let action = app.selected_job().unwrap().action();
@@ -1538,6 +2106,7 @@ fn scheduler_views_keep_independent_drafts_and_share_job_execution() {
                 outcome: RunOutcome::Success,
                 detail: None,
                 recording: None,
+                output: None,
                 swarm_report: None,
             }))
             .is_empty()
@@ -1664,6 +2233,7 @@ fn scheduler_run_saves_the_draft_before_checking_cascade_dependencies() {
                 outcome: failed,
                 detail: None,
                 recording: None,
+                output: None,
                 swarm_report: None,
             }))
             .is_empty()
@@ -1689,6 +2259,7 @@ fn scheduler_run_saves_the_draft_before_checking_cascade_dependencies() {
             outcome: RunOutcome::Success,
             detail: None,
             recording: None,
+            output: None,
             swarm_report: None,
         }))
         .pop()
@@ -1799,6 +2370,7 @@ fn jobs_menu_cancels_only_the_current_exact_run() {
         outcome: RunOutcome::Cancelled,
         detail: None,
         recording: None,
+        output: None,
         swarm_report: None,
     }));
     let rerun = runtime
@@ -1916,8 +2488,11 @@ fn virtual_terminal_attachment_survives_reopen_and_is_removed_with_its_record() 
         snippet: None,
         remote: None,
         agent: None,
+        imported_ai: None,
+        imported_transfer: None,
         sudo: SudoMode::Disabled,
         virtual_terminal: Some(options),
+        journal_detail: JournalDetail::Off,
         automation_journal: None,
         desktop_notices: Default::default(),
         webhook_targets: Vec::new(),
@@ -1956,6 +2531,7 @@ fn virtual_terminal_attachment_survives_reopen_and_is_removed_with_its_record() 
         outcome: RunOutcome::Success,
         detail: None,
         recording: Some(token),
+        output: None,
         swarm_report: None,
     }));
     drop(window);
@@ -2065,6 +2641,7 @@ fn scheduler_journal_search_uses_real_run_fields_and_view_specific_columns() {
         },
         detail: Some("Permission denied".into()),
         recording: None,
+        output: None,
         swarm_report: None,
     }));
     // A clock value containing "42" must not satisfy the exit-code check.
@@ -2131,7 +2708,7 @@ fn scheduler_journal_sorts_runs_and_deletes_only_the_reviewed_visible_selection(
     let now = SystemTime::now();
     let start = |window: &mut TestWindow, job: &JobId, seconds| {
         let at = now + Duration::from_secs(seconds);
-        let batch = window.runtime.start(job, false, at).unwrap();
+        let batch = window.runtime.start(job, false, &[], at).unwrap();
         window.runtime.receive(batch, None, at).pop().unwrap().id
     };
     let finish = |window: &mut TestWindow, id, outcome, detail: &str, seconds| {
@@ -2141,6 +2718,7 @@ fn scheduler_journal_sorts_runs_and_deletes_only_the_reviewed_visible_selection(
                 outcome,
                 detail: Some(detail.into()),
                 recording: None,
+                output: None,
                 swarm_report: None,
             }),
             now + Duration::from_secs(seconds),
@@ -2254,7 +2832,7 @@ fn scheduler_run_journal_retention_prunes_after_apply_commit_and_reopen() {
     let now = SystemTime::from("2025-01-15T12:00:00Z".parse::<Timestamp>().unwrap());
     let day = Duration::from_secs(86_400);
     let start = |window: &mut TestWindow, job: &JobId, at| {
-        let batch = window.runtime.start(job, false, at).unwrap();
+        let batch = window.runtime.start(job, false, &[], at).unwrap();
         window.runtime.receive(batch, None, at).pop().unwrap().id
     };
     let finish = |window: &mut TestWindow, id, at, token| {
@@ -2264,6 +2842,7 @@ fn scheduler_run_journal_retention_prunes_after_apply_commit_and_reopen() {
                 outcome: RunOutcome::Success,
                 detail: None,
                 recording: token,
+                output: None,
                 swarm_report: None,
             }),
             at,
@@ -2344,6 +2923,142 @@ fn scheduler_run_journal_retention_prunes_after_apply_commit_and_reopen() {
 }
 
 #[test]
+fn ai_cascade_root_rechecks_only_the_predecessor_blockers_accepted_at_start() {
+    let profile = Profile::temporary();
+    let path = profile.file();
+    let upstream = JobId::new("upstream").unwrap();
+    let root = JobId::new("ai-root").unwrap();
+    let connection = serde_json::json!({
+        "id": 1, "target": {"host": "fixture.example", "port": 22, "username": "operator"}
+    });
+    let command: SshCommand = serde_json::from_value(serde_json::json!({
+        "connection": connection, "command": "true"
+    }))
+    .unwrap();
+    let action: SshCommand = serde_json::from_value(serde_json::json!({
+        "connection": connection,
+        "working_directory": "/srv",
+        "agent": {"kind": "agent", "probe": "per_firing", "profile": 1, "goal": "Inspect fixture"}
+    }))
+    .unwrap();
+    let graph = JobGraph::new(vec![
+        Job::new(upstream.clone(), "Upstream", command).unwrap(),
+        Job::new(root.clone(), "AI root", action)
+            .unwrap()
+            .with_dependencies(DependencyMode::Gate, vec![upstream.clone()], None),
+    ])
+    .unwrap();
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&graph, &[], &[])
+        .unwrap();
+    let mut app = TestWindow::open(path).unwrap();
+    app.runtime.set_execution_allowed(true);
+    app.runtime.select(&mut app.view, &root);
+    assert!(app.update(Message::Run(true)).is_empty());
+    let root_run = app.update(Message::Confirm).pop().unwrap();
+    assert_eq!(root_run.trigger, RunTrigger::Cascade);
+    assert!(
+        app.runtime
+            .agent_predecessors_current(&root_run, SystemTime::now())
+    );
+
+    app.runtime.select(&mut app.view, &upstream);
+    let predecessor = app.update(Message::Run(false)).pop().unwrap();
+    assert!(
+        app.update(Message::Finished(Completion {
+            id: predecessor.id,
+            outcome: RunOutcome::Failed { exit_code: Some(1) },
+            detail: None,
+            recording: None,
+            output: None,
+            swarm_report: None,
+        }))
+        .is_empty()
+    );
+    assert!(
+        !app.runtime
+            .agent_predecessors_current(&root_run, SystemTime::now())
+    );
+
+    let predecessor = app.update(Message::Run(false)).pop().unwrap();
+    assert!(
+        app.update(Message::Finished(Completion {
+            id: predecessor.id,
+            outcome: RunOutcome::Success,
+            detail: None,
+            recording: None,
+            output: None,
+            swarm_report: None,
+        }))
+        .is_empty()
+    );
+    assert!(
+        app.runtime
+            .agent_predecessors_current(&root_run, SystemTime::now())
+    );
+}
+
+#[test]
+fn imported_ai_drafts_cannot_start_or_be_enabled_with_a_chain() {
+    let profile = Profile::temporary();
+    let root = JobId::new("command").unwrap();
+    let imported = JobId::new("java-imported-ai").unwrap();
+    let action: SshCommand = serde_json::from_value(serde_json::json!({
+        "connection": {"id": 1, "target": {"host": "fixture.example", "port": 22, "username": "operator"}},
+        "imported_ai": {"kind": "agent", "goal": "Inspect fixture", "parallelism": 1, "swarm_read_only": true}
+    })).unwrap();
+    assert_eq!(
+        action.command_for_exec(None),
+        Err(IMPORTED_AI_REVIEW_REQUIRED)
+    );
+    let mut mixed = action.clone();
+    mixed.command = "true".into();
+    assert!(mixed.validated().is_err());
+    let mut command = action.clone();
+    command.imported_ai = None;
+    command.command = "true".into();
+    let ancestor = Job::new(root.clone(), "Command", command)
+        .unwrap()
+        .with_enabled(false);
+    let draft = Job::new(imported.clone(), "Imported Agent", action)
+        .unwrap()
+        .with_dependencies(DependencyMode::Chain, vec![root.clone()], None);
+    assert!(SshCommand::validate_definition(&draft).is_err());
+    let draft = draft.with_enabled(false);
+    let path = profile.file();
+    {
+        let mut store = SchedulerStore::open(&path).unwrap();
+        store
+            .commit_with_actions(&JobGraph::new(vec![ancestor, draft]).unwrap(), &[], &[])
+            .unwrap();
+    }
+    let unchanged = fs::read(&path).unwrap();
+    let mut app = TestWindow::open(path.clone()).unwrap();
+    app.runtime.set_execution_allowed(true);
+    app.runtime.select(&mut app.view, &imported);
+    for cascade in [false, true] {
+        assert!(app.update(Message::Run(cascade)).is_empty());
+        assert_eq!(app.status(), Some(IMPORTED_AI_REVIEW_REQUIRED));
+        assert!(!app.runtime.has_active_runs());
+        assert!(app.runtime.store.journal().is_empty());
+    }
+    app.runtime.select(&mut app.view, &root);
+    assert!(app.update(Message::SwitchChain).is_empty());
+    assert!(app.update(Message::Confirm).is_empty());
+    assert!(app.status().unwrap().contains(IMPORTED_AI_REVIEW_REQUIRED));
+    assert_eq!(fs::read(path).unwrap(), unchanged);
+    assert!(
+        app.runtime
+            .scheduler
+            .graph()
+            .jobs()
+            .iter()
+            .all(|job| !job.enabled())
+    );
+}
+
+#[test]
 fn a_chain_waits_for_the_predecessor_journal_commit_with_session_journals() {
     let profile = Profile::temporary();
     let root = JobId::new("first").unwrap();
@@ -2362,8 +3077,11 @@ fn a_chain_waits_for_the_predecessor_journal_commit_with_session_journals() {
         snippet: None,
         remote: None,
         agent: None,
+        imported_ai: None,
+        imported_transfer: None,
         sudo: SudoMode::Disabled,
         virtual_terminal: None,
+        journal_detail: JournalDetail::Off,
         automation_journal: None,
         desktop_notices: Default::default(),
         webhook_targets: Vec::new(),
@@ -2402,6 +3120,7 @@ fn a_chain_waits_for_the_predecessor_journal_commit_with_session_journals() {
             outcome: RunOutcome::Success,
             detail: Some("Exit status 0".into()),
             recording: Some([3; 16]),
+            output: None,
             swarm_report: None,
         },
         links.clone(),
@@ -2433,6 +3152,7 @@ fn a_chain_waits_for_the_predecessor_journal_commit_with_session_journals() {
                 outcome: failed,
                 detail: None,
                 recording: None,
+                output: None,
                 swarm_report: None,
             }))
             .is_empty()
@@ -2632,6 +3352,1017 @@ fn working_directory_wraps_shell_actions_and_validates_stored_paths() {
 }
 
 #[test]
+fn imported_sftp_form_requires_local_path_and_adopts_only_the_chosen_transfer() {
+    use imported_transfer::Mode;
+    use serde_json::json;
+
+    for (kind, mode, native_kind, folder) in [
+        ("upload", Mode::File, "upload", false),
+        ("download", Mode::Folder, "download", true),
+        ("sync_download", Mode::Compare, "sync", false),
+    ] {
+        let profile = Profile::temporary();
+        let path = profile.file();
+        let id = JobId::new("java-00000000000040009000000000000000").unwrap();
+        let action: SshCommand = serde_json::from_value(json!({
+            "connection": {"id": 1, "target": {"host": "server.example", "port": 22, "username": "operator"}},
+            "imported_transfer": {"kind": kind, "remote": "/stage/file", "local_hint": "/java-only/original"}
+        })).unwrap();
+        {
+            let mut store = SchedulerStore::open(&path).unwrap();
+            let job = Job::new(id.clone(), "Transfer draft", action.clone())
+                .unwrap()
+                .with_enabled(false);
+            let graph = JobGraph::new(vec![job]).unwrap();
+            store.commit_with_actions(&graph, &[], &[]).unwrap();
+        }
+        let mut app = TestWindow::open(path.clone()).unwrap();
+        app.runtime.set_execution_allowed(true);
+        app.update(Message::Select(id.clone()));
+        app.update(Message::Page(Page::Action));
+        assert_eq!(app.view.draft.source, Source::ImportedTransfer);
+        app.update(Message::Enabled(true));
+        app.update(Message::CommandSource(Source::RemoteUpload));
+        app.update(Message::AdoptImportedTransfer(mode));
+        assert!(app.status().unwrap().contains("absolute local path"));
+        assert!(app.view.draft.has_imported_transfer());
+        assert!(app.update(Message::Run(false)).is_empty());
+
+        let local = profile.0.join("chosen path");
+        app.update(Message::Edit(
+            Field::LocalFile,
+            local.to_str().unwrap().into(),
+        ));
+        app.update(Message::Save);
+        let saved = app.selected_job().unwrap();
+        assert!(!saved.enabled());
+        assert_eq!(saved.action(), &action);
+        drop(app);
+
+        let mut app = TestWindow::open(path).unwrap();
+        app.update(Message::Select(id));
+        app.update(Message::Page(Page::Action));
+        app.update(Message::AdoptImportedTransfer(mode));
+        assert!(app.status().unwrap().contains("absolute local path"));
+        app.update(Message::Edit(
+            Field::LocalFile,
+            local.to_str().unwrap().into(),
+        ));
+        app.update(Message::AdoptImportedTransfer(mode));
+        app.update(Message::Save);
+        assert_eq!(app.status(), Some("Job saved"));
+        let selected = app.selected_job().unwrap();
+        assert!(!selected.enabled());
+        assert_eq!(selected.action().connection, action.connection);
+        assert!(selected.action().imported_transfer.is_none());
+        let remote = serde_json::to_value(selected.action()).unwrap()["remote"].clone();
+        assert_eq!(remote["kind"], native_kind);
+        assert_eq!(remote["local"], json!(local));
+        assert_eq!(remote["remote"], "/stage/file");
+        assert_eq!(remote["folder"].as_bool().unwrap_or(false), folder);
+        if mode == Mode::Compare {
+            assert_eq!(remote["direction"], "download");
+            assert!(remote["approval"].is_null());
+            assert!(remote["standing"].is_null());
+            assert!(!selected.schedule().unwrap().enabled());
+        }
+    }
+}
+
+#[test]
+fn imported_rsync_form_keeps_unsupported_options_and_requires_exact_new_review() {
+    use serde_json::json;
+
+    let profile = Profile::temporary();
+    let root = profile.0.canonicalize().unwrap();
+    let path = profile.file();
+    let id = JobId::new("java-00000000000040009002000000000000").unwrap();
+    let unsupported = JobId::new("java-00000000000040009002000000000001").unwrap();
+    let route =
+        json!({"id": 1, "target": {"host": "server.example", "port": 22, "username": "operator"}});
+    let draft = |delete| -> SshCommand {
+        serde_json::from_value(json!({
+            "connection": route,
+            "imported_transfer": {
+                "direction": "download", "java_sources": ["/stage/file"],
+                "java_target_root": "/java-only/root", "java_delete": delete, "java_sudo": false,
+            },
+        }))
+        .unwrap()
+    };
+    let graph = JobGraph::new(vec![
+        Job::new(id.clone(), "Java file rsync", draft(false))
+            .unwrap()
+            .with_enabled(false),
+        Job::new(unsupported.clone(), "Java rsync delete", draft(true))
+            .unwrap()
+            .with_enabled(false),
+    ])
+    .unwrap();
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&graph, &[], &[])
+        .unwrap();
+    let mut app = TestWindow::open(path.clone()).unwrap();
+    app.runtime.set_execution_allowed(true);
+    app.update(Message::Select(unsupported));
+    app.update(Message::Page(Page::Action));
+    app.update(Message::ConfigureImportedRsync { directory: false });
+    assert!(app.status().unwrap().contains("Java delete option"));
+    assert!(app.view.draft.has_imported_transfer());
+    assert!(app.update(Message::Run(false)).is_empty());
+
+    app.update(Message::Select(id.clone()));
+    app.update(Message::Page(Page::Action));
+    app.update(Message::ConfigureImportedRsync { directory: false });
+    assert_eq!(app.view.draft.source, Source::RsyncDownload);
+    let local = root.join("published");
+    let program = root.join("rsync");
+    app.update(Message::Edit(
+        Field::LocalFile,
+        local.to_str().unwrap().into(),
+    ));
+    app.update(Message::Edit(
+        Field::RsyncProgram,
+        program.to_str().unwrap().into(),
+    ));
+    app.update(Message::Save);
+    assert!(
+        app.status()
+            .unwrap()
+            .contains("Review the imported rsync action")
+    );
+    assert!(
+        app.selected_job()
+            .unwrap()
+            .action()
+            .imported_transfer
+            .is_some()
+    );
+
+    let reviewed: RemoteAction = serde_json::from_value(json!({
+        "kind": "rsync_download", "program": program, "local": local, "remote": "/stage/file",
+        "approval": {
+            "program": program, "digest": vec![8; 32], "reference": route,
+            "pins": ["server.example SHA256:fixture"],
+            "download": {"source": "/stage/file", "destination": local},
+        },
+    }))
+    .unwrap();
+    let RemoteAction::RsyncDownload(reviewed) = reviewed else {
+        panic!("not a download")
+    };
+    app.view.rsync_review.begin("review".into(), None);
+    app.update(Message::RsyncProgramReviewed(
+        "review".into(),
+        Ok(Box::new(rsync::Reviewed::restore(&reviewed).unwrap())),
+    ));
+    app.update(Message::ApproveRsyncProgram);
+    app.update(Message::Edit(
+        Field::LocalFile,
+        root.join("different").to_str().unwrap().into(),
+    ));
+    app.update(Message::Save);
+    assert!(
+        app.status()
+            .unwrap()
+            .contains("Review the imported rsync action")
+    );
+    app.update(Message::Edit(
+        Field::LocalFile,
+        local.to_str().unwrap().into(),
+    ));
+    app.update(Message::Save);
+    assert_eq!(app.status(), Some("Job saved"));
+    drop(app);
+
+    let mut app = TestWindow::open(path).unwrap();
+    app.update(Message::Select(id));
+    let job = app.selected_job().unwrap();
+    assert!(!job.enabled() && job.action().imported_transfer.is_none());
+    let exported = serde_json::to_value(job.action()).unwrap();
+    assert_eq!(
+        exported["remote"]["approval"]["download"]["destination"],
+        json!(local)
+    );
+    assert!(!exported.to_string().contains("/java-only/root"));
+}
+
+#[test]
+fn java_existing_rsync_upload_adoption_preserves_contents_mirror_and_disables_schedule() {
+    use serde_json::json;
+
+    let profile = Profile::temporary();
+    let root = profile.0.canonicalize().unwrap();
+    let path = profile.file();
+    let id = JobId::new("java-existing-rsync").unwrap();
+    let connection =
+        json!({"id": 1, "target": {"host": "server.example", "port": 22, "username": "operator"}});
+    let action: SshCommand = serde_json::from_value(json!({
+        "connection": connection,
+        "imported_transfer": {
+            "direction": "upload", "java_sources": ["/from/old-source/"],
+            "java_target_root": "/server/receiver/", "java_delete": true, "java_sudo": false,
+        }
+    }))
+    .unwrap();
+    let graph = JobGraph::new(vec![
+        Job::new(id.clone(), "Java rsync mirror", action)
+            .unwrap()
+            .with_enabled(false),
+    ])
+    .unwrap();
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&graph, &[], &[])
+        .unwrap();
+    let mut app = TestWindow::open(path.clone()).unwrap();
+    app.runtime.set_execution_allowed(true);
+    app.update(Message::Select(id.clone()));
+    app.update(Message::Page(Page::Action));
+    app.update(Message::ConfigureImportedRsync { directory: true });
+    assert!(app.view.draft.has_imported_transfer());
+    app.update(Message::ScheduleEnabled(true));
+    app.update(Message::ConfigureImportedExistingRsync);
+    assert_eq!(app.view.draft.source, Source::RsyncUploadTree);
+    assert!(!app.view.draft.has_imported_transfer());
+    let program = root.join("rsync");
+    let source = root.join("new-source");
+    app.update(Message::Edit(
+        Field::LocalFile,
+        source.to_str().unwrap().into(),
+    ));
+    app.update(Message::Edit(
+        Field::RsyncProgram,
+        program.to_str().unwrap().into(),
+    ));
+    app.update(Message::RsyncMirror(false));
+    app.update(Message::RsyncIncludeSourceName(true));
+    app.update(Message::RsyncExisting(false));
+    let targets = app.view.rsync_review_requests().unwrap().existing_targets();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].1.as_str(), "/server/receiver");
+    app.update(Message::Save);
+    assert!(app.status().unwrap().contains("Review the imported rsync"));
+    assert!(
+        app.selected_job()
+            .unwrap()
+            .action()
+            .imported_transfer
+            .is_some()
+    );
+
+    let settings = json!({"delete": true, "include_source_name": false});
+    let inventory = kortty_server_archive::rsync_tree::Manifest::default().finish();
+    let remote: RemoteAction = serde_json::from_value(json!({
+        "kind": "rsync_upload", "program": program, "local": source, "remote": "/server/receiver",
+        "directory": true, "existing": settings,
+        "approval": {
+            "program": program, "digest": vec![8; 32], "reference": connection, "pins": ["SHA256:fixture"],
+            "directory_upload": {"source": source, "destination": "/server/receiver", "inventory": inventory},
+            "existing": {"destination": "/server/receiver", "settings": settings,
+                "snapshot": {"inventory": inventory, "fingerprint": vec![4; 32]}},
+        },
+    })).unwrap();
+    let RemoteAction::RsyncUpload(transfer) = remote else {
+        panic!("expected rsync upload")
+    };
+    let reviewed = rsync::Reviewed::restore(&transfer).unwrap();
+    app.view.rsync_review.begin("existing".into(), None);
+    app.update(Message::RsyncProgramReviewed(
+        "existing".into(),
+        Ok(Box::new(reviewed)),
+    ));
+    app.update(Message::ApproveRsyncProgram);
+    app.update(Message::Save);
+    assert_eq!(app.status(), Some("Job saved"));
+    drop(app);
+
+    let mut reopened = TestWindow::open(path).unwrap();
+    reopened.update(Message::Select(id));
+    let saved = reopened.selected_job().unwrap();
+    assert!(!saved.enabled());
+    assert!(!saved.schedule().unwrap().enabled());
+    let RemoteAction::RsyncUpload(transfer) = saved.action().remote_action().unwrap() else {
+        panic!("expected approved native rsync upload")
+    };
+    let existing = transfer.existing.unwrap();
+    assert!(existing.delete);
+    assert!(!existing.include_source_name);
+    assert!(saved.action().require_executable().is_ok());
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn java_passwordless_rsync_requires_exact_helper_review_and_keeps_mirror_layout() {
+    use kortty_server_archive::privileged_rsync::{Operation, Review};
+    use kortty_server_archive::rsync_tree::{DeleteScope, Manifest};
+    use serde_json::json;
+
+    let profile = Profile::temporary();
+    let root = profile.0.canonicalize().unwrap();
+    let path = profile.file();
+    let id = JobId::new("java-passwordless-rsync").unwrap();
+    let connection =
+        json!({"id": 1, "target": {"host": "server.example", "port": 22, "username": "operator"}});
+    let action: SshCommand = serde_json::from_value(json!({
+        "connection": connection,
+        "imported_transfer": {
+            "direction": "upload", "java_sources": ["/old/source"],
+            "java_target_root": "/protected/target/", "java_delete": true, "java_sudo": true,
+        }
+    }))
+    .unwrap();
+    let graph = JobGraph::new(vec![
+        Job::new(id.clone(), "Java passwordless mirror", action)
+            .unwrap()
+            .with_enabled(false),
+    ])
+    .unwrap();
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&graph, &[], &[])
+        .unwrap();
+    let mut app = TestWindow::open(path.clone()).unwrap();
+    app.runtime.set_execution_allowed(true);
+    app.update(Message::Select(id.clone()));
+    app.update(Message::Page(Page::Action));
+    app.update(Message::ConfigureImportedExistingRsync);
+    assert!(app.view.draft.has_imported_transfer());
+    app.update(Message::ConfigureImportedPasswordlessRsync {
+        directory: true,
+        existing: false,
+    });
+    assert!(app.view.draft.has_imported_transfer());
+    app.update(Message::ConfigureImportedPasswordlessRsync {
+        directory: true,
+        existing: true,
+    });
+    assert!(!app.view.draft.has_imported_transfer());
+    let program = root.join("rsync");
+    let source = root.join("source");
+    app.update(Message::Edit(
+        Field::LocalFile,
+        source.to_str().unwrap().into(),
+    ));
+    app.update(Message::Edit(
+        Field::RsyncProgram,
+        program.to_str().unwrap().into(),
+    ));
+    app.update(Message::RsyncPasswordless(false));
+    let requests = app.view.rsync_review_requests().unwrap();
+    assert!(requests.existing_targets().is_empty());
+    let mut targets = requests.privileged_targets();
+    assert_eq!(targets.len(), 1);
+    let (_, spec) = targets.pop().unwrap();
+    assert_eq!(spec.path, "/protected/target/source");
+    assert_eq!(
+        spec.operation,
+        Operation::Upload {
+            directory: true,
+            replace: true,
+            delete: DeleteScope::All,
+        }
+    );
+    app.update(Message::Save);
+    assert!(app.status().unwrap().contains("Review the imported rsync"));
+
+    let inventory = Manifest::default().finish();
+    let proof = Review {
+        spec,
+        policy: [5; 32],
+        fingerprint: [7; 32],
+        inventory: Some(inventory),
+        handoff: "/run/kortty/rsync-handoff".into(),
+    };
+    let settings = json!({"delete": true, "include_source_name": true});
+    let remote: RemoteAction = serde_json::from_value(json!({
+        "kind": "rsync_upload", "program": program, "local": source, "remote": "/protected/target",
+        "directory": true, "existing": settings, "elevation": "passwordless",
+        "approval": {
+            "program": program, "digest": vec![8; 32], "reference": connection, "pins": ["SHA256:fixture"],
+            "directory_upload": {"source": source, "destination": "/protected/target", "inventory": inventory},
+            "existing": {"destination": "/protected/target/source", "settings": settings,
+                "snapshot": {"inventory": inventory, "fingerprint": vec![7; 32]}},
+            "privileged": proof,
+        }
+    })).unwrap();
+    let RemoteAction::RsyncUpload(mut transfer) = remote else {
+        panic!("expected passwordless rsync upload");
+    };
+    assert!(transfer.validate(true).is_ok());
+    let good = transfer
+        .approval
+        .as_ref()
+        .unwrap()
+        .privileged
+        .clone()
+        .unwrap();
+    transfer.approval.as_mut().unwrap().privileged = None;
+    assert!(transfer.validate(true).is_err());
+    let mut changed = good.clone();
+    changed.spec.path = "/protected/other".into();
+    transfer.approval.as_mut().unwrap().privileged = Some(changed);
+    assert!(transfer.validate(true).is_err());
+    transfer.approval.as_mut().unwrap().privileged = Some(good);
+
+    let reviewed = rsync::Reviewed::restore(&transfer).unwrap();
+    app.view.rsync_review.begin("privileged".into(), None);
+    app.update(Message::RsyncProgramReviewed(
+        "privileged".into(),
+        Ok(Box::new(reviewed)),
+    ));
+    app.update(Message::ApproveRsyncProgram);
+    app.update(Message::Save);
+    assert_eq!(app.status(), Some("Job saved"));
+    let saved = app.selected_job().unwrap();
+    assert!(!saved.enabled());
+    assert!(!saved.schedule().unwrap().enabled());
+    assert!(saved.action().require_executable().is_ok());
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn java_passwordless_existing_file_upload_binds_every_grouped_receiver() {
+    use kortty_server_archive::privileged_rsync::Operation;
+    use kortty_server_archive::rsync_tree::{DeleteScope, Manifest};
+    use serde_json::json;
+
+    let profile = Profile::temporary();
+    let root = profile.0.canonicalize().unwrap();
+    let path = profile.file();
+    let id = JobId::new("java-passwordless-existing-file").unwrap();
+    let primary = json!({
+        "id": 1, "target": {"host": "first.example", "port": 22, "username": "operator"}
+    });
+    let additional = json!({
+        "id": 2, "target": {"host": "second.example", "port": 22, "username": "operator"}
+    });
+    let action: SshCommand = serde_json::from_value(json!({
+        "connection": primary, "additional_connections": [additional],
+        "imported_transfer": {"direction": "upload", "java_sources": [r"C:\export\report.txt"],
+            "java_target_root": "/protected/reports/", "java_delete": false, "java_sudo": true},
+    }))
+    .unwrap();
+    let graph = JobGraph::new(vec![
+        Job::new(id.clone(), "Java protected file", action)
+            .unwrap()
+            .with_enabled(false),
+    ])
+    .unwrap();
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&graph, &[], &[])
+        .unwrap();
+    let mut app = TestWindow::open(path).unwrap();
+    app.runtime.set_execution_allowed(true);
+    app.update(Message::Select(id));
+    app.update(Message::Page(Page::Action));
+    app.update(Message::ConfigureImportedRsync { directory: false });
+    assert!(app.view.draft.has_imported_transfer());
+    app.update(Message::ConfigureImportedPasswordlessRsync {
+        directory: false,
+        existing: true,
+    });
+    assert_eq!(app.view.draft.source, Source::RsyncUpload);
+    assert!(!app.view.draft.has_imported_transfer());
+    let program = root.join("rsync");
+    let source = root.join("current-name.txt");
+    let first_path = "/protected/reports/report.txt";
+    let second_path = "/protected/other/report.txt";
+    app.update(Message::Edit(
+        Field::RsyncProgram,
+        program.to_str().unwrap().into(),
+    ));
+    app.update(Message::Edit(
+        Field::LocalFile,
+        source.to_str().unwrap().into(),
+    ));
+    app.update(Message::RsyncDestination(2, second_path.into()));
+    app.update(Message::RsyncMirror(true));
+    app.update(Message::RsyncIncludeSourceName(true));
+    let requests = app.view.rsync_review_requests().unwrap();
+    assert!(requests.existing_targets().is_empty());
+    let targets = requests.privileged_targets();
+    assert_eq!(targets.len(), 2);
+    for ((_, spec), destination) in targets.iter().zip([first_path, second_path]) {
+        assert_eq!(spec.path, destination);
+        assert_eq!(
+            spec.operation,
+            Operation::Upload {
+                directory: false,
+                replace: true,
+                delete: DeleteScope::Retain,
+            }
+        );
+    }
+    app.update(Message::Save);
+    assert!(app.status().unwrap().contains("Review the imported rsync"));
+
+    let mut original = Manifest::default();
+    original.add("", Some((5, [4; 32]))).unwrap();
+    let original = original.finish();
+    let settings = json!({"delete": false, "include_source_name": false});
+    let approval = |index: usize, destination: &str, reference, fingerprint: u8| {
+        json!({
+            "program": program, "digest": vec![8; 32], "reference": reference, "pins": ["SHA256:fixture"],
+            "upload": {"source": source, "destination": destination, "bytes": 8, "digest": vec![5; 32]},
+            "existing": {"destination": destination, "settings": settings,
+                "snapshot": {"inventory": original, "fingerprint": vec![fingerprint; 32]}},
+            "privileged": {"spec": targets[index].1,
+                "policy": vec![7; 32], "fingerprint": vec![fingerprint; 32], "inventory": original,
+                "handoff": "/run/kortty/rsync-handoff"},
+        })
+    };
+    let remote: RemoteAction = serde_json::from_value(json!({
+        "kind": "rsync_upload", "program": program, "local": source, "remote": first_path,
+        "existing": settings, "elevation": "passwordless",
+        "approval": approval(0, first_path, &primary, 2),
+        "routes": [{"profile": 2, "destination": second_path,
+            "approval": approval(1, second_path, &additional, 3)}],
+    }))
+    .unwrap();
+    let RemoteAction::RsyncUpload(transfer) = remote else {
+        panic!("expected protected file upload");
+    };
+    let grouped = transfer.for_target(1, true).unwrap();
+    assert!(grouped.validate(true).is_ok());
+    let mut tampered = grouped;
+    tampered
+        .approval
+        .as_mut()
+        .unwrap()
+        .privileged
+        .as_mut()
+        .unwrap()
+        .fingerprint = [2; 32];
+    assert!(tampered.validate(true).is_err());
+    tampered.approval = None;
+    tampered.elevation = rsync::Elevation::Ordinary;
+    assert!(tampered.validate(true).is_err());
+
+    let reviewed = rsync::Reviewed::restore(&transfer).unwrap();
+    app.view.rsync_review.begin("protected-file".into(), None);
+    app.update(Message::RsyncProgramReviewed(
+        "protected-file".into(),
+        Ok(Box::new(reviewed)),
+    ));
+    app.update(Message::ApproveRsyncProgram);
+    app.update(Message::Save);
+    assert_eq!(app.status(), Some("Job saved"));
+    let saved = app.selected_job().unwrap();
+    assert!(!saved.enabled());
+    assert!(!saved.schedule().unwrap().enabled());
+    assert!(saved.action().require_executable().is_ok());
+
+    app.update(Message::ScheduleEnabled(true));
+    app.update(Message::RsyncStanding(true));
+    let intent = app.view.draft.rsync_standing_intent().unwrap();
+    assert!(intent.is_some());
+    let reviewed = rsync::Reviewed::restore(&transfer).unwrap();
+    app.view.rsync_review.begin("recurring-file".into(), intent);
+    app.update(Message::RsyncProgramReviewed(
+        "recurring-file".into(),
+        Ok(Box::new(reviewed)),
+    ));
+    app.update(Message::ApproveRsyncProgram);
+    app.update(Message::Save);
+    assert_eq!(app.status(), Some("Job saved"));
+    let saved = app.selected_job().unwrap();
+    assert!(!saved.enabled());
+    assert!(saved.schedule().unwrap().enabled());
+    assert!(saved.action().require_executable().is_ok());
+    app.runtime
+        .rsync_standing
+        .saved(saved, &app.runtime.zone, SystemTime::now())
+        .unwrap();
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn java_mixed_rsync_adoption_preserves_order_slash_and_delete_until_review() {
+    verify_java_mixed_rsync_adoption(false);
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn java_mixed_passwordless_rsync_adoption_requires_all_ordered_protected_sources() {
+    verify_java_mixed_rsync_adoption(true);
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn verify_java_mixed_rsync_adoption(elevated: bool) {
+    use kortty_server_archive::privileged_rsync::{Operation, Review, Spec};
+    use kortty_server_archive::rsync_tree::Manifest;
+    use kortty_server_archive::rsync_tree::projection::{self, Entry, Placement, Source as Input};
+    use serde_json::json;
+
+    let profile = Profile::temporary();
+    let root = profile.0.canonicalize().unwrap();
+    let path = profile.file();
+    let connection =
+        json!({"id": 1, "target": {"host": "server.example", "port": 22, "username": "operator"}});
+    let sources = ["/srv/README", "/srv/project", "/srv/shared/"];
+    let action: SshCommand = serde_json::from_value(json!({
+        "connection": connection,
+        "imported_transfer": {"direction": "download", "java_sources": sources,
+            "java_target_root": "/java-only", "java_delete": true, "java_sudo": elevated},
+    }))
+    .unwrap();
+    let id = JobId::new("java-mixed-rsync").unwrap();
+    let graph = JobGraph::new(vec![
+        Job::new(id.clone(), "Java mixed rsync", action)
+            .unwrap()
+            .with_enabled(false),
+    ])
+    .unwrap();
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&graph, &[], &[])
+        .unwrap();
+    let mut app = TestWindow::open(path.clone()).unwrap();
+    app.runtime.set_execution_allowed(true);
+    app.update(Message::Select(id.clone()));
+    app.update(Message::Page(Page::Action));
+    app.update(Message::ScheduleEnabled(true));
+    if elevated {
+        app.update(Message::ConfigureImportedMixedRsync);
+        assert!(app.view.draft.has_imported_transfer());
+        app.update(Message::ConfigureImportedPasswordlessMixedRsync);
+    } else {
+        app.update(Message::ConfigureImportedMixedRsync);
+    }
+    assert_eq!(app.view.draft.source, Source::RsyncDownloadTree);
+    let program = root.join("rsync");
+    let local = root.join("receiver");
+    app.update(Message::Edit(
+        Field::RsyncProgram,
+        program.to_str().unwrap().into(),
+    ));
+    app.update(Message::Edit(
+        Field::LocalFile,
+        local.to_str().unwrap().into(),
+    ));
+    app.update(Message::RsyncMixed(false));
+    app.update(Message::RsyncMirror(false));
+    let requests = app.view.rsync_review_requests().unwrap();
+    let targets = requests.mixed_targets();
+    assert_eq!(targets.len(), 1);
+    let target = &targets[0];
+    assert_eq!(target.sources, sources);
+    assert!(target.delete);
+    let elevation = if elevated {
+        rsync::Elevation::Passwordless
+    } else {
+        rsync::Elevation::Ordinary
+    };
+    assert_eq!(target.elevation, elevation);
+    assert!(matches!(&target.destination, rsync::MixedDestination::Local(path) if path == &local));
+    app.update(Message::Save);
+    assert!(app.status().unwrap().contains("Review the imported rsync"));
+
+    let inputs = [
+        Input {
+            placement: Placement::File("README".into()),
+            entries: vec![Entry {
+                relative: "".into(),
+                file: Some((6, [1u8; 32])),
+            }],
+        },
+        Input {
+            placement: Placement::Named("project".into()),
+            entries: Vec::new(),
+        },
+        Input {
+            placement: Placement::Contents,
+            entries: Vec::new(),
+        },
+    ];
+    let projection = projection::project(&inputs, true).unwrap();
+    let privileged = elevated.then(|| {
+        let mut file = Manifest::default();
+        file.add("", Some((6, [1; 32]))).unwrap();
+        let empty = Manifest::default().finish();
+        let reviews = sources
+            .iter()
+            .zip([file.finish(), empty, empty])
+            .enumerate()
+            .map(|(index, (path, inventory))| Review {
+                spec: Spec {
+                    path: path.trim_end_matches('/').into(),
+                    operation: Operation::Download {
+                        directory: index != 0,
+                    },
+                },
+                policy: [3; 32],
+                fingerprint: [5; 32],
+                inventory: Some(inventory),
+                handoff: "/run/kortty/rsync-handoff".into(),
+            })
+            .collect();
+        rsync::MixedPrivilegedReview::Download(reviews)
+    });
+    let review = rsync::MixedReview {
+        plan: rsync::MixedPlan::from_projection(target, &inputs, &projection).unwrap(),
+        receiver: rsync::MixedReceiver::Local {
+            destination: local.clone(),
+            snapshot: None,
+        },
+        privileged,
+    };
+    assert!(target.matches(&review));
+    if elevated {
+        let mut changed = review.clone();
+        let Some(rsync::MixedPrivilegedReview::Download(proofs)) = &mut changed.privileged else {
+            panic!("expected an ordered protected review");
+        };
+        proofs.swap(0, 1);
+        assert!(!target.matches(&changed));
+        let mut ordinary = review.clone();
+        ordinary.privileged = None;
+        assert!(!target.matches(&ordinary));
+    }
+    let remote: RemoteAction = serde_json::from_value(json!({
+        "kind": "rsync_download", "program": program, "local": local, "remote": "/srv/README", "directory": true,
+        "elevation": elevation,
+        "existing_download": {"delete": true, "include_source_name": false}, "mixed": sources,
+        "approval": {"program": program, "digest": vec![8u8; 32], "reference": connection,
+            "pins": ["SHA256:fixture"], "mixed": review},
+    })).unwrap();
+    let RemoteAction::RsyncDownload(transfer) = remote else {
+        panic!("expected rsync download")
+    };
+    let mut recurring = transfer.clone();
+    recurring.standing = Some(rsync::standing::Config {
+        settings: rsync::standing::Settings::default(),
+        approval: None,
+    });
+    assert!(recurring.validate(false).is_err());
+    let reviewed = rsync::Reviewed::restore(&transfer).unwrap();
+    app.view.rsync_review.begin("mixed".into(), None);
+    app.update(Message::RsyncProgramReviewed(
+        "mixed".into(),
+        Ok(Box::new(reviewed)),
+    ));
+    app.update(Message::ApproveRsyncProgram);
+    app.update(Message::Save);
+    drop(app);
+
+    let mut reopened = TestWindow::open(path).unwrap();
+    reopened.update(Message::Select(id));
+    let saved = reopened.selected_job().unwrap();
+    assert!(!saved.enabled());
+    assert!(!saved.schedule().unwrap().enabled());
+    assert!(saved.action().require_executable().is_ok());
+    let RemoteAction::RsyncDownload(transfer) = saved.action().remote_action().unwrap() else {
+        panic!("expected mixed job")
+    };
+    assert_eq!(transfer.mixed.as_ref().unwrap(), &sources);
+    assert_eq!(transfer.elevation, elevation);
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn java_rsync_existing_file_download_prefills_the_original_name_and_requires_exact_review() {
+    use kortty_server_archive::rsync_tree::Manifest;
+    use serde_json::json;
+
+    for elevated in [false, true] {
+        let profile = Profile::temporary();
+        let root = profile.0.canonicalize().unwrap();
+        let path = profile.file();
+        let id = JobId::new("java-existing-rsync-local-file").unwrap();
+        let connection = json!({"id": 1, "target": {"host": "server.example", "port": 22, "username": "operator"}});
+        let server_path = "/site/reports/report.txt";
+        let receiver = root.join("receiver");
+        let destination = receiver.join("report.txt");
+        let program = root.join("rsync");
+        let action: SshCommand = serde_json::from_value(json!({
+            "connection": connection,
+            "imported_transfer": {"direction": "download", "java_sources": [server_path],
+                "java_target_root": receiver, "java_delete": false, "java_sudo": elevated},
+        }))
+        .unwrap();
+        let graph = JobGraph::new(vec![
+            Job::new(id.clone(), "Java existing receiver file", action)
+                .unwrap()
+                .with_enabled(false),
+        ])
+        .unwrap();
+        SchedulerStore::open(&path)
+            .unwrap()
+            .commit_with_actions(&graph, &[], &[])
+            .unwrap();
+        let mut app = TestWindow::open(path).unwrap();
+        app.runtime.set_execution_allowed(true);
+        app.update(Message::Select(id));
+        app.update(Message::Page(Page::Action));
+        app.update(if elevated {
+            Message::ConfigureImportedPasswordlessRsync {
+                directory: false,
+                existing: true,
+            }
+        } else {
+            Message::ConfigureImportedExistingRsyncFile
+        });
+        assert_eq!(app.view.draft.source, Source::RsyncDownload);
+        app.update(Message::Edit(
+            Field::RsyncProgram,
+            program.to_str().unwrap().into(),
+        ));
+        let routes = app.view.rsync_review_requests().unwrap();
+        if elevated {
+            assert_eq!(routes.privileged_targets()[0].1.path, server_path);
+        } else {
+            assert_eq!(routes.local_existing_targets()[0].1, destination);
+        }
+        app.update(Message::Edit(
+            Field::LocalFile,
+            receiver.join("renamed.txt").to_str().unwrap().into(),
+        ));
+        assert!(app.view.rsync_review_requests().is_none());
+        app.update(Message::Edit(
+            Field::LocalFile,
+            destination.to_str().unwrap().into(),
+        ));
+        app.update(Message::Save);
+        assert!(app.status().unwrap().contains("Review the imported rsync"));
+
+        let mut inventory = Manifest::default();
+        inventory.add("", Some((4, [1; 32]))).unwrap();
+        let inventory = inventory.finish();
+        let privileged = elevated.then(|| json!({
+            "spec": {"path": server_path, "operation": {"direction": "download", "directory": false}},
+            "policy": vec![5; 32], "fingerprint": vec![6; 32], "inventory": inventory,
+            "handoff": "/run/kortty/rsync-handoff",
+        }));
+        let remote: RemoteAction = serde_json::from_value(json!({
+            "kind": "rsync_download", "program": program, "local": destination, "remote": server_path,
+            "elevation": if elevated { "passwordless" } else { "ordinary" },
+            "existing_download": {"delete": false, "include_source_name": false},
+            "approval": {"program": program, "digest": vec![8; 32], "reference": connection,
+                "pins": ["SHA256:fixture"], "privileged": privileged,
+                "download": {"source": server_path, "destination": destination},
+                "existing_file_download": {"destination": destination, "snapshot": {
+                    "inventory": inventory, "fingerprint": vec![2; 32], "root_identity": vec![3; 32]
+                }},
+            },
+        }))
+        .unwrap();
+        let RemoteAction::RsyncDownload(transfer) = remote else {
+            panic!("expected existing local file download");
+        };
+        assert!(transfer.validate(false).is_ok());
+        let mut without_proof = transfer.clone();
+        without_proof
+            .approval
+            .as_mut()
+            .unwrap()
+            .existing_file_download = None;
+        assert!(without_proof.validate(false).is_err());
+        app.update(Message::ScheduleEnabled(true));
+        app.update(Message::RsyncStanding(true));
+        let intent = app.view.draft.rsync_standing_intent().unwrap();
+        let approval = rsync::Reviewed::restore(&transfer).unwrap();
+        app.view
+            .rsync_review
+            .begin("recurring-local-file".into(), intent);
+        app.update(Message::RsyncProgramReviewed(
+            "recurring-local-file".into(),
+            Ok(Box::new(approval)),
+        ));
+        app.update(Message::ApproveRsyncProgram);
+        app.update(Message::Save);
+        assert_eq!(app.status(), Some("Job saved"));
+        let saved = app.selected_job().unwrap();
+        assert!(!saved.enabled());
+        assert!(saved.action().require_executable().is_ok());
+        app.runtime
+            .rsync_standing
+            .saved(saved, &app.runtime.zone, SystemTime::now())
+            .unwrap();
+    }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+#[test]
+fn java_existing_rsync_download_retains_placement_and_mirror_through_local_review() {
+    use serde_json::json;
+
+    let profile = Profile::temporary();
+    let root = profile.0.canonicalize().unwrap();
+    let path = profile.file();
+    let connection =
+        json!({"id": 1, "target": {"host": "server.example", "port": 22, "username": "operator"}});
+    let program = root.join("rsync");
+    let destination = root.join("receiver");
+    for (suffix, include_source_name) in [("", true), ("/", false)] {
+        let id = JobId::new("java-existing-rsync-download").unwrap();
+        let source = format!("/site/documents{suffix}");
+        let action: SshCommand = serde_json::from_value(json!({
+            "connection": connection,
+            "imported_transfer": {"direction": "download", "java_sources": [source],
+                "java_target_root": "/java-only", "java_delete": true, "java_sudo": false},
+        }))
+        .unwrap();
+        let graph = JobGraph::new(vec![
+            Job::new(id.clone(), "Java rsync download", action)
+                .unwrap()
+                .with_enabled(false),
+        ])
+        .unwrap();
+        SchedulerStore::open(&path)
+            .unwrap()
+            .commit_with_actions(&graph, &[], &[])
+            .unwrap();
+        let mut app = TestWindow::open(path.clone()).unwrap();
+        app.runtime.set_execution_allowed(true);
+        app.update(Message::Select(id.clone()));
+        app.update(Message::Page(Page::Action));
+        app.update(Message::ScheduleEnabled(true));
+        app.update(Message::ConfigureImportedExistingRsync);
+        assert_eq!(app.view.draft.source, Source::RsyncDownloadTree);
+        assert!(app.view.rsync_review_requests().is_none());
+        app.update(Message::Edit(
+            Field::LocalFile,
+            destination.to_str().unwrap().into(),
+        ));
+        app.update(Message::Edit(
+            Field::RsyncProgram,
+            program.to_str().unwrap().into(),
+        ));
+        app.update(Message::RsyncExisting(false));
+        app.update(Message::RsyncMirror(false));
+        let effective = if include_source_name {
+            destination.join("documents")
+        } else {
+            destination.clone()
+        };
+        let requests = app.view.rsync_review_requests().unwrap();
+        let routes = requests.local_existing_targets();
+        assert_eq!(routes[0].1, effective);
+        app.update(Message::Save);
+        assert!(app.status().unwrap().contains("Review the imported rsync"));
+        assert!(
+            app.selected_job()
+                .unwrap()
+                .action()
+                .imported_transfer
+                .is_some()
+        );
+
+        let settings = json!({"delete": true, "include_source_name": include_source_name});
+        let inventory = kortty_server_archive::rsync_tree::Manifest::default().finish();
+        let remote: RemoteAction = serde_json::from_value(json!({
+            "kind": "rsync_download", "program": program, "local": destination, "remote": "/site/documents",
+            "directory": true, "existing_download": settings,
+            "approval": {"program": program, "digest": vec![8u8; 32], "reference": connection,
+                "pins": ["SHA256:fixture"], "directory": {"source": "/site/documents", "destination": destination},
+                "existing_download": {"destination": effective, "settings": settings,
+                    "snapshot": {"inventory": inventory, "fingerprint": vec![4u8; 32], "root_identity": vec![5u8; 32]}}},
+        })).unwrap();
+        let RemoteAction::RsyncDownload(transfer) = remote else {
+            panic!("expected rsync download")
+        };
+        let reviewed = rsync::Reviewed::restore(&transfer).unwrap();
+        app.view.rsync_review.begin("existing-local".into(), None);
+        app.update(Message::RsyncProgramReviewed(
+            "existing-local".into(),
+            Ok(Box::new(reviewed)),
+        ));
+        app.update(Message::ApproveRsyncProgram);
+        app.update(Message::Save);
+
+        assert!(
+            app.selected_job()
+                .unwrap()
+                .action()
+                .imported_transfer
+                .is_none(),
+            "{:?}",
+            app.status()
+        );
+        drop(app);
+        let mut reopened = TestWindow::open(path.clone()).unwrap();
+        reopened.update(Message::Select(id));
+        let saved = reopened.selected_job().unwrap();
+        assert!(!saved.enabled());
+        assert!(!saved.schedule().unwrap().enabled());
+        let RemoteAction::RsyncDownload(transfer) = saved.action().remote_action().unwrap() else {
+            panic!("expected approved native rsync download")
+        };
+        assert!(transfer.existing.is_none());
+        assert!(transfer.existing_download.unwrap().delete);
+        assert_eq!(
+            transfer.existing_download.unwrap().include_source_name,
+            include_source_name
+        );
+        assert_eq!(transfer.existing_local_destination().unwrap(), effective);
+        assert!(saved.action().require_executable().is_ok());
+    }
+}
+
+#[test]
 fn native_form_reopens_each_sftp_action_and_honors_the_scheduler_policy() {
     use crate::session_journal::automation::{Closing, Keep};
     use automation_journal::Event;
@@ -2640,6 +4371,7 @@ fn native_form_reopens_each_sftp_action_and_honors_the_scheduler_policy() {
         (Source::RemoteMkdir, "mkdir"),
         (Source::RemoteRename, "rename"),
         (Source::RemoteChmod, "chmod"),
+        (Source::RemoteChmod, "chmod_symbolic"),
         (Source::RemoteChown, "chown"),
         (Source::RemoteCopy, "copy_remote"),
         (Source::RemoteUpload, "upload"),
@@ -2667,7 +4399,15 @@ fn native_form_reopens_each_sftp_action_and_honors_the_scheduler_policy() {
             (Field::KeyFile, profile.0.join("key").display().to_string()),
             (Field::RemotePath, "/canonical/remote path".to_owned()),
             (Field::RemoteDestination, "/canonical/renamed".to_owned()),
-            (Field::RemoteMode, "0640".to_owned()),
+            (
+                Field::RemoteMode,
+                if kind == "chmod_symbolic" {
+                    "u+rw,o-w"
+                } else {
+                    "0640"
+                }
+                .to_owned(),
+            ),
             (Field::RemoteUid, "1001".to_owned()),
             (
                 Field::LocalFile,
@@ -2916,6 +4656,153 @@ fn native_archive_form_saves_and_reopens_sources_compression_and_optional_local_
     assert!(matches!(legacy, RemoteAction::Archive(Archive {
         format: ArchiveFormat::Zip, excludes, ..
     }) if excludes.is_empty()));
+}
+
+#[test]
+fn server_archive_form_saves_and_reopens_explicit_output_metadata() {
+    use serde_json::json;
+
+    let profile = Profile::temporary();
+    let path = profile.file();
+    let id = JobId::new("server-archive-output").unwrap();
+    let action: SshCommand = serde_json::from_value(json!({
+        "connection": {"id": 1, "target": {"host": "server.example", "port": 22, "username": "operator"}},
+        "remote": {"kind": "server_archive", "sources": ["/source"], "target": "/target.zip", "level": 6}
+    })).unwrap();
+    let job = Job::new(id.clone(), "Server archive", action).unwrap();
+    let graph = JobGraph::new(vec![job]).unwrap();
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&graph, &[], &[])
+        .unwrap();
+
+    let mut app = TestWindow::open(path.clone()).unwrap();
+    app.update(Message::Select(id.clone()));
+    app.update(Message::Page(Page::Action));
+    app.update(Message::Edit(Field::ArchiveUid, "1200".into()));
+    app.update(Message::Edit(Field::ArchiveGid, "1400".into()));
+    app.update(Message::Edit(Field::ArchiveMode, "4755".into()));
+    app.update(Message::Save);
+    assert!(app.status().unwrap().contains("three octal digits"));
+    app.update(Message::Edit(Field::ArchiveMode, "000".into()));
+    app.update(Message::Save);
+    assert_eq!(app.status(), Some("Job saved"));
+    let action = app.selected_job().unwrap().action().clone();
+    drop(app);
+
+    let mut app = TestWindow::open(path).unwrap();
+    app.update(Message::Select(id));
+    app.update(Message::Save);
+    assert_eq!(app.selected_job().unwrap().action(), &action);
+    let RemoteAction::ServerArchive(archive) = action.remote_action().unwrap() else {
+        panic!("expected server-only archive job");
+    };
+    let spec = archive.server_spec().unwrap();
+    assert_eq!(
+        serde_json::to_value(spec).unwrap()["output"],
+        json!({"uid": 1200, "gid": 1400, "mode": 0})
+    );
+    assert!(!action.remote_action().unwrap().transfers_files());
+    assert!(RemoteAction::Archive(archive.clone()).validate().is_err());
+    assert!(
+        RemoteAction::PrivilegedArchive(privileged::PrivilegedArchive {
+            archive: archive.clone(),
+            approval: None,
+        })
+        .validate()
+        .is_err()
+    );
+
+    let local = profile.0.join("local copy.zip");
+    app.update(Message::Edit(
+        Field::ArchiveDownload,
+        local.to_str().unwrap().into(),
+    ));
+    app.update(Message::Save);
+    assert_eq!(app.status(), Some("Job saved"));
+    let action = app.selected_job().unwrap().action().clone();
+    let remote = action.remote_action().unwrap();
+    assert!(remote.transfers_files() && remote.writes_local_file());
+    let RemoteAction::ServerArchive(archive) = remote else {
+        unreachable!()
+    };
+    assert_eq!(archive.download.as_deref(), Some(local.as_path()));
+    assert!(archive.server_spec().unwrap().report_payload);
+    drop(app);
+
+    let mut app = TestWindow::open(profile.file()).unwrap();
+    app.update(Message::Save);
+    assert_eq!(app.selected_job().unwrap().action(), &action);
+}
+
+#[test]
+fn server_password_zip_form_saves_only_the_vault_reference() {
+    use serde_json::json;
+
+    let profile = Profile::temporary();
+    let path = profile.file();
+    let job_id = JobId::new("server-password-zip").unwrap();
+    let action = serde_json::from_value::<SshCommand>(json!({
+        "connection": {"id": 1, "target": {"host": "server.example", "port": 22, "username": "operator"}},
+        "remote": {"kind": "server_archive", "sources": ["/source"], "target": "/target.zip", "level": 6},
+    })).unwrap();
+    let job = Job::new(job_id.clone(), "Server password ZIP", action).unwrap();
+    let graph = JobGraph::new(vec![job]).unwrap();
+    SchedulerStore::open(&path)
+        .unwrap()
+        .commit_with_actions(&graph, &[], &[])
+        .unwrap();
+
+    let mut app = TestWindow::open(path.clone()).unwrap();
+    app.update(Message::Select(job_id.clone()));
+    app.update(Message::Page(Page::Action));
+    app.update(Message::ArchiveFormat(ArchiveFormat::ZipPassword));
+    app.update(Message::Save);
+    assert_eq!(
+        app.status(),
+        Some("Choose a ZIP archive password from the vault")
+    );
+    let id = "ab".repeat(16);
+    let choice = CredentialChoice {
+        id: id.clone(),
+        label: "Archive password".into(),
+        username: String::new(),
+    };
+    app.runtime.set_archive_passwords(vec![choice.clone()]);
+    app.update(Message::ArchivePassword(choice));
+    let local = profile.0.join("verified copy.zip");
+    app.update(Message::Edit(
+        Field::ArchiveDownload,
+        local.to_str().unwrap().into(),
+    ));
+    app.update(Message::Save);
+    assert_eq!(app.status(), Some("Job saved"));
+    drop(app);
+
+    let mut app = TestWindow::open(path).unwrap();
+    app.update(Message::Select(job_id));
+    let action = app.selected_job().unwrap().action();
+    assert_eq!(action.sudo, SudoMode::Disabled);
+    let RemoteAction::ServerArchive(archive) = action.remote_action().unwrap() else {
+        panic!("expected server archive");
+    };
+    assert_eq!(archive.password_credential.as_deref(), Some(id.as_str()));
+    assert_eq!(archive.download.as_deref(), Some(local.as_path()));
+    let spec = archive.server_spec().unwrap();
+    assert_eq!(
+        spec.format,
+        kortty_server_archive::protocol::CreateFormat::ZipPassword
+    );
+    assert!(spec.report_payload);
+    assert!(!serde_json::to_string(&spec).unwrap().contains(&id));
+    assert!(
+        RemoteAction::PrivilegedArchive(privileged::PrivilegedArchive {
+            archive: archive.clone(),
+            approval: None,
+        })
+        .validate()
+        .is_ok()
+    );
 }
 
 #[test]

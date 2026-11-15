@@ -1,6 +1,6 @@
 use std::io;
 
-use kortty_server_archive::protocol::{Reply, read_request, write_reply};
+use kortty_server_archive::protocol::{Reply, read_stdio_request, write_reply};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod server;
@@ -37,6 +37,46 @@ fn main() -> io::Result<()> {
     {
         return server::privileged_archive::serve();
     }
+    #[cfg(target_os = "linux")]
+    if mode
+        .as_deref()
+        .is_some_and(|arg| arg == kortty_server_archive::protocol::PRIVILEGED_PASSWORD_ARGUMENT)
+        && args.len() == 0
+    {
+        return server::privileged_archive::serve_password();
+    }
+    #[cfg(target_os = "linux")]
+    if mode
+        .as_deref()
+        .is_some_and(|arg| arg == kortty_server_archive::privileged_rsync::ARGUMENT)
+        && args.len() == 0
+    {
+        return server::privileged_rsync::serve();
+    }
+    #[cfg(target_os = "linux")]
+    if mode
+        .as_deref()
+        .is_some_and(|arg| arg == kortty_server_archive::rsync_tree::EXISTING_ARGUMENT)
+        && args.len() == 0
+    {
+        return server::rsync_tree::serve_existing(io::stdin().lock(), io::stdout().lock());
+    }
+    #[cfg(target_os = "linux")]
+    if mode
+        .as_deref()
+        .is_some_and(|arg| arg == kortty_server_archive::rsync_tree::EXISTING_V2_ARGUMENT)
+        && args.len() == 0
+    {
+        return server::rsync_tree::serve_existing_v2(io::stdin().lock(), io::stdout().lock());
+    }
+    #[cfg(target_os = "linux")]
+    if mode
+        .as_deref()
+        .is_some_and(|arg| arg == kortty_server_archive::rsync_tree::EXISTING_V3_ARGUMENT)
+        && args.len() == 0
+    {
+        return server::rsync_tree::serve_existing_v3(io::stdin().lock(), io::stdout().lock());
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     if mode
         .as_deref()
@@ -52,16 +92,17 @@ fn main() -> io::Result<()> {
         ));
     }
 
-    let request = read_request(io::stdin().lock())?;
+    let mut output = io::stdout().lock();
+    let (request, password) = read_stdio_request(io::stdin().lock(), &mut output)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let reply: Reply = server::handle(request);
+    let reply: Reply = server::handle(request, password.as_ref().map(|secret| secret.as_slice()));
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let reply = {
-        drop(request);
+        drop((request, password));
         Reply::Failed {
             message: "Atomic server archive extraction is unavailable on this platform".into(),
             outcome_unknown: false,
         }
     };
-    write_reply(io::stdout().lock(), &reply)
+    write_reply(output, &reply)
 }

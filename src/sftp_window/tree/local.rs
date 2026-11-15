@@ -6,6 +6,16 @@ use super::{MAX_DEPTH, MAX_ENTRIES};
 #[cfg(windows)]
 use crate::sftp_window::{EntryKind, files};
 
+mod reviewed;
+pub(crate) use reviewed::{
+    ReviewedStamp, ReviewedVolume, copy_reviewed_dir_metadata, copy_reviewed_file_metadata,
+    create_reviewed_tree_file, create_reviewed_tree_stage, hold_reviewed_file_ancestors,
+    move_reviewed_tree, open_reviewed_tree_child, open_reviewed_tree_parent,
+    remove_empty_reviewed_tree_stage, remove_reviewed_tree_entry, reviewed_directory_stamp,
+    reviewed_file_stamp, reviewed_tree_parent_stamp, reviewed_tree_volume,
+    sync_reviewed_tree_directory,
+};
+
 #[cfg(unix)]
 mod unix;
 #[cfg(unix)]
@@ -69,12 +79,22 @@ pub(crate) fn publish_file(
 }
 
 pub(crate) fn discard(parent: &Directory, name: &OsStr, stage: Directory) -> io::Result<()> {
+    discard_bounded(parent, name, stage, MAX_DEPTH, MAX_ENTRIES + 1)
+}
+
+pub(crate) fn discard_bounded(
+    parent: &Directory,
+    name: &OsStr,
+    stage: Directory,
+    depth: usize,
+    mut remaining: usize,
+) -> io::Result<()> {
     #[cfg(unix)]
-    return parent.discard(name, stage, MAX_DEPTH, &mut (MAX_ENTRIES + 1));
+    return parent.discard(name, stage, depth, &mut remaining);
     #[cfg(windows)]
     {
         let _ = (parent, name);
-        discard_windows(stage, MAX_DEPTH, &mut (MAX_ENTRIES + 1))
+        discard_windows(stage, depth, &mut remaining)
     }
 }
 

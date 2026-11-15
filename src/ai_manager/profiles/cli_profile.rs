@@ -7,8 +7,9 @@ use iced::{Element, Task};
 use serde::{Deserialize, Serialize};
 
 use crate::local_ai::{self, cli};
+use crate::ssh_dialog::unsafe_text;
 
-use super::{Editor, Field, Message, Profile, ProfileId};
+use super::{Editor, Field, Message, Profile, ProfileId, Reasoning};
 
 mod catalog;
 pub(super) use catalog::State as CatalogState;
@@ -34,6 +35,8 @@ struct MiniMaxSettings {
     package: Option<String>,
     config: String,
     region: cli::MiniMaxRegion,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    require_region_selection: bool,
 }
 
 impl MiniMaxSettings {
@@ -52,25 +55,89 @@ impl MiniMaxSettings {
     }
 
     fn valid(&self) -> bool {
-        cli::valid_minimax_module_path(Path::new(&self.module))
+        !self.require_region_selection
+            && cli::valid_minimax_module_path(Path::new(&self.module))
             && cli::valid_minimax_config_path(Path::new(&self.config))
     }
 }
 
 impl Settings {
+    pub(super) fn java_minimax_draft() -> Self {
+        Self {
+            provider: Some(cli::catalog::Provider::MiniMax),
+            minimax: Some(MiniMaxSettings {
+                require_region_selection: true,
+                ..MiniMaxSettings::default()
+            }),
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn java_draft(
+        path: &str,
+        arguments: Vec<String>,
+        provider: Option<cli::catalog::Provider>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            arguments,
+            provider,
+            ..Self::default()
+        }
+    }
+
+    pub(super) fn is_java_draft(&self) -> bool {
+        if self.fingerprint.is_some() {
+            return false;
+        }
+        if let Some(minimax) = &self.minimax {
+            return self.provider == Some(cli::catalog::Provider::MiniMax)
+                && self.path.is_empty()
+                && self.arguments.is_empty()
+                && *minimax
+                    == (MiniMaxSettings {
+                        require_region_selection: true,
+                        ..MiniMaxSettings::default()
+                    });
+        }
+        !unsafe_text(&self.path)
+            && (!self.path.is_empty()
+                || self.provider.is_some_and(|provider| {
+                    provider != cli::catalog::Provider::MiniMax && provider.can_search()
+                }))
+            && cli::template_requirements(&self.arguments)
+                .is_some_and(|requirements| requirements.explicit_prompt)
+            && self.arguments.iter().all(|arg| !unsafe_text(arg))
+    }
+
+    pub(super) fn uses_reasoning(&self) -> bool {
+        cli::uses_reasoning(&self.arguments)
+    }
+
     pub(super) fn validate_restored(&self, model: &str) -> Result<(), String> {
-        if self.fingerprint.is_some()
-            || self.path.is_empty()
-            || self.path.len() > 4096
-            || self.path.chars().any(char::is_control)
-            || !cli::valid_arguments(&self.arguments)
-            || self.arguments.iter().any(|argument| argument == cli::MODEL)
-                && (!local_ai::valid_model(model) || model.starts_with('-'))
-            || self.minimax.as_ref().is_some_and(|settings| {
-                !settings.valid() || settings.package.is_some() || !self.arguments.is_empty()
-            })
+        const INVALID: &str = "Invalid unreviewed restored CLI settings.";
+        if self.fingerprint.is_some() || !plain_path(&self.path) {
+            return Err(INVALID.into());
+        }
+        if let Some(minimax) = &self.minimax {
+            if self.provider != Some(cli::catalog::Provider::MiniMax)
+                || minimax.package.is_some()
+                || !self.arguments.is_empty()
+                || !model.is_empty() && (!local_ai::valid_model(model) || model.starts_with('-'))
+                || !minimax.module.is_empty()
+                    && !cli::valid_minimax_module_path(Path::new(&minimax.module))
+                || !minimax.config.is_empty()
+                    && !cli::valid_minimax_config_path(Path::new(&minimax.config))
+            {
+                return Err(INVALID.into());
+            }
+            return Ok(());
+        }
+        let requirements = cli::template_requirements(&self.arguments).ok_or(INVALID)?;
+        if (self.path.is_empty() && !self.is_java_draft())
+            || requirements.model && (!local_ai::valid_model(model) || model.starts_with('-'))
         {
-            return Err("Invalid unreviewed restored CLI settings.".into());
+            return Err(INVALID.into());
         }
         Ok(())
     }
@@ -84,13 +151,22 @@ impl Settings {
                 .eq(preset.iter().copied())
     }
 
-    pub(super) fn program(&self, model: &str) -> Result<cli::Program, String> {
+    pub(super) fn program(
+        &self,
+        model: &str,
+        reasoning: Reasoning,
+    ) -> Result<cli::Program, String> {
         let fingerprint = self
             .fingerprint
             .ok_or("Review and approve the CLI executable first.")?;
         if let Some(settings) = &self.minimax {
             if !self.arguments.is_empty() {
                 return Err("The MiniMax CLI uses fixed reviewed arguments.".into());
+            }
+            if !settings.valid() {
+                return Err(
+                    "Choose the MiniMax package, login config and region before review.".into(),
+                );
             }
             let package = settings
                 .package
@@ -106,10 +182,11 @@ impl Settings {
                 model,
             );
         }
-        cli::Program::approved(
+        cli::Program::approved_template(
             self.path.clone().into(),
             &self.arguments,
             model,
+            reasoning.api_value(),
             fingerprint,
         )
     }
@@ -181,18 +258,21 @@ impl Action {
 #[derive(Default)]
 pub(super) struct Review {
     checking: bool,
-    draft: Option<(ProfileId, Settings, String)>,
+    draft: Option<(ProfileId, Settings, String, Reasoning)>,
     candidate: Option<Settings>,
 }
 
 impl Review {
     fn matches(&self, profile: &Profile) -> bool {
-        self.draft.as_ref().is_some_and(|(id, settings, model)| {
-            profile.is_cli()
-                && profile.id == *id
-                && profile.cli.as_ref() == Some(settings)
-                && profile.model == *model
-        })
+        self.draft
+            .as_ref()
+            .is_some_and(|(id, settings, model, reasoning)| {
+                profile.is_cli()
+                    && profile.id == *id
+                    && profile.cli.as_ref() == Some(settings)
+                    && profile.model == *model
+                    && profile.reasoning == *reasoning
+            })
     }
 }
 
@@ -221,8 +301,9 @@ impl Editor {
             }
             match result {
                 Ok(candidate) => {
-                    let (_, _, model) = self.cli_review.draft.as_ref().expect("reviewed draft");
-                    match candidate.program(model) {
+                    let (_, _, model, reasoning) =
+                        self.cli_review.draft.as_ref().expect("reviewed draft");
+                    match candidate.program(model, *reasoning) {
                         Ok(_) => self.cli_review.candidate = Some(*candidate),
                         Err(error) => self.set_status(error),
                     }
@@ -239,14 +320,17 @@ impl Editor {
                 self.cancel_cli_catalog();
                 let profile = self.selected().expect("selected CLI profile");
                 let settings = profile.cli.clone().unwrap_or_default();
-                if !cli::valid_arguments(&settings.arguments)
+                let requirements = cli::template_requirements(&settings.arguments);
+                if requirements.is_none()
                     || settings
                         .minimax
                         .as_ref()
                         .is_some_and(|minimax| !minimax.valid())
                     || (!profile.model.is_empty() && !local_ai::valid_model(&profile.model))
-                    || (settings.arguments.iter().any(|arg| arg == cli::MODEL)
-                        && profile.model.is_empty())
+                    || (requirements
+                        .as_ref()
+                        .is_some_and(|requirements| requirements.model)
+                        && (profile.model.is_empty() || profile.model.starts_with('-')))
                 {
                     self.set_status("Check CLI arguments, selected paths and the model identifier before review.");
                     return Task::none();
@@ -265,7 +349,12 @@ impl Editor {
                 }
                 self.cli_review = Review {
                     checking: true,
-                    draft: Some((profile.id, settings, profile.model.clone())),
+                    draft: Some((
+                        profile.id,
+                        settings,
+                        profile.model.clone(),
+                        profile.reasoning,
+                    )),
                     candidate: None,
                 };
                 self.set_status("Checking the CLI executable…");
@@ -387,12 +476,16 @@ impl Editor {
                     Action::MiniMaxRegion(region) => {
                         if let Some(minimax) = &mut edited.minimax {
                             minimax.region = region;
+                            minimax.require_region_selection = false;
                         }
                     }
                     _ => {}
                 }
                 if edited != *settings || model_cleared {
                     edited.clear_approval();
+                    if !edited.uses_reasoning() {
+                        profile.reasoning = Reasoning::Default;
+                    }
                     *settings = edited;
                     self.cli_discovery = None;
                     self.cancel_cli_catalog();
@@ -420,7 +513,7 @@ impl Editor {
         for (index, argument) in settings.arguments.iter().enumerate() {
             arguments = arguments.push(
                 row![
-                    text_input("Literal argument", argument).on_input_maybe(
+                    text_input("CLI argument", argument).on_input_maybe(
                         enabled
                             .then_some(move |value| Message::Cli(Action::Argument(index, value)))
                     ),
@@ -436,7 +529,7 @@ impl Editor {
             .matches(profile)
             .then_some(self.cli_review.candidate.as_ref())
             .flatten()
-            .and_then(|candidate| candidate.program(&profile.model).ok());
+            .and_then(|candidate| candidate.program(&profile.model, profile.reasoning).ok());
         let mut content = column![
             self.cli_catalog_view(profile, enabled && review.is_none()),
             text_input(
@@ -481,11 +574,12 @@ impl Editor {
                 text_input("Absolute path to the MiniMax config.json", &minimax.config)
                     .on_input_maybe(enabled.then_some(|path| Message::Cli(Action::MiniMaxConfig(path)))),
                 row(cli::MiniMaxRegion::ALL.map(|region| {
-                    button(text(region.to_string())).style(if minimax.region == region { button::primary } else { button::secondary })
-                        .on_press_maybe((enabled && minimax.region != region).then_some(Message::Cli(Action::MiniMaxRegion(region))))
+                    button(text(region.to_string())).style(if !minimax.require_region_selection && minimax.region == region { button::primary } else { button::secondary })
+                    .on_press_maybe((enabled && (minimax.require_region_selection || minimax.region != region)).then_some(Message::Cli(Action::MiniMaxRegion(region))))
                         .into()
                 })).push(button("Use literal arguments").style(button::secondary)
                     .on_press_maybe(enabled.then_some(Message::Cli(Action::LiteralArguments)))).spacing(8).wrap(),
+                minimax.require_region_selection.then(|| text("Select the region used by your MiniMax login.").size(13)),
                 text("The reviewed text command sends JSON over stdin to the selected MiniMax HTTPS endpoint. Proxy settings, redirects, and automatic OAuth refresh are disabled.").size(13),
             ].spacing(8));
         } else {
@@ -497,8 +591,12 @@ impl Editor {
                 button("Add argument").style(button::secondary).on_press_maybe(
                     (enabled && settings.arguments.len() < cli::MAX_ARGS).then_some(Message::Cli(Action::AddArgument))
                 ),
-                text("Arguments are literal. Use {model} as one whole argument for the model identifier. Keep secrets out of arguments.").size(13),
-                text("Input uses UTF-8 stdin by default. Use one {promptFile} argument for a combined file, or one {systemPromptFile} and one {userPromptFile} for separate roles. Each placeholder occupies one argument.").size(13),
+                settings.uses_reasoning().then(|| row![
+                    text("Reasoning effort"),
+                    super::view::choice(Reasoning::ALL, profile.reasoning, enabled, Message::Reasoning),
+                ].spacing(8)),
+                text("Use {model} and {reasoning} alone or inside an argument. Model default substitutes empty text for {reasoning}. Keep secrets out of arguments.").size(13),
+                text("Input uses UTF-8 stdin by default. Use {promptFile} for a combined private file, or include both {systemPromptFile} and {userPromptFile} for separate roles. File placeholders can appear inside an argument.").size(13),
             ].spacing(8));
         }
         content = content
@@ -516,7 +614,7 @@ impl Editor {
                 .spacing(6),
             );
         } else {
-            if let Ok(program) = settings.program(&profile.model) {
+            if let Ok(program) = settings.program(&profile.model, profile.reasoning) {
                 content = content.push(text(program.command_review()).size(13));
             }
             content = content.push(

@@ -93,6 +93,32 @@ fn main() {
             assert!(std::env::var_os("KORTTY_AI_TEST_KEY").is_none());
             respond();
         }
+        Some("fixture_argument_template") => {
+            let args = std::env::args().skip(2).collect::<Vec<_>>();
+            assert_eq!(args.len(), 6);
+            assert_eq!(args[0], "--model=vendor/{promptFile}");
+            assert_eq!(
+                args[1],
+                "literal with spaces vendor/{promptFile}:\\\"xhigh\\"
+            );
+            assert_eq!(args[2..4], ["--reasoning=xhigh", "xhigh"]);
+            let first = args[4].strip_prefix("--input=").unwrap();
+            assert_eq!(first, args[5]);
+            let file = std::path::Path::new(first);
+            assert_eq!(
+                file.canonicalize().unwrap().parent(),
+                Some(directory.canonicalize().unwrap().as_path())
+            );
+            let mut stdin = Vec::new();
+            std::io::stdin().read_to_end(&mut stdin).unwrap();
+            assert!(stdin.is_empty());
+            std::fs::write(
+                parent.join("fixture-template-prompt"),
+                std::fs::read(file).unwrap(),
+            )
+            .unwrap();
+            respond();
+        }
         Some("fixture_files" | "fixture_files_waiting") => {
             let mut stdin = Vec::new();
             std::io::stdin().read_to_end(&mut stdin).unwrap();
@@ -213,6 +239,9 @@ fn main() {
             if prompt.contains("{\"ready\":true}") {
                 std::fs::write(parent.join("fixture-journal-probe"), prompt).unwrap();
                 println!("{{\"ready\":true}}");
+            } else if prompt.contains("Name this terminal session journal") {
+                std::fs::write(parent.join("fixture-journal-title"), prompt).unwrap();
+                println!("{{\"title\":\"Build diagnostics\"}}");
             } else {
                 let name = if prompt.contains("Write a closing session journal summary") {
                     "fixture-journal-close"

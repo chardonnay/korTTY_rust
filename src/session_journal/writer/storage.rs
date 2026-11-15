@@ -149,16 +149,37 @@ impl Storage {
         }
     }
 
-    pub(super) fn save_new(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+    pub(super) fn save_new(&self, name: &str, bytes: &[u8]) -> io::Result<DirectoryIdentity> {
         let mut file = self.file(name)?;
+        let identity = file_identity(&file)?;
         let result = file.write_all(bytes).and_then(|()| file.sync_all());
         #[cfg(unix)]
         let result = result.and_then(|()| self.directory.0.sync_all());
         drop(file);
         if result.is_err() {
+            self.remove_created_file(name, identity);
+        }
+        result.map(|()| identity)
+    }
+
+    #[cfg(unix)]
+    pub(super) fn remove_created_file(&self, name: &str, identity: DirectoryIdentity) {
+        if self
+            .open_file(name)
+            .and_then(|file| file_identity(&file))
+            .is_ok_and(|actual| actual == identity)
+        {
             self.remove_file(name);
         }
-        result
+    }
+
+    #[cfg(windows)]
+    pub(super) fn remove_created_file(&self, name: &str, identity: DirectoryIdentity) {
+        if let Ok(file) = self.directory.child_for_removal(OsStr::new(name))
+            && file_identity(&file).is_ok_and(|actual| actual == identity)
+        {
+            let _ = kortty_files::tree::remove(file);
+        }
     }
 
     pub(super) fn discard(mut self, parent: &Self, name: &str, log_name: &str) {
@@ -265,6 +286,12 @@ impl Storage {
 
     pub(super) fn require_metadata(&self) -> io::Result<()> {
         self.locked_directory().map(|_| ())
+    }
+
+    pub(super) fn document_stamp(&self) -> io::Result<FileStamp> {
+        self.document_stamp
+            .clone()
+            .ok_or_else(|| invalid("Session journal document is missing"))
     }
 
     pub(super) fn locked_directory(&self) -> io::Result<&crate::private_files::Directory> {

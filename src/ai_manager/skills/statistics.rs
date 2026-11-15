@@ -14,7 +14,8 @@ use crate::local_ai::Tokenizer;
 use crate::private_files::{Directory, FileLock, FileStamp, require_single_link};
 
 mod report;
-pub(crate) use report::{Current, Granularity, Hint, Range, Report};
+pub(crate) use report::{Current, Granularity, Hint, Range, Report, SkillKey};
+pub(in crate::ai_manager) mod java;
 
 #[cfg(test)]
 mod tests;
@@ -28,6 +29,7 @@ pub(in crate::ai_manager) const BACKUP_PATH: &str = "stats/skill-usage.json";
 const MAX_RECORDED_SKILLS: usize = 4096;
 const MAX_TOKENS: u64 = 1_048_576;
 const MAX_NAME_BYTES: usize = 256;
+const MAX_JAVA_SIZE_POINTS: usize = 4096;
 const DAILY_RETENTION: i64 = 400;
 const MONTHLY_RETENTION: i64 = 60;
 const SNAPSHOT_RETENTION: i64 = 90;
@@ -74,6 +76,18 @@ pub(crate) struct Ledger {
     version: u8,
     tokenizer: Option<Tokenizer>,
     skills: BTreeMap<u64, SkillRecord>,
+    #[serde(
+        default,
+        deserialize_with = "java::deserialize_records",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    java_history: BTreeMap<String, SkillRecord>,
+    #[serde(
+        default,
+        deserialize_with = "java::deserialize_records",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    java_bindings: BTreeMap<String, java::Disposition>,
 }
 
 impl Default for Ledger {
@@ -82,6 +96,8 @@ impl Default for Ledger {
             version: VERSION,
             tokenizer: None,
             skills: BTreeMap::new(),
+            java_history: BTreeMap::new(),
+            java_bindings: BTreeMap::new(),
         }
     }
 }
@@ -96,6 +112,8 @@ struct SkillRecord {
     monthly: BTreeMap<String, Bucket>,
     yearly: BTreeMap<String, Bucket>,
     snapshots: Vec<Snapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    java_sizes: Vec<JavaSize>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -150,6 +168,27 @@ struct Snapshot {
     identity: SizeIdentity,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JavaSize {
+    date: String,
+    tokens: u64,
+    tokenizer: Tokenizer,
+    fingerprint: String,
+}
+
+impl JavaSize {
+    fn valid(&self) -> bool {
+        self.tokens <= MAX_TOKENS
+            && day(&self.date).is_some()
+            && self.fingerprint.len() == 16
+            && self
+                .fingerprint
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    }
+}
+
 impl Ledger {
     pub(crate) fn tokenizer(&self) -> Tokenizer {
         self.tokenizer.unwrap_or_default()
@@ -162,26 +201,20 @@ impl Ledger {
             ));
         }
         for (&id, record) in &self.skills {
-            if id == 0
-                || record.name.is_empty()
-                || record.name.len() > MAX_NAME_BYTES
-                || record.name.chars().any(char::is_control)
-                || record
-                    .last_used
-                    .as_deref()
-                    .is_some_and(|date| day(date).is_none())
-                || record.daily.keys().any(|key| day(key).is_none())
-                || record.monthly.keys().any(|key| month(key).is_none())
-                || record.yearly.keys().any(|key| year(key).is_none())
-                || record
-                    .snapshots
-                    .iter()
-                    .any(|snapshot| snapshot.tokens > MAX_TOKENS || day(&snapshot.date).is_none())
-            {
+            if id == 0 || !record.valid() {
                 return Err(invalid("The skill statistics contain an invalid record."));
             }
         }
+        if !java::valid_sources(self) {
+            return Err(invalid(
+                "The skill statistics contain invalid Java history.",
+            ));
+        }
         Ok(())
+    }
+
+    fn records(&self) -> impl Iterator<Item = &SkillRecord> {
+        self.skills.values().chain(self.java_history.values())
     }
 
     fn record_at(&mut self, surface: Surface, usage: &[Usage], today: Date) -> io::Result<bool> {
@@ -294,6 +327,25 @@ impl Ledger {
 }
 
 impl SkillRecord {
+    fn valid(&self) -> bool {
+        !self.name.is_empty()
+            && self.name.len() <= MAX_NAME_BYTES
+            && !self.name.chars().any(char::is_control)
+            && self
+                .last_used
+                .as_deref()
+                .is_none_or(|date| day(date).is_some())
+            && self.daily.keys().all(|key| day(key).is_some())
+            && self.monthly.keys().all(|key| month(key).is_some())
+            && self.yearly.keys().all(|key| year(key).is_some())
+            && self
+                .snapshots
+                .iter()
+                .all(|snapshot| snapshot.tokens <= MAX_TOKENS && day(&snapshot.date).is_some())
+            && self.java_sizes.len() <= MAX_JAVA_SIZE_POINTS
+            && self.java_sizes.iter().all(JavaSize::valid)
+    }
+
     fn observe(&mut self, observation: &Observation, date: &str) -> bool {
         let identity = SizeIdentity {
             fingerprint: observation.fingerprint,
@@ -384,22 +436,38 @@ fn transact(
     }
     let directory = open_directory(root, true)?
         .ok_or_else(|| invalid("The skill statistics directory could not be created."))?;
-    let _lock = lock(&directory)?;
+    transact_in(&directory, allowed, |ledger, _| {
+        let today = Zoned::now().date();
+        if !apply(ledger, today)? {
+            return Ok(false);
+        }
+        ledger.roll_up(today);
+        Ok(true)
+    })
+}
+
+fn transact_in(
+    directory: &Directory,
+    allowed: impl Fn() -> bool,
+    edit: impl FnOnce(&mut Ledger, bool) -> io::Result<bool>,
+) -> io::Result<()> {
+    let _lock = lock(directory)?;
     if !allowed() {
         return Ok(());
     }
-    let (mut ledger, stamp) = load(&directory)?.map_or_else(
+    let (mut ledger, stamp) = load(directory)?.map_or_else(
         || (Ledger::default(), None),
         |(ledger, stamp)| (ledger, Some(stamp)),
     );
-    let today = Zoned::now().date();
-    if !apply(&mut ledger, today)? {
+    if !edit(&mut ledger, stamp.is_some())? {
         return Ok(());
     }
-    ledger.roll_up(today);
     let bytes = serde_json::to_vec(&ledger).map_err(io::Error::other)?;
     if bytes.len() > MAX_BYTES {
-        return Err(invalid("The skill statistics exceed their size limit."));
+        return Err(io::Error::new(
+            io::ErrorKind::FileTooLarge,
+            "The skill statistics exceed their size limit.",
+        ));
     }
     let permitted = || {
         if allowed() {
@@ -414,7 +482,7 @@ fn transact(
     if let Some(stamp) = &stamp {
         let check = || {
             permitted()?;
-            let file = open_ledger(&directory)?.ok_or_else(|| {
+            let file = open_ledger(directory)?.ok_or_else(|| {
                 invalid("The skill statistics file changed before it could be saved.")
             })?;
             stamp.require_unchanged(&file)

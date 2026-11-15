@@ -30,6 +30,7 @@ use crate::terminal_theme::Rgb;
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Source {
     Ordinary,
+    Backup,
     RouteLineage,
     CredentialReview,
 }
@@ -43,6 +44,7 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
     let mut source_ids = HashSet::new();
     let mut duplicate_ids = HashSet::new();
     let mut source_entries = 0;
+    let track_lineage = source != Source::Ordinary;
     for entry in root.children().filter(|node| node.is_element()) {
         let rust_local = has_unqualified_tag(entry, "rustLocalConnection");
         if rust_local && !supports_own_settings {
@@ -52,17 +54,36 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
         if !rust_local && !has_unqualified_tag(entry, "connection") {
             continue;
         }
-        let source_id = if source != Source::Ordinary && !rust_local {
+        let declared_id = if track_lineage && !rust_local {
             source_entries += 1;
             if source_entries > MAX_PROFILES && source == Source::CredentialReview {
                 return Err(invalid("Java connections.xml exceeds its entry limit."));
             }
-            entry
-                .attribute("id")
-                .filter(|id| super::valid_teamwork_id(id))
+            entry.attribute("id")
         } else {
             None
         };
+        let source_id = declared_id.filter(|id| super::valid_teamwork_id(id));
+        let favorite = || {
+            source_id
+                .filter(|_| {
+                    binding_field(entry, "connectionSource")
+                        .is_ok_and(|value| matches!(value.map(str::trim), None | Some("LOCAL")))
+                })
+                .map(str::to_owned)
+        };
+        let group = raw_scalar(entry, "group").map(|value| {
+            let value = value.unwrap_or_default();
+            if source != Source::Ordinary && !rust_local {
+                normalize_java_group_path(&value)
+            } else {
+                value
+            }
+        });
+        if track_lineage && !rust_local {
+            preview.java_groups.record(&group, source_id);
+        }
+        let group = group.and_then(validated_group);
         if let Some(id) = source_id
             && !source_ids.insert(id)
         {
@@ -89,8 +110,18 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
                     .is_some_and(|value| value.trim() == "LOCAL_SHELL")
             })
         {
-            match local_profile(entry, rust_local, supports_own_settings) {
-                Ok(local) => preview.push_local(local)?,
+            match group
+                .and_then(|group| local_profile(entry, group, rust_local, supports_own_settings))
+            {
+                Ok(mut local) => {
+                    local.java_favorite_id = favorite();
+                    if binding_field(entry, "connectionSource")
+                        .is_ok_and(|source| matches!(source.map(str::trim), None | Some("LOCAL")))
+                    {
+                        local.java_memory_id = declared_id.map(str::to_owned);
+                    }
+                    preview.push_local(local)?;
+                }
                 Err(_) => preview.invalid += 1,
             }
             continue;
@@ -100,8 +131,11 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
                 .as_deref()
                 .is_some_and(|value| value.trim() == "SERIAL")
         }) {
-            match serial_profile(entry, supports_own_settings) {
-                Ok(serial) => preview.push_serial(serial)?,
+            match group.and_then(|group| serial_profile(entry, group, supports_own_settings)) {
+                Ok(mut serial) => {
+                    serial.java_favorite_id = favorite();
+                    preview.push_serial(serial)?;
+                }
                 Err(_) => preview.invalid += 1,
             }
             continue;
@@ -117,12 +151,15 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
                 continue;
             }
         }
-        match connection(entry, supports_own_settings).and_then(|(mut profile, skipped)| {
+        let connection = group.and_then(|group| connection(entry, group, supports_own_settings));
+        match connection.and_then(|(mut profile, skipped)| {
             profile.connection.window_geometry = window_geometry(entry)?;
             profile.java_id = source_id.map(str::to_owned);
-            if source_id.is_some() {
+            profile.java_favorite_id = favorite();
+            profile.java_memory_id = declared_id.map(str::to_owned);
+            if declared_id.is_some() {
                 profile.java_route = declared_route(entry, &profile.connection).ok().flatten();
-                if key_reference && profile.java_route.is_some() {
+                if key_reference && source_id.is_some() && profile.java_route.is_some() {
                     profile.java_key_id = binding_field(entry, "sshKeyId")
                         .ok()
                         .flatten()
@@ -149,9 +186,22 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
             {
                 entry.java_route = None;
             }
+            clear_duplicate_favorite(&mut entry.java_favorite_id, &duplicate_ids);
+        }
+        for entry in &mut preview.local_entries {
+            clear_duplicate_favorite(&mut entry.java_favorite_id, &duplicate_ids);
+        }
+        for entry in &mut preview.serial_entries {
+            clear_duplicate_favorite(&mut entry.java_favorite_id, &duplicate_ids);
         }
     }
     Ok(preview)
+}
+
+fn clear_duplicate_favorite(id: &mut Option<String>, duplicates: &HashSet<&str>) {
+    if id.as_deref().is_some_and(|id| duplicates.contains(id)) {
+        *id = None;
+    }
 }
 
 fn binding_field<'a, 'input: 'a>(
@@ -239,13 +289,10 @@ fn binding_endpoint(node: Node<'_, '_>) -> io::Result<Option<LoginTarget>> {
 
 fn local_profile(
     node: Node<'_, '_>,
+    group: String,
     rust_local: bool,
     supports_own_settings: bool,
 ) -> io::Result<ImportedLocal> {
-    let group = raw_scalar(node, "group")?.unwrap_or_default();
-    if !group.is_empty() && !super::library::valid_path(&group) {
-        return Err(invalid("invalid kortty connection folder"));
-    }
     let (shell, command) = if rust_local {
         let shell = match raw_scalar(node, "rustLocalShell")?.as_deref() {
             None | Some("default") => LocalShell::Default,
@@ -293,7 +340,12 @@ fn local_profile(
         terminal: terminal_overrides(node, supports_own_settings)?.0,
     };
     profile.validate()?;
-    Ok(ImportedLocal { profile, group })
+    Ok(ImportedLocal {
+        profile,
+        group,
+        java_memory_id: None,
+        java_favorite_id: None,
+    })
 }
 
 fn local_shell_integration(node: Node<'_, '_>) -> io::Result<bool> {
@@ -328,7 +380,11 @@ fn terminal_profile(node: Node<'_, '_>) -> io::Result<TerminalProfile> {
         .ok_or_else(|| invalid("unsupported terminal emulation"))
 }
 
-fn serial_profile(node: Node<'_, '_>, supported: bool) -> io::Result<ImportedSerial> {
+fn serial_profile(
+    node: Node<'_, '_>,
+    group: String,
+    supported: bool,
+) -> io::Result<ImportedSerial> {
     use crate::session::{SerialConnection, SerialSettings};
     let serial =
         optional_child(node, "serial")?.ok_or_else(|| invalid("missing serial settings"))?;
@@ -364,11 +420,11 @@ fn serial_profile(node: Node<'_, '_>, supported: bool) -> io::Result<ImportedSer
         .trim()
         .to_owned();
     profile.validate()?;
-    let group = raw_scalar(node, "group")?.unwrap_or_default();
-    if !group.is_empty() && !super::library::valid_path(&group) {
-        return Err(invalid("invalid kortty connection folder"));
-    }
-    Ok(ImportedSerial { profile, group })
+    Ok(ImportedSerial {
+        profile,
+        group,
+        java_favorite_id: None,
+    })
 }
 
 fn serial_enum<T: serde::de::DeserializeOwned>(
@@ -423,18 +479,32 @@ pub(super) fn is_ssh(node: Node<'_, '_>) -> io::Result<bool> {
     ))
 }
 
+pub(crate) fn normalize_java_group_path(path: &str) -> String {
+    // Java GroupPath splits on slash, trims ASCII control characters and spaces,
+    // and drops empty segments. Non-ASCII whitespace remains significant.
+    path.split('/')
+        .map(|segment| segment.trim_matches(|character| character <= ' '))
+        .filter(|segment| !segment.is_empty())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+pub(super) fn validated_group(group: String) -> io::Result<String> {
+    if !group.is_empty() && !super::library::valid_path(&group) {
+        return Err(invalid("invalid kortty connection folder"));
+    }
+    Ok(group)
+}
+
 pub(super) fn connection(
     node: Node<'_, '_>,
+    group: String,
     supports_own_settings: bool,
 ) -> io::Result<(ImportedProfile, usize)> {
     let host = raw_scalar(node, "host")?.unwrap_or_default();
     let name = raw_scalar(node, "name")?.unwrap_or_else(|| host.clone());
     let connection_port = raw_scalar(node, "port")?.unwrap_or_default();
     let username = raw_scalar(node, "username")?.unwrap_or_default();
-    let group = raw_scalar(node, "group")?.unwrap_or_default();
-    if !group.is_empty() && !super::library::valid_path(&group) {
-        return Err(invalid("invalid kortty connection folder"));
-    }
     let mut tunnels = Vec::new();
     let mut skipped = 0;
     let mut binds = HashSet::new();

@@ -8,18 +8,22 @@ use crate::sftp_window::privileged_file::ProtectedOperation;
 use crate::sftp_window::validate_transfer_name;
 
 use super::{
+    imported_archive,
     privileged::{
         PrivilegedArchive, PrivilegedDirection, PrivilegedFileAction, PrivilegedTransfer,
     },
     rsync, sync,
 };
 
+mod symbolic;
+pub(crate) use symbolic::SymbolicMode;
+
 const MAX_PATH_BYTES: usize = 4096;
 const MAX_COMPONENTS: usize = 32;
 pub(crate) const MAX_ARCHIVE_SOURCES: usize = 16;
 pub(super) const MAX_ARCHIVE_SOURCE_TEXT: usize = MAX_ARCHIVE_SOURCES * (MAX_PATH_BYTES + 1);
-const MAX_ARCHIVE_EXCLUDES: usize = 32;
-const MAX_ARCHIVE_PATTERN_BYTES: usize = 256;
+pub(crate) const MAX_ARCHIVE_EXCLUDES: usize = 32;
+pub(crate) const MAX_ARCHIVE_PATTERN_BYTES: usize = 256;
 pub(crate) const MAX_ARCHIVE_EXCLUDE_TEXT: usize =
     MAX_ARCHIVE_EXCLUDES * (MAX_ARCHIVE_PATTERN_BYTES + 1);
 
@@ -37,6 +41,10 @@ pub(crate) enum RemoteAction {
         path: RemotePath,
         mode: u16,
     },
+    ChmodSymbolic {
+        path: RemotePath,
+        mode: SymbolicMode,
+    },
     Chown {
         path: RemotePath,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -51,6 +59,7 @@ pub(crate) enum RemoteAction {
     #[serde(alias = "archive_zip")]
     Archive(Archive),
     ServerArchive(Archive),
+    ImportedArchive(Box<imported_archive::Draft>),
     PrivilegedArchive(PrivilegedArchive),
     Delete {
         path: RemotePath,
@@ -85,11 +94,13 @@ impl RemoteAction {
         match self {
             Self::Mkdir { .. } => "SFTP_MKDIR",
             Self::Rename { .. } => "SFTP_RENAME",
-            Self::Chmod { .. } => "SFTP_CHMOD",
+            Self::Chmod { .. } | Self::ChmodSymbolic { .. } => "SFTP_CHMOD",
             Self::Chown { .. } => "SFTP_CHOWN",
             Self::PrivilegedFileAction(metadata) => match metadata.operation {
                 ProtectedOperation::Mkdir => "SFTP_MKDIR",
-                ProtectedOperation::Chmod { .. } => "SFTP_CHMOD",
+                ProtectedOperation::Chmod { .. } | ProtectedOperation::ChmodSymbolic { .. } => {
+                    "SFTP_CHMOD"
+                }
                 ProtectedOperation::Chown { .. } => "SFTP_CHOWN",
                 ProtectedOperation::Copy { .. } | ProtectedOperation::CopyTree { .. } => {
                     "SFTP_COPY_REMOTE"
@@ -98,9 +109,10 @@ impl RemoteAction {
                 ProtectedOperation::Delete { .. } => "SFTP_DELETE",
             },
             Self::CopyRemote { .. } => "SFTP_COPY_REMOTE",
-            Self::Archive(_) | Self::ServerArchive(_) | Self::PrivilegedArchive(_) => {
-                "SFTP_ARCHIVE"
-            }
+            Self::Archive(_)
+            | Self::ServerArchive(_)
+            | Self::ImportedArchive(_)
+            | Self::PrivilegedArchive(_) => "SFTP_ARCHIVE",
             Self::Delete { .. } => "SFTP_DELETE",
             Self::Upload { .. }
             | Self::PrivilegedTreeUpload(_)
@@ -120,6 +132,41 @@ impl RemoteAction {
     }
 
     pub(super) fn validate(&self) -> Result<(), &'static str> {
+        self.require_executable()?;
+        self.validate_definition()
+    }
+
+    pub(super) fn require_executable(&self) -> Result<(), &'static str> {
+        if matches!(self, Self::ImportedArchive(_)) {
+            return Err(imported_archive::REVIEW_REQUIRED);
+        }
+        if let Some((transfer, upload)) = self.rsync_transfer()
+            && (transfer.uses_existing_destination() || transfer.uses_passwordless_sudo())
+        {
+            transfer.validate(upload)?;
+            transfer.require_group_review()?;
+        }
+        self.require_delete_confirmation()
+    }
+
+    fn require_delete_confirmation(&self) -> Result<(), &'static str> {
+        if let Self::Delete {
+            path,
+            confirmed_path,
+            ..
+        } = self
+            && confirmed_path != path.as_str()
+        {
+            return Err("Repeat the exact remote path to authorize deletion");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_definition(&self) -> Result<(), &'static str> {
+        // An empty confirmation can be saved as an imported draft only.
+        if !matches!(self, Self::Delete { confirmed_path, .. } if confirmed_path.is_empty()) {
+            self.require_delete_confirmation()?;
+        }
         match self {
             Self::Rename { from, to } if from == to => {
                 Err("Choose a different remote rename destination")
@@ -135,16 +182,13 @@ impl RemoteAction {
             {
                 Err("Choose 7z from the file browser")
             }
+            Self::Archive(archive) if archive.server_output.is_some() => {
+                Err("Choose server-only creation for archive output metadata")
+            }
             Self::Archive(archive) => archive.validate(),
             Self::ServerArchive(archive) => archive.server_spec().map(|_| ()),
+            Self::ImportedArchive(archive) => archive.settings.validate(),
             Self::PrivilegedArchive(archive) => archive.validate(),
-            Self::Delete {
-                path,
-                confirmed_path,
-                ..
-            } if confirmed_path != path.as_str() => {
-                Err("Repeat the exact remote path to authorize deletion")
-            }
             Self::Chmod { mode, .. } if *mode > 0o7777 => {
                 Err("Enter three or four octal permission digits")
             }
@@ -205,13 +249,15 @@ impl RemoteAction {
             Self::Rename { from, to } | Self::CopyRemote { from, to } => {
                 from.has_drive() || to.has_drive()
             }
-            Self::Chmod { path, .. } | Self::Chown { path, .. } | Self::Delete { path, .. } => {
-                path.has_drive()
-            }
+            Self::Chmod { path, .. }
+            | Self::ChmodSymbolic { path, .. }
+            | Self::Chown { path, .. }
+            | Self::Delete { path, .. } => path.has_drive(),
             Self::Upload { remote, .. } | Self::Download { remote, .. } => remote.has_drive(),
-            Self::Privileged(_) | Self::PrivilegedFileAction(_) | Self::PrivilegedArchive(_) => {
-                false
-            }
+            Self::Privileged(_)
+            | Self::PrivilegedFileAction(_)
+            | Self::PrivilegedArchive(_)
+            | Self::ImportedArchive(_) => false,
             Self::Sync(copy)
             | Self::PrivilegedTreeUpload(copy)
             | Self::PrivilegedTreeDownload(copy) => copy.remote.has_drive(),
@@ -236,6 +282,17 @@ impl RemoteAction {
                 | Self::Download { .. }
                 | Self::Privileged(_)
                 | Self::Archive(_)
+                | Self::ServerArchive(Archive {
+                    download: Some(_),
+                    ..
+                })
+                | Self::PrivilegedArchive(PrivilegedArchive {
+                    archive: Archive {
+                        download: Some(_),
+                        ..
+                    },
+                    ..
+                })
                 | Self::Sync(_)
                 | Self::PrivilegedTreeUpload(_)
                 | Self::PrivilegedTreeDownload(_)
@@ -262,7 +319,26 @@ impl RemoteAction {
                     download: Some(_),
                     ..
                 })
+                | Self::ServerArchive(Archive {
+                    download: Some(_),
+                    ..
+                })
+                | Self::PrivilegedArchive(PrivilegedArchive {
+                    archive: Archive {
+                        download: Some(_),
+                        ..
+                    },
+                    ..
+                })
         )
+    }
+
+    pub(crate) fn rsync_transfer(&self) -> Option<(&rsync::Transfer, bool)> {
+        match self {
+            Self::RsyncDownload(transfer) => Some((transfer, false)),
+            Self::RsyncUpload(transfer) => Some((transfer, true)),
+            _ => None,
+        }
     }
 
     pub(crate) fn uses_extended_timeout(&self) -> bool {
@@ -294,6 +370,8 @@ pub(crate) struct Archive {
     pub excludes: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub download: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_output: Option<kortty_server_archive::protocol::OutputMetadata>,
 }
 
 impl Archive {
@@ -303,17 +381,15 @@ impl Archive {
         use kortty_server_archive::protocol::{CreateFormat, CreateSpec};
 
         self.validate()?;
-        if self.download.is_some() || self.password_credential.is_some() {
-            return Err(
-                "Server-only archives use a new server destination and no local download or password.",
-            );
-        }
         let format = match self.format {
             ArchiveFormat::Zip => CreateFormat::Zip,
+            ArchiveFormat::ZipPassword => CreateFormat::ZipPassword,
             ArchiveFormat::Tar => CreateFormat::Tar,
             ArchiveFormat::TarBz2 => CreateFormat::TarBzip2,
             ArchiveFormat::SevenZip => CreateFormat::SevenZip,
-            _ => return Err("Choose ZIP, TAR, TAR.BZ2 or 7z for server-only creation."),
+            ArchiveFormat::SevenZipPassword => {
+                return Err("Choose encrypted 7z for a local archive");
+            }
         };
         Ok(CreateSpec {
             sources: self
@@ -325,10 +401,37 @@ impl Archive {
             format,
             level: self.level,
             excludes: self.excludes.clone(),
+            output: self.server_output,
+            report_payload: self.download.is_some(),
         })
     }
 
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        self.validate_layout()?;
+        match (self.format, self.password_credential.as_deref()) {
+            (ArchiveFormat::ZipPassword, Some(id))
+                if id.len() == 32
+                    && id
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) => {}
+            (ArchiveFormat::ZipPassword, _) => {
+                return Err("Choose a ZIP archive password from the vault");
+            }
+            (_, Some(_)) => return Err("Only encrypted ZIP can use an archive password"),
+            (_, None) => {}
+        }
+        if let Some(download) = &self.download {
+            validate_local_path(download)?;
+        }
+        if let Some(output) = self.server_output {
+            output.validate().map_err(
+                |_| "Choose valid archive output ownership IDs and ordinary permission bits",
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_layout(&self) -> Result<(), &'static str> {
         if self.format == ArchiveFormat::SevenZipPassword {
             return Err("Choose encrypted 7z for a local archive");
         }
@@ -344,18 +447,6 @@ impl Archive {
                 _ => "Choose ZIP compression 0–9 or bzip2 compression 1–9",
             });
         }
-        match (self.format, self.password_credential.as_deref()) {
-            (ArchiveFormat::ZipPassword, Some(id))
-                if id.len() == 32
-                    && id
-                        .bytes()
-                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) => {}
-            (ArchiveFormat::ZipPassword, _) => {
-                return Err("Choose a ZIP archive password from the vault");
-            }
-            (_, Some(_)) => return Err("Only encrypted ZIP can use an archive password"),
-            (_, None) => {}
-        }
         for (index, source) in self.sources.iter().enumerate() {
             if source == &self.target
                 || self.sources[..index]
@@ -364,9 +455,6 @@ impl Archive {
             {
                 return Err("Archive sources must have distinct names and differ from the target");
             }
-        }
-        if let Some(download) = &self.download {
-            validate_local_path(download)?;
         }
         self.exclusions()?;
         Ok(())
@@ -452,7 +540,13 @@ pub enum ArchiveFormat {
 
 impl ArchiveFormat {
     pub(super) const ALL: [Self; 4] = [Self::Zip, Self::ZipPassword, Self::Tar, Self::TarBz2];
-    pub(super) const SERVER_ONLY: [Self; 4] = [Self::Zip, Self::Tar, Self::TarBz2, Self::SevenZip];
+    pub(super) const SERVER_ONLY: [Self; 5] = [
+        Self::Zip,
+        Self::ZipPassword,
+        Self::Tar,
+        Self::TarBz2,
+        Self::SevenZip,
+    ];
 
     pub(crate) fn is_zip(self) -> bool {
         matches!(self, Self::Zip | Self::ZipPassword)
@@ -617,7 +711,7 @@ impl From<RemotePath> for String {
     }
 }
 
-pub(super) fn mode_from_text(value: &str) -> Result<u16, &'static str> {
+pub(crate) fn mode_from_text(value: &str) -> Result<u16, &'static str> {
     let value = value.trim();
     if (3..=4).contains(&value.len()) && value.bytes().all(|byte| matches!(byte, b'0'..=b'7')) {
         u16::from_str_radix(value, 8).map_err(|_| "Enter three or four octal permission digits")
@@ -626,7 +720,7 @@ pub(super) fn mode_from_text(value: &str) -> Result<u16, &'static str> {
     }
 }
 
-pub(super) fn owner_id_from_text(value: &str) -> Result<Option<u32>, &'static str> {
+pub(crate) fn owner_id_from_text(value: &str) -> Result<Option<u32>, &'static str> {
     let value = value.trim();
     if value.is_empty() {
         return Ok(None);
@@ -667,7 +761,9 @@ mod tests {
             unreachable!()
         };
         archive.download = Some(std::env::temp_dir().join("reviewed.tar.bz2"));
-        assert!(RemoteAction::ServerArchive(archive).validate().is_err());
+        let download = RemoteAction::ServerArchive(archive);
+        assert!(download.validate().is_ok());
+        assert!(download.transfers_files() && download.writes_local_file());
     }
 
     #[test]

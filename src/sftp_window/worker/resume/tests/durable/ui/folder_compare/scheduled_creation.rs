@@ -16,7 +16,6 @@ fn scheduled_download_keeps_late_arrivals_and_cancels_without_publication() {
     run(0o100777, false, true);
 }
 
-#[cfg(windows)]
 #[test]
 fn scheduled_changed_download_binds_same_metadata_contents_before_claim_and_keeps_recovery() {
     use crate::sftp_window::scheduled::Comparison;
@@ -39,6 +38,14 @@ fn scheduled_changed_download_binds_same_metadata_contents_before_claim_and_keep
             .unwrap();
     };
     set_modified(&target);
+    #[cfg(unix)]
+    let set_mode = |mode| {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&target, fs::Permissions::from_mode(mode)).unwrap();
+    };
+    #[cfg(unix)]
+    set_mode(0o651);
+    #[cfg(windows)]
     let access =
         kortty_files::ReplacementMetadata::capture(&fs::File::open(&target).unwrap()).unwrap();
     let comparison = || Comparison {
@@ -47,6 +54,7 @@ fn scheduled_changed_download_binds_same_metadata_contents_before_claim_and_keep
         excludes: "",
         to: Side::Local,
         replace_changed: true,
+        upload: None,
     };
     let fixture_client = |source: &[u8], run: bool| {
         client(|bytes| {
@@ -90,6 +98,24 @@ fn scheduled_changed_download_binds_same_metadata_contents_before_claim_and_keep
     );
     assert!(!claimed.get());
 
+    #[cfg(unix)]
+    {
+        set_mode(0o641);
+        assert!(
+            comparison()
+                .apply(
+                    &mut fixture_client(SOURCES[1].1, false),
+                    preview.proof,
+                    &|| false,
+                    &|| false,
+                    claim,
+                )
+                .is_err()
+        );
+        assert!(!claimed.get());
+        set_mode(0o651);
+    }
+
     fs::write(&target, CHANGED).unwrap();
     set_modified(&target);
     assert!(
@@ -107,6 +133,32 @@ fn scheduled_changed_download_binds_same_metadata_contents_before_claim_and_keep
 
     fs::write(&target, ORIGINAL).unwrap();
     set_modified(&target);
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{XattrFlags, fremovexattr, fsetxattr};
+
+        let mut acl = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (1_u16, 6_u16, u32::MAX),
+            (2, 4, 65534),
+            (4, 0, u32::MAX),
+            (16, 4, u32::MAX),
+            (32, 0, u32::MAX),
+        ] {
+            acl.extend_from_slice(&tag.to_le_bytes());
+            acl.extend_from_slice(&permissions.to_le_bytes());
+            acl.extend_from_slice(&id.to_le_bytes());
+        }
+        let file = fs::File::open(&target).unwrap();
+        fsetxattr(&file, "system.posix_acl_access", &acl, XattrFlags::empty()).unwrap();
+        let denied = comparison()
+            .preview(&mut fixture_client(SOURCES[1].1, false), &|| false)
+            .err()
+            .expect("scheduled replacement must reject an unsupported ACL");
+        assert!(denied.contains("extended ACL"), "{denied}");
+        fremovexattr(&file, "system.posix_acl_access").unwrap();
+        set_mode(0o651);
+    }
     let preview = comparison()
         .preview(&mut fixture_client(SOURCES[1].1, false), &|| false)
         .unwrap();
@@ -145,6 +197,15 @@ fn scheduled_changed_download_binds_same_metadata_contents_before_claim_and_keep
     assert!(applied.error.is_none(), "{:?}", applied.error);
     assert_eq!(applied.replaced, 1);
     assert_eq!(fs::read(&target).unwrap(), SOURCES[1].1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(&target).unwrap().permissions().mode() & 0o7777,
+            0o651
+        );
+    }
+    #[cfg(windows)]
     access
         .require_applied(&fs::File::open(&target).unwrap())
         .unwrap();
@@ -158,10 +219,19 @@ fn scheduled_changed_download_binds_same_metadata_contents_before_claim_and_keep
             .starts_with(prefix)
             .then(|| entry.path())
     });
+    let retained_folder = retained.next().unwrap();
     assert_eq!(
-        fs::read(retained.next().unwrap().join("kept.txt")).unwrap(),
+        fs::read(retained_folder.join("kept.txt")).unwrap(),
         ORIGINAL
     );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            fs::metadata(retained_folder).unwrap().permissions().mode() & 0o7777,
+            0o700
+        );
+    }
     assert!(retained.next().is_none());
 }
 

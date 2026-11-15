@@ -8,12 +8,14 @@ use iced::{Element, Size, Subscription, Task, window};
 
 use crate::ai_manager::{self, Configuration, Dialog, Scope};
 use crate::clipboard_policy::ClipboardPolicy;
+use crate::connection_store::Store;
 use crate::local_ai::model_catalog;
 use crate::workspace::dialog_placement::{Kind as DialogKind, escape::on_escape};
 
 use super::{Message as Desktop, Workspace, tool_tabs::Kind};
 
 mod knowledge_sync;
+mod lm_studio_auto;
 mod policy_auto;
 mod runtime_updates;
 
@@ -27,6 +29,7 @@ pub enum Message {
     Open(window::Id),
     Dialog(window::Id, Box<ai_manager::Message>),
     KnowledgeSync(knowledge_sync::Event),
+    LmStudioAuto(lm_studio_auto::Event),
     PolicyAuto(policy_auto::Event),
     RuntimeUpdates(runtime_updates::Event),
     ModelCatalogFinished(model_catalog::online::Completion),
@@ -39,6 +42,7 @@ pub(super) struct State {
     surface: Option<(window::Id, Dialog)>,
     skill_rule_write: Option<u64>,
     knowledge_sync: knowledge_sync::State,
+    lm_studio_auto: lm_studio_auto::State,
     policy_auto: policy_auto::State,
     runtime_updates: runtime_updates::State,
     model_catalog_refresh: Option<model_catalog::online::Cancel>,
@@ -253,7 +257,17 @@ impl Workspace {
     }
 
     pub(super) fn manager_journal_profile_ready(&self) -> bool {
+        if self.uses_legacy_journal_profile() {
+            return false;
+        }
         matches!(self.ai_manager.config.journal_profile(false), Some(Ok(_)))
+    }
+
+    pub(super) fn uses_legacy_journal_profile(&self) -> bool {
+        let preferences = &self.window_settings.journal_ai;
+        (!preferences.endpoint.is_empty() || !preferences.model.is_empty())
+            && (!self.ai_manager.config.journal_profile_is_explicit()
+                || self.ai_manager.config.journal_profile(false).is_none())
     }
 
     pub(super) fn configured_journal_ai(&self, vision: bool) -> Option<crate::local_ai::Profile> {
@@ -264,10 +278,14 @@ impl Workspace {
         if !preferences.enabled || (vision && !preferences.vision_enabled) {
             return None;
         }
-        match self.ai_manager.config.journal_profile(vision) {
-            Some(profile) => profile.ok(),
-            None if vision => preferences.vision_profile().ok().flatten(),
-            None => preferences.profile().ok().flatten(),
+        if self.uses_legacy_journal_profile() {
+            if vision {
+                preferences.vision_profile().ok().flatten()
+            } else {
+                preferences.profile().ok().flatten()
+            }
+        } else {
+            self.ai_manager.config.journal_profile(vision)?.ok()
         }
     }
 
@@ -277,21 +295,20 @@ impl Workspace {
         }
         let preferences = &self.window_settings.journal_ai;
         let policy = &self.clipboard.policy;
-        match self.ai_manager.config.journal_profile(true) {
-            None => preferences.automatic_vision_profile(policy).ok().flatten(),
-            Some(profile)
-                if preferences.enabled
-                    && preferences.vision_enabled
-                    && crate::session_journal::topic_ai_settings::vision_allowed(policy)
-                    && policy
-                        .terminal_logging
-                        .journal_ai_screenshot_analysis()
-                        .unwrap_or(preferences.auto_screenshot_analysis) =>
-            {
-                profile.ok()
-            }
-            Some(_) => None,
+        if self.uses_legacy_journal_profile() {
+            return preferences.automatic_vision_profile(policy).ok().flatten();
         }
+        if !preferences.enabled
+            || !preferences.vision_enabled
+            || !crate::session_journal::topic_ai_settings::vision_allowed(policy)
+            || !policy
+                .terminal_logging
+                .journal_ai_screenshot_analysis()
+                .unwrap_or(preferences.auto_screenshot_analysis)
+        {
+            return None;
+        }
+        self.ai_manager.config.journal_profile(true)?.ok()
     }
 
     pub(super) fn ai_manager_open(&self) -> bool {
@@ -341,6 +358,7 @@ impl Workspace {
         Subscription::batch([
             window,
             self.policy_auto_subscription(),
+            self.lm_studio_auto_subscription(),
             self.knowledge_sync_subscription(),
             self.runtime_updates_subscription(),
         ])
@@ -437,6 +455,7 @@ impl Workspace {
             Message::Open(owner) => return self.open_ai_manager(owner),
             Message::Dialog(id, event) => (id, *event),
             Message::KnowledgeSync(event) => return self.update_knowledge_sync(event),
+            Message::LmStudioAuto(event) => return self.update_lm_studio_auto(event),
             Message::PolicyAuto(event) => return self.update_policy_auto(event),
             Message::RuntimeUpdates(event) => return self.update_runtime_updates(event),
             Message::ModelCatalogFinished(result) => {
@@ -444,7 +463,10 @@ impl Workspace {
             }
         };
         if matches!(event, ai_manager::Message::RefreshPolicyAutoModels) {
-            return self.poll_policy_auto_profiles(true);
+            return Task::batch([
+                self.poll_policy_auto_profiles(true),
+                self.poll_lm_studio_auto(true),
+            ]);
         }
         if let ai_manager::Message::Saved(Ok((saved, _)))
         | ai_manager::Message::ProfileDefaultSaved(Ok(saved)) = &mut event
@@ -459,7 +481,8 @@ impl Workspace {
                 .as_ref()
                 .clone()
                 .with_policy_profiles(&ClipboardPolicy::load())
-            && projected.policy_profiles_changed(saved)
+            && (projected.policy_profiles_changed(saved)
+                || projected.lm_studio_auto_profiles_changed(saved))
         {
             *saved = Arc::new(projected);
         }
@@ -565,11 +588,16 @@ impl Workspace {
         } else {
             Task::none()
         };
+        let models = if configuration_changed {
+            self.poll_lm_studio_auto(false)
+        } else {
+            Task::none()
+        };
         if policy_projection_changed {
             self.refresh_terminal_ai_profile_choices(&Arc::clone(&self.ai_manager.config));
-            return Task::batch([task, catalog, self.resume_policy_auto_consumers()]);
+            return Task::batch([task, catalog, models, self.resume_policy_auto_consumers()]);
         }
-        Task::batch([task, catalog])
+        Task::batch([task, catalog, models])
     }
 
     fn open_ai_manager(&mut self, owner: window::Id) -> Task<Desktop> {
@@ -622,14 +650,8 @@ impl Workspace {
             self.apply_ai_manager_settings(previous_vision);
         }
         let scopes = crate::profile::connections_path()
-            .and_then(crate::connection_store::Store::open)
-            .map(|store| {
-                store
-                    .connections()
-                    .iter()
-                    .map(|entry| Scope::connection(entry.id, entry.name.clone()))
-                    .collect()
-            })
+            .and_then(Store::open)
+            .map(|store| memory_scopes(&store))
             .unwrap_or_default();
         let policy_allowed = self.clipboard.policy.problem.is_none()
             && self.clipboard.policy.ai_allowed
@@ -652,7 +674,11 @@ impl Workspace {
         dialog.set_runtime_downloads_allowed(self.clipboard.policy.ai_runtime_downloads_allowed());
         dialog.set_model_downloads_allowed(self.clipboard.policy.ai_model_downloads_allowed());
         let open = self.open_ai_manager_surface(owner, dialog);
-        Task::batch([open, self.poll_policy_auto_profiles(false)])
+        Task::batch([
+            open,
+            self.poll_policy_auto_profiles(false),
+            self.poll_lm_studio_auto(false),
+        ])
     }
 
     fn open_ai_manager_surface(&mut self, owner: window::Id, mut dialog: Dialog) -> Task<Desktop> {
@@ -716,6 +742,20 @@ impl Workspace {
     }
 }
 
+fn memory_scopes(store: &Store) -> Vec<Scope> {
+    store
+        .connections()
+        .iter()
+        .map(|entry| Scope::connection(entry.id, entry.name.clone()))
+        .chain(
+            store
+                .local_profiles()
+                .iter()
+                .map(|entry| Scope::connection(entry.id, format!("{} (Local shell)", entry.name))),
+        )
+        .collect()
+}
+
 fn wrap(id: window::Id, event: ai_manager::Message) -> Desktop {
     Desktop::AiManager(Message::Dialog(id, Box::new(event)))
 }
@@ -723,6 +763,97 @@ fn wrap(id: window::Id, event: ai_manager::Message) -> Desktop {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ai_manager_lists_saved_ssh_and_local_shell_memory_scopes() {
+        use crate::connection_store::LocalProfile;
+        use serde_json::json;
+
+        let fixture = crate::snippets::tests::Profile::new();
+        let path = fixture.0.join("connections.json");
+        let mut store = Store::open(path.clone()).unwrap();
+        let ssh = store
+            .save(serde_json::from_value(json!({
+                "id": 0, "name": "Development", "tag": "", "emulation": "xterm-256color",
+                "tunnels": [],
+                "login": {"endpoint": {"host": "dev.example", "port": 22, "username": "test"}, "auth": "prompt"},
+            })).unwrap())
+            .unwrap();
+        let save_local = |store: &mut Store, name: &str| {
+            store
+                .save_local(LocalProfile {
+                    id: 0,
+                    name: name.to_owned(),
+                    shell: Default::default(),
+                    command: None,
+                    working_directory: None,
+                    shell_integration: false,
+                    emulation: "xterm-256color".into(),
+                    terminal: Default::default(),
+                })
+                .unwrap()
+        };
+        let local = save_local(&mut store, "Development");
+        let other = save_local(&mut store, "Maintenance");
+        let store = Store::open(path).unwrap();
+        assert_eq!(
+            memory_scopes(&store),
+            [
+                Scope::connection(ssh, "Development".into()),
+                Scope::connection(local, "Development (Local shell)".into()),
+                Scope::connection(other, "Maintenance (Local shell)".into()),
+            ],
+        );
+    }
+
+    #[test]
+    fn explicit_legacy_journal_endpoint_precedes_the_manager_default() {
+        use serde_json::json;
+
+        let mut fixture = json!({
+            "profiles": {
+                "profiles": [
+                    {"id": 1, "name": "Default", "model": "default"},
+                    {"id": 2, "name": "Journal", "model": "journal"},
+                    {"id": 3, "name": "Remote", "model": "remote",
+                        "connection_mode": "remote-open-ai",
+                        "endpoint": "https://example.invalid/v1",
+                        "trusted_remote_endpoint": true}
+                ],
+                "default": 1,
+                "last_id": 3
+            }
+        });
+        let mut workspace = Workspace::default();
+        let preferences = &mut workspace.window_settings.journal_ai;
+        preferences.enabled = true;
+        preferences.endpoint = "127.0.0.1:8091".into();
+        preferences.model = "legacy".into();
+        for (role, expected) in [
+            (json!(null), Some("legacy")),
+            (json!(99), Some("legacy")),
+            (json!(2), Some("journal")),
+            (json!(3), None),
+            (json!("policy-missing"), None),
+        ] {
+            fixture["local"] = json!({"roles": [null, null, null, role]});
+            workspace.set_test_ai_configuration(serde_json::from_value(fixture.clone()).unwrap());
+            let chosen = workspace.configured_journal_ai(false);
+            assert_eq!(
+                chosen
+                    .as_ref()
+                    .map(|profile| profile.usage_estimate_profile().0),
+                expected
+            );
+        }
+
+        fixture["local"] = json!({"roles": [null, null, null, null]});
+        workspace.set_test_ai_configuration(serde_json::from_value(fixture).unwrap());
+        workspace.window_settings.journal_ai.endpoint.clear();
+        workspace.window_settings.journal_ai.model.clear();
+        let default = workspace.configured_journal_ai(false).unwrap();
+        assert_eq!(default.usage_estimate_profile().0, "default");
+    }
 
     #[test]
     fn standalone_ai_manager_keeps_modeless_owner_and_guards_its_close() {

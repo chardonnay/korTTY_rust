@@ -29,7 +29,7 @@ fn job(name: &str, source: &str, run: Option<&str>, host: &str, date: u8, fields
 }
 
 #[test]
-fn journal_tree_mixes_roots_and_groups_runs_with_java_aggregates() {
+fn journal_tree_mixes_roots_and_groups_runs_with_currency_safe_aggregates() {
     let catalog = catalog(vec![
         row("interactive", "<startedAt>2026-06-05T10:00:00Z</startedAt>"),
         job(
@@ -87,8 +87,9 @@ fn journal_tree_mixes_roots_and_groups_runs_with_java_aggregates() {
     assert_eq!(group.usage.completion_tokens, 60);
     assert_eq!(group.usage.total_tokens, 66);
     assert_eq!(group.usage.call_count, 3);
-    assert!((group.usage.cost - 0.6).abs() < 1e-12);
+    assert!((group.usage.cost - 0.1).abs() < 1e-12);
     assert_eq!(group.usage.currency.as_deref(), Some("USD"));
+    assert!(group.usage.cost_partial);
     assert!(!group.usage.local);
     let run = &group.children[0];
     assert_eq!(run.kind(), Kind::Run);

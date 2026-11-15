@@ -98,6 +98,61 @@ fn typed_file_actions_validate_paths_modes_and_the_request_bound() {
 }
 
 #[test]
+fn symbolic_chmod_commits_only_an_ordinary_mode_from_the_held_node() {
+    let action = ProtectedOperation::ChmodSymbolic {
+        mode: SymbolicMode::try_from("g+X,o-r".to_owned()).unwrap(),
+    };
+    let path = "/approved/example";
+    assert!(action.valid_for(path));
+    for mode in ["u+s", "o+t", "u-s"] {
+        assert!(
+            !ProtectedOperation::ChmodSymbolic {
+                mode: SymbolicMode::try_from(mode.to_owned()).unwrap(),
+            }
+            .valid_for(path)
+        );
+    }
+    assert_eq!(
+        serde_json::to_value(action.request(path)).unwrap(),
+        serde_json::json!({"operation":"file_symbolic_chmod", "path":path})
+    );
+
+    let token = "0123456789abcdef0123456789abcdef";
+    let ready = Response::Ready {
+        token: token.into(),
+    };
+    let numeric = ProtectedOperation::Chmod { mode: 0o640 };
+    assert_eq!(
+        serde_json::to_value(numeric.request(path)).unwrap(),
+        serde_json::json!({"operation":"file_action", "path":path, "action": {"kind":"chmod", "mode":0o640}})
+    );
+    assert_eq!(numeric.commit(&ready).unwrap(), token.as_bytes());
+    assert!(action.commit(&ready).is_none());
+    for (directory, expected) in [(false, 0o640_u16), (true, 0o650)] {
+        let response = Response::ReadyMode {
+            token: token.into(),
+            current: 0o644,
+            directory,
+        };
+        let commit = action.commit(&response).unwrap();
+        assert_eq!(&commit[..32], token.as_bytes());
+        assert_eq!(&commit[32..], &expected.to_be_bytes());
+        assert!(numeric.commit(&response).is_none());
+    }
+    for (token, current) in [("invalid", 0o644), (token, 0o4644), (token, 0o666)] {
+        assert!(
+            action
+                .commit(&Response::ReadyMode {
+                    token: token.into(),
+                    current,
+                    directory: false
+                })
+                .is_none()
+        );
+    }
+}
+
+#[test]
 fn response_framing_rejects_bad_lengths_shapes_and_unbounded_text() {
     let digest = "a".repeat(64);
     let encoded = serde_json::json!({
@@ -361,6 +416,84 @@ mod linux {
             0o600
         );
         assert_eq!(fs::read_dir(&fixture.0).unwrap().count(), 4);
+    }
+
+    #[test]
+    #[ignore = "requires explicit root-controlled Linux scratch and Python 3, no sudo is invoked"]
+    fn privileged_symbolic_chmod_rechecks_held_metadata_before_applying() {
+        let fixture = Fixture::new();
+        let source = fixture.0.join("binary");
+        let directory = fixture.0.join("created");
+        fs::write(&source, b"unchanged content").unwrap();
+        fs::create_dir(&directory).unwrap();
+        let set_mode = |path: &Path, mode| {
+            fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap()
+        };
+        let mode_at = |path: &Path| fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        set_mode(&source, 0o644);
+        set_mode(&directory, 0o744);
+        let action = ProtectedOperation::ChmodSymbolic {
+            mode: SymbolicMode::try_from("g+X,o-r".to_owned()).unwrap(),
+        };
+        let start = |path: &Path| {
+            let path = path.to_str().unwrap();
+            let mut helper = Helper::start();
+            helper.request(serde_json::to_value(action.request(path)).unwrap());
+            helper
+        };
+
+        for (path, initial, final_mode, expected_dir) in [
+            (&source, 0o644, 0o640, false),
+            (&directory, 0o744, 0o750, true),
+        ] {
+            let mut helper = start(path);
+            let ready = helper.response();
+            assert!(
+                matches!(&ready, Response::ReadyMode { current, directory, .. } if u32::from(*current) == initial && *directory == expected_dir)
+            );
+            assert_eq!(mode_at(path), initial);
+            helper.body(&action.commit(&ready).unwrap());
+            assert!(matches!(helper.response(), Response::FileActionApplied));
+            helper.finish();
+            assert_eq!(mode_at(path), final_mode);
+        }
+
+        let mut stale = start(&source);
+        let commit = action.commit(&stale.response()).unwrap();
+        set_mode(&source, 0o600);
+        stale.body(&commit);
+        assert!(matches!(stale.response(), Response::Conflict));
+        stale.finish();
+        assert_eq!(mode_at(&source), 0o600);
+
+        let mut invalid = start(&source);
+        let mut commit = action.commit(&invalid.response()).unwrap();
+        commit[32..].copy_from_slice(&0o4600_u16.to_be_bytes());
+        invalid.body(&commit);
+        assert!(matches!(invalid.response(), Response::Blocked));
+        invalid.finish();
+        assert_eq!(mode_at(&source), 0o600);
+
+        let mut wrong_token = start(&source);
+        let mut commit = action.commit(&wrong_token.response()).unwrap();
+        commit[0] = if commit[0] == b'a' { b'b' } else { b'a' };
+        wrong_token.body(&commit);
+        assert!(matches!(wrong_token.response(), Response::Failed));
+        wrong_token.finish();
+        assert_eq!(mode_at(&source), 0o600);
+
+        let link = fixture.0.join("hard-link");
+        let mut linked = start(&source);
+        let commit = action.commit(&linked.response()).unwrap();
+        fs::hard_link(&source, &link).unwrap();
+        linked.body(&commit);
+        assert!(matches!(linked.response(), Response::Conflict));
+        linked.finish();
+        assert_eq!(mode_at(&source), 0o600);
+        let mut refused = start(&link);
+        assert!(matches!(refused.response(), Response::Blocked));
+        refused.finish();
+        assert_eq!(fs::read(&source).unwrap(), b"unchanged content");
     }
 
     #[test]

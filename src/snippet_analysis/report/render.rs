@@ -12,7 +12,7 @@ use crate::session_journal::{
     is_display_character,
 };
 use crate::snippet_analysis::diagram::AnalysisDiagram;
-use crate::snippet_analysis::model::{ApplyRun, ApplyStatus};
+use crate::snippet_analysis::model::{ApplyRun, ApplyStatus, java_history};
 use crate::snippet_window::compare::{ExportDiff, ExportHunk};
 
 use super::markdown::{Link as DiagramLink, href as diagram_href};
@@ -168,37 +168,42 @@ fn report_json(item: &Item, options: &Options) -> (Value, bool) {
         }))
     });
     let failed_diagram = record.diagram.is_some() && diagram.is_none();
-    (
-        json!({
-            "schema": SCHEMA,
-            "kind": if run.is_some() { "POST_APPLY" } else { "PRE_APPLY" },
-            "exportedAt": iso_date(options.exported_at),
-            "locale": options.locale,
-            "header": {
-                "scriptName": source.snippet_name,
-                "snippetId": snippet_id,
-                "scriptLanguage": source.language,
-                "aiProfile": provenance.profile_name,
-                "aiModel": provenance.model,
-                "skills": provenance.skill_names,
-                "analysisLanguage": source.report_language_code,
-                "codeTextLanguage": run.and_then(ApplyRun::code_text_language_code).unwrap_or(&source.code_text_language_code),
-                "analysedAt": iso_date(record.analyzed_at),
-                "appliedAt": run.and_then(|run| iso_date(run.started_at)),
-                "sourceSha256": source.sha256,
-                "stale": item.stale(),
-                "runNumber": run.map_or(0, |run| item.run_number(run.id)),
-                "runCount": record.apply_runs.len(),
-            },
-            "summary": record.analysis.summary,
-            "findings": findings,
-            "dependencies": dependencies,
-            "diagram": diagram,
-            "apply": after.map(|(run, diff)| apply_json(run, diff)),
-            "verification": item.post.as_ref().and_then(|post| post.verification.as_ref()).map(verification_json),
-        }),
-        failed_diagram,
-    )
+    let mut report = json!({
+        "schema": SCHEMA,
+        "kind": if run.is_some() { "POST_APPLY" } else { "PRE_APPLY" },
+        "exportedAt": iso_date(options.exported_at),
+        "locale": options.locale,
+        "header": {
+            "scriptName": source.snippet_name,
+            "snippetId": snippet_id,
+            "scriptLanguage": source.language,
+            "aiProfile": provenance.profile_name,
+            "aiModel": provenance.model,
+            "skills": provenance.skill_names,
+            "analysisLanguage": source.report_language_code,
+            "codeTextLanguage": run.and_then(ApplyRun::code_text_language_code).unwrap_or(&source.code_text_language_code),
+            "analysedAt": iso_date(record.analyzed_at),
+            "appliedAt": run.and_then(|run| iso_date(run.started_at)),
+            "sourceSha256": source.sha256,
+            "stale": item.stale(),
+            "runNumber": run.map_or(0, |run| item.run_number(run.id)),
+            "runCount": record.apply_runs.len(),
+        },
+        "summary": record.analysis.summary,
+        "findings": findings,
+        "dependencies": dependencies,
+        "diagram": diagram,
+        "apply": after.map(|(run, diff)| apply_json(run, diff)),
+        "verification": item.post.as_ref().and_then(|post| post.verification.as_ref()).map(verification_json),
+    });
+    if let Some(java) = &record.java_history {
+        let mut evidence = java.clone();
+        if !options.include_code {
+            evidence.attachments.clear();
+        }
+        report["javaHistory"] = json!(evidence);
+    }
+    (report, failed_diagram)
 }
 
 fn changes(run: &ApplyRun, diff: &ExportDiff, selected: Option<&str>) -> Vec<Value> {
@@ -490,6 +495,20 @@ trait ReportBody {
             self.heading(depth + 1, "Summary")?;
             self.text(&analysis.summary)?;
         }
+        if let Some(java) = &item.record.java_history {
+            self.heading(depth + 1, "Imported Java history")?;
+            for run in &java.apply_runs {
+                self.imported_apply_run(run, depth + 2)?;
+            }
+            if let Some(verification) = &java.verification {
+                self.text(&format!(
+                    "Verification · {} resolved, {} persisting, {} new",
+                    verification.resolved_previous_ids.len(),
+                    verification.persisting_current_to_previous.len(),
+                    verification.new_ids.len()
+                ))?;
+            }
+        }
         self.findings(item, depth + 1)?;
         if !analysis.dependencies.is_empty() {
             self.heading(
@@ -536,6 +555,76 @@ trait ReportBody {
             }
         }
         Ok(failed_diagram)
+    }
+
+    fn imported_apply_run(&mut self, run: &java_history::ApplyRun, depth: usize) -> io::Result<()> {
+        self.heading(depth, run.outcome.label(run.saved_to_snippet_at))?;
+        self.text(&run.summary)?;
+        let Some(details) = &run.details else {
+            return Ok(());
+        };
+        if let Some(provenance) = &details.provenance {
+            self.field("AI profile", &provenance.profile_name)?;
+            self.field("AI model", &provenance.model)?;
+            self.field("Skills", &provenance.skill_names.join(", "))?;
+        }
+        if let Some(options) = &details.options {
+            self.field("Language", &options.snippet_language)?;
+            self.field(
+                "Code text language",
+                options
+                    .code_text_language_code
+                    .as_deref()
+                    .unwrap_or_default(),
+            )?;
+            self.field("Hardening", &options.hardening_options.join(", "))?;
+            self.field(
+                "Input hardening",
+                &options.input_hardening_options.join(", "),
+            )?;
+            self.field("Header", options.header_name.as_deref().unwrap_or_default())?;
+            self.field(
+                "Migration",
+                options
+                    .migration_label
+                    .as_deref()
+                    .or(options.migration_target_language.as_deref())
+                    .unwrap_or_default(),
+            )?;
+            self.field(
+                "Target host format",
+                options
+                    .migration_target_host_format
+                    .as_deref()
+                    .unwrap_or_default(),
+            )?;
+        }
+        if let Some(progress) = &details.progress {
+            if progress.total_items != 0 {
+                self.field(
+                    "Completed items",
+                    &format!("{} of {}", progress.completed_items, progress.total_items),
+                )?;
+            }
+            if progress.retries != 0 {
+                self.field("Retries", &progress.retries.to_string())?;
+            }
+        }
+        if let Some(checkpoint) = &details.checkpoint_progress
+            && checkpoint.total_stages != 0
+        {
+            self.field(
+                "Completed stages",
+                &format!(
+                    "{} of {}",
+                    checkpoint.completed_stages, checkpoint.total_stages
+                ),
+            )?;
+        }
+        self.field(
+            "Failure code",
+            details.failure_key.as_deref().unwrap_or_default(),
+        )
     }
 
     fn finding_selection(&mut self, item: &Item, id: &str) -> io::Result<()> {

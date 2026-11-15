@@ -6,8 +6,7 @@ use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt as _;
 use std::path::{Component, PathBuf, Prefix};
 use std::ptr::{NonNull, copy_nonoverlapping, null, null_mut};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use raw_window_handle::{RawWindowHandle, WindowHandle};
 use windows_sys::Win32::Foundation::{
@@ -33,48 +32,13 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 use windows_sys::core::{BOOL, GUID, HRESULT, IID_IUnknown, IUnknown_Vtbl};
 
+pub use super::file_drag::{Outcome, Permit};
+
 const MAX_FILES: usize = 256;
 const MAX_PATH_UNITS: usize = 32_767;
 const MAX_PAYLOAD_BYTES: usize = 1024 * 1024;
 const IID_DATA_OBJECT: GUID = GUID::from_u128(0x0000010e_0000_0000_c000_000000000046);
 const IID_DROP_SOURCE: GUID = GUID::from_u128(0x00000121_0000_0000_c000_000000000046);
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum Outcome {
-    Copied,
-    Cancelled,
-    Unavailable,
-}
-
-/// The application can revoke a queued or live offer even while OLE owns the pointer.
-#[derive(Clone)]
-pub struct Permit(Arc<Authority>);
-
-struct Authority {
-    live: AtomicBool,
-    check: Box<dyn Fn() -> bool + Send + Sync>,
-}
-
-impl Permit {
-    /// The caller's check runs on the OLE thread and must return promptly.
-    pub fn new(check: impl Fn() -> bool + Send + Sync + 'static) -> Self {
-        Self(Arc::new(Authority {
-            live: AtomicBool::new(true),
-            check: Box::new(check),
-        }))
-    }
-
-    pub fn revoke(&self) {
-        self.0.live.store(false, Ordering::Release);
-    }
-
-    fn allows(&self) -> bool {
-        self.0.live.load(Ordering::Acquire)
-            && std::panic::catch_unwind(std::panic::AssertUnwindSafe(&self.0.check))
-                .unwrap_or(false)
-            && self.0.live.load(Ordering::Acquire)
-    }
-}
 
 /// Starts a native Copy drag on the source window's GUI thread with its primary button held.
 pub fn start(window: WindowHandle<'_>, paths: &[PathBuf], permit: Permit) -> Outcome {
@@ -495,7 +459,7 @@ unsafe extern "system" fn data_get(
         );
         GlobalUnlock(memory);
     }
-    if !data.permit.0.live.load(Ordering::Acquire) {
+    if !data.permit.is_live() {
         // SAFETY: Allocation ownership has not been transferred.
         unsafe { GlobalFree(memory) };
         return DV_E_FORMATETC;

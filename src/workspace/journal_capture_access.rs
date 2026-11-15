@@ -18,8 +18,14 @@ use crate::session_journal::{
 };
 
 use super::journal_access::entry_editor::edit_text_limited;
+use super::journal_access::summaries::preflight::{Cancel as ProbeCancel, Probe};
 use super::journal_note_translation as note_translation;
 use super::{Message as Desktop, PaneSession, Tab, Window, Workspace};
+
+mod preflight;
+#[cfg(test)]
+mod preflight_tests;
+mod preflight_view;
 
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -40,6 +46,35 @@ pub enum Message {
         Result<Option<(u64, PublishedScreenshot)>, String>,
     ),
     AutomaticScreenshotAi(window::Id, u64, u64, bool),
+    AiProbeFinished(u64, u64, Result<(), String>),
+    AiProbeChoice(window::Id, u64, u64, ProbeChoice),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ProbeChoice {
+    Retry,
+    WithoutAi,
+    Cancel,
+}
+
+pub(super) struct AiStart {
+    ticket: u64,
+    target: ProbeTarget,
+    capture_run: Option<u64>,
+    probe: Probe,
+    status: ProbeStatus,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ProbeTarget {
+    session: SessionId,
+    generation: u64,
+}
+
+enum ProbeStatus {
+    Checking { _cancel: ProbeCancel },
+    Ready,
+    Failed(String),
 }
 
 #[derive(Clone)]
@@ -107,6 +142,7 @@ pub(super) struct Entry {
     screenshot: Option<Receiver<()>>,
     automatic_screenshot_ai: Option<u64>,
     automatic_screenshot_ai_disabled: bool,
+    without_ai: bool,
     automatic: Option<(SessionId, u64)>,
     capture_input: bool,
 }
@@ -494,6 +530,13 @@ impl Workspace {
         if !self.journal_allowed() || tab.incognito {
             return false;
         }
+        if self
+            .journal_ai_starts
+            .get(&tab.id)
+            .is_some_and(|start| start.capture_run.is_none())
+        {
+            return false;
+        }
         match self.journal_captures.get(&tab.id).map(|entry| &entry.phase) {
             Some(Phase::Starting(..) | Phase::Active { .. }) => true,
             Some(Phase::Finishing(..)) => false,
@@ -576,15 +619,46 @@ impl Workspace {
         tab_id: u64,
         automatic: bool,
     ) -> Task<Desktop> {
-        let Some(tab) = self.journal_tab_in(owner, tab_id) else {
+        if let Err(error) = self.journal_directory() {
+            self.notice(owner, format!("Could not start session journal ({error})."));
             return Task::none();
+        }
+        let Some((target, config)) = self.journal_probe_target(tab_id) else {
+            return Task::none();
+        };
+        let probe = match self.journal_start_probe(config, None) {
+            Some(probe) if !automatic => {
+                return self.begin_journal_probe(tab_id, target, None, probe);
+            }
+            probe => probe,
+        };
+        let (run, start) = self.open_journal_capture(owner, tab_id, automatic, false);
+        match (run, probe) {
+            (Some(run), Some(probe)) => Task::batch([
+                start,
+                self.begin_journal_probe(tab_id, target, Some(run), probe),
+            ]),
+            _ => start,
+        }
+    }
+
+    fn open_journal_capture(
+        &mut self,
+        owner: window::Id,
+        tab_id: u64,
+        automatic: bool,
+        without_ai: bool,
+    ) -> (Option<u64>, Task<Desktop>) {
+        let Some(tab) = self.journal_tab_in(owner, tab_id) else {
+            return (None, Task::none());
         };
         let journal_pane = tab.primary;
         let Some((source, pane)) = self.journal_source(tab) else {
-            return Task::none();
+            return (None, Task::none());
         };
         let generation = pane.stream_generation;
         let mut config = pane.journal_config;
+        config.ai_summaries &= !without_ai;
         if let Some(cap) = self
             .clipboard
             .policy
@@ -633,7 +707,7 @@ impl Workspace {
                 owner,
                 "Journal metadata could not be prepared safely.".into(),
             );
-            return Task::none();
+            return (None, Task::none());
         };
         let title = metadata.title.clone();
         let root = self.journal_directory();
@@ -642,13 +716,13 @@ impl Workspace {
             Ok(startup) => startup,
             Err(error) => {
                 self.notice(owner, format!("Could not start session journal ({error})."));
-                return Task::none();
+                return (None, Task::none());
             }
         };
         let run = self.allocate();
-        let automatic_screenshot_ai = self
-            .journal_automatic_screenshot_analysis_enabled()
-            .then(|| self.allocate());
+        let automatic_screenshot_ai = (!without_ai
+            && self.journal_automatic_screenshot_analysis_enabled())
+        .then(|| self.allocate());
         let task = when_closed(startup.done.clone(), Message::Started(tab_id, run));
         self.journal_captures.insert(
             tab_id,
@@ -657,16 +731,17 @@ impl Workspace {
                 pane: journal_pane,
                 title,
                 phase: Phase::Starting(source, startup),
-                notice: None,
+                notice: without_ai.then(|| "Recording without AI.".into()),
                 note: None,
                 screenshot: None,
                 automatic_screenshot_ai,
-                automatic_screenshot_ai_disabled: false,
+                automatic_screenshot_ai_disabled: without_ai,
+                without_ai,
                 automatic: automatic.then_some((source, generation)),
                 capture_input: config.capture_input,
             },
         );
-        task
+        (Some(run), task)
     }
 
     fn journal_started(&mut self, tab_id: u64, run: u64) -> Task<Desktop> {
@@ -690,31 +765,18 @@ impl Workspace {
                     Some(Err(error)) => error,
                     _ => "Session journal startup stopped.".into(),
                 });
+                self.journal_ai_starts.remove(&tab_id);
                 return Task::none();
             }
         };
         capture.set_marker_rules(markers);
         let done = capture.done();
-        let summary_config = capture.summary_config();
-        let summary_capture = Arc::clone(&capture);
-        let summary_title = entry.title.clone();
         entry.phase = Phase::Active {
             capture,
             source: None,
             retiring: None,
         };
-        if let Some(config) = summary_config
-            && let Some(secrets) = self
-                .sessions
-                .get(&source)
-                .and_then(|pane| pane.session.journal_redaction_secrets())
-        {
-            let redactor = Arc::new(crate::terminal_logging::Redactor::for_journal(
-                secrets,
-                self.clipboard.policy.terminal_logging.clone(),
-            ));
-            self.register_journal_summaries(summary_capture, config, redactor, summary_title);
-        }
+        self.register_probed_journal(tab_id, run);
         Task::batch([
             when_closed(done, Message::Ended(tab_id, run)),
             self.attach_journal_source(tab_id, Some(source)),
@@ -837,6 +899,7 @@ impl Workspace {
         for id in stop {
             self.stop_journal(id);
         }
+        self.reconcile_journal_probes();
         let mut tasks = self.reconcile_automatic_journals();
         for id in retire {
             let Some(Entry {
@@ -910,7 +973,9 @@ impl Workspace {
             if let Some(pane) = self.sessions.get_mut(&session) {
                 pane.journal_attempted = Some(generation);
             }
-            if existing.is_none_or(|entry| !entry.capturing()) {
+            if !self.journal_ai_starts.contains_key(&tab)
+                && existing.is_none_or(|entry| !entry.capturing())
+            {
                 tasks.push(self.start_journal_for(owner, tab, true));
             }
         }
@@ -925,6 +990,7 @@ impl Workspace {
     }
 
     fn stop_journal(&mut self, tab: u64) {
+        self.journal_ai_starts.remove(&tab);
         if let Some(entry) = self.journal_captures.get_mut(&tab) {
             let done = entry.finish();
             for receiver in done {
@@ -946,6 +1012,7 @@ impl Workspace {
     }
 
     pub(super) fn finish_all_journals(&mut self) {
+        self.journal_ai_starts.clear();
         for (_, mut entry) in std::mem::take(&mut self.journal_captures) {
             for done in entry.finish() {
                 self.track_session_shutdown(done);
@@ -967,9 +1034,10 @@ impl Workspace {
         };
         let frame = Arc::clone(&pane.frame);
         let grid = pane.grid;
-        let analysis_consent = entry
-            .automatic_screenshot_ai
-            .filter(|_| self.journal_automatic_screenshot_analysis_enabled());
+        let analysis_consent = entry.automatic_screenshot_ai.filter(|&consent| {
+            self.journal_automatic_screenshot_analysis_enabled()
+                && self.journal_screenshot_ai_run_consented(id, run, consent)
+        });
         let Some(sink) = entry.writable(tab).map(Capture::sink) else {
             return Task::none();
         };
@@ -1196,6 +1264,12 @@ impl Workspace {
                 }
             }
             Message::Started(tab, run) => return self.journal_started(tab, run),
+            Message::AiProbeFinished(tab, ticket, result) => {
+                return self.journal_probe_finished(tab, ticket, result);
+            }
+            Message::AiProbeChoice(owner, tab, ticket, choice) => {
+                return self.journal_probe_choice(owner, tab, ticket, choice);
+            }
             Message::Attached(tab, run, id, result) => {
                 if let Some(Entry {
                     phase:
@@ -1257,6 +1331,8 @@ impl Workspace {
                 if (!enabled || self.journal_automatic_screenshot_analysis_enabled())
                     && let Some((session, entry)) = self.dock_journal_target(owner, tab, run)
                     && entry.writable(session).is_some()
+                    && !entry.without_ai
+                    && !self.journal_ai_starts.contains_key(&tab)
                     && if enabled {
                         entry.automatic_screenshot_ai.is_none()
                     } else {
@@ -1305,6 +1381,12 @@ impl Workspace {
         owner: window::Id,
         tab: &Tab,
     ) -> Option<Element<'_, Desktop>> {
+        if let Some(probe) = self
+            .journal_probe_view(tab)
+            .filter(|probe| !probe.automatic)
+        {
+            return Some(probe.view(owner, tab.id));
+        }
         if self.terminal_only_fullscreen_active(owner) {
             return None;
         }
@@ -1368,15 +1450,26 @@ impl Workspace {
         Some(content.into())
     }
 
+    pub(super) fn journal_auto_preflight_bar(
+        &self,
+        owner: window::Id,
+        tab: &Tab,
+    ) -> Option<Element<'_, Desktop>> {
+        let probe = self
+            .journal_probe_view(tab)
+            .filter(|probe| probe.automatic)?;
+        Some(probe.view(owner, tab.id))
+    }
+
     pub(super) fn journal_screenshot_ai_run_consented(
         &self,
         tab: u64,
         run: u64,
         consent: u64,
     ) -> bool {
-        self.journal_captures
-            .get(&tab)
-            .is_some_and(|entry| entry.run == run && entry.automatic_screenshot_ai == Some(consent))
+        self.journal_captures.get(&tab).is_some_and(|entry| {
+            entry.run == run && !entry.without_ai && entry.automatic_screenshot_ai == Some(consent)
+        }) && !self.journal_ai_starts.contains_key(&tab)
     }
 
     pub(super) fn journal_screenshot_ai_failed(
@@ -1401,8 +1494,9 @@ impl Workspace {
             .journal_automatic_screenshot_analysis_enabled()
             .then(|| self.allocate());
         for entry in self.journal_captures.values_mut() {
-            entry.automatic_screenshot_ai =
-                consent.filter(|_| entry.capturing() && !entry.automatic_screenshot_ai_disabled);
+            entry.automatic_screenshot_ai = consent.filter(|_| {
+                entry.capturing() && !entry.without_ai && !entry.automatic_screenshot_ai_disabled
+            });
         }
     }
 
@@ -1415,6 +1509,8 @@ impl Workspace {
         let (session, entry) = self.dock_journal_target(owner, tab, run)?;
         if !self.journal_automatic_screenshot_analysis_enabled()
             || entry.writable(session).is_none()
+            || entry.without_ai
+            || self.journal_ai_starts.contains_key(&tab)
         {
             return None;
         }
@@ -1497,10 +1593,10 @@ mod tests {
 
     use super::*;
 
-    struct Scratch(PathBuf);
+    pub(super) struct Scratch(pub(super) PathBuf);
 
     impl Scratch {
-        fn new() -> Self {
+        pub(super) fn new() -> Self {
             let folder = std::env::temp_dir().canonicalize().unwrap().join(format!(
                 "kortty-journal-root-{}",
                 crate::private_files::nonce().unwrap()
@@ -1517,7 +1613,7 @@ mod tests {
     }
 
     #[track_caller]
-    fn wait(mut finished: impl FnMut() -> bool) {
+    pub(super) fn wait(mut finished: impl FnMut() -> bool) {
         let deadline = Instant::now() + Duration::from_secs(8);
         while !finished() {
             assert!(Instant::now() < deadline, "journal worker did not finish");
@@ -1578,6 +1674,7 @@ mod tests {
                 screenshot: None,
                 automatic_screenshot_ai: Some(19),
                 automatic_screenshot_ai_disabled: false,
+                without_ai: false,
                 automatic: None,
                 capture_input: false,
             },
@@ -1686,6 +1783,7 @@ mod tests {
                 screenshot: None,
                 automatic_screenshot_ai: None,
                 automatic_screenshot_ai_disabled: false,
+                without_ai: false,
                 automatic: None,
                 capture_input: false,
             },
@@ -1792,6 +1890,7 @@ mod tests {
                 screenshot: None,
                 automatic_screenshot_ai: None,
                 automatic_screenshot_ai_disabled: false,
+                without_ai: false,
                 automatic: None,
                 capture_input: false,
             },
@@ -2111,6 +2210,7 @@ mod tests {
                 screenshot: None,
                 automatic_screenshot_ai: None,
                 automatic_screenshot_ai_disabled: false,
+                without_ai: false,
                 automatic: None,
                 capture_input: false,
             },

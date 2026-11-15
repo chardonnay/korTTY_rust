@@ -6,11 +6,15 @@ use std::io::{Seek, SeekFrom, Write};
 use bzip2::{Compression, write::BzEncoder};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use kortty_server_archive::manifest::{MAX_EXPANDED_BYTES, MAX_MANIFEST_PATH_BYTES, MAX_MEMBERS};
-use kortty_server_archive::protocol::{CreateFormat, CreateReview, CreateSpec};
+use kortty_server_archive::protocol::{
+    CreateFormat, CreateReview, CreateSpec, CreatedPayload, OutputMetadata,
+};
+use rustix::fs::fchown;
+use rustix::process::{Gid, Uid};
 use sevenz_rust2::{
     ArchiveEntry, ArchiveWriter, EncoderConfiguration, EncoderMethod, encoder_options::Lzma2Options,
 };
-use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
+use zip::{AesMode, CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use super::*;
 
@@ -36,30 +40,52 @@ pub(super) fn review_with_policy(
     })
 }
 
-pub(super) fn apply(spec: CreateSpec, token: &str) -> Result<String, Failure> {
-    apply_with_policy(spec, token, PathPolicy::default())
+pub(super) fn apply(
+    spec: CreateSpec,
+    token: &str,
+    password: Option<&[u8]>,
+) -> Result<(String, Option<CreatedPayload>), Failure> {
+    let publication = apply_with_policy(spec, token, PathPolicy::default(), password)?;
+    Ok((
+        publication.destination,
+        publication.copy.map(|(receipt, _)| receipt),
+    ))
+}
+
+pub(super) struct Publication {
+    pub(super) destination: String,
+    pub(super) copy: Option<(CreatedPayload, File)>,
 }
 
 pub(super) fn apply_with_policy(
     spec: CreateSpec,
     token: &str,
     policy: PathPolicy<'_>,
-) -> Result<String, Failure> {
+    password: Option<&[u8]>,
+) -> Result<Publication, Failure> {
+    if (spec.format == CreateFormat::ZipPassword) != password.is_some() {
+        return Err(invalid("The creation request and archive password do not match").into());
+    }
     let request = Creation::new(&spec, policy)?;
     let mut stage = Stage::create(&request.parent)?;
-    let result = (|| -> io::Result<()> {
+    let result = (|| -> io::Result<Option<(CreatedPayload, File)>> {
         request.policy.prepare_stage(&stage.directory.fd)?;
+        let access = if spec.report_payload {
+            OFlags::RDWR
+        } else {
+            OFlags::WRONLY
+        };
         let mut file = File::from(openat(
             &stage.directory.fd,
             "archive",
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            access | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             PRIVATE_FILE,
         )?);
         stage.entries.insert("archive".into(), fstat(&file)?);
         request.policy.prepare_stage(&file)?;
         make_private(&file, PRIVATE_FILE)?;
         let mut output = ArchiveOutput::new(&mut file, request.policy.output_limit());
-        let mut encoder = Encoder::new(&spec, &mut output)?;
+        let mut encoder = Encoder::new(&spec, &mut output, password)?;
         let inventory = request.scan(|member, reader| encoder.write(member, reader))?;
         if inventory.token != token {
             return Err(invalid("The reviewed archive sources or options changed"));
@@ -69,6 +95,13 @@ pub(super) fn apply_with_policy(
             return Err(invalid(
                 "The created archive exceeds the server helper's archive size limit",
             ));
+        }
+        let receipt = spec
+            .report_payload
+            .then(|| summarize_payload(&mut file))
+            .transpose()?;
+        if let Some(output) = spec.output {
+            apply_output_metadata(&file, output)?;
         }
         file.sync_all()?;
         request.verify_destination()?;
@@ -97,12 +130,62 @@ pub(super) fn apply_with_policy(
         request.parent.require_child(request.name, &payload)?;
         stage.discard()?;
         fsync(&request.parent.fd)?;
-        Ok(())
+        Ok(receipt.map(|receipt| (receipt, file)))
     })();
     match result {
-        Ok(()) => Ok(spec.destination),
+        Ok(copy) => Ok(Publication {
+            destination: spec.destination,
+            copy,
+        }),
         Err(error) => Err(stage.fail(error)),
     }
+}
+
+fn summarize_payload(file: &mut File) -> io::Result<CreatedPayload> {
+    file.rewind()?;
+    let mut hash = Sha256::new();
+    let bytes = io::copy(&mut file.take(MAX_ARCHIVE_BYTES + 1), &mut hash)?;
+    let payload = CreatedPayload {
+        bytes,
+        sha256: hash.finalize().into(),
+    };
+    payload.validate()?;
+    Ok(payload)
+}
+
+fn apply_output_metadata(file: &File, output: OutputMetadata) -> io::Result<()> {
+    // A public mode can expose inherited named ACL entries unless removed first.
+    #[cfg(target_os = "linux")]
+    super::privileged_archive::prepare_stage(file)?;
+    let before = fstat(file)?;
+    let uid = output
+        .uid
+        .filter(|&uid| uid != before.st_uid)
+        .map(Uid::from_raw);
+    let gid = output
+        .gid
+        .filter(|&gid| gid != before.st_gid)
+        .map(Gid::from_raw);
+    if uid.is_some() || gid.is_some() {
+        fchown(file, uid, gid)?;
+    }
+    let mode = output.mode.unwrap_or(0o600);
+    #[cfg(target_os = "linux")]
+    let mode = u32::from(mode);
+    let mode = Mode::from_raw_mode(mode);
+    make_private(file, mode)?;
+    let after = fstat(file)?;
+    if !same_node(&before, &after)
+        || after.st_nlink != 1
+        || after.st_uid != output.uid.unwrap_or(before.st_uid)
+        || after.st_gid != output.gid.unwrap_or(before.st_gid)
+        || Mode::from_raw_mode(after.st_mode) != mode
+    {
+        return Err(invalid(
+            "Could not verify the requested archive output metadata",
+        ));
+    }
+    Ok(())
 }
 
 struct Creation<'a> {
@@ -175,9 +258,24 @@ impl<'a> PathPolicy<'a> {
 
 impl<'a> Creation<'a> {
     fn new(spec: &'a CreateSpec, policy: PathPolicy<'a>) -> io::Result<Self> {
+        if let Some(output) = spec.output {
+            #[cfg(target_os = "linux")]
+            if policy.rules.is_some() {
+                return Err(invalid(
+                    "Privileged archives require root-owned private output",
+                ));
+            }
+            output.validate()?;
+        }
         let (parent_path, name) = absolute_file(&spec.destination)?;
+        #[cfg(target_os = "linux")]
+        if spec.report_payload
+            && let Some(rules) = policy.rules
+        {
+            rules.require_copy_parent(parent_path)?;
+        }
         let expected = match spec.format {
-            CreateFormat::Zip => Format::Zip,
+            CreateFormat::Zip | CreateFormat::ZipPassword => Format::Zip,
             CreateFormat::Tar => Format::Tar,
             CreateFormat::TarBzip2 => Format::TarBzip2,
             CreateFormat::SevenZip => Format::SevenZip,
@@ -222,7 +320,9 @@ impl<'a> Creation<'a> {
                         .map_err(io::Error::other)
                 };
                 excludes.add(glob(pattern)?);
-                if spec.format != CreateFormat::Zip && !pattern.starts_with('/') {
+                if !matches!(spec.format, CreateFormat::Zip | CreateFormat::ZipPassword)
+                    && !pattern.starts_with('/')
+                {
                     excludes.add(glob(&format!("**/{pattern}"))?);
                 }
             }
@@ -492,17 +592,19 @@ impl Seek for ArchiveOutput<'_> {
     }
 }
 
-enum Encoder<W: Write + Seek> {
-    Zip(Box<ZipWriter<W>>, u8),
+enum Encoder<'a, W: Write + Seek> {
+    Zip(Box<ZipWriter<W>>, u8, Option<&'a [u8]>),
     Tar(tar::Builder<W>),
     Bzip2(tar::Builder<BzEncoder<W>>),
     SevenZip(Box<ArchiveWriter<W>>, u8),
 }
 
-impl<W: Write + Seek> Encoder<W> {
-    fn new(spec: &CreateSpec, file: W) -> io::Result<Self> {
+impl<'a, W: Write + Seek> Encoder<'a, W> {
+    fn new(spec: &CreateSpec, file: W, password: Option<&'a [u8]>) -> io::Result<Self> {
         Ok(match spec.format {
-            CreateFormat::Zip => Self::Zip(Box::new(ZipWriter::new(file)), spec.level),
+            CreateFormat::Zip | CreateFormat::ZipPassword => {
+                Self::Zip(Box::new(ZipWriter::new(file)), spec.level, password)
+            }
             CreateFormat::Tar => Self::Tar(tar::Builder::new(file)),
             CreateFormat::TarBzip2 => Self::Bzip2(tar::Builder::new(BzEncoder::new(
                 file,
@@ -518,7 +620,7 @@ impl<W: Write + Seek> Encoder<W> {
 
     fn write(&mut self, member: &Member, reader: &mut dyn Read) -> io::Result<()> {
         match self {
-            Self::Zip(writer, level) => {
+            Self::Zip(writer, level, password) => {
                 let mode = if member.kind == MemberKind::Directory {
                     0o700
                 } else {
@@ -535,6 +637,11 @@ impl<W: Write + Seek> Encoder<W> {
                             .compression_method(CompressionMethod::Deflated)
                             .compression_level(Some(i64::from(*level)))
                     };
+                    let options = if let Some(password) = password {
+                        options.with_aes_encryption_bytes(AesMode::Aes256, password)
+                    } else {
+                        options
+                    };
                     writer.start_file(&member.path, options)?;
                     io::copy(reader, writer)?;
                 }
@@ -548,7 +655,7 @@ impl<W: Write + Seek> Encoder<W> {
 
     fn finish(self) -> io::Result<()> {
         match self {
-            Self::Zip(writer, _) => {
+            Self::Zip(writer, _, _) => {
                 writer.finish()?;
             }
             Self::Tar(writer) => {

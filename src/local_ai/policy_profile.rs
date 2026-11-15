@@ -1,28 +1,23 @@
 //! Request authority for administrator-provided AI profiles.
 
 use std::fmt;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use pgp::crypto::hash::HashAlgorithm;
-#[cfg(not(windows))]
-use ureq::Agent;
-use ureq::unversioned::resolver::{ResolvedSocketAddrs, Resolver};
-#[cfg(not(windows))]
-use ureq::unversioned::transport::DefaultConnector;
-use ureq::unversioned::transport::NextTimeout;
-use ureq::{config::Config, http::Uri};
 use zeroize::Zeroizing;
 
 use crate::clipboard_policy::{ClipboardPolicy, PolicyAiProfile, PolicyAiProvider};
 
 use super::{
-    Activity, Connection, Error, Pending, Profile, ProfileOptions, RemoteProtocol, Target,
-    WorkerPermit, connection_config, policy_auto_model, start_worker, valid_model,
+    Connection, Error, LmStudioEndpoint, Pending, Profile, ProfileOptions, RemoteProtocol, Target,
+    WorkerPermit, policy_auto_model, start_worker, valid_model,
 };
+
+use super::lm_studio_endpoint::{endpoint_parts, strip_ascii_prefix};
 
 const ANTHROPIC_ENDPOINT: &str = "https://api.anthropic.com/v1/messages";
 const CHANGED: &str = "The policy-provided AI profile changed or is unavailable. Reopen the profile or review the request again.";
@@ -47,6 +42,10 @@ pub(super) enum PolicyProfileAuthority {
 }
 
 impl PolicyProfileAuthority {
+    pub(super) fn is_lm_studio(&self) -> bool {
+        self.definition().provider == PolicyAiProvider::LmStudio
+    }
+
     pub(super) fn new(definition: &PolicyAiProfile) -> Self {
         Self::Declared(Arc::new(definition.clone()))
     }
@@ -113,7 +112,7 @@ impl PolicyProfileAuthority {
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) struct PolicyAutoModel {
     definition: Arc<PolicyAiProfile>,
-    target: AutoModelTarget,
+    target: LmStudioEndpoint,
     model: String,
 }
 
@@ -157,144 +156,34 @@ impl PolicyAutoModel {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
-pub(super) struct AutoModelTarget {
-    origin: String,
-    native: bool,
-}
-
-impl AutoModelTarget {
-    fn from_definition(definition: &PolicyAiProfile) -> Result<Self, String> {
-        let invalid =
-            || "Automatic model selection requires a loopback LM Studio chat endpoint.".to_owned();
-        if definition.model.is_some()
-            || !matches!(
-                definition.provider,
-                PolicyAiProvider::OpenAiCompatible | PolicyAiProvider::LmStudio
-            )
-        {
-            return Err(invalid());
-        }
-        let endpoint = definition.endpoint.as_deref().ok_or_else(invalid)?;
-        if endpoint.len() > 2048
-            || endpoint
-                .chars()
-                .any(|ch| ch.is_whitespace() || ch.is_control() || matches!(ch, '\\' | '?' | '#'))
-        {
-            return Err(invalid());
-        }
-        let (scheme, rest) = if let Some(rest) = strip_ascii_prefix(endpoint, "https://") {
-            ("https", rest)
-        } else {
-            (
-                "http",
-                strip_ascii_prefix(endpoint, "http://").unwrap_or(endpoint),
-            )
-        };
-        let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
-        if !authority
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b':' | b'[' | b']'))
-        {
-            return Err(invalid());
-        }
-        let native = match path.trim_end_matches('/') {
-            "" | "v1" | "v1/chat/completions" => false,
-            "api/v1/chat" => true,
-            _ => return Err(invalid()),
-        };
-        let origin = url::Url::parse(&format!("{scheme}://{authority}")).map_err(|_| invalid())?;
-        let host = origin.host_str().ok_or_else(invalid)?;
-        if loopback_ip(host).is_none() && host != "localhost" || origin.port() == Some(0) {
-            return Err(invalid());
-        }
-        Ok(Self {
-            origin: origin.origin().ascii_serialization(),
-            native,
-        })
+pub(super) fn auto_model_target(definition: &PolicyAiProfile) -> Result<LmStudioEndpoint, String> {
+    let invalid =
+        || "Automatic model selection requires a loopback LM Studio chat endpoint.".to_owned();
+    if definition.model.is_some()
+        || !matches!(
+            definition.provider,
+            PolicyAiProvider::OpenAiCompatible | PolicyAiProvider::LmStudio
+        )
+    {
+        return Err(invalid());
     }
-
-    pub(super) fn is_https(&self) -> bool {
-        self.origin.starts_with("https://")
-    }
-
-    pub(super) fn uses_native_protocol(&self) -> bool {
-        self.native
-    }
-
-    pub(super) fn completion_path(&self) -> &'static str {
-        if self.native {
-            "/api/v1/chat"
-        } else {
-            "/v1/chat/completions"
-        }
-    }
-
-    fn destination(&self) -> String {
-        format!("{}{}", self.origin, self.completion_path())
-    }
-
-    pub(super) fn connection(&self, timeout: Duration) -> Connection {
-        self.connect(connection_config(timeout), Arc::new(Activity::default()))
-            .expect("new connection activity is active")
-    }
-
-    pub(super) fn connect(
-        &self,
-        config: Config,
-        activity: Arc<Activity>,
-    ) -> Result<Connection, Error> {
-        #[cfg(windows)]
-        let agent = super::windows_transport::agent(config, LoopbackResolver);
-        #[cfg(not(windows))]
-        let agent = Agent::with_parts(config, DefaultConnector::default(), LoopbackResolver);
-        Connection::attach(self.origin.clone(), agent, activity)
-    }
-}
-
-fn loopback_ip(host: &str) -> Option<IpAddr> {
-    let host = host
-        .strip_prefix('[')
-        .and_then(|value| value.strip_suffix(']'))
-        .unwrap_or(host);
-    host.parse::<IpAddr>().ok().filter(IpAddr::is_loopback)
-}
-
-/// Keep localhost local without changing the host name presented to TLS.
-#[derive(Debug)]
-struct LoopbackResolver;
-
-impl Resolver for LoopbackResolver {
-    fn resolve(
-        &self,
-        uri: &Uri,
-        _config: &Config,
-        _timeout: NextTimeout,
-    ) -> Result<ResolvedSocketAddrs, ureq::Error> {
-        let host = uri.host().ok_or(ureq::Error::HostNotFound)?;
-        let default_port = match uri.scheme_str() {
-            Some("http") => 80,
-            Some("https") => 443,
-            _ => return Err(ureq::Error::HostNotFound),
-        };
-        let port = uri.port_u16().unwrap_or(default_port);
-        let mut addresses = self.empty();
-        if host == "localhost" {
-            addresses.push(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), port));
-            addresses.push(SocketAddr::new(Ipv6Addr::LOCALHOST.into(), port));
-        } else if let Some(ip) = loopback_ip(host) {
-            addresses.push(SocketAddr::new(ip, port));
-        } else {
-            return Err(ureq::Error::HostNotFound);
-        }
-        Ok(addresses)
-    }
+    let (scheme, authority, path) = definition
+        .endpoint
+        .as_deref()
+        .and_then(endpoint_parts)
+        .ok_or_else(invalid)?;
+    let native = match path {
+        "" | "v1" | "v1/chat/completions" => false,
+        "api/v1/chat" => true,
+        _ => return Err(invalid()),
+    };
+    LmStudioEndpoint::from_origin(scheme, authority, native).ok_or_else(invalid)
 }
 
 pub(crate) fn resolve_policy_auto_model(
     definition: &PolicyAiProfile,
 ) -> Result<Pending<PolicyAutoModel>, String> {
-    let target = AutoModelTarget::from_definition(definition)?;
+    let target = auto_model_target(definition)?;
     let authority = PolicyProfileAuthority::new(definition);
     authority
         .require_current(&ClipboardPolicy::load())
@@ -325,17 +214,17 @@ pub(crate) fn resolve_policy_auto_model(
 
 impl Profile {
     pub(crate) fn supports_policy_auto_model(definition: &PolicyAiProfile) -> bool {
-        AutoModelTarget::from_definition(definition).is_ok()
+        auto_model_target(definition).is_ok()
     }
 
     pub(crate) fn policy_auto_model_uses_https(definition: &PolicyAiProfile) -> bool {
-        AutoModelTarget::from_definition(definition).is_ok_and(|target| target.is_https())
+        auto_model_target(definition).is_ok_and(|target| target.is_https())
     }
 
     pub(crate) fn policy_profile_destination(
         definition: &PolicyAiProfile,
     ) -> Result<String, String> {
-        if let Ok(target) = AutoModelTarget::from_definition(definition) {
+        if let Ok(target) = auto_model_target(definition) {
             return Ok(target.destination());
         }
         match definition.provider {
@@ -343,7 +232,7 @@ impl Profile {
             PolicyAiProvider::EmbeddedMlx => Ok("Managed Apple MLX on this computer".into()),
             _ => match http_target(definition)? {
                 Target::External(address) => Ok(address.to_string()),
-                Target::LmStudio(address) => Ok(format!("http://{address}/api/v1/chat")),
+                Target::LmStudio(endpoint) => Ok(endpoint.destination()),
                 Target::Remote(base, protocol) => {
                     Ok(format!("{base}{}", protocol.completion_path()))
                 }
@@ -382,6 +271,9 @@ impl Profile {
                     options,
                     prompt_preset: super::PromptPreset::Generic,
                     usage_account: None,
+                    journal_identity: None,
+                    vision_mode: super::VisionMode::Auto,
+                    lm_studio_auto: None,
                     policy_model: None,
                     policy_profile: None,
                 }
@@ -404,11 +296,14 @@ impl Profile {
         }
         Self::validate_options(&options)?;
         Ok(Self {
-            target: Target::PolicyAuto(resolved.target.clone()),
+            target: Target::LmStudio(resolved.target.clone()),
             model: resolved.model.clone(),
             options,
             prompt_preset: super::PromptPreset::Generic,
             usage_account: None,
+            journal_identity: None,
+            vision_mode: super::VisionMode::Auto,
+            lm_studio_auto: None,
             policy_model: None,
             policy_profile: Some(PolicyProfileAuthority::Resolved(Arc::new(resolved.clone()))),
         })
@@ -438,6 +333,10 @@ impl Profile {
     }
 
     pub(crate) fn require_current_policy_authority(&self) -> Result<(), String> {
+        if self.is_loopback_anthropic() {
+            Self::require_loopback_anthropic_allowed(&ClipboardPolicy::load())
+                .map_err(Error::message)?;
+        }
         if let Some(authority) = &self.policy_profile {
             authority
                 .require_current(&ClipboardPolicy::load())
@@ -480,9 +379,8 @@ pub(super) fn http_target(definition: &PolicyAiProfile) -> Result<Target, String
                 loopback(endpoint, super::numeric_loopback_endpoint).map(Target::External)
             }
         }
-        PolicyAiProvider::LmStudio => {
-            loopback(endpoint()?, super::lm_studio_endpoint).map(Target::LmStudio)
-        }
+        PolicyAiProvider::LmStudio => loopback(endpoint()?, super::lm_studio_endpoint)
+            .map(|address| Target::LmStudio(LmStudioEndpoint::from_address(address, true))),
         PolicyAiProvider::EmbeddedLlama | PolicyAiProvider::EmbeddedMlx => {
             Err("An embedded policy profile uses its configured model without discovery.".into())
         }
@@ -507,11 +405,6 @@ fn loopback(
     } else {
         parse(endpoint)
     }
-}
-
-fn strip_ascii_prefix<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    let (start, rest) = value.split_at_checked(prefix.len())?;
-    start.eq_ignore_ascii_case(prefix).then_some(rest)
 }
 
 const MASK: &str = "█";
@@ -629,7 +522,7 @@ mod tests {
         ] {
             let policy = automatic(provider, endpoint);
             let definition = &policy.ai_profiles()[0];
-            let target = AutoModelTarget::from_definition(definition).unwrap();
+            let target = auto_model_target(definition).unwrap();
             assert!(Profile::supports_policy_auto_model(definition));
             assert_eq!(Profile::policy_auto_model_uses_https(definition), https);
             assert_eq!(
@@ -663,7 +556,7 @@ mod tests {
             let definition = &policy.ai_profiles()[0];
             let mut resolved = PolicyAutoModel {
                 definition: Arc::new(definition.clone()),
-                target: AutoModelTarget::from_definition(definition).unwrap(),
+                target: auto_model_target(definition).unwrap(),
                 model: "reviewed-local-model".into(),
             };
             let profile = Profile::policy_profile_with_auto_model(
@@ -720,7 +613,7 @@ mod tests {
         let definition = &policy.ai_profiles()[0];
         let resolved = PolicyAutoModel {
             definition: Arc::new(definition.clone()),
-            target: AutoModelTarget::from_definition(definition).unwrap(),
+            target: auto_model_target(definition).unwrap(),
             model: "reviewed-local-model".into(),
         };
         let authority = PolicyProfileAuthority::new(definition);
@@ -758,7 +651,7 @@ mod tests {
         let definition = &policy.ai_profiles()[0];
         let resolved = PolicyAutoModel {
             definition: Arc::new(definition.clone()),
-            target: AutoModelTarget::from_definition(definition).unwrap(),
+            target: auto_model_target(definition).unwrap(),
             model: "reviewed-local-model".into(),
         };
         let profile = Profile::policy_profile_with_auto_model(
@@ -883,6 +776,27 @@ mod tests {
             Profile::policy_profile_destination(&https.ai_profiles()[0]).unwrap(),
             "https://models.example.invalid/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn installed_generic_profiles_do_not_infer_minimax_native_routing() {
+        for base in [
+            super::super::MINIMAX_NATIVE_ENDPOINT,
+            "https://gateway.example.test/v1/text/chatcompletion_v2",
+        ] {
+            let policy = installed("openai-compatible", Some(base), None);
+            let definition = &policy.ai_profiles()[0];
+            assert_eq!(
+                Profile::policy_profile_destination(definition).unwrap(),
+                format!("{base}/chat/completions")
+            );
+            let profile =
+                Profile::policy_profile(definition, Path::new("."), ProfileOptions::default())
+                    .unwrap();
+            assert!(
+                matches!(profile.target, Target::Remote(endpoint, RemoteProtocol::OpenAi) if endpoint == base)
+            );
+        }
     }
 
     #[test]

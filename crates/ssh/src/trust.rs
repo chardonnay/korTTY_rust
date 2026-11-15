@@ -373,7 +373,7 @@ impl TrustStore {
     fn read_pins(&self) -> io::Result<Cow<'_, Pins>> {
         match &self.source {
             TrustSource::File(path) => {
-                let _lock = Self::lock(path)?;
+                let _lock = Self::lock_with(path, File::try_lock_shared)?;
                 Ok(Cow::Owned(Self::load(path)?))
             }
             TrustSource::Pins(pins) => Ok(Cow::Borrowed(pins)),
@@ -381,6 +381,13 @@ impl TrustStore {
     }
 
     fn lock(path: &Path) -> io::Result<File> {
+        Self::lock_with(path, File::try_lock)
+    }
+
+    fn lock_with(
+        path: &Path,
+        acquire: impl FnOnce(&File) -> Result<(), fs::TryLockError>,
+    ) -> io::Result<File> {
         let path = sidecar(path, ".lock")?;
         ensure_regular_if_present(&path)?;
         let mut options = OpenOptions::new();
@@ -390,7 +397,7 @@ impl TrustStore {
         if !file.metadata()?.is_file() {
             return Err(invalid("SSH trust lock must be a regular file"));
         }
-        match file.try_lock() {
+        match acquire(&file) {
             Ok(()) => {}
             Err(std::fs::TryLockError::WouldBlock) => {
                 return Err(io::Error::new(
@@ -616,6 +623,31 @@ mod tests {
         assert!(store.check(&endpoint, &key).is_err());
         assert!(store.remember(&endpoint, &key).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), malformed);
+    }
+
+    #[test]
+    fn shared_trust_lock_allows_pin_reads_and_blocks_pin_updates() {
+        let directory = TempDir::new();
+        let path = directory.0.join("pins");
+        let store = TrustStore::new(path.clone(), TrustMode::Strict);
+        let endpoint = Endpoint::new("server.example", 2022).unwrap();
+        let key = key(4);
+        store.remember(&endpoint, &key).unwrap();
+
+        let reader = TrustStore::lock_with(&path, File::try_lock_shared).unwrap();
+        assert_eq!(
+            store
+                .selected_pins(std::slice::from_ref(&endpoint))
+                .unwrap(),
+            vec![(endpoint.clone(), key.clone())]
+        );
+        assert_eq!(
+            store.remove_pin(&endpoint, &key).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        drop(reader);
+        assert!(store.remove_pin(&endpoint, &key).unwrap());
     }
 
     #[test]

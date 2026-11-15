@@ -100,17 +100,39 @@ For the window smoke test, open two main windows and save the option. Open **Kno
 
 **Summary settings…** in the journal manager enables periodic and closing summaries for new eligible recordings. It starts off. A connection can disable automatic summaries or set its own interval. The closing pass can suggest a title when enabled and preserves manually set titles. Summaries link back to their capture ranges. When a model is unavailable, raw activity cards keep the original capture accessible.
 
+A running command becomes eligible for its first summary after 15 minutes. Each refresh of that command's card waits at least 15 minutes after its last successful publication. **Summarize now** in an eligible live journal bypasses both delays and uses the configured summary profile and approvals.
+
+The journal keeps reported token totals for summaries, questions about that journal, and screenshot analyses. The journal manager estimates cost from the model profile's configured input and output rates. Missing usage or prices can leave a partial total. Grouped journals show a subtotal when their costs use different currencies. Questions spanning multiple journals and CLI answers without a usage report have no per-journal token totals.
+
+The usage tooltip includes input tokens, output tokens, the number of calls and the last saved profile name. **Re-evaluate with AI** preselects that profile for the first selected eligible journal when the profile is still available. Java journals can resolve an original profile ID through a matching imported profile. Review the current selection before starting the evaluation.
+
 At startup, kortty finishes abandoned native interactive recordings in the active journal folder in the background. This recovers the end time and command count even when AI summaries are off. It leaves active recordings and imported journals alone.
 
-Select stopped journals and choose **Re-evaluate with AI…** to review the scope and select an AI profile. **Catch up summaries…** finds stopped journals with missing or raw summaries. The selected profile is tested before manual evaluation. **Show progress…** reopens the progress window with the current stage, completed summaries, elapsed time, and an estimate when enough work has been measured. Closing the progress window or the journal manager leaves the pass running. **Cancel pass** stops that batch, including its waiting journals. Original capture files, manual notes, markers, and screenshots remain available. With a vision-capable local profile, **Describe the screenshots again** replaces the AI descriptions and tags. Saved progress allows a pass to resume after an interruption. Pending journals are protected from deletion.
+Select stopped journals and choose **Re-evaluate with AI…** to review the scope and select an AI profile. **Catch up summaries…** finds stopped journals with missing or raw summaries. The selected profile is tested before manual evaluation. **Show progress…** reopens the progress window with the current stage, completed summaries, elapsed time, and an estimate when enough work has been measured. The estimate includes closing summaries, titles, approved screenshot descriptions, and subsequent journals in the same pass. It uses timed model calls and can reuse a rate from the same profile during the current application session. Closing the progress window or the journal manager leaves the pass running. **Cancel pass** stops that batch, including its waiting journals. Original capture files, manual notes, markers, and screenshots remain available. With a vision-capable local profile, **Describe the screenshots again** replaces the AI descriptions and tags. Saved progress allows a pass to resume after an interruption. Pending journals are protected from deletion.
 
-Command summaries follow shell command boundaries. Help-only calls and commands that failed to start are omitted from summaries while their original capture remains available. Enable **Read long command output in chunks** to analyze additional retained output from long commands in bounded requests and combine the result into a single summary. Choose a trusted HTTPS profile or a saved, reviewed CLI profile to approve masked text from the listed journals. In **Summary settings…**, the separate automatic approval covers masked text from new eligible recordings and scheduled journals. The approvals bind the saved profile, journal directory, redaction rules, and reviewed chunk setting. Review again after those settings change. Select the local profile or disable automatic summaries to revoke the automatic approval. Both reviewed routes summarize text. Screenshot descriptions use a local vision profile.
+Command summaries follow shell command boundaries. Help-only calls and commands that failed to start are omitted from summaries while their original capture remains available. Enable **Read long command output in chunks** to analyze additional retained output from long commands in bounded requests and combine the result into a single summary. Choose a trusted HTTPS profile or a saved, reviewed CLI profile to approve masked text from the listed journals. In **Summary settings…**, automation journals can inherit the terminal recording profile or use a separate local, HTTPS, or CLI profile. The job or Swarm journal settings determine when its closing summary runs. An automatic outbound approval covers new eligible journals in its scope and binds the saved profile, journal directory, redaction rules, and reviewed chunk setting. Select a local route to revoke outbound access for that scope. Both reviewed routes summarize text. Screenshot descriptions use a local vision profile.
 
-Streaming summary requests show the current stage and received byte count in the journal manager. A manual summary can preview complete keywords that occur in its masked capture excerpts. Automatic summaries show progress only. The journal stores each summary after the complete response passes validation.
+When a Java backup contains global journal profile assignments, **Summary settings…** shows separate suggestions for terminal recordings and automation journals. Review each imported profile in AI Manager, then choose **Use imported profile** for the intended role and review the new settings. An unresolved Java profile ID stays visible so you can select a replacement manually.
+
+Java backups can restore supported Manual and Auto LM Studio profiles using `localhost` or numeric loopback over HTTP or HTTPS. When a Java profile has neither a selection mode nor a model, migration treats it as Auto. In **AI Manager → Profiles → Connection**, review and trust the imported endpoint before use. Native and OpenAI-compatible LM Studio profiles keep their chat protocol and model selection. HTTPS uses system certificate verification and the existing reviewed HTTPS options for Agent, Swarm, Scheduler and journal summaries. Configure credentials and eligible web integrations separately. Each reviewed native MCP search can use the HTTPS route with its selected integration and allowed tools.
+
+**Use custom summary evidence limits** sets a maximum per input and output stream and a context token budget. Enter `0` lines to use the token budget and application limits. The selected profile's tokenizer checks the serialized request. **Read long command output in chunks** also applies these limits to each part. Changing the limits requires fresh approval for affected automatic summaries. A Java backup can offer its limits and chunking setting through **Use imported limits**. Review and save them to apply them.
+
+In a Scheduler action or the interactive Swarm journal controls, choose a **Closing summary profile** to override the automation default for that run. The usage estimate uses the same profile selection. In **Summary settings… → Per-source outbound approvals**, select a saved job or Interactive Swarm and approve its HTTPS or CLI profile. **Include long output for this source** extends the approval for new runs. Revocation stops queued requests that depend on the source approval. Deleting a job also revokes its source approval. The original capture remains accessible for a separately reviewed summary pass. Restored Java jobs start disabled. If the same backup provides a matching profile, review it in AI Manager, then choose **Use imported profile** in the job's journal settings. A missing or conflicting profile requires a manual selection.
+
+Streaming summary requests show the current stage and received byte count in the journal manager. A manual summary can preview complete keywords that occur in its masked capture excerpts. Automatic summaries show progress only. Before saving a summary, kortty checks paths, links and quoted commands against the masked model input. If it cannot verify the generated text, the original evidence remains available. Local closing summaries also use user notes and saved screenshot descriptions.
+
+Summary requests use the journal's saved language, including when a paused pass resumes. New journals use English. Imported Java journals use their saved language when available. Reviewed HTTPS and CLI requests use the supported primary language code, with English as the fallback.
+
+**Allow an automatic title when the journal closes** gives a journal with its original default title a separate model request after the closing summary is saved. Existing custom titles are preserved. For HTTPS and CLI, approve the additional request in the relevant recording, automation source, or manual re-evaluation review. It uses the masked connection name and the same eligible journal evidence as the closing summary. A managed rename restriction applies to automatic titles. Native command cards show an alternate account when a recognizable shell prompt provides evidence, and the closing summary lists distinct observed accounts.
+
+When automatic summaries are enabled for the connection and the application, **Start journal** tests the effective AI profile first. The capture includes the available scrollback when it starts. On failure, choose **Test again**, **Record without AI**, or **Cancel**. A journal configured to start with the connection records immediately and checks in the background. Its failure banner offers **End journal** as well. The test sends only a readiness prompt. Recent successful checks can be reused for ten minutes for the same profile and approval. Scheduler and Swarm automation journals share a connection check for sibling targets on the same route. A failed test adds **AI not reachable** and preserves the raw capture for re-evaluation.
 
 With journal AI enabled, use **Ask journal…** in the viewer or **Ask across journals…** in the manager. Review the question and masked excerpts before sending them to a local journal profile, a trusted HTTPS profile, or an approved CLI profile. The CLI review shows the executable, expanded arguments, and exact input. A streaming answer can preview complete quotations from the reviewed excerpts. After validation, citations link to the original entry or exact log part and sequence. The cross-journal workflow ranks the current journal filter locally. If a local embedding profile is configured, it can also rank the separately reviewed candidate cards. Unchanged cards can reuse a private vector stored with each journal. Changes to the document, masked card or embedding model invalidate its vector. When semantic ranking is unavailable, the workflow uses lexical matches. **Show local matches** displays the selected excerpts without a model call. Managed policy can disable questions independently of summaries with `[rule.session-journal] ai-ask = false`.
 
-In **JobScheduler**, enable **Record a session journal per target** for a command, script, shared snippet, file action, scheduled AI Agent, or supported AI Swarm mode. The journal manager groups the targets under the run and shows their individual outcomes. Choose which outcomes to keep, when journals expire, and whether to keep one copy of identical target activity. File journals record masked result metadata for each attempted target. **Include the file action and paths for each target** separately enables masked descriptions of SFTP and rsync operations. Capturing sent commands is also a separate opt-in. The **Journal each completed target** option in **AI Swarm** records the reviewed activity for each non-private target. Both workflows can explicitly request closing summaries through the configured local journal model. Pinned journals, active captures, and journals with pending summaries are protected during maintenance.
+In **JobScheduler**, enable **Record a session journal per target** for a command, script, shared snippet, file action, scheduled AI Agent, or supported AI Swarm mode. The journal manager groups the targets under the run and shows their individual outcomes. Choose which outcomes to keep, when journals expire, and whether to keep one copy of identical target activity. File journals record masked result metadata for each attempted target. **Include the file action and paths for each target** separately enables masked descriptions of SFTP and rsync operations. Capturing sent commands is also a separate opt-in. The **Journal each completed target** option in **AI Swarm** records the reviewed activity for each non-private target. Both workflows can explicitly select a profile for closing summaries. Pinned journals, active captures, and journals with pending summaries are protected during maintenance.
+
+When a scheduled command also uses a virtual terminal, the automation journal includes redacted screenshots on its timeline. If the job summarizes the outcome and **Automatically analyze screenshots with AI** is enabled, eligible screenshots receive descriptions and tags from a local vision profile. The scheduled replay remains available from the run history.
 
 The manager groups automated journals by source and run. Groups and runs start collapsed. A run with a single journal appears directly as a journal row. The filters **All journals**, **Interactive**, **JobScheduler**, **AI Swarm**, **Failed runs**, and **Pinned** as well as the metadata search apply before grouping. **Failed runs** includes blocked and aborted runs. A refresh in the same folder retains existing selection and expansion keys. Changing the folder resets them. The table scrolls with a limited number of built rows.
 
@@ -253,11 +275,73 @@ For the standard names `kortty-backup.zip` and `kortty-backup.zip.gpg`, kortty b
 
 For a Java korTTY backup, the preview lists supported connections, snippets and variables, custom themes, project layouts, credential environments with tab colors, saved AI chats, and Swarm histories. Supported formats include AES-256 and legacy ZipCrypto archives and GnuPG archives encrypted to one supported recipient. Export the recipient's private key from GnuPG to open the latter. **Saved Chats** shows imported AI conversations with supported Agent steps and read-only Swarm archives with their messages, server outcomes, times, and token counts. Provider names and Java Agent references are historical metadata. Existing chats with the same ID, environment names and tab colors take precedence.
 
+The Java preview also lists supported AI Memory files. After restart,
+**AI Manager → AI Memory** shows missing global documents, history and
+archives that the current policy allows. Notes and history can also be
+restored for newly added SSH profiles with an exact Java UUID mapping.
+Supported Java SFTP Scheduler jobs import disabled. For a deletion, open the
+job and type the exact remote path before enabling it. Imported copies
+require a new destination.
+
 Choose **Review SSH Host Keys…** in the Java backup preview to inspect the endpoint, algorithm and SHA-256 fingerprint. Verify each fingerprint against a trusted source and select the keys you want to add. **Import Selected Keys** applies only that selection to the local trust store, independently of profile restore on restart. Local pins take precedence at conflicts.
 
-Supported Java HTTPS AI profiles restore as drafts. Open them in **AI Manager → Profiles** and review the destination before using them. Set a default explicitly if desired. Local profile names take precedence. The import omits Java API keys, prior approvals, role assignments, other global settings, model registrations, and RAG definitions.
+Java backups can restore OpenPGP recipient references with full fingerprints.
+After restart, open **OpenPGP Recipients…** and attach a local public
+certificate to a pending reference. Check the full fingerprint against an
+independent source and type it to enroll the certificate. Java backup ZIPs
+contain the references without certificate contents.
 
-Supported Java Scheduler command and snippet-script jobs restore disabled. Targets must resolve to SSH connections added by the same restore. Snippet jobs also require matching snippet and variable definitions. Existing job IDs take precedence. The import omits unresolved or conflicting references, unsupported actions, groups, Scheduler credentials, host pins, run history, and webhooks. Review the imported jobs and set up the required native approvals before enabling them.
+Supported Java HTTPS, loopback HTTP, and CLI AI profiles restore as drafts. Open them in **AI Manager → Profiles**. Review the destination or choose a native CLI executable and review its arguments before use. CLI import preserves supported literal arguments, model and reasoning placeholders, stdin, and private prompt-file placeholders. Set a default explicitly if desired. Local profile names take precedence. Journal summary role assignments return as suggestions for explicit selection. Java API keys, prior approvals, embedded model registrations, and RAG definitions require fresh configuration.
+
+For HTTP APIs that choose a model on the server, select **Server default** in
+the profile's **Model** section and select that profile in **Terminal Chat**.
+The request review shows that the server chooses the model. The client omits
+the `model` field. Choose **Manual** or **Automatic** if the API requires a
+model identifier. Vision requests require an explicit vision setting in
+server default mode.
+
+Supported Java web integrations appear as suggestions after endpoint review. Check the displayed integration and any plugin ID, choose **Use imported integration**, and save the profile. Set the required provider credentials on the local computer. Each lookup still requires its own review.
+
+In **AI Manager → Local Preferences**, imported Java profile roles appear as
+suggestions for the default, text, coding, terminal Agent and snippet security
+profiles. Review and save the matching profile in **Profiles**, then choose
+**Use imported profile** for the role and save the assignment. A Java backup
+with no matching profile leaves the reference visible for review. Existing
+assignments stay active until you save a change.
+
+Java AI Memory notes and history can follow SSH and local shell connections
+added by the same restore. Legacy filenames require a unique match among
+the source connections. A mixed archive is restored when all its connection
+scopes match. Existing local Memory files take precedence.
+
+For a Java Toolpack profile, configure a local API token environment name,
+enter the exact tool names exposed by the installed plugin, and choose **Use
+imported Toolpack**. Then save the profile. A Toolpack grant covers one to
+eight named tools.
+
+Embedded Java profiles also restore as drafts. Register the model under **AI Manager → Local Models**, then open the imported profile under **Profiles → Model**. Use the Java model ID to identify the original, select a registered GGUF chat model or an MLX model on Apple Silicon, and choose **Confirm model and review profile** before saving. Select the saved profile explicitly in the workflow or set it as the default. Portable backups preserve the Java ID and prompt settings and require a fresh model mapping after restore. MLX uses text generation and default reasoning settings.
+
+Under **Local Models**, inspect the imported Java GGUF and MLX registry
+metadata. Select a separately registered native model to review compatible
+settings. Review fills the settings form. Save it explicitly to change the
+native registration. Portable backups keep the inactive hints, including when
+the Java backup contains no AI profiles. Model files and runtime paths require
+local registration.
+
+Imported Java knowledge definitions appear under **Knowledge Stores** as
+inactive suggestions. Review a suggestion to create a native store, then
+choose its embedding model, backend and sources. A folder suggestion can
+prefill rules for the native review. Set up a reviewed Qdrant destination
+with its own credentials and rebuild the index.
+
+The exact built-in Java MiniMax CLI template restores as a MiniMax draft. Select the local Node executable, the supported MiniMax package, the login configuration, and the region. Review the native adapter before saving. It reads the prompt from stdin.
+
+Supported Java Scheduler command, snippet-script, AI Agent and AI Swarm jobs restore disabled. Targets must resolve to SSH connections added by the same restore. Explicit connections and selected folders retain their order. Each selected folder and its descendants must resolve to exactly the SSH targets recorded in the backup. The importer skips affected jobs if a member cannot be restored or local folder membership changes the selection. Snippet jobs also require matching snippet and variable definitions. A command or snippet job with one saved SSH target and no sudo retains its enabled virtual terminal settings, including screen dimensions and capture and runtime limits. Existing job IDs take precedence. For an imported AI job, open **Action**, select a native AI profile, and check the goal, working directory and targets before saving. A matching profile from the backup is offered after its AI Manager review. The first native save leaves the job disabled. Use the native action review before enabling or running it. The import omits Java command approvals, unsupported actions and execution options, Scheduler credentials, host pins, run history, and webhooks.
+
+For an imported Java Scheduler upload, download or sync job, open **Action**.
+Check the displayed Java paths, enter the path on this device and choose a
+file, new-folder or reviewed folder-copy action for one saved SSH target.
+Review the native comparison before running a folder-copy job.
 
 In **Review Java Backup**, choose **Review Keys Without Passphrases** to add supported unencrypted managed keys without a destination vault. For protected managed keys or stored SSH passwords, unlock the destination vault, enter the Java master password, and review the SSH credentials. Check the counts before choosing **Merge on Restart**. Supported private keys copied into the Java profile are checked offline and copied into the Rust profile. Passphrases are sealed in the Rust vault with supported stored and inline passwords. Eligible new connections retain their active key or password assignment and any supported jump-host password. Existing entries take precedence at conflicts. The review lists omitted files and assignments. If the local vault, key catalogue or connection catalogue changes before startup applies the review, the startup error screen can discard the pending import. Open the archive again to review it against the current profile.
 
@@ -486,7 +570,7 @@ Local copies skip items already in the target folder and choose a numbered
 name for collisions. Server drops use the same transfer and conflict
 settings as the upload button.
 
-On Windows, Wayland, or X11, select ordinary files or folders in the Local
+On Windows, macOS, Wayland, or X11, select ordinary files or folders in the Local
 pane, then hold and move **Drag selection to desktop** to copy them into
 another application.
 For server files, choose **Prepare desktop drag** in the Server pane or the
@@ -505,6 +589,14 @@ Under **Settings → SFTP → Archive defaults**, set an absolute remote directo
 After an interrupted regular-file transfer to a new path, the SFTP Manager can retain a private download or upload stage of up to 1 GiB. Resume is enabled by default. **Keep partial files when cancelling a transfer** is a separate opt-in. With resume disabled, retry starts a fresh transfer. In a regular window, the profile retains up to eight receipts with a combined 4 GiB limit. Reconnect with the same SSH route and verified host key, including after restarting kortty, then choose **Find interrupted transfer** and review the saved direction and paths. A download resumes from its checked local prefix. An upload verifies the original local file, remote stage ownership and all bytes already on the server before it appends. Both publish only to a destination that remains free. **Discard partial** removes a saved upload stage through the matching live connection. Private windows keep download recovery in memory and use ordinary uploads.
 
 **Edit text** opens a regular remote UTF-8 file up to 2 MiB in the native editor. **Save to server** uses the same SFTP connection, checks the original attributes and file content, and replaces the target via the atomic rename extension of OpenSSH. In case of a conflict, the changes remain in the editor. The rule `[rule.terminal].load-into-snippet-editor` can restrict or block access to **View text**. SFTP v3 cannot combine version comparison and replacement in a single host call. The method preserves owner, group, and POSIX mode. ACLs and extended attributes are outside the portable SFTP v3 write path.
+
+Select **AI assistance…** in an open file editor to review the exact masked
+request and AI destination. For an action opened from a saved connection,
+the profile selection uses that connection when available. A dedicated
+security profile takes precedence for security actions. A profile selected
+in the picker stays selected across actions. Review any proposed changes
+before applying them to the editor buffer. Use the editor's **Save** or
+**Save to server** action to write the file.
 
 **Open image** displays a regular PNG, JPEG, GIF or BMP from the local or
 server pane. The preview supports zoom, with a 16 MiB input limit and an
@@ -590,7 +682,7 @@ Each reviewed file is limited to 4 GiB and uses the server modification time.
 The destination-permission update is under verification. It preserves the
 reviewed local read, write and execute bits on Unix, or the destination access
 ACL on Windows, following the pinned Java synchronization finalizer. The
-[permission checkpoint](PORTING-PARITY.md#reviewed-local-replacement-permission-parity-verification-pending)
+[permission checkpoint](PORTING-PARITY.md#reviewed-local-replacement-permission-parity)
 records its scope and pending checks.
 
 The target name is briefly absent between saving the original and the atomic
@@ -703,6 +795,21 @@ replacing an existing name. This option also works under a client transfer
 denial. The Scheduler offers the same option for one saved SSH route with
 verified host keys.
 
+The updated helper supports reviewed output owner, group and octal
+permissions on the ordinary server-only route. Use an account name or
+numeric UID/GID. The review shows resolved IDs. An empty mode uses `0600`.
+The archive is published at the new name after the helper applies the
+reviewed output settings. The Linux sudo route publishes a private root-owned
+archive.
+
+For an ordinary Scheduler job using **Create entirely on the server**, enter
+an absolute **Local archive path** to request a verified copy. The updated
+server helper confirms the size and SHA-256 of the new archive. The job
+downloads through the same SSH connection and checks the bytes and current
+file-transfer permission before publishing at the new local path. If the
+copy fails after server publication, the server archive remains available
+and the run reports its path.
+
 For privileged Scheduler archives on Linux, install a reviewed build of the
 same native executable at `/usr/libexec/kortty/kortty-server-archive`.
 The executable and every directory in its path must be root-owned and
@@ -713,38 +820,66 @@ for the delegated operation. For example:
 ```json
 {
   "source_roots": ["/srv/kortty-source"],
-  "destination_roots": ["/srv/kortty-archives"]
+  "destination_roots": ["/srv/kortty-archives"],
+  "download_roots": ["/srv/kortty-archives/client-copies"]
 }
 ```
 
-Use root-owned directories without extended POSIX ACLs for both lists.
+Use root-owned directories without extended POSIX ACLs. An optional
+`download_roots` entry must lie within a destination root. It lets each
+delegated account create and retrieve new archives of the configured sources
+in that destination. Omit the field for server-only creation.
+To request a copy, set **Local archive path**, review the exact pinned route
+and archive paths, and approve the action. The server sends the newly published
+archive through its creation channel. The local file is published after size,
+SHA-256 and current file-transfer permission checks. The root-owned server
+archive remains in place if the copy fails.
+
 The helper requires Linux 5.8 or later for mount IDs and reads its running
 executable identity through `/proc/self/exe`. Every SSH account delegated
 this command can request archives within the configured roots. Give each
-delegated account an exact sudoers rule for the fixed executable and mode. Substitute
-the installed binary's 64-digit SHA-256 digest and the SSH account name, then
-validate the rule with `visudo -cf`. Update the digest when replacing the binary.
+delegated account an exact sudoers rule for the fixed executable and selected
+mode. Keep the rules for the modes you enable. Substitute the installed
+binary's 64-digit SHA-256 digest and the SSH account name, then validate the
+rules with `visudo -cf`. Update the digest when replacing the binary.
 
 ```sudoers
 Cmnd_Alias KORTTY_ARCHIVE = sha256:HEX_DIGEST /usr/libexec/kortty/kortty-server-archive --privileged-create-v1
 Defaults!KORTTY_ARCHIVE fdexec=always,env_reset,command_timeout=1800
 SSH_ACCOUNT ALL=(root) NOPASSWD: NOSETENV: KORTTY_ARCHIVE
+
+Cmnd_Alias KORTTY_ARCHIVE_PASSWORD = sha256:HEX_DIGEST /usr/libexec/kortty/kortty-server-archive --privileged-create-v2
+Defaults!KORTTY_ARCHIVE_PASSWORD fdexec=always,env_reset,command_timeout=1800
+SSH_ACCOUNT ALL=(root) PASSWD: NOSETENV: KORTTY_ARCHIVE_PASSWORD
 ```
 
 The digest and descriptor execution require the command-specific rule to
 govern the invocation. Check for overlapping broader sudoers rules.
 [sudoers command digests and fdexec](https://github.com/sudo-project/sudo/blob/main/docs/sudoers.man.in)
 
-In Scheduler, choose **Create archive**, **Create entirely on the server**,
-and passwordless **Privileged execution**. Review the exact options, paths
-and host keys before saving. The server checks the source inventory and
-accepts a commit on the same authenticated command channel. The result is a
-new root-owned archive with mode `0600`. The SSH server must allow the
-fixed exec command. Archive content stays on the server. ZIP password
-protection and local download are separate from privileged creation. If the
-helper times out or disconnects after commit, check the target before
-retrying. A forced stop can leave a private staging directory for server
-administration.
+In Scheduler, choose **Create archive**, **Create entirely on the server**
+and the matching **Archive execution** mode. **Passwordless sudo** uses the
+V1 helper protocol. **sudo with a vault password** uses V2 and requires an
+unlocked Scheduler sudo credential for the saved route at dispatch. It sends
+the password once after an exact sudo challenge on the pinned SSH channel.
+The channel uses no virtual terminal. V2 waits for the installed helper to
+identify its protocol before sending archive data and requires an explicit
+guarded commit marker before publication. Password-protected ZIP uses a
+separate vault **Archive password** credential.
+
+Review the execution mode, paths, archive options and host keys before
+saving. The SSH server must allow the fixed exec command. The helper checks
+the source inventory and publishes a new root-owned archive with mode `0600`.
+An optional local copy requires a configured administrator download root
+and approval of the local path. If the helper times out or disconnects after
+commit, check the target before retrying. A forced stop can leave a private
+staging directory for server administration.
+
+Java backup restore preserves privileged archive actions as disabled Scheduler
+drafts for the mapped saved routes. Select **Adopt privileged archive** to
+choose the native helper, then select the sudo mode and approve the resulting
+action. Enter a new local destination and select a ZIP password credential
+if the draft requires them.
 
 **Create archive…** in the Local pane uses the displayed selection and can
 run with the SSH connection closed. Choose ZIP, AES-256 ZIP, TAR.BZ2, 7z or
@@ -769,11 +904,31 @@ Both pane filters accept a filename fragment or wildcard. On the server side, **
 
 **Scheduler** opens job definitions, the run journal, and a native dependency diagram. A job executes a command, a script stored in the job, or a **Shared snippet** on an already confirmed SSH target. Linked snippets retain their ID when renamed. Each run reads the last saved version. Bash, Python 3, Perl, and Ruby are available for scripts. The server requires a POSIX login shell and the selected interpreter. Each argument line with content is passed as its own value. `jobs.json` in the Rust profile stores the path of the unencrypted SSH key, the source, and structured results. Jobs can start manually, at fixed times, at intervals, or in dependency chains. **Run now** and **Run with successors** save the current job draft before checking dependencies. If saving fails, the draft stays open and no job starts. While kortty is running, due jobs are executed even if the scheduler window is closed. Up to four SSH jobs run simultaneously. The SFTP actions create directories, rename entries without overwriting, and set octal POSIX permissions. They require absolute server paths and operate via the SFTP subsystem. **Upload file** and **Download file** transfer one regular file up to 1 GiB each between full paths. The file transfer policy applies before the SSH setup. A new target is published only after the transfer is complete. In case of connection loss, a private upload staging folder may remain on the server.
 
+In a Scheduler ownership action with one saved SSH target, use **Resolve
+Name…** next to the UID or GID field. Check the endpoint and its host key
+fingerprints, look up the exact server name, and accept the numeric result
+before saving the job. The lookup uses the saved SSH login and the server's
+`getent` command. Saves retain the numeric UID or GID.
+
 **SFTP · Review folder upload** and **SFTP · Review folder download** copy missing files and folders for one saved SSH route. Choose the absolute roots, set any exclusions, and select **Compare and review…**. The review shows the planned entries, verified host pins and the time of the approved run. **Approve one run**, then save the job. The approval can be used by **Run now**, a single scheduled date and time, or an automatic **Chain** start when every predecessor has succeeded since the copy last ran. Chain starts can occur outside the calendar slot. Calendar starts require the latest results to be successful. Both automatic starts enforce the maximum predecessor age when configured. The review lists the predecessors and binds the dependency mode, IDs and age limit to one approval shared by all the available starts. **Run now** can bypass unmet conditions after confirmation. If a predecessor blocks the scheduled start, that date is skipped and the approval remains available for a manual start. The job checks the route, source contents and destination again before creating entries. A used or changed approval requires a new comparison. **Run with successors** asks for a separate confirmation whenever the cascade includes a reviewed folder copy. The confirmation lists each copy and its approval status. A copy with an unavailable approval stops its branch if reached. Privileged folder transfers require a separate run. Restored jobs require a new review on this device.
 
-On Windows, enable **Replace changed local files after review** on an ordinary one-use folder download to compare regular file contents. The review lists the exact replacements with both SHA-256 digests. Publication checks the route, policy and saved approval again. It preserves local access permissions, uses the source modification time and retains the original in a private sibling folder. The Scheduler result lists the shared recovery pattern. The review compares up to 256 matching files and 256 MiB per side and can include missing entries within the transfer limits.
+On Windows, Linux and macOS, enable **Replace changed local files after review** on an ordinary one-use folder download to compare regular file contents. The review lists the exact replacements with both SHA-256 digests. Publication checks the route, policy and saved approval again. It preserves local access permissions, uses the source modification time and retains the original in a private sibling folder. Unix replacement requires the staged file to match the reviewed owner and group and rejects extended ACLs. The Scheduler result lists the per-run recovery pattern. The review compares up to 256 matching files and 256 MiB per side and can include missing entries within the transfer limits.
 
-For repeated copies, enable **Allow recurring scheduled copies on this device** on an ordinary SFTP folder job. Enable its calendar and select **Condition** dependency mode. Set the approval duration, total firing limit, and per-firing action and MiB limits. **Compare and review…** shows the roots, pinned route, schedule and exact expiry. **Approve recurring runs** authorizes future eligible content under those roots. The calendar window selects due times. A queued or overdue run can start later while the approval is active. Each admitted attempt counts, including an empty scan or an unsuccessful connection. The job checks the roots and hashes current source files before copying missing entries. Existing destination files are preserved. Manual, Chain and cascade starts use the separate one-use workflow.
+For an ordinary one-use folder upload, enable **Replace changed server files
+after review** to compare file contents. Replacement uses the existing
+SFTP connection and requires OpenSSH hard-link support and private regular
+files owned by the saved login. The job verifies the file digests and server
+metadata again before publication. The original is kept in a private sibling
+folder for recovery. Review a new copy before running again.
+
+For repeated copies, enable **Allow recurring scheduled copies on this device** on an ordinary SFTP folder job. Enable its calendar and select **Condition** dependency mode. Set the approval duration, total firing limit, and per-firing action and MiB limits. **Compare and review…** shows the roots, pinned route, schedule and exact expiry. **Approve recurring runs** authorizes future eligible content under those roots. The calendar window selects due times. A queued or overdue run can start later while the approval is active. Each admitted attempt counts, including an empty scan or an unsuccessful connection. The job checks the roots and hashes current source files before copying missing entries. Manual, Chain and cascade starts use the separate one-use workflow.
+
+To include replacements in a recurring approval, also enable **Replace changed
+local files after review** or **Replace changed server files after review**.
+Each firing hashes the current contents and checks both the planned replacements
+and additions against the same per-firing limits. An eligible original is
+retained in a private recovery folder. Recurring jobs check the standing
+approval and host keys before publication.
 
 **SSH · Review privileged folder upload** publishes a reviewed local tree to a new directory on one pinned Linux SSH route. Select passwordless sudo or a saved sudo credential, review the listed files and directories, choose **Approve one run**, and save. The job rechecks the file digests and destination parent before staging. The fixed Python helper publishes the complete root-owned tree in one no-replace operation. The remote filesystem must support Linux `renameat2(RENAME_NOREPLACE)`. A lost reply after publication is reported as uncertain and requires a fresh review.
 
@@ -784,7 +939,10 @@ For **Upload file** or **Download file**, choose **Privileged staging** to enabl
 The Scheduler offers **Privileged execution** for directory creation,
 permission and ownership changes, server copy, rename, and delete on a saved
 Linux SSH route. Choose the sudo authorization, select **Review action and SSH
-route…**, and save after approval. Copy publishes one regular file at a new
+route…**, and save after approval. Permission changes accept an octal mode
+or an explicit-class expression such as `u+rw,o-w`. The helper uses the
+current target mode and verifies the held file or directory before applying
+the ordinary permission bits. Copy publishes one regular file at a new
 path. Enable **Copy a protected folder recursively** to publish a complete
 tree with private file and directory modes at a vacant path. The tree is
 limited to 128 entries and 1 GiB. Rename moves a protected file or directory
@@ -795,11 +953,149 @@ confirmation and supports at most 128 entries in the reviewed tree, including
 its root. Mounted subtrees, links, and unprotected entries are refused. A
 changed operation, route, elevation mode, or restored job needs a new review.
 
-On Linux and macOS, **rsync · Download new file** and **rsync · Upload new file** use an explicitly configured local rsync 3.x executable, version 3.4.1 or later, and rsync on the saved SSH server. Select one regular file of up to 256 MiB and an absolute destination that does not exist. Review and approve the local executable and verified route before saving the job. Upload review also binds the exact paths and local file digest. The rsync stream and SFTP verification share one authenticated SSH connection. The job verifies the staged bytes before publication. A change to an approved executable, route, or upload source requires fresh approval. Windows retains the job definition for use on supported systems.
+On Linux, macOS and Windows, **rsync · Download file** and **rsync · Upload new file** use an explicitly configured local rsync 3.x executable, version 3.4.1 or later, and rsync on the saved SSH server. Select one regular file of up to 256 MiB. The default mode publishes to a vacant absolute destination. Review and approve the local executable, exact paths and verified route before saving the job. Upload review also binds the local file digest. The rsync stream and SFTP verification share one authenticated SSH connection. The job verifies the staged bytes before publication. A change to an approved executable, route, or upload source requires fresh approval.
+
+On Windows, choose a supported Windows rsync.exe, such as the MSYS2 package
+with its adjacent runtime DLLs. The approval binds those DLLs with the
+executable. The job runs a private verified copy and uses the integrated
+SSH connection for the rsync protocol.
+
+For a download, select **Replace an existing local file** and enter the
+absolute path of a regular file you control. A grouped download requires a
+separate, non-overlapping file path for each saved SSH route. The review
+binds the identity, contents and supported metadata of each receiver. The
+job verifies the server bytes, keeps the original in the private recovery
+location recorded in the run journal, and carries the supported receiver
+metadata to the replacement. An intervening change requires a new review.
+For one-time approval, review the replacement before the next run.
 
 **rsync · Download new folder** uses the same reviewed executable and route. Choose an ordinary server directory and a new absolute local destination. Each run checks the bounded source tree, verifies the staged file contents over the pinned SFTP connection and publishes the completed directory to the vacant name with ordinary local access inheritance. The job supports up to 4,096 entries, 256 MiB and 32 directory levels. Symbolic links and special files stop the transfer. A changed path requires a new review.
 
-**rsync · Upload new folder** reviews a local directory inventory and a new absolute server path. Use a saved pinned SSH connection, native rsync on both systems, and the current `kortty-server-archive` helper on the Linux or macOS server. The limits are 4,096 entries, 256 MiB and 32 directory levels. Each run verifies the approved local files, transfers a private staged copy and asks the helper to verify and atomically publish the server tree. An existing destination is rejected. Check the destination before retrying if publication could not be confirmed.
+For one server directory, select **Use an existing local folder** to merge into a protected folder you own. **Include the server folder name under each local destination** selects the named child. Clear it to merge the source contents directly into the destination. **Delete receiver entries missing from the source** mirrors the selected folder. Review each destination separately for a grouped transfer. The job verifies the downloaded tree against the pinned SSH server, checks that the local folder still matches the review, and prepares its replacement privately. Keep the recovery folder reported in the run journal until you verify the result. Review the local folder again after publication or after an intervening change.
+
+**rsync · Upload new folder** reviews a local directory inventory and its absolute server path. Use a saved pinned SSH connection, native rsync on both systems, and the current `kortty-server-archive` helper on the Linux or macOS server. The limits are 4,096 entries, 256 MiB and 32 directory levels. The default mode stages the checked source privately and publishes it to a vacant server path.
+
+For a protected directory owned by the SSH login on Linux, select **Use an existing server folder**. Enter one local directory and the destination for each route. **Include the local folder name under each server destination** reviews a named child. With that option cleared, the source contents go into the selected folder itself. Enable **Delete receiver entries missing from the source** to mirror the reviewed folder. The default existing-folder mode keeps receiver-only entries. **Review rsync transfer…** binds the exact source inventory, receiver contents, routes, and host keys. The server verifies the staged successor before quarantining the original and waits for a separate authorization to publish. Keep the reported recovery location until you verify the result. Review again after publication or if the receiver has changed.
+
+For multiple rsync files or folders on one saved route, enter the first
+source, add one absolute path per line under **Additional sources**, and
+choose an existing destination folder. Each source keeps its final name.
+**Review rsync transfer…** lists the exact source and destination pairs.
+All destinations must be vacant when the job starts. Each confirmed item
+remains in place if a later item fails. The result gives the confirmed
+count. A batch supports up to 16 sources, 4,096 entries and 256 MiB total.
+
+For one combined transfer, choose the upload or download folder action and
+select **Transfer mixed file and folder sources**. Enter one absolute source
+path per line in **Sources** and choose one destination folder for each saved
+route. Files and named folders keep their basename. Add a trailing `/` to
+place a folder's contents directly under the destination. The review lists
+the placement, overlaps and projected totals. Overlapping folders combine,
+folders take priority over same-path files, and the first listed source wins
+between files at the same path.
+
+In combined mode each route publishes its full verified tree once. It can
+publish to a new folder or replace a reviewed existing protected folder and
+retain the original for recovery. **Delete unmatched entries in synchronized
+folders** mirrors the named source folders. A contents source includes the
+whole destination in the mirror scope. Other entries in the destination
+remain outside the scope of a named-folder mirror. Review again whenever a
+source or destination changes. Existing-folder mixed uploads require the
+current `kortty-server-archive` v2 rsync helper on Linux.
+
+For a single folder or combined sources targeting an existing directory,
+a download replacing an existing local file, or a passwordless upload
+replacing an existing protected server file, select
+**Approve recurring rsync** and set an enabled calendar or Chain mode with
+predecessors. Review the verified routes, destination, source placement,
+expiry, number of firings and shared
+per-firing limits on source bytes, entries and removals. Save to activate the
+device-local approval. A firing can use updated contents within the approved
+source paths and placement. A confirmed publication updates that route's
+expected destination and retains the displaced receiver for recovery. A
+changed destination or an unconfirmed result requires a new review.
+Replacing one existing local file counts its incoming bytes and one entry
+toward the firing limits. The replacement uses the same path and consumes
+zero removals. Recurring approval requires an existing reviewed receiver.
+Ordinary recurring uploads use the `kortty-server-archive` v3 rsync helper
+on Linux. Passwordless recurring transfers use the current passwordless
+helper and bind the reviewed policy, configured roots, paths and file types.
+
+To transfer through protected Linux paths, select **Use passwordless sudo**
+before reviewing and saving the rsync job. The review checks the executable,
+saved SSH route, exact paths and the server's current path rules. An upload
+can create a new file or directory, replace a reviewed regular file, or merge
+or mirror a reviewed existing directory. Select **Replace an existing server
+file** for a regular file and enter the full server path. The helper retains
+the original under a private recovery name and carries the reviewed file's
+permission mode, group and supported attributes to the replacement. A new
+review is required to replace the current version after a successful run.
+Downloads support new local files and directories and reviewed existing
+local files and directories.
+
+The current helper also supports **Transfer mixed file and folder sources** in
+passwordless mode. Review each saved route and its ordered source list. A
+protected upload publishes one combined directory per destination. A
+protected download checks each server source, including any entry hidden by
+another source at the same relative path, before publishing the combined
+directory locally. The same merge and scoped mirror rules apply.
+A new local directory from a passwordless download is private to the
+current user. When merging into a reviewed existing local tree, the
+receiver's existing access settings apply to entries that already exist.
+
+Install the root-owned helper at `/usr/libexec/kortty/kortty-server-archive`.
+Grant the SSH login the exact helper command and argument in a sudoers rule.
+The Scheduler runs it with `sudo -k -n -u root --` and keeps the native rsync
+data transfer under the ordinary login. [sudo source](https://github.com/sudo-project/sudo/blob/main/src/parse_args.c) · [rsync manual](https://download.samba.org/pub/rsync/rsync.1).
+
+```sudoers
+syncuser ALL=(root) NOPASSWD: /usr/libexec/kortty/kortty-server-archive --privileged-rsync-v1
+```
+
+In root-owned `/etc/kortty/privileged-rsync.json`, use the exact UID and GID
+of the delegated login. Source roots authorize reads, destination roots
+authorize publication at vacant paths, and replacement roots authorize
+reviewed file replacement or directory merge or mirror below a destination
+root. Each account needs a
+separate root-owned handoff directory outside all source and destination trees.
+The handoff directory and its root-owned ancestors need search access for the
+login. Protect the configuration, helper and permitted directory paths from
+unprivileged changes.
+
+```json
+{
+  "version": 1,
+  "accounts": [
+    {
+      "uid": 1001,
+      "gid": 1001,
+      "handoff_root": "/var/lib/kortty/rsync/1001",
+      "source_roots": ["/srv/export"],
+      "destination_roots": ["/srv/import"],
+      "replace_roots": ["/srv/import/releases"]
+    }
+  ]
+}
+```
+
+For explicit saved SSH targets or a saved connection group, enter a separate
+destination for every target. The same source paths apply to each route.
+Review all routes and pinned host keys together. A grouped download requires
+distinct, non-overlapping local destinations. The Scheduler records each
+target's publication or failure in the run journal.
+
+Java rsync jobs restore as disabled drafts, with their source order, target
+mapping, dependency edges and original options. Configure the native action
+with a local rsync executable, local paths and the exact destinations.
+Select **Review rsync transfer…** before saving. Adopt a single-directory
+transfer in existing-folder mode or use mixed mode for combined sources.
+The adoption retains source order, named and trailing-slash layouts and the
+deletion option. For a single-target regular-file download, existing-file
+adoption prefills the Java destination folder and server file name. Specify
+the exact local file path for each target of a grouped job. The job and its
+schedule stay disabled until explicitly enabled. Rust portable backups
+keep the configured paths and options for existing receivers. Restored jobs
+start disabled and require new route and receiver approvals.
 
 Fixed **AI Agent · Scheduled SSH workflow** diagnostics use one saved SSH connection. **AI Swarm · Scheduled SSH workflow** targets several and records each outcome. Choose a canonical absolute server directory, a local or managed AI profile, and a question. For a fixed system or filesystem probe, use **Review AI workflow…**, then **Approve diagnostics**, and save the job. The model can summarize the masked probe results. Run it manually or use a calendar schedule. Managed execution and route policy apply, and saved connections that require interactive login or isolation are ineligible. Restored jobs require fresh approval.
 
@@ -826,7 +1122,9 @@ To continue, check the available saved SSH targets, select a current AI profile,
 
 With **Model-proposed SSH commands · one run**, review the exact masked request, then select **Ask model for proposal**. Review one command per target alongside the pinned SSH routes. **Approve one run** and save the job. Choose **Run now** or one calendar date and fixed time. The job consumes the approval before launching commands under the reviewed SSH accounts and records each outcome. The model is contacted during proposal review. If it explicitly rejects the JSON response format, the same masked request can be sent once without the option after a fresh check of the pending review, AI profile, policy, and pinned routes. A changed or used approval requires a new review.
 
-For a new proposal on each AI Agent start, choose **Model proposes commands at each start** and select up to eight saved SSH targets. Use **Review AI workflow…**, check the separate masked request for each target, select **Approve model requests**, and save. Start the job with **Run now** or a calendar schedule without dependencies. In **Journal**, choose **Review** on the active run. Review the current target's pinned route, working directory, and up to three exact commands in order. For multiple targets, use **Approve target commands** or **Reject target commands**. The approval expires five minutes after the proposal appears. The approved commands use separate channels on one authenticated SSH connection and stop at the first failure on that target. A rejection or failure leaves the remaining targets eligible for their own proposals and reviews. **Cancel** stops the run and skips any unstarted targets. The journal records one run with the outcomes in target order. A changed profile, SSH route, or masked request requires a new workflow review.
+For a new proposal on each AI Agent start, choose **Model proposes commands at each start** and select up to eight saved SSH targets. Use **Review AI workflow…**, check the separate masked request for each target, select **Approve model requests**, and save. The reviewed job can start manually, on a calendar, after successful prerequisites in a chain, or through **Run with successors**. The same trigger support applies to read-only and iterative AI Swarm. Review the workflow again before using chain starts with an older approval. In **Journal**, choose **Review** on the active run. Review the current target's pinned route, working directory, and up to three exact commands in order. For multiple targets, use **Approve target commands** or **Reject target commands**. The approval expires five minutes after the proposal appears. The approved commands use separate channels on one authenticated SSH connection and stop at the first failure on that target. A rejection or failure leaves the remaining targets eligible for their own proposals and reviews. **Cancel** stops the run and skips any unstarted targets. The journal records one run with the outcomes in target order. A changed profile, SSH route, masked request, or dependency settings requires a new workflow review.
+
+Reviewed model proposals and guided diagnostics include enabled organization and global AI Memory and the saved connection's own memory. Check the masked instructions in **Review AI workflow…**. A one-use proposal sends separate model requests when selected targets have connection-specific instructions. Changing memory used by a scheduled model request requires another workflow review.
 
 The per-target session journal option applies to fixed diagnostics and all scheduled Agent proposal modes. The journal records the outcome and masked output for each attempted target. With sent-command capture enabled, it also records masked commands that the SSH server acknowledged. A target that reached proposal review and was declined can have an outcome-only journal. The run still requires its usual model and SSH approvals.
 
@@ -888,6 +1186,13 @@ An installation policy can provide read-only Bash templates with `[[script-heade
 
 `analysis-max-stored-content-bytes` limits the source fields kept when an analysis history is written. A value of zero retains findings, digests and decisions while omitting source. The live proposal still supports exact review and explicit acceptance. After closing the live review, a source-omitted history entry shows the recorded result and its decision.
 
+Java backup restore can recover saved snippet and folder analyses for matching
+library entries. Imported reports show earlier findings, decisions and any
+valid flowchart. Choose a JSON report with code to inspect retained apply
+snapshots. Each new change uses the native review. Restore preserves existing
+history and applies the current analysis stored-content limit. Native
+encrypted profile backups include these portable analysis histories.
+
 If the analysis is stale, **Apply to current source…** previews the request against the current editor text. The approved request and generated proposal stay in private analysis history. Inspect the diff and change reasons, reject it, or choose **Review later** to return to it from the report. **Accept changes** puts the reviewed text in the editor as an unsaved draft. Use the editor's **Save** to write it to the library.
 
 Single-snippet and folder application show the current generation stage. A streamed response can preview complete masked reasons for selected changes. The reviewed diff and acceptance actions become available after validation. Cancelling or changing the AI configuration stops the current request.
@@ -922,7 +1227,11 @@ In **JobScheduler → Journal**, **All fields** searches the run data. **Selecte
 
 **AI Picture** accepts a motif, a numeric loopback address with port, and an installed model name. Only **Generate** sends the motif to the selected local Ollama-compatible service. kortty checks the SVG response, requests a correction once if needed, and can then use a limited ASCII response. **Cancel** terminates the active HTTP connection. The enterprise rule for AI also applies here. `cargo test --locked -p kortty --bin kortty ai_picture` checks the workflow with a local HTTP test double.
 
-**Use virtual terminal and save screen frames** enables an SSH PTY for a job with adjustable dimensions, capture interval, number of screen states, and runtime limit. kortty waits for the PTY confirmation before requesting the command. The terminal core processes the output without a visible session window. In the run journal, **Open replay and PNGs** opens the colored screen states with a timeline. **View PNG** shows the PNG saved with the image. You can switch between images with **Previous frame** and **Next frame**. Removing the journal entry removes the capture and its PNGs. An intermediate image storage budget applies per run. The last image is reserved, and additional frames can be exported from the playback. For a command without a virtual PTY, the output is discarded. The enterprise rule `allow-terminal-recording = false` blocks jobs that request a virtual terminal.
+**Journal output** saves separate `stdout` and `stderr` for SSH commands, inline scripts, and snippets. New jobs use **Limited, redacted**, which saves up to 4,000 UTF-16 units per stream. **Full, redacted** saves up to 64 KiB per stream. Both modes mask credentials and apply managed redaction rules before storing the output. Existing native jobs without a saved choice open with **Off**. Eligible Java imports preserve the source job's output mode. Search both streams in the Scheduler **Journal** or select individual output columns. The Scheduler can expire older output before the corresponding run status. Application policy can disable capture while the job still runs. The per-target **Automation journal** has its own capture settings.
+
+Select the needed text in **Run details** and use **Copy selected**, the context menu, or `Ctrl+C` (`Cmd+C` on macOS). A managed internal clipboard keeps the copied text inside kortty.
+
+**Use virtual terminal and save screen frames** enables an SSH PTY for a job with adjustable dimensions, capture interval, number of screen states, and runtime limit. kortty waits for the PTY confirmation before requesting the command. The terminal core processes the combined output without a visible session window. In the run journal, **Open replay and PNGs** opens the colored screen states with a timeline. **View PNG** shows the PNG saved with the image. You can switch between images with **Previous frame** and **Next frame**. Removing the journal entry removes the capture and its PNGs. An intermediate image storage budget applies per run. The last image is reserved, and additional frames can be exported from the playback. The enterprise rule `allow-terminal-recording = false` disables output capture and blocks jobs that request a virtual terminal.
 
 **Tools → Video Manager…** manages the storage location, colors, idle pause, default recording scope, and capture permission for the current app start. With several splits, **Start/Stop Terminal Recording** offers **Active split** and **Whole tab**. A whole-tab recording follows the tab when it moves to another window and includes newly added splits. Local, serial, SSH, and IBM panes contribute visible cells, cursor, size, and optional colors to a native `.korttyrec` file. Keyboard inputs are recorded as activity timestamps. Visible echo is part of the terminal output. **View** opens the playback with a timeline, time jump, and adjustable speed in a separate window. If one file contains frames for several panes, playback shows up to four panes per page on the same timeline. **Export** saves a segment as a new capture with the initial state of each visible pane, and **Save frame PNG** saves a single frame. Completed captures can be renamed or deleted after confirmation.
 
@@ -974,6 +1283,8 @@ In **Diagrams → Script → Local AI…** you can configure the numeric loopbac
 ## AI Manager
 
 **AI → AI Agent…** opens a modeless activity window for the selected terminal pane. Choose a profile and review the fixed environment probe. Each proposed command has its own approval showing the command, shell and working directory. Local Windows runs use the absolute directory entered in the setup. Other local runs use the current shell directory. SSH runs use the reported directory and a separate exec channel on the authenticated connection. Pause takes effect between steps. Cancel stops the local process group or closes the SSH command channel and preserves the transcript collected so far.
+
+Interactive Agent and Swarm member reviews include masked AI Memory for the selected target. Organization rules and global memory apply across eligible non-private targets. Each saved target receives its own connection memory. Private terminal reviews can include organization rules. Swarm comparison and workflow script generation use organization and global memory. Review the request again if its memory changes.
 
 A standalone agent on an attached SSH pane can propose a typed passwordless sudo command. The activity window shows the complete command and requires a separate approval. The remote account must allow that exact invocation as root without a password. The run stops if the elevated command fails.
 
@@ -1072,6 +1383,8 @@ mouse-reporting applications use the raw terminal display.
 
 **AI → AI Swarm…** selects eligible live panes, saved SSH connections, or a connection group for a bounded round of independent agent runs or a saved script. Each target keeps its own status, transcript and cancellation. In **AI command review**, **Review commands together…** lists the exact ordinary commands currently ready on multiple targets. A single confirmation approves the displayed commands once. Later commands and elevation require their own reviews. Saved connections require a reviewed absolute working directory and verified host keys on the route. Saved POSIX and PowerShell scripts preserve literal argument values and are rechecked against the reviewed library revision. CMD accepts one reviewed command line without arguments.
 
+The Swarm status strip shows each target's state and the overall counts. Hover over an indicator for elapsed time and reported model tokens. Select the indicator to open that target's transcript. A slow indicator shows when active work exceeds the round's timing threshold. Pausing stops the target clock. Saved conversations show a static status strip with the available measurements.
+
 Use **Save Swarm draft…** to name and save the selected SSH connections and AI profile before starting a run. Unsent task text stays in the open window. Reopen a draft in **Saved Chats** to edit the setup or review its first run. **Save conversation…** names and keeps the masked results of an already completed model round. Reopen a conversation to search the history, export it as Markdown, text or PDF, or continue after reviewing the current saved SSH routes. You can save journal options as profile defaults, estimate summary usage, and open the journals created during the current round.
 
 **Generate workflow…** prepares a Bash, Ansible, Python, or PowerShell draft from selected targets, manual SSH destinations, or an inventory path. **Review model input** shows the masked request before **Generate draft**. The model returns script source. korTTY derives a filename from the reviewed goal and language and inserts the reviewed automatic header locally. **Open unsaved snippet** opens the result for editing and review. Saving and running the snippet are separate actions.
@@ -1086,7 +1399,25 @@ Follow-up questions have their own preview and carry a bounded conversation hist
 
 Managed installations can set `ai-chat = "deny"` under `[rule.features]` to disable terminal AI actions and Saved Chats independently of other AI tools. The highest matching user, group, or global tier sets the rule. Denial wins within a tier, and the master AI switch still applies.
 
-In **AI Manager → Profiles → Connection**, select **Terminal Chat web search**. Direct Tavily uses `TAVILY_API_KEY`. LM Studio profiles can also use Tavily MCP, Bright Data MCP, Brave Search MCP, SearXNG MCP, or a configured Toolpack. Configure the selected integration in LM Studio and enter its plugin ID when requested. Toolpack requires an explicit list of allowed tool names. **Search web…** shows the exact masked query and reviewed destination and tools before dispatch. **Use excerpts in next AI review** includes the masked excerpts in a separate model preview. Saved answers retain available source titles and URLs without query parameters or fragments. Searches are disabled in incognito chats. Managed installations can block searches with `[rule.ai-profiles] allow-internet = false`.
+In **AI Manager → Profiles → Connection**, select **Web search**. Direct Tavily uses `TAVILY_API_KEY`. LM Studio profiles can also use Tavily MCP, Bright Data MCP, Brave Search MCP, SearXNG MCP, or a configured Toolpack. Configure the selected integration in LM Studio and enter its plugin ID when requested. Toolpack requires an explicit list of allowed tool names. **Search web…** shows the exact masked query and reviewed destination and tools before dispatch. **Use excerpts in next AI review** includes the masked excerpts in a separate model preview. Saved Chat answers retain available source titles and URLs without query parameters or fragments. Searches are disabled in incognito chats. Managed installations can block searches with `[rule.ai-profiles] allow-internet = false`.
+
+Choose **Read a webpage** on a profile with Tavily, Bright Data MCP, or a configured SearXNG MCP page endpoint. Enter a public HTTP or HTTPS URL and review it after query parameters and fragments are removed. **Request page** sends the reviewed URL to Tavily Extract, Bright Data `scrape_as_markdown`, or SearXNG `web_url_read`. Tavily and Bright Data use their search provider key. For SearXNG, enable **Read webpages through a SearXNG MCP endpoint** in the profile and enter the full Streamable HTTP endpoint. Use HTTPS or a numeric loopback HTTP address. A server that requires a bearer token uses the optional local environment variable. KorTTY labels the requested URL in a SearXNG result. The server can serve cached or redirected content. Review the masked excerpt before including it in a model request. [Tavily Extract](https://docs.tavily.com/documentation/api-reference/endpoint/extract) · [Bright Data MCP tools](https://docs.brightdata.com/products/mcp-server/tools) · [SearXNG MCP configuration](https://github.com/ihor-sokoliuk/mcp-searxng/blob/main/docs/client-configurations.md)
+
+Use the same search panel when setting up AI Swarm or reviewing a JobScheduler AI request with a configured profile. Swarm member and comparison previews show the included excerpts. Scheduling a standing Agent or Swarm request saves the exact reviewed excerpts with the job approval. Each firing reuses those excerpts, including a separately reviewed Swarm comparison if configured. Edit and review the job to replace the excerpts. Changes to the web profile, masking rules, or web policy require a fresh approval. Automatic journal summaries have no web search.
+
+In a standing Scheduler AI review, choose **Review a fresh web lookup at each start** to pause each run before model requests. Open JobScheduler, enter and review the search or supported webpage, then review and include the returned excerpts. The approval applies to that one run, including its Swarm comparison when configured. The run can be cancelled while waiting and an unanswered review expires after five minutes. Jobs can also use their saved excerpts by including them in the standing review.
+
+To allow unattended research, enter a public topic under **Automatic web lookup**, choose **Review research topic**, approve the displayed model and search route, and save the job. Each run asks the selected model to choose one query using only that topic. Direct Tavily searches the resulting query. With supported LM Studio MCP integrations, LM Studio carries out the allowed search tool calls. The run uses fresh masked excerpts for its reviewed AI requests, including an enabled Swarm comparison. A failed or empty lookup blocks the run. Review the job again after changing the selected AI profile or redaction rules.
+
+Select **Allow up to 2 follow-up lookups per run** before reviewing the topic to let the model continue the research. It receives the topic and masked excerpts from that run. It can stop early, search again, or choose a source URL from that run's search results when page retrieval is configured. Search integrations must supply source URLs in a supported result format. Review and save an existing job to enable follow-ups for it.
+
+A read-only Swarm with reviewed guidance or an iterative Swarm with a reviewed SSH preflight can enable **Search once for each target after its SSH probe**. The query planner receives the approved public topic, the operating system family, and the kernel major and minor version from that target. The masked search excerpts are included in the model requests for that target. A probe without a supported environment projection produces no additional lookup.
+
+An iterative Swarm with reviewed guidance can also enable **Allow reviewed web searches after command batches**. The diagnostic model may propose one public query per target and round. JobScheduler shows the exact query before sending it and asks whether to include the returned excerpts. Including the excerpts or skipping the search resumes the same diagnostic round. The additional excerpts apply to that target and round.
+
+With a configured page reader, the standing review can also enable **Allow reviewed webpage requests in these rounds**. Each proposal shows the exact public URL with query parameters and fragments removed. The page reader receives that URL after approval. Its masked excerpts require their own approval before the target resumes.
+
+In an interactive Agent or Swarm, **Search web…** in the model request review opens a public query or, with a supported profile, an exact webpage request. Review any returned excerpts before including them. The updated model request has its own approval and the excerpts apply to that request.
 
 Fenced code blocks in chat answers offer **Copy code** and **Insert into terminal**. Insertion targets the original pane while it is open. A reopened chat uses the selected or most recently used terminal tab of its window when available. The action uses the existing paste warnings and sends the code without a trailing Enter. Multiline and tabbed code require active bracketed paste. Insertion is unavailable for mirrored input, a password prompt, or a full-screen program.
 
@@ -1202,6 +1533,30 @@ the registered embedded model ID. An OpenAI-compatible endpoint can use
 HTTPS or loopback HTTP. LM Studio uses its native loopback API. Anthropic
 uses HTTPS and defaults to `https://api.anthropic.com/v1/messages`.
 
+For a server on this device with an Anthropic-compatible API, choose
+**Loopback Anthropic Messages API** when editing a user profile. Enter the
+full HTTP or HTTPS Messages URL and explicit model. Review the exact
+destination and add a credential reference if the server requires one.
+Java backup restore preserves the explicit model and path for these profiles
+and requires endpoint review. [LM Studio Messages API](https://lmstudio.ai/docs/developer/anthropic-compat/messages)
+
+Use **OpenAI-compatible HTTPS completion URL** for a complete reviewed route
+such as `https://gateway.example/tenant/V1/Chat/Completions/`. It preserves the
+path, including case and a trailing slash. Use **Manual** for an explicit
+model or **Server default** for a Terminal Chat whose gateway supplies the
+model. Java backups preserve both modes. Edit or review the full destination
+before enrolling its credential, if required.
+
+Use **Anthropic Messages HTTPS URL** for an exact gateway route such as
+`https://gateway.example/tenant/V1/Messages`. Trust the displayed destination
+before enrolling the credential. Java backup restore keeps the explicit model
+and Messages route even when the Java profile stored Auto or Default.
+
+Messages requests use bounded extended-thinking budgets for older supported
+models and adaptive effort for compatible models. An explicit validation
+rejection can retry with a compatible reasoning mode or a smaller output
+limit. The configured request deadline covers all attempts.
+
 For a loopback LM Studio or OpenAI-compatible profile, omitting `model`
 selects the single loaded chat model reported by LM Studio's
 `/api/v1/models` endpoint. The AI Manager shows the resolved model. The
@@ -1298,6 +1653,20 @@ summaries, snippet analysis and verification, and the manager's discovery and
 connection tests. Authentication is an environment variable reference. Changing
 the endpoint clears its trust approval.
 
+For an LM Studio profile, **Model** loads the metadata for the selected
+model key or loaded instance. It shows image support, the available reasoning
+settings and the model default when the server reports them. Journal image
+analysis checks the same selection before preparing a screenshot in
+**Automatic** vision mode. **Enabled** and **Disabled** override automatic
+detection. Choose **LM Studio (OpenAI-compatible)** to use LM Studio's model
+inventory with its `/v1/chat/completions` route.
+
+In either LM Studio connection mode, **Automatic** model selection uses the only
+loaded chat model. When several are loaded, enter the exact **Preferred model**
+key. Reviews show the resolved model. Every request rechecks that selection
+before sending. If the model changes, open a new Agent or Swarm review, review
+the Scheduler job again, or start a new Journal summary pass with that model.
+
 Choose **Configured local CLI** to connect a native executable.
 The **CLI provider** list contains the named providers from Java kortty and a
 custom entry. For supported names, **Find installation** checks common
@@ -1336,6 +1705,13 @@ and removes them afterward. It reads the response from UTF-8 stdout. The
 executable runs with the desktop user's file and network access, subject to
 operating-system controls.
 
+In a custom argument template, `{model}` and `{reasoning}` can appear alone
+or within a single argument. The default reasoning setting expands to empty
+text. Use `{stdinPrompt}`, `{promptFile}`, or the pair `{systemPromptFile}`
+and `{userPromptFile}` for prompt content. File placeholders can appear inside
+an argument. Reviews show the approved executable, resolved model and reasoning
+values, and either the private file roles or the paths for that request.
+
 Choose a saved, reviewed CLI profile explicitly for Agent Ask or Run, Swarm,
 or a scheduled Agent or Swarm job. Each interactive request shows the exact
 masked input and the approved program. A Swarm target, comparison, or workflow
@@ -1360,6 +1736,16 @@ that deliberately detaches into another process group can keep running.
 For MiniMax, choose **OpenAI-compatible HTTPS**, then **Use MiniMax Global
 endpoint**. Trust the displayed HTTPS destination, enter a supported model ID
 and choose the environment variable containing the API key before saving.
+Imported Java profiles keep the original MiniMax regional endpoint when it
+uses `/v1/text/chatcompletion_v2`. For a new profile with that path, select
+**MiniMax native HTTPS API**. Review the displayed destination before use.
+OpenAI-compatible requests to MiniMax send `thinking` set to `disabled` for
+the default and **None** reasoning settings on models that support it.
+For MiniMax-M3.1-Flash, use **Model default** to let the provider choose the
+reasoning level. Explicit reasoning levels retain their configured value.
+korTTY rejects **None** for this model before sending the request.
+[MiniMax thinking settings](https://platform.minimax.io/docs/guides/text-generation.md)
+
 For standalone Agent Ask or Run, a trusted personal HTTPS profile can enable
 **Allow reviewed AI Agent requests over HTTPS** under **Limits and timeouts**.
 Choose the profile explicitly and review the masked input and destination
@@ -1416,6 +1802,12 @@ On Apple Silicon with macOS 14 or later, **Local Models → Managed Apple MLX** 
 
 For the release-signed smoke test, set `KORTTY_SMOKE_RUNTIME_INDEX`, `KORTTY_SMOKE_RUNTIME_SIGNATURE`, and `KORTTY_SMOKE_RUNTIME_ZIP` to the absolute local paths of the published artifacts for the current target. Set `KORTTY_SMOKE_GGUF` to a small local test model to include real profile requests, verify shared leases, and check process and credential cleanup. With that fixture, set `KORTTY_SMOKE_GGUF_SLEEP=1` to verify that llama.cpp reports sleeping after the one-minute idle timeout and reloads the model in the same process. Run `cargo test --locked -p kortty --bin kortty stable_channel_runtime_round_trip -- --ignored --nocapture` with the usual isolated test environment.
 
+In a managed MLX profile, **Reasoning** offers Low, Medium and High for
+reviewed GPT-OSS templates and On and None for reviewed Qwen3 templates.
+Compatible signed runtimes apply the setting to the selected chat template.
+An imported Java effort can be selected after mapping the profile to a
+registered model that supports it. Other templates use **Model default**.
+
 For the policy-model smoke test, place the built test executable in a private
 run directory beside an installation policy. Set `allow-user-models = false`
 and declare a `llama` model named `Remote inference fixture` with an HTTPS
@@ -1431,7 +1823,7 @@ With a fixture that also supports mean-pooled embeddings, run `cargo test --lock
 
 For managed knowledge embeddings, import a compatible GGUF with purpose **Embeddings** under **Local Models** and use **Test model** to check the real embedding route. Choose it as the default under **Local Preferences** or directly as the **Embedding source** of a store. New stores copy the default. The managed model runs in its own authenticated llama.cpp process with mean pooling. External stores can still use a local Ollama endpoint. Changing the source requires consent again and a matching index.
 
-Under **Knowledge Stores**, select UTF-8 files or PDFs with a text layer, confirm their processing by the selected embedding model, and update the index. PDF excerpts cite physical page numbers. A bounded local helper extracts up to 128 pages from a PDF. Newly reviewed input can reach 50 MiB per UTF-8 or PDF file. Default limits are 128 KiB and 2 MiB, respectively. Re-enter an older saved size to review it under the expanded limits. Encrypted files and PDFs without extractable text receive separate errors. When reviewing a folder, select **Include PDFs with a text layer** to add them to the approved formats. A saved store keeps its private index across closing the AI Manager and restarting kortty. Indexes built for changed store settings activate when you save the settings. Reopen the store, approve the query, and run **Test search**. Changed source contents or a different endpoint or model require a new index. Removing a store removes its snapshots and preserves the original files. The snapshots are outside profile backups.
+Under **Knowledge Stores**, select UTF-8 files or PDFs with a text layer, confirm their processing by the selected embedding model, and update the index. New sources default to 50 MiB per file. PDF excerpts cite physical page numbers. A bounded local helper extracts up to 128 pages from a PDF. Encrypted files and PDFs without extractable text receive separate errors. When reviewing a folder, select **Include PDFs with a text layer** to add them to the approved formats. A saved store keeps its private index across closing the AI Manager and restarting kortty. Indexes built for changed store settings activate when you save the settings. Reopen the store, approve the query, and run **Test search**. Changed source contents or a different endpoint or model require a new index. Removing a store removes its snapshots and preserves the original files. The snapshots are outside profile backups.
 
 **Update index** reuses saved vectors for unchanged enabled files in the same store and embedding configuration. New and changed enabled files are embedded after approval. Confirmed removals disappear from the replacement index. **Rebuild index** embeds the enabled sources again and retains disabled vectors that fit the embedding dimensions. Use it after replacing an embedding model under the same endpoint and name, or when the service reports different vector dimensions during an update.
 
@@ -1481,14 +1873,14 @@ previously reviewed excerpts before sending them to a chat or analysis model.
 For a folder source, enter its absolute path and choose **Review folder**. The local scan lists new, changed, unchanged, removed, and skipped entries. **Approve folder files** records the files and reviewed contents on all pages. To sync later changes, review the folder again. **Update index** requires separate approval for the embedding endpoint, and **Save** activates the revised store. Reviews skip links, hidden and unsupported entries, and common build and dependency directories. A store supports up to eight folder roots and 5,000 source files. A folder review reads up to 500 MiB of eligible input. Review folders with older automatic approvals again to enable the larger discovery boundary.
 
 Use **Size limit…** beside an individual file or set the maximum file size
-in **Folder scan options**. A blank field uses 128 KiB for UTF-8 or 2 MiB for
-PDF. An explicitly reviewed value can increase those limits up to 2 MiB for
-UTF-8 or 8 MiB for PDF. A folder applies the smaller of its chosen value and
-each format's limit. Previously saved values keep their original format
-limits until you re-enter the size and review it. Apply a file's new limit
-in the draft and select Automatic again if needed. For a folder, review and
-approve the new limit with its file list. Update the index and save the store
-settings.
+in **Folder scan options**. An explicit UTF-8, PDF or folder setting can be up
+to 1 GiB. The scan reads up to 500 MiB. For large PDFs, the isolated helper
+copies the reviewed input into a private temporary file and bounds text
+extraction separately. Existing sources keep their saved boundaries,
+including earlier PDF limits, until reviewed again. Clear an edited size field to apply the
+50 MiB default. Apply a file's new limit in the draft and select Automatic
+again if needed. For a folder, review and approve the new limit with its file
+list. Update the index and save the store settings.
 
 **Folder scan options** selects subfolder recursion, the source root's
 `.gitignore`, and relative include/exclude globs separated by semicolons.
@@ -1511,7 +1903,7 @@ To use a saved knowledge store in a new full-code snippet or folder analysis, as
 
 For **AI → Ask** in a terminal pane and for chat follow-ups, assign a **Text** profile in **Local Preferences** and allow the store for that profile in **Knowledge Stores**. In the request preview, select a store to see the exact masked question and the embedding destination. **Retrieve reviewed query** sends that question. Review the complete prompt with its masked, cited excerpts, then choose **Send reviewed request** to contact the chat model. Choose **No knowledge store** to send a regular chat request. The retrieved prompt context is temporary and stays out of saved chat history.
 
-Terminal AI can include saved memory when **AI Memory** is enabled in AI Manager. Clear **Include saved AI memory** to omit personal files and their approved references from the chat's requests. Chats opened from a running saved SSH pane can include that connection's memory. Connection entries get priority within the personal token budget. The exact preview shows the masked entries. A change to either reviewed memory file or to the saved route requires another preview before sending. Incognito terminal chats omit personal files and references. Set `KORTTY_AI_MEMORY=off` before starting kortty to exclude personal memory from requests.
+Terminal AI can include saved memory when **AI Memory** is enabled in AI Manager. Clear **Include saved AI memory** to omit personal files and their approved references from the chat's requests. Chats opened from a running saved SSH or local shell pane can include that profile's memory. Choose the profile in the AI Memory editor to edit it. Connection entries get priority within the personal token budget. The exact preview shows the masked entries. A change to either reviewed memory file or to the saved route requires another preview before sending. Incognito terminal chats omit personal files and references. Set `KORTTY_AI_MEMORY=off` before starting kortty to exclude personal memory from requests.
 
 To include previously approved Markdown references in a terminal AI chat, select **Include approved external references** before reviewing the request. The option starts off for each chat. Active `.md` and `.mdc` references in the current memory scopes are eligible under a local home directory. The preview shows the included excerpts separately as untrusted data. They use the remaining memory budget, capped at 1,000 estimated tokens. If an included file or approval changes, review the request again. Managed installations can set `external-files = "deny"` under `[rule.ai-memory]` to prevent inclusion.
 
@@ -1536,6 +1928,16 @@ In the AI Manager, a provisioned profile shows its recorded usage in the read-on
 **AI Skills** edits, imports, and exports local Markdown skills. Open **Import Markdown…**, browse to a folder, and select up to 32 `.md` or `.markdown` files. **Enter paths…** accepts one absolute file path per line. The editor validates all files before adding the batch to the library draft and selects the last imported skill. Escape cancels the selection. Use **Save** to keep the imported skills. When shortening a skill, review the AI suggestion before applying it. **AI Memory** manages global and connection-specific files with entries, history, archive, and verified external file references.
 
 **Skill statistics…** shows local usage in Chat, Agent and workflows by day, month or year, including pinned usage and changes in skill size. The app records skills retained in accepted requests and omits private sessions. **Record local skill statistics** controls new measurements. Managed `statistics` under `[rule.ai-memory]` overrides that control. Existing statistics can be viewed or cleared in the statistics window.
+
+Imported Java skill statistics can include read-only records for custom or
+deleted skills. Select a record in **Skill statistics…** to inspect its usage
+and historical size by the original Java skill ID. Native skill counters keep
+their own identities and take precedence during restore.
+
+Java backup restore can add historical usage for uniquely identified built-in
+skills when the destination has no local statistics ledger. **Skill
+statistics…** identifies imported size measurements by their Java tokenizer.
+Native size-growth calculations use native measurements.
 
 Choose **Browse external skills** to enter a GitHub repository or skill reference, search SkillsMP by keyword, or enter a direct Markdown URL. GitHub keyword search uses a configured token. **Providers…** edits provider addresses and credential environment variable names. A direct Markdown provider can use Basic authentication. Remote requests use HTTPS, with HTTP available for numeric loopback addresses. SkillsMP results download from their GitHub source through the separate GitHub provider.
 
@@ -1650,6 +2052,22 @@ package and its SHA-256 file alongside the portable archives. DEB builds
 require `dpkg-deb`, `dpkg-shlibdeps` and Debian runtime package metadata.
 RPM builds require `rpmbuild`, `rpm` and the RPM ELF dependency generator.
 
+On a matching Arch Linux or Arch Linux ARM build host, add `--linux-pacman`
+with `makepkg`, `pacman` and `readelf` available. The resulting `.pkg.tar.zst`
+and SHA-256 file use the numeric Rust release version. Use an explicit
+`pacman -U` operation when switching from a higher-numbered Java `kortty`
+package. The portable Linux archive is also generated.
+
+On a matching native Linux host, `--linux-flatpak` builds a `.flatpak` bundle
+and SHA-256 sidecar. Install the Freedesktop Platform and SDK `25.08` for the
+target architecture. Build `kortty` and `kortty-cli` against that SDK and pass
+their directory with `--bin-dir`. The packager checks that both programs load
+inside the runtime before publishing. Install the bundle with
+`flatpak install --user ./kortty-<version>-<arch>.flatpak` and start it with
+`flatpak run io.github.chardonnay.korTTY`. To run the bundled CLI, add
+`--command=kortty-cli` after `flatpak run`. Local terminals use the shell and
+tools inside the Flatpak runtime.
+
 On Windows with the native MSVC toolchain, build for the explicit target
 with a static C runtime so the ZIP can run without the Visual C++
 Redistributable.
@@ -1669,9 +2087,31 @@ try {
 }
 ```
 
+On Windows, add `--windows-msi` to stage an MSI with the ZIP and its own
+SHA-256 sidecar. Install WiX Toolset 4 or later and the matching
+`WixToolset.UI.wixext` extension. The installer supports x64 and ARM64 native
+payloads and keeps the desktop, CLI and SSH worker in the same directory. Its
+per-machine `kortty Rust` product and default directory allow the Java
+distribution to remain installed during migration.
+
 Under `target/dist/kortty-<version>-<rust-target>/`, the archive and its SHA-256 file are created. Linux receives a tarball with both programs under `bin/`. The Windows ZIP contains `kortty.exe`, `kortty-cli.exe` and the sibling `kortty-ssh-worker.exe` for the SSH sandbox and the local sandbox console launcher. The macOS ZIP contains the locally signed `kortty.app` with desktop, CLI, and separately signed SSH helper under `Contents/Helpers`. The archives contain the project license and the licenses of the included vendor crates. For a cross-build, `--target` and `--bin-dir` specify the target and the directory of the previously built programs. For repetitions, point `--output-dir` to the private run folder. In the generated package folder, verify with `shasum -a 256 -c` and the generated SHA-256 file. Only then replace the previous local archive along with its checksum with the verified pair.
 
 For `aarch64-pc-windows-gnullvm`, configure the appropriate LLVM MinGW linker and set `CARGO_TARGET_AARCH64_PC_WINDOWS_GNULLVM_RUSTFLAGS="-C target-feature=+crt-static"` during the cross-build. `llvm-readobj --coff-imports` shows the DLL imports of desktop, CLI, and SSH worker. Before package release, start in a Windows ARM64 session with an empty kortty profile and check the visible main window and regular termination.
+
+On macOS, package a prepared, signed app of the workspace version into a
+read-only disk image with an Applications link and a SHA-256 file.
+
+```sh
+cargo run --locked -p kortty-package -- \
+  --target aarch64-apple-darwin --macos-dmg /absolute/path/kortty.app
+```
+
+The disk image and checksum go in `target/dist/kortty-<version>-<rust-target>-dmg/`.
+The packager verifies the app, CLI and SSH worker signatures and copies the
+bundle with its metadata and any existing notarization ticket. Release
+signing, notarization and Gatekeeper assessment of the disk image are
+separate steps. Recompute the SHA-256 file after signing and stapling the
+disk image.
 
 For a separate macOS test bundle, start the process directly from the run folder. When closing the app, the wrapper cleans up the bundle and the isolated profile.
 
@@ -1833,6 +2273,15 @@ A scheduler job can use up to eight stored SSH profiles with optional jump hosts
 
 **ZIP (AES-256)** uses an entry of type **Archive password** from the vault. The job stores its reference and requires an unlocked vault at startup. Encryption protects file contents. File names remain visible. `cargo test --locked -p kortty openssh_scheduled_encrypted_zip -- --ignored` checks the correct and incorrect password, the authentication of archive data, and the unchanged target upon a collision.
 
+The ordinary Scheduler **Create entirely on the server** option also offers
+**ZIP (AES-256)** on a saved pinned SSH route with the updated archive helper.
+The helper acknowledges the protected request before the SSH worker sends the
+password and a separate guarded commit marker. An optional local copy keeps
+the same size and SHA-256 checks. The privileged helper also creates ZIP
+(AES-256) at a vacant root-owned private server path with either sudo mode.
+The approval binds the selected archive password reference, sudo mode, route
+and archive definition.
+
 
 `cargo test --locked -p kortty snippets` checks the library. `cargo test --locked -p kortty openssh_executes_inline_and_linked_scripts_with_literal_argv -- --ignored` runs an inline script and a renamed linked snippet on an isolated OpenSSH test server and checks arguments, exit code, and recording.
 
@@ -1864,10 +2313,12 @@ The 19 character profiles and both IBM profiles are accessible on the desktop. T
 
 Kitty graphics processes direct and split RGB, RGBA, and PNG data, zlib, placement layers, and images in the scrollback. The session worker packs older scrollback lines losslessly during idle time and preserves styles, links, and image anchors. The Strict filter blocks graphics, relevant clipboard sequences, and DCS. The terminal core processes OSC 5522 with multiple MIME types and binary partial transfers. The desktop integration forwards UTF-8 text up to 256 KiB after approval. With read access disabled, the list of MIME types remains empty.
 
-The serial desktop workflow has been verified on macOS with an operating system PTY. Physical verification of break, modem lines, and flow control and the remaining enterprise rules are pending.
+The serial desktop workflow has been verified on macOS with an operating system PTY. Saved serial profiles, encodings and library organization are implemented. Physical verification of break, modem lines and flow control remains deferred by the user; current native Manager and policy acceptance is tracked in the porting plan.
 
 SFTP transfers up to 32 KiB per request and waits for the response before the next request. Per folder, limits of 20,000 entries, 32 nested levels, and 1 TiB apply. When replacement is confirmed, a time window for simultaneous external changes remains between the final check and the rename.
 
 The SSH tunnel dialog manages listeners for a running session. Up to thirteen forwarding streams can run simultaneously per SSH pane across local, remote, and dynamic tunnels. The transport reserves channels for the shell, an attached SFTP session and an agent command. Each SSH connection supports four remote listener registrations. Terminal recording works per pane and per tab. The Video Manager imports Java JSONL recordings and supports optional WebM and MKV encoding.
 
-Full Java and SithTermFX parity is still in progress. This includes additional scheduler action types, SSH login flows and host key algorithms. The independent security review of the SSH transport, the native Windows x64 and macOS Intel sandbox tests, and full verification of native window behavior are pending. Editor, AI, and diagram parity are separate release milestones.
+Full Java v2.26.0 and SithTermFX parity is still in progress. Open work includes AI profiles and Java data migration, native acceptance of large PDF sources and indexes, Finder drag-out verification, additional Scheduler rsync/SFTP/sudo variants, and package signing and acceptance across targets. The [current porting plan](PORTING-PLAN.md#current-result-and-actionable-backlog) tracks the remaining cases.
+
+Independent external SSH review and resolution of the recorded dependency advisories remain release gates. Native Windows x64/macOS Intel sandbox acceptance, the full desktop/provider matrix and comparative performance are also open. Earlier Apple Silicon signing, notarization, Gatekeeper and sandbox results apply to the recorded package. The current source requires a new fixed-snapshot build and verification.

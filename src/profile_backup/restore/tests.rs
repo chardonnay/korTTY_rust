@@ -48,6 +48,79 @@ fn snapshot() -> Snapshot {
     )])
 }
 
+#[test]
+fn java_openpgp_catalogue_restores_only_inactive_full_fingerprints() {
+    use crate::snippets::recipients::{Action, FILE_NAME};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let scratch = Scratch::new();
+    let path = scratch.0.join("java-openpgp.zip");
+    let password = Secret::new("java-archive-password".into());
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    zip.start_file(
+        "gpg-keys.xml",
+        SimpleFileOptions::default()
+            .with_aes_encryption_bytes(AesMode::Aes256, password.as_str().as_bytes()),
+    )
+    .unwrap();
+    zip.write_all(
+        br#"<gpgKeys>
+        <key><id>v4-java</id><name>Java public recipient</name>
+            <keyId>0x9876543210fedcba</keyId>
+            <fingerprint>0123456789ab cdef01234567 9876543210fedcba</fingerprint>
+            <publicKeyPath>/fixture/do-not-follow.asc</publicKeyPath>
+            <email>fixture@example.invalid</email><createdAt>1</createdAt></key>
+        <key><id>v6-java</id><name>Java v6 recipient</name>
+            <keyId>AABBCCDDEEFF0011000000000000000000000000000000000000000000000000</keyId></key>
+        <key><id>mismatched</id><name>Incorrect key ID</name>
+            <keyId>0123456789abcdef</keyId>
+            <fingerprint>1111111111111111111111111111111111111111</fingerprint></key>
+        <key><id>short</id><name>Short key ID</name><keyId>9876543210fedcba</keyId></key>
+        <key><id>duplicate</id><name>Duplicate fingerprint</name><keyId>10fedcba</keyId>
+            <fingerprint>0123456789abcdef012345679876543210fedcba</fingerprint></key>
+    </gpgKeys>"#,
+    )
+    .unwrap();
+    zip.finish().unwrap();
+
+    let local = Scratch::new();
+    let destination = local.0.join(FILE_NAME);
+    let inspect = || super::super::inspect_java_password(&path, &password).unwrap();
+    let preview = inspect();
+    let (_, entries, omissions) = preview.java_review().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|line| line.contains("fingerprint verification (2)"))
+    );
+    assert!(omissions.iter().any(|line| {
+        line.contains("invalid or missing full fingerprints or metadata omitted (2)")
+    }));
+    assert!(
+        omissions
+            .iter()
+            .any(|line| line.contains("Duplicate Java OpenPGP references omitted (1)"))
+    );
+    super::super::queue_restore_at(&local.0, preview, RestoreMode::JavaAdditive).unwrap();
+    assert!(!destination.exists());
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    assert!(Action::List(destination.clone()).run().unwrap().is_empty());
+    let catalogue = Action::List(destination.clone()).run_management().unwrap();
+    assert_eq!(catalogue.pending_java.len(), 2);
+    assert_eq!(
+        catalogue.pending_java[0].fingerprint(),
+        "0123456789ABCDEF012345679876543210FEDCBA"
+    );
+    let bytes = fs::read(&destination).unwrap();
+    let stored = std::str::from_utf8(&bytes).unwrap();
+    assert!(!stored.contains("do-not-follow"));
+    assert!(!stored.contains("fixture@example.invalid"));
+
+    super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    assert_eq!(fs::read(destination).unwrap(), bytes);
+}
+
 fn java_managed_keys_archive(source: &Path) -> (PathBuf, Secret) {
     use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
 
@@ -454,6 +527,682 @@ fn java_chat_backup_replays_additively_and_preserves_local_chat_and_environment(
 }
 
 #[test]
+fn java_global_memory_restore_is_additive_and_excludes_unmapped_scopes() {
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    const GLOBAL: &str = "memory/MEMORY.md";
+    const HISTORY: &str = "memory/history/global-20261102-131415-019-2.md";
+    const ARCHIVE: &str = "memory/archive.md";
+    const SCOPED: &str = "memory/connections/remote-uuid.md";
+    const SECRET_HISTORY: &str = "memory/history/global-20261102-131415-020.md";
+    const STATE: &str = "memory/state.json";
+    const ARCHIVE_ENTRY: &[u8] = b"<!-- kortty:archived scope=global -->\r\n\
+<!-- kortty:entry id=java-archive origin=korTTY sha256=68b692b74b8eb17e8a9f4d37b85a9a6aa4c5b9c419396edd17323fb1155e0f82 created=2026-11-02 source=chat -->\r\n\
+- Check the machine.\r\n\
+<!-- /kortty:entry -->\r\n";
+    const SCOPED_ARCHIVE: &[u8] =
+        b"\xef\xbb\xbf<!-- kortty:archived scope=connection:cmVtb3RlLXV1aWQ -->\r";
+
+    let source = Scratch::new();
+    let path = source.0.join("java-memory.zip");
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    let options = SimpleFileOptions::default().with_aes_encryption_bytes(AesMode::Aes256, b"pw");
+    for (name, bytes) in [
+        (GLOBAL, "# Erinnerungen\r\n- Gerät prüfen.\r\n".as_bytes()),
+        (HISTORY, b"Earlier notes.\n"),
+        (ARCHIVE, ARCHIVE_ENTRY),
+        (SCOPED, b"Connection notes.\n"),
+        (STATE, b"{}"),
+        (SECRET_HISTORY, b"-----BEGIN PRIVATE KEY-----\n"),
+    ] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+    let inspect = || super::super::inspect_java_password(&path, &Secret::new("pw".into())).unwrap();
+    let preview = inspect();
+    let (_, entries, omissions) = preview.java_review().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|line| line == "Global AI Memory files (3)")
+    );
+    for omitted in [SCOPED, STATE, SECRET_HISTORY] {
+        assert!(omissions.iter().any(|line| line.starts_with(omitted)));
+    }
+
+    let local = Scratch::new();
+    super::super::queue_restore_at(&local.0, preview, RestoreMode::JavaAdditive).unwrap();
+    ProfileLease::acquire(&local.0, || false).unwrap();
+    assert_eq!(
+        fs::read(local.0.join(GLOBAL)).unwrap(),
+        "# Erinnerungen\r\n- Gerät prüfen.\r\n".as_bytes()
+    );
+    assert_eq!(
+        fs::read(local.0.join(HISTORY)).unwrap(),
+        b"Earlier notes.\n"
+    );
+    assert_eq!(fs::read(local.0.join(ARCHIVE)).unwrap(), ARCHIVE_ENTRY);
+    for omitted in [SCOPED, STATE, SECRET_HISTORY] {
+        assert!(!local.0.join(omitted).exists());
+    }
+
+    fs::write(local.0.join(GLOBAL), b"Locally edited.\n").unwrap();
+    super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    ProfileLease::acquire(&local.0, || false).unwrap();
+    assert_eq!(
+        fs::read(local.0.join(GLOBAL)).unwrap(),
+        b"Locally edited.\n"
+    );
+
+    for (path, bytes) in [(ARCHIVE, SCOPED_ARCHIVE), (SCOPED, b"Connection notes.\n")] {
+        let delta = Snapshot::from([(path.into(), Zeroizing::new(bytes.to_vec()))]);
+        assert!(queue_with_mode(&local.0, delta, RestoreMode::JavaAdditive, false).is_err());
+    }
+}
+
+#[test]
+fn java_ssh_memory_follows_a_new_exact_route_and_replays_without_overwriting() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    const ID: &str = "f827d86d-1531-4cc5-9d0f-f6e5c1a2d850";
+    const ORPHAN: &str = "bf251306-48fc-4f95-a82c-82c92b63dd17";
+    const ALIASED: &str = "31c3a185-6f6a-4960-bd6a-29a615c5d56f";
+    const STAMP: &str = "20261102-131415-019-2.md";
+    const ARCHIVE: &str = "memory/archive.md";
+    const DESTINATION: &str = "memory/connections/2.md";
+    const ARCHIVED_ENTRY: &str = "<!-- kortty:entry id=fixture origin=korTTY sha256=68b692b74b8eb17e8a9f4d37b85a9a6aa4c5b9c419396edd17323fb1155e0f82 created=2026-11-02 source=chat -->\n- Check the machine.\n<!-- /kortty:entry -->\n";
+    let connections = format!(
+        "<connections><connection id='{ID}'><name>Java SSH</name>\
+        <host>java.example</host><username>tester</username></connection>\
+        <connection id='{ALIASED}'><name>Ambiguous SSH</name>\
+        <host>ambiguous.example</host><username>tester</username></connection>\
+        <connection id='{}'><protocol>UNRECOGNIZED</protocol></connection></connections>",
+        ALIASED.to_ascii_uppercase()
+    );
+    let scope = |id: &str| {
+        format!(
+            "<!-- kortty:archived scope=connection:{} -->",
+            URL_SAFE_NO_PAD.encode(id)
+        )
+    };
+    let backup_archive = format!(
+        "<!-- kortty:archived scope=global -->\n{ARCHIVED_ENTRY}\n{}\r\n{ARCHIVED_ENTRY}",
+        scope(ID)
+    );
+    let source = Scratch::new();
+    let path = source.0.join("java-ssh-memory.zip");
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    let options = SimpleFileOptions::default().with_aes_encryption_bytes(AesMode::Aes256, b"pw");
+    for (name, bytes) in [
+        (CONNECTIONS.replace(".json", ".xml"), connections.as_bytes()),
+        (
+            format!("memory/connections/{ID}.md"),
+            "Machine α.\r\n".as_bytes(),
+        ),
+        (
+            format!("memory/history/connection-{ID}-{STAMP}"),
+            b"Prior notes.\n",
+        ),
+        (
+            format!("memory/connections/{ORPHAN}.md"),
+            b"Unmatched notes.\n",
+        ),
+        (
+            format!("memory/connections/{ALIASED}.md"),
+            b"Ambiguous notes.\n",
+        ),
+        (ARCHIVE.into(), backup_archive.as_bytes()),
+    ] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+    let inspect = || super::super::inspect_java_password(&path, &Secret::new("pw".into())).unwrap();
+    let local = Scratch::new();
+    let directory = Directory::open(&local.0, false).unwrap();
+    let native = crate::connection_store::import::Preview::java_backup(b"<connections><connection><name>Native</name><host>local.example</host></connection></connections>").unwrap();
+    let (native, _) = native.portable_java_backup().unwrap();
+    directory.publish_copy(CONNECTIONS, &native).unwrap();
+    let queued =
+        super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    assert!(
+        queued
+            .scheduler_notes
+            .iter()
+            .any(|note| note.ends_with("imported (2)"))
+    );
+    assert!(
+        queued
+            .scheduler_notes
+            .iter()
+            .any(|note| note.ends_with("missing (3)"))
+    );
+    let mut pending = fs::read(local.0.join(PENDING)).unwrap();
+    assert_eq!(pending[PENDING_MAGIC_WITH_MODE.len()], JAVA_MEMORY);
+
+    let revision = String::from_utf8(native.clone())
+        .unwrap()
+        .replace("local.example", "changed.example");
+    directory
+        .replace_file(CONNECTIONS, revision.as_bytes())
+        .unwrap();
+    assert!(ProfileLease::acquire(&local.0, || false).is_err());
+    assert!(!local.0.join(DESTINATION).exists());
+    directory.replace_file(CONNECTIONS, &native).unwrap();
+
+    let mut forged = pending.clone();
+    let index = forged
+        .windows(b"Prior notes.".len())
+        .position(|window| window == b"Prior notes.")
+        .unwrap();
+    forged[index] = b'p';
+    directory.replace_file(PENDING, &forged).unwrap();
+    assert!(ProfileLease::acquire(&local.0, || false).is_err());
+    assert!(!local.0.join(DESTINATION).exists());
+    directory.replace_file(PENDING, &pending).unwrap();
+
+    ProfileLease::acquire(&local.0, || false).unwrap();
+    let catalogue = crate::connection_store::Store::open(local.0.join(CONNECTIONS)).unwrap();
+    assert_eq!(
+        catalogue.get(2).unwrap().login.endpoint.host,
+        "java.example"
+    );
+    assert_eq!(
+        catalogue.get(3).unwrap().login.endpoint.host,
+        "ambiguous.example"
+    );
+    assert_eq!(
+        fs::read(local.0.join(DESTINATION)).unwrap(),
+        "Machine α.\r\n".as_bytes()
+    );
+    assert_eq!(
+        fs::read(local.0.join(format!("memory/history/connection-2-{STAMP}"))).unwrap(),
+        b"Prior notes.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(local.0.join(ARCHIVE)).unwrap(),
+        backup_archive.replace(&scope(ID), &scope("2"))
+    );
+    assert!(!local.0.join("memory/connections/1.md").exists());
+    assert!(!local.0.join("memory/connections/3.md").exists());
+
+    fs::write(local.0.join(DESTINATION), b"Locally edited.\n").unwrap();
+    pending[PENDING_MAGIC_WITH_MODE.len()] = JAVA_MEMORY_COMMITTING;
+    directory.publish_copy(PENDING, &pending).unwrap();
+    ProfileLease::acquire(&local.0, || false).unwrap();
+    assert_eq!(
+        fs::read(local.0.join(DESTINATION)).unwrap(),
+        b"Locally edited.\n"
+    );
+
+    super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    ProfileLease::acquire(&local.0, || false).unwrap();
+    assert_eq!(
+        fs::read(local.0.join(DESTINATION)).unwrap(),
+        b"Locally edited.\n"
+    );
+    assert!(!local.0.join("memory/connections/3.md").exists());
+}
+
+#[test]
+fn java_memory_restores_legacy_ssh_and_local_shell_ids_only_for_new_profiles() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    const LOCAL_ID: &str = "Ops Café/📦";
+    const LOCAL_NAME: &str = "Ops_Caf___-6880d6da";
+    const SSH_ID: &str = "Ops:@Bastion";
+    const SSH_NAME: &str = "Ops__Bastion-88b26434";
+    const STAMP: &str = "20261102-131415-019-2.md";
+    const DESTINATION: &str = "memory/connections/2.md";
+    const ARCHIVE: &str = "memory/archive.md";
+    let connections = format!(
+        "<connections>\
+            <connection id='{SSH_ID}'><name>SSH</name><host>bastion.example</host>\
+                <username>tester</username></connection>\
+            <connection id='\u{2003}{LOCAL_ID} '><name>Local shell</name><protocol>LOCAL_SHELL</protocol>\
+                <localShellWorkingDirectory>/tmp/java-shell</localShellWorkingDirectory></connection>\
+            <connection id='duplicate-one'><name>Duplicate shell</name><protocol>LOCAL_SHELL</protocol></connection>\
+            <connection id='duplicate-two'><name>Duplicate shell</name><protocol>LOCAL_SHELL</protocol></connection>\
+         </connections>"
+    );
+    let marker = |id: &str| {
+        format!(
+            "<!-- kortty:archived scope=connection:{} -->\r\n",
+            URL_SAFE_NO_PAD.encode(id)
+        )
+    };
+    let archived = format!("{}{}", marker(LOCAL_ID), marker(SSH_ID));
+    let source = Scratch::new();
+    let path = source.0.join("java-local-memory.zip");
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    let options = SimpleFileOptions::default().with_aes_encryption_bytes(AesMode::Aes256, b"pw");
+    for (name, bytes) in [
+        ("connections.xml".into(), connections.as_bytes()),
+        (
+            format!("memory/connections/{LOCAL_NAME}.md"),
+            b"Local notes.\r\n",
+        ),
+        (
+            format!("memory/history/connection-{LOCAL_NAME}-{STAMP}"),
+            b"Prior shell notes.\n",
+        ),
+        (format!("memory/connections/{SSH_NAME}.md"), b"SSH notes.\n"),
+        ("memory/connections/duplicate-one.md".into(), b"Unmapped.\n"),
+        (
+            "memory/connections/duplicate-two.md".into(),
+            b"Also unmapped.\n",
+        ),
+        (ARCHIVE.into(), archived.as_bytes()),
+    ] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+    let inspect = || super::super::inspect_java_password(&path, &Secret::new("pw".into())).unwrap();
+    let local = Scratch::new();
+    let queued =
+        super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    assert!(
+        queued
+            .scheduler_notes
+            .iter()
+            .any(|note| note.ends_with("imported (2)"))
+    );
+    assert!(
+        queued
+            .scheduler_notes
+            .iter()
+            .any(|note| note.ends_with("missing (4)"))
+    );
+    ProfileLease::acquire(&local.0, || false).unwrap();
+    let catalogue = crate::connection_store::Store::open(local.0.join(CONNECTIONS)).unwrap();
+    assert_eq!(
+        catalogue.get(1).unwrap().login.endpoint.host,
+        "bastion.example"
+    );
+    assert_eq!(
+        catalogue.local(2).unwrap().working_directory,
+        Some(PathBuf::from("/tmp/java-shell"))
+    );
+    assert_eq!(catalogue.local(3).unwrap().name, "Duplicate shell");
+    assert_eq!(
+        fs::read(local.0.join(DESTINATION)).unwrap(),
+        b"Local notes.\r\n"
+    );
+    assert_eq!(
+        fs::read(local.0.join("memory/connections/1.md")).unwrap(),
+        b"SSH notes.\n"
+    );
+    assert_eq!(
+        fs::read(local.0.join(format!("memory/history/connection-2-{STAMP}"))).unwrap(),
+        b"Prior shell notes.\n"
+    );
+    assert_eq!(
+        fs::read_to_string(local.0.join(ARCHIVE)).unwrap(),
+        format!("{}{}", marker("2"), marker("1"))
+    );
+    assert!(!local.0.join("memory/connections/3.md").exists());
+
+    fs::write(local.0.join(DESTINATION), b"Edited locally.\n").unwrap();
+    super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    ProfileLease::acquire(&local.0, || false).unwrap();
+    assert_eq!(
+        fs::read(local.0.join(DESTINATION)).unwrap(),
+        b"Edited locally.\n"
+    );
+}
+
+#[test]
+fn java_skill_statistics_restore_resolves_current_builtin_and_preserves_existing_ledger() {
+    use crate::ai_manager::Configuration;
+    use crate::ai_manager::backup::{JAVA_STATISTICS, SETTINGS, STATISTICS};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    const JAVA_SETTINGS: &[u8] = br#"<globalSettings><aiSkills>
+        <skill><id>java-bash</id><builtinId>builtin.shell.bash</builtinId></skill>
+        <skill><id>java-python</id><builtinId>builtin.lang.python</builtinId></skill>
+        <skill><id>java-python-duplicate</id><builtinId>builtin.lang.python</builtinId></skill>
+        <skill><id>java-go</id><builtinId>builtin.lang.go</builtinId></skill>
+        <skill><id>custom</id><name>Bash</name></skill>
+        <skill><id>177</id><name>Bash</name></skill>
+    </aiSkills></globalSettings>"#;
+    const JAVA_STATS: &[u8] = br#"{
+        "version":1,"tokenizer":"CL100K_BASE","skills":{
+        "java-bash":{"name":"Original Bash","lastUsed":"2026-11-03","lastFingerprint":"01234567deadbeef|CL100K_BASE",
+          "daily":{"2026-11-03":{"automatic":3,"pinned":1,"tokens":100,"surfaces":{"CHAT":2,"AGENT":1,"WORKFLOW":1}}},
+          "monthly":{"2025-01":{"automatic":2,"pinned":0,"tokens":40,"surfaces":{"CHAT":2}}},
+          "yearly":{"2019":{"automatic":3,"pinned":0,"tokens":90,"surfaces":{"AGENT":3}}},
+          "snapshots":[{"date":"2026-11-02","tokens":237,"tokenizer":"CL100K_BASE","fingerprint":"01234567deadbeef"}]},
+        "java-python":{"name":"Python"},
+        "java-go":{"name":"Go","daily":{"2026-11-03":{"automatic":-1,"pinned":1,"tokens":1}}},
+        "custom":{"name":"Bash","yearly":{"2021":{"automatic":1,"pinned":0,"tokens":15}}},
+        "177":{"name":"Bash","yearly":{"2021":{"automatic":2,"pinned":1,"tokens":30}}},
+        "deleted-skill":{"name":"Deleted skill","yearly":{"2009":{"automatic":4,"pinned":0,"tokens":75}}},
+        "\u202eunsafe-id":{"name":"Invalid label"}
+      }}"#;
+
+    let source = Scratch::new();
+    let path = source.0.join("java-statistics.zip");
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    let options = SimpleFileOptions::default().with_aes_encryption_bytes(AesMode::Aes256, b"pw");
+    for (name, bytes) in [
+        ("global-settings.xml", JAVA_SETTINGS),
+        (STATISTICS, JAVA_STATS),
+    ] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+    let inspect = || super::super::inspect_java_password(&path, &Secret::new("pw".into())).unwrap();
+    let preview = inspect();
+    let (_, entries, omissions) = preview.java_review().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry
+                == "Skill usage and historical sizes for matching built-in skills (1)")
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry == "Read-only Java skill histories (4)")
+    );
+    assert!(
+        omissions
+            .iter()
+            .any(|entry| entry == "Invalid Java skill histories omitted (2)")
+    );
+    assert!(data::validate(&preview.snapshot).is_err());
+
+    let restricted = Scratch::new();
+    let restricted_directory = Directory::open(&restricted.0, false).unwrap();
+    let checks = std::cell::Cell::new(0);
+    ai_backup::publish_java_statistics(
+        &restricted_directory,
+        &preview.snapshot[JAVA_STATISTICS],
+        || {
+            let previous = checks.get();
+            checks.set(previous + 1);
+            previous < 3
+        },
+    )
+    .unwrap();
+    assert!(checks.get() >= 4);
+    assert!(!restricted.0.join(STATISTICS).exists());
+
+    let target = Scratch::new();
+    let target_directory = Directory::open(&target.0, false).unwrap();
+    super::super::queue_restore_at(&target.0, preview, RestoreMode::JavaAdditive).unwrap();
+    let mut config = serde_json::to_value(Configuration::default()).unwrap();
+    let skills = config["skills"]["skills"].as_object_mut().unwrap();
+    let original_id = skills
+        .iter()
+        .find_map(|(id, skill)| (skill["builtin"] == "builtin.shell.bash").then(|| id.clone()))
+        .unwrap();
+    let bash = skills.remove(&original_id).unwrap();
+    skills.insert("177".into(), bash);
+    config["skills"]["last_id"] = 177.into();
+    let config = serde_json::to_vec(&config).unwrap();
+    target_directory.publish_copy(SETTINGS, &config).unwrap();
+    ProfileLease::acquire(&target.0, || false).unwrap();
+    assert!(!target.0.join(JAVA_STATISTICS).exists());
+    let installed: serde_json::Value =
+        serde_json::from_slice(&fs::read(target.0.join(STATISTICS)).unwrap()).unwrap();
+    let skills = installed["skills"].as_object().unwrap();
+    assert_eq!(skills.len(), 1);
+    let record = &skills["177"];
+    assert_eq!(
+        record["daily"]["2026-11-03"]["surfaces"],
+        serde_json::json!({"chat": 2, "agent": 1, "workflow": 1})
+    );
+    assert_eq!(record["monthly"]["2025-01"]["tokens"], 40);
+    assert_eq!(record["yearly"]["2019"]["tokens"], 90);
+    assert!(record["last_size"].is_null());
+    assert_eq!(record["snapshots"], serde_json::json!([]));
+    assert_eq!(record["java_sizes"][0]["fingerprint"], "01234567deadbeef");
+    assert_eq!(record["java_sizes"][0]["tokens"], 237);
+    assert_eq!(installed["java_bindings"]["java-bash"]["bound"], 177);
+    assert_eq!(fs::read(target.0.join(SETTINGS)).unwrap(), config);
+    let history = installed["java_history"].as_object().unwrap();
+    assert_eq!(history.len(), 4);
+    assert_eq!(history["177"]["yearly"]["2021"]["tokens"], 30);
+    assert_eq!(history["custom"]["name"], history["177"]["name"]);
+    assert_eq!(history["deleted-skill"]["yearly"]["2009"]["tokens"], 75);
+    assert_eq!(history["java-python"]["name"], "Python");
+
+    let native_password = Secret::new("native-backup-password".into());
+    let native_path = source.0.join("native-statistics.zip");
+    let native = data::collect(&target.0).unwrap();
+    archive::write(&native_path, &native, &native_password).unwrap();
+    let native = super::super::inspect_backup(&native_path, &native_password).unwrap();
+    let round_trip = Scratch::new();
+    super::super::queue_restore_at(&round_trip.0, native, RestoreMode::KeepExisting).unwrap();
+    ProfileLease::acquire(&round_trip.0, || false).unwrap();
+    let restored: serde_json::Value =
+        serde_json::from_slice(&fs::read(round_trip.0.join(STATISTICS)).unwrap()).unwrap();
+    assert_eq!(restored, installed);
+
+    let invalid_catalogue_path = source.0.join("java-statistics-invalid-catalogue.zip");
+    let mut zip = ZipWriter::new(File::create(&invalid_catalogue_path).unwrap());
+    zip.start_file("global-settings.xml", options).unwrap();
+    zip.write_all(b"<globalSettings").unwrap();
+    zip.start_file(STATISTICS, options).unwrap();
+    zip.write_all(JAVA_STATS).unwrap();
+    zip.finish().unwrap();
+    let invalid_catalogue =
+        super::super::inspect_java_password(&invalid_catalogue_path, &Secret::new("pw".into()))
+            .unwrap();
+    let (_, entries, omissions) = invalid_catalogue.java_review().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry == "Read-only Java skill histories (5)")
+    );
+    assert!(omissions.iter().any(|entry| entry == "Invalid Java skill catalogue omitted. Skill histories retain their original Java IDs."));
+    super::super::queue_restore_at(&round_trip.0, invalid_catalogue, RestoreMode::JavaAdditive)
+        .unwrap();
+    ProfileLease::acquire(&round_trip.0, || false).unwrap();
+    let replayed: serde_json::Value =
+        serde_json::from_slice(&fs::read(round_trip.0.join(STATISTICS)).unwrap()).unwrap();
+    assert_eq!(replayed, installed);
+
+    let mut edited = installed.clone();
+    edited["skills"]["177"]["yearly"]["2019"]["tokens"] = 120.into();
+    edited["java_history"]["177"]["name"] = "Locally retained historical label".into();
+    let edited = serde_json::to_vec(&edited).unwrap();
+    let stats = target_directory.private_child("stats", false).unwrap();
+    stats.replace_file("skill-usage.json", &edited).unwrap();
+    super::super::queue_restore_at(&target.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    ProfileLease::acquire(&target.0, || false).unwrap();
+    assert_eq!(fs::read(target.0.join(STATISTICS)).unwrap(), edited);
+
+    let local = br#"{"version":1,"skills":{},"tokenizer":null}"#;
+    stats.replace_file("skill-usage.json", local).unwrap();
+    super::super::queue_restore_at(&target.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    ProfileLease::acquire(&target.0, || false).unwrap();
+    let merged: serde_json::Value =
+        serde_json::from_slice(&fs::read(target.0.join(STATISTICS)).unwrap()).unwrap();
+    assert_eq!(merged["skills"], serde_json::json!({}));
+    assert!(merged["tokenizer"].is_null());
+    assert_eq!(merged["java_history"], installed["java_history"]);
+    assert_eq!(merged["java_bindings"]["java-bash"], "reserved");
+
+    let damaged = b"{malformed local statistics";
+    stats.replace_file("skill-usage.json", damaged).unwrap();
+    super::super::queue_restore_at(&target.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    ProfileLease::acquire(&target.0, || false).unwrap();
+    assert_eq!(fs::read(target.0.join(STATISTICS)).unwrap(), damaged);
+}
+
+#[test]
+fn java_snippet_analysis_restore_binds_the_catalogue_and_round_trips_in_native_backups() {
+    use crate::snippet_analysis::model::{Subject, content_hash};
+    use crate::snippet_analysis::store::Store as AnalysisStore;
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    const ID: &str = "4c4a5560-46ba-4570-b589-107496e994b9";
+    const ORPHAN: &str = "c1017ef1-b5bb-4392-a22a-90826ce01a0e";
+    const RECORD: &str = "c0c2a9bc-8f44-4eeb-876d-98206b9ccffe";
+    const RUN: &str = "a8a311fd-3f7a-474c-97fe-59ead4247f7c";
+    const CONTENT: &str = "echo preserved\n";
+    let snippets_xml = format!(
+        "<snippets><snippet><id>{ID}</id><name>fixture</name><language>bash</language><content>{CONTENT}</content></snippet></snippets>"
+    );
+    let hash = content_hash(CONTENT).unwrap();
+    let member = |subject: &str| {
+        serde_json::json!({
+            "schemaVersion":1,"snippetId":subject,"revision":1,"updatedAt":200,
+            "records":[{"id":RECORD,"snippetId":subject,"purpose":"ANALYSIS","analyzedAt":100,"updatedAt":200,"pinned":true,
+              "source":{"sha256":hash,"language":"bash","reportLanguageCode":"en","codeTextLanguageCode":"en","content":hash,"contentTruncated":false,"lineCount":1,"snippetName":"fixture"},
+              "provenance":{"profileId":"a-java-id","profileName":"Java profile","model":"fixture"},
+              "summary":"Analysis text",
+              "applyRuns":[{"id":RUN,"outcome":"FAILED","failureKey":"workflow.timeout",
+                "request":{"baseSha256":hash,"baseContent":hash,"hardeningOptions":["STRICT_MODE"],"headerText":"private-fixture"},
+                "checkpoint":{"completedStages":1,"totalStages":2,"content":hash},
+                "stats":{"completedItems":1,"totalItems":2,"retries":1},
+                "provenance":{"profileId":"apply-profile","profileName":"Java apply profile"}}]}],
+            "blobs":{(hash.clone()): CONTENT}
+        })
+    };
+    let source = Scratch::new();
+    let path = source.0.join("java-analysis.zip");
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    let options = SimpleFileOptions::default().with_aes_encryption_bytes(AesMode::Aes256, b"pw");
+    zip.start_file("snippets.xml", options).unwrap();
+    zip.write_all(snippets_xml.as_bytes()).unwrap();
+    for subject in [ID, ORPHAN] {
+        zip.start_file(format!("snippet-analyses/{subject}.json"), options)
+            .unwrap();
+        zip.write_all(&serde_json::to_vec(&member(subject)).unwrap())
+            .unwrap();
+    }
+    zip.finish().unwrap();
+    let inspect = || super::super::inspect_java_password(&path, &Secret::new("pw".into())).unwrap();
+    let preview = inspect();
+    let (_, entries, omissions) = preview.java_review().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|entry| entry == "Snippet analysis histories (1)")
+    );
+    assert!(
+        omissions
+            .iter()
+            .any(|note| note.contains(ORPHAN) && note.contains("no matching subject"))
+    );
+    assert!(
+        omissions
+            .iter()
+            .any(|note| note == "Unsupported or active Java analysis details omitted (1)")
+    );
+
+    let id = snippets::SnippetId::try_from(ID.replace('-', "")).unwrap();
+    let subject = Subject::Snippet(id);
+    let name = format!("{}.json", String::from(id));
+    let history_path = format!("snippet-analyses/{name}");
+    let target = Scratch::new();
+    super::super::queue_restore_at(&target.0, preview, RestoreMode::JavaAdditive).unwrap();
+    ProfileLease::acquire(&target.0, || false).unwrap();
+    let store = AnalysisStore::new(target.0.clone());
+    let history = store.load(subject).unwrap();
+    let current = history.current().unwrap();
+    assert!(current.pinned);
+    assert_eq!(current.analysis.summary, "Analysis text");
+    assert_eq!(current.source.content.as_deref(), Some(CONTENT));
+    assert!(current.apply_runs.is_empty() && current.apply_recovery.is_none());
+    let java_history = current.java_history.as_ref().unwrap();
+    let details = java_history.apply_runs[0].details.as_ref().unwrap();
+    assert_eq!(details.failure_key.as_deref(), Some("workflow.timeout"));
+    assert_eq!(details.progress.as_ref().unwrap().retries, 1);
+    assert_eq!(
+        details.provenance.as_ref().unwrap().profile_id,
+        "apply-profile"
+    );
+    let native = data::collect(&target.0).unwrap();
+    assert!(
+        !std::str::from_utf8(&native[&history_path])
+            .unwrap()
+            .contains("private-fixture")
+    );
+
+    let denied = Scratch::new();
+    let directory = Directory::open(&denied.0, false).unwrap();
+    directory
+        .publish_copy(snippets::FILE_NAME, &native[snippets::FILE_NAME])
+        .unwrap();
+    let calls = std::cell::Cell::new(0);
+    data::analysis::install(&directory, &native, || {
+        let call = calls.get();
+        calls.set(call + 1);
+        (call < 2).then_some(5 * 1024 * 1024)
+    })
+    .unwrap();
+    assert!(calls.get() >= 3);
+    assert!(!denied.0.join(&history_path).exists());
+    calls.set(0);
+    let error = data::analysis::install(&directory, &native, || {
+        let call = calls.get();
+        calls.set(call + 1);
+        Some(if call < 2 { 5 * 1024 * 1024 } else { 0 })
+    })
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    assert!(!denied.0.join(&history_path).exists());
+    data::analysis::install(&directory, &native, || Some(0)).unwrap();
+    let history = AnalysisStore::new(denied.0.clone()).load(subject).unwrap();
+    let capped = history.current().unwrap();
+    assert!(capped.source.content_truncated);
+    assert!(capped.source.content.is_none());
+    assert_eq!(capped.analysis.summary, "Analysis text");
+    let capped_java = capped.java_history.as_ref().unwrap();
+    assert!(capped_java.attachments.is_empty());
+    assert_eq!(capped_java.apply_runs[0].details.as_ref(), Some(details));
+
+    let differing = Scratch::new();
+    let directory = Directory::open(&differing.0, false).unwrap();
+    let local_xml = snippets_xml.replace("echo preserved", "echo edited locally");
+    let (local_snippets, ..) =
+        snippets::portable_java_backup(Some(local_xml.as_bytes()), None).unwrap();
+    directory
+        .publish_copy(snippets::FILE_NAME, &local_snippets)
+        .unwrap();
+    super::super::queue_restore_at(&differing.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    ProfileLease::acquire(&differing.0, || false).unwrap();
+    assert!(!differing.0.join(&history_path).exists());
+    queue_with_mode(
+        &differing.0,
+        native.clone(),
+        RestoreMode::KeepExisting,
+        false,
+    )
+    .unwrap();
+    ProfileLease::acquire(&differing.0, || false).unwrap();
+    assert!(!differing.0.join(&history_path).exists());
+
+    let replay = Scratch::new();
+    queue_with_mode(&replay.0, native.clone(), RestoreMode::KeepExisting, false).unwrap();
+    ProfileLease::acquire(&replay.0, || false).unwrap();
+    let original = fs::read(replay.0.join(&history_path)).unwrap();
+    let mut local: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    local["history"]["records"][0]["analysis"]["summary"] = "Locally edited".into();
+    let local = serde_json::to_vec(&local).unwrap();
+    let directory = Directory::open(&replay.0, false).unwrap();
+    directory
+        .private_child("snippet-analyses", false)
+        .unwrap()
+        .replace_file(&name, &local)
+        .unwrap();
+    super::super::queue_restore_at(&replay.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    ProfileLease::acquire(&replay.0, || false).unwrap();
+    queue_with_mode(&replay.0, native, RestoreMode::Replace, false).unwrap();
+    ProfileLease::acquire(&replay.0, || false).unwrap();
+    assert_eq!(fs::read(replay.0.join(history_path)).unwrap(), local);
+}
+
+#[test]
 fn java_password_restore_adds_supported_data_and_preserves_native_catalogues() {
     use std::io::Write;
     use zip::{AesMode, CompressionMethod, ZipWriter, write::SimpleFileOptions};
@@ -552,6 +1301,220 @@ fn java_password_restore_adds_supported_data_and_preserves_native_catalogues() {
 }
 
 #[test]
+fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
+    use serde_json::json;
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    const SETTINGS: &[u8] = br#"<globalSettings>
+        <openToolWindowsAsTabs>true</openToolWindowsAsTabs>
+        <connectionColorBorderEnabled>false</connectionColorBorderEnabled>
+        <splitPaneFocusRingEnabled>false</splitPaneFocusRingEnabled>
+        <tabSwitchMostRecentFirst>true</tabSwitchMostRecentFirst>
+        <showTerminalScrollbar>false</showTerminalScrollbar>
+        <hideTerminalScrollbarsInFullscreen>true</hideTerminalScrollbarsInFullscreen>
+        <workflowScriptFontSize>21</workflowScriptFontSize>
+        <uiFontScaleAuto>false</uiFontScaleAuto><uiFontScalePercent>132</uiFontScalePercent>
+        <terminalRemoteSidebarWidth>450.5</terminalRemoteSidebarWidth>
+        <terminalRemoteSidebarPosition>RIGHT</terminalRemoteSidebarPosition>
+        <terminalFontSize>26</terminalFontSize>
+    </globalSettings>"#;
+    let source = Scratch::new();
+    let path = source.0.join("java-display.zip");
+    let mut archive = ZipWriter::new(File::create(&path).unwrap());
+    let options = SimpleFileOptions::default()
+        .with_aes_encryption_bytes(AesMode::Aes256, b"archive-password");
+    for (name, bytes) in [
+        ("global-settings.xml", SETTINGS),
+        (
+            "themes.xml",
+            br#"<themes><theme id="java-display"><name>Restored Theme</name></theme></themes>"#
+                .as_slice(),
+        ),
+    ] {
+        archive.start_file(name, options).unwrap();
+        archive.write_all(bytes).unwrap();
+    }
+    archive.finish().unwrap();
+
+    let local = Scratch::new();
+    let directory = Directory::open(&local.0, false).unwrap();
+    let initial = br#"{"open_tool_windows_as_tabs":false,"show_terminal_scrollbar":true,
+        "remote_sidebar_position":"left","terminal_font":19,"terminal_font_family":"Fixture Mono",
+        "legacy_editor_font":{"name":"Preserved","weight":500}}"#;
+    directory
+        .publish_copy(data::WINDOW_SETTINGS, initial)
+        .unwrap();
+    let installed_path = local.0.join(data::WINDOW_SETTINGS);
+    let inspect = || {
+        super::super::inspect_java_password(&path, &Secret::new("archive-password".into())).unwrap()
+    };
+    let preview = inspect();
+    let (_, entries, _) = preview.java_review().unwrap();
+    assert!(
+        entries
+            .iter()
+            .any(|line| line == "Display preferences for unset fields (9)")
+    );
+    let pending: serde_json::Value =
+        serde_json::from_slice(&preview.snapshot[data::WINDOW_SETTINGS]).unwrap();
+    assert_eq!(pending["java_display_preferences"]["manual_scale"], 132);
+    assert!(pending.get("remote_sidebar_position").is_none());
+    super::super::queue_restore_at(&local.0, preview, RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    let mut active: serde_json::Value =
+        serde_json::from_slice(&fs::read(&installed_path).unwrap()).unwrap();
+    for (key, value) in [
+        ("open_tool_windows_as_tabs", json!(false)),
+        ("connection_color_border_enabled", json!(false)),
+        ("split_pane_focus_ring_enabled", json!(false)),
+        ("tab_switch_most_recent_first", json!(true)),
+        ("show_terminal_scrollbar", json!(true)),
+        ("hide_terminal_scrollbars_in_fullscreen", json!(true)),
+        ("workflow_script_font", json!(21)),
+        ("manual_scale", json!(132)),
+        ("remote_sidebar_width", json!(451)),
+        ("remote_sidebar_position", json!("left")),
+        ("terminal_font", json!(19)),
+        ("terminal_font_family", json!("Fixture Mono")),
+        (
+            "legacy_editor_font",
+            json!({"name":"Preserved","weight":500}),
+        ),
+    ] {
+        assert_eq!(active[key], value, "changed {key}");
+    }
+    assert!(active.get("java_display_preferences").is_none());
+    assert_eq!(active["themes"]["edited"][0]["name"], "Restored Theme");
+    active["manual_scale"] = json!(120);
+    let updated = serde_json::to_vec(&active).unwrap();
+    directory
+        .replace_file(data::WINDOW_SETTINGS, &updated)
+        .unwrap();
+    super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    assert_eq!(fs::read(installed_path).unwrap(), updated);
+}
+
+#[test]
+fn java_connection_library_restore_remaps_only_unambiguous_insertions() {
+    use crate::connection_store::{Store, TabColor, import::Preview as ConnectionPreview};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    const INITIAL: &[u8] = br#"<connections>
+        <connection><name>Local favorite</name><host>local.example</host><username>fixture</username><group>Work</group></connection>
+        <connection><name>Existing match</name><host>existing.example</host><username>fixture</username><group>Work</group></connection>
+    </connections>"#;
+    const CONNECTIONS_XML: &[u8] = br#"<connections>
+        <connection id="new-ssh"><name>Java SSH</name><host>new.example</host><username>fixture</username><group> Work / Imported </group></connection>
+        <connection id="already-here"><name>Existing match</name><host>existing.example</host><username>fixture</username><group>Work</group></connection>
+        <connection id="teamwork"><name>Teamwork entry</name><host>team.example</host><username>fixture</username><connectionSource>TEAMWORK</connectionSource></connection>
+        <connection id="duplicate-id"><name>First duplicate ID</name><host>first.example</host><username>fixture</username></connection>
+        <connection id="duplicate-id"><name>Second duplicate ID</name><host>second.example</host><username>fixture</username><group>Work/Conflict</group></connection>
+        <connection id="shadow-a"><name>Shared endpoint</name><host>shadow.example</host><username>fixture</username></connection>
+        <connection id="shadow-b"><name>Shared endpoint</name><host>shadow.example</host><username>fixture</username></connection>
+        <connection id="new-serial"><name>Java serial</name><protocol>SERIAL</protocol><serial><portName>COM19</portName></serial></connection>
+        <connection id="new-shell"><name>Java shell</name><protocol>LOCAL_SHELL</protocol></connection>
+    </connections>"#;
+    const SETTINGS: &[u8] = br##"<globalSettings>
+        <favoriteConnections>
+            <connection>new-ssh</connection><connection>already-here</connection><connection>teamwork</connection>
+            <connection>duplicate-id</connection><connection>shadow-a</connection><connection>new-serial</connection><connection>new-shell</connection>
+            <connection>new</connection><connection>stale</connection>
+        </favoriteConnections>
+        <connectionGroupColors>
+            <group path="Work" color="#bbb"/>
+            <group path=" Work / Imported " color="#3af"/>
+            <group path="Work/Conflict" color="#1a2"/>
+            <group path=" Work / Conflict " color="#2a4"/>
+            <group path="Orphan" color="#abc"/>
+        </connectionGroupColors>
+    </globalSettings>"##;
+    let source = Scratch::new();
+    let archive_path = source.0.join("java-library.zip");
+    let mut archive = ZipWriter::new(File::create(&archive_path).unwrap());
+    let options = SimpleFileOptions::default()
+        .with_aes_encryption_bytes(AesMode::Aes256, b"archive-password");
+    for (name, bytes) in [
+        ("connections.xml", CONNECTIONS_XML),
+        ("global-settings.xml", SETTINGS),
+    ] {
+        archive.start_file(name, options).unwrap();
+        archive.write_all(bytes).unwrap();
+    }
+    archive.finish().unwrap();
+
+    let local = Scratch::new();
+    let directory = Directory::open(&local.0, false).unwrap();
+    let (initial, _) = ConnectionPreview::java_backup(INITIAL)
+        .unwrap()
+        .portable_java_backup()
+        .unwrap();
+    directory.publish_copy(CONNECTIONS, &initial).unwrap();
+    let connection_path = local.0.join(CONNECTIONS);
+    let mut store = Store::open(connection_path.clone()).unwrap();
+    let native_id = store.connections()[0].id;
+    assert!(
+        store
+            .toggle_connection_favorites(&[native_id], &[])
+            .unwrap()
+    );
+    store
+        .set_group_color("Work", TabColor::parse("#900"))
+        .unwrap();
+    drop(store);
+
+    let inspect = || {
+        super::super::inspect_java_password(&archive_path, &Secret::new("archive-password".into()))
+            .unwrap()
+    };
+    for _ in 0..2 {
+        super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+        drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    }
+    let mut store = Store::open(connection_path.clone()).unwrap();
+    let favorites: Vec<_> = store
+        .connections()
+        .iter()
+        .filter(|entry| store.is_favorite(entry.id))
+        .map(|entry| entry.name.as_str())
+        .collect();
+    assert_eq!(favorites, ["Local favorite", "Java SSH"]);
+    let serial = store
+        .serial_profiles()
+        .iter()
+        .find(|profile| profile.name == "Java serial")
+        .unwrap();
+    assert!(store.is_favorite(serial.id));
+    let shell = store
+        .local_profiles()
+        .iter()
+        .find(|profile| profile.name == "Java shell")
+        .unwrap();
+    assert!(store.is_favorite(shell.id));
+    assert_eq!(store.group_color("Work"), TabColor::parse("#900"));
+    assert_eq!(store.group_color("Work/Imported"), TabColor::parse("#3af"));
+    assert_eq!(store.group_color("Work/Conflict"), None);
+    assert!(!store.has_group("Orphan"));
+
+    let imported = store
+        .connections()
+        .iter()
+        .find(|entry| entry.name == "Java SSH")
+        .unwrap()
+        .id;
+    assert!(!store.toggle_connection_favorites(&[imported], &[]).unwrap());
+    store
+        .set_group_color("Work/Imported", TabColor::parse("#098"))
+        .unwrap();
+    drop(store);
+    super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    let store = Store::open(connection_path).unwrap();
+    assert!(!store.is_favorite(imported));
+    assert_eq!(store.group_color("Work/Imported"), TabColor::parse("#098"));
+}
+
+#[test]
 fn java_ssh_password_restore_seals_and_replays_exact_routes() {
     use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
 
@@ -586,7 +1549,7 @@ fn java_ssh_password_restore_seals_and_replays_exact_routes() {
         .next()
         .unwrap();
     let connections = format!(
-        r#"<connections><connection id="stored-route"><name>Imported SSH</name><host>java.example</host><username>fixture</username><credentialId>stored-credential</credentialId><jumpServer><enabled>true</enabled><host>jump.example</host><username>jump-user</username><encryptedPassword>{java_field}</encryptedPassword></jumpServer></connection><connection id="collision-route"><name>Collision</name><host>preserved.example</host><username>fixture</username><encryptedPassword>{java_field}</encryptedPassword></connection></connections>"#
+        r#"<connections><connection id="stored-route"><name>Imported SSH</name><host>java.example</host><username>fixture</username><group>Java/Protected</group><credentialId>stored-credential</credentialId><jumpServer><enabled>true</enabled><host>jump.example</host><username>jump-user</username><encryptedPassword>{java_field}</encryptedPassword></jumpServer></connection><connection id="collision-route"><name>Collision</name><host>preserved.example</host><username>fixture</username><encryptedPassword>{java_field}</encryptedPassword></connection></connections>"#
     );
     let credentials = format!(
         r#"<credentials><credential><id>stored-credential</id><name>Stored test</name><username>fixture</username><serverPattern>java.example</serverPattern><environmentId>custom-deadbeef</environmentId><passwordType>STORED</passwordType><encryptedPassword>{java_field}</encryptedPassword></credential></credentials>"#
@@ -599,6 +1562,7 @@ fn java_ssh_password_restore_seals_and_replays_exact_routes() {
         ("connections.xml", connections.as_bytes()),
         ("credentials.xml", credentials.as_bytes()),
         ("environments.xml", JAVA_ENVIRONMENTS),
+        ("global-settings.xml", br##"<globalSettings><favoriteConnections><connection>stored-route</connection><connection>collision-route</connection></favoriteConnections><connectionGroupColors><group path="Java/Protected" color="#3af"/></connectionGroupColors></globalSettings>"##),
         (
             "master.key",
             include_bytes!("../java_secrets/fixtures/master.properties"),
@@ -691,6 +1655,12 @@ fn java_ssh_password_restore_seals_and_replays_exact_routes() {
     };
     assert_eq!(original.id, 1);
     assert!(catalog.approved(original.id, &original_plan));
+    assert!(!catalog.is_favorite(original.id));
+    assert!(catalog.is_favorite(imported.id));
+    assert_eq!(
+        catalog.group_color("Java/Protected").unwrap().to_string(),
+        "#33AAFF"
+    );
     assert!(matches!(
         original.login.auth,
         crate::connection_store::Auth::Prompt

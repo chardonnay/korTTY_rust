@@ -130,6 +130,147 @@ fn named_agent_revision_binds_the_policy_and_model_without_the_runtime_handle() 
 }
 
 #[test]
+fn provisioned_https_workflow_profiles_require_exact_names_and_bind_key_rotation() {
+    let scratch = crate::snippets::tests::Profile::new();
+    let root = scratch.0.canonicalize().unwrap();
+    let declaration = |credential: &str| {
+        let envelope = kortty_control::policy_value::encrypt(credential).unwrap();
+        crate::clipboard_policy::parse(&format!(
+            r#"
+[meta]
+schema-version = 1
+
+[[rule]]
+[rule.ai-profiles]
+allow-internet = false
+
+[[ai-profile]]
+id = "policy-Cloud"
+name = "Organization HTTPS profile"
+provider = "anthropic"
+model = "fixture"
+api-key-encrypted = "{envelope}"
+
+[[ai-profile]]
+id = "policy-OpenAi"
+name = "Organization OpenAI-compatible profile"
+provider = "openai-compatible"
+endpoint = "https://example.invalid/v1"
+model = "other-fixture"
+
+[[ai-profile]]
+id = "policy-Loopback"
+name = "Organization loopback profile"
+provider = "openai-compatible"
+endpoint = "http://127.0.0.1:11435"
+model = "local-fixture"
+"#
+        ))
+        .unwrap()
+    };
+    let mut config: Configuration = serde_json::from_value(serde_json::json!({
+        "profiles": {"profiles": [{
+            "id": 1, "name": "User profile", "connection_mode": "remote-open-ai",
+            "endpoint": "https://user.invalid/v1", "model": "user",
+            "trusted_remote_endpoint": true
+        }], "default": 1, "last_id": 1},
+        "local": {"roles": [null, null, "policy-Cloud", null]}
+    }))
+    .unwrap();
+    let policy = declaration("fixture-credential");
+    assert!(policy.ai_agent_allowed());
+    assert!(!policy.ai_web_search_allowed);
+    config = config.with_policy_profiles(&policy).unwrap();
+    assert_eq!(config.reviewed_agent_https_profiles().count(), 0);
+    assert!(config.preferred_agent_https_id().is_none());
+    config.origin = Some(root);
+    assert_eq!(config.reviewed_agent_https_profiles().count(), 2);
+    assert_eq!(config.agent_profiles().count(), 1);
+    assert_eq!(
+        config
+            .profiles
+            .https_role_choices(local::Role::Agent)
+            .count(),
+        2
+    );
+
+    let destination = "https://api.anthropic.com/v1/messages";
+    let reference = ProfileRef::Policy("policy-Cloud".into());
+    assert_eq!(
+        config.preferred_agent_https_id(),
+        config.resolve_profile_reference(&reference)
+    );
+    let (transport, _) = config
+        .reviewed_agent_https_transport(&reference, destination)
+        .unwrap();
+    assert!(transport.is_remote());
+    assert_eq!(transport.policy_profile_id(), Some("policy-Cloud"));
+    assert_eq!(
+        transport.policy_authority_fingerprint(),
+        Some(policy.ai_profiles()[0].fingerprint())
+    );
+    let revision = config.agent_profile_reference_revision(&reference).unwrap();
+    let other = ProfileRef::Policy("policy-OpenAi".into());
+    assert!(
+        config
+            .reviewed_agent_https_transport(&other, "https://example.invalid/v1/chat/completions")
+            .is_ok()
+    );
+    assert!(config.agent_transport_for_reference(&reference).is_err());
+    assert!(
+        config
+            .reviewed_agent_https_transport(&reference, "https://unreviewed.invalid/v1/messages")
+            .is_err()
+    );
+    assert!(
+        config
+            .reviewed_agent_https_transport(&ProfileRef::Policy("policy-cloud".into()), destination)
+            .is_err()
+    );
+    let alias = config
+        .legacy_policy_alias(config.resolve_profile_reference(&reference).unwrap())
+        .unwrap();
+    assert!(
+        config
+            .reviewed_agent_https_transport(&ProfileRef::Numeric(alias), destination)
+            .is_err()
+    );
+    assert!(
+        config
+            .reviewed_agent_https_transport(
+                &ProfileRef::Numeric(1),
+                "https://user.invalid/v1/chat/completions"
+            )
+            .is_err()
+    );
+
+    let rotated = config
+        .clone()
+        .with_policy_profiles(&declaration("rotated-credential"))
+        .unwrap();
+    assert_ne!(
+        rotated
+            .agent_profile_reference_revision(&reference)
+            .unwrap(),
+        revision
+    );
+    let revoked = config
+        .with_policy_profiles(&ClipboardPolicy::default())
+        .unwrap();
+    assert!(revoked.preferred_agent_https_id().is_none());
+    assert!(
+        revoked
+            .agent_profile_reference_revision(&reference)
+            .is_none()
+    );
+    assert!(
+        revoked
+            .reviewed_agent_https_transport(&reference, destination)
+            .is_err()
+    );
+}
+
+#[test]
 fn provisioned_ai_profiles_preserve_legacy_high_numeric_user_references() {
     let high_id = LEGACY_LOCAL_ALIAS;
     let saved = serde_json::json!({
@@ -383,4 +524,155 @@ fn provisioned_ai_profile_uses_installed_policy_credential_on_loopback() {
     assert!(!response.contains(KEY));
     server.join().unwrap();
     assert!(!root.join(FILE_NAME).exists());
+}
+
+#[test]
+#[ignore = "requires a private executable and the synthetic HTTPS provider with its private CA"]
+fn managed_https_native_tls_preserves_review_bindings_and_rechecks_installed_policy() {
+    use local_ai::{Error, Session};
+
+    const KEY: &str = "synthetic-managed-https-credential";
+    let scratch = PathBuf::from(std::env::var_os("KORTTY_TEST_MANAGED_HTTPS_SCRATCH").unwrap());
+    let scratch = scratch.canonicalize().unwrap();
+    let executable = std::env::current_exe().unwrap().canonicalize().unwrap();
+    assert_eq!(executable.parent(), Some(scratch.join("bin").as_path()));
+    let root = scratch.join("profile");
+    std::fs::create_dir(&root).unwrap();
+    let policy_dir = scratch.join("policy");
+    std::fs::create_dir(&policy_dir).unwrap();
+    let policy_file = policy_dir.join("kortty-policy.toml");
+    let endpoint: std::net::SocketAddr = std::env::var("KORTTY_TEST_MANAGED_HTTPS_ENDPOINT")
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(endpoint.ip().is_loopback());
+    let ca = std::fs::read(scratch.join("ca.der")).unwrap();
+    let base = format!("https://{endpoint}/v1");
+    let policy = |credential: &str| {
+        let encrypted = kortty_control::policy_value::encrypt(credential).unwrap();
+        format!(
+            r#"[meta]
+schema-version = 1
+
+[[ai-profile]]
+id = "policy-NativeOpenAi"
+name = "Native OpenAI-compatible fixture"
+provider = "openai-compatible"
+endpoint = "{base}"
+model = "managed-fixture-openai"
+api-key-encrypted = "{encrypted}"
+
+[[ai-profile]]
+id = "policy-NativeAnthropic"
+name = "Native Anthropic fixture"
+provider = "anthropic"
+endpoint = "{base}"
+model = "managed-fixture-anthropic"
+api-key-encrypted = "{encrypted}"
+"#
+        )
+    };
+    std::fs::write(&policy_file, policy(KEY)).unwrap();
+    let config = Configuration::load_from(&root).unwrap();
+    let openai = ProfileRef::Policy("policy-NativeOpenAi".into());
+    let anthropic = ProfileRef::Policy("policy-NativeAnthropic".into());
+    let openai_id = config.resolve_profile_reference(&openai).unwrap();
+    let agent_destination = format!("{base}/chat/completions");
+    let (agent, _) = config
+        .reviewed_agent_https_transport(&openai, &agent_destination)
+        .unwrap();
+    let agent_revision = config.agent_profile_reference_revision(&openai).unwrap();
+
+    let scheduled =
+        crate::scheduler_window::agent::ProfileChoice::for_reference(&config, &anthropic).unwrap();
+    let redactions = &ClipboardPolicy::load().terminal_logging;
+    let scheduled_revision = scheduled.revision(&config, redactions).unwrap();
+    let (scheduler, _) = scheduled.transport(&config).unwrap();
+
+    let (journal, _) = config.journal_question_https_transport(openai_id).unwrap();
+    let journal_revision = config.journal_summary_https_revision(openai_id).unwrap();
+
+    let run = |profile: &local_ai::Profile,
+               credential: Option<zeroize::Zeroizing<String>>,
+               input: &str,
+               authorize: &dyn Fn() -> Result<(), String>| {
+        let (mut session, _cancel) = Session::begin(profile.clone()).unwrap();
+        session.trust_test_server(&ca).unwrap();
+        session.client().complete_reviewed_https_plain_text_before(
+            "Managed HTTPS fixture",
+            input,
+            Instant::now() + Duration::from_secs(10),
+            credential,
+            authorize,
+        )
+    };
+    let require_revision = |current: Option<[u8; 32]>, reviewed| {
+        (current == Some(reviewed))
+            .then_some(())
+            .ok_or_else(|| "The managed HTTPS review changed.".into())
+    };
+    type ReviewedRequest<'a> = (
+        &'a str,
+        &'a local_ai::Profile,
+        &'a dyn Fn() -> Result<(), String>,
+    );
+    let requests: [ReviewedRequest<'_>; 3] = [
+        ("Swarm reviewed request", &agent, &|| {
+            let current = Configuration::load_from(&root).map_err(|error| error.to_string())?;
+            require_revision(
+                current.agent_profile_reference_revision(&openai),
+                agent_revision,
+            )
+        }),
+        ("Scheduler reviewed request", &scheduler, &|| {
+            let current = Configuration::load_from(&root).map_err(|error| error.to_string())?;
+            require_revision(scheduled.revision(&current, redactions), scheduled_revision)
+        }),
+        ("Journal reviewed summary", &journal, &|| {
+            let current = Configuration::load_from(&root).map_err(|error| error.to_string())?;
+            require_revision(
+                current.journal_summary_https_revision(openai_id).ok(),
+                journal_revision,
+            )
+        }),
+    ];
+    for (surface, transport, authorize) in requests {
+        let credential = transport.completion_secret();
+        assert_eq!(credential.as_deref().map(String::as_str), Some(KEY));
+        assert_eq!(
+            run(transport, credential, surface, authorize)
+                .map_err(Error::message)
+                .unwrap(),
+            "Approved fixture response."
+        );
+    }
+
+    std::fs::write(&policy_file, policy("rotated-synthetic-credential")).unwrap();
+    let rotated = Configuration::load_from(&root).unwrap();
+    assert_ne!(
+        rotated.agent_profile_reference_revision(&openai),
+        Some(agent_revision)
+    );
+    assert!(scheduled.revision(&rotated, redactions).is_none());
+    assert_ne!(
+        rotated.journal_summary_https_revision(openai_id).unwrap(),
+        journal_revision
+    );
+    let (rotated_agent, _) = rotated
+        .reviewed_agent_https_transport(&openai, &agent_destination)
+        .unwrap();
+    assert!(matches!(
+        run(&rotated_agent, agent.completion_secret(), "must not dispatch", &|| Ok(())),
+        Err(Error::Review(message)) if message.contains("credential changed")
+    ));
+
+    std::fs::remove_file(&policy_file).unwrap();
+    let revoked = Configuration::load_from(&root).unwrap();
+    assert!(revoked.agent_profile_reference_revision(&openai).is_none());
+    assert!(scheduled.revision(&revoked, redactions).is_none());
+    assert!(revoked.journal_summary_https_revision(openai_id).is_err());
+    assert!(matches!(
+        run(&agent, agent.completion_secret(), "must not dispatch", &|| Ok(())),
+        Err(Error::Review(message)) if message.contains("policy-provided AI profile changed")
+    ));
 }

@@ -85,25 +85,376 @@ pub(crate) fn request(stream: &mut BufReader<TcpStream>) -> Value {
 }
 
 pub(crate) fn wire_request(stream: &mut BufReader<TcpStream>, request_line: &str) -> Vec<u8> {
+    wire_request_headers(stream, request_line).1
+}
+
+fn wire_request_headers(
+    stream: &mut BufReader<TcpStream>,
+    request_line: &str,
+) -> (Vec<(String, String)>, Vec<u8>) {
     let mut line = String::new();
     stream.read_line(&mut line).unwrap();
     assert_eq!(line.trim_end(), request_line);
-    let mut length = None;
+    let mut headers = Vec::new();
     loop {
         line.clear();
         assert!(stream.read_line(&mut line).unwrap() > 0);
         if line == "\r\n" {
             break;
         }
-        if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length")
-        {
-            length = Some(value.trim().parse::<usize>().unwrap());
-        }
+        let (name, value) = line.split_once(':').unwrap();
+        headers.push((name.to_ascii_lowercase(), value.trim().to_owned()));
     }
-    let mut bytes = vec![0; length.unwrap_or_default()];
+    let length = headers
+        .iter()
+        .find(|(name, _)| name == "content-length")
+        .map_or(0, |(_, value)| value.parse::<usize>().unwrap());
+    let mut bytes = vec![0; length];
     stream.read_exact(&mut bytes).unwrap();
-    bytes
+    (headers, bytes)
+}
+
+#[test]
+fn loopback_anthropic_sends_exact_messages_and_reads_json_and_sse() {
+    let (listener, _) = listener();
+    let port = listener.local_addr().unwrap().port();
+    let endpoint = format!("http://localhost:{port}/KorTTY/V1/Messages");
+    let profile =
+        Profile::loopback_anthropic(&endpoint, "explicit/model", ProfileOptions::default())
+            .unwrap();
+    let server = thread::spawn(move || {
+        let stream = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"model\":\"server-label\",\"usage\":{\"input_tokens\":12}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Stream reply\"}}\n\n",
+            "event: content_block_stop\ndata: {\"type\":\"content_block_stop\",\"index\":0}\n\n",
+            "event: message_delta\ndata: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":3}}\n\n",
+            "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
+        );
+        for (streaming, extra_headers, response) in [
+            (
+                false,
+                "Content-Type: application/json\r\n",
+                r#"{"model":"server-label","content":[{"type":"text","text":"JSON reply"}],"stop_reason":"end_turn"}"#,
+            ),
+            (true, "Content-Type: text/event-stream\r\n", stream),
+        ] {
+            let mut socket = accept(&listener);
+            let (headers, body) =
+                wire_request_headers(&mut socket, "POST /KorTTY/V1/Messages HTTP/1.1");
+            assert!(headers.contains(&("anthropic-version".into(), ANTHROPIC_VERSION.into())));
+            assert!(!headers.iter().any(|(name, _)| name == "authorization"));
+            let body: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["model"], "explicit/model");
+            assert_eq!(body["stream"], streaming);
+            assert_eq!(body["system"], "system");
+            assert_eq!(
+                body["messages"],
+                json!([{"role":"user","content":"question"}])
+            );
+            assert!(body.get("integrations").is_none());
+            socket
+                .get_mut()
+                .write_all(fixture_http_response("200 OK", extra_headers, response).as_bytes())
+                .unwrap();
+        }
+    });
+    let client = Client::new(profile);
+    assert_eq!(
+        client.complete_chat("system", &[], "question").unwrap(),
+        "JSON reply"
+    );
+    let mut streamed = String::new();
+    assert_eq!(
+        client
+            .stream_chat(
+                "system",
+                &[],
+                "question",
+                || Ok(()),
+                |delta| {
+                    if let StreamDelta::Text(text) = delta {
+                        streamed.push_str(&text);
+                    }
+                }
+            )
+            .unwrap(),
+        "Stream reply"
+    );
+    assert_eq!(streamed, "Stream reply");
+    assert_eq!(client.model(), "explicit/model");
+    server.join().unwrap();
+}
+
+#[test]
+fn loopback_anthropic_checks_policy_on_a_cached_connection() {
+    let (listener, _) = listener();
+    let address = listener.local_addr().unwrap();
+    let endpoint = format!("http://{address}/v1/messages");
+    let client =
+        Client::new(Profile::loopback_anthropic(&endpoint, "fixture", Default::default()).unwrap());
+    assert!(client.transport.get().is_some());
+    assert!(matches!(
+        client.transport_with_policy(None, || ClipboardPolicy {
+            ai_allowed: false,
+            ..ClipboardPolicy::default()
+        }),
+        Err(Error::Review(message)) if message.contains("Managed policy blocks")
+    ));
+    assert!(
+        client
+            .transport_with_policy(None, ClipboardPolicy::default)
+            .is_ok()
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn server_default_model_sends_no_model_or_inventory_request_on_loopback() {
+    for route in ["external", "compatible", "native"] {
+        let (listener, _) = listener();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let profile = if route == "external" {
+            Profile::configured_with_server_default(&endpoint, ProfileOptions::default())
+        } else {
+            Profile::lm_studio_with_server_default(
+                &endpoint,
+                ProfileOptions::default(),
+                route == "native",
+            )
+        }
+        .unwrap();
+        let native = route == "native";
+        let server = thread::spawn(move || {
+            let (request_line, response) = if native {
+                (
+                    "POST /api/v1/chat HTTP/1.1",
+                    r#"{"model_instance_id":"reported-only","output":[{"type":"message","content":"answer"}]}"#,
+                )
+            } else {
+                (
+                    "POST /v1/chat/completions HTTP/1.1",
+                    r#"{"model":"reported-only","choices":[{"finish_reason":"stop","message":{"content":"answer"}}]}"#,
+                )
+            };
+            for streaming in [false, true] {
+                let mut socket = accept(&listener);
+                let body: Value =
+                    serde_json::from_slice(&wire_request(&mut socket, request_line)).unwrap();
+                assert!(body.get("model").is_none());
+                assert!(body.get("reasoning").is_none());
+                assert!(body.get("reasoning_effort").is_none());
+                assert_eq!(body["stream"], streaming);
+                socket
+                    .get_mut()
+                    .write_all(fixture_http_response("200 OK", "", response).as_bytes())
+                    .unwrap();
+            }
+        });
+        let client = Client::new(profile);
+        assert_eq!(
+            client.complete_chat("system", &[], "question").unwrap(),
+            "answer"
+        );
+        assert_eq!(
+            client.take_usage().unwrap().model.as_deref(),
+            Some("reported-only")
+        );
+        assert_eq!(
+            client
+                .stream_chat("system", &[], "question", || Ok(()), |_| {})
+                .unwrap(),
+            "answer"
+        );
+        assert_eq!(
+            client.take_usage().unwrap().model.as_deref(),
+            Some("reported-only")
+        );
+        assert!(client.profile().uses_server_default_model());
+        assert!(client.model().is_empty());
+        assert!(client.profile().reviewed_model_fingerprint().is_none());
+        server.join().unwrap();
+    }
+}
+
+#[test]
+fn server_default_model_rejects_auto_vision_and_embedding_before_connecting() {
+    let (listener, ordinary) = listener();
+    let endpoint = ordinary.external_address().to_string();
+    let profile =
+        Profile::configured_with_server_default(&endpoint, ProfileOptions::default()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let client = Client::new(profile.clone());
+    assert!(matches!(
+        client.require_vision_supported(deadline, || Ok(())),
+        Err(Error::Review(error)) if error.contains("server selects the model")
+    ));
+    assert!(client.embedding_revision().is_none());
+    assert!(client.embed(&["test"]).is_err());
+    assert!(
+        Client::new(profile.with_vision_mode(VisionMode::Enabled))
+            .require_vision_supported(deadline, || Ok(()))
+            .is_ok()
+    );
+    assert_eq!(
+        listener.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}
+
+#[test]
+fn lm_studio_exact_chat_paths_are_sent_verbatim_after_review() {
+    for (native, suffix, expected) in [
+        (false, "/home/V1/", "/home/V1/chat/completions"),
+        (false, "/V1/Chat/Completions/", "/V1/Chat/Completions/"),
+        (true, "/tenant/API/V1/Chat/", "/tenant/API/V1/Chat/"),
+    ] {
+        let (listener, _) = listener();
+        let endpoint = format!("http://{}{suffix}", listener.local_addr().unwrap());
+        let profile = if native {
+            Profile::lm_studio(
+                &endpoint,
+                "pinned",
+                ProfileOptions {
+                    reasoning_effort: Some("low".into()),
+                    ..ProfileOptions::default()
+                },
+            )
+        } else {
+            Profile::lm_studio_compatible(&endpoint, "pinned", ProfileOptions::default())
+        }
+        .unwrap();
+        assert!(resolve_lm_studio_auto(&endpoint, "", None, native).is_err());
+        let worker = thread::spawn(move || {
+            let mut socket = accept(&listener);
+            let body: Value = serde_json::from_slice(&wire_request(
+                &mut socket,
+                &format!("POST {expected} HTTP/1.1"),
+            ))
+            .unwrap();
+            assert_eq!(body["model"], "pinned");
+            let response = if native {
+                assert_eq!(body["reasoning"], "low");
+                r#"{"output":[{"type":"message","content":"answer"}]}"#
+            } else {
+                r#"{"choices":[{"message":{"content":"answer"}}]}"#
+            };
+            socket
+                .get_mut()
+                .write_all(fixture_http_response("200 OK", "", response).as_bytes())
+                .unwrap();
+        });
+        assert_eq!(
+            Client::new(profile)
+                .complete_chat("system", &[], "question")
+                .unwrap(),
+            "answer"
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn lm_studio_reasoning_reuses_exact_capabilities_and_preserves_model_default() {
+    let (server, _) = listener();
+    let endpoint = server.local_addr().unwrap().to_string();
+    let profile = |reasoning: Option<&str>| {
+        Profile::lm_studio(
+            &endpoint,
+            "ReasoningAlias",
+            ProfileOptions {
+                reasoning_effort: reasoning.map(str::to_owned),
+                ..ProfileOptions::default()
+            },
+        )
+        .unwrap()
+    };
+    let worker = thread::spawn(move || {
+        let mut models = accept(&server);
+        assert!(wire_request(&mut models, "GET /api/v1/models HTTP/1.1").is_empty());
+        models.get_mut().write_all(fixture_http_response("200 OK", "Content-Type: application/json\r\n", r#"{"models":[{"type":"llm","key":"vendor/model","loaded_instances":[{"id":"ReasoningAlias"}],"capabilities":{"vision":false,"reasoning":{"allowed_options":["off","on"],"default":"off"}}}]}"#).as_bytes()).unwrap();
+        drop(models);
+        for expected in [Some("on"), None] {
+            let mut chat = accept(&server);
+            let body: Value =
+                serde_json::from_slice(&wire_request(&mut chat, "POST /api/v1/chat HTTP/1.1"))
+                    .unwrap();
+            assert_eq!(body["model"], "ReasoningAlias");
+            assert_eq!(body["store"], false);
+            assert_eq!(body.get("reasoning").and_then(Value::as_str), expected);
+            chat.get_mut()
+                .write_all(
+                    fixture_http_response(
+                        "200 OK",
+                        "Content-Type: application/json\r\n",
+                        r#"{"output":[{"type":"message","content":"answer"}]}"#,
+                    )
+                    .as_bytes(),
+                )
+                .unwrap();
+        }
+    });
+    let unsupported = Client::new(profile(Some("high"))).complete("System", "Input");
+    assert!(
+        matches!(unsupported, Err(Error::Review(error)) if error.contains("does not support this reasoning setting"))
+    );
+    assert_eq!(
+        Client::new(profile(Some("on")))
+            .complete("System", "Input")
+            .unwrap(),
+        "answer"
+    );
+    assert_eq!(
+        Client::new(profile(None))
+            .complete("System", "Input")
+            .unwrap(),
+        "answer"
+    );
+    worker.join().unwrap();
+}
+
+#[test]
+fn lm_studio_reasoning_rechecks_review_after_a_metadata_lookup() {
+    let (server, _) = listener();
+    let profile = Profile::lm_studio(
+        &server.local_addr().unwrap().to_string(),
+        "review-fixture",
+        ProfileOptions {
+            reasoning_effort: Some("low".into()),
+            ..ProfileOptions::default()
+        },
+    )
+    .unwrap();
+    let client = Client::new(profile);
+    let approved = Arc::new(AtomicBool::new(true));
+    let review = Arc::clone(&approved);
+    let worker = thread::spawn(move || {
+        let mut stream = accept(&server);
+        let _ = wire_request(&mut stream, "GET /api/v1/models HTTP/1.1");
+        approved.store(false, Ordering::Release);
+        stream.get_mut().write_all(fixture_http_response("200 OK", "Content-Type: application/json\r\n", r#"{"models":[{"type":"llm","key":"review-fixture","capabilities":{"vision":false,"reasoning":{"allowed_options":["low"]}}}]}"#).as_bytes()).unwrap();
+        server
+    });
+    let result = client.complete_text_before_guarded(
+        "System",
+        "private review",
+        false,
+        Instant::now() + Duration::from_secs(4),
+        || {
+            review
+                .load(Ordering::Acquire)
+                .then_some(())
+                .ok_or_else(|| "The review was revoked".into())
+        },
+    );
+    assert!(matches!(result, Err(Error::Review(error)) if error == "The review was revoked"));
+    assert_eq!(
+        worker.join().unwrap().accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
 }
 
 #[test]

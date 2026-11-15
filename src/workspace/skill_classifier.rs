@@ -150,7 +150,7 @@ impl Request {
     pub(crate) fn start(
         &self,
         profile: &local_ai::Profile,
-        before_dispatch: impl FnOnce() -> Result<(), String> + Send + 'static,
+        before_dispatch: impl FnMut() -> Result<(), String> + Send + 'static,
     ) -> Result<local_ai::Pending<Vec<u64>>, String> {
         if profile.is_cli() {
             return Err("Skill classification requires a chat provider.".into());

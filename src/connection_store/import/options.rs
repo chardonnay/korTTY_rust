@@ -3,8 +3,9 @@ use std::io;
 
 use super::super::{AuthMethod, Document};
 use super::{
-    Auth, Connection, ImportedLocal, ImportedProfile, ImportedSerial, LocalProfile, Outcome,
-    Preview, SerialProfile, Store, ensure_group, invalid, library, same_profile,
+    Auth, Connection, ImportedLocal, ImportedProfile, ImportedSerial, JavaLibrarySettings,
+    LocalProfile, Outcome, Preview, SerialProfile, Store, ensure_group, invalid, library,
+    same_profile,
 };
 
 #[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -248,11 +249,13 @@ pub(super) fn portable_java_backup(preview: &Preview) -> io::Result<(Vec<u8>, us
         },
         &store,
     )?;
-    let (document, outcome) = stage(
+    let (document, outcome) = stage_with_java_library(
         &store,
         &selection.entries,
         &selection.local_entries,
         &selection.serial_entries,
+        &preview.java_library,
+        |_| {},
     )?;
     Ok((encode(&document)?, outcome.imported))
 }
@@ -294,6 +297,8 @@ pub(super) fn merge_java_backup(
         .map(|profile| ImportedLocal {
             group: group(profile.id),
             profile,
+            java_memory_id: None,
+            java_favorite_id: None,
         })
         .collect();
     let serial_entries: Vec<_> = source
@@ -302,12 +307,26 @@ pub(super) fn merge_java_backup(
         .map(|profile| ImportedSerial {
             group: group(profile.id),
             profile,
+            java_favorite_id: None,
         })
         .collect();
-    let (candidate, outcome) = stage(&store, &entries, &local_entries, &serial_entries)?;
+    let mut favorites = BTreeSet::new();
+    let (mut candidate, outcome) =
+        stage_with_insertions(&store, &entries, &local_entries, &serial_entries, |row| {
+            let (source_id, allocated_id) = row.ids();
+            if source.library.favorites.contains(&source_id) {
+                favorites.insert(allocated_id);
+            }
+        })?;
     if outcome.imported == 0 {
         return Ok(None);
     }
+    candidate.library.favorites.extend(favorites);
+    install_java_colors(
+        &store.document.library,
+        &mut candidate.library,
+        &source.library.group_colors,
+    );
     encode(&candidate).map(Some)
 }
 
@@ -323,7 +342,71 @@ pub(super) fn stage(
     local_entries: &[ImportedLocal],
     serial_entries: &[ImportedSerial],
 ) -> io::Result<(Document, Outcome)> {
-    stage_with_insertions(store, entries, local_entries, serial_entries, |_, _| {})
+    stage_with_insertions(store, entries, local_entries, serial_entries, |_| {})
+}
+
+pub(super) enum Inserted<'a> {
+    Ssh(&'a ImportedProfile, &'a Connection),
+    Local(&'a ImportedLocal, &'a LocalProfile),
+    Serial(&'a ImportedSerial, &'a SerialProfile),
+}
+
+impl Inserted<'_> {
+    fn ids(&self) -> (u64, u64) {
+        match self {
+            Self::Ssh(entry, profile) => (entry.connection.id, profile.id),
+            Self::Local(entry, profile) => (entry.profile.id, profile.id),
+            Self::Serial(entry, profile) => (entry.profile.id, profile.id),
+        }
+    }
+
+    fn java_favorite_id(&self) -> Option<&str> {
+        match self {
+            Self::Ssh(entry, _) => entry.java_favorite_id.as_deref(),
+            Self::Local(entry, _) => entry.java_favorite_id.as_deref(),
+            Self::Serial(entry, _) => entry.java_favorite_id.as_deref(),
+        }
+    }
+}
+
+pub(super) fn stage_with_java_library(
+    store: &Store,
+    entries: &[ImportedProfile],
+    local_entries: &[ImportedLocal],
+    serial_entries: &[ImportedSerial],
+    settings: &JavaLibrarySettings,
+    mut inserted: impl FnMut(Inserted<'_>),
+) -> io::Result<(Document, Outcome)> {
+    let mut favorites = BTreeSet::new();
+    let (mut candidate, outcome) =
+        stage_with_insertions(store, entries, local_entries, serial_entries, |row| {
+            if row
+                .java_favorite_id()
+                .is_some_and(|id| settings.favorites.contains(id))
+            {
+                favorites.insert(row.ids().1);
+            }
+            inserted(row);
+        })?;
+    candidate.library.favorites.extend(favorites);
+    install_java_colors(
+        &store.document.library,
+        &mut candidate.library,
+        &settings.group_colors,
+    );
+    Ok((candidate, outcome))
+}
+
+fn install_java_colors(
+    original: &library::Library,
+    candidate: &mut library::Library,
+    colors: &std::collections::BTreeMap<String, super::super::TabColor>,
+) {
+    for (path, color) in colors {
+        if !original.groups.contains(path) && candidate.groups.contains(path) {
+            candidate.group_colors.insert(path.clone(), *color);
+        }
+    }
 }
 
 pub(super) fn stage_with_insertions(
@@ -331,7 +414,7 @@ pub(super) fn stage_with_insertions(
     entries: &[ImportedProfile],
     local_entries: &[ImportedLocal],
     serial_entries: &[ImportedSerial],
-    mut inserted: impl FnMut(&ImportedProfile, &Connection),
+    mut inserted: impl FnMut(Inserted<'_>),
 ) -> io::Result<(Document, Outcome)> {
     let mut candidate = store.document.clone();
     let mut outcome = Outcome::default();
@@ -360,7 +443,7 @@ pub(super) fn stage_with_insertions(
         candidate
             .library
             .set_os_badge(connection.id, entry.badge.as_deref());
-        inserted(entry, &connection);
+        inserted(Inserted::Ssh(entry, &connection));
         candidate.connections.push(connection);
         outcome.imported += 1;
     }
@@ -382,6 +465,7 @@ pub(super) fn stage_with_insertions(
                 .membership
                 .insert(profile.id, entry.group.clone());
         }
+        inserted(Inserted::Local(entry, &profile));
         candidate.local_profiles.push(profile);
         outcome.imported += 1;
     }
@@ -405,6 +489,7 @@ pub(super) fn stage_with_insertions(
                 .membership
                 .insert(profile.id, entry.group.clone());
         }
+        inserted(Inserted::Serial(entry, &profile));
         candidate.serial_profiles.push(profile);
         outcome.imported += 1;
     }

@@ -73,7 +73,7 @@ impl Prepared {
         let stage = &self._staging;
         #[cfg(windows)]
         let open = |path: &Path| Directory::open(path, false);
-        #[cfg(target_os = "linux")]
+        #[cfg(unix)]
         let open = Directory::open_owner_controlled;
         stage.path.parent().is_some_and(|path| {
             open(path)
@@ -375,10 +375,14 @@ impl Staging {
         Self::in_directory(Directory::open_owner_controlled(&root)?, &root)
     }
 
-    #[cfg(target_os = "windows")]
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
     fn new() -> io::Result<Self> {
         let root = crate::profile::root()?;
-        let parent = Directory::open(&root, false)?.private_child("desktop-drag", true)?;
+        #[cfg(target_os = "windows")]
+        let directory = Directory::open(&root, false)?;
+        #[cfg(target_os = "macos")]
+        let directory = Directory::open_owner_controlled(&root)?;
+        let parent = directory.private_child("desktop-drag", true)?;
         Self::in_directory(parent, &root.join("desktop-drag"))
     }
 

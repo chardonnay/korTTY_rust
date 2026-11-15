@@ -5,13 +5,17 @@ use std::time::{Duration, Instant};
 
 use zeroize::Zeroizing;
 
+use crate::ai_manager::reviewed_memory::{self, Memory};
 use crate::ai_manager::{
     Configuration, RetrievedKnowledge, SkillGuidance, SkillSelection, SkillUsageReceipt,
     SkillUsageSurface,
 };
+use crate::clipboard_policy::{AiMemoryPolicy, ClipboardPolicy};
 use crate::connection_store::Store;
 use crate::terminal_agent::planning::{self as planning_model, Stage};
 use crate::vault_window::VaultWindow;
+use crate::workspace::terminal_ai::web;
+pub(super) use crate::workspace::terminal_ai::web::Message as WebMessage;
 use crate::workspace::{SshTarget, ai_quota, skill_classifier};
 
 use super::knowledge_review;
@@ -19,6 +23,7 @@ use super::swarm::headless::ModelReview as SavedModelReview;
 use super::*;
 
 mod run_target;
+mod web_lookup;
 use run_target::RunTargetReview;
 
 const CHANGED_PINS: &str = "The terminal's saved skill assignments changed. Start a new review.";
@@ -33,6 +38,7 @@ pub enum Message {
     ClassificationQuota(u64, String),
     Classified(u64, Result<Vec<u64>, String>),
     Knowledge(u64, knowledge_review::Message),
+    Web(u64, WebMessage),
 }
 
 impl Message {
@@ -45,7 +51,8 @@ impl Message {
             | Self::Quota(epoch, _)
             | Self::ClassificationQuota(epoch, _)
             | Self::Classified(epoch, _)
-            | Self::Knowledge(epoch, _) => epoch,
+            | Self::Knowledge(epoch, _)
+            | Self::Web(epoch, _) => epoch,
         }
     }
 }
@@ -75,6 +82,7 @@ pub(super) struct Review {
     pub(super) classifier: Option<skill_classifier::Request>,
     pub(super) classification: Classification,
     knowledge: Option<Knowledge>,
+    web_lookup: Option<web_lookup::Lookup>,
 }
 
 struct Knowledge {
@@ -107,6 +115,69 @@ struct Authority {
     private: bool,
     source: Source,
     outbound: Option<OutboundAuthority>,
+    memory: MemoryAuthority,
+}
+
+struct MemoryAuthority {
+    memory: Memory,
+    mask: knowledge_review::Mask,
+    credential: Option<Zeroizing<String>>,
+    vault: Weak<()>,
+}
+
+impl MemoryAuthority {
+    fn capture(
+        workspace: &Workspace,
+        run: &Run,
+        config: &Configuration,
+        connection: Option<u64>,
+        profile: &local_ai::Profile,
+    ) -> Result<Self, String> {
+        let credential = profile.completion_secret();
+        let mask = knowledge_review::Mask::new(
+            run.redactor.clone(),
+            credential.clone(),
+            workspace.vault.as_ref(),
+        );
+        let memory = Memory::masked(
+            config,
+            &workspace.clipboard.policy.ai_memory,
+            connection,
+            !run.binding.private(),
+            |value| mask.apply(value),
+        )?;
+        Ok(Self {
+            memory,
+            mask,
+            credential,
+            vault: workspace.vault_change_revision(),
+        })
+    }
+
+    fn require_current(
+        &self,
+        config: &Configuration,
+        policy: &AiMemoryPolicy,
+        profile: &local_ai::Profile,
+    ) -> Result<(), String> {
+        if self.memory.text().is_some()
+            && (self.vault.strong_count() == 0 || self.credential != profile.completion_secret())
+        {
+            return Err(reviewed_memory::CHANGED.into());
+        }
+        self.memory
+            .require_current_with(config, policy, |value| self.mask.apply(value))
+    }
+
+    fn apply(&self, system: &str, profile: &local_ai::Profile) -> Result<String, String> {
+        let with_memory = self
+            .memory
+            .system(system, profile.structured_system_suffix());
+        if self.mask.apply(&with_memory)? != with_memory {
+            return Err("The reviewed AI memory conflicts with the model request mask.".into());
+        }
+        Ok(with_memory.into_owned())
+    }
 }
 
 #[derive(Clone)]
@@ -259,14 +330,14 @@ struct LiveAuthority {
 #[derive(PartialEq, Eq)]
 enum LiveSource {
     Unassigned,
-    Local(u64),
+    Local(Box<crate::connection_store::LocalProfile>),
     Ssh(Box<SshTarget>),
 }
 
 impl LiveSource {
     fn capture(pane: &PaneSession) -> Self {
         if let Some(local) = &pane.saved_local {
-            return Self::Local(local.id);
+            return Self::Local(Box::new(local.clone()));
         }
         if let Some(target) = &pane.ssh {
             return Self::Ssh(Box::new(target.clone()));
@@ -274,19 +345,25 @@ impl LiveSource {
         Self::Unassigned
     }
 
-    fn saved_pins(&self, root: &std::path::Path) -> Result<Option<Vec<u64>>, String> {
-        let id = match self {
-            Self::Local(id) => Some(*id),
+    fn saved_id(&self) -> Option<u64> {
+        match self {
+            Self::Local(profile) => Some(profile.id),
             Self::Ssh(target) => target.saved_id(),
             Self::Unassigned => None,
-        };
-        let Some(id) = id else {
+        }
+    }
+
+    fn saved_pins(&self, root: &std::path::Path) -> Result<Option<Vec<u64>>, String> {
+        let Some(id) = self.saved_id() else {
             return Ok(None);
         };
         let store = Store::open(crate::profile::connections_path_at(root))
             .map_err(|_| "The saved terminal settings are unavailable.")?;
         let current = match self {
-            Self::Local(_) => store.local(id).map(|profile| &profile.terminal),
+            Self::Local(profile) => store
+                .local(id)
+                .filter(|saved| saved.same_launch(profile))
+                .map(|saved| &saved.terminal),
             Self::Ssh(target) => store
                 .get(id)
                 .filter(|connection| target.matches(connection))
@@ -308,9 +385,10 @@ impl Authority {
     fn check(&self) -> Result<(), String> {
         self.transport.0.require_current_policy_authority()?;
         let root = self.config.saved_root();
+        let policy = ClipboardPolicy::load();
         if let Some(outbound) = &self.outbound {
             outbound.check(&self.transport.0)?;
-            outbound.check_policy(&crate::clipboard_policy::ClipboardPolicy::load())?;
+            outbound.check_policy(&policy)?;
             if root.is_none() || self.private {
                 return Err(
                     "The outbound AI profile must be saved and used in a non-private run.".into(),
@@ -338,7 +416,9 @@ impl Authority {
         match &self.source {
             Source::Live(source) => source.check_worker(root),
             Source::Saved(source) => source.check_worker(),
-        }
+        }?;
+        self.memory
+            .require_current(&self.config, &policy.ai_memory, &self.transport.0)
     }
 
     fn selection(&self, query: &str) -> SkillSelection<'_> {
@@ -563,6 +643,10 @@ impl Review {
                 return Err("The reviewed JSON instruction could not be safely masked.".into());
             }
         }
+        let has_memory = self.authority.memory.memory.text().is_some();
+        if has_memory {
+            system = self.authority.memory.apply(&system, transport)?;
+        }
         if let Some(retrieved) = retrieved {
             let knowledge_mask = knowledge_review::Mask::new(
                 run.redactor.clone(),
@@ -588,16 +672,25 @@ impl Review {
             }
             knowledge_mask.require_current(&system)?;
         }
+        let web_evidence = self.web_context(run, vault)?;
+        if web_evidence.is_some() {
+            system = web::system_with_guidance(&system, transport.structured_system_suffix());
+        }
+        let web_evidence = web_evidence.as_deref();
         let system_chars = system.chars().count();
         let budget = limit.saturating_sub(system_chars);
         let mut input = match self.kind {
-            Kind::Ask if family_preset || retrieved.is_some() => {
-                run.decision_input(false, budget)?
+            Kind::Ask
+                if family_preset || retrieved.is_some() || web_evidence.is_some() || has_memory =>
+            {
+                run.decision_input(false, budget, web_evidence)?
             }
             Kind::Run(engine::RunModel::Decision) => {
-                run.decision_input(self.authority.password_sudo(), budget)?
+                run.decision_input(self.authority.password_sudo(), budget, web_evidence)?
             }
-            Kind::Run(engine::RunModel::FinalAdvice) => run.final_advice_input(budget)?,
+            Kind::Run(engine::RunModel::FinalAdvice) => {
+                run.final_advice_input(budget, web_evidence)?
+            }
             _ => self.base_input.to_string(),
         };
         if system_chars + input.chars().count() > *limit {
@@ -608,8 +701,10 @@ impl Review {
         let cli = if let Some(outbound) = &self.authority.outbound {
             let mask = |value: &str| outbound.mask_text(value, vault);
             let masked_system = mask(&system)?;
-            if retrieved.is_some() && masked_system != system {
-                return Err("The reviewed knowledge no longer matches the outbound mask.".into());
+            if (retrieved.is_some() || has_memory) && masked_system != system {
+                return Err(
+                    "The reviewed model context no longer matches the outbound mask.".into(),
+                );
             }
             system = masked_system;
             let mut request =
@@ -707,7 +802,7 @@ impl Workspace {
         let (kind, input, evidence) = match draft {
             Draft::Ask => (
                 Kind::Ask,
-                run.decision_input(false, limit)?,
+                run.decision_input(false, limit, None)?,
                 run.context.clone(),
             ),
             Draft::Run(kind) => (Kind::Run(kind), String::new(), run_review_evidence(run)),
@@ -727,6 +822,14 @@ impl Workspace {
         };
         let profile = run.profile().ok_or("The agent profile is unavailable.")?;
         let outbound = OutboundAuthority::capture(profile, &transport.0, self.vault.as_ref());
+        let connection = match &source {
+            Source::Live(source) => source
+                .saved_pins
+                .as_ref()
+                .and_then(|_| source.identity.saved_id()),
+            Source::Saved(source) => Some(source.connection_id()),
+        };
+        let memory = MemoryAuthority::capture(self, run, &config, connection, &transport.0)?;
         let authority = Arc::new(Authority {
             config,
             profile: profile.clone(),
@@ -734,6 +837,7 @@ impl Workspace {
             private: run.binding.private(),
             source,
             outbound,
+            memory,
         });
         let relevance = if run.swarm && matches!(kind, Kind::Ask) {
             mask::prompt(&run.redactor, &run.goal)?
@@ -783,6 +887,11 @@ impl Workspace {
                 credential,
             })
         });
+        let web_lookup = web_lookup::Lookup::new(
+            &authority,
+            run,
+            self.clipboard.policy.ai_web_search_allowed && !matches!(kind, Kind::Plan(_)),
+        );
         let mut review = Review {
             authority,
             kind,
@@ -797,6 +906,7 @@ impl Workspace {
             classifier,
             classification: Classification::Closed,
             knowledge,
+            web_lookup,
         };
         self.require_model_review_authority(run, &review)?;
         let vault = self.vault.as_ref();
@@ -822,6 +932,10 @@ impl Workspace {
         run: &Run,
         review: &Review,
     ) -> Result<(), String> {
+        if let Some(evidence) = &run.swarm_web {
+            evidence.require_current(self)?;
+        }
+        review.require_current_web(self)?;
         match &review.authority.source {
             Source::Live(source) => source.require_current(self, run)?,
             Source::Saved(source) => source.require_current(self, run)?,
@@ -848,6 +962,11 @@ impl Workspace {
         if let Some(outbound) = &authority.outbound {
             outbound.check_policy(&self.clipboard.policy)?;
         }
+        authority.memory.require_current(
+            &authority.config,
+            &self.clipboard.policy.ai_memory,
+            &authority.transport.0,
+        )?;
         authority.check()
     }
 
@@ -908,6 +1027,7 @@ impl Workspace {
             }
             Message::ReviewSkills(_)
                 if !run.paused
+                    && !review.web_active()
                     && !review.knowledge_busy()
                     && matches!(review.classification, Classification::Closed) =>
             {
@@ -959,6 +1079,7 @@ impl Workspace {
             }
             Message::Send(_)
                 if !run.paused
+                    && !review.web_active()
                     && review.knowledge_ready()
                     && !review.quota.loading()
                     && matches!(review.classification, Classification::Closed) =>
@@ -974,9 +1095,16 @@ impl Workspace {
                 return self.send_reviewed_request(id, run, review);
             }
             Message::Knowledge(_, message)
-                if matches!(review.classification, Classification::Closed) =>
+                if !review.web_active()
+                    && matches!(review.classification, Classification::Closed) =>
             {
                 return self.review_knowledge_action(id, run, review, message);
+            }
+            Message::Web(_, message)
+                if !review.knowledge_busy()
+                    && matches!(review.classification, Classification::Closed) =>
+            {
+                return self.review_web_action(id, run, review, message);
             }
             _ => {}
         }
@@ -1213,6 +1341,8 @@ impl Workspace {
         let dispatch = self.agent_dispatch_policy(run)?;
         let authority = Arc::clone(&review.authority);
         let cancel = run.cancel.clone();
+        let web = run.swarm_web.clone();
+        let request_web = review.reviewed_web_authority();
         let knowledge = review.knowledge.as_ref().and_then(|knowledge| {
             Some((
                 knowledge.review.retrieved()?,
@@ -1224,6 +1354,12 @@ impl Workspace {
             let check = || {
                 if cancel.requested() {
                     return Err("The reviewed agent run was cancelled.".into());
+                }
+                if let Some(evidence) = &web {
+                    evidence.check()?;
+                }
+                if let Some(web) = &request_web {
+                    web.check()?;
                 }
                 if let Some((_, vault, credential)) = &knowledge {
                     require_knowledge_mask(vault, credential.as_ref(), &authority)?;

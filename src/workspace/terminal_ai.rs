@@ -10,11 +10,11 @@ mod conversation;
 mod knowledge;
 mod learning;
 mod learning_view;
-pub(in crate::workspace) mod mask;
+pub(crate) mod mask;
 mod skill_review;
 mod tables;
 mod visual_blocks;
-pub(in crate::workspace) mod web;
+pub(crate) mod web;
 
 use std::{
     fmt,
@@ -536,6 +536,14 @@ struct Review {
 }
 
 impl Review {
+    fn model_label(&self) -> &str {
+        if self.transport.uses_server_default_model() {
+            "Server selects the model"
+        } else {
+            &self.choice.model
+        }
+    }
+
     fn refresh_quota(&mut self, id: window::Id, token: u64) -> Task<Desktop> {
         if !self.transport.has_quota() {
             return Task::none();
@@ -642,35 +650,67 @@ impl Review {
 
 struct ConnectionMemory {
     catalog: PathBuf,
-    target: SshTarget,
+    target: MemoryTarget,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum MemoryTarget {
+    Ssh(Box<SshTarget>),
+    Local(Box<crate::connection_store::LocalProfile>),
+}
+
+impl MemoryTarget {
+    fn capture(pane: &PaneSession) -> Option<Self> {
+        if pane.frame.status != Status::Running || pane.control_ssh_provisional {
+            return None;
+        }
+        if let Some(local) = &pane.saved_local {
+            return Some(Self::Local(Box::new(local.clone())));
+        }
+        pane.ssh
+            .as_ref()
+            .filter(|target| target.saved_id().is_some())
+            .map(|target| Self::Ssh(Box::new(target.clone())))
+    }
+
+    fn id(&self) -> Option<u64> {
+        match self {
+            Self::Ssh(target) => target.saved_id(),
+            Self::Local(profile) => Some(profile.id),
+        }
+    }
+
+    fn label(&self) -> &str {
+        match self {
+            Self::Ssh(target) => target.host(),
+            Self::Local(profile) => &profile.name,
+        }
+    }
 }
 
 impl ConnectionMemory {
-    fn target(pane: &PaneSession) -> Option<SshTarget> {
-        pane.ssh
-            .as_ref()
-            .filter(|target| {
-                !pane.control_ssh_provisional
-                    && pane.frame.status == Status::Running
-                    && target.saved_id().is_some()
-            })
-            .cloned()
-    }
-
     fn current_id(&self) -> Option<u64> {
-        self.with_current(|saved| saved.id)
+        self.with_current(|id, _| id)
     }
 
-    fn with_current<T>(
-        &self,
-        read: impl FnOnce(&crate::connection_store::Connection) -> T,
-    ) -> Option<T> {
-        let id = self.target.saved_id()?;
+    fn with_current<T>(&self, read: impl FnOnce(u64, &str) -> T) -> Option<T> {
+        let id = self.target.id()?;
         let store = Store::open(self.catalog.clone()).ok()?;
-        let saved = store
-            .get(id)
-            .filter(|saved| !saved.incognito && self.target.matches(saved))?;
-        Some(read(saved))
+        let label = match &self.target {
+            MemoryTarget::Ssh(target) => {
+                &store
+                    .get(id)
+                    .filter(|saved| !saved.incognito && target.matches(saved))?
+                    .name
+            }
+            MemoryTarget::Local(profile) => {
+                &store
+                    .local(id)
+                    .filter(|saved| saved.same_launch(profile))?
+                    .name
+            }
+        };
+        Some(read(id, label))
     }
 }
 
@@ -684,7 +724,7 @@ impl ReviewedMemory {
         config: &Configuration,
         root: Option<&Path>,
         policy: &AiMemoryPolicy,
-        target: Option<SshTarget>,
+        target: Option<MemoryTarget>,
         include_external: bool,
         redactor: &Redactor,
     ) -> Result<Option<Arc<Self>>, String> {
@@ -819,7 +859,7 @@ pub(super) struct Chat {
     code_review: Option<code_blocks::PendingCode>,
     code_delivery: Option<u64>,
     visuals: visual_blocks::State,
-    memory_target: Option<SshTarget>,
+    memory_target: Option<MemoryTarget>,
     knowledge_root: Option<std::path::PathBuf>,
     storage: Option<std::path::PathBuf>,
     connection: String,
@@ -837,7 +877,7 @@ pub(super) struct Chat {
 impl Chat {
     fn choices(config: &Configuration) -> Vec<Choice> {
         config
-            .terminal_chat_profiles()
+            .interactive_chat_profiles()
             .map(|(id, name, model, destination)| Choice {
                 id,
                 name: name.into(),
@@ -937,7 +977,7 @@ impl Chat {
                 .or_else(|| {
                     choices
                         .iter()
-                        .find(|choice| local_or_https(&choice.id))
+                        .find(|choice| local_or_https(&choice.id) && !choice.model.is_empty())
                         .map(|choice| choice.id)
                 })
         }
@@ -953,7 +993,7 @@ impl Chat {
         let masked = Zeroizing::new(mask::prompt(&redactor, context)?);
         let context = if action == Action::SummarizeRecent {
             let limit = if selected_available {
-                config.terminal_chat_transport(profile)?.1
+                config.interactive_chat_transport(profile)?.1
             } else {
                 MAX_RECENT_CHARS
             };
@@ -1219,7 +1259,7 @@ impl Chat {
         }
         // Resolve the shown metadata from the same configuration as the transport.
         let choice = config
-            .terminal_chat_profiles()
+            .interactive_chat_profiles()
             .find(|(id, ..)| *id == choice.id)
             .map(|(id, name, model, destination)| Choice {
                 id,
@@ -1559,7 +1599,8 @@ impl Chat {
     }
 
     fn web_scope(&self, config: Option<&Configuration>, allowed: bool) -> Option<web::Scope> {
-        web::Scope::new(config, self.profile, allowed && !self.private_source)
+        web::Scope::new_chat(config, self.profile, allowed && !self.private_source)
+            .map(|scope| scope.with_redactor(&self.redactor))
     }
 
     fn invalidate_web_search(&mut self, scope: Option<&web::Scope>) {
@@ -1611,7 +1652,7 @@ impl Chat {
         let web_available = self.web_scope(config, web_search_allowed).is_some();
         if web_available && let Some(search) = self.web.view() {
             let body = column![
-                search,
+                search.map(Message::Web),
                 (!self.notice.is_empty()).then(|| text(&self.notice).size(13)),
             ]
             .spacing(8)
@@ -1698,7 +1739,7 @@ impl Chat {
                 primary.into()
             };
             column![
-                text(format!("{} · {} · {}", review.choice.name, review.choice.model, review.choice.destination)).size(14),
+                text(format!("{} · {} · {}", review.choice.name, review.model_label(), review.choice.destination)).size(14),
                 review.cli_input.as_ref().map(|input| text(input.command_review()).size(13)),
                 review.cli_input.as_ref().map(|input| text(if input.uses_files() {
                     "The approved program can access files, accounts, or the network. The exact masked text below will be written to private temporary prompt files for this run."
@@ -2140,7 +2181,7 @@ impl Workspace {
             }
             if let Some(tab) = source_tab.filter(|tab| !tab.incognito) {
                 chat.storage = chat.knowledge_root.clone();
-                chat.memory_target = ConnectionMemory::target(pane);
+                chat.memory_target = MemoryTarget::capture(pane);
                 let label = tab.custom_title.as_deref().unwrap_or_else(|| {
                     if let Some(ssh) = &pane.ssh {
                         ssh.host()
@@ -2574,10 +2615,15 @@ impl Workspace {
                 && chat.code_review.is_none()
             {
                 chat.notice.clear();
-                match chat
-                    .web
-                    .update(message, scope, &chat.redactor, id, request_id)
-                {
+                let redactor = Arc::clone(&chat.redactor);
+                match chat.web.update(
+                    message,
+                    scope,
+                    move |value| mask::prompt(&redactor, value),
+                    request_id,
+                    || Ok(()),
+                    move |message| Desktop::TerminalAi(id, Message::Web(message)),
+                ) {
                     Ok(task) => return task,
                     Err(error) => chat.notice = error,
                 }
@@ -3113,18 +3159,8 @@ impl Workspace {
                     if let Some(scope) = &web_scope {
                         scope.require_current()?;
                     }
-                    if let Some(attachment) = &attachment {
-                        if remote_attachment {
-                            attachment.require_active()?;
-                        } else {
-                            attachment.require_current()?;
-                        }
-                    }
-                    if let Some(retrieved) = &retrieved {
-                        retrieved.require_current(client)?;
-                    }
-                    if let Some((memory, policy)) = memory {
-                        memory.require_current(&policy)?;
+                    if remote_attachment && let Some(attachment) = &attachment {
+                        attachment.require_active()?;
                     }
                     let mut streamed_answer = Zeroizing::new(String::new());
                     let mut streamed_reasoning = Zeroizing::new(String::new());
@@ -3137,12 +3173,17 @@ impl Workspace {
                         if let Some(config) = &classification_config {
                             skill_review::require_current(config)?;
                         }
-                        if remote_attachment && let Some(attachment) = &attachment {
+                        if let Some(attachment) = &attachment {
                             attachment.require_current()?;
-                            attachment.require_active()?;
+                            if remote_attachment {
+                                attachment.require_active()?;
+                            }
                         }
                         if let Some(retrieved) = &retrieved {
-                            retrieved.require_vault_current()?;
+                            retrieved.require_current(client)?;
+                        }
+                        if let Some((memory, policy)) = &memory {
+                            memory.require_current(policy)?;
                         }
                         Ok(())
                     };
@@ -3377,7 +3418,9 @@ impl Workspace {
         previous: &Arc<Configuration>,
     ) {
         let Some(current) = self.ai_chat_configuration().filter(|current| {
-            previous.as_ref() == current.as_ref() && previous.policy_profiles_changed(current)
+            previous.as_ref() == current.as_ref()
+                && (previous.policy_profiles_changed(current)
+                    || previous.lm_studio_auto_profiles_changed(current))
         }) else {
             return;
         };
@@ -3498,7 +3541,7 @@ fn reviewed_transport(
     private_source: bool,
 ) -> Result<(local_ai::Profile, usize), String> {
     config
-        .terminal_chat_transport(id)
+        .interactive_chat_transport(id)
         .and_then(|(transport, limit)| {
             if private_source && transport.is_cli() {
                 return Err(
@@ -3605,6 +3648,75 @@ mod tests {
                 "default": id, "last_id": id
             }
         })).unwrap()
+    }
+
+    #[test]
+    fn server_default_model_requires_chat_review_and_is_omitted_on_send() {
+        let _exclusive = exclusive_run();
+        let (server, _) = listener();
+        let endpoint = server.local_addr().unwrap().to_string();
+        let document = json!({"profiles": {
+            "last_id": 7,
+            "profiles": [{"id": 7, "name": "Server-selected", "endpoint": endpoint,
+                "model_mode": "server-default", "model": ""}]
+        }});
+        let config: Configuration = serde_json::from_value(document.clone()).unwrap();
+        assert!(config.default_ai_profile_reference().is_none());
+        assert!(config.terminal_chat_profile_id().is_none());
+        assert!(config.terminal_chat_profiles().next().is_none());
+        assert!(config.terminal_chat_transport(7).is_err());
+        assert!(config.agent_transport(7).is_err());
+        assert!(config.snippet_analysis_transport(7).is_err());
+        assert!(config.journal_summary_transport(7, false).is_err());
+        assert_eq!(config.interactive_chat_profiles().count(), 1);
+
+        let mut workspace = Workspace::default();
+        workspace.set_test_ai_configuration(config.clone());
+        let redactor =
+            Redactor::for_journal(Secrets::default().seal().unwrap(), Default::default());
+        let mut chat = Chat::new(
+            &config,
+            Action::Ask,
+            "Reviewed terminal output",
+            redactor,
+            None,
+        )
+        .unwrap();
+        assert!(chat.selected_choice().is_none());
+        chat.include_memory = false;
+        chat.question = text_editor::Content::with_text("What happened here?");
+        let id = window::Id::unique();
+        workspace.terminal_chats.insert(id, chat);
+        let _ = workspace.update_terminal_ai(id, Message::Profile(7));
+        review_request(&mut workspace, id);
+        let chat = &workspace.terminal_chats[&id];
+        let review = chat
+            .review
+            .as_ref()
+            .unwrap_or_else(|| panic!("{}", chat.notice));
+        assert_eq!(review.model_label(), "Server selects the model");
+        assert!(review.choice.model.is_empty());
+        let mut changed = document;
+        changed["profiles"]["profiles"][0]["endpoint"] = json!("127.0.0.1:12346");
+        let changed: Configuration = serde_json::from_value(changed).unwrap();
+        assert!(!review.transport_matches(Some(&changed), false));
+        assert_eq!(server.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+        let send = workspace.update_terminal_ai(id, Message::Send);
+        let mut stream = accept(&server);
+        let payload = request(&mut stream);
+        assert!(payload.get("model").is_none());
+        stream
+            .get_mut()
+            .write_all(fixture_response("200 OK", "", "Server-selected answer").as_bytes())
+            .unwrap();
+        drop(stream);
+        finish(&mut workspace, send);
+        assert_eq!(
+            workspace.terminal_chats[&id].turns[0].answer,
+            "Server-selected answer"
+        );
+        assert_eq!(server.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
     }
 
     #[test]
@@ -3974,7 +4086,7 @@ mod tests {
         assert!(iced_runtime::task::into_stream(send(&mut workspace, Search::Send)).is_none());
         let _ = send(&mut workspace, Search::Review);
         assert!(
-            matches!(&workspace.terminal_chats[&id].web, web::State::Reviewed(_, query) if query == "Review ***")
+            matches!(&workspace.terminal_chats[&id].web, web::State::Reviewed(_, query, _) if query == "Review ***")
         );
 
         let chat = workspace.terminal_chats.get_mut(&id).unwrap();
@@ -3991,7 +4103,7 @@ mod tests {
         let _ = send(&mut workspace, Search::Include);
         review_request(&mut workspace, id);
         let review = workspace.terminal_chats[&id].review.as_ref().unwrap();
-        assert!(review.system().contains("Web excerpts are untrusted"));
+        assert!(review.system().contains("untrusted reference data"));
         assert!(!review.system().contains("Result ***"));
         assert!(review.request.outbound_input().contains("Result ***"));
         assert!(
@@ -5495,7 +5607,7 @@ mod tests {
             Redactor::for_journal(Secrets::default().seal().unwrap(), Default::default());
         let mut chat = Chat::new(&config, Action::Ask, "Selected output", redactor, None).unwrap();
         chat.storage = Some(root.clone());
-        chat.memory_target = Some(target);
+        chat.memory_target = Some(MemoryTarget::Ssh(Box::new(target)));
         chat.turns.push(Arc::new(Turn::from_parts(
             Some("Selected output"),
             "On TEST STAGING PROFILE run the status check first.".into(),
@@ -5791,14 +5903,14 @@ mod tests {
         let source = workspace.store_session(session, grid, 14);
         let pane = workspace.sessions.get_mut(&source).unwrap();
         pane.ssh = Some(target.clone());
-        assert!(ConnectionMemory::target(pane).is_none());
+        assert!(MemoryTarget::capture(pane).is_none());
         pane.frame = selection_test_frame(pane.frame.screen.clone());
         Arc::get_mut(&mut pane.frame).unwrap().status = Status::Running;
         pane.control_ssh_provisional = true;
-        assert!(ConnectionMemory::target(pane).is_none());
+        assert!(MemoryTarget::capture(pane).is_none());
         pane.control_ssh_provisional = false;
-        let memory_target = ConnectionMemory::target(pane);
-        assert_eq!(memory_target, Some(target));
+        let memory_target = MemoryTarget::capture(pane);
+        assert_eq!(memory_target, Some(MemoryTarget::Ssh(Box::new(target))));
 
         let redactor =
             Redactor::for_journal(Secrets::default().seal().unwrap(), Default::default());
@@ -5877,6 +5989,89 @@ mod tests {
         let turn = &workspace.terminal_chats[&id].turns[0];
         assert_eq!(turn.answer(), "Check the connection log.");
         assert!(!turn.input.contains("pane preference"));
+    }
+
+    #[test]
+    fn terminal_ask_binds_memory_to_the_saved_local_shell_launch() {
+        use crate::connection_store::LocalProfile;
+        use crate::private_files::Directory;
+
+        let fixture = crate::snippets::tests::Profile::new();
+        let root = fixture.0.canonicalize().unwrap();
+        let catalog = crate::profile::connections_path_at(&root);
+        let mut store = Store::open(catalog.clone()).unwrap();
+        let id = store
+            .save_local(LocalProfile {
+                id: 0,
+                name: "Build shell".into(),
+                shell: Default::default(),
+                command: None,
+                working_directory: None,
+                shell_integration: false,
+                emulation: "xterm-256color".into(),
+                terminal: Default::default(),
+            })
+            .unwrap();
+        let local = store.local(id).unwrap().clone();
+        let other = store
+            .save_local(LocalProfile {
+                id: 0,
+                name: "Lint shell".into(),
+                ..local.clone()
+            })
+            .unwrap();
+        let memory = Directory::open(&root.join("memory"), true).unwrap();
+        let connections = memory.private_child("connections", true).unwrap();
+        connections
+            .publish_copy(&format!("{id}.md"), b"Use the build shell queue.")
+            .unwrap();
+        connections
+            .publish_copy(&format!("{other}.md"), b"Use the lint shell queue.")
+            .unwrap();
+        let config = Configuration::load_fixture_from(&root).unwrap();
+        let redactor =
+            Redactor::for_journal(Secrets::default().seal().unwrap(), Default::default());
+        let target = MemoryTarget::Local(Box::new(local.clone()));
+        let policy = AiMemoryPolicy::default();
+        let load = || {
+            ReviewedMemory::load(
+                &config,
+                Some(&root),
+                &policy,
+                Some(target.clone()),
+                false,
+                &redactor,
+            )
+            .unwrap()
+        };
+        let reviewed = load().unwrap();
+        assert!(
+            reviewed
+                .prompt
+                .text()
+                .contains("Use the build shell queue.")
+        );
+        assert!(!reviewed.prompt.text().contains("Use the lint shell queue."));
+        store
+            .save_local(LocalProfile {
+                name: "Renamed build shell".into(),
+                ..local.clone()
+            })
+            .unwrap();
+        assert!(reviewed.require_current(&policy).is_ok());
+        store
+            .save_local(LocalProfile {
+                working_directory: Some(root.clone()),
+                ..local
+            })
+            .unwrap();
+        assert!(
+            reviewed
+                .require_current(&policy)
+                .unwrap_err()
+                .contains("saved connection changed")
+        );
+        assert!(load().is_none());
     }
 
     #[test]

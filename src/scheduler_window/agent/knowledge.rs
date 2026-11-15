@@ -86,7 +86,7 @@ impl SchedulerView {
         self.skill_preview_closed(preview)
             && self
                 .proposal_review()
-                .is_some_and(|(_, model)| model.knowledge.is_some())
+                .is_some_and(|(_, model)| model.knowledge.is_some() && !model.web_active())
     }
 
     pub(crate) fn proposal_knowledge_mut(&mut self) -> Option<&mut Review> {

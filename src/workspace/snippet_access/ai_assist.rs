@@ -8,12 +8,17 @@ use crate::ai_manager::{
     Configuration, ProfileId, SkillGuidance, SkillUsageReceipt, SkillUsageSurface,
 };
 use crate::clipboard_policy::ClipboardPolicy;
+use crate::editor_window::{self, AiOrigin, EditorWindow};
 use crate::local_ai::{Cancel, Pending, Profile};
+use crate::sftp_window::RemoteEditor;
 use crate::snippet_analysis::request::MAX_REMOTE_REQUEST_BYTES;
+#[cfg(test)]
+use crate::snippet_window::SnippetWindow;
 use crate::snippet_window::ai_assist::{
-    Action, Change, Message as ActionMessage, Outcome, Recipe, Request, Snapshot,
+    Action, Change, Editor, Message as ActionMessage, Outcome, Recipe, Request, Snapshot,
 };
-use crate::snippet_window::{self, SnippetWindow, compare};
+use crate::snippet_window::{self, compare};
+use crate::terminal_clipboard::TerminalClipboard;
 use crate::terminal_logging::{Policy, Redactor, Secrets};
 use crate::vault_window::VaultWindow;
 use crate::workspace::ai_quota;
@@ -23,11 +28,12 @@ use super::{Message, Workspace};
 mod cli;
 
 #[derive(Default)]
-pub(super) struct State(Option<Panel>);
+pub(crate) struct State(Option<Panel>);
 
 struct Panel {
     source: Snapshot,
     recipe: Recipe,
+    explicit_profile: bool,
     profiles: Vec<Choice>,
     skills: Vec<(u64, String)>,
     phase: Phase,
@@ -109,10 +115,43 @@ struct Proposed {
     diff: Option<Box<compare::View>>,
 }
 
+#[derive(Clone)]
 struct Context<'a> {
     policy: &'a ClipboardPolicy,
     vault: Option<&'a VaultWindow>,
     vault_revision: Weak<()>,
+    file: Option<&'a FileScope>,
+}
+
+#[derive(Clone)]
+struct FileScope {
+    origin: AiOrigin,
+    connection: Option<RemoteEditor>,
+    revision: Weak<()>,
+}
+
+impl FileScope {
+    fn authorize(&self, policy: &ClipboardPolicy, edits: bool) -> Result<(), String> {
+        if self.revision.strong_count() == 0 {
+            return Err("The file changed. Review a new AI request.".into());
+        }
+        self.origin.authorize(policy)?;
+        if let Some(connection) = &self.connection {
+            if connection.is_closed() {
+                return Err("The original file connection closed.".into());
+            }
+            if edits
+                && (!connection.writable()
+                    || policy.remote_editor != crate::clipboard_policy::RemoteEditorPolicy::Allow)
+            {
+                return Err("The original file connection is read-only.".into());
+            }
+            if !connection.allows_source_tool(policy, edits) {
+                return Err("Managed policy blocks the original file connection.".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 enum Outbound {
@@ -217,7 +256,7 @@ impl Phase {
 }
 
 impl State {
-    pub(super) fn revalidate_source(&mut self, editor: &SnippetWindow) {
+    pub(super) fn revalidate_source(&mut self, editor: &dyn Editor) {
         if let Some(panel) = self.0.as_mut()
             && panel.phase.outbound().is_some()
             && !panel.current(editor)
@@ -227,15 +266,12 @@ impl State {
         }
     }
 
-    pub(super) fn view<'a>(
-        &'a self,
-        editor: &'a SnippetWindow,
-    ) -> Option<Element<'a, ActionMessage>> {
+    pub(super) fn view<'a>(&'a self, editor: &'a dyn Editor) -> Option<Element<'a, ActionMessage>> {
         let panel = self.0.as_ref()?;
         let close = || button("Close").on_press(ActionMessage::Close);
         let title = match &panel.phase {
             Phase::Last(..) => "Last AI change",
-            _ => "Snippet AI assistance",
+            _ => editor.assistant_title(),
         };
         let mut body = column![
             text(title).size(20),
@@ -249,8 +285,12 @@ impl State {
                     .iter()
                     .find(|choice| Some(choice.id) == panel.recipe.profile)
                     .cloned();
-                let mut actions = Action::ALL.to_vec();
-                if panel.recipe.findings.is_some() {
+                let mut actions: Vec<_> = Action::ALL
+                    .into_iter()
+                    .filter(|&action| editor.supports_ai_action(action))
+                    .collect();
+                if panel.recipe.findings.is_some() && editor.supports_ai_action(Action::SecurityFix)
+                {
                     actions.push(Action::SecurityFix);
                 }
                 let mut options = column![
@@ -366,8 +406,9 @@ impl State {
                                 button("Copy reviewed command").on_press(ActionMessage::CopyCommand)
                             }),
                             button("Propose security fixes…").on_press_maybe(
-                                (panel.recipe.action == Action::SecurityReview)
-                                    .then_some(ActionMessage::Fix)
+                                (panel.recipe.action == Action::SecurityReview
+                                    && editor.supports_ai_action(Action::SecurityFix))
+                                .then_some(ActionMessage::Fix)
                             ),
                             button("Back").on_press(ActionMessage::Back),
                             close()
@@ -409,6 +450,13 @@ impl Workspace {
         for surface in self.snippets.values_mut() {
             surface.assist = State::default();
         }
+        for editor in self.editors.values_mut().chain(
+            self.project_files
+                .values_mut()
+                .filter_map(|tab| tab.editor()),
+        ) {
+            editor.ai_assist = State::default();
+        }
     }
 
     pub(in crate::workspace) fn revalidate_remote_snippet_assistance(&mut self) {
@@ -419,6 +467,7 @@ impl Workspace {
             policy: &self.clipboard.policy,
             vault: self.vault.as_ref(),
             vault_revision: self.vault_change_revision(),
+            file: None,
         };
         for surface in self.snippets.values_mut() {
             if surface
@@ -443,6 +492,38 @@ impl Workspace {
                 );
             }
         }
+        for editor in self.editors.values_mut().chain(
+            self.project_files
+                .values_mut()
+                .filter_map(|tab| tab.editor()),
+        ) {
+            let scope = FileScope {
+                origin: editor.ai_origin.clone(),
+                connection: editor.remote_editor().cloned(),
+                revision: editor.file_ai_revision_token(),
+            };
+            let file_context = Context {
+                file: Some(&scope),
+                ..context.clone()
+            };
+            if editor.ai_assist.0.as_ref().is_some_and(|panel| {
+                (matches!(
+                    panel.phase,
+                    Phase::Review(_) | Phase::Running { .. } | Phase::Result(_)
+                ) && !panel.current(editor))
+                    || scope
+                        .authorize(context.policy, panel.recipe.action.edits_file())
+                        .is_err()
+                    || panel.phase.outbound().is_some_and(|(approved, outbound)| {
+                        !outbound.matches(&file_context)
+                            || config
+                                .as_ref()
+                                .is_none_or(|current| !Arc::ptr_eq(current, approved))
+                    })
+            }) {
+                editor.ai_assist = State::default();
+            }
+        }
     }
 
     pub(super) fn update_snippet_assist(
@@ -462,22 +543,205 @@ impl Workspace {
             policy: &self.clipboard.policy,
             vault: self.vault.as_ref(),
             vault_revision: self.vault_change_revision(),
+            file: None,
         };
         let Some(surface) = self.snippets.get_mut(&id) else {
             return Task::none();
         };
+        surface.assist.update(
+            &mut surface.window,
+            action,
+            config,
+            &context,
+            Dispatch {
+                id,
+                ticket,
+                file: false,
+            },
+            &self.clipboard,
+        )
+    }
+
+    pub(in crate::workspace) fn ssh_file_ai_origin(
+        &self,
+        target: &super::super::SshTarget,
+        session: Option<super::super::SessionId>,
+        incognito: bool,
+    ) -> AiOrigin {
+        AiOrigin {
+            profile: self
+                .saved_terminal_preferences
+                .terminal(target)
+                .and_then(|settings| settings.ai_profile.clone()),
+            target: Some(target.clone()),
+            secrets: session
+                .and_then(|session| self.sessions.get(&session))
+                .and_then(|pane| pane.session.journal_redaction_secrets()),
+            incognito,
+            local_terminal: false,
+        }
+    }
+
+    pub(in crate::workspace) fn assisted_file_view<'a>(
+        &'a self,
+        id: window::Id,
+        editor: &'a EditorWindow,
+        wrap_editor: impl Fn(editor_window::Message) -> Message + 'a,
+    ) -> Element<'a, Message> {
+        if let Some(panel) = editor.ai_assist.view(editor) {
+            return panel.map(move |event| Message::FileAssist(id, event));
+        }
+        let body = editor
+            .view(
+                self.editor_content_theme(),
+                self.window_settings.editor_appearance(),
+                self.window_settings.editor_caret,
+            )
+            .map(wrap_editor);
+        if !editor.file_ai_available()
+            || editor.ai_origin.authorize(&self.clipboard.policy).is_err()
+        {
+            return body;
+        }
+        column![
+            row![
+                button("AI assistance…").on_press_maybe(
+                    self.ai_configuration()
+                        .map(|_| Message::FileAssist(id, ActionMessage::Open))
+                )
+            ]
+            .padding(8),
+            body
+        ]
+        .into()
+    }
+
+    pub(in crate::workspace) fn update_file_assist(
+        &mut self,
+        id: window::Id,
+        action: ActionMessage,
+    ) -> Task<Message> {
+        if self.exiting || self.scheduler_draining || self.hosted_close_locks(id) {
+            return Task::none();
+        }
+        let config = self.ai_configuration();
+        let denied = self.project_remote_denial(id);
+        let ticket = self.allocate();
+        let vault_revision = self.vault_change_revision();
+        let editor = self
+            .editors
+            .get_mut(&id)
+            .or_else(|| self.project_files.get_mut(&id)?.editor());
+        let Some(editor) = editor else {
+            return Task::none();
+        };
         if matches!(action, ActionMessage::Close) {
-            surface.assist = State::default();
+            editor.ai_assist = State::default();
+            return Task::none();
+        }
+        if !editor.file_ai_available() {
+            editor.ai_assist = State::default();
+            return Task::none();
+        }
+        let scope = FileScope {
+            origin: editor.ai_origin.clone(),
+            connection: editor.remote_editor().cloned(),
+            revision: editor.file_ai_revision_token(),
+        };
+        let edits = matches!(action, ActionMessage::Apply | ActionMessage::Undo);
+        let installed = ClipboardPolicy::load();
+        let authorized = denied.map_or_else(
+            || {
+                scope
+                    .authorize(&self.clipboard.policy, edits)
+                    .and_then(|()| scope.authorize(&installed, edits))
+            },
+            Err,
+        );
+        if let Err(error) = authorized {
+            editor.ai_assist = State::default();
+            editor.assist_status(error);
+            return Task::none();
+        }
+        let context = Context {
+            policy: &self.clipboard.policy,
+            vault: self.vault.as_ref(),
+            vault_revision,
+            file: Some(&scope),
+        };
+        let mut state = std::mem::take(&mut editor.ai_assist);
+        let before = editor.file_ai_revision();
+        let task = state.update(
+            editor,
+            action,
+            config,
+            &context,
+            Dispatch {
+                id,
+                ticket,
+                file: true,
+            },
+            &self.clipboard,
+        );
+        editor.ai_assist = state;
+        if editor.file_ai_revision() == before {
+            return task;
+        }
+        let outline = editor.update(editor_window::Message::RefreshOutline);
+        let outline = if self.project_files.contains_key(&id) {
+            outline.map(move |event| {
+                Message::ProjectFile(
+                    id,
+                    super::super::project_access::local_files::Message::Editor(event),
+                )
+            })
+        } else {
+            outline.map(move |event| Message::Editor(id, event))
+        };
+        Task::batch([task, outline])
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Dispatch {
+    id: window::Id,
+    ticket: u64,
+    file: bool,
+}
+
+impl Dispatch {
+    fn wrap(self, event: ActionMessage) -> Message {
+        if self.file {
+            Message::FileAssist(self.id, event)
+        } else {
+            wrap(self.id, event)
+        }
+    }
+}
+
+impl State {
+    fn update(
+        &mut self,
+        editor: &mut dyn Editor,
+        action: ActionMessage,
+        config: Option<Arc<Configuration>>,
+        context: &Context<'_>,
+        dispatch: Dispatch,
+        clipboard: &TerminalClipboard,
+    ) -> Task<Message> {
+        let ticket = dispatch.ticket;
+        if matches!(action, ActionMessage::Close) {
+            *self = State::default();
             return Task::none();
         }
         if matches!(
             action,
             ActionMessage::Open | ActionMessage::OpenCompactCommand
         ) {
-            let source = match surface.window.assist_snapshot() {
+            let source = match editor.assist_snapshot() {
                 Ok(source) => source,
                 Err(error) => {
-                    surface.window.assist_status(error);
+                    editor.assist_status(error);
                     return Task::none();
                 }
             };
@@ -486,12 +750,15 @@ impl Workspace {
                 recipe: Recipe {
                     action: if matches!(action, ActionMessage::OpenCompactCommand) {
                         Action::CompactCommand
-                    } else {
+                    } else if editor.supports_ai_action(Action::default()) {
                         Action::default()
+                    } else {
+                        Action::Describe
                     },
                     ..Recipe::default()
                 },
                 profiles: Vec::new(),
+                explicit_profile: false,
                 skills: Vec::new(),
                 phase: Phase::Configure,
                 status: None,
@@ -501,15 +768,19 @@ impl Workspace {
                 panel.recipe.skills =
                     config.suggest_snippet_skills(&panel.source.language, &panel.source.source);
             }
-            surface.assist = State(Some(panel));
+            *self = State(Some(panel));
             return Task::none();
         }
-        let Some(panel) = surface.assist.0.as_mut() else {
+        let Some(panel) = self.0.as_mut() else {
             return Task::none();
         };
         let opens_review = matches!(action, ActionMessage::Review | ActionMessage::Rerun);
         let result = match action {
-            ActionMessage::Choose(action) if matches!(panel.phase, Phase::Configure) => {
+            ActionMessage::Choose(action)
+                if matches!(panel.phase, Phase::Configure)
+                    && editor.supports_ai_action(action)
+                    && (action != Action::SecurityFix || panel.recipe.findings.is_some()) =>
+            {
                 panel.recipe.action = action;
                 panel.recipe.approved_transport = None;
                 panel.recipe.approved_cli_revision = None;
@@ -521,6 +792,7 @@ impl Workspace {
                     && panel.profiles.iter().any(|choice| choice.id == profile) =>
             {
                 panel.recipe.profile = Some(profile);
+                panel.explicit_profile = true;
                 panel.recipe.approved_transport = None;
                 panel.recipe.approved_cli_revision = None;
                 Ok(())
@@ -553,7 +825,7 @@ impl Workspace {
                 }
             }
             ActionMessage::Review if matches!(panel.phase, Phase::Configure) => {
-                panel.review(&surface.window, config, &context, ticket)
+                panel.review(editor, config, context, ticket)
             }
             ActionMessage::QuotaFinished(token, forecast) => {
                 if let Phase::Review(review) = &mut panel.phase {
@@ -577,9 +849,9 @@ impl Workspace {
                 if review.quota.stale() {
                     panel.status =
                         Some("Review the refreshed quota forecast before sending.".into());
-                    return panel.start_quota(id, ticket);
+                    return panel.start_quota(dispatch);
                 }
-                match panel.start(&surface.window, config.as_ref(), &context, ticket) {
+                match panel.start(editor, config.as_ref(), context, ticket) {
                     Ok(reply) => {
                         panel.status = None;
                         return Task::perform(
@@ -588,7 +860,7 @@ impl Workspace {
                                     Err("The snippet AI worker stopped.".into())
                                 })
                             },
-                            move |result| wrap(id, ActionMessage::Ready(ticket, result)),
+                            move |result| dispatch.wrap(ActionMessage::Ready(ticket, result)),
                         );
                     }
                     Err(error) => Err(error),
@@ -610,7 +882,7 @@ impl Workspace {
                     .is_none_or(|config| !Arc::ptr_eq(config, &approved))
                 {
                     Err("The AI configuration changed while the request was running.".into())
-                } else if !panel.current(&surface.window) {
+                } else if !panel.current(editor) {
                     Err(
                         "The editor changed while AI assistance was running. Review a new request."
                             .into(),
@@ -618,7 +890,7 @@ impl Workspace {
                 } else {
                     result.and_then(|outcome| {
                         if let Some(outbound) = &outbound {
-                            outbound.require_current(&approved, &context)?;
+                            outbound.require_current(&approved, context)?;
                             if context.vault.is_some_and(|vault| vault.summary_contains_secret(outcome.proposed_text())) {
                                 return Err("The AI result contains a vault credential. Review a new request.".into());
                             }
@@ -653,20 +925,19 @@ impl Workspace {
                         return Task::none();
                     }
                     if let Some(outbound) = &proposed.outbound
-                        && let Err(error) = outbound.require_current(&proposed.config, &context)
+                        && let Err(error) = outbound.require_current(&proposed.config, context)
                     {
                         panel.status = Some(error);
                         return Task::none();
                     }
-                    surface
-                        .window
+                    editor
                         .accept_ai_change(
                             panel.source.clone(),
                             panel.recipe.clone(),
                             &proposed.outcome,
                         )
                         .map(|()| {
-                            if let Some(change) = surface.window.last_ai_change() {
+                            if let Some(change) = editor.last_ai_change() {
                                 panel.phase =
                                     Phase::Last(change.clone(), diff_view(change.diff.clone()));
                             }
@@ -682,9 +953,18 @@ impl Workspace {
                 if panel.recipe.action != Action::CompactCommand || proposed.diff.is_some() {
                     return Task::none();
                 }
-                if !self.clipboard.policy.write_allowed || self.clipboard.policy.problem.is_some() {
+                let installed_allows_copy = context.file.is_none_or(|_| {
+                    let installed = ClipboardPolicy::load();
+                    installed.problem.is_none()
+                        && installed.write_allowed
+                        && (!installed.internal || context.policy.internal)
+                });
+                if !context.policy.write_allowed
+                    || context.policy.problem.is_some()
+                    || !installed_allows_copy
+                {
                     Err("Managed policy blocks writing the clipboard.".into())
-                } else if !panel.current(&surface.window)
+                } else if !panel.current(editor)
                     || config
                         .as_ref()
                         .is_none_or(|config| !Arc::ptr_eq(config, &proposed.config))
@@ -693,7 +973,7 @@ impl Workspace {
                 } else if let Some(error) = proposed
                     .outbound
                     .as_ref()
-                    .and_then(|outbound| outbound.require_current(&proposed.config, &context).err())
+                    .and_then(|outbound| outbound.require_current(&proposed.config, context).err())
                 {
                     Err(error)
                 } else if context.vault.is_some_and(|vault| {
@@ -703,49 +983,48 @@ impl Workspace {
                 } else {
                     let command = proposed.outcome.proposed_text().to_owned();
                     panel.status = Some("Reviewed snippet command copied.".into());
-                    return self.write_clipboard(command);
+                    return super::super::clipboard_access::write_value(clipboard, command);
                 }
             }
             ActionMessage::ShowLast => {
-                if let Some(change) = surface.window.last_ai_change() {
+                if let Some(change) = editor.last_ai_change() {
                     panel.phase = Phase::Last(change.clone(), diff_view(change.diff.clone()));
                 }
                 Ok(())
             }
             ActionMessage::Undo => {
                 if let Phase::Last(change, _) = &panel.phase {
-                    surface
-                        .window
+                    editor
                         .undo_ai_change(change)
-                        .and_then(|()| panel.back(&surface.window))
+                        .and_then(|()| panel.back(editor))
                 } else {
                     Ok(())
                 }
             }
             ActionMessage::Rerun if let Phase::Last(change, _) = &panel.phase => {
                 let change = change.clone();
-                surface
-                    .window
+                editor
                     .assist_snapshot()
                     .and_then(|source| change.rerun_source(source))
                     .and_then(|source| {
                         panel.recipe = change.recipe.clone();
                         panel.source = source;
                         panel.phase = Phase::Configure;
-                        panel.review(&surface.window, config, &context, ticket)
+                        panel.review(editor, config, context, ticket)
                     })
             }
             ActionMessage::Fix => {
                 if let Phase::Result(result) = &panel.phase
                     && result.diff.is_none()
                     && panel.recipe.action == Action::SecurityReview
-                    && panel.current(&surface.window)
+                    && editor.supports_ai_action(Action::SecurityFix)
+                    && panel.current(editor)
                     && config
                         .as_ref()
                         .is_some_and(|config| Arc::ptr_eq(config, &result.config))
                 {
                     if let Some(outbound) = &result.outbound
-                        && let Err(error) = outbound.require_current(&result.config, &context)
+                        && let Err(error) = outbound.require_current(&result.config, context)
                     {
                         Err(error)
                     } else {
@@ -758,7 +1037,7 @@ impl Workspace {
                     Ok(())
                 }
             }
-            ActionMessage::Back => panel.back(&surface.window),
+            ActionMessage::Back => panel.back(editor),
             ActionMessage::Diff(message) => {
                 let view = match &mut panel.phase {
                     Phase::Result(result) => match &mut result.diff {
@@ -770,13 +1049,13 @@ impl Workspace {
                 };
                 return view
                     .update(message)
-                    .map(move |event| wrap(id, ActionMessage::Diff(event)));
+                    .map(move |event| dispatch.wrap(ActionMessage::Diff(event)));
             }
             _ => return Task::none(),
         };
         panel.status = result.err();
         if opens_review && panel.status.is_none() {
-            panel.start_quota(id, ticket)
+            panel.start_quota(dispatch)
         } else {
             Task::none()
         }
@@ -823,14 +1102,19 @@ impl Panel {
             .skills
             .retain(|id| self.skills.iter().any(|(available, _)| available == id));
         if prefer_role {
-            self.recipe.profile = config
-                .and_then(|config| {
-                    config.preferred_snippet_assistance_profile_id(
-                        self.recipe.action.uses_text_profile(),
-                    )
-                })
-                .filter(|id| self.profiles.iter().any(|choice| choice.id == *id))
-                .or_else(|| self.profiles.first().map(|choice| choice.id));
+            let available = |id| self.profiles.iter().any(|choice| choice.id == id);
+            self.explicit_profile &= self.recipe.profile.is_some_and(available);
+            if !self.explicit_profile {
+                self.recipe.profile = config
+                    .and_then(|config| {
+                        config.preferred_snippet_assistance_profile_id(
+                            self.recipe.action,
+                            self.source.connection_profile.as_ref(),
+                            available,
+                        )
+                    })
+                    .or_else(|| self.profiles.first().map(|choice| choice.id));
+            }
         }
         self.status = self
             .profiles
@@ -838,13 +1122,13 @@ impl Panel {
             .then(|| "Enable AI features and configure an available profile in AI Manager.".into());
     }
 
-    fn current(&self, editor: &SnippetWindow) -> bool {
+    fn current(&self, editor: &dyn Editor) -> bool {
         editor
             .assist_snapshot()
             .is_ok_and(|current| self.source.same_source(&current))
     }
 
-    fn back(&mut self, editor: &SnippetWindow) -> Result<(), String> {
+    fn back(&mut self, editor: &dyn Editor) -> Result<(), String> {
         self.phase = Phase::Configure;
         self.source = editor.assist_snapshot()?;
         Ok(())
@@ -852,13 +1136,16 @@ impl Panel {
 
     fn review(
         &mut self,
-        editor: &SnippetWindow,
+        editor: &dyn Editor,
         config: Option<Arc<Configuration>>,
         context: &Context<'_>,
         ticket: u64,
     ) -> Result<(), String> {
         if !self.current(editor) {
-            return Err("The snippet changed. Reopen AI assistance for the current draft.".into());
+            return Err("The source changed. Reopen AI assistance for the current draft.".into());
+        }
+        if !editor.supports_ai_action(self.recipe.action) {
+            return Err("The editor cannot use this action in its current state.".into());
         }
         self.configure(config.as_deref(), context.policy, false);
         let config = config.ok_or("AI features are disabled or unavailable.")?;
@@ -878,13 +1165,10 @@ impl Panel {
         {
             return Err("The original AI profile changed. Start a new reviewed request.".into());
         }
-        let (request, _) = self.masked_request(
-            &config,
-            &transport,
-            limit,
-            &context.policy.terminal_logging,
-            context.vault,
-        )?;
+        if let Some(scope) = context.file {
+            scope.authorize(context.policy, self.recipe.action.edits_file())?;
+        }
+        let (request, _) = self.masked_request(&config, &transport, limit, context)?;
         let (outbound, cli) = match choice.route {
             Route::Local => (None, None),
             Route::Https => (
@@ -922,7 +1206,8 @@ impl Panel {
         Ok(())
     }
 
-    fn start_quota(&mut self, id: window::Id, ticket: u64) -> Task<Message> {
+    fn start_quota(&mut self, dispatch: Dispatch) -> Task<Message> {
+        let ticket = dispatch.ticket;
         let Phase::Review(review) = &mut self.phase else {
             return Task::none();
         };
@@ -933,13 +1218,13 @@ impl Panel {
                 review.request.system.as_ref(),
                 review.request.input.as_ref(),
             ],
-            move |forecast| wrap(id, ActionMessage::QuotaFinished(ticket, forecast)),
+            move |forecast| dispatch.wrap(ActionMessage::QuotaFinished(ticket, forecast)),
         )
     }
 
     fn start(
         &mut self,
-        editor: &SnippetWindow,
+        editor: &dyn Editor,
         config: Option<&Arc<Configuration>>,
         context: &Context<'_>,
         ticket: u64,
@@ -947,7 +1232,9 @@ impl Panel {
         let Phase::Review(review) = std::mem::replace(&mut self.phase, Phase::Configure) else {
             return Err("Review the request before sending it.".into());
         };
-        if !self.current(editor) || config.is_none_or(|config| !Arc::ptr_eq(config, &review.config))
+        if !self.current(editor)
+            || !editor.supports_ai_action(self.recipe.action)
+            || config.is_none_or(|config| !Arc::ptr_eq(config, &review.config))
         {
             return Err("The source or AI configuration changed. Review the request again.".into());
         }
@@ -960,13 +1247,13 @@ impl Panel {
         }
         let (transport, limit) = review.choice.transport(&review.config)?;
         transport.require_current_policy_authority()?;
-        let (request, guidance) = self.masked_request(
-            &review.config,
-            &transport,
-            limit,
-            &context.policy.terminal_logging,
-            context.vault,
-        )?;
+        let file = context.file.cloned();
+        let edits = self.recipe.action.edits_file();
+        if let Some(scope) = &file {
+            scope.authorize(context.policy, edits)?;
+        }
+        let (request, guidance) =
+            self.masked_request(&review.config, &transport, limit, context)?;
         if transport != review.transport
             || request.system != review.request.system
             || request.input != review.request.input
@@ -986,13 +1273,20 @@ impl Panel {
         let Pending { reply, cancel } = match (&review.outbound, review.cli) {
             (Some(Outbound::Cli(cli)), Some(prepared)) => {
                 cli.require_current(&saved, context)?;
-                request.start_cli(transport.clone(), prepared.request, cli.guard(saved))
+                let guard = cli.guard(saved);
+                request.start_cli(transport.clone(), prepared.request, move || {
+                    authorize_file(&file, edits)?;
+                    guard()
+                })
             }
             (Some(Outbound::Https(https)), None) => {
                 let https = https.clone();
-                request.start(transport.clone(), move || https.authorize(&saved))
+                request.start(transport.clone(), move || {
+                    authorize_file(&file, edits)?;
+                    https.authorize(&saved)
+                })
             }
-            (None, None) => request.start(transport.clone(), || Ok(())),
+            (None, None) => request.start(transport.clone(), move || authorize_file(&file, edits)),
             _ => {
                 return Err(
                     "The reviewed request no longer matches the selected AI profile.".into(),
@@ -1019,9 +1313,10 @@ impl Panel {
         config: &Configuration,
         transport: &Profile,
         limit: usize,
-        policy: &Policy,
-        vault: Option<&VaultWindow>,
+        context: &Context<'_>,
     ) -> Result<(Request, SkillGuidance), String> {
+        let policy = &context.policy.terminal_logging;
+        let vault = context.vault;
         let guidance = config.reviewed_snippet_skill_guidance(&self.recipe.skills);
         let secrets = Secrets::default();
         let outbound = transport.is_remote() || transport.is_cli();
@@ -1050,7 +1345,15 @@ impl Panel {
         let secrets = secrets
             .seal()
             .map_err(|_| "Could not safely mask the snippet AI request.")?;
-        let redactor = Redactor::for_journal(secrets, policy.clone());
+        let redactor = if let Some(session_secrets) =
+            context.file.and_then(|file| file.origin.secrets.clone())
+        {
+            Redactor::for_journal(session_secrets, policy.clone())
+                .with_overlay(&secrets)
+                .map_err(|_| "Could not safely mask the file AI request.")?
+        } else {
+            Redactor::for_journal(secrets, policy.clone())
+        };
         let mask: crate::snippet_window::ai_assist::Mask = Arc::new(move |text: &str| {
             let overlay = cli_vault
                 .as_ref()
@@ -1125,6 +1428,13 @@ impl Panel {
     }
 }
 
+fn authorize_file(file: &Option<FileScope>, edits: bool) -> Result<(), String> {
+    if let Some(file) = file {
+        file.authorize(&ClipboardPolicy::load(), edits)?;
+    }
+    Ok(())
+}
+
 fn diff_view(diff: Arc<compare::Comparison>) -> Box<compare::View> {
     let mut view = compare::View::default();
     let _ = view.update(compare::Message::Loaded(Ok(diff)));
@@ -1148,6 +1458,55 @@ mod tests {
     use crate::snippets::tests::Profile as Scratch;
 
     use super::*;
+
+    #[test]
+    fn file_actions_select_security_then_origin_and_preserve_explicit_choice() {
+        use crate::ai_manager::ProfileRef;
+
+        let scratch = Scratch::new();
+        let path = scratch.path().with_file_name("review.sh");
+        std::fs::write(&path, "echo fixture\n").unwrap();
+        let document = editor_window::open_terminal_document(&path, true).unwrap();
+        let (mut editor, _) = EditorWindow::with_document(document, None, None);
+        editor.ai_origin.profile = Some(ProfileRef::Numeric(4));
+        let profiles: Vec<_> = (1..=5).map(|id| json!({
+            "id": id, "name": format!("Fixture {id}"), "endpoint": "127.0.0.1:1", "model": "fixture"
+        })).collect();
+        let config = serde_json::from_value(json!({
+            "profiles": {"profiles": profiles, "default": 1, "last_id": 5},
+            "local": {"roles": [2, 3, null, null], "security_profile": 5}
+        }))
+        .unwrap();
+        let mut workspace = Workspace::default();
+        workspace.set_test_ai_configuration(config);
+        let id = window::Id::unique();
+        workspace.editors.insert(id, editor);
+        let profile = |workspace: &Workspace| {
+            workspace.editors[&id]
+                .ai_assist
+                .0
+                .as_ref()
+                .unwrap()
+                .recipe
+                .profile
+        };
+        let _ = workspace.update_file_assist(id, ActionMessage::Open);
+        assert_eq!(profile(&workspace), Some(4));
+        let _ = workspace.update_file_assist(id, ActionMessage::Choose(Action::SecurityReview));
+        assert_eq!(profile(&workspace), Some(5));
+        let _ = workspace.update_file_assist(id, ActionMessage::Choose(Action::Improve));
+        assert_eq!(profile(&workspace), Some(4));
+        let _ = workspace.update_file_assist(id, ActionMessage::Profile(2));
+        let _ = workspace.update_file_assist(id, ActionMessage::Choose(Action::SecurityReview));
+        assert_eq!(profile(&workspace), Some(2));
+        let _ = workspace.update_file_assist(id, ActionMessage::Review);
+        let Phase::Review(review) = &workspace.editors[&id].ai_assist.0.as_ref().unwrap().phase
+        else {
+            panic!("Expected a review");
+        };
+        assert_eq!(review.choice.id, 2);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "echo fixture\n");
+    }
 
     #[test]
     fn snippet_one_liner_copies_locally_and_reviews_the_ai_fallback_before_copying() {
@@ -1430,12 +1789,20 @@ mod tests {
                 ..Default::default()
             },
             profiles: Vec::new(),
+            explicit_profile: false,
             skills: Vec::new(),
             phase: Phase::Configure,
             status: None,
         };
+        let policy = ClipboardPolicy::default();
+        let context = Context {
+            policy: &policy,
+            vault: None,
+            vault_revision: Weak::new(),
+            file: None,
+        };
         assert!(matches!(
-            panel.masked_request(&config, &transport, limit, &Policy::default(), None),
+            panel.masked_request(&config, &transport, limit, &context),
             Err(error) if error.contains("512 KiB")
         ));
     }

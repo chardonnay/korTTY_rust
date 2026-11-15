@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use iced::futures::{StreamExt as _, executor::block_on};
+use iced::futures::executor::block_on;
 
 use super::*;
 use crate::ai_manager::Configuration;
@@ -412,6 +412,119 @@ fn swarm_completion_notices_are_bound_to_the_current_round_and_live_stream() {
 }
 
 #[test]
+fn swarm_status_focus_checks_current_target_attempt_before_revealing() {
+    use iced::advanced::widget::{Operation, operation};
+    use iced::{Font, Rectangle, Renderer, Size, Vector};
+    use iced_runtime::{UserInterface, user_interface::Cache};
+
+    struct TranscriptBounds {
+        surface: StatusSurface,
+        viewport: Option<(Rectangle, Vector)>,
+        transcript: Option<Rectangle>,
+    }
+
+    impl Operation for TranscriptBounds {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+
+        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+            if id == Some(&self.surface.transcript()) {
+                self.transcript = Some(bounds);
+            }
+        }
+
+        fn scrollable(
+            &mut self,
+            id: Option<&Id>,
+            bounds: Rectangle,
+            _: Rectangle,
+            translation: Vector,
+            _: &mut dyn operation::Scrollable,
+        ) {
+            if id == Some(&self.surface.scroll()) {
+                self.viewport = Some((bounds, translation));
+            }
+        }
+    }
+
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    let session = local(&mut workspace, owner, false);
+    let live = Key::Live {
+        session,
+        stream: workspace.sessions[&session].stream_generation,
+    };
+    let saved = Key::Saved(1);
+    let _ = workspace.open_agent_swarm(owner);
+    let id = *workspace.terminal_agents.swarms.keys().next().unwrap();
+    let group = workspace.terminal_agents.swarms.get_mut(&id).unwrap();
+    let mut queue = Queue::new(
+        1,
+        [live, saved]
+            .into_iter()
+            .map(|key| Target {
+                key,
+                label: format!("Target {key:?}"),
+                private: false,
+            })
+            .collect(),
+        2,
+    )
+    .unwrap();
+    let tickets = queue.reserve();
+    let old = tickets[1];
+    assert!(queue.change(old, Status::Failed, "Retryable", ""));
+    assert!(queue.retry(old));
+    let current = queue.reserve()[0];
+    assert!(queue.change(current, Status::Succeeded, "Done", "Swarm transcript"));
+    group.focused = Some(live);
+    group.queue = Some(queue);
+    let rejected = workspace.swarm_action(id, Message::FocusFromStrip(old));
+    assert!(iced_runtime::task::into_stream(rejected).is_none());
+    assert_eq!(workspace.terminal_agents.swarms[&id].focused, Some(live));
+
+    let reveal = workspace.swarm_action(id, Message::FocusFromStrip(current));
+    assert_eq!(workspace.terminal_agents.swarms[&id].focused, Some(saved));
+    let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
+    let mut ui = UserInterface::build(
+        workspace.agent_window_view(id).unwrap(),
+        Size::new(750.0, 330.0),
+        Cache::default(),
+        &mut renderer,
+    );
+    let mut bounds = TranscriptBounds {
+        surface: StatusSurface { id, animate: false },
+        viewport: None,
+        transcript: None,
+    };
+    ui.operate(&renderer, &mut bounds);
+    let (viewport, translation) = bounds.viewport.unwrap();
+    let transcript = bounds.transcript.unwrap();
+    assert!(transcript.y + transcript.height > viewport.y + translation.y + viewport.height);
+    let mut actions = iced_runtime::task::into_stream(reveal).unwrap();
+    for _ in 0..2 {
+        let Some(iced_runtime::Action::Widget(mut action)) = block_on(actions.next()) else {
+            panic!("expected a widget reveal operation");
+        };
+        loop {
+            ui.operate(&renderer, action.as_mut());
+            let operation::Outcome::Chain(next) = action.finish() else {
+                break;
+            };
+            action = next;
+        }
+    }
+    assert!(block_on(actions.next()).is_none());
+    ui.operate(&renderer, &mut bounds);
+    let (viewport, translation) = bounds.viewport.unwrap();
+    let transcript = bounds.transcript.unwrap();
+    let top = viewport.y + translation.y;
+    assert!(transcript.y >= top - 0.5);
+    assert!(transcript.y < top + viewport.height);
+}
+
+#[test]
 fn swarm_saved_script_checks_revision_after_review_without_an_ai_profile() {
     use crate::snippets::{Input, Library};
     use crate::terminal_agent::swarm::script::Prepared;
@@ -515,6 +628,23 @@ fn swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results
     };
     use std::io::Write as _;
 
+    const FIXTURE: &str = "KORTTY_SWARM_WORKFLOW_MEMORY_FIXTURE";
+    const TEST: &str = "workspace::terminal_agent::swarm::tests::swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results";
+    if std::env::var_os(FIXTURE).is_none() {
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(FIXTURE, "1")
+            .env_remove("KORTTY_AI_MEMORY")
+            .output()
+            .unwrap();
+        assert!(
+            child.status.success() && String::from_utf8_lossy(&child.stdout).contains("1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&child.stdout),
+            String::from_utf8_lossy(&child.stderr)
+        );
+        return;
+    }
     let _exclusive = exclusive_run();
     let (peer, _) = listener();
     let profile = Profile::new();
@@ -526,7 +656,36 @@ fn swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results
     config
         .save_fixture_at(&root, &Configuration::default())
         .unwrap();
-    let mut workspace = Workspace::default();
+    let memory = crate::private_files::Directory::open(&root.join("memory"), true).unwrap();
+    let global_memory = "Use the maintenance window. Protect workflow-vault-value.";
+    memory
+        .publish_copy("MEMORY.md", global_memory.as_bytes())
+        .unwrap();
+    memory
+        .private_child("connections", true)
+        .unwrap()
+        .publish_copy("1.md", b"Connection-specific workflow fixture.")
+        .unwrap();
+    let mut vault =
+        kortty_vault::Vault::create(root.join("workflow-vault.json"), b"fixture master password")
+            .unwrap();
+    vault
+        .save(
+            kortty_vault::CredentialInput {
+                label: "Workflow fixture credential".into(),
+                username: "fixture".into(),
+                ..Default::default()
+            },
+            kortty_vault::Secret::new("workflow-vault-value".into()),
+        )
+        .unwrap();
+    let mut workspace = Workspace {
+        vault: Some(crate::vault_window::VaultWindow::with_unlocked_fixture(
+            root.join("workflow-vault.json"),
+            vault,
+        )),
+        ..Workspace::default()
+    };
     workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
     let (owner, _) = workspace.open_window(false);
     local(&mut workspace, owner, false);
@@ -561,6 +720,10 @@ fn swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results
         .as_ref()
         .unwrap();
     let (_, reviewed, header) = workflow.reviewed(1).unwrap();
+    let system = workflow.reviewed_system().to_owned();
+    assert!(system.contains("Use the maintenance window. Protect ***."));
+    assert!(!system.contains("workflow-vault-value"));
+    assert!(!system.contains("Connection-specific workflow fixture"));
     assert!(reviewed.contains("password=***"));
     assert!(!reviewed.contains("fixture-secret"));
     let reviewed = reviewed.to_owned();
@@ -579,28 +742,31 @@ fn swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results
             .is_some()
     );
 
-    let server = std::thread::spawn(move || {
-        let mut socket = accept(&peer);
-        let body = request(&mut socket);
-        assert!(body.get("response_format").is_none());
-        let input = body["messages"][1]["content"].as_str().unwrap();
-        assert_eq!(input, reviewed);
-        assert!(input.contains("operator") && input.contains("2222"));
-        assert!(input.contains("password=***") && !input.contains("fixture-secret"));
-        let system = body["messages"][0]["content"].as_str().unwrap();
-        assert!(system.contains("Execute nothing"));
-        assert!(system.contains("Omit any metadata header"));
-        assert!(system.contains("brief functional description"));
-        let request = body.to_string();
-        assert!(!request.contains("Workflow fixture"));
-        assert!(!request.contains("# Author:") && !request.contains("# Created:"));
+    memory
+        .replace_file("MEMORY.md", b"An updated global memory fixture.")
+        .unwrap();
+    let changed = send(&mut workspace, workflow::Message::Generate(1));
+    assert!(iced_runtime::task::into_stream(changed).is_none());
+    assert_eq!(
+        workspace.terminal_agents.swarms[&id].notice,
+        crate::ai_manager::reviewed_memory::CHANGED
+    );
+    assert_eq!(
+        peer.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+    memory
+        .replace_file("MEMORY.md", global_memory.as_bytes())
+        .unwrap();
+
+    let reply = |socket: &mut std::io::BufReader<std::net::TcpStream>| {
         let body =
             serde_json::json!({"choices":[{"message":{"content":"```bash\r\nprintf ready\r\n```"}}]}).to_string();
         socket
             .get_mut()
             .write_all(fixture_http_response("200 OK", "", &body).as_bytes())
             .unwrap();
-    });
+    };
     let generate = send(&mut workspace, workflow::Message::Generate(1));
     let stale = workspace.swarm_action(
         id,
@@ -617,8 +783,24 @@ fn swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results
             .unwrap()
             .running()
     );
+    let mut socket = accept(&peer);
+    let body = request(&mut socket);
+    assert!(body.get("response_format").is_none());
+    let input = body["messages"][1]["content"].as_str().unwrap();
+    assert_eq!(input, reviewed);
+    assert!(input.contains("operator") && input.contains("2222"));
+    assert!(input.contains("password=***") && !input.contains("fixture-secret"));
+    let sent_system = body["messages"][0]["content"].as_str().unwrap();
+    assert_eq!(sent_system, system);
+    assert!(sent_system.contains("Execute nothing"));
+    assert!(sent_system.contains("Omit any metadata header"));
+    assert!(sent_system.contains("brief functional description"));
+    let encoded = body.to_string();
+    assert!(!encoded.contains("Workflow fixture"));
+    assert!(!encoded.contains("# Author:") && !encoded.contains("# Created:"));
+    reply(&mut socket);
+    drop(socket);
     drain(&mut workspace, generate);
-    server.join().unwrap();
     let group = &workspace.terminal_agents.swarms[&id];
     let draft = group.workflow.as_ref().unwrap().draft(1).unwrap();
     assert_eq!(draft.name(), "inspect_services_password.sh");
@@ -629,4 +811,19 @@ fn swarm_workflow_sends_only_the_reviewed_input_and_discards_stale_panel_results
     assert!(draft.goal().contains("password=***"));
     assert!(group.members.is_empty());
     assert!(group.queue.is_none());
+
+    let _ = send(&mut workspace, workflow::Message::Back);
+    let _ = send(&mut workspace, workflow::Message::Review);
+    let generate = send(&mut workspace, workflow::Message::Generate(3));
+    let mut socket = accept(&peer);
+    let _ = request(&mut socket);
+    memory
+        .replace_file("MEMORY.md", b"Revoked while the model runs.")
+        .unwrap();
+    reply(&mut socket);
+    drop(socket);
+    drain(&mut workspace, generate);
+    let group = &workspace.terminal_agents.swarms[&id];
+    assert!(group.workflow.as_ref().unwrap().draft(3).is_none());
+    assert_eq!(group.notice, crate::ai_manager::reviewed_memory::CHANGED);
 }

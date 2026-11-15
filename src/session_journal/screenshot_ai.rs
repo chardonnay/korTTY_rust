@@ -11,8 +11,9 @@ use tiny_skia::{Color, FilterQuality, Pixmap, PixmapPaint, Transform};
 use zeroize::Zeroizing;
 
 use super::entry_edit::{find_entry, require_java_fields};
+use super::summary_ai::{ObservedUsage, Reporter, Stage};
 use super::viewer::Screenshot;
-use super::{bounded_field, child};
+use super::{bounded_field, child, language};
 use crate::local_ai::{Client, Error};
 use crate::terminal_logging::Redactor;
 
@@ -40,13 +41,90 @@ impl fmt::Debug for Analysis {
     }
 }
 
+pub(crate) struct Analyzed {
+    pub(crate) result: Result<Analysis, String>,
+    pub(crate) usage: Option<ObservedUsage>,
+}
+
 pub(crate) fn analyze(
     client: &Client,
     screenshot: &Screenshot,
     redactor: Option<&Redactor>,
+) -> Analyzed {
+    analyze_guarded(client, screenshot, redactor, None, || Ok(()))
+}
+
+pub(crate) fn analyze_guarded(
+    client: &Client,
+    screenshot: &Screenshot,
+    redactor: Option<&Redactor>,
+    saved_language: Option<&str>,
+    authorize: impl Fn() -> Result<(), String>,
+) -> Analyzed {
+    analyze_recorded(
+        client,
+        screenshot,
+        redactor,
+        saved_language,
+        authorize,
+        None,
+    )
+}
+
+pub(super) fn analyze_with_progress(
+    client: &Client,
+    screenshot: &Screenshot,
+    redactor: Option<&Redactor>,
+    saved_language: Option<&str>,
+    authorize: impl Fn() -> Result<(), String>,
+    reporter: &mut Reporter<'_>,
+) -> Analyzed {
+    reporter.begin(Stage::Screenshot);
+    let analyzed = analyze_recorded(
+        client,
+        screenshot,
+        redactor,
+        saved_language,
+        authorize,
+        Some(reporter),
+    );
+    reporter.clear();
+    analyzed
+}
+
+fn analyze_recorded(
+    client: &Client,
+    screenshot: &Screenshot,
+    redactor: Option<&Redactor>,
+    saved_language: Option<&str>,
+    authorize: impl Fn() -> Result<(), String>,
+    reporter: Option<&mut Reporter<'_>>,
+) -> Analyzed {
+    let mut usage = None;
+    let result = analyze_with_usage(
+        client,
+        screenshot,
+        redactor,
+        saved_language,
+        &authorize,
+        (&mut usage, reporter),
+    );
+    Analyzed { result, usage }
+}
+
+fn analyze_with_usage(
+    client: &Client,
+    screenshot: &Screenshot,
+    redactor: Option<&Redactor>,
+    saved_language: Option<&str>,
+    authorize: &impl Fn() -> Result<(), String>,
+    report: (&mut Option<ObservedUsage>, Option<&mut Reporter<'_>>),
 ) -> Result<Analysis, String> {
     let deadline = Instant::now() + TIMEOUT;
     check_active(client, deadline).map_err(Error::message)?;
+    client
+        .require_vision_supported(deadline, authorize)
+        .map_err(Error::message)?;
     let context =
         Context::read(screenshot, redactor).map_err(|_| SCREENSHOT_UNAVAILABLE.to_owned())?;
     let png = prepare_png(screenshot.bytes())?;
@@ -56,11 +134,28 @@ pub(crate) fn analyze(
     data_url.push_str(PNG_URL_PREFIX);
     STANDARD.encode_string(&png, &mut data_url);
     drop(png);
-    let system = system_prompt(&context.language);
+    let language = saved_language.unwrap_or(&context.language);
+    let language = if client.is_local_usage() {
+        language
+    } else {
+        language::reviewed(language)
+    };
+    let system = system_prompt(language);
     let system = client.render_system_prompt(&system);
     let input = context.user_prompt()?;
     let reply = Zeroizing::new(request(
-        client, screenshot, &system, &input, &data_url, deadline,
+        client,
+        &system,
+        &input,
+        &data_url,
+        deadline,
+        report,
+        || {
+            authorize()?;
+            screenshot
+                .require_current()
+                .map_err(|_| SCREENSHOT_UNAVAILABLE.to_owned())
+        },
     )?);
     response::parse(&reply, &context, client.model(), redactor)
 }
@@ -77,39 +172,76 @@ fn check_active(client: &Client, deadline: Instant) -> Result<(), Error> {
 
 fn request(
     client: &Client,
-    screenshot: &Screenshot,
     system: &str,
     input: &str,
     data_url: &str,
     deadline: Instant,
+    (usage, mut reporter): (&mut Option<ObservedUsage>, Option<&mut Reporter<'_>>),
+    authorize: impl Fn() -> Result<(), String>,
 ) -> Result<String, String> {
     let mut response_format = true;
     let mut delays = [Duration::from_secs(4), Duration::from_secs(10)].into_iter();
-    loop {
-        check_active(client, deadline).map_err(Error::message)?;
-        screenshot
-            .require_current()
-            .map_err(|_| SCREENSHOT_UNAVAILABLE.to_owned())?;
-        let response =
-            client.complete_vision_before(system, input, data_url, response_format, deadline);
-        check_active(client, deadline).map_err(Error::message)?;
-        match response {
-            Err(Error::UnsupportedResponseFormat) if response_format => response_format = false,
-            Err(Error::Status(status @ (429 | 500 | 502 | 503 | 504 | 529))) => {
-                let Some(delay) = delays.next() else {
-                    return Err(Error::Status(status).message());
-                };
-                let wake_at = Instant::now() + delay;
-                if wake_at >= deadline {
-                    return Err(Error::TimedOut.message());
-                }
-                if !client.wait_until(wake_at, &|| false) {
-                    return Err(Error::Cancelled.message());
-                }
+    let stage = Stage::Screenshot;
+    let weight = stage.weight(0);
+    let mut started = false;
+    let mut elapsed = Duration::ZERO;
+    let result = (|| {
+        loop {
+            check_active(client, deadline).map_err(Error::message)?;
+            let mut dispatched_at = None;
+            let response = client.complete_vision_before_guarded(
+                system,
+                input,
+                data_url,
+                response_format,
+                deadline,
+                || {
+                    authorize()?;
+                    if let Some(reporter) =
+                        reporter.as_mut().filter(|reporter| reporter.tracks_work())
+                    {
+                        dispatched_at.get_or_insert_with(|| {
+                            if started {
+                                Instant::now()
+                            } else {
+                                started = true;
+                                reporter.start_work(stage, weight)
+                            }
+                        });
+                    }
+                    Ok(())
+                },
+            );
+            if let Some(at) = dispatched_at {
+                elapsed = elapsed.saturating_add(at.elapsed());
             }
-            result => return result.map_err(Error::message),
+            ObservedUsage::accumulate(
+                usage,
+                ObservedUsage::from_completion(client, response.is_ok()),
+            );
+            check_active(client, deadline).map_err(Error::message)?;
+            match response {
+                Err(Error::UnsupportedResponseFormat) if response_format => response_format = false,
+                Err(Error::Status(status @ (429 | 500 | 502 | 503 | 504 | 529))) => {
+                    let Some(delay) = delays.next() else {
+                        return Err(Error::Status(status).message());
+                    };
+                    let wake_at = Instant::now() + delay;
+                    if wake_at >= deadline {
+                        return Err(Error::TimedOut.message());
+                    }
+                    if !client.wait_until(wake_at, &|| false) {
+                        return Err(Error::Cancelled.message());
+                    }
+                }
+                result => return result.map_err(Error::message),
+            }
         }
+    })();
+    if started && let Some(reporter) = reporter {
+        reporter.finish_elapsed(stage, weight, elapsed);
     }
+    result
 }
 
 fn prepare_png(bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, String> {
@@ -165,20 +297,14 @@ impl Context {
                 let entry = find_entry(document, screenshot.id())?;
                 screenshot.require_entry(entry)?;
                 let mut context = Self {
-                    language: "en".into(),
+                    language: language::DEFAULT.into(),
                     username: String::new(),
                     host: String::new(),
                     caption: Zeroizing::new(String::new()),
                 };
                 if let Some(meta) = child(document.root_element(), "meta") {
-                    require_java_fields(meta, &["appLanguageCode", "username", "host"])?;
-                    let language = bounded_field(meta, "appLanguageCode")?;
-                    if !language.is_empty()
-                        && language.len() <= 32
-                        && language
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-                    {
+                    require_java_fields(meta, &["username", "host"])?;
+                    if let Some(language) = language::read(meta, language::APP_LANGUAGE) {
                         context.language = language.into_owned();
                     }
                     context.username = bounded_field(meta, "username")?.into_owned();

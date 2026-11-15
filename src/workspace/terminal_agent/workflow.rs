@@ -2,16 +2,20 @@
 
 use std::borrow::Cow;
 use std::collections::BTreeSet;
+use std::sync::Weak;
 use std::time::{Duration, Instant};
 
 use iced::Size;
 use iced::widget::text_editor;
 use serde_json::{Value, json};
+use zeroize::Zeroizing;
 
 use crate::ai_manager::{
     Configuration, ProfileId, SkillGuidance, SkillUsageReceipt, SkillUsageSurface,
+    reviewed_memory::{self, Memory},
 };
 use crate::clipboard_policy::ClipboardPolicy;
+use crate::session::StreamLiveness;
 use crate::snippet_analysis::model::hardening::{
     HardeningOption, InputOption, MAX_FILE_SIZE_MIB, Preferences, Requirement,
 };
@@ -27,7 +31,7 @@ use crate::workspace::tab_titles::{MAX_WORKFLOW_FONT, MIN_WORKFLOW_FONT, WindowS
 
 use super::{
     Arc, Desktop, Message as RunMessage, Mode, ProfileChoice, Redactor, Run, Task, Workspace,
-    dialog_placement, local_ai, mask, window,
+    dialog_placement, knowledge_review, local_ai, mask, window,
 };
 
 mod diagram;
@@ -191,6 +195,15 @@ struct Model {
     limit: usize,
 }
 
+impl Model {
+    fn matches(&self, current: &Self) -> bool {
+        self.transport == current.transport
+            && self.name == current.name
+            && self.destination == current.destination
+            && self.limit == current.limit
+    }
+}
+
 struct Authority<'a> {
     owner: window::Id,
     run: &'a Run,
@@ -199,6 +212,8 @@ struct Authority<'a> {
     policy: ClipboardPolicy,
     redactor: Redactor,
     ssh_target: Option<(String, String)>,
+    route: Option<crate::workspace::ssh_access::SshTarget>,
+    stream: Option<Arc<StreamLiveness>>,
 }
 
 struct Request {
@@ -217,6 +232,141 @@ struct Review {
     destination: String,
     goal: String,
     policy: Policy,
+    memory: Option<MemoryReview>,
+}
+
+impl Review {
+    fn require_dispatch(&self, request: &Request, policy: &ClipboardPolicy) -> Result<(), String> {
+        if !policy.ai_agent_allowed()
+            || !policy.terminal_logging.equivalent_redactions(&self.policy)
+            || !workflow_headers_current(&self.headers, &policy.snippets)
+        {
+            return Err(
+                "Managed policy or a reviewed workflow header changed before sending.".into(),
+            );
+        }
+        if let Some(memory) = &self.memory {
+            memory.require_dispatch(&self.model, policy)?;
+            memory.require_masked(&request.system, &request.input)?;
+        }
+        Ok(())
+    }
+}
+
+struct MemoryReview {
+    snapshot: Memory,
+    configuration: Arc<Configuration>,
+    profile: ProfileChoice,
+    mask: knowledge_review::Mask,
+    vault_revision: Weak<()>,
+    credential: Option<Zeroizing<String>>,
+    route: Option<crate::workspace::ssh_access::SshTarget>,
+    stream: Option<Arc<StreamLiveness>>,
+}
+
+impl MemoryReview {
+    fn capture(workspace: &Workspace, authority: &Authority<'_>) -> Result<Self, String> {
+        let credential = authority.model.transport.completion_secret();
+        let mask = knowledge_review::Mask::new(
+            authority.redactor.clone(),
+            credential.clone(),
+            workspace.vault.as_ref(),
+        );
+        let snapshot = Memory::masked(
+            &authority.configuration,
+            &authority.policy.ai_memory,
+            None,
+            true,
+            |text| mask.apply(text),
+        )?;
+        let profile = authority
+            .run
+            .profile()
+            .ok_or("The original AI profile is unavailable.")?
+            .clone();
+        Ok(Self {
+            snapshot,
+            configuration: Arc::clone(&authority.configuration),
+            profile,
+            mask,
+            vault_revision: workspace.vault_change_revision(),
+            credential,
+            route: authority.route.clone(),
+            stream: authority.stream.clone(),
+        })
+    }
+
+    fn current_mask(
+        &self,
+        workspace: &Workspace,
+        authority: &Authority<'_>,
+    ) -> Result<knowledge_review::Mask, String> {
+        let mask = knowledge_review::Mask::new(
+            authority.redactor.clone(),
+            authority.model.transport.completion_secret(),
+            workspace.vault.as_ref(),
+        );
+        self.snapshot.require_current_with(
+            &authority.configuration,
+            &authority.policy.ai_memory,
+            |text| mask.apply(text),
+        )?;
+        self.snapshot.require_current_with(
+            &authority.configuration,
+            &workspace.clipboard.policy.ai_memory,
+            |text| mask.apply(text),
+        )?;
+        Ok(mask)
+    }
+
+    fn require_dispatch(&self, model: &Model, policy: &ClipboardPolicy) -> Result<(), String> {
+        if self
+            .route
+            .as_ref()
+            .is_some_and(|route| !route.workflow_route_allowed(policy))
+            || self.stream.as_ref().is_some_and(|stream| !stream.running())
+        {
+            return Err("The source terminal changed. Review the workflow again.".into());
+        }
+        if self.snapshot.text().is_some()
+            && (self.vault_revision.strong_count() == 0
+                || self.credential != model.transport.completion_secret())
+        {
+            return Err(reviewed_memory::CHANGED.into());
+        }
+        let changed = "The saved AI profile changed. Review the workflow again.";
+        let config = self
+            .configuration
+            .reload_saved()
+            .ok()
+            .filter(Configuration::enabled)
+            .ok_or(changed)?;
+        let saved = workflow_model(&config, &config, &self.profile, false)?;
+        if !model.matches(&saved) {
+            return Err(changed.into());
+        }
+        model.transport.require_current_policy_authority()?;
+        self.snapshot
+            .require_current_with(&config, &policy.ai_memory, |text| self.mask.apply(text))
+    }
+
+    fn require_masked(&self, system: &str, input: &str) -> Result<(), String> {
+        if self.snapshot.text().is_some() {
+            require_memory_mask(&self.mask, system, input)?;
+        }
+        Ok(())
+    }
+}
+
+fn require_memory_mask(
+    mask: &knowledge_review::Mask,
+    system: &str,
+    input: &str,
+) -> Result<(), String> {
+    if mask.apply(system)? != system || mask.apply(input)? != input {
+        return Err("The workflow AI memory could not be safely included.".into());
+    }
+    Ok(())
 }
 
 struct Context {
@@ -224,31 +374,17 @@ struct Context {
     source_shell: String,
     instructions: String,
     evidence: Vec<Value>,
-    memory: Option<crate::ai_manager::MemoryPrompt>,
 }
 
 impl Context {
     fn capture(authority: &Authority<'_>, dialog: &Dialog) -> Result<Self, String> {
         let redactor = &authority.redactor;
         let mask = |value: &str| mask::prompt(redactor, value);
-        let config = &authority.configuration;
-        let memory = if dialog.private {
-            None
-        } else {
-            config.load_memory(
-                config.saved_root(),
-                &authority.policy.ai_memory,
-                None,
-                false,
-                mask,
-            )?
-        };
         Ok(Self {
             goal: mask(&authority.run.goal)?,
             source_shell: mask(&dialog.source_shell)?,
             instructions: mask(dialog.options.instructions.trim())?,
             evidence: authority.run.final_evidence.input(redactor)?,
-            memory,
         })
     }
 
@@ -259,6 +395,7 @@ impl Context {
         language: Language,
         suggestion: u8,
         header: &Header,
+        memory: Option<&MemoryReview>,
     ) -> Result<(String, String, SkillGuidance), String> {
         let mut system = dialog.options.system(language, header)?;
         let config = &authority.configuration;
@@ -270,14 +407,19 @@ impl Context {
             system.push_str("\n\n");
             system.push_str(&masked);
         }
-        if let Some(memory) = &self.memory {
-            system.push_str("\n\n");
-            system.push_str(memory.text());
-        }
         if let std::borrow::Cow::Owned(rendered) =
             authority.model.transport.render_system_prompt(&system)
         {
             system = mask::prompt(&authority.redactor, &rendered)?;
+        }
+        if let Some(memory) = memory {
+            system = memory
+                .snapshot
+                .system(
+                    &system,
+                    authority.model.transport.structured_system_suffix(),
+                )
+                .into_owned();
         }
         let instructions =
             variant_instructions(&self.instructions, suggestion, dialog.options.suggestions);
@@ -289,6 +431,9 @@ impl Context {
             &self.evidence,
             authority.model.limit.saturating_sub(system.chars().count()),
         )?;
+        if let Some(memory) = memory {
+            memory.require_masked(&system, &input)?;
+        }
         Ok((system, input, guidance))
     }
 }
@@ -452,6 +597,8 @@ impl Workspace {
             policy,
             redactor,
             ssh_target,
+            route: pane.ssh.clone(),
+            stream: pane.session.stream_liveness().map(Arc::new),
         })
     }
 
@@ -627,7 +774,13 @@ impl Workspace {
             }
             Message::Generate => {
                 if let Stage::Review(review) = &dialog.stage {
-                    let authority = self.workflow_current(dialog, review)?;
+                    let authority = match self.workflow_current(dialog, review) {
+                        Ok(authority) => authority,
+                        Err(error) => {
+                            dialog.stage = Stage::Setup;
+                            return Err(error);
+                        }
+                    };
                     let review = Arc::clone(review);
                     let total = review.requests.len();
                     dialog.generation += 1;
@@ -844,6 +997,12 @@ impl Workspace {
         let authority = self.workflow_authority(dialog.run, dialog.run_epoch)?;
         let redactor = &authority.redactor;
         let context = Context::capture(&authority, dialog)?;
+        let memory = (!dialog.private)
+            .then(|| MemoryReview::capture(self, &authority))
+            .transpose()?;
+        if let Some(memory) = &memory {
+            memory.current_mask(self, &authority)?;
+        }
         let creator = mask::prompt(redactor, &kortty_pty::local_username().unwrap_or_default())?;
         let profile_name = mask::prompt(redactor, &authority.model.name)?;
         let generated_at = jiff::Zoned::now().datetime();
@@ -892,8 +1051,14 @@ impl Workspace {
                 return Err("A workflow header contains text that requires masking.".into());
             }
             for suggestion in 1..=suggestions {
-                let (system, input, guidance) =
-                    context.request(&authority, dialog, language, suggestion, header)?;
+                let (system, input, guidance) = context.request(
+                    &authority,
+                    dialog,
+                    language,
+                    suggestion,
+                    header,
+                    memory.as_ref(),
+                )?;
                 requests.push(Request {
                     language,
                     suggestion,
@@ -911,20 +1076,26 @@ impl Workspace {
             goal: context.goal,
             model: authority.model,
             policy: self.clipboard.policy.terminal_logging.clone(),
+            memory,
         })
     }
 
     fn workflow_current(&self, dialog: &Dialog, review: &Review) -> Result<Authority<'_>, String> {
         let authority = self.workflow_authority(dialog.run, dialog.run_epoch)?;
-        if authority.model.transport != review.model.transport
-            || authority.model.name != review.model.name
-            || authority.model.destination != review.model.destination
-            || authority.model.limit != review.model.limit
+        if !review.model.matches(&authority.model)
             || !authority.redactor.uses_redactions(&review.policy)
             || !workflow_headers_current(&review.headers, &authority.policy.snippets)
         {
             return Err("The reviewed AI profile, redactions or workflow header changed. Review the request again.".into());
         }
+        let current_mask = review
+            .memory
+            .as_ref()
+            .map(|memory| {
+                memory.require_dispatch(&review.model, &authority.policy)?;
+                memory.current_mask(self, &authority)
+            })
+            .transpose()?;
         let context = Context::capture(&authority, dialog)?;
         for request in &review.requests {
             if let Some(text) = request.header.text()
@@ -940,12 +1111,21 @@ impl Workspace {
                 request.language,
                 request.suggestion,
                 &request.header,
+                review.memory.as_ref(),
             )?;
             if (system.as_str(), input.as_str())
                 != (request.system.as_str(), request.input.as_str())
                 || guidance != request.guidance
             {
                 return Err("The reviewed workflow evidence or AI guidance changed. Review the request again.".into());
+            }
+            if let Some(mask) = &current_mask
+                && review
+                    .memory
+                    .as_ref()
+                    .is_some_and(|memory| memory.snapshot.text().is_some())
+            {
+                require_memory_mask(mask, &system, &input)?;
             }
         }
         Ok(authority)
@@ -976,11 +1156,26 @@ impl Workspace {
             unreachable!("the workflow stage was checked");
         };
         let request = &pending.review.requests[index];
+        let result_mask = pending
+            .review
+            .memory
+            .as_ref()
+            .filter(|memory| memory.snapshot.text().is_some())
+            .map(|_| {
+                knowledge_review::Mask::new(
+                    authority.redactor.clone(),
+                    authority.model.transport.completion_secret(),
+                    self.vault.as_ref(),
+                )
+            });
         let checked = result.as_ref().map_err(Clone::clone).and_then(|draft| {
             if mask::prompt(&authority.redactor, draft.code())? != draft.code()
                 || mask::prompt(&authority.redactor, draft.name())? != draft.name()
             {
                 return Err("The generated workflow contains text that requires masking.".into());
+            }
+            if let Some(mask) = &result_mask {
+                require_memory_mask(mask, draft.code(), draft.name())?;
             }
             Ok(draft)
         });
@@ -1137,20 +1332,12 @@ impl Dialog {
             self.private,
         );
         let started = local_ai::start(profile, move |client| {
+            let request = &review.requests[index];
             let authorize = || {
                 let policy = ClipboardPolicy::load();
-                (policy.ai_agent_allowed()
-                    && policy
-                        .terminal_logging
-                        .equivalent_redactions(&review.policy)
-                    && workflow_headers_current(&review.headers, &policy.snippets))
-                .then_some(())
-                .ok_or_else(|| {
-                    "Managed policy or a reviewed workflow header changed before sending.".into()
-                })
+                review.require_dispatch(request, &policy)
             };
             authorize()?;
-            let request = &review.requests[index];
             let output = client
                 .complete_text_before_guarded(
                     &request.system,
@@ -1160,6 +1347,9 @@ impl Dialog {
                     authorize,
                 )
                 .map_err(local_ai::Error::message)?;
+            if review.memory.is_some() {
+                authorize()?;
+            }
             script::finish_draft(&output, request.language, &review.goal, &request.header)
         });
         let started = match started {

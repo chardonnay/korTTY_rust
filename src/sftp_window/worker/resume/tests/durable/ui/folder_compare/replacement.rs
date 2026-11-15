@@ -84,7 +84,7 @@ fn sftp_reviewed_replacement_rejects_a_changed_windows_acl_after_preview() {
 #[cfg(windows)]
 #[test]
 fn scheduled_replacement_binds_acl_changes_without_changing_file_identity_or_bytes() {
-    use crate::sftp_window::worker::sync::replacement::ScheduledDownload;
+    use crate::sftp_window::worker::sync::replacement::ScheduledReplacement;
 
     let fixture = crate::snippets::tests::Profile::new();
     let root = fixture.0.canonicalize().unwrap();
@@ -110,17 +110,18 @@ fn scheduled_replacement_binds_acl_changes_without_changing_file_identity_or_byt
     .unwrap();
     let path = review.replacement_candidates(Side::Local).next().unwrap();
     let prepare = || {
-        ScheduledDownload::prepare(
+        ScheduledReplacement::prepare(
             &mut client(|bytes| {
                 download_reviewed_file(bytes, 1, SOURCES[1].1);
             }),
             &review,
             path,
+            Side::Local,
             &|| false,
         )
         .unwrap()
     };
-    let fields = |plan: &ScheduledDownload| {
+    let fields = |plan: &ScheduledReplacement| {
         let mut proof = Vec::new();
         plan.bind(&mut |field| proof.push(field.to_vec())).unwrap();
         proof

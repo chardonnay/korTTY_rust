@@ -4,7 +4,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::process::Command;
 use std::sync::Arc;
 
-use kortty_ssh::{Endpoint, SshTarget as Peer, StartupChannel};
+use kortty_ssh::{Endpoint, ExecConnection, SshTarget as Peer, StartupChannel};
 
 use crate::clipboard_policy::RemoteEditorPolicy;
 use crate::session_security::IsolationLevel;
@@ -18,6 +18,57 @@ use crate::workspace::SshTarget;
 use super::*;
 
 const WHEEL: u32 = 10;
+
+#[test]
+#[ignore = "requires Linux OpenSSH and getent"]
+fn openssh_scheduler_account_lookup_uses_only_the_pinned_command_transport() {
+    let fixture = OpenSshFixture::new();
+    let key = fixture.directory().join("client");
+    let request = fixture.request(key.clone());
+    let login = request.target.endpoint;
+    // The private fixture is created under a sticky temporary root.
+    let server = fixture.serve_with_extra("host", "StrictModes no\n");
+    let target = Peer {
+        endpoint: Endpoint::new(&login.host, login.port).unwrap(),
+        username: login.username.clone(),
+        authentication: ssh_connection::private_key(&key).unwrap(),
+    };
+    let tcp = ssh_connection::connect_transport(&target.endpoint, || false).unwrap();
+    let connection = ExecConnection::connect_preconnected(
+        tcp,
+        (target, Vec::new()),
+        fixture.pinned_trust(),
+        request.options,
+        || false,
+        || Ok(()),
+    )
+    .unwrap();
+    let opener = connection.exec_opener().unwrap();
+    let denied = resolve_scheduler_account(
+        opener.clone(),
+        Kind::User,
+        &login.username,
+        || false,
+        Arc::new(|| Err(io::Error::from(io::ErrorKind::PermissionDenied))),
+    )
+    .unwrap_err();
+    assert!(denied.message.contains("could not open the SSH command"));
+    let uid = resolve_scheduler_account(
+        opener,
+        Kind::User,
+        &login.username,
+        || false,
+        Arc::new(|| Ok(())),
+    )
+    .unwrap();
+    assert_eq!(uid, identity("-u").parse::<u32>().unwrap());
+    drop(connection);
+    let output = server.join().unwrap();
+    let trace = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(trace.matches("Accepted publickey").count(), 1, "{trace}");
+    assert_eq!(trace.matches("request exec").count(), 1, "{trace}");
+    assert!(!trace.contains("request subsystem"), "{trace}");
+}
 
 #[test]
 #[ignore = "requires Fedora OpenSSH/getent, wheel membership, and KORTTY_SSH_TEST_EXE"]

@@ -188,9 +188,31 @@ pub(crate) struct Usage {
     pub completion_tokens: u64,
     pub total_tokens: u64,
     pub call_count: u64,
+    pub partial: bool,
     pub cost: f64,
+    pub cost_partial: bool,
     pub currency: Option<String>,
     pub local: bool,
+}
+
+impl Usage {
+    fn add_cost(&mut self, other: &Self) {
+        self.cost_partial |= other.cost_partial;
+        if other.cost == 0.0 {
+            return;
+        }
+        if self.cost == 0.0 || (self.currency.is_none() && other.currency.is_some()) {
+            self.cost_partial |= self.cost != 0.0;
+            self.cost = other.cost;
+            self.currency.clone_from(&other.currency);
+        } else if self.currency.is_some() && self.currency == other.currency {
+            let sum = self.cost + other.cost;
+            self.cost_partial |= !sum.is_finite();
+            self.cost = sum.clamp(-f64::MAX, f64::MAX);
+        } else {
+            self.cost_partial = true;
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -320,10 +342,8 @@ impl Node {
                 .usage
                 .call_count
                 .saturating_add(journal.usage.call_count);
-            self.usage.cost = (self.usage.cost + journal.usage.cost).clamp(-f64::MAX, f64::MAX);
-            if self.usage.currency.is_none() {
-                self.usage.currency.clone_from(&journal.usage.currency);
-            }
+            self.usage.partial |= journal.usage_partial;
+            self.usage.add_cost(&journal.usage);
         }
         match self.kind() {
             Kind::Journal => {

@@ -3,8 +3,8 @@ use std::io;
 
 use super::super::{ActiveAuth, AuthMethod, Document};
 use super::{
-    Auth, ImportedProfile, LoginTarget, MAX_BYTES, Preview, Store, invalid, options, same_profile,
-    valid_teamwork_id, xml,
+    Auth, ImportedProfile, JavaLibrarySettings, LoginTarget, MAX_BYTES, MAX_PROFILES, Preview,
+    Store, invalid, kortty, library, options, same_profile, valid_teamwork_id, xml,
 };
 use crate::clipboard_policy::ServerAccess;
 
@@ -31,6 +31,57 @@ pub(crate) struct JavaImportedRoute {
 pub(crate) struct JavaConnectionImport {
     pub(crate) contents: Option<Vec<u8>>,
     pub(crate) routes: BTreeMap<String, JavaImportedRoute>,
+    pub(crate) memory_ids: BTreeMap<String, u64>,
+    pub(crate) groups: JavaSourceGroups,
+}
+
+#[derive(Default)]
+pub(crate) struct JavaSourceGroups {
+    members: Vec<JavaGroupMember>,
+    incomplete: bool,
+}
+
+struct JavaGroupMember {
+    group: String,
+    source_id: Option<String>,
+}
+
+impl JavaSourceGroups {
+    pub(super) fn record(&mut self, group: &io::Result<String>, source_id: Option<&str>) {
+        match group {
+            Ok(group) if !group.is_empty() && self.members.len() == MAX_PROFILES => {
+                self.incomplete = true;
+            }
+            Ok(group) if !group.is_empty() => self.members.push(JavaGroupMember {
+                group: group.clone(),
+                source_id: source_id.map(str::to_owned),
+            }),
+            Ok(_) => {}
+            // A malformed group field may hide a member of any selected group.
+            Err(_) => self.incomplete = true,
+        }
+    }
+
+    /// Resolves all source members before native deduplication or policy filtering.
+    pub(crate) fn resolve<'a>(
+        &'a self,
+        group: &str,
+        routes: &'a BTreeMap<String, JavaImportedRoute>,
+    ) -> Option<Vec<(&'a str, &'a JavaImportedRoute)>> {
+        if self.incomplete || !library::valid_path(group) {
+            return None;
+        }
+        let members = self
+            .members
+            .iter()
+            .filter(|entry| library::group_suffix(&entry.group, group).is_some())
+            .map(|entry| {
+                let id = entry.source_id.as_deref()?;
+                Some((id, routes.get(id)?))
+            })
+            .collect::<Option<Vec<_>>>()?;
+        (!members.is_empty()).then_some(members)
+    }
 }
 
 enum Credential {
@@ -48,6 +99,11 @@ pub(crate) struct JavaConnectionBindings {
 }
 
 impl JavaConnectionBindings {
+    pub(crate) fn with_library(mut self, settings: JavaLibrarySettings) -> Self {
+        self.imports = self.imports.with_java_library(settings);
+        self
+    }
+
     pub(crate) fn review(
         source: Option<&[u8]>,
         current: Option<&[u8]>,
@@ -199,25 +255,45 @@ impl JavaConnectionBindings {
                 ),
             };
         }
-        stage_import(&self.local, &self.imports, policy)
+        stage_import(&self.local, self.imports, policy)
     }
 }
 
-pub(crate) fn prepare_java_connection_import(
+#[cfg(test)]
+fn prepare_java_connection_import(
     source: &[u8],
     current: Option<&[u8]>,
     policy: &ServerAccess,
 ) -> io::Result<JavaConnectionImport> {
-    let imports = binding_source(source, false)?;
+    prepare_java_connection_import_with_library(
+        source,
+        current,
+        policy,
+        JavaLibrarySettings::default(),
+    )
+}
+
+pub(crate) fn prepare_java_connection_import_with_library(
+    source: &[u8],
+    current: Option<&[u8]>,
+    policy: &ServerAccess,
+    library: JavaLibrarySettings,
+) -> io::Result<JavaConnectionImport> {
+    let imports = binding_source(source, false)?.with_java_library(library);
     let local = local_store(current)?;
-    stage_import(&local, &imports, policy)
+    stage_import(&local, imports, policy)
 }
 
 fn binding_source(source: &[u8], strict_ids: bool) -> io::Result<Preview> {
     if source.len() as u64 > MAX_BYTES {
         return Err(invalid("connection import exceeds its size limit"));
     }
-    xml::parse_java_binding_source(source, strict_ids)
+    let source_kind = if strict_ids {
+        kortty::Source::CredentialReview
+    } else {
+        kortty::Source::RouteLineage
+    };
+    xml::parse_java_backup(source, source_kind)
 }
 
 fn local_store(current: Option<&[u8]>) -> io::Result<Store> {
@@ -230,38 +306,61 @@ fn local_store(current: Option<&[u8]>) -> io::Result<Store> {
     })
 }
 
+pub(crate) fn java_connection_candidate(candidate: &[u8]) -> io::Result<Store> {
+    local_store(Some(candidate))
+}
+
 fn stage_import(
     local: &Store,
-    imports: &Preview,
+    imports: Preview,
     policy: &ServerAccess,
 ) -> io::Result<JavaConnectionImport> {
     let mut routes = BTreeMap::new();
-    let (candidate, outcome) = options::stage_with_insertions(
+    let mut memory_ids = BTreeMap::new();
+    let (candidate, outcome) = options::stage_with_java_library(
         local,
         &imports.entries,
         &imports.local_entries,
         &imports.serial_entries,
-        |entry, connection| {
-            if let Some(source) = &entry.java_id
-                && let Some((target, jump)) = &entry.java_route
-                && connection.matches_route(target, jump.as_ref())
-                && connection.blocked_server(policy).is_none()
-            {
-                routes.insert(
-                    source.clone(),
-                    JavaImportedRoute {
-                        id: connection.id,
-                        target: target.clone(),
-                        jump: jump.clone(),
-                    },
-                );
+        &imports.java_library,
+        |inserted| match inserted {
+            options::Inserted::Ssh(entry, connection) => {
+                if let Some((target, jump)) = &entry.java_route
+                    && connection.matches_route(target, jump.as_ref())
+                    && connection.blocked_server(policy).is_none()
+                {
+                    if let Some(source) = &entry.java_memory_id {
+                        memory_ids.insert(source.clone(), connection.id);
+                    }
+                    if let Some(source) = &entry.java_id {
+                        routes.insert(
+                            source.clone(),
+                            JavaImportedRoute {
+                                id: connection.id,
+                                target: target.clone(),
+                                jump: jump.clone(),
+                            },
+                        );
+                    }
+                }
             }
+            options::Inserted::Local(entry, profile) => {
+                if let Some(source) = &entry.java_memory_id {
+                    memory_ids.insert(source.clone(), profile.id);
+                }
+            }
+            options::Inserted::Serial(..) => {}
         },
     )?;
     let contents = (outcome.imported > 0)
         .then(|| options::encode(&candidate))
         .transpose()?;
-    Ok(JavaConnectionImport { contents, routes })
+    Ok(JavaConnectionImport {
+        contents,
+        routes,
+        memory_ids,
+        groups: imports.java_groups,
+    })
 }
 
 fn eligible(entry: &ImportedProfile, local: &Document, policy: &ServerAccess) -> bool {
@@ -280,13 +379,12 @@ fn eligible(entry: &ImportedProfile, local: &Document, policy: &ServerAccess) ->
 
 /// Rechecks the exact candidate destinations referenced by migrated Java jobs.
 pub(crate) fn check_java_imported_routes(
-    candidate: &[u8],
+    candidate: &Store,
     expected: &[JavaImportedRoute],
     policy: &ServerAccess,
 ) -> io::Result<()> {
-    let candidate = super::super::decode_document(candidate)?;
     let by_id: BTreeMap<_, _> = candidate
-        .connections
+        .connections()
         .iter()
         .map(|connection| (connection.id, connection))
         .collect();
@@ -599,25 +697,32 @@ mod tests {
                 ..endpoint("jump.example", "jump")
             }),
         );
-        check_java_imported_routes(&bytes, std::slice::from_ref(route), policy.server_access())
-            .unwrap();
+        let candidate = java_connection_candidate(&bytes).unwrap();
+        check_java_imported_routes(
+            &candidate,
+            std::slice::from_ref(route),
+            policy.server_access(),
+        )
+        .unwrap();
         let mut changed = route.clone();
         changed.id = document.connections[0].id;
         assert_eq!(
-            check_java_imported_routes(&bytes, &[changed], policy.server_access())
+            check_java_imported_routes(&candidate, &[changed], policy.server_access())
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::InvalidData,
         );
         let mut changed = route.clone();
         changed.jump.as_mut().unwrap().port = 22;
-        assert!(check_java_imported_routes(&bytes, &[changed], policy.server_access()).is_err());
+        assert!(
+            check_java_imported_routes(&candidate, &[changed], policy.server_access()).is_err()
+        );
         let changed_policy = crate::clipboard_policy::parse(
             "[meta]\nschema-version = 1\n[[rule]]\n[rule.servers]\nmode = 'deny'\nhosts = ['jump.example:2222']",
         ).unwrap();
         assert_eq!(
             check_java_imported_routes(
-                &bytes,
+                &candidate,
                 std::slice::from_ref(route),
                 changed_policy.server_access()
             )
@@ -625,5 +730,124 @@ mod tests {
             .kind(),
             io::ErrorKind::PermissionDenied,
         );
+    }
+
+    #[test]
+    fn java_group_lineage_keeps_archive_order_and_canonical_paths() {
+        let source = br#"<connections schemaVersion="2">
+            <connection id="child"><name>Child</name><host>child.example</host><username>alice</username>
+                <group> / Ops / Hosts // Child / </group></connection>
+            <connection id="unrelated"><name>Unrelated</name><host>unrelated.example</host><username>alice</username>
+                <group>Ops/HostsPlus</group></connection>
+            <connection id="root"><name>Root</name><host>root.example</host><username>alice</username>
+                <group> / </group></connection>
+            <connection id="parent"><name>Parent</name><host>parent.example</host><username>alice</username>
+                <group>Ops/Hosts</group></connection>
+        </connections>"#;
+        let plain = prepare_java_connection_import(source, None, &ServerAccess::default()).unwrap();
+        let credential_review =
+            JavaConnectionBindings::review(Some(source), None, &[], &[], &ServerAccess::default())
+                .unwrap()
+                .bind_with_routes(&BTreeMap::new(), &BTreeMap::new(), &ServerAccess::default())
+                .unwrap();
+        for prepared in [plain, credential_review] {
+            let expected = [prepared.routes["child"].id, prepared.routes["parent"].id];
+            let routes = prepared
+                .groups
+                .resolve("Ops/Hosts", &prepared.routes)
+                .unwrap();
+            assert_eq!(
+                routes,
+                [
+                    ("child", &prepared.routes["child"]),
+                    ("parent", &prepared.routes["parent"]),
+                ]
+            );
+            let candidate = java_connection_candidate(&prepared.contents.unwrap()).unwrap();
+            assert!(
+                candidate
+                    .in_group("Ops/Hosts")
+                    .map(|entry| entry.id)
+                    .eq(expected)
+            );
+            assert_eq!(candidate.group_of(prepared.routes["root"].id), None);
+            assert!(
+                prepared
+                    .groups
+                    .resolve("ops/Hosts", &prepared.routes)
+                    .is_none()
+            );
+            assert!(
+                prepared
+                    .groups
+                    .resolve("Ops/Absent", &prepared.routes)
+                    .is_none()
+            );
+        }
+        let (portable, count) = Preview::java_backup(source)
+            .unwrap()
+            .portable_java_backup()
+            .unwrap();
+        assert_eq!(count, 4);
+        let portable = java_connection_candidate(&portable).unwrap();
+        assert!(
+            portable
+                .in_group("Ops/Hosts")
+                .map(|entry| entry.name.as_str())
+                .eq(["Child", "Parent"])
+        );
+        let ordinary = Preview::parse_bytes(super::super::Format::Kortty, source).unwrap();
+        assert_eq!(ordinary.invalid, 2);
+    }
+
+    #[test]
+    fn java_group_lineage_rejects_unmapped_members_without_narrowing_scope() {
+        let source = br#"<connections>
+            <connection id="safe"><host>safe.example</host><username>alice</username><group>Safe</group></connection>
+            <connection id="missing-control"><host>ok.example</host><username>alice</username><group>Missing</group></connection>
+            <connection><host>missing.example</host><username>alice</username><group>Missing/Child</group></connection>
+            <connection id="bad id"><host>bad-id.example</host><username>alice</username><group>InvalidId</group></connection>
+            <connection id="duplicate"><host>outside.example</host><username>alice</username></connection>
+            <connection id="duplicate"><host>inside.example</host><username>alice</username><group>DuplicateId</group></connection>
+            <connection id="overlap1"><host>same.example</host><username>alice</username><group>Overlap</group></connection>
+            <connection id="overlap2"><host>same.example</host><username>alice</username><group>Overlap</group></connection>
+            <connection id="shell"><name>Shell</name><protocol>LOCAL_SHELL</protocol><group>NonSsh</group></connection>
+            <connection id="blocked"><host>blocked.example</host><username>alice</username><group>Policy/Child</group></connection>
+            <connection id="bad-group"><host>bad-group.example</host><username>alice</username><group>BadGroup/..</group></connection>
+        </connections>"#;
+        let policy = crate::clipboard_policy::parse(
+            "[meta]\nschema-version = 1\n[[rule]]\n[rule.servers]\nmode = 'deny'\nhosts = ['blocked.example']",
+        ).unwrap();
+        let prepared =
+            prepare_java_connection_import(source, None, policy.server_access()).unwrap();
+        let safe = prepared.groups.resolve("Safe", &prepared.routes).unwrap();
+        assert_eq!(safe, [("safe", &prepared.routes["safe"])]);
+        assert!(prepared.routes.contains_key("missing-control"));
+        for group in [
+            "Missing",
+            "InvalidId",
+            "DuplicateId",
+            "Overlap",
+            "NonSsh",
+            "Policy",
+            "BadGroup",
+        ] {
+            assert!(
+                prepared.groups.resolve(group, &prepared.routes).is_none(),
+                "{group}"
+            );
+        }
+    }
+
+    #[test]
+    fn java_group_lineage_rejects_unclassifiable_source_rows() {
+        let source = br#"<connections>
+            <connection id="safe"><host>safe.example</host><username>alice</username><group>Ops</group></connection>
+            <connection id="unknown"><host>unknown.example</host><username>alice</username><group>Ops</group><group>Other</group></connection>
+        </connections>"#;
+        let prepared =
+            prepare_java_connection_import(source, None, &ServerAccess::default()).unwrap();
+        assert!(prepared.routes.contains_key("safe"));
+        assert!(prepared.groups.resolve("Ops", &prepared.routes).is_none());
     }
 }

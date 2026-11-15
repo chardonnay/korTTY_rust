@@ -252,7 +252,7 @@ pub(super) fn publish_bytes(
     )
 }
 
-pub(super) fn verify_new_destination(
+pub(in crate::job_executor) fn verify_new_destination(
     client: &mut Sftp<impl Read, impl Write>,
     remote: &RemotePath,
 ) -> Result<(), Failure> {

@@ -61,6 +61,49 @@ impl AnalysisDiagram {
         Ok(saved)
     }
 
+    pub(in crate::snippet_analysis) fn from_java(
+        input: &super::model::java_history::Diagram,
+        source: &super::model::Source,
+    ) -> Result<Self, String> {
+        if input.type_id != "logical-structure" || input.mermaid.len() > MAX_SOURCE_BYTES {
+            return Err("This historical diagram uses a different format.".into());
+        }
+        let diagram = parse_mermaid(&input.mermaid).map_err(|error| error.to_string())?;
+        let mut references = Vec::new();
+        if input.source_sha256 == source.sha256 && source.content.is_some() {
+            for link in &input.code_references {
+                let Some(node) = diagram
+                    .nodes()
+                    .iter()
+                    .position(|node| node.id() == link.node_id)
+                else {
+                    continue;
+                };
+                if SourceRange::new(link.start_line, link.end_line)
+                    .is_some_and(|range| range.end() as usize <= source.line_count)
+                    && !references
+                        .iter()
+                        .any(|reference: &CodeReference| reference.node == node)
+                {
+                    references.push(CodeReference {
+                        node,
+                        start_line: link.start_line,
+                        end_line: link.end_line,
+                    });
+                }
+            }
+        }
+        let native = Self {
+            mermaid: input.mermaid.clone(),
+            fallback: input.fallback,
+            fallback_reason: (!input.notice.is_empty()).then(|| input.notice.clone()),
+            generated_at: input.generated_at,
+            references,
+        };
+        native.validate(source.line_count)?;
+        Ok(native)
+    }
+
     pub(crate) fn parse(&self) -> Result<Diagram, String> {
         if self.mermaid.len() > MAX_SOURCE_BYTES
             || self.references.len() > MAX_NODES

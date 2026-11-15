@@ -60,6 +60,9 @@ impl Editor {
                 if self.catalog.is_marked_default(profile.id) {
                     label.push_str(" · Default");
                 }
+                if profile.restore_review && profile.java_embedded_model.is_some() {
+                    label.push_str(" · Needs model review");
+                }
                 list.push(
                     button(text(label).wrapping(text::Wrapping::WordOrGlyph))
                         .width(Length::Fill)
@@ -218,6 +221,26 @@ impl Editor {
                 text(credential).wrapping(text::Wrapping::WordOrGlyph)
             ),
             discovered,
+            self.lm_studio_vision_status(profile)
+                .map(|status| text(status).size(13)),
+            self.lm_studio_capability(profile)
+                .and_then(|model| model.reasoning.as_ref())
+                .map(|reasoning| {
+                    let options = reasoning
+                        .allowed
+                        .iter()
+                        .copied()
+                        .map(Reasoning::from_lm_studio)
+                        .map(|option| option.to_string())
+                        .collect::<Vec<_>>();
+                    text(if options.is_empty() {
+                        "No model reasoning controls reported.".into()
+                    } else {
+                        format!("Available reasoning settings · {}", options.join(", "))
+                    })
+                    .size(13)
+                    .wrapping(text::Wrapping::WordOrGlyph)
+                }),
             profile
                 .policy_auto_problem()
                 .map(|problem| text(problem).size(13).wrapping(text::Wrapping::WordOrGlyph)),
@@ -280,7 +303,8 @@ impl Editor {
         let form = match self.section {
             Section::Connection => column![
                 self.connection(profile, editable, reveal),
-                (!profile.is_cli()).then(|| self.web_search_view(profile, editable)),
+                (!profile.is_cli() && !profile.restore_review)
+                    .then(|| self.web_search_view(profile, editable)),
             ]
             .spacing(10)
             .into(),
@@ -305,7 +329,11 @@ impl Editor {
                     "Test connection"
                 })
                 .style(button::secondary)
-                .on_press_maybe(editable.then_some(Message::Test)),
+                .on_press_maybe(
+                    (editable
+                        && !(profile.restore_review && profile.java_embedded_model.is_some()))
+                    .then_some(Message::Test)
+                ),
                 space::horizontal(),
                 button("Delete")
                     .style(button::danger)
@@ -343,6 +371,23 @@ impl Editor {
         editable: bool,
         reveal: &Reveal,
     ) -> Element<'a, Message> {
+        if profile.restore_review
+            && let Some(source) = &profile.java_embedded_model
+        {
+            return column![
+                field(
+                    reveal,
+                    ProfileSetting::Connection,
+                    text(profile.connection_mode.to_string())
+                ),
+                self.imported_model_notice(profile, source.as_str()),
+                button("Choose local model…")
+                    .style(button::secondary)
+                    .on_press(Message::Section(Section::Model)),
+            ]
+            .spacing(10)
+            .into();
+        }
         let mode = if mlx_runtime::supported() || profile.is_mlx() {
             choice(
                 ConnectionMode::WITH_MLX,
@@ -379,38 +424,80 @@ impl Editor {
         if let Some(protocol) = profile.remote_protocol() {
             let destination = profile.destination().ok();
             let credential_editable = editable && profile.trusted_remote_endpoint;
-            let provider_picker = editable.then(|| cloud_provider_picker(profile));
+            let lm_studio = profile.connection_mode.uses_lm_studio_inventory();
+            let loopback_messages = profile.connection_mode == ConnectionMode::LoopbackAnthropic;
+            let provider_picker = (editable
+                && !lm_studio
+                && !loopback_messages
+                && !profile.connection_mode.is_exact_https())
+            .then(|| cloud_provider_picker(profile));
+            let placeholder = match profile.connection_mode {
+                ConnectionMode::LmStudio => "https://localhost:1234/api/v1/chat",
+                ConnectionMode::LmStudioCompatible => "https://localhost:1234/v1/chat/completions",
+                ConnectionMode::LoopbackAnthropic => "https://localhost:1234/v1/messages",
+                _ => match protocol {
+                    crate::local_ai::RemoteProtocol::OpenAi => "https://api.openai.com/v1",
+                    crate::local_ai::RemoteProtocol::OpenAiExact => {
+                        "https://gateway.example/v1/chat/completions/"
+                    }
+                    crate::local_ai::RemoteProtocol::MiniMaxNative => {
+                        crate::local_ai::MINIMAX_NATIVE_ENDPOINT
+                    }
+                    crate::local_ai::RemoteProtocol::Anthropic => "https://api.anthropic.com/v1",
+                    crate::local_ai::RemoteProtocol::AnthropicExact => {
+                        "https://gateway.example/tenant/v1/messages"
+                    }
+                },
+            };
             return column![
                 mode,
                 provider_picker,
-                text_field(reveal, ProfileSetting::Endpoint, editable, text_input(match protocol {
-                    crate::local_ai::RemoteProtocol::OpenAi => "https://api.openai.com/v1",
-                    crate::local_ai::RemoteProtocol::Anthropic => "https://api.anthropic.com/v1",
-                }, &profile.endpoint).on_input_maybe(editable.then_some(|value| Message::Edit(Field::Endpoint, value)))),
+                text_field(reveal, ProfileSetting::Endpoint, editable, text_input(placeholder, &profile.endpoint)
+                    .on_input_maybe(editable.then_some(|value| Message::Edit(Field::Endpoint, value)))),
                 destination.as_ref().map(|url| text(format!("Request destination · {url}")).size(13)),
                 field(reveal, ProfileSetting::Trust, checkbox(profile.trusted_remote_endpoint)
                     .label("Trust this HTTPS destination to receive reviewed AI requests")
                     .on_toggle_maybe((editable && destination.is_some()).then_some(Message::TrustRemote))),
-                text_field(reveal, ProfileSetting::Credential, credential_editable, text_input("API key environment variable name", &profile.credential_env)
+                text_field(reveal, ProfileSetting::Credential, credential_editable, text_input(if lm_studio || loopback_messages { "Environment variable name (optional)" } else { "API key environment variable name" }, &profile.credential_env)
                     .on_input_maybe(credential_editable.then_some(|value| Message::Edit(Field::Credential, value)))),
-                text("Requests send reviewed content outside this computer. Certificate verification uses the system trust store. The profile stores the credential variable name only.").size(13),
+                text(if lm_studio || loopback_messages {
+                    "Certificate verification uses the system trust store. The profile stores only the credential variable name."
+                } else {
+                    "Requests send reviewed content outside this computer. Certificate verification uses the system trust store. The profile stores the credential variable name only."
+                }).size(13),
             ].spacing(10).into();
         }
-        let mut trusted = checkbox(profile.trusted_local_endpoint)
-            .label("Trust this local endpoint with an API key");
-        if editable {
+        let loopback_messages = profile.connection_mode == ConnectionMode::LoopbackAnthropic;
+        let mut trusted = checkbox(profile.trusted_local_endpoint).label(
+            if profile.restore_review || loopback_messages {
+                "Review and trust this local AI endpoint"
+            } else {
+                "Trust this local endpoint with an API key"
+            },
+        );
+        if editable && profile.local_endpoint_is_valid() {
             trusted = trusted.on_toggle(Message::TrustLocal);
         }
         let credential_editable = editable && profile.trusted_local_endpoint;
         column![
             mode,
-            text_field(reveal, ProfileSetting::Endpoint, editable, text_input(if profile.connection_mode == ConnectionMode::LmStudio { "127.0.0.1:1234" } else { "127.0.0.1:11434" }, &profile.endpoint)
+            text_field(reveal, ProfileSetting::Endpoint, editable, text_input(if loopback_messages {
+                local_ai::ANTHROPIC_LOOPBACK_ENDPOINT
+            } else if profile.connection_mode.uses_lm_studio_inventory() {
+                "localhost:1234"
+            } else {
+                "127.0.0.1:11434"
+            }, &profile.endpoint)
                 .on_input_maybe(editable.then_some(|value| Message::Edit(Field::Endpoint, value)))),
+            loopback_messages.then(|| profile.destination().ok())
+                .flatten().map(|url| text(format!("Request destination · {url}")).size(13)),
+            profile.restore_review.then(|| text("Check that the restored endpoint runs on this computer before enabling the profile.").size(13)),
             field(reveal, ProfileSetting::Trust, trusted),
             text_field(reveal, ProfileSetting::Credential, credential_editable, text_input("Environment variable name (optional)", &profile.credential_env)
                 .on_input_maybe(credential_editable.then_some(|value| Message::Edit(Field::Credential, value)))),
             text("Store only the name of the environment variable here. A loopback address can also point to a tunnel or proxy. Enable trust only if this endpoint runs on this computer.").size(13),
             (profile.connection_mode == ConnectionMode::LmStudio).then(|| text("Uses /api/v1/chat with server-side conversation storage disabled. Reviewed conversation history is included as an ordered transcript.").size(13)),
+            (profile.connection_mode == ConnectionMode::LmStudioCompatible).then(|| text("Sends chat requests to /v1/chat/completions. Model discovery uses /api/v1/models.").size(13)),
         ]
         .spacing(10)
         .into()
@@ -461,12 +548,35 @@ impl Editor {
         editable: bool,
         reveal: &Reveal,
     ) -> Element<'a, Message> {
-        let selection = choice(
-            ModelMode::ALL,
-            profile.model_mode,
-            editable,
-            Message::ModelMode,
-        );
+        let can_auto_select = profile.connection_mode.allows_automatic_model_selection()
+            && (!profile.connection_mode.uses_lm_studio_inventory()
+                || profile
+                    .lm_studio_endpoint()
+                    .is_ok_and(|endpoint| endpoint.supports_metadata()));
+        let selection = if profile.connection_mode == ConnectionMode::LoopbackAnthropic {
+            text(ModelMode::Manual.to_string()).into()
+        } else if profile.server_default_available() && !can_auto_select {
+            choice(
+                [ModelMode::Manual, ModelMode::ServerDefault],
+                profile.model_mode,
+                editable,
+                Message::ModelMode,
+            )
+        } else if profile.server_default_available() {
+            choice(
+                ModelMode::ALL,
+                profile.model_mode,
+                editable,
+                Message::ModelMode,
+            )
+        } else {
+            choice(
+                [ModelMode::Manual, ModelMode::Auto],
+                profile.model_mode,
+                editable,
+                Message::ModelMode,
+            )
+        };
         let choices = cloud::model_choices(profile, &self.models);
         let has_choices = !choices.is_empty();
         let discovered = super::picker::escape_dismissible(
@@ -475,17 +585,37 @@ impl Editor {
             })
             .placeholder("Choose a model"),
         );
-        let model_input = text_input("Model identifier", &profile.model)
-            .on_input_maybe(editable.then_some(|value| Message::Edit(Field::Model, value)));
+        let automatic_lm_studio = profile.ordinary_lm_studio_auto();
+        let model_input = text_input(
+            if automatic_lm_studio {
+                "Optional preferred model identifier"
+            } else {
+                "Model identifier"
+            },
+            &profile.model,
+        )
+        .on_input_maybe(editable.then_some(|value| Message::Edit(Field::Model, value)));
         let mut model = column![field(reveal, ProfileSetting::ModelMode, selection)].spacing(10);
-        if profile.model_mode == ModelMode::Manual {
+        if profile.model_mode == ModelMode::Manual || automatic_lm_studio {
             model = model.push(text_field(
                 reveal,
                 ProfileSetting::Model,
                 editable,
                 model_input,
             ));
-        } else {
+        }
+        if automatic_lm_studio {
+            let status = match self.lm_studio_auto_preview(profile) {
+                Some(Ok(model)) => format!("Loaded model: {model}"),
+                Some(Err(problem)) => problem.to_owned(),
+                None => match profile.lm_studio_auto_projection() {
+                    Some(Ok(model)) => format!("Loaded model: {}", model.model()),
+                    Some(Err(problem)) => problem.clone(),
+                    None => "Load models or test the connection to check the loaded model.".into(),
+                },
+            };
+            model = model.push(text(status).size(13));
+        } else if profile.model_mode == ModelMode::Auto {
             let model_text = if profile.model.is_empty() {
                 "Load models to resolve the first available model".into()
             } else {
@@ -493,25 +623,40 @@ impl Editor {
             };
             model = model.push(text(model_text).size(13));
         }
+        if profile.uses_server_default_model() {
+            model = model.push(text("The server selects a model for each reviewed request. Use Manual or Automatic if the endpoint requires a model identifier.").size(13));
+        }
+        let vision_status = self.lm_studio_vision_status(profile);
         model
-            .push(field(
-                reveal,
-                ProfileSetting::AvailableModels,
-                row![
-                    (editable && has_choices && profile.model_mode == ModelMode::Manual)
-                        .then_some(discovered),
-                    button("Load models")
-                        .style(button::secondary)
-                        .on_press_maybe(editable.then_some(Message::Discover)),
-                ]
-                .spacing(6)
-                .wrap(),
-            ))
-            .push(self.reasoning(profile, editable, reveal))
+            .push(profile.supports_model_discovery().then(|| {
+                field(
+                    reveal,
+                    ProfileSetting::AvailableModels,
+                    row![
+                        (editable
+                            && has_choices
+                            && (profile.model_mode == ModelMode::Manual || automatic_lm_studio))
+                            .then_some(discovered),
+                        button("Load models")
+                            .style(button::secondary)
+                            .on_press_maybe(editable.then_some(Message::Discover)),
+                    ]
+                    .spacing(6)
+                    .wrap(),
+                )
+            }))
+            .push(
+                (!profile.uses_server_default_model())
+                    .then(|| self.reasoning(profile, editable, reveal)),
+            )
             .push(field(
                 reveal,
                 ProfileSetting::Vision,
-                choice(Vision::ALL, profile.vision, editable, Message::Vision),
+                column![
+                    choice(Vision::ALL, profile.vision, editable, Message::Vision),
+                    vision_status.map(|status| text(status).size(13)),
+                ]
+                .spacing(4),
             ))
             .into()
     }
@@ -527,7 +672,13 @@ impl Editor {
             .choices
             .iter()
             .find(|choice| choice.id == profile.model);
-        let model: Element<'_, Message> = if editable && !models.loading {
+        let backend_supported = !profile.is_mlx() || mlx_runtime::supported();
+        let imported = profile
+            .java_embedded_model
+            .as_ref()
+            .filter(|_| profile.restore_review);
+        let can_select = editable && !models.loading && (imported.is_none() || backend_supported);
+        let model: Element<'_, Message> = if can_select {
             super::picker::escape_dismissible(
                 pick_list(models.choices.as_slice(), selected, |choice| {
                     Message::ManagedModel(choice.id)
@@ -537,7 +688,9 @@ impl Editor {
         } else {
             text(selected.map_or_else(|| profile.model.clone(), ToString::to_string)).into()
         };
-        let status = if models.loading {
+        let status = if !backend_supported && imported.is_some() {
+            "Use korTTY on an Apple Silicon Mac to review this MLX profile."
+        } else if models.loading {
             "Loading managed models…"
         } else if let Some(problem) = &models.problem {
             problem.as_str()
@@ -555,6 +708,7 @@ impl Editor {
             "Import GGUF files in Local Models. A registered projector enables vision."
         };
         column![
+            imported.map(|source| self.imported_model_notice(profile, source.as_str())),
             field(
                 reveal,
                 ProfileSetting::ManagedModel,
@@ -562,14 +716,19 @@ impl Editor {
                     model,
                     button("Refresh models")
                         .style(button::secondary)
-                        .on_press_maybe(
-                            (editable && !models.loading).then_some(Message::RefreshManagedModels)
-                        ),
+                        .on_press_maybe(can_select.then_some(Message::RefreshManagedModels)),
                 ]
                 .spacing(6)
                 .wrap(),
             ),
             text(status).size(13),
+            imported.filter(|_| backend_supported).map(|_| {
+                button("Confirm model and review profile").on_press_maybe(
+                    selected
+                        .filter(|_| can_select && self.imported_model_review.is_none())
+                        .map(|choice| Message::ConfirmImportedModel(profile.id, choice.id.clone())),
+                )
+            }),
             selected.filter(|choice| choice.vision).map(|_| field(
                 reveal,
                 ProfileSetting::Vision,
@@ -583,10 +742,37 @@ impl Editor {
                     text(profile.vision.to_string()).into()
                 },
             )),
-            (!profile.is_mlx()).then(|| self.reasoning(profile, editable, reveal)),
+            self.reasoning(
+                profile,
+                editable && (!profile.is_mlx() || !profile.restore_review),
+                reveal
+            ),
         ]
         .spacing(10)
         .into()
+    }
+
+    fn imported_model_notice<'a>(
+        &self,
+        profile: &Profile,
+        source: &'a str,
+    ) -> Element<'a, Message> {
+        column![
+            text("Java embedded model ID").size(13),
+            text(source).font(iced::Font::MONOSPACE).wrapping(text::Wrapping::WordOrGlyph),
+            text(if profile.is_mlx() && !mlx_runtime::supported() {
+                "Review this profile on an Apple Silicon Mac with a compatible MLX model installed."
+            } else if profile.is_mlx() {
+                "Select an installed MLX model for text generation, confirm the mapping, then save the profile."
+            } else {
+                "Select an installed GGUF model for text generation, confirm the mapping, then save the profile."
+            }).size(13),
+            profile
+                .java_embedded_model
+                .as_ref()
+                .and_then(|model| model.mlx_reasoning())
+                .map(|effort| text(format!("Java reasoning setting · {effort}")).size(13)),
+        ].spacing(4).into()
     }
 
     fn limits<'a>(
@@ -618,7 +804,7 @@ impl Editor {
                 ProfileSetting::Tokenizer,
                 choice(crate::local_ai::Tokenizer::ALL, profile.tokenizer, editable, Message::Tokenizer),
             )),
-            (profile.remote_protocol().is_some() && profile.policy_definition().is_none()).then(||
+            (profile.remote_protocol().is_some() && profile.policy_definition().is_none() && !profile.uses_server_default_model()).then(||
                 checkbox(profile.allows_reviewed_agent_https())
                     .label("Allow reviewed Agent, Swarm, and Scheduler requests over HTTPS")
                     .on_toggle_maybe((editable && profile.trusted_remote_endpoint).then_some(Message::ReviewedAgentHttps))
@@ -657,15 +843,120 @@ impl Editor {
         editable: bool,
         reveal: &Reveal,
     ) -> Element<'static, Message> {
+        if profile.is_mlx() {
+            let controls = self.mlx_reasoning_controls(profile);
+            let options = Reasoning::from_mlx_controls(controls);
+            let supported = controls.supports(profile.reasoning.api_value());
+            let current = if editable && (options.len() > 1 || !supported) {
+                super::picker::escape_dismissible(
+                    pick_list(
+                        options,
+                        supported.then_some(profile.reasoning),
+                        Message::Reasoning,
+                    )
+                    .placeholder("Choose an available reasoning setting"),
+                )
+            } else {
+                text(profile.reasoning.to_string()).into()
+            };
+            let source_effort = profile
+                .java_embedded_model
+                .as_ref()
+                .and_then(|model| model.mlx_reasoning());
+            return field(
+                reveal,
+                ProfileSetting::Reasoning,
+                column![
+                    current,
+                    (!supported).then(|| text(local_ai::mlx_models::UNSUPPORTED_REASONING).size(13)),
+                    source_effort.filter(|_| !profile.restore_review).map(|effort| {
+                        let notice = if controls.supports(effort.api_value()) {
+                            text(format!("Java setting · {effort}. Select it here to adopt it."))
+                        } else {
+                            text(format!("Java setting · {effort}. The selected model does not support it."))
+                        };
+                        notice.size(13)
+                    }),
+                    (controls != local_ai::mlx_models::ReasoningControls::DefaultOnly)
+                        .then(|| text("Explicit settings require a compatible signed MLX runtime.").size(13)),
+                ]
+                .spacing(4),
+            );
+        }
+        if let Some(options) = self.lm_studio_reasoning_options(profile) {
+            let wire_choice = match profile.reasoning {
+                Reasoning::Minimal => Reasoning::Low,
+                Reasoning::ExtraHigh => Reasoning::High,
+                current => current,
+            };
+            let supported = options.contains(&wire_choice);
+            let selected = supported.then_some(wire_choice);
+            let current = if editable {
+                super::picker::escape_dismissible(
+                    pick_list(options, selected, Message::Reasoning)
+                        .placeholder("Choose an available reasoning setting"),
+                )
+            } else {
+                text(profile.reasoning.to_string()).into()
+            };
+            let default = self
+                .lm_studio_capability(profile)
+                .and_then(|capabilities| capabilities.reasoning.as_ref())
+                .and_then(|reasoning| reasoning.default)
+                .map(Reasoning::from_lm_studio);
+            return field(
+                reveal,
+                ProfileSetting::Reasoning,
+                column![
+                    current,
+                    (!supported).then(|| text(format!(
+                        "Saved setting is unavailable for this model ({})",
+                        profile.reasoning
+                    ))
+                    .size(13)),
+                    default.map(|value| text(format!("Model default · {value}")).size(13)),
+                ]
+                .spacing(4),
+            );
+        }
         field(
             reveal,
             ProfileSetting::Reasoning,
-            choice(
-                Reasoning::ALL,
-                profile.reasoning,
-                editable,
-                Message::Reasoning,
-            ),
+            if profile.reasoning == Reasoning::On
+                && profile.lm_studio_discovery_key().is_some()
+                && editable
+            {
+                let mut options = Reasoning::ALL.to_vec();
+                options.push(Reasoning::On);
+                super::picker::escape_dismissible(pick_list(
+                    options,
+                    Some(profile.reasoning),
+                    Message::Reasoning,
+                ))
+            } else {
+                choice(
+                    Reasoning::ALL,
+                    profile.reasoning,
+                    editable,
+                    Message::Reasoning,
+                )
+            },
+        )
+    }
+
+    fn lm_studio_vision_status(&self, profile: &Profile) -> Option<&'static str> {
+        if !profile.is_lm_studio() {
+            return None;
+        }
+        Some(
+            match self
+                .lm_studio_capability(profile)
+                .and_then(|model| model.vision)
+            {
+                Some(true) => "LM Studio reports image support for this model.",
+                Some(false) => "LM Studio reports a text-only model.",
+                None => "Image support is unknown for this model.",
+            },
         )
     }
 }

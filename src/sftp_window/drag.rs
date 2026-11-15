@@ -23,7 +23,7 @@ use super::{
 const DRAG_DISTANCE: f32 = 6.0;
 const DESKTOP_DROP_SETTLE: Duration = Duration::from_millis(100);
 
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(super) mod external;
 pub(super) mod local_copy;
 #[cfg(test)]

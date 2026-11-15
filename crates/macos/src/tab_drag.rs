@@ -69,6 +69,7 @@ impl Press {
 struct Monitor {
     handle: Option<Retained<AnyObject>>,
     windows: HashSet<isize>,
+    file_gestures: bool,
     next_id: u64,
     press: Option<Press>,
 }
@@ -108,6 +109,20 @@ pub fn file_drop_position(window: WindowHandle<'_>) -> Option<(f64, f64)> {
 
 /// Observes primary-button events dispatched to this app while a main window is registered.
 pub fn track_tab_window(number: isize) -> bool {
+    if !install_monitor() {
+        return false;
+    }
+    MONITOR.with_borrow_mut(|monitor| monitor.windows.insert(number));
+    true
+}
+
+pub(super) fn track_file_gestures() {
+    if install_monitor() {
+        MONITOR.with_borrow_mut(|monitor| monitor.file_gestures = true);
+    }
+}
+
+fn install_monitor() -> bool {
     if MainThreadMarker::new().is_none() {
         return false;
     }
@@ -115,7 +130,11 @@ pub fn track_tab_window(number: isize) -> bool {
         let handler = RcBlock::new(|event: NonNull<NSEvent>| {
             if let Some(main) = MainThreadMarker::new() {
                 // SAFETY: AppKit keeps this dispatched event alive during the callback.
-                observe_event(unsafe { event.as_ref() }, main);
+                let native = unsafe { event.as_ref() };
+                if MONITOR.with_borrow(|monitor| monitor.file_gestures) {
+                    super::file_drag::observe(native);
+                }
+                observe_event(native, main);
             }
             event.as_ptr()
         });
@@ -134,7 +153,6 @@ pub fn track_tab_window(number: isize) -> bool {
         };
         MONITOR.with_borrow_mut(|monitor| monitor.handle = Some(handle));
     }
-    MONITOR.with_borrow_mut(|monitor| monitor.windows.insert(number));
     true
 }
 
@@ -152,7 +170,7 @@ pub fn untrack_tab_window(number: isize) {
         {
             monitor.press = None;
         }
-        if monitor.windows.is_empty() {
+        if monitor.windows.is_empty() && !monitor.file_gestures {
             monitor.handle.take()
         } else {
             None

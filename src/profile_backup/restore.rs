@@ -22,6 +22,7 @@ use crate::ssh_key_catalog::{self, Catalog, KeySource};
 mod java_ai_tests;
 mod java_jobs;
 mod java_keys;
+mod java_memory;
 #[cfg(test)]
 mod java_scheduler_tests;
 mod merge;
@@ -40,6 +41,8 @@ const JAVA_CREDENTIALS: u8 = 5;
 const JAVA_CREDENTIALS_COMMITTING: u8 = 6;
 const JAVA_JOBS: u8 = 7;
 const JAVA_JOBS_COMMITTING: u8 = 8;
+const JAVA_MEMORY: u8 = 9;
+const JAVA_MEMORY_COMMITTING: u8 = 10;
 const VAULT: &str = "vault/vault.bin";
 const MAX_PASSWORD_PLAN: usize = 16 * 1024;
 const MAX_CREDENTIAL_PLAN: usize = 128 * 1024;
@@ -218,6 +221,8 @@ impl From<JavaPasswordPlan> for JavaCredentialPlan {
 struct ConnectionRevision {
     before: Option<[u8; 32]>,
     after: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scoped_memory: Option<[u8; 32]>,
 }
 
 #[derive(Clone)]
@@ -276,7 +281,7 @@ fn unstarted_java_id(
     else {
         return Ok(None);
     };
-    if !matches!(mode, JAVA_PASSWORDS | JAVA_CREDENTIALS | JAVA_JOBS) {
+    if committing_java_mode(mode).is_none() {
         return Ok(None);
     }
     pending_body(body).map(|(id, _)| Some((id.to_owned(), stamp)))
@@ -293,26 +298,67 @@ fn read_connections(directory: &Directory) -> io::Result<Option<Zeroizing<Vec<u8
         .transpose()
 }
 
+fn stage_java_connections(
+    directory: &Directory,
+    source: &[u8],
+    library: crate::connection_store::import::JavaLibrarySettings,
+) -> io::Result<Option<java_credential_restore::Connections>> {
+    let current = read_connections(directory)?;
+    let policy = crate::clipboard_policy::ClipboardPolicy::load();
+    let import = crate::connection_store::import::prepare_java_connection_import_with_library(
+        source,
+        current.as_deref().map(Vec::as_slice),
+        policy.server_access(),
+        library,
+    )?;
+    Ok(import
+        .contents
+        .map(|contents| java_credential_restore::Connections {
+            before: current
+                .as_deref()
+                .map(|bytes| java_credential_restore::digest(bytes)),
+            contents: Zeroizing::new(contents),
+            routes: import.routes,
+            memory_ids: import.memory_ids,
+            groups: import.groups,
+        }))
+}
+
 pub(super) fn queue_java_transaction(
     root: &Path,
     mut snapshot: Snapshot,
     prepared: Option<java_credential_restore::Prepared>,
     scheduler: Option<SchedulerSource>,
+    scoped_memory: Option<java_migration::memory::Source>,
+    connection_library: crate::connection_store::import::JavaLibrarySettings,
 ) -> io::Result<QueuedRestore> {
     let (_, directory) = open_root(root)?;
     if !snapshot.is_empty() {
         check_java_delta(&snapshot)?;
     }
-    data::validate(&snapshot)?;
+    data::validate_java(&snapshot)?;
     let transactional_credentials = prepared.is_some();
     let mut prepared = prepared.unwrap_or_default();
     let mut scheduler_notes = Vec::new();
+    let source_connections = scheduler
+        .as_ref()
+        .map(|source| &source.connections)
+        .or_else(|| scoped_memory.as_ref().map(|source| &source.connections));
+    let plain = if prepared.connections.is_none() && snapshot.contains_key(CONNECTIONS) {
+        source_connections
+            .map(|source| stage_java_connections(&directory, source, connection_library))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+    let catalogue = prepared.connections.as_ref().or(plain.as_ref());
     let jobs = scheduler
         .map(|source| {
             java_jobs::stage(
                 &directory,
                 &snapshot,
-                &mut prepared.connections,
+                catalogue,
                 source,
                 &mut scheduler_notes,
             )
@@ -324,10 +370,16 @@ pub(super) fn queue_java_transaction(
         .map(|bytes| java_credential_restore::digest(bytes));
     if let Some(jobs) = jobs {
         snapshot.insert(JOBS.into(), jobs);
-    } else if !transactional_credentials {
+    }
+    let memory = scoped_memory
+        .map(|source| java_memory::stage(source, &snapshot, catalogue, &mut scheduler_notes))
+        .transpose()?
+        .unwrap_or_default();
+    let memory_revision = (!memory.is_empty()).then(|| java_memory::digest(&memory));
+    if job_revision.is_none() && memory_revision.is_none() && !transactional_credentials {
         if snapshot.is_empty() {
             return Err(invalid(
-                "No Java Scheduler jobs could be matched to this profile.",
+                "No Java Scheduler jobs or connection AI Memory could be matched to this profile.",
             ));
         }
         let durable = queue_with_mode(root, snapshot, RestoreMode::JavaAdditive, false)?;
@@ -335,6 +387,10 @@ pub(super) fn queue_java_transaction(
             durable,
             scheduler_notes,
         });
+    }
+    snapshot.extend(memory);
+    if job_revision.is_some() || memory_revision.is_some() {
+        prepared.connections = prepared.connections.or(plain);
     }
     let credential_ids = prepared
         .vault
@@ -352,6 +408,7 @@ pub(super) fn queue_java_transaction(
         let plan = ConnectionRevision {
             before: connections.before,
             after,
+            scoped_memory: memory_revision,
         };
         require_connection_revision(&directory, &plan, false)?;
         let policy = crate::clipboard_policy::ClipboardPolicy::load();
@@ -387,7 +444,7 @@ pub(super) fn queue_java_transaction(
     } else {
         None
     };
-    let (mode, encoded) = if job_revision.is_some() || keys.is_some() {
+    let (mode, encoded) = if job_revision.is_some() || keys.is_some() || memory_revision.is_some() {
         let plan = JavaCredentialPlan {
             vault,
             connections,
@@ -396,6 +453,8 @@ pub(super) fn queue_java_transaction(
         };
         let mode = if job_revision.is_some() {
             JAVA_JOBS
+        } else if plan.keys.is_none() {
+            JAVA_MEMORY
         } else {
             JAVA_CREDENTIALS
         };
@@ -486,6 +545,8 @@ fn apply_pending(
                 | JAVA_CREDENTIALS_COMMITTING
                 | JAVA_JOBS
                 | JAVA_JOBS_COMMITTING
+                | JAVA_MEMORY
+                | JAVA_MEMORY_COMMITTING
         )
     {
         let (_, payload) = pending_body(body)?;
@@ -513,9 +574,11 @@ fn apply_pending(
     let id = id.to_owned();
     let mut snapshot = archive::decode_snapshot(payload)?;
     drop(pending);
-    data::validate(&snapshot)?;
     if mode == RestoreMode::JavaAdditive {
         check_java_delta(&snapshot)?;
+        data::validate_java(&snapshot)?;
+    } else {
+        data::validate(&snapshot)?;
     }
     data::ai::prepare(&mut snapshot)?;
     if let Some(jobs) = snapshot.get_mut(JOBS) {
@@ -569,6 +632,16 @@ fn java_plan_limit(mode: u8) -> usize {
     }
 }
 
+fn committing_java_mode(mode: u8) -> Option<u8> {
+    Some(match mode {
+        JAVA_PASSWORDS => JAVA_PASSWORDS_COMMITTING,
+        JAVA_CREDENTIALS => JAVA_CREDENTIALS_COMMITTING,
+        JAVA_JOBS => JAVA_JOBS_COMMITTING,
+        JAVA_MEMORY => JAVA_MEMORY_COMMITTING,
+        _ => return None,
+    })
+}
+
 fn apply_java_transaction(
     root: &Path,
     directory: &Directory,
@@ -577,7 +650,8 @@ fn apply_java_transaction(
     body: &[u8],
     allow_headers: &impl Fn() -> bool,
 ) -> io::Result<()> {
-    let unstarted = matches!(mode, JAVA_PASSWORDS | JAVA_CREDENTIALS | JAVA_JOBS);
+    let committing = committing_java_mode(mode);
+    let unstarted = committing.is_some();
     let (size, payload) = payload
         .split_first_chunk::<4>()
         .ok_or_else(|| invalid("Invalid Java credential restore plan."))?;
@@ -598,6 +672,18 @@ fn apply_java_transaction(
         ));
     }
     let mut snapshot = archive::decode_snapshot(payload)?;
+    let memory_revision = plan
+        .connections
+        .as_ref()
+        .and_then(|plan| plan.scoped_memory);
+    if matches!(mode, JAVA_MEMORY | JAVA_MEMORY_COMMITTING) && memory_revision.is_none() {
+        return Err(invalid(
+            "The Java AI Memory restore is missing its reviewed files.",
+        ));
+    }
+    let memory = memory_revision
+        .map(|revision| java_memory::take(&mut snapshot, revision))
+        .transpose()?;
     let incoming_jobs = if matches!(mode, JAVA_JOBS | JAVA_JOBS_COMMITTING) {
         let bytes = snapshot
             .remove(JOBS)
@@ -672,16 +758,25 @@ fn apply_java_transaction(
     if !snapshot.is_empty() {
         check_java_delta(&snapshot)?;
     }
-    data::validate(&snapshot)?;
+    data::validate_java(&snapshot)?;
     let _snippet_lock = snapshot
         .contains_key(snippets::FILE_NAME)
         .then(|| snippets::StoreLock::acquire_for_restore(root))
         .transpose()?;
-    let _ai_lock = snapshot
-        .contains_key(ai_backup::SETTINGS)
-        .then(|| ai_backup::lock_for_restore(directory))
-        .transpose()?;
+    let _ai_lock = (snapshot.contains_key(ai_backup::SETTINGS)
+        || snapshot.contains_key(ai_backup::JAVA_STATISTICS))
+    .then(|| ai_backup::lock_for_restore(directory))
+    .transpose()?;
     let updates = prepare_java_updates(directory, &snapshot, allow_headers)?;
+    let memory = memory
+        .as_ref()
+        .map(|files| {
+            let candidate = connections.as_ref().ok_or_else(|| {
+                invalid("Java AI Memory restore is missing its connection catalogue.")
+            })?;
+            java_memory::Pending::prepare(files, &candidate.1)
+        })
+        .transpose()?;
     let jobs = incoming_jobs
         .map(|incoming| {
             let candidate = connections.as_ref().ok_or_else(|| {
@@ -705,12 +800,7 @@ fn apply_java_transaction(
             )
         })
         .transpose()?;
-    if unstarted {
-        let committing = match mode {
-            JAVA_PASSWORDS => JAVA_PASSWORDS_COMMITTING,
-            JAVA_JOBS => JAVA_JOBS_COMMITTING,
-            _ => JAVA_CREDENTIALS_COMMITTING,
-        };
+    if let Some(committing) = committing {
         // Flush the intent before changing any credential data or dependent catalogue.
         // A failed restart can only discard a plan that never reached this point.
         directory.replace_with(
@@ -738,11 +828,11 @@ fn apply_java_transaction(
     if let Some(keys) = keys {
         keys.publish(directory)?;
     }
-    if let Some((revision, contents)) = connections
-        && !require_connection_revision(directory, &revision, true)?
+    if let Some((revision, contents)) = connections.as_ref()
+        && !require_connection_revision(directory, revision, true)?
     {
-        let write = |file: &mut File| file.write_all(&contents);
-        let check = || require_connection_revision(directory, &revision, false).map(|_| ());
+        let write = |file: &mut File| file.write_all(contents);
+        let check = || require_connection_revision(directory, revision, false).map(|_| ());
         if revision.before.is_none() {
             directory.publish_checked(CONNECTIONS, write, check)?;
         } else {
@@ -750,7 +840,19 @@ fn apply_java_transaction(
         }
         directory.sync()?;
     }
-    publish_java_updates(directory, updates)?;
+    publish_java_updates(directory, updates, &snapshot)?;
+    if let Some(memory) = memory {
+        let (revision, _) = connections
+            .as_ref()
+            .expect("reviewed Java Memory has a connection revision");
+        if !require_connection_revision(directory, revision, true)? {
+            return Err(invalid(
+                "The reviewed Java AI Memory catalogue was not published.",
+            ));
+        }
+        let policy = crate::clipboard_policy::ClipboardPolicy::load();
+        memory.publish(directory, &policy)?;
+    }
     if let Some(jobs) = jobs {
         jobs.publish(directory)?;
     }
@@ -830,22 +932,25 @@ fn require_connection_revision(
 }
 
 fn check_java_delta(snapshot: &Snapshot) -> io::Result<()> {
-    if snapshot.is_empty()
-        || snapshot.keys().any(|path| {
-            !java_migration::is_catalogue(path)
-                && data::ai::chat_folder(path).is_none()
-                && !path
-                    .strip_prefix("projects/")
-                    .is_some_and(crate::profile::projects::is_backup_name)
-        })
-    {
+    if snapshot.is_empty() {
         return Err(invalid("Invalid pending Java backup data."));
     }
-    for (path, bytes) in snapshot
-        .iter()
-        .filter(|(path, _)| data::ai::chat_folder(path).is_some())
-    {
-        data::ai::validate_java_chat(path, bytes).map_err(|error| path_error(path, error))?;
+    for (path, bytes) in snapshot {
+        if path == ai_backup::JAVA_STATISTICS {
+            ai_backup::validate_java_statistics(bytes).map_err(|error| path_error(path, error))?;
+        } else if data::ai::chat_folder(path).is_some() {
+            data::ai::validate_java_chat(path, bytes).map_err(|error| path_error(path, error))?;
+        } else if java_migration::memory::supported(path) {
+            java_migration::memory::validate(path, bytes)
+                .map_err(|error| path_error(path, error))?;
+        } else if !java_migration::is_catalogue(path)
+            && data::analysis::filename(path).is_none()
+            && !path
+                .strip_prefix("projects/")
+                .is_some_and(crate::profile::projects::is_backup_name)
+        {
+            return Err(invalid("Invalid pending Java backup data."));
+        }
     }
     Ok(())
 }
@@ -855,19 +960,20 @@ fn apply_java_delta(
     snapshot: &Snapshot,
     allow_headers: &impl Fn() -> bool,
 ) -> io::Result<()> {
-    let _ai_lock = snapshot
-        .contains_key(ai_backup::SETTINGS)
-        .then(|| ai_backup::lock_for_restore(directory))
-        .transpose()?;
+    let _ai_lock = (snapshot.contains_key(ai_backup::SETTINGS)
+        || snapshot.contains_key(ai_backup::JAVA_STATISTICS))
+    .then(|| ai_backup::lock_for_restore(directory))
+    .transpose()?;
     let updates = prepare_java_updates(directory, snapshot, allow_headers)?;
-    publish_java_updates(directory, updates)
+    publish_java_updates(directory, updates, snapshot)
 }
 
 #[derive(Default)]
 struct JavaUpdates<'a> {
     catalogues: Vec<(&'a str, Zeroizing<Vec<u8>>)>,
     additions: Vec<(&'a str, &'a [u8])>,
-    chat_parents: BTreeMap<&'a str, &'a str>,
+    addition_parents: BTreeMap<&'a str, &'a str>,
+    statistics: Option<&'a [u8]>,
 }
 
 fn prepare_java_updates<'a>(
@@ -878,6 +984,13 @@ fn prepare_java_updates<'a>(
     let mut updates = JavaUpdates::default();
     let mut ai = data::ai::Restore::default();
     for (path, incoming) in snapshot {
+        if data::analysis::filename(path).is_some() {
+            continue;
+        }
+        if path == ai_backup::JAVA_STATISTICS {
+            updates.statistics = Some(incoming);
+            continue;
+        }
         if java_migration::is_catalogue(path) {
             let local = missing(directory.open_file(path))?
                 .map(|file| read_bounded(file, data::file_limit(path)))
@@ -897,10 +1010,20 @@ fn prepare_java_updates<'a>(
         let exists = with_target(directory, path, false, Directory::has_entry)
             .map_err(|error| path_error(path, error))?
             .unwrap_or(false);
-        if let Some(folder) = data::ai::chat_folder(path) {
-            updates.chat_parents.entry(folder).or_insert(path);
+        let ai_addition =
+            data::ai::chat_folder(path).is_some() || java_migration::memory::supported(path);
+        if ai_addition {
             if !exists && !ai.may_install(directory, snapshot, path)? {
                 continue;
+            }
+            if let Some((parent, _)) = path.rsplit_once('/') {
+                updates.addition_parents.entry(parent).or_insert(path);
+                if parent == "memory/history" {
+                    updates
+                        .addition_parents
+                        .entry("memory")
+                        .or_insert("memory/history");
+                }
             }
         }
         if !exists {
@@ -910,21 +1033,35 @@ fn prepare_java_updates<'a>(
     Ok(updates)
 }
 
-fn publish_java_updates(directory: &Directory, updates: JavaUpdates<'_>) -> io::Result<()> {
+fn publish_java_updates(
+    directory: &Directory,
+    updates: JavaUpdates<'_>,
+    snapshot: &Snapshot,
+) -> io::Result<()> {
     for (path, bytes) in updates.catalogues {
         if path == ai_backup::SETTINGS {
-            ai_backup::publish_java_https(directory, &bytes)
+            ai_backup::publish_java_profiles(directory, &bytes)
         } else {
             directory.replace_file(path, &bytes)
         }
         .map_err(|error| path_error(path, error))?;
     }
+    if let Some(statistics) = updates.statistics {
+        ai_backup::publish_java_statistics(directory, statistics, || {
+            data::ai::policy_allows(
+                ai_backup::STATISTICS,
+                &crate::clipboard_policy::ClipboardPolicy::load(),
+            )
+        })
+        .map_err(|error| path_error(ai_backup::STATISTICS, error))?;
+    }
     for (path, bytes) in updates.additions {
         merge::publish(directory, path, bytes)?;
     }
-    for path in updates.chat_parents.into_values() {
+    for path in updates.addition_parents.into_values().rev() {
         merge::sync_parent(directory, path)?;
     }
+    data::analysis::install(directory, snapshot, data::analysis::managed_limit)?;
     directory.sync()
 }
 
@@ -946,7 +1083,10 @@ fn apply_replace(
         .chain(old_key_paths(root))
         .filter(|path| !snapshot.contains_key(path))
         .collect();
-    let paths = snapshot.keys().chain(removals.iter());
+    let paths = snapshot
+        .keys()
+        .chain(removals.iter())
+        .filter(|path| data::analysis::filename(path).is_none());
     for path in paths {
         with_target(directory, path, false, |parent, name| {
             missing(parent.open_file(name)).map(|_| ())
@@ -974,6 +1114,9 @@ fn apply_replace(
     }
     let mut ai = data::ai::Restore::default();
     for (path, data) in snapshot {
+        if self::data::analysis::filename(path).is_some() {
+            continue;
+        }
         if path == PINS && protect_pins() {
             check_pins(directory, snapshot, true)?;
             continue;
@@ -996,6 +1139,7 @@ fn apply_replace(
         })
         .map_err(|error| path_error(path, error))?;
     }
+    data::analysis::install(directory, snapshot, data::analysis::managed_limit)?;
     // Make the new settings durable before retiring any old image. Ordinary
     // Settings saves share the profile lease and never remove these copies.
     directory.sync()?;

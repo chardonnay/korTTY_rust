@@ -21,6 +21,8 @@ mod split;
 mod tests;
 #[cfg(test)]
 pub(crate) use split::tests::fixture as split_test_fixture;
+#[cfg(test)]
+pub(crate) use tests::fixture as test_fixture;
 
 pub(crate) const BACKUP_DIRECTORY: &str = "llama-models";
 const REGISTRY: &str = BACKUP_DIRECTORY;
@@ -689,7 +691,15 @@ impl Registry {
         })
     }
 
-    pub(crate) fn configure(&self, mut model: Model) -> io::Result<Model> {
+    pub(crate) fn configure(&self, model: Model) -> io::Result<Model> {
+        self.configure_checked(model, |_| Ok(()))
+    }
+
+    pub(crate) fn configure_checked(
+        &self,
+        mut model: Model,
+        check: impl FnOnce(&Model) -> io::Result<()>,
+    ) -> io::Result<Model> {
         check_id(&model.id)?;
         model.name = model.name.trim().to_owned();
         model.validate_settings()?;
@@ -699,12 +709,12 @@ impl Registry {
         let _lease = lock(&directory, LEASE, false)?;
         let stored = read_model(&directory, &model.id)?;
         model.bytes = stored.bytes;
-        model.shard_bytes = stored.shard_bytes;
-        model.external = stored.external;
+        model.shard_bytes.clone_from(&stored.shard_bytes);
+        model.external.clone_from(&stored.external);
         model.projector_bytes = stored.projector_bytes;
         model.validate_settings()?;
         let bytes = serde_json::to_vec(&model).map_err(io::Error::other)?;
-        directory.replace_file(MANIFEST, &bytes)?;
+        directory.replace_with(MANIFEST, |file| file.write_all(&bytes), || check(&stored))?;
         directory.sync()?;
         Ok(model)
     }

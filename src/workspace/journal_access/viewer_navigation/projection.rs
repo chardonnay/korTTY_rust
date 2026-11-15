@@ -116,11 +116,12 @@ impl<'a> Projection<'a> {
         } else {
             &entry.title
         };
-        [
-            timestamp(entry.created_at),
-            label(marker, 25),
-            label(title, 160),
-        ]
+        let title = if entry.run_as_user.as_deref() == Some("root") {
+            format!("{} · ROOT", label(title, 153))
+        } else {
+            label(title, 160)
+        };
+        [timestamp(entry.created_at), label(marker, 25), title]
     }
 
     pub(super) fn into_fields(self) -> Vec<Cow<'a, str>> {

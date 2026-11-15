@@ -14,7 +14,9 @@ use crate::ai_manager::{
 };
 use crate::clipboard_policy::AiMemoryPolicy;
 
-use super::{Chat, ConnectionMemory, Desktop, Message, edit, learning_view, metadata};
+use super::{
+    Chat, ConnectionMemory, Desktop, MemoryTarget, Message, edit, learning_view, metadata,
+};
 
 const MAX_DRAFT_BYTES: usize = 8 * 1024;
 const UNDO_WINDOW: Duration = Duration::from_secs(30);
@@ -338,7 +340,7 @@ impl Chat {
             draft.retarget(
                 config,
                 policy,
-                self.memory_target.as_ref().map(|route| route.host()),
+                self.memory_target.as_ref().map(MemoryTarget::label),
             );
         } else {
             draft.targets.clear();
@@ -351,7 +353,7 @@ impl Chat {
             let target = self
                 .memory_target
                 .clone()
-                .filter(|route| route.saved_id() == Some(connection))?;
+                .filter(|route| route.id() == Some(connection))?;
             Some(Arc::new(ConnectionMemory {
                 catalog: root.join("connections.json"),
                 target,
@@ -418,14 +420,14 @@ impl Chat {
                     catalog: root.join("connections.json"),
                     target: route.clone(),
                 }
-                .with_current(|saved| {
-                    let name = metadata(&saved.name, 128);
+                .with_current(|id, name| {
+                    let name = metadata(name, 128);
                     let label = if name.is_empty() {
-                        metadata(route.host(), 64)
+                        metadata(route.label(), 64)
                     } else {
                         name
                     };
-                    RuleDestination(Target::Connection(saved.id, label))
+                    RuleDestination(Target::Connection(id, label))
                 })
             });
         let mut draft = Draft {
@@ -440,7 +442,7 @@ impl Chat {
         draft.retarget(
             config,
             policy,
-            self.memory_target.as_ref().map(|route| route.host()),
+            self.memory_target.as_ref().map(MemoryTarget::label),
         );
         draft
     }
@@ -501,7 +503,7 @@ impl Chat {
                     draft.retarget(
                         config,
                         policy,
-                        self.memory_target.as_ref().map(|route| route.host()),
+                        self.memory_target.as_ref().map(MemoryTarget::label),
                     );
                     self.notice.clear();
                 }
@@ -524,7 +526,7 @@ impl Chat {
                     draft.retarget(
                         config,
                         policy,
-                        self.memory_target.as_ref().map(|route| route.host()),
+                        self.memory_target.as_ref().map(MemoryTarget::label),
                     );
                     self.notice.clear();
                 }
@@ -559,7 +561,7 @@ impl Chat {
             draft.retarget(
                 config,
                 policy,
-                self.memory_target.as_ref().map(|route| route.host()),
+                self.memory_target.as_ref().map(MemoryTarget::label),
             );
         }
         let Some((root, draft)) = self

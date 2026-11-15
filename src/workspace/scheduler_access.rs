@@ -23,9 +23,13 @@ use crate::workspace::dialog_placement::Kind as DialogKind;
 
 use super::{Message, Workspace, tool_tabs};
 
-pub(super) mod firing;
+pub(crate) mod firing;
+pub(super) mod firing_web;
+mod ownership;
 mod proposal_knowledge;
 mod proposal_skills;
+mod proposal_web;
+mod rsync;
 pub(super) mod swarm_chat;
 pub(super) mod swarm_comparison;
 
@@ -54,6 +58,10 @@ pub(super) fn desktop_clock(interval: Duration) -> Subscription<()> {
 }
 
 impl Workspace {
+    pub(super) fn scheduler_journal_output_allowed(&self) -> bool {
+        self.clipboard.policy.recording_allowed && self.automation_journal_capture_allowed()
+    }
+
     pub(super) fn initialize_scheduler(&mut self, source: window::Id, existing_only: bool) -> bool {
         if self.scheduler.is_some() {
             return true;
@@ -77,6 +85,7 @@ impl Workspace {
                     self.clipboard.policy.problem.is_none() && !self.isolation_required(),
                 );
                 scheduler.set_recording_allowed(self.clipboard.policy.recording_allowed);
+                scheduler.set_journal_output_allowed(self.scheduler_journal_output_allowed());
                 scheduler.set_swarm_chats_allowed(self.swarm_chat_access_allowed());
                 self.scheduler = Some(scheduler);
                 true
@@ -113,10 +122,11 @@ impl Workspace {
         if !self.initialize_scheduler(source, false) {
             return Err("Could not open JobScheduler.".into());
         }
+        let allow_cli = self.scheduler_cli_allowed(&installed);
         let scheduler = self.scheduler.as_mut().expect("initialized scheduler");
         scheduler.refresh_snippets();
         scheduler.set_connections(Some(&connections));
-        scheduler.set_agent_profiles(Some(&config));
+        scheduler.set_agent_profiles(Some(&config), allow_cli);
         self.refresh_scheduler_credentials();
         self.place_scheduler_swarm_handoff(source, handoff)
     }
@@ -249,15 +259,20 @@ impl Workspace {
         let view = self.scheduler_views.get(&id)?;
         let scheduler = self.scheduler.as_ref()?;
         let journal_root = self.journal_directory().ok();
-        Some(
-            view.view(
+        let body = view
+            .view(
                 scheduler,
                 self.window_settings.job_menu_status_enabled,
                 self.scheduler_privileged_action_allowed(view),
                 journal_root.as_deref(),
+                self.automation_summary_providers(),
             )
-            .map(move |message| Message::Scheduler(id, message)),
-        )
+            .map(move |message| Message::Scheduler(id, message));
+        Some(if let Some(web) = self.firing_web_view() {
+            iced::widget::column![web, body].spacing(8).into()
+        } else {
+            body
+        })
     }
 
     pub(super) fn dismiss_hosted_scheduler(&mut self, id: window::Id) -> Task<Message> {
@@ -302,8 +317,14 @@ impl Workspace {
             Some(Duration::from_millis(200))
         } else if self.automation_journal_policy_needs_tick()
             || self.scheduler_firing_retry_at.is_some()
+            || self.scheduler_firing_web.needs_tick()
+            || self.environment_lookups_need_tick()
             || self.swarm_chat_seed_needs_tick()
             || self.scheduler_swarm_comparisons.needs_tick()
+            || self
+                .scheduler_views
+                .values()
+                .any(|view| view.active_proposal_web_scope().is_some())
             || self.scheduler.as_ref().is_some_and(|scheduler| {
                 scheduler.next_due().is_some()
                     || scheduler.webhook_results_pending()
@@ -324,7 +345,9 @@ impl Workspace {
     }
 
     pub(super) fn runtime_tick(&mut self) -> Task<Message> {
+        self.revalidate_scheduler_web_reviews();
         let expiry = self.expire_firing();
+        let web_expiry = self.expire_pending_firing_web();
         let retry = if self
             .scheduler_firing_retry_at
             .take_if(|deadline| *deadline <= Instant::now())
@@ -348,6 +371,7 @@ impl Workspace {
         };
         Task::batch([
             expiry,
+            web_expiry,
             retry,
             scheduler,
             self.refresh_scheduler_journal_stats(),
@@ -492,7 +516,19 @@ impl Workspace {
         {
             return Task::none();
         }
-        if view.browsing_directory()
+        if view.reviewing_ownership() && matches!(message, scheduler_window::Message::Dismiss) {
+            if let Some(view) = self.scheduler_views.get_mut(&id) {
+                view.cancel_ownership_review();
+            }
+            return Task::none();
+        }
+        if let scheduler_window::Message::Ownership(message) = message {
+            if view.browsing_directory() {
+                return Task::none();
+            }
+            return self.update_scheduler_ownership(id, message);
+        }
+        if (view.browsing_directory() || view.reviewing_ownership())
             && !matches!(
                 message,
                 scheduler_window::Message::DirectoryBrowser(_)
@@ -500,6 +536,10 @@ impl Workspace {
                     | scheduler_window::Message::AgentProposed(_, _)
                     | scheduler_window::Message::ProposalQuotaFinished(..)
                     | scheduler_window::Message::ProposalSkillQuotaFinished(..)
+                    | scheduler_window::Message::ProposalWeb(
+                        _,
+                        crate::workspace::terminal_ai::web::Message::Finished(..)
+                    )
                     | scheduler_window::Message::SwarmComparisonQuotaFinished(..)
             )
         {
@@ -523,6 +563,58 @@ impl Workspace {
         if let scheduler_window::Message::ApproveProposalCommands(ticket) = &message
             && view.proposal_command_ticket() != Some(ticket)
         {
+            return Task::none();
+        }
+        if let scheduler_window::Message::ReviewUnattendedWeb(ticket, topic) = &message {
+            if view.unattended_web_topic(ticket) != Some(topic) {
+                return Task::none();
+            }
+            let reviewed = (|| {
+                if !self.scheduler_proposal_current(id, None)? {
+                    return Err("The model review is unavailable.".into());
+                }
+                let scheduler = self
+                    .scheduler
+                    .as_ref()
+                    .ok_or("The scheduler is unavailable.")?;
+                let authority = scheduler
+                    .proposal_authority(view)?
+                    .ok_or("The model review is unavailable.")?;
+                let config =
+                    Configuration::load().map_err(|_| "The saved AI profile is unavailable.")?;
+                let profile = config
+                    .resolve_profile_reference(&authority.profile.id)
+                    .ok_or("The saved AI profile is unavailable.")?;
+                let scope = super::terminal_ai::web::Scope::new(
+                    Some(&config),
+                    profile,
+                    self.scheduler_web_allowed(),
+                )
+                .filter(super::terminal_ai::web::Scope::supports_unattended_search)
+                .ok_or("The saved web search settings are unavailable.")?;
+                scope.require_current()?;
+                self.require_public_scheduler_topic(
+                    topic,
+                    authority.transport,
+                    &scope,
+                    view.unattended_web_includes_page_mask(ticket),
+                )
+            })();
+            if let Err(error) = reviewed {
+                if let Some(view) = self.scheduler_views.get_mut(&id) {
+                    view.report_status(error);
+                }
+                return Task::none();
+            }
+        }
+        if (matches!(message, scheduler_window::Message::Save)
+            || matches!(message, scheduler_window::Message::Run(_)) && view.dirty())
+            && let Some(grant) = view.new_unattended_web_lookup()
+            && let Err(error) = self.require_saved_public_scheduler_topic(grant)
+        {
+            if let Some(view) = self.scheduler_views.get_mut(&id) {
+                view.report_status(error);
+            }
             return Task::none();
         }
         if matches!(
@@ -602,6 +694,9 @@ impl Workspace {
             scheduler_window::Message::ProposalKnowledge(ticket, message) => {
                 return self.update_scheduler_proposal_knowledge(id, ticket, message);
             }
+            scheduler_window::Message::ProposalWeb(ticket, message) => {
+                return self.update_scheduler_proposal_web(id, ticket, message);
+            }
             scheduler_window::Message::ClassifyProposalSkills(ticket) => {
                 return self.request_scheduler_proposal_skills(id, &ticket);
             }
@@ -632,16 +727,7 @@ impl Workspace {
                 self.refresh_scheduler_agent_profiles();
             }
             scheduler_window::Message::ReviewRsyncProgram => {
-                if let Err(error) = self.current_scheduler_draft_groups(id) {
-                    return self.report_scheduler_group_error(id, error);
-                }
-                return self
-                    .scheduler_views
-                    .get_mut(&id)
-                    .map_or_else(Task::none, |view| {
-                        view.begin_rsync_review()
-                            .map(move |message| Message::Scheduler(id, message))
-                    });
+                return self.review_scheduler_rsync(id);
             }
             scheduler_window::Message::ReviewSync => return self.review_scheduler_sync(id),
             scheduler_window::Message::EstimateAutomationJournal => {
@@ -649,6 +735,14 @@ impl Workspace {
             }
             scheduler_window::Message::AutomationJournal(_)
                 if !self.automation_journal_capture_allowed() =>
+            {
+                return Task::none();
+            }
+            scheduler_window::Message::AutomationJournal(
+                scheduler_window::SwarmJournalEdit::UseImportedProfile(ref choice),
+            ) if !self
+                .automation_summary_providers()
+                .contains(choice.as_ref()) =>
             {
                 return Task::none();
             }
@@ -726,6 +820,16 @@ impl Workspace {
             scheduler_window::Message::OpenSwarmChat(run) => {
                 return self.open_scheduler_swarm_chat(id, run);
             }
+            scheduler_window::Message::CopyRunDetail(run) => {
+                let journal_root = self.journal_directory().ok();
+                let selection = self.scheduler.as_ref().and_then(|scheduler| {
+                    scheduler.selected_run_detail_text(view, run, journal_root.as_deref())
+                });
+                if let Some(view) = self.scheduler_views.get_mut(&id) {
+                    view.dismiss_run_detail_menu(run);
+                }
+                return selection.map_or_else(Task::none, |text| self.write_clipboard(text));
+            }
             scheduler_window::Message::DiagramCopy => {
                 let source = view.diagram_mermaid();
                 return source.map_or_else(Task::none, |source| self.write_clipboard(source));
@@ -746,6 +850,22 @@ impl Workspace {
                 return Task::none();
             }
             _ => {}
+        }
+        if matches!(message, scheduler_window::Message::Confirm)
+            && let Some(job) = self
+                .scheduler
+                .as_ref()
+                .zip(self.scheduler_views.get(&id))
+                .and_then(|(scheduler, view)| scheduler.confirmed_job_deletion(view))
+                .cloned()
+            && let Err(error) = self.revoke_deleted_automation_summary_job(&job)
+        {
+            if let Some(view) = self.scheduler_views.get_mut(&id) {
+                view.report_status(format!(
+                    "Could not revoke the job's journal approval ({error})."
+                ));
+            }
+            return Task::none();
         }
         let swarm_chats_allowed = self.swarm_chat_access_allowed();
         let Some((scheduler, view)) = self
@@ -774,7 +894,12 @@ impl Workspace {
         #[cfg(target_os = "macos")]
         self.sync_native_jobs_menu();
         if cancel {
-            Task::batch([task, self.expire_firing(), self.expire_swarm_comparisons()])
+            Task::batch([
+                task,
+                self.expire_pending_firing_web(),
+                self.expire_firing(),
+                self.expire_swarm_comparisons(),
+            ])
         } else {
             task
         }
@@ -785,10 +910,19 @@ impl Workspace {
         if !self.automation_journal_capture_allowed() {
             return Task::none();
         }
-        let profile = self
-            .journal_summaries_allowed()
-            .then(|| self.configured_journal_ai(false))
-            .flatten();
+        let model = self.scheduler_views.get(&id).and_then(|view| {
+            if view.unresolved_automation_summary_profile() {
+                return None;
+            }
+            let source = view
+                .automation_summary_job()
+                .cloned()
+                .map(crate::session_journal::summary_queue::AutomationSource::Job);
+            let selected = view.automation_summary_profile();
+            let profile = self.automation_summary_estimate_profile(source.as_ref(), selected)?;
+            let limits = self.automation_summary_evidence_limits(source.as_ref(), selected);
+            Some((profile, limits))
+        });
         let root = self.journal_directory().ok();
         let Some((scheduler, view)) = self
             .scheduler
@@ -801,7 +935,7 @@ impl Workspace {
             return Task::none();
         };
         let ticket = request.ticket;
-        let Some((profile, root)) = profile.zip(root) else {
+        let Some(((profile, evidence_limits), root)) = model.zip(root) else {
             view.finish_automation_estimate(
                 ticket,
                 scheduler_window::AutomationEstimate::unavailable(),
@@ -814,8 +948,15 @@ impl Workspace {
                 .name("kortty-job-journal-estimate".into())
                 .spawn(move || {
                     let estimate = if ClipboardPolicy::load().automation_journal_allowed() {
-                        let (model, budget) = profile.usage_estimate_profile();
-                        request.calculate(&root, model, budget)
+                        let (name, budget) = profile.usage_estimate_profile();
+                        request.calculate(
+                            &root,
+                            scheduler_window::AutomationModelEstimate {
+                                name,
+                                budget,
+                                evidence_limits,
+                            },
+                        )
                     } else {
                         scheduler_window::AutomationEstimate::unavailable()
                     };
@@ -834,6 +975,13 @@ impl Workspace {
                 scheduler_window::Message::AutomationEstimateReady(ticket, estimate),
             )
         })
+    }
+
+    pub(in crate::workspace) fn invalidate_automation_summary_estimates(&mut self) {
+        for view in self.scheduler_views.values_mut() {
+            view.clear_automation_estimate();
+        }
+        self.invalidate_swarm_journal_estimates();
     }
 
     fn browse_scheduler_directory(
@@ -973,10 +1121,16 @@ impl Workspace {
     }
 
     fn refresh_scheduler_agent_profiles(&mut self) {
+        let allow_cli = self.scheduler_cli_allowed(&ClipboardPolicy::load());
         let config = self.ai_configuration();
         if let Some(scheduler) = &mut self.scheduler {
-            scheduler.set_agent_profiles(config.as_deref());
+            scheduler.set_agent_profiles(config.as_deref(), allow_cli);
         }
+    }
+
+    fn scheduler_cli_allowed(&self, installed: &ClipboardPolicy) -> bool {
+        crate::local_ai::cli::allowed(&self.clipboard.policy, false)
+            && crate::local_ai::cli::allowed(installed, false)
     }
 
     fn scheduler_agent_policy(
@@ -991,6 +1145,7 @@ impl Workspace {
     }
 
     fn review_scheduler_agent(&mut self, id: window::Id) -> Task<Message> {
+        let policy_allows_web = self.scheduler_web_allowed();
         let prepared = (|| -> Result<_, String> {
             let (scheduler, view) = self
                 .scheduler
@@ -1007,10 +1162,7 @@ impl Workspace {
             let config = self.scheduler_agent_policy(agent.kind, &installed)?;
             let profile = agent::ProfileChoice::for_reference(&config, &agent.profile)
                 .ok_or("The selected AI profile is unavailable.")?;
-            if profile.reviewed_cli.is_some()
-                && (!crate::local_ai::cli::allowed(&self.clipboard.policy, false)
-                    || !crate::local_ai::cli::allowed(&installed, false))
-            {
+            if profile.reviewed_cli.is_some() && !self.scheduler_cli_allowed(&installed) {
                 return Err("Managed policy blocks the configured CLI.".into());
             }
             let store = profile::connections_path()
@@ -1036,7 +1188,7 @@ impl Workspace {
                 self.check_swarm_review_policy(&targets, &store, &trust, &installed)?;
                 let redactor = self.scheduler_review_redactor(action, &store, &trust)?;
                 let (transport, context_limit) = profile.transport(&config)?;
-                if !profile.policy_model_matches(transport.policy_authority_fingerprint()) {
+                if !profile.matches_transport_model(&transport) {
                     return Err("The approved AI profile changed or is unavailable.".into());
                 }
                 transport.require_current_policy_authority()?;
@@ -1056,7 +1208,19 @@ impl Workspace {
                             redactor.clone(),
                             super::terminal_ai::mask::prompt,
                         )
-                        .map(|prompt| prompt.bind_profile(revision))
+                        .and_then(|prompt| {
+                            let memory = prompt.capture_memory(
+                                &config,
+                                &installed.ai_memory,
+                                target.reference.id,
+                            )?;
+                            let prompt = prompt.with_memory(memory)?.bind_profile(revision);
+                            prompt.require_current_memory(
+                                &config,
+                                &self.clipboard.policy.ai_memory,
+                            )?;
+                            Ok(prompt)
+                        })
                     })
                     .collect::<Result<Vec<_>, _>>()?;
                 let question = prompts
@@ -1075,7 +1239,7 @@ impl Workspace {
                 Some(prompts)
             } else if agent.probe.uses_model() {
                 let (transport, context_limit) = profile.transport(&config)?;
-                if !profile.policy_model_matches(transport.policy_authority_fingerprint()) {
+                if !profile.matches_transport_model(&transport) {
                     return Err("The approved AI profile changed or is unavailable.".into());
                 }
                 transport.require_current_policy_authority()?;
@@ -1090,7 +1254,8 @@ impl Workspace {
                         )
                     })
                     .transpose()?;
-                let redactor = if agent.probe.is_firing() || profile.requires_masked_review() {
+                let extended_mask = agent.probe.is_firing() || profile.requires_masked_review();
+                let mut redactor = if extended_mask {
                     self.scheduler_review_redactor(action, &store, &trust)?
                 } else {
                     let secrets = crate::terminal_logging::Secrets::default()
@@ -1101,7 +1266,7 @@ impl Workspace {
                         self.clipboard.policy.terminal_logging.clone(),
                     )
                 };
-                let build = |targets| {
+                let build = |targets, redactor: &crate::terminal_logging::Redactor| {
                     agent::proposal::Prompt::new(
                         transport.clone(),
                         context_limit,
@@ -1124,8 +1289,18 @@ impl Workspace {
                     let prompts = targets
                         .iter()
                         .map(|target| {
-                            build(vec![target.reference.id])
-                                .map(|prompt| prompt.bind_profile(revision))
+                            let prompt = build(vec![target.reference.id], &redactor)?;
+                            let memory = prompt.capture_memory(
+                                &config,
+                                &installed.ai_memory,
+                                target.reference.id,
+                            )?;
+                            let prompt = prompt.with_memory(memory)?.bind_profile(revision);
+                            prompt.require_current_memory(
+                                &config,
+                                &self.clipboard.policy.ai_memory,
+                            )?;
+                            Ok::<_, String>(prompt)
                         })
                         .collect::<Result<Vec<_>, _>>()?;
                     let (prompts, setup) = proposal_skills::prepare_standing(
@@ -1138,17 +1313,57 @@ impl Workspace {
                     skill_setup = Some((setup, false));
                     prompts
                 } else {
-                    let prompt = build(action.targets().map(|reference| reference.id).collect())?;
-                    let (prompt, setup, omitted) = proposal_skills::prepare(
+                    let ordered: Vec<_> = action.targets().map(|reference| reference.id).collect();
+                    let load_memory = |prompt: &agent::proposal::Prompt| {
+                        ordered
+                            .iter()
+                            .map(|&id| prompt.capture_memory(&config, &installed.ai_memory, id))
+                            .collect::<Result<Vec<_>, _>>()
+                    };
+                    let mut prompt = build(ordered.clone(), &redactor)?;
+                    let mut memory = load_memory(&prompt);
+                    if !extended_mask
+                        && !memory.as_ref().is_ok_and(|memory| {
+                            memory.iter().all(|memory| memory.binding().is_none())
+                        })
+                    {
+                        redactor = self.scheduler_review_redactor(action, &store, &trust)?;
+                        prompt = build(ordered.clone(), &redactor)?;
+                        memory = load_memory(&prompt);
+                    }
+                    let memory = memory?;
+                    let prompts = if ordered.len() == 1 {
+                        let [memory] = <[_; 1]>::try_from(memory)
+                            .map_err(|_| "The reviewed AI memory is unavailable.")?;
+                        vec![prompt.with_memory(memory)?]
+                    } else if memory
+                        .iter()
+                        .any(agent::memory::Memory::includes_connection)
+                        || memory
+                            .windows(2)
+                            .any(|pair| pair[0].text() != pair[1].text())
+                    {
+                        ordered
+                            .into_iter()
+                            .zip(memory)
+                            .map(|(id, memory)| build(vec![id], &redactor)?.with_memory(memory))
+                            .collect::<Result<Vec<_>, _>>()?
+                    } else {
+                        vec![prompt.with_shared_memory(&config, &installed.ai_memory, memory)?]
+                    };
+                    for prompt in &prompts {
+                        self.require_scheduler_prompt_memory(prompt, &installed, &config)?;
+                    }
+                    let (prompts, setup, omitted) = proposal_skills::prepare(
                         std::sync::Arc::clone(&config),
                         &store,
                         &targets,
                         &agent.goal,
                         &redactor,
-                        prompt,
+                        prompts,
                     )?;
                     skill_setup = Some((setup, omitted));
-                    vec![prompt]
+                    prompts
                 })
             } else {
                 None
@@ -1176,14 +1391,13 @@ impl Workspace {
                     {
                         scheduler.finish_agent_firing_review(view, review, profile, targets, prompts)?;
                     } else {
-                        let [prompt] = <[_; 1]>::try_from(prompts)
-                            .map_err(|_| "The reviewed proposal request is unavailable.")?;
-                        scheduler.finish_agent_proposal_review(view, review, profile, targets, prompt)?;
+                        scheduler.finish_agent_proposal_review(view, review, profile, targets, prompts)?;
                     }
                     let task = scheduler.attach_proposal_skills(view, setup).inspect_err(|_| {
                         view.discard_proposal_review();
                     })?;
                     scheduler.attach_proposal_knowledge(view);
+                    scheduler.attach_proposal_web(view, policy_allows_web);
                     if omitted {
                         view.report_status("The local skill guidance could not be included. Review the available proposal request.".into());
                     }
@@ -1303,6 +1517,7 @@ impl Workspace {
             let config =
                 Configuration::load().map_err(|_| "The saved AI settings are unavailable.")?;
             for (index, prompt) in authority.prompts.iter().enumerate() {
+                self.require_scheduler_prompt_memory(prompt, &policy, &config)?;
                 job_executor::agent::advisory::require_current_guidance(
                     &config, &store, grant, index, prompt,
                 )?;
@@ -1335,6 +1550,20 @@ impl Workspace {
             return Err("The scheduler review is closing.".into());
         }
         view.proposal_knowledge_vault_revision()?;
+        view.proposal_web_vault_revision()?;
+        if authority.fresh_web && !self.scheduler_web_allowed() {
+            return Err("Managed policy blocks a fresh web lookup at each start.".into());
+        }
+        if let Some(grant) = authority.web_lookup {
+            self.require_saved_public_scheduler_topic(grant)?;
+        }
+        if let Some(evidence) = authority.prompt.web() {
+            if !self.scheduler_web_allowed() {
+                return Err("Managed policy blocks use of the reviewed web excerpts.".into());
+            }
+            evidence.require_current()?;
+            proposal_web::require_current_vault_mask(self.vault.as_ref(), evidence)?;
+        }
         let (policy, saved_config) = self.scheduler_model_policy(
             authority.kind,
             authority.profile,
@@ -1357,6 +1586,7 @@ impl Workspace {
             self.scheduler_reviewed_agent_target(target, &store, &trust, &policy)?;
         }
         for (target, prompt) in authority.targets.iter().zip(authority.prompts) {
+            self.require_scheduler_prompt_memory(prompt, &policy, &saved_config)?;
             proposal_skills::require_firing_guidance(
                 &saved_config,
                 &store,
@@ -1368,6 +1598,8 @@ impl Workspace {
         let secrets = if authority.prompt.profile_revision().is_some()
             || authority.profile.requires_masked_review()
             || authority.prompt.knowledge().is_some()
+            || authority.prompt.web().is_some()
+            || authority.prompts.iter().any(|prompt| prompt.has_memory())
         {
             self.firing_secrets(authority.targets, &store)?.0
         } else {
@@ -1457,9 +1689,14 @@ impl Workspace {
         let Some(authority) = scheduler.proposal_authority(view)? else {
             return Ok(None);
         };
-        let vault_revision = if authority.prompt.knowledge().is_some() {
+        let vault_revision = if authority.prompt.web().is_some() {
+            view.proposal_web_vault_revision()?
+        } else if authority.prompt.knowledge().is_some() {
             view.proposal_knowledge_vault_revision()?
-        } else if authority.standing || authority.profile.requires_masked_review() {
+        } else if authority.standing
+            || authority.profile.requires_masked_review()
+            || authority.prompts.iter().any(|prompt| prompt.has_memory())
+        {
             let store = profile::connections_path()
                 .and_then(ConnectionStore::open)
                 .map_err(|_| "The saved SSH connections changed or are unavailable.")?;
@@ -1656,34 +1893,34 @@ impl Workspace {
             &crate::ssh_dialog::LoginTarget,
         ) -> Result<kortty_vault::Secret, &'static str>,
     ) -> Result<job_executor::agent::Context, &'static str> {
-        if request.cancellation.is_requested()
-            || !matches!(
-                request.trigger,
-                kortty_jobs::RunTrigger::Manual | kortty_jobs::RunTrigger::Scheduled
-            )
-        {
-            return Err("Scheduled diagnostics require Run Now or a calendar start.");
+        if request.cancellation.is_requested() {
+            return Err("The scheduled diagnostics run was cancelled.");
         }
         let action = &request.action;
         let agent = action
             .agent
             .as_ref()
             .ok_or("The scheduled diagnostics action is unavailable.")?;
-        let installed = ClipboardPolicy::load();
-        let config = self.scheduler_agent_policy(agent.kind, &installed)?;
+        if !agent.probe.allows_trigger(request.trigger) {
+            return Err("The selected diagnostics workflow cannot use this start trigger.");
+        }
         let scheduler = self
             .scheduler
             .as_ref()
-            .filter(|scheduler| scheduler.agent_run_approved(request))
+            .filter(|scheduler| scheduler.active_agent_run_approved(request))
             .ok_or("Review the exact scheduled AI action before running.")?;
+        if !scheduler.agent_predecessors_current(request, SystemTime::now()) {
+            return Err("The job prerequisites changed before dispatch. Review the run again.");
+        }
+        let installed = ClipboardPolicy::load();
+        let config = self.scheduler_agent_policy(agent.kind, &installed)?;
         let proposal = scheduler.agent_proposal_run(request)?;
         let approval = agent
             .approval
             .as_ref()
             .ok_or("Review the exact scheduled diagnostics before running.")?;
         if approval.profile.reviewed_cli.is_some()
-            && (!crate::local_ai::cli::allowed(&self.clipboard.policy, false)
-                || !crate::local_ai::cli::allowed(&installed, false)
+            && (!self.scheduler_cli_allowed(&installed)
                 || !Configuration::load()
                     .ok()
                     .is_some_and(|saved| approval.profile.transport(&saved).is_ok()))
@@ -1704,9 +1941,7 @@ impl Workspace {
             .profile
             .transport(&config)
             .map_err(|_| "The approved AI profile is unavailable.")?;
-        if !approval
-            .profile
-            .policy_model_matches(transport.policy_authority_fingerprint())
+        if !approval.profile.matches_transport_model(&transport)
             || transport.require_current_policy_authority().is_err()
         {
             return Err("The approved AI profile changed or is unavailable.");
@@ -1729,10 +1964,19 @@ impl Workspace {
         if let Some(knowledge) = &approval.knowledge {
             proposal_knowledge::require_current_vault_mask(self.vault.as_ref(), knowledge)?;
         }
-        let knowledge_vault_revision = approval
-            .knowledge
-            .as_ref()
-            .map(|_| self.vault_change_revision());
+        if let Some(evidence) = &approval.web {
+            if !self.scheduler_web_allowed() {
+                return Err("Managed policy blocks use of the approved web excerpts.");
+            }
+            evidence
+                .require_current()
+                .map_err(|_| "The approved web search settings changed. Review this job again.")?;
+            proposal_web::require_current_vault_mask(self.vault.as_ref(), evidence)?;
+        }
+        let evidence_vault_revision = (approval.knowledge.is_some()
+            || approval.web.is_some()
+            || approval.requires_fresh_web())
+        .then(|| self.vault_change_revision());
         let journal = agent.probe.supports_target_journal(agent.kind)
             && action
                 .automation_journal
@@ -1772,7 +2016,7 @@ impl Workspace {
                     )
                 })();
                 if advisory || journal {
-                    if let Some(revision) = &knowledge_vault_revision {
+                    if let Some(revision) = &evidence_vault_revision {
                         vault_revision = Some(revision.clone());
                     }
                     target_vault_revisions.push(vault_revision);
@@ -1791,6 +2035,7 @@ impl Workspace {
             mask: super::terminal_ai::mask::prompt,
             proposal,
             journal: None,
+            fresh_web: None,
         })
     }
 
@@ -1824,9 +2069,22 @@ impl Workspace {
         })
     }
 
-    pub(super) fn answer_scheduler_agent_resend(&self, resend: job_executor::agent::Resend) {
-        let approval = self.scheduler_agent_resend_authority(&resend.scope);
-        resend.settle(approval);
+    pub(super) fn answer_scheduler_agent_resend(
+        &mut self,
+        resend: job_executor::agent::Resend,
+    ) -> Task<Message> {
+        match resend {
+            job_executor::agent::Resend::Model(resend) => {
+                let approval = self
+                    .scheduler_agent_resend_authority(&resend.scope)
+                    .and_then(|()| self.require_read_only_environment_web(&resend.scope));
+                resend.settle(approval);
+                Task::none()
+            }
+            job_executor::agent::Resend::Environment(research) => {
+                self.queue_read_only_research(research)
+            }
+        }
     }
 
     fn scheduler_agent_resend_authority(
@@ -1834,14 +2092,17 @@ impl Workspace {
         scope: &job_executor::agent::ResendScope,
     ) -> Result<(), &'static str> {
         let request = &scope.request;
-        if self.exiting
-            || self.scheduler_draining
-            || self
-                .scheduler
-                .as_ref()
-                .is_none_or(|scheduler| !scheduler.active_agent_run_approved(request))
-        {
-            return Err("The scheduled diagnostics run changed or ended.");
+        let scheduler = self
+            .scheduler
+            .as_ref()
+            .filter(|scheduler| {
+                !self.exiting
+                    && !self.scheduler_draining
+                    && scheduler.active_agent_run_approved(request)
+            })
+            .ok_or("The scheduled diagnostics run changed or ended.")?;
+        if !scheduler.agent_predecessors_current(request, SystemTime::now()) {
+            return Err("The job prerequisites changed before dispatch. Review the run again.");
         }
         let action = &request.action;
         let agent = action
@@ -1853,6 +2114,31 @@ impl Workspace {
             .approval
             .as_ref()
             .ok_or("The scheduled diagnostics approval changed.")?;
+        if self.require_firing_web_evidence(request)?.as_deref()
+            != scope
+                .advisory_prompt
+                .as_deref()
+                .and_then(agent::proposal::Prompt::fresh_web)
+        {
+            return Err("The web excerpts reviewed for this run changed.");
+        }
+        if let Some(evidence) = &approved.web {
+            if !self.scheduler_web_allowed() {
+                return Err("Managed policy blocks use of the approved web excerpts.");
+            }
+            evidence
+                .require_current()
+                .map_err(|_| "The approved web search settings changed. Review this job again.")?;
+            proposal_web::require_current_vault_mask(self.vault.as_ref(), evidence)?;
+            if scope
+                .advisory_prompt
+                .as_deref()
+                .and_then(agent::proposal::Prompt::web)
+                != Some(evidence.as_ref())
+            {
+                return Err("The approved web excerpts changed. Review this job again.");
+            }
+        }
         if let Some(grant) = &approved.advisory {
             if scope.evidence_targets.len() != 1 {
                 return Err("Read-only Swarm advice requires exactly one reviewed target.");
@@ -1897,6 +2183,7 @@ impl Workspace {
                     .advisory_prompt
                     .as_deref()
                     .ok_or("The reviewed advisory request is unavailable.")?;
+                self.require_scheduler_prompt_memory(prompt, &policy, &config)?;
                 job_executor::agent::advisory::require_current_guidance(
                     &config, &store, grant, index, prompt,
                 )?;
@@ -1982,10 +2269,12 @@ impl Workspace {
 
     fn update_scheduler_runtime(&mut self, message: scheduler_window::Message) -> Task<Message> {
         let swarm_chats_allowed = self.swarm_chat_access_allowed();
+        let journal_output_allowed = self.scheduler_journal_output_allowed();
         let Some(scheduler) = self.scheduler.as_mut() else {
             return Task::none();
         };
         scheduler.set_swarm_chats_allowed(swarm_chats_allowed);
+        scheduler.set_journal_output_allowed(journal_output_allowed);
         let requests = scheduler.update_runtime(message);
         self.sync_scheduler_views();
         let task = self.enqueue_jobs(requests);
@@ -1996,7 +2285,9 @@ impl Workspace {
 
     fn sync_scheduler_views(&mut self) {
         if let Some(scheduler) = &self.scheduler {
+            let journal_root = self.journal_directory().ok();
             for view in self.scheduler_views.values_mut() {
+                view.retain_run_detail_journal_root(journal_root.as_deref());
                 scheduler.sync_view(view);
             }
         }
@@ -2061,9 +2352,19 @@ impl Workspace {
 
     fn commit_scheduler_run(
         &mut self,
-        outcome: job_executor::Completion,
+        mut outcome: job_executor::Completion,
         session_journals: Vec<String>,
     ) -> Task<Message> {
+        self.scheduler_firing_web.forget(outcome.id);
+        self.scheduler_read_only_research.forget(outcome.id);
+        if !self.scheduler_journal_output_allowed()
+            || outcome
+                .output
+                .as_ref()
+                .is_some_and(|output| output.current(Some(&self.clipboard.policy)).is_none())
+        {
+            outcome.output = None;
+        }
         let message = if session_journals.is_empty() {
             scheduler_window::Message::Finished(outcome)
         } else {
@@ -2092,15 +2393,48 @@ impl Workspace {
         let Some(request) = self.scheduler_queue.remove(index) else {
             return Task::none();
         };
+        self.scheduler_firing_web.forget(request.id);
         self.update_scheduler_runtime(scheduler_window::Message::Finished(
             job_executor::Completion {
                 id: request.id,
                 outcome: kortty_jobs::RunOutcome::Cancelled,
                 detail: None,
                 recording: None,
+                output: None,
                 swarm_report: None,
             },
         ))
+    }
+
+    pub(super) fn expire_pending_firing_web(&mut self) -> Task<Message> {
+        let mut completions = Vec::new();
+        for (id, reason) in self.expire_firing_web() {
+            if let Some(index) = self
+                .scheduler_queue
+                .iter()
+                .position(|queued| queued.id == id)
+                && let Some(request) = self.scheduler_queue.remove(index)
+            {
+                let outcome = if request.cancellation.is_requested() || self.scheduler_draining {
+                    kortty_jobs::RunOutcome::Cancelled
+                } else {
+                    kortty_jobs::RunOutcome::Blocked
+                };
+                completions.push(job_executor::Completion {
+                    id,
+                    outcome,
+                    detail: Some(reason),
+                    recording: None,
+                    output: None,
+                    swarm_report: None,
+                });
+            }
+        }
+        Task::batch(
+            completions
+                .into_iter()
+                .map(|done| self.commit_scheduler_run(done, Vec::new())),
+        )
     }
 
     pub(super) fn enqueue_jobs(&mut self, requests: Vec<RunRequest<SshCommand>>) -> Task<Message> {
@@ -2117,10 +2451,13 @@ impl Workspace {
         let policy = job_executor::ExecutionPolicy {
             file_transfer_allowed: self.clipboard.policy.file_transfer_allowed,
             sudo_allowed: self.clipboard.policy.scheduler_sudo_allowed,
+            job_output_allowed: self.scheduler_journal_output_allowed(),
+            job_output_redactions: self.clipboard.policy.terminal_logging.clone(),
             server_access: self.clipboard.policy.server_access().clone(),
             automation: None,
             sync: None,
             privileged: None,
+            rsync: None,
             group_scope: None,
         };
         let per_firing = |request: &RunRequest<SshCommand>| {
@@ -2141,19 +2478,41 @@ impl Workspace {
                 continue;
             }
             let next = self.scheduler_queue.iter().position(|request| {
-                (ssh_room || per_firing(request))
-                    && (request.cancellation.is_requested()
-                        || !request.action.agent.as_ref().is_some_and(|action| {
-                            self.ai_configuration()
-                                .and_then(|config| {
-                                    config.resolve_profile_reference(&action.profile)
-                                })
-                                .is_some_and(|id| self.policy_auto_model_pending(id))
-                        }))
+                request.action.imported_ai.is_some()
+                    || (!self.scheduler_firing_web.waiting(request.id)
+                        && (ssh_room || per_firing(request))
+                        && (request.cancellation.is_requested()
+                            || !request.action.agent.as_ref().is_some_and(|action| {
+                                self.ai_configuration()
+                                    .and_then(|config| {
+                                        config.resolve_profile_reference(&action.profile)
+                                    })
+                                    .is_some_and(|id| self.ai_model_resolution_pending(id))
+                            })))
             });
             let Some(request) = next.and_then(|index| self.scheduler_queue.remove(index)) else {
                 break;
             };
+            if let Err(error) = request.action.require_executable() {
+                let cancelled = request.cancellation.is_requested();
+                self.scheduler_workers += 1;
+                tasks.push(Task::done(Message::JobFinished(
+                    job_executor::Completion {
+                        id: request.id,
+                        outcome: if cancelled {
+                            kortty_jobs::RunOutcome::Cancelled
+                        } else {
+                            kortty_jobs::RunOutcome::Blocked
+                        },
+                        detail: (!cancelled).then(|| error.into()),
+                        recording: None,
+                        output: None,
+                        swarm_report: None,
+                    },
+                    Vec::new(),
+                )));
+                continue;
+            }
             if !request.cancellation.is_requested()
                 && let Err(error) = request.action.require_installed_target_groups()
             {
@@ -2164,15 +2523,11 @@ impl Workspace {
                         outcome: kortty_jobs::RunOutcome::Blocked,
                         detail: Some(error.into()),
                         recording: None,
+                        output: None,
                         swarm_report: None,
                     },
                     Vec::new(),
                 )));
-                continue;
-            }
-            self.scheduler_swarm_comparisons.remember(&request);
-            if per_firing(&request) {
-                tasks.push(self.queue_firing_generation(request));
                 continue;
             }
             let id = request.id;
@@ -2188,15 +2543,72 @@ impl Workspace {
                         outcome: kortty_jobs::RunOutcome::Blocked,
                         detail: Some("The cascade start conditions changed before dispatch. Review the cascade again.".into()),
                         recording: None,
+                        output: None,
                         swarm_report: None,
                     },
                     Vec::new(),
                 )));
                 continue;
             }
+            let fresh = (|| {
+                if request.cancellation.is_requested() {
+                    return Ok(None);
+                }
+                if request
+                    .action
+                    .agent
+                    .as_ref()
+                    .and_then(|agent| agent.approval.as_deref())
+                    .is_some_and(agent::Approval::requires_fresh_web)
+                    && !self.scheduler_firing_web.contains(id)
+                {
+                    tasks.push(self.begin_firing_web_review(&request)?);
+                    if firing_web::unattended::grant(&request).is_none()
+                        && self.scheduler_views.is_empty()
+                        && let Some((&owner, _)) = self
+                            .windows
+                            .iter()
+                            .find(|(_, window)| window.focused)
+                            .or_else(|| self.windows.iter().next())
+                    {
+                        self.notice(owner, "JobScheduler is waiting for a web review.".into());
+                    }
+                    return Ok(None);
+                }
+                self.require_firing_web_evidence(&request)
+                    .map_err(str::to_owned)
+            })();
+            let fresh = match fresh {
+                Ok(_) if self.scheduler_firing_web.waiting(id) => {
+                    self.scheduler_queue.push_back(request);
+                    continue;
+                }
+                Ok(evidence) => evidence,
+                Err(error) => {
+                    self.scheduler_workers += 1;
+                    tasks.push(Task::done(Message::JobFinished(
+                        job_executor::Completion {
+                            id,
+                            outcome: kortty_jobs::RunOutcome::Blocked,
+                            detail: Some(error),
+                            recording: None,
+                            output: None,
+                            swarm_report: None,
+                        },
+                        Vec::new(),
+                    )));
+                    continue;
+                }
+            };
+            self.scheduler_swarm_comparisons.remember(&request);
+            if per_firing(&request) {
+                tasks.push(self.queue_firing_generation(request));
+                continue;
+            }
             let (done, automation, journal_warning, resends) = if request.action.agent.is_some() {
                 let mut context = self.scheduler_agent_context(&request);
                 let (automation, journal_warning) = if let Ok(context) = &mut context {
+                    context.fresh_web = fresh;
                     match self.scheduler_automation_capture(&request) {
                         Ok(automation) => {
                             context.journal = automation.clone();
@@ -2220,8 +2632,15 @@ impl Workspace {
                 } else {
                     Ok(None)
                 };
-                let elevation_allowed =
-                    request.action.sudo == SudoMode::Disabled || policy.sudo_allowed;
+                let elevated_rsync = request
+                    .action
+                    .remote
+                    .as_ref()
+                    .and_then(RemoteAction::rsync_transfer)
+                    .is_some_and(|(transfer, _)| transfer.uses_passwordless_sudo());
+                let elevation_allowed = (request.action.sudo == SudoMode::Disabled
+                    && !elevated_rsync)
+                    || policy.sudo_allowed;
                 let sync = self
                     .scheduler
                     .as_ref()
@@ -2234,16 +2653,39 @@ impl Workspace {
                             | RemoteAction::PrivilegedTreeDownload(_)
                     )
                 );
-                let saved_auth = if reviewed_folder && sync.is_none() {
-                    job_executor::JobAuth::Manual
-                } else {
-                    self.scheduler_auth(
-                        &request,
-                        policy.file_transfer_allowed,
-                        capture_directory.is_some(),
-                        archive_password.is_ok() && elevation_allowed,
-                    )
+                let rsync = match self.scheduler.as_mut().map_or(Ok(None), |scheduler| {
+                    scheduler.try_rsync_run_context(&request)
+                }) {
+                    Ok(rsync) => rsync,
+                    Err(error) => {
+                        self.scheduler_workers += 1;
+                        tasks.push(Task::done(Message::JobFinished(
+                            job_executor::Completion {
+                                id,
+                                outcome: kortty_jobs::RunOutcome::Blocked,
+                                detail: Some(error),
+                                recording: None,
+                                output: None,
+                                swarm_report: None,
+                            },
+                            Vec::new(),
+                        )));
+                        continue;
+                    }
                 };
+                let reviewed_rsync =
+                    scheduler_window::rsync_authority::uses_reviewed_receiver(&request.action);
+                let saved_auth =
+                    if reviewed_folder && sync.is_none() || reviewed_rsync && rsync.is_none() {
+                        job_executor::JobAuth::Manual
+                    } else {
+                        self.scheduler_auth(
+                            &request,
+                            policy.file_transfer_allowed,
+                            capture_directory.is_some(),
+                            archive_password.is_ok() && elevation_allowed,
+                        )
+                    };
                 let (automation, journal_warning) =
                     match self.scheduler_automation_capture(&request) {
                         Ok(automation) => (automation, None),
@@ -2252,6 +2694,7 @@ impl Workspace {
                 let mut job_policy = policy.clone();
                 job_policy.automation = automation.clone();
                 job_policy.sync = sync;
+                job_policy.rsync = rsync;
                 job_policy.privileged = self
                     .scheduler
                     .as_ref()
@@ -2273,6 +2716,7 @@ impl Workspace {
                     outcome: kortty_jobs::RunOutcome::Failed { exit_code: None },
                     detail: Some("SSH job worker ended without a result".into()),
                     recording: None,
+                    output: None,
                     swarm_report: None,
                 });
                 if let Some(warning) = journal_warning {
@@ -2384,14 +2828,17 @@ impl Workspace {
         request: &RunRequest<SshCommand>,
         file_transfer_allowed: bool,
     ) -> job_executor::ArchivePassword {
-        if request.cancellation.is_requested()
-            || !file_transfer_allowed
-            || request.action.remote.is_none()
-        {
+        if request.cancellation.is_requested() || request.action.remote.is_none() {
             return Ok(None);
         }
-        let RemoteAction::Archive(archive) = request.action.remote_action()? else {
+        let remote = request.action.remote_action()?;
+        if !file_transfer_allowed && remote.transfers_files() {
             return Ok(None);
+        }
+        let archive = match remote {
+            RemoteAction::Archive(archive) | RemoteAction::ServerArchive(archive) => archive,
+            RemoteAction::PrivilegedArchive(archive) => &archive.archive,
+            _ => return Ok(None),
         };
         let Some(id) = archive.password_credential.as_deref() else {
             return Ok(None);
@@ -2565,6 +3012,220 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn scheduler_run_detail_copy_uses_internal_clipboard_for_the_current_selection() {
+        use iced::widget::text_editor::Action;
+        use kortty_jobs::{FinishedRunMetadata, Job, JobGraph, RunOutcome, RunOutput, Scheduler};
+
+        let scratch = Scratch::new();
+        let database = scratch.0.join("jobs.json");
+        let job = JobId::new("clipboard-fixture").unwrap();
+        let action: SshCommand = serde_json::from_value(serde_json::json!({
+            "host": "fixture.invalid", "port": 22, "username": "operator",
+            "key_file": scratch.0.join("unused-key"), "command": "printf ready"
+        }))
+        .unwrap();
+        let graph = JobGraph::new(vec![Job::new(job.clone(), "Fixture", action).unwrap()]).unwrap();
+        let mut scheduler = Scheduler::new(graph);
+        let started = SystemTime::now();
+        let run = scheduler.start_manual(&job, started).unwrap().started[0].id;
+        let completed = scheduler
+            .complete(run, RunOutcome::Success, started)
+            .unwrap();
+        let mut store = kortty_jobs::SchedulerStore::open(&database).unwrap();
+        store
+            .commit_with_actions(scheduler.graph(), &[], &[])
+            .unwrap();
+        store
+            .commit_finished_runs(
+                scheduler.graph(),
+                &completed.finished,
+                FinishedRunMetadata {
+                    output: &[(
+                        run,
+                        RunOutput {
+                            stdout: "café".into(),
+                            stderr: "警告".into(),
+                        },
+                    )],
+                    ..FinishedRunMetadata::default()
+                },
+            )
+            .unwrap();
+        drop(store);
+
+        let mut workspace = Workspace::default();
+        workspace.clipboard.policy.internal = true;
+        let scheduler = SchedulerWindow::open(database).unwrap();
+        let window = window::Id::unique();
+        workspace
+            .scheduler_views
+            .insert(window, scheduler.new_view());
+        workspace.scheduler = Some(scheduler);
+
+        use scheduler_window::{Message as ActionMessage, Page};
+        let _ = workspace.update_scheduler(window, ActionMessage::Page(Page::Journal));
+        let _ = workspace.update_scheduler(window, ActionMessage::SelectRecord(run));
+        let _ = workspace.update_scheduler(
+            window,
+            ActionMessage::SelectRunDetail(run, Action::SelectAll),
+        );
+        let _ = workspace.update_scheduler(window, ActionMessage::CopyRunDetail(run));
+        assert_eq!(
+            workspace.clipboard.buffer.get().as_deref(),
+            Some("stdout\ncafé\n\nstderr\n警告")
+        );
+
+        workspace.clipboard.buffer.set("prior".into());
+        let _ = workspace.update_scheduler(window, ActionMessage::Page(Page::Action));
+        let _ = workspace.update_scheduler(window, ActionMessage::CopyRunDetail(run));
+        assert_eq!(workspace.clipboard.buffer.get().as_deref(), Some("prior"));
+    }
+
+    #[test]
+    fn scheduler_deletion_persists_journal_revocation_before_removing_the_job() {
+        use crate::session_journal::summary_queue::{
+            AutomaticApproval, AutomationSource, ProfileBinding, ProfileChoice, Queue,
+        };
+
+        let scratch = Scratch::new();
+        let job = JobId::new("java-fixture").unwrap();
+        let source = AutomationSource::Job(job.clone());
+        let database = scratch.0.join("jobs.json");
+        let action: SshCommand = serde_json::from_value(serde_json::json!({
+            "host": "fixture.invalid", "port": 22, "username": "operator",
+            "key_file": scratch.0.join("unused-key"), "command": "true"
+        }))
+        .unwrap();
+        let graph = kortty_jobs::JobGraph::new(vec![
+            kortty_jobs::Job::new(job.clone(), "Imported fixture", action).unwrap(),
+        ])
+        .unwrap();
+        kortty_jobs::SchedulerStore::open(&database)
+            .unwrap()
+            .commit_with_actions(&graph, &[], &[])
+            .unwrap();
+        let grant = AutomaticApproval {
+            profile: ProfileChoice {
+                id: crate::ai_manager::ProfileRef::Numeric(1),
+                model: "fixture".into(),
+                destination: "https://fixture.invalid/v1".into(),
+                policy_model_fingerprint: None,
+                https: Some(ProfileBinding {
+                    root: scratch.0.join("journals"),
+                    profile_revision: [0; 32],
+                    redaction_revision: [0; 32],
+                }),
+                cli: None,
+            },
+            since: jiff::Timestamp::now(),
+            evidence_limits: None,
+            title_since: None,
+        };
+        let mut queue = Queue::load(&scratch.0).unwrap();
+        let mut preferences = queue.preferences().clone();
+        preferences
+            .set_source_approval(source.clone(), Some((grant.clone(), false)))
+            .unwrap();
+        preferences
+            .set_source_approval(AutomationSource::Swarm, Some((grant, false)))
+            .unwrap();
+        queue.set_preferences(preferences).unwrap();
+
+        let mut workspace = Workspace::default();
+        workspace.journal_summaries.load(&scratch.0);
+        let scheduler = SchedulerWindow::open(database).unwrap();
+        let window = window::Id::unique();
+        workspace
+            .scheduler_views
+            .insert(window, scheduler.new_view());
+        workspace.scheduler = Some(scheduler);
+        let _ = workspace.update_scheduler(window, scheduler_window::Message::Delete);
+
+        let directory = crate::private_files::Directory::open(&scratch.0, false).unwrap();
+        let lock = directory.open_lock(".journal-summary-jobs.lock").unwrap();
+        lock.try_lock().unwrap();
+        let _ = workspace.update_scheduler(window, scheduler_window::Message::Confirm);
+        lock.unlock().unwrap();
+        let scheduler = workspace.scheduler.as_ref().unwrap();
+        assert_eq!(
+            scheduler.automation_job_name(&job),
+            Some("Imported fixture")
+        );
+        assert_eq!(
+            scheduler.confirmed_job_deletion(&workspace.scheduler_views[&window]),
+            Some(&job)
+        );
+        assert!(
+            Queue::load(&scratch.0)
+                .unwrap()
+                .preferences()
+                .source_approval(&source)
+                .is_some()
+        );
+
+        let _ = workspace.update_scheduler(window, scheduler_window::Message::Confirm);
+        assert!(
+            workspace
+                .scheduler
+                .as_ref()
+                .unwrap()
+                .automation_job_name(&job)
+                .is_none()
+        );
+        let queue = Queue::load(&scratch.0).unwrap();
+        assert!(queue.preferences().source_approval(&source).is_none());
+        assert!(
+            queue
+                .preferences()
+                .source_approval(&AutomationSource::Swarm)
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn injected_imported_ai_run_completes_without_opening_a_worker_or_journal() {
+        use iced::futures::executor::block_on;
+        use kortty_jobs::{Job, JobGraph, RunOutcome, Scheduler};
+
+        let action: SshCommand = serde_json::from_value(serde_json::json!({
+            "connection": {"id": 1, "target": {"host": "fixture.invalid", "port": 22, "username": "operator"}},
+            "imported_ai": {"kind": "agent", "goal": "Inspect fixture", "parallelism": 1, "swarm_read_only": true}
+        })).unwrap();
+        let job = JobId::new("draft").unwrap();
+        let mut model = Scheduler::new(
+            JobGraph::new(vec![
+                Job::new(job.clone(), "Draft fixture", action)
+                    .unwrap()
+                    .with_enabled(false),
+            ])
+            .unwrap(),
+        );
+        let request = model
+            .start_manual(&job, SystemTime::now())
+            .unwrap()
+            .started
+            .remove(0);
+        let expected = request.id;
+        let mut workspace = Workspace::default();
+        let mut stream =
+            iced_runtime::task::into_stream(workspace.enqueue_jobs(vec![request])).unwrap();
+        assert!(workspace.scheduler_queue.is_empty());
+        let Some(iced_runtime::Action::Output(Message::JobFinished(completion, journals))) =
+            block_on(stream.next())
+        else {
+            panic!("expected a blocked scheduler completion")
+        };
+        assert_eq!(completion.id, expected);
+        assert_eq!(completion.outcome, RunOutcome::Blocked);
+        assert_eq!(
+            completion.detail.as_deref(),
+            Some(scheduler_window::IMPORTED_AI_REVIEW_REQUIRED)
+        );
+        assert!(completion.recording.is_none() && journals.is_empty());
+        assert!(block_on(stream.next()).is_none());
     }
 
     #[test]
@@ -2748,6 +3409,7 @@ mod tests {
                 },
                 detail: None,
                 recording: None,
+                output: None,
                 swarm_report: None,
             },
         ));
@@ -2827,7 +3489,7 @@ mod tests {
         }})).unwrap();
         let mut scheduler = SchedulerWindow::open(scratch.0.join("jobs.json")).unwrap();
         scheduler.set_connections(Some(&store));
-        scheduler.set_agent_profiles(Some(&config));
+        scheduler.set_agent_profiles(Some(&config), true);
         let mut workspace = Workspace {
             scheduler: Some(scheduler),
             ..Workspace::default()
@@ -2840,7 +3502,7 @@ mod tests {
             .unwrap();
         let runtime = workspace.scheduler.as_mut().unwrap();
         runtime.set_connections(Some(&store));
-        runtime.set_agent_profiles(Some(&config));
+        runtime.set_agent_profiles(Some(&config), true);
         let handoff = |name: &str| SwarmHandoff {
             name: name.into(),
             goal: "Check disk space".into(),

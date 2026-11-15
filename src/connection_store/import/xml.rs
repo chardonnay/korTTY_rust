@@ -11,7 +11,14 @@ pub(super) fn parse(bytes: &[u8]) -> io::Result<Preview> {
     decode(bytes, parse_xml)
 }
 
-pub(super) fn parse_java_binding_source(bytes: &[u8], strict_ids: bool) -> io::Result<Preview> {
+pub(super) fn parse_java_backup(bytes: &[u8], source: kortty::Source) -> io::Result<Preview> {
+    read_java_root(bytes, |root| kortty::parse(root, source))
+}
+
+pub(super) fn read_java_root<T>(
+    bytes: &[u8],
+    read: impl FnOnce(Node<'_, '_>) -> io::Result<T>,
+) -> io::Result<T> {
     decode(bytes, |xml| {
         let document = parse_document(xml)
             .map_err(|_| invalid("invalid connection XML or XML node limit exceeded"))?;
@@ -19,12 +26,7 @@ pub(super) fn parse_java_binding_source(bytes: &[u8], strict_ids: bool) -> io::R
         if !has_unqualified_tag(root, "connections") {
             return Err(invalid("expected Java connections.xml"));
         }
-        let source = if strict_ids {
-            kortty::Source::CredentialReview
-        } else {
-            kortty::Source::RouteLineage
-        };
-        kortty::parse(root, source)
+        read(root)
     })
 }
 

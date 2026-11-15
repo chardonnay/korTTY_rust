@@ -11,6 +11,191 @@ use crate::terminal_logging::{Redactor, Secrets};
 
 use super::*;
 
+#[test]
+fn scheduled_automation_vision_describes_saved_frames_and_keeps_text_with_vision_disabled() {
+    use std::io::Write as _;
+
+    use crate::local_ai::test_support::{exclusive_run, fixture_http_response, listener, request};
+    use crate::session_journal::automation::Closing;
+    use crate::session_journal::summary_store::Progress;
+    use crate::workspace::journal_access::summaries::Worker;
+
+    let _exclusive = exclusive_run();
+    let scratch = Profile::new();
+    let base = scratch.0.canonicalize().unwrap();
+    let root = base.join("journals");
+    let preferences = base.join("window-settings.json");
+    let (endpoint, profile) = listener();
+    let (_busy_session, _cancel) = crate::local_ai::Session::begin(profile).unwrap();
+    let address = endpoint.local_addr().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let worker_stop = Arc::clone(&stop);
+    let server = std::thread::spawn(move || {
+        let mut images = 0;
+        let mut text = 0;
+        let mut closing_with_vision = 0;
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !worker_stop.load(Ordering::Acquire) && Instant::now() < deadline {
+            let (stream, _) = match endpoint.accept() {
+                Ok(connection) => connection,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
+                Err(error) => panic!("model fixture: {error}"),
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut stream = io::BufReader::new(stream);
+            let body = request(&mut stream);
+            let content = if let Some(parts) = body["messages"][1]["content"].as_array() {
+                images += 1;
+                assert_eq!(parts[1]["type"], "image_url");
+                assert!(
+                    parts[1]["image_url"]["url"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("data:image/png;base64,")
+                );
+                r#"{"description":"The scheduled terminal is visible.","tags":["terminal"]}"#
+            } else if body["messages"][1]["content"] == "{}" {
+                r#"{"ready":true}"#
+            } else {
+                text += 1;
+                if body["messages"][0]["content"]
+                    .as_str()
+                    .is_some_and(|system| system.contains("closing session journal summary"))
+                    && body["messages"][1]["content"]
+                        .as_str()
+                        .is_some_and(|prompt| prompt.contains("The scheduled terminal is visible."))
+                {
+                    closing_with_vision += 1;
+                }
+                r#"{"title":"Scheduler result","summary":"The task finished.","keywords":[]}"#
+            };
+            let response = json!({
+                "choices": [{"message": {"content": content}, "finish_reason": "stop"}],
+                "usage": {"prompt_tokens": 12, "completion_tokens": 3, "total_tokens": 15}
+            });
+            let wire = fixture_http_response("200 OK", "", &response.to_string());
+            stream.get_mut().write_all(wire.as_bytes()).unwrap();
+        }
+        (images, text, closing_with_vision)
+    });
+    let mut workspace = Workspace::default();
+    workspace
+        .set_test_ai_configuration(crate::ai_manager::Configuration::load_from(&base).unwrap());
+    workspace.journal_summaries.load(&base);
+    workspace.window_settings.session_journal.directory = root.to_str().unwrap().into();
+    let settings = &mut workspace.window_settings.journal_ai;
+    settings.enabled = true;
+    settings.vision_enabled = true;
+    settings.auto_screenshot_analysis = true;
+    settings.endpoint = address.to_string();
+    settings.model = "fixture:local".into();
+    workspace.window_settings.save(&preferences).unwrap();
+    let vision = workspace.automation_screenshot_vision(None).unwrap();
+
+    for vision_enabled in [true, false] {
+        let (settings, run) = workspace
+            .automation_capture(
+                Kind::Job,
+                "scheduled-vision".into(),
+                "Scheduled vision fixture".into(),
+                "COMMAND",
+                Timestamp::now(),
+                Options {
+                    enabled: true,
+                    capture_input: true,
+                    closing: Closing::Always,
+                    ..Options::default()
+                },
+            )
+            .unwrap();
+        let redactor = Arc::new(Redactor::for_journal(
+            Secrets::default().seal().unwrap(),
+            workspace.clipboard.policy.terminal_logging.clone(),
+        ));
+        let recorder = Recorder::start(
+            &settings,
+            run.with_vision(Some(vision.clone())),
+            Destination {
+                key: session_journal::automation::identity_digest(b"vision-target").unwrap(),
+                label: "Scheduled target".into(),
+                host: "fixture.example".into(),
+                port: Some(22),
+                username: "operator".into(),
+            },
+            redactor,
+        )
+        .unwrap();
+        recorder.command("printf task-done");
+        recorder.output("task-done", false);
+        let png = tiny_skia::Pixmap::new(16, 16)
+            .unwrap()
+            .encode_png()
+            .unwrap();
+        recorder.try_screenshot(png, true, || true).unwrap();
+        let artifact = recorder.finish(RunStatus::Success, Some(0));
+        assert!(artifact.complete);
+        let source = artifact.source.clone();
+        if !vision_enabled {
+            workspace
+                .window_settings
+                .journal_ai
+                .auto_screenshot_analysis = false;
+            workspace.window_settings.save(&preferences).unwrap();
+        }
+
+        let _ = workspace.automation_journals_completed(vec![artifact]);
+        let maintenance = workspace.tick_automation_journals();
+        let mut actions = iced_runtime::task::into_stream(maintenance).unwrap();
+        let Some(iced_runtime::Action::Output(swept @ Desktop::AutomationJournal(_))) =
+            block_on(actions.next())
+        else {
+            panic!("expected a completed automation journal sweep");
+        };
+        let task = workspace.update(swept);
+        let mut actions = iced_runtime::task::into_stream(task).unwrap();
+        let (event, outcome) = loop {
+            let iced_runtime::Action::Output(event) =
+                block_on(actions.next()).expect("journal summary completion")
+            else {
+                continue;
+            };
+            if let Desktop::JournalSummary(Worker::Finished(_, result)) = &event {
+                let outcome = *result.as_ref().unwrap();
+                break (event, outcome);
+            }
+        };
+        assert_eq!(outcome.images, usize::from(vision_enabled));
+        assert!(Progress::read(&source).unwrap().finished);
+        let xml = std::fs::read_to_string(source.directory().join("journal.xml")).unwrap();
+        assert_eq!(
+            xml.contains("The scheduled terminal is visible."),
+            vision_enabled
+        );
+        assert!(xml.contains("The task finished."));
+        let reopened = crate::session_journal::summary_queue::Queue::load(&base).unwrap();
+        let receipt = reopened
+            .pending()
+            .iter()
+            .find(|receipt| receipt.source.source().same_journal(&source))
+            .unwrap();
+        assert_eq!(receipt.automation_vision.is_some(), vision_enabled);
+        let _ = workspace.update(event);
+        let reopened = crate::session_journal::summary_queue::Queue::load(&base).unwrap();
+        assert!(reopened.pending().is_empty());
+    }
+    stop.store(true, Ordering::Release);
+    let (images, text, closing_with_vision) = server.join().unwrap();
+    assert_eq!(images, 1);
+    assert!(text >= 2);
+    assert_eq!(closing_with_vision, 1);
+}
+
 fn job_finished(task: Task<Desktop>) -> (crate::job_executor::Completion, Vec<Artifact>) {
     let mut actions = iced_runtime::task::into_stream(task).expect("scheduler execution task");
     loop {
@@ -133,6 +318,7 @@ fn verify_run_journal_routing(target_count: usize) {
             outcome: RunOutcome::Success,
             detail: None,
             recording: None,
+            output: None,
             swarm_report: None,
         },
         artifacts,

@@ -17,6 +17,7 @@ use crate::private_files::FileStamp;
 
 mod archive;
 mod java_bindings;
+mod java_library;
 mod kortty;
 mod mobaxterm;
 mod options;
@@ -25,8 +26,11 @@ mod xml;
 
 pub(crate) use java_bindings::{
     JavaConnectionBindings, JavaImportedRoute, JavaManagedKeyBinding, JavaPasswordBinding,
-    check_java_connection_routes, check_java_imported_routes, prepare_java_connection_import,
+    JavaSourceGroups, check_java_connection_routes, check_java_imported_routes,
+    java_connection_candidate, prepare_java_connection_import_with_library,
 };
+pub(crate) use java_library::JavaLibrarySettings;
+pub(crate) use kortty::normalize_java_group_path;
 pub(crate) use options::{CredentialReplacement, Destination, Options, Prepared, SourceGroup};
 pub(crate) use teamwork::{
     MAX_TEAMWORK_BYTES, TeamworkEntry, read_teamwork, read_teamwork_bytes, valid_teamwork_id,
@@ -56,12 +60,16 @@ pub(crate) struct Preview {
     pub(crate) duplicates: usize,
     pub(crate) skipped_tunnels: usize,
     java_key_references: usize,
+    java_groups: JavaSourceGroups,
+    java_library: JavaLibrarySettings,
 }
 
 #[derive(Clone)]
 struct ImportedProfile {
     connection: Connection,
     java_id: Option<String>,
+    java_favorite_id: Option<String>,
+    java_memory_id: Option<String>,
     java_key_id: Option<String>,
     java_route: Option<(LoginTarget, Option<LoginTarget>)>,
     group: String,
@@ -74,12 +82,15 @@ struct ImportedProfile {
 struct ImportedLocal {
     profile: LocalProfile,
     group: String,
+    java_memory_id: Option<String>,
+    java_favorite_id: Option<String>,
 }
 
 #[derive(Clone)]
 struct ImportedSerial {
     profile: SerialProfile,
     group: String,
+    java_favorite_id: Option<String>,
 }
 
 impl ImportedProfile {
@@ -87,6 +98,8 @@ impl ImportedProfile {
         Self {
             connection,
             java_id: None,
+            java_favorite_id: None,
+            java_memory_id: None,
             java_key_id: None,
             java_route: None,
             group,
@@ -186,15 +199,16 @@ impl Preview {
         if bytes.len() as u64 > MAX_BYTES {
             return Err(invalid("connection import exceeds its size limit"));
         }
-        let preview = Self::parse_bytes(Format::Kortty, bytes)?;
-        if preview.format != Format::Kortty {
-            return Err(invalid("expected Java connections.xml"));
-        }
-        Ok(preview)
+        xml::parse_java_backup(bytes, kortty::Source::Backup)
     }
 
     pub(crate) fn portable_java_backup(&self) -> io::Result<(Vec<u8>, usize)> {
         options::portable_java_backup(self)
+    }
+
+    pub(crate) fn with_java_library(mut self, settings: JavaLibrarySettings) -> Self {
+        self.java_library = settings;
+        self
     }
 
     pub(crate) fn merge_java_backup(
@@ -326,6 +340,7 @@ impl Preview {
         }) {
             previous.java_route = None;
             previous.java_key_id = None;
+            previous.java_favorite_id = None;
             self.duplicates += 1;
             return Ok(false);
         }
@@ -335,11 +350,13 @@ impl Preview {
     }
 
     fn push_local(&mut self, entry: ImportedLocal) -> io::Result<()> {
-        if self
+        if let Some(previous) = self
             .local_entries
-            .iter()
-            .any(|previous| previous.profile == entry.profile && previous.group == entry.group)
+            .iter_mut()
+            .find(|previous| previous.profile == entry.profile && previous.group == entry.group)
         {
+            previous.java_memory_id = None;
+            previous.java_favorite_id = None;
             self.duplicates += 1;
         } else {
             self.check_capacity()?;
@@ -359,11 +376,12 @@ impl Preview {
     }
 
     fn push_serial(&mut self, entry: ImportedSerial) -> io::Result<()> {
-        if self
+        if let Some(previous) = self
             .serial_entries
-            .iter()
-            .any(|previous| previous.profile == entry.profile && previous.group == entry.group)
+            .iter_mut()
+            .find(|previous| previous.profile == entry.profile && previous.group == entry.group)
         {
+            previous.java_favorite_id = None;
             self.duplicates += 1;
         } else {
             self.check_capacity()?;
@@ -376,6 +394,27 @@ impl Preview {
     pub(crate) fn apply(&self, store: &mut Store) -> io::Result<Outcome> {
         self.prepare(&Options::default(), store)?.apply(store)
     }
+}
+
+/// Visits every declared Java connection ID, including rejected protocols and profiles.
+pub(crate) fn visit_java_connection_ids(
+    bytes: &[u8],
+    mut visit: impl FnMut(&str),
+) -> io::Result<()> {
+    if bytes.len() as u64 > MAX_BYTES {
+        return Err(invalid("connection import exceeds its size limit"));
+    }
+    xml::read_java_root(bytes, |root| {
+        for entry in root
+            .children()
+            .filter(|entry| xml::has_unqualified_tag(*entry, "connection"))
+        {
+            if let Some(id) = entry.attribute("id") {
+                visit(id);
+            }
+        }
+        Ok(())
+    })
 }
 
 fn read_stable(
@@ -426,6 +465,7 @@ fn serial_bookmark(
     Ok(ImportedSerial {
         profile,
         group: import_group(group)?,
+        java_favorite_id: None,
     })
 }
 

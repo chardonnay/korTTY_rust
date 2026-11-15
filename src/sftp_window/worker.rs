@@ -31,7 +31,7 @@ pub(super) mod archive;
 mod deadline;
 pub(in crate::sftp_window) mod download_access;
 pub(in crate::sftp_window) mod draft_file;
-#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
 pub(crate) mod drag_out;
 pub(super) mod extract;
 mod folder;
@@ -40,6 +40,7 @@ pub(super) mod folder_usage;
 pub(in crate::sftp_window) mod ordinary_access;
 pub(super) use folder_budget::FolderBudget;
 pub(super) mod ownership;
+pub(crate) use ownership::resolve_scheduler_account;
 pub(in crate::sftp_window) mod resume;
 pub(super) mod server_copy;
 mod source_link;

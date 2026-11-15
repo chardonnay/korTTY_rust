@@ -1,6 +1,7 @@
 //! Recheck installed policy before dispatching an approved agent operation.
 
 use crate::clipboard_policy::{AiAgentExecution, ClipboardPolicy};
+use crate::local_ai::Profile;
 use crate::terminal_logging::Policy as RedactionPolicy;
 
 use super::swarm::headless::Source;
@@ -31,12 +32,17 @@ pub(super) struct Dispatch {
     swarm: bool,
     route: Route,
     redactions: Option<RedactionPolicy>,
+    managed_https: Option<Box<Profile>>,
 }
 
 impl Dispatch {
     pub(super) fn check(&self) -> Result<(), String> {
         self.check_with(&ClipboardPolicy::load())
-            .map_err(str::to_owned)
+            .map_err(str::to_owned)?;
+        if let Some(transport) = &self.managed_https {
+            transport.require_current_policy_authority()?;
+        }
+        Ok(())
     }
 
     pub(super) fn check_with(&self, policy: &ClipboardPolicy) -> Result<(), &'static str> {
@@ -94,6 +100,14 @@ impl Workspace {
             redactions: run
                 .profile()
                 .map(|_| run.redactor.redaction_policy().clone()),
+            managed_https: run
+                .transport
+                .as_ref()
+                .map(|(transport, _)| transport)
+                .filter(|transport| {
+                    transport.is_remote() && transport.policy_profile_id().is_some()
+                })
+                .map(|transport| Box::new(transport.clone())),
         })
     }
 }
@@ -116,6 +130,7 @@ mod tests {
             swarm,
             route: Route::Local,
             redactions: None,
+            managed_https: None,
         };
         let agent_denied = policy("ai-agent = 'deny'");
         assert!(

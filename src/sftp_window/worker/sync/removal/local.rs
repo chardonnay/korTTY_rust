@@ -154,7 +154,7 @@ mod platform {
         if directory && !empty(file)? {
             return Ok(Outcome::KeptNotEmpty);
         }
-        let stage = Quarantine::create(parent_path, parent)?;
+        let stage = Quarantine::create(parent_path, parent, nonce()?)?;
         let payload = OsStr::new(PAYLOAD);
         let move_into_stage = (|| -> Result<Option<(Stat, Metadata)>> {
             before_write()?;
@@ -247,8 +247,7 @@ mod platform {
     }
 
     impl Quarantine {
-        pub(super) fn create(parent_path: &Path, parent: Directory) -> Result<Self> {
-            let name = nonce()?;
+        pub(super) fn create(parent_path: &Path, parent: Directory, name: String) -> Result<Self> {
             let folder = parent.create_child(OsStr::new(&name)).map_err(|error| {
                 Failure::from(error).context(quarantine_label(parent_path, &name))
             })?;
@@ -274,6 +273,11 @@ mod platform {
 
         pub(super) fn path(&self, payload: &OsStr) -> PathBuf {
             self.parent_path.join(&self.name).join(payload)
+        }
+
+        pub(super) fn sync(&self) -> Result<()> {
+            self.folder.file().sync_all()?;
+            Ok(self.parent.file().sync_all()?)
         }
 
         pub(super) fn verify_parent(&self, expected: &Identity) -> Result<()> {

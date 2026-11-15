@@ -21,12 +21,19 @@ mod input;
 mod minimax;
 pub(crate) use discovery::{Discovered, Discovery, Load, ModelList};
 pub(crate) use input::Request;
-use input::{Argument, FileRole, Mode};
+use input::{Argument, Mode, Template};
 pub(crate) use minimax::{MiniMaxRegion, valid_minimax_config_path, valid_minimax_module_path};
 
 pub(crate) const MAX_ARGS: usize = 24;
 pub(crate) const MAX_ARG_BYTES: usize = 8 * 1024;
 pub(crate) const MODEL: &str = "{model}";
+const REASONING: &str = "{reasoning}";
+
+pub(crate) struct TemplateRequirements {
+    pub(crate) model: bool,
+    pub(crate) reasoning: bool,
+    pub(crate) explicit_prompt: bool,
+}
 
 pub(crate) fn display_model(model: &str) -> &str {
     if model.is_empty() {
@@ -279,6 +286,27 @@ pub(crate) struct Program {
 }
 
 impl Program {
+    pub(super) fn probe_credential(&self) -> Result<Option<Zeroizing<String>>, Error> {
+        require_policy(false)?;
+        let changed =
+            || Error::Review("The reviewed CLI executable changed or is unavailable.".into());
+        let (path, fingerprint) = Self::inspect(&self.path).map_err(|_| changed())?;
+        if path != self.path || fingerprint != self.fingerprint {
+            return Err(changed());
+        }
+        if let Some(minimax) = &self.minimax {
+            minimax.verify_module()?;
+        }
+        self.current_probe_credential()
+    }
+
+    pub(super) fn current_probe_credential(&self) -> Result<Option<Zeroizing<String>>, Error> {
+        self.minimax
+            .as_ref()
+            .map(|minimax| minimax.read_key())
+            .transpose()
+    }
+
     pub(crate) fn inspect(path: &Path) -> Result<(PathBuf, [u8; 32]), String> {
         Self::inspect_cancellable(path, None)
     }
@@ -312,32 +340,32 @@ impl Program {
         model: &str,
         fingerprint: [u8; 32],
     ) -> Result<Self, String> {
-        if !executable::valid_path(&path) || !valid_arguments(arguments) {
+        Self::approved_template(path, arguments, model, None, fingerprint)
+    }
+
+    pub(crate) fn approved_template(
+        path: PathBuf,
+        arguments: &[String],
+        model: &str,
+        reasoning: Option<&str>,
+        fingerprint: [u8; 32],
+    ) -> Result<Self, String> {
+        let Some(template) = valid_template(arguments).filter(|_| executable::valid_path(&path))
+        else {
             return Err("Enter an absolute native executable and bounded arguments.".into());
-        }
-        let mode = input::mode(arguments).expect("validated prompt placeholders");
-        if arguments.iter().any(|argument| argument == MODEL)
-            && (!super::valid_model(model) || model.starts_with('-'))
-        {
-            return Err("Enter a model identifier for the standalone {model} argument.".into());
-        }
+        };
+        validate_template_values(
+            template.uses_model,
+            template.uses_reasoning,
+            model,
+            reasoning,
+        )?;
+        let mode = template.mode;
         let codex_preset = arguments
             .iter()
             .map(String::as_str)
             .eq(CODEX_STDIN.iter().copied());
-        let arguments = arguments
-            .iter()
-            .filter_map(|argument| {
-                Some(match argument.as_str() {
-                    "{stdinPrompt}" => return None,
-                    "{promptFile}" => Argument::File(FileRole::Combined),
-                    "{systemPromptFile}" => Argument::File(FileRole::System),
-                    "{userPromptFile}" => Argument::File(FileRole::User),
-                    MODEL => Argument::Literal(model.into()),
-                    _ => Argument::Literal(argument.clone()),
-                })
-            })
-            .collect::<Vec<_>>();
+        let arguments = Template::expand(arguments, model, reasoning.unwrap_or_default());
         if arguments
             .iter()
             .map(|argument| argument.review().len())
@@ -370,13 +398,18 @@ impl Program {
     }
 
     pub(crate) fn command_review(&self) -> String {
-        self.review_arguments(
+        let mut review = self.review_arguments(
             &self
                 .arguments
                 .iter()
                 .map(Argument::review)
                 .collect::<Vec<_>>(),
-        )
+        );
+        if matches!(self.mode, Mode::Combined | Mode::Split) {
+            review
+                .push_str("\nPrompt-file placeholders resolve to private files for this request.");
+        }
+        review
     }
 
     fn review_arguments(&self, arguments: &impl serde::Serialize) -> String {
@@ -400,13 +433,52 @@ impl Program {
     }
 }
 
-pub(crate) fn valid_arguments(arguments: &[String]) -> bool {
-    arguments.len() <= MAX_ARGS
+#[cfg(test)]
+fn valid_arguments(arguments: &[String]) -> bool {
+    valid_template(arguments).is_some()
+}
+
+fn valid_template(arguments: &[String]) -> Option<Template> {
+    (arguments.len() <= MAX_ARGS
         && arguments.iter().map(String::len).sum::<usize>() <= MAX_ARG_BYTES
         && arguments
             .iter()
-            .all(|argument| !argument.chars().any(char::is_control))
-        && input::mode(arguments).is_some()
+            .all(|argument| !argument.chars().any(char::is_control)))
+    .then(|| Template::parse(arguments))?
+}
+
+pub(crate) fn template_requirements(arguments: &[String]) -> Option<TemplateRequirements> {
+    let template = valid_template(arguments)?;
+    Some(TemplateRequirements {
+        model: template.uses_model,
+        reasoning: template.uses_reasoning,
+        explicit_prompt: template.explicit_prompt,
+    })
+}
+
+pub(crate) fn uses_reasoning(arguments: &[String]) -> bool {
+    Template::uses_reasoning(arguments)
+}
+
+fn validate_template_values(
+    model_required: bool,
+    reasoning_used: bool,
+    model: &str,
+    reasoning: Option<&str>,
+) -> Result<(), String> {
+    if model_required && (!super::valid_model(model) || model.starts_with('-')) {
+        return Err("Enter a model identifier for {model}.".into());
+    }
+    if let Some(value) = reasoning
+        && (!reasoning_used
+            || !matches!(
+                value,
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+            ))
+    {
+        return Err("Select a supported reasoning effort for a {reasoning} argument.".into());
+    }
+    Ok(())
 }
 
 pub(super) fn prompt(
@@ -823,10 +895,9 @@ mod tests {
         for invalid in [
             vec!["{systemPromptFile}"],
             vec!["{userPromptFile}"],
-            vec!["{promptFile}", "{promptFile}"],
             vec!["{promptFile}", "{stdinPrompt}"],
             vec!["{systemPromptFile}", "{userPromptFile}", "{promptFile}"],
-            vec!["--input={promptFile}"],
+            vec!["--input={stdinPrompt}"],
             vec!["{prompt}"],
         ] {
             assert!(!valid_arguments(
@@ -866,6 +937,76 @@ mod tests {
             )
         );
         assert!(request.secondary().is_none());
+    }
+
+    #[test]
+    fn configured_cli_interpolates_model_reasoning_and_private_file_in_single_arguments() {
+        use crate::local_ai::test_support::exclusive_run;
+
+        let _exclusive = exclusive_run();
+        let fixture = crate::snippets::tests::Profile::new();
+        let root = fixture.0.canonicalize().unwrap().join("argv with spaces");
+        std::fs::create_dir(&root).unwrap();
+        let (executable, fingerprint) = Program::inspect(&fixture_executable(&root)).unwrap();
+        let arguments = [
+            "fixture_argument_template",
+            "--model={model}",
+            "literal with spaces {model}:\\\"{reasoning}\\",
+            "--reasoning={reasoning}",
+            "{reasoning}",
+            "--input={promptFile}",
+            "{promptFile}",
+        ]
+        .map(str::to_owned);
+        let prepared = |reasoning| {
+            Program::approved_template(
+                executable.clone(),
+                &arguments,
+                "vendor/{promptFile}",
+                reasoning,
+                fingerprint,
+            )
+            .unwrap()
+        };
+        let program = prepared(Some("xhigh"));
+        let request = Request::prepare(&program, &root, "System å", &[], "User 漢").unwrap();
+        assert!(program.command_review().contains("--reasoning=xhigh"));
+        assert!(program.command_review().contains("--input={promptFile}"));
+        assert_eq!(request.launch.arguments[1], "--model=vendor/{promptFile}");
+        assert_eq!(request.launch.arguments[4], "xhigh");
+        let path_arg = request.launch.arguments[5]
+            .strip_prefix("--input=")
+            .unwrap();
+        assert!(path_arg.contains("argv with spaces"));
+        assert_eq!(path_arg, request.launch.arguments[6]);
+        assert!(request.command_review().contains("argv with spaces"));
+        assert_ne!(
+            prepared(Some("high")).command_review(),
+            program.command_review()
+        );
+        assert!(!request.matches(&prepared(Some("high")), &root));
+        let missing = prepared(None);
+        let default = Request::prepare(&missing, &root, "System", &[], "User").unwrap();
+        assert_eq!(default.launch.arguments[3], "--reasoning=");
+        assert_eq!(default.launch.arguments[4], "");
+        let expected = request.primary().1.to_owned();
+        let working = root.join(&request.name);
+        let result = run(
+            &program,
+            &root,
+            request,
+            Instant::now() + Duration::from_secs(15),
+            &AtomicBool::new(false),
+            || Ok(()),
+            |_| {},
+        )
+        .unwrap();
+        assert!(result.contains("fixture final answer"));
+        assert_eq!(
+            std::fs::read_to_string(root.join("fixture-template-prompt")).unwrap(),
+            expected
+        );
+        assert!(!working.exists());
     }
 
     #[test]

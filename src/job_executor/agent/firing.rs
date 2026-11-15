@@ -10,10 +10,9 @@ use kortty_ssh::{ConnectError, ExecConnection};
 
 use super::{
     Cancellation, ClipboardPolicy, Completion, Context, Failure, Kind, Mask, Outcome, POLL, Policy,
-    Probe, RedactionSecrets, Redactor, RunOutcome, RunRequest, RunTrigger, SshCommand, Status,
-    Store, Target, TrustStore, check_cancelled, checked_proposal, current_route_policy,
-    require_approved_profile, require_current_route, require_mask_unchanged, seal_targets,
-    terminal_agent,
+    Probe, RedactionSecrets, Redactor, RunOutcome, RunRequest, SshCommand, Status, Store, Target,
+    TrustStore, check_cancelled, checked_proposal, current_route_policy, require_approved_profile,
+    require_current_route, require_mask_unchanged, seal_targets, terminal_agent,
 };
 use crate::job_executor::automation::{IterativeCapture, IterativeTarget};
 use crate::scheduler_window::{
@@ -105,11 +104,6 @@ fn run(
     load_policy: impl Fn() -> ClipboardPolicy + Send + Sync + 'static,
 ) -> Result<FiringResult, Failure> {
     check_cancelled(&request.cancellation)?;
-    if !matches!(request.trigger, RunTrigger::Manual | RunTrigger::Scheduled) {
-        return Err(Failure::blocked(
-            "Scheduled Agent requires Run Now or a calendar start.",
-        ));
-    }
     let action = request
         .action
         .agent
@@ -121,6 +115,11 @@ fn run(
             )
         })
         .ok_or_else(|| Failure::blocked("The reviewed scheduled Agent action is unavailable."))?;
+    if !action.probe.allows_trigger(request.trigger) {
+        return Err(Failure::blocked(
+            "This scheduled Agent workflow does not support the trigger.",
+        ));
+    }
     action.validate(&request.action).map_err(Failure::blocked)?;
     request
         .action
@@ -130,6 +129,11 @@ fn run(
         .approval
         .as_ref()
         .ok_or_else(|| Failure::blocked("The scheduled Agent job scope is unavailable."))?;
+    if !approval.allows_trigger(action.probe, request.trigger) {
+        return Err(Failure::blocked(
+            "Review the scheduled Agent workflow before using a dependency or cascade start.",
+        ));
+    }
     if approval.profile.id != action.profile {
         return Err(Failure::blocked(
             "The reviewed scheduled Agent profile changed.",
@@ -176,7 +180,8 @@ fn run(
         FiringWork::InitialProbe(prompt) => {
             if action.probe != Probe::SwarmIterative
                 || !approval.has_initial_swarm_probe()
-                || !approval.generation_matches_for(target_index, &prompt)
+                || !approval
+                    .generation_matches_for(target_index, &prompt.base_for_standing_review())
             {
                 return Err(Failure::blocked(
                     "The scheduled Swarm environment probe is no longer reviewed.",
@@ -324,6 +329,7 @@ fn run(
                         id: request.id,
                         outcome,
                         detail: Some(detail),
+                        output: None,
                         recording: None,
                         swarm_report: None,
                     },
@@ -610,6 +616,42 @@ mod tests {
             &Policy::default(),
             fixture_mask,
         )
+    }
+
+    #[test]
+    fn dependency_and_cascade_firings_still_require_review() {
+        use kortty_jobs::RunTrigger;
+
+        for trigger in [RunTrigger::Dependency, RunTrigger::Cascade] {
+            for (kind, probe) in [
+                (Kind::Agent, Probe::PerFiring),
+                (Kind::Swarm, Probe::SwarmIterative),
+            ] {
+                let (_, mut request) = crate::job_executor::tests::scheduled_request();
+                request.trigger = trigger;
+                request.action = Arc::new(serde_json::from_value(serde_json::json!({
+                    "connection": {"id": 1, "target": {"host": "fixture.invalid", "port": 22, "username": "operator"}},
+                    "working_directory": "/srv",
+                    "agent": {"kind": kind, "probe": probe, "profile": 9, "goal": "Inspect the fixture"},
+                })).unwrap());
+                let Err(failure) = run(
+                    &request,
+                    0,
+                    Err("No reviewed fixture context"),
+                    (None, None),
+                    FiringWork::Commands(vec!["true".into()]),
+                    |_| panic!("an unreviewed firing must not reach execution"),
+                    ClipboardPolicy::default,
+                ) else {
+                    panic!("the trigger must not supply review authority");
+                };
+                assert_eq!(failure.outcome, RunOutcome::Blocked);
+                assert_eq!(
+                    failure.detail,
+                    "The scheduled Agent job scope is unavailable."
+                );
+            }
+        }
     }
 
     #[test]

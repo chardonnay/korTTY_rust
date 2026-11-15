@@ -10,7 +10,7 @@ use crate::ai_manager::Configuration;
 use crate::ai_manager::profiles::picker::DismissOnEscape as _;
 
 use super::super::Store;
-use super::super::statistics::{self, Current, Granularity, Hint, Ledger, Range, Report};
+use super::super::statistics::{self, Current, Granularity, Hint, Ledger, Range, Report, SkillKey};
 use super::super::usage::allowed_now;
 
 #[derive(Clone)]
@@ -21,7 +21,7 @@ pub(crate) enum Message {
     Granularity(Granularity),
     Periods(PeriodChoice),
     IncludePinned(bool),
-    Select(Option<u64>),
+    Select(Option<SkillKey>),
     Reset,
     ConfirmReset,
     CancelReset,
@@ -50,7 +50,7 @@ pub(super) struct Panel {
     granularity: Granularity,
     periods: PeriodChoice,
     include_pinned: bool,
-    selected: Option<u64>,
+    selected: Option<SkillKey>,
     snapshot: Option<Arc<Snapshot>>,
     report: Option<Report>,
     pending: Option<u64>,
@@ -137,10 +137,10 @@ impl Panel {
                 &snapshot.skills,
             )
         });
-        if self.selected.is_some_and(|id| {
+        if self.selected.as_ref().is_some_and(|id| {
             self.report
                 .as_ref()
-                .is_none_or(|report| !report.rows.iter().any(|row| row.id == id))
+                .is_none_or(|report| !report.rows.iter().any(|row| &row.id == id))
         }) {
             self.selected = None;
         }
@@ -215,8 +215,11 @@ impl Panel {
             .size(15)
         ]
         .spacing(10);
-        if let Some(id) = self.selected {
-            let series = report.series.iter().find(|series| series.id == Some(id));
+        if let Some(id) = &self.selected {
+            let series = report
+                .series
+                .iter()
+                .find(|series| series.id.as_ref() == Some(id));
             let fallback = series
                 .is_none()
                 .then(|| {
@@ -275,8 +278,8 @@ impl Panel {
             ))
             .size(13),
         );
-        if let Some(selected) = self.selected
-            && let Some(skill) = report.rows.iter().find(|skill| skill.id == selected)
+        if let Some(selected) = &self.selected
+            && let Some(skill) = report.rows.iter().find(|skill| &skill.id == selected)
         {
             let surfaces = skill
                 .usage
@@ -291,12 +294,11 @@ impl Panel {
             let avg = skill
                 .average_tokens
                 .map_or_else(|| "—".into(), |tokens| format!("{tokens:.1}"));
-            let status = if !skill.current {
-                "Removed"
-            } else if skill.enabled {
-                "Enabled"
-            } else {
-                "Disabled"
+            let status = match &skill.id {
+                SkillKey::Java(_) => "Imported Java history",
+                SkillKey::Native(_) if !skill.current => "Removed",
+                SkillKey::Native(_) if skill.enabled => "Enabled",
+                SkillKey::Native(_) => "Disabled",
             };
             let last_used = skill.last_used.as_deref().unwrap_or("—");
             let hints = skill
@@ -341,21 +343,33 @@ impl Panel {
                     .push(text("Skill size history").size(15))
                     .push(chart(&values, None, &dates));
             }
+            for (tokenizer, history) in &skill.java_size_history {
+                let values: Vec<_> = history.iter().map(|point| point.tokens).collect();
+                let dates: Vec<_> = history.iter().map(|point| point.date.clone()).collect();
+                body = body
+                    .push(text(format!("Imported Java skill sizes · {tokenizer}")).size(15))
+                    .push(chart(&values, None, &dates));
+            }
         }
         body = body.push(
-            button("All skills").on_press_maybe(self.selected.map(|_| Message::Select(None))),
+            button("All skills")
+                .on_press_maybe(self.selected.is_some().then_some(Message::Select(None))),
         );
         for skill in &report.rows {
+            let label = match &skill.id {
+                SkillKey::Native(_) => text(&skill.name),
+                SkillKey::Java(id) => text(format!("{} · Java history ({id})", skill.name)),
+            };
             body = body.push(
                 row![
-                    button(text(&skill.name).size(13))
-                        .style(if self.selected == Some(skill.id) {
+                    button(label.size(13))
+                        .style(if self.selected.as_ref() == Some(&skill.id) {
                             button::primary
                         } else {
                             button::text
                         })
                         .width(Length::Fill)
-                        .on_press(Message::Select(Some(skill.id))),
+                        .on_press(Message::Select(Some(skill.id.clone()))),
                     text(format!(
                         "{} automatic · {} pinned · {} tokens",
                         skill.usage.automatic, skill.usage.pinned, skill.usage.tokens

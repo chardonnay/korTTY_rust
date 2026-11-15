@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use kortty_ssh::sftp::{StatusCode, UploadMetadata, UploadStage};
 
 use crate::sftp_window::worker::server_copy::Folder;
+use crate::sftp_window::worker::sync::sealed::SealedFile;
 
 use super::*;
 
@@ -14,6 +15,7 @@ mod resume;
 
 struct Target<'a> {
     path: &'a [u8],
+    name: &'a [u8],
     folder: &'a [u8],
     parent: &'a (Location, DirectoryStamp),
     original: Attributes,
@@ -46,6 +48,7 @@ impl<'a> Target<'a> {
         }
         Ok(Self {
             path,
+            name,
             folder,
             parent: &entry.target_parent,
             original: *original,
@@ -55,6 +58,38 @@ impl<'a> Target<'a> {
 
     fn in_place(&self) -> bool {
         self.original.uid != Some(self.uid)
+    }
+
+    fn require_scheduled(&self) -> Result<()> {
+        if self.in_place()
+            || self
+                .original
+                .permissions
+                .is_none_or(|mode| mode & 0o7077 != 0 || mode & 0o400 == 0)
+        {
+            return Err(io::Error::other(
+                "Scheduled replacement requires a readable login-owned server file with owner-only permissions and no special mode bits",
+            )
+            .into());
+        }
+        Ok(())
+    }
+
+    fn backup(
+        &self,
+        client: &mut Client,
+        prefix: Option<&str>,
+        authorize: &impl Fn() -> Result<()>,
+    ) -> Result<RemoteStage> {
+        let Some(prefix) = prefix else {
+            return RemoteStage::claim(client, self.folder, self.uid);
+        };
+        let nonce = crate::private_files::nonce()?;
+        let name = format!(".kortty-{prefix}{}.kortty-part", &nonce[16..]);
+        authorize()?;
+        let mut backup = RemoteStage::claim_named(client, self.folder, name.as_bytes(), self.uid)?;
+        backup.payload = files::remote_join(&backup.directory, self.name);
+        Ok(backup)
     }
 
     fn checked_folder(&self, client: &mut Client, stopped: &impl Fn() -> bool) -> Result<Folder> {
@@ -100,6 +135,18 @@ pub(super) fn prepare(
     Ok(())
 }
 
+pub(super) fn prepare_scheduled(
+    client: &mut Client,
+    entry: &Entry,
+    stopped: &impl Fn() -> bool,
+) -> Result<()> {
+    let target = Target::from_entry(entry)?;
+    target.require_scheduled()?;
+    target.checked_folder(client, stopped)?;
+    upload_time(entry)?;
+    Ok(())
+}
+
 pub(super) fn replace(
     client: &mut Client,
     entry: &Entry,
@@ -110,11 +157,28 @@ pub(super) fn replace(
     scope: ReplaceScope<'_>,
 ) -> ReplaceResult {
     let target = Target::from_entry(entry)?;
+    let (recovery, backup_prefix, standing_roots) = match scope {
+        ReplaceScope::Browser { recovery, .. } => (recovery, None, None),
+        ReplaceScope::Scheduled {
+            backup_prefix,
+            standing_roots,
+            ..
+        } => {
+            target.require_scheduled()?;
+            (None, Some(backup_prefix), standing_roots)
+        }
+    };
+    let before_mutation = |client: &mut Client| -> Result<()> {
+        if let Some(roots) = standing_roots {
+            roots.verify(client, false)?;
+        }
+        authorize()
+    };
     let folder = target.checked_folder(client, stopped)?;
     let Location::Local(path) = &entry.source else {
         return Err(io::Error::other("The reviewed local source is invalid").into());
     };
-    let upload = Upload {
+    let mut upload = Upload {
         entry,
         file: LocalSource::open(path)?,
         progress,
@@ -122,21 +186,22 @@ pub(super) fn replace(
         digest: digests[0],
         stopped,
         authorize,
+        strict_group: backup_prefix.is_some(),
+        sealed: None,
     };
     upload.verify()?;
     authorize()?;
+    if backup_prefix.is_some() {
+        upload.sealed = Some(SealedFile::from_source(&upload.file, digests[0], stopped)?);
+        upload.verify()?;
+        before_mutation(client)?;
+    }
     let _reserved = reservation::Reservation::claim(scope, target.path)?;
     if target.in_place() {
         return in_place::replace(client, &target, &folder, &upload, digests[1]);
     }
-    let (stage, mut checkpoint) = resume::stage(
-        client,
-        &target,
-        &folder,
-        &upload,
-        digests[1],
-        scope.recovery,
-    )?;
+    let (stage, mut checkpoint) =
+        resume::stage(client, &target, &folder, &upload, digests[1], recovery)?;
     let mut state = StageState::default();
     if let Err(error) = upload.write_stage(client, &stage, &mut state, checkpoint.as_mut()) {
         return Err(with_stage_recovery(
@@ -172,7 +237,9 @@ pub(super) fn replace(
         }
     };
     let stage_stamp = state.verified.expect("completed verified upload stage");
-    let backup = match RemoteStage::claim(client, target.folder, target.uid) {
+    let backup_result =
+        before_mutation(client).and_then(|()| target.backup(client, backup_prefix, authorize));
+    let backup = match backup_result {
         Ok(backup) => backup,
         Err(error) => {
             return Err(with_stage_recovery(
@@ -203,7 +270,7 @@ pub(super) fn replace(
         stage.verify(client)?;
         require_entry(client, &stage.payload, stage_stamp)?;
         upload.verify()?;
-        authorize()?;
+        before_mutation(client)?;
         // Metadata may already match. In that case quarantine is the first
         // boundary at which this complete private stage must stop being resumable.
         if let Some(checkpoint) = &mut checkpoint {
@@ -217,7 +284,7 @@ pub(super) fn replace(
         // after it, directly before the unconditional quarantine rename.
         require_absent(client, &backup.payload)?;
         require_entry(client, target.path, target.original)?;
-        authorize()?;
+        before_mutation(client)?;
         Ok(())
     })();
     if let Err(error) = before_move {
@@ -237,7 +304,12 @@ pub(super) fn replace(
             clean_before_move(error, client, &folder, &stage, &backup, &upload, &state).into(),
         );
     }
-    if let Err(error) = client.replace(target.path, &backup.payload) {
+    let quarantine = if backup_prefix.is_some() {
+        client.rename(target.path, &backup.payload)
+    } else {
+        client.replace(target.path, &backup.payload)
+    };
+    if let Err(error) = quarantine {
         let error = Failure::from(error);
         if error.disconnected {
             return Err(ReplaceFailure::uncertain(
@@ -265,7 +337,7 @@ pub(super) fn replace(
         stage.verify(client)?;
         require_entry(client, &stage.payload, stage_stamp)?;
         upload.verify()?;
-        authorize()?;
+        before_mutation(client)?;
         client.hardlink(&stage.payload, target.path)?;
         published = true;
         require_entry(client, target.path, stage_stamp)
@@ -330,16 +402,28 @@ struct Upload<'a> {
     digest: [u8; 32],
     stopped: &'a dyn Fn() -> bool,
     authorize: &'a dyn Fn() -> Result<()>,
+    strict_group: bool,
+    sealed: Option<SealedFile>,
 }
 
 impl Upload<'_> {
+    fn input(&self) -> io::Result<&File> {
+        self.sealed
+            .as_ref()
+            .map_or_else(|| Ok(self.file.file()), SealedFile::file)
+    }
+
     fn verify(&self) -> Result<()> {
         let (SnapshotEntry::LocalFile { stamp, identity }, (_, DirectoryStamp::Local(parent))) =
             (&self.entry.source_stamp, &self.entry.source_parent)
         else {
             return Err(io::Error::other("The reviewed local source is invalid").into());
         };
-        Ok(self.file.verify_reviewed(stamp, identity, parent)?)
+        self.file.verify_reviewed(stamp, identity, parent)?;
+        if let Some(sealed) = &self.sealed {
+            sealed.verify()?;
+        }
+        Ok(())
     }
 
     fn write_stage(
@@ -360,7 +444,7 @@ impl Upload<'_> {
             &stage.payload,
             mode,
             self.file.size(),
-            Counted(self.progress, self.file.file()),
+            Counted(self.progress, self.input()?),
             |owner, offset| {
                 if owner.uid != stage.uid {
                     return Err(io::Error::other("The private stage has a different owner"));
@@ -413,10 +497,12 @@ impl Upload<'_> {
             match self.metadata(client, &stage.payload, verified, wanted, &mut checkpoint) {
                 Ok(()) => None,
                 Err(Error::Status(status))
-                    if matches!(
-                        status.code,
-                        StatusCode::PermissionDenied | StatusCode::Failure
-                    ) && wanted.gid != initial.gid
+                    if !self.strict_group
+                        && matches!(
+                            status.code,
+                            StatusCode::PermissionDenied | StatusCode::Failure
+                        )
+                        && wanted.gid != initial.gid
                         && unchanged(initial, *verified)
                         && unchanged(initial, client.lstat(&stage.payload)?) =>
                 {
@@ -446,7 +532,7 @@ impl Upload<'_> {
                 .new_hasher()
                 .map_err(|error| Error::LocalIo(io::Error::other(error)))?,
         ));
-        let input = ObserveInput(self.file.file(), |bytes: &[u8]| {
+        let input = ObserveInput(self.input().map_err(Error::LocalIo)?, |bytes: &[u8]| {
             if let Some(digest) = digest.borrow_mut().as_mut() {
                 digest.update(bytes);
             }
@@ -556,7 +642,7 @@ fn clean_stage(
             &stage.payload,
             owner,
             upload.file.size(),
-            upload.file.file(),
+            upload.input()?,
             || false,
         )?;
         upload.verify()?;

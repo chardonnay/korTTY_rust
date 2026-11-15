@@ -12,6 +12,7 @@ use crate::job_executor::{
     Completion,
     automation::{IterativeCapture, Plan},
 };
+use crate::scheduled_agent_review::Ticket;
 use crate::scheduler_window::{
     SshCommand,
     agent::{
@@ -19,6 +20,9 @@ use crate::scheduler_window::{
         proposal::{MAX_SWARM_COMMAND_ROUNDS, SwarmEvidence, SwarmRound},
     },
 };
+use crate::workspace::terminal_ai::web::Evidence;
+
+use super::environment_research::Lookup;
 
 const MAX_NOTE_BYTES: usize = 64;
 
@@ -74,7 +78,15 @@ impl Target {
 #[derive(Default)]
 struct Swarm {
     environment: Option<SwarmEvidence>,
+    environment_lookup: Option<Lookup>,
+    environment_web: Option<Arc<Evidence>>,
+    round_web: Option<RoundWeb>,
     prior: Vec<SwarmRound>,
+}
+
+enum RoundWeb {
+    Waiting(Ticket),
+    Reviewed(Option<Arc<Evidence>>),
 }
 
 #[derive(Default)]
@@ -175,6 +187,13 @@ impl Sequence {
         &self.request
     }
 
+    pub(super) fn round_web_request(
+        &self,
+        ticket: &Ticket,
+    ) -> Option<&Arc<RunRequest<SshCommand>>> {
+        self.waiting_for_round_web(ticket).then_some(&self.request)
+    }
+
     pub(super) fn current_round(&self, index: usize) -> Option<u8> {
         self.is_current(index).then(|| {
             self.swarm_prior(index)
@@ -193,6 +212,118 @@ impl Sequence {
             .as_ref()?
             .environment
             .as_ref()
+    }
+
+    pub(super) fn environment_web(&self, index: usize) -> Option<&Arc<Evidence>> {
+        self.targets
+            .get(index)?
+            .swarm
+            .as_ref()?
+            .environment_web
+            .as_ref()
+    }
+
+    pub(super) fn environment_lookup(&self, index: usize) -> Option<&Lookup> {
+        self.targets
+            .get(index)?
+            .swarm
+            .as_ref()?
+            .environment_lookup
+            .as_ref()
+    }
+
+    pub(super) fn active_environment_lookups(&self) -> impl Iterator<Item = (usize, &Lookup)> {
+        self.targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| {
+                Some((index, target.swarm.as_ref()?.environment_lookup.as_ref()?))
+            })
+    }
+
+    pub(super) fn set_environment_lookup(&mut self, index: usize, lookup: Lookup) {
+        let swarm = self.targets[index]
+            .swarm
+            .as_mut()
+            .expect("claimed Swarm target");
+        swarm.environment_lookup = Some(lookup);
+    }
+
+    pub(super) fn take_environment_lookup(&mut self, index: usize) -> Option<Lookup> {
+        self.targets
+            .get_mut(index)?
+            .swarm
+            .as_mut()?
+            .environment_lookup
+            .take()
+    }
+
+    pub(super) fn accept_environment_web(&mut self, index: usize, evidence: Arc<Evidence>) {
+        if let Some(swarm) = self.targets[index].swarm.as_mut() {
+            swarm.environment_lookup = None;
+            swarm.environment_web = Some(evidence);
+        }
+        self.defer(index);
+    }
+
+    pub(super) fn round_web_decided(&self, index: usize) -> bool {
+        self.targets[index]
+            .swarm
+            .as_ref()
+            .is_some_and(|swarm| swarm.round_web.is_some())
+    }
+
+    pub(super) fn round_web(&self, index: usize) -> Option<&Evidence> {
+        match self.targets[index].swarm.as_ref()?.round_web.as_ref()? {
+            RoundWeb::Reviewed(evidence) => evidence.as_deref(),
+            RoundWeb::Waiting(_) => None,
+        }
+    }
+
+    pub(super) fn wait_for_round_web(&mut self, ticket: &Ticket) -> bool {
+        let index = ticket.target_index();
+        if ticket.run() != self.request.id
+            || self.current_round(index) != Some(ticket.round())
+            || !crate::scheduler_window::agent::proposal::allows_swarm_round_research(
+                ticket.round(),
+            )
+            || self.round_web_decided(index)
+            || self.cancellation_requested()
+        {
+            return false;
+        }
+        let Some(swarm) = &mut self.targets[index].swarm else {
+            return false;
+        };
+        swarm.round_web = Some(RoundWeb::Waiting(ticket.clone()));
+        true
+    }
+
+    pub(super) fn waiting_for_round_web(&self, ticket: &Ticket) -> bool {
+        let index = ticket.target_index();
+        self.current_round(index) == Some(ticket.round())
+            && self.targets[index].swarm.as_ref().is_some_and(|swarm| {
+                matches!(&swarm.round_web, Some(RoundWeb::Waiting(current)) if current == ticket)
+            })
+    }
+
+    pub(super) fn accept_round_web(
+        &mut self,
+        ticket: &Ticket,
+        evidence: Option<Arc<Evidence>>,
+    ) -> bool {
+        if !self.waiting_for_round_web(ticket) || self.cancellation_requested() {
+            return false;
+        }
+        let index = ticket.target_index();
+        let target = &mut self.targets[index];
+        target
+            .swarm
+            .as_mut()
+            .expect("reviewed Swarm target")
+            .round_web = Some(RoundWeb::Reviewed(evidence));
+        target.phase = Phase::Ready;
+        true
     }
 
     pub(super) fn needs_initial_probe(&self, index: usize) -> bool {
@@ -261,6 +392,7 @@ impl Sequence {
             return false;
         };
         swarm.prior.push(SwarmRound { round, commands });
+        swarm.round_web = None;
         target.phase = Phase::Ready;
         true
     }
@@ -481,6 +613,7 @@ impl Sequence {
             outcome,
             detail: Some(detail),
             recording: None,
+            output: None,
             swarm_report,
         })
     }

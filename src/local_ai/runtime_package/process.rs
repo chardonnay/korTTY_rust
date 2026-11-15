@@ -286,6 +286,7 @@ struct MlxAssets {
     runtime: Mutex<mlx_runtime::Runtime>,
     model: mlx_models::Opened,
     environment: mlx_runtime::KeyFile,
+    reasoning_controls: mlx_models::ReasoningControls,
 }
 
 impl Sidecar {
@@ -473,6 +474,11 @@ impl Sidecar {
         let idle_timeout =
             (idle_minutes != 0).then(|| Duration::from_secs(u64::from(idle_minutes) * 60));
         let runtime = mlx_runtime::Runtime::open(profile, cancelled)?;
+        let reasoning_controls = if runtime.supports_template_reasoning() {
+            model.reasoning_controls()
+        } else {
+            mlx_models::ReasoningControls::DefaultOnly
+        };
         let mut random = Zeroizing::new([0_u8; 32]);
         getrandom::fill(&mut *random).map_err(io::Error::other)?;
         let token = Zeroizing::new(URL_SAFE_NO_PAD.encode(random.as_slice()));
@@ -526,6 +532,7 @@ impl Sidecar {
                     runtime: Mutex::new(runtime.take().expect("prepared MLX runtime")),
                     model,
                     environment: key,
+                    reasoning_controls,
                 })),
                 address,
                 pid,
@@ -679,6 +686,13 @@ impl Sidecar {
 
     pub(in crate::local_ai) fn has_vision(&self) -> bool {
         matches!(&self.assets, Assets::Gguf(assets) if assets.model.model.projector_bytes.is_some())
+    }
+
+    pub(in crate::local_ai) fn mlx_reasoning_controls(&self) -> mlx_models::ReasoningControls {
+        match &self.assets {
+            Assets::Mlx(assets) => assets.reasoning_controls,
+            Assets::Gguf(_) => mlx_models::ReasoningControls::DefaultOnly,
+        }
     }
 
     pub(super) fn stop(&self) -> io::Result<()> {
@@ -845,6 +859,7 @@ pub(super) fn test_model(
                 false,
                 Some(deadline),
                 false,
+                || Ok(()),
             )
             .map_err(Error::message)
             .and_then(|reply| {

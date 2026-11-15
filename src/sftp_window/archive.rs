@@ -231,7 +231,7 @@ impl Draft {
         !self.name.is_empty()
             && self.level().is_some()
             && !self.excludes.contains('\0')
-            && (self.side != Side::Remote || self.server_only || self.metadata().is_some())
+            && (self.side != Side::Remote || self.metadata().is_some())
             && self.password_ready()
     }
 
@@ -316,9 +316,9 @@ impl Draft {
             }
         }
         if self.side == Side::Remote && self.server_only {
-            form = form.push(text("Requires the kortty server archive helper. The archive is private to the SSH account."));
+            form = form.push(text("Requires the kortty server archive helper. It publishes the reviewed ownership and permissions."));
         }
-        if self.side == Side::Remote && !self.server_only {
+        if self.side == Side::Remote {
             form = form
                 .push(text(
                     "Owner and group are optional. Blank permissions use 600.",
@@ -410,13 +410,11 @@ impl Draft {
             text(format!("{} entries to archive · {excluded_count} excluded paths", entries.len())),
             text(match self.side {
                 Side::Local => "korTTY reads the reviewed local files and creates a new private archive.",
-                Side::Remote if self.server_only => "The server helper reads the reviewed files and creates a private archive on the server.",
+                Side::Remote if self.server_only => "The server helper reads the reviewed files and publishes the archive with the reviewed attributes.",
                 Side::Remote => "korTTY reads the selected files over SFTP, builds the archive in memory and publishes it with the reviewed attributes.",
             }),
         ].padding(16).spacing(8);
-        if let Review::Remote(plan) = review
-            && !plan.server_only()
-        {
+        if let Review::Remote(plan) = review {
             let (owner, group, mode) = reviewed_metadata(plan);
             form = form
                 .push(text(format!(
@@ -777,12 +775,6 @@ impl SftpWindow {
                     self.target.clone(),
                     worker,
                 )?;
-                if draft.server_only {
-                    return Ok(worker::Operation::ReviewServerArchive(
-                        Box::new(request.on_server(worker)?),
-                        cancel,
-                    ));
-                }
                 let metadata = draft.metadata().ok_or_else(|| {
                     io::Error::other("Enter valid server archive ownership and permissions.")
                 })?;
@@ -797,6 +789,11 @@ impl SftpWindow {
                             .as_ref()
                             .is_some_and(estimate::Selection::is_pending),
                     )?
+                };
+                let request = if draft.server_only {
+                    request.on_server(worker)?
+                } else {
+                    request
                 };
                 Ok(worker::Operation::ReviewServerArchive(
                     Box::new(request),

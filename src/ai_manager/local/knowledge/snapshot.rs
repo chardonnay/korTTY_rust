@@ -275,7 +275,7 @@ fn encoded_size(index: &Index, receipt: Option<&QdrantReceipt>) -> io::Result<us
     let mut previous = 0;
     for (passage, embedding) in &index.entries {
         let location_valid = match passage.location {
-            Location::Line(line) => (1..=super::source::MAX_TEXT_BYTES).contains(&line),
+            Location::Line(line) => (1..=super::source::MAX_CORPUS_BYTES).contains(&line),
             Location::Page(page) => (1..=pdf::MAX_PAGES).contains(&page),
         };
         if passage.source < previous
@@ -534,7 +534,7 @@ fn read_index(input: &mut impl Read, scope: &Scope) -> io::Result<Index> {
     let mut vector = vec![0; vector_bytes as usize];
     let mut previous = 0;
     let max_line = if expanded {
-        super::source::MAX_TEXT_BYTES
+        super::source::MAX_CORPUS_BYTES
     } else if graph_tag {
         super::source::PREVIOUS_LARGE_TEXT_BYTES
     } else {

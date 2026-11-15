@@ -111,13 +111,14 @@ impl Fixture {
         let config = self.directory.0.join(format!("{host}.conf"));
         let host_key = self.directory.0.join(host);
         let authorized = self.directory.0.join("client.pub");
+        // OpenSSH takes the first value for a setting.
         fs::write(
             &config,
             format!(
-                "HostKey \"{}\"\nAuthorizedKeysFile \"{}\"\nAllowUsers {}\n\
+                "{extra}HostKey \"{}\"\nAuthorizedKeysFile \"{}\"\nAllowUsers {}\n\
                  PasswordAuthentication no\nKbdInteractiveAuthentication no\nPubkeyAuthentication yes\n\
                  UsePAM no\nStrictModes yes\nLogLevel DEBUG2\nPrintMotd no\nPrintLastLog no\n\
-                 PermitTTY yes\nAllowTcpForwarding yes\nGatewayPorts no\nSubsystem sftp internal-sftp\n{extra}",
+                 PermitTTY yes\nAllowTcpForwarding yes\nGatewayPorts no\nSubsystem sftp internal-sftp\n",
                 host_key.display(),
                 authorized.display(),
                 self.user,

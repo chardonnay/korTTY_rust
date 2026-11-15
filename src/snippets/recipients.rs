@@ -15,7 +15,53 @@ pub(crate) use super::archive::{CertificateInfo, inspect_certificate};
 pub(crate) const FILE_NAME: &str = "openpgp-recipients.json";
 const VERSION: u8 = 1;
 const MAX_RECIPIENTS: usize = 64;
+pub(crate) const MAX_PENDING_JAVA: usize = 64;
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JavaRecipient {
+    source_id: String,
+    name: String,
+    fingerprint: String,
+}
+
+impl JavaRecipient {
+    pub(crate) fn new(source_id: &str, name: &str, fingerprint: &str) -> io::Result<Self> {
+        if source_id.is_empty()
+            || source_id.len() > 128
+            || !source_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+            || crate::ssh_dialog::unsafe_text(name)
+        {
+            return Err(invalid("Invalid imported OpenPGP recipient metadata"));
+        }
+        Ok(Self {
+            source_id: source_id.to_owned(),
+            name: self::name(name)?.to_owned(),
+            fingerprint: normalize_fingerprint(fingerprint)?,
+        })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(crate) fn key_id(&self) -> &str {
+        key_id(&self.fingerprint)
+    }
+}
+
+#[derive(Clone)]
+pub struct Management {
+    pub(crate) choices: Vec<Choice>,
+    pub(crate) pending_java: Vec<JavaRecipient>,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -69,7 +115,9 @@ pub(crate) enum Action {
     List(PathBuf),
     Save(PathBuf, Change),
     SaveReviewed(PathBuf, Change, CertificateInfo),
+    AttachJava(PathBuf, JavaRecipient, Change, CertificateInfo),
     Delete(PathBuf, Choice),
+    DeleteJava(PathBuf, JavaRecipient),
 }
 
 #[derive(PartialEq, Eq)]
@@ -82,13 +130,27 @@ pub(crate) struct Change {
 
 impl Action {
     pub(crate) fn run(self) -> io::Result<Vec<Choice>> {
+        Ok(self.run_management()?.choices)
+    }
+
+    pub(crate) fn run_management(self) -> io::Result<Management> {
         match self {
-            Self::List(path) => Ok(Document::read(&path)?.choices()),
-            Self::Save(path, change) => save(&path, change, None),
-            Self::SaveReviewed(path, change, reviewed) => save(&path, change, Some(&reviewed)),
+            Self::List(path) => Ok(Document::read(&path)?.management()),
+            Self::Save(path, change) => save(&path, change, None, None),
+            Self::SaveReviewed(path, change, reviewed) => {
+                save(&path, change, Some(&reviewed), None)
+            }
+            Self::AttachJava(path, imported, change, reviewed) => {
+                save(&path, change, Some(&reviewed), Some(&imported))
+            }
             Self::Delete(path, choice) => mutate(&path, |document| {
                 let index = document.index(&choice)?;
                 document.entries.remove(index);
+                Ok(())
+            }),
+            Self::DeleteJava(path, imported) => mutate(&path, |document| {
+                let index = document.java_index(&imported)?;
+                document.pending_java.remove(index);
                 Ok(())
             }),
         }
@@ -126,17 +188,24 @@ struct Entry {
 struct Document {
     version: u8,
     entries: Vec<Entry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending_java: Vec<JavaRecipient>,
 }
 
 impl Document {
+    fn empty() -> Self {
+        Self {
+            version: VERSION,
+            entries: Vec::new(),
+            pending_java: Vec::new(),
+        }
+    }
+
     fn read(path: &Path) -> io::Result<Self> {
         let file = match profile::open_preference(path) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Ok(Self {
-                    version: VERSION,
-                    entries: Vec::new(),
-                });
+                return Ok(Self::empty());
             }
             Err(error) => return Err(error),
         };
@@ -162,7 +231,10 @@ impl Document {
     }
 
     fn validate(&self) -> io::Result<()> {
-        if self.version != VERSION || self.entries.len() > MAX_RECIPIENTS {
+        if self.version != VERSION
+            || self.entries.len() > MAX_RECIPIENTS
+            || self.pending_java.len() > MAX_PENDING_JAVA
+        {
             return Err(invalid("Unsupported OpenPGP recipient catalog"));
         }
         let mut names = HashSet::new();
@@ -179,13 +251,26 @@ impl Document {
                 return Err(invalid("Invalid or duplicate OpenPGP recipient"));
             }
         }
+        let mut java_ids = HashSet::new();
+        for imported in &self.pending_java {
+            if JavaRecipient::new(&imported.source_id, &imported.name, &imported.fingerprint)?
+                != *imported
+                || !fingerprints.insert(&imported.fingerprint)
+                || !java_ids.insert(&imported.source_id)
+            {
+                return Err(invalid("Invalid or duplicate imported OpenPGP recipient"));
+            }
+        }
         Ok(())
     }
 
-    fn choices(self) -> Vec<Choice> {
+    fn management(self) -> Management {
         let mut choices: Vec<_> = self.entries.into_iter().map(|entry| entry.choice).collect();
         choices.sort_by_cached_key(|choice| choice.name.to_lowercase());
-        choices
+        Management {
+            choices,
+            pending_java: self.pending_java,
+        }
     }
 
     fn index(&self, previous: &Choice) -> io::Result<usize> {
@@ -196,6 +281,62 @@ impl Document {
                 invalid("The OpenPGP recipient changed or was removed. Reload and select it again")
             })
     }
+
+    fn java_index(&self, imported: &JavaRecipient) -> io::Result<usize> {
+        self.pending_java
+            .iter()
+            .position(|entry| entry == imported)
+            .ok_or_else(|| invalid("The imported OpenPGP recipient changed or was removed. Reload and select it again"))
+    }
+
+    fn encode(&self) -> io::Result<Vec<u8>> {
+        self.validate()?;
+        let bytes = serde_json::to_vec(self).map_err(io::Error::other)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(invalid("The recipient catalog exceeds 8 MiB"));
+        }
+        Ok(bytes)
+    }
+}
+
+pub(crate) fn java_backup_delta(pending_java: Vec<JavaRecipient>) -> io::Result<Vec<u8>> {
+    Document {
+        pending_java,
+        ..Document::empty()
+    }
+    .encode()
+}
+
+pub(crate) fn merge_java_backup(
+    local: Option<&[u8]>,
+    incoming: &[u8],
+) -> io::Result<Option<Vec<u8>>> {
+    let incoming = Document::decode(incoming)?;
+    if !incoming.entries.is_empty() {
+        return Err(invalid(
+            "A Java OpenPGP catalogue may contain only pending metadata",
+        ));
+    }
+    let mut local = local.map_or_else(|| Ok(Document::empty()), Document::decode)?;
+    let original_count = local.pending_java.len();
+    for imported in incoming.pending_java {
+        if local.pending_java.len() == MAX_PENDING_JAVA {
+            break;
+        }
+        if !local
+            .entries
+            .iter()
+            .any(|entry| entry.choice.fingerprint == imported.fingerprint)
+            && !local.pending_java.iter().any(|entry| {
+                entry.source_id == imported.source_id || entry.fingerprint == imported.fingerprint
+            })
+        {
+            local.pending_java.push(imported);
+        }
+    }
+    (local.pending_java.len() != original_count)
+        .then(|| local.encode())
+        .transpose()
 }
 
 pub(crate) fn validate_backup(bytes: &[u8]) -> io::Result<()> {
@@ -222,7 +363,8 @@ fn save(
     path: &Path,
     change: Change,
     reviewed: Option<&CertificateInfo>,
-) -> io::Result<Vec<Choice>> {
+    imported: Option<&JavaRecipient>,
+) -> io::Result<Management> {
     let name = name(&change.name)?.to_owned();
     let fingerprint = normalize_fingerprint(&change.fingerprint)?;
     if change
@@ -232,6 +374,11 @@ fn save(
     {
         return Err(invalid(
             "Enroll a new recipient to use a different OpenPGP fingerprint",
+        ));
+    }
+    if imported.is_some_and(|entry| entry.fingerprint != fingerprint || change.previous.is_some()) {
+        return Err(invalid(
+            "The public certificate must match the imported OpenPGP fingerprint",
         ));
     }
     let candidate = change
@@ -277,6 +424,14 @@ fn save(
             if revoked {
                 return Err(invalid("The OpenPGP certificate is revoked"));
             }
+            if let Some(imported) = imported {
+                let index = document.java_index(imported)?;
+                document.pending_java.remove(index);
+            } else {
+                document
+                    .pending_java
+                    .retain(|imported| imported.fingerprint != choice.fingerprint);
+            }
             document.entries.push(Entry {
                 choice,
                 certificate,
@@ -289,20 +444,16 @@ fn save(
 fn mutate(
     path: &Path,
     change: impl FnOnce(&mut Document) -> io::Result<()>,
-) -> io::Result<Vec<Choice>> {
+) -> io::Result<Management> {
     let _lock = StoreLock::acquire_for(
         path,
         "The recipient catalog is being saved by another instance",
     )?;
     let mut document = Document::read(path)?;
     change(&mut document)?;
-    document.validate()?;
-    let bytes = serde_json::to_vec(&document).map_err(io::Error::other)?;
-    if bytes.len() as u64 > MAX_BYTES {
-        return Err(invalid("The recipient catalog exceeds 8 MiB"));
-    }
+    let bytes = document.encode()?;
     profile::save_atomic(path, &bytes)?;
-    Ok(document.choices())
+    Ok(document.management())
 }
 
 #[cfg(test)]

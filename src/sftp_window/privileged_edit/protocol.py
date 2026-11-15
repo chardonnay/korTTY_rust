@@ -207,9 +207,9 @@ def store(fd, data):
         pending = pending[count:]
 
 
-def await_commit():
+def await_commit(status="ready", **fields):
     token = os.urandom(16).hex()
-    send("ready", token=token)
+    send(status, token=token, **fields)
     require(hmac.compare_digest(receive(32), token.encode("ascii")), "failed")
 
 
@@ -758,6 +758,26 @@ def delete_protected(parts, parent, chain, recursive, stack):
     os.fsync(parent)
 
 
+def file_symbolic_chmod(parts, parent, chain, stack):
+    global PUBLISHING
+    name = parts[-1]
+    source, expected, directory = protected_node(parent, name, stack)
+    info = os.fstat(source)
+    require(metadata(info) == expected, "conflict")
+    current = stat.S_IMODE(info.st_mode)
+    await_commit("ready_mode", current=current, directory=directory)
+    desired = struct.unpack(">H", receive(2))[0]
+    require(desired <= 0o777)
+    require_ancestry(parts[:-1], chain)
+    require_node(parent, name, source, expected)
+    if current != desired:
+        PUBLISHING = True
+        os.fchmod(source, desired)
+        require(stat.S_IMODE(os.fstat(source).st_mode) == desired, "uncertain")
+        os.fsync(source)
+    send("file_action_applied")
+
+
 def file_operation(action, parts, parent, chain, stack):
     global PUBLISHING
     require(isinstance(action, dict))
@@ -834,7 +854,7 @@ def run():
         keys.add("action")
     require(op in (("download", "create", "inspect_tree", "create_tree",
                     "inspect_tree_source", "download_tree")
-                   if transfer else ("read", "write", "file_action"))
+                   if transfer else ("read", "write", "file_action", "file_symbolic_chmod"))
             and req.keys() == keys)
     parts = components(req["path"])
     if op in ("inspect_tree_source", "download_tree"):
@@ -844,6 +864,9 @@ def run():
         parent, chain = ancestors(parts[:-1], stack)
         if op == "file_action":
             file_operation(req["action"], parts, parent, chain, stack)
+            return
+        if op == "file_symbolic_chmod":
+            file_symbolic_chmod(parts, parent, chain, stack)
             return
         if transfer:
             if op == "download":

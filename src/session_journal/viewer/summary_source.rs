@@ -22,6 +22,10 @@ impl SummarySource {
         &self.directory
     }
 
+    pub(in crate::session_journal) fn id(&self) -> &str {
+        &self.id
+    }
+
     pub(crate) fn source(&self) -> Source {
         Source {
             directory: self.directory.clone(),

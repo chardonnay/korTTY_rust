@@ -4,7 +4,9 @@ use iced::widget::{button, column, container, row, scrollable, space, text, text
 use iced::{Alignment, Element, Length};
 
 use crate::snippets::MAX_NAME_BYTES;
-use crate::snippets::recipients::{Action, CertificateInfo, Change, Choice};
+use crate::snippets::recipients::{
+    Action, CertificateInfo, Change, Choice, JavaRecipient, Management,
+};
 
 const MAX_FINGERPRINT_BYTES: usize = 128;
 const MAX_CERTIFICATE_PATH_BYTES: usize = 8192;
@@ -16,6 +18,8 @@ mod tests;
 pub enum Message {
     Select(Choice),
     New,
+    AttachJava(JavaRecipient),
+    AskDeleteJava(JavaRecipient),
     Edit,
     Name(String),
     Fingerprint(String),
@@ -32,12 +36,13 @@ pub enum Message {
     Done,
     KeepEditing,
     DiscardAndClose,
-    Finished(Result<Vec<Choice>, String>),
+    Finished(Result<Management, String>),
 }
 
 #[derive(Default)]
 struct Form {
     previous: Option<Choice>,
+    imported: Option<JavaRecipient>,
     name: String,
     fingerprint: String,
     certificate: String,
@@ -55,8 +60,22 @@ impl Form {
         }
     }
 
+    fn for_java(imported: JavaRecipient) -> Self {
+        Self {
+            name: imported.name().to_owned(),
+            imported: Some(imported),
+            ..Self::default()
+        }
+    }
+
     fn dirty(&self) -> bool {
-        self.name != self.previous.as_ref().map_or("", Choice::name)
+        let original_name = self
+            .previous
+            .as_ref()
+            .map(Choice::name)
+            .or_else(|| self.imported.as_ref().map(JavaRecipient::name))
+            .unwrap_or_default();
+        self.name != original_name
             || self.fingerprint != self.previous.as_ref().map_or("", Choice::fingerprint)
             || !self.certificate.is_empty()
     }
@@ -75,6 +94,10 @@ impl Form {
             !previous.revoked() && previous.fingerprint() == preview.fingerprint
         } else {
             !preview.revoked
+                && self
+                    .imported
+                    .as_ref()
+                    .is_none_or(|entry| entry.fingerprint() == preview.fingerprint)
                 && self
                     .fingerprint
                     .bytes()
@@ -119,12 +142,14 @@ enum Operation {
 
 pub(crate) struct Page {
     choices: Vec<Choice>,
+    pending_java: Vec<JavaRecipient>,
     selected: Option<String>,
     form: Option<Form>,
     loaded: bool,
     pending: Option<Operation>,
     preview_revision: u64,
     confirm_delete: Option<Choice>,
+    confirm_delete_java: Option<JavaRecipient>,
     confirm_close: bool,
     error: Option<String>,
 }
@@ -133,12 +158,14 @@ impl Page {
     pub(crate) fn loading() -> Self {
         Self {
             choices: Vec::new(),
+            pending_java: Vec::new(),
             selected: None,
             form: None,
             loaded: false,
             pending: Some(Operation::Load),
             preview_revision: 0,
             confirm_delete: None,
+            confirm_delete_java: None,
             confirm_close: false,
             error: None,
         }
@@ -173,7 +200,7 @@ impl Page {
         if self.busy() || self.confirm_close {
             return false;
         }
-        if self.confirm_delete.take().is_some() {
+        if self.confirm_delete.take().is_some() || self.confirm_delete_java.take().is_some() {
             return true;
         }
         if self.form.is_some() && !self.dirty() {
@@ -218,7 +245,7 @@ impl Page {
             .find(|choice| choice.fingerprint() == fingerprint)
     }
 
-    fn finish_catalog(&mut self, result: Result<Vec<Choice>, String>) {
+    fn finish_catalog(&mut self, result: Result<Management, String>) {
         let Some(operation @ (Operation::Load | Operation::Save | Operation::Delete)) =
             self.pending
         else {
@@ -226,7 +253,10 @@ impl Page {
         };
         self.pending = None;
         match result {
-            Ok(choices) => {
+            Ok(Management {
+                choices,
+                pending_java,
+            }) => {
                 let selected = if operation == Operation::Save {
                     self.form.as_ref().and_then(|form| {
                         choices
@@ -242,6 +272,7 @@ impl Page {
                 };
                 self.selected = selected.map(|choice| choice.fingerprint().to_owned());
                 self.choices = choices;
+                self.pending_java = pending_java;
                 self.form = None;
                 self.loaded = true;
                 self.error = None;
@@ -285,17 +316,23 @@ impl Page {
         }
         let (operation, action) = match message {
             Message::Delete => {
-                let previous = self.confirm_delete.take()?;
-                (
-                    Operation::Delete,
-                    Action::Delete(path.to_path_buf(), previous),
-                )
+                let action = if let Some(imported) = self.confirm_delete_java.take() {
+                    Action::DeleteJava(path.to_path_buf(), imported)
+                } else {
+                    Action::Delete(path.to_path_buf(), self.confirm_delete.take()?)
+                };
+                (Operation::Delete, action)
             }
-            Message::CancelDelete if self.confirm_delete.is_some() => {
+            Message::CancelDelete
+                if self.confirm_delete.is_some() || self.confirm_delete_java.is_some() =>
+            {
                 self.confirm_delete = None;
+                self.confirm_delete_java = None;
                 return None;
             }
-            _ if self.confirm_delete.is_some() => return None,
+            _ if self.confirm_delete.is_some() || self.confirm_delete_java.is_some() => {
+                return None;
+            }
             Message::Reload if self.form.is_none() => {
                 (Operation::Load, Action::List(path.to_path_buf()))
             }
@@ -303,7 +340,16 @@ impl Page {
             Message::Save => {
                 let form = self.form.as_ref().filter(|form| form.can_save())?;
                 let action = if let Some(preview) = &form.preview {
-                    Action::SaveReviewed(path.to_path_buf(), form.change(), preview.clone())
+                    if let Some(imported) = &form.imported {
+                        Action::AttachJava(
+                            path.to_path_buf(),
+                            imported.clone(),
+                            form.change(),
+                            preview.clone(),
+                        )
+                    } else {
+                        Action::SaveReviewed(path.to_path_buf(), form.change(), preview.clone())
+                    }
                 } else {
                     Action::Save(path.to_path_buf(), form.change())
                 };
@@ -316,6 +362,20 @@ impl Page {
             }
             Message::New if self.form.is_none() => {
                 self.form = Some(Form::default());
+                self.error = None;
+                return None;
+            }
+            Message::AttachJava(imported)
+                if self.form.is_none() && self.pending_java.contains(&imported) =>
+            {
+                self.form = Some(Form::for_java(imported));
+                self.error = None;
+                return None;
+            }
+            Message::AskDeleteJava(imported)
+                if self.form.is_none() && self.pending_java.contains(&imported) =>
+            {
+                self.confirm_delete_java = Some(imported);
                 self.error = None;
                 return None;
             }
@@ -421,6 +481,25 @@ impl Page {
             .spacing(12)
             .into();
         }
+        if let Some(imported) = &self.confirm_delete_java {
+            return column![
+                text("Remove imported recipient reference?").size(21),
+                text(imported.name()),
+                text(imported.fingerprint())
+                    .font(iced::Font::MONOSPACE)
+                    .size(13),
+                row![
+                    button("Cancel").on_press(Message::CancelDelete),
+                    button("Remove Reference")
+                        .style(button::danger)
+                        .on_press(Message::Delete),
+                ]
+                .spacing(8),
+            ]
+            .padding(20)
+            .spacing(12)
+            .into();
+        }
         if let Some(form) = &self.form {
             return self.form_view(form);
         }
@@ -465,6 +544,29 @@ impl Page {
             };
             entries = entries.push(text(empty).size(14));
         }
+        if !self.pending_java.is_empty() {
+            entries = entries.push(text("Imported Java references").size(16));
+            for imported in &self.pending_java {
+                let label = column![
+                    text(imported.name()),
+                    text(imported.fingerprint())
+                        .font(iced::Font::MONOSPACE)
+                        .size(12),
+                ]
+                .width(Length::Fill)
+                .spacing(4);
+                entries = entries.push(
+                    row![
+                        label,
+                        button("Attach Certificate…")
+                            .on_press(Message::AttachJava(imported.clone())),
+                        button("Remove…").on_press(Message::AskDeleteJava(imported.clone())),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
         let has_selection = self.selected_choice().is_some();
         column![
             text("OpenPGP recipients").size(22),
@@ -501,7 +603,13 @@ impl Page {
     fn form_view<'a>(&'a self, form: &'a Form) -> Element<'a, Message> {
         let editing = form.previous.is_some();
         let can_browse = self.can_browse_certificate();
-        let matching_preview = form.preview.as_ref().filter(|preview| !preview.revoked);
+        let matching_preview = form.preview.as_ref().filter(|preview| {
+            !preview.revoked
+                && form
+                    .imported
+                    .as_ref()
+                    .is_none_or(|entry| entry.fingerprint() == preview.fingerprint)
+        });
         let can_confirm = !editing && matching_preview.is_some();
         let certificate = can_browse.then(|| {
             row![
@@ -542,11 +650,16 @@ impl Page {
                 form.previous.as_ref().filter(|previous| {
                     previous.fingerprint() != preview.fingerprint
                 }).map(|_| text("This certificate does not match the enrolled fingerprint.").size(13).style(text::danger)),
+                form.imported.as_ref().filter(|entry| {
+                    entry.fingerprint() != preview.fingerprint
+                }).map(|_| text("This certificate does not match the imported fingerprint.").size(13).style(text::danger)),
             ].spacing(5)
         });
         let body = column![
             text(if editing {
                 "Edit OpenPGP Recipient"
+            } else if form.imported.is_some() {
+                "Attach Public Certificate"
             } else {
                 "Import Public Certificate"
             })
@@ -554,6 +667,11 @@ impl Page {
             text_input("Display name", &form.name).on_input(Message::Name),
             form.previous.as_ref().map(|previous| {
                 text(format!("Enrolled fingerprint: {}", previous.fingerprint()))
+                    .font(iced::Font::MONOSPACE)
+                    .size(13)
+            }),
+            form.imported.as_ref().map(|entry| {
+                text(format!("Imported fingerprint: {}", entry.fingerprint()))
                     .font(iced::Font::MONOSPACE)
                     .size(13)
             }),

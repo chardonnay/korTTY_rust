@@ -12,6 +12,7 @@ use pgp::crypto::hash::HashAlgorithm;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::scheduler_window::SymbolicMode;
 use crate::{ssh_connection::ExecOpener, ssh_worker};
 
 mod transfer;
@@ -99,6 +100,7 @@ pub fn valid_path(path: &str) -> bool {
 pub(crate) enum ProtectedOperation {
     Mkdir,
     Chmod { mode: u16 },
+    ChmodSymbolic { mode: SymbolicMode },
     Chown { uid: Option<u32>, gid: Option<u32> },
     Copy { to: String },
     CopyTree { to: String },
@@ -114,6 +116,7 @@ impl ProtectedOperation {
         match self {
             Self::Mkdir => true,
             Self::Chmod { mode } => *mode <= 0o777,
+            Self::ChmodSymbolic { mode } => mode.ordinary_only(),
             Self::Chown { uid, gid } => {
                 (uid.is_some() || gid.is_some()) && *uid != Some(u32::MAX) && *gid != Some(u32::MAX)
             }
@@ -137,6 +140,39 @@ impl ProtectedOperation {
             _ => None,
         }
     }
+
+    fn request<'a>(&'a self, path: &'a str) -> Request<'a> {
+        match self {
+            Self::ChmodSymbolic { .. } => Request::FileSymbolicChmod { path },
+            _ => Request::FileAction { path, action: self },
+        }
+    }
+
+    fn commit(&self, response: &Response) -> Option<Vec<u8>> {
+        match (self, response) {
+            (
+                Self::ChmodSymbolic { mode },
+                Response::ReadyMode {
+                    token,
+                    current,
+                    directory,
+                },
+            ) if lowercase_hex(token, 32) && *current <= 0o777 && current & 0o022 == 0 => {
+                let desired = mode.adjust(u32::from(*current), *directory).ok()?;
+                if desired > 0o777 {
+                    return None;
+                }
+                let mut commit = token.as_bytes().to_vec();
+                commit.extend_from_slice(&(desired as u16).to_be_bytes());
+                Some(commit)
+            }
+            (Self::ChmodSymbolic { .. }, _) => None,
+            (_, Response::Ready { token }) if lowercase_hex(token, 32) => {
+                Some(token.as_bytes().to_vec())
+            }
+            _ => None,
+        }
+    }
 }
 
 pub(crate) fn apply_file_action(
@@ -151,17 +187,17 @@ pub(crate) fn apply_file_action(
         return Err(Failure::Blocked);
     }
     let mut connection = Connection::open(&opener, auth, allowed)?;
-    connection.send(&Request::FileAction { path, action })?;
-    let token = match connection.response()? {
-        Response::Ready { token } if lowercase_hex(&token, 32) => token,
-        response => return Err(connection.rejection(response, Failure::Failed)),
+    connection.send(&action.request(path))?;
+    let response = connection.response()?;
+    let Some(commit) = action.commit(&response) else {
+        return Err(connection.rejection(response, Failure::Failed));
     };
     if !commit_allowed() {
         return Err(Failure::Blocked);
     }
     connection.gate.check().map_err(|_| connection.failure())?;
     connection
-        .write_all(token.as_bytes())
+        .write_all(&commit)
         .map_err(|_| Failure::Uncertain)?;
     match connection.response().map_err(|_| Failure::Uncertain)? {
         Response::FileActionApplied => {}
@@ -270,6 +306,9 @@ enum Request<'a> {
         path: &'a str,
         action: &'a ProtectedOperation,
     },
+    FileSymbolicChmod {
+        path: &'a str,
+    },
 }
 
 #[derive(Deserialize)]
@@ -282,6 +321,11 @@ enum Response {
     Accept,
     Ready {
         token: String,
+    },
+    ReadyMode {
+        token: String,
+        current: u16,
+        directory: bool,
     },
     Written(Body),
     FileActionApplied,

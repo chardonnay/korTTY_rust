@@ -288,6 +288,21 @@ impl Redactor {
             .map(|(text, _)| text)
     }
 
+    pub(crate) fn journal_output_text(
+        &self,
+        input: &str,
+        deadline: Instant,
+    ) -> Option<Zeroizing<String>> {
+        // The observer already bounds each line. Simple display filtering can
+        // finish even if the terminal parser exhausted the chunk's masking budget.
+        if self.secrets.is_empty() && !self.policy.has_redactions() && input.len() <= MAX_REDACTED {
+            let mut text = Zeroizing::new(input.to_owned());
+            text.retain(crate::session_journal::is_display_character);
+            return Some(text);
+        }
+        self.journal_text(input, deadline)
+    }
+
     pub(crate) fn outbound_text(
         &self,
         input: &str,
@@ -332,6 +347,25 @@ impl Redactor {
             .0
             .iter()
             .any(|secret| input.contains(secret.as_str()))
+    }
+
+    /// A live frame can end while the terminal is still drawing a credential.
+    pub(crate) fn ends_with_partial_secret(&self, input: &str, deadline: Instant) -> Option<bool> {
+        for secret in self.secrets.0.iter() {
+            for (start, _) in input
+                .char_indices()
+                .rev()
+                .take_while(|(start, _)| input.len() - start < secret.len())
+            {
+                if Instant::now() >= deadline {
+                    return None;
+                }
+                if secret.starts_with(&input[start..]) {
+                    return Some(true);
+                }
+            }
+        }
+        Some(false)
     }
 
     fn mask(&self, text: &mut Zeroizing<String>, limit: usize) -> Option<usize> {

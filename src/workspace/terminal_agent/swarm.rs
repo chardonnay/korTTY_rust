@@ -4,15 +4,20 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
 
+use iced::futures::{StreamExt as _, stream::BoxStream};
 use iced::widget::{
-    Column, button, checkbox, column, pick_list, row, scrollable, text, text_editor, text_input,
+    Column, Id, button, checkbox, column, container, pick_list, row, scrollable, text, text_editor,
+    text_input,
 };
-use iced::{Element, Length, Size, Task, window};
+use iced::{Element, Length, Size, Subscription, Task, window};
 
 use crate::ai_manager::ProfileRef;
 use crate::clipboard_policy::{AiAgentExecution, ClipboardPolicy};
-use crate::scheduler_window::{AutomationEstimate, SwarmHandoff, SwarmJournalEdit};
+use crate::scheduler_window::{
+    AutomationEstimate, AutomationSummaryProvider, SwarmHandoff, SwarmJournalEdit,
+};
 use crate::terminal_agent::swarm::{self as engine, Key, Queue, Status, Target, Ticket};
 
 use super::{
@@ -20,6 +25,7 @@ use super::{
     dialog_placement, mask, palette::Palette, request_review,
 };
 use crate::workspace::saved_chats::swarm::Record;
+use crate::workspace::terminal_ai::web;
 
 pub(super) mod batch;
 mod comparison;
@@ -29,21 +35,16 @@ mod journal;
 mod notice;
 mod restart;
 pub(super) mod snippet;
+pub(in crate::workspace) mod status_strip;
 #[cfg(test)]
 mod tests;
+pub(super) mod web_evidence;
 mod workflow;
 
 const SAVED_PROFILE_UNAVAILABLE: &str =
     "The saved AI profile is unavailable. Choose an available profile to continue.";
-
-fn swarm_profiles(config: &crate::ai_manager::Configuration) -> Vec<ProfileChoice> {
-    let mut profiles = super::profile_choices(config);
-    profiles.extend(super::https_profile_choices(config));
-    if crate::local_ai::cli::allowed(&ClipboardPolicy::load(), false) {
-        profiles.extend(super::cli_profile_choices(config));
-    }
-    profiles
-}
+const PROFILE_UNAVAILABLE: &str =
+    "The selected AI profile changed or is unavailable. Choose a current profile.";
 
 fn swarm_profile_entries(
     config: &crate::ai_manager::Configuration,
@@ -72,6 +73,8 @@ pub enum Message {
     JournalEstimate(u64, Result<AutomationEstimate, &'static str>),
     OpenJournal(usize),
     Start,
+    Web(web::Message),
+    RefreshProfiles,
     RefreshSavedTargets,
     ConnectionGroup(String),
     AddConnectionGroup,
@@ -89,7 +92,8 @@ pub enum Message {
     FollowUpSaved(u64, FollowUpResult),
     Comparison(comparison::Message),
     Batch(batch::Message),
-    Focus(Key),
+    Focus(Ticket),
+    FocusFromStrip(Ticket),
     Member(window::Id, MemberAction),
     #[cfg(test)]
     Cancel(Key),
@@ -158,6 +162,7 @@ struct Launch<'a> {
     prepared: Option<&'a snippet::Review>,
     goal: &'a str,
     continuation: Option<&'a conversation::Reviewed>,
+    web: Option<&'a web_evidence::Evidence>,
 }
 
 #[derive(Clone, Copy)]
@@ -203,6 +208,10 @@ pub(super) struct Group {
     snippets: Vec<snippet::Choice>,
     snippet: Option<snippet::Choice>,
     arguments: text_editor::Content,
+    web_search: web::State,
+    web_ticket: u64,
+    web_vault: Option<std::sync::Weak<()>>,
+    round_web: Option<web_evidence::Evidence>,
     prepared: Option<snippet::Review>,
     preparing: bool,
     discard_preparation: bool,
@@ -223,6 +232,7 @@ pub(super) struct Group {
     restarts: restart::State,
     batch_review: Option<std::sync::Arc<batch::Review>>,
     focused: Option<Key>,
+    status_started: Option<Instant>,
     round: u64,
     closing: bool,
     notifications: notice::State,
@@ -235,7 +245,57 @@ pub(super) struct Group {
     comparison: comparison::State,
 }
 
+#[derive(Clone, Copy)]
+struct StatusSurface {
+    id: window::Id,
+    animate: bool,
+}
+
+impl StatusSurface {
+    fn focus_id(id: window::Id) -> Id {
+        Id::from(format!("swarm/{id:?}"))
+    }
+
+    fn roster(self) -> Id {
+        Id::from(format!("swarm/{:?}/targets", self.id))
+    }
+
+    fn row(self, ticket: Ticket) -> Id {
+        Id::from(format!("swarm/{:?}/target/{ticket:?}", self.id))
+    }
+
+    fn scroll(self) -> Id {
+        Id::from(format!("swarm/{:?}/details", self.id))
+    }
+
+    fn transcript(self) -> Id {
+        Id::from(format!("swarm/{:?}/transcript", self.id))
+    }
+
+    fn reveal(self, ticket: Ticket) -> Task<Desktop> {
+        use crate::workspace::coding_agents::roster_scroll::reveal_row;
+
+        reveal_row(self.roster(), self.row(ticket))
+            .chain(reveal_row(self.scroll(), self.transcript()))
+    }
+}
+
 impl Group {
+    fn clock_queue(&self) -> Option<&Queue> {
+        if self.closing
+            || self.save_name.is_some()
+            || self.workflow.is_some()
+            || self.web_search.active()
+        {
+            return None;
+        }
+        self.queue.as_ref().filter(|queue| queue.has_clock())
+    }
+
+    fn status_animated(&self) -> bool {
+        self.clock_queue().is_some_and(Queue::has_animated_target)
+    }
+
     fn with_comparison(&self, report: String) -> String {
         match self.comparison.result() {
             Some(result) => format!("{report}\n\n## AI comparison\n\n{result}\n"),
@@ -263,6 +323,10 @@ impl Group {
             snippets: Vec::new(),
             snippet: None,
             arguments: text_editor::Content::new(),
+            web_search: web::State::default(),
+            web_ticket: 0,
+            web_vault: None,
+            round_web: None,
             prepared: None,
             preparing: false,
             discard_preparation: false,
@@ -280,6 +344,7 @@ impl Group {
             restarts: restart::State::default(),
             batch_review: None,
             focused: None,
+            status_started: None,
             round: 0,
             closing: false,
             notifications: notice::State::default(),
@@ -323,6 +388,7 @@ impl Group {
             Ok(queue) => {
                 self.focused = queue.rows().first().map(|row| row.target.key);
                 self.queue = Some(queue);
+                self.status_started = Some(Instant::now());
                 self.batch_review = None;
                 self.notifications = notice::State::new(self.round);
                 self.notice.clear();
@@ -335,7 +401,12 @@ impl Group {
         }
     }
 
-    fn setup_view(&self, running: bool) -> Column<'_, Message> {
+    fn setup_view(
+        &self,
+        running: bool,
+        web_available: bool,
+        summary_profiles: Vec<AutomationSummaryProvider>,
+    ) -> Column<'_, Message> {
         let conversation = self.conversation.as_ref();
         let draft = conversation.is_some_and(|chat| chat.record.is_draft());
         let mut targets = column![].spacing(6);
@@ -401,7 +472,7 @@ impl Group {
                 });
         let mut view = column![].spacing(8).padding(12);
         view = if let Some(chat) = conversation {
-            view.push(chat.history()).push(row![
+            view.push(chat.history(self.queue.is_none())).push(row![
                 (!chat.record.is_draft()).then(|| button("Rename…")
                     .on_press_maybe((!running && !self.closing && !chat.loading).then_some(Message::RenameConversation))),
                 text("Choose up to eight current saved SSH connections. Enter an absolute directory for each target.").size(13),
@@ -410,6 +481,9 @@ impl Group {
         } else {
             view.push(text("AI Swarm").size(22))
                 .push(text("Choose up to eight live panes or saved SSH connections. Review model requests and commands for each target.").size(13))
+                .push(button("Refresh AI profiles").on_press_maybe(
+                    (!running && !self.closing).then_some(Message::RefreshProfiles),
+                ))
         };
         let groups = self.connection_groups();
         if !groups.is_empty() {
@@ -473,9 +547,20 @@ impl Group {
                     )
                     .on_input_maybe((!running).then_some(Message::Goal)),
                 );
+            if !running {
+                if self.web_search.included().is_some() {
+                    view = view.push(
+                        button("Remove web excerpts from next round")
+                            .on_press(Message::Web(web::Message::Close)),
+                    );
+                } else if web_available {
+                    view =
+                        view.push(button("Search web…").on_press(Message::Web(web::Message::Open)));
+                }
+            }
         }
         if !running && self.journal_allowed {
-            view = view.push(self.journal.view(self.selected.len()));
+            view = view.push(self.journal.view(self.selected.len(), summary_profiles));
         }
         if let Some(chat) = conversation {
             view = view.push(
@@ -623,8 +708,11 @@ impl Group {
     fn view<'a>(
         &'a self,
         state: &'a State,
+        surface: StatusSurface,
         palette: Option<Palette>,
         batch_allowed: bool,
+        web_available: bool,
+        summary_profiles: Vec<AutomationSummaryProvider>,
     ) -> Element<'a, Message> {
         let muted = palette.map(|palette| palette.muted.color());
         if let Some(save) = &self.save_name {
@@ -668,15 +756,40 @@ impl Group {
             .padding(12)
             .into();
         }
+        if let Some(search) = self.web_search.view() {
+            return column![search.map(Message::Web), text(&self.notice).size(13)]
+                .spacing(8)
+                .padding(12)
+                .into();
+        }
         let running = self.running();
         let mut view = if self.comparison.busy()
             || self.queue.as_ref().is_some_and(|queue| !queue.complete())
         {
             column![text("AI Swarm").size(22)].spacing(8).padding(12)
         } else {
-            self.setup_view(running)
+            self.setup_view(running, web_available, summary_profiles)
         };
         if let Some(queue) = &self.queue {
+            let now = Instant::now();
+            let phase = self
+                .status_started
+                .filter(|_| surface.animate && queue.has_clock())
+                .map(|started| now.saturating_duration_since(started).as_secs_f32());
+            let targets = queue
+                .status_strip(now)
+                .targets
+                .into_iter()
+                .map(|target| status_strip::Target {
+                    name: target.row.target.label.clone(),
+                    state: target.state.into(),
+                    elapsed_seconds: target.elapsed_seconds,
+                    total_tokens: target.row.usage_tokens,
+                    slow: target.slow,
+                    ticket: (!self.closing).then_some(target.ticket),
+                })
+                .collect();
+            view = view.push(status_strip::view(targets, phase, Message::FocusFromStrip));
             let mut rows = column![].spacing(6);
             for item in queue.rows() {
                 let key = item.target.key;
@@ -695,40 +808,55 @@ impl Group {
                     Status::Review | Status::Running => palette.accent.color(),
                     _ => palette.muted.color(),
                 });
+                let selected = self.focused == Some(key);
                 rows = rows.push(
-                    row![
-                        button(text(&item.target.label)).on_press(Message::Focus(key)),
-                        text(status).style(move |_| text::Style {
-                            color: status_color
-                        }),
-                        text(&item.detail)
-                            .size(13)
-                            .style(move |_| text::Style { color: muted }),
-                        button("Stop target").on_press_maybe(
-                            ((!item.status.finished() && item.status != Status::Cancelling)
-                                || restarting)
-                                .then_some(Message::StopTarget(ticket))
-                        ),
-                        (self.mode != SwarmMode::Snippet).then(|| button(if held {
-                            "Resume target"
-                        } else {
-                            "Pause target"
-                        })
-                        .on_press_maybe(
-                            self.can_hold_target(ticket)
-                                .then_some(Message::PauseTarget(ticket, !held))
-                        )),
-                        (self.mode != SwarmMode::Snippet).then(|| button("Restart target")
+                    container(
+                        row![
+                            button(text(&item.target.label))
+                                .style(if selected {
+                                    button::primary
+                                } else {
+                                    button::secondary
+                                })
+                                .on_press_maybe((!self.closing).then_some(Message::Focus(ticket))),
+                            text(status).style(move |_| text::Style {
+                                color: status_color
+                            }),
+                            text(&item.detail)
+                                .size(13)
+                                .style(move |_| text::Style { color: muted }),
+                            button("Stop target").on_press_maybe(
+                                ((!item.status.finished() && item.status != Status::Cancelling)
+                                    || restarting)
+                                    .then_some(Message::StopTarget(ticket))
+                            ),
+                            (self.mode != SwarmMode::Snippet).then(|| button(if held {
+                                "Resume target"
+                            } else {
+                                "Pause target"
+                            })
                             .on_press_maybe(
-                                self.can_restart_target(ticket)
-                                    .then_some(Message::RestartTarget(ticket))
+                                self.can_hold_target(ticket)
+                                    .then_some(Message::PauseTarget(ticket, !held))
                             )),
-                    ]
-                    .spacing(8)
-                    .wrap(),
+                            (self.mode != SwarmMode::Snippet).then(|| button("Restart target")
+                                .on_press_maybe(
+                                    self.can_restart_target(ticket)
+                                        .then_some(Message::RestartTarget(ticket))
+                                )),
+                        ]
+                        .spacing(8)
+                        .wrap(),
+                    )
+                    .id(surface.row(ticket))
+                    .width(Length::Fill),
                 );
             }
-            view = view.push(scrollable(rows).height(Length::Fixed(150.0)));
+            view = view.push(
+                scrollable(rows)
+                    .id(surface.roster())
+                    .height(Length::Fixed(150.0)),
+            );
             view = view.push(
                 self.batch_view(state, batch_allowed)
                     .map(|view| view.map(Message::Batch)),
@@ -737,7 +865,13 @@ impl Group {
                 let item = queue.rows().iter().find(|item| item.target.key == key);
                 let member = self.focused_member(state);
                 if let Some(item) = item {
-                    view = view.push(text(&item.target.label));
+                    let heading = container(text(&item.target.label)).width(Length::Fill);
+                    let heading = if item.transcript.is_empty() {
+                        heading.id(surface.transcript())
+                    } else {
+                        heading
+                    };
+                    view = view.push(heading);
                 }
                 if let Some((id, run)) = member.filter(|(_, run)| !run.cancel.requested())
                     && let Some(review) = run.model_review_view(Length::Fixed(190.0))
@@ -745,10 +879,20 @@ impl Group {
                     view = view.push(review.map(move |message| {
                         Message::Member(id, MemberAction::ReviewModel(message))
                     }));
+                    if run
+                        .model_review
+                        .as_ref()
+                        .is_some_and(|review| review.web_active())
+                    {
+                        view = view.push(text(&run.notice).size(13));
+                    }
                 }
                 if let Some(item) = item.filter(|item| !item.transcript.is_empty()) {
-                    view =
-                        view.push(scrollable(text(&item.transcript)).height(Length::Fixed(150.0)));
+                    view = view.push(
+                        container(scrollable(text(&item.transcript)).height(Length::Fixed(150.0)))
+                            .id(surface.transcript())
+                            .width(Length::Fill),
+                    );
                 }
                 if let Some((id, run)) = member {
                     if let Some((purpose, command)) = run.reviewed_command() {
@@ -850,7 +994,7 @@ impl Group {
                         .view(!running && !self.closing)
                         .map(|view| view.map(Message::Comparison))
                 }),
-            scrollable(view).height(Length::Fill),
+            scrollable(view).id(surface.scroll()).height(Length::Fill),
             column![
                 text(&self.notice)
                     .size(13)
@@ -904,12 +1048,26 @@ impl State {
     pub(super) fn swarm_view(
         &self,
         id: window::Id,
+        animate: bool,
         palette: Option<Palette>,
         batch_allowed: bool,
+        web_available: bool,
+        summary_profiles: impl FnOnce() -> Vec<AutomationSummaryProvider>,
     ) -> Option<Element<'_, Message>> {
-        self.swarms
-            .get(&id)
-            .map(|group| group.view(self, palette, batch_allowed))
+        self.swarms.get(&id).map(|group| {
+            container(group.view(
+                self,
+                StatusSurface { id, animate },
+                palette,
+                batch_allowed,
+                web_available,
+                summary_profiles(),
+            ))
+            .id(StatusSurface::focus_id(id))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+        })
     }
 
     pub(super) fn swarm_focused_run(&self, id: window::Id) -> Option<&Run> {
@@ -927,6 +1085,61 @@ impl State {
 }
 
 impl Workspace {
+    pub(in crate::workspace) fn swarm_status_subscription(&self) -> Subscription<Desktop> {
+        if self.exiting || self.scheduler_draining {
+            return Subscription::none();
+        }
+        if self
+            .native_focused_window
+            .is_some_and(|id| self.swarm_status_animated(id))
+        {
+            Subscription::run(swarm_animation_clock)
+        } else if self
+            .terminal_agents
+            .swarms
+            .values()
+            .any(|group| group.clock_queue().is_some())
+        {
+            Subscription::run(swarm_status_clock)
+        } else {
+            Subscription::none()
+        }
+    }
+
+    pub(in crate::workspace) fn swarm_status_animated(&self, id: window::Id) -> bool {
+        self.window_settings.appearance.animations
+            && self.native_focused_window == Some(id)
+            && self
+                .terminal_agents
+                .swarms
+                .get(&id)
+                .is_some_and(Group::status_animated)
+    }
+
+    pub(in crate::workspace) fn swarm_focus_next(
+        &self,
+        id: window::Id,
+        backwards: bool,
+    ) -> Option<Task<Desktop>> {
+        use iced::advanced::widget::operation::{focusable, scope};
+
+        use crate::workspace::coding_agents::roster_scroll::reveal_focused;
+
+        self.terminal_agents
+            .swarms
+            .get(&id)
+            .filter(|group| !group.closing)?;
+
+        let root = StatusSurface::focus_id(id);
+        let surface = StatusSurface { id, animate: false };
+        let action = if backwards {
+            iced_runtime::Action::widget(scope(root.clone(), focusable::focus_previous()))
+        } else {
+            iced_runtime::Action::widget(scope(root.clone(), focusable::focus_next()))
+        };
+        Some(iced_runtime::task::effect(action).chain(reveal_focused(root, surface.scroll())))
+    }
+
     pub(in crate::workspace) fn agent_swarm_available(&self) -> bool {
         self.swarm_policy().is_ok()
     }
@@ -937,10 +1150,10 @@ impl Workspace {
             return Task::none();
         }
         let config = self.ai_configuration();
-        let mut profiles = config.as_deref().map(swarm_profiles).unwrap_or_default();
-        if !crate::local_ai::cli::allowed(&self.clipboard.policy, false) {
-            profiles.retain(|profile| profile.reviewed_cli.is_none());
-        }
+        let profiles = config
+            .as_deref()
+            .map(|config| self.swarm_profiles(config))
+            .unwrap_or_default();
         let profile = config
             .as_ref()
             .and_then(|config| {
@@ -1185,18 +1398,59 @@ impl Workspace {
         let Some(config) = self.ai_configuration() else {
             return (Vec::new(), None);
         };
-        let profiles = swarm_profiles(&config);
+        let profiles = self.swarm_profiles(&config);
         let selected = config
             .resolve_profile_reference(selection)
-            .and_then(|id| profiles.iter().find(|profile| profile.id == id))
+            .and_then(|id| {
+                profiles.iter().find(|profile| {
+                    profile.id == id
+                        && (!profile.is_reviewed_outbound() || profile.reference == *selection)
+                })
+            })
             .cloned();
         (profiles, selected)
+    }
+
+    fn swarm_profiles(&self, config: &crate::ai_manager::Configuration) -> Vec<ProfileChoice> {
+        let mut profiles = super::profile_choices(config);
+        profiles.extend(super::https_profile_choices(config));
+        if crate::local_ai::cli::allowed(&self.clipboard.policy, false)
+            && crate::local_ai::cli::allowed(&ClipboardPolicy::load(), false)
+        {
+            profiles.extend(super::cli_profile_choices(config));
+        }
+        profiles
     }
 
     pub(super) fn swarm_action(&mut self, id: window::Id, message: Message) -> Task<Desktop> {
         let Some(mut group) = self.terminal_agents.swarms.remove(&id) else {
             return Task::none();
         };
+        if let Message::Web(message) = message {
+            let result = if !group.running()
+                && !group.closing
+                && group.workflow.is_none()
+                && group.save_name.is_none()
+            {
+                if let Some(chat) = &mut group.conversation {
+                    chat.review = None;
+                }
+                group.notice.clear();
+                self.update_swarm_web(id, &mut group, message)
+            } else {
+                Ok(Task::none())
+            };
+            let task = result.unwrap_or_else(|error| {
+                group.notice = error;
+                Task::none()
+            });
+            self.terminal_agents.swarms.insert(id, group);
+            return task;
+        }
+        if group.web_search.active() && !matches!(message, Message::Close | Message::CancelAll) {
+            self.terminal_agents.swarms.insert(id, group);
+            return Task::none();
+        }
         if let Message::Batch(message) = message {
             return self.swarm_batch_action(id, group, message);
         }
@@ -1211,6 +1465,19 @@ impl Workspace {
         }
         let running = group.running();
         let setup = !running && group.workflow.is_none() && group.save_name.is_none();
+        if setup
+            && matches!(
+                message,
+                Message::Profile(_)
+                    | Message::Mode(_)
+                    | Message::Toggle(..)
+                    | Message::AddConnectionGroup
+                    | Message::RefreshProfiles
+                    | Message::RefreshSavedTargets
+            )
+        {
+            group.clear_web_search();
+        }
         if setup
             && let Some(chat) = &mut group.conversation
             && matches!(
@@ -1234,6 +1501,9 @@ impl Workspace {
                     if group.notice == SAVED_PROFILE_UNAVAILABLE {
                         group.notice.clear();
                     }
+                }
+                if group.notice == PROFILE_UNAVAILABLE {
+                    group.notice.clear();
                 }
                 group.profile = Some(profile)
             }
@@ -1272,6 +1542,26 @@ impl Workspace {
                 Ok(choices) => group.snippets = choices,
                 Err(error) => group.notice = error.into(),
             },
+            Message::RefreshProfiles if setup && !group.closing && group.conversation.is_none() => {
+                group.profiles = self
+                    .ai_configuration()
+                    .map(|config| self.swarm_profiles(&config))
+                    .unwrap_or_default();
+                if group
+                    .profile
+                    .as_ref()
+                    .is_some_and(|profile| !group.profiles.contains(profile))
+                {
+                    group.profile = None;
+                    group.notice = PROFILE_UNAVAILABLE.into();
+                }
+                group.modes = self.available_swarm_modes(!group.profiles.is_empty());
+                if !group.modes.contains(&group.mode)
+                    && let Some(&mode) = group.modes.first()
+                {
+                    group.mode = mode;
+                }
+            }
             Message::RefreshSavedTargets if setup => {
                 if let Some(chat) = &mut group.conversation
                     && !chat.loading
@@ -1557,11 +1847,13 @@ impl Workspace {
             }
             Message::ReviewFollowUp if setup && !group.closing => {
                 if let Err(error) = self.review_saved_swarm_follow_up(&mut group) {
+                    group.clear_web_search();
                     group.notice = error;
                 }
             }
             Message::StartFollowUp(epoch) if setup && !group.closing => {
                 if let Err(error) = self.start_saved_swarm_follow_up(&mut group, epoch) {
+                    group.clear_web_search();
                     group.notice = error;
                 }
             }
@@ -1599,6 +1891,16 @@ impl Workspace {
                     && !group.selected.is_empty()
                     && !group.closing =>
             {
+                let reviewed_web = match self.reviewed_swarm_web(&group) {
+                    Ok(web) => web,
+                    Err(error) => {
+                        group.clear_web_search();
+                        group.notice = error;
+                        self.terminal_agents.swarms.insert(id, group);
+                        return Task::none();
+                    }
+                };
+                group.round_web = reviewed_web;
                 group.round += 1;
                 group.comparison.clear_round();
                 group.journal_run = None;
@@ -1635,7 +1937,27 @@ impl Workspace {
                     }
                 }
             }
-            Message::Focus(key) => group.focused = Some(key),
+            Message::Focus(ticket) | Message::FocusFromStrip(ticket) => {
+                if group.closing
+                    || group.workflow.is_some()
+                    || group.save_name.is_some()
+                    || group
+                        .queue
+                        .as_ref()
+                        .and_then(|queue| queue.current(ticket))
+                        .is_none()
+                {
+                    self.terminal_agents.swarms.insert(id, group);
+                    return Task::none();
+                }
+                group.focused = Some(ticket.key());
+                self.terminal_agents.swarms.insert(id, group);
+                return if matches!(message, Message::FocusFromStrip(_)) {
+                    StatusSurface { id, animate: false }.reveal(ticket)
+                } else {
+                    Task::none()
+                };
+            }
             Message::Member(member, action)
                 if group.members.contains_key(&member) && !group.closing =>
             {
@@ -1662,6 +1984,7 @@ impl Workspace {
                 self.cancel_swarm_target(&mut group, key);
             }
             Message::CancelAll | Message::Close => {
+                group.clear_web_search();
                 group.restarts.cancel();
                 group.batch_review = None;
                 group.closing |= matches!(message, Message::Close);
@@ -2084,6 +2407,12 @@ impl Workspace {
         }
     }
 
+    pub(in crate::workspace) fn invalidate_swarm_journal_estimates(&mut self) {
+        for group in self.terminal_agents.swarms.values_mut() {
+            group.journal.clear_estimate();
+        }
+    }
+
     fn swarm_journal_capture_allowed(&mut self) -> bool {
         self.refresh_automation_journal_capture_policy();
         self.automation_journal_capture_allowed()
@@ -2102,6 +2431,7 @@ impl Workspace {
         if !group.start_queue() {
             return;
         }
+        group.clear_web_search();
         group.remember_round();
         self.begin_swarm_comparison(group);
         group.set_journal_allowed(self.swarm_journal_capture_allowed());
@@ -2161,6 +2491,7 @@ impl Workspace {
                     return false;
                 };
                 let status = member_status(run);
+                queue.set_usage_tokens(*ticket, run.presentation.model_usage.total());
                 let transcript = run
                     .activity
                     .iter()
@@ -2228,6 +2559,7 @@ impl Workspace {
                     .as_ref()
                     .and_then(|chat| chat.active.as_ref())
                     .map(|active| active.reviewed.as_ref()),
+                web: group.round_web.as_ref(),
             };
             let original = group
                 .restarts
@@ -2256,6 +2588,7 @@ impl Workspace {
                             let member = window::Id::unique();
                             let work = self.agent_action(member, &mut run, RunMessage::Start);
                             let status = member_status(&run);
+                            queue.set_usage_tokens(ticket, run.presentation.model_usage.total());
                             queue.change(ticket, status, &run.notice, "");
                             if status.finished() {
                                 group.comparison.record(self, ticket.key(), &run);
@@ -2356,8 +2689,30 @@ impl Workspace {
                 .map_or_else(|| launch.goal.into(), |review| review.prepared.name.clone())
         };
         run.context = format!("Selected target {}", run.label);
+        run.swarm_web = launch.web.cloned();
         Ok(run)
     }
+}
+
+fn swarm_status_clock() -> BoxStream<'static, Desktop> {
+    swarm_clock(Duration::from_secs(1))
+}
+
+fn swarm_animation_clock() -> BoxStream<'static, Desktop> {
+    swarm_clock(Duration::from_millis(35))
+}
+
+fn swarm_clock(period: Duration) -> BoxStream<'static, Desktop> {
+    let (sender, receiver) = async_channel::bounded(1);
+    let _ = std::thread::Builder::new()
+        .name("kortty-swarm-status".into())
+        .spawn(move || {
+            while !sender.is_closed() {
+                let _ = sender.try_send(Desktop::SwarmStatusTick);
+                std::thread::sleep(period);
+            }
+        });
+    receiver.boxed()
 }
 
 fn ai_mode(mode: Mode) -> SwarmMode {
@@ -2411,9 +2766,13 @@ fn member_status(run: &Run) -> Status {
         Phase::Cancelled => Status::Cancelled,
         _ if run.cancel.requested() => Status::Cancelling,
         _ if run.paused => Status::Paused,
-        Phase::ModelReview | Phase::ProbeApproval | Phase::Approval | Phase::Question => {
-            Status::Review
-        }
+        Phase::Paused => Status::Paused,
+        Phase::ModelReview
+        | Phase::DirectoryConfirmation
+        | Phase::ProbeApproval
+        | Phase::Approval
+        | Phase::Question
+        | Phase::SudoPassword => Status::Review,
         Phase::Setup | Phase::Directory | Phase::SavedPreflight => Status::Starting,
         _ => Status::Running,
     }

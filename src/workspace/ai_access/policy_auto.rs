@@ -4,7 +4,9 @@ use std::time::Instant;
 
 use iced::{Subscription, Task};
 
-use crate::ai_manager::{ProfileId, policy_auto};
+#[cfg(test)]
+use crate::ai_manager::ProfileId;
+use crate::ai_manager::policy_auto;
 use crate::clipboard_policy::{ClipboardPolicy, PolicyAiProfile};
 use crate::local_ai::{self, Cancel, PolicyAutoModel};
 use crate::workspace::journal_access::summaries::Worker;
@@ -39,6 +41,7 @@ fn message(event: Event) -> Desktop {
 }
 
 impl Workspace {
+    #[cfg(test)]
     pub(in crate::workspace) fn policy_auto_model_pending(&self, id: ProfileId) -> bool {
         !self.exiting
             && !self.scheduler_draining

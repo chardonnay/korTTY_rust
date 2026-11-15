@@ -16,6 +16,7 @@ const NEXT_JOBS: usize = 5;
 
 struct JobMenu<'a> {
     status: MenuStatus<'a>,
+    web_reviews: &'a crate::workspace::scheduler_access::firing_web::State,
     waiting: &'a std::collections::VecDeque<
         kortty_jobs::RunRequest<crate::scheduler_window::SshCommand>,
     >,
@@ -26,6 +27,8 @@ impl JobMenu<'_> {
     fn label(&self, run: &crate::scheduler_window::MenuRun<'_>) -> &'static str {
         if run.cancelling {
             "Cancelling"
+        } else if self.web_reviews.waiting(run.id) {
+            "Web review required"
         } else if self.waiting.iter().any(|queued| queued.id == run.id) {
             "Queued"
         } else {
@@ -45,8 +48,14 @@ impl JobMenu<'_> {
                 if cancelling != 0 {
                     return format!("Cancelling {cancelling} of {}", runs.len());
                 }
-                let waiting = self.waiting.len();
-                if waiting == 0 {
+                let web_reviews = runs
+                    .iter()
+                    .filter(|run| self.web_reviews.waiting(run.id))
+                    .count();
+                let waiting = self.waiting.len().saturating_sub(web_reviews);
+                if web_reviews > 0 {
+                    format!("Jobs: {web_reviews} waiting for web review")
+                } else if waiting == 0 {
                     format!("Running jobs: {}", runs.len())
                 } else {
                     format!(
@@ -134,6 +143,7 @@ impl Workspace {
         let status = self.scheduler.as_ref()?.menu_status(now, NEXT_JOBS)?;
         Some(JobMenu {
             status,
+            web_reviews: &self.scheduler_firing_web,
             waiting: &self.scheduler_queue,
             now,
         })

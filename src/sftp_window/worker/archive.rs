@@ -5,7 +5,7 @@ use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::sync::Weak;
 
-use kortty_server_archive::protocol::{self, CreateReview, CreateSpec};
+use kortty_server_archive::protocol::{self, CreateReview, CreateSpec, OutputMetadata};
 use kortty_ssh::sftp::{UploadMetadata, UploadOwner, UploadStage};
 
 use crate::job_executor::{BrowserArchiveManifest, scan_browser_archive};
@@ -194,6 +194,7 @@ fn request_archive(directory: &[u8], selected: &[Entry], options: Options) -> io
         excludes,
         password_credential: None,
         download: None,
+        server_output: None,
     };
     archive.validate().map_err(io::Error::other)?;
     Ok(archive)
@@ -329,19 +330,27 @@ fn prepare_checked(
         ensure_ownership_allowed(control, cancel, Some(&request.target))
     })?;
     let contents = if let Some(creation) = &request.creation {
+        let mut spec = creation.spec.clone();
+        spec.output = request
+            .metadata
+            .as_ref()
+            .zip(metadata_ids)
+            .map(|(metadata, (uid, gid))| OutputMetadata {
+                uid,
+                gid,
+                mode: metadata.selection.mode().map(|mode| mode as u16),
+            });
         let reply = exchange_creation(
             &request,
             creation,
-            &protocol::Request::ReviewCreation {
-                spec: creation.spec.clone(),
-            },
+            &protocol::Request::ReviewCreation { spec: spec.clone() },
             cancel,
             control,
         )?;
         let protocol::Reply::CreationReview { review } = reply else {
             return Err(creation_reply_failure(reply));
         };
-        review.validate_for(&creation.spec)?;
+        review.validate_for(&spec)?;
         let entries = review
             .manifest
             .members
@@ -398,11 +407,17 @@ pub(super) fn apply(
         verify_boundaries(client, plan, true, &stopped)?;
         if let Contents::Server { review, .. } = &plan.contents {
             let creation = plan.request.creation.as_ref().ok_or_else(stale)?;
+            if plan.request.resolve_metadata(false, &metadata_allowed)? != plan.metadata_ids {
+                return Err(io::Error::other(
+                    "The reviewed server account IDs changed. Review the archive again.",
+                )
+                .into());
+            }
             let reply = exchange_creation(
                 &plan.request,
                 creation,
                 &protocol::Request::ApplyCreation {
-                    spec: creation.spec.clone(),
+                    spec: review.spec.clone(),
                     token: review.token.clone(),
                 },
                 cancel,
@@ -479,6 +494,12 @@ fn exchange_creation(
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "Current policy forbids this server archive",
+            ));
+        }
+        if request.metadata.is_some() && !control.route_allowed(&policy) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "Current policy does not allow the reviewed archive ownership or permissions",
             ));
         }
         Ok(())

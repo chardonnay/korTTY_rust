@@ -363,9 +363,9 @@ impl Workspace {
         if let sftp_window::Message::ExternalFileDrag(request) = message {
             return self.start_linux_file_drag(id, request);
         }
-        #[cfg(target_os = "windows")]
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
         if let sftp_window::Message::ExternalFileDrag(request) = message {
-            return self.start_windows_sftp_drag(id, request);
+            return self.start_native_sftp_drag(id, request);
         }
         self.note_project_sftp_activity(id);
         let pointer_transfer = match &message {
@@ -373,7 +373,7 @@ impl Workspace {
             sftp_window::Message::DesktopDrop(drop) => Some(drop.is_remote()),
             #[cfg(target_os = "linux")]
             sftp_window::Message::WaylandDesktopDrop(drop) => Some(drop.is_remote()),
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
             sftp_window::Message::PrepareExternalFileDrag
             | sftp_window::Message::ExternalFileDragPrepared(..) => Some(true),
             sftp_window::Message::DesktopDropReady(reply) => Some(reply.is_remote()),
@@ -512,7 +512,14 @@ impl Workspace {
                     }
                     comparison_ai::Update::Snippet(draft) => {
                         let owner = self.hosted_tool_owner(id).unwrap_or(id);
-                        self.open_file_comparison_snippet(owner, draft)
+                        let profile = self
+                            .sftp
+                            .get(&id)
+                            .and_then(|state| {
+                                self.saved_terminal_preferences.terminal(state.target())
+                            })
+                            .and_then(|settings| settings.ai_profile.clone());
+                        self.open_file_comparison_snippet(owner, draft, profile)
                     }
                 };
             }
@@ -548,7 +555,9 @@ impl Workspace {
                         crate::profile::RemoteProjectTool::valid_remote_path(path, false)
                     }))
                     .map(|(owner, path)| (owner, state.target().clone(), path.to_owned()));
-                let (editor, loaded) = EditorWindow::with_remote(document, editor, label);
+                let (mut editor, loaded) = EditorWindow::with_remote(document, editor, label);
+                editor.ai_origin =
+                    self.ssh_file_ai_origin(state.target(), state.attached_to(), state.incognito());
                 if let Some((owner, target, path)) = project_file {
                     return self.host_project_remote_editor(owner, target, path, editor, loaded);
                 }
@@ -660,8 +669,8 @@ impl Workspace {
     pub(super) fn finish_sftp_close(&mut self, id: window::Id) -> Task<Message> {
         #[cfg(target_os = "linux")]
         self.wayland_file_drop.forget(id);
-        #[cfg(target_os = "windows")]
-        self.windows_file_drag.forget(id);
+        #[cfg(any(target_os = "macos", target_os = "windows"))]
+        self.native_file_drag.forget(id);
         self.sftp_logins.remove(&id);
         let mut returned = Task::none();
         if let Some(mut state) = self.sftp.remove(&id) {
@@ -718,12 +727,12 @@ impl Workspace {
             let desktop_drag = self
                 .wayland_file_drop
                 .can_drag(self.hosted_tool_owner(id).unwrap_or(id));
-            #[cfg(target_os = "windows")]
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
             let desktop_drag =
-                self.windows_drag_owner_available(self.hosted_tool_owner(id).unwrap_or(id));
+                self.native_drag_owner_available(self.hosted_tool_owner(id).unwrap_or(id));
             state
                 .view(
-                    #[cfg(any(target_os = "linux", target_os = "windows"))]
+                    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
                     desktop_drag,
                 )
                 .map(move |message| Message::Sftp(id, message))
@@ -743,7 +752,7 @@ impl Workspace {
         self.owner_dialog(id).is_none()
     }
 
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
     pub(super) fn native_sftp_drag_target(&self, owner: window::Id) -> Option<window::Id> {
         if self.exiting
             || self.scheduler_draining

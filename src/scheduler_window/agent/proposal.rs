@@ -9,19 +9,25 @@ use std::time::{Duration, Instant};
 
 use kortty_jobs::JobId;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
-use crate::clipboard_policy::ClipboardPolicy;
+use crate::ai_manager::Configuration;
+use crate::clipboard_policy::{AiMemoryPolicy, ClipboardPolicy};
 use crate::job_executor::agent::advisory;
 use crate::job_executor::agent::require_policy;
 use crate::local_ai;
 use crate::private_files::{Directory, FileStamp, require_single_link};
 use crate::terminal_agent::usage::authorize_resend;
 use crate::terminal_logging::{Policy, Redactor};
+use crate::workspace::terminal_ai::web::Lookup as WebLookup;
 
+use super::memory::{Binding, Memory};
 use super::provider_mask::ProviderMask;
 use super::{Approval, Kind, digest, knowledge, valid_text};
 
 mod swarm;
+mod web;
+pub(crate) use swarm::allows_research as allows_swarm_round_research;
 pub(crate) use swarm::{
     MAX_SWARM_COMMAND_ROUNDS, MAX_SWARM_STREAM_BYTES, SWARM_FIRING_SYSTEM,
     SWARM_PROBE_FIRING_SYSTEM, SwarmEvidence, SwarmRound,
@@ -112,6 +118,11 @@ pub(crate) enum Decision {
     SwarmBlocked {
         summary: String,
     },
+    #[serde(skip)]
+    SwarmResearch {
+        lookup: WebLookup,
+        input: String,
+    },
 }
 
 fn parse_firing(response: &str, prompt: &Prompt) -> Result<Decision, String> {
@@ -171,7 +182,9 @@ pub(crate) struct Prompt {
     mask: Mask,
     profile_revision: Option<[u8; 32]>,
     firing_skills: Option<FiringSkillPrompt>,
+    memory: Option<MemorySystems>,
     knowledge: Option<KnowledgePrompt>,
+    web: Option<web::ReviewedWeb>,
     swarm: Option<SwarmInput>,
     advisory: Option<MaskedInput>,
 }
@@ -199,6 +212,14 @@ struct FiringSkillPrompt {
 }
 
 #[derive(Clone)]
+struct MemorySystems {
+    memory: Memory,
+    targets: Vec<Memory>,
+    proposal: Option<Zeroizing<String>>,
+    firing: Option<Zeroizing<String>>,
+}
+
+#[derive(Clone)]
 struct KnowledgePrompt {
     grant: Arc<knowledge::Grant>,
     standing: bool,
@@ -215,6 +236,8 @@ struct SwarmInput {
 struct SwarmRoundInput {
     number: u8,
     input: String,
+    research_system: Option<String>,
+    allows_page: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -313,10 +336,101 @@ impl Prompt {
             mask,
             profile_revision: None,
             firing_skills: None,
+            memory: None,
             knowledge: None,
+            web: None,
             swarm: None,
             advisory: advisory.then_some(masked),
         })
+    }
+
+    pub(crate) fn capture_memory(
+        &self,
+        config: &Configuration,
+        policy: &AiMemoryPolicy,
+        connection: u64,
+    ) -> Result<Memory, String> {
+        if !self.targets.contains(&connection) {
+            return Err("AI memory can only be loaded for a reviewed SSH target.".into());
+        }
+        Memory::capture(config, policy, connection, &self.redactor)
+    }
+
+    pub(crate) fn with_memory(self, memory: Memory) -> Result<Self, String> {
+        if !matches!(self.targets.as_slice(), [target] if memory.connection() == Some(*target)) {
+            return Err("The scheduled AI memory does not match the reviewed SSH target.".into());
+        }
+        self.bind_memory(memory, Vec::new())
+    }
+
+    pub(crate) fn with_shared_memory(
+        self,
+        config: &Configuration,
+        policy: &AiMemoryPolicy,
+        targets: Vec<Memory>,
+    ) -> Result<Self, String> {
+        if !targets
+            .iter()
+            .map(Memory::connection)
+            .eq(self.targets.iter().copied().map(Some))
+            || targets.iter().any(Memory::includes_connection)
+        {
+            return Err("Review connection memory in separate requests for each target.".into());
+        }
+        let memory = Memory::global(config, policy, &self.redactor)?;
+        if targets.iter().any(|target| target.text() != memory.text()) {
+            return Err("Review different AI memory in separate requests for each target.".into());
+        }
+        self.bind_memory(memory, targets)
+    }
+
+    fn bind_memory(mut self, memory: Memory, targets: Vec<Memory>) -> Result<Self, String> {
+        self.memory = Some(MemorySystems {
+            memory,
+            targets,
+            proposal: None,
+            firing: None,
+        });
+        self.refresh_knowledge()?;
+        Ok(self)
+    }
+
+    pub(crate) fn require_current_memory(
+        &self,
+        config: &Configuration,
+        policy: &AiMemoryPolicy,
+    ) -> Result<(), String> {
+        if let Some(memory) = &self.memory {
+            memory
+                .memory
+                .require_current(config, policy, &self.redactor)?;
+            for target in &memory.targets {
+                target.require_current(config, policy, &self.redactor)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn has_memory(&self) -> bool {
+        self.memory_binding().is_some()
+    }
+
+    pub(crate) fn memory_binding(&self) -> Option<Binding> {
+        self.memory.as_ref()?.memory.binding()
+    }
+
+    pub(super) fn memory_matches(&self, other: &Self) -> bool {
+        self.memory_binding() == other.memory_binding()
+            && self
+                .memory
+                .iter()
+                .flat_map(|memory| &memory.targets)
+                .map(Memory::binding)
+                .eq(other
+                    .memory
+                    .iter()
+                    .flat_map(|memory| &memory.targets)
+                    .map(Memory::binding))
     }
 
     pub(crate) fn with_skill_guidance(&self, guidance: &str) -> Result<Self, String> {
@@ -341,12 +455,27 @@ impl Prompt {
 
     pub(crate) fn messages(&self) -> [&str; 2] {
         [
-            self.knowledge
-                .as_ref()
-                .filter(|knowledge| !knowledge.standing)
-                .map_or(self.system.as_str(), |knowledge| knowledge.system.as_str()),
-            &self.input,
+            self.reviewed_system(false)
+                .unwrap_or_else(|| self.base_proposal_system()),
+            self.reviewed_input(false),
         ]
+    }
+
+    fn base_proposal_system(&self) -> &str {
+        self.knowledge
+            .as_ref()
+            .filter(|knowledge| !knowledge.standing)
+            .map_or_else(
+                || self.proposal_system_with_memory(),
+                |knowledge| knowledge.system.as_str(),
+            )
+    }
+
+    fn proposal_system_with_memory(&self) -> &str {
+        self.memory
+            .as_ref()
+            .and_then(|memory| memory.proposal.as_ref())
+            .map_or(self.system.as_str(), |system| system.as_str())
     }
 
     pub(crate) fn with_knowledge(
@@ -374,7 +503,7 @@ impl Prompt {
             .map(|knowledge| knowledge.grant.as_ref())
     }
 
-    fn knowledge_mask(&self, text: &str) -> Result<String, String> {
+    pub(super) fn knowledge_mask(&self, text: &str) -> Result<String, String> {
         self.provider_mask.check(&self.transport)?;
         (self.mask)(&self.redactor, text)
     }
@@ -389,8 +518,21 @@ impl Prompt {
     }
 
     fn refresh_knowledge(&mut self) -> Result<(), String> {
+        self.refresh_memory();
+        if self.has_memory()
+            && [
+                self.proposal_system_with_memory(),
+                self.base_firing_system(),
+            ]
+            .iter()
+            .any(|system| {
+                !(self.mask)(&self.redactor, system).is_ok_and(|masked| masked == *system)
+            })
+        {
+            return Err("The scheduled AI memory conflicts with the current mask.".into());
+        }
         let Some(knowledge) = &self.knowledge else {
-            return Ok(());
+            return self.refresh_web();
         };
         let context = knowledge.grant.context();
         if !knowledge.grant.valid() || self.knowledge_mask(context)? != context {
@@ -399,7 +541,7 @@ impl Prompt {
         let base = if knowledge.standing {
             self.base_firing_system()
         } else {
-            &self.system
+            self.proposal_system_with_memory()
         };
         let system = crate::workspace::terminal_agent::knowledge_review::system_with_context(
             base,
@@ -414,7 +556,7 @@ impl Prompt {
             );
         }
         self.knowledge.as_mut().expect("reviewed knowledge").system = system;
-        Ok(())
+        self.refresh_web()
     }
 
     pub(crate) fn cli_review_input(
@@ -431,8 +573,9 @@ impl Prompt {
                 .map(Some)
                 .map_err(|error| error.message())
         } else {
+            let [system, input] = self.messages();
             self.transport
-                .prepare_cli_chat(self.messages()[0], &[], &self.input)
+                .prepare_cli_chat(system, &[], input)
                 .map(Some)
                 .map_err(|error| error.message())
         }
@@ -448,7 +591,8 @@ impl Prompt {
     }
 
     fn check_one_use_context(&self) -> Result<(), String> {
-        if self.input.chars().count() + self.messages()[0].chars().count() > self.context_limit {
+        let [system, input] = self.messages();
+        if input.chars().count() + system.chars().count() > self.context_limit {
             return Err("The proposal request exceeds the selected AI context limit.".into());
         }
         Ok(())
@@ -528,6 +672,11 @@ impl Prompt {
     }
 
     pub(crate) fn firing_system(&self) -> &str {
+        self.reviewed_system(true)
+            .unwrap_or_else(|| self.firing_system_with_knowledge())
+    }
+
+    fn firing_system_with_knowledge(&self) -> &str {
         self.knowledge
             .as_ref()
             .filter(|knowledge| knowledge.standing)
@@ -538,6 +687,16 @@ impl Prompt {
     }
 
     fn base_firing_system(&self) -> &str {
+        self.memory
+            .as_ref()
+            .and_then(|memory| memory.firing.as_ref())
+            .map_or_else(
+                || self.firing_system_without_memory(),
+                |system| system.as_str(),
+            )
+    }
+
+    fn firing_system_without_memory(&self) -> &str {
         self.firing_skills
             .as_ref()
             .map(|skills| skills.system.as_str())
@@ -550,13 +709,30 @@ impl Prompt {
             })
     }
 
+    fn refresh_memory(&mut self) {
+        let Some(memory) = self.memory.as_ref().map(|memory| &memory.memory) else {
+            return;
+        };
+        let append =
+            |system: &str| match memory.system(system, self.transport.structured_system_suffix()) {
+                std::borrow::Cow::Borrowed(_) => None,
+                std::borrow::Cow::Owned(system) => Some(Zeroizing::new(system)),
+            };
+        let proposal = append(&self.system);
+        let firing = append(self.firing_system_without_memory());
+        if let Some(memory) = &mut self.memory {
+            memory.proposal = proposal;
+            memory.firing = firing;
+        }
+    }
+
     pub(crate) fn firing_input_preview(&self) -> Result<String, String> {
         if self.is_advisory() {
             self.advisory_input(None)
         } else if self.is_swarm_iterative() {
             swarm::initial_round_input(self)
-        } else if self.firing_input_fits(&self.input) {
-            Ok(self.input.clone())
+        } else if self.firing_input_fits(self.reviewed_input(true)) {
+            Ok(self.reviewed_input(true).to_owned())
         } else {
             Err("The proposal request exceeds the selected AI context limit.".into())
         }
@@ -570,7 +746,12 @@ impl Prompt {
         let (Some(masked), [target]) = (self.advisory.as_ref(), self.targets.as_slice()) else {
             return Err("The read-only Swarm request is unavailable.".into());
         };
-        let input = advisory::input(&masked.question, &masked.directory, *target, output);
+        let input = self.advisory_input_with_web(advisory::input(
+            &masked.question,
+            &masked.directory,
+            *target,
+            output,
+        ))?;
         self.require_provider_credential(self.firing_system(), &input)?;
         if self.firing_system().chars().count() + input.chars().count()
             > advisory::context_limit(self.context_limit)
@@ -610,6 +791,7 @@ impl Prompt {
         if let Some(skills) = &mut self.firing_skills {
             skills.system = firing_system_with_guidance(base, &self.transport, &skills.guidance);
         }
+        self.refresh_memory();
     }
 
     fn firing_input_fits(&self, input: &str) -> bool {
@@ -638,26 +820,55 @@ impl Prompt {
         self.swarm.as_ref()?.probe_command.as_deref()
     }
 
-    pub(crate) fn with_swarm_round(&self, round: u8, prior: &[SwarmRound]) -> Result<Self, String> {
+    #[cfg(test)]
+    fn with_swarm_round(&self, round: u8, prior: &[SwarmRound]) -> Result<Self, String> {
         self.with_swarm_round_and_probe(round, prior, None)
     }
 
-    pub(crate) fn with_swarm_round_and_probe(
+    #[cfg(test)]
+    fn with_swarm_round_and_probe(
         &self,
         round: u8,
         prior: &[SwarmRound],
         probe: Option<&SwarmEvidence>,
     ) -> Result<Self, String> {
+        self.with_swarm_round_research(round, prior, probe, None)
+    }
+
+    pub(crate) fn with_swarm_round_research(
+        &self,
+        round: u8,
+        prior: &[SwarmRound],
+        probe: Option<&SwarmEvidence>,
+        research_scope: Option<(&str, bool)>,
+    ) -> Result<Self, String> {
         if !self.is_swarm_iterative() {
             return Err("The reviewed model request is not for iterative AI Swarm.".into());
         }
-        let input = swarm::round_input(self, round, prior, probe)?;
+        let research = research_scope.map(|(topic, allows_page)| swarm::Research {
+            topic,
+            system: swarm::research_system(self, allows_page),
+        });
+        let input = swarm::round_input(self, round, prior, probe, research.as_ref())?;
         let mut prompt = self.clone();
         prompt.swarm.as_mut().expect("checked Swarm input").round = Some(SwarmRoundInput {
             number: round,
             input,
+            research_system: research.map(|research| research.system),
+            allows_page: research_scope.is_some_and(|(_, allows_page)| allows_page),
         });
         Ok(prompt)
+    }
+
+    pub(crate) fn offers_swarm_round_research(&self, round: u8, lookup: WebLookup) -> bool {
+        self.swarm
+            .as_ref()
+            .and_then(|swarm| swarm.round.as_ref())
+            .is_some_and(|input| {
+                input.number == round
+                    && input.research_system.is_some()
+                    && (lookup == WebLookup::Search || input.allows_page)
+            })
     }
 
     pub(crate) fn bind_profile(mut self, revision: [u8; 32]) -> Self {
@@ -669,7 +880,7 @@ impl Prompt {
         self.profile_revision
     }
 
-    pub(super) fn target_ids(&self) -> &[u64] {
+    pub(crate) fn target_ids(&self) -> &[u64] {
         &self.targets
     }
 
@@ -693,7 +904,10 @@ impl Prompt {
         self.provider_mask.check(&self.transport)?;
         self.provider_mask.check_text(system)?;
         self.provider_mask.check_text(input)?;
-        if (self.knowledge.is_some() || self.transport.prompt_preset().guidance().is_some())
+        if (self.knowledge.is_some()
+            || self.web.is_some()
+            || self.has_memory()
+            || self.transport.prompt_preset().guidance().is_some())
             && !(self.mask)(&self.redactor, system).is_ok_and(|masked| masked == system)
         {
             return Err("The model instructions conflict with the current mask.");
@@ -733,6 +947,21 @@ impl Prompt {
                             })
                 });
         guidance_current
+            && (!self.has_memory()
+                || (self.redactor.matches_secrets(redactor)
+                    && [
+                        self.proposal_system_with_memory(),
+                        self.base_firing_system(),
+                    ]
+                    .iter()
+                    .all(|system| {
+                        (self.mask)(redactor, system).is_ok_and(|masked| masked == *system)
+                    })))
+            && self.web().is_none_or(|evidence| {
+                evidence
+                    .require_mask(|value| (self.mask)(redactor, value))
+                    .is_ok()
+            })
             && self.knowledge.as_ref().is_none_or(|knowledge| {
                 (self.mask)(redactor, &knowledge.system)
                     .is_ok_and(|masked| masked == knowledge.system)
@@ -754,10 +983,22 @@ impl Prompt {
         self.redactor.redaction_policy()
     }
 
+    pub(super) fn web_redactor(&self) -> &Redactor {
+        &self.redactor
+    }
+
     pub(super) fn generation_fingerprint(&self) -> io::Result<[u8; 32]> {
         let fingerprint = self.base_generation_fingerprint()?;
-        match self.knowledge() {
-            Some(grant) => digest(&("kortty-firing-knowledge-v1", fingerprint, grant)),
+        let fingerprint = match self.memory_binding() {
+            Some(memory) => digest(&("kortty-firing-memory-v1", fingerprint, memory))?,
+            None => fingerprint,
+        };
+        let fingerprint = match self.knowledge() {
+            Some(grant) => digest(&("kortty-firing-knowledge-v1", fingerprint, grant))?,
+            None => fingerprint,
+        };
+        match self.web() {
+            Some(evidence) => digest(&("kortty-firing-web-v1", fingerprint, evidence)),
             None => Ok(fingerprint),
         }
     }
@@ -844,8 +1085,16 @@ impl Prompt {
             self.quota_transport().effective_output_limit(),
             self.profile_revision,
         ))?;
-        match self.knowledge() {
-            Some(grant) => digest(&("kortty-advisory-knowledge-v1", fingerprint, grant)),
+        let fingerprint = match self.memory_binding() {
+            Some(memory) => digest(&("kortty-advisory-memory-v1", fingerprint, memory))?,
+            None => fingerprint,
+        };
+        let fingerprint = match self.knowledge() {
+            Some(grant) => digest(&("kortty-advisory-knowledge-v1", fingerprint, grant))?,
+            None => fingerprint,
+        };
+        match self.web() {
+            Some(evidence) => digest(&("kortty-advisory-web-v1", fingerprint, evidence)),
             None => Ok(fingerprint),
         }
     }
@@ -878,7 +1127,11 @@ impl Prompt {
                 .round
                 .as_ref()
                 .ok_or("The reviewed AI Swarm request is missing its current round.")?;
-            if !self.firing_input_fits(&round.input) {
+            let system = round
+                .research_system
+                .as_deref()
+                .unwrap_or_else(|| self.firing_system());
+            if round.input.chars().count() + system.chars().count() > self.context_limit {
                 return Err(
                     "The scheduled Swarm request exceeds the selected AI context limit.".into(),
                 );
@@ -889,11 +1142,23 @@ impl Prompt {
         let transport = self.quota_transport();
         local_ai::start(transport, move |client| {
             let deadline = Instant::now() + DEADLINE;
-            let system = self.firing_system();
-            let (input, kind, round) =
+            let (system, input, kind, round) =
                 match self.swarm.as_ref().and_then(|swarm| swarm.round.as_ref()) {
-                    Some(SwarmRoundInput { number, input }) => (input, Kind::Swarm, Some(*number)),
-                    _ => (&self.input, Kind::Agent, None),
+                    Some(round) => (
+                        round
+                            .research_system
+                            .as_deref()
+                            .unwrap_or_else(|| self.firing_system()),
+                        round.input.as_str(),
+                        Kind::Swarm,
+                        Some(round.number),
+                    ),
+                    _ => (
+                        self.firing_system(),
+                        self.reviewed_input(true),
+                        Kind::Agent,
+                        None,
+                    ),
                 };
             let cli_permitted = Cell::new(false);
             let authorize = || {
@@ -917,6 +1182,9 @@ impl Prompt {
                     return Err("The managed AI redaction rules changed.".into());
                 }
                 self.require_provider_credential(system, input)?;
+                if let Some(evidence) = self.web() {
+                    evidence.require_current()?;
+                }
                 guard(&self, &policy)
             };
             let send = |response_format| {
@@ -941,6 +1209,12 @@ impl Prompt {
                 _ => "The configured AI model could not produce a proposal.".into(),
             })?;
             self.provider_mask.check(&self.transport)?;
+            if let Some(evidence) = self.web() {
+                evidence.require_current()?;
+                let policy = load_policy();
+                require_policy(&policy, kind)?;
+                guard(&self, &policy)?;
+            }
             match round {
                 Some(round) => swarm::parse(&response, &self, round),
                 None => parse_firing(&response, &self),
@@ -948,13 +1222,13 @@ impl Prompt {
         })
     }
 
-    pub(crate) fn start_guarded(
-        self: Arc<Self>,
+    pub(in crate::scheduler_window) fn start_guarded(
+        prompts: Vec<Arc<Self>>,
         progress: async_channel::Sender<Progress>,
         kind: Kind,
         guard: impl Fn() -> Result<(), String> + Send + 'static,
     ) -> Result<local_ai::Pending<Vec<Item>>, String> {
-        self.start_with_policy_guarded(progress, kind, ClipboardPolicy::load, guard)
+        Self::start_requests(prompts, progress, kind, ClipboardPolicy::load, guard)
     }
 
     #[cfg(test)]
@@ -967,6 +1241,7 @@ impl Prompt {
         self.start_with_policy_guarded(progress, kind, load_policy, || Ok(()))
     }
 
+    #[cfg(test)]
     fn start_with_policy_guarded(
         self: Arc<Self>,
         progress: async_channel::Sender<Progress>,
@@ -974,64 +1249,98 @@ impl Prompt {
         load_policy: impl Fn() -> ClipboardPolicy + Send + 'static,
         guard: impl Fn() -> Result<(), String> + Send + 'static,
     ) -> Result<local_ai::Pending<Vec<Item>>, String> {
-        if self.is_advisory() {
-            return Err("The read-only Swarm request cannot propose commands.".into());
-        }
-        if self.is_swarm_iterative() {
-            return Err("The reviewed AI Swarm request must use an active round.".into());
-        }
-        self.check_one_use_context()?;
-        let transport = self.quota_transport();
-        local_ai::start(transport, move |client| {
-            let deadline = Instant::now() + DEADLINE;
-            let authorize = || -> Result<(), String> {
-                let policy = load_policy();
-                require_policy(&policy, kind)?;
-                if !self
-                    .redaction_policy()
-                    .equivalent_redactions(&policy.terminal_logging)
-                {
-                    return Err("The managed AI redaction rules changed.".into());
-                }
-                self.require_provider_credential(self.messages()[0], &self.input)?;
-                guard()
-            };
-            authorize()?;
-            let [system, input] = self.messages();
-            let send = |response_format| {
-                if self.transport.is_cli() {
-                    client.complete_cli_before_guarded(system, input, deadline, authorize)
-                } else {
-                    client.complete_before_guarded(
-                        system,
-                        input,
-                        response_format,
-                        deadline,
-                        authorize,
-                    )
-                }
-            };
-            let response = match send(true) {
-                Err(local_ai::Error::UnsupportedResponseFormat) => {
-                    authorize_resend(
-                        client,
-                        &progress,
-                        deadline,
-                        "The JSON compatibility retry was not authorized for the current review.",
-                        Progress::FormatFallback,
-                    )
-                    .map_err(local_ai::Error::message)?;
-                    send(false)
-                }
-                response => response,
+        Self::start_requests(vec![self], progress, kind, load_policy, guard)
+    }
+
+    fn start_requests(
+        prompts: Vec<Arc<Self>>,
+        progress: async_channel::Sender<Progress>,
+        kind: Kind,
+        load_policy: impl Fn() -> ClipboardPolicy + Send + 'static,
+        guard: impl Fn() -> Result<(), String> + Send + 'static,
+    ) -> Result<local_ai::Pending<Vec<Item>>, String> {
+        let first = prompts
+            .first()
+            .ok_or("The reviewed model request is unavailable.")?;
+        for prompt in &prompts {
+            if prompt.is_advisory() {
+                return Err("The read-only Swarm request cannot propose commands.".into());
             }
-            .map_err(|error| match error {
-                local_ai::Error::Review(reason) => reason,
-                _ => "The configured AI model could not produce a proposal.".into(),
-            })?;
-            self.provider_mask.check(&self.transport)?;
-            parse(&response, &self.targets, &self.redactor, self.mask)
+            if prompt.is_swarm_iterative() {
+                return Err("The reviewed AI Swarm request must use an active round.".into());
+            }
+            if prompt.transport != first.transport || prompt.context_limit != first.context_limit {
+                return Err(
+                    "The reviewed proposal requests must use the same model settings.".into(),
+                );
+            }
+            prompt.check_one_use_context()?;
+        }
+        local_ai::start(first.quota_transport(), move |client| {
+            let mut items = Vec::new();
+            for prompt in &prompts {
+                items.extend(prompt.request_once(client, &progress, kind, &load_policy, &guard)?);
+            }
+            Ok(items)
         })
+    }
+
+    fn request_once(
+        &self,
+        client: &local_ai::Client,
+        progress: &async_channel::Sender<Progress>,
+        kind: Kind,
+        load_policy: &impl Fn() -> ClipboardPolicy,
+        guard: &impl Fn() -> Result<(), String>,
+    ) -> Result<Vec<Item>, String> {
+        let deadline = Instant::now() + DEADLINE;
+        let [system, input] = self.messages();
+        let authorize = || -> Result<(), String> {
+            let policy = load_policy();
+            require_policy(&policy, kind)?;
+            if !self
+                .redaction_policy()
+                .equivalent_redactions(&policy.terminal_logging)
+            {
+                return Err("The managed AI redaction rules changed.".into());
+            }
+            self.require_provider_credential(system, input)?;
+            if let Some(evidence) = self.web() {
+                evidence.require_current()?;
+            }
+            guard()
+        };
+        authorize()?;
+        let send = |response_format| {
+            if self.transport.is_cli() {
+                client.complete_cli_before_guarded(system, input, deadline, authorize)
+            } else {
+                client.complete_before_guarded(system, input, response_format, deadline, authorize)
+            }
+        };
+        let response = match send(true) {
+            Err(local_ai::Error::UnsupportedResponseFormat) => {
+                authorize_resend(
+                    client,
+                    progress,
+                    deadline,
+                    "The JSON compatibility retry was not authorized for the current review.",
+                    Progress::FormatFallback,
+                )
+                .map_err(local_ai::Error::message)?;
+                send(false)
+            }
+            response => response,
+        }
+        .map_err(|error| match error {
+            local_ai::Error::Review(reason) => reason,
+            _ => "The configured AI model could not produce a proposal.".into(),
+        })?;
+        self.provider_mask.check(&self.transport)?;
+        if self.web().is_some() || self.memory.is_some() {
+            authorize()?;
+        }
+        parse(&response, &self.targets, &self.redactor, self.mask)
     }
 }
 
@@ -1275,6 +1584,123 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_proposals_send_only_the_selected_targets_memory() {
+        let _exclusive = exclusive_run();
+        let fixture = crate::snippets::tests::Profile::new();
+        let root = fixture.0.canonicalize().unwrap();
+        let memory = Directory::open(&root.join("memory"), true).unwrap();
+        memory
+            .publish_copy("MEMORY.md", b"Use maintenance windows.\n")
+            .unwrap();
+        let hosts = memory.private_child("connections", true).unwrap();
+        hosts
+            .publish_copy("4.md", b"Inspect staging with staging-credential-value.\n")
+            .unwrap();
+        hosts
+            .publish_copy("5.md", b"Inspect the production queue.\n")
+            .unwrap();
+        let config = Configuration::load_fixture_from(&root).unwrap();
+        let policy = crate::clipboard_policy::parse(
+            "[meta]\nschema-version = 1\n[[organization-memory]]\ntitle = 'Approved scope'\ncontent = 'Observe change freezes.'",
+        )
+        .unwrap();
+        let secrets = Secrets::default();
+        secrets.add("staging-credential-value");
+        let redactor = Redactor::for_journal(secrets.seal().unwrap(), Policy::default());
+        let (listener, transport) = listener();
+        let build = |targets| {
+            Prompt::new(
+                transport.clone(),
+                4096,
+                "Check the target",
+                "/srv",
+                targets,
+                redactor.clone(),
+                crate::workspace::terminal_ai::mask::prompt,
+            )
+            .unwrap()
+        };
+        let combined = build(vec![4, 5]);
+        let staging = combined
+            .capture_memory(&config, &policy.ai_memory, 4)
+            .unwrap();
+        let production = combined
+            .capture_memory(&config, &policy.ai_memory, 5)
+            .unwrap();
+        assert!(
+            combined
+                .capture_memory(&config, &policy.ai_memory, 6)
+                .is_err()
+        );
+        assert!(build(vec![4]).with_memory(production.clone()).is_err());
+        assert!(
+            combined
+                .with_shared_memory(
+                    &config,
+                    &policy.ai_memory,
+                    vec![staging.clone(), production.clone()]
+                )
+                .is_err()
+        );
+        let prompts = [(4, staging), (5, production)]
+            .into_iter()
+            .map(|(id, memory)| {
+                Arc::new(
+                    build(vec![id])
+                        .with_memory(memory)
+                        .unwrap()
+                        .with_skill_guidance("Use read-only checks.")
+                        .unwrap(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let reviewed = prompts
+            .iter()
+            .map(|prompt| prompt.messages().map(str::to_owned))
+            .collect::<Vec<_>>();
+        assert!(reviewed[0][0].contains("Inspect staging with ***."));
+        assert!(!reviewed[0][0].contains("production queue"));
+        assert!(reviewed[1][0].contains("Inspect the production queue."));
+        assert!(!reviewed[1][0].contains("Inspect staging"));
+        assert!(reviewed.iter().all(|[system, _]| {
+            system.contains("Use maintenance windows.")
+                && system.contains("Observe change freezes.")
+                && system.contains("Use read-only checks.")
+                && !system.contains("staging-credential-value")
+        }));
+        let worker = thread::spawn(move || {
+            for (target, [system, input]) in [4, 5].into_iter().zip(reviewed) {
+                let mut socket = accept(&listener);
+                let body = request(&mut socket);
+                assert_eq!(body["messages"][0]["content"], system);
+                assert_eq!(body["messages"][1]["content"], input);
+                let response = serde_json::json!({"commands":[{
+                    "target": target, "command": "pwd -P", "purpose": "Identify the directory"
+                }]});
+                socket
+                    .get_mut()
+                    .write_all(fixture_response("200 OK", "", &response.to_string()).as_bytes())
+                    .unwrap();
+            }
+        });
+        let (progress, _updates) = async_channel::bounded(1);
+        let pending = Prompt::start_requests(
+            prompts,
+            progress,
+            Kind::Swarm,
+            ClipboardPolicy::default,
+            || Ok(()),
+        )
+        .unwrap();
+        let items = pending.reply.recv_blocking().unwrap().unwrap();
+        assert_eq!(
+            items.iter().map(|item| item.target).collect::<Vec<_>>(),
+            [4, 5]
+        );
+        worker.join().unwrap();
+    }
+
+    #[test]
     fn scheduled_knowledge_binds_exact_context_and_source_snapshot() {
         let (_, transport) = listener();
         let base = fixture_prompt(transport)
@@ -1328,6 +1754,68 @@ mod tests {
             .unwrap();
         assert!(proposal.messages()[0].contains(excerpts));
         assert!(proposal.messages()[0].contains("Inspect only."));
+    }
+
+    #[test]
+    fn reviewed_web_excerpts_bind_standing_agent_and_swarm_inputs() {
+        use crate::workspace::terminal_ai::web::Evidence;
+
+        let (_, transport) = listener();
+        let base = fixture_prompt(transport)
+            .as_ref()
+            .clone()
+            .bind_profile([3; 32]);
+        let excerpt = "Check the public deployment note.";
+        let evidence = Arc::new(Evidence::fixture(excerpt));
+        let saved = serde_json::to_vec(&evidence).unwrap();
+        let proposal = base
+            .clone()
+            .with_web(Some(Arc::clone(&evidence)), false)
+            .unwrap();
+        assert!(proposal.messages()[0].contains("untrusted reference data"));
+        assert!(!proposal.messages()[0].contains(excerpt));
+        assert!(proposal.messages()[1].contains(excerpt));
+        assert!(!proposal.firing_input_preview().unwrap().contains(excerpt));
+
+        for prompt in [base.clone(), base.clone().for_swarm()] {
+            let reviewed = prompt
+                .clone()
+                .with_web(Some(Arc::clone(&evidence)), true)
+                .unwrap();
+            let restored = prompt
+                .clone()
+                .with_web(Some(serde_json::from_slice(&saved).unwrap()), true)
+                .unwrap();
+            let input = reviewed.firing_input_preview().unwrap();
+            let input: serde_json::Value = serde_json::from_str(&input).unwrap();
+            assert!(input["web_evidence"].as_str().unwrap().contains(excerpt));
+            assert!(!reviewed.firing_system().contains(excerpt));
+            assert_eq!(
+                reviewed.generation_fingerprint().unwrap(),
+                restored.generation_fingerprint().unwrap()
+            );
+            assert_ne!(
+                reviewed.generation_fingerprint().unwrap(),
+                prompt.generation_fingerprint().unwrap()
+            );
+            let edited = prompt
+                .with_web(
+                    Some(Arc::new(Evidence::fixture("A different excerpt."))),
+                    true,
+                )
+                .unwrap();
+            assert_ne!(
+                reviewed.generation_fingerprint().unwrap(),
+                edited.generation_fingerprint().unwrap()
+            );
+        }
+        assert!(
+            base.with_web(
+                Some(Arc::new(Evidence::fixture("private-fixture-text"))),
+                true
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1842,6 +2330,52 @@ mod tests {
         ));
         assert!(parse_firing(r#"{"state":"swarm_done","summary":"Finished"}"#, &prompt).is_err());
         assert!(parse_firing(r#"{"state":"done","summary":"Finished"}"#, &prompt).is_err());
+    }
+
+    #[test]
+    fn scheduled_swarm_round_page_requires_page_authority_and_a_public_url() {
+        let (_listener, transport) = listener();
+        let prompt = fixture_prompt(transport).as_ref().clone().for_swarm();
+        let prior = [swarm_evidence(1, String::new())];
+        let search = prompt
+            .with_swarm_round_research(
+                2,
+                &prior,
+                None,
+                Some(("Public kernel documentation", false)),
+            )
+            .unwrap();
+        let page = prompt
+            .with_swarm_round_research(2, &prior, None, Some(("Public kernel documentation", true)))
+            .unwrap();
+        assert_eq!(
+            swarm_wire(&page)["public_research_topic"],
+            "Public kernel documentation"
+        );
+        assert!(page.offers_swarm_round_research(2, WebLookup::Page));
+        assert!(!page.offers_swarm_round_research(3, WebLookup::Page));
+        assert!(!search.offers_swarm_round_research(2, WebLookup::Page));
+        let response = r#"{"state":"research_page","url":"https://docs.example.com/release?ignored=1#details"}"#;
+        assert!(swarm::parse(response, &search, 2).is_err());
+        assert!(swarm::parse(response, &page, 1).is_err());
+        assert!(swarm::parse(response, &prompt.with_swarm_round(2, &prior).unwrap(), 2).is_err());
+        assert!(
+            matches!(swarm::parse(response, &page, 2), Ok(Decision::SwarmResearch {
+            lookup: WebLookup::Page, input,
+        }) if input == "https://docs.example.com/release")
+        );
+        for value in [
+            "http://127.0.0.1/docs",
+            "https://user@docs.example.com/docs",
+            "https://docs.example.com/%70rivate-fixture-text",
+        ] {
+            let response = serde_json::json!({"state":"research_page","url":value}).to_string();
+            assert!(
+                matches!(swarm::parse(&response, &page, 2), Ok(Decision::SwarmResearch {
+                lookup: WebLookup::Page, input,
+            }) if input.is_empty())
+            );
+        }
     }
 
     fn first_request(
@@ -2468,6 +3002,7 @@ mod tests {
         };
         let mut approval = Approval {
             scope: [7; 32],
+            dependency_triggers: false,
             profile: ProfileChoice {
                 id: ProfileRef::Numeric(7),
                 name: "Local".into(),
@@ -2484,6 +3019,9 @@ mod tests {
             comparison: None,
             initial_swarm_probe: None,
             knowledge: None,
+            web: None,
+            fresh_web: false,
+            web_lookup: None,
         };
         let items = [Item {
             target: 1,

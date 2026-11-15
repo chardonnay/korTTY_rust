@@ -5,6 +5,10 @@ edition = "2024"
 license = "MIT"
 description = "Native file operations for the kortty desktop"
 
+[dependencies]
+memmap2 = "0.9"
+tempfile = "3"
+
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 zeroize = { version = "1.9.0", default-features = false, features = ["alloc"] }

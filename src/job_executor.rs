@@ -12,7 +12,7 @@ use kortty_jobs::{Cancellation, JournalRecording, RunId, RunOutcome, RunRequest}
 use kortty_ssh::{ConnectError, SshSession, TrustStore};
 
 use crate::clipboard_policy::{ClipboardPolicy, ServerAccess};
-use crate::scheduler_window::{SshCommand, SudoMode};
+use crate::scheduler_window::{RemoteAction, SshCommand, SudoMode};
 use crate::sftp_window::worker::{Connection as SftpConnection, Worker as SftpWorker};
 use crate::ssh_connection;
 
@@ -20,12 +20,14 @@ pub(crate) mod agent;
 pub(crate) mod automation;
 mod batch;
 mod connection;
+mod output;
 mod remote;
 pub(crate) mod rsync;
 mod sudo;
 pub(crate) mod virtual_terminal;
 
 pub(crate) use connection::{BatchAuth, Credentials, JobAuth, SavedAuth};
+pub(crate) use output::CapturedOutput;
 pub(crate) use remote::sync::preview as preview_sftp_sync;
 pub(crate) use remote::{BrowserArchiveManifest, scan_browser_archive};
 pub(crate) type ArchivePassword = Result<Option<kortty_vault::Secret>, &'static str>;
@@ -87,6 +89,7 @@ pub struct Completion {
     pub id: RunId,
     pub outcome: RunOutcome,
     pub detail: Option<String>,
+    pub(crate) output: Option<CapturedOutput>,
     pub recording: Option<JournalRecording>,
     pub swarm_report: Option<Box<kortty_jobs::SwarmReport>>,
 }
@@ -95,10 +98,13 @@ pub struct Completion {
 pub(crate) struct ExecutionPolicy {
     pub(crate) file_transfer_allowed: bool,
     pub(crate) sudo_allowed: bool,
+    pub(crate) job_output_allowed: bool,
+    pub(crate) job_output_redactions: crate::terminal_logging::Policy,
     pub(crate) server_access: ServerAccess,
     pub(crate) automation: Option<automation::Plan>,
     pub(crate) sync: Option<crate::scheduler_window::sync::RunContext>,
     pub(crate) privileged: Option<crate::scheduler_window::privileged::RunContext>,
+    pub(crate) rsync: Option<crate::scheduler_window::rsync_authority::RunContext>,
     pub(crate) group_scope: Option<std::sync::Arc<SshCommand>>,
 }
 
@@ -115,9 +121,31 @@ impl ExecutionPolicy {
             .map_err(Failure::blocked)
     }
 
+    fn require_rsync_approval(
+        &self,
+        run: RunId,
+        job: &kortty_jobs::JobId,
+        reference: &crate::scheduler_window::ConnectionRef,
+    ) -> Result<(), Failure> {
+        self.rsync
+            .as_ref()
+            .ok_or_else(|| {
+                Failure::blocked(
+                    "The existing-directory upload requires a current saved rsync approval.",
+                )
+            })?
+            .require_current(run, job, reference)
+            .map_err(Failure::blocked)
+    }
+
     fn check_elevation(&self, action: &SshCommand) -> Result<(), Failure> {
         action.validate_elevation().map_err(Failure::blocked)?;
-        if action.sudo != SudoMode::Disabled && !self.sudo_allowed {
+        let elevated_rsync = action
+            .remote
+            .as_ref()
+            .and_then(RemoteAction::rsync_transfer)
+            .is_some_and(|(transfer, _)| transfer.uses_passwordless_sudo());
+        if (action.sudo != SudoMode::Disabled || elevated_rsync) && !self.sudo_allowed {
             return Err(Failure::blocked("Managed policy forbids scheduler sudo."));
         }
         Ok(())
@@ -138,10 +166,13 @@ impl ExecutionPolicy {
         Self {
             file_transfer_allowed,
             sudo_allowed: true,
+            job_output_allowed: true,
+            job_output_redactions: crate::terminal_logging::Policy::default(),
             server_access: ServerAccess::default(),
             automation: None,
             sync: None,
             privileged: None,
+            rsync: None,
             group_scope: None,
         }
     }
@@ -158,6 +189,11 @@ pub(crate) fn spawn(
 ) -> CompletionReceiver<Completion> {
     let (completion, result) = async_channel::bounded(1);
     let id = request.id;
+    if let Err(message) = request.action.require_executable() {
+        let reason = check_cancelled(&request.cancellation).and(Err(Failure::blocked(message)));
+        let _ = completion.try_send(Completion::from_result(id, reason));
+        return result;
+    }
     let finished = completion.clone();
     let worker = thread::Builder::new()
         .name("kortty-job".into())
@@ -245,6 +281,7 @@ impl Completion {
             id,
             outcome,
             detail,
+            output: None,
             recording: None,
             swarm_report: None,
         }
@@ -280,6 +317,40 @@ fn run(
     archive_password: BorrowedArchivePassword<'_>,
     trust_store: impl FnOnce() -> io::Result<TrustStore>,
 ) -> Completion {
+    let output = if request.action.remote.is_none() && request.action.virtual_terminal.is_none() {
+        output::Scope::new(
+            request.action.journal_detail,
+            policy,
+            1,
+            saved_auth.as_ref().ok().and_then(Option::as_ref),
+        )
+    } else {
+        None
+    };
+    run_with_output(
+        request,
+        recording_directory,
+        snippets_path,
+        (policy, output.as_ref()),
+        saved_auth,
+        archive_password,
+        trust_store,
+    )
+}
+
+fn run_with_output(
+    request: &RunRequest<SshCommand>,
+    recording_directory: Option<PathBuf>,
+    snippets_path: Option<&Path>,
+    (policy, output): (&ExecutionPolicy, Option<&output::Scope>),
+    saved_auth: SavedAuth,
+    archive_password: BorrowedArchivePassword<'_>,
+    trust_store: impl FnOnce() -> io::Result<TrustStore>,
+) -> Completion {
+    if let Err(message) = request.action.require_executable() {
+        let reason = check_cancelled(&request.cancellation).and(Err(Failure::blocked(message)));
+        return Completion::from_result(request.id, reason);
+    }
     if !request.action.additional_connections.is_empty() {
         return Completion::from_result(
             request.id,
@@ -296,9 +367,11 @@ fn run(
         }
         let credentials = saved_auth.as_ref().ok().and_then(Option::as_ref);
         let archive_secret = match file_action {
-            Some(crate::scheduler_window::RemoteAction::Archive(_)) => {
-                archive_password.ok().flatten()
-            }
+            Some(
+                crate::scheduler_window::RemoteAction::Archive(_)
+                | crate::scheduler_window::RemoteAction::ServerArchive(_)
+                | crate::scheduler_window::RemoteAction::PrivilegedArchive(_),
+            ) => archive_password.ok().flatten(),
             _ => None,
         };
         match plan.start(
@@ -329,7 +402,7 @@ fn run(
                     policy,
                     saved_auth,
                     trust_store,
-                    policy.automation.as_ref().zip(journal.as_ref()),
+                    (policy.automation.as_ref().zip(journal.as_ref()), output),
                 )
                 .map(|completion| (completion, None))
             }
@@ -362,10 +435,13 @@ fn run_command(
     policy: &ExecutionPolicy,
     saved_auth: SavedAuth,
     trust_store: impl FnOnce() -> io::Result<TrustStore>,
-    journal: Option<(
-        &automation::Plan,
-        &crate::session_journal::automation::Recorder,
-    )>,
+    (journal, output): (
+        Option<(
+            &automation::Plan,
+            &crate::session_journal::automation::Recorder,
+        )>,
+        Option<&output::Scope>,
+    ),
 ) -> Result<Completion, Failure> {
     let action = &request.action;
     let cancellation = &request.cancellation;
@@ -388,10 +464,21 @@ fn run_command(
             let directory = recording_directory.as_deref().ok_or_else(|| {
                 Failure::blocked("Application policy forbids virtual terminal recordings")
             })?;
-            virtual_terminal::Capture::create(directory, request.id)
-                .map_err(|_| Failure::failed("Could not create the virtual terminal recording"))
+            match virtual_terminal::Capture::create(directory, request.id) {
+                Ok(capture) => Ok(Some(capture)),
+                Err(_)
+                    if journal
+                        .is_some_and(|(plan, _)| plan.can_capture(&ClipboardPolicy::load())) =>
+                {
+                    Ok(None)
+                }
+                Err(_) => Err(Failure::failed(
+                    "Could not create the virtual terminal recording",
+                )),
+            }
         })
-        .transpose()?;
+        .transpose()?
+        .flatten();
     let (target, jumps) = connection::route(action, saved_auth, &policy.server_access)?;
     let trust =
         trust_store().map_err(|_| Failure::failed("Could not access SSH host-key trust store"))?;
@@ -436,17 +523,15 @@ fn run_command(
         policy.require_target_groups(action)?;
     }
     let mut session = opened.map_err(connect_failure)?;
-    let journal = journal
-        .filter(|(plan, _)| plan.can_capture(&ClipboardPolicy::load()))
-        .map(|(_, journal)| journal);
-    if let Some(journal) = journal {
+    let journal = journal.filter(|(plan, _)| plan.can_capture(&ClipboardPolicy::load()));
+    if let Some((_, journal)) = journal {
         if action.sudo == SudoMode::Disabled {
             journal.command(&command);
         } else {
             journal.command(&format!("sudo {command}"));
         }
     }
-    Ok(if let (Some(options), Some(capture)) = (options, capture) {
+    Ok(if let Some(options) = options {
         virtual_terminal::supervise(
             request.id,
             &mut session,
@@ -456,10 +541,26 @@ fn run_command(
             journal,
         )
     } else {
-        Completion::from_result(
-            request.id,
-            supervise(&mut session, cancellation, journal, invocation.password),
-        )
+        let mut streams = [output::Stream::default(), output::Stream::default()];
+        let output = output.filter(|scope| scope.authorized());
+        let result = supervise(
+            &mut session,
+            cancellation,
+            journal.map(|(_, recorder)| recorder),
+            invocation.password,
+            output.map(|_| &mut streams),
+        );
+        let interrupted = result.as_ref().is_err_and(|failure| {
+            matches!(failure.outcome, RunOutcome::Failed { exit_code: None })
+        });
+        let mut completion = Completion::from_result(request.id, result);
+        if matches!(
+            completion.outcome,
+            RunOutcome::Success | RunOutcome::Failed { .. }
+        ) {
+            completion.output = output.and_then(|scope| scope.finish(streams, interrupted));
+        }
+        completion
     })
 }
 
@@ -492,6 +593,7 @@ fn supervise(
     cancellation: &Cancellation,
     journal: Option<&crate::session_journal::automation::Recorder>,
     password: Option<sudo::Password<'_>>,
+    streams: Option<&mut [output::Stream; 2]>,
 ) -> Result<u32, Failure> {
     let abort = session.abort_handle();
     let stdout = session.take_reader().ok_or_else(missing_stream)?;
@@ -517,17 +619,23 @@ fn supervise(
         sudo::Output::new(stdout, None),
         sudo::Output::new(stderr, prompt),
     ];
+    let streams = streams.map_or([None, None], |[stdout, stderr]| {
+        [Some(stdout), Some(stderr)]
+    });
     let deadline = Instant::now() + COMMAND_TIMEOUT;
     let (report, reports) = mpsc::sync_channel(3);
 
     let drained = thread::scope(|scope| {
         let result = (|| {
-            for (index, reader) in outputs.into_iter().enumerate() {
+            for (index, (reader, stream)) in outputs.into_iter().zip(streams).enumerate() {
                 let report = report.clone();
                 thread::Builder::new()
                     .name("kortty-job-output".into())
                     .spawn_scoped(scope, move || {
-                        let _ = report.send(automation::drain(reader, journal, index == 1));
+                        let mut reader = output::Reader::new(reader, stream);
+                        let drained = automation::drain(&mut reader, journal, index == 1);
+                        reader.finish(drained);
+                        let _ = report.send(drained);
                     })
                     .map_err(|_| Failure::failed("Could not start SSH output drain"))?;
             }
@@ -609,6 +717,7 @@ mod tests {
 
     use super::*;
 
+    mod automation_virtual_terminal;
     #[cfg(unix)]
     mod openssh_script;
 
@@ -659,9 +768,12 @@ mod tests {
             automation: None,
             sync: None,
             privileged: None,
+            rsync: None,
             group_scope: None,
             file_transfer_allowed: true,
             sudo_allowed: policy.scheduler_sudo_allowed,
+            job_output_allowed: policy.automation_journal_allowed(),
+            job_output_redactions: policy.terminal_logging.clone(),
             server_access: policy.server_access().clone(),
         }
     }
@@ -756,23 +868,37 @@ mod tests {
             "level": 6,
             "password_credential": "0123456789abcdef0123456789abcdef",
         });
-        request.action = std::sync::Arc::new(serde_json::from_value(action).unwrap());
-        for password in [
-            Ok(None),
-            Ok(Some("  ")),
-            Err("The archive vault is locked."),
-        ] {
-            let completed = run(
-                &request,
-                None,
-                None,
-                &ExecutionPolicy::unrestricted(true),
+        for kind in ["archive", "server_archive", "privileged_archive"] {
+            action["remote"]["kind"] = kind.into();
+            if kind != "archive" {
+                action["connection"] = serde_json::json!({"id": 1, "target": {
+                    "host": "example.test", "port": 22, "username": "test-only",
+                }});
+            }
+            if kind == "privileged_archive" {
+                let mut archive = action["remote"].clone();
+                archive.as_object_mut().unwrap().remove("kind");
+                action["remote"] = serde_json::json!({"kind": kind, "archive": archive});
+                action["sudo"] = "passwordless".into();
+            }
+            request.action = std::sync::Arc::new(serde_json::from_value(action.clone()).unwrap());
+            for password in [
                 Ok(None),
-                password,
-                || panic!("An encrypted ZIP without a password reached SSH setup"),
-            );
-            assert_eq!(completed.outcome, RunOutcome::Blocked);
-            assert!(completed.detail.unwrap().contains("vault"));
+                Ok(Some("  ")),
+                Err("The archive vault is locked."),
+            ] {
+                let completed = run(
+                    &request,
+                    None,
+                    None,
+                    &ExecutionPolicy::unrestricted(kind == "archive"),
+                    Ok(None),
+                    password,
+                    || panic!("An encrypted ZIP without a password reached SSH setup"),
+                );
+                assert_eq!(completed.outcome, RunOutcome::Blocked);
+                assert!(completed.detail.unwrap().contains("vault"));
+            }
         }
     }
 
@@ -816,7 +942,7 @@ mod tests {
             &ExecutionPolicy::unrestricted(true),
             Ok(None),
             || panic!("invalid script must stop before trust lookup"),
-            None,
+            (None, None),
         );
         assert!(matches!(result, Err(failure) if failure.outcome == RunOutcome::Blocked));
     }
@@ -841,7 +967,7 @@ mod tests {
             &ExecutionPolicy::unrestricted(true),
             Ok(None),
             || panic!("missing snippet must stop before trust lookup"),
-            None,
+            (None, None),
         );
         assert!(
             matches!(result, Err(failure) if failure.outcome == RunOutcome::Blocked && failure.detail == "The linked snippet is missing")
@@ -890,7 +1016,7 @@ mod tests {
             &ExecutionPolicy::unrestricted(true),
             Ok(None),
             || panic!("missing default reached the SSH trust lookup"),
-            None,
+            (None, None),
         );
         assert!(
             matches!(result, Err(failure) if failure.outcome == RunOutcome::Blocked && failure.detail.contains("needs a value"))
@@ -1006,9 +1132,12 @@ mod tests {
             snippet: None,
             remote: None,
             agent: None,
+            imported_ai: None,
+            imported_transfer: None,
             sudo: SudoMode::Disabled,
             virtual_terminal: None,
             automation_journal: None,
+            journal_detail: Default::default(),
             desktop_notices: Default::default(),
             webhook_targets: Vec::new(),
         };

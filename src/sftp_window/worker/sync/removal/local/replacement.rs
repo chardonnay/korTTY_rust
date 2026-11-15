@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use pgp::crypto::hash::HashAlgorithm;
 
 use crate::private_files::require_single_link;
+use crate::sftp_window::files::nonce;
 use crate::sftp_window::worker::sync::require_running;
 
 use super::*;
@@ -44,6 +45,15 @@ impl ReplacementBackup {
     }
 
     pub(in crate::sftp_window::worker::sync) fn restore(self) -> Result<()> {
+        self.restore_with_sync(false)
+    }
+
+    pub(in crate::sftp_window::worker::sync) fn sync(&self) -> Result<()> {
+        self.verify()?;
+        self.backup.sync()
+    }
+
+    pub(in crate::sftp_window::worker::sync) fn restore_with_sync(self, sync: bool) -> Result<()> {
         self.verify()?;
         let Self {
             path,
@@ -55,6 +65,9 @@ impl ReplacementBackup {
         } = self;
         if let Err(error) = backup.restore(&name, &file, &expected_parent) {
             return Err(recovery_path(error, &path));
+        }
+        if sync {
+            backup.sync().map_err(|error| recovery_path(error, &path))?;
         }
         drop(file);
         backup
@@ -150,6 +163,24 @@ fn require_content(
     }
     require_single_link(file)?;
     Ok(())
+}
+
+fn recovery_name(prefix: Option<&str>) -> io::Result<String> {
+    let mut name = nonce()?;
+    if let Some(prefix) = prefix {
+        if prefix.len() != 16
+            || !prefix
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(io::Error::other(
+                "Invalid scheduled replacement backup prefix",
+            ));
+        }
+        let start = ".kortty-".len();
+        name.replace_range(start..start + prefix.len(), prefix);
+    }
+    Ok(name)
 }
 
 #[cfg(test)]
@@ -522,6 +553,10 @@ mod native {
     pub(super) struct Backup(Quarantine);
 
     impl Backup {
+        pub(super) fn sync(&self) -> Result<()> {
+            self.0.sync()
+        }
+
         pub(super) fn verify(
             &self,
             name: &OsStr,
@@ -553,7 +588,7 @@ mod native {
         (expected, expected_digest): (&SnapshotEntry, [u8; 32]),
         before_write: &impl Fn(&File) -> Result<()>,
         stopped: &impl Fn() -> bool,
-        _backup_prefix: Option<&str>,
+        backup_prefix: Option<&str>,
     ) -> Result<(Backup, File, LocalStamp, PathBuf)> {
         let parent = Directory::open_path(parent_path)?;
         check_parent(&parent, expected_parent)?;
@@ -568,7 +603,7 @@ mod native {
             expected_digest,
             stopped,
         )?;
-        let stage = Quarantine::create(parent_path, parent)?;
+        let stage = Quarantine::create(parent_path, parent, recovery_name(backup_prefix)?)?;
         let path = stage.path(name);
         let moved = (|| {
             before_write(&file)?;
@@ -615,8 +650,6 @@ mod native {
 
 #[cfg(windows)]
 mod native {
-    use crate::sftp_window::files::nonce;
-
     use super::*;
 
     pub(super) struct Backup {
@@ -627,6 +660,11 @@ mod native {
     }
 
     impl Backup {
+        pub(super) fn sync(&self) -> Result<()> {
+            crate::sftp_window::local_tree::sync_reviewed_tree_directory(&self.stage)?;
+            Ok(crate::sftp_window::local_tree::sync_reviewed_tree_directory(&self.parent)?)
+        }
+
         fn check_stage(&self) -> Result<()> {
             self.stage.require_owner_only()?;
             let current = self
@@ -692,19 +730,7 @@ mod native {
         let file = parent.child_for_reviewed_removal(name, false)?;
         let stamp = LocalStamp::capture(&check_entry(&file, expected)?);
         require_content(&file, &stamp, expected_digest, stopped)?;
-        let mut stage_name = nonce()?;
-        if let Some(prefix) = backup_prefix {
-            if prefix.len() != 16
-                || !prefix
-                    .bytes()
-                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-            {
-                return Err(io::Error::other("Invalid scheduled replacement backup prefix").into());
-            }
-            let start = ".kortty-".len();
-            stage_name.replace_range(start..start + prefix.len(), prefix);
-        }
-        let stage_name = OsString::from(stage_name);
+        let stage_name = OsString::from(recovery_name(backup_prefix)?);
         let stage = parent.create_backup_directory(&stage_name)?;
         let path = parent_path.join(&stage_name).join(name);
         let backup = Backup {

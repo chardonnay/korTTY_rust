@@ -13,11 +13,14 @@ use rsa::signature::digest::DynDigest;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::ai_manager::JavaProfileSource;
+use crate::private_files::EntryIdentity;
 use crate::terminal_logging::Redactor;
 
 use super::entry_edit::{apply_patches, lock_source, patch_scalars};
 use super::markers::Compiled;
-use super::tree::RunStatus;
+use super::summary_queue::{AutomationSource, AutomationVision, ProfileChoice, SourceApproval};
+use super::tree::{RunStatus, SourceKind};
 use super::viewer::Source;
 use super::{
     Capture, ConnectionConfig, LogFormat, MAX_DOCUMENT_BYTES, Metadata, RecordKind, Sink, Status,
@@ -27,7 +30,10 @@ use super::{
 pub(crate) const MAX_DAYS: u16 = 3_650;
 pub(crate) const MAX_RUNS: u16 = 1_000;
 pub(crate) const MAX_STORAGE_MIB: u32 = 1_048_576;
+pub(crate) const INTERACTIVE_SWARM_SOURCE: &str = "interactive-swarm";
 pub(super) const OPTIONS: &str = "nativeAutomationOptions";
+pub(super) const SUMMARY_PROOF: &str = "nativeAutomationSummaryProof";
+const VISION_PROOF: &str = "nativeAutomationVisionProfile";
 pub(super) const TARGET: &str = "nativeAutomationTarget";
 pub(super) const COMPLETE: &str = "nativeAutomationComplete";
 pub(super) const COMMAND_DIGEST: &str = "nativeAutomationCommandDigest";
@@ -80,6 +86,12 @@ pub(crate) struct Options {
     pub(crate) capture_input: bool,
     pub(crate) keep: Keep,
     pub(crate) closing: Closing,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) summary_profile: Option<ProfileChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) unresolved_summary_profile: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) java_profile_source: Option<JavaProfileSource>,
     pub(crate) retention: Retention,
     pub(crate) max_runs: u16,
     pub(crate) max_storage_mib: u32,
@@ -93,6 +105,9 @@ impl Default for Options {
             capture_input: false,
             keep: Keep::Always,
             closing: Closing::Off,
+            summary_profile: None,
+            unresolved_summary_profile: None,
+            java_profile_source: None,
             retention: Retention::default(),
             max_runs: 0,
             max_storage_mib: 0,
@@ -113,7 +128,27 @@ impl Options {
             }
             Retention::Forever => true,
         };
-        if valid_retention && self.max_runs <= MAX_RUNS && self.max_storage_mib <= MAX_STORAGE_MIB {
+        if valid_retention
+            && self.max_runs <= MAX_RUNS
+            && self.max_storage_mib <= MAX_STORAGE_MIB
+            && self
+                .summary_profile
+                .as_ref()
+                .is_none_or(ProfileChoice::valid)
+            && self
+                .unresolved_summary_profile
+                .as_ref()
+                .is_none_or(|reference| {
+                    self.summary_profile.is_none()
+                        && !reference.trim().is_empty()
+                        && reference.len() <= 256
+                        && reference.chars().all(super::is_display_character)
+                })
+            && self.java_profile_source.as_ref().is_none_or(|source| {
+                self.unresolved_summary_profile.as_deref() == Some(source.id())
+                    && JavaProfileSource::parse_id(source.id()) == Some(source.id())
+            })
+        {
             Ok(())
         } else {
             Err(invalid(
@@ -214,6 +249,16 @@ impl Kind {
     }
 }
 
+impl AutomationSource {
+    pub(crate) fn from_kind(kind: Kind, source_id: &str) -> Option<Self> {
+        match kind {
+            Kind::Job => kortty_jobs::JobId::new(source_id).ok().map(Self::Job),
+            Kind::Swarm if source_id == INTERACTIVE_SWARM_SOURCE => Some(Self::Swarm),
+            Kind::Swarm => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct Run(Arc<Identity>);
 
@@ -227,6 +272,8 @@ struct Identity {
     started: Timestamp,
     options: Options,
     caps: Caps,
+    summary_approval: Option<(AutomationSource, SourceApproval)>,
+    vision: Option<AutomationVision>,
 }
 
 impl Run {
@@ -256,11 +303,25 @@ impl Run {
             started,
             options,
             caps,
+            summary_approval: None,
+            vision: None,
         })))
     }
 
     pub(crate) fn options(&self) -> &Options {
         &self.0.options
+    }
+
+    pub(crate) fn with_summary_approval(mut self, approval: Option<SourceApproval>) -> Self {
+        let run = Arc::get_mut(&mut self.0).expect("unshared automation run");
+        run.summary_approval = AutomationSource::from_kind(run.kind, &run.source_id).zip(approval);
+        self
+    }
+
+    pub(crate) fn with_vision(mut self, vision: Option<AutomationVision>) -> Self {
+        let run = Arc::get_mut(&mut self.0).expect("unshared automation run");
+        run.vision = vision.filter(|_| run.kind == Kind::Job);
+        self
     }
 }
 
@@ -274,6 +335,13 @@ pub(super) struct TargetMetadata {
     command_digest: Arc<OnceLock<String>>,
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredVision {
+    location: (EntryIdentity, EntryIdentity),
+    profile: AutomationVision,
+}
+
 impl TargetMetadata {
     pub(super) fn complete(&self, complete: bool) {
         let _ = self.complete.set(complete);
@@ -281,6 +349,8 @@ impl TargetMetadata {
 
     pub(super) fn write(
         &self,
+        journal: &str,
+        location: (EntryIdentity, EntryIdentity),
         ended: Option<Timestamp>,
         mut field: impl FnMut(&str, &str),
     ) -> io::Result<()> {
@@ -293,6 +363,19 @@ impl TargetMetadata {
         field("runStartedAt", &run.started.to_string());
         field(TARGET, &self.target);
         field(OPTIONS, &serde_json::to_string(&run.options)?);
+        if let Some((source, approval)) = &run.summary_approval {
+            let receipt = approval.receipt(source, &run.run_id, run.started, journal)?;
+            field(SUMMARY_PROOF, &serde_json::to_string(&receipt)?);
+        }
+        if let Some(vision) = &run.vision {
+            field(
+                VISION_PROOF,
+                &serde_json::to_string(&StoredVision {
+                    location,
+                    profile: vision.clone(),
+                })?,
+            );
+        }
         if let Some(ended) = ended {
             if let Some(digest) = self.command_digest.get() {
                 field(COMMAND_DIGEST, digest);
@@ -308,6 +391,46 @@ impl TargetMetadata {
             }
         }
         Ok(())
+    }
+}
+
+/// A malformed optional image route leaves ordinary journal text available.
+pub(super) fn stored_vision(
+    meta: roxmltree::Node<'_, '_>,
+    source: &Source,
+) -> Option<AutomationVision> {
+    let vision: StoredVision =
+        serde_json::from_str(field(meta, VISION_PROOF).ok()??.as_ref()).ok()?;
+    source
+        .has_location(vision.location)
+        .then_some(vision.profile)
+}
+
+impl Source {
+    pub(crate) fn require_automation_vision(&self, expected: &AutomationVision) -> io::Result<()> {
+        if self
+            .directory()
+            .parent()
+            .is_none_or(|root| !is_native_path(root, self))
+        {
+            return Err(invalid("The scheduled journal changed"));
+        }
+        self.with_document(|_, document| {
+            let journal = document.root_element();
+            let meta = child(journal, "meta").ok_or_else(|| invalid("Missing journal metadata"))?;
+            let options = field(meta, OPTIONS)?
+                .and_then(|value| serde_json::from_str::<Options>(&value).ok());
+            if SourceKind::parse(&super::bounded_field(meta, "sourceKind")?) == SourceKind::Job
+                && number::<Timestamp>(meta, "endedAt")?.is_some()
+                && RunStatus::parse(&super::bounded_field(meta, "runStatus")?)
+                    .is_some_and(|status| options.is_some_and(|options| options.summarize(status)))
+                && stored_vision(meta, self).as_ref() == Some(expected)
+            {
+                Ok(())
+            } else {
+                Err(invalid("The scheduled journal image approval changed"))
+            }
+        })
     }
 }
 
@@ -595,6 +718,24 @@ impl Recorder {
             Arc::clone(&self.redactor),
             Arc::clone(&self.stopped),
         )
+    }
+
+    pub(crate) fn redactor(&self) -> &Redactor {
+        &self.redactor
+    }
+
+    pub(crate) fn try_screenshot(
+        &self,
+        png: Vec<u8>,
+        final_frame: bool,
+        permit: impl Fn() -> bool + Send + 'static,
+    ) -> Result<(), super::writer::SendError> {
+        let stopped = Arc::clone(&self.stopped);
+        self.capture
+            .sink()
+            .try_automation_screenshot(png, final_frame, move || {
+                !stopped.load(Ordering::Acquire) && permit()
+            })
     }
 
     pub(crate) fn finish(self, outcome: RunStatus, exit_code: Option<i32>) -> Artifact {

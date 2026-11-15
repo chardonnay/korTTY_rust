@@ -74,7 +74,7 @@ fn picture_in_picture_detaches_with_separate_identity_and_close_only_reattaches(
         fixture
             .workspace
             .terminal_agents
-            .view(detached, None, false)
+            .view(detached, None, false, false, false, Vec::new)
             .is_some()
     );
     assert_eq!(
@@ -90,7 +90,7 @@ fn picture_in_picture_detaches_with_separate_identity_and_close_only_reattaches(
         fixture
             .workspace
             .terminal_agents
-            .view(detached, None, false)
+            .view(detached, None, false, false, false, Vec::new)
             .is_none()
     );
 }

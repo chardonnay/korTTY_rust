@@ -25,16 +25,17 @@ pub use jiff::{
 pub use profile_ref::{MAX_POLICY_PROFILE_ID_BYTES, ProfileRef, valid_policy_ai_profile_id};
 pub use schedule::{JobSchedule, SCHEDULE_SEARCH_DAYS, ScheduleError};
 pub use scheduler::{
-    BlockReason, Blocker, Cancellation, CascadeOrigin, RunBatch, RunId, RunOutcome, RunRecord,
-    RunRequest, RunTrigger, Scheduler, SchedulerError,
+    BlockReason, Blocker, Cancellation, CascadeOrigin, FiringOccurrence, RunBatch, RunId,
+    RunOutcome, RunRecord, RunRequest, RunTrigger, Scheduler, SchedulerError,
 };
 pub use store::{
-    FinishedRunMetadata, JournalRecording, MAX_JOURNAL_RECORDS, MAX_SESSION_JOURNALS_PER_RUN,
-    MAX_STORE_BYTES, MAX_SWARM_COMPARISON_BYTES, MAX_SWARM_QUESTION_BYTES,
-    MAX_SWARM_TARGET_DETAIL_BYTES, MAX_SWARM_TARGET_LABEL_BYTES, MAX_SWARM_TARGETS,
-    MAX_WEBHOOKS_PER_RUN, PreparedJobAdditions, SchedulerStore, StoreError, StoreLock,
-    SwarmChatOrigin, SwarmChatSeed, SwarmReport, SwarmTargetReport, WebhookOutcome,
-    valid_session_journal_id, valid_session_journal_ids, valid_swarm_comparison,
+    FinishedRunMetadata, JournalRecording, MAX_JOURNAL_DETAIL_BYTES, MAX_JOURNAL_RECORDS,
+    MAX_RUN_OUTPUT_BYTES, MAX_SESSION_JOURNALS_PER_RUN, MAX_STORE_BYTES,
+    MAX_SWARM_COMPARISON_BYTES, MAX_SWARM_QUESTION_BYTES, MAX_SWARM_TARGET_DETAIL_BYTES,
+    MAX_SWARM_TARGET_LABEL_BYTES, MAX_SWARM_TARGETS, MAX_WEBHOOKS_PER_RUN, PreparedJobAdditions,
+    RunOutput, SchedulerStore, StoreError, StoreLock, SwarmChatOrigin, SwarmChatSeed, SwarmReport,
+    SwarmTargetReport, WebhookOutcome, valid_session_journal_id, valid_session_journal_ids,
+    valid_swarm_comparison,
 };
 
 /// Maximum simultaneously active targets in one scheduled iterative Swarm.

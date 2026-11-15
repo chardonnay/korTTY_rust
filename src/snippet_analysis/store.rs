@@ -31,6 +31,7 @@ const CONTENT_BUDGET: usize = MAX_FILE_BYTES / 2;
 // Keep some space for finding and provenance metadata even with heavy JSON escaping.
 const ENCODED_CONTENT_BUDGET: usize = MAX_FILE_BYTES - 8 * 1024 * 1024;
 
+pub(crate) mod java;
 mod modularization;
 pub(crate) use modularization::ReviewedSplitRevision;
 
@@ -601,11 +602,7 @@ impl Store {
         if let Some(limit) = &self.retention_limit {
             return limit.load(std::sync::atomic::Ordering::Acquire);
         }
-        ClipboardPolicy::load()
-            .snippets
-            .analysis_max_stored_content_bytes
-            .unwrap_or(MAX_CONTENT_BYTES)
-            .min(MAX_CONTENT_BYTES)
+        java::content_limit(&ClipboardPolicy::load())
     }
 
     fn update(
@@ -894,6 +891,25 @@ impl Document {
                 blobs.insert(source.sha256.clone(), Arc::clone(content));
             }
         }
+        for evidence in history
+            .records
+            .iter_mut()
+            .filter_map(|record| record.java_history.as_mut())
+        {
+            evidence.attachments.retain(|_, content| {
+                let raw = content.len();
+                let encoded = encoded_cost(content);
+                if !source_fits(content, retention_limit)
+                    || raw > raw_remaining
+                    || encoded > encoded_remaining
+                {
+                    return false;
+                }
+                raw_remaining -= raw;
+                encoded_remaining -= encoded;
+                true
+            });
+        }
         Ok(Self {
             schema_version: SCHEMA_VERSION,
             history,
@@ -914,6 +930,12 @@ impl Document {
                         .apply_recovery
                         .as_ref()
                         .is_none_or(|recovery| recovery.fits_retention(limit))
+                    && record.java_history.as_ref().is_none_or(|evidence| {
+                        evidence
+                            .attachments
+                            .values()
+                            .all(|content| source_fits(content, limit))
+                    })
             })
     }
 
@@ -966,6 +988,19 @@ impl Document {
                 return Err(invalid(
                     "The analysis history has an invalid record identity",
                 ));
+            }
+            if let Some(evidence) = &record.java_history {
+                evidence.validate()?;
+                total += evidence
+                    .attachments
+                    .values()
+                    .map(|content| content.len())
+                    .sum::<usize>();
+                if total > CONTENT_BUDGET {
+                    return Err(invalid(
+                        "The analysis history exceeds its source storage limit",
+                    ));
+                }
             }
             if !record.source.content_truncated {
                 let content = self

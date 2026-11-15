@@ -255,9 +255,14 @@ mod tests {
             &script,
         )
         .unwrap();
-        let result =
-            super::super::supervise(&mut session, &Cancellation::default(), None, Some(password))
-                .unwrap_or_else(|failure| panic!("{}", failure.detail));
+        let result = super::super::supervise(
+            &mut session,
+            &Cancellation::default(),
+            None,
+            Some(password),
+            None,
+        )
+        .unwrap_or_else(|failure| panic!("{}", failure.detail));
         assert_eq!(result, 29);
     }
 }

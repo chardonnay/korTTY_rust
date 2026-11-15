@@ -32,7 +32,8 @@ impl Fixture {
         fs::write(
             self.0.join("journal.xml"),
             format!(
-                r#"<session-journal formatVersion="1" id="{ID}"><meta><title>Images</title></meta>
+                r#"<session-journal formatVersion="1" id="{ID}">
+                <meta><title>Images</title><endedAt>2026-11-07T07:00:00Z</endedAt></meta>
                 <entries><entry><id>screen</id><kind>SCREENSHOT</kind>
                 <screenshotFile>{reference}</screenshotFile></entry></entries></session-journal>"#
             ),

@@ -532,7 +532,7 @@ impl TryFrom<CitationWire> for Citation {
 
     fn try_from(wire: CitationWire) -> Result<Self, Self::Error> {
         let location = match (wire.line, wire.page) {
-            (Some(line), None) if (1..=super::source::MAX_TEXT_BYTES).contains(&line) => {
+            (Some(line), None) if (1..=super::source::MAX_CORPUS_BYTES).contains(&line) => {
                 super::Location::Line(line)
             }
             (None, Some(page)) if (1..=super::pdf::MAX_PAGES).contains(&page) => {

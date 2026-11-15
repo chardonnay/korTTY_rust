@@ -2,16 +2,23 @@ use std::collections::HashSet;
 use std::fs::{self, DirBuilder, OpenOptions};
 use std::io::{self, BufWriter};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use kortty_jobs::{Cancellation, JournalRecording, RunId, RunOutcome};
 use kortty_recording::{CaptureOptions, FILE_EXTENSION, Recorder};
 use kortty_ssh::{SshSession, WindowSize};
-use kortty_terminal::{Style, Terminal};
+use kortty_terminal::{ScreenSnapshot, Style, Terminal};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest as _, Sha256};
 
 use super::{CANCELLATION_POLL, COMMAND_TIMEOUT, Completion, Failure, check_cancelled};
+use crate::clipboard_policy::ClipboardPolicy;
 use crate::recording_window::screenshots;
+use crate::session_journal::automation::Recorder as JournalRecorder;
+
+mod journal_screen;
 
 const SCREEN_TICK: Duration = Duration::from_millis(500);
 const CHANGE_GAP: Duration = Duration::from_secs(2);
@@ -73,19 +80,16 @@ pub(super) fn supervise(
     session: &mut SshSession,
     cancellation: &Cancellation,
     options: Options,
-    capture: Capture,
-    journal: Option<&crate::session_journal::automation::Recorder>,
+    capture: Option<Capture>,
+    journal: Option<(&super::automation::Plan, &JournalRecorder)>,
 ) -> Completion {
-    let mut screen = Screen::new(options, capture);
-    if let Some(journal) = journal {
-        super::automation::attach(&mut screen.terminal, journal, false);
-    }
-    let (result, limit_detail) = run(session, cancellation, options, &mut screen);
+    let mut screen = Screen::new(options, capture, journal);
+    let (result, limit_detail, drained) = run(session, cancellation, options, &mut screen);
     let mut completion = Completion::from_result(id, result);
     if let Some(detail) = limit_detail {
         completion.append_detail(detail);
     }
-    match screen.finish() {
+    match screen.finish(drained) {
         Ok(Some(capture)) => {
             completion.recording = Some(capture.name);
             completion.append_detail(&format!(
@@ -117,8 +121,8 @@ fn run(
     session: &mut SshSession,
     cancellation: &Cancellation,
     options: Options,
-    screen: &mut Screen,
-) -> (Result<u32, Failure>, Option<&'static str>) {
+    screen: &mut Screen<'_>,
+) -> (Result<u32, Failure>, Option<&'static str>, bool) {
     let result = read_until_done(session, cancellation, options, screen);
     let exit_code = session.exit_code();
     if !matches!(result, Ok(false)) {
@@ -126,13 +130,17 @@ fn run(
     }
     let closed = session.close();
     if let Err(error) = check_cancelled(cancellation) {
-        return (Err(error), None);
+        return (Err(error), None, false);
     }
     match result {
-        Err(failure) => (Err(failure), None),
+        Err(failure) => (Err(failure), None, false),
         Ok(true) => {
             if options.limit_is_success {
-                (Ok(0), Some("Virtual terminal reached its runtime limit"))
+                (
+                    Ok(0),
+                    Some("Virtual terminal reached its runtime limit"),
+                    false,
+                )
             } else {
                 (
                     Err(Failure {
@@ -140,6 +148,7 @@ fn run(
                         detail: "Virtual terminal reached its runtime limit",
                     }),
                     None,
+                    false,
                 )
             }
         }
@@ -152,6 +161,7 @@ fn run(
                 }
             }),
             None,
+            closed.is_ok() && exit_code.is_some(),
         ),
     }
 }
@@ -160,7 +170,7 @@ fn read_until_done(
     session: &mut SshSession,
     cancellation: &Cancellation,
     options: Options,
-    screen: &mut Screen,
+    screen: &mut Screen<'_>,
 ) -> Result<bool, Failure> {
     let mut reader = session.take_reader().ok_or_else(super::missing_stream)?;
     let mut writer = session.take_writer().ok_or_else(super::missing_stream)?;
@@ -196,13 +206,14 @@ fn read_until_done(
             Err(error) if error.kind() == io::ErrorKind::TimedOut => {}
             Err(_) => return Err(Failure::failed("SSH virtual terminal output failed")),
         }
-        screen.tick();
+        screen.tick(screen.started.elapsed());
     }
 }
 
-struct Screen {
+struct Screen<'a> {
     terminal: Terminal,
-    capture: Capture,
+    capture: Option<Capture>,
+    journal: Option<JournalFrames<'a>>,
     started: Instant,
     last_tick: Duration,
     last_attempt: Duration,
@@ -212,26 +223,96 @@ struct Screen {
     recording_failed: bool,
 }
 
+struct JournalFrames<'a> {
+    permit: JournalPermit,
+    recorder: &'a JournalRecorder,
+    frames: u16,
+    previous: Option<[u8; 32]>,
+}
+
+#[derive(Clone)]
+struct JournalPermit {
+    plan: super::automation::Plan,
+    revoked: Arc<AtomicBool>,
+}
+
+impl JournalPermit {
+    fn current(&self) -> bool {
+        !self.revoked.load(Ordering::Acquire) && self.accepts(&ClipboardPolicy::load())
+    }
+
+    fn accepts(&self, policy: &ClipboardPolicy) -> bool {
+        if !policy.recording_allowed || !self.plan.can_capture(policy) {
+            self.revoked.store(true, Ordering::Release);
+        }
+        !self.revoked.load(Ordering::Acquire)
+    }
+}
+
+impl JournalFrames<'_> {
+    fn capture(&mut self, terminal: &Terminal, visible: bool, final_frame: bool, drained: bool) {
+        if self.frames == 0 && !visible {
+            return;
+        }
+        if !self.permit.current() {
+            return;
+        }
+        let Some(png) = journal_screen::render(terminal, self.recorder.redactor(), drained) else {
+            return;
+        };
+        let digest = Sha256::digest(&png).into();
+        if self.previous == Some(digest) {
+            return;
+        }
+        let permit = self.permit.clone();
+        if self
+            .recorder
+            .try_screenshot(png, final_frame, move || permit.current())
+            .is_ok()
+        {
+            self.previous = Some(digest);
+            self.frames += 1;
+        }
+    }
+}
+
 struct FinishedCapture {
     name: JournalRecording,
     frames: u16,
     path: PathBuf,
 }
 
-impl Screen {
-    fn new(options: Options, capture: Capture) -> Self {
+impl<'a> Screen<'a> {
+    fn new(
+        options: Options,
+        capture: Option<Capture>,
+        journal: Option<(&super::automation::Plan, &'a JournalRecorder)>,
+    ) -> Self {
         let mut terminal = Terminal::new(options.columns, options.rows);
         terminal.set_strict_escape_filter(true);
+        let journal = journal.map(|(plan, recorder)| {
+            super::automation::attach(&mut terminal, recorder, false);
+            JournalFrames {
+                permit: JournalPermit {
+                    plan: plan.clone(),
+                    revoked: Arc::default(),
+                },
+                recorder,
+                frames: 0,
+                previous: None,
+            }
+        });
         Self {
             terminal,
+            recording_failed: capture.is_none(),
             capture,
+            journal,
             started: Instant::now(),
             last_tick: Duration::ZERO,
             last_attempt: Duration::ZERO,
             frames: 0,
             options,
             changed: false,
-            recording_failed: false,
         }
     }
 
@@ -242,14 +323,8 @@ impl Screen {
         self.changed = true;
     }
 
-    fn tick(&mut self) {
-        let elapsed = self.started.elapsed();
-        if !self.changed
-            || self.recording_failed
-            || self.frames >= self.options.max_frames - 1
-            || elapsed - self.last_tick < SCREEN_TICK
-            || self.capture.bytes_written() >= INTERMEDIATE_RECORDING_BUDGET
-        {
+    fn tick(&mut self, elapsed: Duration) {
+        if !self.changed || elapsed - self.last_tick < SCREEN_TICK {
             return;
         }
         self.last_tick = elapsed;
@@ -258,44 +333,73 @@ impl Screen {
         if (!interval.is_zero() && since_attempt >= interval)
             || (self.options.capture_changes && since_attempt >= CHANGE_GAP)
         {
-            self.recording_failed = self.snapshot(elapsed).is_err();
+            self.snapshot(elapsed, false, false);
         }
     }
 
-    fn snapshot(&mut self, at: Duration) -> Result<(), kortty_recording::Error> {
+    fn snapshot(&mut self, at: Duration, final_frame: bool, drained: bool) {
         self.last_attempt = at;
         self.changed = false;
-        let screen = self.terminal.snapshot();
-        if self.frames == 0
-            && screen.cells.iter().all(|cell| {
-                (cell.style.hidden || cell.text.trim().is_empty()) && cell.style == Style::default()
-            })
-        {
-            return Ok(());
+        let journal_due = self
+            .journal
+            .as_ref()
+            .is_some_and(|journal| final_frame || journal.frames < self.options.max_frames - 1);
+        let replay_due = self.capture.as_ref().is_some_and(|capture| {
+            final_frame
+                || !self.recording_failed
+                    && self.frames < self.options.max_frames - 1
+                    && capture.bytes_written() < INTERMEDIATE_RECORDING_BUDGET
+        });
+        if !journal_due && !replay_due {
+            return;
         }
+        let screen = self.terminal.snapshot();
+        let visible = screen.cells.iter().any(|cell| {
+            !cell.style.hidden && !cell.text.trim().is_empty() || cell.style != Style::default()
+        });
+        if journal_due && let Some(journal) = &mut self.journal {
+            journal.capture(&self.terminal, visible, final_frame, drained);
+        }
+        if replay_due && (visible || self.frames != 0) {
+            self.recording_failed = self.record_screen(at, &screen).is_err();
+        }
+    }
+
+    fn record_screen(
+        &mut self,
+        at: Duration,
+        screen: &ScreenSnapshot,
+    ) -> Result<(), kortty_recording::Error> {
         let recorder = self
             .capture
-            .recorder
             .as_mut()
+            .and_then(|capture| capture.recorder.as_mut())
             .ok_or(kortty_recording::Error::Poisoned)?;
-        if recorder.record_screen(at, 1, &screen, (0, 0))? {
+        if recorder.record_screen(at, 1, screen, (0, 0))? {
             self.frames += 1;
         }
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Option<FinishedCapture>, kortty_recording::Error> {
+    fn finish(mut self, drained: bool) -> Result<Option<FinishedCapture>, kortty_recording::Error> {
         self.terminal.set_journal_observer(None);
         let now = self.started.elapsed();
-        self.snapshot(now)?;
+        self.snapshot(now, true, drained);
+        if self.recording_failed {
+            return Err(kortty_recording::Error::Poisoned);
+        }
         if self.frames == 0 {
             return Ok(None);
         }
-        self.capture.finish(now).map(|name| {
+        let capture = self
+            .capture
+            .as_mut()
+            .ok_or(kortty_recording::Error::Poisoned)?;
+        capture.finish(now).map(|name| {
             Some(FinishedCapture {
                 name,
                 frames: self.frames,
-                path: self.capture.path.clone(),
+                path: capture.path.clone(),
             })
         })
     }
@@ -481,4 +585,149 @@ fn managed_name(stem: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use jiff::Timestamp;
+
+    use crate::session_journal::automation::{Caps, CaptureSettings, Kind, Run};
+    use crate::session_journal::tree::RunStatus;
+    use crate::snippets::tests::Profile;
+    use crate::terminal_logging::Policy;
+
+    use super::*;
+
+    fn plan(profile: &Profile) -> super::super::automation::Plan {
+        super::super::automation::Plan::new(
+            CaptureSettings {
+                root: profile.0.join("journals"),
+                format: Default::default(),
+                max_parts: None,
+                markers: Default::default(),
+                stopped: Arc::default(),
+            },
+            Run::new(
+                Kind::Job,
+                "nightly".into(),
+                "Nightly validation".into(),
+                "COMMAND",
+                Timestamp::now(),
+                crate::session_journal::automation::Options {
+                    enabled: true,
+                    ..Default::default()
+                },
+                Caps::default(),
+            )
+            .unwrap(),
+            Policy::default(),
+        )
+    }
+
+    #[test]
+    fn virtual_terminal_journal_permission_stays_revoked_for_queued_frames() {
+        let fixture = Profile::new();
+        let permit = JournalPermit {
+            plan: plan(&fixture),
+            revoked: Arc::default(),
+        };
+        let queued = permit.clone();
+        let permitted = ClipboardPolicy::default();
+        let denied = crate::clipboard_policy::parse(
+            "[meta]\nschema-version = 1\n[[rule]]\n[rule.security]\nallow-terminal-recording = false",
+        )
+        .unwrap();
+        assert!(permit.accepts(&permitted));
+        assert!(!queued.accepts(&denied));
+        assert!(!permit.accepts(&permitted));
+        assert!(!queued.accepts(&permitted));
+    }
+
+    #[test]
+    fn virtual_terminal_journal_capture_reserves_final_frame_without_replay() {
+        let fixture = Profile::new();
+        let plan = plan(&fixture);
+        let (_, request) = super::super::tests::scheduled_request();
+        let recorder = plan
+            .start(&request.action, None, None, &ClipboardPolicy::load())
+            .unwrap()
+            .unwrap();
+        recorder.command("printf 'first and final frames'");
+        let mut screen = Screen::new(
+            Options {
+                columns: 40,
+                rows: 10,
+                interval_seconds: 1,
+                capture_changes: false,
+                max_frames: 2,
+                ..Options::default()
+            },
+            None,
+            Some((&plan, &recorder)),
+        );
+        screen.advance(b"first phase\r\n");
+        screen.tick(Duration::from_millis(500));
+        assert_eq!(screen.journal.as_ref().unwrap().frames, 0);
+        screen.tick(Duration::from_secs(1));
+        assert_eq!(screen.journal.as_ref().unwrap().frames, 1);
+        screen.advance(b"last phase\r\n");
+        screen.tick(Duration::from_secs(2));
+        assert_eq!(screen.journal.as_ref().unwrap().frames, 1);
+        assert!(screen.finish(true).is_err());
+
+        let artifact = recorder.finish(RunStatus::Success, Some(0));
+        let document = artifact.source.read(None).unwrap().unwrap();
+        assert_eq!(
+            document
+                .timeline
+                .iter()
+                .filter(|entry| entry.kind == "SCREENSHOT")
+                .map(|entry| entry.text.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Virtual terminal screenshot",
+                "Final virtual terminal screenshot"
+            ]
+        );
+        assert!(artifact.complete);
+    }
+
+    #[test]
+    fn virtual_terminal_journal_change_capture_skips_a_duplicate_final_frame() {
+        let fixture = Profile::new();
+        let plan = plan(&fixture);
+        let (_, request) = super::super::tests::scheduled_request();
+        let recorder = plan
+            .start(&request.action, None, None, &ClipboardPolicy::load())
+            .unwrap()
+            .unwrap();
+        let mut screen = Screen::new(
+            Options {
+                columns: 40,
+                rows: 10,
+                interval_seconds: 0,
+                capture_changes: true,
+                ..Options::default()
+            },
+            None,
+            Some((&plan, &recorder)),
+        );
+        screen.advance(b"job output\r\n");
+        screen.tick(Duration::from_secs(1));
+        assert_eq!(screen.journal.as_ref().unwrap().frames, 0);
+        screen.tick(CHANGE_GAP);
+        assert_eq!(screen.journal.as_ref().unwrap().frames, 1);
+        assert!(screen.finish(true).is_err());
+
+        let artifact = recorder.finish(RunStatus::Success, Some(0));
+        let journal = artifact.source.read(None).unwrap().unwrap();
+        assert_eq!(
+            journal
+                .timeline
+                .iter()
+                .filter(|entry| entry.kind == "SCREENSHOT")
+                .count(),
+            1
+        );
+    }
 }

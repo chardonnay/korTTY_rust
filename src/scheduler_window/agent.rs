@@ -5,18 +5,19 @@ use std::fmt;
 use std::io;
 use std::sync::Arc;
 
-use kortty_jobs::{Job, JobId, RunRequest};
+use kortty_jobs::{DependencyMode, Job, JobId, RunRequest, RunTrigger};
 use kortty_ssh::TrustStore;
 use pgp::crypto::hash::HashAlgorithm;
 use serde::{Deserialize, Serialize};
 
 use crate::ai_manager::{
-    Configuration, ProfileRef, ReviewedLocalAiProfile, SkillGuidance, SkillUsageReceipt,
-    SkillUsageSurface,
+    Configuration, JavaProfileSource, ProfileRef, ReviewedLocalAiProfile, SkillGuidance,
+    SkillUsageReceipt, SkillUsageSurface,
 };
 use crate::connection_store::Connection;
 use crate::terminal_agent::swarm::comparison::ScheduledGrant;
 use crate::workspace::skill_classifier;
+use crate::workspace::terminal_ai::web;
 
 use super::{
     ConnectionRef, Message, Page, SchedulerView, SchedulerWindow, SshCommand, new_id, sync,
@@ -24,11 +25,14 @@ use super::{
 
 mod comparison_review;
 pub(crate) mod knowledge;
+pub(crate) use crate::ai_manager::reviewed_memory as memory;
 pub(crate) mod proposal;
+mod proposal_web;
 pub(crate) mod provider_mask;
 pub(super) mod skill_review;
 #[cfg(test)]
 mod tests;
+pub(crate) mod web_lookup;
 
 use skill_review::{Classification, SkillReview};
 
@@ -79,6 +83,25 @@ impl Probe {
 
     pub(crate) fn is_firing(self) -> bool {
         matches!(self, Self::PerFiring | Self::SwarmIterative)
+    }
+
+    fn supports_fresh_web(self) -> bool {
+        matches!(
+            self,
+            Self::PerFiring | Self::SwarmIterative | Self::SwarmReadOnly
+        )
+    }
+
+    pub(crate) fn allows_trigger(self, trigger: RunTrigger) -> bool {
+        match trigger {
+            RunTrigger::Manual | RunTrigger::Scheduled => true,
+            RunTrigger::Dependency | RunTrigger::Cascade => {
+                matches!(
+                    self,
+                    Self::PerFiring | Self::SwarmIterative | Self::SwarmReadOnly
+                )
+            }
+        }
     }
 
     pub(crate) fn supports_comparison(self) -> bool {
@@ -160,7 +183,7 @@ pub struct ProfileChoice {
     pub(crate) name: String,
     pub(crate) model: String,
     pub(crate) destination: String,
-    // Keep the original receipt key for the independently checked policy authority.
+    // Keep the original receipt key for policy and automatically resolved model authority.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) policy_model_fingerprint: Option<[u8; 32]>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -192,7 +215,7 @@ impl ProfileChoice {
             .chain(config.reviewed_agent_https_profiles().filter_map(
                 |(id, name, model, destination)| {
                     let id = config.profile_reference(id)?;
-                    Self::from_https(id, name, model, destination)
+                    Self::from_https(config, id, name, model, destination)
                 },
             ))
             .chain(config.reviewed_agent_cli_profiles().filter_map(
@@ -221,7 +244,7 @@ impl ProfileChoice {
             .reviewed_agent_https_profiles()
             .find(|(profile, _, _, _)| *profile == id)
         {
-            return Self::from_https(reference.clone(), name, model, destination);
+            return Self::from_https(config, reference.clone(), name, model, destination);
         }
         let (_, name, model, destination) = config
             .reviewed_agent_cli_profiles()
@@ -242,13 +265,22 @@ impl ProfileChoice {
         profile.valid().then_some(profile)
     }
 
-    fn from_https(id: ProfileRef, name: &str, model: &str, destination: String) -> Option<Self> {
+    fn from_https(
+        config: &Configuration,
+        id: ProfileRef,
+        name: &str,
+        model: &str,
+        destination: String,
+    ) -> Option<Self> {
+        let (transport, _) = config
+            .reviewed_agent_https_transport(&id, &destination)
+            .ok()?;
         let profile = Self {
             id,
             name: name.to_owned(),
             model: model.to_owned(),
             destination,
-            policy_model_fingerprint: None,
+            policy_model_fingerprint: transport.reviewed_model_fingerprint(),
             reviewed_https: true,
             reviewed_cli: None,
         };
@@ -289,9 +321,17 @@ impl ProfileChoice {
             }
             config.reviewed_agent_cli_transport(&self.id, &self.destination)
         } else if self.reviewed_https {
-            config.reviewed_agent_https_transport(&self.id, &self.destination)
+            let selected = config.reviewed_agent_https_transport(&self.id, &self.destination)?;
+            if !self.matches_transport_model(&selected.0) {
+                return Err("The reviewed HTTPS profile changed. Review the job again.".into());
+            }
+            Ok(selected)
         } else {
-            config.agent_transport_for_reference(&self.id)
+            let selected = config.agent_transport_for_reference(&self.id)?;
+            if !self.matches_transport_model(&selected.0) {
+                return Err("The approved AI model changed. Review the job again.".into());
+            }
+            Ok(selected)
         }
     }
 
@@ -311,21 +351,26 @@ impl ProfileChoice {
             ))
             .ok();
         }
-        let revision = config.agent_profile_reference_revision(&self.id)?;
         if self.reviewed_https {
+            self.transport(config).ok()?;
             digest(&(
                 "kortty scheduled HTTPS profile v1",
-                revision,
+                config.agent_profile_reference_revision(&self.id)?,
                 policy.redaction_revision()?,
             ))
             .ok()
         } else {
-            Some(revision)
+            config.agent_profile_reference_revision(&self.id)
         }
     }
 
     pub(crate) fn policy_model_matches(&self, current: Option<[u8; 32]>) -> bool {
         self.policy_model_fingerprint == current
+    }
+
+    pub(crate) fn matches_transport_model(&self, transport: &crate::local_ai::Profile) -> bool {
+        self.policy_model_matches(transport.reviewed_model_fingerprint())
+            && (transport.lm_studio_auto_binding().is_none() || self.model == transport.model())
     }
 
     fn valid(&self) -> bool {
@@ -335,9 +380,11 @@ impl ProfileChoice {
                     && matches!(self.id, ProfileRef::Numeric(_))
                     && self.policy_model_fingerprint.is_none()))
             && (!self.reviewed_https
-                || (matches!(self.id, ProfileRef::Numeric(_))
-                    && self.destination.starts_with("https://")
-                    && self.policy_model_fingerprint.is_none()))
+                || (self.destination.starts_with("https://")
+                    && (self.policy_model_fingerprint.is_none()
+                        || matches!(self.id, ProfileRef::Policy(_))
+                        || crate::local_ai::LmStudioEndpoint::from_destination(&self.destination)
+                            .is_some_and(|endpoint| endpoint.is_https()))))
             && (!matches!(self.id, ProfileRef::Policy(_))
                 || self.policy_model_fingerprint.is_some())
             && valid_text(&self.name, 256)
@@ -349,16 +396,26 @@ impl ProfileChoice {
 #[derive(Default)]
 pub(super) struct ProfileChoices {
     pub(super) entries: Vec<ProfileChoice>,
+    pub(super) default: Option<ProfileRef>,
     legacy_aliases: BTreeMap<u64, usize>,
+    java_sources: Vec<(usize, JavaProfileSource)>,
 }
 
 impl ProfileChoices {
-    pub(super) fn new(config: &Configuration) -> Self {
-        let entries = ProfileChoice::available(config);
+    pub(super) fn new(config: &Configuration, allow_cli: bool) -> Self {
+        let mut entries = ProfileChoice::available(config);
+        if !allow_cli {
+            entries.retain(|profile| profile.reviewed_cli.is_none());
+        }
+        let default = config
+            .default_ai_profile_reference()
+            .filter(|reference| entries.iter().any(|profile| profile.id == *reference));
         let legacy_aliases = entries
             .iter()
             .enumerate()
-            .filter(|(_, choice)| matches!(choice.id, ProfileRef::Policy(_)))
+            .filter(|(_, choice)| {
+                matches!(choice.id, ProfileRef::Policy(_)) && !choice.reviewed_https
+            })
             .filter_map(|(index, choice)| {
                 config
                     .resolve_profile_reference(&choice.id)
@@ -366,10 +423,30 @@ impl ProfileChoices {
                     .map(|id| (id, index))
             })
             .collect();
+        let java_sources = entries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, choice)| {
+                config
+                    .java_profile_source(&choice.id)
+                    .cloned()
+                    .map(|source| (index, source))
+            })
+            .collect();
         Self {
             entries,
+            default,
             legacy_aliases,
+            java_sources,
         }
+    }
+
+    pub(super) fn for_java_source(&self, source: &JavaProfileSource) -> Option<&ProfileChoice> {
+        let (index, _) = self
+            .java_sources
+            .iter()
+            .find(|(_, candidate)| source == candidate)?;
+        self.entries.get(*index)
     }
 
     pub(super) fn selected(&self, reference: &ProfileRef) -> Option<&ProfileChoice> {
@@ -403,6 +480,8 @@ pub(crate) struct Action {
 #[serde(deny_unknown_fields)]
 pub(crate) struct Approval {
     scope: [u8; 32],
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    dependency_triggers: bool,
     pub(crate) profile: ProfileChoice,
     pub(crate) targets: Vec<Target>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -417,6 +496,12 @@ pub(crate) struct Approval {
     pub(crate) comparison: Option<ScheduledGrant>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) knowledge: Option<Arc<knowledge::Grant>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) web: Option<Arc<web::Evidence>>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    fresh_web: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    web_lookup: Option<web_lookup::Grant>,
 }
 
 #[derive(Clone, Eq, PartialEq, Serialize, Deserialize)]
@@ -649,6 +734,7 @@ impl AdvisoryGrant {
                 || prompt.context_limit != first.context_limit
                 || prompt.firing_skill_ids() != first.firing_skill_ids()
                 || prompt.knowledge() != first.knowledge()
+                || prompt.web() != first.web()
                 || !prompt.redaction_policy().equivalent_redactions(first.redaction_policy())
                 || !prompt.masked_question().is_some_and(|question| self.matches_question(&question))
             {
@@ -678,8 +764,47 @@ impl AdvisoryGrant {
 }
 
 impl Approval {
+    pub(crate) fn allows_trigger(&self, probe: Probe, trigger: RunTrigger) -> bool {
+        probe.allows_trigger(trigger)
+            && (self.dependency_triggers
+                || matches!(trigger, RunTrigger::Manual | RunTrigger::Scheduled))
+    }
+
+    pub(crate) fn requires_fresh_web(&self) -> bool {
+        self.fresh_web || self.web_lookup.is_some()
+    }
+
+    pub(crate) fn web_lookup(&self) -> Option<&web_lookup::Grant> {
+        self.web_lookup.as_ref()
+    }
+
+    fn scope_for(&self, job: &Job<SshCommand>) -> Result<[u8; 32], String> {
+        scope_with_web_lookup(
+            approval_scope(job, self.dependency_triggers)?,
+            self.fresh_web,
+            self.web_lookup(),
+        )
+    }
+
+    fn matches_scope(&self, job: &Job<SshCommand>) -> bool {
+        self.scope_for(job).is_ok_and(|scope| scope == self.scope)
+    }
+
     pub(crate) fn has_initial_swarm_probe(&self) -> bool {
         self.initial_swarm_probe == Some(true)
+    }
+
+    fn supports_environment_lookup(&self, probe: Probe) -> bool {
+        match probe {
+            Probe::SwarmIterative => self.has_initial_swarm_probe() && self.generation.is_some(),
+            Probe::SwarmReadOnly => self.advisory.as_ref().is_some_and(AdvisoryGrant::is_guided),
+            _ => false,
+        }
+    }
+
+    fn supports_round_lookup(&self, probe: Probe) -> bool {
+        probe == Probe::SwarmIterative
+            && matches!(self.generation.as_ref(), Some(GenerationGrant::Guided(_)))
     }
 
     /// An empty snapshot still identifies a guided approval.
@@ -720,6 +845,7 @@ impl Approval {
             }
         };
         prompt.knowledge() == self.knowledge.as_deref()
+            && prompt.web() == self.web.as_deref()
             && prompt.firing_skill_guidance() == guidance
             && prompt.firing_skill_ids() == self.firing_skill_ids()
             && prompt
@@ -779,6 +905,7 @@ impl Action {
     }
 
     pub(crate) fn validate(&self, action: &SshCommand) -> Result<(), &'static str> {
+        action.require_executable()?;
         if self.probe == Probe::PerFiring && self.kind != Kind::Agent {
             return Err("Per-start command proposals require a scheduled AI Agent action.");
         }
@@ -811,8 +938,8 @@ impl Action {
                 (Kind::Swarm, _) => "Choose 1 to 32 saved SSH connections for AI Swarm.",
             });
         }
-        if !self.profile.is_nonzero() || !valid_text(&self.goal, MAX_GOAL_BYTES) {
-            return Err("Choose an AI profile and enter a short diagnostic question.");
+        if !self.profile.is_nonzero() || !valid_goal(&self.goal) {
+            return Err("Choose an AI profile and enter a diagnostic question of at most 4 KiB.");
         }
         let directory = action
             .working_directory()
@@ -830,6 +957,8 @@ impl Action {
         }
         if let Some(approval) = &self.approval
             && (!approval.profile.valid()
+                || (approval.dependency_triggers
+                    && !self.probe.allows_trigger(RunTrigger::Dependency))
                 || (approval.profile.requires_masked_review()
                     && self.probe.reviews_advice(&approval.profile)
                     && !approval
@@ -858,6 +987,31 @@ impl Action {
                                 .as_ref()
                                 .is_some_and(AdvisoryGrant::is_guided))
                 })
+                || approval.web.as_ref().is_some_and(|evidence| {
+                    !evidence.valid()
+                        || (approval.generation.is_none()
+                            && !approval
+                                .advisory
+                                .as_ref()
+                                .is_some_and(AdvisoryGrant::is_guided))
+                })
+                || approval.web_lookup().is_some_and(|grant| {
+                    approval.fresh_web
+                        || grant.profile() != &approval.profile.id
+                        || !grant.valid()
+                        || (grant.allows_environment_lookup()
+                            && !approval.supports_environment_lookup(self.probe))
+                        || (grant.allows_round_lookup()
+                            && !approval.supports_round_lookup(self.probe))
+                })
+                || (approval.requires_fresh_web()
+                    && (approval.profile.reviewed_cli.is_some()
+                        || approval.web.is_some()
+                        || (approval.generation.is_none()
+                            && !approval
+                                .advisory
+                                .as_ref()
+                                .is_some_and(AdvisoryGrant::is_guided))))
                 || (approval.has_initial_swarm_probe() && approval.generation.is_none())
                 || !(1..=super::connection::target_limit(self.kind == Kind::Swarm))
                     .contains(&approval.targets.len())
@@ -879,6 +1033,14 @@ fn valid_text(value: &str, limit: usize) -> bool {
         && value
             .chars()
             .all(|ch| crate::session_journal::is_display_character(ch) && ch != '\n' && ch != '\t')
+}
+
+fn valid_goal(value: &str) -> bool {
+    !value.trim().is_empty()
+        && value.len() <= MAX_GOAL_BYTES
+        && value
+            .chars()
+            .all(crate::session_journal::is_display_character)
 }
 
 fn digest(value: &impl Serialize) -> io::Result<[u8; 32]> {
@@ -917,6 +1079,7 @@ fn generation_grant(
                 || guidance.is_some() != guided
                 || prompt.firing_skill_ids() != first.firing_skill_ids()
                 || prompt.knowledge() != first.knowledge()
+                || prompt.web() != first.web()
                 || !prompt
                     .redaction_policy()
                     .equivalent_redactions(first.redaction_policy())
@@ -987,6 +1150,15 @@ fn reviewed_initial_swarm_probe(
 }
 
 fn scope(job: &Job<SshCommand>) -> Result<[u8; 32], String> {
+    let dependency_triggers = job
+        .action()
+        .agent
+        .as_ref()
+        .is_some_and(|agent| agent.probe.allows_trigger(RunTrigger::Dependency));
+    approval_scope(job, dependency_triggers)
+}
+
+fn approval_scope(job: &Job<SshCommand>, dependency_triggers: bool) -> Result<[u8; 32], String> {
     let command = job.action();
     let action = command
         .agent
@@ -1001,11 +1173,11 @@ fn scope(job: &Job<SshCommand>) -> Result<[u8; 32], String> {
         if !job.dependencies().is_empty() {
             return Err("Model-proposed commands cannot run as a job dependency.".into());
         }
-    } else if action.probe.is_firing() && !job.dependencies().is_empty() {
-        return Err(
-            "Per-start proposals require Run Now or a calendar schedule without dependencies."
-                .into(),
-        );
+    }
+    if (dependency_triggers && !action.probe.allows_trigger(RunTrigger::Dependency))
+        || (!dependency_triggers && action.probe.is_firing() && !job.dependencies().is_empty())
+    {
+        return Err("Review the workflow for its current start conditions.".into());
     }
     let targets: Vec<_> = command.targets().collect();
     let review = (
@@ -1047,7 +1219,42 @@ fn scope(job: &Job<SshCommand>) -> Result<[u8; 32], String> {
         Some(groups) => digest(&("kortty-agent-target-groups-v1", receipt, groups)),
         None => Ok(receipt),
     });
+    let receipt = receipt.and_then(|receipt| {
+        if dependency_triggers {
+            digest(&(
+                "kortty-agent-dependency-triggers-v1",
+                receipt,
+                job.max_age_minutes(),
+            ))
+        } else {
+            Ok(receipt)
+        }
+    });
     receipt.map_err(|_| "Could not identify the exact diagnostics review.".into())
+}
+
+fn scope_with_fresh_web(scope: [u8; 32], fresh_web: bool) -> Result<[u8; 32], String> {
+    if fresh_web {
+        digest(&("kortty-agent-fresh-web-review-v1", scope))
+            .map_err(|_| "Could not identify the fresh web lookup review.".into())
+    } else {
+        Ok(scope)
+    }
+}
+
+fn scope_with_web_lookup(
+    scope: [u8; 32],
+    fresh_web: bool,
+    lookup: Option<&web_lookup::Grant>,
+) -> Result<[u8; 32], String> {
+    match lookup {
+        Some(grant) if !fresh_web => {
+            digest(&("kortty-agent-automatic-web-review-v1", scope, grant))
+                .map_err(|_| "Could not identify the automatic web lookup review.".into())
+        }
+        Some(_) => Err("Select one type of fresh web lookup.".into()),
+        None => scope_with_fresh_web(scope, fresh_web),
+    }
 }
 
 pub(crate) struct ReviewRequest {
@@ -1066,9 +1273,15 @@ pub(super) struct Review {
     pub(super) command: String,
     pub(super) directory: String,
     pub(super) swarm_parallelism: Option<usize>,
+    pub(super) dependency_summary: Option<String>,
     pub(super) approval: Approval,
     pub(super) model: Option<Model>,
     pub(super) comparison_review: Option<comparison_review::Review>,
+    pub(super) unattended_web_topic: String,
+    pub(super) unattended_web_followups: bool,
+    pub(super) unattended_web_environment: bool,
+    pub(super) unattended_web_rounds: bool,
+    pub(super) unattended_web_round_pages: bool,
 }
 
 impl Review {
@@ -1092,8 +1305,29 @@ impl Review {
         self.kind == Kind::Swarm && self.comparison_supported && self.model.is_some()
     }
 
+    fn supports_fresh_web(&self) -> bool {
+        self.standing()
+            && self.model.is_some()
+            && self
+                .action
+                .agent
+                .as_ref()
+                .is_some_and(|action| action.probe.supports_fresh_web())
+    }
+
+    pub(super) fn fresh_web_choice(&self) -> Option<(&str, bool)> {
+        let model = self.model.as_ref()?;
+        let ticket = self.firing_review_ticket()?;
+        (self.supports_fresh_web()
+            && model.skills.is_some()
+            && self.approval.web.is_none()
+            && self.approval.web_lookup().is_none()
+            && (self.approval.fresh_web || model.web.is_some()))
+        .then_some((ticket, self.approval.fresh_web))
+    }
+
     pub(super) fn firing_review_ticket(&self) -> Option<&str> {
-        if self.comparison_review.is_some() || !self.knowledge_ready() {
+        if self.comparison_review.is_some() || !self.model_sources_ready() {
             return None;
         }
         let original = self.generation_ticket.as_deref()?;
@@ -1103,11 +1337,46 @@ impl Review {
         }
     }
 
+    pub(super) fn unattended_web_draft_pending(&self) -> bool {
+        let grant = self.approval.web_lookup();
+        grant.map_or("", web_lookup::Grant::public_topic) != self.unattended_web_topic
+            || grant.is_some_and(web_lookup::Grant::allows_followups)
+                != self.unattended_web_followups
+            || grant.is_some_and(web_lookup::Grant::allows_environment_lookup)
+                != self.unattended_web_environment
+            || grant.is_some_and(web_lookup::Grant::allows_round_lookup)
+                != self.unattended_web_rounds
+            || grant.is_some_and(web_lookup::Grant::allows_round_page)
+                != self.unattended_web_round_pages
+    }
+
+    pub(super) fn supports_unattended_web_environment(&self) -> bool {
+        self.kind == Kind::Swarm
+            && self
+                .action
+                .agent
+                .as_ref()
+                .is_some_and(|agent| self.approval.supports_environment_lookup(agent.probe))
+    }
+
+    pub(super) fn supports_unattended_web_rounds(&self) -> bool {
+        self.kind == Kind::Swarm
+            && self
+                .action
+                .agent
+                .as_ref()
+                .is_some_and(|agent| self.approval.supports_round_lookup(agent.probe))
+    }
+
     pub(super) fn knowledge_ready(&self) -> bool {
         self.model
             .as_ref()
             .and_then(|model| model.knowledge.as_ref())
             .is_none_or(|review| review.ready())
+    }
+
+    pub(super) fn model_sources_ready(&self) -> bool {
+        self.knowledge_ready() && self.model.as_ref().is_none_or(|model| !model.web_active())
     }
 }
 
@@ -1118,6 +1387,7 @@ pub(super) struct Model {
     pub(super) skills: Option<SkillReview>,
     pub(super) knowledge: Option<crate::workspace::terminal_agent::knowledge_review::Review>,
     knowledge_vault_revision: Option<std::sync::Weak<()>>,
+    pub(super) web: Option<proposal_web::Review>,
 }
 
 impl Model {
@@ -1155,6 +1425,9 @@ pub(crate) struct ProposalAuthority<'a> {
     pub(crate) skills: Option<&'a ProposalSkillSetup>,
     pub(crate) comparison: Option<&'a ScheduledGrant>,
     pub(crate) knowledge: Option<&'a Arc<knowledge::Grant>>,
+    pub(crate) web: Option<&'a Arc<web::Evidence>>,
+    pub(crate) fresh_web: bool,
+    pub(crate) web_lookup: Option<&'a web_lookup::Grant>,
 }
 
 struct AdvisoryDraft {
@@ -1196,6 +1469,7 @@ impl SchedulerWindow {
         }
         let id = view.draft.id.clone().map_or_else(new_id, Ok)?;
         let job = self.build_current_draft(view, id)?;
+        job.action().require_executable()?;
         let scope = scope(&job)?;
         Ok(ReviewRequest {
             job,
@@ -1220,9 +1494,9 @@ impl SchedulerWindow {
         request: ReviewRequest,
         profile: ProfileChoice,
         targets: Vec<Target>,
-        prompt: proposal::Prompt,
+        prompts: Vec<proposal::Prompt>,
     ) -> Result<(), String> {
-        self.prepare_agent_review(view, request, profile, targets, vec![prompt], None)
+        self.prepare_agent_review(view, request, profile, targets, prompts, None)
     }
 
     pub(crate) fn finish_agent_firing_review(
@@ -1247,7 +1521,7 @@ impl SchedulerWindow {
         self.prepare_agent_review(view, request, profile, targets, prompts, None)
     }
 
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     pub(crate) fn finish_swarm_read_only_review(
         &self,
         view: &mut SchedulerView,
@@ -1368,12 +1642,18 @@ impl SchedulerWindow {
         let generation = match agent.probe {
             probe if probe.is_firing() => Some(generation_grant(&prompts, &targets)?),
             Probe::Proposed => {
-                if !matches!(prompts.as_slice(), [prompt] if prompt
-                    .target_ids()
-                    .iter()
-                    .copied()
-                    .eq(targets.iter().map(|target| target.reference.id)))
-                {
+                let ordered = targets.iter().map(|target| target.reference.id);
+                let matches = match prompts.as_slice() {
+                    [prompt] => prompt.target_ids().iter().copied().eq(ordered),
+                    prompts => {
+                        prompts.len() == targets.len()
+                            && prompts
+                                .iter()
+                                .zip(ordered)
+                                .all(|(prompt, id)| prompt.target_ids() == [id])
+                    }
+                };
+                if !matches {
                     return Err("The model request does not match the ordered SSH targets.".into());
                 }
                 None
@@ -1398,7 +1678,33 @@ impl SchedulerWindow {
             skills,
             knowledge: None,
             knowledge_vault_revision: None,
+            web: None,
         });
+        let saved_web = agent.approval.as_ref().filter(|approval| {
+            agent.probe.supports_fresh_web()
+                && profile.reviewed_cli.is_none()
+                && model.is_some()
+                && approval.profile.id == agent.profile
+        });
+        let fresh_web = saved_web.is_some_and(|approval| approval.fresh_web);
+        let web_lookup = saved_web
+            .and_then(|approval| approval.web_lookup())
+            .cloned();
+        let unattended_web_topic = web_lookup
+            .as_ref()
+            .map_or_else(String::new, |grant| grant.public_topic().to_owned());
+        let unattended_web_followups = web_lookup
+            .as_ref()
+            .is_some_and(web_lookup::Grant::allows_followups);
+        let unattended_web_environment = web_lookup
+            .as_ref()
+            .is_some_and(web_lookup::Grant::allows_environment_lookup);
+        let unattended_web_rounds = web_lookup
+            .as_ref()
+            .is_some_and(web_lookup::Grant::allows_round_lookup);
+        let unattended_web_round_pages = web_lookup
+            .as_ref()
+            .is_some_and(web_lookup::Grant::allows_round_page);
         let review = Review {
             id: request.job.id().clone(),
             kind: agent.kind,
@@ -1412,8 +1718,13 @@ impl SchedulerWindow {
                 .probe
                 .supports_parallelism()
                 .then(|| agent.swarm_parallelism()),
+            dependency_summary: agent
+                .probe
+                .allows_trigger(RunTrigger::Dependency)
+                .then(|| self.agent_dependency_summary(&request.job)),
             approval: Approval {
-                scope: request.scope,
+                scope: scope_with_web_lookup(request.scope, fresh_web, web_lookup.as_ref())?,
+                dependency_triggers: agent.probe.allows_trigger(RunTrigger::Dependency),
                 profile,
                 targets,
                 proposal: None,
@@ -1422,9 +1733,17 @@ impl SchedulerWindow {
                 advisory: advisory_grant,
                 comparison: None,
                 knowledge: None,
+                web: None,
+                fresh_web,
+                web_lookup,
             },
             model,
             comparison_review: None,
+            unattended_web_topic,
+            unattended_web_followups,
+            unattended_web_environment,
+            unattended_web_rounds,
+            unattended_web_round_pages,
         };
         self.agent_review_current(view, &review)?;
         view.agent_review = Some(review);
@@ -1453,6 +1772,34 @@ impl SchedulerWindow {
         Ok(())
     }
 
+    fn agent_dependency_summary(&self, job: &Job<SshCommand>) -> String {
+        if job.dependencies().is_empty() {
+            return "Eligible starts · Run now, calendar, and Run with successors.".into();
+        }
+        let predecessors = job
+            .dependencies()
+            .iter()
+            .map(|id| {
+                self.scheduler
+                    .graph()
+                    .job(id)
+                    .map_or_else(|| id.to_string(), |job| format!("{} ({id})", job.name()))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let starts = match job.mode() {
+            DependencyMode::Gate => "Eligible starts · Run now, calendar, and Run with successors.",
+            DependencyMode::Chain => {
+                "Eligible starts · Run now, calendar, Run with successors, and after all prerequisites succeed since the last run."
+            }
+        };
+        let freshness = job.max_age_minutes().map_or_else(
+            || "Prerequisite success has no age limit.".to_owned(),
+            |age| format!("Maximum age of a prerequisite success · {age} min."),
+        );
+        format!("{starts}\nPrerequisites · {predecessors}\n{freshness}")
+    }
+
     fn agent_review_current(&self, view: &SchedulerView, review: &Review) -> Result<(), String> {
         if view.page != Page::Action
             || view.confirm.is_some()
@@ -1464,7 +1811,9 @@ impl SchedulerWindow {
                 .model
                 .as_ref()
                 .is_some_and(|model| model.graph_revision != self.graph_revision)
-            || scope(&self.build_current_draft(view, review.id.clone())?)? != review.approval.scope
+            || !review
+                .approval
+                .matches_scope(&self.build_current_draft(view, review.id.clone())?)
         {
             return Err("The scheduled AI action changed. Review it again.".into());
         }
@@ -1500,6 +1849,9 @@ impl SchedulerWindow {
                 .and_then(|skills| skills.setup.as_ref()),
             comparison: review.approval.comparison.as_ref(),
             knowledge: review.approval.knowledge.as_ref(),
+            web: review.approval.web.as_ref(),
+            fresh_web: review.approval.requires_fresh_web(),
+            web_lookup: review.approval.web_lookup(),
         }))
     }
 
@@ -1585,7 +1937,7 @@ impl SchedulerWindow {
             return Ok(iced::Task::none());
         }
         let (review, _) = view.proposal_review().expect("matching proposal preview");
-        if !review.knowledge_ready() {
+        if !review.model_sources_ready() {
             return Ok(iced::Task::none());
         }
         self.agent_review_current(view, review)?;
@@ -1626,7 +1978,7 @@ impl SchedulerWindow {
         &self,
         view: &mut SchedulerView,
         preview: &str,
-        before_dispatch: impl FnOnce() -> Result<(), String> + Send + 'static,
+        before_dispatch: impl FnMut() -> Result<(), String> + Send + 'static,
     ) -> Result<iced::Task<Message>, String> {
         if !view.matches_proposal_skill_preview(preview) {
             return Ok(iced::Task::none());
@@ -1677,9 +2029,11 @@ impl SchedulerWindow {
                         || current.is_advisory() != updated.is_advisory()
                         || current.is_swarm_iterative() != updated.is_swarm_iterative()
                         || current.swarm_probe_command() != updated.swarm_probe_command()
+                        || !current.memory_matches(updated)
                         || current.firing_skill_guidance().is_some()
                             != updated.firing_skill_guidance().is_some()
                         || current.knowledge() != updated.knowledge()
+                        || current.web() != updated.web()
                         || (standing && updated.firing_skill_ids().is_empty())
                         || !current
                             .redaction_policy()
@@ -1748,7 +2102,7 @@ impl SchedulerWindow {
             return Ok(iced::Task::none());
         };
         self.agent_review_current(view, &review)?;
-        if review.standing() {
+        if review.standing() || !review.model_sources_ready() {
             view.agent_review = Some(review);
             return Ok(iced::Task::none());
         }
@@ -1761,7 +2115,7 @@ impl SchedulerWindow {
             view.agent_review = Some(review);
             return Ok(iced::Task::none());
         }
-        let [prompt] = model.prompts.as_slice() else {
+        let Some(prompt) = model.prompts.first() else {
             return Err("The one-use model request is unavailable.".into());
         };
         if let Some(skills) = &mut model.skills {
@@ -1791,7 +2145,12 @@ impl SchedulerWindow {
             )
         });
         let (progress, updates) = async_channel::bounded(1);
-        let pending = Arc::clone(prompt).start_guarded(progress, review.kind, before_dispatch)?;
+        let pending = proposal::Prompt::start_guarded(
+            model.prompts.clone(),
+            progress,
+            review.kind,
+            before_dispatch,
+        )?;
         model.state = ModelState::Pending {
             ticket: ticket.clone(),
             _cancel: pending.cancel,
@@ -1865,10 +2224,20 @@ impl SchedulerWindow {
         {
             return Ok(());
         }
+        if view
+            .agent_review
+            .as_ref()
+            .is_some_and(Review::unattended_web_draft_pending)
+        {
+            return Err("Review the public research topic or remove it before approving.".into());
+        }
         let Some(mut review) = view.agent_review.take() else {
             return Ok(());
         };
         self.agent_review_current(view, &review)?;
+        if review.approval.requires_fresh_web() {
+            review.require_fresh_web_scope()?;
+        }
         let standing = review.standing();
         let advisory = review.advisory();
         let masked_goal = if review.approval.profile.requires_masked_review() {
@@ -1877,7 +2246,7 @@ impl SchedulerWindow {
                 .as_ref()
                 .and_then(|model| model.prompts.first())
                 .and_then(|prompt| prompt.masked_question_for_save())
-                .filter(|goal| valid_text(goal, MAX_GOAL_BYTES))
+                .filter(|goal| valid_goal(goal))
                 .ok_or("The reviewed masked question cannot be saved. Edit the question and review again.")?;
             Some(goal)
         } else {
@@ -1953,7 +2322,14 @@ impl SchedulerWindow {
         let Some(agent) = job.action().agent.as_ref() else {
             return Ok(job);
         };
-        let current = scope(&job)?;
+        let converting_import = view.draft.has_imported_ai() && !job.enabled();
+        if converting_import && self.agent_profiles.selected(&agent.profile).is_none() {
+            return Err("Choose an available AI profile before saving this imported job.".into());
+        }
+        if converting_import && view.agent_approval.is_none() {
+            return Ok(job);
+        }
+        scope(&job)?;
         let mut action = job.action().clone();
         let approval = if let Some(Approved {
             approval,
@@ -1962,7 +2338,7 @@ impl SchedulerWindow {
             ..
         }) = &view.agent_approval
         {
-            if approval.scope != current || approval.profile.id != agent.profile {
+            if !approval.matches_scope(&job) || approval.profile.id != agent.profile {
                 return Err("The diagnostics settings changed. Review them again.".into());
             }
             let mut approval = approval.clone();
@@ -1974,7 +2350,7 @@ impl SchedulerWindow {
                     .definition()
                     .with_action(action.clone())
                     .map_err(|error| error.to_string())?;
-                approval.scope = scope(&masked_job)?;
+                approval.scope = approval.scope_for(&masked_job)?;
                 if let Some(items) = items {
                     approval.proposal = Some(
                         approval
@@ -1997,7 +2373,7 @@ impl SchedulerWindow {
                 .approval
                 .as_ref()
                 .filter(|approval| {
-                    approval.scope == current && approval.profile.id == agent.profile
+                    approval.matches_scope(&job) && approval.profile.id == agent.profile
                 })
                 .cloned()
         };
@@ -2035,6 +2411,11 @@ impl SchedulerWindow {
                             .as_ref()
                             .is_some_and(AdvisoryGrant::is_guided);
                     agent.profile == approval.profile.id
+                        && approval.allows_trigger(probe, request.trigger)
+                        && (request.trigger != RunTrigger::Dependency
+                            || (job.enabled()
+                                && job.mode() == DependencyMode::Chain
+                                && !job.dependencies().is_empty()))
                         && (probe == Probe::Proposed) == approval.proposal.is_some()
                         && firing == approval.generation.is_some()
                         && (!approval.has_initial_swarm_probe() || probe == Probe::SwarmIterative)
@@ -2044,7 +2425,8 @@ impl SchedulerWindow {
                                 .targets()
                                 .eq(approval.targets.iter().map(|target| &target.reference)))
                         && probe.reviews_advice(&approval.profile) == approval.advisory.is_some()
-                        && scope(job).is_ok_and(|scope| scope == approval.scope)
+                        && (!approval.requires_fresh_web() || probe.supports_fresh_web())
+                        && approval.matches_scope(job)
                 })
     }
 
@@ -2057,6 +2439,9 @@ impl SchedulerWindow {
                     && active.started_at == request.started_at
                     && active.trigger == request.trigger
                     && !active.cancellation.is_requested()
+                    && active
+                        .cancellation
+                        .shares_signal_with(&request.cancellation)
             })
             && self.agent_run_approved(request)
     }
@@ -2066,11 +2451,6 @@ impl SchedulerWindow {
         request: &RunRequest<SshCommand>,
     ) -> bool {
         self.active_agent_run_approved(request)
-            && self.active.get(&request.id).is_some_and(|active| {
-                active
-                    .cancellation
-                    .shares_signal_with(&request.cancellation)
-            })
             && request.action.agent.as_ref().is_some_and(|agent| {
                 agent.kind == Kind::Swarm
                     && agent.probe.supports_comparison()
@@ -2103,6 +2483,30 @@ impl SchedulerWindow {
 }
 
 impl SchedulerView {
+    fn displayed_agent_approval(&self) -> Option<&Approval> {
+        match self.agent_approval.as_ref() {
+            Some(review) => Some(&review.approval),
+            None => self
+                .baseline
+                .as_ref()
+                .and_then(|(_, action)| action.agent.as_ref())
+                .and_then(|agent| agent.approval.as_deref()),
+        }
+    }
+
+    pub(super) fn saved_fresh_web_requirement(&self) -> bool {
+        self.displayed_agent_approval()
+            .is_some_and(|approval| approval.fresh_web)
+    }
+
+    pub(super) fn saved_unattended_web_lookup(&self) -> Option<&web_lookup::Grant> {
+        self.displayed_agent_approval()?.web_lookup()
+    }
+
+    pub(crate) fn new_unattended_web_lookup(&self) -> Option<&web_lookup::Grant> {
+        self.agent_approval.as_ref()?.approval.web_lookup()
+    }
+
     pub(crate) fn advisory_approval(&self) -> Option<&Approval> {
         let review = self.agent_review.as_ref()?;
         review.approval.advisory.as_ref()?;
@@ -2158,7 +2562,7 @@ impl SchedulerView {
 
     pub(crate) fn matches_proposal_preview(&self, preview: &str) -> bool {
         self.proposal_review()
-            .is_some_and(|(review, _)| !review.standing() && review.knowledge_ready())
+            .is_some_and(|(review, _)| !review.standing() && review.model_sources_ready())
             && self.skill_preview_closed(preview)
     }
 
@@ -2275,7 +2679,7 @@ mod generation_tests {
         let runtime = config.resolve_profile_reference(&named).unwrap();
         let alias = config.legacy_policy_alias(runtime).unwrap();
         let legacy = ProfileRef::Numeric(alias);
-        let picker = ProfileChoices::new(&config);
+        let picker = ProfileChoices::new(&config, true);
         let selected = picker.selected(&named).unwrap();
         assert_eq!(selected.id, named);
         assert!(selected.policy_model_fingerprint.is_some());
@@ -2295,7 +2699,11 @@ mod generation_tests {
         assert!(picker.selected(&wrong_case).is_none());
         assert!(ProfileChoice::for_reference(&config, &wrong_case).is_none());
         let missing = Configuration::default();
-        assert!(ProfileChoices::new(&missing).selected(&named).is_none());
+        assert!(
+            ProfileChoices::new(&missing, true)
+                .selected(&named)
+                .is_none()
+        );
         assert!(ProfileChoice::for_reference(&missing, &named).is_none());
 
         for profiles in [
@@ -2317,7 +2725,7 @@ mod generation_tests {
             let runtime = config.resolve_profile_reference(&named).unwrap();
             assert!(runtime > u128::from(u64::MAX));
             assert_eq!(config.legacy_policy_alias(runtime), None);
-            let picker = ProfileChoices::new(&config);
+            let picker = ProfileChoices::new(&config, true);
             assert_eq!(picker.selected(&named).unwrap().id, named);
             assert_eq!(
                 picker.selected(&legacy).map(|choice| &choice.id),
@@ -2359,6 +2767,7 @@ mod generation_tests {
     fn approval(targets: Vec<Target>, generation: GenerationGrant) -> Approval {
         Approval {
             scope: [4; 32],
+            dependency_triggers: false,
             profile: ProfileChoice {
                 id: ProfileRef::Numeric(7),
                 name: "Fixture".into(),
@@ -2375,6 +2784,9 @@ mod generation_tests {
             advisory: None,
             comparison: None,
             knowledge: None,
+            web: None,
+            fresh_web: false,
+            web_lookup: None,
         }
     }
 
@@ -2741,7 +3153,8 @@ mod generation_tests {
             vec![JobId::new("prerequisite").unwrap()],
             None,
         );
-        assert!(scope(&dependent).is_err());
+        assert!(scope(&dependent).is_ok());
+        assert!(approval_scope(&dependent, false).is_err());
 
         let targets = vec![target(9), target(3)];
         let swarm = [
@@ -2830,7 +3243,8 @@ mod generation_tests {
             legacy.dependencies(),
         ))
         .unwrap();
-        assert_eq!(scope(&legacy).unwrap(), legacy_scope);
+        assert_eq!(approval_scope(&legacy, false).unwrap(), legacy_scope);
+        assert_ne!(scope(&legacy).unwrap(), legacy_scope);
 
         let named = ProfileRef::Policy("policy-Fixture".into());
         let mut named_draft = Draft::from_job(&legacy);

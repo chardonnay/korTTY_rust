@@ -71,6 +71,24 @@ pub(crate) struct Stage {
 }
 
 impl Stage {
+    pub(crate) fn review_vacancy(path: &Path) -> io::Result<bool> {
+        let parent_path = parent(path)?;
+        let parent = local::Directory::open_path(parent_path)?;
+        let identity = Identity::directory(&parent)?;
+        let vacant = match require_absent(path) {
+            Ok(()) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error),
+        };
+        if vacant {
+            Access::capture_directory(parent_path, &identity)?.verify_parent()?;
+        }
+        if !parent.same_as(&local::Directory::open_path(parent_path)?)? {
+            return Err(changed());
+        }
+        Ok(vacant)
+    }
+
     pub(crate) fn create(path: &Path, cleanup_failed: &mut bool) -> io::Result<Self> {
         Self::create_checked(path, None, cleanup_failed)
     }
@@ -242,7 +260,13 @@ impl Stage {
         drop(self.payload.take());
         if let Some(outer) = self.outer.take() {
             if owns_unpublished_payload {
-                local::discard(&self.parent, &self.name, outer)
+                local::discard_bounded(
+                    &self.parent,
+                    &self.name,
+                    outer,
+                    MAX_DEPTH + 1,
+                    MAX_ENTRIES + 1,
+                )
             } else {
                 // A published or unverified payload must never cause recursive
                 // deletion of names substituted inside the wrapper.

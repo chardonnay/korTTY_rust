@@ -1,13 +1,14 @@
 //! Restricts elevated archive creation to administrator-configured Linux paths.
 
-use std::io::Write;
+use std::io::{Seek, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use kortty_server_archive::protocol::{
-    PRIVILEGED_PATH, PrivilegedReply, PrivilegedRequest, read_privileged_request,
-    write_privileged_reply,
+    CreateFormat, CreatedPayload, PRIVILEGED_PASSWORD_READY, PRIVILEGED_PATH, PrivilegedReply,
+    PrivilegedRequest, read_committed_password, read_privileged_request, require_eof,
+    require_privileged_password_commit, write_privileged_reply,
 };
 use rustix::fs::{StatxFlags, fgetxattr_query, fremovexattr, statx};
 use serde::Deserialize;
@@ -24,6 +25,14 @@ const COMMIT_TIMEOUT: Duration = Duration::from_secs(300);
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(1800);
 
 pub(crate) fn serve() -> io::Result<()> {
+    serve_inner(false)
+}
+
+pub(crate) fn serve_password() -> io::Result<()> {
+    serve_inner(true)
+}
+
+fn serve_inner(password_protocol: bool) -> io::Result<()> {
     let mut output = io::stdout().lock();
     let result = (|| {
         require_installation()?;
@@ -32,11 +41,24 @@ pub(crate) fn serve() -> io::Result<()> {
         let rules = Rules::load(CONFIG)?;
         let committed = Arc::new(AtomicBool::new(false));
         start_watchdog(Arc::clone(&committed))?;
-        transaction(io::stdin().lock(), &mut output, &rules, || {
-            committed.store(true, Ordering::Release);
-        })
+        if password_protocol {
+            output.write_all(PRIVILEGED_PASSWORD_READY)?;
+            output.flush()?;
+        }
+        let publication = transaction(
+            io::stdin().lock(),
+            &mut output,
+            &rules,
+            password_protocol,
+            || committed.store(true, Ordering::Release),
+        )?;
+        Ok((rules, publication))
     })();
-    write_privileged_reply(output, &result.unwrap_or_else(failed))
+    match result {
+        Ok((rules, Some(publication))) => finish(&mut output, &rules, publication),
+        Ok((_, None)) => write_privileged_reply(output, &PrivilegedReply::Aborted),
+        Err(error) => write_privileged_reply(output, &failed(error)),
+    }
 }
 
 fn start_watchdog(committed: Arc<AtomicBool>) -> io::Result<()> {
@@ -55,7 +77,7 @@ fn start_watchdog(committed: Arc<AtomicBool>) -> io::Result<()> {
     Ok(())
 }
 
-fn require_installation() -> io::Result<()> {
+pub(super) fn require_installation() -> io::Result<()> {
     if getuid().as_raw() != 0 || geteuid().as_raw() != 0 || getgid() != getegid() {
         return Err(invalid(
             "Privileged archive creation requires the root account",
@@ -79,8 +101,9 @@ fn transaction(
     mut input: impl Read,
     mut output: impl Write,
     rules: &Rules,
+    password_protocol: bool,
     on_commit: impl FnOnce(),
-) -> Result<PrivilegedReply, Failure> {
+) -> Result<Option<create::Publication>, Failure> {
     let PrivilegedRequest::Review { spec } = read_privileged_request(&mut input)? else {
         return Err(invalid("Privileged archive creation must start with a review").into());
     };
@@ -94,23 +117,103 @@ fn transaction(
     write_privileged_reply(&mut output, &PrivilegedReply::Review { review })?;
     let decision = match read_privileged_request(&mut input) {
         Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-            return Ok(PrivilegedReply::Aborted);
+            return Ok(None);
         }
         other => other?,
     };
-    if io::copy(&mut input.take(1), &mut io::sink())? != 0 {
-        return Err(invalid("Unexpected input after the privileged archive decision").into());
-    }
-    match decision {
+    let password = match decision {
         PrivilegedRequest::Commit { token: received } if received == token => {
-            rules.require_current()?;
-            on_commit();
-            let destination = create::apply_with_policy(spec, &inventory, policy)?;
-            Ok(PrivilegedReply::Applied { destination })
+            if spec.format == CreateFormat::ZipPassword {
+                Some(read_committed_password(input)?)
+            } else {
+                if password_protocol {
+                    require_privileged_password_commit(input)?;
+                } else {
+                    require_eof(input)?;
+                }
+                None
+            }
         }
-        PrivilegedRequest::Abort => Ok(PrivilegedReply::Aborted),
-        _ => Err(invalid("The privileged archive commitment did not match this review").into()),
+        PrivilegedRequest::Abort => {
+            require_eof(input)?;
+            return Ok(None);
+        }
+        _ => {
+            return Err(
+                invalid("The privileged archive commitment did not match this review").into(),
+            );
+        }
+    };
+    rules.require_current()?;
+    on_commit();
+    let publication = create::apply_with_policy(
+        spec,
+        &inventory,
+        policy,
+        password.as_ref().map(|secret| secret.as_slice()),
+    )?;
+    Ok(Some(publication))
+}
+
+fn finish(
+    output: &mut impl Write,
+    rules: &Rules,
+    publication: create::Publication,
+) -> io::Result<()> {
+    let create::Publication { destination, copy } = publication;
+    let Some((payload, mut file)) = copy else {
+        return write_privileged_reply(output, &PrivilegedReply::Applied { destination });
+    };
+    // The path is checked again, but the stream uses only the file held since
+    // creation. A revoked rule prevents copying and leaves the archive in place.
+    let ready = (|| {
+        rules.require_current()?;
+        let (parent, name) = absolute_file(&destination)?;
+        let parent = rules.require_copy_parent(parent)?;
+        let stat = fstat(&file)?;
+        require_private_stat(&stat, false)?;
+        if Mode::from_raw_mode(stat.st_mode) != PRIVATE_FILE
+            || file.metadata()?.len() != payload.bytes
+        {
+            return Err(invalid("The published privileged archive changed"));
+        }
+        parent.require_child(name, &stat)?;
+        file.rewind()
+    })();
+    if ready.is_err() {
+        return write_privileged_reply(output, &PrivilegedReply::Applied { destination });
     }
+    write_privileged_reply(
+        &mut *output,
+        &PrivilegedReply::AppliedCopy {
+            destination,
+            payload,
+        },
+    )?;
+    stream_archive_copy(output, rules, &mut file, payload)
+}
+
+fn stream_archive_copy(
+    output: &mut impl Write,
+    rules: &Rules,
+    file: &mut File,
+    payload: CreatedPayload,
+) -> io::Result<()> {
+    let mut remaining = payload.bytes;
+    let mut buffer = [0; 64 * 1024];
+    let mut check = Instant::now();
+    while remaining != 0 {
+        if check.elapsed() >= Duration::from_millis(250) {
+            rules.require_current()?;
+            check = Instant::now();
+        }
+        let limit = remaining.min(buffer.len() as u64) as usize;
+        file.read_exact(&mut buffer[..limit])?;
+        output.write_all(&buffer[..limit])?;
+        remaining -= limit as u64;
+    }
+    output.flush()?;
+    rules.require_current()
 }
 
 fn failed(failure: Failure) -> PrivilegedReply {
@@ -125,12 +228,15 @@ fn failed(failure: Failure) -> PrivilegedReply {
 struct Configuration {
     source_roots: Vec<String>,
     destination_roots: Vec<String>,
+    #[serde(default)]
+    download_roots: Vec<String>,
 }
 
 pub(super) struct Rules {
     configuration: ConfigFile,
     sources: Vec<Root>,
     destinations: Vec<Root>,
+    downloads: Vec<Root>,
 }
 
 impl Rules {
@@ -138,10 +244,20 @@ impl Rules {
         let (configuration, bytes) = ConfigFile::read(path)?;
         let options: Configuration = serde_json::from_slice(&bytes)
             .map_err(|_| invalid("Invalid privileged archive configuration"))?;
+        let destinations = Root::open_all(options.destination_roots)?;
+        let downloads = if options.download_roots.is_empty() {
+            Vec::new()
+        } else {
+            Root::open_all(options.download_roots)?
+        };
+        for root in &downloads {
+            select_root(&destinations, &root.path)?.open_descendant(&root.path)?;
+        }
         Ok(Self {
             configuration,
             sources: Root::open_all(options.source_roots)?,
-            destinations: Root::open_all(options.destination_roots)?,
+            destinations,
+            downloads,
         })
     }
 
@@ -161,27 +277,38 @@ impl Rules {
         select_root(&self.destinations, parent)?.open_descendant(parent)
     }
 
+    pub(super) fn require_copy_parent(&self, parent: &str) -> io::Result<Directory> {
+        select_root(&self.downloads, parent)
+            .map_err(|_| invalid("The administrator has not allowed archive downloads here"))?
+            .open_descendant(parent)
+    }
+
     pub(super) fn require_current(&self) -> io::Result<()> {
         let (current, _) = ConfigFile::read(&self.configuration.path)?;
         if current.stamp != self.configuration.stamp || current.digest != self.configuration.digest
         {
             return Err(invalid("The privileged archive configuration changed"));
         }
-        for root in self.sources.iter().chain(&self.destinations) {
+        for root in self
+            .sources
+            .iter()
+            .chain(&self.destinations)
+            .chain(&self.downloads)
+        {
             root.open_current()?;
         }
         Ok(())
     }
 }
 
-struct ConfigFile {
+pub(super) struct ConfigFile {
     path: String,
     stamp: Stamp,
     digest: [u8; 32],
 }
 
 impl ConfigFile {
-    fn read(path: &str) -> io::Result<(Self, Vec<u8>)> {
+    pub(super) fn read(path: &str) -> io::Result<(Self, Vec<u8>)> {
         let file = open_protected_file(path)?;
         let stamp = Stamp::of(&file.metadata()?);
         if !(1..=MAX_CONFIG_BYTES).contains(&stamp.size) {
@@ -208,16 +335,21 @@ impl ConfigFile {
             bytes,
         ))
     }
+
+    pub(super) fn hash_into(&self, hash: &mut Sha256) {
+        self.stamp.hash_into(hash);
+        hash.update(self.digest);
+    }
 }
 
-struct Root {
-    path: String,
+pub(super) struct Root {
+    pub(super) path: String,
     identity: Stat,
-    mount: u64,
+    pub(super) mount: u64,
 }
 
 impl Root {
-    fn open_all(paths: Vec<String>) -> io::Result<Vec<Self>> {
+    pub(super) fn open_all(paths: Vec<String>) -> io::Result<Vec<Self>> {
         if paths.is_empty() || paths.len() > MAX_ROOTS {
             return Err(invalid(
                 "Configure between one and sixteen privileged archive roots per role",
@@ -243,7 +375,7 @@ impl Root {
         Ok(roots)
     }
 
-    fn open_current(&self) -> io::Result<Directory> {
+    pub(super) fn open_current(&self) -> io::Result<Directory> {
         let root = open_protected_directory(&self.path)?;
         if !same_node(&root.stat, &self.identity) || mount_id(&root.fd)? != self.mount {
             return Err(invalid("A configured privileged archive root changed"));
@@ -251,7 +383,7 @@ impl Root {
         Ok(root)
     }
 
-    fn open_descendant(&self, path: &str) -> io::Result<Directory> {
+    pub(super) fn open_descendant(&self, path: &str) -> io::Result<Directory> {
         let mut directory = self.open_current()?;
         if path == self.path {
             return Ok(directory);
@@ -268,7 +400,7 @@ impl Root {
     }
 }
 
-fn select_root<'a>(roots: &'a [Root], path: &str) -> io::Result<&'a Root> {
+pub(super) fn select_root<'a>(roots: &'a [Root], path: &str) -> io::Result<&'a Root> {
     roots
         .iter()
         .filter(|root| within(&root.path, path))
@@ -276,7 +408,7 @@ fn select_root<'a>(roots: &'a [Root], path: &str) -> io::Result<&'a Root> {
         .ok_or_else(outside_scope)
 }
 
-fn within(root: &str, path: &str) -> bool {
+pub(super) fn within(root: &str, path: &str) -> bool {
     root == path
         || path
             .strip_prefix(root)
@@ -287,7 +419,7 @@ fn outside_scope() -> io::Error {
     invalid("An archive path is outside the configured privileged archive roots")
 }
 
-fn open_protected_directory(path: &str) -> io::Result<Directory> {
+pub(super) fn open_protected_directory(path: &str) -> io::Result<Directory> {
     let mut directory = Directory::from_fd(open("/", DIRECTORY, Mode::empty())?)?;
     require_private_node(&directory, true)?;
     if path != "/" {

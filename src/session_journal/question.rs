@@ -13,6 +13,7 @@ use crate::local_ai::{Cancel, Error, Profile, Session, StreamDelta};
 
 use super::capture::retrieval::{self, Position};
 use super::deletion::DeletionIdentity;
+use super::summary_ai::{ObservedUsage, Reply};
 use super::summary_plan::SensitiveBlocks;
 use super::viewer::Source;
 use super::{
@@ -87,6 +88,7 @@ pub(crate) struct Citation {
     pub(crate) excerpt: String,
     pub(crate) target: Target,
     stamp: DeletionIdentity,
+    displayed_stamp: Option<DeletionIdentity>,
 }
 
 impl Citation {
@@ -98,7 +100,13 @@ impl Citation {
     }
 
     pub(crate) fn matches_document(&self, document: &Journal) -> bool {
-        document.summary.deletion_identity.as_ref() == Some(&self.stamp)
+        document
+            .summary
+            .deletion_identity
+            .as_ref()
+            .is_some_and(|stamp| {
+                stamp == &self.stamp || self.displayed_stamp.as_ref() == Some(stamp)
+            })
     }
 }
 
@@ -198,6 +206,7 @@ impl Review {
                 citations.push(Citation {
                     source: source.clone(),
                     stamp: stamp.clone(),
+                    displayed_stamp: None,
                     journal: title.clone(),
                     title: candidate.title,
                     excerpt: candidate.excerpt,
@@ -231,6 +240,21 @@ impl Review {
             prompt,
             outbound_profile: None,
         })
+    }
+
+    pub(crate) fn update_usage_stamp(&mut self, old: &DeletionIdentity, new: &DeletionIdentity) {
+        for (_, stamp) in &mut self.sources {
+            if stamp == old {
+                *stamp = new.clone();
+            }
+        }
+        for citation in &mut self.citations {
+            if citation.stamp == *old {
+                // The viewer may still be displaying the same evidence from before the write.
+                citation.displayed_stamp.get_or_insert_with(|| old.clone());
+                citation.stamp = new.clone();
+            }
+        }
     }
 
     pub(crate) fn verify(&self, cancelled: &dyn Fn() -> bool) -> io::Result<()> {
@@ -462,6 +486,18 @@ impl Answering {
         review: &Review,
         cancelled: &dyn Fn() -> bool,
         emit: impl FnMut(Vec<Quotation>),
+    ) -> Reply<Answer> {
+        let mut usage = None;
+        let result = self.answer_observed(review, cancelled, emit, &mut usage);
+        Reply { result, usage }
+    }
+
+    fn answer_observed(
+        &self,
+        review: &Review,
+        cancelled: &dyn Fn() -> bool,
+        emit: impl FnMut(Vec<Quotation>),
+        usage: &mut Option<ObservedUsage>,
     ) -> io::Result<Answer> {
         let client = self.session.client();
         let cancelled = || cancelled() || !client.active();
@@ -484,7 +520,7 @@ impl Answering {
         let mut preview = live::reporter(&review.citations, emit);
         let [system, prompt] = review.answer_messages();
         let mut request = |response_format| {
-            client.stream_structured(
+            let reply = client.stream_structured(
                 system,
                 prompt,
                 response_format,
@@ -499,7 +535,9 @@ impl Answering {
                     check_cancel(&cancelled).map_err(|error| error.to_string())
                 },
                 &mut preview,
-            )
+            );
+            ObservedUsage::accumulate(usage, ObservedUsage::from_completion(client, reply.is_ok()));
+            reply
         };
         let reply = match request(true) {
             Err(Error::UnsupportedResponseFormat) if !cancelled() => request(false),

@@ -51,7 +51,7 @@ impl Fixture {
     }
 
     fn finish(&self, page: &mut Page, action: Action) {
-        let result = action.run().map_err(|error| error.to_string());
+        let result = action.run_management().map_err(|error| error.to_string());
         assert!(result.is_ok());
         let _ = self.edit(page, Message::Finished(result));
     }
@@ -102,6 +102,67 @@ fn recipient_page_requires_current_review_and_independent_fingerprint_before_enr
     assert!(matches!(&save, Action::SaveReviewed(..)));
     fixture.finish(&mut page, save);
     assert_eq!(page.selected_choice().unwrap().fingerprint(), fingerprint);
+}
+
+#[test]
+fn imported_java_reference_requires_matching_certificate_and_independent_confirmation() {
+    use crate::snippets::recipients::java_backup_delta;
+
+    let fixture = Fixture::new();
+    let certificate = fixture.certificate();
+    let actual = inspect_certificate(&certificate).unwrap();
+    let imported = JavaRecipient::new("java-matching", "Reports", &actual.fingerprint).unwrap();
+    let other = JavaRecipient::new(
+        "java-other",
+        "Other",
+        "0000000000000000000000000000000000000001",
+    )
+    .unwrap();
+    fs::write(
+        fixture.catalog(),
+        java_backup_delta(vec![imported.clone(), other.clone()]).unwrap(),
+    )
+    .unwrap();
+    assert!(Action::List(fixture.catalog()).run().unwrap().is_empty());
+
+    let mut page = fixture.page();
+    let _ = fixture.edit(&mut page, Message::AttachJava(other.clone()));
+    let _ = fixture.edit(
+        &mut page,
+        Message::Certificate(certificate.to_str().unwrap().to_owned()),
+    );
+    let (revision, _) = page.begin_preview().unwrap();
+    let _ = fixture.edit(
+        &mut page,
+        Message::PreviewFinished(revision, Ok(actual.clone())),
+    );
+    let _ = fixture.edit(&mut page, Message::Fingerprint(actual.fingerprint.clone()));
+    assert!(fixture.edit(&mut page, Message::Save).is_none());
+    let _ = fixture.edit(&mut page, Message::Discard);
+
+    let _ = fixture.edit(&mut page, Message::AttachJava(imported));
+    let _ = fixture.edit(
+        &mut page,
+        Message::Certificate(certificate.to_str().unwrap().to_owned()),
+    );
+    let (revision, _) = page.begin_preview().unwrap();
+    let _ = fixture.edit(
+        &mut page,
+        Message::PreviewFinished(revision, Ok(actual.clone())),
+    );
+    assert!(fixture.edit(&mut page, Message::Save).is_none());
+    let _ = fixture.edit(&mut page, Message::Fingerprint(actual.fingerprint.clone()));
+    let save = fixture.edit(&mut page, Message::Save).unwrap();
+    assert!(matches!(&save, Action::AttachJava(..)));
+    fixture.finish(&mut page, save);
+    assert_eq!(page.pending_java, [other]);
+    assert_eq!(
+        page.selected_choice().unwrap().fingerprint(),
+        actual.fingerprint
+    );
+    let choices = Action::List(fixture.catalog()).run().unwrap();
+    assert_eq!(choices.len(), 1);
+    assert_eq!(choices[0].fingerprint(), actual.fingerprint);
 }
 
 #[test]

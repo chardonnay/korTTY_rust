@@ -394,7 +394,7 @@ impl Output {
             self.reset();
             return;
         }
-        let Some(mut text) = self.redact.journal_text(line, self.deadline) else {
+        let Some(mut text) = self.redact.journal_output_text(line, self.deadline) else {
             self.truncate();
             return;
         };
@@ -548,6 +548,46 @@ fn add_seed(
 mod tests {
     use super::*;
     use crate::terminal_logging::Secrets;
+
+    #[test]
+    fn journal_output_filters_plain_text_after_the_chunk_deadline() {
+        let deadline = Instant::now();
+        let empty = Secrets::default().seal().unwrap();
+        let plain = Redactor::for_journal(empty.clone(), Policy::default());
+        assert_eq!(
+            plain
+                .journal_output_text("visible\u{202e}\r\ttext", deadline)
+                .unwrap()
+                .as_str(),
+            "visible\ttext"
+        );
+
+        let secrets = Secrets::default();
+        secrets.add("private-token");
+        let credential = Redactor::for_journal(secrets.seal().unwrap(), Policy::default());
+        assert!(
+            credential
+                .journal_output_text("private-token", deadline)
+                .is_none()
+        );
+
+        let rules = r#"
+[session-journal]
+[[session-journal.replace]]
+pattern = 'private-token'
+replacement = '***'
+"#
+        .parse::<toml_edit::DocumentMut>()
+        .unwrap();
+        let mut policy = Policy::default();
+        policy.read_rule(rules.as_table()).unwrap();
+        let managed = Redactor::for_journal(empty, policy);
+        assert!(
+            managed
+                .journal_output_text("private-token", deadline)
+                .is_none()
+        );
+    }
 
     #[test]
     fn scrollback_seed_redacts_a_known_secret_across_soft_wraps() {

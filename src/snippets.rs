@@ -60,7 +60,7 @@ impl SnippetId {
         Ok(Self(bytes))
     }
 
-    pub(super) fn from_java_uuid(text: &str) -> io::Result<Self> {
+    pub(crate) fn from_java_uuid(text: &str) -> io::Result<Self> {
         let bytes = text.as_bytes();
         if bytes.len() != 36
             || ![8, 13, 18, 23]
@@ -383,6 +383,15 @@ pub(crate) struct Library {
 }
 
 impl Library {
+    pub(crate) fn analysis_backup_catalogue(bytes: &[u8]) -> io::Result<Self> {
+        Ok(Self {
+            path: PathBuf::new(),
+            document: Arc::new(decode_document(bytes)?),
+            #[cfg(test)]
+            allow_custom_script_headers: None,
+        })
+    }
+
     pub(crate) fn path(&self) -> &Path {
         &self.path
     }
@@ -412,6 +421,58 @@ impl Library {
 
     pub(crate) fn get(&self, id: SnippetId) -> Option<&Snippet> {
         self.entries().iter().find(|entry| entry.id == id)
+    }
+
+    pub(crate) fn has_analysis_subject(
+        &self,
+        subject: crate::snippet_analysis::model::Subject,
+    ) -> bool {
+        match subject {
+            crate::snippet_analysis::model::Subject::Snippet(id) => self.get(id).is_some(),
+            crate::snippet_analysis::model::Subject::Folder(id) => self.folder(id).is_some(),
+        }
+    }
+
+    pub(crate) fn matches_analysis_subject(
+        &self,
+        other: &Self,
+        subject: crate::snippet_analysis::model::Subject,
+    ) -> bool {
+        use crate::snippet_analysis::model::Subject;
+
+        let same_snippet = |id| {
+            self.get(id)
+                .zip(other.get(id))
+                .is_some_and(|(source, target)| {
+                    source.content == target.content && source.language == target.language
+                })
+        };
+        match subject {
+            Subject::Snippet(id) => same_snippet(id),
+            Subject::Folder(id) => {
+                if !self
+                    .folder(id)
+                    .zip(other.folder(id))
+                    .is_some_and(|(source, target)| source.path == target.path)
+                {
+                    return false;
+                }
+                let ids = self.snippets_in_folder(Some(id), true);
+                let other_ids = other.snippets_in_folder(Some(id), true);
+                let source = archive::analysis_files(self, &ids, Some(id));
+                let target = archive::analysis_files(other, &other_ids, Some(id));
+                let (Ok(source), Ok(target)) = (source, target) else {
+                    return false;
+                };
+                source.len() == target.len()
+                    && source.iter().zip(target).all(|(source, target)| {
+                        source.path == target.path
+                            && source.executable == target.executable
+                            && source.snippet.id == target.snippet.id
+                            && same_snippet(source.snippet.id)
+                    })
+            }
+        }
     }
 
     pub(crate) fn variables(&self) -> &[Variable] {

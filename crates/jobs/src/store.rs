@@ -13,6 +13,7 @@ use jiff::Timestamp;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::graph::validate_name;
 use crate::schedule::timestamp;
@@ -24,17 +25,81 @@ use crate::{
 
 const VERSION: u32 = 1;
 const MAX_STORED_RUN_ID: u64 = u64::MAX - u32::MAX as u64;
-const MAX_JOURNAL_DETAIL_BYTES: usize = 4096;
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 
 /// Maximum number of retained finished records. Older records also expire
 /// when newer records would exceed the scheduler file's byte limit.
 pub const MAX_JOURNAL_RECORDS: usize = 256;
+/// Maximum UTF-8 bytes retained for one finished run's detail.
+pub const MAX_JOURNAL_DETAIL_BYTES: usize = 40 * 1024;
 /// Maximum accepted or written size of the scheduler file.
 pub const MAX_STORE_BYTES: u64 = 16 * 1024 * 1024;
+/// Maximum UTF-8 bytes retained in each output stream of a run.
+pub const MAX_RUN_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_RUN_OUTPUT_STORAGE_BYTES: usize = 2 * 1024 * 1024;
 
 /// Opaque name component for a recording stored beside the scheduler profile.
 pub type JournalRecording = [u8; 16];
+
+/// Masked, display-safe output retained for a finished run.
+#[derive(Clone, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunOutput {
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl fmt::Debug for RunOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RunOutput")
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .finish()
+    }
+}
+
+impl RunOutput {
+    fn valid(&self) -> bool {
+        (!self.stdout.is_empty() || !self.stderr.is_empty())
+            && [&self.stdout, &self.stderr].iter().all(|stream| {
+                stream.len() <= MAX_RUN_OUTPUT_BYTES && stream.chars().all(valid_output_character)
+            })
+    }
+
+    fn receipt(&self) -> [u8; 32] {
+        let mut digest = Sha256::new();
+        digest.update(b"kortty-job-output-v1");
+        digest.update((self.stdout.len() as u64).to_le_bytes());
+        digest.update(self.stdout.as_bytes());
+        digest.update(self.stderr.as_bytes());
+        digest.finalize().into()
+    }
+
+    fn storage_bytes(&self) -> usize {
+        // Bytes contributed by the optional "output" JSON field, including its delimiter.
+        const FIELD_BYTES: usize = r#","output":{"stdout":"","stderr":""}"#.len();
+        [&self.stdout, &self.stderr]
+            .into_iter()
+            .map(|stream| {
+                stream.len()
+                    + stream
+                        .bytes()
+                        .filter(|byte| matches!(byte, b'\\' | b'"' | b'\n' | b'\t'))
+                        .count()
+            })
+            .sum::<usize>()
+            + FIELD_BYTES
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct StoredRunOutput {
+    receipt: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    output: Option<RunOutput>,
+}
 
 /// Maximum number of target journals attached to a single scheduler run.
 pub const MAX_SESSION_JOURNALS_PER_RUN: usize = MAX_SWARM_TARGETS;
@@ -96,6 +161,8 @@ pub struct SwarmChatSeed {
 #[derive(Default)]
 pub struct FinishedRunMetadata<'a> {
     pub details: &'a [(RunId, String)],
+    /// Optional masked output. Text can expire before its corresponding run.
+    pub output: &'a [(RunId, RunOutput)],
     pub recordings: &'a [(RunId, JournalRecording)],
     pub session_journals: &'a [(RunId, &'a [String])],
     pub swarm_reports: &'a [(RunId, SwarmReport)],
@@ -106,7 +173,6 @@ impl SwarmReport {
     pub fn is_valid_for(&self, record: &RunRecord) -> bool {
         record.counted_as_run
             && record.blockers.is_empty()
-            && matches!(record.trigger, RunTrigger::Manual | RunTrigger::Scheduled)
             && self.outcome() == Some(record.outcome)
     }
 
@@ -240,6 +306,8 @@ struct StoreData {
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     journal_details: BTreeMap<RunId, String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    journal_output: BTreeMap<RunId, StoredRunOutput>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     journal_recordings: BTreeMap<RunId, JournalRecording>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     session_journals: BTreeMap<RunId, Vec<String>>,
@@ -264,6 +332,7 @@ impl Default for StoreData {
             dependency_results: None,
             actions: BTreeMap::new(),
             journal_details: BTreeMap::new(),
+            journal_output: BTreeMap::new(),
             journal_recordings: BTreeMap::new(),
             session_journals: BTreeMap::new(),
             swarm_reports: BTreeMap::new(),
@@ -412,9 +481,21 @@ impl SchedulerStore {
         bytes: &[u8],
         mut project: impl FnMut(&mut Value),
     ) -> Result<Vec<u8>, StoreError> {
+        Self::portable_backup_project(bytes, |_, action| project(action))
+    }
+
+    /// Projects portable definitions and actions without changing local history.
+    pub fn portable_backup_project(
+        bytes: &[u8],
+        mut project: impl FnMut(&mut JobDefinition, &mut Value),
+    ) -> Result<Vec<u8>, StoreError> {
         let mut data = decode_store(bytes)?;
         data.validate()?;
-        data.actions.values_mut().for_each(&mut project);
+        for definition in &mut data.definitions {
+            if let Some(action) = data.actions.get_mut(&definition.id) {
+                project(definition, action);
+            }
+        }
         let portable = StoreData {
             definitions: data.definitions,
             actions: data.actions,
@@ -490,6 +571,11 @@ impl SchedulerStore {
     /// Optional executor-supplied summary attached to a retained run.
     pub fn journal_detail(&self, id: RunId) -> Option<&str> {
         self.data.journal_details.get(&id).map(String::as_str)
+    }
+
+    /// Returns the retained masked output for a finished run, when available.
+    pub fn journal_output(&self, id: RunId) -> Option<&RunOutput> {
+        self.data.journal_output.get(&id)?.output.as_ref()
     }
 
     /// Identifies the recording attached to a retained run.
@@ -757,6 +843,7 @@ impl SchedulerStore {
         if metadata.swarm_reports.len() > records.len()
             || metadata.swarm_chat_origins.len() > metadata.swarm_reports.len()
             || metadata.session_journals.len() > records.len()
+            || metadata.output.len() > MAX_JOURNAL_RECORDS
         {
             return Err(StoreError::InvalidRecord);
         }
@@ -818,6 +905,7 @@ impl SchedulerStore {
                 return Err(StoreError::ConflictingRecord(*id));
             }
         }
+        next.stage_output(metadata.output, &indices)?;
         for &(id, recording) in metadata.recordings {
             if !indices.contains_key(&id) {
                 return Err(StoreError::InvalidRecord);
@@ -991,6 +1079,14 @@ impl SchedulerStore {
         }
         let mut bytes = serde_json::to_vec(&next).map_err(|_| StoreError::InvalidRecord)?;
         if bytes.len() as u64 > MAX_STORE_BYTES {
+            let excess = bytes.len() - MAX_STORE_BYTES as usize;
+            let current = next.run_output_storage_bytes();
+            next.fit_run_output(HashMap::new(), current.saturating_sub(excess));
+            if next.run_output_storage_bytes() < current {
+                bytes = serde_json::to_vec(&next).map_err(|_| StoreError::InvalidRecord)?;
+            }
+        }
+        if bytes.len() as u64 > MAX_STORE_BYTES {
             let pending = next.swarm_chat_seeds.len();
             // Preserve existing delivery obligations and the newly committed report.
             next.swarm_chat_seeds
@@ -1055,8 +1151,79 @@ impl StoreData {
         self.dependency_results = Some(results);
     }
 
+    fn stage_output(
+        &mut self,
+        output: &[(RunId, RunOutput)],
+        indices: &HashMap<RunId, usize>,
+    ) -> Result<(), StoreError> {
+        if output.is_empty() {
+            return Ok(());
+        }
+        let mut runs = HashMap::new();
+        for (run, output) in output {
+            if !indices
+                .get(run)
+                .and_then(|&index| self.journal.get(index))
+                .is_some_and(allows_output)
+                || !output.valid()
+            {
+                return Err(StoreError::InvalidRecord);
+            }
+            let receipt = output.receipt();
+            if runs.insert(*run, (receipt, output)).is_some() {
+                return Err(StoreError::InvalidRecord);
+            }
+            if self
+                .journal_output
+                .get(run)
+                .is_some_and(|previous| previous.receipt != receipt)
+            {
+                return Err(StoreError::ConflictingRecord(*run));
+            }
+        }
+        runs.retain(|run, _| !self.journal_output.contains_key(run));
+        if !runs.is_empty() {
+            self.fit_run_output(runs, MAX_RUN_OUTPUT_STORAGE_BYTES);
+        }
+        Ok(())
+    }
+
+    fn run_output_storage_bytes(&self) -> usize {
+        self.journal_output
+            .values()
+            .filter_map(|stored| stored.output.as_ref())
+            .map(RunOutput::storage_bytes)
+            .sum()
+    }
+
+    fn fit_run_output(
+        &mut self,
+        mut incoming: HashMap<RunId, ([u8; 32], &RunOutput)>,
+        mut available: usize,
+    ) {
+        // Select in append order before cloning new output, retaining receipts for dropped text.
+        for record in self.journal.iter().rev() {
+            if let Some((receipt, output)) = incoming.remove(&record.id) {
+                let retain = retain_output(output, &mut available);
+                self.journal_output.insert(
+                    record.id,
+                    StoredRunOutput {
+                        receipt,
+                        output: retain.then(|| output.clone()),
+                    },
+                );
+            } else if let Some(stored) = self.journal_output.get_mut(&record.id)
+                && let Some(output) = stored.output.as_ref()
+                && !retain_output(output, &mut available)
+            {
+                stored.output = None;
+            }
+        }
+    }
+
     fn retain_journal_metadata(&mut self) {
         if !self.journal_details.is_empty()
+            || !self.journal_output.is_empty()
             || !self.journal_recordings.is_empty()
             || !self.session_journals.is_empty()
             || !self.swarm_reports.is_empty()
@@ -1065,6 +1232,7 @@ impl StoreData {
         {
             let retained: HashSet<_> = self.journal.iter().map(|record| record.id).collect();
             self.journal_details.retain(|id, _| retained.contains(id));
+            self.journal_output.retain(|id, _| retained.contains(id));
             self.journal_recordings
                 .retain(|id, _| retained.contains(id));
             self.session_journals.retain(|id, _| retained.contains(id));
@@ -1130,6 +1298,14 @@ impl StoreData {
             .journal_details
             .iter()
             .any(|(id, detail)| !known.contains_key(id) || !valid_detail(detail))
+            || self.journal_output.iter().any(|(id, stored)| {
+                !known.get(id).copied().is_some_and(allows_output)
+                    || stored
+                        .output
+                        .as_ref()
+                        .is_some_and(|output| !output.valid() || output.receipt() != stored.receipt)
+            })
+            || self.run_output_storage_bytes() > MAX_RUN_OUTPUT_STORAGE_BYTES
             || self
                 .journal_recordings
                 .keys()
@@ -1266,6 +1442,22 @@ fn valid_detail(detail: &str) -> bool {
         })
 }
 
+fn valid_output_character(ch: char) -> bool {
+    matches!(ch, '\n' | '\t')
+        || (!ch.is_control()
+            && !matches!(ch, '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{fffe}' | '\u{ffff}'))
+}
+
+fn retain_output(output: &RunOutput, available: &mut usize) -> bool {
+    let remaining = available.checked_sub(output.storage_bytes());
+    *available = remaining.unwrap_or_default();
+    remaining.is_some()
+}
+
+fn allows_output(record: &RunRecord) -> bool {
+    record.counted_as_run && record.blockers.is_empty() && record.outcome != RunOutcome::Cancelled
+}
+
 fn valid_report_text(text: &str, limit: usize) -> bool {
     text.len() <= limit
         && !text.trim().is_empty()
@@ -1344,6 +1536,7 @@ fn decode_backup(bytes: &[u8]) -> Result<StoreData, StoreError> {
             .as_ref()
             .is_some_and(|results| !results.is_empty())
         || !data.journal_details.is_empty()
+        || !data.journal_output.is_empty()
         || !data.journal_recordings.is_empty()
         || !data.session_journals.is_empty()
         || !data.swarm_reports.is_empty()
