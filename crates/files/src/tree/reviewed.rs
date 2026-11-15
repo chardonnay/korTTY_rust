@@ -271,6 +271,8 @@ mod tests {
     use super::*;
     use std::io::Write as _;
 
+    use crate::NewFileAccess;
+
     #[test]
     fn private_windows_stage_discards_readonly_entries_by_handle() {
         let scratch = tempfile::tempdir().unwrap();
@@ -394,10 +396,21 @@ mod tests {
         let root = scratch_root.join("owned");
         let receiver = OsStr::new("receiver");
         let name = OsStr::new("data");
-        std::fs::create_dir(root.join(receiver)).unwrap();
-        std::fs::write(root.join(receiver).join(name), b"original").unwrap();
         let parent = Directory::open_reviewed_removal_parent(&root).unwrap();
         let parent_before = parent.reviewed_tree_metadata().unwrap();
+        // Keep the explicit owner when applying the native inherited DACLs.
+        let original = parent.create_reviewed_tree_stage(receiver).unwrap();
+        NewFileAccess::capture_ordinary_directory(&parent)
+            .unwrap()
+            .apply_to_directory(&original)
+            .unwrap();
+        let original_file = original.create_replacement_file(name).unwrap();
+        (&original_file).write_all(b"original").unwrap();
+        NewFileAccess::capture_ordinary(&original)
+            .unwrap()
+            .apply_to(&original_file)
+            .unwrap();
+        drop((original_file, original));
         let original =
             Directory::from_file(parent.child_for_reviewed_removal(receiver, true).unwrap())
                 .unwrap();
@@ -412,11 +425,18 @@ mod tests {
         let checked = stage.create_transfer_child(OsStr::new("verified")).unwrap();
         let checked_nested = checked.create_transfer_child(OsStr::new("nested")).unwrap();
         let checked_file = checked_nested.create_ordinary_file(name).unwrap();
-        checked.reviewed_tree_metadata().unwrap();
-        checked_nested.reviewed_tree_metadata().unwrap();
-        drop(checked_file);
-        let checked_file = checked_nested.read_child(name).unwrap().unwrap();
-        reviewed_tree_file_metadata(&checked_file).unwrap();
+        NewFileAccess::capture_ordinary_directory(&stage)
+            .unwrap()
+            .require_applied_directory(&checked)
+            .unwrap();
+        NewFileAccess::capture_ordinary_directory(&checked)
+            .unwrap()
+            .require_applied_directory(&checked_nested)
+            .unwrap();
+        NewFileAccess::capture_ordinary(&checked_nested)
+            .unwrap()
+            .require_applied(&checked_file)
+            .unwrap();
         drop((checked_file, checked_nested, checked));
 
         let result = stage
@@ -424,6 +444,10 @@ mod tests {
             .unwrap();
         let result_file = result.create_replacement_file(name).unwrap();
         (&result_file).write_all(b"next").unwrap();
+        assert_ne!(
+            ReplacementMetadata::capture(&result_file).unwrap(),
+            file_before.access
+        );
         let original_file = original.read_child(name).unwrap().unwrap();
         copy_reviewed_tree_file_metadata(&original_file, &result_file).unwrap();
         result.copy_reviewed_tree_metadata(&original).unwrap();

@@ -121,7 +121,10 @@ pub(super) fn receive_existing<C: Fn() -> bool>(
         listener,
         bridge_endpoint,
         reference,
-        Output::inherited(&output),
+        Output {
+            directory: &output,
+            owner_only: true,
+        },
         preflight,
     )?;
     Ok((output, manifest))

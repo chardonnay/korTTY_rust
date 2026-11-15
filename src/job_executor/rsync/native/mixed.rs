@@ -326,7 +326,7 @@ pub(super) fn run(
                 Some(receiver) => {
                     let output = create_scratch_child(inputs, OsStr::new("combined"))
                         .map_err(|_| stage_failed())?;
-                    arrange(&projected, inputs, &output, false, &stopped)
+                    arrange(&projected, inputs, &output, true, &stopped)
                         .map_err(|_| stage_failed())?;
                     let local_existing::Published {
                         completion,
