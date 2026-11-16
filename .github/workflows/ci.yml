@@ -33,6 +33,24 @@ jobs:
       - name: Check formatting
         run: cargo +stable fmt --all --check
 
+      - name: Identify Rust compiler for the Cargo cache
+        id: rust-cache-key
+        shell: bash
+        run: |
+          compiler=$(rustc +stable -vV | git hash-object --stdin)
+          echo "compiler=$compiler" >> "$GITHUB_OUTPUT"
+
+      - name: Restore Cargo development cache
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: &cargo-cache-paths |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            target/debug
+          key: cargo-dev-v1-${{ matrix.os }}-${{ steps.rust-cache-key.outputs.compiler }}-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.cargo/config*') }}
+          restore-keys: cargo-dev-v1-${{ matrix.os }}-${{ steps.rust-cache-key.outputs.compiler }}-
+
       - name: Check lints
         run: cargo +stable clippy --locked --workspace --all-targets -- -D warnings
 
@@ -71,6 +89,14 @@ jobs:
             }
             Remove-Item -LiteralPath $scratch.FullName -Recurse -Force
           }
+
+      # Publish the successful dev build before cleaning it. PRs can restore the default branch's cache.
+      - name: Save Cargo development cache
+        if: github.event_name == 'push' && (github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || github.ref == 'refs/heads/ci/cargo-cache') && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: *cargo-cache-paths
+          key: ${{ steps.cargo-cache.outputs.cache-primary-key }}
 
       - name: Remove development build before release build
         run: cargo +stable clean --profile dev
