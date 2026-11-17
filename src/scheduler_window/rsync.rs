@@ -1942,7 +1942,7 @@ mod tests {
         let root = profile.0.canonicalize().unwrap();
         let parent = Directory::open_path(&root).unwrap();
         let protected = OsStr::new("protected");
-        let directory = local_tree::create_reviewed_tree_stage(&parent, protected).unwrap();
+        drop(local_tree::create_reviewed_tree_stage(&parent, protected).unwrap());
         let root = root.join(protected);
         let program = root.join("rsync");
         let destination = root.join("report.txt");
@@ -1985,10 +1985,12 @@ mod tests {
             approval.vacant_file_download.as_ref().unwrap().destination,
             destination
         );
+        let directory = Directory::open_path(&root).unwrap();
         local_tree::create_reviewed_tree_file(&directory, destination.file_name().unwrap())
             .unwrap()
             .write_all(b"unreviewed receiver")
             .unwrap();
+        drop(directory);
         assert!(make_review(request().primary).is_err());
 
         let mut one_use = transfer.clone();

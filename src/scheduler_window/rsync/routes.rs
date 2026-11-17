@@ -910,20 +910,22 @@ mod tests {
         let root = profile.0.canonicalize().unwrap();
         let parent = local_tree::Directory::open_path(&root).unwrap();
         let protected = OsStr::new("protected");
-        let directory = local_tree::create_reviewed_tree_stage(&parent, protected).unwrap();
+        drop(local_tree::create_reviewed_tree_stage(&parent, protected).unwrap());
         let root = root.join(protected);
         let first_path = root.join("first-report.txt");
         let second_path = root.join("second-report.txt");
         let vacancy = VacantLocalFileReceiver::inspect(&first_path, &|| false).unwrap();
+        let directory = local_tree::Directory::open_path(&root).unwrap();
         local_tree::create_reviewed_tree_file(&directory, first_path.file_name().unwrap())
             .unwrap()
             .write_all(b"first report")
             .unwrap();
-        let formerly_vacant = ReviewedFileReceiver::inspect(&first_path, &|| false).unwrap();
         local_tree::create_reviewed_tree_file(&directory, second_path.file_name().unwrap())
             .unwrap()
             .write_all(b"second report")
             .unwrap();
+        drop(directory);
+        let formerly_vacant = ReviewedFileReceiver::inspect(&first_path, &|| false).unwrap();
         let existing = ReviewedFileReceiver::inspect(&second_path, &|| false).unwrap();
         let program = root.join("rsync");
         let source = "/site/report.txt";
