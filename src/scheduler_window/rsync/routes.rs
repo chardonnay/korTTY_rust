@@ -902,6 +902,7 @@ mod tests {
     #[test]
     fn grouped_recurring_file_downloads_bind_distinct_vacant_and_existing_slots() {
         use std::ffi::OsStr;
+        use std::io::Write;
 
         use crate::sftp_window::{ReviewedFileReceiver, VacantLocalFileReceiver, local_tree};
 
@@ -909,14 +910,20 @@ mod tests {
         let root = profile.0.canonicalize().unwrap();
         let parent = local_tree::Directory::open_path(&root).unwrap();
         let protected = OsStr::new("protected");
-        drop(local_tree::create_reviewed_tree_stage(&parent, protected).unwrap());
+        let directory = local_tree::create_reviewed_tree_stage(&parent, protected).unwrap();
         let root = root.join(protected);
         let first_path = root.join("first-report.txt");
         let second_path = root.join("second-report.txt");
         let vacancy = VacantLocalFileReceiver::inspect(&first_path, &|| false).unwrap();
-        std::fs::write(&first_path, b"first report").unwrap();
+        local_tree::create_reviewed_tree_file(&directory, first_path.file_name().unwrap())
+            .unwrap()
+            .write_all(b"first report")
+            .unwrap();
         let formerly_vacant = ReviewedFileReceiver::inspect(&first_path, &|| false).unwrap();
-        std::fs::write(&second_path, b"second report").unwrap();
+        local_tree::create_reviewed_tree_file(&directory, second_path.file_name().unwrap())
+            .unwrap()
+            .write_all(b"second report")
+            .unwrap();
         let existing = ReviewedFileReceiver::inspect(&second_path, &|| false).unwrap();
         let program = root.join("rsync");
         let source = "/site/report.txt";

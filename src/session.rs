@@ -468,7 +468,7 @@ impl WriteReply {
 }
 
 enum StreamTransport {
-    Pty(Pty),
+    Pty(Box<Pty>),
     Ssh(crate::ssh_connection::Connected),
     Serial {
         port: Arc<SerialPort>,
@@ -2100,7 +2100,7 @@ impl StreamTransport {
                 let writer = pty
                     .take_writer()
                     .ok_or_else(|| io::Error::other("PTY input handle missing"))?;
-                Ok((Self::Pty(pty), Box::new(reader), Box::new(writer)))
+                Ok((Self::Pty(Box::new(pty)), Box::new(reader), Box::new(writer)))
             }
             StreamSource::Ssh(Some(mut ssh), _) => {
                 let reader = ssh

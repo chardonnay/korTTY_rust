@@ -1931,6 +1931,7 @@ mod tests {
     #[test]
     fn recurring_rsync_file_review_binds_exact_paths_and_receivers() {
         use std::ffi::OsStr;
+        use std::io::Write;
 
         use kortty_ssh::{Endpoint, HostKey, TrustStore};
         use serde_json::json;
@@ -1941,7 +1942,7 @@ mod tests {
         let root = profile.0.canonicalize().unwrap();
         let parent = Directory::open_path(&root).unwrap();
         let protected = OsStr::new("protected");
-        drop(local_tree::create_reviewed_tree_stage(&parent, protected).unwrap());
+        let directory = local_tree::create_reviewed_tree_stage(&parent, protected).unwrap();
         let root = root.join(protected);
         let program = root.join("rsync");
         let destination = root.join("report.txt");
@@ -1984,7 +1985,10 @@ mod tests {
             approval.vacant_file_download.as_ref().unwrap().destination,
             destination
         );
-        std::fs::write(&destination, b"unreviewed receiver").unwrap();
+        local_tree::create_reviewed_tree_file(&directory, destination.file_name().unwrap())
+            .unwrap()
+            .write_all(b"unreviewed receiver")
+            .unwrap();
         assert!(make_review(request().primary).is_err());
 
         let mut one_use = transfer.clone();
