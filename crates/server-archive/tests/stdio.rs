@@ -43,6 +43,7 @@ fn stdio_creates_private_archive_after_review_and_preserves_late_collisions() {
             format,
             level,
             excludes: vec!["*.log".into()],
+            member_layout: Default::default(),
             output: None,
             report_payload: false,
         };
@@ -134,6 +135,7 @@ fn stdio_binds_archive_output_metadata_to_review_and_applies_it_before_publicati
         format: CreateFormat::Zip,
         level: 6,
         excludes: Vec::new(),
+        member_layout: Default::default(),
         output: Some(OutputMetadata { uid, gid, mode }),
         report_payload: false,
     };
@@ -207,6 +209,7 @@ fn stdio_returns_a_bounded_digest_receipt_for_the_exact_published_archive() {
         format: CreateFormat::Zip,
         level: 6,
         excludes: Vec::new(),
+        member_layout: Default::default(),
         output: None,
         report_payload: false,
     };
@@ -268,6 +271,7 @@ fn stdio_password_zip_requires_a_separate_commit_and_encrypts_the_exact_payload(
         format: CreateFormat::ZipPassword,
         level: 6,
         excludes: Vec::new(),
+        member_layout: Default::default(),
         output: None,
         report_payload: true,
     };

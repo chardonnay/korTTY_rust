@@ -3,6 +3,7 @@
 use std::cell::Cell;
 use std::fs::File;
 use std::io::{self, Read, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -19,10 +20,90 @@ use zeroize::Zeroizing;
 use crate::ssh_connection::ExecOpener;
 use crate::ssh_worker;
 
+mod archive_update;
+pub(crate) mod file_replace;
+pub(crate) use archive_update::{
+    ArchiveUpdateFailure, exchange_archive_update, exchange_privileged_archive_update,
+};
+
 const POLL: Duration = Duration::from_millis(25);
 const MAX_DIAGNOSTICS: usize = 8 * 1024;
 const COPY_POLICY_POLL: Duration = Duration::from_millis(250);
 const SUDO_TIMEOUT: Duration = Duration::from_secs(30);
+pub(in crate::sftp_window) const DECISION_TIMEOUT: Duration = Duration::from_secs(60);
+
+pub(in crate::sftp_window) type Permit = Arc<dyn Fn() -> bool + Send + Sync>;
+
+pub(in crate::sftp_window) struct FixedHelper {
+    lease: ExecLease,
+    stdout: SshReader,
+    input: SshWriter,
+}
+
+impl FixedHelper {
+    pub(in crate::sftp_window) fn open(
+        opener: &DirectExecOpener,
+        argument: &'static str,
+        ready: &'static [u8],
+        password: Option<SensitiveLine>,
+        permitted: Permit,
+    ) -> io::Result<Self> {
+        if opener.verified_host_key().is_none() {
+            return Err(invalid_output());
+        }
+        let received_greeting = password.is_some();
+        let (lease, stdout, input) = open_privileged_helper(
+            opener,
+            (argument, argument),
+            ready,
+            false,
+            password,
+            permitted.clone(),
+        )?;
+        let mut helper = Self {
+            lease,
+            stdout,
+            input,
+        };
+        if !received_greeting {
+            let mut greeting = vec![0; ready.len()];
+            helper.reader(&|| !permitted()).read_exact(&mut greeting)?;
+            if greeting != ready {
+                return Err(invalid_output());
+            }
+        }
+        Ok(helper)
+    }
+
+    pub(in crate::sftp_window) fn write(
+        &mut self,
+        bytes: &[u8],
+        permitted: Permit,
+    ) -> io::Result<()> {
+        submit(&mut self.input, bytes, permitted)
+    }
+
+    pub(in crate::sftp_window) fn reader<'a>(
+        &'a mut self,
+        stopped: &'a impl Fn() -> bool,
+    ) -> impl Read + 'a {
+        PrivilegedReader {
+            stdout: &mut self.stdout,
+            stopped,
+        }
+    }
+
+    pub(in crate::sftp_window) fn finish(&mut self, stopped: &impl Fn() -> bool) -> io::Result<()> {
+        require_privileged_eof(
+            &mut PrivilegedReader {
+                stdout: &mut self.stdout,
+                stopped,
+            },
+            || self.lease.exit_code(),
+            stopped,
+        )
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PrivilegedArchiveFailure {
@@ -52,14 +133,12 @@ pub(crate) fn exchange_privileged(
         .map(protocol::creation_password_body)
         .transpose()
         .map_err(|_| BeforeCommit)?;
-    let challenge = if sudo_password.is_some() {
-        let mut nonce = [0; 16];
-        getrandom::fill(&mut nonce).map_err(|_| BeforeCommit)?;
-        Some(marker(nonce))
-    } else {
-        None
-    };
-    let command = privileged_command(challenge.as_deref());
+    let challenge = sudo_prompt(sudo_password.as_ref()).map_err(|_| BeforeCommit)?;
+    let command = privileged_command(
+        challenge.as_deref(),
+        protocol::PRIVILEGED_ARGUMENT,
+        protocol::PRIVILEGED_PASSWORD_ARGUMENT,
+    );
     let mut frame = Vec::new();
     protocol::write_privileged_request(
         &mut frame,
@@ -83,6 +162,7 @@ pub(crate) fn exchange_privileged(
             &mut stdout,
             line,
             challenge,
+            protocol::PRIVILEGED_PASSWORD_READY,
             stopped.clone(),
             authorize.clone(),
         )
@@ -209,16 +289,29 @@ pub(crate) fn exchange_privileged(
     Ok(())
 }
 
-fn privileged_command(challenge: Option<&str>) -> String {
+fn sudo_prompt(line: Option<&SensitiveLine>) -> io::Result<Option<String>> {
+    line.map(|_| {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).map_err(io::Error::other)?;
+        Ok(marker(nonce))
+    })
+    .transpose()
+}
+
+fn privileged_command(
+    challenge: Option<&str>,
+    passwordless_argument: &'static str,
+    password_argument: &'static str,
+) -> String {
     let mut command = String::from("exec /usr/bin/sudo -k ");
     let argument = if let Some(challenge) = challenge {
         command.push_str("-S -p ");
         crate::scheduler_window::script::shell_quote(&mut command, challenge);
         command.push(' ');
-        protocol::PRIVILEGED_PASSWORD_ARGUMENT
+        password_argument
     } else {
         command.push_str("-n ");
-        protocol::PRIVILEGED_ARGUMENT
+        passwordless_argument
     };
     command.push_str("-u root -- ");
     command.push_str(protocol::PRIVILEGED_PATH);
@@ -227,11 +320,66 @@ fn privileged_command(challenge: Option<&str>) -> String {
     command
 }
 
+fn open(
+    opener: &DirectExecOpener,
+    command: &str,
+    sensitive: bool,
+    permitted: Permit,
+) -> io::Result<ExecLease> {
+    let denied = move || !permitted();
+    if sensitive {
+        opener.open_sensitive_cancellable(command, denied)
+    } else {
+        opener.open_cancellable(command, denied)
+    }
+    .map_err(io::Error::other)
+}
+
+fn take_io(mut lease: ExecLease) -> io::Result<(ExecLease, SshReader, SshWriter)> {
+    drop(lease.take_stderr());
+    let stdout = lease.take_reader().ok_or_else(closed)?;
+    let input = lease.take_writer().ok_or_else(closed)?;
+    Ok((lease, stdout, input))
+}
+
+fn open_privileged_helper(
+    opener: &DirectExecOpener,
+    arguments: (&'static str, &'static str),
+    greeting: &'static [u8],
+    sensitive_input: bool,
+    sudo_password: Option<SensitiveLine>,
+    permitted: Permit,
+) -> io::Result<(ExecLease, SshReader, SshWriter)> {
+    let challenge = sudo_prompt(sudo_password.as_ref())?;
+    let command = privileged_command(challenge.as_deref(), arguments.0, arguments.1);
+    let mut lease = open(
+        opener,
+        &command,
+        sensitive_input || sudo_password.is_some(),
+        permitted.clone(),
+    )?;
+    if let Some((line, challenge)) = sudo_password.zip(challenge.as_deref()) {
+        let mut stdout = lease.take_reader().ok_or_else(closed)?;
+        let input = authenticate_privileged(
+            &mut lease,
+            &mut stdout,
+            line,
+            challenge,
+            greeting,
+            move || !permitted(),
+            || Ok(()),
+        )?;
+        return Ok((lease, stdout, input));
+    }
+    take_io(lease)
+}
+
 fn authenticate_privileged(
     lease: &mut ExecLease,
     stdout: &mut SshReader,
     line: SensitiveLine,
     challenge: &str,
+    expected: &'static [u8],
     stopped: impl Fn() -> bool + Clone + Send + Sync + 'static,
     authorize: impl Fn() -> io::Result<()> + Clone + Send + Sync + 'static,
 ) -> io::Result<SshWriter> {
@@ -243,8 +391,7 @@ fn authenticate_privileged(
     let mut prompt = Prompt::new(challenge);
     let mut diagnostics = Zeroizing::new([0; MAX_DIAGNOSTICS]);
     let mut diagnostic_bytes = 0;
-    let expected = protocol::PRIVILEGED_PASSWORD_READY;
-    let mut greeting = [0; protocol::PRIVILEGED_PASSWORD_READY.len()];
+    let mut greeting = Zeroizing::new(vec![0; expected.len()]);
     let mut offset = 0;
     while offset < greeting.len() {
         running(&stopped)?;
@@ -607,6 +754,18 @@ fn send<T>(
         watchdog.join().map_err(|_| closed())?;
         result
     })
+}
+
+fn submit(input: &mut SshWriter, mut frame: &[u8], permitted: Permit) -> io::Result<()> {
+    while !frame.is_empty() {
+        match input.write_guarded_nonblocking(frame, permitted.clone()) {
+            Ok(0) => return Err(invalid_output()),
+            Ok(sent) => frame = &frame[sent..],
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => thread::sleep(POLL),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(())
 }
 
 fn read_direct(

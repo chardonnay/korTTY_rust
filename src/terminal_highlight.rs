@@ -2,6 +2,11 @@
 
 mod interchange;
 mod network;
+pub(crate) use interchange::{
+    BackupImport as JavaBackupImport, BackupMerge as JavaBackupMerge,
+    merge_backup as merge_java_backup, read_backup as read_java_backup,
+    resolve_backup_set as resolve_java_backup_set, validate_backup as validate_java_backup,
+};
 pub(crate) use interchange::{decode_interchange, encode_java};
 
 use std::collections::{HashSet, VecDeque};
@@ -11,7 +16,6 @@ use std::ops::Range;
 use std::path::Path;
 
 use kortty_terminal::{Cell, Color, OutputSnapshot, ScreenSnapshot, Style};
-use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 use crate::private_files::Directory;
@@ -64,6 +68,8 @@ pub(crate) struct Rule {
     pub(crate) pattern: String,
     pub(crate) enabled: bool,
     pub(crate) regex: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) java_regex: bool,
     pub(crate) ignore_case: bool,
     pub(crate) whole_word: bool,
     pub(crate) whole_line: bool,
@@ -84,6 +90,7 @@ impl Default for Rule {
             pattern: String::new(),
             enabled: true,
             regex: false,
+            java_regex: false,
             ignore_case: true,
             whole_word: false,
             whole_line: false,
@@ -117,18 +124,19 @@ pub(crate) struct CompiledSet {
 struct CompiledRule {
     rule: Rule,
     matcher: Matcher,
+    check_whole_word: bool,
     foreground: Option<Color>,
     background: Option<Color>,
 }
 
 #[derive(Clone, Debug)]
 enum Matcher {
-    Regex(Regex),
+    Regex(crate::java_pattern::Pattern),
     Network(network::Kind),
 }
 
 enum Matches<'r, 't> {
-    Regex(regex::Matches<'r, 't>),
+    Regex(crate::java_pattern::Matches<'r, 't>),
     Network(network::Matches<'t>),
 }
 
@@ -137,7 +145,7 @@ impl Iterator for Matches<'_, '_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Regex(matches) => matches.next().map(|found| found.range()),
+            Self::Regex(matches) => matches.next(),
             Self::Network(matches) => matches.next(),
         }
     }
@@ -146,7 +154,7 @@ impl Iterator for Matches<'_, '_> {
 impl Matcher {
     fn find_iter<'r, 't>(&'r self, text: &'t str) -> Matches<'r, 't> {
         match self {
-            Self::Regex(matcher) => Matches::Regex(matcher.find_iter(text)),
+            Self::Regex(pattern) => Matches::Regex(pattern.find_iter(text)),
             Self::Network(kind) => Matches::Network(kind.find_iter(text)),
         }
     }
@@ -244,22 +252,48 @@ impl CompiledRule {
                 "A rule needs a pattern of at most 512 characters and a short name.",
             ));
         }
+        let mut check_whole_word = rule.whole_word;
         let matcher = if rule.regex
             && let Some(kind) = network::Kind::pinned(&rule.pattern)
         {
             Matcher::Network(kind)
         } else {
-            let expression = if rule.regex {
-                rule.pattern.clone()
+            let matcher = if rule.java_regex {
+                let body = if rule.regex {
+                    std::borrow::Cow::Borrowed(rule.pattern.as_str())
+                } else {
+                    std::borrow::Cow::Owned(format!(
+                        r"\Q{}\E",
+                        rule.pattern.replace(r"\E", r"\E\\E\Q")
+                    ))
+                };
+                if rule.whole_word {
+                    // Put the assertions inside the expression so the matcher
+                    // can retry another alternative at the same position.
+                    check_whole_word = false;
+                    crate::java_pattern::Pattern::java_whole_word(
+                        &body,
+                        rule.ignore_case,
+                        256 * 1024,
+                    )
+                } else {
+                    crate::java_pattern::Pattern::java(&body, rule.ignore_case, 256 * 1024, 64)
+                }
             } else {
-                regex::escape(&rule.pattern)
-            };
-            let matcher = RegexBuilder::new(&expression)
-                .case_insensitive(rule.ignore_case)
-                .size_limit(256 * 1024)
-                .dfa_size_limit(256 * 1024)
-                .build()
-                .map_err(|error| invalid(format!("Invalid bounded regular expression: {error}")))?;
+                let expression = if rule.regex {
+                    rule.pattern.clone()
+                } else {
+                    regex::escape(&rule.pattern)
+                };
+                crate::java_pattern::Pattern::linear(
+                    &expression,
+                    rule.ignore_case,
+                    false,
+                    256 * 1024,
+                    250,
+                )
+            }
+            .map_err(|error| invalid(format!("Invalid bounded regular expression: {error}")))?;
             if matcher.is_match("") {
                 return Err(invalid("A rule must not match empty text."));
             }
@@ -273,6 +307,7 @@ impl CompiledRule {
         Ok(Self {
             rule: rule.clone(),
             matcher,
+            check_whole_word,
             foreground: color(rule.foreground.as_deref())?,
             background: color(rule.background.as_deref())?,
         })
@@ -477,6 +512,33 @@ fn append_output_row(text: &mut String, cells: &[Cell], wrapped: Option<usize>) 
 }
 
 impl CompiledSet {
+    pub(crate) fn presentation_ranges<'a>(
+        &'a self,
+        line: &'a str,
+    ) -> impl Iterator<Item = (Range<usize>, Style)> + 'a {
+        self.rules
+            .iter()
+            .filter(|rule| rule.rule.enabled && rule.paints())
+            .flat_map(move |rule| {
+                let mut style = Style::default();
+                rule.style(&mut style);
+                rule.matcher
+                    .find_iter(line)
+                    .filter(|range| !range.is_empty())
+                    .take(if rule.rule.whole_line { 1 } else { usize::MAX })
+                    .map(move |range| {
+                        (
+                            if rule.rule.whole_line {
+                                0..line.len()
+                            } else {
+                                range
+                            },
+                            style,
+                        )
+                    })
+            })
+    }
+
     /// Matches retained live output on the worker, using stable absolute history coordinates.
     pub(crate) fn scan_output(
         &self,
@@ -546,7 +608,7 @@ impl CompiledSet {
                 .filter(|(_, rule)| rule.rule.enabled)
             {
                 let found = rule.matcher.find_iter(&text).take(MAX_HITS).find(|found| {
-                    !rule.rule.whole_word
+                    !rule.check_whole_word
                         || !(text[..found.start].chars().next_back().is_some_and(word)
                             || text[found.end..].chars().next().is_some_and(word))
                 });
@@ -647,7 +709,7 @@ impl CompiledSet {
             {
                 let mut signature = None;
                 for found in rule.matcher.find_iter(&text).take(matches_left) {
-                    if rule.rule.whole_word
+                    if rule.check_whole_word
                         && (text[..found.start].chars().next_back().is_some_and(word)
                             || text[found.end..].chars().next().is_some_and(word))
                     {

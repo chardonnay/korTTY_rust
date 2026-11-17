@@ -180,14 +180,11 @@ fn parse_chat_path(path: &str, native: bool) -> Option<Option<String>> {
     let full_path = if !native && has_path_suffix(trimmed, "/v1") {
         format!("{trimmed}/chat/completions")
     } else if !path.ends_with("//")
-        && has_path_suffix(
-            trimmed,
-            if native {
-                "/api/v1/chat"
-            } else {
-                "/chat/completions"
-            },
-        )
+        && if native {
+            has_path_suffix(trimmed, "/api/v1/chat")
+        } else {
+            super::providers::is_openai_chat_path(trimmed)
+        }
     {
         full_path
     } else {

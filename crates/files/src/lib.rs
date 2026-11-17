@@ -7,6 +7,20 @@ mod spooled_input;
 
 pub use spooled_input::with_spooled_input;
 
+/// Name comparison rules obtained from the filesystem of an open directory.
+pub enum DirectoryNameRules {
+    Literal,
+    Normalized,
+    Folded,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[allow(unsafe_code)]
+mod unix_names;
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub use unix_names::directory_name_rules;
+
 #[cfg(unix)]
 #[allow(unsafe_code)]
 pub mod unix_accounts;

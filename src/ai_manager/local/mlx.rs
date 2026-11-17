@@ -382,7 +382,7 @@ impl State {
             }),
             field("Absolute path to mlx-runtime-index-v1.json", &self.paths[0], Field::Index),
             field("Absolute path to the detached signature", &self.paths[1], Field::Signature),
-            field("Absolute path to the signed MLX package ZIP (optional for catalog review)", &self.paths[2], Field::Archive),
+            field("Absolute path to the signed MLX package ZIP or TAR.ZST (optional for catalog review)", &self.paths[2], Field::Archive),
             row![
                 action("Refresh MLX", Action::Refresh, editing),
                 action("Review signed runtime…", Action::ReviewRuntime, can_request && self.runtime_paths_ready()),

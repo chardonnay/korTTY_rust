@@ -39,7 +39,10 @@ fn changed_copies_bind_direction_and_separate_one_use_and_standing_authority() {
     copy.replace_changed = true;
     let download = copy.scope(&connection, None).unwrap();
     assert_ne!(download, missing);
-    assert!(copy.validate_replacement(true).is_err());
+    let protected_download = copy
+        .privileged_scope(&connection, None, SudoMode::Vault)
+        .unwrap();
+    assert_ne!(protected_download, download);
     copy.standing = Some(standing::Settings::default());
     let action: SshCommand =
         serde_json::from_value(serde_json::json!({ "command": "true" })).unwrap();
@@ -52,6 +55,11 @@ fn changed_copies_bind_direction_and_separate_one_use_and_standing_authority() {
         .unwrap();
     assert_ne!(standing_download, download);
     copy.replace_changed = false;
+    assert_ne!(
+        protected_download,
+        copy.privileged_scope(&connection, None, SudoMode::Vault)
+            .unwrap()
+    );
     assert_ne!(
         standing_download,
         copy.standing_scope(&job, &connection, &TimeZone::UTC)
@@ -66,8 +74,17 @@ fn changed_copies_bind_direction_and_separate_one_use_and_standing_authority() {
         copy.standing_scope(&job, &connection, &TimeZone::UTC)
             .unwrap()
     );
-    assert!(copy.validate_replacement(true).is_err());
+    let protected_upload = copy
+        .privileged_scope(&connection, None, SudoMode::Vault)
+        .unwrap();
+    assert_ne!(protected_upload, protected_download);
+    assert_ne!(protected_upload, upload);
     copy.replace_changed = false;
+    assert_ne!(
+        protected_upload,
+        copy.privileged_scope(&connection, None, SudoMode::Vault)
+            .unwrap()
+    );
     assert_ne!(upload, copy.scope(&connection, None).unwrap());
 }
 
@@ -250,8 +267,9 @@ fn historical_standing_download_approval_requires_new_review_after_reopening() {
         epoch: [1; 16],
         run: serde_json::from_value(serde_json::json!(1)).unwrap(),
     };
+    let admission = standing::calendar_admission(&id, firing, SystemTime::now());
     reopened
-        .claim_standing(&id, &loaded, firing, 1, 5, &|| false)
+        .claim_standing(&id, &loaded, &admission, 1, 5, &|| false)
         .unwrap();
     reopened
         .require_standing_claimed(&id, &fresh, firing, SystemTime::now())

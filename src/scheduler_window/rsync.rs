@@ -9,10 +9,12 @@ use std::sync::{
 use iced::widget::{button, column, row, scrollable, text};
 use iced::{Element, Length, Task};
 use kortty_server_archive::privileged_rsync::{Review as PrivilegedReview, Spec as PrivilegedSpec};
-use kortty_server_archive::rsync_tree::{ExistingTree, Inventory};
+use kortty_server_archive::rsync_tree::{DeleteScope, ExistingTree, Inventory, RecurringReceiver};
 use serde::{Deserialize, Serialize};
 
-use crate::job_executor::rsync::LocalExistingSnapshot;
+use crate::job_executor::rsync::{
+    LocalExistingSnapshot, RecurringReceiverTarget, VacantFileProof, VacantLocalTreeSnapshot,
+};
 
 use super::{ConnectionRef, Message, Page, RemotePath, SchedulerView};
 
@@ -44,6 +46,14 @@ pub(crate) struct Transfer {
     pub(crate) existing: Option<ExistingDestination>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) existing_download: Option<ExistingDestination>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) allow_vacant_directory_download: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) allow_vacant_file_download: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) allow_vacant_server_file_upload: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) allow_vacant_server_tree_upload: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mixed: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -117,9 +127,24 @@ pub(crate) struct LocalExistingReview {
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct LocalVacantDirectoryReview {
+    pub(crate) destination: PathBuf,
+    pub(crate) snapshot: VacantLocalTreeSnapshot,
+    pub(crate) settings: ExistingDestination,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct LocalExistingFileReview {
     pub(crate) destination: PathBuf,
     pub(crate) snapshot: crate::sftp_window::LocalFileSnapshot,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LocalVacantFileReview {
+    pub(crate) destination: PathBuf,
+    pub(crate) snapshot: VacantFileProof,
 }
 
 pub(super) const LOCAL_EXISTING_SUPPORTED: bool =
@@ -143,7 +168,11 @@ pub struct Approval {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) existing_download: Option<Box<LocalExistingReview>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vacant_directory_download: Option<Box<LocalVacantDirectoryReview>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) existing_file_download: Option<Box<LocalExistingFileReview>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vacant_file_download: Option<Box<LocalVacantFileReview>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) mixed: Option<Box<MixedReview>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -152,9 +181,62 @@ pub struct Approval {
     pub(crate) download: Option<Box<DirectoryReview>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) privileged: Option<Box<PrivilegedReview>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ordinary_receiver: Option<OrdinaryReceiverReview>,
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OrdinaryReceiverReview {
+    pub(crate) destination: RemotePath,
+    pub(crate) directory: bool,
+    pub(crate) settings: ExistingDestination,
+    pub(crate) receiver: RecurringReceiver,
 }
 
 impl Approval {
+    fn first_server_file_upload(&self) -> bool {
+        self.privileged
+            .as_ref()
+            .is_some_and(|review| review.first_file)
+    }
+
+    fn first_server_tree_upload(&self) -> bool {
+        self.privileged
+            .as_ref()
+            .is_some_and(|review| review.first_tree)
+    }
+
+    fn existing_upload_scope(&self) -> Option<(ExistingDestination, &str)> {
+        if let Some(review) = &self.ordinary_receiver {
+            return Some((review.settings, review.destination.as_str()));
+        }
+        if let Some(review) = &self.existing {
+            return Some((review.settings, review.destination.as_str()));
+        }
+        if self.first_server_file_upload() {
+            let review = self.upload.as_ref()?;
+            return Some((ExistingDestination::FILE, review.destination.as_str()));
+        }
+        let proof = self.privileged.as_ref().filter(|proof| proof.first_tree)?;
+        let review = self.directory_upload.as_ref()?;
+        let kortty_server_archive::privileged_rsync::Operation::Upload { delete, .. } =
+            &proof.spec.operation
+        else {
+            return None;
+        };
+        let settings = ExistingDestination {
+            delete: match delete {
+                DeleteScope::Retain => false,
+                DeleteScope::All => true,
+                DeleteScope::Named(_) => return None,
+            },
+            include_source_name: review.destination.as_str() != proof.spec.path,
+        };
+        let mapped = mapped_receiver(&review.destination, &review.source, settings).ok()?;
+        (mapped.as_str() == proof.spec.path).then_some((settings, proof.spec.path.as_str()))
+    }
+
     fn same_existing_source(&self, other: &Self) -> bool {
         if let Some(mixed) = &self.mixed
             && matches!(mixed.receiver, MixedReceiver::Server { .. })
@@ -164,14 +246,18 @@ impl Approval {
                 .as_ref()
                 .is_some_and(|other| mixed.plan == other.plan);
         }
-        if let Some(upload) = self.upload.as_ref().filter(|_| self.privileged.is_some()) {
+        if let Some(upload) = self
+            .upload
+            .as_ref()
+            .filter(|_| self.privileged.is_some() || self.ordinary_receiver.is_some())
+        {
             return other.upload.as_ref().is_some_and(|candidate| {
                 candidate.source == upload.source
                     && candidate.bytes == upload.bytes
                     && candidate.digest == upload.digest
             });
         }
-        (self.existing.is_none() && self.privileged.is_none())
+        (self.existing.is_none() && self.privileged.is_none() && self.ordinary_receiver.is_none())
             || self
                 .directory_upload
                 .as_ref()
@@ -208,16 +294,28 @@ impl Approval {
                 || self.directory_upload.is_some()
                 || self.existing.is_some()
                 || self.existing_download.is_some()
+                || self.vacant_directory_download.is_some()
                 || self.existing_file_download.is_some()
+                || self.vacant_file_download.is_some()
                 || self.batch.is_some()
                 || self.download.is_some()
                 || self.privileged.is_some()
+                || self.ordinary_receiver.is_some()
                 || !mixed.valid()
             {
                 return Err("The reviewed mixed rsync approval is invalid.");
             }
-            if let MixedReceiver::Local { destination, .. } = &mixed.receiver {
-                require_program_outside_receiver(&self.program, destination)?;
+            if let MixedReceiver::Local {
+                destination,
+                vacant,
+                ..
+            } = &mixed.receiver
+            {
+                let scope = match vacant.as_deref() {
+                    Some(snapshot) => reviewed_vacant_tree_scope(destination, snapshot)?,
+                    None => destination,
+                };
+                require_program_outside_receiver(&self.program, scope)?;
             }
             return Ok(());
         }
@@ -227,9 +325,12 @@ impl Approval {
                 || self.directory_upload.is_some()
                 || self.existing.is_some()
                 || self.existing_download.is_some()
+                || self.vacant_directory_download.is_some()
                 || self.existing_file_download.is_some()
+                || self.vacant_file_download.is_some()
                 || self.download.is_some()
                 || self.privileged.is_some()
+                || self.ordinary_receiver.is_some()
             {
                 return Err("An rsync batch approval cannot authorize a separate transfer.");
             }
@@ -288,6 +389,27 @@ impl Approval {
                 return Err("The reviewed existing rsync destination is invalid.");
             }
         }
+        if let Some(ordinary) = &self.ordinary_receiver {
+            let exact = if ordinary.directory {
+                self.directory_upload.as_ref().is_some_and(|upload| {
+                    mapped_receiver(&upload.destination, &upload.source, ordinary.settings)
+                        .is_ok_and(|destination| destination == ordinary.destination)
+                })
+            } else {
+                ordinary.settings == ExistingDestination::FILE
+                    && self
+                        .upload
+                        .as_ref()
+                        .is_some_and(|upload| upload.destination == ordinary.destination)
+            };
+            if !exact
+                || self.existing.is_some()
+                || self.privileged.is_some()
+                || !ordinary.receiver.valid(ordinary.directory)
+            {
+                return Err("The reviewed recurring server rsync destination is invalid.");
+            }
+        }
         if let Some(existing) = &self.existing_download
             && (self.directory.as_ref().is_none_or(|directory| {
                 mapped_local_receiver(&directory.destination, &directory.source, existing.settings)
@@ -303,6 +425,24 @@ impl Approval {
         if let Some(existing) = &self.existing_download {
             require_program_outside_receiver(&self.program, &existing.destination)?;
         }
+        if let Some(vacant) = &self.vacant_directory_download {
+            if self.directory.as_ref().is_none_or(|directory| {
+                mapped_local_receiver(&directory.destination, &directory.source, vacant.settings)
+                    .ok()
+                    .as_ref()
+                    != Some(&vacant.destination)
+            }) || !vacant.snapshot.valid()
+                || self.existing.is_some()
+                || self.existing_download.is_some()
+                || self.download.is_some()
+            {
+                return Err("The reviewed vacant local rsync directory is invalid.");
+            }
+            require_program_outside_receiver(
+                &self.program,
+                reviewed_vacant_tree_scope(&vacant.destination, &vacant.snapshot)?,
+            )?;
+        }
         if let Some(existing) = &self.existing_file_download {
             if self
                 .download
@@ -315,6 +455,24 @@ impl Approval {
                 return Err("The reviewed existing local rsync file is invalid.");
             }
             require_program_outside_receiver(&self.program, &existing.destination)?;
+        }
+        if let Some(vacant) = &self.vacant_file_download {
+            if self
+                .download
+                .as_ref()
+                .is_none_or(|review| review.destination != vacant.destination)
+                || self.existing.is_some()
+                || self.existing_download.is_some()
+                || self.existing_file_download.is_some()
+                || !vacant.snapshot.valid()
+            {
+                return Err("The reviewed vacant local rsync file path is invalid.");
+            }
+            let scope = vacant
+                .snapshot
+                .first_missing(&vacant.destination)
+                .ok_or("Review the exact vacant local rsync file path again.")?;
+            require_program_outside_receiver(&self.program, scope)?;
         }
         if let Some(download) = &self.download {
             super::remote::validate_local_path(&download.destination)?;
@@ -341,6 +499,31 @@ impl Transfer {
         self.existing.is_some() || self.existing_download.is_some()
     }
 
+    pub(crate) fn uses_ordinary_recurring_receiver(&self, upload: bool) -> bool {
+        upload
+            && !self.uses_passwordless_sudo()
+            && (self.allow_vacant_server_file_upload || self.allow_vacant_server_tree_upload)
+    }
+
+    pub(crate) fn uses_vacant_recurring_file_receiver(&self, upload: bool) -> bool {
+        self.standing.is_some() && self.uses_reviewed_file_creation(upload)
+    }
+
+    pub(crate) fn uses_reviewed_file_creation(&self, upload: bool) -> bool {
+        !upload
+            && !self.directory
+            && !self.uses_existing_destination()
+            && self.mixed.is_none()
+            && self.additional_sources.is_empty()
+            && (self.standing.is_some() || self.allow_vacant_file_download)
+    }
+
+    pub(crate) fn requires_reviewed_receiver(&self, upload: bool) -> bool {
+        self.uses_existing_destination()
+            || self.uses_reviewed_file_creation(upload)
+            || self.uses_passwordless_sudo()
+    }
+
     pub(crate) fn existing_destination(&self) -> Result<RemotePath, &'static str> {
         let settings = self
             .existing
@@ -356,20 +539,48 @@ impl Transfer {
     }
 
     pub(crate) fn require_safe_existing_local_program(&self) -> Result<(), &'static str> {
-        let present = self
+        let destination = self.existing_local_destination()?;
+        let scope = match self
             .approval
             .as_ref()
-            .and_then(|approval| approval.mixed.as_deref())
-            .is_none_or(|mixed| {
-                matches!(
-                    &mixed.receiver,
-                    MixedReceiver::Local {
-                        snapshot: Some(_),
-                        ..
-                    }
-                )
-            });
-        let destination = canonical_local_receiver(&self.existing_local_destination()?, present)?;
+            .and_then(|approval| approval.vacant_directory_download.as_deref())
+        {
+            Some(vacant) => reviewed_vacant_tree_scope(&destination, &vacant.snapshot)?,
+            None => &destination,
+        };
+        let present = self.approval.as_ref().is_none_or(|approval| {
+            approval.vacant_directory_download.is_none()
+                && approval.mixed.as_deref().is_none_or(|mixed| {
+                    matches!(
+                        &mixed.receiver,
+                        MixedReceiver::Local {
+                            snapshot: Some(_),
+                            ..
+                        }
+                    )
+                })
+        });
+        let destination = canonical_local_receiver(scope, present)?;
+        let program = self
+            .program
+            .canonicalize()
+            .map_err(|_| "The approved rsync executable changed or is unavailable.")?;
+        require_program_outside_receiver(&program, &destination)
+    }
+
+    pub(crate) fn require_safe_vacant_local_program(&self) -> Result<(), &'static str> {
+        let scope = match self
+            .approval
+            .as_ref()
+            .and_then(|approval| approval.vacant_file_download.as_deref())
+        {
+            Some(vacant) => vacant
+                .snapshot
+                .first_missing(&self.local)
+                .ok_or("Review the exact vacant local rsync file path again.")?,
+            None => &self.local,
+        };
+        let destination = canonical_local_receiver(scope, false)?;
         let program = self
             .program
             .canonicalize()
@@ -378,12 +589,24 @@ impl Transfer {
     }
 
     pub(crate) fn require_safe_mixed_local_program(&self) -> Result<(), &'static str> {
-        let destination = match self.local.canonicalize() {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                canonical_local_receiver(&self.local, false)?
+        let vacancy = self
+            .approval
+            .as_ref()
+            .and_then(|approval| approval.mixed.as_deref())
+            .and_then(|mixed| match &mixed.receiver {
+                MixedReceiver::Local { vacant, .. } => vacant.as_deref(),
+                MixedReceiver::Server { .. } => None,
+            });
+        let destination = if let Some(vacancy) = vacancy {
+            canonical_local_receiver(reviewed_vacant_tree_scope(&self.local, vacancy)?, false)?
+        } else {
+            match self.local.canonicalize() {
+                Ok(path) => path,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    canonical_local_receiver(&self.local, false)?
+                }
+                Err(_) => return Err("The local rsync destination changed or is unavailable."),
             }
-            Err(_) => return Err("The local rsync destination changed or is unavailable."),
         };
         let program = self
             .program
@@ -393,20 +616,73 @@ impl Transfer {
     }
 
     pub(crate) fn validate(&self, upload: bool) -> Result<(), &'static str> {
+        if self.allow_vacant_server_tree_upload
+            && (!upload
+                || !self.directory
+                || self.existing.is_none()
+                || self.existing_download.is_some()
+                || !self.additional_sources.is_empty()
+                || self.standing.is_none())
+        {
+            return Err("Creating a reviewed server folder requires a recurring upload.");
+        }
+        if self.allow_vacant_server_file_upload
+            && (!upload
+                || self.directory
+                || self.existing != Some(ExistingDestination::FILE)
+                || self.existing_download.is_some()
+                || self.mixed.is_some()
+                || !self.additional_sources.is_empty()
+                || self.standing.is_none())
+        {
+            return Err("Creating a reviewed server file requires a recurring file upload.");
+        }
+        if self.allow_vacant_directory_download
+            && (upload
+                || !self.directory
+                || !LOCAL_EXISTING_SUPPORTED
+                || self.existing_download.is_none()
+                || self.existing.is_some()
+                || !self.additional_sources.is_empty())
+        {
+            return Err(
+                "Creation at a reviewed vacant path requires a checked local directory download.",
+            );
+        }
+        let checked_file = self.uses_reviewed_file_creation(upload);
+        if self.allow_vacant_file_download && !checked_file {
+            return Err(
+                "Creation at a reviewed vacant file path requires one direct file download.",
+            );
+        }
+        if checked_file {
+            if !LOCAL_EXISTING_SUPPORTED {
+                return Err("Rsync to a reviewed file path is unavailable on this platform.");
+            }
+            require_program_outside_receiver(&self.program, &self.local)?;
+        }
         let privileged = (self.uses_passwordless_sudo() && self.mixed.is_none())
             .then(|| self.privileged_spec(upload))
             .transpose()?;
         if let Some(approval) = &self.approval
-            && !approval.matches_elevation(privileged.as_ref())
+            && (!approval.matches_elevation(privileged.as_ref())
+                || approval.first_server_file_upload() && !self.allow_vacant_server_file_upload
+                || approval.first_server_tree_upload() && !self.allow_vacant_server_tree_upload)
         {
             return Err(elevation::REVIEW_REQUIRED);
+        }
+        if let Some(approval) = &self.approval
+            && approval.ordinary_receiver.is_some()
+                != (self.mixed.is_none() && self.uses_ordinary_recurring_receiver(upload))
+        {
+            return Err("Review the exact recurring server rsync destination again.");
         }
         if let Some(config) = &self.standing {
             config
                 .settings
                 .validate()
                 .map_err(|_| "Choose valid limits for recurring rsync.")?;
-            if !(self.uses_existing_destination() || self.mixed.is_some())
+            if !(self.uses_existing_destination() || checked_file || self.mixed.is_some())
                 || self
                     .approval
                     .as_ref()
@@ -455,12 +731,10 @@ impl Transfer {
             if !upload
                 || !self.additional_sources.is_empty()
                 || !self.directory
-                    && !(self.uses_passwordless_sudo()
+                    && !((self.uses_passwordless_sudo() || self.allow_vacant_server_file_upload)
                         && self.existing == Some(ExistingDestination::FILE))
             {
-                return Err(
-                    "Choose one local source directory or one file with passwordless sudo.",
-                );
+                return Err("Choose one source directory or a reviewed server file upload.");
             }
             self.existing_destination()?;
         }
@@ -493,30 +767,60 @@ impl Transfer {
                 }
                 return Ok(());
             }
+            let reviewed_existing = approval
+                .existing_file_download
+                .as_ref()
+                .map(|review| &review.destination);
+            let reviewed_vacant = approval
+                .vacant_file_download
+                .as_ref()
+                .map(|review| &review.destination);
+            let file_receiver_matches = if checked_file {
+                reviewed_vacant == Some(&self.local)
+                    || self.standing.is_some() && reviewed_existing == Some(&self.local)
+            } else {
+                reviewed_vacant.is_none()
+                    && reviewed_existing
+                        == self
+                            .existing_download
+                            .filter(|_| !self.directory)
+                            .map(|_| &self.local)
+            };
+            let reviewed_directory = approval
+                .existing_download
+                .as_ref()
+                .map(|review| (&review.destination, review.settings))
+                .or_else(|| {
+                    approval
+                        .vacant_directory_download
+                        .as_ref()
+                        .map(|review| (&review.destination, review.settings))
+                });
             if (upload && !self.directory) != approval.upload.is_some()
                 || (!upload && self.directory) != approval.directory.is_some()
                 || (upload && self.directory) != approval.directory_upload.is_some()
                 || approval.batch.is_some()
-                || approval.existing.as_ref().map(|review| review.settings) != self.existing
-                || approval.existing.as_ref().is_some_and(|review| {
-                    self.existing_destination().ok().as_ref() != Some(&review.destination)
-                })
+                || ((checked_file || self.allow_vacant_directory_download)
+                    && approval.program != self.program)
                 || approval
-                    .existing_download
-                    .as_ref()
-                    .map(|review| review.settings)
+                    .existing_upload_scope()
+                    .map(|(settings, _)| settings)
+                    != self.existing
+                || approval
+                    .existing_upload_scope()
+                    .is_some_and(|(_, destination)| {
+                        !self
+                            .existing_destination()
+                            .is_ok_and(|mapped| mapped.as_str() == destination)
+                    })
+                || (!self.allow_vacant_directory_download
+                    && approval.vacant_directory_download.is_some())
+                || reviewed_directory.map(|(_, settings)| settings)
                     != self.existing_download.filter(|_| self.directory)
-                || approval.existing_download.as_ref().is_some_and(|review| {
-                    self.existing_local_destination().ok().as_ref() != Some(&review.destination)
+                || reviewed_directory.is_some_and(|(destination, _)| {
+                    self.existing_local_destination().ok().as_ref() != Some(destination)
                 })
-                || approval
-                    .existing_file_download
-                    .as_ref()
-                    .map(|review| &review.destination)
-                    != self
-                        .existing_download
-                        .filter(|_| !self.directory)
-                        .map(|_| &self.local)
+                || !file_receiver_matches
                 || approval.upload.as_ref().is_some_and(|review| {
                     review.source != self.local || review.destination != self.remote
                 })
@@ -612,6 +916,37 @@ fn canonical_local_receiver(destination: &Path, present: bool) -> Result<PathBuf
     Ok(parent.join(name))
 }
 
+fn reviewed_vacant_tree_scope<'a>(
+    destination: &'a Path,
+    snapshot: &VacantLocalTreeSnapshot,
+) -> Result<&'a Path, &'static str> {
+    snapshot
+        .first_missing(destination)
+        .ok_or("Review the exact missing local rsync directories again.")
+}
+
+fn parent_creation_detail(
+    destination: &Path,
+    snapshot: &VacantLocalTreeSnapshot,
+) -> Option<String> {
+    missing_parent_detail(
+        snapshot.missing_parent_count(),
+        snapshot.first_missing(destination),
+    )
+}
+
+fn missing_parent_detail(count: u8, first_missing: Option<&Path>) -> Option<String> {
+    if count == 0 {
+        return None;
+    }
+    let first_missing = first_missing?;
+    let folder = if count == 1 { "folder" } else { "folders" };
+    Some(format!(
+        "Creates {count} missing parent {folder} starting at {}.",
+        first_missing.display()
+    ))
+}
+
 fn local_scope_path(path: &Path) -> Result<PathBuf, &'static str> {
     let path = path
         .to_str()
@@ -647,18 +982,46 @@ pub(super) struct ReviewRequest {
     pub(super) directory_upload: Option<(PathBuf, RemotePath)>,
     pub(super) existing: Option<(ExistingDestination, RemotePath)>,
     pub(super) existing_download: Option<(ExistingDestination, PathBuf)>,
+    pub(super) allow_vacant_directory_download: bool,
+    pub(super) vacant_file_download: bool,
+    pub(super) allow_existing_file_download: bool,
+    pub(super) review_vacant_server_upload: bool,
     pub(super) mixed: Option<MixedReviewTarget>,
     pub(super) batch: Option<batch::Plan>,
     pub(super) download: Option<DirectoryReview>,
     pub(super) privileged: Option<PrivilegedSpec>,
 }
 
+pub(crate) enum UploadReceiverPreview<'a> {
+    ExistingDirectory(&'a RemotePath),
+    Recurring(RecurringReceiverTarget<'a>),
+}
+
+impl UploadReceiverPreview<'_> {
+    pub(crate) fn destination(&self) -> &RemotePath {
+        match self {
+            Self::ExistingDirectory(destination) => destination,
+            Self::Recurring(target) => target.destination,
+        }
+    }
+}
+
 impl ReviewRequest {
+    fn review_ordinary_receiver(&self) -> bool {
+        self.privileged.is_none() && self.review_vacant_server_upload && self.existing.is_some()
+    }
+
     pub(super) fn matches(&self, approval: &Approval, legacy_single: bool) -> bool {
+        let recurring_existing = self.vacant_file_download
+            && self.allow_existing_file_download
+            && approval.existing_file_download.is_some();
         approval.validate().is_ok()
             && self.program == approval.program
             && self.reference == approval.reference
             && approval.matches_elevation(self.privileged.as_ref())
+            && self.review_ordinary_receiver() == approval.ordinary_receiver.is_some()
+            && (self.review_vacant_server_upload
+                || !(approval.first_server_file_upload() || approval.first_server_tree_upload()))
             && match (&self.mixed, &approval.mixed) {
                 (Some(request), Some(review)) => request.matches(review),
                 (None, None) => true,
@@ -670,14 +1033,15 @@ impl ReviewRequest {
                 _ => false,
             }
             && self.directory.as_ref() == approval.directory.as_deref()
+            && (self.allow_vacant_directory_download
+                || approval.vacant_directory_download.is_none())
+            && (self.vacant_file_download && !recurring_existing)
+                == approval.vacant_file_download.is_some()
             && self
                 .existing
                 .as_ref()
-                .map(|(settings, path)| (settings, path))
-                == approval
-                    .existing
-                    .as_ref()
-                    .map(|review| (&review.settings, &review.destination))
+                .map(|(settings, path)| (*settings, path.as_str()))
+                == approval.existing_upload_scope()
             && self
                 .existing_download
                 .as_ref()
@@ -688,8 +1052,15 @@ impl ReviewRequest {
                     .map(|review| (&review.settings, &review.destination))
                     .or_else(|| {
                         approval
+                            .vacant_directory_download
+                            .as_ref()
+                            .map(|review| (&review.settings, &review.destination))
+                    })
+                    .or_else(|| {
+                        approval
                             .existing_file_download
                             .as_ref()
+                            .filter(|_| !recurring_existing)
                             .map(|review| (&ExistingDestination::FILE, &review.destination))
                     })
             && (self.download.as_ref() == approval.download.as_deref()
@@ -718,10 +1089,10 @@ fn review(
     digest: [u8; 32],
     inspect: &mut impl FnMut(
         &ConnectionRef,
-        &RemotePath,
+        UploadReceiverPreview<'_>,
         &kortty_ssh::TrustStore,
         &Arc<AtomicBool>,
-    ) -> Result<ExistingTree, String>,
+    ) -> Result<RecurringReceiver, String>,
     inspect_mixed: &mut impl FnMut(
         &MixedReviewTarget,
         &kortty_ssh::TrustStore,
@@ -730,16 +1101,19 @@ fn review(
     inspect_privileged: &mut impl FnMut(
         &ConnectionRef,
         &PrivilegedSpec,
+        bool,
         &kortty_ssh::TrustStore,
         &Arc<AtomicBool>,
     ) -> Result<PrivilegedReview, String>,
     cancelled: &Arc<AtomicBool>,
 ) -> Result<Approval, String> {
     require_review_running(cancelled)?;
+    let review_ordinary_receiver = request.review_ordinary_receiver();
     super::remote::validate_local_path(&request.program)?;
     let pins = super::sync::pins(&request.reference, trust).map_err(|error| error.to_string())?;
     if request.privileged.is_some()
         && request.existing_download.is_none()
+        && !request.vacant_file_download
         && let Some(paths) = request.directory.as_ref().or(request.download.as_ref())
     {
         match std::fs::symlink_metadata(&paths.destination) {
@@ -796,9 +1170,16 @@ fn review(
         .as_ref()
         .map(|spec| {
             require_review_running(cancelled)?;
-            let proof = inspect_privileged(&request.reference, spec, trust, cancelled)?;
+            let proof = inspect_privileged(
+                &request.reference,
+                spec,
+                request.review_vacant_server_upload,
+                trust,
+                cancelled,
+            )?;
             if !proof.valid()
                 || &proof.spec != spec
+                || (proof.first_file || proof.first_tree) && !request.review_vacant_server_upload
                 || super::sync::pins(&request.reference, trust)
                     .map_err(|error| error.to_string())?
                     != pins
@@ -811,14 +1192,43 @@ fn review(
             Ok(Box::new(proof))
         })
         .transpose()?;
-    let existing = request
+    let (existing, ordinary_receiver) = request
         .existing
+        .filter(|_| {
+            privileged
+                .as_ref()
+                .is_none_or(|proof| !(proof.first_file || proof.first_tree))
+        })
         .map(|(settings, destination)| {
             require_review_running(cancelled)?;
-            let snapshot = if let Some(proof) = &privileged {
-                elevation::existing_snapshot(proof).ok_or(elevation::REVIEW_REQUIRED)?
+            let receiver = if let Some(proof) = &privileged {
+                RecurringReceiver::Existing {
+                    snapshot: elevation::existing_snapshot(proof)
+                        .ok_or(elevation::REVIEW_REQUIRED)?,
+                }
+            } else if review_ordinary_receiver {
+                let delete = if settings.delete {
+                    DeleteScope::All
+                } else {
+                    DeleteScope::Retain
+                };
+                inspect(
+                    &request.reference,
+                    UploadReceiverPreview::Recurring(RecurringReceiverTarget {
+                        destination: &destination,
+                        directory: directory_upload.is_some(),
+                        delete: &delete,
+                    }),
+                    trust,
+                    cancelled,
+                )?
             } else {
-                inspect(&request.reference, &destination, trust, cancelled)?
+                inspect(
+                    &request.reference,
+                    UploadReceiverPreview::ExistingDirectory(&destination),
+                    trust,
+                    cancelled,
+                )?
             };
             if super::sync::pins(&request.reference, trust).map_err(|error| error.to_string())?
                 != pins
@@ -826,55 +1236,122 @@ fn review(
                 return Err("The saved SSH route or host keys changed during review.".to_owned());
             }
             require_review_running(cancelled)?;
-            Ok(Box::new(ExistingReview {
-                destination,
-                snapshot,
-                settings,
-            }))
+            if review_ordinary_receiver {
+                Ok((
+                    None,
+                    Some(OrdinaryReceiverReview {
+                        destination,
+                        directory: directory_upload.is_some(),
+                        settings,
+                        receiver,
+                    }),
+                ))
+            } else if let RecurringReceiver::Existing { snapshot } = receiver {
+                Ok((
+                    Some(Box::new(ExistingReview {
+                        destination,
+                        snapshot,
+                        settings,
+                    })),
+                    None,
+                ))
+            } else {
+                Err("The server rsync destination is unavailable for replacement.".to_owned())
+            }
         })
-        .transpose()?;
-    let existing_download = request
+        .transpose()?
+        .unwrap_or_default();
+    let (existing_download, vacant_directory_download) = request
         .existing_download
         .as_ref()
         .filter(|_| request.directory.is_some())
         .map(|(settings, destination)| {
             require_review_running(cancelled)?;
-            let snapshot =
-                crate::job_executor::rsync::review_local_existing(destination, cancelled)?;
+            let vacant = if request.allow_vacant_directory_download {
+                match std::fs::symlink_metadata(destination) {
+                    Ok(_) => false,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+                    Err(error) => return Err(error.to_string()),
+                }
+            } else {
+                false
+            };
+            let receiver = if vacant {
+                let snapshot =
+                    crate::job_executor::rsync::review_local_vacant_tree(destination, cancelled)?;
+                (
+                    None,
+                    Some(Box::new(LocalVacantDirectoryReview {
+                        destination: destination.clone(),
+                        snapshot,
+                        settings: *settings,
+                    })),
+                )
+            } else {
+                let snapshot =
+                    crate::job_executor::rsync::review_local_existing(destination, cancelled)?;
+                (
+                    Some(Box::new(LocalExistingReview {
+                        destination: destination.clone(),
+                        snapshot,
+                        settings: *settings,
+                    })),
+                    None,
+                )
+            };
             if super::sync::pins(&request.reference, trust).map_err(|error| error.to_string())?
                 != pins
             {
                 return Err("The saved SSH route or host keys changed during review.".to_owned());
             }
             require_review_running(cancelled)?;
-            Ok::<_, String>(Box::new(LocalExistingReview {
-                destination: destination.clone(),
-                snapshot,
-                settings: *settings,
-            }))
+            Ok(receiver)
         })
-        .transpose()?;
-    let existing_file_download = request
-        .existing_download
-        .filter(|_| request.download.is_some())
-        .map(|(_, destination)| {
-            require_review_running(cancelled)?;
-            let snapshot = crate::sftp_window::ReviewedFileReceiver::inspect(&destination, &|| {
-                cancelled.load(Ordering::Acquire)
-            })
-            .map_err(|error| error.to_string())?;
-            if super::sync::pins(&request.reference, trust).map_err(|error| error.to_string())?
-                != pins
-            {
-                return Err("The saved SSH route or host keys changed during review.".to_owned());
+        .transpose()?
+        .unwrap_or_default();
+    let (mut existing_file_download, mut vacant_file_download) = (None, None);
+    if request.vacant_file_download
+        || request.download.is_some() && request.existing_download.is_some()
+    {
+        require_review_running(cancelled)?;
+        let destination = request
+            .download
+            .as_ref()
+            .ok_or("Choose one server file and an exact local file path.")?
+            .destination
+            .clone();
+        let existing = if request.allow_existing_file_download {
+            match std::fs::symlink_metadata(&destination) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.to_string()),
             }
-            require_review_running(cancelled)?;
-            Ok(Box::new(LocalExistingFileReview {
+        } else {
+            request.existing_download.is_some()
+        };
+        let stopped = || cancelled.load(Ordering::Acquire);
+        if existing {
+            let snapshot =
+                crate::sftp_window::ReviewedFileReceiver::inspect(&destination, &stopped)
+                    .map_err(|error| error.to_string())?;
+            existing_file_download = Some(Box::new(LocalExistingFileReview {
                 destination,
                 snapshot,
-            }))
-        })
-        .transpose()?;
+            }));
+        } else {
+            let snapshot =
+                crate::job_executor::rsync::review_local_file_vacancy(&destination, cancelled)?;
+            vacant_file_download = Some(Box::new(LocalVacantFileReview {
+                destination,
+                snapshot,
+            }));
+        }
+        if super::sync::pins(&request.reference, trust).map_err(|error| error.to_string())? != pins
+        {
+            return Err("The saved SSH route or host keys changed during review.".into());
+        }
+        require_review_running(cancelled)?;
+    }
     let mixed = request
         .mixed
         .map(|target| {
@@ -901,7 +1378,9 @@ fn review(
         directory_upload,
         existing,
         existing_download,
+        vacant_directory_download,
         existing_file_download,
+        vacant_file_download,
         mixed,
         batch: request
             .batch
@@ -910,6 +1389,7 @@ fn review(
             .map(Box::new),
         download: request.download.map(Box::new),
         privileged,
+        ordinary_receiver,
     };
     approval.validate()?;
     Ok(approval)
@@ -1000,7 +1480,9 @@ impl Editor {
             && primary.batch.is_none()
             && primary.existing.is_none()
             && primary.existing_download.is_none()
+            && primary.vacant_directory_download.is_none()
             && primary.existing_file_download.is_none()
+            && primary.vacant_file_download.is_none()
             && primary.mixed.is_none()
         {
             details.into()
@@ -1031,7 +1513,7 @@ impl Editor {
                     triggers.predecessors.iter().map(ToString::to_string).collect::<Vec<_>>().join(", "),
                 ))),
                 triggers.max_age_minutes.map(|age| text(format!("Predecessor maximum age · {age} minutes"))),
-                text("Each firing checks the current sources and expected destinations. A successful publication retains the prior directory for recovery. Review any uncertain outcome before continuing.").size(12),
+                text("Each firing checks the current sources and expected destinations. A successful replacement retains the prior receiver for recovery. Review any uncertain outcome before continuing.").size(12),
             ]
             .spacing(6)
         });
@@ -1047,6 +1529,7 @@ impl Editor {
                 text(primary.program.display().to_string()),
                 text(format!("SHA-256 · {}", primary.fingerprint())).size(12),
                 standing,
+                approval.shares_missing_parent().then(|| text("Shared missing parent folders are created once. Each route publishes its own reviewed destination.").size(12)),
                 details,
                 row![
                     button("Discard review").on_press(Message::DiscardRsyncProgram),
@@ -1112,11 +1595,11 @@ impl Approval {
                 }),
                 self.download.as_ref().map(|download| column![
                     text(format!("Server file · {}", download.source.as_str())),
-                    self.existing_file_download.is_none().then(|| text(format!("New local file · {}", download.destination.display()))),
+                    (self.existing_file_download.is_none() && self.vacant_file_download.is_none()).then(|| text(format!("New local file · {}", download.destination.display()))),
                 ].spacing(4)),
                 self.directory.as_ref().map(|directory| column![
                     text(format!("Server directory · {}", directory.source.as_str())),
-                    self.existing_download.is_none().then(|| column![
+                    (self.existing_download.is_none() && self.vacant_directory_download.is_none()).then(|| column![
                         text(format!("New local folder · {}", directory.destination.display())),
                         text("Each run checks the complete tree, up to 4,096 entries and 256 MiB. A destination that exists blocks the run.").size(12),
                     ].spacing(4)),
@@ -1154,6 +1637,36 @@ impl Approval {
                         (!recurring).then(|| text("A successful run retains the prior server folder for recovery and requires a fresh review before the next run.").size(12)),
                     ].spacing(4)
                 }),
+                self.privileged.as_ref().filter(|proof| proof.first_file).map(|proof| column![
+                    text(format!("Vacant server file path · {}", proof.spec.path)),
+                    text("The first successful firing creates the file. Later firings replace each confirmed file and retain it for recovery.").size(12),
+                ].spacing(4)),
+                self.privileged.as_ref().filter(|proof| proof.first_tree).map(|proof| column![
+                    text(format!("Vacant server folder · {}", proof.spec.path)),
+                    text("The first successful firing creates this folder. Later firings replace only the last confirmed folder and retain it for recovery.").size(12),
+                    text(if self.existing_upload_scope().is_some_and(|(settings, _)| settings.delete) {
+                        "Future firings remove entries missing from the local source within this folder."
+                    } else {
+                        "Future firings retain server entries missing from the local source."
+                    }).size(12),
+                ].spacing(4)),
+                self.ordinary_receiver.as_ref().map(|review| column![
+                    text(format!("{} server {} · {}",
+                        if matches!(review.receiver, RecurringReceiver::Vacant { .. }) { "Vacant" } else { "Existing" },
+                        if review.directory { "folder" } else { "file" },
+                        review.destination.as_str()
+                    )),
+                    text(if matches!(review.receiver, RecurringReceiver::Vacant { .. }) {
+                        "The first successful firing creates this destination. Later firings replace only the last confirmed receiver and retain it for recovery."
+                    } else {
+                        "The first firing replaces this exact destination and retains it for recovery. Later firings replace each confirmed successor."
+                    }).size(12),
+                    review.directory.then(|| text(if review.settings.delete {
+                        "Future firings remove entries missing from the local source within this folder."
+                    } else {
+                        "Future firings retain server entries missing from the local source."
+                    }).size(12)),
+                ].spacing(4)),
                 self.existing_download.as_ref().map(|existing| {
                     let inventory = existing.snapshot.inventory;
                     column![
@@ -1167,16 +1680,49 @@ impl Approval {
                         (!recurring).then(|| text("A successful run retains the prior local folder for recovery and requires a fresh review before the next run.").size(12)),
                     ].spacing(4)
                 }),
+                self.vacant_directory_download.as_ref().map(|vacant| {
+                    column![
+                        text(format!("Vacant local folder · {}", vacant.destination.display())),
+                        parent_creation_detail(&vacant.destination, &vacant.snapshot)
+                            .map(|detail| text(detail).wrapping(text::Wrapping::Glyph).size(12)),
+                        text(if recurring {
+                            "The first successful firing creates this folder. Later firings replace only the last confirmed folder and retain it for recovery."
+                        } else {
+                            "The run creates this folder only while the reviewed destination is vacant."
+                        }).size(12),
+                        recurring.then(|| text(if vacant.settings.delete {
+                            "Future firings remove local entries missing from the checked server tree within this destination."
+                        } else {
+                            "Future firings retain local entries that are absent from the checked server tree."
+                        }).size(12)),
+                    ].spacing(4)
+                }),
                 self.existing_file_download.as_ref().map(|existing| {
                     column![
                         text(format!("Existing local file · {}", existing.destination.display())),
                         text(format!("The reviewed file contains {} bytes.", existing.snapshot.inventory.bytes)).size(12),
-                        text("The run replaces this exact file and keeps the original for recovery.").size(12),
+                        text(if recurring {
+                            "The first firing replaces this exact file and retains it for recovery. Later firings replace each confirmed successor."
+                        } else {
+                            "The run replaces this exact file and keeps the original for recovery."
+                        }).size(12),
                         (!recurring).then(|| text("Review the replacement before running this transfer again.").size(12)),
                     ].spacing(4)
                 }),
+                self.vacant_file_download.as_ref().map(|vacant| {
+                    column![
+                        text(format!("Vacant local file path · {}", vacant.destination.display())),
+                        missing_parent_detail(vacant.snapshot.missing_parent_count(), vacant.snapshot.first_missing(&vacant.destination))
+                            .map(|detail| text(detail).wrapping(text::Wrapping::Glyph).size(12)),
+                        text(if recurring {
+                            "The first successful firing creates the file. Later firings replace only the last confirmed file and retain it for recovery."
+                        } else {
+                            "The run creates this file only while the reviewed destination is vacant."
+                        }).size(12),
+                    ].spacing(4)
+                }),
                 self.batch.as_ref().map(|review| review.view()),
-                self.mixed.as_ref().map(|review| review.view()),
+                self.mixed.as_ref().map(|review| review.view(recurring)),
             ]
             .spacing(4)
     }
@@ -1199,10 +1745,10 @@ impl SchedulerView {
         request: ReviewRequests,
         inspect: impl FnMut(
             &ConnectionRef,
-            &RemotePath,
+            UploadReceiverPreview<'_>,
             &kortty_ssh::TrustStore,
             &Arc<AtomicBool>,
-        ) -> Result<ExistingTree, String>
+        ) -> Result<RecurringReceiver, String>
         + Send
         + 'static,
         inspect_mixed: impl FnMut(
@@ -1215,6 +1761,7 @@ impl SchedulerView {
         inspect_privileged: impl FnMut(
             &ConnectionRef,
             &PrivilegedSpec,
+            bool,
             &kortty_ssh::TrustStore,
             &Arc<AtomicBool>,
         ) -> Result<PrivilegedReview, String>
@@ -1302,6 +1849,10 @@ mod tests {
             directory: false,
             existing: None,
             existing_download: None,
+            allow_vacant_directory_download: false,
+            allow_vacant_file_download: false,
+            allow_vacant_server_file_upload: false,
+            allow_vacant_server_tree_upload: false,
             mixed: None,
             additional_sources: Vec::new(),
             routes: Vec::new(),
@@ -1322,11 +1873,14 @@ mod tests {
                 directory_upload: None,
                 existing: None,
                 existing_download: None,
+                vacant_directory_download: None,
                 existing_file_download: None,
+                vacant_file_download: None,
                 mixed: None,
                 batch: None,
                 download: None,
                 privileged: None,
+                ordinary_receiver: None,
             }),
         };
         assert!(transfer.validate(true).is_ok());
@@ -1371,5 +1925,164 @@ mod tests {
         assert!(transfer.validate(true).is_err());
         transfer.local = root.join("other-folder");
         assert!(transfer.validate(false).is_err());
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn recurring_rsync_file_review_binds_exact_paths_and_receivers() {
+        use std::ffi::OsStr;
+
+        use kortty_ssh::{Endpoint, HostKey, TrustStore};
+        use serde_json::json;
+
+        use crate::sftp_window::local_tree::{self, Directory};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let parent = Directory::open_path(&root).unwrap();
+        let protected = OsStr::new("protected");
+        drop(local_tree::create_reviewed_tree_stage(&parent, protected).unwrap());
+        let root = root.join(protected);
+        let program = root.join("rsync");
+        let destination = root.join("report.txt");
+        let source = "/site/report.txt";
+        let host = "server.example";
+        let reference: ConnectionRef = serde_json::from_value(json!({
+            "id": 1, "target": {"host": host, "port": 22, "username": "operator"},
+        }))
+        .unwrap();
+        let key = HostKey::from_openssh(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIBm/RAlphM3+hUG6wWfcO5bIUIaqMLa2ywxcOK1wMWbh",
+        )
+        .unwrap();
+        let trust = TrustStore::from_pins(vec![(Endpoint::new(host, 22).unwrap(), key)]).unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut transfer: Transfer = serde_json::from_value(json!({
+            "program": program, "local": destination, "remote": source,
+            "standing": {"settings": standing::Settings::default()},
+        }))
+        .unwrap();
+        let make_review = |request| {
+            review(
+                request,
+                &trust,
+                [8; 32],
+                &mut |_, _, _, _| panic!("unexpected server receiver review"),
+                &mut |_, _, _| panic!("unexpected mixed review"),
+                &mut |_, _, _, _, _| panic!("unexpected protected review"),
+                &cancelled,
+            )
+        };
+
+        assert!(transfer.require_group_review(false).is_err());
+        let request = || ReviewRequests::for_transfer(&transfer, &reference, &[], false).unwrap();
+        assert!(request().primary.vacant_file_download);
+        assert!(!request().primary.allow_existing_file_download);
+        let approval = make_review(request().primary).unwrap();
+        assert!(request().primary.matches(&approval, true));
+        assert_eq!(
+            approval.vacant_file_download.as_ref().unwrap().destination,
+            destination
+        );
+        std::fs::write(&destination, b"unreviewed receiver").unwrap();
+        assert!(make_review(request().primary).is_err());
+
+        let mut one_use = transfer.clone();
+        one_use.standing = None;
+        let one_use_request = ReviewRequests::for_transfer(&one_use, &reference, &[], false)
+            .unwrap()
+            .primary;
+        assert!(!one_use_request.matches(&approval, true));
+        let one_use_approval = make_review(one_use_request).unwrap();
+        assert!(!request().primary.matches(&one_use_approval, true));
+        assert!(
+            !serde_json::to_value(one_use_approval)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("vacant_file_download")
+        );
+
+        one_use.allow_vacant_file_download = true;
+        let explicit_request = |transfer: &Transfer| {
+            ReviewRequests::for_transfer(transfer, &reference, &[], false)
+                .unwrap()
+                .primary
+        };
+        assert!(make_review(explicit_request(&one_use)).is_err());
+        let missing_parent = root.join("reports");
+        one_use.local = missing_parent.join("daily/report.txt");
+        let request_for_creation = explicit_request(&one_use);
+        assert!(request_for_creation.vacant_file_download);
+        assert!(!request_for_creation.allow_existing_file_download);
+        let creation = make_review(request_for_creation).unwrap();
+        let vacant = creation.vacant_file_download.as_deref().unwrap();
+        assert_eq!(vacant.destination, one_use.local);
+        assert_eq!(
+            vacant.snapshot.first_missing(&one_use.local),
+            Some(missing_parent.as_path())
+        );
+        assert_eq!(vacant.snapshot.missing_parent_count(), 2);
+        assert!(explicit_request(&one_use).matches(&creation, true));
+        assert!(!missing_parent.exists());
+        one_use.approval = Some(creation);
+        assert!(one_use.validate(false).is_ok());
+        assert!(one_use.require_group_review(false).is_ok());
+        assert!(!one_use.requires_automatic_receiver(false));
+        one_use.program = missing_parent.join("bin/rsync");
+        one_use.approval.as_mut().unwrap().program = one_use.program.clone();
+        assert!(one_use.validate(false).is_err());
+
+        transfer.approval = Some(approval);
+        assert!(transfer.validate(false).is_ok());
+        let mut wrong_route = reference.clone();
+        wrong_route.id = 2;
+        assert!(transfer.validate_routes(&wrong_route, &[], false).is_err());
+        let mut wrong_path = transfer.clone();
+        wrong_path.local = root.join("other.txt");
+        assert!(wrong_path.validate(false).is_err());
+        let mut wrong_program = transfer.clone();
+        wrong_program.program = root.join("other-rsync");
+        assert!(wrong_program.validate(false).is_err());
+        transfer.routes.push(Route {
+            profile: wrong_route.id,
+            destination: wrong_path.local.to_str().unwrap().into(),
+            approval: None,
+        });
+        let group = std::slice::from_ref(&wrong_route);
+        let grouped_requests =
+            || ReviewRequests::for_transfer(&transfer, &reference, group, false).unwrap();
+        let requests = grouped_requests();
+        assert!(requests.primary.allow_existing_file_download);
+        assert!(requests.additional[0].allow_existing_file_download);
+        let mut additional = requests.additional.into_iter();
+        let reviewed = Reviewed {
+            primary: make_review(requests.primary).unwrap(),
+            additional: vec![make_review(additional.next().unwrap()).unwrap()],
+        };
+        assert!(grouped_requests().matches(&reviewed));
+        assert_eq!(
+            reviewed
+                .primary
+                .existing_file_download
+                .as_ref()
+                .unwrap()
+                .destination,
+            destination
+        );
+        assert!(reviewed.primary.vacant_file_download.is_none());
+        assert_eq!(
+            reviewed.additional[0]
+                .vacant_file_download
+                .as_ref()
+                .unwrap()
+                .destination,
+            wrong_path.local
+        );
+        assert!(reviewed.additional[0].existing_file_download.is_none());
+
+        reviewed.apply(&mut transfer);
+        assert!(transfer.validate_routes(&reference, group, false).is_ok());
+        assert!(transfer.require_group_review(false).is_ok());
     }
 }

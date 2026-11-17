@@ -243,6 +243,144 @@ mod tests {
         message
     }
 
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "downloads a signed MLX release and requires KORTTY_SMOKE_MLX_MODEL"]
+    fn native_java_qwen_reasoning_adoption() {
+        native_java_mlx_reasoning("KORTTY_SMOKE_MLX_MODEL", "NONE", Reasoning::None, false);
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    #[ignore = "downloads a signed MLX release and requires KORTTY_SMOKE_MLX_GPT_OSS_MODEL"]
+    fn native_java_gpt_oss_reasoning_adoption() {
+        native_java_mlx_reasoning(
+            "KORTTY_SMOKE_MLX_GPT_OSS_MODEL",
+            "HIGH",
+            Reasoning::High,
+            true,
+        );
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn native_java_mlx_reasoning(
+        source_variable: &str,
+        java_effort: &str,
+        effort: Reasoning,
+        expects_reasoning: bool,
+    ) {
+        use crate::local_ai::runtime_package::with_stopped_mlx_model;
+
+        let source = PathBuf::from(std::env::var_os(source_variable).expect(source_variable));
+        let scratch = Scratch::new();
+        let root = scratch.0.canonicalize().unwrap();
+        let cancelled = AtomicBool::new(false);
+        let java = format!(
+            "<globalSettings><aiProfiles><profile>
+               <id>java-mlx</id><name>Imported MLX</name>
+               <connectionMode>EMBEDDED_MLX</connectionMode>
+               <embeddedModelId>previous-mlx</embeddedModelId>
+               <reasoningEffort>{java_effort}</reasoningEffort>
+             </profile></aiProfiles></globalSettings>"
+        );
+        let (portable, _) = backup::portable_java_profiles(java.as_bytes()).unwrap();
+        let merged = backup::merge_java_profiles(None, &portable, &ClipboardPolicy::default())
+            .unwrap()
+            .unwrap();
+        let draft = Configuration::decode(&merged).unwrap();
+        draft
+            .save_fixture_at(&root, &Configuration::default())
+            .unwrap();
+        let draft = Configuration::load_fixture_from(&root).unwrap();
+        let reference = ProfileRef::Numeric(1);
+        let source_profile = draft.java_profile_source(&reference).unwrap();
+        assert!(draft.terminal_chat_transport(1).is_err());
+
+        let registry = mlx_models::Registry::new(&root);
+        let model = registry
+            .import(
+                &mlx_models::Review::prepare(&source, &cancelled).unwrap(),
+                &cancelled,
+            )
+            .unwrap();
+        let mut editor = Editor::new(draft.profiles.clone());
+        let runtime = PolicyModelRuntime::Mlx;
+        editor.update(
+            Message::ManagedModelsLoaded(runtime, ManagedModels::load(&root, runtime, &cancelled)),
+            true,
+        );
+        editor.update(Message::ManagedModel(model.id.clone()), true);
+        let imported_effort = editor
+            .selected()
+            .unwrap()
+            .java_embedded_model
+            .as_ref()
+            .unwrap()
+            .mlx_reasoning();
+        assert_eq!(imported_effort, Some(effort));
+        editor.update(Message::Reasoning(effort), true);
+        assert_eq!(editor.selected().unwrap().reasoning, Reasoning::Default);
+        let review = editor.review_imported_model(root.clone(), 1, &model.id);
+        editor.update(complete(review), true);
+        let reviewed = editor.selected().unwrap();
+        assert!(!reviewed.restore_review);
+        assert_eq!(reviewed.reasoning, Reasoning::Default);
+        editor.update(Message::Reasoning(effort), true);
+
+        let settings = Configuration {
+            profiles: editor.validated_catalog().unwrap(),
+            ..draft.clone()
+        };
+        settings.save_fixture_at(&root, &draft).unwrap();
+        let settings = Configuration::load_fixture_from(&root).unwrap();
+        assert_eq!(settings.profiles.profile(1).unwrap().reasoning, effort);
+        assert_eq!(
+            settings.java_profile_source(&reference),
+            Some(source_profile)
+        );
+
+        let pending = mlx_runtime::online::check(root.clone()).unwrap();
+        let catalog = pending.reply.recv_blocking().unwrap().unwrap();
+        let choice = catalog
+            .choices()
+            .first()
+            .expect("A compatible signed runtime")
+            .clone();
+        println!("Runtime {choice}");
+        let pending = mlx_runtime::online::download(root.clone(), catalog, choice).unwrap();
+        assert!(pending.reply.recv_blocking().unwrap().unwrap().activated);
+        let (profile, _) = settings.terminal_chat_transport(1).unwrap();
+        assert_eq!(profile.usage_estimate_profile().0, model.id);
+        let client = local_ai::Client::new(profile);
+        let mut reasoning = String::new();
+        let answer = client.stream_chat(
+            "Answer in one word.",
+            &[],
+            "What is the capital of France?",
+            || Ok(()),
+            |delta| {
+                if let local_ai::StreamDelta::Reasoning(part) = delta {
+                    reasoning.push_str(&part);
+                }
+            },
+        );
+        drop(client);
+        with_stopped_mlx_model(&root, &model.id, || Ok(())).unwrap();
+        let answer = answer.unwrap();
+        assert!(
+            answer
+                .trim()
+                .trim_end_matches('.')
+                .eq_ignore_ascii_case("Paris"),
+            "{answer:?}"
+        );
+        assert_eq!(!reasoning.trim().is_empty(), expects_reasoning);
+        println!(
+            "Java {java_effort} adopted after model review, persisted and used in native inference (reasoning bytes {})",
+            reasoning.len()
+        );
+    }
+
     #[test]
     fn imported_java_embedded_mlx_review_uses_the_native_platform_gate() {
         let mlx = String::from_utf8_lossy(JAVA).replace("EMBEDDED_LLAMA_CPP", "EMBEDDED_MLX");

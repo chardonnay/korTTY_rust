@@ -49,13 +49,21 @@ fn reviewed_split_generates_modules_first_and_publishes_the_selected_files() {
 
     let (listener, _) = listener();
     let endpoint = listener.local_addr().unwrap().to_string();
-    let mut workspace = Workspace::default();
-    workspace.set_test_ai_configuration(serde_json::from_value(json!({
+    let root = profile.0.canonicalize().unwrap();
+    let mut draft = json!({
         "profiles": {
-            "profiles": [{"id": 7, "name": "Local test", "endpoint": endpoint, "model": "reviewed-model"}],
-            "default": 7, "last_id": 7
+            "profiles": [{"id": 7, "name": "Local test", "endpoint": endpoint,
+                          "model": "", "model_mode": "server-default"}],
+            "last_id": 7
         }
-    })).unwrap());
+    });
+    let server: Configuration = serde_json::from_value(draft.clone()).unwrap();
+    server
+        .save_fixture_at(&root, &Configuration::default())
+        .unwrap();
+    let saved = Configuration::load_fixture_from(&root).unwrap();
+    let mut workspace = Workspace::default();
+    workspace.set_test_ai_configuration(saved.clone());
     let (owner, _) = workspace.open_window(false);
     let (id, _) = workspace.install_snippet_surface(owner, window, true);
     let _ = workspace.update_snippets(id, SnippetMessage::Open(snippet));
@@ -95,20 +103,38 @@ fn reviewed_split_generates_modules_first_and_publishes_the_selected_files() {
     let plan = update(&mut workspace, Action::Confirm);
     let load = complete(&mut workspace, plan);
     let _ = complete(&mut workspace, load);
-    assert!(
-        store
-            .load(subject)
-            .unwrap()
-            .current()
-            .unwrap()
-            .modularization
-            .is_some()
+    let history = store.load(subject).unwrap();
+    let job = history.current().unwrap().modularization.as_ref().unwrap();
+    assert!(job.local_profile_revision.is_some());
+    draft["profiles"]["profiles"][0]["model_mode"] = json!("manual");
+    draft["profiles"]["profiles"][0]["model"] = json!("reviewed-model");
+    draft["profiles"]["default"] = json!(7);
+    let named: Configuration = serde_json::from_value(draft).unwrap();
+    named.save_fixture_at(&root, &saved).unwrap();
+    let named = Configuration::load_fixture_from(&root).unwrap();
+    let guard = reviewed_local_profile_guard(
+        Arc::new(saved.clone()),
+        ProfileRef::Numeric(7),
+        job.local_profile_revision,
     );
+    assert!(guard().is_err());
+    workspace.set_test_ai_configuration(named.clone());
+    let _ = update(&mut workspace, Action::Generate);
+    let page = workspace.snippets[&id].analysis.page(subject).unwrap();
+    assert!(
+        page.status
+            .as_deref()
+            .unwrap()
+            .contains("saved profile revision changed")
+    );
+    server.save_fixture_at(&root, &named).unwrap();
+    workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
     let _ = update(&mut workspace, Action::Generate);
     let generate = update(&mut workspace, Action::Confirm);
     let load = complete(&mut workspace, generate);
     let _ = complete(&mut workspace, load);
     let requests = provider.join().unwrap();
+    assert!(requests.iter().all(|body| body.get("model").is_none()));
     let prompt = |index: usize| requests[index]["messages"][1]["content"].as_str().unwrap();
     assert!(prompt(0).contains("print(42)"));
     let (_, first) = prompt(1)
@@ -386,7 +412,7 @@ fn reviewed_cli_split_reopens_at_the_next_unapproved_module() {
 
 #[test]
 fn reviewed_auto_split_waits_for_saved_pre_and_runs_before_the_flowchart() {
-    automatic_split_fixture(false);
+    automatic_split_fixture(false, false);
 }
 
 #[test]
@@ -419,10 +445,10 @@ fn saved_https_analysis_opens_a_separate_split_review_and_revokes_on_vault_chang
     let endpoint = format!("https://{}/v1", listener.local_addr().unwrap());
     let config: Configuration = serde_json::from_value(json!({
         "profiles": {
-            "profiles": [{"id": 1, "name": "HTTPS", "model": "fixture",
+            "profiles": [{"id": 1, "name": "HTTPS", "model": "", "model_mode": "server-default",
                 "connection_mode": "remote-open-ai", "endpoint": endpoint,
                 "trusted_remote_endpoint": true}],
-            "default": 1, "last_id": 1
+            "last_id": 1
         }
     }))
     .unwrap();
@@ -494,7 +520,21 @@ fn saved_https_analysis_opens_a_separate_split_review_and_revokes_on_vault_chang
         panic!("expected the separately approved HTTPS preview");
     };
     assert!(matches!(preview.destination, OutboundDestination::Https));
+    assert!(preview.profile.server_selected);
+    assert_eq!(preview.profile.model, "Server selects the model");
     assert!(preview.prompt.contains("Keep reviewed behavior."));
+    let current = workspace.ai_configuration().unwrap();
+    let revision = split_revision(&current, &preview.profile.reference, OutboundKind::Https);
+    assert!(revision.is_some());
+    let mut named = serde_json::to_value(&*current).unwrap();
+    named["profiles"]["profiles"][0]["model_mode"] = json!("manual");
+    named["profiles"]["profiles"][0]["model"] = json!("fixture");
+    let named: Configuration = serde_json::from_value(named).unwrap();
+    assert_ne!(
+        split_revision(&named, &preview.profile.reference, OutboundKind::Https),
+        revision
+    );
+    assert!(split_transport(&named, preview.profile, Some(OutboundKind::Https)).is_err());
     assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
     let approval = preview.approval;
     workspace.vault_change_revision = Arc::new(());
@@ -514,10 +554,15 @@ fn saved_https_analysis_opens_a_separate_split_review_and_revokes_on_vault_chang
 
 #[test]
 fn disabling_auto_split_before_pre_completes_keeps_the_report_without_sending_the_plan() {
-    automatic_split_fixture(true);
+    automatic_split_fixture(true, false);
 }
 
-fn automatic_split_fixture(disable: bool) {
+#[test]
+fn reviewed_server_selected_local_split_waits_for_the_saved_analysis() {
+    automatic_split_fixture(false, true);
+}
+
+fn automatic_split_fixture(disable: bool, server_selected: bool) {
     let _exclusive = exclusive_run();
     let profile = Profile::new();
     let original = "print(42)\n";
@@ -548,12 +593,21 @@ fn automatic_split_fixture(disable: bool) {
         .window_settings
         .snippet_analysis_auto_modularization = true;
     workspace.window_settings.snippet_analysis_auto_diagram = !disable;
-    workspace.set_test_ai_configuration(serde_json::from_value(json!({
+    let draft: Configuration = serde_json::from_value(json!({
         "profiles": {
-            "profiles": [{"id": 7, "name": "Local test", "endpoint": endpoint, "model": "reviewed-model"}],
-            "default": 7, "last_id": 7
-        }
-    })).unwrap());
+            "profiles": [{"id": 7, "name": "Local test", "endpoint": endpoint,
+                "model": if server_selected { "" } else { "reviewed-model" },
+                "model_mode": if server_selected { "server-default" } else { "manual" }}],
+            "default": if server_selected { None } else { Some(7) }, "last_id": 7
+        },
+        "local": {"roles": [null, 7, null, null]}
+    }))
+    .unwrap();
+    let root = profile.0.canonicalize().unwrap();
+    draft
+        .save_fixture_at(&root, &Configuration::default())
+        .unwrap();
+    workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
     let (owner, _) = workspace.open_window(false);
     let (id, _) = workspace.install_snippet_surface(owner, window, true);
     let _ = workspace.update_snippets(id, SnippetMessage::Open(snippet));
@@ -645,7 +699,18 @@ fn automatic_split_fixture(disable: bool) {
     if disable {
         assert_eq!(sent.len(), 1);
     } else {
-        assert_eq!(sent[1]["model"], "reviewed-model");
+        if server_selected {
+            assert!(sent.iter().all(|request| request.get("model").is_none()));
+            assert!(
+                pre.modularization
+                    .as_ref()
+                    .unwrap()
+                    .local_profile_revision
+                    .is_some()
+            );
+        } else {
+            assert_eq!(sent[1]["model"], "reviewed-model");
+        }
         for (index, prompt) in reviewed.iter().enumerate() {
             assert_eq!(
                 sent[1]["messages"][index]["content"].as_str(),

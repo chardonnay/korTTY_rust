@@ -8,14 +8,17 @@ use regex::{RegexSet, RegexSetBuilder};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
+use crate::java_pattern;
+
 use super::entry_edit::LegacyMarker;
 use super::export::normalize_marker;
 use super::is_display_character;
 use super::metadata::java_whitespace;
 
+pub(crate) mod java;
 mod storage;
 
-pub(crate) use storage::{FILE, MAX_FILE_BYTES, validate_backup};
+pub(crate) use storage::{FILE, MAX_FILE_BYTES, lock_settings, validate_backup};
 
 pub(crate) const MAX_NAME_BYTES: usize = 256;
 pub(crate) const MAX_PATTERN_BYTES: usize = 1024;
@@ -61,6 +64,8 @@ pub(crate) struct Rule {
     pub(crate) pattern: String,
     pub(crate) regex: bool,
     pub(crate) ignore_case: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) java_regex: bool,
 }
 
 impl Default for Rule {
@@ -71,6 +76,7 @@ impl Default for Rule {
             pattern: String::new(),
             regex: false,
             ignore_case: true,
+            java_regex: false,
         }
     }
 }
@@ -84,6 +90,46 @@ impl fmt::Debug for Rule {
             .field("regex", &self.regex)
             .field("ignore_case", &self.ignore_case)
             .finish_non_exhaustive()
+    }
+}
+
+impl Rule {
+    fn expression(&self) -> Result<(String, bool), &'static str> {
+        let pattern = trim(&self.pattern);
+        if self.regex && self.java_regex {
+            return java_pattern::translate(pattern, self.ignore_case);
+        }
+        let expression = if self.regex {
+            pattern.to_owned()
+        } else {
+            regex::escape(pattern)
+        };
+        Ok((
+            if self.ignore_case {
+                format!("(?i){expression}")
+            } else {
+                expression
+            },
+            false,
+        ))
+    }
+
+    fn valid_pattern_text(&self) -> bool {
+        self.pattern.len() <= MAX_PATTERN_BYTES
+            && self
+                .pattern
+                .chars()
+                .all(|character| !character.is_control() || matches!(character, '\n' | '\r' | '\t'))
+    }
+
+    fn advanced_matcher(&self) -> io::Result<java_pattern::Pattern> {
+        if self.regex && self.java_regex {
+            java_pattern::Pattern::advanced(trim(&self.pattern), self.ignore_case, MAX_REGEX_BYTES)
+        } else {
+            Err(invalid(
+                "This journal marker pattern needs changes before it can run.",
+            ))
+        }
     }
 }
 
@@ -108,6 +154,14 @@ impl Settings {
             ..definition.clone()
         }));
         definitions
+    }
+
+    pub(crate) fn has_marker(&self, id: &str) -> bool {
+        builtin_id(id)
+            || self
+                .definitions
+                .iter()
+                .any(|definition| definition.id == id)
     }
 
     pub(crate) fn add_definition(
@@ -194,11 +248,7 @@ impl Settings {
             }
         }
         for rule in &self.rules {
-            if rule.pattern.len() > MAX_PATTERN_BYTES
-                || rule.pattern.chars().any(|character| {
-                    character.is_control() && !matches!(character, '\n' | '\r' | '\t')
-                })
-            {
+            if !rule.valid_pattern_text() {
                 return Err(invalid(
                     "A journal marker pattern exceeds its text limit or contains invalid characters.",
                 ));
@@ -220,7 +270,9 @@ pub(crate) struct Compiled {
     enabled: bool,
     definitions: Vec<Definition>,
     matcher: Option<RegexSet>,
-    targets: Vec<usize>,
+    java_end_matcher: Option<(RegexSet, Vec<usize>)>,
+    targets: Vec<(usize, usize)>,
+    advanced: Vec<(usize, usize, java_pattern::Pattern)>,
 }
 
 impl Default for Compiled {
@@ -229,7 +281,9 @@ impl Default for Compiled {
             enabled: false,
             definitions: builtin_definitions(),
             matcher: None,
+            java_end_matcher: None,
             targets: Vec::new(),
+            advanced: Vec::new(),
         }
     }
 }
@@ -240,7 +294,7 @@ impl fmt::Debug for Compiled {
             .debug_struct("CompiledJournalMarkers")
             .field("enabled", &self.enabled)
             .field("definitions", &self.definitions.len())
-            .field("rules", &self.targets.len())
+            .field("rules", &(self.targets.len() + self.advanced.len()))
             .finish()
     }
 }
@@ -252,6 +306,8 @@ impl Compiled {
         let mut targets = Vec::new();
         let mut expressions = Vec::new();
         let mut rows = Vec::new();
+        let mut java_ends = Vec::new();
+        let mut advanced = Vec::new();
         for (index, rule) in settings.rules.iter().enumerate() {
             let pattern = trim(&rule.pattern);
             if !rule.enabled || pattern.chars().all(java_whitespace) {
@@ -261,17 +317,21 @@ impl Compiled {
                 .iter()
                 .position(|definition| definition.id == rule.marker_id)
                 .ok_or_else(|| invalid("A journal marker rule refers to an unavailable marker."))?;
-            let expression = if rule.regex {
-                pattern.into()
-            } else {
-                regex::escape(pattern)
+            let (expression, java_end) = match rule.expression() {
+                Ok(linear) => linear,
+                Err(_) => {
+                    let matcher = rule.advanced_matcher().map_err(|error| {
+                        invalid(format!("Journal marker rule {}. {error}", index + 1))
+                    })?;
+                    advanced.push((index, target, matcher));
+                    continue;
+                }
             };
-            expressions.push(if rule.ignore_case {
-                format!("(?i){expression}")
-            } else {
-                expression
-            });
-            targets.push(target);
+            if java_end {
+                java_ends.push(expressions.len());
+            }
+            expressions.push(expression);
+            targets.push((index, target));
             rows.push(index + 1);
         }
         let matcher = if expressions.is_empty() {
@@ -298,11 +358,25 @@ impl Compiled {
                 )
             })?)
         };
+        let java_end_matcher = if java_ends.is_empty() {
+            None
+        } else {
+            let trailing: Vec<_> = java_ends
+                .iter()
+                .map(|&index| expressions[index].as_str())
+                .collect();
+            let matcher = compile(&trailing).map_err(|_| {
+                invalid("The combined journal marker patterns exceed the matcher limit.")
+            })?;
+            Some((matcher, java_ends))
+        };
         Ok(Self {
             enabled: settings.enabled,
             definitions,
             matcher,
+            java_end_matcher,
             targets,
+            advanced,
         })
     }
 
@@ -322,18 +396,46 @@ impl Compiled {
 
     /// Matches the first enabled rule in list order, even when live application is disabled.
     pub(crate) fn first_match(&self, haystack: &str) -> Option<&Definition> {
-        let matcher = self.matcher.as_ref().filter(|_| !haystack.is_empty())?;
+        if haystack.is_empty() {
+            return None;
+        }
         let prefix = if haystack.len() <= MAX_MATCH_UNITS {
             haystack
         } else {
             utf16_prefix(haystack, MAX_MATCH_UNITS).0
         };
-        let rule = matcher.matches(prefix).into_iter().next()?;
-        Some(&self.definitions[self.targets[rule]])
+        let first = self
+            .matcher
+            .as_ref()
+            .and_then(|matcher| matcher.matches(prefix).into_iter().next());
+        let before_terminator = self
+            .java_end_matcher
+            .as_ref()
+            .and_then(|(matcher, indices)| {
+                let line = java_pattern::without_final_line_break(prefix)?;
+                matcher
+                    .matches(line)
+                    .into_iter()
+                    .next()
+                    .map(|found| indices[found])
+            });
+        let linear = first
+            .into_iter()
+            .chain(before_terminator)
+            .min()
+            .map(|rule| self.targets[rule]);
+        let target = self
+            .advanced
+            .iter()
+            .take_while(|(index, _, _)| linear.is_none_or(|(linear, _)| *index < linear))
+            .find(|(_, _, matcher)| matcher.is_match(prefix))
+            .map(|(_, target, _)| *target)
+            .or_else(|| linear.map(|(_, target)| target))?;
+        Some(&self.definitions[target])
     }
 }
 
-fn compile(expressions: &[String]) -> Result<RegexSet, regex::Error> {
+fn compile(expressions: &[impl AsRef<str>]) -> Result<RegexSet, regex::Error> {
     RegexSetBuilder::new(expressions)
         .size_limit(MAX_REGEX_BYTES)
         .dfa_size_limit(MAX_REGEX_BYTES)

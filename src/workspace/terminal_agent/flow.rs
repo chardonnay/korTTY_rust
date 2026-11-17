@@ -223,14 +223,8 @@ impl Workspace {
                 let (_, pane) = self.current_run_pane(run)?;
                 match run.phase {
                     Phase::Directory => {
-                        let settings = pane
-                            .local_security
-                            .as_ref()
-                            .ok_or("The source shell changed.")?;
-                        let program = kortty_pty::shell_program(settings.shell)
-                            .map_err(|_| "The selected shell is unavailable.")?;
                         run.target = Some(RunTarget::Attached(Target::Local {
-                            shell: active_shell(program)?,
+                            shell: local_agent_shell(pane)?,
                             directory,
                         }));
                         run.review_initial_command()?;
@@ -623,6 +617,14 @@ impl Workspace {
             .ai_configuration()
             .ok_or("AI is unavailable under the current settings.")?;
         let profile = run.profile().ok_or("The agent profile is unavailable.")?;
+        if profile.server_default.is_some()
+            && (run.binding.private()
+                || run.binding.saved().is_some()
+                || run.swarm
+                || !matches!(run.mode, Mode::Ask | Mode::Run))
+        {
+            return Err("Server-selected agent profiles require a standalone, non-private terminal Ask or Run session.".into());
+        }
         if profile.is_reviewed_outbound()
             && (run.binding.private() || !matches!(run.mode, Mode::Ask | Mode::Run))
         {
@@ -991,7 +993,21 @@ fn bounded(text: &str) -> String {
     text.chars().take(4000).collect()
 }
 
-pub(super) fn active_shell(path: PathBuf) -> Result<Shell, String> {
+pub(super) fn local_agent_shell(pane: &crate::workspace::PaneSession) -> Result<Shell, String> {
+    #[cfg(target_os = "linux")]
+    if pane.session.flatpak_host_shell() {
+        return Ok(Shell::FlatpakHost);
+    }
+    let settings = pane
+        .local_security
+        .as_ref()
+        .ok_or("The source shell changed.")?;
+    let program = kortty_pty::shell_program(settings.shell)
+        .map_err(|_| "The selected shell is unavailable.")?;
+    active_shell(program)
+}
+
+fn active_shell(path: PathBuf) -> Result<Shell, String> {
     let name = path
         .file_name()
         .and_then(|name| name.to_str())

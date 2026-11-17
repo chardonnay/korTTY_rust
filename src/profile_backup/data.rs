@@ -11,7 +11,9 @@ use kortty_vault::Vault;
 use zeroize::Zeroizing;
 
 use crate::private_files::Directory;
+use crate::recording_window::preferences as recording_preferences;
 use crate::session_journal::markers;
+use crate::terminal_highlight;
 use crate::terminal_view::background_image::{self, AssetId};
 use crate::workspace::backup_data;
 use crate::{connection_store, profile, scheduler_window::SshCommand, snippets, ssh_key_catalog};
@@ -131,12 +133,30 @@ pub(super) fn portable_jobs(bytes: &[u8]) -> io::Result<Vec<u8>> {
             )
         {
             remote.remove("approval");
+            let replacement_field = match remote.get("kind").and_then(serde_json::Value::as_str) {
+                Some("privileged") => Some("replace_existing"),
+                Some("privileged_tree_upload" | "privileged_tree_download") => {
+                    Some("replace_changed")
+                }
+                _ => None,
+            };
+            if replacement_field
+                .and_then(|field| remote.get(field))
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                definition.enabled = false;
+            }
             if matches!(
                 remote.get("kind").and_then(serde_json::Value::as_str),
                 Some("rsync_download" | "rsync_upload")
             ) {
                 if remote.get("elevation").and_then(serde_json::Value::as_str)
                     == Some("passwordless")
+                    || remote
+                        .get("allow_vacant_file_download")
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true)
                     || ["existing", "existing_download", "mixed"]
                         .into_iter()
                         .any(|field| remote.get(field).is_some_and(|value| !value.is_null()))
@@ -244,12 +264,19 @@ fn validate_entries(snapshot: &Snapshot, java: bool) -> io::Result<()> {
     let mut expected_backgrounds = background_ids(snapshot)?;
     for (path, bytes) in snapshot {
         let java_statistics = java && path == crate::ai_manager::backup::JAVA_STATISTICS;
+        let java_recording_preferences = java && path == recording_preferences::FILE;
+        let java_highlights = java && path == terminal_highlight::FILE;
         let limit = if java_statistics {
             crate::ai_manager::backup::MAX_STATISTICS_BYTES
         } else {
             file_limit(path)
         };
-        if (!java_statistics && !allowed_path(path)) || bytes.len() > limit {
+        if (!java_statistics
+            && !java_recording_preferences
+            && !java_highlights
+            && !allowed_path(path))
+            || bytes.len() > limit
+        {
             return Err(invalid("unsupported or oversized profile backup entry"));
         }
         total += bytes.len();
@@ -269,6 +296,12 @@ fn validate_entries(snapshot: &Snapshot, java: bool) -> io::Result<()> {
                 }
             }
             markers::FILE => markers::validate_backup(bytes)?,
+            recording_preferences::FILE if java_recording_preferences => {
+                backup_data::recording::validate(bytes)?;
+            }
+            terminal_highlight::FILE if java_highlights => {
+                terminal_highlight::validate_java_backup(bytes)?;
+            }
             "environments.json" | "toolbar.json" | WINDOW_SETTINGS => {
                 backup_data::validate(path, bytes)?;
             }
@@ -343,6 +376,7 @@ pub(super) fn file_limit(path: &str) -> usize {
         "snippets.json" => 64 * 1024 * 1024,
         "jobs.json" => 16 * 1024 * 1024,
         markers::FILE => markers::MAX_FILE_BYTES,
+        recording_preferences::FILE => recording_preferences::MAX_BYTES,
         "openpgp-recipients.json" => 8 * 1024 * 1024,
         "vault/vault.bin" => 4 * 1024 * 1024,
         _ if AssetId::from_relative_path(path).is_some() => background_image::MAX_STORED_BYTES,

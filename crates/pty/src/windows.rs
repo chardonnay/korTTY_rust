@@ -57,6 +57,8 @@ use crate::{JobProcessIdentity, LaunchOptions, LocalShell, Size, closed};
 
 #[path = "windows/job_processes.rs"]
 pub(crate) mod job_processes;
+#[path = "windows/presets.rs"]
+mod presets;
 #[path = "windows/sandbox.rs"]
 mod sandbox;
 #[path = "windows/sandbox_broker.rs"]
@@ -134,6 +136,8 @@ impl Control {
         term: &str,
         options: &LaunchOptions,
     ) -> io::Result<(Self, PtyReader, PtyWriter)> {
+        let preset = presets::launch_options(options)?;
+        let options = preset.as_ref().unwrap_or(options);
         let stop = Arc::new(event()?);
         let (output, console_output) = HostPipe::new(PipeDirection::Output, Arc::clone(&stop))?;
         let (input, console_input) = HostPipe::new(PipeDirection::Input, Arc::clone(&stop))?;
@@ -985,6 +989,30 @@ fn limited_job(process_memory: Option<usize>) -> io::Result<OwnedHandle> {
 }
 
 pub(crate) fn shell_program(preset: LocalShell) -> io::Result<PathBuf> {
+    match preset {
+        LocalShell::GitBash | LocalShell::Cygwin | LocalShell::Wsl => {
+            return presets::program(preset);
+        }
+        LocalShell::Bash | LocalShell::Zsh => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "choose a Windows shell preset",
+            ));
+        }
+        _ => {}
+    }
+    let directory = system_directory()?;
+    let powershell = directory.join(r"WindowsPowerShell\v1.0\powershell.exe");
+    Ok(
+        if preset == LocalShell::PowerShell || (preset.is_default() && powershell.is_file()) {
+            powershell
+        } else {
+            directory.join("cmd.exe")
+        },
+    )
+}
+
+fn system_directory() -> io::Result<PathBuf> {
     let mut directory = vec![0; 260];
     loop {
         // SAFETY: directory holds the supplied number of writable UTF-16 units.
@@ -998,14 +1026,7 @@ pub(crate) fn shell_program(preset: LocalShell) -> io::Result<PathBuf> {
         }
         directory.resize(len as usize, 0);
     }
-    let directory = PathBuf::from(OsString::from_wide(&directory));
-    let powershell = directory.join(r"WindowsPowerShell\v1.0\powershell.exe");
-    let shell = match preset {
-        LocalShell::Default if powershell.is_file() => powershell,
-        LocalShell::PowerShell => powershell,
-        LocalShell::Default | LocalShell::CommandPrompt => directory.join("cmd.exe"),
-    };
-    Ok(shell)
+    Ok(PathBuf::from(OsString::from_wide(&directory)))
 }
 
 pub(crate) fn pipe_name() -> io::Result<Vec<u16>> {

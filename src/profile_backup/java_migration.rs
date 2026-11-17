@@ -13,10 +13,13 @@ use super::{Snapshot, archive, data, java_host_pins, java_scheduler};
 use crate::ai_manager::{backup as ai, java_knowledge, java_models};
 use crate::clipboard_policy::ClipboardPolicy;
 use crate::connection_store::import::{JavaLibrarySettings, Preview as ConnectionPreview};
+use crate::recording_window::preferences as recording_preferences;
+use crate::session_journal::markers;
 use crate::snippets::recipients;
+use crate::workspace::backup_data::java_toolbar;
 use crate::workspace::environment_access::java_backup as environments;
 use crate::workspace::saved_chats;
-use crate::{profile::projects, snippets, workspace::backup_data};
+use crate::{profile::projects, snippets, terminal_highlight, workspace::backup_data};
 
 pub(super) const CONNECTIONS: &str = "connections.json";
 
@@ -33,12 +36,18 @@ pub(super) struct Report {
     pub(super) host_pins: Option<Arc<kortty_ssh::KnownHostsFile>>,
     pub(super) scheduler: Option<SchedulerSource>,
     pub(super) scoped_memory: Option<memory::Source>,
+    pub(super) toolbar: Option<ToolbarSource>,
     pub(super) connection_library: JavaLibrarySettings,
 }
 
 pub(super) struct SchedulerSource {
     pub(super) review: java_scheduler::Review,
     pub(super) connections: Arc<Zeroizing<Vec<u8>>>,
+}
+
+pub(super) struct ToolbarSource {
+    pub(super) layout: java_toolbar::Source,
+    pub(super) connections: Option<Arc<Zeroizing<Vec<u8>>>>,
 }
 
 pub(super) struct SshSource {
@@ -74,6 +83,7 @@ pub(super) fn convert(
         host_pins: None,
         scheduler: None,
         scoped_memory: None,
+        toolbar: None,
         connection_library: JavaLibrarySettings::default(),
     };
     let mut snapshot = Snapshot::new();
@@ -90,50 +100,6 @@ pub(super) fn convert(
         || has_field("connections.xml", "<encryptedPassword");
     let has_keys = content("ssh-keys.xml").is_some();
     let connections = content("connections.xml");
-    if let Some(bytes) = connections {
-        if let Some(settings) = content("global-settings.xml") {
-            match JavaLibrarySettings::parse(settings) {
-                Ok(library) => report.connection_library = library,
-                Err(error) => report.omit("Java connection library settings", error),
-            }
-        }
-        match ConnectionPreview::java_backup(bytes).and_then(|preview| {
-            let preview = preview.with_java_library(report.connection_library.clone());
-            let (bytes, count) = preview.portable_java_backup()?;
-            report.note_count(
-                preview.unsupported + preview.invalid,
-                "invalid or unsupported connection profiles omitted",
-            );
-            report.note_count(
-                preview.skipped_tunnels,
-                "invalid or unsupported tunnels omitted",
-            );
-            Ok((bytes, count))
-        }) {
-            Ok((bytes, count)) if count > 0 => {
-                snapshot.insert(CONNECTIONS.into(), Zeroizing::new(bytes));
-                report
-                    .entries
-                    .push(format!("Connection profiles ({count})"));
-                let (favorites, colors) = report.connection_library.counts();
-                if favorites != 0 {
-                    report.entries.push(format!(
-                        "Java favorites to match with newly added connections (up to {favorites})"
-                    ));
-                }
-                if colors != 0 {
-                    report.entries.push(format!(
-                        "Java group colors to match with newly added folders (up to {colors})"
-                    ));
-                }
-                report.omissions.push("Connection profiles require local credentials or SSH keys where applicable. Review connection commands and paths before use.".into());
-            }
-            Ok(_) => report
-                .omissions
-                .push("connections.xml: no supported profiles".into()),
-            Err(error) => report.omit("connections.xml", error),
-        }
-    }
     let (snippet_xml, variables_xml) = (content("snippets.xml"), content("snippet-variables.xml"));
     if snippet_xml.is_some() || variables_xml.is_some() {
         match snippets::portable_java_backup(snippet_xml, variables_xml) {
@@ -215,25 +181,105 @@ pub(super) fn convert(
     }
 
     let mut journal_profiles = None;
+    let mut toolbar = None;
     if let Some(bytes) = content("global-settings.xml") {
         let themes = snapshot
             .get(data::WINDOW_SETTINGS)
             .map(|bytes| bytes.as_slice());
-        match backup_data::portable_java_display_preferences(bytes, themes) {
+        match backup_data::portable_java_preferences(bytes, themes) {
             Ok(import) => {
+                toolbar = import.toolbar;
                 if let Some(contents) = import.contents {
                     snapshot.insert(data::WINDOW_SETTINGS.into(), Zeroizing::new(contents));
                     report.entries.push(format!(
-                        "Display preferences for unset fields ({})",
+                        "Global preferences for unset fields ({})",
                         import.count
                     ));
                 }
+                if import.sftp_overwrite {
+                    report.entries.push("SFTP conflict default in this backup is Replace regular files. A saved local conflict default takes precedence.".into());
+                }
+                if import.paste_warning_off {
+                    report.entries.push("Paste warning mode in this backup is Off. A saved local mode and managed policy still take precedence.".into());
+                }
+                if import.analysis_export_includes_code {
+                    report.entries.push("This backup selects Include source code by default in snippet analysis exports.".into());
+                }
                 report.note_count(
                     import.omitted,
-                    "Invalid or unsupported Java display preferences omitted",
+                    "Invalid or unsupported Java global preferences omitted",
                 );
+                let recording = import.recording;
+                if let Some(contents) = recording.contents {
+                    snapshot.insert(recording_preferences::FILE.into(), Zeroizing::new(contents));
+                    report.entries.push(format!(
+                        "Recording preferences for unset fields ({})",
+                        recording.count
+                    ));
+                }
+                report.note_count(
+                    recording.omitted,
+                    "Invalid Java recording preferences omitted",
+                );
+                report.note_count(
+                    recording.paths,
+                    "Java recording storage and encoder paths require selection on this device",
+                );
+                let journal = import.markers;
+                if let Some(contents) = journal.contents {
+                    snapshot.insert(markers::FILE.into(), Zeroizing::new(contents));
+                    report.entries.push(format!(
+                        "Journal marker definitions ({}) and rules ({})",
+                        journal.definitions, journal.rules,
+                    ));
+                }
+                report.note_count(
+                    journal.omitted,
+                    "Invalid or unsupported Java marker settings omitted",
+                );
+                report.note_count(
+                    journal.review,
+                    "Java journal marker rules kept inactive pending pattern review",
+                );
+                match import.highlights {
+                    Ok(highlights) => {
+                        if let Some(contents) = highlights.contents {
+                            snapshot
+                                .insert(terminal_highlight::FILE.into(), Zeroizing::new(contents));
+                            if highlights.sets != 0 {
+                                report.entries.push(format!(
+                                    "Custom highlight sets for presentation ({})",
+                                    highlights.sets
+                                ));
+                            }
+                        }
+                        if highlights.preferences != 0 {
+                            report.entries.push(format!(
+                                "Terminal highlight preferences for unset fields ({})",
+                                highlights.preferences
+                            ));
+                        }
+                        report.note_count(
+                            highlights.omitted_preferences,
+                            "Invalid Java terminal highlight preferences omitted",
+                        );
+                        report.note_count(
+                            highlights.omitted_sets,
+                            "Invalid or unsupported Java highlight sets omitted",
+                        );
+                        report.note_count(
+                            highlights.omitted_rules,
+                            "Invalid or unsupported Java highlight rules omitted",
+                        );
+                        report.note_count(
+                            highlights.omitted_actions,
+                            "Java highlight trigger actions require separate review",
+                        );
+                    }
+                    Err(error) => report.omit("Java highlight sets", error),
+                }
             }
-            Err(error) => report.omit("Java display preferences", error),
+            Err(error) => report.omit("Java global preferences", error),
         }
         match ai::portable_java_profiles(bytes) {
             Ok((bytes, imported)) => {
@@ -439,6 +485,64 @@ pub(super) fn convert(
         }
     }
 
+    if let Some(bytes) = connections {
+        if let Some(settings) = content("global-settings.xml") {
+            match JavaLibrarySettings::parse(settings) {
+                Ok(library) => report.connection_library = library,
+                Err(error) => report.omit("Java connection library settings", error),
+            }
+        }
+        match ConnectionPreview::java_backup(bytes).and_then(|preview| {
+            let mut preview = preview.with_java_library(report.connection_library.clone());
+            let sources = journal_profiles
+                .iter()
+                .flat_map(|settings| settings.java_profile_sources())
+                .collect::<Vec<_>>();
+            let (matched, unresolved) = preview.associate_java_ai_profiles(&sources);
+            let (bytes, count) = preview.portable_java_backup()?;
+            report.note_count(
+                preview.unsupported + preview.invalid,
+                "invalid or unsupported connection profiles omitted",
+            );
+            report.note_count(
+                preview.skipped_tunnels,
+                "invalid or unsupported tunnels omitted",
+            );
+            report.note_count(
+                matched,
+                "Java connection AI assignments require review in Connection Manager",
+            );
+            report.note_count(
+                unresolved,
+                "Java connection AI assignments have no matching profile in the backup",
+            );
+            Ok((bytes, count))
+        }) {
+            Ok((bytes, count)) if count > 0 => {
+                snapshot.insert(CONNECTIONS.into(), Zeroizing::new(bytes));
+                report
+                    .entries
+                    .push(format!("Connection profiles ({count})"));
+                let (favorites, colors) = report.connection_library.counts();
+                if favorites != 0 {
+                    report.entries.push(format!(
+                        "Java favorites to match with newly added connections (up to {favorites})"
+                    ));
+                }
+                if colors != 0 {
+                    report.entries.push(format!(
+                        "Java group colors to match with newly added folders (up to {colors})"
+                    ));
+                }
+                report.omissions.push("Connection profiles require local credentials or SSH keys where applicable. Review connection commands and paths before use.".into());
+            }
+            Ok(_) => report
+                .omissions
+                .push("connections.xml: no supported profiles".into()),
+            Err(error) => report.omit("connections.xml", error),
+        }
+    }
+
     let scheduler = content("job-scheduler.xml").and_then(|bytes| {
         match java_scheduler::inspect(bytes) {
             Ok(mut review) => {
@@ -468,6 +572,14 @@ pub(super) fn convert(
                     report.note_count(
                         review.transfer_drafts(),
                         "Imported Scheduler SFTP transfers require a local path and transfer review in JobScheduler",
+                    );
+                    report.note_count(
+                        review.staging_drafts(),
+                        "Imported Scheduler sudo staging transfers are disabled per saved SSH route. Choose paths on this device and the server, then review sudo and the transfer",
+                    );
+                    report.note_count(
+                        review.privileged_drafts(),
+                        "Imported Scheduler sudo commands, snippets and file actions require native sudo adoption. File actions and virtual terminals use individual saved SSH routes",
                     );
                     report.note_count(
                         review.rsync_drafts(),
@@ -715,17 +827,37 @@ pub(super) fn convert(
     let connections = members
         .remove("connections.xml")
         .map(|member| Arc::new(member.bytes));
+    if let Some(layout) = toolbar {
+        report.entries.push(format!(
+            "Java toolbar layout and icon size ({} buttons and separators)",
+            layout.count()
+        ));
+        report.toolbar = Some(ToolbarSource {
+            connections: connections.clone().filter(|_| layout.uses_profiles()),
+            layout,
+        });
+    }
     if !scoped_memory.is_empty()
         && let Some(connections) = connections.clone()
     {
-        report.entries.push(format!(
-            "AI Memory files to match with newly added SSH or local shell profiles (up to {})",
-            scoped_memory.len()
-        ));
-        report.scoped_memory = Some(memory::Source {
-            connections,
-            files: scoped_memory,
-        });
+        let scopes = memory::MappedScopes::read(&connections, |_| None)?;
+        let ambiguous = scoped_memory
+            .keys()
+            .filter(|path| scopes.ambiguous_file(path))
+            .count();
+        report.note_count(ambiguous, "AI Memory documents or history files omitted because Java connection filenames collide");
+        scoped_memory.retain(|path, _| !scopes.ambiguous_file(path));
+        if !scoped_memory.is_empty() {
+            report.entries.push(format!(
+                "Connection AI Memory files available for matching (up to {})",
+                scoped_memory.len()
+            ));
+            report.scoped_memory = Some(memory::Source {
+                connections,
+                files: scoped_memory,
+                review: None,
+            });
+        }
     }
     report.scheduler = scheduler
         .zip(connections.clone())
@@ -829,12 +961,17 @@ pub(super) fn merge_catalogue(
     path: &str,
     local: Option<&[u8]>,
     incoming: &[u8],
+    highlight_set_ids: &BTreeMap<String, String>,
     allow_headers: &impl Fn() -> bool,
 ) -> io::Result<Option<Vec<u8>>> {
     match path {
-        CONNECTIONS => ConnectionPreview::merge_java_backup(local, incoming),
+        CONNECTIONS => ConnectionPreview::merge_java_backup(local, incoming, highlight_set_ids),
         snippets::FILE_NAME => snippets::merge_java_backup(local, incoming, allow_headers()),
-        data::WINDOW_SETTINGS => backup_data::merge_java_window_settings(local, incoming),
+        data::WINDOW_SETTINGS => {
+            backup_data::merge_java_window_settings(local, incoming, highlight_set_ids)
+        }
+        recording_preferences::FILE => backup_data::recording::merge(local, incoming),
+        markers::FILE => markers::java::merge(local, incoming),
         environments::PATH => environments::merge(local, incoming),
         ai::SETTINGS => ai::merge_java_profiles(local, incoming, &ClipboardPolicy::load()),
         recipients::FILE_NAME => recipients::merge_java_backup(local, incoming),
@@ -851,6 +988,9 @@ pub(super) fn is_catalogue(path: &str) -> bool {
         CONNECTIONS
             | snippets::FILE_NAME
             | data::WINDOW_SETTINGS
+            | recording_preferences::FILE
+            | markers::FILE
+            | terminal_highlight::FILE
             | environments::PATH
             | ai::SETTINGS
             | recipients::FILE_NAME

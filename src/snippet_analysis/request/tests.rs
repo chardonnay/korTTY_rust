@@ -94,7 +94,7 @@ fn request_sends_the_preview_once_via_shared_ai_transport() {
     assert_eq!(preview[0].matches("<kortty_model_preset>").count(), 1);
     assert!(preview[1].contains("File: marker.sh (executable)"));
     assert!(preview[1].contains("Review exit codes"));
-    let pending = request.start(profile, |_| {}).unwrap();
+    let pending = request.start(profile, || Ok(()), |_| {}).unwrap();
     let result = pending.reply.recv_blocking().unwrap().unwrap();
     assert_eq!(result.improvements[0].line, Some(1));
     assert_eq!(result.improvements[0].file, None);
@@ -108,6 +108,51 @@ fn request_sends_the_preview_once_via_shared_ai_transport() {
             Some(expected.as_str())
         );
     }
+}
+
+#[test]
+fn folder_analysis_omits_the_model_and_keeps_reviewed_file_identity() {
+    use std::io::Write;
+
+    use crate::local_ai::test_support::{accept, listener, request};
+
+    let (listener, _) = listener();
+    let profile = Profile::configured_with_server_default(
+        &listener.local_addr().unwrap().to_string(),
+        local_ai::ProfileOptions::default(),
+    )
+    .unwrap();
+    let snapshot = Snapshot::folder(
+        "Demo".into(),
+        vec![
+            input("main.sh", "echo first"),
+            input("lib/helper.sh", "echo second"),
+        ],
+    );
+    let analysis_request = Request::new(&snapshot, "en", "", "")
+        .unwrap()
+        .with_profile(&profile);
+    let reviewed_payload = analysis_request.input().to_owned();
+    let receiver = std::thread::spawn(move || {
+        let mut stream = accept(&listener);
+        let body = request(&mut stream);
+        assert!(body.get("model").is_none());
+        assert_eq!(body["messages"][1]["content"], reviewed_payload);
+        let response = fixture_response(
+            "200 OK",
+            "",
+            r#"{"summary":"Demo","improvements":[{"title":"Check helper","file":"lib/helper.sh","line":1}]}"#,
+        );
+        stream.get_mut().write_all(response.as_bytes()).unwrap();
+    });
+    let pending = analysis_request.start(profile, || Ok(()), |_| {}).unwrap();
+    let analysis = pending.reply.recv_blocking().unwrap().unwrap();
+    receiver.join().unwrap();
+    assert_eq!(
+        analysis.improvements[0].file.as_deref(),
+        Some("lib/helper.sh")
+    );
+    assert_eq!(analysis.improvements[0].line, Some(1));
 }
 
 #[test]
@@ -137,11 +182,11 @@ fn masked_remote_request_preserves_references_and_rejects_another_route() {
             .contains("1 | PASSWORD=***\n2 | echo second")
     );
     assert!(!request.input().contains("private-value"));
-    assert!(request.start(different, |_| {}).is_err());
+    assert!(request.start(different, || Ok(()), |_| {}).is_err());
     assert!(
         Request::new(&snapshot, "en", "", "")
             .unwrap()
-            .start(approved.clone(), |_| {})
+            .start(approved.clone(), || Ok(()), |_| {})
             .is_err()
     );
 

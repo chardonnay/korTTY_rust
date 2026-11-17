@@ -38,13 +38,17 @@ pub(in crate::ai_manager::local) fn publish(
     authorize: impl Fn() -> Result<(), String>,
 ) -> io::Result<Publication> {
     let Some(settings) = &scope.qdrant else {
-        cache.save(index, || {
-            authorize().map_err(io::Error::other)?;
-            index
-                .check_sources(scope, || client.map_or(Ok(()), check_active))
-                .map_err(io::Error::other)?;
-            authorize().map_err(io::Error::other)
-        })?;
+        cache.save_checked(
+            index,
+            || client.map_or(Ok(()), check_active),
+            || {
+                authorize().map_err(io::Error::other)?;
+                index
+                    .check_sources(scope, || client.map_or(Ok(()), check_active))
+                    .map_err(io::Error::other)?;
+                authorize().map_err(io::Error::other)
+            },
+        )?;
         return Ok(Publication::default());
     };
     let check = || {

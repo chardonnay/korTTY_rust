@@ -1637,18 +1637,19 @@ impl Dialog {
                                 }
                                 Configuration::require_local_settings(&profile_dir, &baseline)
                             };
-                            let previous = if let Some(index) = draft {
-                                Some((scope.clone(), index))
+                            let (previous, previous_stamp) = if let Some(index) = draft {
+                                (Some((scope.clone(), index)), None)
                             } else if let Some(base) = base {
-                                match cache.load(&base) {
-                                    Ok(index) => Some((base, Arc::new(index))),
-                                    Err(error) if rebuild || error.kind() == io::ErrorKind::NotFound => None,
+                                match cache.load_file_backed(&base, || knowledge::check_active(client)) {
+                                    Ok((index, stamp)) => (Some((base, Arc::new(index))), Some(stamp)),
+                                    Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error.to_string()),
+                                    Err(error) if rebuild || error.kind() == io::ErrorKind::NotFound => (None, None),
                                     Err(error) => return Err(format!(
                                         "Could not load the previous knowledge index ({error}). Choose Rebuild index to replace it."
                                     )),
                                 }
                             } else {
-                                None
+                                (None, None)
                             };
                             authorize()?;
                             let (index, summary) = Index::update(
@@ -1664,14 +1665,26 @@ impl Dialog {
                                 && previous.as_ref().and_then(|(base, index)| {
                                     base.same_snapshot(&scope).then_some(index.qdrant_receipt.as_ref()).flatten()
                                 }).is_none_or(|receipt| !receipt.sources.covers(&scope.enabled_sources()));
-                            drop(previous);
+                            let previous_scope = previous.map(|(base, _)| base);
+                            let require_previous = || {
+                                if scope.qdrant.is_none()
+                                    && let Some((base, stamp)) = previous_scope.as_ref().zip(previous_stamp.as_ref())
+                                {
+                                    cache.require_current(base, stamp)?;
+                                }
+                                Ok::<(), io::Error>(())
+                            };
+                            require_previous().map_err(|error| format!("The saved knowledge index changed ({error}). Update the index again."))?;
                             let mut cleanup_warning = false;
                             if persistent && (summary.indexed != 0 || summary.removed != 0 || remote_missing) {
                                 cleanup_warning = Configuration::publish_knowledge_index(&profile_dir, |current| {
                                     if !current.index_scopes(&profile_dir).contains(&scope) {
                                         return Err(io::Error::other("The saved knowledge settings changed. Update the index again."));
                                     }
-                                    remote_index::publish(&cache, &scope, &index, scope.enabled_sources(), Some(client), vault_key.clone(), authorize)
+                                    remote_index::publish(&cache, &scope, &index, scope.enabled_sources(), Some(client), vault_key.clone(), || {
+                                        authorize()?;
+                                        require_previous().map_err(|error| format!("The saved knowledge index changed ({error}). Update the index again."))
+                                    })
                                 })
                                     .map_err(|error| {
                                         format!("Could not save the knowledge index ({error}).")
@@ -1713,13 +1726,13 @@ impl Dialog {
                             let (index, stamp) = match index {
                                 Some(index) => (index, None),
                                 None => {
-                                    let (index, stamp) = cache.load_stamped(&scope).map_err(|error| {
-                                    if error.kind() == io::ErrorKind::NotFound {
-                                        "No saved index matches these settings. Choose Update index.".into()
-                                    } else {
-                                        format!("Could not load the saved index ({error}). Choose Update index.")
-                                    }
-                                    })?;
+                                    let (index, stamp) = cache
+                                        .load_file_backed(&scope, || knowledge::check_active(client))
+                                        .map_err(|error| match error.kind() {
+                                            io::ErrorKind::NotFound => "No saved index matches these settings. Choose Update index.".into(),
+                                            io::ErrorKind::Interrupted => error.to_string(),
+                                            _ => format!("Could not load the saved index ({error}). Choose Update index."),
+                                        })?;
                                     (Arc::new(index), Some(stamp))
                                 }
                             };
@@ -1732,6 +1745,9 @@ impl Dialog {
                                 }
                                 Ok(())
                             })?;
+                            if let Some(stamp) = &stamp {
+                                cache.require_current(&scope, stamp).map_err(|_| "The knowledge index changed. Search again.")?;
+                            }
                             scope.profile.require_current_policy_authority()?;
                             Configuration::require_local_settings(&profile_dir, &baseline)?;
                             Ok(Output::Hits { query, hits, vault_revision })
@@ -3419,7 +3435,7 @@ fn preferences(
         let mut options = options.clone();
         options.extend(
             profiles
-                .https_role_choices(role)
+                .role_specific_choices(role)
                 .filter_map(|(id, name)| Some(Choice(Some(profiles.profile_reference(id)?), name))),
         );
         let selected = match state.profile(role) {

@@ -13,8 +13,8 @@ use super::toolbar_settings::{
 };
 use super::{
     Action, Category, ChromeColors, Icon, Message, Navigation, OpenToolbarOverflow, ToolbarMessage,
-    Workspace, WorkspaceMessage, button_style, divider, menu_popup, next_item, popup, toolbar_drag,
-    toolbar_strip, wrap,
+    Workspace, WorkspaceMessage, button_style, divider, menu_popup, next_item, popup,
+    settings_window, toolbar_drag, toolbar_strip, wrap,
 };
 
 impl Workspace {
@@ -736,13 +736,29 @@ impl Workspace {
             ]
             .into_iter()
             .map(|action| (Group::Settings, Item::Action(action)))
+            .chain(
+                [
+                    settings_window::Section::Messaging,
+                    settings_window::Section::Video,
+                    settings_window::Section::Backup,
+                    settings_window::Section::Export,
+                    settings_window::Section::Updates,
+                    settings_window::Section::Sftp,
+                    settings_window::Section::Editor,
+                    settings_window::Section::SnippetEditor,
+                ]
+                .into_iter()
+                .map(|section| (Group::Settings, Item::Settings(section))),
+            )
             .collect(),
             Catalog::Actions => {
                 let mut actions = vec![(Group::Terminal, Item::Action(LocalShell))];
                 for (action, _, _) in Action::shortcut_catalog() {
                     let group = match action {
-                        QuickConnect | LocalShell | PowerShell | CommandPrompt | IncognitoShell
-                        | Ssh | IncognitoSsh | Serial | Tn3270 | Tn5250 => Group::Terminal,
+                        QuickConnect | LocalShell | PowerShell | CommandPrompt | GitBash
+                        | IncognitoShell | Ssh | IncognitoSsh | Serial | Tn3270 | Tn5250 => {
+                            Group::Terminal
+                        }
                         Settings | FontSettings | WindowSettings | TerminalSettings | Clipboard
                         | Vault | Isolation | ControlApi => continue,
                         ShowMenuBar => Group::Settings,
@@ -767,6 +783,7 @@ impl Workspace {
                     LocalShell | IncognitoShell | TerminalSettings => Icon::Shell,
                     PowerShell => Icon::PowerShell,
                     CommandPrompt => Icon::CommandPrompt,
+                    GitBash => Icon::GitBash,
                     ManageConnections => Icon::Connections,
                     Sftp | SftpHere => Icon::Sftp,
                     Snippets => Icon::Snippets,
@@ -798,6 +815,23 @@ impl Workspace {
                 let (icon, title) = reference.presentation();
                 (icon, Cow::Borrowed(title))
             }
+            Item::Settings(section) => {
+                let icon = match section {
+                    settings_window::Section::Video => Icon::Video,
+                    settings_window::Section::Backup => Icon::Backup,
+                    settings_window::Section::Export => Icon::Export,
+                    settings_window::Section::Updates => Icon::Updates,
+                    settings_window::Section::Sftp => Icon::Sftp,
+                    settings_window::Section::Editor => Icon::Editor,
+                    settings_window::Section::SnippetEditor => Icon::Snippets,
+                    _ => Icon::Gear,
+                };
+                (icon, Cow::Borrowed(section.label()))
+            }
+            Item::Unavailable(target) => {
+                let (icon, target) = target.presentation();
+                (icon, Cow::Owned(format!("{target} (unavailable)")))
+            }
             Item::Connection(id) => (
                 Icon::Server,
                 self.chrome
@@ -826,6 +860,9 @@ impl Workspace {
             Item::Action(action) if self.chrome_enabled(id, *action) => {
                 Some(wrap(Message::Invoke(id, *action)))
             }
+            Item::Settings(section) if self.chrome_enabled(id, Action::Settings) => Some(
+                WorkspaceMessage::Settings(settings_window::Message::OpenAt(id, *section)),
+            ),
             Item::Connection(connection)
                 if self.clipboard.policy.problem.is_none()
                     && toolbar.connections().iter().any(|entry| {
@@ -1047,5 +1084,26 @@ mod tests {
         let (icon, label) = workspace.toolbar_presentation(&item);
         assert!(matches!(icon, Icon::Journal));
         assert_eq!(label, "Logging");
+    }
+
+    #[test]
+    fn toolbar_opens_the_selected_settings_section_and_disables_unresolved_actions() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let item = Item::Settings(settings_window::Section::Video);
+        let (icon, label) = workspace.toolbar_presentation(&item);
+        assert!(matches!(icon, Icon::Video));
+        assert_eq!(label, "Video");
+        assert!(matches!(
+            workspace.toolbar_item_action(owner, &item),
+            Some(WorkspaceMessage::Settings(settings_window::Message::OpenAt(
+                id,
+                settings_window::Section::Video
+            ))) if id == owner
+        ));
+        let unavailable = Item::Unavailable(super::super::toolbar_settings::JavaTarget::Action(
+            "toolbar.settings.language".into(),
+        ));
+        assert!(workspace.toolbar_item_action(owner, &unavailable).is_none());
     }
 }

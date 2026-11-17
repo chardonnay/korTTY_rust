@@ -7,7 +7,7 @@ use bzip2::{Compression, write::BzEncoder};
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
 use kortty_server_archive::manifest::{MAX_EXPANDED_BYTES, MAX_MANIFEST_PATH_BYTES, MAX_MEMBERS};
 use kortty_server_archive::protocol::{
-    CreateFormat, CreateReview, CreateSpec, CreatedPayload, OutputMetadata,
+    ArchiveMemberLayout, CreateFormat, CreateReview, CreateSpec, CreatedPayload, OutputMetadata,
 };
 use rustix::fs::fchown;
 use rustix::process::{Gid, Uid};
@@ -17,6 +17,15 @@ use sevenz_rust2::{
 use zip::{AesMode, CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use super::*;
+
+#[cfg(target_os = "linux")]
+mod update;
+#[cfg(target_os = "linux")]
+mod zip_update;
+#[cfg(target_os = "linux")]
+pub(crate) use update::serve as serve_update;
+#[cfg(target_os = "linux")]
+pub(super) use update::serve_privileged as serve_privileged_update;
 
 pub(super) fn review(spec: CreateSpec) -> Result<CreateReview, Failure> {
     review_with_policy(spec, PathPolicy::default())
@@ -193,7 +202,7 @@ struct Creation<'a> {
     parent_path: &'a str,
     name: &'a str,
     parent: Directory,
-    excludes: GlobSet,
+    excludes: Excludes,
     policy: PathPolicy<'a>,
 }
 
@@ -258,6 +267,13 @@ impl<'a> PathPolicy<'a> {
 
 impl<'a> Creation<'a> {
     fn new(spec: &'a CreateSpec, policy: PathPolicy<'a>) -> io::Result<Self> {
+        let creation = Self::open(spec, policy)?;
+        require_absent(&creation.parent.fd, creation.name)?;
+        Ok(creation)
+    }
+
+    fn open(spec: &'a CreateSpec, policy: PathPolicy<'a>) -> io::Result<Self> {
+        spec.validate_member_layout()?;
         if let Some(output) = spec.output {
             #[cfg(target_os = "linux")]
             if policy.rules.is_some() {
@@ -293,7 +309,7 @@ impl<'a> Creation<'a> {
         let mut names = BTreeSet::new();
         for source in &spec.sources {
             let (_, name) = absolute_file(source)?;
-            if !names.insert(name)
+            if (spec.member_layout == ArchiveMemberLayout::SourceBasename && !names.insert(name))
                 || spec.destination == *source
                 || spec
                     .destination
@@ -305,36 +321,14 @@ impl<'a> Creation<'a> {
                 ));
             }
         }
-        let mut excludes = GlobSetBuilder::new();
-        for pattern in &spec.excludes {
-            if pattern.len() > 256 || pattern.chars().any(char::is_control) {
-                return Err(invalid("Invalid server archive exclude pattern"));
-            }
-            let pattern = pattern.trim().strip_prefix("./").unwrap_or(pattern.trim());
-            if !pattern.is_empty() {
-                let glob = |value| {
-                    GlobBuilder::new(value)
-                        .backslash_escape(true)
-                        .literal_separator(false)
-                        .build()
-                        .map_err(io::Error::other)
-                };
-                excludes.add(glob(pattern)?);
-                if !matches!(spec.format, CreateFormat::Zip | CreateFormat::ZipPassword)
-                    && !pattern.starts_with('/')
-                {
-                    excludes.add(glob(&format!("**/{pattern}"))?);
-                }
-            }
-        }
+        let excludes = Excludes::compile(spec)?;
         let parent = policy.destination_parent(parent_path)?;
-        require_absent(&parent.fd, name)?;
         Ok(Self {
             spec,
             parent_path,
             name,
             parent,
-            excludes: excludes.build().map_err(io::Error::other)?,
+            excludes,
             policy,
         })
     }
@@ -377,22 +371,32 @@ impl<'a> Creation<'a> {
             {
                 scan.source_mount = mount;
             }
-            scan.entry(&root, name, name, source)?;
+            let member = match self.spec.member_layout {
+                ArchiveMemberLayout::SourceBasename => name,
+                ArchiveMemberLayout::ServerPath => &source[1..],
+            };
+            scan.entry(&root, name, member, source, true)?;
             let (current, current_mount) = self.policy.source_parent(source, parent)?;
             if !same_node(&root.stat, &current.stat) || mount != current_mount {
                 return Err(invalid("A server archive source folder changed"));
             }
         }
-        scan.members
-            .sort_by(|left, right| left.path.cmp(&right.path));
-        let manifest = Manifest {
-            members: scan.members,
-            expanded_bytes: scan.expanded,
-        };
-        if manifest.members.is_empty() {
+        if scan.members.is_empty() {
             return Err(invalid("Every server archive source was excluded"));
         }
-        manifest.validate()?;
+        let manifest = if self.spec.member_layout == ArchiveMemberLayout::ServerPath {
+            // The checked review includes implicit ancestors without writing synthetic entries.
+            Manifest::from_canonical_members(&scan.members)?
+        } else {
+            scan.members
+                .sort_by(|left, right| left.path.cmp(&right.path));
+            let manifest = Manifest {
+                members: scan.members,
+                expanded_bytes: scan.expanded,
+            };
+            manifest.validate()?;
+            manifest
+        };
         Ok(Inventory {
             manifest,
             token: hex::encode(scan.hash.finalize()),
@@ -407,9 +411,99 @@ struct Inventory {
     excluded: usize,
 }
 
+enum Excludes {
+    Basename(GlobSet),
+    Zip {
+        relative: GlobSet,
+        absolute: GlobSet,
+    },
+    Tar(GlobSet),
+}
+
+impl Excludes {
+    fn compile(spec: &CreateSpec) -> io::Result<Self> {
+        let mut patterns = GlobSetBuilder::new();
+        let mut absolute = GlobSetBuilder::new();
+        let server_paths = spec.member_layout == ArchiveMemberLayout::ServerPath;
+        let zip = matches!(spec.format, CreateFormat::Zip | CreateFormat::ZipPassword);
+        let tar_paths = server_paths && !zip;
+        let glob = |value: &str| {
+            GlobBuilder::new(value)
+                .backslash_escape(true)
+                .literal_separator(false)
+                .build()
+                .map_err(io::Error::other)
+        };
+        for pattern in &spec.excludes {
+            if pattern.len() > 256 || pattern.chars().any(char::is_control) {
+                return Err(invalid("Invalid server archive exclude pattern"));
+            }
+            let pattern = pattern.trim();
+            if pattern.is_empty() {
+                continue;
+            }
+            if tar_paths {
+                // GNU tar filters the original names. It keeps literal leading ./ and
+                // trailing / in the pattern even though the stored paths differ.
+                patterns.add(glob(pattern)?);
+                continue;
+            }
+            let is_absolute = pattern.starts_with('/');
+            let pattern = pattern.strip_prefix("./").unwrap_or(pattern);
+            if pattern.is_empty() {
+                continue;
+            }
+            if server_paths && is_absolute {
+                absolute.add(glob(pattern)?);
+            } else {
+                patterns.add(glob(pattern)?);
+            }
+            if !zip && !pattern.starts_with('/') {
+                patterns.add(glob(&format!("**/{pattern}"))?);
+            }
+        }
+        let patterns = patterns.build().map_err(io::Error::other)?;
+        Ok(if tar_paths {
+            Self::Tar(patterns)
+        } else if server_paths {
+            Self::Zip {
+                relative: patterns,
+                absolute: absolute.build().map_err(io::Error::other)?,
+            }
+        } else {
+            Self::Basename(patterns)
+        })
+    }
+
+    fn prune(&self, path: &str, absolute: &str, source_root: bool) -> bool {
+        match self {
+            Self::Basename(patterns) => patterns.is_match(path) || patterns.is_match(absolute),
+            Self::Zip {
+                absolute: patterns, ..
+            } => patterns.is_match(absolute),
+            Self::Tar(patterns) => {
+                !patterns.is_empty()
+                    && (tar_matches(patterns, absolute)
+                        || (source_root
+                            && absolute
+                                .match_indices('/')
+                                .skip(1)
+                                .any(|(index, _)| tar_matches(patterns, &absolute[..index]))))
+            }
+        }
+    }
+}
+
+fn tar_matches(patterns: &GlobSet, path: &str) -> bool {
+    patterns.is_match(path)
+        || path
+            .match_indices('/')
+            .any(|(index, _)| patterns.is_match(&path[index + 1..]))
+}
+
 struct Scan<'a, F> {
     visit: F,
-    excludes: &'a GlobSet,
+    excludes: &'a Excludes,
     hash: Sha256,
     members: Vec<Member>,
     expanded: u64,
@@ -426,6 +520,7 @@ impl<F: FnMut(&Member, &mut dyn Read) -> io::Result<()>> Scan<'_, F> {
         name: &str,
         path: &str,
         absolute: &str,
+        source_root: bool,
     ) -> io::Result<()> {
         if self.members.len() + self.excluded >= MAX_MEMBERS
             || path.len() > MAX_PATH_BYTES
@@ -434,19 +529,41 @@ impl<F: FnMut(&Member, &mut dyn Read) -> io::Result<()>> Scan<'_, F> {
         {
             return Err(invalid("The server archive inventory exceeds its limits"));
         }
-        if self.excludes.is_match(path) || self.excludes.is_match(absolute) {
+        if self.excludes.prune(path, absolute, source_root) {
             self.excluded += 1;
             return Ok(());
-        }
-        self.path_bytes += path.len();
-        if self.path_bytes > MAX_MANIFEST_PATH_BYTES {
-            return Err(invalid(
-                "The server archive inventory paths exceed their limit",
-            ));
         }
         let named = statat(&parent.fd, name, AtFlags::SYMLINK_NOFOLLOW)?;
         let kind = FileType::from_raw_mode(named.st_mode);
         let directory = kind == FileType::Directory;
+        let mut emit = true;
+        if let Excludes::Zip {
+            relative,
+            absolute: absolute_excludes,
+        } = self.excludes
+        {
+            if directory {
+                if absolute_excludes.is_match(format!("{absolute}/")) {
+                    self.excluded += 1;
+                    return Ok(());
+                }
+                // ZIP patterns match stored names, with a slash on directories. An excluded
+                // directory member can still have descendants that match no exclusion.
+                emit = !relative.is_match(format!("{path}/"));
+                self.excluded += usize::from(!emit);
+            } else if relative.is_match(path) {
+                self.excluded += 1;
+                return Ok(());
+            }
+        }
+        if emit {
+            self.path_bytes += path.len();
+            if self.path_bytes > MAX_MANIFEST_PATH_BYTES {
+                return Err(invalid(
+                    "The server archive inventory paths exceed their limit",
+                ));
+            }
+        }
         if !directory && !protected_file(&named) {
             return Err(invalid(
                 "Server archives require protected regular files and directories",
@@ -490,8 +607,10 @@ impl<F: FnMut(&Member, &mut dyn Read) -> io::Result<()>> Scan<'_, F> {
             size,
         };
         if directory {
-            (self.visit)(&member, &mut io::empty())?;
-            self.members.push(member);
+            if emit {
+                (self.visit)(&member, &mut io::empty())?;
+                self.members.push(member);
+            }
             let mut names = BTreeSet::new();
             for entry in Dir::read_from(&node.fd)? {
                 let entry = entry?;
@@ -512,6 +631,7 @@ impl<F: FnMut(&Member, &mut dyn Read) -> io::Result<()>> Scan<'_, F> {
                     &name,
                     &format!("{path}/{name}"),
                     &format!("{absolute}/{name}"),
+                    false,
                 )?;
             }
         } else {
@@ -594,8 +714,8 @@ impl Seek for ArchiveOutput<'_> {
 
 enum Encoder<'a, W: Write + Seek> {
     Zip(Box<ZipWriter<W>>, u8, Option<&'a [u8]>),
-    Tar(tar::Builder<W>),
-    Bzip2(tar::Builder<BzEncoder<W>>),
+    Tar(tar::Builder<W>, ArchiveMemberLayout),
+    Bzip2(tar::Builder<BzEncoder<W>>, ArchiveMemberLayout),
     SevenZip(Box<ArchiveWriter<W>>, u8),
 }
 
@@ -605,11 +725,14 @@ impl<'a, W: Write + Seek> Encoder<'a, W> {
             CreateFormat::Zip | CreateFormat::ZipPassword => {
                 Self::Zip(Box::new(ZipWriter::new(file)), spec.level, password)
             }
-            CreateFormat::Tar => Self::Tar(tar::Builder::new(file)),
-            CreateFormat::TarBzip2 => Self::Bzip2(tar::Builder::new(BzEncoder::new(
-                file,
-                Compression::new(u32::from(spec.level)),
-            ))),
+            CreateFormat::Tar => Self::Tar(tar::Builder::new(file), spec.member_layout),
+            CreateFormat::TarBzip2 => Self::Bzip2(
+                tar::Builder::new(BzEncoder::new(
+                    file,
+                    Compression::new(u32::from(spec.level)),
+                )),
+                spec.member_layout,
+            ),
             CreateFormat::SevenZip => {
                 let mut writer = ArchiveWriter::new(file).map_err(sevenz_error)?;
                 writer.set_encrypt_header(false);
@@ -647,8 +770,8 @@ impl<'a, W: Write + Seek> Encoder<'a, W> {
                 }
                 Ok(())
             }
-            Self::Tar(writer) => append_tar(writer, member, reader),
-            Self::Bzip2(writer) => append_tar(writer, member, reader),
+            Self::Tar(writer, layout) => append_tar(writer, member, *layout, reader),
+            Self::Bzip2(writer, layout) => append_tar(writer, member, *layout, reader),
             Self::SevenZip(writer, level) => append_sevenz(writer, *level, member, reader),
         }
     }
@@ -658,10 +781,10 @@ impl<'a, W: Write + Seek> Encoder<'a, W> {
             Self::Zip(writer, _, _) => {
                 writer.finish()?;
             }
-            Self::Tar(writer) => {
+            Self::Tar(writer, _) => {
                 writer.into_inner()?;
             }
-            Self::Bzip2(writer) => {
+            Self::Bzip2(writer, _) => {
                 writer.into_inner()?.finish()?;
             }
             Self::SevenZip(writer, _) => {
@@ -730,6 +853,7 @@ fn sevenz_error(error: sevenz_rust2::Error) -> io::Error {
 fn append_tar(
     writer: &mut tar::Builder<impl Write>,
     member: &Member,
+    layout: ArchiveMemberLayout,
     reader: &mut dyn Read,
 ) -> io::Result<()> {
     let mut header = tar::Header::new_gnu();
@@ -741,5 +865,9 @@ fn append_tar(
     });
     header.set_mode(if directory { 0o700 } else { 0o600 });
     header.set_size(member.size);
-    writer.append_data(&mut header, &member.path, reader)
+    if directory && layout == ArchiveMemberLayout::ServerPath {
+        writer.append_data(&mut header, format!("{}/", member.path), reader)
+    } else {
+        writer.append_data(&mut header, &member.path, reader)
+    }
 }

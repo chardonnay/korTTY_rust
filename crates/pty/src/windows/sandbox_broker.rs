@@ -110,6 +110,7 @@ pub(super) fn spawn(
         LocalShell::Default => "default",
         LocalShell::CommandPrompt => "cmd",
         LocalShell::PowerShell => "powershell",
+        _ => return Err(invalid_arguments()),
     };
     let mut arguments = vec![
         WINDOWS_LOCAL_SANDBOX_BROKER_ARGUMENT.to_owned(),

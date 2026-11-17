@@ -25,6 +25,8 @@ use crate::scheduler_window::{SshCommand, rsync, sync};
 use crate::sftp_window::{StagedDownload, local_tree};
 
 use super::super::{Completion, ExecutionPolicy, Failure, check_cancelled, remote};
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+use super::LocalParentReceipt;
 
 mod batch;
 mod bridge;
@@ -49,12 +51,17 @@ mod windows_tests;
 pub(crate) use bridge::{ARGUMENT as BRIDGE_ARGUMENT, serve as serve_bridge};
 use bridge::{Listener, Stream};
 pub(super) use existing::review as review_existing;
+pub(super) use existing::review_recurring as review_recurring_receiver;
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 pub(super) use local_existing::review as review_local_existing;
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+pub(super) use local_existing::review_file_vacancy as review_local_file_vacancy;
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+pub(super) use local_existing::review_vacant as review_local_vacant_tree;
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
 pub(super) use mixed::review as review_mixed;
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-pub(super) use privileged::review as review_privileged;
+pub(super) use privileged::review_destination as review_privileged_destination;
 pub(crate) use upload::digest as upload_digest;
 pub(crate) use upload_tree::inventory as upload_tree_inventory;
 #[cfg(windows)]
@@ -156,16 +163,26 @@ pub(in crate::job_executor) fn run(
         .as_ref()
         .ok_or_else(review_required)?;
     let grouped = policy.group_scope.is_some();
-    let updates_existing = action.uses_existing_destination();
+    let vacant_file = action.uses_reviewed_file_creation(uploading);
+    let automatic_receiver = action.requires_automatic_receiver(uploading);
     let elevated = action.uses_passwordless_sudo();
-    let current_review = elevated || updates_existing;
+    let current_review = action.requires_reviewed_receiver(uploading);
+    let recurring_trigger = matches!(
+        request.trigger,
+        kortty_jobs::RunTrigger::Scheduled | kortty_jobs::RunTrigger::Dependency
+    );
+    if automatic_receiver && !recurring_trigger {
+        return Err(Failure::blocked(
+            "This reviewed recurring rsync transfer requires an approved Calendar or Chain firing.",
+        ));
+    }
     if elevated && !policy.sudo_allowed {
         return Err(Failure::blocked("Managed policy forbids privileged rsync."));
     }
     if current_review {
         policy.require_rsync_approval(request.id, &request.job, reference)?;
     }
-    if cfg!(windows) || uploading || action.directory || grouped {
+    if cfg!(windows) || uploading || action.directory || grouped || vacant_file {
         authorize_transfer(reference, elevated)?;
     }
     let approval = action.approval.as_ref().ok_or_else(review_required)?;
@@ -177,12 +194,7 @@ pub(in crate::job_executor) fn run(
         .as_ref()
         .and_then(crate::scheduler_window::rsync_authority::RunContext::standing)
         .map(|lease| recurring::Route { lease, reference });
-    if action.standing.is_some()
-        && matches!(
-            request.trigger,
-            kortty_jobs::RunTrigger::Scheduled | kortty_jobs::RunTrigger::Dependency
-        )
-        && recurring.is_none()
+    if (automatic_receiver || action.standing.is_some() && recurring_trigger) && recurring.is_none()
     {
         return Err(Failure::blocked(
             "A recurring rsync run requires its current firing approval.",
@@ -273,7 +285,8 @@ pub(in crate::job_executor) fn run(
                 target,
                 jumps,
                 pinned,
-                elevated || (uploading && action.directory),
+                elevated
+                    || (uploading && (action.directory || approval.ordinary_receiver.is_some())),
                 cancelled,
                 || require_authority(guard.as_ref()),
             )
@@ -293,6 +306,8 @@ pub(in crate::job_executor) fn run(
         guard,
         executable,
         recurring,
+        #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+        batch_parents: policy.rsync_batch_parents.as_deref(),
     };
     let outcome = remote::sync::supervise(&mut session, &cancelled, |client, stopped, _| {
         let stopped = || stopped() || policy.require_target_groups(&request.action).is_err();
@@ -312,6 +327,38 @@ pub(in crate::job_executor) fn run(
                 "Privileged rsync is unavailable on this platform.",
             ));
         }
+        if action.uses_ordinary_recurring_receiver(uploading) {
+            let approved = approval
+                .ordinary_receiver
+                .as_ref()
+                .ok_or_else(review_required)?;
+            let recurring = context.recurring.ok_or_else(review_required)?;
+            if approved.directory != action.directory
+                || Some(approved.settings) != action.existing
+                || action.existing_destination().as_ref().ok() != Some(&approved.destination)
+            {
+                return Err(review_required());
+            }
+            let scope = if approved.settings.delete {
+                kortty_server_archive::rsync_tree::DeleteScope::All
+            } else {
+                kortty_server_archive::rsync_tree::DeleteScope::Retain
+            };
+            let (temp, listener, endpoint) = stage_bridge(&context, &stopped)?;
+            return existing::apply_ordinary_recurring(
+                context.transfer(action, &temp, &stopped),
+                listener,
+                &endpoint,
+                request.id,
+                existing::Receiver {
+                    destination: &approved.destination,
+                    approval: existing::ReceiverApproval::Recurring(approved.receiver),
+                    scope: &scope,
+                    projected: None,
+                },
+                recurring,
+            );
+        }
         if action.existing.is_some() {
             let (temp, listener, endpoint) = stage_bridge(&context, &stopped)?;
             if let Some(recurring) = context.recurring {
@@ -323,7 +370,7 @@ pub(in crate::job_executor) fn run(
                     &endpoint,
                     request.id,
                     snapshot,
-                    |incoming| recurring.reserve([incoming]),
+                    |incoming| recurring.reserve([incoming], 0),
                     |removed| recurring.arm(removed),
                 )?;
                 return Ok(recurring.confirm(
@@ -341,16 +388,16 @@ pub(in crate::job_executor) fn run(
                 request.id,
             );
         }
-        if action.existing_download.is_some() {
+        if action.existing_download.is_some() || vacant_file {
             #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
             return if action.directory {
-                run_existing_download(client, &context, action, request.id, &stopped)
+                run_reviewed_directory_download(client, &context, action, request.id, &stopped)
             } else {
                 local_file::run(client, &context, action, None, request.id, &stopped)
             };
             #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
             return Err(Failure::blocked(
-                "Existing local rsync receivers are unavailable on this platform.",
+                "Reviewed local rsync receivers are unavailable on this platform.",
             ));
         }
         if batch.is_some() {
@@ -391,44 +438,33 @@ pub(in crate::job_executor) fn run(
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
-fn run_existing_download(
+fn run_reviewed_directory_download(
     client: &mut crate::sftp_window::scheduled::Client,
     context: &TransferContext<'_>,
     action: &rsync::Transfer,
     id: kortty_jobs::RunId,
     stopped: &impl Fn() -> bool,
 ) -> Result<Completion, Failure> {
-    let approval = action
-        .approval
-        .as_ref()
-        .and_then(|approval| approval.existing_download.as_deref())
-        .ok_or_else(|| Failure::blocked("Review the exact existing local rsync directory."))?;
     let authorize = || {
         check_cancelled(context.cancellation)?;
         require_authority(context.guard.as_ref())
     };
     require_running(stopped).map_err(|_| transfer_stopped())?;
     authorize()?;
-    action
-        .require_safe_existing_local_program()
-        .map_err(Failure::blocked)?;
-    let snapshot = match context.recurring {
-        Some(recurring) => recurring.local(&approval.destination)?,
-        None => approval.snapshot,
-    };
-    let receiver = local_existing::Receiver::prepare(&approval.destination, snapshot, stopped)
-        .map_err(|_| {
-            Failure::blocked("The reviewed local rsync directory changed or is unavailable.")
-        })?;
+    let parents = context.local_parents()?;
+    let receiver =
+        local_existing::DirectDownload::prepare(action, context.recurring, &parents, stopped)?;
     let (temp, listener, endpoint) = stage_bridge(context, stopped)?;
     let environment = context.transfer(action, &temp, stopped);
     let preflight = match context.recurring {
         Some(recurring) => {
-            let remaining = recurring.remaining()?;
+            let parent_entries = receiver.missing_parent_count();
+            let remaining = recurring.remaining(parent_entries)?;
             let manifest = tree::Manifest::read_limited(
                 client,
                 &action.remote,
                 tree::Limits {
+                    // The scanner counts the source root. The inventory charges its descendants.
                     entries: remaining.entries as usize + 1,
                     bytes: remaining.bytes,
                 },
@@ -439,7 +475,7 @@ fn run_existing_download(
                     "Choose an ordinary server directory for the rsync download.",
                 ));
             }
-            recurring.reserve([manifest.inventory()?])?;
+            recurring.reserve([manifest.inventory()?], parent_entries)?;
             Some(manifest)
         }
         None => None,
@@ -452,33 +488,9 @@ fn run_existing_download(
         context.reference,
         preflight,
     )?;
-    let local_existing::Published {
-        mut completion,
-        successor,
-    } = receiver.publish(
-        local_existing::Incoming {
-            directory: &incoming,
-            inventory: manifest.inventory()?,
-            delete: &if approval.settings.delete {
-                kortty_server_archive::rsync_tree::DeleteScope::All
-            } else {
-                kortty_server_archive::rsync_tree::DeleteScope::Retain
-            },
-        },
-        stopped,
-        &authorize,
-        id,
-        |removed| context.recurring.map_or(Ok(()), |route| route.arm(removed)),
-    )?;
-    if let Some(recurring) = context.recurring {
-        completion = recurring.confirm(
-            completion,
-            successor.map(|snapshot| rsync::standing::Receiver::Local {
-                destination: approval.destination.clone(),
-                snapshot,
-            }),
-        );
-    }
+    let (completion, created) =
+        receiver.publish(&incoming, manifest.inventory()?, stopped, &authorize, id)?;
+    let mut completion = context.record_local_parents(completion, created);
     if completion.outcome == RunOutcome::Success {
         completion.append_detail(&manifest.download_detail());
     }
@@ -514,6 +526,8 @@ struct TransferContext<'a> {
     guard: Option<ExecutionGuard>,
     executable: &'a Path,
     recurring: Option<recurring::Route<'a>>,
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    batch_parents: Option<&'a std::sync::Mutex<Vec<LocalParentReceipt>>>,
 }
 
 pub(super) type ExecutionGuard = std::sync::Arc<dyn Fn() -> io::Result<()> + Send + Sync>;
@@ -529,6 +543,61 @@ fn authority_revoked(checked: &Cell<(Instant, bool)>, guard: &ExecutionGuard) ->
 }
 
 impl TransferContext<'_> {
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    fn local_parents(&self) -> Result<Vec<LocalParentReceipt>, Failure> {
+        if let Some(route) = self.recurring {
+            route
+                .lease
+                .local_parents()
+                .map_err(|_| local_parent_review())
+        } else if let Some(parents) = self.batch_parents {
+            parents
+                .lock()
+                .map(|parents| parents.clone())
+                .map_err(|_| local_parent_review())
+        } else {
+            Ok(Vec::new())
+        }
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    fn record_local_parents(
+        &self,
+        mut completion: Completion,
+        created: Vec<LocalParentReceipt>,
+    ) -> Completion {
+        if completion.outcome != RunOutcome::Success
+            || created.is_empty()
+            || self.recurring.is_some()
+        {
+            return completion;
+        }
+        if let Some(parents) = self.batch_parents {
+            let recorded = parents.lock().is_ok_and(|mut parents| {
+                if created.iter().any(|receipt| {
+                    parents
+                        .iter()
+                        .any(|known| known.path_key() == receipt.path_key() && known != receipt)
+                }) {
+                    return false;
+                }
+                for receipt in created {
+                    if !parents.contains(&receipt) {
+                        parents.push(receipt);
+                    }
+                }
+                true
+            });
+            if !recorded {
+                completion.outcome = RunOutcome::Failed { exit_code: None };
+                completion.append_detail(
+                    "Could not share the confirmed local rsync parents with the other routes.",
+                );
+            }
+        }
+        completion
+    }
+
     fn transfer<'a, C>(
         &'a self,
         action: &'a rsync::Transfer,
@@ -545,6 +614,13 @@ impl TransferContext<'_> {
             executable: self.executable,
         }
     }
+}
+
+#[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+fn local_parent_review() -> Failure {
+    Failure::blocked(
+        "The reviewed local rsync parents are unavailable. Review the destination again.",
+    )
 }
 
 fn require_authority(guard: Option<&ExecutionGuard>) -> Result<(), Failure> {

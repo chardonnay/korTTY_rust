@@ -73,7 +73,7 @@ fn native_windows_shells_emit_fresh_prompt_boundaries_only_when_enabled() {
 
 #[test]
 #[ignore = "requires an explicitly selected native Git Bash executable"]
-fn native_windows_custom_bash_preserves_startup_and_emits_shell_marks() {
+fn native_windows_git_bash_preserves_startup_and_emits_shell_marks() {
     let program = PathBuf::from(
         env::var_os(BASH_PROGRAM)
             .expect("set KORTTY_TEST_WINDOWS_BASH to an approved full Git Bash path"),
@@ -91,7 +91,13 @@ fn native_windows_custom_bash_preserves_startup_and_emits_shell_marks() {
     fs::write(root.join(".bashrc"), RC).unwrap();
     fs::write(root.join(".bash_profile"), PROFILE).unwrap();
     let checked = std::panic::catch_unwind(|| {
-        for (flags, enabled) in [("-i", false), ("-i", true), ("-il", true)] {
+        for (case, flags, enabled) in [
+            ("bash", "-i", false),
+            ("bash", "-i", true),
+            ("bash", "-il", true),
+            ("git-bash", "-il", false),
+            ("git-bash", "-il", true),
+        ] {
             let child = Command::new(env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -99,7 +105,7 @@ fn native_windows_custom_bash_preserves_startup_and_emits_shell_marks() {
                     "--ignored",
                     "--nocapture",
                 ])
-                .env(CASE, "bash")
+                .env(CASE, case)
                 .env(BASH_PROGRAM, &program)
                 .env("KORTTY_TEST_WINDOWS_BASH_FLAGS", flags)
                 .env(
@@ -123,7 +129,7 @@ fn native_windows_custom_bash_preserves_startup_and_emits_shell_marks() {
             let output = child.wait_with_output().unwrap();
             assert!(
                 output.status.success(),
-                "Git Bash {flags} enabled={enabled}\n{}\n{}",
+                "Git Bash {case} {flags} enabled={enabled}\n{}\n{}",
                 String::from_utf8_lossy(&output.stdout),
                 String::from_utf8_lossy(&output.stderr)
             );
@@ -156,14 +162,26 @@ fn fixture_windows_prompt() {
         return;
     };
     let powershell = case == "powershell";
-    let bash = case == "bash";
+    let git_preset = case == "git-bash";
+    let bash = case == "bash" || git_preset;
     let enabled = env::var("KORTTY_NATIVE_PROMPT_ENABLED").as_deref() == Ok("1");
     let root = PathBuf::from(env::var_os("KORTTY_NATIVE_PROMPT_ROOT").unwrap());
     let preset = if powershell {
         LocalShell::PowerShell
+    } else if git_preset {
+        LocalShell::GitBash
     } else {
         LocalShell::CommandPrompt
     };
+    if git_preset {
+        let discovered = kortty_pty::shell_program(preset).unwrap();
+        let expected = PathBuf::from(env::var_os(BASH_PROGRAM).unwrap());
+        assert_eq!(
+            discovered.canonicalize().unwrap(),
+            expected.canonicalize().unwrap()
+        );
+        assert!(kortty_pty::available_local_shells().contains(&preset));
+    }
     let mut command = if bash {
         vec![
             env::var(BASH_PROGRAM).unwrap(),
@@ -192,7 +210,12 @@ fn fixture_windows_prompt() {
         24,
         "xterm-256color",
         &LaunchOptions {
-            command: Some(command),
+            shell: if git_preset {
+                preset
+            } else {
+                LocalShell::Default
+            },
+            command: (!git_preset).then_some(command),
             working_directory: Some(if bash { root.join("cwd proof'") } else { root }),
             shell_integration: enabled,
             ..LaunchOptions::default()

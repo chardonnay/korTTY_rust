@@ -1,9 +1,8 @@
-use std::fmt;
 use std::path::PathBuf;
 
 use iced::widget::{button, checkbox, column, pick_list, row, text, text_input};
 use iced::{Element, Length, Task};
-use kortty_pty::LocalShell;
+use kortty_pty::{LocalShell, available_local_shells};
 use kortty_terminal::TerminalProfile;
 
 use crate::connection_store::LocalProfile;
@@ -11,15 +10,6 @@ use crate::connection_store::LocalProfile;
 use super::{ConnectionWindow, Message, Persisted, Scope, terminal_overrides};
 
 const MAX_ARGUMENTS: usize = 127;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ShellChoice(LocalShell);
-
-impl fmt::Display for ShellChoice {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0.preset_title().unwrap_or("System default"))
-    }
-}
 
 #[derive(Clone, Debug)]
 pub enum Edit {
@@ -118,7 +108,10 @@ impl Draft {
         match edit {
             Edit::Name(name) if name.len() <= 160 => self.name = name,
             Edit::Directory(directory) if directory.len() <= 4096 => self.directory = directory,
-            Edit::Shell(shell) if !self.custom => self.shell = shell,
+            Edit::Shell(shell) if !self.custom => {
+                self.shell = shell;
+                self.integration &= self.integration_support().is_ok();
+            }
             Edit::Emulation(emulation) => self.emulation = emulation,
             Edit::Integration(enabled) if !enabled || self.integration_support().is_ok() => {
                 self.integration = enabled;
@@ -200,23 +193,11 @@ impl Draft {
                 (self.arguments.len() < MAX_ARGUMENTS).then_some(Edit::AddArgument),
             ));
         } else {
-            let mut shells = vec![ShellChoice(LocalShell::Default)];
-            if cfg!(windows) {
-                shells.extend([
-                    ShellChoice(LocalShell::PowerShell),
-                    ShellChoice(LocalShell::CommandPrompt),
-                ]);
-            } else if !self.shell.is_default() {
-                shells.push(ShellChoice(self.shell));
+            let mut shells = available_local_shells();
+            if !shells.contains(&self.shell) {
+                shells.push(self.shell);
             }
-            form = form.push(
-                pick_list(
-                    shells,
-                    Some(ShellChoice(self.shell)),
-                    |choice: ShellChoice| Edit::Shell(choice.0),
-                )
-                .width(Length::Fill),
-            );
+            form = form.push(pick_list(shells, Some(self.shell), Edit::Shell).width(Length::Fill));
         }
         let integration = self.integration_support();
         form = form.push(

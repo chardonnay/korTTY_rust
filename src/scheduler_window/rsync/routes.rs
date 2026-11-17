@@ -2,15 +2,17 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, atomic::AtomicBool};
 
 use kortty_server_archive::privileged_rsync::{Review as PrivilegedReview, Spec as PrivilegedSpec};
-use kortty_server_archive::rsync_tree::ExistingTree;
+use kortty_server_archive::rsync_tree::RecurringReceiver;
 use serde::{Deserialize, Serialize};
 
 use super::{
     Approval, ConnectionRef, DirectoryReview, MixedReceiver, MixedReview, MixedReviewTarget,
-    RemotePath, ReviewRequest, Transfer,
+    RemotePath, ReviewRequest, Transfer, UploadReceiverPreview,
 };
-use crate::job_executor::rsync::LocalExistingSnapshot;
-use crate::sftp_window::LocalFileSnapshot;
+use crate::job_executor::rsync::{
+    LocalExistingSnapshot, LocalTreeLocation, VacantFileProof, VacantLocalTreeSnapshot,
+};
+use crate::sftp_window::{LocalFileSnapshot, VacantLocalFileAlias};
 
 const TARGETS: &str = "Choose one exact rsync destination for each saved SSH target.";
 const REVIEW: &str = "Review every rsync destination and saved SSH route before running.";
@@ -26,6 +28,31 @@ pub(crate) struct Route {
 }
 
 impl Transfer {
+    pub(crate) fn requires_automatic_receiver(&self, upload: bool) -> bool {
+        (upload && (self.allow_vacant_server_file_upload || self.allow_vacant_server_tree_upload))
+            || self.uses_vacant_recurring_file_receiver(upload)
+            || !upload
+                && self.standing.is_some()
+                && self.approvals().any(|approval| {
+                    approval.vacant_directory_download.is_some()
+                        || matches!(
+                            approval.mixed.as_deref().map(|review| &review.receiver),
+                            Some(MixedReceiver::Local {
+                                vacant: Some(_),
+                                ..
+                            })
+                        )
+                })
+    }
+
+    fn approvals(&self) -> impl Iterator<Item = &Approval> {
+        self.approval.iter().chain(
+            self.routes
+                .iter()
+                .filter_map(|route| route.approval.as_ref()),
+        )
+    }
+
     pub(crate) fn for_target(&self, index: usize, upload: bool) -> Result<Self, &'static str> {
         let route = index
             .checked_sub(1)
@@ -44,6 +71,10 @@ impl Transfer {
             directory: self.directory,
             existing: self.existing,
             existing_download: self.existing_download,
+            allow_vacant_directory_download: self.allow_vacant_directory_download,
+            allow_vacant_file_download: self.allow_vacant_file_download,
+            allow_vacant_server_file_upload: self.allow_vacant_server_file_upload,
+            allow_vacant_server_tree_upload: self.allow_vacant_server_tree_upload,
             mixed: self.mixed.clone(),
             additional_sources: self.additional_sources.clone(),
             approval: match route {
@@ -65,10 +96,7 @@ impl Transfer {
         if self.routes.len() != additional.len() {
             return Err(TARGETS);
         }
-        if additional.is_empty()
-            && !self.uses_existing_destination()
-            && !self.uses_passwordless_sudo()
-        {
+        if additional.is_empty() && !self.requires_reviewed_receiver(upload) {
             return Ok(());
         }
         let mut local_destinations = Vec::new();
@@ -101,19 +129,16 @@ impl Transfer {
         Ok(())
     }
 
-    pub(crate) fn require_group_review(&self) -> Result<(), &'static str> {
-        if self.routes.is_empty()
-            && !self.uses_existing_destination()
-            && !self.uses_passwordless_sudo()
-        {
+    pub(crate) fn require_group_review(&self, upload: bool) -> Result<(), &'static str> {
+        if self.routes.is_empty() && !self.requires_reviewed_receiver(upload) {
             return Ok(());
         }
         let primary = self.approval.as_ref().ok_or(REVIEW)?;
-        if !self.review_matches_mode(primary)
+        if !self.review_matches_mode(primary, upload)
             || self.routes.iter().any(|route| {
                 route.approval.as_ref().is_none_or(|review| {
                     review.digest != primary.digest
-                        || !self.review_matches_mode(review)
+                        || !self.review_matches_mode(review, upload)
                         || !primary.same_existing_source(review)
                 })
             })
@@ -121,32 +146,52 @@ impl Transfer {
             return Err(REVIEW);
         }
         if !local_receivers_distinct(
-            std::iter::once(primary).chain(
-                self.routes
-                    .iter()
-                    .filter_map(|route| route.approval.as_ref()),
-            ),
+            self.approvals(),
+            self.uses_reviewed_file_creation(upload) && !self.routes.is_empty(),
         ) {
             return Err(OVERLAP);
         }
         Ok(())
     }
 
-    fn review_matches_mode(&self, approval: &Approval) -> bool {
-        if self.mixed.is_some() {
-            approval
-                .mixed
-                .as_ref()
-                .is_some_and(|review| self.uses_passwordless_sudo() == review.privileged.is_some())
-        } else {
-            self.uses_passwordless_sudo() == approval.privileged.is_some()
-                && approval.mixed.is_none()
-                && approval.existing.is_some() == self.existing.is_some()
-                && approval.existing_download.is_some()
-                    == (self.directory && self.existing_download.is_some())
-                && approval.existing_file_download.is_some()
-                    == (!self.directory && self.existing_download.is_some())
+    fn review_matches_mode(&self, approval: &Approval, upload: bool) -> bool {
+        let vacant_directory = approval.vacant_directory_download.is_some();
+        if vacant_directory
+            && (upload
+                || !self.allow_vacant_directory_download
+                || approval.existing_download.is_some())
+        {
+            return false;
         }
+        if self.uses_reviewed_file_creation(upload) {
+            let vacant = approval.vacant_file_download.is_some();
+            let existing = approval.existing_file_download.is_some();
+            return self.uses_passwordless_sudo() == approval.privileged.is_some()
+                && vacant != existing
+                && (vacant || self.standing.is_some());
+        }
+        approval.vacant_file_download.is_none()
+            && approval.ordinary_receiver.is_some()
+                == (self.mixed.is_none() && self.uses_ordinary_recurring_receiver(upload))
+            && (self.allow_vacant_server_file_upload || !approval.first_server_file_upload())
+            && (self.allow_vacant_server_tree_upload || !approval.first_server_tree_upload())
+            && if self.mixed.is_some() {
+                approval.mixed.as_ref().is_some_and(|review| {
+                    self.uses_passwordless_sudo() == review.privileged.is_some()
+                        && review.matches_server_vacancy(
+                            self.allow_vacant_server_tree_upload,
+                            self.elevation,
+                        )
+                })
+            } else {
+                self.uses_passwordless_sudo() == approval.privileged.is_some()
+                    && approval.mixed.is_none()
+                    && approval.existing_upload_scope().is_some() == self.existing.is_some()
+                    && (approval.existing_download.is_some() || vacant_directory)
+                        == (self.directory && self.existing_download.is_some())
+                    && approval.existing_file_download.is_some()
+                        == (!self.directory && self.existing_download.is_some())
+            }
     }
 }
 
@@ -162,26 +207,141 @@ fn push_disjoint(paths: &mut Vec<PathBuf>, destination: &Path) -> Result<(), &'s
     Ok(())
 }
 
-fn local_receivers_distinct<'a>(approvals: impl Iterator<Item = &'a Approval>) -> bool {
-    let mut seen = Vec::<LocalWitness<'_>>::new();
-    for snapshot in
-        approvals.filter_map(|approval| approval.local_review().and_then(|(_, snapshot)| snapshot))
-    {
-        if seen.iter().any(|previous| previous.aliases(&snapshot)) {
-            return false;
-        }
-        seen.push(snapshot);
-    }
-    true
+fn local_receivers_distinct<'a>(
+    approvals: impl Iterator<Item = &'a Approval>,
+    require_file_aliases: bool,
+) -> bool {
+    LocalWitness::group_paths_are_distinct(
+        approvals.filter_map(Approval::local_review),
+        require_file_aliases,
+        false,
+    )
 }
 
-enum LocalWitness<'a> {
+#[derive(Clone, Copy)]
+pub(super) enum LocalWitness<'a> {
     Tree(&'a LocalExistingSnapshot),
+    VacantTree(&'a VacantLocalTreeSnapshot),
     File(&'a LocalFileSnapshot),
+    VacantFile(&'a VacantFileProof),
 }
 
-impl LocalWitness<'_> {
-    fn aliases(&self, other: &Self) -> bool {
+impl<'a> LocalWitness<'a> {
+    pub(super) fn group_is_distinct(
+        witnesses: impl Iterator<Item = (&'a Path, Self)>,
+        require_file_aliases: bool,
+        published_siblings: bool,
+    ) -> bool {
+        Self::group_paths_are_distinct(
+            witnesses.map(|(path, witness)| (path, Some(witness))),
+            require_file_aliases,
+            published_siblings,
+        )
+    }
+
+    fn group_paths_are_distinct(
+        witnesses: impl Iterator<Item = (&'a Path, Option<Self>)>,
+        require_file_aliases: bool,
+        published_siblings: bool,
+    ) -> bool {
+        let mut final_paths = Vec::new();
+        let mut scopes: Vec<LocalPublicationScope<'a>> = Vec::new();
+        for (destination, witness) in witnesses {
+            if push_disjoint(&mut final_paths, destination).is_err()
+                || (require_file_aliases
+                    && witness.is_some_and(|witness| witness.file_alias().is_none()))
+            {
+                return false;
+            }
+            let Some(boundary) = Self::publication_boundary(witness.as_ref(), destination) else {
+                return false;
+            };
+            let Ok(normalized) = super::local_scope_path(boundary) else {
+                return false;
+            };
+            let scope = LocalPublicationScope {
+                destination,
+                boundary,
+                normalized,
+                witness,
+            };
+            if scopes
+                .iter()
+                .any(|other| !scope.separate_from(other, require_file_aliases, published_siblings))
+            {
+                return false;
+            }
+            scopes.push(scope);
+        }
+        true
+    }
+
+    fn publication_boundary<'path>(
+        witness: Option<&Self>,
+        destination: &'path Path,
+    ) -> Option<&'path Path> {
+        match witness {
+            Some(Self::VacantTree(snapshot)) => snapshot.first_missing(destination),
+            Some(Self::VacantFile(snapshot)) => snapshot.first_missing(destination),
+            _ => Some(destination),
+        }
+    }
+
+    pub(super) fn are_distinct(
+        snapshots: impl Iterator<Item = Self>,
+        require_file_aliases: bool,
+    ) -> bool {
+        let snapshots = snapshots.collect::<Vec<_>>();
+        let require_tree_locations = snapshots.len() > 1
+            && snapshots.iter().any(|snapshot| match snapshot {
+                Self::VacantTree(_) => true,
+                Self::VacantFile(snapshot) => snapshot.missing_parent_count() > 0,
+                _ => false,
+            });
+        snapshots.iter().enumerate().all(|(index, snapshot)| {
+            (!require_file_aliases || snapshot.file_alias().is_some())
+                && (!require_tree_locations || snapshot.tree_location().is_some())
+                && snapshots[..index].iter().all(|previous| {
+                    !previous.aliases(snapshot, require_file_aliases, require_tree_locations)
+                })
+        })
+    }
+
+    pub(super) fn file_alias(&self) -> Option<&'a VacantLocalFileAlias> {
+        match self {
+            Self::File(snapshot) => snapshot.alias(),
+            Self::VacantFile(snapshot) => snapshot.alias(),
+            Self::Tree(_) | Self::VacantTree(_) => None,
+        }
+    }
+
+    pub(super) fn tree_location(&self) -> Option<&'a LocalTreeLocation> {
+        match self {
+            Self::Tree(snapshot) => snapshot.location(),
+            Self::VacantTree(snapshot) => Some(snapshot.location()),
+            Self::File(snapshot) => snapshot.location(),
+            Self::VacantFile(snapshot) => snapshot.location(),
+        }
+    }
+
+    fn aliases(
+        &self,
+        other: &Self,
+        compare_file_aliases: bool,
+        compare_tree_locations: bool,
+    ) -> bool {
+        if compare_file_aliases
+            && let (Some(a), Some(b)) = (self.file_alias(), other.file_alias())
+            && a.aliases(b)
+        {
+            return true;
+        }
+        if compare_tree_locations
+            && let (Some(a), Some(b)) = (self.tree_location(), other.tree_location())
+            && a.overlaps(b)
+        {
+            return true;
+        }
         match (self, other) {
             (Self::Tree(a), Self::Tree(b)) => a.aliases(b),
             (Self::File(a), Self::File(b)) => a.aliases(b),
@@ -190,13 +350,109 @@ impl LocalWitness<'_> {
     }
 }
 
+struct LocalPublicationScope<'a> {
+    destination: &'a Path,
+    boundary: &'a Path,
+    normalized: PathBuf,
+    witness: Option<LocalWitness<'a>>,
+}
+
+impl LocalPublicationScope<'_> {
+    fn separate_from(
+        &self,
+        other: &Self,
+        require_file_aliases: bool,
+        published_siblings: bool,
+    ) -> bool {
+        let disjoint_native = LocalWitness::are_distinct(
+            [self.witness, other.witness].into_iter().flatten(),
+            require_file_aliases,
+        );
+        let disjoint_paths = !self.normalized.starts_with(&other.normalized)
+            && !other.normalized.starts_with(&self.normalized);
+        if disjoint_paths {
+            return disjoint_native;
+        }
+        match (self.witness, other.witness) {
+            (Some(LocalWitness::VacantTree(left)), Some(LocalWitness::VacantTree(right))) => {
+                self.boundary.as_os_str() == other.boundary.as_os_str()
+                    && left.missing_parent_count() > 0
+                    && right.missing_parent_count() > 0
+                    && left.same_publication_prefix(right)
+                    && safe_divergent_children(self.boundary, self.destination, other.destination)
+            }
+            (Some(LocalWitness::VacantFile(left)), Some(LocalWitness::VacantFile(right))) => {
+                self.boundary.as_os_str() == other.boundary.as_os_str()
+                    && left.same_publication_prefix(right)
+                    && safe_divergent_children(self.boundary, self.destination, other.destination)
+            }
+            (Some(LocalWitness::VacantTree(_)), Some(LocalWitness::Tree(_)))
+            | (Some(LocalWitness::VacantFile(_)), Some(LocalWitness::File(_)))
+                if published_siblings && disjoint_native =>
+            {
+                safe_divergent_children(self.boundary, self.destination, other.destination)
+            }
+            (Some(LocalWitness::Tree(_)), Some(LocalWitness::VacantTree(_)))
+            | (Some(LocalWitness::File(_)), Some(LocalWitness::VacantFile(_)))
+                if published_siblings && disjoint_native =>
+            {
+                safe_divergent_children(other.boundary, self.destination, other.destination)
+            }
+            _ => false,
+        }
+    }
+}
+
+fn safe_divergent_children(boundary: &Path, left: &Path, right: &Path) -> bool {
+    let suffix = |path: &Path| {
+        path.ancestors()
+            .any(|ancestor| ancestor.as_os_str() == boundary.as_os_str())
+    };
+    if !suffix(left) || !suffix(right) {
+        return false;
+    }
+    let (Ok(left), Ok(right)) = (left.strip_prefix(boundary), right.strip_prefix(boundary)) else {
+        return false;
+    };
+    for (left, right) in left.components().zip(right.components()) {
+        let (std::path::Component::Normal(left), std::path::Component::Normal(right)) =
+            (left, right)
+        else {
+            return false;
+        };
+        if left == right {
+            continue;
+        }
+        let (Some(left), Some(right)) = (left.to_str(), right.to_str()) else {
+            return false;
+        };
+        // An uncreated directory's lookup rules can differ from the checked ancestor's.
+        let unambiguous = |name: &str| {
+            name.is_ascii()
+                && !name.ends_with(['.', ' '])
+                && !name.contains(['~', '<', '>', ':', '"', '|', '?', '*', '\\'])
+                && kortty_server_archive::rsync_tree::valid_name(name)
+                && crate::sftp_window::checked_local_component(name.as_bytes()).is_ok()
+        };
+        return unambiguous(left) && unambiguous(right) && !left.eq_ignore_ascii_case(right);
+    }
+    false
+}
+
 impl Approval {
     fn local_review(&self) -> Option<(&Path, Option<LocalWitness<'_>>)> {
         match self.mixed.as_deref().map(|review| &review.receiver) {
             Some(MixedReceiver::Local {
                 destination,
                 snapshot,
-            }) => Some((destination, snapshot.as_ref().map(LocalWitness::Tree))),
+                vacant,
+            }) => Some((
+                destination,
+                snapshot
+                    .as_ref()
+                    .map(LocalWitness::Tree)
+                    .or_else(|| vacant.as_deref().map(LocalWitness::VacantTree)),
+            )),
             _ => self
                 .existing_download
                 .as_ref()
@@ -207,10 +463,26 @@ impl Approval {
                     )
                 })
                 .or_else(|| {
+                    self.vacant_directory_download.as_ref().map(|review| {
+                        (
+                            review.destination.as_path(),
+                            Some(LocalWitness::VacantTree(&review.snapshot)),
+                        )
+                    })
+                })
+                .or_else(|| {
                     self.existing_file_download.as_ref().map(|review| {
                         (
                             review.destination.as_path(),
                             Some(LocalWitness::File(&review.snapshot)),
+                        )
+                    })
+                })
+                .or_else(|| {
+                    self.vacant_file_download.as_ref().map(|review| {
+                        (
+                            review.destination.as_path(),
+                            Some(LocalWitness::VacantFile(&review.snapshot)),
                         )
                     })
                 }),
@@ -230,6 +502,23 @@ pub struct Reviewed {
 }
 
 impl Reviewed {
+    pub(super) fn shares_missing_parent(&self) -> bool {
+        let mut prefixes = std::collections::BTreeSet::new();
+        std::iter::once(&self.primary)
+            .chain(&self.additional)
+            .filter_map(Approval::local_review)
+            .filter_map(|(destination, witness)| match witness {
+                Some(LocalWitness::VacantTree(snapshot)) if snapshot.missing_parent_count() > 0 => {
+                    snapshot.first_missing(destination)
+                }
+                Some(LocalWitness::VacantFile(snapshot)) if snapshot.missing_parent_count() > 0 => {
+                    snapshot.first_missing(destination)
+                }
+                _ => None,
+            })
+            .any(|prefix| !prefixes.insert(prefix.as_os_str()))
+    }
+
     pub(in crate::scheduler_window) fn restore(transfer: &Transfer) -> Option<Self> {
         Some(Self {
             primary: transfer.approval.clone()?,
@@ -271,6 +560,10 @@ impl ReviewRequests {
                         directory_upload: None,
                         existing: None,
                         existing_download: None,
+                        allow_vacant_directory_download: false,
+                        vacant_file_download: false,
+                        allow_existing_file_download: false,
+                        review_vacant_server_upload: false,
                         mixed: Some(mixed),
                         batch: None,
                         download: None,
@@ -299,6 +592,9 @@ impl ReviewRequests {
                     })
                     .transpose()?;
                 let single = batch.is_none();
+                let vacant_file_download = transfer.uses_reviewed_file_creation(upload);
+                let allow_existing_file_download =
+                    transfer.uses_vacant_recurring_file_receiver(upload) && !additional.is_empty();
                 let download = (single && !upload).then(|| DirectoryReview {
                     source: transfer.remote.clone(),
                     destination: transfer.local.clone(),
@@ -319,6 +615,11 @@ impl ReviewRequests {
                         .then_some((transfer.local, transfer.remote)),
                     existing,
                     existing_download,
+                    allow_vacant_directory_download: transfer.allow_vacant_directory_download,
+                    vacant_file_download,
+                    allow_existing_file_download,
+                    review_vacant_server_upload: transfer.allow_vacant_server_file_upload
+                        || transfer.allow_vacant_server_tree_upload,
                     mixed: None,
                     batch,
                     privileged,
@@ -337,6 +638,7 @@ impl ReviewRequests {
             && self.additional.len() == approval.additional.len()
             && local_receivers_distinct(
                 std::iter::once(&approval.primary).chain(&approval.additional),
+                self.primary.vacant_file_download && !self.additional.is_empty(),
             )
             && self
                 .additional
@@ -392,10 +694,10 @@ impl ReviewRequests {
         self,
         mut inspect: impl FnMut(
             &ConnectionRef,
-            &RemotePath,
+            UploadReceiverPreview<'_>,
             &kortty_ssh::TrustStore,
             &Arc<AtomicBool>,
-        ) -> Result<ExistingTree, String>,
+        ) -> Result<RecurringReceiver, String>,
         mut inspect_mixed: impl FnMut(
             &MixedReviewTarget,
             &kortty_ssh::TrustStore,
@@ -404,6 +706,7 @@ impl ReviewRequests {
         mut inspect_privileged: impl FnMut(
             &ConnectionRef,
             &PrivilegedSpec,
+            bool,
             &kortty_ssh::TrustStore,
             &Arc<AtomicBool>,
         ) -> Result<PrivilegedReview, String>,
@@ -414,6 +717,7 @@ impl ReviewRequests {
         let trust = crate::ssh_connection::trust_store().map_err(|error| error.to_string())?;
         let digest = crate::job_executor::rsync::program_digest(&self.primary.program)
             .map_err(|error| error.to_string())?;
+        let require_file_aliases = self.primary.vacant_file_download && !self.additional.is_empty();
         let primary = super::review(
             self.primary,
             &trust,
@@ -443,10 +747,11 @@ impl ReviewRequests {
             })
             .collect::<Result<Vec<_>, _>>()?;
         let routes = || std::iter::once(&primary).chain(&additional);
-        if !local_receivers_distinct(routes()) {
+        if !local_receivers_distinct(routes(), require_file_aliases) {
             return Err(OVERLAP.into());
         }
         let mut canonical_destinations = Vec::new();
+        let mut reviewed_boundaries = std::collections::BTreeSet::new();
         if primary.local_review().is_some() {
             let program = primary
                 .program
@@ -454,9 +759,19 @@ impl ReviewRequests {
                 .map_err(|_| "The approved rsync executable changed or is unavailable.")?;
             for (destination, snapshot) in routes().filter_map(Approval::local_review) {
                 super::require_review_running(cancelled)?;
-                let canonical = super::canonical_local_receiver(destination, snapshot.is_some())?;
+                let boundary = LocalWitness::publication_boundary(snapshot.as_ref(), destination)
+                    .ok_or(REVIEW)?;
+                let present = snapshot.is_some_and(|snapshot| {
+                    !matches!(
+                        snapshot,
+                        LocalWitness::VacantFile(_) | LocalWitness::VacantTree(_)
+                    )
+                });
+                let canonical = super::canonical_local_receiver(boundary, present)?;
                 super::require_program_outside_receiver(&program, &canonical)?;
-                push_disjoint(&mut canonical_destinations, &canonical)?;
+                if reviewed_boundaries.insert(boundary.as_os_str()) {
+                    push_disjoint(&mut canonical_destinations, &canonical)?;
+                }
             }
         }
         Ok(Reviewed {
@@ -473,7 +788,70 @@ mod tests {
     use kortty_jobs::{Job, JobId};
     use serde_json::json;
 
+    use super::{LocalWitness, VacantFileProof, VacantLocalTreeSnapshot};
     use crate::scheduler_window::{RemoteAction, SshCommand, form::Draft};
+
+    #[test]
+    fn missing_parent_routes_share_only_the_same_reviewed_prefix_with_distinct_children() {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let shared = root.join("shared");
+        let proof = |count, prefix, mount| -> VacantLocalTreeSnapshot {
+            serde_json::from_value(json!({
+                "fingerprint": vec![7; 32], "prefix": prefix, "missing_parents": count,
+                "location": {"alias": {"parent": vec![2; 32], "name": {"literal": vec![3; 32]}}, "mount": mount},
+            }))
+            .unwrap()
+        };
+        let left = proof(2, Some(vec![8; 32]), [1, 2]);
+        let right = proof(2, Some(vec![8; 32]), [1, 2]);
+        let different_prefix = proof(2, Some(vec![9; 32]), [1, 2]);
+        let different_mount = proof(2, Some(vec![8; 32]), [1, 3]);
+        let legacy = proof(2, None, [1, 2]);
+        let destination = shared.join("reports/first");
+        let pair = |other: &Path, proof: &VacantLocalTreeSnapshot| {
+            let separate_trees = LocalWitness::group_is_distinct(
+                [
+                    (destination.as_path(), LocalWitness::VacantTree(&left)),
+                    (other, LocalWitness::VacantTree(proof)),
+                ]
+                .into_iter(),
+                false,
+                false,
+            );
+            let separate_files = LocalWitness::group_is_distinct(
+                [
+                    (
+                        destination.as_path(),
+                        LocalWitness::VacantFile(&VacantFileProof::Hierarchy(left)),
+                    ),
+                    (
+                        other,
+                        LocalWitness::VacantFile(&VacantFileProof::Hierarchy(*proof)),
+                    ),
+                ]
+                .into_iter(),
+                true,
+                false,
+            );
+            assert_eq!(separate_files, separate_trees);
+            separate_trees
+        };
+        assert!(pair(&shared.join("reports/second"), &right));
+        assert!(!pair(&shared.join("Reports/second"), &right));
+        assert!(!pair(&shared.join("REPORT~1/second"), &right));
+        assert!(!pair(&shared.join("réports/second"), &right));
+        assert!(!pair(&shared.join("reports/first"), &right));
+        assert!(!pair(&shared.join("reports/second"), &different_prefix));
+        assert!(!pair(&shared.join("reports/second"), &different_mount));
+        assert!(!pair(&shared.join("reports/second"), &legacy));
+        assert!(!pair(&root.join("Shared/reports/second"), &right));
+        assert!(!pair(&root.join("different/reports/second"), &right));
+        assert!(!pair(
+            &shared.join("reports/first/nested"),
+            &proof(3, Some(vec![8; 32]), [1, 2])
+        ));
+    }
 
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     #[test]
@@ -518,6 +896,141 @@ mod tests {
                 .unwrap_err()
                 .contains("non-overlapping")
         );
+    }
+
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn grouped_recurring_file_downloads_bind_distinct_vacant_and_existing_slots() {
+        use std::ffi::OsStr;
+
+        use crate::sftp_window::{ReviewedFileReceiver, VacantLocalFileReceiver, local_tree};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let parent = local_tree::Directory::open_path(&root).unwrap();
+        let protected = OsStr::new("protected");
+        drop(local_tree::create_reviewed_tree_stage(&parent, protected).unwrap());
+        let root = root.join(protected);
+        let first_path = root.join("first-report.txt");
+        let second_path = root.join("second-report.txt");
+        let vacancy = VacantLocalFileReceiver::inspect(&first_path, &|| false).unwrap();
+        std::fs::write(&first_path, b"first report").unwrap();
+        let formerly_vacant = ReviewedFileReceiver::inspect(&first_path, &|| false).unwrap();
+        std::fs::write(&second_path, b"second report").unwrap();
+        let existing = ReviewedFileReceiver::inspect(&second_path, &|| false).unwrap();
+        let program = root.join("rsync");
+        let source = "/site/report.txt";
+        let first = json!({"id": 1, "target": {"host": "first.example", "port": 22, "username": "operator"}});
+        let second = json!({"id": 2, "target": {"host": "second.example", "port": 22, "username": "operator"}});
+        let mut saved = json!({
+            "connection": first, "additional_connections": [second],
+            "remote": {
+                "kind": "rsync_download", "program": program, "local": first_path, "remote": source,
+                "standing": {"settings": crate::scheduler_window::rsync::standing::Settings::default()},
+                "approval": {
+                    "program": program, "digest": vec![8_u8; 32], "reference": first, "pins": ["SHA256:fixture"],
+                    "download": {"source": source, "destination": first_path},
+                    "vacant_file_download": {"destination": first_path, "snapshot": vacancy},
+                },
+                "routes": [{"profile": 2, "destination": second_path, "approval": {
+                    "program": program, "digest": vec![8_u8; 32], "reference": second, "pins": ["SHA256:fixture"],
+                    "download": {"source": source, "destination": second_path},
+                    "existing_file_download": {"destination": second_path, "snapshot": existing},
+                }}],
+            },
+        });
+        let action = |value| {
+            serde_json::from_value::<SshCommand>(value)
+                .unwrap()
+                .validated()
+                .unwrap()
+        };
+        assert!(action(saved.clone()).require_executable().is_ok());
+
+        let mut legacy = saved.clone();
+        let legacy_snapshot = legacy["remote"]["approval"]["vacant_file_download"]["snapshot"]
+            .as_object_mut()
+            .unwrap();
+        legacy_snapshot.remove("alias");
+        legacy_snapshot.remove("location");
+        assert!(action(legacy).require_executable().is_err());
+
+        // The paths can have different spellings even when their checked slots coincide.
+        saved["remote"]["routes"][0]["approval"]["existing_file_download"]["snapshot"] =
+            json!(formerly_vacant);
+        assert!(
+            action(saved)
+                .require_executable()
+                .unwrap_err()
+                .contains("non-overlapping")
+        );
+    }
+
+    #[test]
+    fn direct_named_directory_reviews_bind_the_effective_path_on_each_route() {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let program = root.join("rsync");
+        let source = "/srv/docs";
+        let first_root = root.join("first");
+        let second_root = root.join("second");
+        let first = json!({"id": 1, "target": {"host": "first.example", "port": 22, "username": "operator"}});
+        let second = json!({"id": 2, "target": {"host": "second.example", "port": 22, "username": "operator"}});
+        let settings = json!({"include_source_name": true, "delete": true});
+        let location = |parent| {
+            json!({
+                "alias": {"parent": vec![parent; 32], "name": {"literal": vec![1_u8; 32]}},
+                "mount": [1, 1],
+            })
+        };
+        let mut value = json!({
+            "connection": first, "additional_connections": [second],
+            "remote": {
+                "kind": "rsync_download", "directory": true, "program": program,
+                "local": first_root, "remote": source, "existing_download": settings,
+                "allow_vacant_directory_download": true,
+                "approval": {
+                    "program": program, "digest": vec![2_u8; 32], "reference": first, "pins": ["SHA256:fixture"],
+                    "directory": {"source": source, "destination": first_root},
+                    "existing_download": {"destination": first_root.join("docs"), "settings": settings,
+                        "snapshot": {"inventory": kortty_server_archive::rsync_tree::Manifest::default().finish(),
+                            "fingerprint": vec![3_u8; 32], "root_identity": vec![4_u8; 32], "location": location(5_u8)}},
+                },
+                "routes": [{"profile": 2, "destination": second_root, "approval": {
+                    "program": program, "digest": vec![2_u8; 32], "reference": second, "pins": ["SHA256:fixture"],
+                    "directory": {"source": source, "destination": second_root},
+                    "vacant_directory_download": {"destination": second_root.join("docs"), "settings": settings,
+                        "snapshot": {"fingerprint": vec![6_u8; 32], "location": location(7_u8)}},
+                }}],
+            }
+        });
+        let parse = |value| {
+            serde_json::from_value::<SshCommand>(value)
+                .unwrap()
+                .validated()
+        };
+        let requires_automatic = |action: &SshCommand| {
+            let RemoteAction::RsyncDownload(transfer) = action.remote_action().unwrap() else {
+                panic!("expected a direct rsync download")
+            };
+            transfer.requires_automatic_receiver(false)
+        };
+        let one_use = parse(value.clone()).unwrap();
+        assert!(one_use.require_executable().is_ok());
+        assert!(!requires_automatic(&one_use));
+
+        value["remote"]["standing"] =
+            json!({"settings": crate::scheduler_window::rsync::standing::Settings::default()});
+        let recurring = parse(value.clone()).unwrap();
+        assert!(recurring.require_executable().is_ok());
+        assert!(requires_automatic(&recurring));
+
+        let mut redirected = value.clone();
+        redirected["remote"]["routes"][0]["approval"]["vacant_directory_download"]["destination"] =
+            json!(second_root);
+        assert!(parse(redirected).is_err());
+        value["remote"]["allow_vacant_directory_download"] = json!(false);
+        assert!(parse(value).is_err());
     }
 
     #[test]

@@ -123,6 +123,95 @@ fn an_explicit_windows_shell_is_unavailable_on_other_hosts() {
     assert_eq!(result.err().unwrap().kind(), io::ErrorKind::Unsupported);
 }
 
+#[cfg(windows)]
+#[test]
+fn windows_wsl_preset_cannot_escape_required_sandbox() {
+    let directory = TestDirectory::new();
+    let options = LaunchOptions {
+        shell: LocalShell::Wsl,
+        working_directory: Some(directory.0.clone()),
+        sandbox: Some(Sandbox {
+            profile_root: directory.0.clone(),
+        }),
+        ..LaunchOptions::default()
+    };
+    let error = Pty::spawn_with_options(80, 24, "xterm-256color", &options)
+        .err()
+        .expect("reject WSL before starting an unsupported sandbox");
+    assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+    assert!(
+        error
+            .to_string()
+            .contains("cannot isolate a WSL distribution")
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+fn unix_shell_presets_run_the_selected_native_shell() {
+    let directory = TestDirectory::new();
+    let child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "fixture_native_unix_shell_presets",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("HOME", &directory.0)
+        .env("ZDOTDIR", &directory.0)
+        .env_remove("BASH_ENV")
+        .env_remove("ENV")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    eprintln!("owned local shell preset fixture PID {}", child.id());
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(not(windows))]
+#[test]
+#[ignore = "private native shell preset child fixture"]
+fn fixture_native_unix_shell_presets() {
+    let presets = kortty_pty::available_local_shells();
+    assert_eq!(presets.first(), Some(&LocalShell::Default));
+    let cases = [
+        (LocalShell::Bash, "$BASH_VERSION"),
+        (LocalShell::Zsh, "$ZSH_VERSION"),
+    ];
+    for (shell, version) in cases {
+        if shell == LocalShell::Zsh && !cfg!(target_os = "macos") {
+            assert!(!presets.contains(&shell));
+            continue;
+        }
+        assert!(presets.contains(&shell));
+        let mut pty = Pty::spawn_with_options(
+            80,
+            24,
+            "xterm-256color",
+            &LaunchOptions {
+                shell,
+                ..LaunchOptions::default()
+            },
+        )
+        .unwrap();
+        eprintln!("owned {shell} fixture PID {}", pty.shell_pid());
+        let command =
+            format!("test -n \"{version}\" && printf '%s-%s\\n' native shell && exit 0; exit 18\n");
+        let (status, output) = run_shell(&mut pty, command.as_bytes());
+        assert!(
+            status.success() && output.contains("native-shell"),
+            "{shell}: {status} {output}"
+        );
+    }
+}
+
 #[test]
 fn job_process_evidence_is_local_to_the_pane_and_clears_on_exit() {
     #[cfg(unix)]

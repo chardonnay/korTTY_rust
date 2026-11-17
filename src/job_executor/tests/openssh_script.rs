@@ -31,6 +31,8 @@ mod changed_upload;
 #[cfg(target_os = "linux")]
 mod privileged_archive;
 #[cfg(target_os = "linux")]
+mod privileged_file_replace;
+#[cfg(target_os = "linux")]
 mod rsync_existing;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 mod rsync_existing_download;
@@ -504,27 +506,39 @@ fn scheduled_privileged_tree(download: bool) {
 
 #[cfg(target_os = "linux")]
 #[test]
-#[ignore = "requires an explicit OpenSSH fixture with private Linux mount namespace and mock sudo"]
-fn openssh_scheduled_privileged_binary_transfer_reuses_pinned_route_and_never_replaces() {
+#[ignore = "requires an isolated OpenSSH fixture with both sudo modes and a private protected file"]
+fn openssh_scheduled_privileged_binary_transfer_checks_creation_and_reviewed_replacement() {
     use crate::job_executor::JobAuth;
-    use crate::scheduler_window::{RemoteAction, privileged::approve_fixture};
+    use crate::scheduler_window::{RemoteAction, SudoMode, privileged::approve_fixture};
 
     let remote = std::env::var("KORTTY_SSH_PRIVILEGED_TRANSFER_PATH")
         .expect("set KORTTY_SSH_PRIVILEGED_TRANSFER_PATH for the fixture");
     assert_eq!(remote, "/fixtures/scheduled.bin");
     let profile = Profile::new();
-    let (account, pins) = privileged_fixture_route();
-    let reference = ConnectionRef::from(&account);
+    let (mut account, pins) = privileged_fixture_route();
+    let mut connections = Store::open(crate::profile::connections_path_at(&profile.0)).unwrap();
+    account.id = 0;
+    account.id = connections.save(account.clone()).unwrap();
+    let mut passwordless = account.clone();
+    if let Ok(username) = std::env::var("KORTTY_SSH_PRIVILEGED_PASSWORDLESS_USER") {
+        passwordless.id = 0;
+        passwordless.login.endpoint.username = username;
+        passwordless.id = connections.save(passwordless.clone()).unwrap();
+    }
+    let account_for = |mode| match mode {
+        SudoMode::Passwordless => &passwordless,
+        _ => &account,
+    };
     let trust = TrustStore::from_pins(pins.clone()).unwrap();
     let (_, mut request) = scheduled_request();
     let source = profile.0.join("upload");
     let destination = profile.0.join("download");
     let bytes: Vec<_> = (0..196_610).map(|index| (index % 256) as u8).collect();
     fs::write(&source, &bytes).unwrap();
-    let action = |direction, local: &Path| -> SshCommand {
+    let action = |direction, sudo, local: &Path| -> SshCommand {
         serde_json::from_value::<SshCommand>(json!({
-            "connection": reference,
-            "sudo": if direction == "upload" { "vault" } else { "passwordless" },
+            "connection": ConnectionRef::from(account_for(sudo)),
+            "sudo": sudo,
             "remote": {"kind": "privileged", "direction": direction, "local": local, "remote": remote}
         }))
         .unwrap()
@@ -532,11 +546,13 @@ fn openssh_scheduled_privileged_binary_transfer_reuses_pinned_route_and_never_re
         .unwrap()
     };
     let credentials = |action: &SshCommand, password: Option<&str>| -> super::super::SavedAuth {
-        let credentials =
-            Credentials::resolve(action, &account, &ServerAccess::default(), |_, _, _| {
-                panic!("The plain fixture key must not read the vault")
-            })
-            .unwrap();
+        let credentials = Credentials::resolve(
+            action,
+            account_for(action.sudo),
+            &ServerAccess::default(),
+            |_, _, _| panic!("The plain fixture key must not read the vault"),
+        )
+        .unwrap();
         let Some(password) = password else {
             return Ok(Some(credentials));
         };
@@ -559,7 +575,7 @@ fn openssh_scheduled_privileged_binary_transfer_reuses_pinned_route_and_never_re
         )
     };
     let good_password = "kortty-file-fixture";
-    request.action = Arc::new(action("upload", &source));
+    request.action = Arc::new(action("upload", SudoMode::Vault, &source));
     let mut policy = ExecutionPolicy::unrestricted(true);
     let blocked = run(
         &request,
@@ -620,7 +636,7 @@ fn openssh_scheduled_privileged_binary_transfer_reuses_pinned_route_and_never_re
         RunOutcome::Success
     );
 
-    request.action = Arc::new(action("download", &destination));
+    request.action = Arc::new(action("download", SudoMode::Passwordless, &destination));
     policy.privileged = Some(
         approve_fixture(
             &profile.0,
@@ -639,7 +655,86 @@ fn openssh_scheduled_privileged_binary_transfer_reuses_pinned_route_and_never_re
     );
     assert_eq!(fs::read(&destination).unwrap(), bytes);
     assert_eq!(exec(&request, &policy, None).outcome, RunOutcome::Blocked);
-    assert_eq!(fs::read(destination).unwrap(), bytes);
+    assert_eq!(fs::read(&destination).unwrap(), bytes);
+
+    fs::set_permissions(&destination, fs::Permissions::from_mode(0o640)).unwrap();
+
+    for (mode, password) in [
+        (SudoMode::Passwordless, None),
+        (SudoMode::Vault, Some(good_password)),
+    ] {
+        let mut replacement = action("download", mode, &destination);
+        let Some(RemoteAction::Privileged(transfer)) = &mut replacement.remote else {
+            unreachable!()
+        };
+        transfer.replace_existing = true;
+        request.action = Arc::new(replacement);
+        let mut approve = |request: &mut RunRequest<SshCommand>| {
+            policy.privileged = Some(
+                approve_fixture(
+                    &profile.0,
+                    &request.job,
+                    Arc::make_mut(&mut request.action),
+                    &pins,
+                )
+                .unwrap(),
+            );
+            policy.clone()
+        };
+        let reviewed = approve(&mut request);
+        let original = b"local contents changed since review";
+        fs::write(&destination, original).unwrap();
+        assert_eq!(
+            exec(&request, &reviewed, password).outcome,
+            RunOutcome::Blocked
+        );
+        assert_eq!(fs::read(&destination).unwrap(), original);
+
+        let reviewed = approve(&mut request);
+        let mut denied = reviewed.clone();
+        denied.file_transfer_allowed = false;
+        assert_eq!(
+            exec(&request, &denied, password).outcome,
+            RunOutcome::Blocked
+        );
+        let mut changed_route = account_for(mode).clone();
+        changed_route.login.endpoint.username.push('x');
+        connections.save(changed_route).unwrap();
+        assert_eq!(
+            exec(&request, &reviewed, password).outcome,
+            RunOutcome::Blocked
+        );
+        assert_eq!(fs::read(&destination).unwrap(), original);
+        connections.save(account_for(mode).clone()).unwrap();
+
+        let published = exec(&request, &reviewed, password);
+        assert_eq!(
+            published.outcome,
+            RunOutcome::Success,
+            "{:?}",
+            published.detail
+        );
+        assert_eq!(fs::read(&destination).unwrap(), bytes);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        let recovery = published
+            .detail
+            .as_deref()
+            .unwrap()
+            .split_once("Original retained at ")
+            .unwrap()
+            .1
+            .trim_end_matches('.');
+        let recovery: PathBuf = serde_json::from_str(recovery).unwrap();
+        assert!(recovery.starts_with(&profile.0));
+        assert_eq!(fs::read(recovery).unwrap(), original);
+        assert_eq!(
+            exec(&request, &reviewed, password).outcome,
+            RunOutcome::Blocked
+        );
+    }
 }
 
 #[test]
@@ -1398,69 +1493,234 @@ fn openssh_runs_scheduled_sftp_metadata_actions_with_strict_host_keys() {
 #[test]
 #[ignore = "requires an ordinary Linux account, private XDG config, OpenSSH and the freshly built archive helper"]
 fn openssh_scheduled_server_archive_saves_a_verified_local_copy_on_the_pinned_session() {
-    scheduled_server_archive_local_copy(None);
+    scheduled_server_archive_local_copy(None, ScheduledArchiveFixture::Create);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 #[ignore = "requires an ordinary Linux account, private XDG config, OpenSSH and the freshly built archive helper"]
 fn openssh_scheduled_password_zip_uses_the_vault_and_saves_a_verified_local_copy() {
-    scheduled_server_archive_local_copy(Some("fixture 東京 password\0\nfor server ZIP"));
+    scheduled_server_archive_local_copy(
+        Some("fixture 東京 password\0\nfor server ZIP"),
+        ScheduledArchiveFixture::Create,
+    );
 }
 
 #[cfg(target_os = "linux")]
-fn scheduled_server_archive_local_copy(password: Option<&str>) {
+#[test]
+#[ignore = "requires an ordinary Linux account, private XDG config, OpenSSH and the freshly built archive helper"]
+fn openssh_scheduled_server_archive_reuses_the_reviewed_zip_and_local_copy() {
+    scheduled_server_archive_local_copy(None, ScheduledArchiveFixture::Reuse);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires an ordinary Linux account, private XDG config, OpenSSH and the freshly built archive helper"]
+fn openssh_scheduled_server_archive_reuses_password_zip_through_the_vault() {
+    scheduled_server_archive_local_copy(
+        Some("fixture 東京 password\0\nfor server ZIP"),
+        ScheduledArchiveFixture::Reuse,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires Info-ZIP, an ordinary Linux account, private XDG config, OpenSSH and the freshly built archive helper"]
+fn openssh_scheduled_server_archive_updates_a_java_layout_zip_in_place() {
+    scheduled_server_archive_local_copy(None, ScheduledArchiveFixture::JavaLayout);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires GNU tar, bzip2, an ordinary Linux account, private XDG config, OpenSSH and the freshly built archive helper"]
+fn openssh_scheduled_server_archive_recreates_java_layout_tar_variants() {
+    use std::collections::BTreeMap;
+    use std::io::Read;
+
+    let members = |path: &Path, compressed: bool| -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+        let file = fs::File::open(path).unwrap();
+        let reader: Box<dyn Read> = if compressed {
+            Box::new(bzip2::read::BzDecoder::new(file))
+        } else {
+            Box::new(file)
+        };
+        tar::Archive::new(reader)
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().components().collect();
+                let bytes = if entry.header().entry_type().is_dir() {
+                    None
+                } else {
+                    assert!(entry.header().entry_type().is_file());
+                    let mut bytes = Vec::new();
+                    entry.read_to_end(&mut bytes).unwrap();
+                    Some(bytes)
+                };
+                (path, bytes)
+            })
+            .collect()
+    };
+    for (compressed, format, suffix, level) in
+        [(false, "tar", "tar", 0), (true, "tar_bz2", "tar.bz2", 6)]
+    {
+        let (profile, fixture) = scheduled_archive_fixture();
+        let root = &fixture.profile.0;
+        let primary = root.join("one/selected");
+        let secondary = root.join("two/selected");
+        let outside = root.join("outside/skipped-ancestor");
+        fs::create_dir_all(primary.join("ignored")).unwrap();
+        fs::create_dir_all(primary.join("staging")).unwrap();
+        fs::create_dir_all(primary.join("keepdir")).unwrap();
+        fs::create_dir_all(&secondary).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(primary.join("ignored/child"), b"excluded subtree").unwrap();
+        fs::write(primary.join("staging/cache.tmp"), b"excluded file").unwrap();
+        fs::write(primary.join("staging/keep.txt"), b"retained file").unwrap();
+        fs::write(
+            primary.join("keepdir/child"),
+            b"trailing slash does not match",
+        )
+        .unwrap();
+        fs::write(primary.join("second.txt"), b"previous member").unwrap();
+        fs::write(secondary.join("second.txt"), b"distinct duplicate basename").unwrap();
+        let explicitly_excluded = outside.join("explicit.txt");
+        fs::write(
+            &explicitly_excluded,
+            b"an ancestor excludes this exact source",
+        )
+        .unwrap();
+        let original_remote = root.join(format!("archive.{suffix}"));
+        let local = root.join(format!("local.{suffix}"));
+        let excludes = ["ignored", "staging/*.tmp", "keepdir/", "skipped-ancestor"];
+        let sources = [&primary, &secondary, &explicitly_excluded];
+        let gnu_tar = |path: &Path| {
+            let mut command = Command::new("tar");
+            command.env_remove("TAR_OPTIONS").env_remove("BZIP");
+            if compressed {
+                command.env("BZIP2", "-6");
+            }
+            let output = command
+                .arg(if compressed { "-cjf" } else { "-cf" })
+                .arg(path)
+                .args(excludes.map(|pattern| format!("--exclude={pattern}")))
+                .args(sources)
+                .output()
+                .expect("GNU tar for the Java archive fixture");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        gnu_tar(&original_remote);
+        fs::set_permissions(&original_remote, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::copy(&original_remote, &local).unwrap();
+        let prior = fs::read(&original_remote).unwrap();
+        let remote_inode = fs::metadata(&original_remote).unwrap().ino();
+        let local_inode = fs::metadata(&local).unwrap().ino();
+        fs::remove_file(primary.join("second.txt")).unwrap();
+        fs::write(primary.join("current.txt"), b"current member").unwrap();
+        let reference_archive = root.join(format!("reference.{suffix}"));
+        gnu_tar(&reference_archive);
+        let expected = members(&reference_archive, compressed);
+        assert!(expected.contains_key(primary.join("current.txt").strip_prefix("/").unwrap()));
+        assert!(expected.contains_key(secondary.join("second.txt").strip_prefix("/").unwrap()));
+        assert!(!expected.contains_key(primary.join("second.txt").strip_prefix("/").unwrap()));
+        assert!(!expected.contains_key(primary.join("ignored").strip_prefix("/").unwrap()));
+        assert!(
+            !expected.contains_key(primary.join("staging/cache.tmp").strip_prefix("/").unwrap())
+        );
+        assert!(expected.contains_key(primary.join("keepdir/child").strip_prefix("/").unwrap()));
+        assert!(!expected.contains_key(explicitly_excluded.strip_prefix("/").unwrap()));
+
+        let (_, mut request, connections) =
+            scheduled_batch(&profile.0, &[&fixture], "true", Vec::new());
+        request.action = Arc::new(serde_json::from_value(json!({
+            "connection": request.action.connection,
+            "remote": {
+                "kind": "server_archive", "format": format, "sources": sources,
+                "target": original_remote, "download": local, "level": level, "excludes": excludes,
+                "reuse_output": true, "member_layout": "server_path",
+            },
+        })).unwrap());
+        let detail = run_archive_fixture(&fixture, &connections, &request, None);
+        assert_eq!(members(&original_remote, compressed), expected);
+        assert_eq!(
+            fs::read(&local).unwrap(),
+            fs::read(&original_remote).unwrap()
+        );
+        assert_archive_recovery(root, &detail, "original", remote_inode, &prior);
+        assert_archive_recovery(
+            root,
+            &detail,
+            local.file_name().unwrap().to_str().unwrap(),
+            local_inode,
+            &prior,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy)]
+enum ScheduledArchiveFixture {
+    Create,
+    Reuse,
+    JavaLayout,
+}
+
+#[cfg(target_os = "linux")]
+fn scheduled_server_archive_local_copy(password: Option<&str>, scenario: ScheduledArchiveFixture) {
     use std::io::Read as _;
 
-    let helper = PathBuf::from(
-        std::env::var_os("KORTTY_SERVER_ARCHIVE_TEST_HELPER")
-            .expect("set KORTTY_SERVER_ARCHIVE_TEST_HELPER"),
-    )
-    .canonicalize()
-    .unwrap();
-    assert!(helper.is_file());
-    let config = crate::profile::root().unwrap();
-    let config_parent = config.parent().unwrap().canonicalize().unwrap();
-    assert!(config_parent.starts_with(std::env::temp_dir().canonicalize().unwrap()));
-    fs::DirBuilder::new().mode(0o700).create(&config).unwrap();
-    let profile = Profile(config);
-
-    let fixture = Sshd::new();
+    let reuse_output = !matches!(scenario, ScheduledArchiveFixture::Create);
+    let java_layout = matches!(scenario, ScheduledArchiveFixture::JavaLayout);
+    let (profile, fixture) = scheduled_archive_fixture();
     let root = &fixture.profile.0;
-    let script = root.join("archive-dispatch.sh");
-    let mut command = String::new();
-    crate::scheduler_window::script::shell_quote(&mut command, helper.to_str().unwrap());
-    let helper_command = kortty_server_archive::protocol::COMMAND;
-    let sftp = [
-        "/usr/libexec/openssh/sftp-server",
-        "/usr/lib/openssh/sftp-server",
-        "/usr/libexec/sftp-server",
-    ]
-    .into_iter()
-    .find(|path| Path::new(path).is_file())
-    .expect("OpenSSH external sftp-server for the private forced-command fixture");
-    fs::write(&script, format!(
-        "#!/bin/sh\ncase \"$SSH_ORIGINAL_COMMAND\" in\n  '{helper_command}') exec {command} --stdio-v1 ;;\n  'internal-sftp') exec {sftp} ;;\n  *) exit 1 ;;\nesac\n"
-    )).unwrap();
-    let mut daemon_config = fs::OpenOptions::new()
-        .append(true)
-        .open(&fixture.config)
-        .unwrap();
-    writeln!(
-        daemon_config,
-        "ForceCommand /bin/sh \"{}\"",
-        script.display()
-    )
-    .unwrap();
 
     let (_, mut request, connections) =
         scheduled_batch(&profile.0, &[&fixture], "true", Vec::new());
     let reference = request.action.connection.clone().unwrap();
     let source = root.join("source.txt");
+    let extras = root.join("extras");
+    let separate = root.join("separate");
     let remote = root.join("remote.zip");
     let local = root.join("local.zip");
     let payload = b"checked bytes from the helper's published archive";
     fs::write(&source, payload).unwrap();
+    let mut sources = vec![source.clone()];
+    if reuse_output {
+        fs::DirBuilder::new().mode(0o700).create(&extras).unwrap();
+        fs::write(extras.join("retain.txt"), b"keep the previous ZIP member").unwrap();
+        sources.push(extras.clone());
+    }
+    let layout = if java_layout {
+        fs::write(&source, b"old contents from Java").unwrap();
+        let info_zip = Command::new("zip")
+            .args(["-r", "-6"])
+            .args([&remote, &source, &extras])
+            .output()
+            .expect("Info-ZIP for the Java archive fixture");
+        assert!(
+            info_zip.status.success(),
+            "{}",
+            String::from_utf8_lossy(&info_zip.stderr)
+        );
+        fs::set_permissions(&remote, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(&source, payload).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&separate).unwrap();
+        let another_source = separate.join("source.txt");
+        fs::write(
+            &another_source,
+            b"distinct source with an identical basename",
+        )
+        .unwrap();
+        sources.push(another_source);
+        "server_path"
+    } else {
+        "source_basename"
+    };
     let mut vault =
         Vault::create(profile.0.join("vault.bin"), b"test-only vault password").unwrap();
     let password_id = password.map(|password| {
@@ -1476,9 +1736,11 @@ fn scheduled_server_archive_local_copy(password: Option<&str>) {
             .unwrap()
     });
     let remote_action = json!({
-        "kind": "server_archive", "sources": [source], "target": remote, "download": local, "level": 6,
+        "kind": "server_archive", "sources": sources, "target": remote, "download": local, "level": 6,
         "format": if password_id.is_some() { "zip_password" } else { "zip" },
         "password_credential": password_id,
+        "reuse_output": reuse_output,
+        "member_layout": layout,
     });
     request.action = Arc::new(
         serde_json::from_value(json!({
@@ -1487,6 +1749,7 @@ fn scheduled_server_archive_local_copy(password: Option<&str>) {
         }))
         .unwrap(),
     );
+    let prior = fs::read(&remote).ok();
     let denied = run(
         &request,
         None,
@@ -1497,8 +1760,130 @@ fn scheduled_server_archive_local_copy(password: Option<&str>) {
         || panic!("a denied copy must stop before SSH trust lookup"),
     );
     assert_eq!(denied.outcome, RunOutcome::Blocked);
-    assert!(!remote.exists() && !local.exists());
+    assert_eq!(fs::read(&remote).ok(), prior);
+    assert!(!local.exists());
 
+    let run_archive = || {
+        let detail = run_archive_fixture(
+            &fixture,
+            &connections,
+            &request,
+            password_id
+                .as_deref()
+                .and_then(|id| vault.archive_password(id)),
+        );
+        assert_eq!(fs::read(&local).unwrap(), fs::read(&remote).unwrap());
+        detail
+    };
+    let check_member = |path: &Path, name: &str, expected: &[u8]| {
+        let mut zip = zip::ZipArchive::new(fs::File::open(&local).unwrap()).unwrap();
+        let name = if java_layout {
+            assert!(
+                zip.by_name(name).is_err(),
+                "unexpected basename member {name}"
+            );
+            path.strip_prefix("/").unwrap().to_str().unwrap()
+        } else {
+            name
+        };
+        let mut contents = Vec::new();
+        let mut member = if let Some(password) = password {
+            assert!(zip.by_name(name).is_err());
+            assert!(zip.by_name_decrypt(name, b"incorrect").is_err());
+            zip.by_name_decrypt(name, password.as_bytes()).unwrap()
+        } else {
+            zip.by_name(name).unwrap()
+        };
+        member.read_to_end(&mut contents).unwrap();
+        assert_eq!(contents, expected);
+    };
+    run_archive();
+    check_member(&source, "source.txt", payload);
+    if java_layout {
+        check_member(
+            &separate.join("source.txt"),
+            "source.txt",
+            b"distinct source with an identical basename",
+        );
+    }
+    if reuse_output {
+        let original = fs::read(&local).unwrap();
+        let local_inode = fs::metadata(&local).unwrap().ino();
+        let remote_inode = fs::metadata(&remote).unwrap().ino();
+        fs::write(&source, b"fresh replacement bytes").unwrap();
+        fs::remove_file(extras.join("retain.txt")).unwrap();
+        fs::write(extras.join("fresh.txt"), b"new ZIP member").unwrap();
+
+        let detail = run_archive();
+        check_member(&source, "source.txt", b"fresh replacement bytes");
+        check_member(
+            &extras.join("fresh.txt"),
+            "extras/fresh.txt",
+            b"new ZIP member",
+        );
+        check_member(
+            &extras.join("retain.txt"),
+            "extras/retain.txt",
+            b"keep the previous ZIP member",
+        );
+        for (name, inode) in [("local.zip", local_inode), ("original", remote_inode)] {
+            assert_archive_recovery(root, &detail, name, inode, &original);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn scheduled_archive_fixture() -> (Profile, Sshd) {
+    let helper = PathBuf::from(
+        std::env::var_os("KORTTY_SERVER_ARCHIVE_TEST_HELPER")
+            .expect("set KORTTY_SERVER_ARCHIVE_TEST_HELPER"),
+    )
+    .canonicalize()
+    .unwrap();
+    assert!(helper.is_file());
+    let config = crate::profile::root().unwrap();
+    let config_parent = config.parent().unwrap().canonicalize().unwrap();
+    assert!(config_parent.starts_with(std::env::temp_dir().canonicalize().unwrap()));
+    fs::DirBuilder::new().mode(0o700).create(&config).unwrap();
+    let profile = Profile(config);
+    let fixture = Sshd::new();
+    let script = fixture.profile.0.join("archive-dispatch.sh");
+    let mut command = String::new();
+    crate::scheduler_window::script::shell_quote(&mut command, helper.to_str().unwrap());
+    let helper_command = kortty_server_archive::protocol::COMMAND;
+    let update_command = kortty_server_archive::protocol::UPDATE_COMMAND;
+    let sftp = [
+        "/usr/libexec/openssh/sftp-server",
+        "/usr/lib/openssh/sftp-server",
+        "/usr/libexec/sftp-server",
+    ]
+    .into_iter()
+    .find(|path| Path::new(path).is_file())
+    .expect("OpenSSH external sftp-server for the private forced-command fixture");
+    fs::write(&script, format!(
+        "#!/bin/sh\ncase \"$SSH_ORIGINAL_COMMAND\" in\n  '{helper_command}') exec {command} --stdio-v1 ;;\n  '{update_command}') exec {command} --archive-update-v1 ;;\n  'internal-sftp') exec {sftp} ;;\n  *) exit 1 ;;\nesac\n"
+    )).unwrap();
+    let mut daemon_config = fs::OpenOptions::new()
+        .append(true)
+        .open(&fixture.config)
+        .unwrap();
+    writeln!(
+        daemon_config,
+        "ForceCommand /bin/sh \"{}\"",
+        script.display()
+    )
+    .unwrap();
+    (profile, fixture)
+}
+
+#[cfg(target_os = "linux")]
+fn run_archive_fixture(
+    fixture: &Sshd,
+    connections: &Store,
+    request: &RunRequest<SshCommand>,
+    password: Option<&str>,
+) -> String {
+    let reference = request.action.connection.as_ref().unwrap();
     let saved = connections.get(reference.id).unwrap();
     let credentials = Credentials::resolve(
         &request.action,
@@ -1509,14 +1894,12 @@ fn scheduled_server_archive_local_copy(password: Option<&str>) {
     .unwrap();
     let daemon = fixture.spawn();
     let completion = run(
-        &request,
+        request,
         None,
         None,
         &ExecutionPolicy::unrestricted(true),
         Ok(Some(credentials)),
-        Ok(password_id
-            .as_deref()
-            .and_then(|id| vault.archive_password(id))),
+        Ok(password),
         || Ok(fixture.trust.clone()),
     );
     let log = String::from_utf8_lossy(&daemon.join().unwrap().stderr).into_owned();
@@ -1527,20 +1910,21 @@ fn scheduled_server_archive_local_copy(password: Option<&str>) {
         completion.detail
     );
     assert_eq!(log.matches("Accepted publickey").count(), 1, "{log}");
-    assert_eq!(fs::read(&local).unwrap(), fs::read(&remote).unwrap());
-    let mut zip = zip::ZipArchive::new(fs::File::open(local).unwrap()).unwrap();
-    let mut contents = Vec::new();
-    let mut member = if let Some(password) = password {
+    if let Some(password) = password {
         assert!(!log.contains(password));
-        assert!(zip.by_name("source.txt").is_err());
-        assert!(zip.by_name_decrypt("source.txt", b"incorrect").is_err());
-        zip.by_name_decrypt("source.txt", password.as_bytes())
-            .unwrap()
-    } else {
-        zip.by_name("source.txt").unwrap()
-    };
-    member.read_to_end(&mut contents).unwrap();
-    assert_eq!(contents, payload);
+    }
+    completion.detail.unwrap()
+}
+
+#[cfg(target_os = "linux")]
+fn assert_archive_recovery(root: &Path, detail: &str, name: &str, inode: u64, original: &[u8]) {
+    let recovery = fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path().join(name))
+        .find(|path| detail.contains(path.to_str().unwrap()))
+        .expect("the run reports the retained original");
+    assert_eq!(fs::metadata(&recovery).unwrap().ino(), inode);
+    assert_eq!(fs::read(&recovery).unwrap(), original);
 }
 
 #[test]
@@ -2367,6 +2751,151 @@ fn openssh_scheduled_standing_upload_replaces_within_the_combined_byte_budget() 
 #[ignore = "requires installed OpenSSH sshd and ssh-keygen and a local account"]
 fn openssh_scheduled_standing_download_replaces_within_the_combined_action_budget() {
     standing_copy("download", true);
+}
+
+#[test]
+#[ignore = "requires native OpenSSH"]
+fn openssh_standing_sftp_chain_replaces_with_a_fresh_predecessor_round() {
+    use std::num::NonZeroU32;
+
+    use kortty_jobs::{DependencyMode, Job, JobGraph, SchedulerStore, TimeZone};
+
+    for direction in ["upload", "download"] {
+        let fixture = Sshd::new();
+        let root = &fixture.profile.0;
+        let (_, seed, connections) = scheduled_batch(root, &[&fixture], "true", Vec::new());
+        let reference = seed.action.connection.as_ref().unwrap();
+        let profile = connections.get(reference.id).unwrap();
+        let local = root.join("chain-standing-local");
+        let remote = root.join("chain-standing-remote");
+        for directory in [&local, &remote] {
+            fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+        }
+        let (source, receiver) = if direction == "upload" {
+            (&local, &remote)
+        } else {
+            (&remote, &local)
+        };
+        let source = source.join("report");
+        let receiver = receiver.join("report");
+        let old = b"original receiver";
+        fs::write(&source, b"first valid firing").unwrap();
+        fs::write(&receiver, old).unwrap();
+        fs::set_permissions(&receiver, fs::Permissions::from_mode(0o600)).unwrap();
+        let id = JobId::new("standing-chain-copy").unwrap();
+        let predecessor = JobId::new("standing-chain-predecessor").unwrap();
+        let action: SshCommand = serde_json::from_value(json!({
+            "connection": reference,
+            "remote": {
+                "kind": "sync", "direction": direction, "local": local, "remote": remote,
+                "replace_changed": true,
+                "standing": { "days": 7, "limits": {
+                    "max_firings": 2, "max_actions": 8, "max_bytes": 1_024,
+                }},
+            },
+        }))
+        .unwrap();
+        let path = root.join("standing-chain-jobs.json");
+        let graph = JobGraph::new(vec![
+            Job::new(id.clone(), "Standing Chain copy", action)
+                .unwrap()
+                .with_dependencies(
+                    DependencyMode::Chain,
+                    vec![predecessor.clone()],
+                    NonZeroU32::new(5),
+                ),
+            Job::new(
+                predecessor.clone(),
+                "Standing Chain predecessor",
+                seed.action.as_ref().clone(),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        SchedulerStore::open(&path)
+            .unwrap()
+            .commit_with_actions(&graph, &[], &[])
+            .unwrap();
+        let open = || {
+            let mut runtime = SchedulerWindow::open(path.clone()).unwrap();
+            runtime.set_execution_allowed(true);
+            runtime
+                .initialize_schedules_at(TimeZone::UTC, SystemTime::now())
+                .unwrap();
+            runtime
+        };
+        approve_pinned_copy(&mut open(), &id, &fixture, profile);
+        let assert_no_dial = || {
+            assert_eq!(
+                fixture.listener.accept().unwrap_err().kind(),
+                ErrorKind::WouldBlock
+            );
+        };
+        let mut previous = old.as_slice();
+        for incoming in [
+            b"first valid firing".as_slice(),
+            b"second after reopening".as_slice(),
+        ] {
+            let mut runtime = open();
+            assert!(
+                complete_copy_predecessor(
+                    &mut runtime,
+                    &predecessor,
+                    RunOutcome::Failed { exit_code: Some(1) }
+                )
+                .is_empty()
+            );
+            fs::write(&source, incoming).unwrap();
+            let mut request = start_chained_copy(&mut runtime, &predecessor, &id);
+            let context = runtime
+                .sync_run_context(&request)
+                .expect("an admitted Chain occurrence");
+            request.trigger = RunTrigger::Manual;
+            assert!(runtime.sync_run_context(&request).is_none());
+            assert_eq!(
+                run_saved_route(&fixture, profile, &request, Some(context.clone())).outcome,
+                RunOutcome::Blocked
+            );
+            assert_no_dial();
+            request.trigger = RunTrigger::Dependency;
+
+            let daemon = fixture.spawn();
+            let result = run_saved_route(&fixture, profile, &request, Some(context.clone()));
+            let log = daemon.join().unwrap();
+            assert_eq!(
+                result.outcome,
+                RunOutcome::Success,
+                "{result:?}\n{}",
+                String::from_utf8_lossy(&log.stderr)
+            );
+            assert_eq!(fs::read(&receiver).unwrap(), incoming);
+            let recovery = fs::read_dir(receiver.parent().unwrap())
+                .unwrap()
+                .map(|entry| entry.unwrap())
+                .filter(|entry| {
+                    entry
+                        .file_name()
+                        .as_encoded_bytes()
+                        .starts_with(b".kortty-")
+                })
+                .filter(|entry| entry.metadata().unwrap().mode() & 0o7777 == 0o700)
+                .filter_map(|entry| fs::read(entry.path().join(receiver.file_name().unwrap())).ok())
+                .any(|contents| contents == previous);
+            assert!(recovery, "the original must be retained for recovery");
+            assert_eq!(
+                run_saved_route(&fixture, profile, &request, Some(context)).outcome,
+                RunOutcome::Blocked
+            );
+            assert_no_dial();
+            assert!(runtime.update_runtime(Message::Finished(result)).is_empty());
+            previous = incoming;
+        }
+        let mut runtime = open();
+        let request = start_chained_copy(&mut runtime, &predecessor, &id);
+        assert!(runtime.sync_run_context(&request).is_none());
+        assert_no_dial();
+        assert_eq!(fs::read(&receiver).unwrap(), previous);
+    }
 }
 
 fn standing_copy(direction: &str, replace: bool) {

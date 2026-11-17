@@ -222,13 +222,14 @@ fn target(
         destination,
         delete: mode == ReceiverMode::ScopedMirror,
         elevation: Elevation::Passwordless,
+        review_vacant: false,
     }
 }
 
 fn preview(fixture: &Fixture, target: &MixedReviewTarget) -> Result<MixedReview, String> {
     let credentials = Credentials::resolve_directory_browser(
-        &fixture.reference,
-        fixture.connections.get(fixture.reference.id).unwrap(),
+        &target.reference,
+        fixture.connections.get(target.reference.id).unwrap(),
         &ServerAccess::default(),
         |_, _, _| Err("unexpected credential"),
     )

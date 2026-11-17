@@ -60,7 +60,7 @@ impl CascadeReview {
             ),
             CascadeCopy::Privileged => Some("Start the privileged folder transfer separately."),
             CascadeCopy::Standing => {
-                Some("The recurring SFTP approval is available only to calendar starts.")
+                Some("Recurring SFTP copies start through an approved calendar or Chain.")
             }
             CascadeCopy::Available(_) => None,
         }
@@ -85,7 +85,7 @@ impl CascadeReview {
         let member = self.members.iter().find(|member| member.job == *job)?;
         match member.copy.as_ref()? {
             CascadeCopy::Standing => Some(
-                "The recurring approval is available only to calendar starts. This branch stops if it reaches this job.",
+                "This job needs its approved calendar or Chain to start. The branch stops if it reaches this job.",
             ),
             _ => None,
         }
@@ -127,6 +127,7 @@ struct Subject {
     id: JobId,
     scope: [u8; 32],
     schedule: String,
+    calendar: bool,
     mode: DependencyMode,
     predecessors: Vec<JobId>,
     max_age_minutes: Option<NonZeroU32>,
@@ -279,7 +280,7 @@ impl SchedulerWindow {
             .map_err(|error| error.to_string())?;
             (
                 SaveApproval::Standing(approval),
-                "Recurring folder copy approved. Save the job to keep the calendar approval.",
+                "Recurring folder copy approved. Save the job to keep the approval.",
             )
         } else {
             let receipt = Receipt::new(approved.scope, &review)
@@ -322,11 +323,19 @@ impl SchedulerWindow {
                 .is_ok_and(|blockers| blockers.is_empty())
         };
         let (standing, cascade_receipt) = match (subject.standing, request.trigger) {
-            (Some(_), RunTrigger::Scheduled) if self.can_run() && unblocked() => {
+            (Some(_), RunTrigger::Scheduled | RunTrigger::Dependency)
+                if self.can_run()
+                    && self
+                        .scheduler
+                        .active_predecessor_blockers(request, now)
+                        .is_some_and(|blockers| blockers.is_empty()) =>
+            {
                 let firing = standing::Firing {
                     epoch: self.sync_epoch?,
                     run: request.id,
                 };
+                let occurrence = self.scheduler.active_firing_occurrence(request)?;
+                let admission = standing::Admission::new(firing, job, request, occurrence).ok()?;
                 let approval = self
                     .sync_store
                     .load_standing(&request.job, copy.approval.as_deref(), subject.scope, now)
@@ -334,7 +343,7 @@ impl SchedulerWindow {
                 if !approval.active_at(request.started_at) {
                     return None;
                 }
-                (Some((approval, firing)), None)
+                (Some((approval, admission)), None)
             }
             (Some(_), _) => return None,
             (None, RunTrigger::Manual | RunTrigger::Scheduled) => (None, None),
@@ -478,13 +487,14 @@ fn subject<'a>(
         }
         .map_err(|_| "Could not bind this review to the job.")?
     };
+    let calendar = schedule.filter(|schedule| schedule.enabled());
     let schedule = if copy.standing.is_some() {
-        standing_schedule(
-            schedule.ok_or("Choose an enabled calendar for recurring SFTP copies.")?,
-            zone,
+        calendar.map_or_else(
+            || "Starts after a successful predecessor round".to_owned(),
+            |schedule| standing_schedule(schedule, zone),
         )
     } else {
-        schedule.filter(|schedule| schedule.enabled()).map_or_else(
+        calendar.map_or_else(
             || "Run Now".to_owned(),
             |schedule| {
                 let (date, _) = schedule.active_dates();
@@ -503,6 +513,7 @@ fn subject<'a>(
             id: job.id().clone(),
             scope,
             schedule,
+            calendar: calendar.is_some(),
             mode: job.mode(),
             predecessors: predecessors.to_vec(),
             max_age_minutes,
@@ -559,6 +570,25 @@ pub(in crate::scheduler_window) fn standing_schedule(
 }
 
 impl DraftReview {
+    pub(in crate::scheduler_window) fn discard_standing(&mut self) -> bool {
+        let active = self
+            .pending
+            .as_ref()
+            .is_some_and(|pending| pending.subject.standing.is_some())
+            || self
+                .preview
+                .as_ref()
+                .is_some_and(|preview| preview.subject.standing.is_some())
+            || self
+                .approved
+                .as_ref()
+                .is_some_and(|(subject, _)| subject.standing.is_some());
+        if active {
+            *self = Self::default();
+        }
+        active
+    }
+
     pub(in crate::scheduler_window) fn approved_job(&self) -> Option<&JobId> {
         self.approved.as_ref().map(|(subject, _)| &subject.id)
     }
@@ -590,7 +620,7 @@ impl DraftReview {
                     expires_at: pending.expires_at,
                 });
                 Some(if standing {
-                    "Review the recurring calendar, folder roots and transfer limits before approving."
+                    "Review the automatic triggers, folder roots and transfer limits before approving."
                 } else {
                     "Review the exact folder-copy actions before approving."
                 }.into())
@@ -623,7 +653,11 @@ impl DraftReview {
         let standing = subject.standing;
         let mut details = column![
             text(match (privileged, subject.direction, standing.is_some()) {
+                (true, Direction::Upload, _) if subject.replace_changed =>
+                    "One-use privileged folder upload and replacement review",
                 (true, Direction::Upload, _) => "One-use privileged folder upload review",
+                (true, Direction::Download, _) if subject.replace_changed =>
+                    "One-use privileged folder download and replacement review",
                 (true, Direction::Download, _) => "One-use privileged folder download review",
                 (_, _, true) if subject.replace_changed => "Recurring SFTP replacement review",
                 (_, _, true) => "Recurring SFTP copy review",
@@ -654,7 +688,17 @@ impl DraftReview {
         if !privileged && matches!(subject.direction, Direction::Download) {
             details = details.push(text("New local files and folders use normal destination permissions and inherited access. New files use their local write time.").size(12));
         }
-        if subject.replace_changed {
+        if privileged && subject.replace_changed {
+            let access = match subject.direction {
+                Direction::Upload => {
+                    "New entries are private and root-owned. Replacements preserve supported server access metadata and keep the originals in private sibling folders. The run result gives the recovery pattern."
+                }
+                Direction::Download => {
+                    "New entries use private access. Replacements preserve supported local access metadata and keep the originals in private sibling folders. The run result gives the recovery pattern."
+                }
+            };
+            details = details.push(text(access).size(12));
+        } else if subject.replace_changed {
             let access = if subject.direction == Direction::Upload {
                 "Server replacements require login-owned files with owner-only permissions. The server must preserve the owner, group and mode."
             } else if cfg!(unix) {
@@ -666,15 +710,22 @@ impl DraftReview {
         }
         if !subject.predecessors.is_empty() {
             if subject.mode == DependencyMode::Chain {
-                details = details
-                    .push(text("Chain can start the copy when every predecessor has succeeded since this job last ran.").size(12))
-                    .push(text("A Chain start can occur outside the optional calendar date and time.").size(12))
-                    .push(text("Run Now, a calendar start and a Chain start share this approval. The approval is used before the reviewed copy writes.").size(12));
+                details = details.push(text("Chain can start the copy when every predecessor has succeeded since this job last ran.").size(12));
+                if subject.calendar {
+                    details = details.push(
+                        text("Chain can start the copy outside the calendar window.").size(12),
+                    );
+                }
+                if standing.is_none() {
+                    details = details.push(text("Run Now and the configured automatic starts share this one-use approval.").size(12));
+                }
             }
-            details = details.push(
-                text("A calendar start requires the last result of each predecessor to be successful.")
-                    .size(12),
-            );
+            if subject.calendar {
+                details = details.push(
+                    text("A calendar start requires the last result of each predecessor to be successful.")
+                        .size(12),
+                );
+            }
             for id in &subject.predecessors {
                 let label = graph
                     .job(id)
@@ -697,16 +748,16 @@ impl DraftReview {
             details = details
                 .push(text(format!("Approval expires · {expires}")).size(12))
                 .push(text(format!(
-                    "Up to {} calendar attempts · {} actions and {} bytes per attempt",
+                    "Up to {} automatic attempts · {} actions and {} bytes per attempt",
                     settings.limits.max_firings, settings.limits.max_actions, settings.limits.max_bytes,
                 )).size(12))
                 .push(text(if subject.replace_changed {
-                    "Approve future eligible source content and replacement of eligible existing files under these roots. Each calendar firing verifies its own source and destination bytes before writing."
+                    "Approve future eligible source content and replacement of eligible existing files under these roots. Each firing verifies its own source and destination bytes before writing."
                 } else {
                     "The approval covers future eligible source content under these folder roots. It allows creation of missing regular files and folders only."
                 }).size(12))
-                .push(text("The calendar window selects due times. A queued or overdue run can start later while the approval is active.").size(12))
-                .push(text("An admitted calendar attempt uses one allowance, including a failed connection or an empty copy plan.").size(12));
+                .push(subject.calendar.then(|| text("The calendar window selects due times. A queued or overdue run can start later while the approval is active.").size(12)))
+                .push(text("Each admitted automatic attempt uses one allowance, including a failed connection or an empty copy plan.").size(12));
         } else if privileged {
             details = details
                 .push(

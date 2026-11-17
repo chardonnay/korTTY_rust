@@ -177,7 +177,9 @@ fn review_on(
     let (archive, mut input) = Input::capture(paths.archive)?;
     let size = input.metadata()?.len();
     if !(1..=MAX_ARCHIVE_BYTES).contains(&size) {
-        return Err(invalid("The MLX ZIP is empty or exceeds its size limit"));
+        return Err(invalid(
+            "The MLX package is empty or exceeds its size limit",
+        ));
     }
     let sha256 = copy_archive(&mut input, &mut io::sink(), size, cancelled)?;
     archive.stamp.require_unchanged(&input)?;

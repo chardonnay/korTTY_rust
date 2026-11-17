@@ -75,7 +75,6 @@ pub enum Message {
     Profile(TerminalProfile),
     Font(u8),
     ShowAppearance,
-    #[cfg(windows)]
     LocalShell(LocalShell),
     ShellIntegration(bool),
     AdHocLocal,
@@ -244,13 +243,9 @@ impl Dialog {
     }
 
     fn group_members(&self, group: &str) -> usize {
-        self.store.as_ref().map_or(0, |store| {
-            store
-                .connections()
-                .iter()
-                .filter(|connection| store.group_of(connection.id) == Some(group))
-                .count()
-        })
+        self.store
+            .as_ref()
+            .map_or(0, |store| store.direct_group_ids(group).count())
     }
 }
 
@@ -508,11 +503,13 @@ impl Workspace {
                 dialog.font = Some(font);
             }
             Message::ShowAppearance => dialog.appearance = !dialog.appearance,
-            #[cfg(windows)]
             Message::LocalShell(shell)
-                if dialog.protocol == Protocol::Local && !dialog.group_tab =>
+                if dialog.protocol == Protocol::Local
+                    && !dialog.group_tab
+                    && kortty_pty::available_local_shells().contains(&shell) =>
             {
                 dialog.local_shell = shell;
+                dialog.shell_integration &= validate_shell_integration(shell, None).is_ok();
             }
             Message::ShellIntegration(enabled) if dialog.protocol == Protocol::Local => {
                 dialog.shell_integration = enabled;
@@ -803,7 +800,21 @@ impl Workspace {
                 members.push_back(connection.id);
             }
         }
-        let task = self.advance_quick_group(owner, members);
+        let mut launches = vec![self.advance_quick_group(owner, members)];
+        for profile in store
+            .local_profiles()
+            .iter()
+            .filter(|profile| store.group_of(profile.id) == Some(group))
+        {
+            launches.push(self.open_saved_local(owner, profile.clone()));
+        }
+        for profile in store
+            .serial_profiles()
+            .iter()
+            .filter(|profile| store.group_of(profile.id) == Some(group))
+        {
+            launches.push(self.open_saved_serial(owner, profile.clone()));
+        }
         let mut notices = Vec::new();
         if !skipped.is_empty() {
             notices.push(format!(
@@ -820,7 +831,7 @@ impl Workspace {
         if !notices.is_empty() {
             self.notice(owner, notices.join(" "));
         }
-        task
+        Task::batch(launches)
     }
 
     pub(super) fn advance_quick_group(

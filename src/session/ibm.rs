@@ -210,6 +210,7 @@ fn init(kind: IbmKind, status: Status) -> (Actor, Arc<Shared>, Receiver<()>) {
         program_notifications: Mutex::default(),
         output_activity: Arc::default(),
         local_shell_pid: Default::default(),
+        flatpak_host_shell: Default::default(),
         sandbox_backend: Mutex::default(),
         serial: None,
         serial_notice: Mutex::new(None),

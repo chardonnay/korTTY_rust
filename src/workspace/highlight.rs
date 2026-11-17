@@ -356,6 +356,18 @@ impl State {
         }
     }
 
+    pub(super) fn logfile_styles(
+        &self,
+        id: &str,
+    ) -> (&[(String, String)], Option<&Arc<CompiledSet>>) {
+        (
+            &self.ordered_sets,
+            self.sets
+                .get(id)
+                .or_else(|| self.sets.get(crate::logfile_window::style::DEFAULT_SET)),
+        )
+    }
+
     pub(super) fn preferences(&self) -> Preferences {
         Preferences::from(&self.configuration)
     }
@@ -508,6 +520,13 @@ fn clock() -> BoxStream<'static, Desktop> {
 }
 
 impl Workspace {
+    fn saved_highlight_set<'a>(&'a self, pane: &'a super::PaneSession) -> Option<&'a str> {
+        pane.saved_serial
+            .as_ref()
+            .and_then(|profile| self.saved_terminal_preferences.serial_highlight(profile.id))
+            .or_else(|| self.terminal_overrides(pane)?.highlight_set.as_deref())
+    }
+
     pub(super) fn commit_highlight_preferences(
         &mut self,
         initial: &Preferences,
@@ -588,9 +607,7 @@ impl Workspace {
         let Some(source) = self.sessions.get(&session) else {
             return;
         };
-        let connection = self
-            .terminal_overrides(source)
-            .and_then(|settings| settings.highlight_set.clone());
+        let connection = self.saved_highlight_set(source);
         let choice = self
             .highlight
             .panes
@@ -600,7 +617,7 @@ impl Workspace {
             && (!source.frame.screen.alternate_screen
                 || self.highlight.configuration.alternate_screen)
         {
-            self.highlight.resolved(choice, connection.as_deref())
+            self.highlight.resolved(choice, connection)
         } else {
             None
         };
@@ -859,9 +876,7 @@ impl Workspace {
             .panes
             .get(&session)
             .ok_or("The trigger's highlighting selection changed.")?;
-        let connection = self
-            .terminal_overrides(pane)
-            .and_then(|settings| settings.highlight_set.as_deref());
+        let connection = self.saved_highlight_set(pane);
         let resolved = self.highlight.resolved(state.choice.as_deref(), connection);
         if pane.stream_generation != trigger.generation
             || state.revision != trigger.pane_revision
@@ -1539,7 +1554,15 @@ impl Workspace {
                         );
                     for (flag, label, value) in [
                         (Flag::Enabled, "Rule enabled", rule.enabled),
-                        (Flag::Regex, "Regular expression", rule.regex),
+                        (
+                            Flag::Regex,
+                            if rule.regex && rule.java_regex {
+                                "Java regular expression"
+                            } else {
+                                "Regular expression"
+                            },
+                            rule.regex,
+                        ),
                         (Flag::IgnoreCase, "Ignore case", rule.ignore_case),
                         (Flag::WholeWord, "Whole word", rule.whole_word),
                         (Flag::WholeLine, "Entire logical line", rule.whole_line),

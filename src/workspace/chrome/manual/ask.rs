@@ -150,7 +150,7 @@ impl Authority {
                 .map_err(|_| "The saved AI settings are unavailable.")?;
             if current.preferred_manual_profile_id() != Some(self.id)
                 || !current
-                    .terminal_chat_transport(self.id)
+                    .interactive_chat_transport(self.id)
                     .is_ok_and(|(profile, limit)| {
                         profile.with_output_limit(ANSWER_OUTPUT_TOKENS) == self.transport
                             && limit == self.selection_limit
@@ -283,9 +283,9 @@ impl State {
         let id = config
             .preferred_manual_profile_id()
             .ok_or("Set a default text profile in AI Manager.")?;
-        let (transport, limit) = config.terminal_chat_transport(id)?;
+        let (transport, limit) = config.interactive_chat_transport(id)?;
         let (_, name, model, destination) = config
-            .terminal_chat_profiles()
+            .interactive_chat_profiles()
             .find(|(profile, ..)| *profile == id)
             .ok_or("The default AI profile is unavailable.")?;
         let vault = scope.vault.map_or_else(
@@ -301,6 +301,11 @@ impl State {
                 credential.as_deref().map(String::as_str),
                 text,
             )
+        };
+        let model = if transport.uses_server_default_model() {
+            "Server selects the model"
+        } else {
+            model
         };
         let destination = mask(&format!("{name} · {model} · {destination}"))?;
         let system = mask(&transport.render_system_prompt(evidence::SYSTEM))?;
@@ -497,16 +502,28 @@ mod tests {
 
     #[test]
     fn manual_question_sends_only_reviewed_evidence_and_links_to_bundled_sources() {
+        check_manual_question(false);
+    }
+
+    #[test]
+    fn manual_question_uses_the_server_selected_text_profile_after_review() {
+        check_manual_question(true);
+    }
+
+    fn check_manual_question(server_selected: bool) {
         let _exclusive = exclusive_run();
         let (server, _) = listener();
         let settings = json!({
             "profiles": {
                 "profiles": [{"id": 1, "name": "Guide fixture",
-                    "endpoint": server.local_addr().unwrap().to_string(), "model": "fixture",
+                    "endpoint": server.local_addr().unwrap().to_string(),
+                    "model": if server_selected { "" } else { "fixture" },
+                    "model_mode": if server_selected { "server-default" } else { "manual" },
                     "prompt_preset": "qwen"}],
-                "default": 1,
+                "default": if server_selected { None } else { Some(1) },
                 "last_id": 1
-            }
+            },
+            "local": { "roles": [1, null, null, null] }
         });
         let configuration = Arc::new(serde_json::from_value::<Configuration>(settings).unwrap());
         let mut state = State::default();
@@ -532,6 +549,10 @@ mod tests {
         let _ = state.update(Event::Review, scope(Some(configuration.clone()), &policy));
         let approved = state.epoch;
         let review = state.review.as_ref().unwrap();
+        assert_eq!(
+            review.destination.contains("Server selects the model"),
+            server_selected
+        );
         let preview = review.evidence.payload.clone();
         let system = review.system.clone();
         assert!(system.starts_with(evidence::SYSTEM));
@@ -542,6 +563,7 @@ mod tests {
         );
         let mut stream = accept(&server);
         let body = request(&mut stream);
+        assert_eq!(body.get("model").is_none(), server_selected);
         assert_eq!(body["messages"][0]["content"], system);
         assert_eq!(body["messages"][1]["content"], preview.as_str());
         stream

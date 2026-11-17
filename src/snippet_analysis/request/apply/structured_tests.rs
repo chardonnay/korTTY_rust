@@ -81,6 +81,7 @@ fn option_only_apply_rechecks_earlier_literals_after_restart() {
         elapsed_millis: 2,
         profile_name: "Reviewed local endpoint".into(),
         model: "test".into(),
+        profile_revision: None,
         request: request.recovery_snapshot().unwrap(),
         checkpoint: Some(Arc::new(Checkpoint {
             code_sha256: content_hash(&first_result.code).unwrap(),
@@ -169,7 +170,7 @@ fn apply_format_retry_rechecks_dispatch_authority() {
         "system",
         "exact reviewed apply input",
         &mut true,
-        &|| {
+        &|_| {
             allowed
                 .load(Ordering::Acquire)
                 .then_some(())

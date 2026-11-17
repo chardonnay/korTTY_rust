@@ -33,6 +33,7 @@ pub(crate) struct ViewChoices<'a> {
     pub(crate) passphrases: &'a [CredentialChoice],
     pub(crate) keys: &'a [KeyChoice],
     pub(crate) ai_profiles: &'a [(Option<u64>, ProfileRef, String)],
+    pub(crate) java_ai_profiles: &'a [(crate::ai_manager::JavaProfileSource, ProfileRef, String)],
     pub(crate) ai_skills: &'a [(u64, String)],
     pub(crate) ai_agent_designs: &'a [AgentDesignChoice],
     pub(crate) highlighting: HighlightChoices<'a>,
@@ -192,6 +193,16 @@ impl ConnectionWindow {
                     .journal
                     .view(choices.journal_max_parts)
                     .map(Message::SerialJournal),
+                row![
+                    text("Keyword highlighting"),
+                    super::terminal_overrides::highlight_picker(
+                        &choices.highlighting,
+                        draft.highlight_set.as_deref(),
+                        Message::SerialHighlightSet,
+                    ),
+                ]
+                .spacing(8)
+                .align_y(iced::Alignment::Center),
             ]
             .spacing(10)
             .into()
@@ -1645,6 +1656,7 @@ fn teamwork_auth_picker_displays_missing_references_without_offering_them() {
         passphrases: &[],
         keys: &keys,
         ai_profiles: &[],
+        java_ai_profiles: &[],
         ai_skills: &[],
         ai_agent_designs: &[],
         highlighting: HighlightChoices::default(),

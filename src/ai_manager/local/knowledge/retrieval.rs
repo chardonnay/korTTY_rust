@@ -13,7 +13,7 @@ use crate::private_files::FileStamp;
 use crate::vault_window::VaultWindow;
 
 use super::super::Role;
-use super::{Cache, Passage, Scope, check_active, qdrant};
+use super::{Cache, Index, Scope, check_active, qdrant};
 
 pub(crate) const MAX_QUERY_BYTES: usize = 2048;
 const MAX_CONTEXT_BYTES: usize = 4000;
@@ -280,9 +280,18 @@ impl Plan {
         if budget < 256 {
             return Err("The profile selection limit is too small for retrieved context.".into());
         }
-        let (index, stamp) = self.cache.load_stamped(&self.scope).map_err(|error| {
-            format!("Could not open the knowledge index ({error}). Update it in AI Manager.")
-        })?;
+        let (index, stamp) = self
+            .cache
+            .load_file_backed(&self.scope, || check_active(client))
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    error.to_string()
+                } else {
+                    format!(
+                        "Could not open the knowledge index ({error}). Update it in AI Manager."
+                    )
+                }
+            })?;
         let store = mask(&self.name)?;
         let vault_envelope = vault_key
             .as_deref()
@@ -307,25 +316,12 @@ impl Plan {
         let vault_revision = vault_key.as_ref().map(|key| key.revision());
         let enabled = index.enabled_entries(&self.scope);
         let search_graph = self.scope.qdrant.is_none() && index.search_graph(enabled).is_some();
-        let candidate_limit = if search_graph {
-            GRAPH_CANDIDATES
-        } else {
-            enabled
-        };
         let check = || {
             check_active(client)?;
             vault_revision
                 .as_ref()
                 .map_or(Ok(()), qdrant::require_vault_revision)
         };
-        let candidates = index.rank_reviewed(
-            client,
-            &self.scope,
-            &vector,
-            candidate_limit,
-            vault_key,
-            before_dispatch,
-        )?;
         let mut excerpts = Excerpts {
             scope: &self.scope,
             store,
@@ -334,24 +330,46 @@ impl Plan {
             citations: Vec::new(),
             source_counts: vec![0; self.scope.sources.len()],
         };
-        for &(_, position) in &candidates {
-            excerpts.add(&index.entries[position].0, &mask)?;
-            if excerpts.full() {
-                break;
+        if !search_graph && self.scope.qdrant.is_none() {
+            for (_, position) in index.ranked_exact(&self.scope, &vector, check)? {
+                excerpts.add(&index, position, &mask)?;
+                if excerpts.full() {
+                    break;
+                }
             }
-        }
-        // Size and per-source limits can skip the best graph hits. Refill from
-        // the remaining enabled passages if they can still provide context.
-        if search_graph && candidates.len() < enabled && !excerpts.full() {
-            let mut visited = vec![false; index.len()];
+        } else {
+            let limit = if search_graph {
+                GRAPH_CANDIDATES
+            } else {
+                enabled
+            };
+            let candidates = index.rank_reviewed(
+                client,
+                &self.scope,
+                &vector,
+                limit,
+                vault_key,
+                before_dispatch,
+            )?;
             for &(_, position) in &candidates {
-                visited[position] = true;
+                excerpts.add(&index, position, &mask)?;
+                if excerpts.full() {
+                    break;
+                }
             }
-            for (_, position) in index.rank_exact(&self.scope, &vector, check)? {
-                if !visited[position] {
-                    excerpts.add(&index.entries[position].0, &mask)?;
-                    if excerpts.full() {
-                        break;
+            // Size and per-source limits can skip the best graph hits. Refill
+            // from the remaining enabled passages that can still provide context.
+            if search_graph && candidates.len() < enabled && !excerpts.full() {
+                let mut visited = vec![false; index.len()];
+                for &(_, position) in &candidates {
+                    visited[position] = true;
+                }
+                for (_, position) in index.ranked_exact(&self.scope, &vector, check)? {
+                    if !visited[position] {
+                        excerpts.add(&index, position, &mask)?;
+                        if excerpts.full() {
+                            break;
+                        }
                     }
                 }
             }
@@ -435,9 +453,11 @@ impl Excerpts<'_> {
 
     fn add(
         &mut self,
-        passage: &Passage,
+        index: &Index,
+        position: usize,
         mask: &impl Fn(&str) -> Result<String, String>,
     ) -> Result<(), String> {
+        let passage = &index.entries[position].0;
         if self.source_counts[passage.source] == PER_SOURCE {
             return Ok(());
         }
@@ -447,7 +467,7 @@ impl Excerpts<'_> {
             .unwrap_or("Source");
         let file = mask(file)?;
         let file = &file[..file.floor_char_boundary(512.min(file.len()))];
-        let excerpt = mask(&passage.text)?;
+        let excerpt = mask(&index.passage_text(position)?)?;
         let excerpt = &excerpt[..excerpt.floor_char_boundary(MAX_EXCERPT_BYTES.min(excerpt.len()))];
         let (line, page) = match passage.location {
             super::Location::Line(line) => (Some(line), None),

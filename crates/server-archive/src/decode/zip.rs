@@ -1,26 +1,16 @@
-use std::io::{self, Cursor};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 
 use zip::ZipArchive;
 use zip::read::{ArchiveOffset, Config};
 
-use crate::manifest::{MAX_MEMBERS, MemberKind};
+use crate::MAX_ARCHIVE_BYTES;
+use crate::manifest::{MAX_MEMBERS, ManifestBuilder, Member, MemberKind};
 
 use super::{Output, encrypted, invalid, link_bytes, unsupported_entry};
 
 pub(super) fn visit(bytes: &[u8], output: &mut Output<'_>) -> io::Result<()> {
-    let count = preflight_directory(bytes)?;
-    let mut archive = ZipArchive::with_config(
-        Config {
-            archive_offset: ArchiveOffset::Known(0),
-        },
-        Cursor::new(bytes),
-    )
-    .map_err(zip_error)?;
-    if archive.len() != count {
-        return Err(invalid(
-            "ZIP central directory has duplicate or inconsistent entries",
-        ));
-    }
+    let mut archive = open_checked_zip(Cursor::new(bytes))?;
+    let count = archive.len();
     for index in 0..count {
         if archive.by_index_data(index).map_err(zip_error)?.encrypted() {
             return Err(encrypted());
@@ -47,16 +37,62 @@ pub(super) fn visit(bytes: &[u8], output: &mut Output<'_>) -> io::Result<()> {
     Ok(())
 }
 
+/// Checks the central directory before allocating its entry map.
+/// Callers must verify local header consistency before using entry data.
+pub fn open_checked_zip<R: Read + Seek>(mut reader: R) -> io::Result<ZipArchive<R>> {
+    let count = preflight_directory(&mut reader)?;
+    reader.rewind()?;
+    let archive = ZipArchive::with_config(
+        Config {
+            archive_offset: ArchiveOffset::Known(0),
+        },
+        reader,
+    )
+    .map_err(zip_error)?;
+    if archive.len() != count {
+        return Err(invalid(
+            "ZIP central directory has duplicate or inconsistent entries",
+        ));
+    }
+    Ok(archive)
+}
+
+/// Checks exact ZIP update names, including all implicit containing directories.
+pub fn validate_zip_update_members<'a>(
+    members: impl IntoIterator<Item = &'a Member>,
+) -> io::Result<()> {
+    let mut builder = ManifestBuilder::new();
+    for member in members {
+        if builder
+            .add(&member.path, member.kind.clone(), member.size)?
+            .as_ref()
+            != Some(member)
+        {
+            return Err(invalid("ZIP update member paths must be canonical"));
+        }
+    }
+    builder.finish()?;
+    Ok(())
+}
+
 // Bound the number of records before ZipArchive allocates the directory map.
 // Require one contiguous central directory with a footer at the end of the file.
-fn preflight_directory(bytes: &[u8]) -> io::Result<usize> {
+fn preflight_directory(reader: &mut (impl Read + Seek)) -> io::Result<usize> {
+    let size = reader.seek(SeekFrom::End(0))?;
+    if size > MAX_ARCHIVE_BYTES {
+        return Err(invalid("Choose a ZIP no larger than 64 MiB"));
+    }
+    let tail_offset = size.saturating_sub(22 + u64::from(u16::MAX) + 20);
+    reader.seek(SeekFrom::Start(tail_offset))?;
+    let mut bytes = vec![0; (size - tail_offset) as usize];
+    reader.read_exact(&mut bytes)?;
     let end = bytes.len().checked_sub(22).ok_or_else(bad_directory)?;
     let start = end.saturating_sub(u16::MAX as usize);
     let end = (start..=end)
         .rev()
         .find(|&index| {
             bytes[index..].starts_with(b"PK\x05\x06")
-                && index + 22 + usize::from(u16_at(bytes, index + 20)) == bytes.len()
+                && index + 22 + usize::from(u16_at(&bytes, index + 20)) == bytes.len()
         })
         .ok_or_else(bad_directory)?;
     let footer = &bytes[end..end + 22];
@@ -72,29 +108,39 @@ fn preflight_directory(bytes: &[u8]) -> io::Result<usize> {
         .checked_sub(20)
         .filter(|&offset| bytes[offset..end].starts_with(b"PK\x06\x07"));
     let (dir, footer_start) = match locator {
-        Some(locator) => zip64_directory(bytes, locator, zip32)?,
-        None => (zip32, end),
+        Some(locator) => zip64_directory(
+            reader,
+            &bytes[locator..end],
+            tail_offset + locator as u64,
+            zip32,
+        )?,
+        None => (zip32, tail_offset + end as u64),
     };
     if dir.count > MAX_MEMBERS as u64 {
         return Err(invalid("The ZIP has too many entries"));
     }
-    if dir.offset.checked_add(dir.size) != Some(footer_start as u64) {
+    if dir.offset.checked_add(dir.size) != Some(footer_start) {
         return Err(bad_directory());
     }
-    let mut directory = &bytes[dir.offset as usize..footer_start];
+    reader.seek(SeekFrom::Start(dir.offset))?;
+    let mut remaining = dir.size;
     for _ in 0..dir.count {
-        let record = directory.get(..46).ok_or_else(bad_directory)?;
-        if !record.starts_with(b"PK\x01\x02") || u16_at(record, 34) != 0 {
+        let mut record = [0; 46];
+        remaining = remaining
+            .checked_sub(record.len() as u64)
+            .ok_or_else(bad_directory)?;
+        reader.read_exact(&mut record)?;
+        if !record.starts_with(b"PK\x01\x02") || u16_at(&record, 34) != 0 {
             return Err(bad_directory());
         }
-        let length = 46
-            + [28, 30, 32]
-                .into_iter()
-                .map(|index| usize::from(u16_at(record, index)))
-                .sum::<usize>();
-        directory = directory.get(length..).ok_or_else(bad_directory)?;
+        let length = [28, 30, 32]
+            .into_iter()
+            .map(|index| u64::from(u16_at(&record, index)))
+            .sum::<u64>();
+        remaining = remaining.checked_sub(length).ok_or_else(bad_directory)?;
+        reader.seek_relative(length as i64)?;
     }
-    if !directory.is_empty() {
+    if remaining != 0 {
         return Err(bad_directory());
     }
     Ok(dir.count as usize)
@@ -108,30 +154,33 @@ struct Directory {
 }
 
 fn zip64_directory(
-    bytes: &[u8],
-    locator: usize,
+    reader: &mut (impl Read + Seek),
+    locator_record: &[u8],
+    locator: u64,
     zip32: Directory,
-) -> io::Result<(Directory, usize)> {
-    let locator_record = &bytes[locator..locator + 20];
+) -> io::Result<(Directory, u64)> {
     if u32_at(locator_record, 4) != 0 || u32_at(locator_record, 16) != 1 {
         return Err(invalid("Multi-disk ZIP64 archives are unsupported"));
     }
-    let start = usize::try_from(u64_at(locator_record, 8)).map_err(|_| bad_directory())?;
-    let record = bytes
-        .get(start..locator)
-        .filter(|record| record.len() >= 56 && record.len() <= 64 * 1024)
+    let start = u64_at(locator_record, 8);
+    let length = locator
+        .checked_sub(start)
+        .filter(|length| (56..=64 * 1024).contains(length))
         .ok_or_else(bad_directory)?;
+    reader.seek(SeekFrom::Start(start))?;
+    let mut record = vec![0; length as usize];
+    reader.read_exact(&mut record)?;
     if !record.starts_with(b"PK\x06\x06")
-        || u64_at(record, 4) != record.len() as u64 - 12
+        || u64_at(&record, 4) != length - 12
         || record[16..24] != [0; 8]
-        || u64_at(record, 24) != u64_at(record, 32)
+        || u64_at(&record, 24) != u64_at(&record, 32)
     {
         return Err(bad_directory());
     }
     let dir = Directory {
-        count: u64_at(record, 32),
-        size: u64_at(record, 40),
-        offset: u64_at(record, 48),
+        count: u64_at(&record, 32),
+        size: u64_at(&record, 40),
+        offset: u64_at(&record, 48),
     };
     if zip32.count != dir.count && zip32.count != u64::from(u16::MAX)
         || zip32.size != dir.size && zip32.size != u64::from(u32::MAX)

@@ -95,17 +95,35 @@ impl JavaProfileSource {
     }
 }
 
-/// A Journal profile selection from a Java backup, pending native review.
+/// A profile selection from a Java backup, pending native review.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct JavaJournalProfileHint {
+pub(crate) struct JavaAiProfileHint {
     #[serde(deserialize_with = "deserialize_java_profile_source_id")]
     id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     source: Option<JavaProfileSource>,
 }
 
-impl JavaJournalProfileHint {
+impl JavaAiProfileHint {
+    pub(crate) fn from_id(id: &str) -> Option<Self> {
+        Some(Self {
+            id: JavaProfileSource::parse_id(id)?.into(),
+            source: None,
+        })
+    }
+
+    pub(crate) fn associate_source(&mut self, sources: &[&JavaProfileSource]) {
+        let mut candidates = sources
+            .iter()
+            .copied()
+            .filter(|source| source.id() == self.id);
+        self.source = candidates
+            .next()
+            .filter(|_| candidates.next().is_none())
+            .cloned();
+    }
+
     pub(crate) fn id(&self) -> &str {
         &self.id
     }
@@ -119,9 +137,9 @@ impl JavaJournalProfileHint {
 #[serde(default, deny_unknown_fields)]
 struct JavaJournalProfiles {
     #[serde(skip_serializing_if = "Option::is_none")]
-    recording: Option<JavaJournalProfileHint>,
+    recording: Option<JavaAiProfileHint>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    automation: Option<JavaJournalProfileHint>,
+    automation: Option<JavaAiProfileHint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     evidence: Option<JavaJournalEvidence>,
 }
@@ -138,7 +156,7 @@ impl JavaJournalProfiles {
         self.recording.is_none() && self.automation.is_none() && self.evidence.is_none()
     }
 
-    fn hints(&self) -> impl Iterator<Item = &JavaJournalProfileHint> {
+    fn hints(&self) -> impl Iterator<Item = &JavaAiProfileHint> {
         self.recording.iter().chain(&self.automation)
     }
 
@@ -278,7 +296,10 @@ pub(crate) struct Configuration {
 #[derive(Clone, Copy)]
 enum ProfileRoute {
     Local,
-    ReviewedHttp,
+    ForegroundAgentDefault,
+    SnippetAssistance,
+    SnippetAnalysis,
+    JournalHttps,
     ReviewedHttps,
     ReviewedCli,
     TerminalChat,
@@ -303,12 +324,19 @@ pub(crate) struct JournalNoteProfile {
 impl ProfileRoute {
     fn allows(self, profile: &profiles::Profile) -> bool {
         if profile.uses_server_default_model() {
-            return matches!(self, Self::InteractiveChat);
+            return matches!(
+                self,
+                Self::InteractiveChat
+                    | Self::ForegroundAgentDefault
+                    | Self::SnippetAssistance
+                    | Self::SnippetAnalysis
+            ) || matches!(self, Self::JournalHttps) && profile.remote_protocol().is_some();
         }
         match self {
             Self::Local => profile.allows_local_roles(),
-            Self::ReviewedHttp => !profile.is_cli(),
-            Self::ReviewedHttps => profile.remote_protocol().is_some(),
+            Self::ForegroundAgentDefault => false,
+            Self::SnippetAnalysis | Self::SnippetAssistance => !profile.is_cli(),
+            Self::ReviewedHttps | Self::JournalHttps => profile.remote_protocol().is_some(),
             Self::ReviewedCli => profile.is_cli() && !profile.restore_review,
             Self::TerminalChat | Self::InteractiveChat => true,
         }
@@ -317,6 +345,17 @@ impl ProfileRoute {
 
 fn is_policy_model_profile(profile: &profiles::Profile) -> bool {
     profile.is_managed() && crate::clipboard_policy::valid_policy_model_id(&profile.model)
+}
+
+fn snippet_http_target(
+    profile: &profiles::Profile,
+) -> Result<(Option<&str>, String, bool), String> {
+    let model = (!profile.uses_server_default_model()).then(|| profile.effective_model());
+    Ok((
+        model,
+        profile.destination()?,
+        profile.remote_protocol().is_some(),
+    ))
 }
 
 fn require_journal_vision(profile: &profiles::Profile, vision: bool) -> Result<(), String> {
@@ -584,7 +623,7 @@ impl Configuration {
     pub(crate) fn imported_journal_summary_profile(
         &self,
         automation: bool,
-    ) -> Option<&JavaJournalProfileHint> {
+    ) -> Option<&JavaAiProfileHint> {
         if automation {
             self.java_journal_profiles.automation.as_ref()
         } else {
@@ -1001,27 +1040,50 @@ impl Configuration {
             let (transport, selection_limit) = if profile.is_cli() {
                 self.reviewed_cli_transport(profile.id)?
             } else {
-                self.terminal_chat_transport(profile.id)?
+                self.interactive_chat_transport(profile.id)?
             };
             if transport.is_remote() && self.saved_root().is_none() {
                 return Err("Save the reviewed HTTPS profile before using it here.".into());
             }
+            let model = if transport.uses_server_default_model() {
+                "Server selects the model"
+            } else {
+                profile.effective_model()
+            };
             Ok(JournalNoteProfile {
                 id: profile.id,
                 transport,
                 selection_limit,
-                destination: format!(
-                    "{} · {} · {}",
-                    profile.name,
-                    profile.effective_model(),
-                    profile.destination()?
-                ),
+                destination: format!("{} · {} · {}", profile.name, model, profile.destination()?),
             })
         })())
     }
 
     pub(crate) fn journal_embedding_profile(&self) -> Option<(local_ai::Profile, String)> {
         self.local.journal_embedding(self.saved_root())
+    }
+
+    pub(crate) fn journal_question_loopback_server_default(
+        &self,
+    ) -> Option<(local_ai::Profile, String)> {
+        self.saved_root()?;
+        let profile = self.selected_journal_profile()?;
+        if !self.enabled() || !profile.journal_loopback_server_default() {
+            return None;
+        }
+        let transport = self.transport_for(profile).ok()?;
+        if transport.is_remote() {
+            return None;
+        }
+        transport.require_current_policy_authority().ok()?;
+        let destination = profile.destination().ok()?;
+        Some((
+            transport,
+            format!(
+                "{} · Server selects the model · {destination}",
+                profile.name
+            ),
+        ))
     }
 
     fn selected_journal_profile(&self) -> Option<&profiles::Profile> {
@@ -1288,40 +1350,92 @@ impl Configuration {
         Some(self.local_profile_for(local::Role::Coding)?.id)
     }
 
-    fn agent_profile_binding(&self) -> Option<&ProfileRef> {
+    fn agent_profile_binding(&self, allow_server_default: bool) -> Option<&ProfileRef> {
         [local::Role::Agent, local::Role::Coding]
             .into_iter()
             .filter_map(|role| self.local.profile(role))
             .find(|reference| {
                 matches!(reference, ProfileRef::Policy(_))
-                    || self.bound_profile(reference).is_some()
+                    || self.bound_profile(reference).is_some_and(|profile| {
+                        !profile.uses_server_default_model()
+                            || (allow_server_default && profile.allows_role(local::Role::Agent))
+                    })
             })
     }
 
     pub(crate) fn has_named_agent_profile(&self) -> bool {
-        matches!(self.agent_profile_binding(), Some(ProfileRef::Policy(_)))
+        matches!(
+            self.agent_profile_binding(false),
+            Some(ProfileRef::Policy(_))
+        )
     }
 
     pub(crate) fn agent_profile_id(&self) -> Option<ProfileId> {
-        self.profile_or_default(self.agent_profile_binding())
+        self.profile_or_default(self.agent_profile_binding(false))
             .filter(|profile| profile.allows_local_roles())
             .map(|profile| profile.id)
     }
 
     pub(crate) fn preferred_agent_cli_id(&self) -> Option<ProfileId> {
-        self.reviewed_cli_preference(self.profile_or_default(self.agent_profile_binding()))
+        self.reviewed_cli_preference(self.profile_or_default(self.agent_profile_binding(false)))
     }
 
     pub(crate) fn preferred_agent_https_id(&self) -> Option<ProfileId> {
-        let reference = self.agent_profile_binding()?;
+        let reference = self.agent_profile_binding(false)?;
         let profile = self.bound_profile(reference)?;
         self.reviewed_agent_https_transport(reference, &profile.destination().ok()?)
             .ok()?;
         Some(profile.id)
     }
 
+    pub(crate) fn foreground_agent_default_role_id(&self) -> Option<ProfileId> {
+        let profile = self.bound_profile(self.agent_profile_binding(true)?)?;
+        profile.uses_server_default_model().then_some(profile.id)
+    }
+
     pub(crate) fn agent_profiles(&self) -> impl Iterator<Item = (ProfileId, &str, &str, String)> {
         self.available_ai_profiles(ProfileRoute::Local)
+    }
+
+    pub(crate) fn foreground_agent_default_profiles(
+        &self,
+    ) -> impl Iterator<Item = (ProfileId, &str, String, bool)> {
+        self.available_profile_transports(ProfileRoute::ForegroundAgentDefault)
+            .filter_map(|(profile, transport)| {
+                let remote = transport.is_remote();
+                if remote && !self.permits_foreground_agent_https(profile) {
+                    return None;
+                }
+                Some((
+                    profile.id,
+                    profile.name.as_str(),
+                    profile.destination().ok()?,
+                    remote,
+                ))
+            })
+    }
+
+    pub(crate) fn foreground_agent_default_transport(
+        &self,
+        reference: &ProfileRef,
+        destination: &str,
+        remote: bool,
+    ) -> Result<(local_ai::Profile, usize), String> {
+        let changed =
+            || "The server-selected agent profile changed. Start a new review.".to_owned();
+        let profile = self.bound_profile(reference).ok_or_else(changed)?;
+        if profile.reference() != *reference
+            || profile.destination().as_deref() != Ok(destination)
+            || profile.remote_protocol().is_some() != remote
+            || (remote && !self.permits_foreground_agent_https(profile))
+        {
+            return Err(changed());
+        }
+        self.selected_transport(profile.id, ProfileRoute::ForegroundAgentDefault)
+    }
+
+    fn permits_foreground_agent_https(&self, profile: &profiles::Profile) -> bool {
+        self.saved_root().is_some() && profile.permits_reviewed_agent_https()
     }
 
     pub(crate) fn reviewed_agent_https_profiles(
@@ -1578,12 +1692,24 @@ impl Configuration {
         self.reviewed_cli_preference(self.profile_or_default(self.local.profile(local::Role::Text)))
     }
 
+    pub(crate) fn server_selected_chat_preference_id(&self) -> Option<ProfileId> {
+        let reference = self.local.profile(local::Role::Text);
+        let profile = match reference.and_then(|value| self.bound_profile(value)) {
+            Some(profile) if profile.can_be_server_selected_chat_default() => profile,
+            Some(_) => return None,
+            None if matches!(reference, Some(ProfileRef::Policy(_))) => return None,
+            None => self.profiles.interactive_chat_default()?,
+        };
+        self.interactive_chat_transport(profile.id).ok()?;
+        Some(profile.id)
+    }
+
     pub(crate) fn preferred_manual_profile_id(&self) -> Option<ProfileId> {
         let selected = self.profile_or_default(self.local.profile(local::Role::Text));
         match selected {
             Some(profile) if profile.is_cli() => self.reviewed_cli_preference(Some(profile)),
             Some(profile) => self
-                .terminal_chat_transport(profile.id)
+                .interactive_chat_transport(profile.id)
                 .ok()
                 .map(|_| profile.id),
             None => self.terminal_chat_profile_id(),
@@ -1602,18 +1728,59 @@ impl Configuration {
             .is_some_and(profiles::Profile::is_cli)
     }
 
+    pub(crate) fn is_server_selected_profile(&self, id: ProfileId) -> bool {
+        self.profiles
+            .profile(id)
+            .is_some_and(profiles::Profile::uses_server_default_model)
+    }
+
     pub(crate) fn snippet_analysis_profiles(
         &self,
-    ) -> impl Iterator<Item = (ProfileId, &str, &str, String, bool)> {
-        self.available_ai_profiles(ProfileRoute::ReviewedHttp).map(
-            |(id, name, model, destination)| {
-                let remote = self
-                    .profiles
-                    .profile(id)
-                    .is_some_and(|profile| profile.remote_protocol().is_some());
-                (id, name, model, destination, remote)
-            },
-        )
+    ) -> impl Iterator<Item = (ProfileId, &str, Option<&str>, String, bool)> {
+        self.snippet_http_profiles(ProfileRoute::SnippetAnalysis)
+    }
+
+    pub(crate) fn snippet_assistance_profiles(
+        &self,
+    ) -> impl Iterator<Item = (ProfileId, &str, Option<&str>, String, bool)> {
+        self.snippet_http_profiles(ProfileRoute::SnippetAssistance)
+    }
+
+    fn snippet_http_profiles(
+        &self,
+        route: ProfileRoute,
+    ) -> impl Iterator<Item = (ProfileId, &str, Option<&str>, String, bool)> {
+        self.available_profile_transports(route)
+            .filter_map(|(profile, _)| {
+                let (model, destination, remote) = snippet_http_target(profile).ok()?;
+                Some((
+                    profile.id,
+                    profile.name.as_str(),
+                    model,
+                    destination,
+                    remote,
+                ))
+            })
+    }
+
+    pub(crate) fn snippet_assistance_transport(
+        &self,
+        id: ProfileId,
+        model: Option<&str>,
+        destination: &str,
+        remote: bool,
+    ) -> Result<(local_ai::Profile, usize), String> {
+        let entry = self
+            .profiles
+            .profile(id)
+            .ok_or("The profile was removed.")?;
+        let current = snippet_http_target(entry)?;
+        if (current.0, current.1.as_str(), current.2) != (model, destination, remote) {
+            return Err(
+                "The snippet profile changed. Reopen snippet assistance and review again.".into(),
+            );
+        }
+        self.selected_transport(id, ProfileRoute::SnippetAssistance)
     }
 
     pub(crate) fn snippet_analysis_cli_profiles(
@@ -1642,7 +1809,18 @@ impl Configuration {
         let coding = self.local.profile(local::Role::Coding);
         coding
             .and_then(|reference| self.bound_profile(reference))
-            .and_then(|profile| self.usable_snippet_profile_id(profile))
+            .and_then(|profile| {
+                self.usable_snippet_profile_id(profile, ProfileRoute::SnippetAnalysis)
+            })
+            .or_else(|| {
+                coding
+                    .is_none()
+                    .then(|| self.profiles.interactive_chat_default())
+                    .flatten()
+                    .and_then(|profile| {
+                        self.usable_snippet_profile_id(profile, ProfileRoute::SnippetAnalysis)
+                    })
+            })
             .or_else(|| self.reviewed_cli_preference(self.profile_or_default(coding)))
     }
 
@@ -1667,7 +1845,9 @@ impl Configuration {
             .flatten()
             .filter_map(|reference| self.bound_profile(reference))
             .chain(self.profiles.default_profile())
-            .filter_map(|profile| self.usable_snippet_profile_id(profile))
+            .filter_map(|profile| {
+                self.usable_snippet_profile_id(profile, ProfileRoute::SnippetAssistance)
+            })
             .find(|&id| available(id))
             .or_else(|| {
                 if workload == local::Role::Text {
@@ -1679,11 +1859,15 @@ impl Configuration {
             })
     }
 
-    fn usable_snippet_profile_id(&self, profile: &profiles::Profile) -> Option<ProfileId> {
+    fn usable_snippet_profile_id(
+        &self,
+        profile: &profiles::Profile,
+        route: ProfileRoute,
+    ) -> Option<ProfileId> {
         let available = if profile.is_cli() {
             self.reviewed_cli_transport(profile.id).is_ok()
         } else {
-            self.snippet_analysis_transport(profile.id).is_ok()
+            self.selected_transport(profile.id, route).is_ok()
         };
         available.then_some(profile.id)
     }
@@ -1700,10 +1884,23 @@ impl Configuration {
         self.available_ai_profiles(ProfileRoute::InteractiveChat)
     }
 
-    pub(crate) fn journal_question_https_profiles(
+    pub(crate) fn journal_https_profiles(
         &self,
     ) -> impl Iterator<Item = (ProfileId, &str, &str, String)> {
-        self.available_ai_profiles(ProfileRoute::ReviewedHttps)
+        self.available_profile_transports(ProfileRoute::JournalHttps)
+            .filter_map(|(entry, transport)| {
+                let model = if transport.uses_server_default_model() {
+                    "Server selects the model"
+                } else {
+                    entry.effective_model()
+                };
+                Some((
+                    entry.id,
+                    entry.name.as_str(),
+                    model,
+                    entry.destination().ok()?,
+                ))
+            })
     }
 
     pub(crate) fn journal_question_cli_profiles(
@@ -1724,8 +1921,21 @@ impl Configuration {
             .ok_or_else(|| "Choose a saved, reviewed CLI profile for journal questions.".into())
     }
 
-    pub(crate) fn preferred_journal_question_cli_id(&self) -> Option<ProfileId> {
-        self.reviewed_cli_preference(self.selected_journal_profile())
+    pub(crate) fn preferred_journal_question_outbound_id(
+        &self,
+        has_local_answer: bool,
+    ) -> Option<ProfileId> {
+        let profile = self.selected_journal_profile()?;
+        if profile.is_cli() {
+            return self.reviewed_cli_preference(Some(profile));
+        }
+        self.saved_root()?;
+        if has_local_answer && !self.journal_profile_is_explicit() {
+            return None;
+        }
+        let (transport, _) = self.journal_question_https_transport(profile.id).ok()?;
+        transport.require_current_policy_authority().ok()?;
+        Some(profile.id)
     }
 
     fn available_ai_profiles(
@@ -1764,21 +1974,29 @@ impl Configuration {
         &self,
         id: ProfileId,
     ) -> Result<(local_ai::Profile, usize), String> {
-        self.selected_transport(id, ProfileRoute::ReviewedHttp)
+        self.selected_transport(id, ProfileRoute::SnippetAnalysis)
     }
 
     pub(crate) fn journal_question_https_transport(
         &self,
         id: ProfileId,
     ) -> Result<(local_ai::Profile, usize), String> {
-        self.selected_transport(id, ProfileRoute::ReviewedHttps)
+        self.selected_transport(id, ProfileRoute::JournalHttps)
+    }
+
+    pub(crate) fn journal_summary_https_transport(
+        &self,
+        id: ProfileId,
+    ) -> Result<local_ai::Profile, String> {
+        self.selected_transport(id, ProfileRoute::JournalHttps)
+            .map(|(profile, _)| profile)
     }
 
     pub(crate) fn journal_summary_https_revision(&self, id: ProfileId) -> Result<[u8; 32], String> {
         let unavailable =
             || "Choose a saved, trusted HTTPS profile for journal summaries.".to_owned();
         self.saved_root().ok_or_else(unavailable)?;
-        let (profile, _) = self.journal_question_https_transport(id)?;
+        let profile = self.journal_summary_https_transport(id)?;
         profile.require_current_policy_authority()?;
         let revision = self.agent_profile_revision(id).ok_or_else(unavailable)?;
         let bytes = serde_json::to_vec(&(
@@ -1884,7 +2102,10 @@ impl Configuration {
             return Err(if entry.uses_server_default_model() {
                 "This workflow requires a reviewed model. Select a Manual or Automatic profile."
                     .into()
-            } else if matches!(route, ProfileRoute::ReviewedHttps) {
+            } else if matches!(
+                route,
+                ProfileRoute::ReviewedHttps | ProfileRoute::JournalHttps
+            ) {
                 "Choose a saved, trusted HTTPS profile for this request.".into()
             } else if entry.is_cli() {
                 "This workflow does not support a configured CLI profile.".into()
@@ -3146,7 +3367,8 @@ impl Dialog {
                 self.saving = false;
                 self.notice = match result {
                     Ok(saved) => {
-                        self.profiles.adopt_saved_default(&saved.profiles);
+                        self.profiles
+                            .adopt_saved_default(&saved.profiles, &self.saved.profiles);
                         self.saved = saved;
                         "Default AI profile saved.".into()
                     }
@@ -3218,6 +3440,26 @@ impl Dialog {
             return Task::none();
         }
         let mut saved = self.saved.as_ref().clone();
+        let catalog = self.profiles.catalog();
+        let draft = catalog.profile(id);
+        let previous = saved.profiles.profile(id);
+        if draft
+            .into_iter()
+            .chain(previous)
+            .any(profiles::Profile::uses_server_default_model)
+            && (draft != previous
+                || catalog
+                    .server_selected_chat_default()
+                    .map(|profile| profile.id)
+                    != saved
+                        .profiles
+                        .server_selected_chat_default()
+                        .map(|profile| profile.id))
+        {
+            self.profiles
+                .update(profiles::Message::SetDefault(id), true);
+            return Task::none();
+        }
         if !saved.profiles.set_default(id) {
             self.profiles
                 .update(profiles::Message::SetDefault(id), true);

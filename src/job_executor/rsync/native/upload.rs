@@ -3,6 +3,8 @@
 use std::cell::Cell;
 use std::io::Seek;
 
+use kortty_server_archive::privileged_rsync::SourceLimits;
+use kortty_server_archive::rsync_tree::{Inventory, Manifest};
 use kortty_ssh::sftp::Error;
 
 use crate::scheduler_window::ConnectionRef;
@@ -20,6 +22,42 @@ pub(super) fn checked_digest(
     stopped: &impl Fn() -> bool,
 ) -> io::Result<(u64, [u8; 32])> {
     copy_reviewed(&LocalSource::open(path)?, io::sink(), stopped)
+}
+
+pub(super) fn stage_file<C: Fn() -> bool>(
+    transfer: &Transfer<'_, C>,
+    limits: Option<SourceLimits>,
+) -> Result<Inventory, Failure> {
+    let review_required = || Failure::blocked("Review and approve the exact rsync upload first.");
+    let failed = || Failure::failed("Could not verify the private local rsync source.");
+    let action = transfer.action;
+    let review = action
+        .approval
+        .as_ref()
+        .and_then(|approval| approval.upload.as_ref())
+        .ok_or_else(review_required)?;
+    let source = LocalSource::open(&action.local).map_err(|_| review_required())?;
+    if limits.is_some_and(|limits| limits.entries == 0 || source.size() > limits.bytes) {
+        return Err(Failure::blocked(
+            "The recurring rsync source exceeds the firing limits.",
+        ));
+    }
+    let staged = transfer
+        .temp
+        .directory()
+        .and_then(|stage| stage.create_file(OsStr::new(PAYLOAD)))
+        .map_err(|_| failed())?;
+    let (bytes, digest) =
+        copy_reviewed(&source, &staged, transfer.stopped).map_err(|_| failed())?;
+    if limits.is_none() && (bytes, digest) != (review.bytes, review.digest) {
+        return Err(review_required());
+    }
+    staged.sync_all().map_err(|_| failed())?;
+    let mut manifest = Manifest::default();
+    manifest
+        .add("", Some((bytes, digest)))
+        .map_err(|_| failed())?;
+    Ok(manifest.finish())
 }
 
 pub(super) fn apply<C: Fn() -> bool>(

@@ -54,6 +54,8 @@ const MLX_DESTINATION: &str = "Managed Apple MLX on this computer";
 pub(super) struct Catalog {
     profiles: Vec<Profile>,
     default: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_selected_chat_default: Option<u64>,
     last_id: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     policy_default: Option<String>,
@@ -65,6 +67,7 @@ impl PartialEq for Catalog {
     fn eq(&self, other: &Self) -> bool {
         self.profiles == other.profiles
             && self.default == other.default
+            && self.server_selected_chat_default == other.server_selected_chat_default
             && self.last_id == other.last_id
             && self.policy_default == other.policy_default
     }
@@ -141,6 +144,7 @@ impl Catalog {
 
     pub(super) fn prepare_backup(&mut self) {
         self.policy_default = None;
+        self.server_selected_chat_default = None;
         for profile in &mut self.profiles {
             profile.trusted_local_endpoint = false;
             profile.trusted_remote_endpoint = false;
@@ -181,13 +185,26 @@ impl Catalog {
         choices
     }
 
-    pub(super) fn https_role_choices(
+    pub(super) fn role_specific_choices(
         &self,
         role: super::local::Role,
     ) -> impl Iterator<Item = (ProfileId, String)> + '_ {
         self.entries()
-            .filter(move |profile| profile.remote_protocol().is_some() && profile.allows_role(role))
-            .map(|profile| (profile.id, format!("{} · HTTPS", profile.name)))
+            .filter(move |profile| {
+                (profile.remote_protocol().is_some() || profile.uses_server_default_model())
+                    && profile.allows_role(role)
+            })
+            .map(|profile| {
+                let suffix = match (
+                    profile.remote_protocol().is_some(),
+                    profile.uses_server_default_model(),
+                ) {
+                    (true, true) => "HTTPS · Server selects the model",
+                    (false, true) => "Server selects the model",
+                    _ => "HTTPS",
+                };
+                (profile.id, format!("{} · {suffix}", profile.name))
+            })
     }
 
     pub(super) fn profile(&self, id: ProfileId) -> Option<&Profile> {
@@ -226,6 +243,24 @@ impl Catalog {
             .or_else(|| self.policy_profiles.first())
     }
 
+    pub(super) fn server_selected_chat_default(&self) -> Option<&Profile> {
+        self.server_selected_chat_default
+            .and_then(|id| self.user_profile(id.into()))
+            .filter(|profile| profile.can_be_server_selected_chat_default())
+    }
+
+    pub(super) fn interactive_chat_default(&self) -> Option<&Profile> {
+        if self
+            .policy_default
+            .as_deref()
+            .and_then(|id| self.policy_profile(id))
+            .is_some()
+        {
+            return None;
+        }
+        self.server_selected_chat_default()
+    }
+
     fn policy_profile(&self, id: &str) -> Option<&Profile> {
         self.policy_profiles.iter().find(|profile| {
             profile
@@ -247,6 +282,17 @@ impl Catalog {
     }
 
     pub(super) fn set_default(&mut self, id: ProfileId) -> bool {
+        if self
+            .profile(id)
+            .is_some_and(Profile::can_be_server_selected_chat_default)
+        {
+            let Ok(id) = u64::try_from(id) else {
+                return false;
+            };
+            self.server_selected_chat_default =
+                (self.server_selected_chat_default != Some(id)).then_some(id);
+            return true;
+        }
         let Some(profile) = self.profile(id).filter(|profile| profile.can_be_default()) else {
             return false;
         };
@@ -299,6 +345,7 @@ impl Catalog {
             profile != revised
         });
         if edited
+            || self.server_selected_chat_default != baseline.server_selected_chat_default
             || (self.default != baseline.default
                 && self
                     .default
@@ -330,6 +377,8 @@ impl Catalog {
         };
         if self.profiles.len() > MAX_PROFILES
             || !valid_default
+            || (self.server_selected_chat_default.is_some()
+                && self.server_selected_chat_default().is_none())
             || self
                 .policy_default
                 .as_deref()
@@ -886,6 +935,10 @@ impl Profile {
             && (!self.is_cli() || self.validate_connection().is_ok())
     }
 
+    pub(super) fn can_be_server_selected_chat_default(&self) -> bool {
+        self.uses_server_default_model() && !self.restore_review && self.validate().is_ok()
+    }
+
     pub(super) fn allows_local_roles(&self) -> bool {
         !self.restore_review
             && !self.is_cli()
@@ -896,7 +949,19 @@ impl Profile {
     pub(super) fn allows_role(&self, role: super::local::Role) -> bool {
         use super::local::Role;
 
-        if self.validate_connection().is_err() || self.uses_server_default_model() {
+        if self.uses_server_default_model() {
+            return self.can_be_server_selected_chat_default()
+                && match role {
+                    Role::Text | Role::Coding | Role::Security => true,
+                    Role::Agent => {
+                        self.remote_protocol().is_none() || self.permits_reviewed_agent_https()
+                    }
+                    Role::Journal => {
+                        self.remote_protocol().is_some() || self.journal_loopback_server_default()
+                    }
+                };
+        }
+        if self.validate_connection().is_err() {
             return false;
         }
         if self.is_cli() || self.allows_local_roles() {
@@ -904,9 +969,19 @@ impl Profile {
         }
         self.remote_protocol().is_some()
             && match role {
-                Role::Text | Role::Coding | Role::Security => true,
+                Role::Text | Role::Coding | Role::Security | Role::Journal => true,
                 Role::Agent => self.allows_reviewed_agent_https(),
-                Role::Journal => false,
+            }
+    }
+
+    pub(super) fn journal_loopback_server_default(&self) -> bool {
+        self.uses_server_default_model()
+            && match self.connection_mode {
+                ConnectionMode::External => self.local_address().is_ok(),
+                ConnectionMode::LmStudio | ConnectionMode::LmStudioCompatible => self
+                    .lm_studio_endpoint()
+                    .is_ok_and(|endpoint| !endpoint.is_https()),
+                _ => false,
             }
     }
 
@@ -940,8 +1015,11 @@ impl Profile {
     }
 
     pub(super) fn allows_reviewed_agent_https(&self) -> bool {
-        !self.uses_server_default_model()
-            && self.remote_protocol().is_some()
+        !self.uses_server_default_model() && self.permits_reviewed_agent_https()
+    }
+
+    pub(super) fn permits_reviewed_agent_https(&self) -> bool {
+        self.remote_protocol().is_some()
             && (self.policy_definition().is_some()
                 || (self.reviewed_agent_https && self.trusted_remote_endpoint))
     }
@@ -1918,14 +1996,18 @@ impl Editor {
 
     pub(super) fn can_set_default(&self, id: ProfileId) -> bool {
         !self.wizard_open()
-            && !self.catalog.is_marked_default(id)
-            && self
-                .selected()
-                .is_some_and(|profile| profile.id == id && profile.can_be_default())
+            && self.selected().is_some_and(|profile| {
+                profile.id == id
+                    && (profile.can_be_server_selected_chat_default()
+                        || (profile.can_be_default() && !self.catalog.is_marked_default(id)))
+            })
     }
 
-    pub(super) fn adopt_saved_default(&mut self, saved: &Catalog) {
+    pub(super) fn adopt_saved_default(&mut self, saved: &Catalog, previous: &Catalog) {
         self.catalog.default = saved.default;
+        if self.catalog.server_selected_chat_default == previous.server_selected_chat_default {
+            self.catalog.server_selected_chat_default = saved.server_selected_chat_default;
+        }
         self.catalog
             .policy_default
             .clone_from(&saved.policy_default);
@@ -2199,9 +2281,10 @@ impl Editor {
             Message::Number(field, input) => self.edit_number(field, input),
             Message::Override(field, enabled) => self.toggle_override(field, enabled),
             Message::ReviewedAgentHttps(allow) if self.wizard.is_none() => {
-                if let Some(profile) = self.selected_mut().filter(|profile| {
-                    profile.remote_protocol().is_some() && !profile.uses_server_default_model()
-                }) {
+                if let Some(profile) = self
+                    .selected_mut()
+                    .filter(|profile| profile.remote_protocol().is_some())
+                {
                     profile.reviewed_agent_https = allow && profile.trusted_remote_endpoint;
                 }
             }
@@ -2302,11 +2385,13 @@ impl Editor {
                                     .lm_studio_endpoint()
                                     .is_ok_and(|endpoint| endpoint.supports_metadata())))
                 {
+                    if profile.uses_server_default_model() || mode == ModelMode::ServerDefault {
+                        profile.reviewed_agent_https = false;
+                    }
                     profile.model_mode = mode;
                     if mode == ModelMode::ServerDefault {
                         profile.model.clear();
                         profile.reasoning = Reasoning::Default;
-                        profile.reviewed_agent_https = false;
                     } else if mode == ModelMode::Auto && !profile.ordinary_lm_studio_auto() {
                         profile.model.clear();
                     }
@@ -2382,6 +2467,11 @@ impl Editor {
             Message::ConfirmDelete if self.deleting => self.delete(),
             Message::CancelDelete => self.deleting = false,
             _ => {}
+        }
+        if self.catalog.server_selected_chat_default.is_some()
+            && self.catalog.server_selected_chat_default().is_none()
+        {
+            self.catalog.server_selected_chat_default = None;
         }
     }
 

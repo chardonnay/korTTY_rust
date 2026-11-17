@@ -260,6 +260,12 @@ pub(crate) struct ApplyRecovery {
     pub(crate) elapsed_millis: u64,
     pub(crate) profile_name: String,
     pub(crate) model: String,
+    #[serde(
+        default,
+        alias = "localProfileRevision",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) profile_revision: Option<[u8; 32]>,
     pub(crate) request: ApplyRequestSnapshot,
     pub(crate) checkpoint: Option<Arc<Checkpoint>>,
 }
@@ -321,6 +327,7 @@ impl ApplyRecovery {
                 .selection
                 .matches_live(&self.request.selection)
             || self.started_at != previous.started_at
+            || self.profile_revision != previous.profile_revision
             || self.elapsed_millis < previous.elapsed_millis
         {
             return false;
@@ -348,6 +355,7 @@ impl ApplyRecovery {
         let short_text =
             |text: &str, limit| text.len() <= limit && !text.chars().any(char::is_control);
         if self.started_at == 0
+            || self.profile_revision == Some([0; 32])
             || !short_text(&self.profile_name, 160)
             || !short_text(&self.model, crate::local_ai::MAX_MODEL_BYTES)
             || request.version != APPLY_PLAN_VERSION

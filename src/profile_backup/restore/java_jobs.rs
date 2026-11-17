@@ -17,7 +17,7 @@ use crate::connection_store::import::{
     JavaImportedRoute, check_java_imported_routes, java_connection_candidate,
 };
 use crate::private_files::{FileStamp, require_single_link};
-use crate::scheduler_window::{ConnectionRef, SshCommand};
+use crate::scheduler_window::{ConnectionRef, SshCommand, imported_privileged};
 use crate::snippets;
 
 /// Resolves source identities only against the connections this restore adds.
@@ -41,7 +41,7 @@ pub(super) fn stage(
         .review
         .jobs
         .iter()
-        .any(|job| matches!(&job.action, java_scheduler::Action::Snippet { .. }))
+        .any(|job| job.action.snippet_id().is_some())
     {
         snippet_links(directory, snapshot, None)?
     } else {
@@ -67,6 +67,7 @@ pub(super) fn stage(
                         .collect()
                 })
         },
+        |id| catalogue.routes.get(id)?.rsync_folder.clone(),
         |id| snippets.contains(&id),
     )?;
     for (reason, count) in bound.omitted {
@@ -156,6 +157,15 @@ fn snippet_links(
     )
 }
 
+fn linked_snippet(action: &SshCommand) -> Option<snippets::SnippetId> {
+    action.snippet.as_ref().map(|link| link.id).or_else(|| {
+        match &action.imported_privileged.as_deref()?.settings {
+            imported_privileged::Settings::Snippet { link, .. } => Some(link.id),
+            _ => None,
+        }
+    })
+}
+
 fn check_routes(
     candidate: &Store,
     jobs: &JobGraph<SshCommand>,
@@ -169,6 +179,7 @@ fn check_routes(
             id: route.id,
             target: route.target.clone(),
             jump: route.jump.clone(),
+            rsync_folder: None,
         })
         .collect();
     check_java_imported_routes(candidate, &routes, policy.server_access())?;
@@ -216,14 +227,14 @@ impl Pending {
         policy: &ClipboardPolicy,
     ) -> io::Result<Self> {
         check_routes(&java_connection_candidate(connections)?, &jobs, policy)?;
-        if jobs.jobs().iter().any(|job| job.action().snippet.is_some()) {
+        let links: Vec<_> = jobs
+            .jobs()
+            .iter()
+            .filter_map(|job| linked_snippet(job.action()))
+            .collect();
+        if !links.is_empty() {
             let snippets = snippet_links(directory, snapshot, Some(updates))?;
-            if jobs
-                .jobs()
-                .iter()
-                .filter_map(|job| job.action().snippet.as_ref())
-                .any(|link| !snippets.contains(&link.id))
-            {
+            if links.iter().any(|id| !snippets.contains(id)) {
                 return Err(invalid(
                     "A reviewed Java Scheduler snippet or its variables changed.",
                 ));

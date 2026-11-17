@@ -39,6 +39,7 @@ mod toolbar_view;
 use icons::Icon;
 pub(crate) use icons::Icon as ToolIcon;
 pub use toolbar_settings::Message as ToolbarMessage;
+pub(crate) use toolbar_settings::java as java_toolbar;
 pub(super) use toolbar_settings::validate_backup as validate_toolbar_backup;
 use toolbar_settings::{Catalog, Group, MAX_ICON, MIN_ICON, Row as ToolbarRow, Toolbar};
 
@@ -341,6 +342,7 @@ pub enum Action {
     AgentSwarm,
     AgentDesign,
     Cut,
+    GitBash,
 }
 
 #[derive(Clone, Copy)]
@@ -812,9 +814,14 @@ impl Action {
                 (ClearBuffer, ClearBuffer.title(), "Terminal"),
             ])
             .chain(
-                [PowerShell, CommandPrompt]
+                [PowerShell, CommandPrompt, GitBash]
                     .into_iter()
-                    .filter(|_| cfg!(windows))
+                    .filter(|action| {
+                        cfg!(windows)
+                            && (*action != GitBash
+                                || kortty_pty::shell_program(kortty_pty::LocalShell::GitBash)
+                                    .is_ok())
+                    })
                     .map(|action| (action, action.title(), "Terminal")),
             )
     }
@@ -825,6 +832,7 @@ impl Action {
             LocalShell => "New Local Shell",
             PowerShell => "New PowerShell",
             CommandPrompt => "New Command Prompt",
+            GitBash => "New Git Bash",
             IncognitoShell => "New Incognito Shell",
             NewWindow => "New Window",
             CloseTab => "Close Tab",
@@ -1721,6 +1729,12 @@ impl Workspace {
             }
             CommandPrompt if cfg!(windows) && permitted => {
                 W::NewWindowsShell(id, kortty_pty::LocalShell::CommandPrompt)
+            }
+            GitBash
+                if permitted
+                    && kortty_pty::shell_program(kortty_pty::LocalShell::GitBash).is_ok() =>
+            {
+                W::NewWindowsShell(id, kortty_pty::LocalShell::GitBash)
             }
             IncognitoShell if permitted && self.clipboard.policy.incognito_allowed => {
                 W::SessionSecurity(session_security::Message::IncognitoLocal(id))
@@ -2910,9 +2924,16 @@ mod menu_tests {
         for (action, shell) in [
             (PowerShell, Preset::PowerShell),
             (CommandPrompt, Preset::CommandPrompt),
+            (GitBash, Preset::GitBash),
         ] {
             let message = workspace.chrome_action(owner, action);
-            if cfg!(windows) {
+            let available = cfg!(windows)
+                && (shell != Preset::GitBash || kortty_pty::shell_program(shell).is_ok());
+            assert_eq!(
+                Action::shortcut_catalog().any(|(entry, _, _)| entry == action),
+                available,
+            );
+            if available {
                 assert!(matches!(
                     message,
                     Some(WorkspaceMessage::NewWindowsShell(id, preset))
@@ -2925,6 +2946,7 @@ mod menu_tests {
         workspace.clipboard.policy.problem = Some("test managed policy failure".into());
         assert!(workspace.chrome_action(owner, PowerShell).is_none());
         assert!(workspace.chrome_action(owner, CommandPrompt).is_none());
+        assert!(workspace.chrome_action(owner, GitBash).is_none());
     }
 
     #[test]

@@ -12,6 +12,9 @@ use crate::connection_store::Store;
 use crate::connection_store::import::java_connection_candidate;
 use crate::profile_backup::java_migration::memory::{self, ARCHIVE, MappedScopes};
 
+mod review;
+pub(crate) use review::{Review, Target};
+
 pub(super) fn stage(
     source: memory::Source,
     snapshot: &Snapshot,
@@ -27,10 +30,16 @@ pub(super) fn stage(
         return Ok(Snapshot::new());
     };
     let candidate = java_connection_candidate(&catalogue.contents)?;
+    let reviewed = source
+        .review
+        .as_ref()
+        .map(|review| review.bindings(catalogue.before))
+        .transpose()?
+        .unwrap_or_default();
     let scopes = MappedScopes::read(&source.connections, |original_id| {
-        catalogue
-            .memory_ids
+        reviewed
             .get(original_id)
+            .or_else(|| catalogue.memory_ids.get(original_id))
             .copied()
             .filter(|&id| eligible(&candidate, id, &policy))
     })?;
@@ -56,6 +65,21 @@ pub(super) fn stage(
         ));
     }
     Ok(files)
+}
+
+pub(super) fn existing_catalogue(
+    directory: &Directory,
+) -> io::Result<Option<java_credential_restore::Connections>> {
+    Ok(
+        super::read_connections(directory)?.map(|contents| java_credential_restore::Connections {
+            before: Some(java_credential_restore::digest(&contents)),
+            contents,
+            routes: Default::default(),
+            memory_ids: Default::default(),
+            profile_ids: Default::default(),
+            groups: Default::default(),
+        }),
+    )
 }
 
 pub(super) fn digest(files: &Snapshot) -> [u8; 32] {
@@ -132,6 +156,7 @@ impl<'a> Pending<'a> {
 
 fn scope_exists(candidate: &Store, id: u64) -> bool {
     candidate.local(id).is_some()
+        || candidate.serial(id).is_some()
         || candidate.get(id).is_some_and(|connection| {
             !connection.incognito && connection.missing_username().is_none()
         })
@@ -139,6 +164,7 @@ fn scope_exists(candidate: &Store, id: u64) -> bool {
 
 fn eligible(candidate: &Store, id: u64, policy: &ClipboardPolicy) -> bool {
     scope_exists(candidate, id)
+        && (candidate.serial(id).is_none() || policy.serial_allowed)
         && candidate
             .get(id)
             .is_none_or(|connection| connection.blocked_server(policy.server_access()).is_none())

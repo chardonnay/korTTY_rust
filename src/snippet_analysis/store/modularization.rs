@@ -153,7 +153,11 @@ impl Store {
             require(record)?;
             let previous = record.modularization.as_deref();
             if let Some(next) = &mut next {
-                if previous.is_some_and(|old| old.id == next.id && old.outbound != next.outbound) {
+                if previous.is_some_and(|old| {
+                    old.id == next.id
+                        && (old.outbound != next.outbound
+                            || old.local_profile_revision != next.local_profile_revision)
+                }) {
                     return Err(invalid(
                         "The destination changed. Review a new modularization plan.",
                     ));
@@ -206,6 +210,7 @@ fn require_job_version(
 
 pub(super) fn validate_job(job: &Job, record: &Record, subject: Subject) -> io::Result<()> {
     if record.purpose == Purpose::Verify
+        || (job.local_profile_revision.is_some() && !record.provenance.profile_id.is_nonzero())
         || (job.outbound.is_none()
             && job
                 .generation
@@ -353,6 +358,7 @@ mod tests {
             sources: vec![("original.py".into(), source)],
             plan,
             outbound: outbound.clone(),
+            local_profile_revision: None,
             generation: Some(Generation {
                 profile_id: generation_profile.clone(),
                 approved_preview_sha256: content_hash("approved preview").unwrap(),

@@ -12,6 +12,7 @@ use iced::{Task, window};
 use crate::ai_manager::{
     Configuration, ProfileRef, SkillGuidance, SkillUsageReceipt, SkillUsageSurface,
 };
+use crate::clipboard_policy::ClipboardPolicy;
 use crate::diagram_window::AnalysisFlowchartRequest;
 use crate::local_ai;
 use crate::snippet_analysis::{
@@ -42,6 +43,62 @@ mod remote;
 mod reports;
 mod verification;
 pub(crate) use reports::Action as SnippetReportAction;
+
+pub(super) fn reviewed_local_profile_transport(
+    config: &Configuration,
+    id: crate::ai_manager::ProfileId,
+    server_selected: bool,
+) -> Result<(local_ai::Profile, usize), String> {
+    if !server_selected {
+        return config.code_analysis_transport(id);
+    }
+    let (transport, limit) = config.snippet_analysis_transport(id)?;
+    if !transport.uses_server_default_model()
+        || transport.is_remote()
+        || config.saved_root().is_none()
+    {
+        return Err("Choose a saved loopback profile that uses the server's model.".into());
+    }
+    Ok((transport, limit))
+}
+
+pub(super) fn reviewed_local_profile_revision(
+    config: &Configuration,
+    reference: &ProfileRef,
+    transport: &local_ai::Profile,
+) -> Result<Option<[u8; 32]>, String> {
+    if !transport.uses_server_default_model() || transport.is_remote() {
+        return Ok(None);
+    }
+    config
+        .agent_profile_reference_revision(reference)
+        .map(Some)
+        .ok_or_else(|| "The saved local profile revision is unavailable.".into())
+}
+
+fn reviewed_local_profile_guard(
+    config: Arc<Configuration>,
+    reference: ProfileRef,
+    revision: Option<[u8; 32]>,
+) -> impl Fn() -> Result<(), String> + Clone + Send + 'static {
+    move || {
+        let Some(revision) = revision else {
+            return Ok(());
+        };
+        let policy = ClipboardPolicy::load();
+        if policy.problem.is_none()
+            && policy.ai_allowed
+            && config.reload_saved().is_ok_and(|current| {
+                current == *config
+                    && current.agent_profile_reference_revision(&reference) == Some(revision)
+            })
+        {
+            Ok(())
+        } else {
+            Err("The saved local profile changed. Review the request again.".into())
+        }
+    }
+}
 
 const MAX_TABS: usize = 12;
 const MAX_INSTRUCTIONS_BYTES: usize = 4096;
@@ -573,10 +630,11 @@ impl Page {
                         id,
                         reference: config.profile_reference(id)?,
                         name: name.into(),
-                        model: model.into(),
+                        model: model.unwrap_or("Server selects the model").into(),
                         endpoint,
                         remote,
                         cli: false,
+                        server_selected: model.is_none(),
                     })
                 })
                 .chain(config.snippet_analysis_cli_profiles().filter_map(
@@ -589,6 +647,7 @@ impl Page {
                             endpoint,
                             remote: false,
                             cli: true,
+                            server_selected: false,
                         })
                     },
                 ))
@@ -932,6 +991,26 @@ impl Workspace {
                 return self.mutate_snippet_history(id, HistoryChange::Remove, false);
             }
             Action::Compare => return self.compare_snippet_analyses(id),
+            Action::CompareImportedSnapshots {
+                record,
+                run,
+                left,
+                right,
+            } => {
+                let request = self.snippets.get(&id).and_then(|surface| {
+                    let page = surface.analysis.page(surface.analysis.active?)?;
+                    let selected = page.record().filter(|selected| selected.id == record)?;
+                    let history = selected.java_history.as_ref()?;
+                    let run = history.apply_runs.iter().find(|entry| entry.id == run)?;
+                    Some(compare::Request::shared([
+                        (left.label().into(), history.snapshot(run, left)?.clone()),
+                        (right.label().into(), history.snapshot(run, right)?.clone()),
+                    ]))
+                });
+                return request.map_or_else(Task::none, |request| {
+                    self.open_snippet_comparison(id, request)
+                });
+            }
             Action::Export => return self.export_current_snippet_analysis(id),
             Action::Reports(action) => return self.update_snippet_analysis_reports(id, action),
             Action::Jump { file, line } => return self.jump_from_snippet_analysis(id, file, line),
@@ -1242,8 +1321,11 @@ impl Workspace {
             } else {
                 None
             };
+            let local_followups = remote.is_none()
+                && reviewed_local_profile_transport(&config, profile.id, profile.server_selected)
+                    .is_ok_and(|(selected, _)| selected == transport);
             let diagram =
-                (auto_diagram && remote.is_none())
+                (auto_diagram && local_followups)
                     .then(|| {
                         let script: Arc<str> = source.content.clone().unwrap_or_else(|| match page
                             .subject
@@ -1259,19 +1341,18 @@ impl Workspace {
                         .map(|request| request.with_profile(&transport))
                     })
                     .flatten();
-            let plan = if auto_plan
-                && remote.is_none()
-                && config
-                    .code_analysis_transport(profile.id)
-                    .is_ok_and(|(selected, _)| selected == transport)
-            {
+            let plan = if auto_plan && local_followups {
                 modularization::automatic::Prepared::new(
                     &surface.window,
                     page,
                     &snapshot,
                     &source,
                     &rendered_hash,
-                    (&guidance.text, &transport),
+                    (
+                        &guidance.text,
+                        &transport,
+                        reviewed_local_profile_revision(&config, &profile_reference, &transport)?,
+                    ),
                 )?
             } else {
                 None
@@ -1334,6 +1415,7 @@ impl Workspace {
             .filter(|_| !self.exiting && !self.scheduler_draining);
         let auto_diagram = self.window_settings.snippet_analysis_auto_diagram;
         let auto_plan = self.window_settings.snippet_analysis_auto_modularization;
+        let vault_revision = self.vault_change_revision();
         let token = self.allocate();
         let policy = &self.clipboard.policy;
         let Some(surface) = self.snippets.get_mut(&id) else {
@@ -1414,7 +1496,9 @@ impl Workspace {
             let checked = (|| {
                 let snapshot = source_snapshot(&surface.window, page)?;
                 let (current, _) = config.snippet_analysis_transport(profile.id)?;
-                if current != transport {
+                if current != transport
+                    || current.uses_server_default_model() != profile.server_selected
+                {
                     return Err("The HTTPS destination changed. Review the request again.".into());
                 }
                 let current_guidance =
@@ -1449,15 +1533,26 @@ impl Workspace {
         } else {
             None
         };
-        let diagram = diagram
-            .filter(|_| auto_diagram)
-            .map(|request| diagrams::Approved {
+        let diagram = if let Some(request) = diagram.filter(|_| auto_diagram) {
+            let local_profile_revision =
+                match reviewed_local_profile_revision(&config, &profile_reference, &transport) {
+                    Ok(revision) => revision,
+                    Err(error) => {
+                        page.status = Some(error);
+                        return Task::none();
+                    }
+                };
+            Some(diagrams::Approved {
                 request,
                 config: Arc::clone(&config),
                 profile: profile.clone(),
                 transport: transport.clone(),
                 source_hash: source.sha256.clone(),
-            });
+                local_profile_revision,
+            })
+        } else {
+            None
+        };
         let plan = plan.map(|plan| {
             plan.approve(
                 Arc::clone(&config),
@@ -1503,8 +1598,25 @@ impl Workspace {
             let authority = Arc::clone(authority);
             request.start_reviewed_cli(transport.clone(), move || authority.require_current())
         } else {
+            let require_saved_destination = profile.server_selected && transport.is_remote();
+            let saved = Arc::clone(&config);
+            let redactions = policy.terminal_logging.clone();
             request.start(
                 transport.clone(),
+                move || {
+                    if require_saved_destination {
+                        let installed = ClipboardPolicy::load();
+                        if installed.problem.is_some()
+                            || !installed.ai_allowed
+                            || !redactions.equivalent_redactions(&installed.terminal_logging)
+                            || vault_revision.strong_count() == 0
+                            || !saved.reload_saved().is_ok_and(|current| current == *saved)
+                        {
+                            return Err("The saved AI settings, vault, or masking policy changed. Review the HTTPS analysis again.".into());
+                        }
+                    }
+                    Ok(())
+                },
                 live::reporter(Arc::clone(&redactor), progress),
             )
         };

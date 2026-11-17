@@ -5,7 +5,9 @@ use std::sync::Arc;
 
 use iced::{Task, window};
 
-use crate::scheduler_window::{ConnectionRef, RemotePath, TargetGroups};
+use crate::scheduler_window::rsync::UploadReceiverPreview;
+use crate::scheduler_window::{ConnectionRef, TargetGroups};
+use kortty_server_archive::rsync_tree::RecurringReceiver;
 
 use super::{ClipboardPolicy, ConnectionStore, Message, Workspace, job_executor, profile};
 
@@ -45,7 +47,7 @@ impl Workspace {
                     || !installed.file_transfer_allowed
                     || !installed.minimum_isolation.is_none()
                 {
-                    return Err("Managed policy forbids existing-directory rsync review.".into());
+                    return Err("Managed policy forbids rsync destination review.".into());
                 }
                 let privileged = !privileged_targets.is_empty()
                     || mixed_targets.iter().any(|target| {
@@ -141,25 +143,41 @@ impl Workspace {
         let privileged_review = reviewed.clone();
         view.begin_rsync_review(
             request,
-            move |reference, destination: &RemotePath, trust, cancelled| {
+            move |reference, target, trust, cancelled| {
                 let (expected, path, auth) = credentials
                     .pop_front()
                     .ok_or("The reviewed rsync credentials are unavailable.")?;
-                if &expected != reference || &path != destination {
+                if &expected != reference || &path != target.destination() {
                     return Err("The rsync route or receiver changed before review.".into());
                 }
                 let reviewed = reviewed
                     .as_ref()
                     .cloned()
-                    .ok_or("The existing-directory review is unavailable.")?;
-                job_executor::rsync::preview_existing(
-                    auth,
-                    reference,
-                    destination,
-                    trust,
-                    Arc::clone(cancelled),
-                    move || reviewed.open().map(|_| ()),
-                )
+                    .ok_or("The rsync destination review is unavailable.")?;
+                let current = move || reviewed.open().map(|_| ());
+                match target {
+                    UploadReceiverPreview::ExistingDirectory(destination) => {
+                        job_executor::rsync::preview_existing(
+                            auth,
+                            reference,
+                            destination,
+                            trust,
+                            Arc::clone(cancelled),
+                            current,
+                        )
+                        .map(|snapshot| RecurringReceiver::Existing { snapshot })
+                    }
+                    UploadReceiverPreview::Recurring(target) => {
+                        job_executor::rsync::preview_recurring_receiver(
+                            auth,
+                            reference,
+                            target,
+                            trust,
+                            Arc::clone(cancelled),
+                            current,
+                        )
+                    }
+                }
             },
             move |target, trust, cancelled| {
                 let (reference, auth) = mixed_credentials
@@ -180,7 +198,7 @@ impl Workspace {
                     move || reviewed.open().map(|_| ()),
                 )
             },
-            move |reference, spec, trust, cancelled| {
+            move |reference, spec, review_vacant_server_upload, trust, cancelled| {
                 let (expected, reviewed_spec, auth) = privileged_credentials
                     .pop_front()
                     .ok_or("The privileged rsync credentials are unavailable.")?;
@@ -191,7 +209,18 @@ impl Workspace {
                     .as_ref()
                     .cloned()
                     .ok_or("The privileged rsync review is unavailable.")?;
-                job_executor::rsync::preview_privileged(
+                let preview = match (review_vacant_server_upload, &spec.operation) {
+                    (
+                        true,
+                        kortty_server_archive::privileged_rsync::Operation::Upload {
+                            directory: true,
+                            ..
+                        },
+                    ) => job_executor::rsync::preview_privileged_tree_creation,
+                    (true, _) => job_executor::rsync::preview_privileged_file_creation,
+                    (false, _) => job_executor::rsync::preview_privileged,
+                };
+                preview(
                     auth,
                     reference,
                     spec,

@@ -1784,7 +1784,7 @@ impl Workspace {
             return Vec::new();
         };
         config
-            .journal_question_https_profiles()
+            .journal_https_profiles()
             .filter_map(|(id, name, model, destination)| {
                 Some(Choice {
                     label: format!("{name} · {model} · {destination}"),

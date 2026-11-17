@@ -28,6 +28,7 @@ mod view;
 const MAX_PATH_BYTES: usize = 4096;
 const PAGE_SIZE: usize = 80;
 const MAX_VISIBLE_PREVIEW_ENTRIES: usize = 160;
+const MEMORY_SCOPE_PAGE_SIZE: usize = 6;
 
 #[derive(Debug, Clone)]
 pub enum Message {
@@ -51,6 +52,9 @@ pub enum Message {
     Submit,
     RestoreMode(RestoreMode),
     Restore(u64),
+    ShowJavaMemory(u64),
+    JavaMemoryPage(u64, bool),
+    SelectJavaMemory(u64, usize, Option<u64>),
     JavaMasterPassword(u64, Password),
     ReviewJavaCredentials(u64, JavaCredentialReview),
     JavaCredentialsReviewed(u64, JavaCredentialsReply),
@@ -491,6 +495,7 @@ impl Dialog {
                     let passphrase = std::mem::take(&mut self.password);
                     self.start(Work::Inspect, move || {
                         profile_backup::inspect_openpgp(&path, &private_key, &passphrase)
+                            .map(Preview::prepare_java_memory_review)
                             .map(Outcome::Inspected)
                     })
                 }
@@ -515,7 +520,9 @@ impl Dialog {
             }),
             Kind::Import => self.start(Work::Inspect, move || {
                 if java_password {
-                    profile_backup::inspect_java_password(&path, &password).map(Outcome::Inspected)
+                    profile_backup::inspect_java_password(&path, &password)
+                        .map(Preview::prepare_java_memory_review)
+                        .map(Outcome::Inspected)
                 } else {
                     profile_backup::inspect_backup(&path, &password).map(Outcome::Inspected)
                 }
@@ -1174,6 +1181,39 @@ impl Workspace {
                 }
             }
             Message::Restore(revision) => return dialog.restore(revision),
+            Message::ShowJavaMemory(revision) if revision == dialog.revision => {
+                if let Phase::Review(preview) = &mut dialog.phase
+                    && let Some(review) = preview.java_memory_review_mut()
+                {
+                    review.open = !review.open;
+                }
+            }
+            Message::JavaMemoryPage(revision, next) if revision == dialog.revision => {
+                if let Phase::Review(preview) = &mut dialog.phase
+                    && let Some(review) = preview
+                        .java_memory_review_mut()
+                        .filter(|review| review.open)
+                {
+                    let last = review.len().saturating_sub(1) / MEMORY_SCOPE_PAGE_SIZE;
+                    review.page = if next {
+                        (review.page + 1).min(last)
+                    } else {
+                        review.page.saturating_sub(1)
+                    };
+                }
+            }
+            Message::SelectJavaMemory(revision, index, target) if revision == dialog.revision => {
+                if let Phase::Review(preview) = &mut dialog.phase
+                    && preview.java_memory_review().is_some_and(|review| {
+                        review.open && index / MEMORY_SCOPE_PAGE_SIZE == review.page
+                    })
+                {
+                    dialog.error = preview
+                        .select_java_memory(index, target)
+                        .err()
+                        .map(|error| error.to_string());
+                }
+            }
             message if matches!(dialog.phase, Phase::Browse(_)) => {
                 return dialog.browse_message(message);
             }

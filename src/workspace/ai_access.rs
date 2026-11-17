@@ -753,6 +753,11 @@ fn memory_scopes(store: &Store) -> Vec<Scope> {
                 .iter()
                 .map(|entry| Scope::connection(entry.id, format!("{} (Local shell)", entry.name))),
         )
+        .chain(
+            store.serial_profiles().iter().map(|entry| {
+                Scope::connection(entry.id, format!("{} (Serial)", entry.display_name()))
+            }),
+        )
         .collect()
 }
 
@@ -765,8 +770,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ai_manager_lists_saved_ssh_and_local_shell_memory_scopes() {
-        use crate::connection_store::LocalProfile;
+    fn ai_manager_lists_saved_ssh_local_shell_and_serial_memory_scopes() {
+        use crate::connection_store::{LocalProfile, SerialProfile};
+        use crate::session::SerialConnection;
         use serde_json::json;
 
         let fixture = crate::snippets::tests::Profile::new();
@@ -795,6 +801,16 @@ mod tests {
         };
         let local = save_local(&mut store, "Development");
         let other = save_local(&mut store, "Maintenance");
+        let serial = store
+            .save_serial(SerialProfile::new(
+                "Console",
+                SerialConnection {
+                    device: "COM7".into(),
+                    ..SerialConnection::default()
+                },
+                kortty_terminal::TerminalProfile::default(),
+            ))
+            .unwrap();
         let store = Store::open(path).unwrap();
         assert_eq!(
             memory_scopes(&store),
@@ -802,6 +818,7 @@ mod tests {
                 Scope::connection(ssh, "Development".into()),
                 Scope::connection(local, "Development (Local shell)".into()),
                 Scope::connection(other, "Maintenance (Local shell)".into()),
+                Scope::connection(serial, "Console (Serial)".into()),
             ],
         );
     }

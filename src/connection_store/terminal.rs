@@ -117,6 +117,10 @@ pub(crate) struct TerminalOverrides {
     pub(crate) strict_terminal_mode: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) ai_profile: Option<ProfileRef>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) java_ai_profile: Option<crate::ai_manager::JavaAiProfileHint>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) java_ai_profile_dismissed: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) ai_agent_disabled: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -134,6 +138,36 @@ fn no_ansi_colors(colors: &[Option<Rgb>; 16]) -> bool {
 }
 
 impl TerminalOverrides {
+    pub(crate) fn dismiss_java_ai_profile(&mut self) {
+        self.java_ai_profile_dismissed |= self.java_ai_profile.take().is_some();
+    }
+
+    pub(super) fn merge_java_ai_profile(&mut self, incoming: &Self) -> bool {
+        let Some(hint) = &incoming.java_ai_profile else {
+            return false;
+        };
+        if self.ai_profile.is_some() || self.java_ai_profile_dismissed {
+            return false;
+        }
+        if self.java_ai_profile.as_ref().is_some_and(|current| {
+            current.id() != hint.id() || current.source().is_some() || hint.source().is_none()
+        }) {
+            return false;
+        }
+        self.java_ai_profile = Some(hint.clone());
+        true
+    }
+
+    pub(super) fn remap_java_highlight(
+        &mut self,
+        ids: &std::collections::BTreeMap<String, String>,
+    ) {
+        self.highlight_set = self
+            .highlight_set
+            .as_deref()
+            .and_then(|id| crate::terminal_highlight::resolve_java_backup_set(ids, id));
+    }
+
     pub(crate) fn scrollback(&self, defaults: ScrollbackConfig) -> ScrollbackConfig {
         ScrollbackConfig {
             lines: self.scrollback_lines.unwrap_or(defaults.lines),
@@ -148,6 +182,16 @@ impl TerminalOverrides {
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
+        if self
+            .java_ai_profile
+            .as_ref()
+            .is_some_and(|hint| hint.source().is_some_and(|source| source.id() != hint.id()))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid imported AI profile provenance",
+            ));
+        }
         self.journal.validate()?;
         self.initial_size().validate()?;
         validate_paste_line_delay(self.paste_line_delay_ms)?;

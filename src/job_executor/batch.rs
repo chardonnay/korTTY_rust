@@ -85,6 +85,13 @@ fn execute(
     if action.target_groups.is_some() || rsync.is_some() {
         scoped_policy.group_scope = Some(Arc::clone(action));
     }
+    if rsync.is_some_and(|(transfer, upload)| {
+        !upload
+            && transfer.standing.is_none()
+            && (transfer.directory || transfer.uses_reviewed_file_creation(upload))
+    }) {
+        scoped_policy.rsync_batch_parents = Some(Default::default());
+    }
     let credentials = credentials.map_err(Failure::blocked)?;
     let total = action.targets().count();
     if total < 2 || total != credentials.len() {

@@ -327,6 +327,7 @@ mod tests {
         workspace.window_settings.quick_select = Preferences {
             alphabet: "zx".into(),
             patterns: vec!["TICKET-[0-9]+".into()],
+            java_patterns: false,
         };
         let (owner, _) = workspace.open_window(false);
         workspace.windows.get_mut(&owner).unwrap().focused = true;
@@ -409,6 +410,7 @@ mod windows_tests {
             workspace.window_settings.quick_select = Preferences {
                 alphabet: "zx".into(),
                 patterns: Vec::new(),
+                java_patterns: false,
             };
             let (owner, _) = workspace.open_window(false);
             workspace.windows.get_mut(&owner).unwrap().focused = true;

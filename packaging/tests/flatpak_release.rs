@@ -95,10 +95,10 @@ fn native_flatpak_installs_desktop_and_cli_in_the_matching_runtime() {
         format!("runtime={runtime}"),
         "command=kortty".to_owned(),
         "org.freedesktop.Notifications=talk".to_owned(),
+        "org.freedesktop.Flatpak=talk".to_owned(),
     ] {
         assert!(meta.lines().any(|line| line == expected), "{meta}");
     }
-    assert!(!meta.contains("org.freedesktop.Flatpak=talk"), "{meta}");
     let installed =
         stdout(Command::new("flatpak").args(["info", "--user", "--show-location", APP]));
     let installed = Path::new(installed.trim());

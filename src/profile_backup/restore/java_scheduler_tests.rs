@@ -42,6 +42,8 @@ const GLOBAL_SETTINGS: &[u8] =
     include_bytes!("../../ai_manager/profiles/fixtures/java-global-settings.xml");
 const COMMAND: &str = "java-3f9bab16184b4e13bf71e37331b8843a";
 const SNIPPET: &str = "java-0bd3734742024c5a912d4fe43c09f755";
+const PRIVILEGED: &str = "java-e02d8f33ccdb4fd8bd8c340688f038a3";
+const PRIVILEGED_DEPENDENT: &str = "java-50dc55a9cac94798932908798863715b";
 const AGENT: &str = "java-2bd70fbea5e44b29b621370fcce50b96";
 
 struct Fixture {
@@ -615,7 +617,7 @@ fn java_scheduler_restore_keeps_remote_paths_and_requires_deletion_confirmation(
         ),
         (
             "SFTP_MKDIR",
-            "<remotePath>/work/sudo</remotePath><useSudo>true</useSudo>",
+            "<remotePath>/work/sudo</remotePath><useSudo>true</useSudo><sudoStagingEnabled>true</sudoStagingEnabled>",
             None,
         ),
         (
@@ -751,6 +753,12 @@ fn java_scheduler_restore_keeps_transfer_intent_inert_and_replays_it() {
             "<syncDirection>DOWNLOAD</syncDirection>",
             "sync_download",
         ),
+        ("SFTP_UPLOAD", "<useSudo>true</useSudo>", "upload"),
+        (
+            "SFTP_DOWNLOAD",
+            "<sudoStagingEnabled>true</sudoStagingEnabled>",
+            "download",
+        ),
     ];
     let mut xml = String::from("<jobScheduler><jobs>");
     for (index, (kind, options, _)) in actions.iter().enumerate() {
@@ -766,7 +774,7 @@ fn java_scheduler_restore_keeps_transfer_intent_inert_and_replays_it() {
     let fixture = Fixture::with_scheduler(&xml);
     let preview = super::super::inspect_java_password(&fixture.archive, &fixture.password).unwrap();
     let (_, _, notes) = preview.java_review().unwrap();
-    assert!(notes.iter().any(|note| note.contains("Imported Scheduler SFTP transfers require a local path and transfer review in JobScheduler (4)")));
+    assert!(notes.iter().any(|note| note.contains("Imported Scheduler SFTP transfers require a local path and transfer review in JobScheduler (6)")));
     fixture.queue();
     let pending = fs::read(fixture.root.join(PENDING)).unwrap();
     fixture.apply();
@@ -819,6 +827,119 @@ fn java_scheduler_restore_keeps_transfer_intent_inert_and_replays_it() {
 }
 
 #[test]
+fn java_scheduler_restore_binds_sudo_staging_drafts_and_expands_dependencies() {
+    use std::fmt::Write as _;
+
+    use crate::scheduler_window::{SudoMode, imported_transfer};
+
+    const PRIMARY: &str = "b04d413f-9ee5-4b56-bc12-c72da52d4b3e";
+    const SYNC: &str = "55be1473-abc2-450d-8000-000000000003";
+    const AFTER: &str = "55be1473-abc2-450d-8000-000000000004";
+    const SECRET: &str = "fixture-opaque-sudo-password";
+    let primary = format!("<connectionId>{PRIMARY}</connectionId>");
+    let mut xml = String::from("<jobScheduler><jobs>");
+    for (index, (kind, direction)) in [
+        ("SFTP_UPLOAD", "UPLOAD"),
+        ("SFTP_DOWNLOAD", "DOWNLOAD"),
+        ("SFTP_SYNC", "UPLOAD"),
+        ("SFTP_SYNC", "DOWNLOAD"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let group = if index == 3 {
+            "<targetGroupNames><groupName>Ops/Hosts</groupName></targetGroupNames>"
+        } else {
+            ""
+        };
+        write!(
+            xml,
+            r"<job><id>55be1473-abc2-450d-8000-{index:012x}</id><name>Stage {index}</name>
+               <enabled>true</enabled>{primary}{group}
+               <schedule><enabled>true</enabled><fixedTimes><time>08:15</time></fixedTimes></schedule>
+               <action><type>{kind}</type><syncDirection>{direction}</syncDirection>
+               <useSudo>true</useSudo><sudoStagingEnabled>true</sudoStagingEnabled>
+               <localPath>C:\Java\東京</localPath><remotePath>relative/東京</remotePath></action></job>"
+        )
+        .unwrap();
+    }
+    write!(
+        xml,
+        "<job><id>{AFTER}</id><name>After</name>{primary}
+         <dependsOn><jobId>{SYNC}</jobId></dependsOn><dependencyMode>CHAIN</dependencyMode>
+         <action><type>COMMAND</type><command>printf after</command></action></job>
+         </jobs><sudoCredentials><credential><encryptedPassword>{SECRET}</encryptedPassword>
+         </credential></sudoCredentials></jobScheduler>"
+    )
+    .unwrap();
+
+    let fixture = Fixture::with_connections(&xml, GROUP_CONNECTIONS.as_bytes(), None);
+    let preview = super::super::inspect_java_password(&fixture.archive, &fixture.password).unwrap();
+    let (_, _, notes) = preview.java_review().unwrap();
+    assert!(
+        notes.iter().any(|note| {
+            note.starts_with(
+                "Imported Scheduler sudo staging transfers are disabled per saved SSH route",
+            ) && note.ends_with("(4)")
+        }),
+        "{notes:?}"
+    );
+    fixture.queue();
+    fixture.apply();
+
+    let store = SchedulerStore::open(fixture.root.join(JOBS)).unwrap();
+    let scheduler = store.restore_with_actions::<SshCommand>().unwrap();
+    let graph = scheduler.graph();
+    assert_eq!(graph.jobs().len(), 6);
+    let mut split = Vec::new();
+    for job in graph.jobs().iter().filter(|job| job.name() != "After") {
+        let action = job.action();
+        let Some(imported_transfer::Draft::StagedSftp(draft)) = action.imported_transfer.as_deref()
+        else {
+            panic!("missing staged transfer intent");
+        };
+        let expected = match job.name() {
+            "Stage 0" => imported_transfer::Kind::Upload,
+            "Stage 1" => imported_transfer::Kind::Download,
+            "Stage 2" => imported_transfer::Kind::SyncUpload,
+            _ => {
+                assert!(job.id().as_str().starts_with("java-staging-"));
+                split.push(job.id().clone());
+                imported_transfer::Kind::SyncDownload
+            }
+        };
+        assert!(draft.settings.kind == expected);
+        assert_eq!(draft.settings.local_hint, r"C:\Java\東京");
+        assert_eq!(draft.settings.remote_hint, "relative/東京");
+        assert!(!job.enabled());
+        assert!(job.schedule().unwrap().enabled());
+        assert_eq!(action.sudo, SudoMode::Disabled);
+        assert!(action.remote.is_none());
+        assert_eq!(action.connection.as_ref(), Some(&draft.route));
+        assert!(action.additional_connections.is_empty());
+        assert!(action.target_groups.is_none());
+        assert!(action.require_executable().is_err());
+        assert!(SshCommand::validate_definition(job).is_ok());
+        let mut changed = action.clone();
+        changed.connection.as_mut().unwrap().target.host = "changed.example".into();
+        assert!(changed.validated().is_err());
+    }
+    assert_eq!(split.len(), 2);
+    let after = graph
+        .job(&JobId::new(format!("java-{}", AFTER.replace('-', ""))).unwrap())
+        .unwrap();
+    assert_eq!(after.mode(), DependencyMode::Chain);
+    assert_eq!(after.dependencies(), split);
+
+    drop(store);
+    let installed = fs::read(fixture.root.join(JOBS)).unwrap();
+    assert!(!String::from_utf8_lossy(&installed).contains(SECRET));
+    fixture.queue();
+    fixture.apply();
+    assert_eq!(fs::read(fixture.root.join(JOBS)).unwrap(), installed);
+}
+
+#[test]
 fn java_scheduler_restore_keeps_rsync_routes_dependencies_and_options_inert() {
     use serde_json::json;
 
@@ -842,7 +963,10 @@ fn java_scheduler_restore_keeps_rsync_routes_dependencies_and_options_inert() {
         </action></job>
       </jobs></jobScheduler>"#;
     let globals = b"<globalSettings><jobSchedulerRsyncBinaryPath>/java-only/rsync</jobSchedulerRsyncBinaryPath></globalSettings>";
-    let fixture = Fixture::with_connections(xml, GROUP_CONNECTIONS.as_bytes(), Some(globals));
+    let connections = GROUP_CONNECTIONS
+        .replace("<name>Primary</name>", "<name>  Primary /  Büro__  </name>")
+        .replace("<name>Secondary</name>", "");
+    let fixture = Fixture::with_connections(xml, connections.as_bytes(), Some(globals));
     let preview = super::super::inspect_java_password(&fixture.archive, &fixture.password).unwrap();
     let (_, _, notes) = preview.java_review().unwrap();
     assert!(notes.iter().any(|note| note.contains("Imported Scheduler rsync drafts require a native executable, destinations, and fresh transfer review in JobScheduler (2)")));
@@ -868,10 +992,14 @@ fn java_scheduler_restore_keeps_rsync_routes_dependencies_and_options_inert() {
         ["primary.example", "secondary.example"]
     );
     assert_eq!(mapped.target_groups.as_ref().unwrap().groups, ["Ops/Hosts"]);
+    let mut routes = mapped.targets();
+    let primary_id = routes.next().unwrap().id.to_string();
+    let secondary_id = routes.next().unwrap().id.to_string();
     for (job, draft) in [
         (
             grouped,
-            json!({"direction":"download", "java_sources":["/work/first","/work/second"], "java_target_root":r"C:\Java copy", "java_delete":false, "java_sudo":false}),
+            json!({"direction":"download", "java_sources":["/work/first","/work/second"], "java_target_root":r"C:\Java copy", "java_delete":false, "java_sudo":false,
+                "java_target_folders": { (primary_id): "_Primary_B_ro_-b04d413f", (secondary_id): "other_secondary.example-9c0719d8" }}),
         ),
         (
             upload,
@@ -907,6 +1035,7 @@ fn java_scheduler_restore_keeps_rsync_routes_dependencies_and_options_inert() {
 
 #[test]
 fn java_scheduler_restore_keeps_archive_drafts_inert_without_vault_or_local_path_authority() {
+    use kortty_server_archive::protocol::ArchiveMemberLayout;
     use serde_json::json;
     use std::fmt::Write as _;
 
@@ -921,10 +1050,11 @@ fn java_scheduler_restore_keeps_archive_drafts_inert_without_vault_or_local_path
         ("ZIP", "<useSudo>true</useSudo>", "", "zip"),
         ("ZIP", "<useSudo>false</useSudo><sudoStagingEnabled>true</sudoStagingEnabled>", "", "zip"),
     ].into_iter().enumerate() {
+        let second_source = if matches!(index, 0 | 3) { "/etc/東京" } else { "/etc/hosts" };
         write!(xml, "<job><id>00000000-0000-4000-a000-{index:012x}</id><name>Archive {index}</name>\
             <enabled>true</enabled><connectionId>b04d413f-9ee5-4b56-bc12-c72da52d4b3e</connectionId>{targets}\
             <action><type>SFTP_ARCHIVE</type><archiveFormat>{format}</archiveFormat>\
-            <archiveSources><path> /srv/東京 </path><path>/etc/hosts</path></archiveSources>\
+            <archiveSources><path> /srv/東京 </path><path>{second_source}</path></archiveSources>\
             <archiveExcludes><pattern> *.log </pattern><pattern>var/*/tmp</pattern></archiveExcludes>\
             <archivePath>/copies/output-{index}.{suffix}</archivePath><archiveCompressionLevel>7</archiveCompressionLevel>\
             <encryptedArchivePassword>{JAVA_SECRET}</encryptedArchivePassword>{options}</action></job>").unwrap();
@@ -967,7 +1097,17 @@ fn java_scheduler_restore_keeps_archive_drafts_inert_without_vault_or_local_path
         assert_eq!(archive.route.target.host, "primary.example");
         assert_eq!(archive.route.jump.as_ref().unwrap().host, "jump.example");
         let settings = serde_json::to_value(&archive.settings).unwrap();
-        assert_eq!(settings["sources"], json!(["/srv/東京", "/etc/hosts"]));
+        let second_source = if matches!(index, 0 | 3) {
+            "/etc/東京"
+        } else {
+            "/etc/hosts"
+        };
+        assert_eq!(settings["sources"], json!(["/srv/東京", second_source]));
+        assert_eq!(
+            archive.settings.member_layout(),
+            ArchiveMemberLayout::ServerPath
+        );
+        assert!(settings.get("reuse_output").is_none());
         assert_eq!(settings["java_excludes"], json!(["*.log", "var/*/tmp"]));
         assert_eq!(settings["format"], format);
         assert_eq!(settings["level"], if format == "tar" { 6 } else { 7 });
@@ -1173,6 +1313,177 @@ fn java_scheduler_restore_omits_archive_fanout_when_any_member_is_unavailable() 
 }
 
 #[test]
+fn java_scheduler_restore_keeps_privileged_actions_inert_with_exact_routes_and_dependencies() {
+    use std::fmt::Write as _;
+
+    use serde_json::json;
+
+    use crate::scheduler_window::{JournalDetail, SudoMode, imported_privileged};
+
+    const PRIMARY: &str = "b04d413f-9ee5-4b56-bc12-c72da52d4b3e";
+    const SECONDARY: &str = "9c0719d8-dfa7-4468-a1d9-4149cb8fa01e";
+    let actions = [
+        (
+            "COMMAND",
+            "<command>printf '%s' 'root &amp; data'</command>",
+            json!({"kind": "command", "text": "printf '%s' 'root & data'",
+                "options": {"working_directory": "/srv/project files"}}),
+        ),
+        (
+            "SNIPPET_SCRIPT",
+            "<snippetId>3ee66545-2eaf-4ac7-b352-d9a1a51d75ed</snippetId>\
+             <snippetArguments><argument>space &amp; 東京</argument></snippetArguments>\
+             <ptyEnabled>true</ptyEnabled><ptyColumns>132</ptyColumns>",
+            json!({"kind": "snippet"}),
+        ),
+        (
+            "SFTP_MKDIR",
+            "<remotePath>relative/directory</remotePath>",
+            json!({"operation": "mkdir", "path": "relative/directory"}),
+        ),
+        (
+            "SFTP_RENAME",
+            "<remoteSourcePath>/srv/old</remoteSourcePath><newName>new name</newName>",
+            json!({"operation": "rename", "from": "/srv/old", "to": "new name"}),
+        ),
+        (
+            "SFTP_CHMOD",
+            "<remotePath>/srv/tool</remotePath><permissions>u=rwX,g=rX,o=</permissions>",
+            json!({"operation": "chmod", "path": "/srv/tool", "permissions": "u=rwX,g=rX,o="}),
+        ),
+        (
+            "SFTP_CHOWN",
+            "<remotePath>/srv/input</remotePath><owner>backup-user</owner><group>ops</group>",
+            json!({"operation": "chown", "path": "/srv/input", "owner": "backup-user", "group": "ops"}),
+        ),
+        (
+            "SFTP_COPY_REMOTE",
+            "<remoteSourcePath>/srv/from</remoteSourcePath><remoteDestinationPath>/srv/to</remoteDestinationPath>",
+            json!({"operation": "copy", "from": "/srv/from", "to": "/srv/to"}),
+        ),
+        (
+            "SFTP_DELETE",
+            "<remotePath>/srv/retired</remotePath>",
+            json!({"operation": "delete", "path": "/srv/retired"}),
+        ),
+    ];
+    let uuid = |index| format!("00000000-0000-4000-8000-{index:012x}");
+    let mut xml = String::from("<jobScheduler><jobs>");
+    for (index, (kind, fields, _)) in actions.iter().enumerate() {
+        let secondary = if matches!(index, 0 | 1 | 7) {
+            format!("<connectionId>{SECONDARY}</connectionId>")
+        } else {
+            String::new()
+        };
+        write!(
+            xml,
+            "<job><id>{}</id><name>{kind}</name><enabled>true</enabled>\
+             <targetConnectionIds><connectionId>{PRIMARY}</connectionId>{secondary}</targetConnectionIds>\
+             <workingDirectory>/srv/project files</workingDirectory><journalDetailMode>FULL</journalDetailMode>\
+             <action><type>{kind}</type><useSudo>true</useSudo>{fields}</action></job>",
+            uuid(index),
+        )
+        .unwrap();
+    }
+    let successor = actions.len();
+    write!(
+        xml,
+        "<job><id>{}</id><name>After all deletions</name><connectionId>{PRIMARY}</connectionId>\
+         <dependsOn><jobId>{}</jobId></dependsOn><dependencyMode>CHAIN</dependencyMode>\
+         <action><type>COMMAND</type><command>true</command></action></job></jobs></jobScheduler>",
+        uuid(successor),
+        uuid(7),
+    )
+    .unwrap();
+    let fixture = Fixture::with_scheduler(&xml);
+    fixture.queue();
+    fixture.apply();
+    let store = SchedulerStore::open(fixture.root.join(JOBS)).unwrap();
+    let scheduler = store.restore_with_actions::<SshCommand>().unwrap();
+    let graph = scheduler.graph();
+    assert_eq!(graph.jobs().len(), actions.len() + 3);
+    let mut deletes = Vec::new();
+    for (index, (kind, _, expected)) in actions.iter().enumerate() {
+        let jobs: Vec<_> = graph
+            .jobs()
+            .iter()
+            .filter(|job| {
+                job.name() == *kind || job.name().starts_with(&format!("{kind} (target "))
+            })
+            .collect();
+        assert_eq!(jobs.len(), if matches!(index, 1 | 7) { 2 } else { 1 });
+        for (target_index, job) in jobs.into_iter().enumerate() {
+            let action = job.action();
+            assert!(!job.enabled());
+            assert_eq!(action.sudo, SudoMode::Disabled);
+            assert!(action.command.is_empty());
+            assert!(action.snippet.is_none());
+            assert!(action.working_directory.is_none());
+            assert!(action.virtual_terminal.is_none());
+            assert!(action.remote.is_none());
+            assert_eq!(
+                action.require_executable(),
+                Err(imported_privileged::REVIEW_REQUIRED)
+            );
+            let enabled = job
+                .definition()
+                .with_action(action.clone())
+                .unwrap()
+                .with_enabled(true);
+            assert!(SshCommand::validate_definition(&enabled).is_err());
+            let draft = action.imported_privileged.as_ref().unwrap();
+            assert!(draft.routes.iter().eq(action.targets()));
+            assert_eq!(
+                draft.routes[0].target.host,
+                ["primary.example", "secondary.example"][target_index]
+            );
+            let settings = serde_json::to_value(&draft.settings).unwrap();
+            match &draft.settings {
+                imported_privileged::Settings::Command { .. } => {
+                    assert_eq!(&settings, expected);
+                    assert_eq!(draft.routes[1].target.host, "secondary.example");
+                    assert_eq!(action.journal_detail, JournalDetail::Full);
+                }
+                imported_privileged::Settings::Snippet { link, options } => {
+                    assert_eq!(settings["kind"], expected["kind"]);
+                    assert_eq!(link.arguments, ["space & 東京"]);
+                    assert_eq!(options.virtual_terminal.unwrap().columns, 132);
+                    assert_eq!(
+                        options.working_directory.as_deref(),
+                        Some("/srv/project files")
+                    );
+                    assert_eq!(action.journal_detail, JournalDetail::Full);
+                    assert!(job.id().as_str().starts_with("java-privileged-"));
+                }
+                imported_privileged::Settings::File { action: file } => {
+                    assert_eq!(&settings["action"], expected);
+                    assert_eq!(action.journal_detail, JournalDetail::Off);
+                    if matches!(file, imported_privileged::FileAction::Delete { .. }) {
+                        assert!(job.id().as_str().starts_with("java-privileged-"));
+                        deletes.push(job.id().clone());
+                    }
+                }
+            }
+        }
+    }
+    let dependent = graph
+        .jobs()
+        .iter()
+        .find(|job| job.name() == "After all deletions")
+        .unwrap();
+    assert!(!dependent.enabled());
+    assert_eq!(dependent.mode(), DependencyMode::Chain);
+    assert_eq!(dependent.dependencies(), deletes);
+    assert!(store.journal().is_empty());
+    drop(store);
+
+    let installed = fs::read(fixture.root.join(JOBS)).unwrap();
+    fixture.queue();
+    fixture.apply();
+    assert_eq!(fs::read(fixture.root.join(JOBS)).unwrap(), installed);
+}
+
+#[test]
 fn java_scheduler_restore_rebinds_exact_targets_and_preserves_local_history_on_replay() {
     let fixture = Fixture::new();
     let (local, existing_run) = fixture.seed_local("local");
@@ -1217,7 +1528,7 @@ fn java_scheduler_restore_rebinds_exact_targets_and_preserves_local_history_on_r
     let scheduler = store.restore_with_actions::<SshCommand>().unwrap();
     let graph = scheduler.graph();
     let get = |id| graph.job(&JobId::new(id).unwrap()).unwrap();
-    assert_eq!(graph.jobs().len(), 4);
+    assert_eq!(graph.jobs().len(), 6);
     assert_eq!(get("local").action().connection.as_ref(), Some(&local));
     assert!(get("local").enabled());
     let command = get(COMMAND);
@@ -1235,6 +1546,14 @@ fn java_scheduler_restore_rebinds_exact_targets_and_preserves_local_history_on_r
     );
     let link = snippet.action().snippet.as_ref().unwrap();
     assert_eq!(link.arguments, ["literal space", "a'b"]);
+    let privileged = get(PRIVILEGED);
+    assert!(!privileged.enabled());
+    assert_eq!(privileged.action().connection.as_ref(), Some(&primary));
+    assert!(privileged.action().imported_privileged.is_some());
+    assert_eq!(
+        get(PRIVILEGED_DEPENDENT).dependencies(),
+        std::slice::from_ref(privileged.id())
+    );
     let agent = get(AGENT);
     assert!(!agent.enabled());
     assert_eq!(agent.action().connection.as_ref(), Some(&primary));
@@ -1271,7 +1590,7 @@ fn java_scheduler_restore_preserves_conflicting_job_and_omits_its_dependent() {
     fixture.queue();
     fixture.apply();
     let store = SchedulerStore::open(fixture.root.join(JOBS)).unwrap();
-    assert_eq!(store.definitions().len(), 2);
+    assert_eq!(store.definitions().len(), 4);
     assert_eq!(store.definitions()[0].name, "Existing job");
     assert!(
         store

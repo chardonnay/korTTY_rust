@@ -35,6 +35,8 @@ mod child_limits;
 mod parent_exit;
 #[cfg(unix)]
 pub use child_limits::limit_child_file_size;
+#[cfg(target_os = "linux")]
+pub mod flatpak;
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[path = "unix.rs"]
 mod platform;
@@ -67,7 +69,7 @@ pub use worker_sandbox::{WindowsCli, WindowsWorker, WindowsWorkerProcess};
 #[cfg(windows)]
 pub use worker_sandbox::{WindowsRelayIo, WindowsRelayReader, WindowsRelayWriter};
 
-/// An operating-system shell choice. The explicit presets are Windows-only.
+/// An operating-system shell choice, saved independently of the executable path.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum LocalShell {
@@ -75,40 +77,93 @@ pub enum LocalShell {
     Default,
     PowerShell,
     CommandPrompt,
+    GitBash,
+    Cygwin,
+    Wsl,
+    Zsh,
+    Bash,
 }
 
 impl LocalShell {
+    const ALL: [Self; 8] = [
+        Self::Default,
+        Self::PowerShell,
+        Self::CommandPrompt,
+        Self::GitBash,
+        Self::Cygwin,
+        Self::Wsl,
+        Self::Zsh,
+        Self::Bash,
+    ];
+
     /// Whether the requested choice uses the platform default.
     pub fn is_default(&self) -> bool {
         *self == Self::Default
     }
 
-    /// Name of the explicit Windows shell, if selected.
+    /// Stable value for the native connection interchange format.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::PowerShell => "power-shell",
+            Self::CommandPrompt => "command-prompt",
+            Self::GitBash => "git-bash",
+            Self::Cygwin => "cygwin",
+            Self::Wsl => "wsl",
+            Self::Zsh => "zsh",
+            Self::Bash => "bash",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|preset| preset.id() == id)
+    }
+
+    /// Name of the explicit shell, if selected.
     pub fn preset_title(self) -> Option<&'static str> {
         match self {
             Self::Default => None,
             Self::PowerShell => Some("PowerShell"),
             Self::CommandPrompt => Some("cmd.exe"),
+            Self::GitBash => Some("Git Bash"),
+            Self::Cygwin => Some("Cygwin"),
+            Self::Wsl => Some("WSL"),
+            Self::Zsh => Some("Zsh"),
+            Self::Bash => Some("Bash"),
         }
+    }
+}
+
+impl std::fmt::Display for LocalShell {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.preset_title().unwrap_or("System default"))
     }
 }
 
 /// Resolves the same platform shell executable used by a built-in terminal preset.
 pub fn shell_program(preset: LocalShell) -> io::Result<PathBuf> {
-    #[cfg(windows)]
-    {
-        platform::shell_program(preset)
-    }
-    #[cfg(any(target_os = "macos", target_os = "linux"))]
-    {
-        if !preset.is_default() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Unsupported shell preset",
-            ));
-        }
-        Ok(platform::default_shell().into())
-    }
+    platform::shell_program(preset)
+}
+
+/// Lists the installed presets relevant to the current platform.
+pub fn available_local_shells() -> Vec<LocalShell> {
+    use LocalShell::*;
+
+    let candidates: &[LocalShell] = if cfg!(windows) {
+        &[PowerShell, CommandPrompt, GitBash, Cygwin, Wsl]
+    } else if cfg!(target_os = "macos") {
+        &[Zsh, Bash]
+    } else {
+        &[Bash]
+    };
+    std::iter::once(Default)
+        .chain(
+            candidates
+                .iter()
+                .copied()
+                .filter(|preset| shell_program(*preset).is_ok_and(|program| program.is_file())),
+        )
+        .collect()
 }
 
 /// Local shell launch settings. A requested sandbox is mandatory for this launch.
@@ -250,6 +305,18 @@ impl Pty {
     /// The ID must not be used to identify a live process after it exits.
     pub fn shell_pid(&self) -> u32 {
         self.control.shell_pid()
+    }
+
+    /// Whether the local process handle belongs to a Flatpak host launcher.
+    pub fn uses_flatpak_host(&self) -> bool {
+        #[cfg(unix)]
+        {
+            self.control.uses_flatpak_host()
+        }
+        #[cfg(windows)]
+        {
+            false
+        }
     }
 
     /// Checks process images owned by this terminal's live job.
@@ -394,14 +461,12 @@ impl Pty {
         if options.shell_integration {
             validate_shell_integration(options.shell, options.command.as_deref())?;
         }
-        if !cfg!(windows) && !options.shell.is_default() {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "the selected local shell requires Windows",
-            ));
-        }
+        #[cfg(target_os = "linux")]
+        let on_host = flatpak::routes_to_host(options);
+        #[cfg(not(target_os = "linux"))]
+        let on_host = false;
         if let Some(directory) = &options.working_directory
-            && (!directory.is_absolute() || !directory.metadata()?.is_dir())
+            && (!directory.is_absolute() || (!on_host && !directory.metadata()?.is_dir()))
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -430,11 +495,13 @@ impl Pty {
                 "no OS sandbox is available for this local PTY",
             ));
         }
-        let native_shell = options.command.is_none() && {
+        let native_shell = !on_host && options.command.is_none() && {
             #[cfg(unix)]
             {
-                Path::new(&platform::default_shell())
-                    .file_name()
+                shell_program(options.shell)
+                    .ok()
+                    .as_deref()
+                    .and_then(Path::file_name)
                     .and_then(std::ffi::OsStr::to_str)
                     .is_some_and(|name| {
                         matches!(
@@ -456,7 +523,7 @@ impl Pty {
             }
             #[cfg(windows)]
             {
-                true
+                options.shell != LocalShell::Wsl
             }
         };
         let (control, reader, writer) = platform::Control::spawn(size, term, options)?;

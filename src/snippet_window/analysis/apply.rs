@@ -208,6 +208,7 @@ pub(super) fn preview_body(preview: Preview<'_>) -> Column<'_, WindowMessage> {
         ))
         .wrapping(Wrapping::WordOrGlyph),
         text(explanation).size(13).wrapping(Wrapping::WordOrGlyph),
+        preview.profile.remote.then(|| notice("This sends source code over HTTPS. A request or proposal containing protected text stops the run.")),
         preview.stale.then(|| notice("You selected the current source. The saved recommendations were made for an earlier revision.")),
         text(preview.prompt).font(Font::MONOSPACE).size(13).wrapping(Wrapping::WordOrGlyph),
     ]

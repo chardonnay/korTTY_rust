@@ -3936,6 +3936,10 @@ impl Workspace {
         }
         let new_id =
             self.store_connected_session(session, grid, replacement.map(|(_, _, old)| old), font);
+        if let Some(saved) = &saved {
+            self.saved_terminal_preferences
+                .remember_serial_highlight(saved);
+        }
         if let Some(pane) = self.sessions.get_mut(&new_id) {
             pane.strict_escapes = strict;
             pane.saved_strict_escapes = saved_strict.is_some();
@@ -3946,6 +3950,7 @@ impl Workspace {
                 .unwrap_or_default();
             pane.saved_serial = saved;
         }
+        self.refresh_highlight(new_id);
         if let Some((tab, pane, old)) = replacement {
             if let Some(slot) = self
                 .windows

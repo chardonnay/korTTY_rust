@@ -26,6 +26,7 @@ pub(super) mod sync;
 pub(super) mod transfer;
 
 pub(crate) use archive::{BrowserArchiveManifest, scan_browser_archive};
+pub(crate) use privileged::preview_file_upload as preview_privileged_file_upload;
 
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(60);
 

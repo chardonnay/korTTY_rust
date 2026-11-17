@@ -8,8 +8,10 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use kortty_server_archive::protocol::{
     CreateFormat, CreateSpec, OutputMetadata, PASSWORD_COMMIT, PRIVILEGED_ARGUMENT,
     PRIVILEGED_PASSWORD_ARGUMENT, PRIVILEGED_PASSWORD_COMMIT, PRIVILEGED_PASSWORD_READY,
-    PRIVILEGED_PATH, PrivilegedReply, PrivilegedRequest, creation_password_body,
-    read_privileged_reply, write_privileged_request,
+    PRIVILEGED_PATH, PRIVILEGED_UPDATE_ARGUMENT, PRIVILEGED_UPDATE_PASSWORD_ARGUMENT,
+    PRIVILEGED_UPDATE_PASSWORD_READY, PrivilegedReply, PrivilegedRequest, UpdateDecision,
+    UpdateReply, UpdateRequest, creation_password_body, read_privileged_reply, read_update_reply,
+    write_privileged_request, write_update_decision, write_update_request,
 };
 use sha2::{Digest, Sha256};
 
@@ -46,6 +48,7 @@ fn privileged_archive_stdio_scopes_one_commit_and_preserves_existing_paths() {
         format,
         level: 3,
         excludes: vec![],
+        member_layout: Default::default(),
         output: None,
         report_payload: false,
     };
@@ -309,6 +312,157 @@ fn privileged_archive_stdio_scopes_one_commit_and_preserves_existing_paths() {
     assert!(fs::metadata(&copy.destination).unwrap().len() >= 256 * 1024);
 }
 
+#[test]
+#[ignore = "requires a separate disposable root-mapped Linux namespace and an installed fixture helper"]
+fn privileged_archive_update_checks_role_separation_and_the_held_copy() {
+    assert_eq!(
+        std::env::var("KORTTY_ARCHIVE_TEST_ROOT").as_deref(),
+        Ok("/data")
+    );
+    assert_eq!(rustix::process::geteuid().as_raw(), 0);
+    assert!(!std::path::Path::new(CONFIG).exists());
+    assert!(fs::read_dir("/data").unwrap().next().is_none());
+    fs::create_dir_all("/etc/kortty").unwrap();
+    fs::create_dir_all("/data/output/reusable").unwrap();
+    fs::create_dir("/data/source").unwrap();
+    fs::write("/data/source/member", b"first source").unwrap();
+    let mut spec = CreateSpec {
+        sources: vec!["/data/source".into()],
+        destination: "/data/output/reusable/output.tar".into(),
+        format: CreateFormat::Tar,
+        level: 0,
+        excludes: vec![],
+        member_layout: Default::default(),
+        output: None,
+        report_payload: false,
+    };
+    let create_only = RULES;
+    let replace_only = r#"{"source_roots":["/data/source"],"destination_roots":["/data/output"],"replacement_roots":["/data/output/reusable"]}"#;
+    let full = r#"{"source_roots":["/data/source"],"destination_roots":["/data/output"],"replacement_roots":["/data/output/reusable"],"download_roots":["/data/output/reusable"]}"#;
+
+    fs::write(CONFIG, create_only).unwrap();
+    let mut first = Helper::open_with_argument(PRIVILEGED_UPDATE_ARGUMENT);
+    let (token, vacancy) = first.review_update(&spec, false);
+    first.prepare_update(&spec, token);
+    first.update_decision(UpdateDecision::Publish);
+    let UpdateReply::Published {
+        receiver,
+        recovery: None,
+        ..
+    } = first.finish_update()
+    else {
+        panic!("create-only authority should publish the vacant archive");
+    };
+    assert_ne!(receiver, vacancy);
+    let before = fs::read(&spec.destination).unwrap();
+    let first_id = fs::metadata(&spec.destination).unwrap().ino();
+    let mut denied = Helper::open_with_argument(PRIVILEGED_UPDATE_ARGUMENT);
+    denied.send_update(&UpdateRequest::Review { spec: spec.clone() });
+    assert!(matches!(
+        denied.finish_update(),
+        UpdateReply::Failed {
+            outcome_unknown: false,
+            recovery: None,
+            ..
+        }
+    ));
+    assert_eq!(fs::read(&spec.destination).unwrap(), before);
+
+    fs::write(CONFIG, replace_only).unwrap();
+    spec.report_payload = true;
+    let mut denied = Helper::open_with_argument(PRIVILEGED_UPDATE_ARGUMENT);
+    denied.send_update(&UpdateRequest::Review { spec: spec.clone() });
+    assert!(matches!(
+        denied.finish_update(),
+        UpdateReply::Failed {
+            outcome_unknown: false,
+            recovery: None,
+            ..
+        }
+    ));
+
+    fs::write(CONFIG, full).unwrap();
+    fs::write("/data/source/member", b"second source").unwrap();
+    let mut revoked = Helper::open_with_argument(PRIVILEGED_UPDATE_ARGUMENT);
+    let (token, current) = revoked.review_update(&spec, true);
+    assert_eq!(current, receiver);
+    revoked.prepare_update(&spec, token);
+    let recovery = revoked.quarantine_update();
+    assert_eq!(fs::metadata(&recovery).unwrap().ino(), first_id);
+    fs::write(CONFIG, create_only).unwrap();
+    revoked.update_decision(UpdateDecision::Publish);
+    assert!(matches!(
+        revoked.finish_update(),
+        UpdateReply::Failed {
+            outcome_unknown: false,
+            recovery: None,
+            ..
+        }
+    ));
+    assert_eq!(fs::metadata(&spec.destination).unwrap().ino(), first_id);
+    assert_eq!(fs::read(&spec.destination).unwrap(), before);
+
+    fs::write(CONFIG, full).unwrap();
+    let mut published = Helper::open_with_argument(PRIVILEGED_UPDATE_PASSWORD_ARGUMENT);
+    let mut greeting = [0; PRIVILEGED_UPDATE_PASSWORD_READY.len()];
+    published.output.read_exact(&mut greeting).unwrap();
+    assert_eq!(greeting.as_slice(), PRIVILEGED_UPDATE_PASSWORD_READY);
+    let (token, _) = published.review_update(&spec, true);
+    let expected = published.prepare_update(&spec, token);
+    let original = published.quarantine_update();
+    published.update_decision(UpdateDecision::Publish);
+    let UpdateReply::Published {
+        destination,
+        payload,
+        recovery,
+        receiver,
+    } = published.receive_update()
+    else {
+        panic!("the confirmed publication should precede the copy");
+    };
+    assert_eq!(destination, spec.destination);
+    assert_eq!(payload, expected);
+    assert_eq!(recovery.as_deref(), Some(original.as_str()));
+    assert_eq!(fs::metadata(&original).unwrap().ino(), first_id);
+    assert_eq!(fs::read(&original).unwrap(), before);
+    let metadata = fs::metadata(&spec.destination).unwrap();
+    assert_eq!(
+        (metadata.uid(), metadata.mode() & 0o777, metadata.nlink()),
+        (0, 0o600, 1)
+    );
+    published.update_decision(UpdateDecision::FetchCopy);
+    assert!(
+        matches!(published.receive_update(), UpdateReply::CopyReady { payload: copy } if copy == payload)
+    );
+    let mut bytes = vec![0; payload.bytes as usize];
+    published.output.read_exact(&mut bytes).unwrap();
+    assert_eq!(io::copy(&mut published.output, &mut io::sink()).unwrap(), 0);
+    assert!(published.child.wait().unwrap().success());
+    assert_eq!(payload.sha256, <[u8; 32]>::from(Sha256::digest(&bytes)));
+    assert_eq!(bytes, fs::read(&spec.destination).unwrap());
+
+    fs::write("/data/source/member", b"third source").unwrap();
+    let mut copy_revoked = Helper::open_with_argument(PRIVILEGED_UPDATE_ARGUMENT);
+    let (token, current) = copy_revoked.review_update(&spec, true);
+    assert_eq!(current, receiver);
+    copy_revoked.prepare_update(&spec, token);
+    let recovery = copy_revoked.quarantine_update();
+    copy_revoked.update_decision(UpdateDecision::Publish);
+    assert!(matches!(
+        copy_revoked.receive_update(),
+        UpdateReply::Published { .. }
+    ));
+    let confirmed = fs::read(&spec.destination).unwrap();
+    fs::write(CONFIG, replace_only).unwrap();
+    copy_revoked.update_decision(UpdateDecision::FetchCopy);
+    assert!(matches!(
+        copy_revoked.finish_update(),
+        UpdateReply::CopyFailed
+    ));
+    assert_eq!(fs::read(&spec.destination).unwrap(), confirmed);
+    assert_eq!(fs::read(recovery).unwrap(), bytes);
+}
+
 struct Helper {
     child: Child,
     input: Option<ChildStdin>,
@@ -364,6 +518,70 @@ impl Helper {
 
     fn send(&mut self, request: &PrivilegedRequest) {
         write_privileged_request(self.input.as_mut().unwrap(), request).unwrap();
+    }
+
+    fn send_update(&mut self, request: &UpdateRequest) {
+        write_update_request(self.input.as_mut().unwrap(), request).unwrap();
+    }
+
+    fn receive_update(&mut self) -> UpdateReply {
+        read_update_reply(&mut self.output).unwrap()
+    }
+
+    fn review_update(&mut self, spec: &CreateSpec, replacing: bool) -> (String, [u8; 32]) {
+        self.send_update(&UpdateRequest::Review { spec: spec.clone() });
+        let reply = self.receive_update();
+        let UpdateReply::Reviewed {
+            review,
+            receiver,
+            existing,
+        } = reply
+        else {
+            panic!("expected the exact archive update review: {reply:?}");
+        };
+        review.validate_for(spec).unwrap();
+        assert_eq!(existing.is_some(), replacing);
+        assert_ne!(receiver, [0; 32]);
+        (review.token, receiver)
+    }
+
+    fn prepare_update(
+        &mut self,
+        spec: &CreateSpec,
+        token: String,
+    ) -> kortty_server_archive::protocol::CreatedPayload {
+        self.send_update(&UpdateRequest::Prepare {
+            spec: spec.clone(),
+            token,
+        });
+        let reply = self.receive_update();
+        let UpdateReply::Prepared { payload } = reply else {
+            panic!("expected the exact staged archive: {reply:?}");
+        };
+        payload.validate().unwrap();
+        payload
+    }
+
+    fn update_decision(&mut self, decision: UpdateDecision) {
+        write_update_decision(self.input.as_mut().unwrap(), &decision).unwrap();
+    }
+
+    fn quarantine_update(&mut self) -> String {
+        self.update_decision(UpdateDecision::Quarantine);
+        let reply = self.receive_update();
+        let UpdateReply::Quarantined { recovery } = reply else {
+            panic!("expected the held original: {reply:?}");
+        };
+        assert!(recovery.ends_with(".kortty-part/original"));
+        recovery
+    }
+
+    fn finish_update(mut self) -> UpdateReply {
+        self.input.take();
+        let reply = self.receive_update();
+        assert_eq!(io::copy(&mut self.output, &mut io::sink()).unwrap(), 0);
+        assert!(self.child.wait().unwrap().success());
+        reply
     }
 
     fn review(&mut self, spec: &CreateSpec) -> String {

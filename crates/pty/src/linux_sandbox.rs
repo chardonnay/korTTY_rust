@@ -11,6 +11,8 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::ptr;
 
+#[path = "linux_sandbox/flatpak.rs"]
+mod flatpak;
 #[path = "linux_sandbox/seccomp.rs"]
 mod seccomp;
 #[path = "linux_sandbox/worker.rs"]
@@ -121,6 +123,7 @@ pub(crate) fn prepare(
 ) -> io::Result<(Restrictions, SessionDirectory)> {
     let uid = unprivileged_user()?;
     check_landlock_abi()?;
+    let in_flatpak = flatpak::installed_namespace()?;
     let profile = canonical_protected_path(profile, false)?;
     let protected = protected_paths(&profile, uid)?;
     let workspace = fs::canonicalize(workspace)?;
@@ -138,13 +141,19 @@ pub(crate) fn prepare(
     let ruleset = create_ruleset(0)?;
 
     for path in SYSTEM_DIRECTORIES {
-        allow_system_path(&ruleset, Path::new(path), READ_SYSTEM, &protected)?;
+        allow_system_path(
+            &ruleset,
+            Path::new(path),
+            READ_SYSTEM,
+            &protected,
+            in_flatpak,
+        )?;
     }
     for (path, access) in SYSTEM_FILES {
-        allow_system_path(&ruleset, Path::new(path), *access, &protected)?;
+        allow_system_path(&ruleset, Path::new(path), *access, &protected, in_flatpak)?;
     }
     allow_path(&ruleset, &workspace_fd, WRITE_WORKSPACE)?;
-    let directory = SessionDirectory::new()?;
+    let directory = SessionDirectory::new(uid, in_flatpak)?;
     check_overlap(&directory.root, &protected)?;
     if intersects(&workspace, &directory.root) {
         return Err(io::Error::new(
@@ -255,21 +264,29 @@ fn enforce(ruleset: &OwnedFd) -> io::Result<()> {
 
 fn allow_system_path(
     ruleset: &OwnedFd,
-    path: &Path,
+    requested: &Path,
     access: u64,
     protected: &[PathBuf],
+    in_flatpak: bool,
 ) -> io::Result<()> {
-    let system_resolver = path == Path::new("/etc/resolv.conf");
-    let path = match fs::canonicalize(path) {
+    let path = match fs::canonicalize(requested) {
         Ok(path) => path,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(error),
     };
     check_overlap(&path, protected)?;
-    let fd = path_handle(&path)?;
+    let fd = if in_flatpak {
+        flatpak::path_handle(&path)?
+    } else {
+        path_handle(&path)?
+    };
     let metadata = fd.metadata()?;
+    if in_flatpak {
+        flatpak::require_system_path(requested, &path, &fd, &metadata)?;
+        return allow_path(ruleset, &fd, access);
+    }
     // systemd-resolved generates these exact read-only inputs under its own UID.
-    let generated_resolver = system_resolver
+    let generated_resolver = requested == Path::new("/etc/resolv.conf")
         && matches!(
             path.to_str(),
             Some("/run/systemd/resolve/resolv.conf" | "/run/systemd/resolve/stub-resolv.conf")
@@ -312,12 +329,15 @@ fn path_handle(path: &Path) -> io::Result<File> {
         .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
         .open(path)?;
     let file_type = file.metadata()?.file_type();
-    if file_type.is_symlink()
-        || fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))? != path
-    {
+    let opened = fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))?;
+    if file_type.is_symlink() || opened != path {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "a sandbox path changed while preparing it",
+            format!(
+                "sandbox path {} resolved to {} during preparation",
+                path.display(),
+                opened.display()
+            ),
         ));
     }
     Ok(file)
@@ -434,10 +454,16 @@ pub(crate) struct SessionDirectory {
 }
 
 impl SessionDirectory {
-    fn new() -> io::Result<Self> {
+    fn new(uid: libc::uid_t, in_flatpak: bool) -> io::Result<Self> {
         let base = fs::canonicalize("/tmp")?;
-        let metadata = base.metadata()?;
-        if metadata.uid() != 0 || metadata.mode() & 0o022 != 0 && metadata.mode() & 0o1000 == 0 {
+        let metadata = path_handle(&base)?.metadata()?;
+        // Flatpak binds a private, per-application directory at /tmp.
+        let trusted = if in_flatpak {
+            base == Path::new("/tmp") && metadata.uid() == uid && metadata.mode() & 0o077 == 0
+        } else {
+            metadata.uid() == 0 && (metadata.mode() & 0o022 == 0 || metadata.mode() & 0o1000 != 0)
+        };
+        if !metadata.is_dir() || !trusted {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "the sandbox needs a trusted system temporary directory",
@@ -545,7 +571,7 @@ mod tests {
     fn inaccessible_home_suffix_keeps_its_known_canonical_prefix() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
-        let directory = SessionDirectory::new().unwrap();
+        let directory = SessionDirectory::new(unprivileged_user().unwrap(), false).unwrap();
         let blocked = directory.path().join("blocked");
         DirBuilder::new().mode(0o000).create(&blocked).unwrap();
         let alias = directory.path().join("alias");

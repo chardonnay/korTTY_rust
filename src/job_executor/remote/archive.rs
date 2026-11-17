@@ -501,6 +501,8 @@ mod tests {
             excludes: vec!["*.tmp".to_owned()],
             download: None,
             server_output: None,
+            reuse_output: false,
+            member_layout: kortty_server_archive::protocol::ArchiveMemberLayout::SourceBasename,
         }
     }
 

@@ -51,7 +51,7 @@ impl Workspace {
                 self.terminal_file_error(owner, "Wait for the snippet transfer to finish."),
             );
         }
-        if !remote && pane.session.local_shell_pid().is_none() {
+        if !remote && !pane.session.local_shell_running() {
             return None;
         }
         let policy = self.clipboard.policy.remote_editor;

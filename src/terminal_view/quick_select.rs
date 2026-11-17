@@ -520,6 +520,12 @@ fn path_pattern(windows_paths: bool) -> &'static Regex {
     if windows_paths { &WINDOWS_PATH } else { &PATH }
 }
 
+pub(crate) fn printed_path_ranges(line: &str) -> impl Iterator<Item = Range<usize>> + '_ {
+    path_pattern(true)
+        .captures_iter(line)
+        .filter_map(|hit| path(line, &hit, true))
+}
+
 fn path(line: &str, hit: &Captures<'_>, windows_paths: bool) -> Option<Range<usize>> {
     let range = hit.get(0)?.range();
     if line[..range.start]
@@ -895,6 +901,7 @@ mod tests {
             patterns: [r"\s*TICKET-[0-9]+\s*", "abc def", "def ghi", "文界"]
                 .map(str::to_owned)
                 .to_vec(),
+            java_patterns: false,
         };
         preferences.validate().unwrap();
         let mut terminal = Terminal::new(100, 4);
@@ -928,7 +935,7 @@ mod tests {
         for alphabet in ["z", "zz", "zX", "z x", "z文"] {
             assert!(Preferences::validate_alphabet(alphabet).is_err());
         }
-        assert!(Preferences::validate_pattern(&"😀".repeat(256)).is_ok());
+        assert!(Preferences::validate_pattern(&"😀".repeat(256), false).is_ok());
         for pattern in [
             "😀".repeat(257),
             "a*".into(),
@@ -936,11 +943,12 @@ mod tests {
             "x\0".into(),
             r"(x)\1".into(),
         ] {
-            assert!(Preferences::validate_pattern(&pattern).is_err());
+            assert!(Preferences::validate_pattern(&pattern, false).is_err());
         }
         let mut preferences = Preferences {
             alphabet: "zz".into(),
             patterns: vec!["[".into(), "TICKET-[0-9]+".into()],
+            java_patterns: false,
         };
         assert!(preferences.validate().is_err());
         let mut terminal = Terminal::new(40, 3);
@@ -953,5 +961,22 @@ mod tests {
         preferences.alphabet = DEFAULT_ALPHABET.into();
         preferences.patterns = vec!["ticket".into(); MAX_PATTERNS + 1];
         assert!(preferences.validate().is_err());
+    }
+
+    #[test]
+    fn quick_select_java_patterns_copy_only_the_matched_text() {
+        let preferences = Preferences {
+            patterns: vec![r"(?<!old-)\b((?i:\QTKT+\E)\d+):\1$".into()],
+            java_patterns: true,
+            ..Preferences::default()
+        };
+        preferences.validate().unwrap();
+        let compiled = preferences.compile();
+        let mut matching = compiled.matching().unwrap();
+        let line = "éTkT+42:TkT+42\u{2028}";
+        let spans = matching.spans(line);
+        assert_eq!(spans, [(2..15, 0)]);
+        assert_eq!(&line[spans[0].0.clone()], "TkT+42:TkT+42");
+        assert!(matching.spans("old-TKT+42:TKT+42").is_empty());
     }
 }

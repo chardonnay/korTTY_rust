@@ -1,29 +1,112 @@
 use std::fs;
 use std::io::{self, Write as _};
 use std::net::TcpStream;
+use std::process::Output;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use kortty_server_archive::manifest::{Manifest, Member, MemberKind};
 use kortty_server_archive::protocol::{
-    self, CreateFormat, CreateReview, CreateSpec, CreatedPayload, PrivilegedReply,
+    self, CreateFormat, CreateReview, CreateSpec, CreatedPayload, PrivilegedReply, UpdateDecision,
+    UpdateReply, UpdateRequest,
 };
-use kortty_ssh::{Authentication, ConnectOptions, ExecConnection, SensitiveLine, SshTarget};
+use kortty_ssh::{
+    Authentication, ConnectOptions, ExecConnection, HostKey, SensitiveLine, SshTarget,
+};
 use sha2::{Digest, Sha256};
 
-use crate::sftp_window::{PrivilegedArchiveFailure, exchange_privileged_server_archive};
+use crate::sftp_window::{
+    PrivilegedArchiveFailure, exchange_privileged_archive_update,
+    exchange_privileged_server_archive,
+};
 
 use super::Sshd;
 
 const COMMAND: &str = "exec /usr/bin/sudo -k -n -u root -- /usr/libexec/kortty/kortty-server-archive --privileged-create-v1";
+const UPDATE_COMMAND: &str = "exec /usr/bin/sudo -k -n -u root -- /usr/libexec/kortty/kortty-server-archive --privileged-update-v1";
 const TOKEN: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const RECOVERY: &str =
+    "/fixture/exports/.kortty-0123456789abcdef0123456789abcdef.kortty-part/original";
 const HELPER: &str = include_str!("privileged_archive_fixture.py");
 const PASSWORD: &str = "test-only archive password\n東京";
 const SUDO_PASSWORD: &str = "test-only elevated password 東京";
 const COPY: &[u8] = b"new root-owned archive\0bytes\n";
+
+fn archive_fixture(mode: &str, command: &str) -> Sshd {
+    let fixture = Sshd::new();
+    let root = &fixture.profile.0;
+    let script = root.join("archive-fixture.py");
+    fs::write(&script, HELPER).unwrap();
+    fs::write(root.join("mode"), mode).unwrap();
+    fs::write(root.join("command"), command).unwrap();
+    if mode.starts_with("sudo-") {
+        fs::write(
+            root.join("expected-sudo-password"),
+            format!("{SUDO_PASSWORD}\n"),
+        )
+        .unwrap();
+    }
+    let mut config = fs::OpenOptions::new()
+        .append(true)
+        .open(&fixture.config)
+        .unwrap();
+    let mut quoted = String::new();
+    crate::scheduler_window::script::shell_quote(&mut quoted, script.to_str().unwrap());
+    writeln!(config, "ForceCommand /usr/bin/python3 -I -S {quoted}").unwrap();
+    fixture
+}
+
+fn connect_fixture(
+    fixture: &Sshd,
+    mode: &str,
+    stopped: impl Fn() -> bool,
+) -> (ExecConnection, HostKey, JoinHandle<Output>) {
+    let daemon = fixture.spawn();
+    let address = fixture.listener.local_addr().unwrap();
+    let (endpoint, pin) = fixture.pin();
+    let target = SshTarget {
+        endpoint,
+        username: fixture.user.clone(),
+        authentication: Authentication::private_key(fs::read(&fixture.user_key).unwrap()),
+    };
+    match ExecConnection::connect_preconnected(
+        TcpStream::connect(address).unwrap(),
+        (target, Vec::new()),
+        fixture.trust.clone(),
+        ConnectOptions::default(),
+        stopped,
+        || Ok(()),
+    ) {
+        Ok(connection) => (connection, pin, daemon),
+        Err(error) => {
+            let output = daemon.join().unwrap();
+            panic!(
+                "The archive fixture could not authenticate ({mode}): {error:?}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+}
+
+fn review(spec: &CreateSpec) -> CreateReview {
+    CreateReview {
+        spec: spec.clone(),
+        token: TOKEN.into(),
+        manifest: Manifest {
+            members: vec![Member {
+                path: "data".into(),
+                kind: MemberKind::File,
+                size: 1,
+            }],
+            expanded_bytes: 1,
+        },
+        excluded: 0,
+    }
+}
 
 #[test]
 #[ignore = "requires native OpenSSH sshd, ssh-keygen and Python 3"]
@@ -74,19 +157,8 @@ fn openssh_privileged_archive_exchange_commits_once_and_reports_uncertainty() {
         let withdrawn_before_review = mode == "sudo-revoked-before-review";
         let reaches_review = !(uses_vault && expected.is_err());
         let sends_sudo_password = uses_vault && mode != "sudo-no-prompt" && !withdrawn_before_auth;
-        let fixture = Sshd::new();
+        let fixture = archive_fixture(mode, COMMAND);
         let root = &fixture.profile.0;
-        let script = root.join("archive-fixture.py");
-        fs::write(&script, HELPER).unwrap();
-        fs::write(root.join("mode"), mode).unwrap();
-        fs::write(root.join("command"), COMMAND).unwrap();
-        if uses_vault {
-            fs::write(
-                root.join("expected-sudo-password"),
-                format!("{SUDO_PASSWORD}\n"),
-            )
-            .unwrap();
-        }
 
         let spec = CreateSpec {
             sources: vec!["/fixture/pinned/data".into()],
@@ -105,28 +177,15 @@ fn openssh_privileged_archive_exchange_commits_once_and_reports_uncertainty() {
             excludes: Vec::new(),
             output: None,
             report_payload: copies_archive,
+            member_layout: protocol::ArchiveMemberLayout::SourceBasename,
         };
-        let mut review = Vec::new();
         protocol::write_privileged_reply(
-            &mut review,
+            fs::File::create(root.join("review")).unwrap(),
             &PrivilegedReply::Review {
-                review: CreateReview {
-                    spec: spec.clone(),
-                    token: TOKEN.into(),
-                    manifest: Manifest {
-                        members: vec![Member {
-                            path: "data".into(),
-                            kind: MemberKind::File,
-                            size: 1,
-                        }],
-                        expanded_bytes: 1,
-                    },
-                    excluded: 0,
-                },
+                review: review(&spec),
             },
         )
         .unwrap();
-        fs::write(root.join("review"), review).unwrap();
         let mut expected_review = Vec::new();
         protocol::write_privileged_request(
             &mut expected_review,
@@ -182,42 +241,9 @@ fn openssh_privileged_archive_exchange_commits_once_and_reports_uncertainty() {
             }
         }
         fs::write(root.join("applied"), applied).unwrap();
-        let mut config = fs::OpenOptions::new()
-            .append(true)
-            .open(&fixture.config)
-            .unwrap();
-        let script = script.to_str().unwrap();
-        let mut command = String::new();
-        crate::scheduler_window::script::shell_quote(&mut command, script);
-        writeln!(config, "ForceCommand /usr/bin/python3 -I -S {command}").unwrap();
-
-        let daemon = fixture.spawn();
-        let address = fixture.listener.local_addr().unwrap();
-        let (endpoint, pin) = fixture.pin();
-        let target = SshTarget {
-            endpoint,
-            username: fixture.user.clone(),
-            authentication: Authentication::private_key(fs::read(&fixture.user_key).unwrap()),
-        };
         let deadline = Instant::now() + Duration::from_secs(10);
         let stopped = move || Instant::now() >= deadline;
-        let connection = match ExecConnection::connect_preconnected(
-            TcpStream::connect(address).unwrap(),
-            (target, Vec::new()),
-            fixture.trust.clone(),
-            ConnectOptions::default(),
-            stopped,
-            || Ok(()),
-        ) {
-            Ok(connection) => connection,
-            Err(error) => {
-                let output = daemon.join().unwrap();
-                panic!(
-                    "The archive fixture could not authenticate ({mode}): {error:?}\n{}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-            }
-        };
+        let (connection, pin, daemon) = connect_fixture(&fixture, mode, stopped);
         let opener = connection.exec_opener().unwrap();
         assert_eq!(opener.verified_host_key(), Some(&pin));
         let denied = Arc::new(AtomicBool::new(false));
@@ -283,6 +309,206 @@ fn openssh_privileged_archive_exchange_commits_once_and_reports_uncertainty() {
             "{mode}: {log}"
         );
         assert!(!root.join("unexpected-data").exists(), "{mode}: {log}");
+        assert!(!log.contains(PASSWORD));
+        assert!(!log.contains(SUDO_PASSWORD));
+    }
+}
+
+#[test]
+#[ignore = "requires native OpenSSH sshd, ssh-keygen and Python 3"]
+fn openssh_privileged_archive_update_keeps_publication_when_copy_fails() {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CopyResult {
+        None,
+        Verified,
+        Short,
+        Denied,
+        Revoked,
+    }
+
+    for (mode, copy_result) in [
+        ("update-no-download", CopyResult::None),
+        ("sudo-update-zip-copy", CopyResult::Verified),
+        ("update-copy-short", CopyResult::Short),
+        ("sudo-update-copy-denied", CopyResult::Denied),
+        ("update-copy-revoked", CopyResult::Revoked),
+    ] {
+        let fixture = archive_fixture(mode, UPDATE_COMMAND);
+        let root = &fixture.profile.0;
+        let protected = mode == "sudo-update-zip-copy";
+        let uses_vault = mode.starts_with("sudo-");
+        let spec = CreateSpec {
+            sources: vec!["/fixture/pinned/data".into()],
+            destination: if protected {
+                "/fixture/exports/job.zip"
+            } else {
+                "/fixture/exports/job.tar"
+            }
+            .into(),
+            format: if protected {
+                CreateFormat::ZipPassword
+            } else {
+                CreateFormat::Tar
+            },
+            level: 6,
+            excludes: Vec::new(),
+            output: None,
+            report_payload: copy_result != CopyResult::None,
+            member_layout: protocol::ArchiveMemberLayout::SourceBasename,
+        };
+        let previous = b"prior root-owned archive";
+        let payload = CreatedPayload {
+            bytes: COPY.len() as u64,
+            sha256: Sha256::digest(COPY).into(),
+        };
+        let create = |name: &str| fs::File::create(root.join(name)).unwrap();
+        for (name, request) in [
+            (
+                "expected-review",
+                UpdateRequest::Review { spec: spec.clone() },
+            ),
+            (
+                "expected-prepare",
+                UpdateRequest::Prepare {
+                    spec: spec.clone(),
+                    token: TOKEN.into(),
+                },
+            ),
+        ] {
+            protocol::write_update_request(create(name), &request).unwrap();
+        }
+        for (name, decision) in [
+            ("expected-quarantine", UpdateDecision::Quarantine),
+            ("expected-publish", UpdateDecision::Publish),
+            ("expected-fetch-copy", UpdateDecision::FetchCopy),
+        ] {
+            protocol::write_update_decision(create(name), &decision).unwrap();
+        }
+        for (name, reply) in [
+            (
+                "review",
+                UpdateReply::Reviewed {
+                    review: review(&spec),
+                    existing: Some(CreatedPayload {
+                        bytes: previous.len() as u64,
+                        sha256: Sha256::digest(previous).into(),
+                    }),
+                    receiver: [1; 32],
+                },
+            ),
+            ("password-required", UpdateReply::PasswordRequired),
+            ("prepared", UpdateReply::Prepared { payload }),
+            (
+                "quarantined",
+                UpdateReply::Quarantined {
+                    recovery: RECOVERY.into(),
+                },
+            ),
+            (
+                "published",
+                UpdateReply::Published {
+                    destination: spec.destination.clone(),
+                    payload,
+                    recovery: Some(RECOVERY.into()),
+                    receiver: [2; 32],
+                },
+            ),
+        ] {
+            protocol::write_update_reply(create(name), &reply).unwrap();
+        }
+        if protected {
+            let body = protocol::creation_password_body(PASSWORD).unwrap();
+            fs::write(root.join("expected-password"), &body[..]).unwrap();
+        }
+        match copy_result {
+            CopyResult::Verified | CopyResult::Short => {
+                let mut copy = create("copy");
+                protocol::write_update_reply(&mut copy, &UpdateReply::CopyReady { payload })
+                    .unwrap();
+                let count = COPY.len() - usize::from(copy_result == CopyResult::Short);
+                copy.write_all(&COPY[..count]).unwrap();
+            }
+            CopyResult::Denied => {
+                protocol::write_update_reply(create("copy"), &UpdateReply::CopyFailed).unwrap();
+            }
+            CopyResult::None | CopyResult::Revoked => {}
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let stopped = move || Instant::now() >= deadline;
+        let (connection, pin, daemon) = connect_fixture(&fixture, mode, stopped);
+        let opener = connection.exec_opener().unwrap();
+        assert_eq!(opener.verified_host_key(), Some(&pin));
+        let published = root.join("publish-seen");
+        let denied = Arc::new(AtomicBool::new(false));
+        let observed = Arc::clone(&denied);
+        let copy = spec.report_payload.then(|| create("private-archive-stage"));
+        let result = exchange_privileged_archive_update(
+            &opener,
+            &spec,
+            uses_vault.then(|| SensitiveLine::new(SUDO_PASSWORD).unwrap()),
+            protected.then_some(PASSWORD),
+            copy.as_ref(),
+            stopped,
+            move || {
+                if copy_result == CopyResult::Revoked && published.is_file() {
+                    observed.store(true, Ordering::Release);
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
+                Ok(())
+            },
+        );
+        drop(opener);
+        drop(connection);
+        drop(copy);
+        let output = daemon.join().unwrap();
+        let log = String::from_utf8_lossy(&output.stderr);
+        let publication = result.unwrap_or_else(|error| panic!("{mode}: {error:?}\n{log}"));
+        assert_eq!(publication.payload, payload, "{mode}: {log}");
+        assert_eq!(
+            publication.recovery.as_deref(),
+            Some(RECOVERY),
+            "{mode}: {log}"
+        );
+        assert_eq!(
+            publication.copy_verified,
+            copy_result == CopyResult::Verified
+        );
+        for phase in [
+            "update-channel",
+            "review-seen",
+            "prepare-seen",
+            "quarantine-seen",
+            "publish-seen",
+        ] {
+            assert!(root.join(phase).is_file(), "{mode}, {phase}: {log}");
+        }
+        assert_eq!(root.join("sudo-password-seen").is_file(), uses_vault);
+        assert_eq!(root.join("archive-password-seen").is_file(), protected);
+        assert_eq!(
+            root.join("fetch-copy-seen").is_file(),
+            matches!(
+                copy_result,
+                CopyResult::Verified | CopyResult::Short | CopyResult::Denied
+            ),
+            "{mode}: {log}"
+        );
+        assert_eq!(
+            root.join("copy-not-requested").is_file(),
+            copy_result == CopyResult::Revoked
+        );
+        assert_eq!(
+            denied.load(Ordering::Acquire),
+            copy_result == CopyResult::Revoked
+        );
+        if spec.report_payload {
+            let bytes = fs::read(root.join("private-archive-stage")).unwrap();
+            if copy_result == CopyResult::Verified {
+                assert_eq!(bytes, COPY, "{mode}: {log}");
+            } else {
+                assert!(bytes.is_empty(), "{mode}: {log}");
+            }
+        }
         assert!(!log.contains(PASSWORD));
         assert!(!log.contains(SUDO_PASSWORD));
     }

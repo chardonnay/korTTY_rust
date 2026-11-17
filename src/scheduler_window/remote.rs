@@ -2,6 +2,7 @@ use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 use globset::{GlobBuilder, GlobSet, GlobSetBuilder};
+use kortty_server_archive::protocol::ArchiveMemberLayout;
 use serde::{Deserialize, Serialize};
 
 use crate::sftp_window::privileged_file::ProtectedOperation;
@@ -141,10 +142,10 @@ impl RemoteAction {
             return Err(imported_archive::REVIEW_REQUIRED);
         }
         if let Some((transfer, upload)) = self.rsync_transfer()
-            && (transfer.uses_existing_destination() || transfer.uses_passwordless_sudo())
+            && transfer.requires_reviewed_receiver(upload)
         {
             transfer.validate(upload)?;
-            transfer.require_group_review()?;
+            transfer.require_group_review(upload)?;
         }
         self.require_delete_confirmation()
     }
@@ -185,6 +186,12 @@ impl RemoteAction {
             Self::Archive(archive) if archive.server_output.is_some() => {
                 Err("Choose server-only creation for archive output metadata")
             }
+            Self::Archive(archive) if archive.reuse_output => {
+                Err("Choose server-only creation to reuse an archive output")
+            }
+            Self::Archive(archive) if archive.member_layout == ArchiveMemberLayout::ServerPath => {
+                Err("Choose server-only creation to preserve Java archive paths")
+            }
             Self::Archive(archive) => archive.validate(),
             Self::ServerArchive(archive) => archive.server_spec().map(|_| ()),
             Self::ImportedArchive(archive) => archive.settings.validate(),
@@ -211,7 +218,6 @@ impl RemoteAction {
                     Self::PrivilegedTreeDownload(_) => Some(sync::Direction::Download),
                     _ => None,
                 };
-                copy.validate_replacement(privileged_direction.is_some())?;
                 if let Some(settings) = &copy.standing
                     && (privileged_direction.is_some() || settings.validate().is_err())
                 {
@@ -372,6 +378,14 @@ pub(crate) struct Archive {
     pub download: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_output: Option<kortty_server_archive::protocol::OutputMetadata>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reuse_output: bool,
+    #[serde(default, skip_serializing_if = "source_basename_layout")]
+    pub member_layout: ArchiveMemberLayout,
+}
+
+fn source_basename_layout(layout: &ArchiveMemberLayout) -> bool {
+    *layout == ArchiveMemberLayout::SourceBasename
 }
 
 impl Archive {
@@ -403,6 +417,7 @@ impl Archive {
             excludes: self.excludes.clone(),
             output: self.server_output,
             report_payload: self.download.is_some(),
+            member_layout: self.member_layout,
         })
     }
 
@@ -447,8 +462,24 @@ impl Archive {
                 _ => "Choose ZIP compression 0–9 or bzip2 compression 1–9",
             });
         }
+        let server_paths = self.member_layout == ArchiveMemberLayout::ServerPath;
+        if server_paths
+            && (!self.format.supports_server_member_paths()
+                || self.target.root() != "/"
+                || self.sources.iter().any(|source| source.root() != "/"))
+        {
+            return Err("Java archive paths require ZIP, TAR or TAR.BZ2 and absolute Linux paths");
+        }
         for (index, source) in self.sources.iter().enumerate() {
-            if source == &self.target
+            if server_paths {
+                if source.contains(&self.target)
+                    || self.sources[..index]
+                        .iter()
+                        .any(|other| source.contains(other) || other.contains(source))
+                {
+                    return Err("Choose disjoint archive source paths and a target outside them");
+                }
+            } else if source == &self.target
                 || self.sources[..index]
                     .iter()
                     .any(|other| source.basename() == other.basename())
@@ -550,6 +581,13 @@ impl ArchiveFormat {
 
     pub(crate) fn is_zip(self) -> bool {
         matches!(self, Self::Zip | Self::ZipPassword)
+    }
+
+    pub(super) fn supports_server_member_paths(self) -> bool {
+        matches!(
+            self,
+            Self::Zip | Self::ZipPassword | Self::Tar | Self::TarBz2
+        )
     }
 
     pub(crate) fn is_password_protected(self) -> bool {
@@ -764,6 +802,92 @@ mod tests {
         let download = RemoteAction::ServerArchive(archive);
         assert!(download.validate().is_ok());
         assert!(download.transfers_files() && download.writes_local_file());
+    }
+
+    #[test]
+    fn java_archive_members_use_disjoint_server_paths_and_remain_opt_in() {
+        use serde_json::json;
+
+        let legacy = json!({
+            "kind": "server_archive", "sources": ["/srv/a/report"],
+            "target": "/backups/report.zip", "format": "zip", "level": 6,
+        });
+        let RemoteAction::ServerArchive(archive) =
+            serde_json::from_value::<RemoteAction>(legacy.clone()).unwrap()
+        else {
+            unreachable!()
+        };
+        assert_eq!(archive.member_layout, ArchiveMemberLayout::SourceBasename);
+        assert!(
+            serde_json::to_value(&archive)
+                .unwrap()
+                .get("member_layout")
+                .is_none()
+        );
+        assert!(
+            serde_json::to_value(archive.server_spec().unwrap())
+                .unwrap()
+                .get("member_layout")
+                .is_none()
+        );
+
+        let mut checked = legacy;
+        checked["sources"] = json!(["/srv/a/report", "/srv/b/report"]);
+        assert!(
+            serde_json::from_value::<RemoteAction>(checked.clone())
+                .unwrap()
+                .validate()
+                .is_err()
+        );
+        checked["member_layout"] = json!("server_path");
+        for (format, target) in [
+            ("zip", "/backups/report.zip"),
+            ("tar", "/backups/report.tar"),
+            ("tar_bz2", "/backups/report.tar.bz2"),
+        ] {
+            checked["format"] = json!(format);
+            checked["target"] = json!(target);
+            assert!(
+                serde_json::from_value::<RemoteAction>(checked.clone())
+                    .unwrap()
+                    .validate()
+                    .is_ok()
+            );
+        }
+
+        for (kind, format, target, sources) in [
+            (
+                "archive",
+                "zip",
+                "/backups/report.zip",
+                ["/srv/a", "/srv/b"],
+            ),
+            (
+                "server_archive",
+                "seven_zip",
+                "/backups/report.7z",
+                ["/srv/a", "/srv/b"],
+            ),
+            (
+                "server_archive",
+                "zip",
+                "/backups/report.zip",
+                ["/srv/a", "/srv/a/report"],
+            ),
+            (
+                "server_archive",
+                "zip",
+                "/srv/a/report.zip",
+                ["/srv/a", "/srv/b"],
+            ),
+        ] {
+            let action: RemoteAction = serde_json::from_value(json!({
+                "kind": kind, "format": format, "target": target, "sources": sources,
+                "level": 6, "member_layout": "server_path",
+            }))
+            .unwrap();
+            assert!(action.validate().is_err());
+        }
     }
 
     #[test]

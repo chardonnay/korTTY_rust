@@ -25,8 +25,7 @@ const ICONS: [(&str, &[u8]); 2] = [
     ),
 ];
 
-// Local files, model files, and serial ports have the same access as the Java
-// Flatpak. Shell processes remain inside Flatpak and use the runtime programs.
+// Match the Java Flatpak's host file, serial port and host shell access.
 const PERMISSIONS: &[&str] = &[
     "--no-inherit-permissions",
     "--share=network",
@@ -36,6 +35,7 @@ const PERMISSIONS: &[&str] = &[
     "--device=all",
     "--filesystem=host",
     "--talk-name=org.freedesktop.Notifications",
+    "--talk-name=org.freedesktop.Flatpak",
     "--env=SHELL=/bin/bash",
 ];
 
@@ -136,6 +136,7 @@ fn check_runtime(build: &Path) -> Result<()> {
                 "-ec",
                 r#"
 test -x /bin/bash
+test -x /usr/bin/flatpak-spawn
 for program do
     if ! linked=$(LC_ALL=C /usr/bin/ldd -r "/app/bin/$program" 2>&1); then
         printf '%s\n' "$linked" >&2

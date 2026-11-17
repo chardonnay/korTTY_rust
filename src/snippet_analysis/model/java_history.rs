@@ -36,6 +36,10 @@ pub(crate) struct Evidence {
 }
 
 impl Evidence {
+    pub(crate) fn snapshot(&self, run: &ApplyRun, kind: Snapshot) -> Option<&Arc<str>> {
+        self.attachments.get(run.snapshots()[kind as usize])
+    }
+
     pub(crate) fn validate(&self) -> io::Result<()> {
         let mut run_ids = HashSet::new();
         let good = text(&self.profile_id, 256)
@@ -81,6 +85,27 @@ impl Evidence {
             }
         }
         Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Snapshot {
+    Base,
+    Result,
+    Accepted,
+    Checkpoint,
+}
+
+impl Snapshot {
+    pub(crate) const ALL: [Self; 4] = [Self::Base, Self::Result, Self::Accepted, Self::Checkpoint];
+
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Base => "Base",
+            Self::Result => "Result",
+            Self::Accepted => "Accepted",
+            Self::Checkpoint => "Checkpoint",
+        }
     }
 }
 

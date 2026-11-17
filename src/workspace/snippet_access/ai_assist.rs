@@ -44,7 +44,7 @@ struct Panel {
 struct Choice {
     id: ProfileId,
     name: String,
-    model: String,
+    model: Option<String>,
     destination: String,
     route: Route,
 }
@@ -58,7 +58,8 @@ enum Route {
 
 impl fmt::Display for Choice {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} · {}", self.name, self.model)?;
+        let model = self.model.as_deref().unwrap_or("Server selects the model");
+        write!(f, "{} · {model}", self.name)?;
         match self.route {
             Route::Local => Ok(()),
             Route::Https => f.write_str(" · HTTPS"),
@@ -79,7 +80,12 @@ impl Choice {
             Route::Cli => {
                 config.snippet_analysis_cli_transport(&self.cli_reference()?, &self.destination)
             }
-            Route::Local | Route::Https => config.snippet_analysis_transport(self.id),
+            Route::Local | Route::Https => config.snippet_assistance_transport(
+                self.id,
+                self.model.as_deref(),
+                &self.destination,
+                self.route == Route::Https,
+            ),
         }
     }
 }
@@ -1072,11 +1078,11 @@ impl Panel {
         self.profiles = config
             .map(|config| {
                 config
-                    .snippet_analysis_profiles()
+                    .snippet_assistance_profiles()
                     .map(|(id, name, model, destination, remote)| Choice {
                         id,
                         name: name.into(),
-                        model: model.into(),
+                        model: model.map(str::to_owned),
                         destination,
                         route: if remote { Route::Https } else { Route::Local },
                     })
@@ -1089,7 +1095,7 @@ impl Panel {
                     |(id, name, model, destination)| Choice {
                         id,
                         name: name.into(),
-                        model: model.into(),
+                        model: Some(model.into()),
                         destination,
                         route: Route::Cli,
                     },
@@ -1699,7 +1705,7 @@ mod tests {
             panic!("expected HTTPS review: {:?}", panel.status);
         };
         assert_eq!(reviewed.choice.destination, format!("{endpoint}/messages"));
-        assert_eq!(reviewed.choice.model, "reviewed-model");
+        assert_eq!(reviewed.choice.model.as_deref(), Some("reviewed-model"));
         assert!(matches!(
             reviewed.outbound.as_ref(),
             Some(Outbound::Https(_))
@@ -1963,19 +1969,24 @@ mod tests {
         let root = scratch.0.canonicalize().unwrap();
         let (listener, _) = listener();
         let endpoint = listener.local_addr().unwrap().to_string();
-        let configuration = |model: &str| -> Configuration {
+        let configuration = |model: Option<&str>| -> Configuration {
             serde_json::from_value(json!({
                 "profiles": {
                     "profiles": [{
-                        "id": 1, "name": "Fixture", "endpoint": endpoint, "model": model,
+                        "id": 1, "name": "Fixture", "endpoint": endpoint,
+                        "model": model.unwrap_or_default(),
+                        "model_mode": if model.is_some() { "manual" } else { "server-default" },
                         "usage_budget": {"token_limit": 2000}, "max_output_tokens": 321
+                    }, {
+                        "id": 2, "name": "Named fallback", "endpoint": endpoint, "model": "fallback"
                     }],
-                    "default":1,"last_id":1,
-                }
+                    "default":2,"last_id":2,
+                },
+                "local": {"roles": [null, 1, null, null]}
             }))
             .unwrap()
         };
-        configuration("fixture-original")
+        configuration(None)
             .save_fixture_at(&root, &Configuration::default())
             .unwrap();
         let mut workspace = Workspace::default();
@@ -2017,6 +2028,13 @@ mod tests {
             panic!("expected reviewed request: {:?}", panel.status);
         };
         assert!(review.quota.loading());
+        assert_eq!(review.choice.id, 1);
+        assert!(
+            review
+                .choice
+                .to_string()
+                .contains("Server selects the model")
+        );
         let approved_payload = review.request.input.clone();
         let approved_system = review.request.system.clone();
         assert!(!approved_payload.contains("fixture-private-value"));
@@ -2064,6 +2082,7 @@ mod tests {
         };
         let _ = workspace.update_snippets(id, message);
         let wire = server.join().unwrap();
+        assert!(wire.get("model").is_none());
         assert_eq!(wire["max_tokens"], 321);
         assert_eq!(wire["messages"][0]["content"], approved_system.as_ref());
         assert_eq!(
@@ -2104,7 +2123,7 @@ mod tests {
                 .contains("Recorded usage is incomplete")
         );
         let _ = send(&mut workspace, ActionMessage::ShowLast);
-        workspace.set_test_ai_configuration(configuration("fixture-changed"));
+        workspace.set_test_ai_configuration(configuration(Some("fixture-changed")));
         let _ = send(&mut workspace, ActionMessage::Rerun);
         let panel = workspace.snippets[&id].assist.0.as_ref().unwrap();
         assert!(

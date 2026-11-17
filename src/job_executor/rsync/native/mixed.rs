@@ -4,8 +4,11 @@ use std::cell::Cell;
 
 use kortty_jobs::RunId;
 use kortty_server_archive::privileged_rsync::{Operation, Review, SourceLimits, Spec};
-use kortty_server_archive::rsync_tree::{self as protocol, DeleteScope, ExistingTree, projection};
+use kortty_server_archive::rsync_tree::{
+    self as protocol, DeleteScope, ExistingTree, RecurringReceiver, projection,
+};
 
+use crate::job_executor::rsync::{RecurringReceiverTarget, UploadCreation};
 use crate::scheduler_window::RemotePath;
 use crate::scheduler_window::rsync::{
     Elevation, MixedDestination, MixedPlan, MixedPrivilegedReview, MixedReceiver, MixedReview,
@@ -17,11 +20,17 @@ use crate::sftp_window::{
     scheduled::Client,
 };
 
+use super::recurring::LocalTree;
 use super::*;
 
 const INPUT_FILE: &str = "source-file";
 const SOURCE_CHANGED: &str = "The mixed rsync inputs changed. Review the transfer again.";
 const STAGE_FAILED: &str = "Could not verify the combined private rsync stage.";
+
+enum LocalReceiver {
+    Existing(Box<local_existing::Receiver>),
+    Vacant(Box<local_existing::VacantLocalTreeReceiver>),
+}
 
 pub(in crate::job_executor::rsync) fn review(
     client: &mut Client,
@@ -48,7 +57,7 @@ pub(in crate::job_executor::rsync) fn review(
             (inputs, Some(MixedPrivilegedReview::Download(proofs)))
         }
         MixedDestination::Local(_) => (
-            remote_inputs(client, &target.sources, &stopped, None)
+            remote_inputs(client, &target.sources, &stopped, None, 0)
                 .map_err(|error| error.detail)?
                 .1,
             None,
@@ -56,6 +65,7 @@ pub(in crate::job_executor::rsync) fn review(
     };
     let projected =
         projection::project(&inputs, target.delete).map_err(|error| error.to_string())?;
+    let mut ordinary_receiver = None;
     let receiver = match &target.destination {
         MixedDestination::Server(destination) if elevated => {
             let mut spec = Spec {
@@ -66,17 +76,30 @@ pub(in crate::job_executor::rsync) fn review(
                     delete: DeleteScope::Retain,
                 },
             };
-            let proof = privileged::review(exec, &spec, cancelled.clone(), authority.clone())
-                .or_else(|_| {
-                    require_running(&stopped).map_err(|_| transfer_stopped())?;
-                    spec.operation = Operation::Upload {
-                        directory: true,
-                        replace: true,
-                        delete: projected.delete.clone(),
-                    };
-                    privileged::review(exec, &spec, cancelled, authority.clone())
-                })
-                .map_err(|error| error.detail)?;
+            let replacement = Operation::Upload {
+                directory: true,
+                replace: true,
+                delete: projected.delete.clone(),
+            };
+            let proof = if target.review_vacant {
+                spec.operation = replacement;
+                privileged::review_destination(
+                    exec,
+                    &spec,
+                    cancelled,
+                    authority.clone(),
+                    Some(UploadCreation::Tree),
+                )
+            } else {
+                privileged::review(exec, &spec, cancelled.clone(), authority.clone()).or_else(
+                    |_| {
+                        require_running(&stopped).map_err(|_| transfer_stopped())?;
+                        spec.operation = replacement;
+                        privileged::review(exec, &spec, cancelled, authority.clone())
+                    },
+                )
+            }
+            .map_err(|error| error.detail)?;
             let snapshot = proof.inventory.map(|inventory| ExistingTree {
                 inventory,
                 fingerprint: proof.fingerprint,
@@ -85,6 +108,27 @@ pub(in crate::job_executor::rsync) fn review(
             MixedReceiver::Server {
                 destination: destination.clone(),
                 snapshot,
+            }
+        }
+        MixedDestination::Server(destination) if target.review_vacant => {
+            let proof = existing::review_recurring(
+                exec,
+                RecurringReceiverTarget {
+                    destination,
+                    directory: true,
+                    delete: &projected.delete,
+                },
+                cancelled,
+                authority.clone(),
+            )
+            .map_err(|error| error.detail)?;
+            ordinary_receiver = Some(proof);
+            MixedReceiver::Server {
+                destination: destination.clone(),
+                snapshot: match proof {
+                    RecurringReceiver::Existing { snapshot } => Some(snapshot),
+                    RecurringReceiver::Vacant { .. } => None,
+                },
             }
         }
         MixedDestination::Server(destination) => {
@@ -112,27 +156,8 @@ pub(in crate::job_executor::rsync) fn review(
             }
         }
         MixedDestination::Local(destination) => {
-            let vacant = if elevated {
-                match PrivateTreeDestination::inspect(destination) {
-                    Ok(_) => true,
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
-                    Err(error) => return Err(error.to_string()),
-                }
-            } else {
-                VerifiedTreeStage::review_vacancy(destination).map_err(|error| error.to_string())?
-            };
-            let snapshot = if vacant {
-                None
-            } else {
-                Some(
-                    local_existing::inspect(destination, &stopped)
-                        .map_err(|error| error.to_string())?,
-                )
-            };
-            MixedReceiver::Local {
-                destination: destination.clone(),
-                snapshot,
-            }
+            review_local_receiver(destination, target.review_vacant, elevated, &stopped)
+                .map_err(|error| error.to_string())?
         }
     };
     require_running(&stopped).map_err(|error| error.to_string())?;
@@ -141,12 +166,48 @@ pub(in crate::job_executor::rsync) fn review(
         plan,
         receiver,
         privileged,
+        ordinary_receiver,
     };
     authority().map_err(|error| error.to_string())?;
     if !target.matches(&review) {
         return Err("The mixed rsync review changed or is inconsistent.".into());
     }
     Ok(review)
+}
+
+fn review_local_receiver(
+    destination: &Path,
+    review_vacant: bool,
+    elevated: bool,
+    stopped: &impl Fn() -> bool,
+) -> io::Result<MixedReceiver> {
+    let absent = if review_vacant {
+        match std::fs::symlink_metadata(destination) {
+            Ok(_) => false,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error),
+        }
+    } else if elevated {
+        match PrivateTreeDestination::inspect(destination) {
+            Ok(_) => true,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => false,
+            Err(error) => return Err(error),
+        }
+    } else {
+        VerifiedTreeStage::review_vacancy(destination)?
+    };
+    let snapshot = (!absent)
+        .then(|| local_existing::inspect(destination, stopped))
+        .transpose()?;
+    let vacant = (absent && review_vacant)
+        .then(|| local_existing::VacantLocalTreeReceiver::inspect(destination, stopped))
+        .transpose()?
+        .map(Box::new);
+    Ok(MixedReceiver::Local {
+        destination: destination.to_owned(),
+        snapshot,
+        vacant,
+    })
 }
 
 pub(super) fn run(
@@ -188,19 +249,23 @@ pub(super) fn run(
             destination,
             snapshot,
         } => {
-            let snapshot = match context.recurring {
-                Some(route) => Some(route.remote(destination)?),
-                None => *snapshot,
+            let privileged = match &approval.privileged {
+                Some(MixedPrivilegedReview::Upload(proof)) => Some(proof),
+                _ => None,
+            };
+            let snapshot = match (privileged, approval.ordinary_receiver, context.recurring) {
+                (None, None, Some(route)) => Some(route.remote(destination)?),
+                _ => *snapshot,
             };
             let limits = context
                 .recurring
-                .map(recurring::Route::source_limits)
+                .map(|route| route.source_limits(0))
                 .transpose()?
                 .unwrap_or(SourceLimits::MAXIMUM);
             let scanned = local_inputs(&target.sources, Some(inputs), limits, &stopped)
                 .map_err(|_| Failure::blocked(SOURCE_CHANGED))?;
             let projected =
-                require_projection(&target, &approval.plan, &scanned, context.recurring)?;
+                require_projection(&target, &approval.plan, &scanned, context.recurring, 0)?;
             let (temp, listener, endpoint) = stage_bridge(context, &stopped)?;
             let output = create_scratch_child(
                 temp.directory().map_err(|_| stage_failed())?,
@@ -210,7 +275,7 @@ pub(super) fn run(
             arrange(&projected, inputs, &output, false, &stopped).map_err(|_| stage_failed())?;
             drop(output);
             let transfer = context.transfer(action, &temp, &stopped);
-            if let Some(MixedPrivilegedReview::Upload(proof)) = &approval.privileged {
+            if let Some(proof) = privileged {
                 privileged::Control::from_context(context)?.upload_staged(
                     transfer,
                     listener,
@@ -222,10 +287,27 @@ pub(super) fn run(
                     },
                     id,
                 )?
+            } else if let Some(approved) = approval.ordinary_receiver {
+                let route = context.recurring.ok_or_else(|| {
+                    Failure::blocked("A recurring rsync run requires its current firing approval.")
+                })?;
+                existing::apply_ordinary_recurring(
+                    transfer,
+                    listener,
+                    &endpoint,
+                    id,
+                    existing::Receiver {
+                        destination,
+                        approval: existing::ReceiverApproval::Recurring(approved),
+                        scope: &projected.delete,
+                        projected: Some(projected.inventory),
+                    },
+                    route,
+                )?
             } else if let Some(snapshot) = snapshot {
                 let receiver = existing::Receiver {
                     destination,
-                    snapshot,
+                    approval: existing::ReceiverApproval::Directory(snapshot),
                     scope: &projected.delete,
                     projected: Some(projected.inventory),
                 };
@@ -263,18 +345,49 @@ pub(super) fn run(
         MixedReceiver::Local {
             destination,
             snapshot,
+            vacant,
         } => {
             action
                 .require_safe_mixed_local_program()
                 .map_err(Failure::blocked)?;
-            let snapshot = match context.recurring {
-                Some(route) => Some(route.local(destination)?),
-                None => *snapshot,
+            let proof = match (context.recurring, snapshot, vacant) {
+                (Some(route), Some(_), None) | (Some(route), None, Some(_)) => {
+                    Some(route.local_tree(destination, vacant.as_deref())?)
+                }
+                (None, Some(snapshot), None) => Some(LocalTree::Existing(*snapshot)),
+                (None, None, Some(vacant))
+                    if action.standing.is_none() && action.allow_vacant_directory_download =>
+                {
+                    Some(LocalTree::Vacant(**vacant))
+                }
+                (None, None, None) => None,
+                _ => return Err(vacant_local_changed()),
             };
-            let receiver = snapshot
-                .map(|snapshot| local_existing::Receiver::prepare(destination, snapshot, &stopped))
+            let parents = context.local_parents()?;
+            let receiver = proof
+                .map(|proof| match proof {
+                    LocalTree::Existing(snapshot) => {
+                        local_existing::Receiver::prepare(destination, snapshot, &stopped)
+                            .map(Box::new)
+                            .map(LocalReceiver::Existing)
+                    }
+                    LocalTree::Vacant(snapshot) => {
+                        local_existing::VacantLocalTreeReceiver::prepare_with_parents(
+                            destination,
+                            snapshot,
+                            &parents,
+                            &stopped,
+                        )
+                        .map(Box::new)
+                        .map(LocalReceiver::Vacant)
+                    }
+                })
                 .transpose()
                 .map_err(|_| Failure::blocked("The reviewed local rsync receiver changed."))?;
+            let parent_entries = match &receiver {
+                Some(LocalReceiver::Vacant(receiver)) => receiver.missing_parent_count(),
+                _ => 0,
+            };
             let projected =
                 if let Some(MixedPrivilegedReview::Download(proofs)) = &approval.privileged {
                     let fresh;
@@ -284,11 +397,16 @@ pub(super) fn run(
                             context,
                             &target.sources,
                             proofs,
-                            route.source_limits()?,
+                            route.source_limits(parent_entries)?,
                             &stopped,
                         )?;
-                        let projected =
-                            require_projection(&target, &approval.plan, &scanned, Some(route))?;
+                        let projected = require_projection(
+                            &target,
+                            &approval.plan,
+                            &scanned,
+                            Some(route),
+                            parent_entries,
+                        )?;
                         (fresh.as_slice(), Some(projected))
                     } else {
                         (proofs.as_slice(), None)
@@ -309,13 +427,23 @@ pub(super) fn run(
                         }
                         expected
                     } else {
-                        require_projection(&target, &approval.plan, &scanned, None)?
+                        require_projection(&target, &approval.plan, &scanned, None, 0)?
                     }
                 } else {
-                    let (sources, scanned) =
-                        remote_inputs(client, &target.sources, &stopped, context.recurring)?;
-                    let projected =
-                        require_projection(&target, &approval.plan, &scanned, context.recurring)?;
+                    let (sources, scanned) = remote_inputs(
+                        client,
+                        &target.sources,
+                        &stopped,
+                        context.recurring,
+                        parent_entries,
+                    )?;
+                    let projected = require_projection(
+                        &target,
+                        &approval.plan,
+                        &scanned,
+                        context.recurring,
+                        parent_entries,
+                    )?;
                     for (index, input) in sources.into_iter().enumerate() {
                         receive_source(client, context, action, inputs, index, input, &stopped)?;
                     }
@@ -328,29 +456,35 @@ pub(super) fn run(
                         .map_err(|_| stage_failed())?;
                     arrange(&projected, inputs, &output, true, &stopped)
                         .map_err(|_| stage_failed())?;
+                    let incoming = local_existing::Incoming {
+                        directory: &output,
+                        inventory: projected.inventory,
+                        delete: &projected.delete,
+                    };
+                    let arm =
+                        |removed| context.recurring.map_or(Ok(()), |route| route.arm(removed));
                     let local_existing::Published {
                         completion,
                         successor,
-                    } = receiver.publish(
-                        local_existing::Incoming {
-                            directory: &output,
-                            inventory: projected.inventory,
-                            delete: &projected.delete,
-                        },
-                        &stopped,
-                        &authorize,
-                        id,
-                        |removed| context.recurring.map_or(Ok(()), |route| route.arm(removed)),
-                    )?;
+                        parents,
+                    } = match receiver {
+                        LocalReceiver::Existing(receiver) => {
+                            receiver.publish(incoming, &stopped, &authorize, id, arm)
+                        }
+                        LocalReceiver::Vacant(receiver) => {
+                            receiver.publish(incoming, &stopped, &authorize, id, arm)
+                        }
+                    }?;
                     match context.recurring {
-                        Some(route) => route.confirm(
+                        Some(route) => route.confirm_with_parents(
                             completion,
                             successor.map(|snapshot| rsync::standing::Receiver::Local {
                                 destination: destination.clone(),
                                 snapshot,
                             }),
+                            &parents,
                         ),
-                        None => completion,
+                        None => context.record_local_parents(completion, parents),
                     }
                 }
                 None => {
@@ -432,6 +566,7 @@ fn require_projection(
     reviewed: &MixedPlan,
     sources: &[projection::Source],
     recurring: Option<recurring::Route<'_>>,
+    parent_entries: u32,
 ) -> Result<projection::Projection, Failure> {
     let projected = projection::project(sources, target.delete)
         .map_err(|_| Failure::blocked(SOURCE_CHANGED))?;
@@ -450,7 +585,10 @@ fn require_projection(
         {
             return Err(Failure::blocked(SOURCE_CHANGED));
         }
-        route.reserve(current.sources.into_iter().map(|source| source.inventory))?;
+        route.reserve(
+            current.sources.into_iter().map(|source| source.inventory),
+            parent_entries,
+        )?;
     } else if &current != reviewed {
         return Err(Failure::blocked(SOURCE_CHANGED));
     }
@@ -646,11 +784,12 @@ fn remote_inputs(
     sources: &[String],
     stopped: &impl Fn() -> bool,
     recurring: Option<recurring::Route<'_>>,
+    parent_entries: u32,
 ) -> Result<(Vec<RemoteInput>, Vec<projection::Source>), Failure> {
     let mut budget = protocol::Manifest::default();
     let mut limits = match recurring {
         Some(recurring) => {
-            let remaining = recurring.remaining()?;
+            let remaining = recurring.remaining(parent_entries)?;
             tree::Limits {
                 entries: remaining.entries as usize,
                 bytes: remaining.bytes,

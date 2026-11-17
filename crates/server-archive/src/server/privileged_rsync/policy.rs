@@ -29,7 +29,8 @@ struct Configuration {
 struct Account {
     uid: u32,
     gid: u32,
-    handoff_root: String,
+    #[serde(default)]
+    handoff_root: Option<String>,
     #[serde(default)]
     source_roots: Vec<String>,
     #[serde(default)]
@@ -50,7 +51,7 @@ impl Account {
 pub(super) struct Rules {
     configuration: ConfigFile,
     login: (u32, u32),
-    handoff: Root,
+    handoff: Option<Root>,
     sources: Vec<Root>,
     destinations: Vec<Root>,
     replacements: Vec<Root>,
@@ -59,6 +60,14 @@ pub(super) struct Rules {
 
 impl Rules {
     pub(super) fn load() -> io::Result<Self> {
+        Self::load_for(true)
+    }
+
+    pub(super) fn load_inline_upload() -> io::Result<Self> {
+        Self::load_for(false)
+    }
+
+    fn load_for(with_handoff: bool) -> io::Result<Self> {
         require_installation()?;
         if getgid().as_raw() != 0 || getegid().as_raw() != 0 {
             return Err(invalid("Privileged rsync requires the root UID and GID"));
@@ -69,16 +78,25 @@ impl Rules {
         );
         let (configuration, bytes) = ConfigFile::read(CONFIG)?;
         let account = account(&bytes, login)?;
-        let sources = open_optional(account.source_roots)?;
+        let sources = if with_handoff {
+            open_optional(account.source_roots)?
+        } else {
+            Vec::new()
+        };
         let destinations = open_optional(account.destination_roots)?;
         let replacements = open_optional(account.replace_roots)?;
         for root in &replacements {
             select_root(&destinations, &root.path)?.open_descendant(&root.path)?;
         }
-        let handoff = Root::open_all(vec![account.handoff_root])?
-            .pop()
-            .expect("one handoff root");
-        require_searchable(&handoff.path)?;
+        let handoff = with_handoff
+            .then(|| {
+                let path = account
+                    .handoff_root
+                    .ok_or_else(|| invalid("Configure an rsync handoff root for this login"))?;
+                require_searchable(&path)?;
+                Ok::<_, io::Error>(Root::open_all(vec![path])?.pop().expect("one handoff root"))
+            })
+            .transpose()?;
         let mut rules = Self {
             configuration,
             login,
@@ -101,12 +119,12 @@ impl Rules {
     }
 
     pub(super) fn handoff(&self) -> io::Result<(String, Directory, u64)> {
-        require_searchable(&self.handoff.path)?;
-        Ok((
-            self.handoff.path.clone(),
-            self.handoff.open_current()?,
-            self.handoff.mount,
-        ))
+        let root = self
+            .handoff
+            .as_ref()
+            .ok_or_else(|| invalid("Configure an rsync handoff root for this login"))?;
+        require_searchable(&root.path)?;
+        Ok((root.path.clone(), root.open_current()?, root.mount))
     }
 
     pub(super) fn source_parent(&self, path: &str, parent: &str) -> io::Result<(Directory, u64)> {
@@ -140,7 +158,9 @@ impl Rules {
 
     pub(super) fn require_current(&self) -> io::Result<()> {
         let (configuration, _) = ConfigFile::read(CONFIG)?;
-        require_searchable(&self.handoff.path)?;
+        if let Some(handoff) = &self.handoff {
+            require_searchable(&handoff.path)?;
+        }
         if self.current_revision(&configuration)? != self.revision {
             return Err(invalid(
                 "The privileged rsync configuration or an allowed root changed",
@@ -154,7 +174,9 @@ impl Rules {
         configuration.hash_into(&mut hash);
         hash.update(self.login.0.to_be_bytes());
         hash.update(self.login.1.to_be_bytes());
-        for root in std::iter::once(&self.handoff)
+        for root in self
+            .handoff
+            .iter()
             .chain(&self.sources)
             .chain(&self.destinations)
             .chain(&self.replacements)
@@ -186,22 +208,33 @@ fn account(bytes: &[u8], login: (u32, u32)) -> io::Result<Account> {
     for (index, current) in configuration.accounts.iter().enumerate() {
         valid_id(current.uid)?;
         valid_id(current.gid)?;
-        if current.handoff_root.len() > 960 || !valid_path(&current.handoff_root) {
+        for root in current.roots() {
+            absolute_file(root)?;
+        }
+        let earlier = &configuration.accounts[..index];
+        if earlier
+            .iter()
+            .any(|other| (current.uid, current.gid) == (other.uid, other.gid))
+        {
+            return Err(invalid("Privileged file rules require unique accounts"));
+        }
+        let Some(handoff) = &current.handoff_root else {
+            continue;
+        };
+        if handoff.len() > 960 || !valid_path(handoff) {
             return Err(invalid(
                 "Choose a canonical privileged rsync handoff path of at most 960 bytes",
             ));
         }
-        for root in current.roots() {
-            absolute_file(root)?;
-        }
-        if configuration.accounts[..index].iter().any(|other| {
-            (current.uid, current.gid) == (other.uid, other.gid)
-                || overlaps(&current.handoff_root, &other.handoff_root)
-        }) || configuration
-            .accounts
+        if earlier
             .iter()
-            .flat_map(Account::roots)
-            .any(|root| overlaps(&current.handoff_root, root))
+            .filter_map(|other| other.handoff_root.as_deref())
+            .any(|other| overlaps(handoff, other))
+            || configuration
+                .accounts
+                .iter()
+                .flat_map(Account::roots)
+                .any(|root| overlaps(handoff, root))
         {
             return Err(invalid(
                 "Privileged rsync needs unique accounts and isolated handoff roots",
@@ -276,8 +309,11 @@ mod tests {
             {"uid":1002,"gid":1003,"handoff_root":"/srv/stage/bob","destination_roots":["/srv/out"]}
         ]}"#;
         assert_eq!(
-            account(bytes, (1000, 1001)).unwrap().handoff_root,
-            "/srv/stage/alice"
+            account(bytes, (1000, 1001))
+                .unwrap()
+                .handoff_root
+                .as_deref(),
+            Some("/srv/stage/alice")
         );
         assert!(account(bytes, (1000, 1003)).is_err());
         let changed = String::from_utf8(bytes.to_vec())

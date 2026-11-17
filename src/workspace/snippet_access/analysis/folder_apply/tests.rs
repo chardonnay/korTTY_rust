@@ -56,13 +56,46 @@ fn next_output(
 
 #[test]
 fn folder_reviewed_apply_writes_only_selected_files_after_rechecking_editors() {
+    reviewed_folder_apply(Fixture::Local);
+}
+
+#[test]
+fn https_folder_apply_checks_unselected_context_and_rejects_revocation() {
+    reviewed_folder_apply(Fixture::Protected);
+    reviewed_folder_apply(Fixture::Revoked);
+}
+
+#[test]
+#[ignore = "requires the private HTTPS apply fixture and its dedicated CA"]
+fn https_folder_apply_transmits_reviewed_source_and_publishes_only_the_accepted_file() {
+    reviewed_folder_apply(Fixture::Tls);
+}
+
+#[derive(Clone, Copy)]
+enum Fixture {
+    Local,
+    Protected,
+    Revoked,
+    Tls,
+}
+
+fn reviewed_folder_apply(fixture: Fixture) {
     let _exclusive = exclusive_run();
+    let remote = !matches!(fixture, Fixture::Local);
+    let protected = matches!(fixture, Fixture::Protected);
+    let tls = matches!(fixture, Fixture::Tls);
+    let secret = "opaque_project_only_fixture_83";
     let profile = Profile::new();
     let mut library = Library::open(profile.path()).unwrap();
     let folder = library.create_folder(None, "Project").unwrap();
     let mut files = Vec::new();
     for name in ["alpha", "beta", "gamma"] {
-        let content = format!("echo {name}\r\n");
+        let value = if protected && name == "alpha" {
+            secret
+        } else {
+            name
+        };
+        let content = format!("echo {value}\r\n");
         files.push(
             library
                 .save_with_metadata(
@@ -124,14 +157,48 @@ fn folder_reviewed_apply_writes_only_selected_files_after_rechecking_editors() {
     store(&window).unwrap().append(subject, record).unwrap();
 
     let (listener, _) = listener();
-    let endpoint = listener.local_addr().unwrap().to_string();
+    let endpoint = if tls {
+        let endpoint = std::env::var("KORTTY_TEST_HTTPS_APPLY_URL").unwrap();
+        let url = url::Url::parse(&endpoint).unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.path(), "/tenant/v1/apply/");
+        endpoint
+    } else if remote {
+        format!("https://{}/v1", listener.local_addr().unwrap())
+    } else {
+        listener.local_addr().unwrap().to_string()
+    };
     let config: Configuration = serde_json::from_value(json!({"profiles": {
-        "profiles": [{"id": 7, "name": "Local", "endpoint": endpoint, "model": "test"}],
-        "default": 7, "last_id": 7
+        "profiles": [{"id": 7, "name": "Fixture", "endpoint": endpoint, "model": "", "model_mode": "server-default",
+            "connection_mode": if tls { "remote-open-ai-exact" } else if remote { "remote-open-ai" } else { "external" },
+            "trusted_remote_endpoint": remote,
+            "credential_env": if tls { "KORTTY_TEST_HTTPS_APPLY_KEY" } else { "" }}],
+        "last_id": 7
     }}))
     .unwrap();
+    let root = profile.0.canonicalize().unwrap();
+    config
+        .save_fixture_at(&root, &Configuration::default())
+        .unwrap();
     let mut workspace = Workspace::default();
-    workspace.set_test_ai_configuration(config);
+    if protected {
+        use crate::vault_window::VaultWindow;
+        use kortty_vault::{CredentialInput, Secret, Vault};
+
+        let path = root.join("fixture-vault");
+        let mut vault = Vault::create(&path, b"https-folder-apply-fixture").unwrap();
+        vault
+            .save(
+                CredentialInput {
+                    label: "Unselected project context".into(),
+                    ..CredentialInput::default()
+                },
+                Secret::new(secret.into()),
+            )
+            .unwrap();
+        workspace.vault = Some(VaultWindow::with_unlocked_fixture(path, vault));
+    }
+    workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
     let (owner, _) = workspace.open_window(false);
     let (id, _) = workspace.install_snippet_surface(owner, window, true);
     let (peer, _) = workspace.install_snippet_surface(
@@ -144,13 +211,98 @@ fn folder_reviewed_apply_writes_only_selected_files_after_rechecking_editors() {
     let update = |workspace: &mut Workspace, action| {
         workspace.update_snippet_analysis(id, super::super::Action::Apply(action))
     };
-    let _ = update(&mut workspace, Action::AllFindings(pre, true));
+    if remote {
+        let _ = update(&mut workspace, Action::Finding(pre, "F3".into(), true));
+    } else {
+        let _ = update(&mut workspace, Action::AllFindings(pre, true));
+    }
     let _ = update(&mut workspace, Action::Plan(pre, false));
     let page = workspace.snippets[&id].analysis.page(subject).unwrap();
+    if protected {
+        assert!(matches!(page.state, State::Ready));
+        assert!(page.status.as_deref().unwrap().contains("protected text"));
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        return;
+    }
     let State::FolderApplyPreview(preview) = &page.state else {
         panic!("Missing folder approval: {:?}", page.status);
     };
+    if tls {
+        assert!(preview.approval.profile.server_selected && preview.approval.profile.remote);
+        assert_eq!(preview.jobs.len(), 1);
+        let approved = preview.jobs[0].request.preview().unwrap();
+        let (system, input) = approved
+            .strip_prefix("System prompt\n")
+            .unwrap()
+            .split_once("\n\nFirst stage user prompt\n")
+            .unwrap();
+        let (input, _) = input
+            .rsplit_once("\nIf a stage returns an invalid proposal")
+            .unwrap();
+        let expected = std::env::var_os("KORTTY_TEST_HTTPS_APPLY_EXPECTED").unwrap();
+        std::fs::write(
+            expected,
+            serde_json::to_vec(&json!([system, input])).unwrap(),
+        )
+        .unwrap();
+        let ca =
+            std::fs::read(std::env::var_os("KORTTY_TEST_HTTPS_APPLY_CA_DER").unwrap()).unwrap();
+        let worker = crate::local_ai::test_support::with_https_fixture_ca(ca, || {
+            update(&mut workspace, Action::Approve)
+        });
+        complete(&mut workspace, worker);
+        let page = workspace.snippets[&id].analysis.page(subject).unwrap();
+        let State::ReviewFolderApply(review) = &page.state else {
+            panic!("expected a verified HTTPS proposal: {:?}", page.status);
+        };
+        assert_eq!(review.proposals.files.len(), 1);
+        assert_eq!(review.proposals.files[0].id, files[2]);
+        assert_eq!(
+            Library::open(profile.path())
+                .unwrap()
+                .get(files[2])
+                .unwrap()
+                .content(),
+            "echo gamma\r\n"
+        );
+        let _ = update(&mut workspace, Action::FolderInclude(files[2], true));
+        let _ = update(&mut workspace, Action::Accept);
+        let saved = Library::open(profile.path()).unwrap();
+        assert_eq!(saved.get(files[0]).unwrap().content(), "echo alpha\r\n");
+        assert_eq!(saved.get(files[1]).unwrap().content(), "echo beta\r\n");
+        assert_eq!(saved.get(files[2]).unwrap().content(), "echo 'gamma'\r\n");
+        return;
+    }
+    if remote {
+        assert!(preview.approval.profile.remote);
+        assert_eq!(preview.jobs.len(), 1);
+        assert_eq!(preview.jobs[0].id, files[2]);
+        assert!(preview.prompt.contains("echo alpha"));
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        workspace.vault_change_revision = Arc::new(());
+        let worker = update(&mut workspace, Action::Approve);
+        complete(&mut workspace, worker);
+        let page = workspace.snippets[&id].analysis.page(subject).unwrap();
+        assert!(matches!(page.state, State::Ready));
+        assert!(
+            page.status
+                .as_deref()
+                .unwrap()
+                .contains("masking policy changed")
+        );
+        assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+        assert_eq!(
+            Library::open(profile.path())
+                .unwrap()
+                .get(files[2])
+                .unwrap()
+                .content(),
+            "echo gamma\r\n"
+        );
+        return;
+    }
     assert_eq!(preview.jobs.len(), 3);
+    assert!(preview.approval.profile.server_selected);
     assert!(
         preview
             .prompt
@@ -169,7 +321,7 @@ fn folder_reviewed_apply_writes_only_selected_files_after_rechecking_editors() {
     assert!(!approved_system.contains("language code auto"));
     assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
 
-    let (session, cancel) = local_ai::Session::begin(preview.transport.clone()).unwrap();
+    let (session, cancel) = local_ai::Session::begin(preview.approval.transport.clone()).unwrap();
     let page = workspace
         .snippets
         .get_mut(&id)
@@ -184,7 +336,7 @@ fn folder_reviewed_apply_writes_only_selected_files_after_rechecking_editors() {
     let obsolete = u64::MAX;
     page.state = State::FolderApplying(Box::new(Run {
         token: obsolete,
-        config: preview.config,
+        config: preview.approval.config,
         skill_usage: Default::default(),
         revision: preview.revision,
         _cancel: cancel,
@@ -220,6 +372,7 @@ fn folder_reviewed_apply_writes_only_selected_files_after_rechecking_editors() {
         {
             let mut stream = accept(&listener);
             let payload = request(&mut stream);
+            assert!(payload.get("model").is_none());
             assert_eq!(payload["stream"], true);
             assert_eq!(
                 payload["messages"][0]["content"].as_str(),

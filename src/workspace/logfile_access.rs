@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use iced::{Element, Size, Task, keyboard::Modifiers, window};
 
-use crate::logfile_window::{Message, Window};
+use crate::logfile_window::{Message, Window, style};
 use crate::terminal_theme::Rgb;
 use crate::workspace::dialog_placement::Kind as DialogKind;
 
@@ -165,8 +165,18 @@ impl Workspace {
         self.logfiles.0.get(&id).map(|tool| {
             let owner = self.hosted_tool_owner(id).unwrap_or(id);
             let [r, g, b, _] = self.window_theme(owner).palette().text.into_rgba8();
-            tool.view(Rgb::from_bytes([r, g, b]))
-                .map(move |message| Desktop::Logfile(id, message))
+            let preferences = &self.window_settings.logfile_presentation;
+            let (options, rules) = self.highlight.logfile_styles(&preferences.keyword_set);
+            tool.view(
+                Rgb::from_bytes([r, g, b]),
+                style::Context {
+                    preferences,
+                    options,
+                    rules,
+                    palette: self.window_settings.terminal_appearance().palette,
+                },
+            )
+            .map(move |message| Desktop::Logfile(id, message))
         })
     }
 
@@ -191,6 +201,33 @@ impl Workspace {
             return Task::none();
         }
         match message {
+            Message::CopyLink(link) => {
+                if !self.window_settings.logfile_presentation.links {
+                    return Task::none();
+                }
+                self.logfiles.0[&id]
+                    .copy_link(&link)
+                    .map_or_else(Task::none, |value| self.write_clipboard(value))
+            }
+            Message::HighlightLinks(_) | Message::HighlightKeywords(_) | Message::KeywordSet(_)
+                if !self.logfiles.0[&id].is_manager() && !self.logfiles.0[&id].busy() =>
+            {
+                let preferences = &mut self.window_settings.logfile_presentation;
+                match message {
+                    Message::HighlightLinks(enabled) => preferences.links = enabled,
+                    Message::HighlightKeywords(enabled) => preferences.keywords = enabled,
+                    Message::KeywordSet(choice) => {
+                        let (sets, _) = self.highlight.logfile_styles(&choice.id);
+                        if !sets.iter().any(|(id, _)| *id == choice.id) {
+                            return Task::none();
+                        }
+                        preferences.keyword_set = choice.id;
+                    }
+                    _ => unreachable!("matched logfile presentation messages"),
+                }
+                self.save_window_settings(None);
+                Task::none()
+            }
             Message::FolderPrepared(prepared) => self.open_logfile_folder(id, prepared),
             Message::View => {
                 let viewer = self

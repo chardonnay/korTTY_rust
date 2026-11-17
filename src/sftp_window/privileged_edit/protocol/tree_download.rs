@@ -12,9 +12,11 @@ use crate::sftp_window::{Location, files, scheduled};
 use super::transfer::{MAX_TRANSFER_BYTES, hash_copy};
 use super::tree::{MAX_ENTRIES, MAX_PATH_BYTES};
 use super::{
-    Auth, Connection, ExecOpener, Failure, HashAlgorithm, Helper, Response, lowercase_hex,
-    valid_path,
+    Auth, Connection, ExecOpener, Failure, HashAlgorithm, Helper, MergeReport, Response,
+    lowercase_hex, valid_path,
 };
+
+mod merge;
 
 #[derive(Serialize)]
 struct Entry {
@@ -127,19 +129,24 @@ pub(crate) fn preview_tree_download(
     local: &Path,
     auth: Auth,
     allowed: impl Fn() -> bool + Send + Sync + 'static,
+    merge: bool,
 ) -> Result<scheduled::Preview, Failure> {
     if !valid_path(path) {
         return Err(Failure::Blocked);
     }
-    let roots = [
-        review_root(&Location::Remote(path.as_bytes().to_vec())).map_err(|_| Failure::Blocked)?,
-        review_root(&Location::Local(local.to_owned())).map_err(|_| Failure::Blocked)?,
-    ];
-    let destination = Destination::inspect(local).map_err(|_| Failure::Blocked)?;
+    let roots = review_roots(path, local)?;
+    let destination = (!merge)
+        .then(|| Destination::inspect(local))
+        .transpose()
+        .map_err(|_| Failure::Blocked)?;
     let mut channel = Connection::open_for(&opener, auth, allowed, Helper::Transfer)?;
     channel.send(&Request::InspectTreeSource { path })?;
     let manifest = Manifest::read(&mut channel)?;
     channel.finish().map_err(|_| channel.failure())?;
+    let Some(destination) = destination else {
+        let plan = merge::Plan::inspect(&manifest, local, roots, &|| !channel.gate.running())?;
+        return Ok(plan.preview);
+    };
     Ok(scheduled::Preview {
         proof: manifest.proof(&destination)?,
         replacements: Vec::new(),
@@ -158,6 +165,13 @@ pub(crate) fn preview_tree_download(
     })
 }
 
+fn review_roots(path: &str, local: &Path) -> Result<[String; 2], Failure> {
+    Ok([
+        review_root(&Location::Remote(path.as_bytes().to_vec())).map_err(|_| Failure::Blocked)?,
+        review_root(&Location::Local(local.to_owned())).map_err(|_| Failure::Blocked)?,
+    ])
+}
+
 pub(crate) fn download_tree(
     opener: ExecOpener,
     path: &str,
@@ -171,13 +185,7 @@ pub(crate) fn download_tree(
         return Err(Failure::Blocked);
     }
     let destination = Destination::inspect(local).map_err(|_| Failure::Blocked)?;
-    let mut channel = Connection::open_for(&opener, auth, allowed, Helper::Transfer)?;
-    channel.send(&Request::DownloadTree { path })?;
-    let manifest = Manifest::read(&mut channel)?;
-    let token = match channel.response()? {
-        Response::Ready { token } if lowercase_hex(&token, 32) => token,
-        response => return Err(channel.rejection(response, Failure::Failed)),
-    };
+    let (mut channel, manifest, token) = begin_download(&opener, path, auth, allowed)?;
     channel.gate.check().map_err(|_| channel.failure())?;
     claim(manifest.proof(&destination)?)?;
     let mut stage = destination.stage().map_err(|_| Failure::Conflict)?;
@@ -198,11 +206,7 @@ pub(crate) fn download_tree(
                 .map_err(|_| Failure::Blocked)?;
         }
     }
-    match channel.response()? {
-        Response::TreeRead { witness } if witness == manifest.witness => {}
-        response => return Err(channel.rejection(response, Failure::Failed)),
-    }
-    channel.finish().map_err(|_| channel.failure())?;
+    finish_download(&mut channel, &manifest.witness)?;
     stage
         .publish(|| channel.gate.running() && publication_allowed() && channel.gate.running())
         .map_err(|error| match error {
@@ -214,6 +218,57 @@ pub(crate) fn download_tree(
             PublishError::Uncertain => Failure::Uncertain,
         })?;
     Ok((manifest.entries.len(), manifest.size))
+}
+
+pub(crate) fn download_tree_merge(
+    opener: ExecOpener,
+    path: &str,
+    local: &Path,
+    auth: Auth,
+    allowed: impl Fn() -> bool + Send + Sync + 'static,
+    claim: impl FnOnce([u8; 32]) -> Result<(), Failure>,
+    publication_allowed: impl Fn() -> bool,
+) -> Result<MergeReport, Failure> {
+    if !valid_path(path) {
+        return Err(Failure::Blocked);
+    }
+    let roots = review_roots(path, local)?;
+    let (mut channel, manifest, token) = begin_download(&opener, path, auth, allowed)?;
+    let gate = channel.gate.clone();
+    let stopped = || !gate.running();
+    let plan = merge::Plan::inspect(&manifest, local, roots, &stopped)?;
+    gate.check().map_err(|_| channel.failure())?;
+    claim(plan.preview.proof)?;
+    channel
+        .write_all(token.as_bytes())
+        .map_err(|_| channel.failure())?;
+    let staged = plan.receive(&manifest, &mut channel, &stopped)?;
+    finish_download(&mut channel, &manifest.witness)?;
+    Ok(staged.publish(&stopped, &publication_allowed))
+}
+
+fn begin_download(
+    opener: &ExecOpener,
+    path: &str,
+    auth: Auth,
+    allowed: impl Fn() -> bool + Send + Sync + 'static,
+) -> Result<(Connection, Manifest, String), Failure> {
+    let mut channel = Connection::open_for(opener, auth, allowed, Helper::Transfer)?;
+    channel.send(&Request::DownloadTree { path })?;
+    let manifest = Manifest::read(&mut channel)?;
+    let token = match channel.response()? {
+        Response::Ready { token } if lowercase_hex(&token, 32) => token,
+        response => return Err(channel.rejection(response, Failure::Failed)),
+    };
+    Ok((channel, manifest, token))
+}
+
+fn finish_download(channel: &mut Connection, expected: &str) -> Result<(), Failure> {
+    match channel.response()? {
+        Response::TreeRead { witness } if witness == expected => {}
+        response => return Err(channel.rejection(response, Failure::Failed)),
+    }
+    channel.finish().map_err(|_| channel.failure())
 }
 
 #[cfg(test)]

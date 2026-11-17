@@ -8,9 +8,14 @@ use zeroize::Zeroizing;
 use crate::manifest::Manifest;
 
 pub const COMMAND: &str = "exec /usr/local/bin/kortty-server-archive --stdio-v1";
+pub const UPDATE_ARGUMENT: &str = "--archive-update-v1";
+pub const UPDATE_COMMAND: &str = "exec /usr/local/bin/kortty-server-archive --archive-update-v1";
 pub const PRIVILEGED_ARGUMENT: &str = "--privileged-create-v1";
 pub const PRIVILEGED_PASSWORD_ARGUMENT: &str = "--privileged-create-v2";
 pub const PRIVILEGED_PASSWORD_READY: &[u8] = b"KORTTY-PRIVILEGED-ARCHIVE-V2\n";
+pub const PRIVILEGED_UPDATE_ARGUMENT: &str = "--privileged-update-v1";
+pub const PRIVILEGED_UPDATE_PASSWORD_ARGUMENT: &str = "--privileged-update-v2";
+pub const PRIVILEGED_UPDATE_PASSWORD_READY: &[u8] = b"KORTTY-PRIVILEGED-ARCHIVE-UPDATE-V2\n";
 pub const PRIVILEGED_PASSWORD_COMMIT: &[u8] = b"KORTTY-PRIVILEGED-ARCHIVE-COMMIT\n";
 pub const PRIVILEGED_PATH: &str = "/usr/libexec/kortty/kortty-server-archive";
 pub const MAX_REQUEST_BYTES: usize = 32 * 1024;
@@ -59,6 +64,31 @@ pub enum CreateFormat {
     SevenZip,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArchiveMemberLayout {
+    #[default]
+    SourceBasename,
+    ServerPath,
+}
+
+impl ArchiveMemberLayout {
+    fn is_default(&self) -> bool {
+        *self == Self::SourceBasename
+    }
+
+    pub fn supports(self, format: CreateFormat) -> bool {
+        self == Self::SourceBasename
+            || matches!(
+                format,
+                CreateFormat::Zip
+                    | CreateFormat::ZipPassword
+                    | CreateFormat::Tar
+                    | CreateFormat::TarBzip2
+            )
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateSpec {
@@ -67,10 +97,51 @@ pub struct CreateSpec {
     pub format: CreateFormat,
     pub level: u8,
     pub excludes: Vec<String>,
+    #[serde(default, skip_serializing_if = "ArchiveMemberLayout::is_default")]
+    pub member_layout: ArchiveMemberLayout,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<OutputMetadata>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub report_payload: bool,
+}
+
+impl CreateSpec {
+    pub fn validate_member_layout(&self) -> io::Result<()> {
+        if !self.member_layout.supports(self.format) {
+            return Err(invalid("Full server paths require ZIP or TAR archives"));
+        }
+        if self.member_layout == ArchiveMemberLayout::ServerPath {
+            use crate::manifest::{MAX_PATH_BYTES, canonical_member_path};
+
+            if !(1..=16).contains(&self.sources.len()) {
+                return Err(invalid(
+                    "Choose between one and sixteen absolute archive source paths",
+                ));
+            }
+            for (index, source) in self.sources.iter().enumerate() {
+                if source.len() > MAX_PATH_BYTES
+                    || !source
+                        .strip_prefix('/')
+                        .is_some_and(|path| canonical_member_path(path).unwrap_or(false))
+                    || self.sources[..index]
+                        .iter()
+                        .any(|previous| within(source, previous) || within(previous, source))
+                {
+                    return Err(invalid(
+                        "Choose distinct, non-overlapping absolute archive source paths",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn within(root: &str, path: &str) -> bool {
+    root == path
+        || path
+            .strip_prefix(root)
+            .is_some_and(|tail| tail.starts_with('/'))
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -131,6 +202,7 @@ impl CreateReview {
         if let Some(output) = spec.output {
             output.validate()?;
         }
+        spec.validate_member_layout()?;
         if &self.spec != spec
             || self.token.len() != 64
             || !self.token.bytes().all(|byte| byte.is_ascii_hexdigit())
@@ -142,13 +214,27 @@ impl CreateReview {
             ));
         }
         self.manifest.validate()?;
+        let roots: Vec<_> = spec
+            .sources
+            .iter()
+            .filter_map(|source| match spec.member_layout {
+                ArchiveMemberLayout::SourceBasename => source.rsplit('/').next(),
+                ArchiveMemberLayout::ServerPath => source.strip_prefix('/').filter(|root| {
+                    self.manifest
+                        .members
+                        .binary_search_by(|member| member.path.as_str().cmp(root))
+                        .is_ok()
+                }),
+            })
+            .collect();
         for member in &self.manifest.members {
-            let root = member.path.split('/').next();
             if !matches!(member.kind, MemberKind::File | MemberKind::Directory)
-                || !spec
-                    .sources
-                    .iter()
-                    .any(|source| source.rsplit('/').next() == root)
+                || !roots.iter().any(|root| {
+                    within(root, &member.path)
+                        || (spec.member_layout == ArchiveMemberLayout::ServerPath
+                            && member.kind == MemberKind::Directory
+                            && within(&member.path, root))
+                })
             {
                 return Err(invalid(
                     "The server archive review included an unexpected member",
@@ -188,6 +274,85 @@ pub enum Reply {
         message: String,
         outcome_unknown: bool,
     },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UpdateRequest {
+    Review { spec: CreateSpec },
+    Prepare { spec: CreateSpec, token: String },
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UpdateDecision {
+    Quarantine,
+    Publish,
+    Abort,
+    FetchCopy,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "result", rename_all = "snake_case", deny_unknown_fields)]
+pub enum UpdateReply {
+    Reviewed {
+        review: CreateReview,
+        existing: Option<CreatedPayload>,
+        receiver: [u8; 32],
+    },
+    PasswordRequired,
+    Prepared {
+        payload: CreatedPayload,
+    },
+    Quarantined {
+        recovery: String,
+    },
+    Published {
+        destination: String,
+        payload: CreatedPayload,
+        recovery: Option<String>,
+        receiver: [u8; 32],
+    },
+    /// Followed by exactly `payload.bytes` bytes from the held published output.
+    CopyReady {
+        payload: CreatedPayload,
+    },
+    CopyFailed,
+    Aborted,
+    Failed {
+        message: String,
+        outcome_unknown: bool,
+        recovery: Option<String>,
+    },
+}
+
+pub fn read_update_request(input: impl Read) -> io::Result<UpdateRequest> {
+    read_message(input, MAX_REQUEST_BYTES)
+}
+
+pub fn write_update_request(output: impl Write, request: &UpdateRequest) -> io::Result<()> {
+    write_frame(output, request, MAX_REQUEST_BYTES)
+}
+
+pub fn read_update_decision(input: impl Read) -> io::Result<UpdateDecision> {
+    read_message(input, MAX_REQUEST_BYTES)
+}
+
+pub fn write_update_decision(output: impl Write, decision: &UpdateDecision) -> io::Result<()> {
+    write_frame(output, decision, MAX_REQUEST_BYTES)
+}
+
+pub fn read_update_reply(input: impl Read) -> io::Result<UpdateReply> {
+    read_message(input, MAX_RESPONSE_BYTES)
+}
+
+pub fn write_update_reply(output: impl Write, reply: &UpdateReply) -> io::Result<()> {
+    write_frame(output, reply, MAX_RESPONSE_BYTES)
+}
+
+/// Reads the bounded secret from an update stream that remains open for publication decisions.
+pub fn read_update_password(mut input: impl Read) -> io::Result<Zeroizing<Vec<u8>>> {
+    read_creation_password(&mut input)
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -379,6 +544,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn server_path_archive_schema_and_review_require_a_selected_member() {
+        use crate::manifest::{Member, MemberKind};
+
+        let mut spec = CreateSpec {
+            sources: vec![
+                "/srv/left/report.txt".into(),
+                "/srv/right/report.txt".into(),
+            ],
+            destination: "/srv/result.zip".into(),
+            format: CreateFormat::Zip,
+            level: 0,
+            excludes: Vec::new(),
+            member_layout: ArchiveMemberLayout::SourceBasename,
+            output: None,
+            report_payload: false,
+        };
+        let legacy = serde_json::to_value(&spec).unwrap();
+        assert!(legacy.get("member_layout").is_none());
+        assert_eq!(serde_json::from_value::<CreateSpec>(legacy).unwrap(), spec);
+        spec.member_layout = ArchiveMemberLayout::ServerPath;
+        assert_eq!(
+            serde_json::to_value(&spec).unwrap()["member_layout"],
+            "server_path"
+        );
+        assert!(spec.validate_member_layout().is_ok());
+        let review = |path: &str, kind, size| CreateReview {
+            spec: spec.clone(),
+            token: "a".repeat(64),
+            manifest: Manifest::from_canonical_members(&[Member {
+                path: path.into(),
+                kind,
+                size,
+            }])
+            .unwrap(),
+            excluded: 0,
+        };
+        assert!(
+            review("srv/left/report.txt", MemberKind::File, 5)
+                .validate_for(&spec)
+                .is_ok()
+        );
+        assert!(
+            review("srv/left", MemberKind::Directory, 0)
+                .validate_for(&spec)
+                .is_err()
+        );
+        assert!(
+            review("srv/left", MemberKind::File, 4)
+                .validate_for(&spec)
+                .is_err()
+        );
+        assert!(
+            review("srv/unselected/report.txt", MemberKind::File, 4)
+                .validate_for(&spec)
+                .is_err()
+        );
+        for source in [
+            "/srv/left",
+            "/srv/right/./file",
+            "//srv/more",
+            "/srv/../else",
+        ] {
+            spec.sources.push(source.into());
+            assert!(spec.validate_member_layout().is_err());
+            spec.sources.pop();
+        }
+        for format in [CreateFormat::Tar, CreateFormat::TarBzip2] {
+            spec.format = format;
+            assert!(spec.validate_member_layout().is_ok());
+        }
+        spec.format = CreateFormat::SevenZip;
+        assert!(spec.validate_member_layout().is_err());
+    }
+
+    #[test]
     fn frames_require_bounded_lengths_one_message_and_exact_fields() {
         let request = Request::Review {
             source: "/tmp/ä.zip".into(),
@@ -407,6 +647,7 @@ mod tests {
             format: CreateFormat::Tar,
             level: 0,
             excludes: vec![],
+            member_layout: ArchiveMemberLayout::SourceBasename,
             output: None,
             report_payload: false,
         };

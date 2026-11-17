@@ -9,7 +9,8 @@ use super::{
 use crate::private_files::require_single_link;
 use crate::sftp_window::LocalSource;
 
-pub(crate) const MAX_TRANSFER_BYTES: u64 = 1024 * 1024 * 1024;
+pub(crate) const MAX_TRANSFER_BYTES: u64 =
+    kortty_server_archive::privileged_file_replace::MAX_BYTES;
 const CHUNK: usize = 64 * 1024;
 
 #[derive(Serialize)]
@@ -29,28 +30,30 @@ pub(crate) fn download(
     opener: ExecOpener,
     path: &str,
     mut destination: impl Write,
+    limit: u64,
     auth: Auth,
     allowed: impl Fn() -> bool + Send + Sync + 'static,
-) -> Result<u64, Failure> {
+) -> Result<(u64, [u8; 32]), Failure> {
     if !valid_path(path) {
         return Err(Failure::Blocked);
     }
     let mut channel = Connection::open_for(&opener, auth, allowed, Helper::Transfer)?;
     channel.send(&Request::Download { path })?;
     let size = match channel.response()? {
-        Response::Download { size } if size <= MAX_TRANSFER_BYTES => size,
+        Response::Download { size } if size <= limit.min(MAX_TRANSFER_BYTES) => size,
         response => return Err(channel.rejection(response, Failure::Failed)),
     };
-    let digest = hash_copy(&mut channel, &mut destination, size, || true)?;
+    let digest = copy_digest(&mut channel, &mut destination, size, || true)?;
+    let encoded = digest_hex(&digest)?;
     match channel.response()? {
         Response::Downloaded {
             size: count,
             sha256,
-        } if count == size && sha256 == digest => {}
+        } if count == size && sha256 == encoded => {}
         response => return Err(channel.rejection(response, Failure::Failed)),
     }
     channel.finish().map_err(|_| channel.failure())?;
-    Ok(size)
+    Ok((size, digest))
 }
 
 pub(crate) fn upload(
@@ -116,9 +119,18 @@ fn verify_source(source: &LocalSource) -> Result<(), Failure> {
 pub(super) fn hash_copy(
     source: &mut impl Read,
     destination: &mut impl Write,
-    mut remaining: u64,
+    remaining: u64,
     allowed: impl Fn() -> bool,
 ) -> Result<String, Failure> {
+    digest_hex(&copy_digest(source, destination, remaining, allowed)?)
+}
+
+pub(crate) fn copy_digest(
+    source: &mut impl Read,
+    destination: &mut impl Write,
+    mut remaining: u64,
+    allowed: impl Fn() -> bool,
+) -> Result<[u8; 32], Failure> {
     let mut hash = HashAlgorithm::Sha256
         .new_hasher()
         .map_err(|_| Failure::Failed)?;
@@ -134,5 +146,8 @@ pub(super) fn hash_copy(
         destination.write_all(bytes).map_err(|_| Failure::Failed)?;
         remaining -= count as u64;
     }
-    digest_hex(hash.finalize().as_ref())
+    hash.finalize()
+        .as_ref()
+        .try_into()
+        .map_err(|_| Failure::Failed)
 }

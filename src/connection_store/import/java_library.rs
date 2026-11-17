@@ -14,9 +14,15 @@ const MAX_SETTINGS_NODES: u32 = 65_536;
 pub(crate) struct JavaLibrarySettings {
     pub(super) favorites: BTreeSet<String>,
     pub(super) group_colors: BTreeMap<String, TabColor>,
+    pub(super) highlight_sets: Option<BTreeMap<String, String>>,
 }
 
 impl JavaLibrarySettings {
+    pub(crate) fn with_highlight_sets(mut self, ids: BTreeMap<String, String>) -> Self {
+        self.highlight_sets = Some(ids);
+        self
+    }
+
     pub(crate) fn parse(bytes: &[u8]) -> io::Result<Self> {
         if bytes.len() > MAX_SETTINGS_BYTES {
             return Err(invalid(

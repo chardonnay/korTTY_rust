@@ -10,7 +10,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::private_files::{Directory, EntryIdentity, FileStamp, nonce, require_single_link};
+use crate::private_files::{
+    Directory, EntryIdentity, FileLock, FileStamp, nonce, require_single_link,
+};
 
 use super::managed_models::valid_id;
 
@@ -288,7 +290,7 @@ pub(crate) struct Opened {
     directory: Directory,
     files: BTreeMap<String, File>,
     stamps: BTreeMap<String, FileStamp>,
-    _lease: Option<File>,
+    _lease: Option<FileLock>,
 }
 
 impl Opened {
@@ -643,7 +645,7 @@ fn ids(root: &Directory) -> io::Result<Vec<String>> {
         .collect()
 }
 
-fn lock(directory: &Directory, name: &str, shared: bool) -> io::Result<File> {
+fn lock(directory: &Directory, name: &str, shared: bool) -> io::Result<FileLock> {
     let file = directory.open_lock(name)?;
     require_single_link(&file)?;
     if shared {
@@ -657,7 +659,7 @@ fn lock(directory: &Directory, name: &str, shared: bool) -> io::Result<File> {
         }
         std::fs::TryLockError::Error(error) => error,
     })?;
-    Ok(file)
+    Ok(FileLock::new(file))
 }
 
 fn prepare_staging(root: &Directory) -> io::Result<Directory> {
@@ -768,6 +770,9 @@ mod tests {
         .unwrap();
         assert!(leased.revalidate().is_err());
         std::fs::remove_file(leased.path.join("unexpected.py")).unwrap();
+        #[cfg(unix)]
+        // A child between fork and exec can still hold the same file description.
+        let inherited_lease = leased._lease.as_ref().unwrap().try_clone().unwrap();
         drop(leased);
         assert_eq!(
             registry
@@ -777,6 +782,8 @@ mod tests {
             0
         );
         registry.remove(&model.id).unwrap();
+        #[cfg(unix)]
+        drop(inherited_lease);
         assert!(registry.list().unwrap().is_empty());
         assert!(source.join("model.safetensors").is_file());
     }

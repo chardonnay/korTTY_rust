@@ -10,7 +10,7 @@ use kortty_server_archive::rsync_tree::{DeleteScope, Inventory, Manifest, hash};
 use super::super::draft_replace::mount_id;
 use super::super::rsync_tree::{
     ExistingFile, ExistingPublication, ExistingRecovery, ExistingTarget, RECEIVED_FILE as FILE,
-    UploadStage,
+    UploadStage, VacantFile, VacantTree,
 };
 use super::super::*;
 use super::{Recovery, Rules};
@@ -21,6 +21,8 @@ use handoff::Handoff;
 
 enum Receiver<'a> {
     Vacant(Directory),
+    FirstFile(Box<VacantFile<'a>>),
+    FirstTree(Box<VacantTree<'a>>),
     ExistingTree(Box<ExistingTarget<'a>>),
     ExistingFile(Box<ExistingFile<'a>>),
 }
@@ -53,6 +55,8 @@ impl<'a> Receiver<'a> {
     fn parent(&self) -> &Directory {
         match self {
             Self::Vacant(parent) => parent,
+            Self::FirstFile(target) => target.parent(),
+            Self::FirstTree(target) => target.parent(),
             Self::ExistingTree(target) => target.parent(),
             Self::ExistingFile(target) => target.parent(),
         }
@@ -60,6 +64,8 @@ impl<'a> Receiver<'a> {
 
     fn proof(&self, destination: &str) -> io::Result<([u8; 32], Option<Inventory>)> {
         match self {
+            Self::FirstFile(target) => Ok((target.fingerprint(), None)),
+            Self::FirstTree(target) => Ok((target.fingerprint()?, None)),
             Self::ExistingTree(target) => {
                 let original = target.review();
                 Ok((original.fingerprint, Some(original.inventory)))
@@ -98,6 +104,42 @@ pub(super) fn review(rules: &Rules, spec: Spec) -> io::Result<Review> {
         fingerprint,
         inventory,
         handoff: rules.handoff()?.0,
+        first_file: false,
+        first_tree: false,
+    })
+}
+
+pub(super) fn review_recurring(rules: &Rules, spec: Spec) -> io::Result<Review> {
+    let Operation::Upload {
+        directory,
+        replace: true,
+        ref delete,
+    } = spec.operation
+    else {
+        return Err(invalid("Expected a protected recurring rsync upload"));
+    };
+    let (path, name) = absolute_file(&spec.path)?;
+    let parent = rules.destination_parent(path, true)?;
+    let vacant = absent(&parent.fd, name)?;
+    let receiver = if vacant && directory {
+        Receiver::FirstTree(Box::new(VacantTree::open_at(&spec.path, parent, delete)?))
+    } else if vacant {
+        Receiver::FirstFile(Box::new(VacantFile::open_at(&spec.path, parent)?))
+    } else if directory {
+        Receiver::ExistingTree(Box::new(ExistingTarget::open_at(&spec.path, parent)?))
+    } else {
+        Receiver::ExistingFile(Box::new(ExistingFile::open_at(&spec.path, parent)?))
+    };
+    let (fingerprint, inventory) = receiver.proof(&spec.path)?;
+    drop(receiver);
+    Ok(Review {
+        spec,
+        policy: rules.revision(),
+        fingerprint,
+        inventory,
+        handoff: rules.handoff()?.0,
+        first_file: vacant && !directory,
+        first_tree: vacant && directory,
     })
 }
 
@@ -124,14 +166,58 @@ pub(super) fn apply(
         ));
     }
     let destination = &review.spec.path;
-    let receiver = Receiver::open(rules, destination, directory, replace)?;
+    let (path, name) = absolute_file(destination)?;
+    let receiver = if review.first_publication() {
+        if !recurring || !review.valid() {
+            return Err(invalid(
+                "The protected vacant rsync receiver requires a recurring review",
+            ));
+        }
+        let parent = rules.destination_parent(path, true)?;
+        if review.first_tree {
+            Receiver::FirstTree(Box::new(VacantTree::open_at(destination, parent, delete)?))
+        } else {
+            Receiver::FirstFile(Box::new(VacantFile::open_at(destination, parent)?))
+        }
+    } else {
+        Receiver::open(rules, destination, directory, replace)?
+    };
     if !valid_inventory(incoming, directory)
         || receiver.proof(destination)? != (review.fingerprint, review.inventory)
         || rules.handoff()?.0 != review.handoff
     {
         return Err(invalid("The reviewed privileged rsync receiver changed"));
     }
+    let permit = || {
+        rules.require_current()?;
+        let held = receiver.parent();
+        let current = rules.destination_parent(path, replace)?;
+        if !same_node(&current.stat, &held.stat)
+            || current.stat.st_mode != held.stat.st_mode
+            || current.stat.st_uid != held.stat.st_uid
+            || current.stat.st_gid != held.stat.st_gid
+            || mount_id(&current.fd)? != mount_id(&held.fd)?
+            || review.first_publication() && rules.handoff()?.0 != review.handoff
+        {
+            return Err(invalid(
+                "The privileged rsync receiver parent or handoff changed",
+            ));
+        }
+        Ok(())
+    };
+    let require_first_vacancy = || match &receiver {
+        Receiver::FirstFile(target) => {
+            permit()?;
+            target.require_vacant()
+        }
+        Receiver::FirstTree(target) => {
+            permit()?;
+            target.require_vacant()
+        }
+        _ => Ok(()),
+    };
     rules.require_current()?;
+    require_first_vacancy()?;
     let mut handoff = Handoff::create(rules)?;
     if !review.contains_payload(handoff.path()) {
         return Err(invalid("Invalid privileged rsync handoff address"));
@@ -155,24 +241,40 @@ pub(super) fn apply(
         }
     }
     rules.require_current()?;
+    require_first_vacancy()?;
     let mut received = UploadStage::create(receiver.parent())?;
-    handoff.copy(&received.payload, directory, incoming)?;
+    handoff.copy(
+        &received.payload,
+        directory,
+        incoming,
+        &require_first_vacancy,
+    )?;
     handoff.discard()?;
-    let (path, name) = absolute_file(destination)?;
-    let permit = || {
-        rules.require_current()?;
-        let held = receiver.parent();
-        let current = rules.destination_parent(path, replace)?;
-        if !same_node(&current.stat, &held.stat)
-            || current.stat.st_mode != held.stat.st_mode
-            || current.stat.st_gid != held.stat.st_gid
-            || mount_id(&current.fd)? != mount_id(&held.fd)?
-        {
-            return Err(invalid("The privileged rsync receiver parent changed"));
-        }
-        Ok(())
-    };
     match &receiver {
+        Receiver::FirstTree(target) => publish_first_tree(
+            target,
+            received,
+            (destination, incoming),
+            Replacement {
+                input,
+                output,
+                recovery,
+                recurring,
+            },
+            permit,
+        ),
+        Receiver::FirstFile(target) => publish_first_file(
+            target,
+            received,
+            (destination, incoming),
+            Replacement {
+                input,
+                output,
+                recovery,
+                recurring,
+            },
+            permit,
+        ),
         Receiver::Vacant(parent) => {
             let mut publish = Vacancy {
                 parent,
@@ -216,6 +318,81 @@ pub(super) fn apply(
             },
             permit,
         ),
+    }
+}
+
+fn publish_first_file(
+    target: &VacantFile<'_>,
+    mut stage: UploadStage<'_>,
+    (destination, inventory): (&str, Inventory),
+    transaction: Replacement<'_, impl Read, impl Write>,
+    permit: impl Fn() -> io::Result<()>,
+) -> io::Result<Reply> {
+    let candidate = target.prepare(&stage, inventory)?;
+    permit()?;
+    target.require_vacant()?;
+    if !first_publication_decision(transaction.input, transaction.output, inventory)? {
+        stage.discard()?;
+        return Ok(Reply::Aborted);
+    }
+    let receiver = target.publish(
+        &stage,
+        &candidate,
+        &mut transaction.recovery.outcome_unknown,
+        permit,
+    )?;
+    stage.discard()?;
+    Ok(Reply::FirstRecurringFilePublished {
+        destination: destination.to_owned(),
+        vacancy: target.fingerprint(),
+        receiver,
+    })
+}
+
+fn publish_first_tree(
+    target: &VacantTree<'_>,
+    mut stage: UploadStage<'_>,
+    (destination, inventory): (&str, Inventory),
+    transaction: Replacement<'_, impl Read, impl Write>,
+    permit: impl Fn() -> io::Result<()>,
+) -> io::Result<Reply> {
+    let candidate = target.prepare(&stage, inventory)?;
+    permit()?;
+    target.require_vacant()?;
+    if !first_publication_decision(transaction.input, transaction.output, inventory)? {
+        stage.discard()?;
+        return Ok(Reply::Aborted);
+    }
+    let receiver = target.publish(
+        &mut stage,
+        &candidate,
+        &mut transaction.recovery.outcome_unknown,
+        permit,
+    )?;
+    stage.discard()?;
+    Ok(Reply::FirstRecurringTreePublished {
+        destination: destination.to_owned(),
+        vacancy: target.fingerprint()?,
+        receiver,
+    })
+}
+
+fn first_publication_decision(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    inventory: Inventory,
+) -> io::Result<bool> {
+    write_reply(
+        output,
+        &Reply::Verified {
+            inventory,
+            removed: 0,
+        },
+    )?;
+    match read_decision(input)? {
+        Decision::Abort => Ok(false),
+        Decision::Publish => Ok(true),
+        _ => Err(invalid("Unexpected privileged rsync publication decision")),
     }
 }
 
@@ -466,6 +643,138 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    fn first_tree_fixture() -> Scratch {
+        let mut nonce = [0; 16];
+        getrandom::fill(&mut nonce).unwrap();
+        let root = std::env::temp_dir().canonicalize().unwrap().join(format!(
+            "kortty-privileged-first-tree-{}",
+            hex::encode(nonce)
+        ));
+        fs::DirBuilder::new().mode(0o700).create(&root).unwrap();
+        Scratch(root)
+    }
+
+    fn first_tree_candidate<'a>(target: &'a VacantTree<'_>) -> (UploadStage<'a>, Inventory) {
+        let stage = UploadStage::create(target.parent()).unwrap();
+        mkdirat(&stage.payload.fd, "named", PRIVATE_DIRECTORY).unwrap();
+        let named = stage.payload.child("named").unwrap();
+        let bytes = b"checked projected source";
+        let mut file = File::from(
+            openat(
+                &named.fd,
+                "file",
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
+                PRIVATE_FILE,
+            )
+            .unwrap(),
+        );
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        fsync(&named.fd).unwrap();
+        let mut manifest = Manifest::default();
+        manifest.add("named", None).unwrap();
+        manifest
+            .add(
+                "named/file",
+                Some((bytes.len() as u64, Sha256::digest(bytes).into())),
+            )
+            .unwrap();
+        (stage, manifest.finish())
+    }
+
+    #[test]
+    fn first_recurring_privileged_tree_returns_the_exact_existing_receiver() {
+        let root = first_tree_fixture();
+        let destination = root.0.join("receiver");
+        let path = destination.to_str().unwrap();
+        let parent = || Directory::open_parent(root.0.to_str().unwrap()).unwrap();
+        let scope = DeleteScope::Named(vec!["named".into()]);
+        let target = VacantTree::open_at(path, parent(), &scope).unwrap();
+        let proof = target.fingerprint().unwrap();
+        assert_ne!(
+            VacantTree::open_at(path, parent(), &DeleteScope::Retain)
+                .unwrap()
+                .fingerprint()
+                .unwrap(),
+            proof
+        );
+        let (stage, inventory) = first_tree_candidate(&target);
+        let wrong =
+            VacantTree::open_at(path, parent(), &DeleteScope::Named(vec!["missing".into()]))
+                .unwrap();
+        assert!(wrong.prepare(&stage, inventory).is_err());
+
+        let mut decisions = Vec::new();
+        write_frame(&mut decisions, &Decision::Publish).unwrap();
+        let mut output = Vec::new();
+        let mut recovery = Recovery::default();
+        let reply = publish_first_tree(
+            &target,
+            stage,
+            (path, inventory),
+            Replacement {
+                input: &mut decisions.as_slice(),
+                output: &mut output,
+                recovery: &mut recovery,
+                recurring: true,
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        let Reply::FirstRecurringTreePublished {
+            destination: actual,
+            vacancy,
+            receiver,
+        } = reply
+        else {
+            panic!("expected a first recurring directory receipt");
+        };
+        assert_eq!(actual, path);
+        assert_eq!(vacancy, proof);
+        assert_eq!(receiver.inventory, inventory);
+        assert_eq!(
+            receiver,
+            ExistingTarget::open_at(path, parent()).unwrap().review()
+        );
+        assert!(
+            matches!(read_reply(output.as_slice()), Ok(Reply::Verified { inventory: verified, removed: 0 }) if verified == inventory)
+        );
+        assert_eq!(
+            fs::read(destination.join("named/file")).unwrap(),
+            b"checked projected source"
+        );
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
+        assert!(VacantTree::open_at(path, parent(), &scope).is_err());
+    }
+
+    #[test]
+    fn first_recurring_privileged_tree_leaves_a_late_occupant_untouched() {
+        let root = first_tree_fixture();
+        let destination = root.0.join("receiver");
+        let path = destination.to_str().unwrap();
+        let parent = Directory::open_parent(root.0.to_str().unwrap()).unwrap();
+        let target = VacantTree::open_at(path, parent, &DeleteScope::Retain).unwrap();
+        let (mut stage, inventory) = first_tree_candidate(&target);
+        let candidate = target.prepare(&stage, inventory).unwrap();
+        let mut uncertain = false;
+        assert!(
+            target
+                .publish(&mut stage, &candidate, &mut uncertain, || {
+                    fs::DirBuilder::new().mode(0o700).create(&destination)?;
+                    fs::write(destination.join("sentinel"), b"late occupant")
+                })
+                .is_err()
+        );
+        assert!(!uncertain);
+        stage.discard().unwrap();
+        assert_eq!(
+            fs::read(destination.join("sentinel")).unwrap(),
+            b"late occupant"
+        );
+        assert!(!destination.join("named").exists());
+        assert_eq!(fs::read_dir(&root.0).unwrap().count(), 1);
     }
 
     #[test]

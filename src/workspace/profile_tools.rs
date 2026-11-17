@@ -468,15 +468,25 @@ impl Workspace {
             let mut passwords = self.credential_choices(Kind::Password);
             passwords.extend(self.credential_choices(Kind::PasswordCommand));
             let passphrases = self.credential_choices(Kind::KeyPassphrase);
+            let mut java_ai_profiles = Vec::new();
             let ai_profiles = self.ai_configuration().map_or_else(Vec::new, |config| {
                 config
-                    .terminal_chat_profiles()
+                    .interactive_chat_profiles()
                     .filter_map(|(id, name, ..)| {
-                        Some((
-                            config.legacy_policy_alias(id),
-                            config.profile_reference(id)?,
-                            name.to_owned(),
-                        ))
+                        let label = if config.is_server_selected_profile(id) {
+                            format!("{name} · Server selects the model")
+                        } else {
+                            name.to_owned()
+                        };
+                        let reference = config.profile_reference(id)?;
+                        if let Some(source) = config.java_profile_source(&reference) {
+                            java_ai_profiles.push((
+                                source.clone(),
+                                reference.clone(),
+                                label.clone(),
+                            ));
+                        }
+                        Some((config.legacy_policy_alias(id), reference, label))
                     })
                     .collect()
             });
@@ -501,6 +511,7 @@ impl Workspace {
                 passphrases: &passphrases,
                 keys: &self.ssh_key_choices,
                 ai_profiles: &ai_profiles,
+                java_ai_profiles: &java_ai_profiles,
                 incognito_allowed: self.clipboard.policy.incognito_allowed,
                 serial_allowed: self.serial_profiles_allowed(),
                 terminal_effects: effects.as_deref(),
@@ -808,6 +819,20 @@ impl Workspace {
             )
         {
             return window::gain_focus(dialog);
+        }
+        if let Some((reference, source)) = message.java_ai_adoption()
+            && !self.ai_configuration().is_some_and(|config| {
+                config.java_profile_source(reference) == Some(source)
+                    && config
+                        .resolve_profile_reference(reference)
+                        .is_some_and(|id| config.interactive_chat_transport(id).is_ok())
+            })
+        {
+            self.notice(
+                owner,
+                "The imported AI profile changed. Review it in AI Manager.".into(),
+            );
+            return Task::none();
         }
         let task = match message {
             Profile::SaveTeamworkAuth if !editing => self.save_teamwork_auth(id),

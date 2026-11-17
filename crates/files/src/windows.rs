@@ -61,6 +61,15 @@ pub fn is_local_reference_file(file: &File) -> io::Result<bool> {
 }
 
 pub(crate) fn local_reference_path(file: &File) -> io::Result<Option<PathBuf>> {
+    local_reference_path_on(file, |format| {
+        matches!(format, "NTFS" | "ReFS" | "FAT" | "FAT32" | "exFAT")
+    })
+}
+
+pub(crate) fn local_reference_path_on(
+    file: &File,
+    supported_format: impl FnOnce(&str) -> bool,
+) -> io::Result<Option<PathBuf>> {
     let mut path = vec![0_u16; 32_768];
     // SAFETY: The file handle and UTF-16 output buffer remain live for the call.
     let used = unsafe {
@@ -116,8 +125,7 @@ pub(crate) fn local_reference_path(file: &File) -> io::Result<Option<PathBuf>> {
     let Some(end) = format.iter().position(|&unit| unit == 0) else {
         return Ok(None);
     };
-    let local = String::from_utf16(&format[..end])
-        .is_ok_and(|format| matches!(format.as_str(), "NTFS" | "ReFS" | "FAT" | "FAT32" | "exFAT"));
+    let local = String::from_utf16(&format[..end]).is_ok_and(|format| supported_format(&format));
     Ok(local.then(|| PathBuf::from(path)))
 }
 

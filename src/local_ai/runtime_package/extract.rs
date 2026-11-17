@@ -25,6 +25,9 @@ const MAX_EXPANDED_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MIN_EXPANSION_LIMIT: u64 = 512 * 1024 * 1024;
 const CHUNK: usize = 128 * 1024;
 
+mod tar_zst;
+pub(in crate::local_ai) use tar_zst::apply_tar_zst;
+
 pub(in crate::local_ai) struct Layout<'a> {
     pub(in crate::local_ai) size: u64,
     pub(in crate::local_ai) sha256: &'a str,
@@ -97,12 +100,8 @@ pub(in crate::local_ai) fn apply_archive(
     let mut has_companion = layout.companion.is_none();
     let mut ranges = Vec::new();
     let mut central_start = layout.size;
-    let mut remaining = layout
-        .size
-        .saturating_mul(30)
-        .clamp(MIN_EXPANSION_LIMIT, MAX_EXPANDED_BYTES);
-    let mut buffer = vec![0; CHUNK];
-    let mut compare_buffer = if create { Vec::new() } else { vec![0; CHUNK] };
+    let mut remaining = expansion_budget(layout.size);
+    let mut files_on_disk = FilesOnDisk::new(create, cancelled);
 
     while let Some(entry) = files.next() {
         check_cancelled(cancelled)?;
@@ -164,15 +163,7 @@ pub(in crate::local_ai) fn apply_archive(
         }
         inventory.record(&components, is_directory, &mut node_count, layout.nodes)?;
         let (name, parents) = components.split_last().expect("validated path");
-        let mut child = None;
-        for part in parents {
-            child = Some(
-                child
-                    .as_ref()
-                    .unwrap_or(&payload)
-                    .private_child(part, create)?,
-            );
-        }
+        let child = open_parent(&payload, parents, create)?;
         let parent = child.as_ref().unwrap_or(&payload);
         let name = *name;
 
@@ -191,42 +182,16 @@ pub(in crate::local_ai) fn apply_archive(
         ranges.push((header, end));
 
         if is_directory {
-            stream_entry(&mut input, size, &mut buffer, cancelled, |_| Ok(()))?;
+            stream_entry(
+                &mut input,
+                size,
+                &mut files_on_disk.buffer,
+                cancelled,
+                |_| Ok(()),
+            )?;
             parent.private_child(name, create)?;
-        } else if create {
-            parent.publish_with(name, |file| {
-                stream_entry(&mut input, size, &mut buffer, cancelled, |bytes| {
-                    file.write_all(bytes)
-                })?;
-                #[cfg(unix)]
-                if executable {
-                    mark_executable(file)?;
-                }
-                Ok(())
-            })?;
         } else {
-            let mut file = parent.open_private_file(name)?;
-            require_single_link(&file)?;
-            let file_stamp = FileStamp::read(&file)?;
-            if file.metadata()?.len() != size {
-                return Err(invalid("Installed runtime file has the wrong size"));
-            }
-            #[cfg(unix)]
-            if executable {
-                require_executable(&file)?;
-            }
-            stream_entry(&mut input, size, &mut buffer, cancelled, |expected| {
-                let actual = &mut compare_buffer[..expected.len()];
-                file.read_exact(actual)?;
-                if actual != expected {
-                    return Err(invalid(
-                        "Installed runtime file differs from the signed ZIP",
-                    ));
-                }
-                Ok(())
-            })?;
-            file_stamp.require_unchanged(&file)?;
-            file_stamp.require_unchanged(&parent.open_private_file(name)?)?;
+            files_on_disk.apply(parent, name, &mut input, size, executable)?;
         }
     }
 
@@ -253,6 +218,93 @@ pub(in crate::local_ai) fn apply_archive(
     check_cancelled(cancelled)
 }
 
+fn expansion_budget(size: u64) -> u64 {
+    size.saturating_mul(30)
+        .clamp(MIN_EXPANSION_LIMIT, MAX_EXPANDED_BYTES)
+}
+
+fn open_parent(
+    payload: &Directory,
+    parents: &[&str],
+    create: bool,
+) -> io::Result<Option<Directory>> {
+    let mut child = None;
+    for part in parents {
+        child = Some(
+            child
+                .as_ref()
+                .unwrap_or(payload)
+                .private_child(part, create)?,
+        );
+    }
+    Ok(child)
+}
+
+struct FilesOnDisk<'a> {
+    create: bool,
+    cancelled: &'a AtomicBool,
+    buffer: Vec<u8>,
+    compare: Vec<u8>,
+}
+
+impl<'a> FilesOnDisk<'a> {
+    fn new(create: bool, cancelled: &'a AtomicBool) -> Self {
+        Self {
+            create,
+            cancelled,
+            buffer: vec![0; CHUNK],
+            compare: if create { Vec::new() } else { vec![0; CHUNK] },
+        }
+    }
+
+    fn apply(
+        &mut self,
+        parent: &Directory,
+        name: &str,
+        input: &mut impl Read,
+        size: u64,
+        executable: bool,
+    ) -> io::Result<()> {
+        if self.create {
+            return parent.publish_with(name, |file| {
+                stream_entry(input, size, &mut self.buffer, self.cancelled, |bytes| {
+                    file.write_all(bytes)
+                })?;
+                #[cfg(unix)]
+                if executable {
+                    mark_executable(file)?;
+                }
+                Ok(())
+            });
+        }
+
+        let mut file = parent.open_private_file(name)?;
+        require_single_link(&file)?;
+        let stamp = FileStamp::read(&file)?;
+        if file.metadata()?.len() != size {
+            return Err(invalid("Installed runtime file has the wrong size"));
+        }
+        #[cfg(unix)]
+        if executable {
+            require_executable(&file)?;
+        }
+        #[cfg(not(unix))]
+        let _ = executable;
+        stream_entry(input, size, &mut self.buffer, self.cancelled, |expected| {
+            let actual = &mut self.compare[..expected.len()];
+            file.read_exact(actual)?;
+            if actual != expected {
+                return Err(invalid(
+                    "Installed runtime file differs from the signed archive",
+                ));
+            }
+            Ok(())
+        })?;
+        stamp.require_unchanged(&file)?;
+        stamp.require_unchanged(&parent.open_private_file(name)?)
+    }
+}
+
 fn authenticate_archive(
     archive: &mut File,
     layout: &Layout<'_>,
@@ -262,11 +314,15 @@ fn authenticate_archive(
     let stamp = FileStamp::read(archive)?;
     let size = layout.size;
     if !(1..=MAX_ARCHIVE_BYTES).contains(&size) || archive.metadata()?.len() != size {
-        return Err(invalid("Runtime ZIP size differs from the signed index"));
+        return Err(invalid(
+            "Runtime archive size differs from the signed index",
+        ));
     }
     archive.rewind()?;
     if copy_archive(archive, &mut io::sink(), size, cancelled)? != layout.sha256 {
-        return Err(invalid("Runtime ZIP digest differs from the signed index"));
+        return Err(invalid(
+            "Runtime archive digest differs from the signed index",
+        ));
     }
     stamp.require_unchanged(archive)?;
     archive.rewind()?;
@@ -275,7 +331,7 @@ fn authenticate_archive(
 
 fn path_components(path: &str) -> io::Result<Vec<&str>> {
     if path.len() > MAX_PATH_BYTES {
-        return Err(invalid("Runtime ZIP entry path is too long"));
+        return Err(invalid("Runtime archive entry path is too long"));
     }
     let parts: Vec<_> = path.split('/').collect();
     if parts.len() > MAX_PATH_DEPTH
@@ -293,7 +349,7 @@ fn path_components(path: &str) -> io::Result<Vec<&str>> {
                 || is_device_name(part)
         })
     {
-        return Err(invalid("Runtime ZIP contains an unsafe portable path"));
+        return Err(invalid("Runtime archive contains an unsafe portable path"));
     }
     Ok(parts)
 }
@@ -327,7 +383,7 @@ fn stream_entry(
         let count = input.read(&mut buffer[..limit])?;
         if count == 0 {
             return Err(invalid(
-                "Runtime ZIP entry is smaller than its declared size",
+                "Runtime archive entry is smaller than its declared size",
             ));
         }
         consume(&buffer[..count])?;
@@ -336,7 +392,7 @@ fn stream_entry(
     // Reading to EOF lets the ZIP reader also validate the entry's CRC.
     if input.read(&mut buffer[..1])? != 0 {
         return Err(invalid(
-            "Runtime ZIP entry is larger than its declared size",
+            "Runtime archive entry is larger than its declared size",
         ));
     }
     Ok(())
@@ -366,7 +422,7 @@ impl Inventory {
             Entry::Vacant(slot) => {
                 *count += 1;
                 if *count > max_nodes {
-                    return Err(invalid("Runtime ZIP creates too many payload nodes"));
+                    return Err(invalid("Runtime archive creates too many payload nodes"));
                 }
                 slot.insert(Node {
                     name: name.to_owned(),
@@ -381,7 +437,7 @@ impl Inventory {
                     || (node.explicit && explicit)
                 {
                     return Err(invalid(
-                        "Runtime ZIP contains a duplicate or conflicting path",
+                        "Runtime archive contains a duplicate or conflicting path",
                     ));
                 }
                 node.explicit |= explicit;

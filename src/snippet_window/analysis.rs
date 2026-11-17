@@ -11,7 +11,7 @@ use iced::{Alignment, Element, Font, Length, Theme};
 
 use crate::ai_manager::{ProfileId, ProfileRef};
 use crate::snippet_analysis::model::{
-    Dependency, Finding, History, Purpose, Record, Subject, Verification,
+    Dependency, Finding, History, Purpose, Record, Subject, Verification, java_history::Snapshot,
 };
 use crate::snippets::SnippetId;
 
@@ -51,13 +51,22 @@ pub enum Message {
     Discard,
     CancelDiscard,
     Compare,
+    CompareImportedSnapshots {
+        record: SnippetId,
+        run: SnippetId,
+        left: Snapshot,
+        right: Snapshot,
+    },
     Diagram,
     GenerateDiagram,
     AutoDiagram(bool),
     AutoModularization(bool),
     Export,
     Reports(crate::workspace::SnippetReportAction),
-    Jump { file: Option<String>, line: usize },
+    Jump {
+        file: Option<String>,
+        line: usize,
+    },
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -69,6 +78,7 @@ pub(crate) struct ProfileChoice {
     pub(crate) endpoint: String,
     pub(crate) remote: bool,
     pub(crate) cli: bool,
+    pub(crate) server_selected: bool,
 }
 
 impl fmt::Display for ProfileChoice {
@@ -78,6 +88,9 @@ impl fmt::Display for ProfileChoice {
             output.write_str(" · CLI")?;
         } else if self.remote {
             output.write_str(" · HTTPS")?;
+        }
+        if self.server_selected {
+            output.write_str(" · Server selects the model")?;
         }
         Ok(())
     }
@@ -964,6 +977,31 @@ fn flowchart<'a>(state: &View<'a>, record: &'a Record) -> Column<'a, WindowMessa
         } else {
             body = body.push(notice("The stored flowchart could not be rendered."));
         }
+    } else if let Some(diagram) = record
+        .java_history
+        .as_ref()
+        .and_then(|history| history.historical_diagram.as_ref())
+    {
+        body = body.push(text(format!("Imported diagram · {}", diagram.type_id)).size(14));
+        if !diagram.notice.is_empty() {
+            body = body.push(notice(&diagram.notice));
+        }
+        if let Some(handle) = state.diagram_preview {
+            body = body.push(svg(handle.clone()).width(Length::Fill).height(250));
+        } else {
+            body = body.push(notice(
+                "This diagram is available as its original Mermaid source.",
+            ));
+            body = body.push(
+                scrollable(
+                    text(&diagram.mermaid)
+                        .font(Font::MONOSPACE)
+                        .size(13)
+                        .wrapping(Wrapping::WordOrGlyph),
+                )
+                .height(200),
+            );
+        }
     } else {
         body = body.push(notice("No flowchart was stored for this analysis."));
     }
@@ -1002,11 +1040,35 @@ fn report<'a>(
     if let Some(history) = &record.java_history {
         body = body.push(text("Imported Java history").size(16));
         for run in &history.apply_runs {
+            let snapshots: Vec<_> = Snapshot::ALL
+                .into_iter()
+                .filter(|&kind| history.snapshot(run, kind).is_some())
+                .collect();
+            let mut comparisons = Row::new().spacing(6);
+            for (index, &left) in snapshots.iter().enumerate() {
+                for &right in &snapshots[index + 1..] {
+                    comparisons = comparisons.push(
+                        button(text(format!("{} ↔ {}", left.label(), right.label()))).on_press(
+                            wrap(Message::CompareImportedSnapshots {
+                                record: record.id,
+                                run: run.id,
+                                left,
+                                right,
+                            }),
+                        ),
+                    );
+                }
+            }
             body = body.push(
                 column![
                     text(run.outcome.label(run.saved_to_snippet_at)).size(13),
                     (!run.summary.is_empty())
                         .then(|| text(&run.summary).size(13).wrapping(Wrapping::WordOrGlyph)),
+                    (snapshots.len() >= 2).then(|| comparisons.wrap()),
+                    (snapshots.len() == 1).then(|| text(
+                        "One snapshot is available in the JSON export with code."
+                    )
+                    .size(13)),
                 ]
                 .spacing(3),
             );
@@ -1021,10 +1083,6 @@ fn report<'a>(
                 ))
                 .size(13),
             );
-        }
-        if !history.attachments.is_empty() {
-            body =
-                body.push(text("Export JSON with code to view the historical snapshots.").size(13));
         }
     }
     if !provenance.knowledge_citations.is_empty() {

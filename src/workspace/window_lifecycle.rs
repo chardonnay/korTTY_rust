@@ -41,8 +41,9 @@ impl Default for StartupPreferences {
 pub(super) struct FixedGeometry {
     pub(super) width: u16,
     pub(super) height: u16,
-    pub(super) x: u16,
-    pub(super) y: u16,
+    pub(super) x: i32,
+    pub(super) y: i32,
+    pub(super) maximized: bool,
 }
 
 impl Default for FixedGeometry {
@@ -52,6 +53,7 @@ impl Default for FixedGeometry {
             height: 800,
             x: 100,
             y: 100,
+            maximized: false,
         }
     }
 }
@@ -59,8 +61,8 @@ impl Default for FixedGeometry {
 impl FixedGeometry {
     pub(super) const WIDTH: std::ops::RangeInclusive<u16> = 520..=4000;
     pub(super) const HEIGHT: std::ops::RangeInclusive<u16> = 300..=3000;
-    pub(super) const X: std::ops::RangeInclusive<u16> = 0..=5000;
-    pub(super) const Y: std::ops::RangeInclusive<u16> = 0..=3000;
+    pub(super) const POSITION: std::ops::RangeInclusive<i32> =
+        -SavedPosition::MAX_COORDINATE..=SavedPosition::MAX_COORDINATE;
 
     pub(super) fn clamped(self) -> Self {
         let clamp = |value: u16, range: std::ops::RangeInclusive<u16>| {
@@ -69,8 +71,9 @@ impl FixedGeometry {
         Self {
             width: clamp(self.width, Self::WIDTH),
             height: clamp(self.height, Self::HEIGHT),
-            x: clamp(self.x, Self::X),
-            y: clamp(self.y, Self::Y),
+            x: self.x.clamp(*Self::POSITION.start(), *Self::POSITION.end()),
+            y: self.y.clamp(*Self::POSITION.start(), *Self::POSITION.end()),
+            maximized: self.maximized,
         }
     }
 
@@ -79,7 +82,7 @@ impl FixedGeometry {
         WindowPlacement {
             width: f32::from(geometry.width),
             height: f32::from(geometry.height),
-            position: SavedPosition::new(f32::from(geometry.x), f32::from(geometry.y)),
+            position: SavedPosition::new(geometry.x as f32, geometry.y as f32),
         }
     }
 }
@@ -292,7 +295,7 @@ impl Lifecycle {
 
     pub(super) fn startup(&self, preferences: StartupPreferences) -> (WindowPlacement, bool, bool) {
         let (placement, maximized) = if preferences.use_fixed_geometry {
-            (preferences.fixed.placement(), false)
+            (preferences.fixed.placement(), preferences.fixed.maximized)
         } else if let Some(placement) = self
             .last
             .placement()

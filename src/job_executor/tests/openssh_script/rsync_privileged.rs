@@ -11,6 +11,7 @@ use super::*;
 
 mod existing_file;
 mod local_file_download;
+mod local_tree_download;
 mod mixed;
 
 #[test]
@@ -151,6 +152,14 @@ struct Fixture {
 }
 
 impl Fixture {
+    fn second_pinned_reference(&mut self) -> ConnectionRef {
+        let mut profile = self.connections.get(self.reference.id).unwrap().clone();
+        profile.id = 0;
+        profile.name = "Second saved profile for the pinned fixture".into();
+        let id = self.connections.save(profile).unwrap();
+        ConnectionRef::from(self.connections.get(id).unwrap())
+    }
+
     fn new() -> Self {
         let profile = Profile::new();
         let (mut connection, pins) = privileged_fixture_route();
@@ -294,13 +303,6 @@ impl Fixture {
             .update_view(&mut view, Message::Run(false))
             .pop()
             .unwrap();
-        let saved = Credentials::resolve(
-            &request.action,
-            self.connections.get(self.reference.id).unwrap(),
-            &ServerAccess::default(),
-            |_, _, _| Err("unexpected credential"),
-        )
-        .map(Some);
         let mut policy = ExecutionPolicy::unrestricted(true);
         policy.sudo_allowed = sudo_allowed;
         policy.rsync = runtime.try_rsync_run_context(&request).unwrap();
@@ -312,9 +314,25 @@ impl Fixture {
             runtime.update_view(&mut view, Message::CancelRun(request.id));
             assert!(request.cancellation.is_requested());
         }
-        let result = run(&request, None, None, &policy, saved, Ok(None), || {
-            Ok(self.trust.clone())
-        });
+        let trust = || Ok(self.trust.clone());
+        let result = if request.action.additional_connections.is_empty() {
+            let saved = Credentials::resolve(
+                &request.action,
+                self.connections.get(self.reference.id).unwrap(),
+                &policy.server_access,
+                |_, _, _| Err("unexpected credential"),
+            )
+            .map(Some);
+            run(&request, None, None, &policy, saved, Ok(None), trust)
+        } else {
+            let saved = Credentials::resolve_batch(
+                &request.action,
+                &self.connections,
+                &policy.server_access,
+                |_, _, _| Err("unexpected credential"),
+            );
+            batch::run(&request, None, &policy, saved, Ok(None), trust)
+        };
         runtime.update_runtime(Message::Finished(result.clone()));
         result
     }

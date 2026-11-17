@@ -24,7 +24,7 @@ const REPLACEMENT_STOPPED: &str =
 
 enum Authority<'a> {
     OneUse(sync::Receipt),
-    Standing(&'a sync::standing::Approval, sync::standing::Firing),
+    Standing(&'a sync::standing::Approval, &'a sync::standing::Admission),
 }
 
 fn plan_limits(limits: sync::standing::Limits) -> StandingLimits {
@@ -148,8 +148,8 @@ pub(super) fn run(
         .as_ref()
         .ok_or_else(|| Failure::blocked(REVIEW_REQUIRED))?;
     let authority = match (copy.standing.is_some(), context.standing_approval()) {
-        (true, Some((approval, firing))) if sync_allowed(reference) => {
-            Authority::Standing(approval, *firing)
+        (true, Some((approval, admission))) if sync_allowed(reference) => {
+            Authority::Standing(approval, admission)
         }
         (false, None) => Authority::OneUse(
             context
@@ -190,9 +190,14 @@ pub(super) fn run(
             return Err(io::Error::other(stopped_message));
         }
         match &authority {
-            Authority::Standing(approval, firing) if reserved.load(Ordering::Acquire) => context
-                .store
-                .require_standing_claimed(&request.job, approval, *firing, SystemTime::now()),
+            Authority::Standing(approval, admission) if reserved.load(Ordering::Acquire) => {
+                context.store.require_standing_claimed(
+                    &request.job,
+                    approval,
+                    admission.firing(),
+                    SystemTime::now(),
+                )
+            }
             Authority::Standing(approval, _) if !approval.active_at(SystemTime::now()) => {
                 Err(io::Error::other(STANDING_STOPPED))
             }
@@ -224,11 +229,11 @@ pub(super) fn run(
     };
     check_cancelled(&request.cancellation)?;
     policy.require_target_groups(&request.action)?;
-    if let Authority::Standing(approval, firing) = &authority {
+    if let Authority::Standing(approval, admission) = &authority {
         let reservation =
             context
                 .store
-                .claim_standing(&request.job, approval, *firing, 0, 0, &stopped);
+                .claim_standing(&request.job, approval, admission, 0, 0, &stopped);
         check_cancelled(&request.cancellation)?;
         reservation.map_err(|_| {
             Failure::blocked("The recurring SFTP firing could not reserve an unused approval slot.")

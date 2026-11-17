@@ -19,7 +19,7 @@ use zeroize::Zeroizing;
 use crate::local_ai::{self, Client};
 use crate::vault_window::VaultWindow;
 
-use super::{MAX_DIMENSIONS, MAX_INDEX_PASSAGES, MAX_SOURCES, sha256};
+use super::{MAX_DIMENSIONS, MAX_QDRANT_INDEX_PASSAGES, MAX_SOURCES, sha256};
 
 const MAX_ENDPOINT_BYTES: usize = 2048;
 const MAX_COLLECTION_BYTES: usize = 128;
@@ -479,11 +479,11 @@ impl Connection {
         validate_generation(generation)?;
         let authority = Authority::new(check);
         authority.remaining()?;
-        let mut seen = [false; MAX_INDEX_PASSAGES];
-        if points.len() > MAX_INDEX_PASSAGES
+        let mut seen = [false; MAX_QDRANT_INDEX_PASSAGES];
+        if points.len() > MAX_QDRANT_INDEX_PASSAGES
             || points.iter().any(|point| {
                 point.source >= MAX_SOURCES
-                    || point.position >= MAX_INDEX_PASSAGES
+                    || point.position >= MAX_QDRANT_INDEX_PASSAGES
                     || std::mem::replace(&mut seen[point.position], true)
                     || !valid_vector(point.vector, self.dimensions)
             })
@@ -536,7 +536,7 @@ impl Connection {
         let authority = Authority::new(check);
         authority.remaining()?;
         if enabled.len() > MAX_SOURCES
-            || limit > MAX_INDEX_PASSAGES
+            || limit > MAX_QDRANT_INDEX_PASSAGES
             || !valid_vector(query, self.dimensions)
         {
             return Err("The Qdrant query does not match the reviewed index limits.".into());
@@ -573,7 +573,7 @@ impl Connection {
         if result.points.len() > limit {
             return Err(RESPONSE.into());
         }
-        let mut seen = [false; MAX_INDEX_PASSAGES];
+        let mut seen = [false; MAX_QDRANT_INDEX_PASSAGES];
         let mut hits = Vec::with_capacity(result.points.len());
         for WireHit { id, score, payload } in result.points {
             let PointPayload {
@@ -583,7 +583,7 @@ impl Connection {
             } = payload;
             if returned != generation_text
                 || enabled.get(source) != Some(&true)
-                || position >= MAX_INDEX_PASSAGES
+                || position >= MAX_QDRANT_INDEX_PASSAGES
                 || std::mem::replace(&mut seen[position], true)
                 || !(-MAX_COSINE_MAGNITUDE..=MAX_COSINE_MAGNITUDE).contains(&score)
                 || id != point_id(generation, position)?

@@ -10,7 +10,7 @@ use super::{
     Catalog, ConnectionMode, JavaProfileSource, MAX_PROFILES, ModelMode, Profile, ProfileId,
     Reasoning, Vision, cli_profile,
 };
-use crate::ai_manager::{JavaJournalEvidence, JavaJournalProfileHint, JavaJournalProfiles};
+use crate::ai_manager::{JavaAiProfileHint, JavaJournalEvidence, JavaJournalProfiles};
 use crate::local_ai::cli::{self, catalog::Provider};
 use crate::local_ai::web_search::{McpMode, McpSettings};
 use crate::local_ai::{self, PromptPreset, RemoteProtocol, Tokenizer, UsageBudget};
@@ -328,7 +328,7 @@ pub(in crate::ai_manager) fn decode(bytes: &[u8]) -> io::Result<(Catalog, Report
         .or_else(|| default_id.filter(selected))
         .or(first_id);
     let automation = automation.filter(selected).or(regular);
-    let hint = |id: &str| JavaJournalProfileHint {
+    let hint = |id: &str| JavaAiProfileHint {
         id: id.into(),
         source: catalog
             .java_profile_sources()
@@ -1153,7 +1153,7 @@ mod tests {
                 java_id
             );
             assert_eq!(
-                hint.as_ref().and_then(JavaJournalProfileHint::source),
+                hint.as_ref().and_then(JavaAiProfileHint::source),
                 profile.java_source.as_ref()
             );
             assert!(profile.model.is_empty() && profile.endpoint.is_empty());
@@ -1287,14 +1287,14 @@ mod tests {
             journal
                 .recording
                 .as_ref()
-                .and_then(JavaJournalProfileHint::source),
+                .and_then(JavaAiProfileHint::source),
             openai.java_source.as_ref()
         );
         assert_eq!(
             journal
                 .automation
                 .as_ref()
-                .and_then(JavaJournalProfileHint::source),
+                .and_then(JavaAiProfileHint::source),
             cli.java_source.as_ref()
         );
         catalog.validate_java_profiles().unwrap();
@@ -1475,7 +1475,7 @@ mod tests {
             <defaultAiProfileId>supported</defaultAiProfileId>
             <aiProfiles>
                 <profile><id>original-first</id><name>Unsupported first</name>
-                    <apiUrl>http://127.0.0.1:8080/custom/generate</apiUrl><model>fixture</model></profile>
+                    <apiUrl>http://127.0.0.1:8080/v1/responses</apiUrl><model>fixture</model></profile>
                 <profile><id>supported</id><name>Supported second</name>
                     <apiUrl>https://example.test/v1</apiUrl><model>fixture</model></profile>
             </aiProfiles>
@@ -1760,7 +1760,7 @@ mod tests {
                 .journal_profiles
                 .recording
                 .as_ref()
-                .and_then(JavaJournalProfileHint::source),
+                .and_then(JavaAiProfileHint::source),
             native.java_source.as_ref()
         );
         assert!(catalog.default_profile().is_none());
@@ -2279,9 +2279,16 @@ mod tests {
             <profile><id>completion-native-mcp</id><name>Wrong MCP Route</name>
                 <apiUrl>https://gateway.example/tenant/V1/Chat/Completions/</apiUrl><model>fixture</model>
                 <internetAccessMode>LM_STUDIO_TOOLPACK</internetAccessMode></profile>
+            <profile><id>custom-https</id><name>Custom HTTPS Route</name>
+                <apiUrl>https://gateway.example/tenant/chat-proxy/Invoke/</apiUrl>
+                <modelSelectionMode>DEFAULT</modelSelectionMode></profile>
+            <profile><id>custom-loopback</id><name>Custom Loopback Route</name>
+                <apiUrl>http://127.0.0.1:1234/chat-proxy/Invoke/</apiUrl>
+                <modelSelectionMode>MANUAL</modelSelectionMode><model>fixture/local</model></profile>
         </aiProfiles></globalSettings>"#;
         let (catalog, report) = decode(xml).unwrap();
-        assert_eq!(report.https_imported, 4);
+        assert_eq!(report.https_imported, 5);
+        assert_eq!(report.loopback_imported, 1);
         assert_eq!(report.omitted, 2);
         for (profile, mode, destination, model_mode, model) in [
             (
@@ -2312,6 +2319,20 @@ mod tests {
                 ModelMode::ServerDefault,
                 "",
             ),
+            (
+                &catalog.profiles[4],
+                ConnectionMode::RemoteOpenAiExact,
+                "https://gateway.example/tenant/chat-proxy/Invoke/",
+                ModelMode::ServerDefault,
+                "",
+            ),
+            (
+                &catalog.profiles[5],
+                ConnectionMode::LmStudioCompatible,
+                "http://127.0.0.1:1234/chat-proxy/Invoke/",
+                ModelMode::Manual,
+                "fixture/local",
+            ),
         ] {
             assert_eq!(profile.connection_mode, mode);
             assert_eq!(profile.endpoint, destination);
@@ -2323,7 +2344,7 @@ mod tests {
             assert!(profile.restore_review && profile.credential_env.is_empty());
             assert!(profile.transport(1).is_err());
         }
-        assert_eq!(catalog.profiles.len(), 4);
+        assert_eq!(catalog.profiles.len(), 6);
         catalog.validate_java_profiles().unwrap();
         let replayed = decode(xml).unwrap().0;
         assert_eq!(

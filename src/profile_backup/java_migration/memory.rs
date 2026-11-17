@@ -1,6 +1,6 @@
 //! Converts Java AI Memory documents without changing their scope.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::sync::{Arc, LazyLock};
 
@@ -23,6 +23,7 @@ const MAX_SAFE_NAME: usize = 80;
 pub(in crate::profile_backup) struct Source {
     pub(in crate::profile_backup) connections: Arc<Zeroizing<Vec<u8>>>,
     pub(in crate::profile_backup) files: Snapshot,
+    pub(in crate::profile_backup) review: Option<crate::profile_backup::JavaMemoryReview>,
 }
 
 fn safe_name(id: &str) -> String {
@@ -55,6 +56,7 @@ fn java_whitespace(character: char) -> bool {
 pub(in crate::profile_backup) struct MappedScopes {
     names: BTreeMap<String, u64>,
     ids: BTreeMap<String, u64>,
+    ambiguous_names: BTreeSet<String>,
 }
 
 impl MappedScopes {
@@ -63,27 +65,76 @@ impl MappedScopes {
         mut lookup_native: impl FnMut(&str) -> Option<u64>,
     ) -> io::Result<Self> {
         let mut aliases = BTreeMap::new();
+        let mut identities = BTreeMap::new();
         visit_java_connection_ids(source, |original| {
             let id = original.trim_matches(java_whitespace);
             if id.is_empty() {
                 return;
             }
             let name = safe_name(id);
-            // Count filename aliases before considering whether their profiles can
-            // be imported. A single backup file might represent either source ID.
+            // The truncated filename and the exact archive marker carry different identities.
+            // Count collisions before considering which profiles have destinations.
             aliases
                 .entry(name.to_ascii_lowercase())
                 .and_modify(|entry| *entry = None)
-                .or_insert_with(|| {
-                    lookup_native(original).map(|native| (id.to_owned(), name, native))
-                });
+                .or_insert_with(|| Some((id.to_owned(), name)));
+            identities
+                .entry(id.to_owned())
+                .and_modify(|entry| *entry = None)
+                .or_insert_with(|| lookup_native(original));
         })?;
-        let mut mapping = Self::default();
-        for (id, name, native) in aliases.into_values().flatten() {
-            mapping.names.insert(name, native);
-            mapping.ids.insert(id, native);
+        let mut mapping = Self {
+            ids: identities
+                .into_iter()
+                .filter_map(|(id, native)| Some((id, native?)))
+                .collect(),
+            ..Self::default()
+        };
+        for (portable_name, alias) in aliases {
+            if let Some((id, name)) = alias {
+                if let Some(&native) = mapping.ids.get(&id) {
+                    mapping.names.insert(name, native);
+                }
+            } else {
+                mapping.ambiguous_names.insert(portable_name);
+            }
         }
         Ok(mapping)
+    }
+
+    pub(in crate::profile_backup) fn ambiguous_file(&self, path: &str) -> bool {
+        match Scoped::parse(path) {
+            Some(Scoped::Document(name) | Scoped::History(name, _)) => {
+                self.ambiguous_names.contains(&name.to_ascii_lowercase())
+            }
+            _ => false,
+        }
+    }
+
+    pub(in crate::profile_backup) fn referenced(&self, files: &Snapshot) -> BTreeSet<u64> {
+        let mut ids = BTreeSet::new();
+        for (path, bytes) in files {
+            match Scoped::parse(path) {
+                Some(Scoped::Document(name) | Scoped::History(name, _)) => {
+                    ids.extend(self.names.get(name));
+                }
+                Some(Scoped::Archive) => {
+                    if let Ok(contents) = std::str::from_utf8(bytes) {
+                        for (line, _) in archive_lines(contents) {
+                            if let Some(id) = archive_scope(line)
+                                .flatten()
+                                .and_then(|encoded| URL_SAFE_NO_PAD.decode(encoded).ok())
+                                .and_then(|decoded| String::from_utf8(decoded).ok())
+                            {
+                                ids.extend(self.ids.get(&id));
+                            }
+                        }
+                    }
+                }
+                None => {}
+            }
+        }
+        ids
     }
 }
 
@@ -295,7 +346,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn java_ssh_memory_rejects_case_and_trimmed_aliases_from_unsupported_profiles() {
+    fn java_ssh_memory_distinguishes_filename_aliases_from_duplicate_ids() {
         let id = "f827d86d-1531-4cc5-9d0f-f6e5c1a2d850";
         let source = |alias: &str| {
             format!(
@@ -303,13 +354,16 @@ mod tests {
                  <connection id='{alias}'><protocol>UNRECOGNIZED</protocol></connection></connections>"
             )
         };
-        for alias in [id.to_ascii_uppercase(), format!("\u{2003}{id} ")] {
+        for (alias, exact_is_unique) in [
+            (id.to_ascii_uppercase(), true),
+            (format!("\u{2003}{id} "), false),
+        ] {
             let scopes = MappedScopes::read(source(&alias).as_bytes(), |original| {
                 (original == id).then_some(17)
             })
             .unwrap();
             assert!(scopes.names.is_empty());
-            assert!(scopes.ids.is_empty());
+            assert_eq!(scopes.ids.get(id), exact_is_unique.then_some(&17));
         }
         let nonbreaking = format!("\u{00a0}{id}");
         let scopes = MappedScopes::read(source(&nonbreaking).as_bytes(), |original| {
@@ -336,7 +390,18 @@ mod tests {
         })
         .unwrap();
         assert!(scopes.names.is_empty());
+        assert_eq!(scopes.ids, BTreeMap::from([(first, 17)]));
+        assert!(scopes.ambiguous_file(&format!("memory/connections/{name}.md")));
+    }
+
+    #[test]
+    fn java_memory_exact_id_duplicates_still_block_archive_markers() {
+        let source =
+            b"<connections><connection id='exact'/><connection id=' exact '/></connections>";
+        let scopes = MappedScopes::read(source, |_| Some(1)).unwrap();
+        assert!(scopes.names.is_empty());
         assert!(scopes.ids.is_empty());
+        assert!(scopes.ambiguous_file("memory/connections/exact.md"));
     }
 
     #[test]

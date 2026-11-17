@@ -32,6 +32,72 @@ fn rule(id: &str, pattern: &str) -> Rule {
 }
 
 #[test]
+fn java_marker_assertions_preserve_priority_over_linear_rules() {
+    let comparison = Rule {
+        regex: true,
+        java_regex: true,
+        ..rule("important", r"(?<=verified )([a-z]++):\1")
+    };
+    let mut settings = Settings {
+        rules: vec![comparison, rule("info", "ok")],
+        ..Settings::default()
+    };
+    let matcher = Compiled::new(&settings).unwrap();
+    assert_eq!(
+        matcher.first_match("verified ok:ok").unwrap().id,
+        "important"
+    );
+    assert_eq!(matcher.first_match("verified ok:no").unwrap().id, "info");
+    settings.rules.reverse();
+    let matcher = Compiled::new(&settings).unwrap();
+    assert_eq!(matcher.first_match("verified ok:ok").unwrap().id, "info");
+    settings.rules.remove(0);
+    let matcher = Compiled::new(&settings).unwrap();
+    assert_eq!(
+        matcher.first_match("verified ok:ok").unwrap().id,
+        "important"
+    );
+}
+
+#[test]
+fn java_marker_patterns_use_ascii_classes_and_java_line_endings_in_rule_order() {
+    let java = |id, pattern| Rule {
+        regex: true,
+        java_regex: true,
+        ..rule(id, pattern)
+    };
+    let settings = Settings {
+        rules: vec![
+            java("important", r"^\d+\h+\QERROR+\E$"),
+            rule("info", "error+"),
+            java("important", r"^a.b\z"),
+            java("error", r"(?s)^a.b\z"),
+            java("important", r"^\w+\z"),
+        ],
+        ..Settings::default()
+    };
+    let compiled = Compiled::new(&settings).unwrap();
+    for (text, expected) in [
+        ("41 error+", Some("important")),
+        ("41\u{a0}error+\r\n", Some("important")),
+        ("41 error+\u{2028}", Some("important")),
+        ("\u{0661} error+", Some("info")),
+        ("41 error+\n\n", Some("info")),
+        ("a\u{0085}b", Some("error")),
+        ("a\rb", Some("error")),
+        ("a-b", Some("important")),
+        ("ABC_42", Some("important")),
+        ("\u{212a}", None),
+    ] {
+        assert_eq!(
+            compiled.first_match(text).map(|marker| marker.id.as_str()),
+            expected,
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
 fn journal_markers_keep_reserved_order_and_unique_stable_custom_ids() -> io::Result<()> {
     let mut settings = Settings::default();
     assert!(!Compiled::default().enabled());

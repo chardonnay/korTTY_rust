@@ -29,6 +29,10 @@ const SOURCE: OFlags = OFlags::RDONLY
 pub(crate) struct Directory(File);
 
 impl Directory {
+    pub(crate) fn try_clone(&self) -> io::Result<Self> {
+        self.0.try_clone().map(Self)
+    }
+
     pub(crate) fn file(&self) -> &File {
         &self.0
     }
@@ -247,12 +251,13 @@ impl Directory {
     }
 }
 
-pub(super) fn hold_reviewed_child(parent: &Directory, name: &OsStr) -> io::Result<Directory> {
+pub(super) fn hold_reviewed_child(
+    parent: &Directory,
+    name: &OsStr,
+    lock: rustix::fs::FlockOperation,
+) -> io::Result<Directory> {
     let child = parent.open_child(name)?;
-    rustix::fs::flock(
-        &child.0,
-        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-    )?;
+    rustix::fs::flock(&child.0, lock)?;
     parent.require_child(name, &child)?;
     Ok(child)
 }

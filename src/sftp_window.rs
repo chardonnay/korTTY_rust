@@ -57,7 +57,6 @@ mod workbench;
 pub(crate) mod worker;
 
 pub use conflicts::ConflictDefault;
-#[cfg(windows)]
 pub(crate) use files::local_name as checked_local_component;
 pub(crate) use files::nonce as staging_name;
 pub(crate) use files::{LocalStamp as LocalFileStamp, list_local, validate_transfer_name};
@@ -76,12 +75,18 @@ pub(crate) use tree::{FolderError, FolderTransfer, copy_scheduled as copy_schedu
 pub(crate) use worker::RemoteEditor;
 pub(crate) use worker::extract::transport::exchange as exchange_server_archive;
 pub(crate) use worker::extract::transport::exchange_password_creation as exchange_server_password_archive;
+pub(crate) use worker::extract::transport::file_replace as privileged_file_replace;
 pub(crate) use worker::extract::transport::{
-    PrivilegedArchiveFailure, exchange_privileged as exchange_privileged_server_archive,
+    ArchiveUpdateFailure, PrivilegedArchiveFailure, exchange_archive_update,
+    exchange_privileged as exchange_privileged_server_archive, exchange_privileged_archive_update,
 };
 #[cfg(test)]
 pub(crate) use worker::folder_usage::tests::exercise_live_folder_sizes;
-pub(crate) use worker::sync::{LocalFileSnapshot, ReviewedFilePublication, ReviewedFileReceiver};
+pub(crate) use worker::sync::{
+    FileWitness, LocalFileSnapshot, ReviewedFilePublication, ReviewedFileReceiver,
+    VacantLocalFileAlias, VacantLocalFilePublication, VacantLocalFileReceiver,
+    VacantLocalFileSnapshot,
+};
 
 const PAGE_SIZE: usize = 160;
 const SERVER_COPY_PAGE_SIZE: usize = 16;

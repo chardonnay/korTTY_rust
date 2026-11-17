@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 
 use super::super::{AuthMethod, Document};
@@ -263,13 +263,14 @@ pub(super) fn portable_java_backup(preview: &Preview) -> io::Result<(Vec<u8>, us
 pub(super) fn merge_java_backup(
     local: Option<&[u8]>,
     incoming: &[u8],
+    highlight_sets: &BTreeMap<String, String>,
 ) -> io::Result<Option<Vec<u8>>> {
     let source = super::super::decode_document(incoming)?;
     let document = local
         .map(super::super::decode_document)
         .transpose()?
         .unwrap_or_default();
-    let store = Store {
+    let mut store = Store {
         path: Default::default(),
         document,
     };
@@ -284,32 +285,43 @@ pub(super) fn merge_java_backup(
     let entries: Vec<_> = source
         .connections
         .into_iter()
-        .map(|connection| {
+        .map(|mut connection| {
             let id = connection.id;
+            connection.terminal.remap_java_highlight(highlight_sets);
             let mut entry = ImportedProfile::new(connection, group(id));
             entry.badge = source.library.os_badges.get(&id).cloned();
             entry
         })
         .collect();
-    let local_entries: Vec<_> = source
+    let mut local_entries: Vec<_> = source
         .local_profiles
         .into_iter()
-        .map(|profile| ImportedLocal {
-            group: group(profile.id),
-            profile,
-            java_memory_id: None,
-            java_favorite_id: None,
+        .map(|mut profile| {
+            profile.terminal.remap_java_highlight(highlight_sets);
+            ImportedLocal {
+                group: group(profile.id),
+                profile,
+                java_memory_id: None,
+                java_favorite_id: None,
+            }
         })
         .collect();
     let serial_entries: Vec<_> = source
         .serial_profiles
         .into_iter()
-        .map(|profile| ImportedSerial {
-            group: group(profile.id),
-            profile,
-            java_favorite_id: None,
+        .map(|mut profile| {
+            profile.highlight_set = profile.highlight_set.as_deref().and_then(|id| {
+                crate::terminal_highlight::resolve_java_backup_set(highlight_sets, id)
+            });
+            ImportedSerial {
+                group: group(profile.id),
+                profile,
+                java_memory_id: None,
+                java_favorite_id: None,
+            }
         })
         .collect();
+    let ai_hints_changed = merge_java_ai_hints(&mut store.document, &entries, &mut local_entries);
     let mut favorites = BTreeSet::new();
     let (mut candidate, outcome) =
         stage_with_insertions(&store, &entries, &local_entries, &serial_entries, |row| {
@@ -318,7 +330,7 @@ pub(super) fn merge_java_backup(
                 favorites.insert(allocated_id);
             }
         })?;
-    if outcome.imported == 0 {
+    if outcome.imported == 0 && !ai_hints_changed {
         return Ok(None);
     }
     candidate.library.favorites.extend(favorites);
@@ -328,6 +340,84 @@ pub(super) fn merge_java_backup(
         &source.library.group_colors,
     );
     encode(&candidate).map(Some)
+}
+
+fn merge_java_ai_hints(
+    document: &mut Document,
+    entries: &[ImportedProfile],
+    local_entries: &mut Vec<ImportedLocal>,
+) -> bool {
+    let group = |id| {
+        document
+            .library
+            .membership
+            .get(&id)
+            .map_or("", String::as_str)
+    };
+    let mut changed = false;
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.connection.terminal.java_ai_profile.is_some())
+    {
+        let mut matches = document.connections.iter_mut().filter(|existing| {
+            same_profile(
+                existing,
+                group(existing.id),
+                &entry.connection,
+                &entry.group,
+            )
+        });
+        if let Some(existing) = matches.next()
+            && matches.next().is_none()
+            && existing.jump.as_ref().map(|login| &login.endpoint)
+                == entry.connection.jump.as_ref().map(|login| &login.endpoint)
+        {
+            changed |= existing
+                .terminal
+                .merge_java_ai_profile(&entry.connection.terminal);
+        }
+    }
+    let incoming = std::mem::take(local_entries);
+    for entry in &incoming {
+        let mut matches = document.local_profiles.iter_mut().filter(|existing| {
+            group(existing.id) == entry.group && same_local_without_ai(existing, &entry.profile)
+        });
+        let Some(existing) = matches.next() else {
+            local_entries.push(entry.clone());
+            continue;
+        };
+        if matches.next().is_none()
+            && !incoming.iter().any(|other| {
+                other.group == entry.group
+                    && other.profile.terminal.java_ai_profile
+                        != entry.profile.terminal.java_ai_profile
+                    && same_local_without_ai(&other.profile, &entry.profile)
+            })
+        {
+            changed |= existing
+                .terminal
+                .merge_java_ai_profile(&entry.profile.terminal);
+        }
+    }
+    changed
+}
+
+fn same_local_without_ai(existing: &LocalProfile, imported: &LocalProfile) -> bool {
+    if existing.name != imported.name {
+        return false;
+    }
+    let mut imported = imported.clone();
+    imported.id = existing.id;
+    imported
+        .terminal
+        .ai_profile
+        .clone_from(&existing.terminal.ai_profile);
+    imported
+        .terminal
+        .java_ai_profile
+        .clone_from(&existing.terminal.java_ai_profile);
+    imported.terminal.java_ai_profile_dismissed = existing.terminal.java_ai_profile_dismissed;
+    existing == &imported
 }
 
 pub(super) fn encode(document: &Document) -> io::Result<Vec<u8>> {
@@ -352,7 +442,7 @@ pub(super) enum Inserted<'a> {
 }
 
 impl Inserted<'_> {
-    fn ids(&self) -> (u64, u64) {
+    pub(super) fn ids(&self) -> (u64, u64) {
         match self {
             Self::Ssh(entry, profile) => (entry.connection.id, profile.id),
             Self::Local(entry, profile) => (entry.profile.id, profile.id),
@@ -360,7 +450,7 @@ impl Inserted<'_> {
         }
     }
 
-    fn java_favorite_id(&self) -> Option<&str> {
+    pub(super) fn java_favorite_id(&self) -> Option<&str> {
         match self {
             Self::Ssh(entry, _) => entry.java_favorite_id.as_deref(),
             Self::Local(entry, _) => entry.java_favorite_id.as_deref(),

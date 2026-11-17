@@ -187,12 +187,61 @@ fn windows_rsync_pinned_ssh_replaces_only_the_reviewed_local_file() {
 }
 
 #[test]
+#[ignore = "requires native Windows rsync, the current bridge, and a disposable pinned OpenSSH source file"]
+fn windows_recurring_rsync_creates_and_then_replaces_a_reviewed_local_file() {
+    Fixture::read().vacant_file_download();
+}
+
+#[test]
+#[ignore = "requires native Windows rsync, the current bridge, and a disposable pinned OpenSSH source file"]
+fn windows_recurring_rsync_group_creates_and_replaces_each_reviewed_local_file() {
+    Fixture::read().grouped_vacant_file_download(false);
+}
+
+#[test]
+#[ignore = "requires native Windows rsync, the current bridge, and a disposable pinned OpenSSH source file"]
+fn windows_recurring_rsync_file_downloads_into_reviewed_missing_parents() {
+    Fixture::read().grouped_vacant_file_download(true);
+}
+
+#[test]
 #[ignore = "requires native Windows rsync, the current bridge, and a disposable pinned OpenSSH source tree"]
 fn windows_rsync_pinned_ssh_projects_one_mixed_local_directory() {
     let fixture = Fixture::read();
     for existing in [false, true] {
         fixture.mixed_download(existing);
     }
+}
+
+#[test]
+#[ignore = "requires native Windows rsync, the current bridge, and a disposable pinned OpenSSH source tree"]
+fn windows_recurring_mixed_rsync_creates_and_replaces_a_reviewed_local_tree() {
+    Fixture::read().vacant_mixed_download(false);
+}
+
+#[test]
+#[ignore = "requires native Windows rsync, the current bridge, and a disposable pinned OpenSSH source tree"]
+fn windows_recurring_direct_rsync_creates_and_replaces_reviewed_local_trees() {
+    let fixture = Fixture::read();
+    for named in [false, true] {
+        fixture.vacant_direct_download(named, false);
+    }
+}
+
+#[test]
+#[ignore = "requires native Windows rsync, the current bridge, and a disposable pinned OpenSSH source tree"]
+fn windows_recurring_rsync_creates_reviewed_local_hierarchies() {
+    let fixture = Fixture::read();
+    for named in [false, true] {
+        fixture.vacant_direct_download(named, true);
+    }
+    fixture.vacant_mixed_download(true);
+}
+
+#[test]
+#[ignore = "requires native Windows rsync, the current bridge, and a disposable pinned OpenSSH source tree"]
+fn windows_recurring_rsync_group_shares_reviewed_local_parents() {
+    Fixture::read().shared_local_parent_download();
 }
 
 #[test]
@@ -519,6 +568,423 @@ impl Fixture {
         assert_eq!(recovery_files(), recovered);
     }
 
+    fn vacant_file_download(&self) {
+        use crate::sftp_window::{ReviewedFileReceiver, VacantLocalFileReceiver};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let directory = local_tree::Directory::open_path(&root).unwrap();
+        let workspace = OsStr::new("protected");
+        drop(local_tree::create_reviewed_tree_stage(&directory, workspace).unwrap());
+        let destination = root.join(workspace).join("new recurring file.bin");
+        let initial = VacantLocalFileReceiver::inspect(&destination, &|| false).unwrap();
+        let (connections, reference) = self.save_connection(&root);
+        let source = format!("{}/download", self.remote_root);
+        let pins = sync::fingerprints(&sync::pins(&reference, &self.trust).unwrap());
+        let digest = program_digest(&self.program).unwrap();
+        let mut transfer = json!({
+            "kind": "rsync_download", "program": self.program,
+            "local": destination, "remote": source,
+            "approval": {
+                "program": self.program, "digest": digest, "reference": reference, "pins": pins,
+                "download": {"source": source, "destination": destination},
+                "vacant_file_download": {"destination": destination, "snapshot": initial},
+            },
+            "standing": {"settings": {
+                "days": 2, "firings": 3, "budget": {"bytes": 4096, "entries": 1, "deletes": 0}
+            }},
+        });
+        let id = JobId::new("windows-vacant-rsync").unwrap();
+        let job = |transfer| {
+            let action: SshCommand = serde_json::from_value(json!({
+                "connection": reference, "remote": transfer,
+            }))
+            .unwrap();
+            Job::new(
+                id.clone(),
+                "Initially vacant rsync file",
+                action.validated().unwrap(),
+            )
+            .unwrap()
+            .with_schedule(JobSchedule::default().with_interval_minutes(NonZeroU32::new(1)))
+        };
+        let issued = SystemTime::now() - Duration::from_secs(15 * 60);
+        let grant = standing::Grant::new(&job(transfer.clone()), &TimeZone::UTC, issued).unwrap();
+        transfer["standing"]["approval"] = json!(grant.approval);
+        let path = root.join("jobs.json");
+        let graph = JobGraph::new(vec![job(transfer)]).unwrap();
+        SchedulerStore::open(&path)
+            .unwrap()
+            .commit_with_actions(&graph, &[], &[])
+            .unwrap();
+        standing::Store::new(root.clone())
+            .swap(&id, grant, |_| true)
+            .unwrap();
+
+        let fire = |firing| self.fire_recurring(&path, &connections, issued, firing);
+        fs::write(&destination, b"an unrelated arrival").unwrap();
+        let blocked = fire(0);
+        assert_eq!(blocked.outcome, RunOutcome::Blocked, "{blocked:?}");
+        assert_eq!(fs::read(&destination).unwrap(), b"an unrelated arrival");
+        assert!(recovery_paths(&destination).is_empty());
+        fs::remove_file(&destination).unwrap();
+
+        let created = fire(120);
+        assert_eq!(created.outcome, RunOutcome::Success, "{created:?}");
+        assert_eq!(fs::read(&destination).unwrap(), SERVER_BYTES);
+        assert!(recovery_paths(&destination).is_empty());
+        let first = ReviewedFileReceiver::inspect(&destination, &|| false).unwrap();
+
+        let replaced = fire(240);
+        assert_eq!(replaced.outcome, RunOutcome::Success, "{replaced:?}");
+        assert_eq!(fs::read(&destination).unwrap(), SERVER_BYTES);
+        let second = ReviewedFileReceiver::inspect(&destination, &|| false).unwrap();
+        assert!(!second.aliases(&first));
+        let recoveries = recovery_paths(&destination);
+        let [original] = recoveries.as_slice() else {
+            panic!("expected one recovery")
+        };
+        let recovered = original.with_file_name(destination.file_name().unwrap());
+        assert!(
+            ReviewedFileReceiver::inspect(&recovered, &|| false)
+                .unwrap()
+                .aliases(&first)
+        );
+    }
+
+    fn grouped_vacant_file_download(&self, missing_parents: bool) {
+        use crate::sftp_window::{ReviewedFileReceiver, VacantLocalFileReceiver};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let directory = local_tree::Directory::open_path(&root).unwrap();
+        let shared = root.join("protected").join("shared parent");
+        if missing_parents {
+            drop(
+                local_tree::create_reviewed_tree_stage(&directory, OsStr::new("protected"))
+                    .unwrap(),
+            );
+        }
+        let [first, second] = ["first route", "second route"].map(|workspace| {
+            if missing_parents {
+                shared.join(workspace).join("received file.bin")
+            } else {
+                drop(
+                    local_tree::create_reviewed_tree_stage(&directory, OsStr::new(workspace))
+                        .unwrap(),
+                );
+                root.join(workspace).join("received file.bin")
+            }
+        });
+        let (mut connections, primary) = self.save_connection(&root);
+        let mut additional = connections.get(primary.id).unwrap().clone();
+        additional.id = 0;
+        additional.name = "Second Windows rsync fixture route".into();
+        let additional_id = connections.save(additional).unwrap();
+        let additional = ConnectionRef::from(connections.get(additional_id).unwrap());
+        let source = format!("{}/download", self.remote_root);
+        let digest = program_digest(&self.program).unwrap();
+        let approval = |route: &ConnectionRef, destination: &Path| {
+            let snapshot = if missing_parents {
+                use crate::job_executor::rsync::{VacantFileProof, review_local_file_vacancy};
+
+                let proof =
+                    review_local_file_vacancy(destination, &AtomicBool::new(false)).unwrap();
+                assert!(matches!(proof, VacantFileProof::Hierarchy(_)));
+                json!(proof)
+            } else {
+                json!(VacantLocalFileReceiver::inspect(destination, &|| false).unwrap())
+            };
+            let pins = sync::fingerprints(&sync::pins(route, &self.trust).unwrap());
+            json!({
+                "program": self.program, "digest": digest, "reference": route, "pins": pins,
+                "download": {"source": source, "destination": destination},
+                "vacant_file_download": {"destination": destination, "snapshot": snapshot},
+            })
+        };
+        let entries = if missing_parents { 3 } else { 2 };
+        let firings = if missing_parents { 4 } else { 3 };
+        let mut transfer = json!({
+            "kind": "rsync_download", "program": self.program,
+            "local": first, "remote": source,
+            "approval": approval(&primary, &first),
+            "routes": [{
+                "profile": additional_id, "destination": second,
+                "approval": approval(&additional, &second),
+            }],
+            "standing": {"settings": {
+                "days": 2, "firings": firings, "budget": {"bytes": 4096, "entries": entries, "deletes": 0}
+            }},
+        });
+        if missing_parents {
+            transfer["allow_vacant_file_download"] = json!(true);
+        }
+        let id = JobId::new("windows-grouped-vacant-rsync").unwrap();
+        let job = |transfer| {
+            let action: SshCommand = serde_json::from_value(json!({
+                "connection": primary, "additional_connections": [additional], "remote": transfer,
+            }))
+            .unwrap();
+            Job::new(
+                id.clone(),
+                "Initially vacant grouped rsync files",
+                action.validated().unwrap(),
+            )
+            .unwrap()
+            .with_schedule(JobSchedule::default().with_interval_minutes(NonZeroU32::new(1)))
+        };
+        let issued = SystemTime::now() - Duration::from_secs(15 * 60);
+        let grant = standing::Grant::new(&job(transfer.clone()), &TimeZone::UTC, issued).unwrap();
+        transfer["standing"]["approval"] = json!(grant.approval);
+        let jobs = root.join("jobs.json");
+        let graph = JobGraph::new(vec![job(transfer)]).unwrap();
+        SchedulerStore::open(&jobs)
+            .unwrap()
+            .commit_with_actions(&graph, &[], &[])
+            .unwrap();
+        standing::Store::new(root.clone())
+            .swap(&id, grant, |_| true)
+            .unwrap();
+
+        let fire = |firing| self.fire_recurring(&jobs, &connections, issued, firing);
+        let inspect = |path: &Path| ReviewedFileReceiver::inspect(path, &|| false).unwrap();
+        let recoveries = |path: &Path| {
+            recovery_paths(path)
+                .into_iter()
+                .map(|recovery| recovery.with_file_name(path.file_name().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        let assert_recovered = |path: &Path, original: crate::sftp_window::LocalFileSnapshot| {
+            let recovery = recoveries(path)
+                .into_iter()
+                .find(|recovery| inspect(recovery).aliases(&original))
+                .expect("the exact previous file must be retained");
+            assert!(!inspect(path).aliases(&original));
+            assert_eq!(fs::read(recovery).unwrap(), SERVER_BYTES);
+        };
+        let partial_firing = if missing_parents {
+            assert!(!shared.exists(), "review created the shared parent");
+            // An arrival at the first missing name blocks both receivers.
+            fs::write(&shared, b"unrelated arrival").unwrap();
+            let blocked = fire(0);
+            assert_eq!(blocked.outcome, RunOutcome::Blocked, "{blocked:?}");
+            assert_eq!(fs::read(&shared).unwrap(), b"unrelated arrival");
+            fs::remove_file(&shared).unwrap();
+            120
+        } else {
+            fs::write(&second, b"unrelated arrival").unwrap();
+            0
+        };
+        let occupant =
+            (!missing_parents).then(|| FileStamp::read(&File::open(&second).unwrap()).unwrap());
+        let partial = fire(partial_firing);
+        assert_eq!(partial.outcome, RunOutcome::Blocked, "{partial:?}");
+        assert!(partial.detail.unwrap().contains("1 of 2 targets succeeded"));
+        if let Some(occupant) = occupant {
+            occupant
+                .require_unchanged(&File::open(&second).unwrap())
+                .unwrap();
+            assert_eq!(fs::read(&second).unwrap(), b"unrelated arrival");
+            assert!(recoveries(&second).is_empty());
+            fs::remove_file(&second).unwrap();
+        } else {
+            // The first file and its two new parents consumed all three entries.
+            assert!(!second.parent().unwrap().exists());
+        }
+        assert_eq!(fs::read(&first).unwrap(), SERVER_BYTES);
+        assert!(recoveries(&first).is_empty());
+        let first_created = inspect(&first);
+
+        // The remaining two entries of the reopened firing cover the second
+        // route's file and its private parent. Its shared parent was confirmed earlier.
+        let both = fire(partial_firing + 120);
+        assert_eq!(both.outcome, RunOutcome::Success, "{both:?}");
+        assert_eq!(fs::read(&second).unwrap(), SERVER_BYTES);
+        assert_recovered(&first, first_created);
+        assert!(recoveries(&second).is_empty());
+
+        let before = [inspect(&first), inspect(&second)];
+        let both = fire(partial_firing + 240);
+        assert_eq!(both.outcome, RunOutcome::Success, "{both:?}");
+        for (path, previous) in [&first, &second].into_iter().zip(before) {
+            assert_eq!(fs::read(path).unwrap(), SERVER_BYTES);
+            assert_recovered(path, previous);
+        }
+        assert_eq!(recoveries(&first).len(), 2);
+        assert_eq!(recoveries(&second).len(), 1);
+    }
+
+    fn shared_local_parent_download(&self) {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let dir = local_tree::Directory::open_path(&root).unwrap();
+        drop(local_tree::create_reviewed_tree_stage(&dir, OsStr::new("protected")).unwrap());
+        let shared = root.join("protected").join("shared parent");
+        let first = shared.join("first").join("inner").join("result");
+        let second = shared.join("second");
+        let (mut connections, primary) = self.save_connection(&root);
+        let mut additional = connections.get(primary.id).unwrap().clone();
+        additional.id = 0;
+        additional.name = "Sibling route for a shared parent".into();
+        let additional_id = connections.save(additional).unwrap();
+        let additional = ConnectionRef::from(connections.get(additional_id).unwrap());
+        let source = format!("{}/download-tree", self.remote_root);
+        let digest = program_digest(&self.program).unwrap();
+        let settings = json!({"delete": true, "include_source_name": false});
+        let approval = |route: &ConnectionRef, destination: &Path| {
+            let pins = sync::fingerprints(&sync::pins(route, &self.trust).unwrap());
+            let snapshot = crate::job_executor::rsync::review_local_vacant_tree(
+                destination,
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            json!({
+                "program": self.program, "digest": digest, "reference": route, "pins": pins,
+                "directory": {"source": source, "destination": destination},
+                "vacant_directory_download": {"destination": destination, "snapshot": snapshot, "settings": settings},
+            })
+        };
+        let mut transfer = json!({
+            "kind": "rsync_download", "directory": true, "program": self.program,
+            "local": first, "remote": source, "existing_download": settings,
+            "allow_vacant_directory_download": true,
+            "approval": approval(&primary, &first),
+            "routes": [{
+                "profile": additional_id, "destination": second,
+                "approval": approval(&additional, &second),
+            }],
+            "standing": {"settings": {
+                "days": 2, "firings": 3, "budget": {"bytes": 4096, "entries": 6, "deletes": 0}
+            }},
+        });
+        let id = JobId::new("windows-shared-parent-rsync").unwrap();
+        let job = |transfer| {
+            let action: SshCommand = serde_json::from_value(json!({
+                "connection": primary, "additional_connections": [additional], "remote": transfer,
+            }))
+            .unwrap();
+            Job::new(
+                id.clone(),
+                "Grouped rsync with a shared parent",
+                action.validated().unwrap(),
+            )
+            .unwrap()
+            .with_schedule(JobSchedule::default().with_interval_minutes(NonZeroU32::new(1)))
+        };
+        let issued = SystemTime::now() - Duration::from_secs(15 * 60);
+        let grant = standing::Grant::new(&job(transfer.clone()), &TimeZone::UTC, issued).unwrap();
+        transfer["standing"]["approval"] = json!(grant.approval);
+        let jobs = root.join("jobs.json");
+        let graph = JobGraph::new(vec![job(transfer)]).unwrap();
+        SchedulerStore::open(&jobs)
+            .unwrap()
+            .commit_with_actions(&graph, &[], &[])
+            .unwrap();
+        standing::Store::new(root.clone())
+            .swap(&id, grant, |_| true)
+            .unwrap();
+
+        assert!(!shared.exists());
+        fs::create_dir(&shared).unwrap();
+        let occupant = shared.join("external");
+        fs::write(&occupant, b"independent arrival").unwrap();
+        let fire = |firing| self.fire_recurring(&jobs, &connections, issued, firing);
+        let blocked = fire(0);
+        assert_eq!(blocked.outcome, RunOutcome::Blocked, "{blocked:?}");
+        assert!(!first.exists() && !second.exists());
+        assert_eq!(fs::read(&occupant).unwrap(), b"independent arrival");
+        fs::remove_file(occupant).unwrap();
+        fs::remove_dir(&shared).unwrap();
+
+        // The first route consumes all six entries: three newly created
+        // parents and three entries from the source fixture.
+        let partial = fire(120);
+        assert_ne!(partial.outcome, RunOutcome::Success, "{partial:?}");
+        assert!(
+            partial
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("1 of 2 targets succeeded")
+        );
+        assert_eq!(
+            fs::read(first.join("nested/content")).unwrap(),
+            SERVER_BYTES
+        );
+        assert!(!second.exists());
+        let original = local_existing::inspect(&first, &|| false).unwrap();
+        let outside = shared.join("outside");
+        fs::write(&outside, b"not part of either receiver").unwrap();
+
+        // Reopen the scheduler. Both three-entry source trees now fit only
+        // if the missing sibling reuses the exact published shared directory.
+        let resumed = fire(240);
+        assert_eq!(resumed.outcome, RunOutcome::Success, "{resumed:?}");
+        for target in [&first, &second] {
+            assert_eq!(
+                fs::read(target.join("nested/content")).unwrap(),
+                SERVER_BYTES
+            );
+            assert!(target.join("empty").is_dir());
+        }
+        assert_eq!(fs::read(outside).unwrap(), b"not part of either receiver");
+        let recoveries = recovery_paths(&first);
+        let [recovery] = recoveries.as_slice() else {
+            panic!("expected one recovery from the first route");
+        };
+        assert!(
+            local_existing::inspect(recovery, &|| false)
+                .unwrap()
+                .aliases(&original)
+        );
+        assert!(recovery_paths(&second).is_empty());
+    }
+
+    fn fire_recurring(
+        &self,
+        path: &Path,
+        connections: &Store,
+        issued: SystemTime,
+        firing: u64,
+    ) -> Completion {
+        let mut scheduler = SchedulerWindow::open(path.to_owned()).unwrap();
+        scheduler.set_connections(Some(connections));
+        scheduler.set_execution_allowed(true);
+        let scheduled = issued + Duration::from_secs(firing);
+        scheduler
+            .initialize_schedules_at(TimeZone::UTC, scheduled)
+            .unwrap();
+        let time = scheduled + Duration::from_secs(90);
+        let jobs = scheduler.update_runtime_at(Message::Tick, time);
+        let [request] = jobs.as_slice() else {
+            panic!("expected one Calendar firing");
+        };
+        assert_eq!(request.trigger, RunTrigger::Scheduled);
+        let result = if request.action.additional_connections.is_empty() {
+            self.execute_request(&mut scheduler, request)
+        } else {
+            use crate::job_executor::{Credentials, batch};
+
+            let mut policy = ExecutionPolicy::unrestricted(true);
+            policy.rsync = scheduler.try_rsync_run_context(request).unwrap();
+            assert!(policy.rsync.is_some());
+            let saved = Credentials::resolve_batch(
+                &request.action,
+                connections,
+                &policy.server_access,
+                |_, _, _| Err("unexpected credential prompt"),
+            );
+            batch::run(request, None, &policy, saved, Ok(None), || {
+                Ok(self.trust.clone())
+            })
+        };
+        scheduler.update_runtime_at(
+            Message::Finished(result.clone()),
+            time + Duration::from_secs(10),
+        );
+        result
+    }
+
     fn mixed_download(&self, existing: bool) {
         let profile = crate::snippets::tests::Profile::new();
         let root = profile.0.canonicalize().unwrap();
@@ -550,6 +1016,7 @@ impl Fixture {
             destination: MixedDestination::Local(destination.clone()),
             delete: existing,
             elevation: crate::scheduler_window::rsync::Elevation::Ordinary,
+            review_vacant: false,
         };
         let credentials = crate::job_executor::Credentials::resolve_directory_browser(
             &reference,
@@ -568,7 +1035,7 @@ impl Fixture {
         .unwrap();
         assert!(matches!(
             &review.receiver,
-            MixedReceiver::Local { destination: checked, snapshot }
+            MixedReceiver::Local { destination: checked, snapshot, vacant: None }
                 if checked == &destination && snapshot.is_some() == existing
         ));
         assert_eq!(
@@ -781,6 +1248,255 @@ impl Fixture {
             recoveries = found;
             scheduler.update_runtime_at(Message::Finished(result), time + Duration::from_secs(10));
         }
+    }
+
+    fn vacant_mixed_download(&self, missing_parents: bool) {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let directory = local_tree::Directory::open_path(&root).unwrap();
+        let workspace = OsStr::new("protected");
+        drop(local_tree::create_reviewed_tree_stage(&directory, workspace).unwrap());
+        let workspace = root.join(workspace);
+        let prefix = workspace.join("missing parent");
+        let destination = if missing_parents {
+            prefix.join("inner").join("new recurring mixed tree")
+        } else {
+            workspace.join("new recurring mixed tree")
+        };
+        let first_missing = if missing_parents {
+            &prefix
+        } else {
+            &destination
+        };
+        let (connections, reference) = self.save_connection(&root);
+        let remote = format!("{}/download-tree", self.remote_root);
+        let mut sources = vec![format!("{remote}/")];
+        if missing_parents {
+            sources.push(format!("{}/download", self.remote_root));
+        }
+        let target = MixedReviewTarget {
+            reference: reference.clone(),
+            sources: sources.clone(),
+            destination: MixedDestination::Local(destination.clone()),
+            delete: true,
+            elevation: crate::scheduler_window::rsync::Elevation::Ordinary,
+            review_vacant: true,
+        };
+        let credentials = crate::job_executor::Credentials::resolve_directory_browser(
+            &reference,
+            connections.get(reference.id).unwrap(),
+            &crate::clipboard_policy::ServerAccess::default(),
+            |_, _, _| Err("Unexpected saved password in the key-only rsync fixture."),
+        )
+        .unwrap();
+        let review = crate::job_executor::rsync::preview_mixed(
+            credentials,
+            &target,
+            &self.trust,
+            Arc::new(AtomicBool::new(false)),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(matches!(
+            &review.receiver,
+            MixedReceiver::Local {
+                snapshot: None,
+                vacant: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(review.plan.sources[0].placement, Placement::Contents);
+        let pins = sync::fingerprints(&sync::pins(&reference, &self.trust).unwrap());
+        let digest = program_digest(&self.program).unwrap();
+        let transfer = json!({
+            "kind": "rsync_download", "directory": true, "program": self.program,
+            "local": destination, "remote": remote, "mixed": sources,
+            "existing_download": {"delete": true, "include_source_name": false},
+            "approval": {
+                "program": self.program, "digest": digest, "reference": reference, "pins": pins,
+                "mixed": review,
+            },
+            "standing": {"settings": {
+                "days": 2, "firings": 3, "budget": {"bytes": 4096, "entries": 32, "deletes": 0}
+            }},
+        });
+        self.verify_vacant_tree_firings(
+            &root,
+            &connections,
+            &reference,
+            transfer,
+            &destination,
+            first_missing,
+        );
+        if missing_parents {
+            assert_eq!(
+                fs::read(destination.join("download")).unwrap(),
+                SERVER_BYTES
+            );
+        }
+    }
+
+    fn vacant_direct_download(&self, named: bool, missing_parents: bool) {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let directory = local_tree::Directory::open_path(&root).unwrap();
+        let workspace = OsStr::new("protected");
+        let checked = local_tree::create_reviewed_tree_stage(&directory, workspace).unwrap();
+        let workspace = root.join(workspace);
+        let prefix = workspace.join("missing parent");
+        let configured = if missing_parents {
+            prefix.join("inner").join("direct target")
+        } else {
+            workspace.join("direct target")
+        };
+        let destination = if named {
+            if !missing_parents {
+                drop(
+                    local_tree::create_reviewed_tree_stage(&checked, OsStr::new("direct target"))
+                        .unwrap(),
+                );
+            }
+            configured.join("download-tree")
+        } else {
+            configured.clone()
+        };
+        let first_missing = if missing_parents {
+            &prefix
+        } else {
+            &destination
+        };
+        drop(checked);
+        let (connections, reference) = self.save_connection(&root);
+        let remote = format!("{}/download-tree", self.remote_root);
+        let pins = sync::fingerprints(&sync::pins(&reference, &self.trust).unwrap());
+        let digest = program_digest(&self.program).unwrap();
+        let snapshot = crate::job_executor::rsync::review_local_vacant_tree(
+            &destination,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        let settings = json!({"delete": true, "include_source_name": named});
+        let transfer = json!({
+            "kind": "rsync_download", "directory": true, "program": self.program,
+            "local": configured, "remote": remote, "existing_download": settings,
+            "allow_vacant_directory_download": true,
+            "approval": {
+                "program": self.program, "digest": digest, "reference": reference, "pins": pins,
+                "directory": {"source": remote, "destination": configured},
+                "vacant_directory_download": {"destination": destination, "snapshot": snapshot, "settings": settings},
+            },
+            "standing": {"settings": {
+                "days": 2, "firings": 3, "budget": {"bytes": 4096, "entries": 32, "deletes": 0}
+            }},
+        });
+        self.verify_vacant_tree_firings(
+            &root,
+            &connections,
+            &reference,
+            transfer,
+            &destination,
+            first_missing,
+        );
+    }
+
+    fn verify_vacant_tree_firings(
+        &self,
+        root: &Path,
+        connections: &Store,
+        reference: &ConnectionRef,
+        mut transfer: serde_json::Value,
+        destination: &Path,
+        first_missing: &Path,
+    ) {
+        let id = JobId::new("windows-vacant-rsync-tree").unwrap();
+        let job = |transfer| {
+            let action: SshCommand = serde_json::from_value(json!({
+                "connection": reference, "remote": transfer,
+            }))
+            .unwrap();
+            Job::new(
+                id.clone(),
+                "Initially vacant rsync tree",
+                action.validated().unwrap(),
+            )
+            .unwrap()
+            .with_schedule(JobSchedule::default().with_interval_minutes(NonZeroU32::new(1)))
+        };
+        let issued = SystemTime::now() - Duration::from_secs(15 * 60);
+        let grant = standing::Grant::new(&job(transfer.clone()), &TimeZone::UTC, issued).unwrap();
+        transfer["standing"]["approval"] = json!(grant.approval);
+        let path = root.join("jobs.json");
+        let graph = JobGraph::new(vec![job(transfer)]).unwrap();
+        SchedulerStore::open(&path)
+            .unwrap()
+            .commit_with_actions(&graph, &[], &[])
+            .unwrap();
+        standing::Store::new(root.to_owned())
+            .swap(&id, grant, |_| true)
+            .unwrap();
+
+        let fire = |firing| {
+            let mut scheduler = SchedulerWindow::open(path.clone()).unwrap();
+            scheduler.set_connections(Some(connections));
+            scheduler.set_execution_allowed(true);
+            let scheduled = issued + Duration::from_secs(firing);
+            scheduler
+                .initialize_schedules_at(TimeZone::UTC, scheduled)
+                .unwrap();
+            let time = scheduled + Duration::from_secs(90);
+            let jobs = scheduler.update_runtime_at(Message::Tick, time);
+            let [request] = jobs.as_slice() else {
+                panic!("expected one Calendar firing")
+            };
+            assert_eq!(request.trigger, RunTrigger::Scheduled);
+            let completion = self.execute_request(&mut scheduler, request);
+            scheduler.update_runtime_at(
+                Message::Finished(completion.clone()),
+                time + Duration::from_secs(10),
+            );
+            completion
+        };
+        assert!(!first_missing.exists(), "review created a vacant path");
+        fs::create_dir(first_missing).unwrap();
+        let occupant = first_missing.join("independent");
+        fs::write(&occupant, b"unrelated").unwrap();
+        let blocked = fire(0);
+        assert_eq!(blocked.outcome, RunOutcome::Blocked, "{blocked:?}");
+        assert_eq!(fs::read(&occupant).unwrap(), b"unrelated");
+        assert!(recovery_paths(first_missing).is_empty());
+        if first_missing != destination {
+            assert!(!destination.exists());
+        }
+        fs::remove_file(occupant).unwrap();
+        fs::remove_dir(first_missing).unwrap();
+
+        let created = fire(120);
+        assert_eq!(created.outcome, RunOutcome::Success, "{created:?}");
+        assert_eq!(
+            fs::read(destination.join("nested/content")).unwrap(),
+            SERVER_BYTES
+        );
+        assert!(destination.join("empty").is_dir());
+        assert!(recovery_paths(destination).is_empty());
+        let first = local_existing::inspect(destination, &|| false).unwrap();
+        let sibling = destination.parent().unwrap().join("unrelated-sibling");
+        fs::write(&sibling, b"outside the approved receiver").unwrap();
+
+        let replaced = fire(240);
+        assert_eq!(replaced.outcome, RunOutcome::Success, "{replaced:?}");
+        let current = local_existing::inspect(destination, &|| false).unwrap();
+        assert_eq!(current.inventory, first.inventory);
+        assert!(!current.aliases(&first));
+        let recovered = recovery_paths(destination);
+        let [original] = recovered.as_slice() else {
+            panic!("expected one recovery")
+        };
+        assert!(
+            local_existing::inspect(original, &|| false)
+                .unwrap()
+                .aliases(&first)
+        );
+        assert_eq!(fs::read(sibling).unwrap(), b"outside the approved receiver");
     }
 
     fn save_connection(&self, root: &Path) -> (Store, ConnectionRef) {

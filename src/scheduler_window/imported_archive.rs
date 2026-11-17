@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use kortty_server_archive::protocol::ArchiveMemberLayout;
 use serde::{Deserialize, Serialize};
 
 use crate::clipboard_policy::ClipboardPolicy;
@@ -25,6 +26,14 @@ pub(crate) struct Settings {
 }
 
 impl Settings {
+    pub(crate) fn member_layout(&self) -> ArchiveMemberLayout {
+        if self.format.supports_server_member_paths() {
+            ArchiveMemberLayout::ServerPath
+        } else {
+            ArchiveMemberLayout::SourceBasename
+        }
+    }
+
     pub(crate) fn validate(&self) -> Result<(), &'static str> {
         use super::remote::{MAX_ARCHIVE_EXCLUDES, MAX_ARCHIVE_PATTERN_BYTES};
 
@@ -33,13 +42,8 @@ impl Settings {
                 && path.as_str().trim() == path.as_str()
                 && display_text(path.as_str(), 4096)
         };
-        if !matches!(
-            self.format,
-            ArchiveFormat::Zip
-                | ArchiveFormat::ZipPassword
-                | ArchiveFormat::Tar
-                | ArchiveFormat::TarBz2
-        ) || !display_path(&self.target)
+        if !self.format.supports_server_member_paths()
+            || !display_path(&self.target)
             || self
                 .sources
                 .iter()
@@ -74,6 +78,8 @@ impl Settings {
             download,
             password_credential,
             server_output: None,
+            reuse_output: false,
+            member_layout: self.member_layout(),
         }
     }
 }

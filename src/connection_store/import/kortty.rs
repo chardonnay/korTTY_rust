@@ -54,6 +54,14 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
         if !rust_local && !has_unqualified_tag(entry, "connection") {
             continue;
         }
+        if track_lineage
+            && !rust_local
+            && raw_scalar(entry, "host").is_ok_and(|host| host.as_deref() == Some("placeholder"))
+            && raw_scalar(entry, "name")
+                .is_ok_and(|name| name.is_some_and(|name| name.starts_with("(Ordner:")))
+        {
+            continue;
+        }
         let declared_id = if track_lineage && !rust_local {
             source_entries += 1;
             if source_entries > MAX_PROFILES && source == Source::CredentialReview {
@@ -72,16 +80,10 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
                 })
                 .map(str::to_owned)
         };
-        let group = raw_scalar(entry, "group").map(|value| {
-            let value = value.unwrap_or_default();
-            if source != Source::Ordinary && !rust_local {
-                normalize_java_group_path(&value)
-            } else {
-                value
-            }
-        });
+        let mut group = raw_scalar(entry, "group").map(Option::unwrap_or_default);
         if track_lineage && !rust_local {
             preview.java_groups.record(&group, source_id);
+            group = group.map(|value| normalize_java_group_path(&value));
         }
         let group = group.and_then(validated_group);
         if let Some(id) = source_id
@@ -134,6 +136,11 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
             match group.and_then(|group| serial_profile(entry, group, supports_own_settings)) {
                 Ok(mut serial) => {
                     serial.java_favorite_id = favorite();
+                    if binding_field(entry, "connectionSource")
+                        .is_ok_and(|source| matches!(source.map(str::trim), None | Some("LOCAL")))
+                    {
+                        serial.java_memory_id = declared_id.map(str::to_owned);
+                    }
                     preview.push_serial(serial)?;
                 }
                 Err(_) => preview.invalid += 1,
@@ -155,6 +162,9 @@ pub(super) fn parse(root: Node<'_, '_>, source: Source) -> io::Result<Preview> {
         match connection.and_then(|(mut profile, skipped)| {
             profile.connection.window_geometry = window_geometry(entry)?;
             profile.java_id = source_id.map(str::to_owned);
+            if track_lineage && let Some(id) = source_id {
+                profile.java_rsync_folder = rsync_folder(entry, id)?;
+            }
             profile.java_favorite_id = favorite();
             profile.java_memory_id = declared_id.map(str::to_owned);
             if declared_id.is_some() {
@@ -294,12 +304,9 @@ fn local_profile(
     supports_own_settings: bool,
 ) -> io::Result<ImportedLocal> {
     let (shell, command) = if rust_local {
-        let shell = match raw_scalar(node, "rustLocalShell")?.as_deref() {
-            None | Some("default") => LocalShell::Default,
-            Some("power-shell") => LocalShell::PowerShell,
-            Some("command-prompt") => LocalShell::CommandPrompt,
-            _ => return Err(invalid("unsupported local shell preset")),
-        };
+        let shell = raw_scalar(node, "rustLocalShell")?;
+        let shell = LocalShell::from_id(shell.as_deref().unwrap_or(LocalShell::Default.id()))
+            .ok_or_else(|| invalid("unsupported local shell preset"))?;
         let command = raw_scalar(node, "rustLocalArgv")?
             .map(|encoded| {
                 let json = STANDARD
@@ -415,6 +422,7 @@ fn serial_profile(
     profile.journal = terminal.journal;
     profile.paste_line_delay_ms = terminal.paste_line_delay_ms;
     profile.strict_terminal_mode = terminal.strict_terminal_mode;
+    profile.highlight_set = terminal.highlight_set;
     profile.tag = raw_scalar(node, "tag")?
         .unwrap_or_default()
         .trim()
@@ -423,6 +431,7 @@ fn serial_profile(
     Ok(ImportedSerial {
         profile,
         group,
+        java_memory_id: None,
         java_favorite_id: None,
     })
 }
@@ -588,6 +597,50 @@ pub(super) fn connection(
     Ok((entry, skipped))
 }
 
+fn rsync_folder(node: Node<'_, '_>, id: &str) -> io::Result<Option<String>> {
+    let label = match raw_scalar(node, "name")? {
+        Some(name) if !name.chars().all(java_whitespace) => name,
+        _ => format!(
+            "{}@{}",
+            raw_scalar(node, "username")?.as_deref().unwrap_or("null"),
+            raw_scalar(node, "host")?.as_deref().unwrap_or("null")
+        ),
+    };
+    let mut folder = String::new();
+    for character in label.chars() {
+        let character = if character.is_ascii_alphanumeric() || matches!(character, '-' | '.') {
+            character
+        } else {
+            '_'
+        };
+        if character != '_' || !folder.ends_with('_') {
+            folder.push(character);
+        }
+    }
+    if folder.is_empty() {
+        folder.push_str("target");
+    }
+    if id.len() >= 8 {
+        // Java uses the first eight UTF-16 units. Refuse an unpaired surrogate
+        // or invalid native file name instead of changing the target layout.
+        let units: Vec<_> = id.encode_utf16().take(8).collect();
+        if units.len() == 8 {
+            let Ok(prefix) = String::from_utf16(&units) else {
+                return Ok(None);
+            };
+            folder.push('-');
+            folder.push_str(&prefix);
+        }
+    }
+    Ok(kortty_server_archive::rsync_tree::valid_name(&folder).then_some(folder))
+}
+
+fn java_whitespace(character: char) -> bool {
+    matches!(character, '\u{001c}'..='\u{001f}')
+        || character.is_whitespace()
+            && !matches!(character, '\u{0085}' | '\u{00a0}' | '\u{2007}' | '\u{202f}')
+}
+
 fn ssh_keepalive(node: Node<'_, '_>) -> io::Result<Option<KeepAlive>> {
     let Some(settings) = optional_child(node, "settings")? else {
         return Ok(None);
@@ -646,6 +699,11 @@ fn terminal_overrides(
         }),
         strict_terminal_mode: optional_boolean(node, "strictTerminalMode")?,
         ai_agent_disabled: optional_boolean(node, "aiAgentDisabled")?.unwrap_or(false),
+        java_ai_profile: raw_scalar(node, "aiProfileId")
+            .ok()
+            .flatten()
+            .as_deref()
+            .and_then(crate::ai_manager::JavaAiProfileHint::from_id),
         journal: journal_config(node)?,
         highlight_set: raw_scalar(node, "highlightRuleSetId")?
             .map(|value| value.trim().to_owned())

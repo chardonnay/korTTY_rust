@@ -1,9 +1,12 @@
 //! Versioned private snapshots. A scope has one atomically replaced active index.
 
 use std::fmt::Write as _;
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::fs::File;
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::mem::size_of;
+use std::ops::Range;
 use std::path::PathBuf;
+use std::sync::Mutex;
 
 use pgp::crypto::hash::HashAlgorithm;
 
@@ -11,8 +14,8 @@ use crate::private_files::{Directory, FileStamp, require_single_link};
 
 use super::{
     CHUNK_BYTES, Index, LEGACY_MAX_SOURCES, Location, MAX_CHUNKS, MAX_DIMENSIONS,
-    MAX_INDEX_PASSAGES, MAX_SOURCES, MAX_STORES, Passage, QdrantReceipt, Scope, SourceMask, hnsw,
-    pdf, qdrant, valid_text,
+    MAX_LOCAL_INDEX_PASSAGES, MAX_QDRANT_INDEX_PASSAGES, MAX_SOURCES, MAX_STORES, Passage,
+    QdrantReceipt, Scope, SourceMask, hnsw, pdf, qdrant, valid_text,
 };
 
 const DIRECTORY: &str = "knowledge-indexes";
@@ -23,11 +26,33 @@ const MAGIC_V4: &[u8; 8] = b"KTRAG\0\0\x04";
 const MAGIC_V5: &[u8; 8] = b"KTRAG\0\0\x05";
 const MAGIC_V6: &[u8; 8] = b"KTRAG\0\0\x06";
 const MAGIC_V7: &[u8; 8] = b"KTRAG\0\0\x07";
+const MAGIC_V8: &[u8; 8] = b"KTRAG\0\0\x08";
+const V6_MAX_CHUNKS: usize = 32_768;
 const LEGACY_MAX_CHUNKS: usize = 256;
 const LEGACY_MAX_LINE: usize = 128 * 1024;
-pub(super) const MAX_BYTES: u64 = 96 * 1024 * 1024;
+const V6_MAX_BYTES: u64 = 384 * 1024 * 1024;
+const MAX_LOCAL_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const MAX_QDRANT_BYTES: u64 = 96 * 1024 * 1024;
 pub(super) const V4_BASE_BYTES: usize = 47;
+pub(super) const V8_BASE_BYTES: usize = V4_BASE_BYTES + 2;
 const MAX_DIRECTORY_ENTRIES: usize = 4 * MAX_STORES;
+const CHECK_INTERVAL: usize = 256;
+
+pub(super) fn byte_limit(qdrant: bool) -> u64 {
+    if qdrant {
+        MAX_QDRANT_BYTES
+    } else {
+        MAX_LOCAL_BYTES
+    }
+}
+
+fn passage_limit(qdrant: bool) -> usize {
+    if qdrant {
+        MAX_QDRANT_INDEX_PASSAGES
+    } else {
+        MAX_LOCAL_INDEX_PASSAGES
+    }
+}
 
 pub(super) fn qdrant_receipt_bytes(source_count: usize) -> usize {
     size_of::<qdrant::Generation>() + SourceMask::word_count(source_count).max(1) * size_of::<u32>()
@@ -43,20 +68,330 @@ pub(super) struct AuthorityEvidence {
     pub(super) receipt: Option<QdrantReceipt>,
 }
 
+pub(super) struct SnapshotVectors {
+    file: Mutex<File>,
+    stamp: FileStamp,
+    offsets: Vec<u64>,
+    text_lengths: Option<Vec<u16>>,
+    staged_texts: Option<StagedTexts>,
+    staged: bool,
+}
+
+pub(super) struct VectorStage {
+    file: BufWriter<File>,
+    offsets: Vec<Option<u64>>,
+    block: Vec<u8>,
+    end: u64,
+}
+
+impl VectorStage {
+    pub(super) fn new(count: usize) -> io::Result<Self> {
+        Ok(Self {
+            file: BufWriter::with_capacity(64 * 1024, tempfile::tempfile()?),
+            offsets: vec![None; count],
+            block: Vec::new(),
+            end: 0,
+        })
+    }
+
+    pub(super) fn contains(&self, position: usize) -> bool {
+        self.offsets[position].is_some()
+    }
+
+    pub(super) fn write(&mut self, position: usize, vector: &[f32]) -> io::Result<()> {
+        self.block.resize(size_of_val(vector), 0);
+        encode_vector(&mut self.block, vector);
+        self.file.write_all(&self.block)?;
+        self.record_vector(position, self.block.len());
+        Ok(())
+    }
+
+    pub(super) fn write_encoded(&mut self, position: usize, encoded: &[u8]) -> io::Result<()> {
+        self.file.write_all(encoded)?;
+        self.record_vector(position, encoded.len());
+        Ok(())
+    }
+
+    fn record_vector(&mut self, position: usize, bytes: usize) {
+        self.offsets[position] = Some(self.end);
+        self.end += bytes as u64;
+    }
+
+    pub(super) fn finish(self, order: impl Iterator<Item = usize>) -> io::Result<SnapshotVectors> {
+        let file = self.file.into_inner().map_err(|error| error.into_error())?;
+        let stamp = FileStamp::read(&file)?;
+        let offsets = order
+            .map(|position| self.offsets[position].ok_or_else(invalid))
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok(SnapshotVectors {
+            file: Mutex::new(file),
+            stamp,
+            offsets,
+            text_lengths: None,
+            staged_texts: None,
+            staged: true,
+        })
+    }
+}
+
+pub(super) struct TextStage {
+    file: BufWriter<File>,
+    ends: Vec<u64>,
+    lengths: Vec<u16>,
+}
+
+struct StagedTexts {
+    file: Mutex<File>,
+    stamp: FileStamp,
+    ends: Vec<u64>,
+    lengths: Vec<u16>,
+}
+
+impl TextStage {
+    pub(super) fn new() -> io::Result<Self> {
+        Ok(Self {
+            file: BufWriter::with_capacity(64 * 1024, tempfile::tempfile()?),
+            ends: Vec::new(),
+            lengths: Vec::new(),
+        })
+    }
+
+    pub(super) fn push(&mut self, text: &str) -> io::Result<()> {
+        let length = u16::try_from(text.len()).map_err(|_| invalid())?;
+        self.file.write_all(text.as_bytes())?;
+        self.ends
+            .push(self.ends.last().copied().unwrap_or(0) + u64::from(length));
+        self.lengths.push(length);
+        Ok(())
+    }
+
+    pub(super) fn length(&self, position: usize) -> usize {
+        usize::from(self.lengths[position])
+    }
+
+    pub(super) fn with_texts<T>(
+        &mut self,
+        read: impl FnOnce(&mut SnapshotTextReader<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        self.file.flush().map_err(|error| error.to_string())?;
+        let mut reader = SnapshotTextReader::new(self.file.get_mut(), &self.ends, &self.lengths);
+        let result = read(&mut reader)?;
+        self.file
+            .get_mut()
+            .seek(SeekFrom::End(0))
+            .map_err(|error| error.to_string())?;
+        Ok(result)
+    }
+}
+
+impl SnapshotVectors {
+    pub(super) fn len(&self) -> usize {
+        self.offsets.len()
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self.offsets.capacity() * size_of::<u64>()
+            + self
+                .text_lengths
+                .as_ref()
+                .map_or(0, |lengths| lengths.capacity() * size_of::<u16>())
+            + self.staged_texts.as_ref().map_or(0, |texts| {
+                texts.ends.capacity() * size_of::<u64>()
+                    + texts.lengths.capacity() * size_of::<u16>()
+            })
+    }
+
+    pub(super) fn has_texts(&self) -> bool {
+        self.text_lengths.is_some() || self.staged_texts.is_some()
+    }
+
+    pub(super) fn text_length(&self, position: usize) -> Option<usize> {
+        self.staged_texts
+            .as_ref()
+            .map(|texts| usize::from(texts.lengths[position]))
+            .or_else(|| {
+                self.text_lengths
+                    .as_ref()
+                    .map(|lengths| usize::from(lengths[position]))
+            })
+    }
+
+    pub(super) fn stage_texts(&mut self, stage: TextStage, order: &[usize]) -> io::Result<()> {
+        let file = stage
+            .file
+            .into_inner()
+            .map_err(|error| error.into_error())?;
+        let stamp = FileStamp::read(&file)?;
+        self.staged_texts = Some(StagedTexts {
+            file: Mutex::new(file),
+            stamp,
+            ends: order.iter().map(|&position| stage.ends[position]).collect(),
+            lengths: order
+                .iter()
+                .map(|&position| stage.lengths[position])
+                .collect(),
+        });
+        Ok(())
+    }
+
+    pub(super) fn with_texts<T>(
+        &self,
+        read: impl FnOnce(&mut SnapshotTextReader<'_>) -> Result<T, String>,
+    ) -> Result<T, String> {
+        let changed = || super::retrieval::changed_index();
+        let (file, stamp, ends, lengths) = if let Some(texts) = &self.staged_texts {
+            (&texts.file, &texts.stamp, &texts.ends, &texts.lengths)
+        } else {
+            (
+                &self.file,
+                &self.stamp,
+                &self.offsets,
+                self.text_lengths.as_ref().ok_or_else(changed)?,
+            )
+        };
+        let mut file = file.lock().map_err(|_| changed())?;
+        stamp.require_unchanged(&file).map_err(|_| changed())?;
+        let mut reader = SnapshotTextReader::new(&mut file, ends, lengths);
+        let result = read(&mut reader)?;
+        stamp.require_unchanged(&file).map_err(|_| changed())?;
+        Ok(result)
+    }
+
+    pub(super) fn for_each_vector(
+        &self,
+        ranges: impl Iterator<Item = Range<usize>>,
+        dimensions: usize,
+        check: impl Fn() -> Result<(), String>,
+        mut visit: impl FnMut(usize, &[f32]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let mut values = vec![0.0; dimensions];
+        self.for_each_encoded_vector(ranges, dimensions, check, |position, block| {
+            decode_vector(block, &mut values);
+            visit(position, &values)
+        })
+    }
+
+    pub(super) fn for_each_encoded_vector(
+        &self,
+        ranges: impl Iterator<Item = Range<usize>>,
+        dimensions: usize,
+        check: impl Fn() -> Result<(), String>,
+        mut visit: impl FnMut(usize, &[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let changed = |_| super::retrieval::changed_index();
+        let mut file = self.file.lock().map_err(changed)?;
+        self.stamp
+            .require_unchanged(&file)
+            .map_err(|_| super::retrieval::changed_index())?;
+        let mut block = vec![0; dimensions * size_of::<f32>()];
+        let mut reader = BufReader::with_capacity(64 * 1024, &mut *file);
+        let mut previous_end = None;
+        for position in ranges.flatten() {
+            check()?;
+            let offset = self.offsets[position];
+            let outcome = match previous_end {
+                Some(end) => reader.seek_relative(offset as i64 - end as i64),
+                None => reader.seek(SeekFrom::Start(offset)).map(|_| ()),
+            };
+            outcome
+                .and_then(|()| reader.read_exact(&mut block))
+                .map_err(|_| super::retrieval::changed_index())?;
+            visit(position, &block)?;
+            previous_end = Some(offset + block.len() as u64);
+        }
+        self.stamp
+            .require_unchanged(&file)
+            .map_err(|_| super::retrieval::changed_index())
+    }
+
+    fn for_each_encoded_entry(
+        &self,
+        dimensions: usize,
+        mut visit: impl FnMut(usize, Option<&str>, &[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let range = std::iter::once(0..self.len());
+        if self.staged_texts.is_some() {
+            return self.with_texts(|texts| {
+                self.for_each_encoded_vector(
+                    range,
+                    dimensions,
+                    || Ok(()),
+                    |position, vector| {
+                        let text = texts.read(position).map_err(|error| error.to_string())?;
+                        visit(position, Some(text), vector)
+                    },
+                )
+            });
+        }
+        self.for_each_encoded_vector(
+            range,
+            dimensions,
+            || Ok(()),
+            |position, vector| visit(position, None, vector),
+        )
+    }
+}
+
+pub(super) struct SnapshotTextReader<'a> {
+    input: BufReader<&'a mut File>,
+    offsets: &'a [u64],
+    lengths: &'a [u16],
+    buffer: Vec<u8>,
+    previous_end: Option<u64>,
+}
+
+impl<'a> SnapshotTextReader<'a> {
+    fn new(file: &'a mut File, offsets: &'a [u64], lengths: &'a [u16]) -> Self {
+        Self {
+            input: BufReader::new(file),
+            offsets,
+            lengths,
+            buffer: Vec::new(),
+            previous_end: None,
+        }
+    }
+
+    pub(super) fn read(&mut self, position: usize) -> io::Result<&str> {
+        let end = self.offsets[position];
+        let length = usize::from(self.lengths[position]);
+        let start = end - length as u64;
+        match self.previous_end {
+            Some(previous) => self.input.seek_relative(start as i64 - previous as i64)?,
+            None => {
+                self.input.seek(SeekFrom::Start(start))?;
+            }
+        }
+        self.buffer.resize(length, 0);
+        self.input.read_exact(&mut self.buffer)?;
+        self.previous_end = Some(end);
+        std::str::from_utf8(&self.buffer).map_err(|_| invalid())
+    }
+}
+
 impl Cache {
     pub(in crate::ai_manager::local) fn new(profile: PathBuf) -> Self {
         Self(profile)
     }
 
+    #[cfg(test)]
     pub(in crate::ai_manager::local) fn save(
         &self,
         index: &Index,
         check: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
+        self.save_checked(index, || Ok(()), check)
+    }
+
+    pub(super) fn save_checked(
+        &self,
+        index: &Index,
+        active: impl Fn() -> Result<(), String>,
+        check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
         if index.qdrant_receipt.is_some() {
             return Err(invalid());
         }
-        self.save_index(index, None, check)
+        self.save_index(index, None, || active().map_err(io::Error::other), check)
     }
 
     pub(in crate::ai_manager::local) fn save_with_receipt(
@@ -65,24 +400,31 @@ impl Cache {
         receipt: &QdrantReceipt,
         check: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
-        self.save_index(index, Some(receipt), check)
+        self.save_index(index, Some(receipt), || Ok(()), check)
     }
 
     fn save_index(
         &self,
         index: &Index,
         receipt: Option<&QdrantReceipt>,
+        active: impl Fn() -> io::Result<()>,
         check: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
+        active()?;
         let directory = self.directory(true)?;
-        directory.replace_with(
+        directory.replace_with_shared_readers(
             &name(&index.scope),
             |file| {
                 let mut writer = BufWriter::new(file);
-                write_index(&mut writer, index, receipt)?;
-                writer.flush()
+                write_index_checked(&mut writer, index, receipt, &active)?;
+                writer.flush()?;
+                active()
             },
-            check,
+            || {
+                active()?;
+                check()?;
+                active()
+            },
         )?;
         directory.sync().map_err(|error| {
             io::Error::new(
@@ -100,9 +442,33 @@ impl Cache {
         &self,
         scope: &Scope,
     ) -> io::Result<(Index, FileStamp)> {
+        self.load_with_storage(scope, false, || Ok(()))
+    }
+
+    pub(in crate::ai_manager::local) fn load_file_backed(
+        &self,
+        scope: &Scope,
+        active: impl Fn() -> Result<(), String>,
+    ) -> io::Result<(Index, FileStamp)> {
+        self.load_with_storage(scope, true, || {
+            active().map_err(|error| io::Error::new(io::ErrorKind::Interrupted, error))
+        })
+    }
+
+    fn load_with_storage(
+        &self,
+        scope: &Scope,
+        file_backed: bool,
+        active: impl Fn() -> io::Result<()>,
+    ) -> io::Result<(Index, FileStamp)> {
+        active()?;
         let file = self.open_snapshot(scope)?;
         let stamp = FileStamp::read(&file)?;
-        let index = read_index(&mut BufReader::new((&file).take(MAX_BYTES + 1)), scope)?;
+        let mut reader = BufReader::new(&file);
+        let length = file.metadata()?.len();
+        let held = file_backed.then_some((&file, &stamp));
+        let index = read_index_with_file(&mut reader, scope, length, held, &active)?;
+        active()?;
         stamp.require_unchanged(&file)?;
         self.require_current(scope, &stamp).map_err(|error| {
             if error.kind() == io::ErrorKind::NotFound {
@@ -147,7 +513,7 @@ impl Cache {
             return Err(super::retrieval::changed_index());
         }
         let length = file.metadata().map_err(changed)?.len();
-        if length > MAX_BYTES {
+        if length > byte_limit(scope.qdrant.is_some()) {
             return Err(super::retrieval::changed_index());
         }
         let mut reader = (&file).take(length);
@@ -156,6 +522,9 @@ impl Cache {
         let mut header_bytes = Vec::new();
         let header = read_header(&mut HeaderReader(&mut reader, &mut header_bytes), scope)
             .map_err(changed)?;
+        if length > header.byte_limit() {
+            return Err(super::retrieval::changed_index());
+        }
         header
             .require_minimum_length(reader.limit())
             .map_err(changed)?;
@@ -195,10 +564,20 @@ impl Cache {
             .directory(false)?
             .open_private_file(&name(&scope.digest))?;
         require_single_link(&file)?;
-        if file.metadata()?.len() > MAX_BYTES {
+        if file.metadata()?.len() > byte_limit(scope.qdrant.is_some()) {
             return Err(invalid());
         }
         Ok(file)
+    }
+
+    pub(super) fn require_absent(&self, scope: &Scope) -> io::Result<()> {
+        match self.open_snapshot(scope) {
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other(
+                "The knowledge index was created by another operation.",
+            )),
+        }
     }
 
     pub(in crate::ai_manager::local) fn remove(&self, index: &Index) -> io::Result<()> {
@@ -250,11 +629,20 @@ pub(super) fn encoded_entry_bytes(text_len: usize, dimensions: usize) -> usize {
         .saturating_add(dimensions.saturating_mul(size_of::<f32>()))
 }
 
-fn encoded_size(index: &Index, receipt: Option<&QdrantReceipt>) -> io::Result<usize> {
+fn encoded_size(
+    index: &Index,
+    receipt: Option<&QdrantReceipt>,
+    active: &impl Fn() -> io::Result<()>,
+) -> io::Result<usize> {
     let count = index.entries.len();
     let dimensions = index.dimensions;
-    if index.sources.len() > MAX_SOURCES
-        || !valid_dimensions(count, dimensions, MAX_INDEX_PASSAGES, true)
+    let limit = byte_limit(receipt.is_some());
+    if index
+        .snapshot_vectors
+        .as_ref()
+        .is_some_and(|vectors| !vectors.staged || receipt.is_some())
+        || index.sources.len() > MAX_SOURCES
+        || !valid_dimensions(count, dimensions, passage_limit(receipt.is_some()), true)
         || (count > MAX_CHUNKS && index.graph.is_some())
         || (count == 0 && index.graph.is_some())
         || receipt.is_some_and(|receipt| !valid_receipt(receipt, index.sources.len()))
@@ -273,7 +661,15 @@ fn encoded_size(index: &Index, receipt: Option<&QdrantReceipt>) -> io::Result<us
             .map(|source| if source.is_some() { 33 } else { 1 })
             .sum::<usize>();
     let mut previous = 0;
-    for (passage, embedding) in &index.entries {
+    for (position, (passage, embedding)) in index.entries.iter().enumerate() {
+        if position % CHECK_INTERVAL == 0 {
+            active()?;
+        }
+        let staged_length = index
+            .snapshot_vectors
+            .as_ref()
+            .and_then(|snapshot| snapshot.text_length(position));
+        let length = staged_length.unwrap_or(passage.text.len());
         let location_valid = match passage.location {
             Location::Line(line) => (1..=super::source::MAX_CORPUS_BYTES).contains(&line),
             Location::Page(page) => (1..=pdf::MAX_PAGES).contains(&page),
@@ -284,17 +680,17 @@ fn encoded_size(index: &Index, receipt: Option<&QdrantReceipt>) -> io::Result<us
                 .get(passage.source)
                 .is_none_or(Option::is_none)
             || !location_valid
-            || !(1..=CHUNK_BYTES).contains(&passage.text.len())
-            || !valid_text(&passage.text)
-            || passage.text.trim().is_empty()
-            || embedding.len() != dimensions
-            || !normalized(embedding)
+            || !(1..=CHUNK_BYTES).contains(&length)
+            || (staged_length.is_none()
+                && (!valid_text(&passage.text) || passage.text.trim().is_empty()))
+            || (index.snapshot_vectors.is_none()
+                && (embedding.len() != dimensions || !normalized(embedding)))
         {
             return Err(invalid());
         }
         previous = passage.source;
-        bytes += encoded_entry_bytes(passage.text.len(), dimensions);
-        if bytes as u64 > MAX_BYTES {
+        bytes += encoded_entry_bytes(length, dimensions);
+        if bytes as u64 > limit {
             return Err(invalid());
         }
     }
@@ -305,29 +701,49 @@ fn encoded_size(index: &Index, receipt: Option<&QdrantReceipt>) -> io::Result<us
         }
         bytes += graph_bytes;
     }
-    if bytes as u64 > MAX_BYTES {
+    if receipt.is_none() && wide_local_header(count, bytes) {
+        bytes += V8_BASE_BYTES - V4_BASE_BYTES;
+    }
+    if bytes as u64 > limit {
         return Err(invalid());
     }
     Ok(bytes)
 }
 
+fn wide_local_header(count: usize, bytes: usize) -> bool {
+    count > V6_MAX_CHUNKS || bytes as u64 > V6_MAX_BYTES
+}
+
+#[cfg(test)]
 fn write_index(
     output: &mut impl Write,
     index: &Index,
     receipt: Option<&QdrantReceipt>,
 ) -> io::Result<()> {
+    write_index_checked(output, index, receipt, &|| Ok(()))
+}
+
+fn write_index_checked(
+    output: &mut impl Write,
+    index: &Index,
+    receipt: Option<&QdrantReceipt>,
+    active: &impl Fn() -> io::Result<()>,
+) -> io::Result<()> {
+    let bytes = encoded_size(index, receipt, active)?;
+    let wide = receipt.is_none() && wide_local_header(index.len(), bytes);
     let mut output = ExactWriter {
         output,
-        remaining: encoded_size(index, receipt)?,
+        remaining: bytes,
     };
     let expanded = index.sources.len() > LEGACY_MAX_SOURCES
         || index.entries.len() > MAX_CHUNKS
         || index.entries.iter().any(|(passage, _)| matches!(passage.location, Location::Line(line) if line > super::source::PREVIOUS_LARGE_TEXT_BYTES));
-    output.write_all(match (receipt.is_some(), expanded) {
-        (true, true) => MAGIC_V7,
-        (true, false) => MAGIC_V5,
-        (false, true) => MAGIC_V6,
-        (false, false) => MAGIC_V4,
+    output.write_all(match (receipt.is_some(), expanded, wide) {
+        (_, _, true) => MAGIC_V8,
+        (true, true, false) => MAGIC_V7,
+        (true, false, false) => MAGIC_V5,
+        (false, true, false) => MAGIC_V6,
+        (false, false, false) => MAGIC_V4,
     })?;
     output.write_all(&index.scope)?;
     if let Some(receipt) = receipt {
@@ -337,7 +753,15 @@ fn write_index(
         }
     }
     write_size(&mut output, index.dimensions)?;
-    write_size(&mut output, index.entries.len())?;
+    if wide {
+        output.write_all(
+            &u32::try_from(index.len())
+                .map_err(|_| invalid())?
+                .to_le_bytes(),
+        )?;
+    } else {
+        write_size(&mut output, index.len())?;
+    }
     write_size(&mut output, index.sources.len())?;
     for source in &index.sources {
         output.write_all(&[u8::from(source.is_some())])?;
@@ -345,28 +769,61 @@ fn write_index(
             output.write_all(digest)?;
         }
     }
-    let mut vector = vec![0; index.dimensions * size_of::<f32>()];
-    for (passage, embedding) in &index.entries {
-        write_size(&mut output, passage.source)?;
-        let (tag, number) = match passage.location {
-            Location::Line(line) => (0, line),
-            Location::Page(page) => (1, page),
-        };
-        output.write_all(&[tag])?;
-        output.write_all(&u32::try_from(number).map_err(|_| invalid())?.to_le_bytes())?;
-        write_size(&mut output, passage.text.len())?;
-        output.write_all(passage.text.as_bytes())?;
-        for (bytes, value) in vector.as_chunks_mut::<4>().0.iter_mut().zip(embedding) {
-            *bytes = value.to_le_bytes();
-        }
-        output.write_all(&vector)?;
-    }
+    write_entries(&mut output, index, active).map_err(io::Error::other)?;
     output.write_all(&[u8::from(index.graph.is_some())])?;
     if let Some(graph) = &index.graph {
         graph.write(&mut output)?;
     }
     if output.remaining != 0 {
         return Err(invalid());
+    }
+    Ok(())
+}
+
+fn write_entries(
+    output: &mut impl Write,
+    index: &Index,
+    active: &impl Fn() -> io::Result<()>,
+) -> Result<(), String> {
+    let check = |position| {
+        if position % CHECK_INTERVAL == 0 {
+            active().map_err(|error| error.to_string())?;
+        }
+        Ok::<(), String>(())
+    };
+    let mut write = |position: usize, text: &str, encoded: &[u8]| -> io::Result<()> {
+        let passage = &index.entries[position].0;
+        write_size(output, passage.source)?;
+        let (tag, number) = match passage.location {
+            Location::Line(line) => (0, line),
+            Location::Page(page) => (1, page),
+        };
+        output.write_all(&[tag])?;
+        output.write_all(&u32::try_from(number).map_err(|_| invalid())?.to_le_bytes())?;
+        write_size(output, text.len())?;
+        output.write_all(text.as_bytes())?;
+        output.write_all(encoded)
+    };
+    if let Some(snapshot) = &index.snapshot_vectors {
+        let mut values = vec![0.0; index.dimensions];
+        return snapshot.for_each_encoded_entry(index.dimensions, |position, text, encoded| {
+            check(position)?;
+            decode_vector(encoded, &mut values);
+            if !normalized(&values)
+                || text.is_some_and(|text| !valid_text(text) || text.trim().is_empty())
+            {
+                return Err(invalid().to_string());
+            }
+            let text = text.unwrap_or(&index.entries[position].0.text);
+            write(position, text, encoded).map_err(|error| error.to_string())
+        });
+    }
+
+    let mut encoded = vec![0; index.dimensions * size_of::<f32>()];
+    for (position, (passage, embedding)) in index.entries.iter().enumerate() {
+        check(position)?;
+        encode_vector(&mut encoded, embedding);
+        write(position, &passage.text, &encoded).map_err(|error| error.to_string())?;
     }
     Ok(())
 }
@@ -402,6 +859,7 @@ impl<R: Read> Read for HeaderReader<'_, R> {
 }
 
 struct Header {
+    wide: bool,
     typed: bool,
     graph_tag: bool,
     dimensions: usize,
@@ -412,6 +870,14 @@ struct Header {
 }
 
 impl Header {
+    fn byte_limit(&self) -> u64 {
+        match (self.wide, self.receipt.is_some()) {
+            (true, _) => MAX_LOCAL_BYTES,
+            (false, true) => MAX_QDRANT_BYTES,
+            (false, false) => V6_MAX_BYTES,
+        }
+    }
+
     fn require_minimum_length(&self, remaining: u64) -> io::Result<()> {
         let vector_bytes = self.dimensions as u64 * size_of::<f32>() as u64;
         let minimum_entry = 9 + u64::from(self.typed) + vector_bytes;
@@ -429,7 +895,7 @@ fn read_header(input: &mut impl Read, scope: &Scope) -> io::Result<Header> {
         MAGIC_V1 => (false, false, false),
         MAGIC_V2 => (true, false, false),
         MAGIC_V3 => (true, true, false),
-        MAGIC_V4 | MAGIC_V5 | MAGIC_V6 | MAGIC_V7 => (true, true, true),
+        MAGIC_V4 | MAGIC_V5 | MAGIC_V6 | MAGIC_V7 | MAGIC_V8 => (true, true, true),
         _ => return Err(invalid()),
     };
     let has_receipt = matches!(&magic, MAGIC_V5 | MAGIC_V7);
@@ -457,15 +923,20 @@ fn read_header(input: &mut impl Read, scope: &Scope) -> io::Result<Header> {
         None
     };
     let dimensions = read_size(input)?;
-    let count = read_size(input)?;
-    let source_count = read_size(input)?;
-    let expanded = matches!(&magic, MAGIC_V6 | MAGIC_V7);
-    let max_count = if expanded {
-        MAX_INDEX_PASSAGES
-    } else if graph_tag {
-        MAX_CHUNKS
+    let wide = &magic == MAGIC_V8;
+    let count = if wide {
+        u32::from_le_bytes(read(input)?) as usize
     } else {
-        LEGACY_MAX_CHUNKS
+        read_size(input)?
+    };
+    let source_count = read_size(input)?;
+    let expanded = matches!(&magic, MAGIC_V6 | MAGIC_V7 | MAGIC_V8);
+    let max_count = match &magic {
+        MAGIC_V8 => MAX_LOCAL_INDEX_PASSAGES,
+        MAGIC_V7 => MAX_QDRANT_INDEX_PASSAGES,
+        MAGIC_V6 => V6_MAX_CHUNKS,
+        _ if graph_tag => MAX_CHUNKS,
+        _ => LEGACY_MAX_CHUNKS,
     };
     if !valid_dimensions(count, dimensions, max_count, optional)
         || source_count > MAX_SOURCES
@@ -495,6 +966,7 @@ fn read_header(input: &mut impl Read, scope: &Scope) -> io::Result<Header> {
         })
         .collect::<io::Result<Vec<_>>>()?;
     Ok(Header {
+        wide,
         typed,
         graph_tag,
         dimensions,
@@ -513,10 +985,26 @@ fn index_header_error(error: io::Error) -> io::Error {
     }
 }
 
-fn read_index(input: &mut impl Read, scope: &Scope) -> io::Result<Index> {
-    let mut input = input.take(MAX_BYTES);
+#[cfg(test)]
+fn read_index(input: &mut &[u8], scope: &Scope) -> io::Result<Index> {
+    let length = input.len() as u64;
+    read_index_with_file(input, scope, length, None, &|| Ok(()))
+}
+
+fn read_index_with_file(
+    input: &mut impl Read,
+    scope: &Scope,
+    file_length: u64,
+    held: Option<(&File, &FileStamp)>,
+    active: &impl Fn() -> io::Result<()>,
+) -> io::Result<Index> {
+    let mut input = input.take(file_length);
     let header = read_header(&mut input, scope)?;
+    if file_length > header.byte_limit() {
+        return Err(invalid());
+    }
     header.require_minimum_length(input.limit())?;
+    active()?;
     let Header {
         typed,
         graph_tag,
@@ -525,6 +1013,7 @@ fn read_index(input: &mut impl Read, scope: &Scope) -> io::Result<Index> {
         sources,
         receipt,
         expanded,
+        wide: _,
     } = header;
     let source_count = sources.len();
     let vector_bytes = dimensions as u64 * size_of::<f32>() as u64;
@@ -532,6 +1021,11 @@ fn read_index(input: &mut impl Read, scope: &Scope) -> io::Result<Index> {
     let minimum_tail = u64::from(graph_tag);
     let mut entries = Vec::with_capacity(count);
     let mut vector = vec![0; vector_bytes as usize];
+    let mut embedding = vec![0.0; dimensions];
+    let mut offsets = (held.is_some() && receipt.is_none() && count > MAX_CHUNKS)
+        .then(|| Vec::with_capacity(count));
+    let mut text_lengths = offsets.as_ref().map(|_| Vec::with_capacity(count));
+    let mut text_buffer = Vec::new();
     let mut previous = 0;
     let max_line = if expanded {
         super::source::MAX_CORPUS_BYTES
@@ -541,6 +1035,9 @@ fn read_index(input: &mut impl Read, scope: &Scope) -> io::Result<Index> {
         LEGACY_MAX_LINE
     };
     for remaining in (0..count).rev() {
+        if remaining % CHECK_INTERVAL == 0 {
+            active()?;
+        }
         let source = read_size(&mut input)?;
         if graph_tag && source < previous {
             return Err(invalid());
@@ -564,30 +1061,37 @@ fn read_index(input: &mut impl Read, scope: &Scope) -> io::Result<Index> {
         {
             return Err(invalid());
         }
-        let mut text = vec![0; length];
-        input.read_exact(&mut text)?;
-        let text = String::from_utf8(text).map_err(|_| invalid())?;
-        if !valid_text(&text) || text.trim().is_empty() {
+        text_buffer.resize(length, 0);
+        input.read_exact(&mut text_buffer)?;
+        let text = std::str::from_utf8(&text_buffer).map_err(|_| invalid())?;
+        if !valid_text(text) || text.trim().is_empty() {
             return Err(invalid());
         }
+        let text = if let Some(lengths) = &mut text_lengths {
+            lengths.push(u16::try_from(length).map_err(|_| invalid())?);
+            String::new()
+        } else {
+            text.to_owned()
+        };
+        let offset = file_length - input.limit();
         input.read_exact(&mut vector)?;
-        let embedding = vector
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .copied()
-            .map(f32::from_le_bytes)
-            .collect::<Vec<_>>();
+        decode_vector(&vector, &mut embedding);
         if !normalized(&embedding) {
             return Err(invalid());
         }
+        let stored_vector = if let Some(offsets) = &mut offsets {
+            offsets.push(offset);
+            Vec::new()
+        } else {
+            embedding.clone()
+        };
         entries.push((
             Passage {
                 source,
                 location,
                 text,
             },
-            embedding,
+            stored_vector,
         ));
     }
     let graph = if graph_tag {
@@ -606,9 +1110,39 @@ fn read_index(input: &mut impl Read, scope: &Scope) -> io::Result<Index> {
     if input.get_mut().read(&mut [0])? != 0 {
         return Err(invalid());
     }
-    let mut index = Index::from_parts(scope.digest, sources, entries, dimensions, graph)?;
+    let snapshot_vectors = match (offsets, held) {
+        (Some(offsets), Some((file, stamp))) => Some(SnapshotVectors {
+            file: Mutex::new(file.try_clone()?),
+            stamp: stamp.clone(),
+            offsets,
+            text_lengths,
+            staged_texts: None,
+            staged: false,
+        }),
+        _ => None,
+    };
+    let mut index = Index::from_snapshot_parts(
+        scope.digest,
+        sources,
+        entries,
+        dimensions,
+        graph,
+        snapshot_vectors,
+    )?;
     index.qdrant_receipt = receipt;
     Ok(index)
+}
+
+fn decode_vector(bytes: &[u8], values: &mut [f32]) {
+    for (bits, value) in bytes.as_chunks::<4>().0.iter().zip(values) {
+        *value = f32::from_le_bytes(*bits);
+    }
+}
+
+fn encode_vector(bytes: &mut [u8], values: &[f32]) {
+    for (bytes, value) in bytes.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+        *bytes = value.to_le_bytes();
+    }
 }
 
 fn valid_receipt(receipt: &QdrantReceipt, source_count: usize) -> bool {
@@ -677,7 +1211,7 @@ mod tests {
             ..Default::default()
         });
         let scope = Scope::new(&store, "127.0.0.1:1234", "fixture").unwrap();
-        let entries = (0..MAX_INDEX_PASSAGES)
+        let entries = (0..MAX_QDRANT_INDEX_PASSAGES)
             .map(|_| entry(MAX_SOURCES - 1, "Evidence"))
             .collect();
         let mut sources = vec![None; MAX_SOURCES];
@@ -692,7 +1226,7 @@ mod tests {
         write_index(&mut data, &index, Some(&receipt)).unwrap();
         assert!(data.starts_with(MAGIC_V7));
         let reopened = read_index(&mut data.as_slice(), &scope).unwrap();
-        assert_eq!(reopened.len(), MAX_INDEX_PASSAGES);
+        assert_eq!(reopened.len(), MAX_QDRANT_INDEX_PASSAGES);
         assert_eq!(reopened.entries.last().unwrap().0.source, MAX_SOURCES - 1);
         assert_eq!(reopened.qdrant_receipt.as_ref(), Some(&receipt));
         let receipt_end = 40 + qdrant_receipt_bytes(MAX_SOURCES);
@@ -733,10 +1267,250 @@ mod tests {
             [(1.0, MAX_CHUNKS)]
         );
         cache.require_current(&scope, &stamp).unwrap();
-        let mut bytes = std::fs::read(profile.0.join(DIRECTORY).join(name(&scope.digest))).unwrap();
+        let (file_backed, _) = cache.load_file_backed(&scope, || Ok(())).unwrap();
+        let mut staged = VectorStage::new(MAX_CHUNKS + 2).unwrap();
+        assert_eq!(
+            file_backed.reuse_source_vectors(0, 1, &mut [], Some(&mut staged), || {
+                Err("Canceled".into())
+            }),
+            Err("Canceled".into())
+        );
+        assert!(!staged.contains(1));
+        file_backed
+            .reuse_source_vectors(0, 1, &mut [], Some(&mut staged), || Ok(()))
+            .unwrap();
+        let mut staged = staged.finish(1..MAX_CHUNKS + 2).unwrap();
+        staged
+            .for_each_vector(
+                [0..1, MAX_CHUNKS..MAX_CHUNKS + 1].into_iter(),
+                2,
+                || Ok(()),
+                |position, vector| {
+                    assert_eq!(
+                        vector,
+                        if position == 0 {
+                            &[0.0, 1.0]
+                        } else {
+                            &[1.0, 0.0]
+                        }
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+        let path = profile.0.join(DIRECTORY).join(name(&scope.digest));
+        let mut bytes = std::fs::read(&path).unwrap();
         assert_eq!(&bytes[..8], MAGIC_V6);
+        assert_eq!(
+            cache.save(&file_backed, || Ok(())).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut texts = TextStage::new().unwrap();
+        let mut copies = Vec::with_capacity(index.len());
+        for (passage, _) in &index.entries {
+            texts.push(&passage.text).unwrap();
+            copies.push((
+                Passage {
+                    text: String::new(),
+                    ..passage.clone()
+                },
+                Vec::new(),
+            ));
+        }
+        staged
+            .stage_texts(texts, &(0..index.len()).collect::<Vec<_>>())
+            .unwrap();
+        let staged_index = Index::from_snapshot_parts(
+            scope.digest,
+            index.sources.clone(),
+            copies,
+            2,
+            None,
+            Some(staged),
+        )
+        .unwrap();
+        cache.save(&staged_index, || Ok(())).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let (previous, previous_stamp) = cache.load_file_backed(&scope, || Ok(())).unwrap();
         bytes[..8].copy_from_slice(MAGIC_V4);
         assert!(read_index(&mut &bytes[..], &scope).is_err());
+
+        let mut replacement = index;
+        replacement.entries[MAX_CHUNKS].0.text = "Updated passage".into();
+        cache.save(&replacement, || Ok(())).unwrap();
+        assert_eq!(previous.len(), MAX_CHUNKS + 1);
+        assert!(cache.require_current(&scope, &previous_stamp).is_err());
+        let (current, _) = cache.load_file_backed(&scope, || Ok(())).unwrap();
+        assert_eq!(current.passage_text(MAX_CHUNKS).unwrap(), "Updated passage");
+    }
+
+    #[test]
+    fn canceled_snapshot_io_preserves_the_published_index() {
+        use std::cell::Cell;
+
+        let profile = crate::snippets::tests::Profile::new();
+        let mut store = Store::new("Cancelable snapshot fixture").unwrap();
+        store.add_source(profile.0.join("source.txt")).unwrap();
+        let scope = Scope::new(&store, "127.0.0.1:1234", "fixture").unwrap();
+        let cache = Cache::new(profile.0.clone());
+        let mut index = Index::from_parts(
+            scope.digest,
+            vec![Some([8; 32])],
+            (0..MAX_CHUNKS + 1)
+                .map(|_| entry(0, "Published passage"))
+                .collect(),
+            2,
+            None,
+        )
+        .unwrap();
+        cache.save(&index, || Ok(())).unwrap();
+        let (_, stamp) = cache.load_file_backed(&scope, || Ok(())).unwrap();
+        let calls = Cell::new(0);
+        let abort_after = |limit| {
+            calls.set(calls.get() + 1);
+            if calls.get() == limit {
+                Err("Canceled".to_owned())
+            } else {
+                Ok(())
+            }
+        };
+        let error = cache
+            .load_file_backed(&scope, || abort_after(3))
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+        assert_eq!(error.to_string(), "Canceled");
+
+        calls.set(0);
+        index.entries[0].0.text = "Replacement passage".into();
+        // Pass the size checks and write the first block before canceling.
+        let write_limit = 1 + index.len().div_ceil(CHECK_INTERVAL) + 2;
+        let error = cache
+            .save_checked(
+                &index,
+                || abort_after(write_limit),
+                || panic!("The canceled write reached publication"),
+            )
+            .unwrap_err();
+        assert_eq!(error.to_string(), "Canceled");
+        cache.require_current(&scope, &stamp).unwrap();
+        assert_eq!(
+            cache.directory(false).unwrap().names(2).unwrap(),
+            [std::ffi::OsString::from(name(&scope.digest))]
+        );
+    }
+
+    #[test]
+    fn wide_local_snapshot_round_trips_beyond_the_u16_boundary() {
+        const PASSAGES: usize = 65_536;
+        let profile = crate::snippets::tests::Profile::new();
+        let mut store = Store::new("Wide snapshot fixture").unwrap();
+        store.add_source(profile.0.join("source.txt")).unwrap();
+        let scope = Scope::new(&store, "127.0.0.1:1234", "fixture").unwrap();
+        let mut entries: Vec<_> = (0..PASSAGES).map(|_| entry(0, "Passage")).collect();
+        entries.last_mut().unwrap().1 = vec![0.0, 1.0];
+        let index = Index::from_parts(scope.digest, vec![Some([8; 32])], entries, 2, None).unwrap();
+        let cache = Cache::new(profile.0.clone());
+        cache.save(&index, || Ok(())).unwrap();
+        let (loaded, stamp) = cache.load_file_backed(&scope, || Ok(())).unwrap();
+        assert_eq!(loaded.len(), PASSAGES);
+        assert_eq!(
+            loaded
+                .rank_candidates(&scope, &[0.0, 1.0], 5, || Ok(()))
+                .unwrap(),
+            [(1.0, PASSAGES - 1), (0.0, 0), (0.0, 1), (0.0, 2), (0.0, 3)]
+        );
+        let mut ranked = loaded.ranked_exact(&scope, &[0.0, 1.0], || Ok(())).unwrap();
+        assert_eq!(ranked.next(), Some((1.0, PASSAGES - 1)));
+        assert_eq!(ranked.next(), Some((0.0, 0)));
+        let mut bytes = std::fs::read(profile.0.join(DIRECTORY).join(name(&scope.digest))).unwrap();
+        assert_eq!(&bytes[..8], MAGIC_V8);
+        assert_eq!(
+            cache.digest_current(&scope, &stamp, || Ok(())).unwrap(),
+            super::super::sha256(&bytes).unwrap()
+        );
+        let count_position = MAGIC_V8.len() + scope.digest.len() + size_of::<u16>();
+        bytes[count_position..count_position + size_of::<u32>()]
+            .copy_from_slice(&(MAX_LOCAL_INDEX_PASSAGES as u32 + 1).to_le_bytes());
+        assert!(read_index(&mut bytes.as_slice(), &scope).is_err());
+        bytes[count_position..count_position + size_of::<u32>()]
+            .copy_from_slice(&(MAX_LOCAL_INDEX_PASSAGES as u32).to_le_bytes());
+        let path = profile.0.join(DIRECTORY).join(name(&scope.digest));
+        drop(ranked);
+        drop(loaded);
+        std::fs::write(path, &bytes[..V8_BASE_BYTES + 32]).unwrap();
+        assert_eq!(
+            cache
+                .load_file_backed(&scope, || Ok(()))
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::InvalidData
+        );
+    }
+
+    #[test]
+    #[ignore = "measures the Java passage ceiling with synthetic records"]
+    fn knowledge_local_snapshot_reopens_java_passage_ceiling() {
+        const PASSAGES: usize = 5_000_000;
+        const BATCH: usize = 8_192;
+        let profile = crate::snippets::tests::Profile::new();
+        let mut store = Store::new("Java passage ceiling fixture").unwrap();
+        store.add_source(profile.0.join("source.txt")).unwrap();
+        let scope = Scope::new(&store, "127.0.0.1:1234", "fixture").unwrap();
+        let cache = Cache::new(profile.0.clone());
+        let directory = cache.directory(true).unwrap();
+        let mut entry = Vec::new();
+        write_size(&mut entry, 0).unwrap();
+        entry.push(0);
+        entry.extend_from_slice(&1_u32.to_le_bytes());
+        write_size(&mut entry, 1).unwrap();
+        entry.push(b'x');
+        entry.extend_from_slice(&1.0_f32.to_le_bytes());
+        entry.extend_from_slice(&0.0_f32.to_le_bytes());
+        let batch = entry.repeat(BATCH);
+        let mut last = entry.clone();
+        let vector_start = last.len() - 2 * size_of::<f32>();
+        encode_vector(&mut last[vector_start..], &[0.0, 1.0]);
+        directory
+            .replace_with(
+                &name(&scope.digest),
+                |file| {
+                    let mut writer = BufWriter::new(file);
+                    writer.write_all(MAGIC_V8)?;
+                    writer.write_all(&scope.digest)?;
+                    write_size(&mut writer, 2)?;
+                    writer.write_all(&(PASSAGES as u32).to_le_bytes())?;
+                    write_size(&mut writer, 1)?;
+                    writer.write_all(&[1])?;
+                    writer.write_all(&[8; 32])?;
+                    for _ in 0..(PASSAGES - 1) / BATCH {
+                        writer.write_all(&batch)?;
+                    }
+                    writer.write_all(&batch[..((PASSAGES - 1) % BATCH) * entry.len()])?;
+                    writer.write_all(&last)?;
+                    writer.write_all(&[0])?;
+                    writer.flush()
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        let start = std::time::Instant::now();
+        let (index, stamp) = cache.load_file_backed(&scope, || Ok(())).unwrap();
+        let load_ms = start.elapsed().as_millis();
+        assert_eq!(index.len(), PASSAGES);
+        let start = std::time::Instant::now();
+        assert_eq!(
+            index
+                .rank_candidates(&scope, &[0.0, 1.0], 1, || Ok(()))
+                .unwrap(),
+            [(1.0, PASSAGES - 1)]
+        );
+        let rank_ms = start.elapsed().as_millis();
+        assert_eq!(index.passage_text(PASSAGES - 1).unwrap(), "x");
+        cache.require_current(&scope, &stamp).unwrap();
+        println!(
+            "passages={PASSAGES} dimensions=2 load_ms={load_ms} rank_ms={rank_ms} search_index_bytes={}",
+            index.bytes()
+        );
     }
 
     fn fixture_scope(paths: &[&str]) -> Scope {
@@ -995,7 +1769,7 @@ mod tests {
                 sources: 1.into(),
             });
             cache
-                .save_index(&index, receipt.as_ref(), || Ok(()))
+                .save_index(&index, receipt.as_ref(), || Ok(()), || Ok(()))
                 .unwrap();
             let (reopened, stamp) = cache.load_stamped(&scope).unwrap();
             assert_eq!(reopened.entries.len(), MAX_CHUNKS);
@@ -1010,7 +1784,7 @@ mod tests {
             let mut changed = index;
             changed.entries[0].0.text = "Replaced".into();
             cache
-                .save_index(&changed, receipt.as_ref(), || Ok(()))
+                .save_index(&changed, receipt.as_ref(), || Ok(()), || Ok(()))
                 .unwrap();
             assert!(
                 cache

@@ -93,6 +93,11 @@ pub fn file_link_count(file: &File) -> io::Result<u32> {
 }
 
 impl Directory {
+    /// Duplicates the held directory handle without reopening its path.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        self.0.try_clone().map(Self)
+    }
+
     pub(crate) fn file(&self) -> &File {
         &self.0
     }

@@ -9,8 +9,9 @@ use serde::{Deserialize, Serialize};
 use crate::profile;
 
 pub(super) const DEFAULT_IDLE: u16 = 20;
-pub(super) const MAX_IDLE: u16 = 3600;
-const MAX_BYTES: u64 = 32 * 1024;
+pub(crate) const MAX_IDLE: u16 = 3600;
+pub(crate) const FILE: &str = "video-settings.json";
+pub(crate) const MAX_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,11 +76,15 @@ impl Preferences {
             return Err(invalid("Recording settings must be a regular file"));
         }
         let mut bytes = Vec::new();
-        file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > MAX_BYTES {
+        file.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?;
+        Self::decode(&bytes)
+    }
+
+    pub(crate) fn decode(bytes: &[u8]) -> io::Result<Self> {
+        if bytes.len() > MAX_BYTES {
             return Err(invalid("Recording settings exceed the profile size limit"));
         }
-        let preferences: Self = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+        let preferences: Self = serde_json::from_slice(bytes).map_err(io::Error::other)?;
         preferences.validate()?;
         Ok(preferences)
     }
@@ -99,7 +104,7 @@ impl Preferences {
             }
         }
         let bytes = serde_json::to_vec_pretty(self).map_err(io::Error::other)?;
-        if bytes.len() as u64 > MAX_BYTES {
+        if bytes.len() > MAX_BYTES {
             return Err(invalid("Recording settings exceed the profile size limit"));
         }
         profile::save_atomic(path, &bytes)
@@ -174,7 +179,7 @@ pub(super) fn default_directory() -> io::Result<PathBuf> {
 }
 
 fn path() -> io::Result<PathBuf> {
-    Ok(profile::root()?.join("video-settings.json"))
+    Ok(profile::root()?.join(FILE))
 }
 
 fn invalid(message: &'static str) -> io::Error {

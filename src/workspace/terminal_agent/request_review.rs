@@ -595,7 +595,10 @@ impl Review {
         &self.authority.transport
     }
 
-    pub(super) fn outbound_destination(&self) -> Option<(&str, &str)> {
+    pub(super) fn reviewed_destination(&self) -> Option<(&str, &str)> {
+        if let Some(destination) = &self.authority.profile.server_default {
+            return Some((destination, "Server selects the model"));
+        }
         self.authority.outbound.as_ref().map(|outbound| {
             let model = self.authority.transport.0.usage_estimate_profile().0;
             (outbound.destination.as_str(), model)

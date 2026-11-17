@@ -578,13 +578,7 @@ impl Destination {
                 }
                 let (_, pane) = workspace.current_run_pane(run)?;
                 if pane.ssh.is_some()
-                    || pane
-                        .local_security
-                        .as_ref()
-                        .and_then(|settings| kortty_pty::shell_program(settings.shell).ok())
-                        .and_then(|program| super::super::flow::active_shell(program).ok())
-                        .as_ref()
-                        != Some(shell)
+                    || super::super::flow::local_agent_shell(pane).as_ref() != Ok(shell)
                 {
                     return Err(CHANGED.into());
                 }

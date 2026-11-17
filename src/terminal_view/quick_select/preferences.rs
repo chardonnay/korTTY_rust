@@ -3,8 +3,9 @@ use std::io;
 use std::ops::Range;
 use std::time::{Duration, Instant};
 
-use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
+
+use crate::java_pattern;
 
 pub(crate) const DEFAULT_ALPHABET: &str = "asdfqwerzxcvjklmiuopghtybn";
 pub(crate) const MAX_PATTERNS: usize = 16;
@@ -19,6 +20,8 @@ const CAPTURE_BUDGET: Duration = Duration::from_millis(100);
 pub(crate) struct Preferences {
     pub(crate) alphabet: String,
     pub(crate) patterns: Vec<String>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) java_patterns: bool,
 }
 
 impl fmt::Debug for Preferences {
@@ -34,13 +37,16 @@ impl Default for Preferences {
         Self {
             alphabet: DEFAULT_ALPHABET.into(),
             patterns: Vec::new(),
+            java_patterns: false,
         }
     }
 }
 
 impl Preferences {
     pub(crate) fn is_default(&self) -> bool {
-        self.patterns.is_empty() && (self.alphabet == DEFAULT_ALPHABET || blank(&self.alphabet))
+        !self.java_patterns
+            && self.patterns.is_empty()
+            && (self.alphabet == DEFAULT_ALPHABET || blank(&self.alphabet))
     }
 
     pub(crate) fn validate(&self) -> io::Result<()> {
@@ -50,7 +56,7 @@ impl Preferences {
             return Err(invalid("Enter no more than 16 Quick Select patterns."));
         }
         for pattern in patterns {
-            Self::validate_pattern(pattern)?;
+            Self::validate_pattern(pattern, self.java_patterns)?;
         }
         Ok(())
     }
@@ -81,8 +87,8 @@ impl Preferences {
         Ok(())
     }
 
-    pub(crate) fn validate_pattern(pattern: &str) -> io::Result<()> {
-        compile_pattern(pattern).map(|_| ())
+    pub(crate) fn validate_pattern(pattern: &str, java: bool) -> io::Result<()> {
+        compile_pattern(pattern, java).map(|_| ())
     }
 
     pub(crate) fn compile(&self) -> Compiled {
@@ -95,7 +101,7 @@ impl Preferences {
         let patterns = self
             .patterns
             .iter()
-            .filter_map(|pattern| compile_pattern(pattern).ok().flatten())
+            .filter_map(|pattern| compile_pattern(pattern, self.java_patterns).ok().flatten())
             .take(MAX_PATTERNS)
             .collect();
         Compiled {
@@ -105,7 +111,7 @@ impl Preferences {
     }
 }
 
-fn compile_pattern(pattern: &str) -> io::Result<Option<Regex>> {
+fn compile_pattern(pattern: &str, java: bool) -> io::Result<Option<java_pattern::Pattern>> {
     if blank(pattern) {
         return Ok(None);
     }
@@ -117,14 +123,12 @@ fn compile_pattern(pattern: &str) -> io::Result<Option<Regex>> {
     if !pattern.chars().all(|character| matches!(character, '\t' | '\n' | '\r' | '\u{20}'..='\u{d7ff}' | '\u{e000}'..='\u{fffd}' | '\u{10000}'..='\u{10ffff}')) {
         return Err(invalid("A Quick Select pattern contains an unsupported character."));
     }
-    let regex = RegexBuilder::new(pattern)
-        .size_limit(MAX_PATTERN_PROGRAM)
-        .dfa_size_limit(MAX_PATTERN_PROGRAM)
-        .nest_limit(64)
-        .build()
-        .map_err(|_| {
-            invalid("Invalid, unsupported, or oversized Quick Select regular expression.")
-        })?;
+    let regex = if java {
+        java_pattern::Pattern::java(pattern, false, MAX_PATTERN_PROGRAM, 64)
+    } else {
+        java_pattern::Pattern::linear(pattern, false, false, MAX_PATTERN_PROGRAM, 64)
+    }
+    .map_err(|_| invalid("Invalid, unsupported, or oversized Quick Select regular expression."))?;
     if regex.is_match("") {
         return Err(invalid(
             "A Quick Select pattern cannot match an empty string.",
@@ -149,7 +153,7 @@ fn whitespace(character: char) -> bool {
 
 pub(crate) struct Compiled {
     pub(super) alphabet: String,
-    patterns: Vec<Regex>,
+    patterns: Vec<java_pattern::Pattern>,
 }
 
 impl Compiled {
@@ -163,7 +167,7 @@ impl Compiled {
 }
 
 pub(super) struct Matching<'a> {
-    patterns: &'a [Regex],
+    patterns: &'a [java_pattern::Pattern],
     overrun: u16,
     deadline: Instant,
 }
@@ -185,11 +189,11 @@ impl Matching<'_> {
                 if Instant::now() >= deadline {
                     break;
                 }
-                let value = found.as_str();
+                let value = &line[found.clone()];
                 let start_trimmed = value.trim_start_matches(whitespace);
                 let trimmed = start_trimmed.trim_end_matches(whitespace);
                 if !trimmed.is_empty() {
-                    let start = found.start() + value.len() - start_trimmed.len();
+                    let start = found.start + value.len() - start_trimmed.len();
                     spans.push((start..start + trimmed.len(), index));
                 }
             }

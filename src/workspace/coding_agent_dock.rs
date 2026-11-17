@@ -11,8 +11,8 @@ use crate::horizontal_divider;
 
 use super::{Message as Desktop, Window, Workspace, coding_agents, local_dock};
 
-const DEFAULT_WIDTH: u16 = 750;
-const MAX_WIDTH: u16 = 1200;
+pub(super) const DEFAULT_WIDTH: u16 = 750;
+pub(super) const MAX_WIDTH: u16 = 1200;
 const TERMINAL_RESERVE: f32 = 320.0;
 const SAVE_WIDTH_DELAY: Duration = Duration::from_millis(350);
 

@@ -4,8 +4,7 @@ use iced::widget::{
     button, checkbox, column, container, pick_list, row, rule, scrollable, space, text, text_input,
 };
 use iced::{Alignment, Color, Element, Length, Theme, window};
-#[cfg(windows)]
-use kortty_pty::LocalShell;
+use kortty_pty::available_local_shells;
 
 use super::{
     Connection, Desktop, Dialog, IbmKind, Message, Protocol, Store, TerminalProfile, Workspace,
@@ -17,21 +16,6 @@ use crate::workspace::dialog_placement::escape::on_escape;
 
 const RECENT_COUNT: usize = 10;
 const LABEL_WIDTH: f32 = 200.0;
-
-#[cfg(windows)]
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ShellChoice(LocalShell);
-
-#[cfg(windows)]
-impl fmt::Display for ShellChoice {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(match self.0 {
-            LocalShell::Default => "System default",
-            LocalShell::PowerShell => "PowerShell",
-            LocalShell::CommandPrompt => "cmd.exe (Command Prompt)",
-        })
-    }
-}
 
 impl Workspace {
     pub(in crate::workspace) fn quick_connect_view(
@@ -267,19 +251,11 @@ impl Workspace {
             Protocol::Local => {
                 let integration =
                     self.quick_shell_integration(dialog.ssh.profile(), dialog.local_shell);
-                #[cfg(windows)]
                 let shell = pick_list(
-                    [
-                        LocalShell::Default,
-                        LocalShell::PowerShell,
-                        LocalShell::CommandPrompt,
-                    ]
-                    .map(ShellChoice),
-                    Some(ShellChoice(dialog.local_shell)),
-                    |choice| Message::LocalShell(choice.0),
+                    available_local_shells(),
+                    Some(dialog.local_shell),
+                    Message::LocalShell,
                 );
-                #[cfg(not(windows))]
-                let shell = text("System default");
                 body = body.push(labeled("Shell", shell)).push(labeled(
                     "Shell integration",
                     checkbox(dialog.shell_integration)

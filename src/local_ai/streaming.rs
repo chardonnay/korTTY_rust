@@ -12,6 +12,8 @@ use super::{
     Usage, UsageAttempt, chat_messages, completion_status, is_event_stream, providers,
 };
 
+mod harmony;
+
 const MAX_WIRE_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EVENT_BYTES: usize = 64 * 1024;
 
@@ -83,10 +85,50 @@ impl Client {
         response_format: bool,
         deadline: Option<Instant>,
         before_dispatch: impl FnMut() -> Result<(), String>,
+        emit: impl FnMut(StreamDelta),
+    ) -> Result<String, Error> {
+        self.stream_structured_bound(
+            [system, input],
+            (response_format, deadline),
+            None,
+            before_dispatch,
+            emit,
+        )
+    }
+
+    pub(crate) fn stream_reviewed_structured_before(
+        &self,
+        messages: [&str; 2],
+        response_format: bool,
+        deadline: Instant,
+        credential: Option<&str>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
+        emit: impl FnMut(StreamDelta),
+    ) -> Result<String, Error> {
+        if !self.profile.is_remote() {
+            return Err(Error::Invalid("choose a reviewed HTTPS profile"));
+        }
+        self.stream_structured_bound(
+            messages,
+            (response_format, Some(deadline)),
+            Some(credential),
+            before_dispatch,
+            emit,
+        )
+    }
+
+    fn stream_structured_bound(
+        &self,
+        [system, input]: [&str; 2],
+        (response_format, deadline): (bool, Option<Instant>),
+        reviewed_credential: Option<Option<&str>>,
+        before_dispatch: impl FnMut() -> Result<(), String>,
         mut emit: impl FnMut(StreamDelta),
     ) -> Result<String, Error> {
         let messages = chat_messages(system, &[], input);
         self.with_completion(|attempt| {
+            attempt.reviewed_https_credential = reviewed_credential
+                .map(|credential| credential.map(|value| Zeroizing::new(value.to_owned())));
             self.stream_messages(
                 &messages,
                 Mode::Structured {
@@ -174,13 +216,11 @@ impl Client {
         }
         let deadline =
             self.before_completion_dispatch(transport, deadline, &mut before_dispatch, attempt)?;
+        let mut decode_harmony = false;
         let (mut response, buffered, deadline) = if protocol == Protocol::OpenAi {
-            let request = self.openai_payload(
-                messages,
-                response_format,
-                true,
-                self.openai_reasoning(transport)?,
-            )?;
+            let controls = self.openai_reasoning(transport)?;
+            decode_harmony = controls == super::mlx_models::ReasoningControls::GptOssEffort;
+            let request = self.openai_payload(messages, response_format, true, controls)?;
             let response = self
                 .openai_response(transport, request, deadline, before_dispatch, attempt)
                 .or_else(|error| {
@@ -215,6 +255,7 @@ impl Client {
                     self.profile.target,
                     Target::Remote(_, RemoteProtocol::MiniMaxNative)
                 ),
+                harmony: decode_harmony.then(harmony::Decoder::default),
                 ..State::default()
             };
             let mut text = EchoMask::default();
@@ -288,6 +329,18 @@ impl Client {
                     }
                 }
             };
+            let answer = if decode_harmony {
+                let (answer, analysis) = decode_harmony_content(answer)?;
+                if !structured {
+                    emit_nonempty(
+                        emit,
+                        StreamDelta::Reasoning(redact_echo(analysis, credential)),
+                    );
+                }
+                answer
+            } else {
+                answer
+            };
             if !structured {
                 emit(StreamDelta::Text(redact_echo(answer.clone(), credential)));
             }
@@ -317,6 +370,16 @@ fn emit_nonempty(emit: &mut impl FnMut(StreamDelta), delta: StreamDelta) {
     if !text.is_empty() {
         emit(delta);
     }
+}
+
+pub(super) fn decode_harmony_content(content: String) -> Result<(String, String), Error> {
+    let mut state = State {
+        harmony: Some(harmony::Decoder::default()),
+        ..State::default()
+    };
+    state.append_openai(&Zeroizing::new(content), false, &mut |_| {})?;
+    let answer = state.final_answer(&mut |_| {})?;
+    Ok((answer, std::mem::take(&mut *state.reasoning)))
 }
 
 #[cfg(test)]
@@ -372,7 +435,7 @@ fn read_stream(
                 state.event(&data, protocol, limit, emit)?;
             }
             return if state.finished || state.native_minimax && state.openai_stopped {
-                state.final_answer()
+                state.final_answer(emit)
             } else {
                 Err(Error::Invalid("stream ended before completion"))
             };
@@ -385,7 +448,7 @@ fn read_stream(
                 state.event(&data, protocol, limit, emit)?;
                 data.clear();
                 if state.finished {
-                    return state.final_answer();
+                    return state.final_answer(emit);
                 }
             }
         } else if let Some(value) = line.strip_prefix("data:") {
@@ -410,6 +473,7 @@ struct State {
     native_minimax: bool,
     anthropic: Anthropic,
     usage: Usage,
+    harmony: Option<harmony::Decoder>,
 }
 
 #[derive(Default)]
@@ -428,11 +492,28 @@ enum Block {
 }
 
 impl State {
-    fn final_answer(&self) -> Result<String, Error> {
+    fn final_answer(&mut self, emit: &mut impl FnMut(StreamDelta)) -> Result<String, Error> {
+        if let Some(decoder) = self.harmony.take() {
+            decoder.finish(|text, reasoning| self.append(text, reasoning, emit))?;
+        }
         if self.native_minimax && self.answer.trim().is_empty() {
             return Err(Error::Invalid("missing MiniMax stream answer"));
         }
         Ok(self.answer.to_string())
+    }
+
+    fn append_openai(
+        &mut self,
+        text: &str,
+        reasoning: bool,
+        emit: &mut impl FnMut(StreamDelta),
+    ) -> Result<(), Error> {
+        if !reasoning && let Some(mut decoder) = self.harmony.take() {
+            decoder.push(text, |text, reasoning| self.append(text, reasoning, emit))?;
+            self.harmony = Some(decoder);
+            return Ok(());
+        }
+        self.append(text, reasoning, emit)
     }
 
     fn append(
@@ -594,7 +675,7 @@ impl State {
                         // Accept either reasoning field, with reasoning_content preferred.
                         received[usize::from(reasoning)].get_or_insert(text);
                     } else {
-                        self.append(text, reasoning, emit)?;
+                        self.append_openai(text, reasoning, emit)?;
                     }
                 }
             }
@@ -716,6 +797,76 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Duration;
+
+    const GPT_OSS_CONTENT: &str = concat!(
+        "<|channel|>analysis<|message|>Vérifier 2 < 3.<|end|>",
+        "<|start|>assistant<|channel|>commentary<|message|>Working…<|end|>",
+        "<|start|>assistant<|channel|>final<|message|>Trois<|return|>"
+    );
+
+    #[test]
+    fn managed_gpt_oss_decodes_harmony_markers_split_across_events() {
+        let mut wire = String::new();
+        for character in GPT_OSS_CONTENT.chars() {
+            let event = serde_json::json!({
+                "choices": [{ "delta": { "content": character.to_string() } }],
+            });
+            wire.push_str(&format!("data: {event}\n\n"));
+        }
+        wire.push_str("data: [DONE]\n\n");
+        let mut state = State {
+            harmony: Some(harmony::Decoder::default()),
+            ..State::default()
+        };
+        let mut answer = String::new();
+        let mut reasoning = String::new();
+        let decoded = read_stream(
+            wire.as_bytes(),
+            Protocol::OpenAi,
+            None,
+            || true,
+            &mut |delta| match delta {
+                StreamDelta::Text(part) => answer.push_str(&part),
+                StreamDelta::Reasoning(part) => reasoning.push_str(&part),
+            },
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(decoded, "Trois");
+        assert_eq!(answer, decoded);
+        assert_eq!(reasoning, "Vérifier 2 < 3.");
+        assert_eq!(
+            decode(
+                wire.as_bytes(),
+                Protocol::OpenAi,
+                None,
+                || true,
+                &mut |_| {}
+            )
+            .unwrap()
+            .0,
+            GPT_OSS_CONTENT
+        );
+    }
+
+    #[test]
+    fn managed_gpt_oss_buffered_responses_require_the_final_channel() {
+        assert_eq!(
+            decode_harmony_content(GPT_OSS_CONTENT.into()).unwrap(),
+            ("Trois".into(), "Vérifier 2 < 3.".into())
+        );
+        let plain = "3 < 5";
+        assert_eq!(
+            decode_harmony_content(plain.into()).unwrap(),
+            (plain.into(), String::new())
+        );
+        let analysis_only = "<|channel|>analysis<|message|>Draft<|end|>";
+        let incomplete_final = "<|channel|>final<|message|>Three<|ret";
+        let tool_call = "<|channel|>commentary to=functions.command<|message|>{}<|call|>";
+        for bad in [analysis_only, incomplete_final, tool_call] {
+            assert!(decode_harmony_content(bad.into()).is_err());
+        }
+    }
 
     #[test]
     fn streaming_handles_utf8_reasoning_and_requires_an_explicit_finish() {

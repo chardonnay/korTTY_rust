@@ -9,20 +9,27 @@ use kortty_vault::Vault;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use super::java_migration::{CONNECTIONS, SchedulerSource};
+use super::java_migration::{CONNECTIONS, SchedulerSource, ToolbarSource};
 use super::{
     QueuedRestore, Snapshot, archive, data, java_credential_restore, java_migration, java_scheduler,
 };
 use crate::ai_manager::backup as ai_backup;
+use crate::connection_store::{
+    Store,
+    import::{java_connection_candidate, normalize_java_group_path},
+};
 use crate::private_files::{Directory, nonce};
-use crate::snippets;
+use crate::session_journal::markers;
 use crate::ssh_key_catalog::{self, Catalog, KeySource};
+use crate::workspace::backup_data::java_toolbar;
+use crate::{snippets, terminal_highlight};
 
 #[cfg(test)]
 mod java_ai_tests;
 mod java_jobs;
 mod java_keys;
 mod java_memory;
+pub(crate) use java_memory::{Review as JavaMemoryReview, Target as JavaMemoryTarget};
 #[cfg(test)]
 mod java_scheduler_tests;
 mod merge;
@@ -43,6 +50,8 @@ const JAVA_JOBS: u8 = 7;
 const JAVA_JOBS_COMMITTING: u8 = 8;
 const JAVA_MEMORY: u8 = 9;
 const JAVA_MEMORY_COMMITTING: u8 = 10;
+const JAVA_TOOLBAR: u8 = 11;
+const JAVA_TOOLBAR_COMMITTING: u8 = 12;
 const VAULT: &str = "vault/vault.bin";
 const MAX_PASSWORD_PLAN: usize = 16 * 1024;
 const MAX_CREDENTIAL_PLAN: usize = 128 * 1024;
@@ -149,7 +158,7 @@ fn queue_with_header_policy(
                 snapshot.remove(PINS);
             }
         }
-        RestoreMode::JavaAdditive => check_java_delta(&snapshot)?,
+        RestoreMode::JavaAdditive => check_java_delta(&snapshot, None)?,
     }
     let payload = archive::encode_snapshot(&snapshot)?;
     drop(snapshot);
@@ -223,6 +232,10 @@ struct ConnectionRevision {
     after: [u8; 32],
     #[serde(default, skip_serializing_if = "Option::is_none")]
     scoped_memory: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    toolbar: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    highlight_bindings: Option<[u8; 32]>,
 }
 
 #[derive(Clone)]
@@ -320,8 +333,49 @@ fn stage_java_connections(
             contents: Zeroizing::new(contents),
             routes: import.routes,
             memory_ids: import.memory_ids,
+            profile_ids: import.profile_ids,
             groups: import.groups,
         }))
+}
+
+fn stage_java_toolbar(
+    directory: &Directory,
+    snapshot: &mut Snapshot,
+    layout: java_toolbar::Source,
+    connections: Option<&java_credential_restore::Connections>,
+    notes: &mut Vec<String>,
+) -> io::Result<Option<[u8; 32]>> {
+    let catalogue = connections
+        .filter(|_| layout.uses_profiles())
+        .map(|connections| {
+            java_connection_candidate(&connections.contents).map(|store| (connections, store))
+        })
+        .transpose()?;
+    let staged = layout.stage(
+        |source_id| catalogue.as_ref()?.0.profile_ids.get(source_id).copied(),
+        |source_path| {
+            let (connections, store) = catalogue.as_ref()?;
+            let path = normalize_java_group_path(source_path);
+            let expected = connections
+                .groups
+                .toolbar_members(source_path, &connections.profile_ids)?;
+            let actual: BTreeSet<_> = store.direct_group_ids(&path).collect();
+            (expected == actual).then_some(path)
+        },
+    )?;
+    if directory.has_entry(java_toolbar::FILE)? {
+        notes.push("The existing toolbar layout takes precedence.".into());
+    } else if staged.unavailable != 0 {
+        notes.push(format!(
+            "{} Java toolbar buttons were retained as unavailable because their actions or exact targets could not be matched.",
+            staged.unavailable
+        ));
+    }
+    let revision = staged
+        .bound
+        .then(|| java_credential_restore::digest(&staged.contents));
+    snapshot.insert(java_toolbar::FILE.into(), Zeroizing::new(staged.contents));
+    Ok(revision)
 }
 
 pub(super) fn queue_java_transaction(
@@ -330,21 +384,37 @@ pub(super) fn queue_java_transaction(
     prepared: Option<java_credential_restore::Prepared>,
     scheduler: Option<SchedulerSource>,
     scoped_memory: Option<java_migration::memory::Source>,
+    toolbar: Option<ToolbarSource>,
     connection_library: crate::connection_store::import::JavaLibrarySettings,
 ) -> io::Result<QueuedRestore> {
     let (_, directory) = open_root(root)?;
     if !snapshot.is_empty() {
-        check_java_delta(&snapshot)?;
+        check_java_delta(&snapshot, None)?;
     }
     data::validate_java(&snapshot)?;
     let transactional_credentials = prepared.is_some();
     let mut prepared = prepared.unwrap_or_default();
+    let highlights = prepare_java_highlights(&directory, &snapshot)?;
+    let highlight_bindings = highlight_digest(&highlights.set_ids)?;
+    if prepared.connections.is_some()
+        && prepared
+            .highlight_bindings
+            .is_some_and(|reviewed| reviewed != highlight_bindings)
+    {
+        return Err(highlight_revision_error());
+    }
+    let connection_library = connection_library.with_highlight_sets(highlights.set_ids);
     let mut scheduler_notes = Vec::new();
     let source_connections = scheduler
         .as_ref()
         .map(|source| &source.connections)
-        .or_else(|| scoped_memory.as_ref().map(|source| &source.connections));
-    let plain = if prepared.connections.is_none() && snapshot.contains_key(CONNECTIONS) {
+        .or_else(|| scoped_memory.as_ref().map(|source| &source.connections))
+        .or_else(|| {
+            toolbar
+                .as_ref()
+                .and_then(|source| source.connections.as_ref())
+        });
+    let mut plain = if prepared.connections.is_none() && snapshot.contains_key(CONNECTIONS) {
         source_connections
             .map(|source| stage_java_connections(&directory, source, connection_library))
             .transpose()?
@@ -352,6 +422,20 @@ pub(super) fn queue_java_transaction(
     } else {
         None
     };
+    if prepared.connections.is_none()
+        && plain.is_none()
+        && scoped_memory
+            .as_ref()
+            .and_then(|source| source.review.as_ref())
+            .is_some_and(JavaMemoryReview::selected)
+    {
+        plain = java_memory::existing_catalogue(&directory)?;
+        if plain.is_none() {
+            return Err(invalid(
+                "Saved connections changed. Open the backup again to review AI Memory destinations.",
+            ));
+        }
+    }
     let catalogue = prepared.connections.as_ref().or(plain.as_ref());
     let jobs = scheduler
         .map(|source| {
@@ -376,7 +460,21 @@ pub(super) fn queue_java_transaction(
         .transpose()?
         .unwrap_or_default();
     let memory_revision = (!memory.is_empty()).then(|| java_memory::digest(&memory));
-    if job_revision.is_none() && memory_revision.is_none() && !transactional_credentials {
+    let toolbar_revision = toolbar
+        .map(|source| {
+            stage_java_toolbar(
+                &directory,
+                &mut snapshot,
+                source.layout,
+                catalogue,
+                &mut scheduler_notes,
+            )
+        })
+        .transpose()?
+        .flatten();
+    let bound_catalogue =
+        job_revision.is_some() || memory_revision.is_some() || toolbar_revision.is_some();
+    if !bound_catalogue && !transactional_credentials {
         if snapshot.is_empty() {
             return Err(invalid(
                 "No Java Scheduler jobs or connection AI Memory could be matched to this profile.",
@@ -389,7 +487,7 @@ pub(super) fn queue_java_transaction(
         });
     }
     snapshot.extend(memory);
-    if job_revision.is_some() || memory_revision.is_some() {
+    if bound_catalogue {
         prepared.connections = prepared.connections.or(plain);
     }
     let credential_ids = prepared
@@ -409,6 +507,10 @@ pub(super) fn queue_java_transaction(
             before: connections.before,
             after,
             scoped_memory: memory_revision,
+            toolbar: toolbar_revision,
+            highlight_bindings: snapshot
+                .contains_key(terminal_highlight::FILE)
+                .then_some(highlight_bindings),
         };
         require_connection_revision(&directory, &plan, false)?;
         let policy = crate::clipboard_policy::ClipboardPolicy::load();
@@ -444,7 +546,7 @@ pub(super) fn queue_java_transaction(
     } else {
         None
     };
-    let (mode, encoded) = if job_revision.is_some() || keys.is_some() || memory_revision.is_some() {
+    let (mode, encoded) = if bound_catalogue || keys.is_some() {
         let plan = JavaCredentialPlan {
             vault,
             connections,
@@ -453,10 +555,12 @@ pub(super) fn queue_java_transaction(
         };
         let mode = if job_revision.is_some() {
             JAVA_JOBS
-        } else if plan.keys.is_none() {
+        } else if plan.keys.is_some() {
+            JAVA_CREDENTIALS
+        } else if memory_revision.is_some() {
             JAVA_MEMORY
         } else {
-            JAVA_CREDENTIALS
+            JAVA_TOOLBAR
         };
         (mode, serde_json::to_vec(&plan))
     } else {
@@ -547,6 +651,8 @@ fn apply_pending(
                 | JAVA_JOBS_COMMITTING
                 | JAVA_MEMORY
                 | JAVA_MEMORY_COMMITTING
+                | JAVA_TOOLBAR
+                | JAVA_TOOLBAR_COMMITTING
         )
     {
         let (_, payload) = pending_body(body)?;
@@ -575,7 +681,7 @@ fn apply_pending(
     let mut snapshot = archive::decode_snapshot(payload)?;
     drop(pending);
     if mode == RestoreMode::JavaAdditive {
-        check_java_delta(&snapshot)?;
+        check_java_delta(&snapshot, None)?;
         data::validate_java(&snapshot)?;
     } else {
         data::validate(&snapshot)?;
@@ -591,6 +697,10 @@ fn apply_pending(
     } else {
         None
     };
+    let _marker_lock = (snapshot.contains_key(markers::FILE)
+        || mode == RestoreMode::Replace && directory.has_entry(markers::FILE)?)
+    .then(|| markers::lock_settings(directory))
+    .transpose()?;
     check_script_headers(directory, &snapshot, mode, allow_headers)?;
     if mode != RestoreMode::JavaAdditive {
         crate::profile::session::Store::purge_saved_output(root)?;
@@ -638,6 +748,7 @@ fn committing_java_mode(mode: u8) -> Option<u8> {
         JAVA_CREDENTIALS => JAVA_CREDENTIALS_COMMITTING,
         JAVA_JOBS => JAVA_JOBS_COMMITTING,
         JAVA_MEMORY => JAVA_MEMORY_COMMITTING,
+        JAVA_TOOLBAR => JAVA_TOOLBAR_COMMITTING,
         _ => return None,
     })
 }
@@ -676,6 +787,12 @@ fn apply_java_transaction(
         .connections
         .as_ref()
         .and_then(|plan| plan.scoped_memory);
+    let toolbar_revision = plan.connections.as_ref().and_then(|plan| plan.toolbar);
+    if matches!(mode, JAVA_TOOLBAR | JAVA_TOOLBAR_COMMITTING) && toolbar_revision.is_none() {
+        return Err(invalid(
+            "The Java toolbar restore is missing its reviewed layout.",
+        ));
+    }
     if matches!(mode, JAVA_MEMORY | JAVA_MEMORY_COMMITTING) && memory_revision.is_none() {
         return Err(invalid(
             "The Java AI Memory restore is missing its reviewed files.",
@@ -755,19 +872,44 @@ fn apply_java_transaction(
     } else {
         None
     };
-    if !snapshot.is_empty() {
-        check_java_delta(&snapshot)?;
+    if !snapshot.is_empty() || toolbar_revision.is_some() {
+        let toolbar_catalogue = toolbar_revision
+            .map(|digest| {
+                if !snapshot
+                    .get(java_toolbar::FILE)
+                    .is_some_and(|bytes| java_credential_restore::digest(bytes) == digest)
+                {
+                    return Err(invalid("The reviewed Java toolbar layout changed."));
+                }
+                let (_, contents) = connections.as_ref().ok_or_else(|| {
+                    invalid("The Java toolbar restore is missing its connection catalogue.")
+                })?;
+                java_connection_candidate(contents)
+            })
+            .transpose()?;
+        check_java_delta(&snapshot, toolbar_catalogue.as_ref())?;
     }
     data::validate_java(&snapshot)?;
     let _snippet_lock = snapshot
         .contains_key(snippets::FILE_NAME)
         .then(|| snippets::StoreLock::acquire_for_restore(root))
         .transpose()?;
+    let _marker_lock = snapshot
+        .contains_key(markers::FILE)
+        .then(|| markers::lock_settings(directory))
+        .transpose()?;
     let _ai_lock = (snapshot.contains_key(ai_backup::SETTINGS)
         || snapshot.contains_key(ai_backup::JAVA_STATISTICS))
     .then(|| ai_backup::lock_for_restore(directory))
     .transpose()?;
     let updates = prepare_java_updates(directory, &snapshot, allow_headers)?;
+    if let Some(expected) = connections
+        .as_ref()
+        .and_then(|(revision, _)| revision.highlight_bindings)
+        && expected != updates.highlight_bindings
+    {
+        return Err(highlight_revision_error());
+    }
     let memory = memory
         .as_ref()
         .map(|files| {
@@ -931,12 +1073,15 @@ fn require_connection_revision(
     ))
 }
 
-fn check_java_delta(snapshot: &Snapshot) -> io::Result<()> {
+fn check_java_delta(snapshot: &Snapshot, toolbar_catalogue: Option<&Store>) -> io::Result<()> {
     if snapshot.is_empty() {
         return Err(invalid("Invalid pending Java backup data."));
     }
     for (path, bytes) in snapshot {
-        if path == ai_backup::JAVA_STATISTICS {
+        if path == java_toolbar::FILE {
+            java_toolbar::validate_bindings(bytes, toolbar_catalogue)
+                .map_err(|error| path_error(path, error))?;
+        } else if path == ai_backup::JAVA_STATISTICS {
             ai_backup::validate_java_statistics(bytes).map_err(|error| path_error(path, error))?;
         } else if data::ai::chat_folder(path).is_some() {
             data::ai::validate_java_chat(path, bytes).map_err(|error| path_error(path, error))?;
@@ -974,6 +1119,39 @@ struct JavaUpdates<'a> {
     additions: Vec<(&'a str, &'a [u8])>,
     addition_parents: BTreeMap<&'a str, &'a str>,
     statistics: Option<&'a [u8]>,
+    highlight_bindings: [u8; 32],
+}
+
+pub(super) fn java_highlight_bindings(
+    root: &Path,
+    snapshot: &Snapshot,
+) -> io::Result<terminal_highlight::JavaBackupMerge> {
+    let (_, directory) = open_root(root)?;
+    prepare_java_highlights(&directory, snapshot)
+}
+
+pub(super) fn highlight_digest(ids: &BTreeMap<String, String>) -> io::Result<[u8; 32]> {
+    Ok(java_credential_restore::digest(&serde_json::to_vec(ids)?))
+}
+
+fn highlight_revision_error() -> io::Error {
+    invalid("Terminal highlight selections changed after the Java restore review.")
+}
+
+fn prepare_java_highlights(
+    directory: &Directory,
+    snapshot: &Snapshot,
+) -> io::Result<terminal_highlight::JavaBackupMerge> {
+    let Some(incoming) = snapshot.get(terminal_highlight::FILE) else {
+        return Ok(terminal_highlight::JavaBackupMerge::default());
+    };
+    let prepare = || {
+        let local = missing(directory.open_file(terminal_highlight::FILE))?
+            .map(terminal_highlight::read_bounded)
+            .transpose()?;
+        terminal_highlight::merge_java_backup(local, incoming)
+    };
+    prepare().map_err(|error| path_error(terminal_highlight::FILE, error))
 }
 
 fn prepare_java_updates<'a>(
@@ -981,10 +1159,19 @@ fn prepare_java_updates<'a>(
     snapshot: &'a Snapshot,
     allow_headers: &impl Fn() -> bool,
 ) -> io::Result<JavaUpdates<'a>> {
-    let mut updates = JavaUpdates::default();
+    let highlights = prepare_java_highlights(directory, snapshot)?;
+    let mut updates = JavaUpdates {
+        highlight_bindings: highlight_digest(&highlights.set_ids)?,
+        ..JavaUpdates::default()
+    };
     let mut ai = data::ai::Restore::default();
+    if let Some(bytes) = highlights.contents {
+        updates
+            .catalogues
+            .push((terminal_highlight::FILE, Zeroizing::new(bytes)));
+    }
     for (path, incoming) in snapshot {
-        if data::analysis::filename(path).is_some() {
+        if path == terminal_highlight::FILE || data::analysis::filename(path).is_some() {
             continue;
         }
         if path == ai_backup::JAVA_STATISTICS {
@@ -999,6 +1186,7 @@ fn prepare_java_updates<'a>(
                 path,
                 local.as_deref().map(Vec::as_slice),
                 incoming,
+                &highlights.set_ids,
                 allow_headers,
             )
             .map_err(|error| path_error(path, error))?

@@ -10,7 +10,9 @@ use rustix::fs::Mode;
 use rustix::process::umask;
 
 mod download;
+pub(crate) mod file_replace;
 mod policy;
+pub(crate) mod tree_merge;
 mod upload;
 
 use policy::Rules;
@@ -65,6 +67,17 @@ fn transaction(
             }
             Ok(Reply::Reviewed { review })
         }
+        Request::ReviewRecurringFileUpload { spec }
+        | Request::ReviewRecurringTreeUpload { spec } => {
+            let review = upload::review_recurring(rules, spec)?;
+            rules.require_current()?;
+            if !review.valid() {
+                return Err(super::invalid(
+                    "The recurring privileged rsync review is invalid",
+                ));
+            }
+            Ok(Reply::Reviewed { review })
+        }
         Request::ReviewSource { spec } => {
             stream_manifest(rules, output, download::review_manifest(rules, spec)?)
         }
@@ -92,10 +105,17 @@ fn transaction(
                 Operation::Download { .. } => download::apply(rules, review, input, output),
             }
         }
-        Request::PrepareRecurring { review, incoming } if review.policy == rules.revision() => {
+        Request::PrepareRecurring { review, incoming }
+        | Request::PrepareFirstRecurringFileUpload { review, incoming }
+        | Request::PrepareFirstRecurringTreeUpload { review, incoming }
+            if review.policy == rules.revision() =>
+        {
             upload::apply(rules, review, incoming, input, output, recovery, true)
         }
-        Request::Prepare { .. } | Request::PrepareRecurring { .. } => {
+        Request::Prepare { .. }
+        | Request::PrepareRecurring { .. }
+        | Request::PrepareFirstRecurringFileUpload { .. }
+        | Request::PrepareFirstRecurringTreeUpload { .. } => {
             Err(super::invalid("The privileged rsync policy changed"))
         }
     }

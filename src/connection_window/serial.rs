@@ -15,6 +15,7 @@ pub(super) struct Draft {
     pub(super) journal: journal_settings::Draft,
     pub(super) paste_line_delay: String,
     pub(super) strict_terminal_mode: Option<bool>,
+    pub(super) highlight_set: Option<String>,
 }
 
 impl Draft {
@@ -28,6 +29,7 @@ impl Draft {
         profile.paste_line_delay_ms =
             super::terminal_overrides::parse_paste_line_delay(&self.paste_line_delay)?;
         profile.strict_terminal_mode = self.strict_terminal_mode;
+        profile.highlight_set.clone_from(&self.highlight_set);
         profile.validate().map_err(|error| error.to_string())?;
         Ok(profile)
     }
@@ -45,7 +47,7 @@ impl ConnectionWindow {
             None => self.active_group(),
         }
         .map(str::to_owned);
-        let (id, name, tag, pinned, connection, emulation, journal, delay, strict) =
+        let (id, name, tag, pinned, connection, emulation, journal, delay, strict, highlight_set) =
             if let Some(profile) = profile {
                 let emulation = profile.profile().unwrap_or_default();
                 let mut name = if duplicate {
@@ -66,6 +68,7 @@ impl ConnectionWindow {
                     profile.journal,
                     profile.paste_line_delay_ms,
                     profile.strict_terminal_mode,
+                    profile.highlight_set,
                 )
             } else {
                 (
@@ -76,6 +79,7 @@ impl ConnectionWindow {
                     Default::default(),
                     Default::default(),
                     Default::default(),
+                    None,
                     None,
                     None,
                 )
@@ -92,6 +96,7 @@ impl ConnectionWindow {
             journal: journal_settings::Draft::new(journal),
             paste_line_delay: delay.map_or_else(String::new, |value| value.to_string()),
             strict_terminal_mode: strict,
+            highlight_set,
         });
         self.badge_picker = None;
         self.dismiss_tree_context();

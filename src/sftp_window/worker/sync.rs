@@ -22,7 +22,11 @@ use super::*;
 use super::download_access;
 mod removal;
 pub(in crate::sftp_window) mod replacement;
-pub(crate) use replacement::{LocalFileSnapshot, ReviewedFilePublication, ReviewedFileReceiver};
+pub(crate) use replacement::{
+    FileWitness, LocalFileSnapshot, ReviewedFilePublication, ReviewedFileReceiver,
+    VacantLocalFileAlias, VacantLocalFilePublication, VacantLocalFileReceiver,
+    VacantLocalFileSnapshot,
+};
 mod sealed;
 
 const MAX_ACTIONS: usize = 256;

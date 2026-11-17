@@ -1136,7 +1136,17 @@ fn verify_archive(
         entries: MAX_ENTRIES,
         nodes: MAX_NODES,
     };
-    extract::apply_archive(
+    let apply = if package
+        .download_url
+        .split('?')
+        .next()
+        .is_some_and(|url| url.ends_with(".tar.zst"))
+    {
+        extract::apply_tar_zst
+    } else {
+        extract::apply_archive
+    };
+    apply(
         directory.open_private_file(ARCHIVE)?,
         directory,
         layout,

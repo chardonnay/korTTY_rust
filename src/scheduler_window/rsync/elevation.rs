@@ -105,6 +105,11 @@ impl Approval {
             (Some(spec), Some(review)) => {
                 review.valid()
                     && &review.spec == spec
+                    && (!(review.first_file || review.first_tree)
+                        || self.existing.is_none()
+                            && self
+                                .existing_upload_scope()
+                                .is_some_and(|(_, path)| path == review.spec.path))
                     && existing_snapshot(review)
                         == self.existing.as_ref().map(|existing| existing.snapshot)
                     && (!matches!(spec.operation, Operation::Download { directory: false })

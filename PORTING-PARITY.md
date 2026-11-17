@@ -16,6 +16,1207 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## Pull-request preparation on 2026-11-17
+
+The current checkpoint is prepared on `port/java-v2.26-current-state-20261117`
+from `main` at `8fdb5d4`. Formatting is applied. Clippy follow-up groups the
+embedding dimension inputs, removes redundant borrows/closures and boxes the
+larger connection-import preview without changing its contents. Java-pattern
+tests document that their expected vectors contain match ranges rather than
+expanded character indices; the corresponding lint exception is scoped to
+those two test modules.
+
+Native Windows ARM64 with Rust 1.99.1 passed
+`cargo fmt --all --check` and
+`cargo clippy --locked --workspace --all-targets -- -D warnings`.
+The memory-aware build selected 23 of 26 CPU jobs with the normal development
+profile. [Clippy record](target/verification/20261117-pr-current-833377bc5b-windows-clippy-final.log).
+These are static checks, including test-target compilation. No new application
+tests, Mac/Fedora runs or packages were produced for this head. The partial
+credential-binding work remains F1 in the plan and is included as work in
+progress in the draft PR. The implementation goal remains paused.
+
+## Porting plan reconciliation on 2026-11-17
+
+The [current plan](PORTING-PLAN.md#reconciliation-against-the-current-working-tree)
+was reconciled with the working tree on `main` at `8fdb5d4`, the pinned Java
+v2.26.0 source and retained verification records. This was a documentation
+review while the implementation goal remained paused; no new application
+tests, native sessions or dependency-advisory refresh were performed.
+
+The plan now distinguishes implemented recurring protected file replacement,
+one-use protected folder merges and ordinary SFTP Chain starts from the
+remaining recurring protected folder workflow. It marks the Java-sized local
+knowledge ceiling, imported analysis inspection and package staging as
+implemented, retains their acceptance work, and names remaining migration
+field mappings and exact-model consumer audits.
+
+Comparison with verified manifest `af1c17601ffa` found subsequent source
+changes only in `src/local_ai/streaming.rs` and
+`src/session_journal/question.rs`, apart from the two planning documents.
+The partial HTTPS credential-binding change is unverified and does not yet
+cover summary streaming. F1 in the plan records the completion and regression
+work. The latest Mac run covers 612 regular Journal tests and two separately
+run TLS fixtures; Windows compiled the tests and Fedora ran targeted TLS
+checks. The 4,332-test full Mac workspace pass belongs to the earlier
+`e75aff4df394` snapshot. The latest retained Mac ZIP is ad hoc signed and
+predates F1. Historical Developer ID/notarization evidence does not apply to
+that candidate or the unfinished source change.
+
+## Scheduler privileged file replacement
+
+Single-file uploads and downloads offer one-use replacement review with
+passwordless or vault-backed sudo. Each regular file can be up to 1 GiB.
+Review binds the receiver's identity, contents and metadata to the saved action
+and pinned SSH route. Upload review checks the local payload and the configured
+server replacement scope. The Linux helper streams and verifies the payload
+under its protected command and uses the existing native receiver publisher.
+The publisher saves the original, confirms authorization before publication
+and retains the supported receiver metadata. The Scheduler writes the recovery
+path to the journal.
+
+Portable backup restores these jobs disabled with their paths and sudo mode.
+Q2 tracks configured deployment and remaining metadata coverage for protected folder merges.
+
+For the download path, native Windows ARM64 and macOS app tests passed approval persistence,
+single-use enforcement, local recovery and exact destination checks. Native
+macOS and Fedora tests verified portable backup. The final Fedora ARM64 test
+build used 26 Cargo jobs and LLD. Its integration exercised both sudo modes
+through pinned OpenSSH in a private namespace. The sudo PAM stack checked a
+synthetic password. Both routes rejected changed destinations, changed saved
+routes and denied transfer policy, then preserved the original's bytes and
+the receiver mode on successful publication. The Apple Silicon release ZIP
+passed its checksum, native architecture, ad hoc signatures and CLI start
+checks.
+
+- [Native Apple Silicon scheduler and receiver tests](target/verification/20261116-privileged-download-macos-748d7c7fda2b-tests.log)
+- [Native Apple Silicon portable backup test](target/verification/20261116-privileged-download-release-macos-a1ab5eb67357-tests.log)
+- [Apple Silicon release package verification](target/verification/20261116-privileged-download-release-macos-af6ab036b02b-package.log)
+- [Native Fedora scheduler and receiver tests](target/verification/20261116-privileged-download-fedora-af6ab036b02b-tests.log)
+- [Native Fedora OpenSSH and sudo acceptance](target/verification/20261116-privileged-download-fedora-af6ab036b02b-openssh.log)
+
+The upload checkpoint passed a second native Fedora ARM64 OpenSSH run with the
+installed Linux helper and real sudo in both modes. Both routes went through
+Scheduler review, rejected changes to the approved local payload or protected
+receiver, then preserved receiver metadata and retained the original inode.
+They refused reuse of the approval after publication. Separate protocol cases
+rejected corrupt payloads and paths outside the configured roots. The helper
+restored the original after an abort, lost input or server policy revocation.
+It reviewed a receiver of 256 MiB plus one byte and rejected one above 1 GiB.
+Strict Windows ARM64 application Clippy, native macOS tests and Apple Silicon
+release ZIP verification passed.
+
+- [Fedora helper component tests and Clippy](target/verification/20261116-privileged-upload-fedora-component-90b4c407afc9-tests.log)
+- [Fedora Scheduler and receiver tests](target/verification/20261116-privileged-upload-fedora-8ba19d310472-tests.log)
+- [Fedora installed upload helper and OpenSSH acceptance](target/verification/20261116-privileged-upload-fedora-8ba19d310472-openssh.log)
+- [Apple Silicon replacement tests](target/verification/20261116-privileged-upload-macos-8ba19d310472-tests.log)
+- [Apple Silicon release ZIP verification](target/verification/20261116-privileged-upload-macos-8ba19d310472-package.log)
+
+## Recurring protected Scheduler file replacement
+
+The Scheduler can approve a protected file replacement for a calendar or
+Chain on one pinned Linux SSH route. Both directions support passwordless
+and vault-backed sudo. The approval binds the literal paths, route, elevation,
+time zone and exact triggers. Each firing accepts bounded current source bytes
+and requires the reviewed receiver fingerprint. Only a confirmed, held
+successor advances the saved receiver. A pending publication survives a
+restart and an uncertain outcome requires fresh review. Portable backup
+preserves settings and clears the approval on the restored disabled job.
+
+Fedora ARM64 passed real pinned OpenSSH transfers in both directions with
+both sudo modes. Two successive firings used different source contents and
+retained each original with its supported access metadata. The fixture
+rejected oversized sources, replayed firings and an externally changed
+receiver. Native Apple Silicon passed the Scheduler and approval-store
+regressions and verified the ad hoc signed release ZIP and CLI start.
+Windows ARM64 passed strict application Clippy and both recurring replacement
+regressions, including native publication on a reviewed private directory.
+
+- [Fedora helper and Scheduler tests](target/verification/20261116-recurring-protected-fedora-a2314d286f7f-tests.log)
+- [Fedora OpenSSH and sudo verification](target/verification/20261116-recurring-protected-fedora-a2314d286f7f-openssh.log)
+- [Apple Silicon Scheduler tests](target/verification/20261116-recurring-protected-macos-9989addefc89-tests.log)
+- [Apple Silicon release ZIP verification](target/verification/20261116-recurring-protected-macos-9989addefc89-package.log)
+
+## Protected Scheduler folder downloads into existing directories
+
+A one-use approval binds the protected source tree, the pinned SSH route and
+the local destination directories and inspected files. After verifying the
+source data, the Scheduler adds reviewed entries privately and replaces only
+the reviewed changed files. It preserves existing directories, unchanged
+files and receiver-only entries. Replacements retain supported local access
+metadata and keep the originals in private recovery directories. Restored
+Java folder download drafts can adopt an existing destination, and portable
+backup restores a protected merge disabled for a fresh review.
+
+Fedora ARM64 passed the Scheduler workflow against native OpenSSH and real
+sudo in both passwordless and PAM-backed modes. It rejected an edited receiver
+before publishing any entries, then accepted a fresh approval, kept file and
+directory identities where expected, preserved the replacement mode and
+verified the recoverable original. It also rejected replay of the approval.
+Native Apple Silicon passed the nested receiver, recovery and Java adoption
+tests. Its release ZIP passed SHA-256, ARM64 architecture, strict ad hoc
+signature and CLI startup checks. Windows ARM64 passed the nested receiver,
+recovery, portable backup and Java adoption tests.
+
+- [Fedora Scheduler and receiver tests](target/verification/20261116-protected-folder-merge-fedora-0cdbf8a43f3d-tests.log)
+- [Fedora OpenSSH and sudo verification](target/verification/20261116-protected-folder-merge-fedora-0cdbf8a43f3d-openssh.log)
+- [Apple Silicon Scheduler and receiver tests](target/verification/20261116-protected-folder-merge-macos-0cdbf8a43f3d-tests.log)
+- [Apple Silicon release ZIP verification](target/verification/20261116-protected-folder-merge-macos-0cdbf8a43f3d-package.log)
+- [Windows ARM64 Scheduler and receiver tests](target/verification/20261116-protected-folder-merge-windows-final.log)
+
+## Protected Scheduler folder uploads into existing directories
+
+One-use uploads use an installed Linux helper and the exact saved,
+pinned SSH route. The configured destination roots cover creation and the
+replacement roots authorize inspection and replacement of existing files.
+The review binds the payload digests, receiver file fingerprints, directory
+identities and server policy. The helper verifies the private stages before
+writing any destination entries. It rechecks authority before each publication.
+Missing subtrees publish together, unchanged entries keep their identity, and
+each replaced file retains its original and name in a private sibling directory.
+The run journal reports confirmed changes and the recovery prefix.
+
+Native Fedora ARM64 component tests and strict Clippy passed. The installed
+helper accepted only the configured scopes over pinned OpenSSH and actual
+sudo. It refused a corrupt late payload before publishing any entry and
+left the receiver untouched on abort. It restored the quarantined original
+after a disconnected channel and a server policy change. It preserved a
+late occupant and reported a confirmed addition
+before refusing a later stale receiver. Direct file and nested subtree
+publication each passed with a file of 256 MiB plus one byte. The Apple Silicon
+build passed the selected Scheduler tests and verified the ad hoc signed
+release ZIP and CLI startup.
+
+The native Fedora Scheduler ran the upload with both passwordless and
+PAM-backed sudo. It blocked stale source and receiver proofs, kept the
+existing directory and unchanged file identities, retained receiver-only
+entries and confirmed the original and its name in the recovery directory.
+Replay of the approval was refused. The existing download workflow passed
+the same pinned OpenSSH and sudo fixture. Native Windows ARM64 passed strict
+application Clippy and all ten selected tests for the Scheduler, receiver
+publication, Java adoption and portable backup.
+
+- [Fedora Scheduler upload and download acceptance](target/verification/20261116-protected-tree-upload-fedora-761963936a97-openssh.log)
+- [Fedora component tests and Clippy](target/verification/20261116-protected-tree-protocol-fedora-7c58dd6143d4-tests.log)
+- [Fedora installed helper and recovery tests](target/verification/20261116-protected-tree-protocol-fedora-7c58dd6143d4-openssh.log)
+- [Fedora large direct and nested uploads](target/verification/20261116-protected-tree-size-fedora-7c58dd6143d4-openssh.log)
+- [Apple Silicon Scheduler tests](target/verification/20261116-protected-tree-upload-macos-761963936a97-tests.log)
+- [Apple Silicon release ZIP verification](target/verification/20261116-protected-tree-upload-macos-761963936a97-package.log)
+- [Windows ARM64 Clippy and Scheduler tests](target/verification/20261116-protected-tree-upload-windows-final.log)
+
+## Java Scheduler sudo staging restore
+
+Java SFTP upload, download and sync jobs with sudo staging restore as
+disabled drafts. An explicit or grouped multi-target job creates one draft
+per exact saved SSH route. Dependent jobs retain all of the split jobs as
+prerequisites. The original local and server paths are visible in the Action
+editor. Adoption requires paths on the current device and server, a native
+sudo mode and a choice of a new file, a file replacement or a new folder.
+A folder upload or download can also adopt an existing destination. The job
+retains its calendar and stays disabled pending separate execution review.
+
+Native Apple Silicon passed all 32 Java Scheduler tests and all 12 tests
+selected by the `staging` filter. The checks include additive restore, replay,
+exact route binding and Scheduler adoption without an execution approval.
+Windows ARM64 passed strict application Clippy and all 12 tests selected by
+the `staging` filter.
+The native release ZIP passed SHA-256, architecture, strict ad hoc signature
+and CLI startup checks.
+
+- [Native Apple Silicon Scheduler tests](target/verification/20261116-java-staging-macos-7f0fc573af1c-tests.log)
+- [Native Apple Silicon release ZIP verification](target/verification/20261116-java-staging-macos-7f0fc573af1c-package.log)
+
+## Java Journal markers and ordered rules
+
+Java backup restore adds custom marker labels, colours and severity. Rules
+retain their saved order below existing native rules. An ID collision between
+different definitions gives the imported marker a stable separate ID and
+updates the imported rules to reference it. The existing automatic rules
+setting takes precedence. The native editor can target built-in markers.
+
+Imported expressions retain their Java source text. The bounded native
+matcher translates supported expressions and preserves Java ASCII shorthand
+classes, quoting and line terminators. The import keeps expressions that need
+translation work disabled and available for editing. Twelve Java 21
+reference comparisons passed. [Java Pattern syntax](https://docs.oracle.com/en/java/javase/21/docs/api/java.base/java/util/regex/Pattern.html)
+
+Apple Silicon, Fedora ARM64 and Windows ARM64 each passed 31 targeted tests,
+including encrypted backup restore, marker ID collisions, native portable
+backup and repeat restore. The tests also cover the existing live and saved
+Journal marker workflows. Windows passed strict application Clippy. The
+native Apple Silicon release ZIP passed SHA-256, ARM64 architecture, strict
+ad hoc signature and CLI startup checks.
+
+- [Java reference comparisons](target/verification/20261116-java-marker-reference.log)
+- [Apple Silicon Journal tests](target/verification/20261116-java-journal-markers-macos-9329ef106b99-tests.log)
+- [Apple Silicon release ZIP verification](target/verification/20261116-java-journal-markers-macos-9329ef106b99-package.log)
+- [Fedora ARM64 Journal tests](target/verification/20261116-java-journal-markers-fedora-9329ef106b99-tests.log)
+- [Windows ARM64 Journal tests and Clippy](target/verification/20261116-java-journal-markers-windows-final.log)
+
+## Java toolbar layouts and connection buttons
+
+Java 2.26.0 backup import reads the `iconToolbar` entries and
+`toolbarIconSize` from `global-settings.xml`. It preserves custom
+section order, separators, icon size, and the action and connection row
+visibility settings. Older layouts inherit the shared visibility flag and
+receive the appropriate Logfile Manager, Connection Manager, and Windows shell
+button additions. A deliberately empty current layout stays empty.
+
+Connection buttons bind to exact newly inserted SSH, local shell and serial
+profiles. Folder buttons require the same direct member set after mapping
+the source IDs to their native IDs. The restart plan verifies the reviewed
+catalogue and layout before publishing them. Existing native layouts take
+precedence. Unknown Java actions, ambiguous identities and mismatched
+folders are visible as unavailable buttons. Native toolbar and Quick Connect
+groups open direct saved profiles using their normal launch checks.
+
+Ten comparisons against the pinned Java toolbar implementation passed.
+The selected toolbar, backup restore, Quick Connect and Scheduler tests passed
+74 cases each on Windows ARM64, Fedora ARM64 and Apple Silicon. Windows also
+passed app Clippy with `-D warnings`. Cargo used 24, 26 and 9 jobs respectively
+with the memory available at startup. The Apple Silicon release build produced
+an ad hoc signed ZIP with strict bundle and helper signature checks, arm64
+architecture checks and a successful packaged CLI start. Its SHA-256 is
+`6303c7a253a6fe51fbedde698e6fbd961293b6ce770d3939729287ccab302ffc`.
+
+- [Java reference comparisons](target/verification/20261116-java-toolbar-reference.log)
+- [Windows ARM64 verification](target/verification/20261116-java-toolbar-windows-final.log)
+- [Fedora ARM64 verification](target/verification/20261116-java-toolbar-fedora-18456a2fc30a-tests.log)
+- [Apple Silicon tests](target/verification/20261116-java-toolbar-macos-18456a2fc30a-tests.log)
+- [Apple Silicon package verification](target/verification/20261116-java-toolbar-macos-18456a2fc30a-package.log)
+
+The Java Git Bash slot uses the Windows toolbar launcher. Pending work
+includes Java settings destinations without native equivalents, assisted
+resolution of ambiguous connection and folder references, and visual
+acceptance on the native desktops.
+
+## Native local shell presets
+
+Quick Connect and saved profiles share installed shell choices. The Windows
+Git Bash preset resolves a Git for Windows installation and runs its Bash
+with `--login -i`. The Cygwin preset resolves a Cygwin Bash installation
+with the same startup arguments. WSL availability uses the installed
+distributions reported by the native Windows launcher. WSL automatic
+integration is set up inside the distribution. Windows sandbox policy
+rejects a WSL preset because its Linux process cannot be contained by the
+Windows shell sandbox. macOS offers Zsh and Bash, and Linux offers Bash.
+
+The Git Bash toolbar action uses the normal local launch path and managed
+policy. It retains the Java icon and resolves the exact action ID. Existing
+imported toolbars with an unavailable `toolbar.gitBash` entry obtain the
+action in place. The native profile and connection exchange retain the
+chosen preset while resolving the program on the current machine.
+
+Windows ARM64 verified the detected Git Bash executable, the private login
+profile, an exact working directory containing spaces and an apostrophe, and
+prompt, directory and exit-status markers with automatic integration enabled.
+It also verified the WSL distribution-list parser and the Windows sandbox
+guard. Apple Silicon launched the Bash and Zsh presets. Fedora ARM64 launched
+the Bash preset. The selected application suite passed 51 cases on each
+platform. The PTY runs passed 31 cases on Windows and macOS and 29 on Fedora.
+Windows app and PTY Clippy passed with `-D warnings`. Cargo used 23, 28 and
+26 jobs on Windows, macOS and Fedora with the memory available for the final
+runs.
+
+The current native Apple Silicon ZIP contains the ad hoc signed application,
+CLI and SSH worker. Architecture and signature checks passed. The extracted
+app opened a visible native window, started a Seatbelt shell that could
+write in the workspace and was denied its private profile, and persisted
+window geometry on orderly exit. The ZIP SHA-256 is
+`1c8cae353816c1aaa243878c921138962482a0df21177033536f6f52c2f8ece8`.
+
+- [Windows PTY and Git Bash verification](target/verification/20261116-java-shell-presets-windows-pty.log)
+- [Windows ARM64 app tests](target/verification/20261116-java-shell-presets-windows-final.log)
+- [Fedora ARM64 tests](target/verification/20261116-java-shell-presets-fedora-9b227d643d6b-tests.log)
+- [Apple Silicon tests](target/verification/20261116-java-shell-presets-macos-9b227d643d6b-tests.log)
+- [Apple Silicon packaged desktop and Seatbelt verification](target/verification/20261116-java-shell-presets-macos-9b227d643d6b-desktop.log)
+
+Live Cygwin and WSL launches and visual desktop acceptance remain open.
+
+## Logfile viewer presentation
+
+The native viewer applies the terminal's link and path detection and the
+selected bounded highlight set. Find highlights take precedence. Clicks copy
+the complete rendered token through the workspace clipboard policy and a
+page revision check. Link and keyword switches and the set ID persist in
+the profile and can be adopted from Java backups. Additive Java restore
+imports custom sets with compatible display rules within the native
+catalogue limits. When a local ID has a different definition, an imported
+set receives a stable replacement ID and an unset viewer selection uses
+that ID. Existing sets, selections, and trigger settings take precedence.
+The preview reports unsupported rules and omitted trigger actions.
+Unavailable custom sets use the built-in errors and warnings set.
+The same mapping resolves live terminal defaults and per-connection
+selections in newly imported SSH, local shell and serial profiles. Java's
+master switch and alternate-screen choice fill unset fields. An explicit
+None stops inheritance, while an unavailable source set falls back to the
+global selection. Credential and other transactional restores verify the
+mapping before publishing connections. The serial connection editor
+offers the same selection as the SSH and local shell editors.
+Imported highlight rules and Quick Select patterns retain Java syntax.
+The bounded matcher supports Java literal quoting, named captures,
+ASCII word boundaries, Unicode character classes, supported Unicode
+categories, line-break sequences and final-line anchors. The latter
+exclude the terminator from copied or styled ranges. Journal marker
+rules also use the shared translation. Lookarounds, numeric and named
+backreferences, atomic groups and possessive quantifiers use the bounded
+Rust matcher already linked for tokenization. Numeric references follow
+Java's group numbering and retain trailing literal digits when applicable.
+Named and numeric backreferences apply the ASCII or Unicode case folding
+in effect at each reference. Unicode backreferences use the JDK 25 simple
+case comparison from Unicode 16.0 and support equivalent characters with
+different UTF-8 widths.
+Large input and expressions that exceed the evaluation limits may produce
+no match. Journal rules retain their original priority when they use
+different matchers. Java inline and scoped case, Unicode-class, dot-all,
+multiline, Unix-lines and comments settings are restored, including
+changes within a group. Comments mode preserves escaped and quoted text
+and applies Java's whitespace rules to classes, repetitions and escapes.
+Java patterns support extended graphemes and the boundary check relative
+to the previous match. The opt-in instructions use the native Unicode
+segmentation tables and have a per-search work limit. The tables implement
+Unicode 17, while the reference application's default JDK 25 uses Unicode
+16 for grapheme segmentation. Supported Unicode case-insensitive bracket
+classes use Java's singleton and range rules. The translator expands
+class members before applying negation and preserves the configured
+shorthand and category predicates. Unicode-aware literals use Java's
+distinct rules for a single character and a contiguous run. The
+translator preserves those boundaries across quoting and escapes,
+and separates the final character of a run when a quantifier applies.
+Nested bracket classes and intersections preserve the order of union,
+intersection, and whole-class negation. All 18 Java-named character
+properties use the matcher's Unicode 16.0 tables and Java-specific
+identifier and whitespace rules. POSIX properties use ASCII by default
+and Unicode with the Java Unicode-character-class flag. Java binary
+Unicode properties, category aliases, and explicit category selectors
+are also recognized. Script and block selectors distinguish Unicode
+script membership from block ranges. Octal and control escapes, paired
+UTF-16 escapes and short Unicode category escapes are supported. The
+bounded matcher uses Java's previous-match end for `\G` and retains an
+empty match directly after a nonempty match. Short script aliases and Java's
+historical block names come from the Unicode 16.0 catalog with verified
+Java-specific aliases. Java's handling of missing intersection operands
+and lone ampersands after nested intersection operands remains open, as
+does visible desktop interaction.
+
+Apple Silicon passed 47 targeted tests and Windows ARM64 passed 42. Windows
+also passed application Clippy with warnings denied.
+
+- [Apple Silicon logfile tests](target/verification/20261116-logfile-presentation-macos-3e5045f8e071-tests.log)
+- [Windows ARM64 logfile tests](target/verification/20261116-logfile-presentation-windows-final.log)
+- [Windows ARM64 Clippy](target/verification/20261116-logfile-presentation-windows-clippy.log)
+
+After custom set migration, the expanded Apple Silicon restore, settings and
+highlighting selection passed 118 tests. Windows ARM64 passed 109 tests.
+The opt-in packaged desktop startup test on macOS was skipped. The separately
+built Apple Silicon ZIP passed architecture, checksum, ad hoc signature and
+CLI startup checks.
+
+- [Apple Silicon custom set restore tests](target/verification/20261116-java-highlight-restore-macos-90b0ebff937a-tests.log)
+- [Windows ARM64 custom set restore tests](target/verification/20261116-java-highlight-migration-windows-restore-verified.log)
+- [Apple Silicon package verification](target/verification/20261116-java-highlight-migration-macos-d88763015847-package.log)
+
+The live-terminal and serial-editor follow-up passed 120 targeted application
+tests on Apple Silicon and 111 on Windows ARM64. The opt-in desktop startup
+test remained skipped.
+The revised ZIP passed architecture, checksum, ad hoc signature and CLI
+startup checks.
+
+- [Apple Silicon live terminal restore and editor tests](target/verification/20261116-java-live-highlights-final-macos-4fc5acd0754f-tests.log)
+- [Windows ARM64 live terminal restore and editor tests](target/verification/20261116-java-live-highlights-windows-verified.log)
+- [Apple Silicon live terminal package verification](target/verification/20261116-java-live-highlights-final-macos-4fc5acd0754f-package.log)
+
+The Java expression compatibility follow-up passed 139 targeted application
+tests on Apple Silicon and 130 on Windows ARM64. The macOS opt-in desktop
+startup test remained skipped.
+The native ZIP passed architecture, checksum, ad hoc signature and CLI
+startup checks. The range fixtures correspond to the JDK 21 reference
+matches after converting UTF-16 indices to UTF-8 byte offsets.
+
+- [JDK 21 reference matches](target/verification/20261116-java-pattern-jdk21.log)
+- [Apple Silicon Java expression compatibility tests](target/verification/20261116-java-pattern-verified-macos-78c8ee170e5d-tests.log)
+- [Windows ARM64 Java expression compatibility tests](target/verification/20261116-java-pattern-compatibility-windows-verified.log)
+- [Apple Silicon Java expression package verification](target/verification/20261116-java-pattern-verified-macos-78c8ee170e5d-package.log)
+
+Java lookaround and backreference coverage passed 141 targeted application
+tests on Apple Silicon and 132 on Windows ARM64. The macOS opt-in desktop
+startup test remained skipped. The Apple Silicon ZIP passed architecture,
+checksum, ad hoc signature and CLI startup checks.
+
+- [JDK 21 assertion and backreference matches](target/verification/20261116-java-regex-assertions-jdk21.log)
+- [Apple Silicon assertion and backreference tests](target/verification/20261116-java-regex-assertions-final-macos-1d8e90bfd494-tests.log)
+- [Windows ARM64 assertion and backreference tests](target/verification/20261116-java-regex-assertions-windows-verified.log)
+- [Apple Silicon assertion and backreference package verification](target/verification/20261116-java-regex-assertions-final-macos-1d8e90bfd494-package.log)
+
+Atomic groups, possessive quantifiers and multi-digit reference parsing
+passed 142 targeted application tests on Apple Silicon and 133 on Windows
+ARM64. The opt-in macOS
+desktop startup test remained skipped. JDK 21 reference cases cover
+commit behavior, literal digits after a reference and mixed named and
+numbered groups.
+
+- [JDK 21 atomicity and numeric reference fixtures](target/verification/20261116-java-regex-atomic-jdk21.log)
+- [Apple Silicon atomicity and numeric reference tests](target/verification/20261116-java-regex-atomic-final-macos-24b1c8e6396e-tests.log)
+- [Windows ARM64 atomicity and numeric reference tests](target/verification/20261116-java-regex-atomic-windows-verified.log)
+- [Apple Silicon atomicity and numeric reference package verification](target/verification/20261116-java-regex-atomic-final-macos-24b1c8e6396e-package.log)
+
+Inline and scoped Java flags passed 143 targeted application tests on
+Apple Silicon and 134 on Windows ARM64. The opt-in desktop startup test
+remained skipped. The ZIP
+passed architecture, checksum, ad hoc signature and CLI startup checks.
+Reference cases cover changes in scope, ASCII versus Unicode case,
+character classes, CRLF and Unicode line separators.
+
+- [JDK 21 inline and scoped flag fixtures](target/verification/20261116-java-regex-flags-jdk21.log)
+- [Apple Silicon inline and scoped flag tests](target/verification/20261116-java-regex-flags-macos-b0cdd0e20883-tests.log)
+- [Windows ARM64 inline and scoped flag tests](target/verification/20261116-java-regex-flags-windows-final.log)
+- [Apple Silicon inline and scoped flag package verification](target/verification/20261116-java-regex-flags-macos-b0cdd0e20883-package.log)
+
+Java comments mode passed 144 targeted application tests on Apple Silicon
+and 135 on Windows ARM64.
+The opt-in desktop startup test remained skipped. JDK 21 fixtures cover
+character classes, line separators, quoted text, repeated groups, and
+flag changes. The native ZIP passed architecture, checksum, ad hoc
+signature, and CLI startup checks.
+
+- [JDK 21 comments mode fixtures](target/verification/20261116-java-regex-comments-jdk21.log)
+- [Apple Silicon comments mode tests](target/verification/20261116-java-regex-comments-macos-66304cff464b-tests.log)
+- [Windows ARM64 comments mode tests](target/verification/20261116-java-regex-comments-windows-final.log)
+- [Apple Silicon comments mode package verification](target/verification/20261116-java-regex-comments-macos-66304cff464b-package.log)
+
+Java grapheme atoms passed 145 targeted application tests on Apple Silicon
+and 136 on Windows ARM64.
+The opt-in desktop startup test remained skipped. The native ZIP passed
+architecture, checksum, ad hoc signature, and CLI startup checks. The
+boundary fixtures use the previous match end, as in Java. The Indic
+conjunct fixture follows the rule added after the JDK 21 reference.
+
+- [JDK 21 grapheme reference fixtures](target/verification/20261116-java-graphemes-jdk21.log)
+- [OpenJDK 25 grapheme segmentation](https://raw.githubusercontent.com/openjdk/jdk25u/master/src/java.base/share/classes/jdk/internal/util/regex/Grapheme.java)
+- [Apple Silicon grapheme tests](target/verification/20261116-java-graphemes-macos-d09661bb2029-tests.log)
+- [Windows ARM64 grapheme tests](target/verification/20261116-java-graphemes-windows-final.log)
+- [Apple Silicon grapheme package verification](target/verification/20261116-java-graphemes-macos-d09661bb2029-package.log)
+
+ASCII-only case-insensitive backreferences matched all 11 JDK 21 reference
+cases. Apple Silicon passed 146 targeted application tests and 31 PTY tests.
+Windows ARM64 passed 137 targeted application tests. The native Apple Silicon
+ZIP passed the checksum, architecture, ad hoc signature, and CLI startup checks.
+The opt-in desktop startup test was skipped.
+
+- [JDK 21 backreference case fixtures](target/verification/20261116-java-backref-case-jdk21.log)
+- [Apple Silicon backreference case tests](target/verification/20261116-java-backref-case-macos-227626d33392-tests.log)
+- [Windows ARM64 backreference case tests](target/verification/20261116-java-backref-case-windows.log)
+- [Apple Silicon backreference case package verification](target/verification/20261116-java-backref-case-macos-227626d33392-package.log)
+
+The Unicode backreference table matched all 1,114,112 code points in the
+OpenJDK 25 comparison. Ten reference regex cases covered differing UTF-8
+widths, named references, scoped flags, supplementary and Unicode 16.0
+characters, empty captures, and rejected nonmatches. Apple Silicon passed
+147 targeted application tests and 31 PTY tests. Windows ARM64 passed
+138 targeted application tests. The native Apple Silicon ZIP also passed
+the checksum, architecture, ad hoc signature, Unicode license notice, and
+CLI startup checks. The opt-in desktop startup test was skipped.
+
+- [OpenJDK 25 backreference fixtures and case table check](target/verification/20261116-java-backref-unicode-jdk25.log)
+- [Apple Silicon Unicode backreference tests](target/verification/20261116-java-backref-unicode-macos-35e8b637fe2a-tests.log)
+- [Windows ARM64 Unicode backreference tests](target/verification/20261116-java-backref-unicode-windows.log)
+- [Apple Silicon Unicode backreference package verification](target/verification/20261116-java-backref-unicode-macos-35e8b637fe2a-package.log)
+
+Eighteen bracket class and category fixtures matched OpenJDK 25, including
+the different rules for a singleton and a one-code-point range, negation,
+hyphens, and ASCII word shorthands under Unicode case mode. Apple Silicon
+passed 148 targeted application tests and 31 PTY tests. Windows ARM64
+passed 139 targeted application tests. The Apple Silicon ZIP passed the
+checksum, architecture, ad hoc signature, and CLI start checks. The
+opt-in desktop startup test was skipped. Separate JDK 21 fixtures record
+the difference between a single literal and a literal run.
+
+- [OpenJDK 25 class fixtures](target/verification/20261116-java-unicode-classes-jdk25.log)
+- [Apple Silicon Unicode class tests](target/verification/20261116-java-unicode-classes-macos-20ab0cfe2810-tests.log)
+- [Windows ARM64 Unicode class tests](target/verification/20261116-java-unicode-classes-windows-final.log)
+- [Apple Silicon Unicode class package verification](target/verification/20261116-java-unicode-classes-macos-20ab0cfe2810-package.log)
+- [JDK 21 literal run reference fixtures](target/verification/20261116-java-literal-runs-jdk21.log)
+
+Nineteen Unicode literal fixtures matched OpenJDK 25, including single
+characters, literal runs, scoped flags, quoting, escapes, and quantifiers.
+Apple Silicon passed 149 targeted application tests and 31 PTY tests.
+Windows ARM64 passed 140 targeted application tests. The native Apple
+Silicon ZIP passed architecture, checksum, ad hoc signature, and CLI
+startup checks. The opt-in desktop startup test was skipped.
+
+- [OpenJDK 25 literal fixtures](target/verification/20261116-java-unicode-literals-jdk25.log)
+- [Apple Silicon Unicode literal tests](target/verification/20261116-java-unicode-literals-macos-1a9823f90f3f-tests.log)
+- [Windows ARM64 Unicode literal tests](target/verification/20261116-java-unicode-literals-windows-final.log)
+- [Apple Silicon Unicode literal package verification](target/verification/20261116-java-unicode-literals-macos-1a9823f90f3f-package.log)
+
+Twenty-five nested-class fixtures matched OpenJDK 25. They cover unions,
+intersections, outer and inner negation, Unicode and ASCII case rules,
+escaped class operators, and rejected ranges. Apple Silicon passed 150
+targeted application tests and 31 PTY tests. Windows ARM64 passed 141
+targeted application tests. The Apple Silicon ZIP passed architecture,
+checksum, ad hoc signature, and CLI startup checks. The opt-in desktop
+startup test was skipped.
+
+- [OpenJDK 25 nested class fixtures](target/verification/20261116-java-nested-classes-jdk25.log)
+- [Apple Silicon nested class tests](target/verification/20261116-java-nested-classes-macos-0882c8509ade-tests.log)
+- [Windows ARM64 nested class tests](target/verification/20261116-java-nested-classes-windows-final.log)
+- [Apple Silicon nested class package verification](target/verification/20261116-java-nested-classes-macos-0882c8509ade-package.log)
+
+The 18 Java-named properties matched OpenJDK 25.0.2 over all 1,112,064
+Unicode scalar values, both with default flags and with Unicode
+case-insensitive matching. The comparison covered all 36 combinations
+and confirmed Java's inclusion of U+2E2F in the Unicode identifier
+predicates. The Quick Select restore test retains the original property
+expression. Apple Silicon passed 151 targeted application tests and 31
+PTY tests, and Windows ARM64 passed 142 targeted application tests.
+The native ZIP passed architecture, checksum, ad hoc signature, and CLI
+startup checks. The opt-in desktop startup test was skipped for this
+snapshot.
+
+- [Exhaustive OpenJDK 25 property comparison](target/verification/20261116-java-character-properties-jdk25.log)
+- [Apple Silicon Java property tests](target/verification/20261116-java-character-properties-macos-c69d3a782441-tests.log)
+- [Windows ARM64 Java property tests](target/verification/20261116-java-character-properties-windows-final.log)
+- [Apple Silicon Java property package verification](target/verification/20261116-java-character-properties-macos-c69d3a782441-package.log)
+
+The POSIX, binary Unicode, and explicit category selector comparison
+matched OpenJDK 25.0.2 for 133 property and flag combinations across all
+1,112,064 Unicode scalar values. Apple Silicon passed 152 targeted
+application tests and 31 PTY tests with 17 Cargo jobs out of 28 after
+the available-memory check. Windows ARM64 passed 143 targeted application
+tests using 24 jobs out of 26. The Apple Silicon ZIP passed architecture,
+checksum, ad hoc signature, and CLI startup checks. The opt-in
+desktop startup test was skipped for this snapshot.
+
+- [Exhaustive OpenJDK 25 POSIX and binary property comparison](target/verification/20261116-java-posix-properties-jdk25.log)
+- [Apple Silicon POSIX property tests](target/verification/20261116-java-posix-properties-macos-4fc9aff91ee8-tests.log)
+- [Windows ARM64 POSIX property tests](target/verification/20261116-java-posix-properties-windows-final.log)
+- [Apple Silicon POSIX property package verification](target/verification/20261116-java-posix-properties-macos-4fc9aff91ee8-package.log)
+
+The Java Unicode catalog matched 782 block names and 334 script names
+or aliases against OpenJDK 25.0.2. Every block alias compiled and passed
+its scalar boundary checks. All 342 positive and negated script sets
+matched across all 1,112,064 Unicode scalar values. Apple Silicon passed
+153 targeted application tests and 31 PTY tests. Windows ARM64 passed
+144 targeted application tests. The native Apple Silicon ZIP passed
+architecture, checksum, ad hoc signature, and CLI startup checks. The
+opt-in desktop startup test was skipped for this snapshot.
+
+The comparison also reproduced a general `regex-syntax` 0.8.11 negation
+issue at U+D7FF and U+E000. Negating the union of `Cn` and `Co` through
+bracket syntax erroneously includes these characters. Imported Java
+character classes and property complements now subtract the positive
+set from the full scalar range. This applies after case expansion and
+set operations. The surrogate category has an empty scalar set.
+
+- [OpenJDK 25 block and script catalog](target/verification/20261116-java-unicode-catalog-jdk25.log)
+- [Exhaustive OpenJDK 25 script comparison](target/verification/20261116-java-script-block-properties-jdk25.log)
+- [Apple Silicon script and block tests](target/verification/20261116-java-script-block-properties-macos-40fc394ebc15-tests.log)
+- [Windows ARM64 script and block tests](target/verification/20261116-java-script-block-properties-windows-final.log)
+- [Apple Silicon script and block package verification](target/verification/20261116-java-script-block-properties-macos-40fc394ebc15-package.log)
+
+With scalar-range subtraction, 559 scripted character-class and
+property expressions matched OpenJDK 25.0.2 over all 1,112,064 Unicode
+scalar values. The cases cover negated Unicode properties, nested
+intersections, empty surrogate sets and both sides of the surrogate gap.
+The application tests also exercise the bounded matcher. Apple Silicon
+passed 154 targeted application tests and 31 PTY tests. Windows ARM64
+passed 145 targeted application tests. The native Apple Silicon ZIP
+passed architecture, checksum, ad hoc signature and CLI startup checks.
+The opt-in desktop startup test was skipped for this snapshot.
+
+- [Exhaustive OpenJDK 25 negation comparison](target/verification/20261116-java-negated-classes-jdk25.log)
+- [Apple Silicon negated class tests](target/verification/20261116-java-negated-classes-macos-0795fb6dbf6e-tests.log)
+- [Windows ARM64 negated class tests](target/verification/20261116-java-negated-classes-windows-final.log)
+- [Apple Silicon negated class package verification](target/verification/20261116-java-negated-classes-macos-0795fb6dbf6e-package.log)
+
+The octal, control, paired UTF-16, short property and previous-match
+anchor checks matched OpenJDK 25.0.2 in 38 cases, including rejected
+escapes and zero-width matches. The bounded matcher also passed its
+capture-iteration regression. Apple Silicon passed 155 targeted
+application tests and 31 PTY tests. Windows ARM64 passed 146 targeted
+application tests. The native Apple Silicon ZIP passed architecture,
+checksum, ad hoc signature and CLI startup checks. The opt-in desktop
+startup test was skipped for this snapshot.
+
+- [OpenJDK 25 escape and anchor comparison](target/verification/20261116-java-escapes-and-anchor-jdk25.log)
+- [Apple Silicon escape and anchor tests](target/verification/20261116-java-escapes-and-anchor-macos-050244c2ddbc-tests.log)
+- [Windows ARM64 escape and anchor tests](target/verification/20261116-java-escapes-and-anchor-windows-final.log)
+- [Apple Silicon escape and anchor package verification](target/verification/20261116-java-escapes-and-anchor-macos-050244c2ddbc-package.log)
+
+The Java matcher resolves `\N{...}` with a generated Unicode 16.0 name
+catalog. The source data and OpenJDK 25.0.2 produced the same digest for
+all 292,531 named scalars. The comparison covers control character
+names and Java's synthetic names for assigned scalars such as CJK,
+Hangul and private-use characters. A separate OpenJDK probe recorded
+the matcher positions inside supplementary characters that isolated
+UTF-16 surrogate escapes can encounter.
+
+Apple Silicon passed 156 targeted application tests and 31 PTY tests.
+Windows ARM64 passed 147 targeted application tests. Cargo selected 22
+of 28 jobs on the Mac and 24 of 26 on Windows from available memory.
+The native Apple Silicon ZIP for source manifest `035f4e05e7a6` passed
+architecture, SHA-256, strict ad hoc signature and CLI startup checks.
+The opt-in desktop startup test was skipped for this snapshot.
+
+- [OpenJDK 25 character name comparison](target/verification/20261116-java-character-names-jdk25.log)
+- [Generated Unicode scalar catalog comparison](target/verification/20261116-java-character-names-ucd.log)
+- [OpenJDK 25 isolated surrogate probe](target/verification/20261116-java-isolated-surrogates-probe-jdk25.log)
+- [Apple Silicon named escape tests](target/verification/20261116-java-named-escapes-macos-035f4e05e7a6-tests.log)
+- [Windows ARM64 named escape tests](target/verification/20261116-java-named-escapes-windows-final.log)
+- [Apple Silicon named escape package verification](target/verification/20261116-java-named-escapes-macos-035f4e05e7a6-package.log)
+
+Java character classes now preserve operand boundaries for empty
+intersections and lone ampersands. The class parser also uses Java's
+vertical-tab interpretation of the vertical-whitespace escape at range
+endpoints. OpenJDK 25.0.2 and the Rust matcher agreed on acceptance and
+sampled membership across 7,492 shorter and 3,018 longer expressions.
+Eight longer expressions exceeded the initial 128 KiB compilation
+budget. The larger comparison used a 2 MiB test budget. The advanced
+matcher used by the Journal also agreed with OpenJDK for 2,704 expressions.
+An additional comparison identified three cases for empty `\Q\E`
+sequences next to class negation or range delimiters.
+
+Apple Silicon passed 157 targeted application tests and 31 PTY tests.
+Windows ARM64 passed 148 targeted application tests. Fedora ARM64 passed
+all 18 matcher tests and 156 targeted application tests. A native GNU
+link failed with AArch64 relocation overflows. The successful rerun used
+LLD 22.1.8 from signed Fedora RPMs extracted into the test directory.
+Cargo selected 26 of 28 jobs on the Mac, 24 of 26
+on Windows and 26 of 26 on Fedora. The Apple Silicon ZIP
+for source manifest `fc5bc6464e8c` passed the arm64, SHA-256, ad hoc
+signature and CLI startup checks. The opt-in desktop startup check
+was skipped for this snapshot.
+
+- [OpenJDK 25 intersection operand examples](target/verification/20261116-java-intersection-operands-probe-jdk25.log)
+- [Short class expression comparison](target/verification/20261116-java-class-operands-differential.log)
+- [Long class expression comparison](target/verification/20261116-java-class-operands-long-differential.log)
+- [Advanced matcher class expression comparison](target/verification/20261116-java-class-operands-advanced-differential.log)
+- [Empty quote comparison](target/verification/20261116-java-empty-class-quotes-differential.log)
+- [Apple Silicon class operand tests](target/verification/20261116-java-class-operands-macos-fc5bc6464e8c-tests.log)
+- [Windows ARM64 class operand tests](target/verification/20261116-java-class-operands-windows-final.log)
+- [Fedora ARM64 matcher tests](target/verification/20261116-java-class-operands-fedora-focused.log)
+- [Fedora ARM64 application tests with LLD](target/verification/20261116-java-class-operands-fedora-lld-42e2154d5acf-tests.log)
+- [Apple Silicon package verification](target/verification/20261116-java-class-operands-macos-fc5bc6464e8c-package.log)
+
+Quote expansion now runs before the Java syntax parser reads any
+tokens. It handles empty quotes near class delimiters and letters
+quoted inside flags, property names and named backreferences. Leading
+quoted digits remain separate from a preceding octal or hexadecimal
+escape. The follow-up comparison agreed with OpenJDK 25.0.2 for all
+7,461 expressions, including the three previously reported cases.
+All 18 matcher tests passed on Windows ARM64 and Fedora ARM64.
+Apple Silicon passed 157 targeted application tests and 31 PTY tests.
+The native ZIP for source manifest `db060ff4697d` passed the arm64,
+SHA-256, ad hoc signature and CLI startup checks. The opt-in desktop
+startup check was skipped. Cargo selected 13 of 28 jobs using the
+Mac's available memory at launch.
+
+- [OpenJDK 25 quote token cases](target/verification/20261116-java-quote-preprocessing-jdk25.log)
+- [Quote preprocessing comparison](target/verification/20261116-java-quote-preprocessing-differential.log)
+- [Fedora ARM64 quote preprocessing matcher tests](target/verification/20261116-java-quote-preprocessing-fedora-focused.log)
+- [Apple Silicon quote preprocessing tests](target/verification/20261116-java-quote-preprocessing-macos-db060ff4697d-tests.log)
+- [Apple Silicon quote preprocessing package verification](target/verification/20261116-java-quote-preprocessing-macos-db060ff4697d-package.log)
+
+The Java grapheme matcher uses the Unicode 16.0 classifications
+observed in OpenJDK 25.0.2. It applies Java's control rules for
+unassigned scalars and its cluster rules for pictographic sequences
+following Prepend characters. The comparison through the Rust
+application matcher reproduced OpenJDK's match boundaries for
+`\X`, `\b{g}` and `\b{g}\X` over 24,344 scalar strings. It
+included the Unicode 16.0 and 17.0 GraphemeBreakTest inputs, products
+of representative classes, and seeded longer strings. Windows ARM64
+and Fedora ARM64 passed all 18 matcher tests.
+Apple Silicon passed 157 targeted application tests and 31 PTY tests.
+Cargo selected 18 of 28 jobs on the Mac, 24 of 26 on Windows, and 26 of
+26 on Fedora. The native Apple Silicon ZIP for source manifest
+`a0c9562209af` passed arm64, SHA-256, strict ad hoc signature and CLI
+startup checks. The opt-in desktop startup check was skipped.
+
+- [OpenJDK grapheme differential comparison](target/verification/20261116-java-grapheme-unicode-differential.log)
+- [Windows ARM64 grapheme matcher tests](target/verification/20261116-java-grapheme-unicode-windows-tests.log)
+- [Fedora ARM64 grapheme matcher tests](target/verification/20261116-java-grapheme-unicode-fedora-a0c9562209af-tests.log)
+- [Apple Silicon grapheme matcher application tests](target/verification/20261116-java-grapheme-unicode-macos-a0c9562209af-tests.log)
+- [Apple Silicon grapheme matcher package verification](target/verification/20261116-java-grapheme-unicode-macos-a0c9562209af-package.log)
+
+Java isolated surrogate literals in `\u`, `\x{...}` and `\N{...}`
+use UTF-16 match positions over Rust's UTF-8 text. Fixed-width lookbehind
+checks its end position and follows Java's distinction between counting
+UTF-16 units and counting code points. A nonempty partial match covers
+the complete UTF-8 character when displayed or copied. An empty match
+inside a character is reported at its beginning.
+
+The comparison with OpenJDK 25.0.2 agreed on 895 pattern and input pairs
+after applying that display mapping. Windows ARM64 and Fedora ARM64 each
+passed 19 matcher tests.
+Apple Silicon passed 158 targeted application tests and 31 PTY tests.
+The native ZIP for source manifest `5261f26ad36c` passed arm64,
+SHA-256, strict ad hoc signature and CLI startup checks. The opt-in
+desktop startup test was skipped. Cargo selected 12 of 28 jobs on
+the Mac, 24 of 26 on Windows and 26 of 26 on Fedora.
+
+- [OpenJDK isolated literal comparison](target/verification/20261116-java-surrogate-atom-differential.log)
+- [Fedora ARM64 isolated literal matcher tests](target/verification/20261116-java-surrogate-literals-fedora-5261f26ad36c-tests.log)
+- [Apple Silicon isolated literal application tests](target/verification/20261116-java-surrogate-literals-macos-5261f26ad36c-tests.log)
+- [Apple Silicon isolated literal package verification](target/verification/20261116-java-surrogate-literals-macos-5261f26ad36c-package.log)
+
+Numbered and named Java backreferences compare original UTF-16 capture
+positions, including captures comprising a low surrogate. Exact
+references compare code units. Case-insensitive references compare
+Java code points and advance by the captured UTF-16 width. The matcher's
+work budget bounds both paths. OpenJDK 25.0.2 and the Rust matcher agreed
+on all 1,987 pattern and input pairs after converting visible match
+ranges to UTF-8. All 20 matcher tests passed on Windows ARM64 and
+Fedora ARM64.
+Apple Silicon passed 159 targeted application tests and 31 PTY tests.
+The native ZIP for source manifest `2461b65443eb` passed arm64,
+SHA-256, strict ad hoc signature and CLI startup checks. The opt-in
+desktop startup check was skipped. Available memory selected Cargo
+job counts of 19 on the Mac, 24 on Windows and 26 on Fedora.
+
+- [OpenJDK surrogate backreference comparison](target/verification/20261116-java-surrogate-backref-differential.log)
+- [Fedora ARM64 surrogate backreference matcher tests](target/verification/20261116-java-surrogate-backrefs-fedora-2461b65443eb-tests.log)
+- [Apple Silicon surrogate backreference application tests](target/verification/20261116-java-surrogate-backrefs-macos-2461b65443eb-tests.log)
+- [Apple Silicon surrogate backreference package verification](target/verification/20261116-java-surrogate-backrefs-macos-2461b65443eb-package.log)
+- [Reference membership of Java character predicates on low surrogates](target/verification/20261116-java-surrogate-class-probe-jdk25.log)
+
+Java character classes keep a scalar predicate and low-surrogate
+membership in UTF-16 mode. Literals, ranges, negation and intersections
+carry both results. The Java surrogate category and its current
+Unicode blocks activate this mode. Shorthands, ordinary character
+properties and dot carry their low-surrogate membership inside it.
+OpenJDK 25.0.2 and the Rust matcher agreed on 5,887 pattern and input
+pairs. Windows ARM64 and Fedora ARM64 each passed 21 matcher tests.
+The initial 165-case comparison for implicit activation recorded 21
+mismatches, including lookbehind with the general category `C`.
+Apple Silicon passed 160 targeted application tests and 31 PTY tests.
+The native ZIP for source manifest `58cf4eea0aa5` passed arm64,
+SHA-256, strict ad hoc signature and CLI startup checks. The opt-in
+desktop startup test was skipped. Cargo used 19 jobs on the Mac,
+24 on Windows and 26 on Fedora according to available memory.
+
+- [OpenJDK surrogate class comparison](target/verification/20261116-java-surrogate-classes-differential.log)
+- [Fedora ARM64 surrogate class matcher tests](target/verification/20261116-java-surrogate-classes-fedora-58cf4eea0aa5-tests.log)
+- [Apple Silicon surrogate class application tests](target/verification/20261116-java-surrogate-classes-macos-58cf4eea0aa5-tests.log)
+- [Apple Silicon surrogate class package verification](target/verification/20261116-java-surrogate-classes-macos-58cf4eea0aa5-package.log)
+- [Implicit UTF-16 activation comparison](target/verification/20261116-java-implicit-utf16-differential.log)
+- [OpenJDK variable-width surrogate lookbehind probe](target/verification/20261116-java-surrogate-variable-lookbehind-probe-jdk25.log)
+
+Variable-width Java lookbehind in UTF-16 mode searches from the
+closest possible start to the farthest. It binds successful matches to
+the original endpoint and commits the first successful positive
+lookbehind, including its captures. Width analysis preserves Java's
+grouping and signed overflow rules. The existing work limits bound
+candidate scans. The `\R` atom in this mode treats CRLF as indivisible.
+The comparison examined match spans and compile-time rejections for
+all 11,788 pattern and input pairs against OpenJDK 25.0.2. Windows ARM64
+and Fedora ARM64 each passed 22 matcher tests.
+Apple Silicon passed 161 targeted application tests and 31 PTY tests.
+The native ZIP for source manifest `0de1b1859ec4` passed arm64,
+SHA-256, strict ad hoc signature and CLI startup checks. The opt-in
+desktop startup test was skipped. Cargo used 17 jobs on the Mac,
+24 on Windows and 26 on Fedora according to available memory.
+
+- [OpenJDK surrogate lookbehind comparison](target/verification/20261116-java-surrogate-lookbehind-differential.log)
+- [Fedora ARM64 surrogate lookbehind matcher tests](target/verification/20261116-java-surrogate-lookbehind-fedora-0de1b1859ec4-tests.log)
+- [Apple Silicon surrogate lookbehind application tests](target/verification/20261116-java-surrogate-lookbehind-macos-0de1b1859ec4-tests.log)
+- [Apple Silicon surrogate lookbehind package verification](target/verification/20261116-java-surrogate-lookbehind-macos-0de1b1859ec4-package.log)
+
+The bounded Java matcher now uses UTF-16 positions even when the source
+has no explicit surrogate atom. Ordinary character predicates carry
+their low-surrogate membership, and empty matches advance by one UTF-16
+unit. OpenJDK 21 agreed on all 165 focused predicate cases. The broader
+1,595-case comparison reported 121 differences, down from 419 before
+the change. These cover empty alternatives in the linear matcher, Java
+word boundaries and supplementary-character start-position scanning.
+Windows ARM64 and Fedora ARM64 each passed 23 matcher tests. The vendored
+matcher passed 130 library tests and compiled with only its Unicode
+feature enabled.
+Apple Silicon passed 162 targeted application tests and 31 PTY tests.
+The native ZIP for source manifest `6baa4ca363b0` passed arm64,
+SHA-256, strict ad hoc signature and CLI startup checks. The opt-in
+desktop startup test was skipped. Cargo used 16 jobs on macOS, 24 on
+Windows and 26 on Fedora according to available memory.
+
+- [OpenJDK implicit UTF-16 comparison](target/verification/20261116-java-implicit-utf16-windows-probe.log)
+- [Baseline on the same comparison inputs](target/verification/20261116-java-implicit-utf16-windows-baseline-probe.log)
+- [Windows ARM64 implicit UTF-16 matcher tests](target/verification/20261116-java-implicit-utf16-windows-tests.log)
+- [Fedora ARM64 implicit UTF-16 matcher tests](target/verification/20261116-java-implicit-utf16-fedora-tests.log)
+- [Vendored matcher tests and Unicode-only build](target/verification/20261116-java-implicit-utf16-vendor-tests.log)
+- [Apple Silicon implicit UTF-16 application tests](target/verification/20261116-java-implicit-utf16-macos-6baa4ca363b0-tests.log)
+- [Apple Silicon implicit UTF-16 package verification](target/verification/20261116-java-implicit-utf16-macos-6baa4ca363b0-package.log)
+
+Linear Java matching now returns an empty match at the end of a
+preceding nonempty match and advances empty matches by one UTF-16
+unit. A lazily compiled bounded VM checks the low-surrogate position
+after an empty match and leaves the bulk search in the linear engine.
+The bounded matcher evaluates Java word boundaries using the active
+word class and the base-character rule for nonspacing marks. Its
+failed searches advance by code point or code unit according to the
+source pattern's character predicates.
+
+OpenJDK 21 on Windows ARM64 and OpenJDK 25.0.4.1 on Fedora ARM64
+agreed on all 1,595 cases in the previous comparison.
+An extended comparison of 3,251 cases found 24 remaining differences
+in linear word boundaries and candidate scanning for escaped
+supplementary characters in multi-character literal runs. Windows
+ARM64 and Fedora ARM64 each passed 25 matcher tests. The vendored
+matcher passed 130 library tests and its Unicode-only build.
+Apple Silicon passed 164 targeted application tests and 31 PTY tests.
+Windows ARM64 passed 88 targeted application tests.
+The native ZIP for source manifest `083d610f28a6` passed arm64,
+SHA-256, strict ad hoc signature and CLI startup checks. The opt-in
+desktop startup test was skipped. The memory budget selected 13 Cargo
+jobs on macOS, 24 on Windows and 26 on Fedora.
+
+- [OpenJDK match-position comparison](target/verification/20261116-java-match-positions-windows-probe.log)
+- [Extended OpenJDK match-position comparison](target/verification/20261116-java-match-positions-windows-extended-probe.log)
+- [Windows ARM64 match-position matcher tests](target/verification/20261116-java-match-positions-windows-tests.log)
+- [Windows ARM64 match-position application tests](target/verification/20261116-java-match-positions-windows-app.log)
+- [Fedora ARM64 match-position matcher tests](target/verification/20261116-java-match-positions-fedora-tests.log)
+- [Fedora ARM64 comparison with OpenJDK 25](target/verification/20261116-java-match-positions-fedora-jdk25.log)
+- [Vendored match-position library tests](target/verification/20261116-java-match-positions-vendor-tests.log)
+- [Apple Silicon match-position application tests](target/verification/20261116-java-match-positions-macos-083d610f28a6-tests.log)
+- [Apple Silicon match-position package verification](target/verification/20261116-java-match-positions-macos-083d610f28a6-package.log)
+
+Regular Java patterns retain linear matching on ordinary text. When a
+word assertion can encounter a supplementary character or a nonspacing
+mark, they use the Java UTF-16 assertion and scanner. The work allowance
+accounts for the remaining input length. The regression test reaches
+200 matches after a prefix longer than 32 KiB.
+The translator keeps escaped supplementary characters inside literal
+runs and only switches the scanner for supplementary singleton atoms
+or other code-point predicates. A quantifier still takes the last
+literal as a separate atom.
+
+All 3,251 cases in the extended comparison agreed with OpenJDK 21 on
+Windows ARM64 and OpenJDK 25.0.4.1 on Fedora ARM64. Both passed 27
+matcher tests. The comparison covers the 24 previously differing cases.
+Apple Silicon passed 166 targeted application tests and 31 PTY tests.
+The native ZIP for source manifest `5125b6487285` passed arm64,
+SHA-256, strict ad hoc signature and CLI startup checks. An independent
+run from the verified ZIP opened a window registered with WindowServer,
+launched a Seatbelt PTY that could neither read nor modify a private
+profile canary, and saved geometry on normal exit. The first run could
+not confirm that the window was onscreen. The second run checked
+registration across all windows of the exact test process. The opt-in
+backup-apply startup fixture remained skipped.
+Cargo selected 18 jobs on macOS, 24 on Windows and 26 on Fedora.
+
+- [Windows ARM64 word-boundary and literal-run comparison](target/verification/20261116-java-regular-boundaries-windows-extended-probe.log)
+- [Windows ARM64 word-boundary and literal-run tests](target/verification/20261116-java-regular-boundaries-windows-tests.log)
+- [Fedora ARM64 word-boundary and literal-run comparison](target/verification/20261116-java-regular-boundaries-fedora-jdk25.log)
+- [Fedora ARM64 word-boundary and literal-run tests](target/verification/20261116-java-regular-boundaries-fedora-tests.log)
+- [Apple Silicon word-boundary and literal-run tests](target/verification/20261116-java-regular-boundaries-macos-5125b6487285-tests.log)
+- [Apple Silicon package verification](target/verification/20261116-java-regular-boundaries-macos-5125b6487285-package.log)
+- [Apple Silicon packaged desktop and Seatbelt check](target/verification/20261116-java-regular-boundaries-macos-5125b6487285-desktop-registered.log)
+
+A separate 930-case comparison with OpenJDK 25.0.4.1 exposed 105
+line-ending differences and 130 cases involving inline canonical
+equivalence flags. In particular, `\R\n` lets the first atom retry
+after consuming only CR when the CRLF branch fails. Counted repetition
+of `\R` has additional Java-specific behavior. The previous
+lookbehind checkpoint records the implementation at that time.
+
+The Java v2.26.0 highlight compiler places its whole-word assertions
+around the regular expression. The Rust highlight painter checks
+adjacent characters after choosing a match. For `foo-bar|foo` in
+`foo-barx`, Java can retry the second alternative and highlight
+`foo`. The Rust check discards the first match and misses that
+alternative. This is a separate matcher integration gap.
+
+- [Fedora ARM64 line-ending and canonical-equivalence comparison](target/verification/20261116-java-regular-boundaries-fedora-line-canon-jdk25.log)
+
+The Java matcher now tries CRLF first and lets a standalone line-ending
+atom retry with CR when its continuation fails. Direct repetition
+commits the selected line ending. Deterministic and possessive group
+repetition commits each successful group body, while an ordinary
+optional group can retry its alternatives. For patterns accepted by
+the regular matcher, CRLF input uses the bounded UTF-16 program when
+the source contains `\R`.
+
+Imported whole-word highlighting now compiles Java's
+`[\p{L}\p{N}_]` lookarounds around the complete expression. The
+matcher can retry a shorter alternative and uses the same result in
+the terminal and logfile viewer. Imported literal rules retain the Java
+dialect through interchange and profile serialization, including an
+escaped quote terminator.
+
+The 6,048-case grouped line-ending comparison agreed with OpenJDK 21 on
+Windows and OpenJDK 25.0.4.1 on Fedora. Windows ARM64 and Fedora ARM64
+each passed 28 matcher tests. The whole-word matcher agreed with
+OpenJDK on 390 cases. The Apple Silicon application tests cover Java
+import, profile serialization and use by the highlight presenter.
+The earlier 3,251 cases still agree with OpenJDK. A rerun of the
+930-case supplemental comparison leaves 130 differences, all in
+inline `(?c)` cases.
+
+Apple Silicon passed 168 targeted application tests and 31 PTY tests.
+The native ZIP for source manifest `b074d0ff5a28` passed SHA-256,
+arm64, strict ad hoc signature and CLI startup verification. The app
+registered a window, started a Seatbelt PTY with denied read and write
+access to a private profile canary, and saved window geometry on normal
+exit. The window check inspected registration for the exact app process.
+The opt-in backup-apply startup fixture was skipped.
+Cargo selected 18 jobs on macOS, 24 on Windows and 26 on Fedora.
+
+- [Windows ARM64 grouped line-ending comparison](target/verification/20261117-java-line-ending-windows-grouped-probe.log)
+- [Fedora ARM64 grouped line-ending comparison](target/verification/20261117-java-line-ending-fedora-grouped-jdk25.log)
+- [Windows ARM64 line-ending tests](target/verification/20261117-java-line-ending-windows-tests.log)
+- [Fedora ARM64 line-ending tests](target/verification/20261117-java-line-ending-fedora-tests.log)
+- [Windows ARM64 earlier matcher cases](target/verification/20261117-java-line-ending-windows-existing-probe.log)
+- [Fedora ARM64 line-ending and canonical-equivalence rerun](target/verification/20261117-java-line-ending-fedora-line-canon-jdk25.log)
+- [Windows ARM64 whole-word comparison](target/verification/20261117-java-line-ending-windows-whole-word-probe.log)
+- [Vendored matcher tests and Unicode-only build](target/verification/20261117-java-line-ending-vendor-tests.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-java-line-ending-macos-b074d0ff5a28-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-java-line-ending-macos-b074d0ff5a28-package.log)
+- [Apple Silicon packaged desktop and Seatbelt check](target/verification/20261117-java-line-ending-macos-b074d0ff5a28-desktop-registered.log)
+
+Inline Java `(?c)`, `(?-c)` and scoped canonical-equivalence
+flags now apply to bracket classes and explicit Unicode properties.
+The matcher tests NFC grapheme prefixes against the class predicate
+and returns the original input range. It tries longer prefixes first
+and commits the choice for directly repeated atoms and possessive
+group repetitions. The work limit accounts for grapheme scanning.
+OpenJDK 21 on Windows ARM64 and OpenJDK 25.0.4.1 on Fedora ARM64
+agreed on all 4,780 cases, including the 130 previously rejected cases.
+Both systems passed 29 matcher tests. The vendored matcher passed 130
+library tests and a build with only the Unicode feature enabled.
+An exhaustive scalar decomposition comparison confirmed the four-scalar
+NFD maximum and identical decomposition mappings in the Unicode 16.0
+and Unicode 18.0 data used for the comparison.
+
+Pending Java highlight backups now regain the Java dialect marker
+for old literal rules. Reimport also upgrades a matching legacy set
+in place when its earlier content-derived ID confirms the relationship
+to the incoming Java set. The migration retains IDs and references,
+checks the configuration size, and can be replayed. Existing sets
+stored under their source ID can have ambiguous provenance.
+
+Apple Silicon passed 170 targeted application tests and 31 PTY tests.
+The native ZIP for source manifest `44d7a570faaa` passed SHA-256,
+arm64, strict ad hoc signature and CLI startup verification. The app
+registered a window, denied Seatbelt shell read and write access to a
+private profile canary, and saved window geometry on normal exit.
+The opt-in backup-apply startup fixture was skipped. Cargo selected
+20 jobs on macOS, 24 on Windows and 26 on Fedora.
+
+- [Windows ARM64 canonical-equivalence comparison](target/verification/20261117-java-canonical-windows-expanded-probe.log)
+- [Fedora ARM64 OpenJDK 25 canonical-equivalence comparison](target/verification/20261117-java-canonical-fedora-jdk25.log)
+- [Windows ARM64 canonical-equivalence matcher tests](target/verification/20261117-java-canonical-windows-expanded-tests.log)
+- [Fedora ARM64 canonical-equivalence matcher tests](target/verification/20261117-java-canonical-fedora-tests.log)
+- [Vendored matcher tests and Unicode-only build](target/verification/20261117-java-canonical-vendor-tests.log)
+- [Unicode scalar decomposition comparison](target/verification/20261117-java-canonical-normalization-tables.log)
+- [Apple Silicon canonical-equivalence application and PTY tests](target/verification/20261117-java-canonical-macos-44d7a570faaa-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-java-canonical-macos-44d7a570faaa-package.log)
+- [Apple Silicon packaged desktop and Seatbelt check](target/verification/20261117-java-canonical-macos-44d7a570faaa-desktop-registered.log)
+
+## Native macOS and Windows workspace acceptance
+
+Source manifest `c04e6db11135a8900ebbd6141a167ae8d5d29766e3ee41768ebab072778c9c29`
+contains 2,373 inputs. On Apple Silicon, macOS 27.2.1 and Rust 1.100.0
+passed 4,296 workspace tests with 187 opt-in tests skipped. One doctest,
+the opt-in Seatbelt test, and the packaged backup startup test also
+passed. Windows ARM64 passed 4,196 workspace tests with 85 skipped. The
+native Windows terminal sandbox fixture ran in that suite. The memory
+budget selected 28 out of 28 Cargo jobs on the Mac and 25 out of 26 on
+Windows.
+
+The native Apple Silicon ZIP passed SHA-256, arm64, strict ad hoc
+signature, helper entitlement, license, and CLI startup checks. The
+extracted package opened a visible window, launched a Seatbelt PTY that
+could neither read nor modify the profile canary, and exited normally
+with the window geometry saved. The ZIP digest is
+`bc64cd42b89d298d400333813446342189fabf2e3971d6d1c6de6bf848a2d54f`.
+
+OpenSSH rejected the fixture key under `/private/tmp` because of that
+ancestor's permissions. The repeat used the exact ZIP and a short
+private scratch directory under the user's home while keeping
+`StrictModes yes`. All eight packaged SSH tests passed, including the
+approved tunnel, pinned jump, shell and SFTP, tampered helper rejection,
+cancellation, timeouts, and encrypted RSA and ECDSA authentication.
+Both owned Mac work directories were verified absent after testing.
+
+- [Apple Silicon workspace suite](target/verification/20261116-native-macos-acceptance-macos-c04e6db11135-tests.log)
+- [Windows ARM64 workspace suite](target/verification/20261116-native-windows-workspace-windows-final.log)
+- [Apple Silicon package checks](target/verification/20261116-native-macos-acceptance-macos-c04e6db11135-package.log)
+- [Packaged desktop and Seatbelt PTY](target/verification/20261116-native-macos-acceptance-macos-c04e6db11135-desktop.log)
+- [Seatbelt isolation test](target/verification/20261116-native-macos-acceptance-macos-c04e6db11135-seatbelt.log)
+- [Packaged backup startup](target/verification/20261116-native-macos-acceptance-macos-c04e6db11135-startup.log)
+- [Packaged SSH tests with strict permissions](target/verification/20261116-native-macos-ssh-strict-macos-c04e6db11135-ssh.log)
+
+The later Apple Silicon source manifest
+`dfa89f0c5e27141058f6d269ccc889a4edebab6d4537f7d273b96a152e3b0703`
+passed 4,331 workspace tests including one doctest, with 198 opt-in
+tests skipped. The opt-in Seatbelt and packaged backup startup tests
+also passed. Cargo selected 28 of 28 logical CPUs, leaving a 4,096 MiB
+reserve from 65,863 MiB available at admission. The release ZIP reproduced
+the preceding archive's SHA-256
+`a4ba0e68bb44d3a27da98caf287918056fa15326c32d31b080879910cb8675db`.
+It passed native ARM64, strict ad hoc app and SSH worker signature, and
+CLI startup checks. The packaged SSH integration evidence above applies
+to the earlier source manifest.
+
+- [Current Apple Silicon workspace suite](target/verification/20261117-native-workspace-current-macos-dfa89f0c5e27-tests.log)
+- [Current Apple Silicon package verification](target/verification/20261117-native-workspace-current-macos-dfa89f0c5e27-package.log)
+- [Current Seatbelt and packaged backup startup tests](target/verification/20261117-native-workspace-current-macos-dfa89f0c5e27-scale.log)
+
+## Native Cargo build budget
+
+The optional Python wrapper estimates build parallelism from available RAM
+and logical CPUs. A Windows ARM64 build-script fixture observed 23 jobs on
+26 CPUs and two jobs with the explicit override. Fedora ARM64 observed 26
+jobs on 26 CPUs. A transient Fedora scope with 250% CPU quota and 6 GiB of
+memory chose two jobs. The Apple Silicon app test and release build used 28
+jobs on 28 CPUs, passed 26 targeted application tests, and produced an
+ad hoc signed ZIP with verified checksum and CLI startup.
+
+- [Windows ARM64 Cargo budget](target/verification/20261116-native-cargo-budget-windows.log)
+- [Fedora ARM64 Cargo budget](target/verification/20261116-native-cargo-budget-fedora.log)
+- [Apple Silicon Cargo budget](target/verification/20261116-native-cargo-budget-macos-1f445d099d46-jobs.log)
+
+## Java window, keyboard and recording preferences
+
+Editor migration fills unset file-editor caret fields and snippet font and
+appearance fields. A selected Java built-in or uniquely matched custom
+palette supplies its effective text, background and caret colors and shape.
+The named profile catalogue and syntax-token palette remain part of the
+Monaco product disposition.
+Twenty-six targeted tests passed on Apple Silicon and Windows ARM64. The
+encrypted fixture covers custom-profile precedence and preservation of
+native values. The parser tests cover a built-in palette and duplicate
+custom profile IDs.
+
+- [Apple Silicon editor preferences](target/verification/20261116-editor-preferences-macos-8fbf502d3070-tests.log)
+- [Windows ARM64 editor preferences](target/verification/20261116-editor-preferences-windows-final.log)
+
+Java startup preferences fill unset remembered geometry, remembered
+dashboard and fixed window fields, including signed coordinates and
+maximization. The merge preserves native values at each nested field.
+Incomplete layouts are reported as omissions. Java's main-window launch
+uses the regular bounds and maximized flag even if a stored geometry record
+contains fullscreen metadata. The additive importer applies the same bounds
+and maximized state. J `ui/MainWindowGeometrySupport.java`.
+
+Java snippet analysis defaults for automatic diagram generation,
+modularization proposals, and source-code export fill unset native fields.
+The restore preview identifies the source-code export default.
+Twenty-four targeted tests passed on Apple Silicon and Windows ARM64,
+covering encrypted additive restore, the stored fullscreen metadata, and
+native report export settings.
+
+- [Apple Silicon analysis preferences](target/verification/20261116-analysis-preferences-macos-5b2f43f97fb9-tests.log)
+- [Windows ARM64 analysis preferences](target/verification/20261116-analysis-preferences-windows-final.log)
+Twenty targeted tests passed on Apple Silicon and Windows ARM64. The suite
+includes encrypted restore and replay with partial native geometry, invalid
+Java bounds, and native startup precedence.
+
+- [Apple Silicon startup preferences](target/verification/20261116-startup-preference-migration-macos-7a6255400e56-tests.log)
+- [Windows ARM64 startup preferences](target/verification/20261116-startup-preference-migration-windows-final.log)
+
+The signed position and maximization extension passed 21 targeted tests on
+Apple Silicon and Windows ARM64, including the editor, Java restore and
+startup placement projection.
+
+- [Apple Silicon signed startup geometry](target/verification/20261116-signed-startup-geometry-macos-4af9d0abc887-tests.log)
+- [Windows ARM64 signed startup geometry](target/verification/20261116-signed-startup-geometry-windows-final.log)
+
+Terminal input migration fills unset copy-on-select, paste warning and
+pacing, and Quick Select preferences. Quick Select retains order and uses
+the bounded Java regex translator, with unsupported expressions reported
+as omissions. An explicit native choice takes precedence at restore.
+Seventeen targeted tests passed on Apple Silicon and Windows ARM64. The
+tests cover the encrypted restore, compatible and incompatible patterns,
+local defaults, and the native Quick Select matcher.
+
+- [Apple Silicon terminal input preferences](target/verification/20261116-terminal-input-migration-macos-63ba21594bf0-tests.log)
+- [Windows ARM64 terminal input preferences](target/verification/20261116-terminal-input-migration-windows-final.log)
+
+Journal restore can fill unset palette, theme, font, scale, link and capture
+format settings and export watermark and footer fields. The existing journal
+directory stays local to the installation.
+Thirteen targeted tests passed on Apple Silicon and Windows ARM64. The
+encrypted restore test checks partial native settings, Unicode branding,
+the retained local journal directory, and edits between restores.
+
+- [Apple Silicon journal preferences](target/verification/20261116-journal-preference-migration-macos-f6becc70f425-tests.log)
+- [Windows ARM64 journal preferences](target/verification/20261116-journal-preference-migration-windows-final.log)
+
+The Java backup restore also fills unset SFTP preferences for parallel
+transfers, resume and retention of partial files, conflict handling, idle
+timeout, remote archive directory, and ZIP compression. The review reports
+the overwrite default explicitly. Local archive fields merge independently.
+Seven targeted tests passed on Apple Silicon and Windows ARM64. They cover
+the encrypted restore, partial native settings, invalid and explicit empty
+values, and the standalone Java XML exchange.
+
+- [Apple Silicon SFTP preferences](target/verification/20261116-sftp-preference-migration-macos-f08881abe9bb-tests.log)
+- [Windows ARM64 SFTP preferences](target/verification/20261116-sftp-preference-migration-windows-retry.log)
+
+Additive restore brings over Coding Agents detection, badge, notification and
+dock settings, remote sidebar placement, supported action shortcuts and
+explicitly cleared shortcuts. It also fills unset shell tab titles, command
+timestamps, link detection, terminal background transparency, the terminal
+silence threshold, and Scheduler menu status. Terminal bell, command,
+OSC 9/777 and AI-run notifications merge into unset native fields, including
+the minimum command duration. Existing native settings and
+reserved key combinations take precedence. Recording restore fills unset capture scope,
+colors, idle pause and threshold. A fresh profile can adopt availability after
+restart. The restore keeps device-local recording and encoder paths separate.
+Java v2.26.0 writes replay files with either value of its legacy recording
+format field.
+
+Apple Silicon passed 23 preference and keyboard tests. Fedora ARM64 and
+Windows ARM64 each passed 22. Windows also passed strict application Clippy.
+The encrypted backup case covers a fresh
+profile, a profile with existing settings and a second restore after restart.
+The native release ZIP passed checksum, ARM64 architecture, strict ad hoc
+signature and CLI startup checks.
+
+The six additional terminal and Scheduler preferences passed five targeted
+tests on each of Apple Silicon and Windows ARM64. The encrypted restore case
+covers existing values and replay after editing an imported preference.
+
+- [Apple Silicon display migration tests](target/verification/20261116-display-migration-macos-f1af2be06197-tests.log)
+- [Windows ARM64 display migration tests](target/verification/20261116-display-migration-windows-final.log)
+
+The terminal notification migration passed 12 targeted tests on each of
+Apple Silicon and Windows ARM64. The encrypted restore test preserves a
+partial native notification section and changes made between restores.
+
+- [Apple Silicon notification migration tests](target/verification/20261116-notification-migration-macos-13aace4f5682-tests.log)
+- [Windows ARM64 notification migration tests](target/verification/20261116-notification-migration-windows-final.log)
+
+- [Apple Silicon preference tests](target/verification/20261116-java-global-preferences-macos-8e5ba7ca76be-tests.log)
+- [Apple Silicon release ZIP verification](target/verification/20261116-java-global-preferences-macos-8e5ba7ca76be-package.log)
+- [Fedora ARM64 preference tests](target/verification/20261116-java-global-preferences-fedora-8e5ba7ca76be-tests.log)
+- [Windows ARM64 preference tests and Clippy](target/verification/20261116-java-global-preferences-windows-final.log)
+
+## Java Scheduler sudo command, snippet and file restore
+
+Java sudo commands, shared snippets and file operations restore as disabled
+drafts with the original settings and exact saved SSH targets. Sudo file jobs
+and shell jobs with a virtual terminal split by route and preserve every
+prerequisite of dependent jobs. The native editor checks the saved routes,
+host pins and policy before adopting either sudo mode. Passwordless jobs can
+keep the virtual terminal. Vault-backed jobs use an SSH exec channel. File
+actions need a separate review, and recursive deletion needs confirmation of
+the exact server path.
+
+Native Apple Silicon, Fedora ARM64 and Windows ARM64 each passed 36 Scheduler
+migration and adoption tests, including encrypted backup restore, repeat
+import, route expansion, rejected authority changes and guarded deletion.
+Windows also passed strict application Clippy. Fedora passed the Linux helper
+checks and existing protected transfer regressions against pinned OpenSSH and
+real sudo. The native Apple Silicon release ZIP passed checksum, ARM64
+architecture, strict ad hoc signature and CLI start checks. Configured native
+desktop adoption and firing remain in M1.
+
+- [Apple Silicon Scheduler tests](target/verification/20261116-java-privileged-adoption-macos-b9046317677b-tests.log)
+- [Apple Silicon release ZIP verification](target/verification/20261116-java-privileged-adoption-macos-b9046317677b-package.log)
+- [Fedora Scheduler and helper tests](target/verification/20261116-java-privileged-adoption-fedora-b9046317677b-tests.log)
+- [Fedora OpenSSH and sudo tests](target/verification/20261116-java-privileged-adoption-fedora-b9046317677b-openssh.log)
+- [Windows ARM64 Clippy and Scheduler tests](target/verification/20261116-java-privileged-adoption-windows-final.log)
+
 ## Scheduler rsync downloads replacing existing local files
 
 An ordinary or passwordless single-file rsync download can replace a
@@ -33,7 +1234,14 @@ review before another replacement. Calendar and Chain approvals advance
 the exact receiver identity only after confirmed publication. Each firing
 charges one entry and the source bytes, with zero removals because the
 receiver path remains present. A changed receiver or an unconfirmed result
-requires review. Initially vacant recurring receivers remain open.
+requires review. An ordinary or passwordless rsync download of one server file
+per saved route can start at a reviewed vacant local name in an existing
+protected folder. Each route independently reviews and advances its receiver.
+The first successful Calendar or Chain firing on a vacant route creates its file
+without overwriting an arrival. Later firings verify and replace the exact
+published file and retain it for recovery. A grouped renewal can review both
+published and still-vacant paths. Grouped paths need distinct local file slots
+based on filesystem identity and supported name lookup rules.
 
 Existing-file adoption for a single-target Java download prefills the
 original local destination folder and server basename. Grouped drafts
@@ -46,11 +1254,270 @@ PR #4 fixed the transfer direction in the Scheduler and gave private Windows
 rsync stages explicit current-user ownership. On `590acff`, Windows, Ubuntu
 and macOS CI passed the local publication/recovery, Java draft and portable
 restore regressions, along with workspace Clippy, release builds and package
-staging. The ordinary and passwordless pinned OpenSSH fixtures require an
-explicit test environment. Those fixtures and native Scheduler editor
-acceptance remain open for the direct file receiver.
+staging.
 [PR workflow](https://github.com/chardonnay/korTTY_rust/actions/runs/43733461845)
 and [Push workflow](https://github.com/chardonnay/korTTY_rust/actions/runs/43733458752).
+
+The ordinary and passwordless opt-in fixtures passed on Fedora ARM64 at
+`bf757dce9fcb766593625960194891c593ace7cd`. Each used pinned OpenSSH and ran
+an exact one-use replacement, refused both a same-length edit and a file
+substituted with identical bytes, and completed two Calendar firings before
+refusing a substituted receiver. Supported mode, UID, GID and user xattr
+were preserved, and the previous inode and bytes were retained for recovery.
+The protected case also exercised real `sudo -n` in an isolated namespace,
+managed denial and handoff cleanup.
+[Fedora OpenSSH record](target/verification/20261115-pr4-rsync-fedora-native.log)
+and [sudo record](target/verification/20261115-pr4-rsync-fedora-sudo.log).
+
+On the same source, the native Windows ARM64 app and test executables ran the
+opt-in download against pinned OpenSSH on Fedora, using the test's verified
+x86-64 MSYS2 rsync client under emulation. The test checked replacement bytes,
+the recipient ACL and timestamps, retention of the original file identity in
+recovery and refusal to reuse the stale review. The three local publisher tests, Java draft
+adoption and portable restore also passed on Windows ARM64. Native Scheduler
+editor acceptance remains open.
+[Windows OpenSSH record](target/verification/20261115-pr4-merged-rsync-windows-pinned.log)
+and [Windows local regression record](target/verification/20261115-pr4-merged-rsync-windows-local.log).
+
+For initially vacant destinations, the Fedora ARM64 application tests used
+`bf757dce9fcb766593625960194891c593ace7cd` plus the reviewed source changes.
+The ordinary Calendar case used pinned OpenSSH with strict key-file ownership
+checks. The protected Chain case used pinned OpenSSH, real passwordless sudo
+and the current Linux helper, with a policy limited to temporary test files.
+Both verified first publication, a second download with changed source bytes,
+retention of the first file's bytes and inode, and refusal of an unrelated file
+placed at the reviewed vacant path.
+[Fedora OpenSSH record](target/verification/20261115-rsync-vacant-fedora-openssh.log)
+and [Fedora sudo record](target/verification/20261115-rsync-vacant-fedora-sudo.log).
+
+Windows ARM64 also verified the ordinary recurring file download against pinned
+OpenSSH. A pre-existing arrival blocked the first firing. After removal, the
+next firing created the file and the following firing retained that exact file
+for recovery. The first-publication receipt records the actual creation time
+when NTFS reuses the deleted name's creation time. It still verifies the file
+identity, access, content and named binding. The five focused Scheduler and
+publisher tests and all 54 non-opt-in rsync tests passed. The final Clippy run
+also checks the subsequent storage-only adjustment to the receiver enum.
+[Windows OpenSSH record](target/verification/20261115-rsync-vacant-windows-fixed-pinned.log),
+[Windows focused record](target/verification/20261115-rsync-vacant-windows-fixed-local.log),
+[Windows rsync regression record](target/verification/20261115-rsync-vacant-windows-regression.log)
+and [Windows Clippy record](target/verification/20261115-rsync-vacant-windows-clippy.log).
+
+Fedora ARM64 passed grouped Calendar and passwordless Chain downloads and the
+direct-file regressions from the same verified source manifest. Each group test
+preserved a late occupant while the other route succeeded. Subsequent firings
+created or replaced each file independently, preserved the preceding file for
+recovery and enforced a shared byte limit. A renewed group ran with one existing
+receiver and one vacant receiver. The passwordless helper left its test handoff
+empty. The focused suite passed 57 rsync and nine local receiver tests.
+[Fedora OpenSSH record](target/verification/20261115-rsync-grouped-files-fedora-openssh.log),
+[Fedora sudo record](target/verification/20261115-rsync-grouped-files-fedora-sudo.log),
+[Fedora regression record](target/verification/20261115-rsync-grouped-files-fedora-regression.log)
+and [verified source manifest](target/verification/20261115-rsync-grouped-files-fedora-manifest.sha256).
+
+The same source passed the Windows ARM64 grouped Calendar test over pinned
+OpenSSH and both direct-file checks. The group first created one file and left
+the other route's occupant unchanged. After removing the occupant, the next
+firing created that route's file, followed by successful replacement and
+retention on both routes. Windows used the reviewed x86-64 MSYS2 rsync
+executable under emulation. The Windows suite passed 60 focused tests and the
+changed packages passed Clippy. The `kortty-files` crate cross-checked for
+Apple Silicon and Intel macOS. Native macOS workflow testing remains open.
+[Windows OpenSSH record](target/verification/20261115-rsync-grouped-files-windows-pinned.log),
+[Windows regression record](target/verification/20261115-rsync-grouped-files-windows-regression.log)
+and [macOS cross-check record](target/verification/20261115-rsync-grouped-files-macos-check.log).
+
+## Scheduler initially vacant mixed-source rsync directory downloads
+
+Mixed-source ordinary and passwordless downloads accept a reviewed vacant
+local directory name inside an existing checked parent for Calendar and Chain
+firings. A source directory without a trailing slash keeps its name and a
+source with a trailing slash contributes its contents. This applies to
+single-directory Java imports as well as multiple sources. The Scheduler
+shows each route's initial receiver and its delete scope. A confirmed first
+publication gives later firings the exact receiver to replace and retain for
+recovery. Two routes cannot enroll physical aliases or ambiguous Linux mount
+views of the same volume. The per-firing byte, entry and removal limits are
+shared across routes. Automatic creation of missing ancestor directories and
+vacant server receivers remain open.
+
+Fedora ARM64 verified grouped Calendar and real passwordless sudo Chain
+firings over pinned OpenSSH. The tests checked one named directory source,
+one contents source and two mixed inputs. They exercised unrelated arrivals,
+first publication, subsequent mirror replacements and recovery of the exact
+previous directory on each route. The focused regression run also covered
+legacy approvals, first-publication receipts and same-volume mount conflicts.
+[Fedora OpenSSH record](target/verification/20261115-rsync-vacant-tree-fedora-openssh.log),
+[Fedora sudo record](target/verification/20261115-rsync-vacant-tree-fedora-sudo.log),
+[Fedora regression record](target/verification/20261115-rsync-vacant-tree-fedora-regression.log)
+and [verified source manifest](target/verification/20261115-rsync-vacant-tree-fedora-refreshed-manifest.sha256).
+
+The same source passed the Windows ARM64 contents case over pinned OpenSSH.
+It left an unrelated directory untouched after review, then published the
+verified tree after that directory was removed. The next firing retained the
+exact previously published tree for recovery. Existing directory replacement,
+one-use mixed projection and grouped regular-file OpenSSH regressions passed
+as well. The Windows app and test executable ran natively with the reviewed
+x86-64 MSYS2 rsync under emulation. The focused Windows suite passed 64 tests.
+[Windows OpenSSH record](target/verification/20261115-rsync-vacant-trees-windows-pinned.log),
+[Windows regression record](target/verification/20261115-rsync-vacant-trees-windows-regression.log)
+and [Windows Clippy record](target/verification/20261115-rsync-vacant-trees-windows-clippy.log).
+
+## Scheduler initially vacant direct rsync directory downloads
+
+The direct download mode exposes **Allow creation at reviewed vacant paths**
+under the local destination review. Each review records the effective receiver,
+either the specified path for contents placement or the named server folder
+below it. Mirror deletion is scoped to that effective receiver. Users can
+confirm an existing directory or a vacant name in an existing checked parent
+on each route. An explicitly reviewed one-use run can create the vacant
+directory. Calendar and Chain runs require their current firing approval and
+advance to the exact verified tree, which subsequent replacement retains for
+recovery. The preview of a renewed group can include both existing and still
+vacant routes.
+
+Fedora ARM64 verified direct named and contents placement over pinned OpenSSH
+with Calendar firings and with actual passwordless sudo on Chain firings. The
+tests preserved an unrelated arrival, then created the directory and mirrored
+changed source contents. The second successful firing retained the exact
+previous tree and left the sibling above a named receiver unchanged. The
+ordinary one-use case refused replay of its consumed vacancy review. The same
+snapshot passed the mixed-tree and grouped-file regressions.
+[Fedora OpenSSH record](target/verification/20261115-rsync-vacant-direct-tree-fedora-openssh.log),
+[Fedora sudo record](target/verification/20261115-rsync-vacant-direct-tree-fedora-sudo.log),
+[Fedora regression record](target/verification/20261115-rsync-vacant-direct-tree-fedora-regression.log)
+and [verified source manifest](target/verification/20261115-rsync-vacant-direct-tree-fedora-manifest.sha256).
+
+The same source passed Windows ARM64 direct named and contents Calendar
+firings over pinned OpenSSH, including refusal of a late occupant, first
+publication, exact recovery and preservation of the named receiver's sibling.
+The Windows app and test executable ran natively with the reviewed x86-64
+MSYS2 rsync under emulation. The focused Windows suite passed 65 tests.
+[Windows OpenSSH record](target/verification/20261115-rsync-direct-tree-windows-pinned.log),
+[Windows regression record](target/verification/20261115-rsync-direct-tree-windows-regression.log)
+and [Windows Clippy record](target/verification/20261115-rsync-direct-tree-windows-clippy.log).
+
+## Scheduler rsync downloads with missing local parents and Java group paths
+
+Checked direct rsync directory downloads and recurring mixed-source downloads
+can create missing local parents. Review identifies the existing ancestor,
+the first missing component and the effective download folder. Publication
+builds the missing branch and verified incoming tree in a private stage.
+The first absent component is published without replacing an arrival. A
+recurring firing counts newly created parent directories in the shared entry
+budget. The device-local receipt binds the existing anchor to the resulting
+leaf. Later firings verify and replace that leaf alone and retain the
+previous tree for recovery. Grouped routes may publish disjoint missing
+branches. The next checkpoint covers shared parents.
+
+Newly restored Java group download drafts retain the derived directory name
+for each bound route. The name uses Java's sanitized original display name
+and the first eight UTF-16 code units of the original ID where available. The Job Scheduler
+uses it to prefill a native download path for compatible local roots. Every
+route still needs explicit review. J `jobscheduler/JobSchedulerRsyncSupport.java`
+and `model/ServerConnection.java`, R `src/profile_backup/java_scheduler.rs`
+and `src/scheduler_window/form.rs`.
+
+Fedora ARM64 passed five pinned OpenSSH live tests and three live tests with
+actual passwordless sudo. The tests cover direct named and contents
+downloads, disjoint grouped mixed downloads, late arrivals, first-firing
+entry limits, and subsequent scoped replacement and recovery. The focused
+suite also passed both Java group layout import and adoption, all 16 Java
+Scheduler restore tests, 66 rsync tests, and nine file receiver tests.
+[OpenSSH record](target/verification/20261115-rsync-local-hierarchy-fedora-final-openssh.log),
+[sudo record](target/verification/20261115-rsync-local-hierarchy-fedora-final-sudo.log),
+[regression record](target/verification/20261115-rsync-local-hierarchy-fedora-final-regression.log),
+and [verified source manifest](target/verification/20261115-rsync-local-hierarchy-fedora-handle-proof-manifest.sha256).
+
+The same source passed five Windows ARM64 tests over pinned OpenSSH, including
+the direct named and contents layouts and a mixed download into a missing
+hierarchy. The app and tests ran natively with the reviewed x86-64 MSYS2 rsync
+under emulation. The focused suite passed 106 tests, including the local
+publication and Java group import regressions. Clippy passed for the app and
+filesystem crate with all targets enabled.
+[Windows OpenSSH record](target/verification/20261115-rsync-local-hierarchy-windows-pinned.log),
+[Windows regression record](target/verification/20261115-rsync-local-hierarchy-windows-regression.log),
+and [Windows Clippy record](target/verification/20261115-rsync-local-hierarchy-windows-clippy.log).
+
+## Scheduler rsync groups sharing missing local parents
+
+Direct and mixed directory downloads can use a common missing parent when
+all reviewed destination trees are disjoint. Review binds the literal common
+prefix to the same native anchor and checks the first divergent child names
+for unambiguous lookup. Filesystems must expose a supported stable directory
+identity and birth timestamp to share a newly created parent. Aliases, changed
+access, another mount view and an independently created folder are rejected.
+
+The first successful route publishes its subtree and records the parent
+directories that it created. During the same batch or a later firing, a
+pending sibling checks the original anchor and each recorded directory
+identity before preparing its own destination. A confirmed destination binds
+the original review and protects the exact leaf on subsequent replacements.
+The firing entry limit charges a parent only when it is created. One-use runs keep the
+proofs within the current group. Calendar and Chain runs persist the needed
+proofs atomically with the confirmed route and release them after the
+dependent destinations are confirmed. An explicit vacant-path option makes
+the checked publisher available for one-use mixed downloads.
+
+Fedora ARM64 passed five live tests over pinned OpenSSH and three isolated
+live tests with actual passwordless sudo. Coverage includes direct Calendar
+and Chain runs, one-use direct and mixed groups, partial success across
+Scheduler reopen, occupied or replaced parents, and the shared entry budget.
+The focused suite passed 69 rsync tests, including the two shared-parent
+publisher cases, plus nine local-file receiver tests.
+[Fedora OpenSSH record](target/verification/20261115-rsync-shared-local-parents-fedora-openssh.log),
+[Fedora sudo record](target/verification/20261115-rsync-shared-local-parents-fedora-sudo.log),
+[Fedora regression record](target/verification/20261115-rsync-shared-local-parents-fedora-regression.log),
+and [verified source manifest](target/verification/20261115-rsync-shared-local-parents-fedora-fixed-manifest.sha256).
+
+Windows ARM64 passed six pinned OpenSSH live tests and 109 focused tests.
+The new Calendar fixture confirms partial progress, exact entry allowance
+after reopening, recovery, and preservation of an unrelated sibling.
+The app and tests ran natively with the reviewed x86-64 MSYS2 rsync under
+emulation. The test binary predates removal of a Windows-only re-export
+condition for Linux compilation. The condition already enabled the same
+code on Windows. The application bridge was built with the final sources.
+Clippy passed against the final sources.
+[Windows OpenSSH record](target/verification/20261115-rsync-shared-local-parents-windows-pinned.log),
+[Windows regression record](target/verification/20261115-rsync-shared-local-parents-windows-regression.log),
+and [Windows Clippy record](target/verification/20261115-rsync-shared-local-parents-windows-clippy.log).
+
+## Scheduler direct rsync files with missing local parents
+
+An ordinary or passwordless direct download can review the exact vacant
+local file and its first missing parent. korTTY writes and verifies the
+incoming file under a private directory and atomically publishes the missing
+hierarchy without replacing an arrival. Grouped routes can also borrow a
+shared parent whose native identity was recorded by a confirmed earlier
+route. A route counts one file entry and the parents that it creates.
+
+Explicit one-use review permits creation at the checked path. Calendar and
+Chain runs record the original vacancy, exact file successor and any shared
+parent receipts in the standing approval. Later replacements protect the
+confirmed file identity and retain the previous version for recovery. Old
+vacant and existing file snapshots remain readable. Portable backups retain
+the review option and require fresh device-local approval.
+
+Fedora ARM64 passed six live cases over pinned OpenSSH and five isolated
+live cases with actual passwordless sudo. The cases cover one-use file
+groups, Calendar and Chain firings, a late arrival, cancellation, shared
+entry limits, restart after partial success, a replaced shared parent, and
+exact recovery on a later firing. The final focused runs passed 73 rsync
+tests and nine local file receiver tests, including older saved proofs.
+[Fedora OpenSSH record](target/verification/20261115-rsync-file-hierarchy-fedora-final-openssh.log),
+[Fedora sudo record](target/verification/20261115-rsync-file-hierarchy-fedora-final-sudo.log),
+[Fedora regression record](target/verification/20261115-rsync-file-hierarchy-fedora-final-regression.log),
+and [verified source manifest](target/verification/20261115-rsync-file-hierarchy-fedora-complete-manifest.sha256).
+
+Windows ARM64 passed seven pinned OpenSSH live tests, including the new
+grouped file hierarchy case. That case verifies the exact shared entry
+limit, rejection of a late occupant, continuation after reopening and
+preservation of the previous file in recovery. The native app and test
+executables used the reviewed x86-64 MSYS2 rsync under emulation. The focused
+suite passed 113 tests and Clippy passed on the app and filesystem crate.
+[Windows OpenSSH record](target/verification/20261115-rsync-file-hierarchy-windows-pinned.log),
+[Windows regression record](target/verification/20261115-rsync-file-hierarchy-windows-regression.log),
+and [Windows Clippy record](target/verification/20261115-rsync-file-hierarchy-windows-clippy.log).
 
 ## Scheduler passwordless rsync for protected Linux paths
 
@@ -145,9 +1612,11 @@ publication the scheduler records the pending attempt and removal charge.
 An unconfirmed result requires a new review before the next firing. Grants
 reject overlapping destinations on the same reviewed SSH route. The store
 preserves the replay watermark across predecessor changes and reapprovals.
-Native macOS editor acceptance and creation-to-replacement grants remain
-open. The [direct local file workflow](#scheduler-rsync-downloads-replacing-existing-local-files)
-extends the existing receivers.
+Native macOS editor acceptance remains open. The
+[direct local file workflow](#scheduler-rsync-downloads-replacing-existing-local-files)
+extends the existing receivers. The
+[protected creation workflow](#scheduler-recurring-passwordless-rsync-to-a-vacant-server-file)
+extends recurring single-file uploads.
 
 The Fedora ARM64 helper passed 66 tests and strict Clippy, including bounded
 source scans and the verified file and directory successor receipts. Fedora
@@ -160,6 +1629,252 @@ tests on retry. Strict app Clippy passed on both native platforms. The app
 and tests passed the Apple Silicon cross-check.
 [Verification](target/verification/20261115-recurring-sudo-rsync-acceptance.md).
 [Verification records](target/verification/20261115-privileged-rsync-acceptance.md).
+
+## Scheduler recurring passwordless rsync to a vacant server file
+
+An explicit Scheduler option allows a recurring passwordless single-file
+upload to start at a reviewed vacant path. A job can bind an existing file
+on one pinned route and a vacant path on another. Java maps the upload
+destination to the same saved path on each server without a separate
+remote parent-creation step.
+
+The Linux helper requires the protected existing parent under both create
+and replacement roots. The vacancy proof binds the full path and the
+parent's native identity, creation timestamp, mount, owner, mode and
+supported extended attributes. After checking the exact staged bytes,
+the helper uses atomic no-replace publication and returns the held
+successor. This creates a private root-owned file with no displaced
+original. Only a matching receipt advances the device-local approval to
+the successor. On later firings the exact receiver is checked and retained
+for recovery. A lost or misbound receipt leaves the approved transition
+unconfirmed. Creating or replacing one regular file consumes one source
+entry and no removals. The original sudo command and saved existing-file
+proofs remain compatible. Portable backups require a fresh review.
+
+Fedora ARM64 passed 69 helper tests. The focused wire and filesystem cases
+verify the exact vacancy and held successor, leave a late occupant in
+place and show the first receipt matches the supported existing-file proof.
+A pinned OpenSSH connection using actual sudo in an isolated namespace
+returned the same vacancy fingerprint in two separate reviews and rejected
+a path covered only by the create rule.
+[Fedora helper verification](target/verification/20261116-rsync-vacant-server-file-fedora-helper-regression.log),
+and [sudo preflight](target/verification/20261116-rsync-vacant-server-file-fedora-sudo-preflight.log).
+
+Eight Fedora ARM64 live tests passed through pinned OpenSSH and actual sudo
+in the isolated fixture. The new test verifies first publication through
+Calendar and Chain, receipt replay after reopening the Scheduler, recovery
+on replacement, a late occupant, a replaced parent and firing limits. The
+previous protected rsync fixtures also passed. Fedora passed six separate
+ordinary pinned OpenSSH tests, 75 focused rsync and Scheduler tests, and
+nine local receiver tests.
+[Fedora sudo](target/verification/20261116-rsync-vacant-server-file-fedora-sudo.log),
+[OpenSSH](target/verification/20261116-rsync-vacant-server-file-fedora-openssh.log),
+[application regression](target/verification/20261116-rsync-vacant-server-file-fedora-regression.log),
+and [source manifest](target/verification/20261116-rsync-vacant-server-file-fedora-manifest.sha256).
+
+Windows ARM64 passed 115 focused application tests and strict Clippy. The
+suite checks the accepted first-file receipt and rejects a receipt for a
+different destination, vacancy or inventory. It also checks Java grouped
+adoption with a mix of existing and vacant receivers. Seven separate
+Windows ARM64 live tests over pinned OpenSSH verified the local file and tree
+receivers. The application and test executables used a reviewed x86-64 MSYS2
+rsync under emulation.
+[Windows application tests](target/verification/20261116-rsync-vacant-server-file-windows-regression.log),
+[Windows OpenSSH](target/verification/20261116-rsync-vacant-server-file-windows-pinned.log),
+[Clippy](target/verification/20261116-rsync-vacant-server-file-windows-clippy.log),
+and [source manifest](target/verification/20261116-rsync-vacant-server-file-windows-manifest.sha256).
+
+## Scheduler recurring passwordless rsync to a vacant server folder
+
+An explicit standing review allows direct and combined passwordless uploads
+to start at a vacant server folder. A direct upload binds either the mapped
+named child or the selected contents destination. A combined upload binds
+the ordered projection and the exact merge or mirror scope. Existing and
+vacant targets can be reviewed within the same group. One-use creation
+keeps its existing approval path.
+
+The helper checks the protected parent under both configured roots and
+binds its identity and the future deletion scope to the vacancy. It
+checks the staged tree under the metadata rules of an existing receiver
+before publishing without replacement. The held tree receipt advances the
+standing approval, so later runs use the existing merge or mirror and
+recovery paths for that exact receiver.
+
+The Fedora ARM64 helper passed 72 tests, including the exact wire and
+native publication cases. The application bridge built successfully.
+The isolated OpenSSH and sudo preflight verified both full and named mirror
+scopes and rejection in a create-only root. The native Scheduler test
+passed direct contents, named folder and combined scoped mirror uploads
+over actual sudo and pinned OpenSSH. Calendar and Chain firings left late
+occupants in place, reopened the saved approval with the exact successor
+and retained the prior contents before applying the reviewed deletions.
+The final Fedora run passed nine live sudo cases, six ordinary pinned
+OpenSSH cases, 75 focused application tests and nine local receiver tests.
+[Fedora helper tests](target/verification/20261116-rsync-vacant-server-tree-fedora-helper.log),
+[sudo preflight](target/verification/20261116-rsync-vacant-server-tree-fedora-preflight.log),
+[Fedora Scheduler and sudo](target/verification/20261116-rsync-vacant-server-tree-fedora-sudo.log),
+[source manifest](target/verification/20261116-rsync-vacant-server-tree-fedora-lf-manifest.sha256)
+and [cleanup](target/verification/20261116-rsync-vacant-server-tree-fedora-cleanup.log).
+
+Windows ARM64 passed strict Clippy for the application, files and archive
+crates on the folder change. The native live checks in the preceding
+single-file checkpoint use the earlier recorded executables.
+[Windows Clippy](target/verification/20261116-rsync-vacant-server-tree-windows-clippy.log)
+and [source manifest](target/verification/20261116-rsync-vacant-server-tree-windows-manifest.sha256).
+The Windows test directories and development build were cleaned after
+verification. [Cleanup record](target/verification/20261116-rsync-vacant-server-tree-windows-cleanup.log).
+
+## Scheduler recurring ordinary rsync to reviewed server receivers
+
+An ordinary Calendar or Chain upload can explicitly bind a vacant or existing
+regular file, a direct directory or a combined directory projection on a
+saved Linux SSH route. The current v3 helper holds the protected login-owned
+parent and accepts only the reviewed type and delete scope. Direct directory
+reviews preserve the configured named or contents placement. Combined
+reviews keep their exact scoped mirror roots. The one-use upload protocols
+and earlier directory reviews remain readable.
+
+The first firing stages and verifies a complete private file or tree before
+atomic no-replace publication. The held successor receipt advances the
+standing approval. Later firings replace the exact recorded receiver and
+retain its original for recovery. A file consumes one entry and no removals.
+File replacements preserve supported owner, group, mode and extended
+attributes. An unconfirmed receipt blocks further automatic publication
+until the destination is reviewed again.
+
+The native Fedora ARM64 helper passed 76 tests. The ordinary stdio tests
+cover first publication, an exact reviewed successor, expected recovery,
+named mirroring, a late occupant and an unexpected staging entry. The
+native Fedora Scheduler passed both new ordinary pinned OpenSSH tests and
+four ordinary regressions. They verify Calendar and Chain firings, direct
+files, named and contents layouts, combined scoped mirrors, exact successor
+rereview and recovery after replacement. Three pinned OpenSSH cases through
+actual sudo also passed on the same build. Fedora passed 76 focused rsync
+tests and nine local receiver tests. The Windows ARM64 application,
+filesystem and archive crates passed strict Clippy. The native Windows
+application executable passed 118 focused tests.
+[Fedora OpenSSH](target/verification/20261116-rsync-ordinary-receiver-fedora-openssh.log),
+[sudo regressions](target/verification/20261116-rsync-ordinary-receiver-fedora-protected.log),
+[helper tests](target/verification/20261116-rsync-ordinary-receiver-fedora-helper-regression.log),
+[Fedora manifest](target/verification/20261116-rsync-ordinary-receiver-fedora-manifest.sha256),
+[Windows tests](target/verification/20261116-rsync-ordinary-server-receiver-windows-regression.log)
+and [Windows Clippy](target/verification/20261116-rsync-ordinary-server-receiver-windows-clippy.log).
+
+## Scheduler recurring SFTP Chain starts
+
+An ordinary folder SFTP job can review Chain predecessors with or without
+an enabled calendar. The scope binds the saved route, roots and exact
+trigger configuration to one allowance for all automatic firings.
+Manual runs and cascades use the one-use workflow. Graph edits cancel a
+pending standing review.
+
+The device-local store admits the exact captured calendar occurrence or
+successful predecessor round. The relevant timestamp persists through
+reopen and reapproval. Historical calendar grants and consumed run records
+remain readable. The job checks its approved roots, route, file identities
+and per-firing limits as before when creating or replacing entries.
+
+Fedora ARM64 passed the native pinned OpenSSH Chain case in both directions
+and all four existing Calendar cases. The corrected Chain fixture verifies
+the preceding bytes under the original name in a private recovery directory.
+The focused regressions cover a queued calendar start, the legacy store
+and replay. The native Fedora application built and Windows ARM64 passed
+strict Clippy.
+[Fedora build](target/verification/20261116-archive-and-sftp-chain-fedora-native.log),
+[Fedora manifest](target/verification/20261116-archive-and-sftp-chain-fedora-manifest.sha256),
+[Fedora Chain and Calendar](target/verification/20261116-archive-and-sftp-chain-fedora-chain.log),
+[Fedora Chain first run](target/verification/20261116-sftp-chain-fedora-openssh.log),
+[Windows Clippy](target/verification/20261116-sftp-standing-chain-windows-clippy.log)
+and [Windows manifest](target/verification/20261116-sftp-standing-chain-windows-manifest.sha256).
+Windows test profiles, source copies and development artifacts were cleaned.
+[Windows cleanup](target/verification/20261116-sftp-standing-chain-windows-cleanup.log).
+
+## Scheduler archive output reuse
+
+An ordinary Linux job can enable **Reuse reviewed archive paths** for one
+saved SSH route. The helper reviews the configured paths, exact native
+receiver identity and source inventory before each publication. The
+review token binds these values throughout the firing. Each guarded
+replacement validates the candidate, quarantines the displaced file and
+publishes into a vacant name. A checked abort restores the previous file
+when the name is still vacant. The next firing reviews the current
+occupant at the saved path.
+
+ZIP retains unmatched members and replaces or adds paths from the current
+sources. Password ZIP validates the protected original and re-encodes
+retained files with AES-256. TAR, TAR.BZ2 and 7z are rebuilt. A requested
+local copy checks the server receipt and current transfer policy and
+publishes through the local file receiver. The journal records available
+recovery paths and distinguishes a confirmed server publication with a
+failed local copy.
+
+On Fedora ARM64, four native helper transactions and four ZIP update
+regressions passed, including cancellation, same-byte inode substitution,
+late occupancy, AES authentication and ZipCrypto migration. The pinned
+OpenSSH Scheduler cases passed two firings each for plain ZIP and vault
+AES-256 ZIP, retained both exact previous files and preserved a removed
+member. The two existing create-only cases also passed. Windows ARM64
+passed strict Clippy and 25 archive-library tests.
+[Fedora helper](target/verification/20261116-archive-and-sftp-chain-fedora-helper.log),
+[Fedora pinned OpenSSH](target/verification/20261116-archive-and-sftp-chain-fedora-archive.log),
+[Fedora source manifest](target/verification/20261116-archive-and-sftp-chain-fedora-manifest.sha256),
+[Windows Clippy](target/verification/20261116-archive-update-windows-clippy.log)
+and [Windows archive-library tests](target/verification/20261116-archive-update-windows-library-tests.log).
+
+The two Linux sudo modes have dedicated update commands and a distinct
+Scheduler approval. An administrator must grant a replacement root within
+a creation root before an existing archive can be displaced. A protected
+local copy needs a separate download grant, a confirmed server publication
+and a subsequent authorized copy request for the held file. On Fedora ARM64,
+the isolated helper transaction test passed directly and through native
+sudo with command-specific digest rules. It checked role separation,
+rollback after grant revocation, the held copy and denial after publication.
+Actual PAM rejected a wrong password and accepted the exact vault-mode
+command with a test password. Windows ARM64 passed strict application
+Clippy. The Fedora application passed the pinned OpenSSH transport
+fixtures for both sudo modes, including refusal, revocation and failed
+copy after confirmed server publication. The client wire fixtures and the
+real sudo/PAM fixtures ran separately. A configured desktop route still
+needs deployment acceptance.
+[Fedora source manifest](target/verification/20261116-privileged-archive-update-fedora-manifest.sha256),
+[Fedora sudo](target/verification/20261116-privileged-archive-update-fedora-sudo.log),
+[Fedora PAM](target/verification/20261116-privileged-archive-update-fedora-password.log),
+[Fedora native application](target/verification/20261116-java-archive-layout-fedora-app.log)
+and [Windows Clippy](target/verification/20261116-archive-sudo-update-windows-final-clippy.log).
+
+Imported Java ZIP, password ZIP, TAR and TAR.BZ2 drafts display and adopt
+the full server-path layout while remaining disabled. The setting can also
+be selected for existing server-only jobs in those formats. Each archive
+member starts with its absolute server path after removal of the leading
+slash. The review binds the layout and allows disjoint sources with the
+same basename. Implicit parent directories belong to the review manifest.
+ZIP Add matches exact stored member paths and retains unmatched entries.
+TAR creates a fresh archive and prunes excluded subtrees. The source
+basename is the default for native jobs.
+
+Windows ARM64 passed strict Clippy and all 26 archive-library tests.
+Fedora ARM64 passed 36 focused archive helper tests, strict Clippy and
+14 application checks. The pinned OpenSSH tests used starting archives
+created by Info-ZIP and GNU tar with the arguments from Java. They
+verified both TAR variants, ZIP updates, subtree exclusions, local copies
+and recovery of the displaced files. The regression cases covered explicit
+adoption, disabled backup restoration, approval scope and changed staged
+bytes. GNU ld failed on an AArch64 branch relocation in the native test
+binary. The final executable used the Fedora-signed LLVM LLD 22.1.8
+package extracted into the isolated run directory.
+The complete application test harness on the same binary reported 3,599
+passed, zero failed and 209 ignored. Test processes, source copies,
+development artifacts and the private linker were cleaned after verification.
+[Windows Clippy](target/verification/20261116-java-tar-layout-windows-clippy.log),
+[Windows tests](target/verification/20261116-java-tar-layout-windows-library-tests.log),
+[Windows cleanup](target/verification/20261116-java-tar-layout-windows-cleanup.log),
+[Fedora source manifest](target/verification/20261116-java-archive-layout-fedora-manifest.sha256),
+[Fedora helper tests](target/verification/20261116-java-archive-layout-fedora-helper.log),
+[Fedora application tests](target/verification/20261116-java-archive-layout-fedora-app.log),
+[Fedora full application suite](target/verification/20261116-java-archive-layout-fedora-full-app.log),
+[Fedora cleanup](target/verification/20261116-java-archive-layout-fedora-cleanup.log),
+[GNU ld failure](target/verification/20261116-privileged-archive-update-fedora-native.log)
+and [Fedora GNU tar exclusions](target/verification/20261116-java-tar-layout-fedora-gnu-excludes.log).
 
 ## Scheduler recurring rsync for existing directories
 
@@ -426,8 +2141,8 @@ The Windows and Linux packager accepts `--windows-msi` and `--linux-flatpak`
 alongside the ordinary portable archives. MSI stages the app, CLI, SSH
 worker and license files with a separate installer identity from Java.
 Flatpak preserves the Java application ID and checks both executables in
-the target Freedesktop 25.08 runtime. Packaged local shells run inside the
-runtime. Reviewed host-shell parity remains open.
+the target Freedesktop 25.08 runtime. The initial package ran local shells
+inside the runtime.
 
 The Fedora ARM64 Flatpak built against the Freedesktop 25.08 SDK using
 verified upstream Rust 1.99.1. It replaced the signature-verified Java
@@ -437,6 +2152,83 @@ found a connected local shell. X11 reported the expected `WM_CLASS`, the
 exported AppStream metadata validated, and uninstall preserved the private
 profile. Publisher signing and x86-64 verification remain release gates.
 [Native Flatpak verification](target/verification/20261115-flatpak-native-release-verified.log).
+
+### Flatpak host shell and local Agent commands
+
+The package grants `org.freedesktop.Flatpak` access for local host launches.
+The PTY forwards the terminal to the host service. Shell selection, executable
+discovery, exact arguments, working directory and the ordinary environment
+use the host context. The host service receives the terminal environment and
+private startup paths for opted-in Bash, Zsh and Fish integration. At a fresh
+integrated prompt, relative file and Agent actions resolve only through a
+directory with the same filesystem identity on both sides. Approved local
+Agent commands have their own host process group and a cancellation pipe.
+
+The installed Fedora ARM64 PTY fixture passed host-only PATH lookup, literal
+arguments, start directory and environment, 100 by 35 terminal size, Bash
+login startup and prompt marks, interactive input, terminal and background
+job shutdown, and supervised Agent exit and cancellation. The first installed
+candidate refused required local isolation because its read-only `/usr` mount
+and `/usr/bin` reported the installation user's UID. The following checkpoint
+verifies the corrected isolation path.
+
+The rebuilt Fedora ARM64 bundle started the desktop under native headless
+Wayland. Its bundled CLI connected to the app, found the host shell, read the
+host-only startup marker and submitted `exit`. The host shell then exited.
+The native Fedora app passed 57 selected tests, including fresh prompt
+directory handling. The Flatpak has SHA-256
+`24a9cfe378290e22714ed77187969186f3368f74a0efb683e1e5c42a20b6f732`.
+The same source snapshot built an ad hoc signed Apple Silicon ZIP. Native
+validation checked its ARM64 executables, app and SSH helper signatures, and
+CLI startup. Its SHA-256 is
+`6079ed0ed29a5ad9dc124b7fd4e77f332ce05b4073572bc5b5b92a7e568d6431`.
+The selected native tests passed on Apple Silicon (87 PTY and app tests) and
+Windows ARM64 (55 app tests). The earlier notarized ZIP retains its original
+verification.
+
+[Fedora installed PTY tests](target/verification/20261116-flatpak-host-shell-fedora-8c3f14350643-installed-test.log),
+[Fedora packaged desktop test](target/verification/20261116-flatpak-host-shell-fedora-8c3f14350643-desktop-test.log),
+[Fedora native app tests](target/verification/20261116-flatpak-host-shell-fedora-8c3f14350643-host-tests.log),
+[Apple Silicon package verification](target/verification/20261116-flatpak-host-shell-macos-8c3f14350643-package.log).
+
+### Required Landlock isolation inside Flatpak
+
+The installed namespace uses a read-only Flatpak metadata file, read-only
+runtime system paths, the expected terminal device numbers and the app's
+private `/tmp` directory. Canonical system paths are opened with `openat2`
+and checked through the resulting file descriptors. This covers runtime and
+configuration bind mounts created from anonymous files. Landlock and seccomp
+still enforce filesystem and IPC restrictions before the selected shell starts.
+
+The Fedora ARM64 release passed installation and startup on native Wayland
+and a private X11 display with saved Session Security settings. The bundled
+CLI reported the local pane as `sandboxed` in both cases. The PTY probes
+verified workspace and scratch writes, hidden
+profile data and refused reads through a symlink, restricted access outside
+the workspace, denied host execution, and scratch cleanup. The full local
+Landlock probe also passed inside Flatpak, including inherited descriptor,
+local IPC and allowed IP networking checks. The native Fedora PTY and SSH
+worker isolation probes passed in a separate run outside Flatpak. Host Zsh
+5.9 retained its configured startup, emitted its working directory and prompt
+marks, and accepted a command through the installed PTY. Host Fish 4.6 loaded
+its configuration and accepted input and exit in the packaged terminal. Both
+shells came from signature-verified Fedora RPMs extracted into the test directory.
+
+The verified Fedora Flatpak SHA-256 is
+`cb56fdfacaa0ec40c869d522a50ae9ce2d93562cda71166b7da21f2993844f12`.
+From the same source snapshot, Apple Silicon passed the selected PTY and
+desktop tests, built the release and verified the ad hoc app and helper
+signatures. Windows ARM64 passed the PTY tests and native ConPTY containment
+probe. Flatpak x86-64 and publisher signing remain release checks.
+
+[Installed Flatpak PTY and containment](target/verification/20261116-flatpak-landlock-fedora-6e035fa3f105-packaged.log),
+[Packaged Wayland sandbox launch](target/verification/20261116-flatpak-landlock-fedora-6e035fa3f105-gui.log),
+[Packaged X11 sandbox launch](target/verification/20261116-flatpak-landlock-fedora-6e035fa3f105-x11-test.log),
+[Zsh host PTY](target/verification/20261116-flatpak-landlock-fedora-6e035fa3f105-zsh-test.log),
+[Fish host terminal](target/verification/20261116-flatpak-landlock-fedora-6e035fa3f105-fish-desktop.log),
+[Native Fedora PTY and SSH worker](target/verification/20261116-flatpak-landlock-fedora-6e035fa3f105-native-tests.log),
+[Mac package](target/verification/20261116-flatpak-landlock-macos-6e035fa3f105-package.log),
+[Windows PTY verification](target/verification/20261116-flatpak-landlock-windows.log).
 
 WiX 6 on Windows ARM64 generated MSI packages for ARM64 and x64 using the
 retained release binaries. The native Windows Installer database and cabinet
@@ -465,6 +2257,809 @@ cleanup. Both the native Fedora process and the installed Flatpak worker
 extracted the exact 500 MiB fixture. The Flatpak worker rejected one extra
 byte and cleaned up the spool. The [verification record](target/verification/20261115-native-packages-and-pdf.md)
 records these checks with their tested sources.
+
+## Expanded local knowledge capacity and the macOS PDF worker
+
+The local snapshot admission path, writer, reader and source-authority
+checks now use 32,768 passages and a 384 MiB byte budget. Qdrant has a
+separate budget of 16,384 passages and 96 MiB. Larger local snapshots use
+exact scoring. A native Apple Silicon development-profile fixture wrote
+and reopened 32,768 passages at 1,536 dimensions, verified source
+contents and returned the expected top result. The snapshot was
+333,788,879 bytes. Save took 2,269 ms, reopen took 2,232 ms and one
+exact ranking took 392 ms. Peak RSS for the profiling test was about
+361 MiB. The Java snapshot reader ceiling remains a separate scale goal.
+
+The previous Apple Silicon package failed before reading any PDF bytes.
+Darwin returned EINVAL because the fixed address-space limit was below
+the process's initial virtual mappings. The parser now budgets 1 GiB
+of additional address space on macOS and honors stricter inherited
+limits. The packaged worker passed three native extraction tests,
+including cancellation during transfer and exact 500 MiB input. Direct
+invocation extracted the expected physical-page text in 1.15 seconds
+with about 511 MiB peak RSS, rejected one additional byte and left
+the private spool empty. The isolated Fedora check verified its actual
+address-space, CPU and core-file limits.
+
+The Apple Silicon ZIP for source manifest `cac9f21ef86d` passed
+SHA-256, ARM64, strict ad hoc signature and CLI startup checks.
+The build passed 172 targeted application tests and 31 PTY tests.
+The Windows ARM64 application and test targets passed `cargo check`.
+Cargo selected 17 jobs on macOS, 24 on Windows and 26 on Fedora.
+
+- [Apple Silicon packaged PDF tests](target/verification/20261117-knowledge-capacity-macos-cac9f21ef86d-pdf.log)
+- [Apple Silicon direct PDF worker measurement](target/verification/20261117-knowledge-capacity-macos-cac9f21ef86d-pdf-worker-rss.log)
+- [Apple Silicon expanded snapshot profile](target/verification/20261117-knowledge-capacity-macos-cac9f21ef86d-scale.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-knowledge-capacity-macos-cac9f21ef86d-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-capacity-macos-cac9f21ef86d-package.log)
+- [Windows ARM64 application check](target/verification/20261117-knowledge-capacity-windows-check.log)
+- [Fedora ARM64 PDF resource limits](target/verification/20261117-knowledge-capacity-fedora-pdf-limits.log)
+
+## Disk-backed search for large local knowledge indexes
+
+Terminal Chat retrieval and AI Manager Saved Search open local snapshots
+above 8,192 passages with file-backed vectors. The reader validates source
+metadata, passage text and every vector on open. Exact scoring reads
+the vectors for enabled sources from the validated file. The regression
+test covers ordering, source filters, cancellation and rejection of
+a truncated snapshot. Index construction and updates still require
+materialized vectors.
+
+The Apple Silicon development-profile fixture used the same 32,768
+passages and 1,536 dimensions for both index representations. Measured
+retained index data fell from 335,853,728 to 134,789,280 bytes (59.9%).
+This figure counts the index's passage data and vector storage. The
+profiling process also built the materialized fixture. One exact search
+over the file-backed vectors took 669 ms.
+
+The native Apple Silicon ZIP for source manifest `ee434f38295c` passed
+SHA-256, ARM64, strict ad hoc signature and CLI startup checks. The
+build passed 172 selected application tests, 31 PTY tests, the opt-in
+corpus fixture and three packaged PDF worker tests. Windows ARM64 passed
+`cargo check` for the application and its tests. Cargo selected 18 jobs
+on the Mac and 24 on Windows.
+
+- [Apple Silicon snapshot profile](target/verification/20261117-knowledge-disk-search-macos-ee434f38295c-scale.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-knowledge-disk-search-macos-ee434f38295c-tests.log)
+- [Apple Silicon packaged PDF tests](target/verification/20261117-knowledge-disk-search-macos-ee434f38295c-pdf.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-disk-search-macos-ee434f38295c-package.log)
+- [Windows ARM64 application check](target/verification/20261117-knowledge-disk-search-windows-check.log)
+
+## Reusing vectors during large local index updates
+
+Manual AI Manager updates and automatic source refresh open the previous
+large local snapshot with file-backed vectors. Updates reuse vectors for
+matching sources after comparing the digest, locations and passage text.
+They also retain vectors of disabled sources when the embedding
+dimensions agree. The shared reader checks cancellation and the held file
+stamp. Manual publication checks whether the saved predecessor is still
+current. The replacement index currently keeps its vectors in memory.
+
+On Apple Silicon, the fixture reused all vectors for 32,768 passages at
+1,536 dimensions without requesting new embeddings. The two live index
+representations retained 448.84 MiB together. Two fully materialized
+indexes of the same measured size would retain 640.59 MiB. The
+development-profile update took 12.90 seconds including source scans
+and verification. The regression also checks preservation of disabled
+sources and rejection of a truncated predecessor.
+
+The Apple Silicon ZIP for source manifest `deb4f37020ee` passed checksum,
+ARM64, strict ad hoc signature and CLI startup checks. The native run
+passed 172 selected application tests, 31 PTY tests, three packaged PDF
+worker tests and the expanded snapshot fixture. Windows ARM64 passed
+`cargo check` for the application and its tests. Cargo selected 20 jobs
+on the Mac and 24 on Windows.
+
+- [Apple Silicon snapshot update measurement](target/verification/20261117-knowledge-snapshot-reuse-macos-deb4f37020ee-scale.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-knowledge-snapshot-reuse-macos-deb4f37020ee-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-snapshot-reuse-macos-deb4f37020ee-package.log)
+- [Windows ARM64 application check](target/verification/20261117-knowledge-snapshot-reuse-windows-check.log)
+
+## Staging vectors during large local index builds
+
+Large local builds and refreshes write new and reused vectors to a
+private temporary file in batches. The index holds passage text,
+source metadata and vector offsets in memory. Disabled source vectors
+remain associated with their original passages after the entries are
+reordered. Publishing streams the staged vectors into the existing
+snapshot format through the atomic writer. The staging file is removed
+when its last handle closes.
+
+On Apple Silicon, the 32,768-passage fixture at 1,536 dimensions retained
+257.09 MiB across the old and replacement indexes, compared with
+448.84 MiB when only the old vectors were read from disk. The reduction
+was 42.7%. The development-profile refresh took 14.50 seconds including
+source verification and vector staging. The regression also published
+and reopened a staged snapshot with disabled sources.
+
+The native Apple Silicon ZIP for source manifest `297f8b33635d` passed
+checksum, ARM64, strict ad hoc signature and CLI startup checks. The
+native run passed 172 selected application tests, 31 PTY tests, three
+packaged PDF worker tests and the expanded snapshot fixture. Cargo
+selected eight jobs from the available RAM on the Mac. The native
+Windows ARM64 run passed 75 selected knowledge tests using 24 Cargo jobs.
+
+- [Apple Silicon snapshot staging measurement](target/verification/20261117-knowledge-vector-stage-macos-297f8b33635d-scale.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-knowledge-vector-stage-macos-297f8b33635d-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-vector-stage-macos-297f8b33635d-package.log)
+- [Windows ARM64 knowledge tests](target/verification/20261117-knowledge-vector-stage-windows-tests.log)
+
+## Larger local knowledge snapshots
+
+Local knowledge indexes now support 65,536 passages and a 768 MiB
+snapshot. Snapshots beyond the earlier local passage or byte limits
+use version 8 with an unsigned 32-bit passage count. Smaller local
+snapshots retain their compatible representation. The reader enforces
+the limit associated with each version and uses the same header for
+authority checks and normal retrieval. The regression reopens 65,536
+passages, finds the final passage by vector rank, validates the stored
+digest and rejects a count above the new limit.
+
+The Apple Silicon fixture used 65,536 passages and 1,536 dimensions.
+The snapshot occupied 667,611,857 bytes (636.68 MiB). It reopened
+and ranked correctly, then reused all vectors during refresh.
+The opened index retained 257.12 MiB of passage data and offsets.
+In the development build, opening took 4.73 seconds, ranking
+took 1.34 seconds and refresh took 26.30 seconds including source
+verification and staging.
+
+The native Apple Silicon ZIP for source manifest `c9e1dd9165cb` passed
+checksum, ARM64, strict ad hoc signature and CLI startup verification.
+The Mac passed 173 selected application tests, 31 PTY tests and
+three packaged PDF worker tests. Windows ARM64 passed `cargo check`
+for the application and test targets. Cargo selected nine jobs on
+the Mac and 24 on Windows.
+
+- [Apple Silicon snapshot measurement](target/verification/20261117-knowledge-wide-snapshot-macos-c9e1dd9165cb-scale.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-knowledge-wide-snapshot-macos-c9e1dd9165cb-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-wide-snapshot-macos-c9e1dd9165cb-package.log)
+- [Windows ARM64 application and test compilation](target/verification/20261117-knowledge-wide-snapshot-windows-check.log)
+
+## Ranking exact results for larger local indexes
+
+AI Manager Saved Search scores enabled vectors and keeps only the
+requested number of best candidates during exact search. Terminal Chat
+builds a priority queue of scores and consumes candidates in rank order
+until the excerpt budget is full. Graph search uses the same lazy exact
+ordering when it needs additional excerpts. The score order and
+lower-position tie break are shared by both exact paths. The regression
+checks a top hit at position 65,536 followed by tied results in their
+original passage order.
+
+The 65,536-passage Apple Silicon fixture passed with 1,536-dimensional
+vectors. The development-profile run scored and selected the top
+hit from the opened snapshot in 1.30 seconds. The native ZIP for
+source manifest `118e357f1f50` passed checksum, ARM64, strict ad hoc
+signature and CLI startup verification. The Mac passed 173 selected
+application tests, 31 PTY tests and three packaged PDF worker tests.
+Windows ARM64 passed `cargo check` for the application and test targets.
+Cargo used 12 jobs on the Mac and 24 on Windows.
+
+- [Apple Silicon snapshot measurement](target/verification/20261117-knowledge-bounded-ranking-macos-118e357f1f50-scale.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-knowledge-bounded-ranking-macos-118e357f1f50-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-bounded-ranking-macos-118e357f1f50-package.log)
+- [Windows ARM64 compilation check](target/verification/20261117-knowledge-bounded-ranking-windows-check.log)
+
+## Reading passage text on demand
+
+Saved Search and Terminal Chat open large local snapshots with both
+vectors and passage text on disk. Opening validates the complete
+snapshot. The query retains source and citation metadata, vector
+offsets and text lengths. Before embedding the query, source
+verification compares the live source passages with text read from
+the held snapshot. Search reads the text of selected results for
+display or citation. The regression exercises source verification,
+filtering, the returned passage and refusal after snapshot truncation.
+Index refresh currently retains passage text.
+
+The 65,536-passage Apple Silicon fixture retained 5.13 MiB in the opened
+query index, down from 257.12 MiB when the text was held in memory.
+The development-profile run opened the snapshot in 4.37 seconds and
+ranked one result in 1.30 seconds after checking the sources. The
+refresh fixture still uses the text-resident representation.
+
+The native Apple Silicon ZIP for source manifest `7dc2a92c7cd6` passed
+checksum, ARM64, strict ad hoc signature and CLI startup verification.
+The Mac passed 173 selected application tests, 31 PTY tests and
+three packaged PDF worker tests. Windows ARM64 passed `cargo check`
+for the application and tests. Cargo used 16 jobs on the Mac
+and 24 on Windows.
+
+- [Apple Silicon snapshot measurement](target/verification/20261117-knowledge-disk-text-macos-7dc2a92c7cd6-scale.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-knowledge-disk-text-macos-7dc2a92c7cd6-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-disk-text-macos-7dc2a92c7cd6-package.log)
+- [Windows ARM64 compilation check](target/verification/20261117-knowledge-disk-text-windows-check.log)
+
+## Reading the previous snapshot during refresh
+
+Manual and automatic refresh use the same file-backed local snapshot
+reader as search. When a source digest matches, refresh compares the
+new passage locations and text with the held snapshot through a
+buffered reader. Disabled sources use saved passage lengths for the
+size check and copy their saved passages and vectors in order. The
+regression reuses the file-backed predecessor, preserves a disabled
+source, publishes the replacement and rejects a truncated predecessor.
+The replacement index still retains passage text.
+
+On Apple Silicon, the 65,536-passage refresh retained 5.13 MiB in the
+previous index and 257.12 MiB in the replacement. The two indexes
+retained 262.25 MiB together, compared with 514.24 MiB when the
+previous index also retained text. The fixture reused all vectors
+and took 25.33 seconds in the development profile.
+
+The native Apple Silicon ZIP for source manifest `43667e850eee`
+passed checksum, ARM64, strict ad hoc signature and CLI startup
+verification. The Mac passed 173 selected application tests, 31 PTY
+tests and three packaged PDF worker tests. Windows ARM64 passed
+`cargo check` for the application and tests. Cargo used 18 jobs on
+the Mac and 24 on Windows.
+
+- [Apple Silicon refresh measurement](target/verification/20261117-knowledge-disk-refresh-base-macos-43667e850eee-scale.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-knowledge-disk-refresh-base-macos-43667e850eee-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-disk-refresh-base-macos-43667e850eee-package.log)
+- [Windows ARM64 compilation check](target/verification/20261117-knowledge-disk-refresh-base-windows-check.log)
+
+## Staging replacement passage text
+
+Large local index builds and refreshes spill passage text into a private
+temporary file after crossing the graph size limit. The previous
+snapshot and replacement are compared through buffered readers.
+New embedding requests read one batch of passages at a time. Publication
+streams the stored text and vectors into the existing atomic snapshot
+writer. Disabled sources are copied and published in source order. The
+regression exercises the threshold crossing, the embedding batch,
+passage lookup and publication with a reordered source.
+
+The 65,536-passage Apple Silicon fixture reused all vectors and
+published and reopened the replacement snapshot. The previous and
+replacement indexes retained 10.75 MiB combined, compared with
+262.25 MiB when replacement text stayed in memory. The development
+profile measured 25.22 seconds for refresh before publication.
+
+The native Apple Silicon ZIP for source manifest `27a257feb91a`
+passed checksum, ARM64, strict ad hoc signature and CLI startup
+verification. The Mac passed 173 selected application tests, 31 PTY
+tests and three packaged PDF worker tests. Windows ARM64 passed
+`cargo check` for the application and tests. Cargo used 19 jobs on
+the Mac and 24 on Windows.
+
+- [Apple Silicon staging measurement](target/verification/20261117-knowledge-staged-passages-macos-27a257feb91a-scale.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-knowledge-staged-passages-macos-27a257feb91a-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-staged-passages-macos-27a257feb91a-package.log)
+- [Windows ARM64 compilation check](target/verification/20261117-knowledge-staged-passages-windows-check.log)
+
+## Local snapshot capacity at 131,072 passages
+
+Local snapshots support 131,072 passages and up to 1.5 GiB using
+the version 8 format. The scale fixture stages source text and
+1,536-dimensional vectors before writing the initial snapshot. It
+then verifies live sources, finds the final passage by exact rank,
+reuses all vectors during refresh, and publishes and reopens the
+replacement. Tests also exercise both passage and byte limit
+enforcement. Qdrant uses its own format and admission limits.
+
+The Apple Silicon fixture wrote a 1,335,257,809-byte snapshot
+(1.24 GiB) and reused all vectors. The development-profile run took
+8.45 seconds to open the snapshot, 2.78 seconds to select the top
+hit after source verification, 52.29 seconds to refresh and 10.16
+seconds to publish. The old and new indexes retained 21.50 MiB
+together. Maximum RSS for the whole fixture was about 135 MiB.
+The earlier 65,536-passage fixture seeded vectors in RAM. This fixture
+seeds them on disk before measuring the whole process.
+
+The Apple Silicon ZIP for source manifest `5ceabd899801` passed
+checksum, ARM64, strict ad hoc signature and CLI startup verification.
+The Mac passed 173 selected application tests, 31 PTY tests and three
+packaged PDF worker tests. Windows ARM64 passed `cargo check` for
+the application and tests. Cargo used 17 jobs on the Mac and 24 on
+Windows.
+
+- [Apple Silicon large snapshot measurement](target/verification/20261117-knowledge-131k-macos-5ceabd899801-scale.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-knowledge-131k-macos-5ceabd899801-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-131k-macos-5ceabd899801-package.log)
+- [Windows ARM64 compilation check](target/verification/20261117-knowledge-131k-windows-check.log)
+
+## Java local snapshot passage ceiling
+
+Version 8 local snapshots admit up to 5,000,000 passages and 64 GiB.
+These independent bounds account for the chosen embedding dimensions
+and the amount of passage text. Earlier snapshot formats use their own
+bounds. The decoder checks the file length against the declared shape
+before allocating passage metadata. Automatic refresh checks for a
+concurrently created predecessor by opening its private file.
+
+The ceiling fixture uses five million synthetic two-dimensional records,
+then validates the last passage through exact ranking. The separate
+131,072-passage fixture uses 1,536-dimensional vectors and exercises
+source validation, refresh and publication. A full-size corpus with
+real sources and embeddings remains an acceptance case.
+
+On Apple Silicon, the development-profile ceiling fixture opened all
+five million synthetic passages in 2.62 seconds and found the final
+passage in 0.78 seconds. The opened index retained 391.01 MiB of metadata.
+The 131,072-passage fixture published and reopened its 1.24 GiB
+replacement snapshot with all vectors reused.
+
+The Apple Silicon ZIP for source manifest `ecd27082afe8` passed
+checksum, ARM64, strict ad hoc signature and CLI startup verification.
+The Mac passed 173 selected application tests, 31 PTY tests, three
+packaged PDF worker tests and both scale fixtures. Windows ARM64
+passed `cargo check` for the application and tests. Cargo used 18
+jobs on the Mac and 24 on Windows.
+
+- [Apple Silicon scale and ceiling measurements](target/verification/20261117-knowledge-java-ceiling-macos-ecd27082afe8-scale.log)
+- [Apple Silicon application and PTY tests](target/verification/20261117-knowledge-java-ceiling-macos-ecd27082afe8-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-java-ceiling-macos-ecd27082afe8-package.log)
+- [Windows ARM64 compilation check](target/verification/20261117-knowledge-java-ceiling-windows-check.log)
+
+## Cancellation during local snapshot I/O
+
+Saved Search, Terminal Chat, manual updates and automatic refresh
+check cancellation while decoding a local snapshot. Local publication
+also checks during size validation and serialization, and again before
+the atomic replacement. The regression cancels during a read and
+after serialization begins. It verifies that the previous file stamp
+still matches and that the partial file has been removed.
+
+The realistic-dimension scale fixture now covers 262,144 passages.
+The separate synthetic fixture continues to check the Java passage
+ceiling of five million.
+
+On Apple Silicon, the 262,144-passage test published and reopened a
+2,670,549,713-byte snapshot (2.49 GiB) and reused all vectors.
+The development-profile run took 16.57 seconds to open the snapshot,
+5.72 seconds to rank the best result, 96.91 seconds to refresh and
+19.50 seconds to publish. The previous and replacement indexes
+retained 43.00 MiB together.
+
+The Apple Silicon ZIP for source manifest `008636db5c19` passed
+checksum, ARM64, strict ad hoc signature and CLI startup verification.
+The Mac passed 174 selected application tests, 31 PTY tests, three
+packaged PDF worker tests and both scale fixtures. Windows ARM64 passed
+`cargo check` for the application and tests. Cargo used 17 jobs on
+the Mac and 24 on Windows.
+
+- [Apple Silicon large snapshot measurements](target/verification/20261117-knowledge-cancel-262k-macos-008636db5c19-scale.log)
+- [Apple Silicon cancellation and application tests](target/verification/20261117-knowledge-cancel-262k-macos-008636db5c19-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-knowledge-cancel-262k-macos-008636db5c19-package.log)
+- [Windows ARM64 compilation check](target/verification/20261117-knowledge-cancel-262k-windows-check.log)
+
+## Dense local snapshot scale
+
+The opt-in scale fixture accepts 524,288 or 1,048,576 passages in addition
+to the 262,144-passage tier. It stages deterministic text and dense
+1,536-dimensional synthetic vectors. It checks exact ranking, unchanged
+source reuse, atomic publication and reopening of the replacement.
+
+Fedora ARM64 passed 77 regular knowledge tests and the 524,288-passage
+scale run with Cargo using 26 jobs. The snapshot occupied 5,341,337,809
+bytes. The reopened index reported 42,993,184 bytes of retained index
+data. The test process peaked at 229,972 KiB of resident memory. In the
+development profile, staging took 126.71 seconds, initial publication
+55.08 seconds, reopening 40.44 seconds, exact ranking 12.27 seconds,
+refresh 231.85 seconds and replacement publication 61.88 seconds.
+The fixture reused every vector. Acceptance with embeddings from a
+configured provider and a real corpus remains open.
+
+Apple Silicon passed 77 regular knowledge tests and the 1,048,576-passage
+tier with Cargo using 28 jobs. The snapshot occupied 10,683,029,713 bytes.
+The reopened index reported 85,984,800 bytes of retained index data, and
+the test process peaked at 298,991,616 bytes of resident memory. In the
+development profile, staging took 239.18 seconds, initial publication
+91.70 seconds, reopening 75.26 seconds, exact ranking 21.98 seconds,
+refresh 437.52 seconds and replacement publication 90.71 seconds.
+The development build and measurement overlapped other verification work.
+The native release ZIP reproduced the previous SHA-256 and passed
+ARM64, strict ad hoc signature and CLI startup verification.
+
+Windows ARM64 passed 77 regular tests on the baseline. The 524,288-passage
+run exposed an access denial when replacing the index with the previous
+file-backed reader still open. Snapshot publication now uses the existing
+Windows replacement path for shared readers. The regression keeps the old
+handle open through publication and checks that its stamp cannot authorize
+the replacement. That regression and all 77 regular knowledge tests passed
+natively on Windows ARM64 with the replacement change.
+The corrected 524,288-passage run also passed on Windows ARM64 with 24
+Cargo jobs. It reopened and queried a 5,341,337,809-byte snapshot, reused
+every vector and reopened the published replacement. In the development
+profile, exact ranking took 18.44 seconds, refresh 283.60 seconds and
+replacement publication 96.15 seconds.
+Publication preserves staged vector bytes after normalization validation.
+The regression builds the replacement from staged text and reused vectors
+and compares the exact bytes with the original snapshot. A file-backed
+reader must stage its data before it can be published.
+
+Refresh copies the stored little-endian bytes of reusable vectors straight
+to the stage. It checks cancellation and the held snapshot stamp through the
+same reader as exact ranking. Publication still validates normalization.
+On Fedora ARM64, the repeat at 524,288 passages preserved the snapshot size,
+exact result and complete vector reuse. The refresh phase measured 219.04
+seconds after 231.85 seconds in the baseline. The full runs took 697.05 and
+694.72 seconds respectively. These individual development-profile runs
+included other verification activity.
+Apple Silicon passed all 77 regular knowledge tests after both changes.
+The new release ZIP passed checksum, ARM64, strict ad hoc signatures and
+CLI startup verification.
+The staged-byte publication change passed the 77-test Apple Silicon suite,
+including the byte-equivalence regression. Its source snapshot built and
+passed the same release ZIP checks.
+
+Fedora ARM64 passed the 77 regular tests and repeated the
+524,288-passage scale test with staged-byte publication and 26 Cargo jobs.
+The 5,341,337,809-byte snapshot preserved exact ranking and complete vector
+reuse. The test process peaked at 226,040 KiB of resident memory.
+Replacement publication took 66.12 seconds and the complete measured run
+took 710.95 seconds. The measurements so far do not establish a publication
+speed improvement.
+
+Windows ARM64 passed the focused byte-equivalence regression and all 77
+regular knowledge tests after the staged-byte publication change. Cargo
+selected 24 of 26 logical CPUs from 27,822 MiB of available RAM with a
+3,072 MiB reserve.
+
+- [Fedora ARM64 dense snapshot measurements](target/verification/20261117-native-knowledge-524k-fedora-lld-5e63568c1146-scale.log)
+- [Fedora ARM64 vector reuse repeat](target/verification/20261117-native-knowledge-vector-reuse-fedora-lld-55e5e27b5e53-scale.log)
+- [Apple Silicon dense snapshot measurements](target/verification/20261117-native-knowledge-1m-macos-5e63568c1146-scale.log)
+- [Windows ARM64 baseline](target/verification/20261117-native-knowledge-524k-windows.log)
+- [Windows ARM64 open-reader replacement and knowledge tests](target/verification/20261117-native-knowledge-524k-shared-publish-windows.log)
+- [Apple Silicon updated snapshot tests](target/verification/20261117-native-knowledge-shared-publish-macos-f815f3cc2748-tests.log)
+- [Apple Silicon staged-byte publication tests](target/verification/20261117-native-knowledge-encoded-publish-macos-947016479886-tests.log)
+- [Fedora ARM64 staged-byte publication measurements](target/verification/20261117-native-knowledge-encoded-publish-fedora-lld-947016479886-scale.log)
+- [Windows ARM64 staged-byte publication tests](target/verification/20261117-native-knowledge-encoded-publish-windows.log)
+
+## Java custom OpenAI-compatible chat routes
+
+Java profile restore and the native OpenAI-compatible transports accept
+custom chat gateway paths on loopback and HTTPS. The exact destination
+retains the written path case and a trailing slash. Known Responses,
+embeddings, model inventory, native LM Studio, MiniMax and Anthropic Messages
+routes keep their protocol-specific validation. Custom routes use
+Manual or Server default model selection. Imported profiles remain
+subject to destination review and local credential enrollment.
+
+The regression restores custom loopback and HTTPS profiles from Java
+settings. The local wire fixture checks that buffered and streamed
+chat use the custom request path, skip model inventory and omit the
+model field in Server default mode. Configured HTTPS gateways remain
+an acceptance case.
+
+The native Apple Silicon ZIP for source manifest `5ce1fdf41bde`
+passed checksum, ARM64, strict ad hoc signature and CLI startup
+verification. The serial native run passed 307 selected profile and
+local AI tests. The PTY suite passed 31 tests and the packaged PDF
+worker passed three tests. A parallel run encountered a lock conflict
+in an MLX registry test that passed in the serial run. Windows ARM64
+passed `cargo check` for the application and tests. Cargo used 21 jobs
+on the Mac and 24 on Windows.
+
+- [Apple Silicon profile and local AI tests](target/verification/20261117-java-custom-chat-route-serial-macos-5ce1fdf41bde-tests.log)
+- [Apple Silicon loopback wire test](target/verification/20261117-java-custom-chat-route-serial-macos-5ce1fdf41bde-scale.log)
+- [Apple Silicon package verification](target/verification/20261117-java-custom-chat-route-serial-macos-5ce1fdf41bde-package.log)
+- [Windows ARM64 compilation check](target/verification/20261117-java-custom-chat-route-windows-check.log)
+
+## Releasing managed MLX model locks
+
+The managed MLX registry and model leases use the shared private-file
+lock guard. The owner releases the advisory lock when the guard drops.
+A Unix regression holds a duplicate of the lease descriptor across
+the release and verifies that the registry can then update and remove
+the model. Removal still refuses an active model lease.
+
+On Apple Silicon, an operating-system probe confirmed that closing
+one descriptor leaves the advisory lock held while a duplicate is
+open, and that explicit release permits a competing exclusive lock.
+The strengthened MLX regression passed both in isolation and in
+the parallel run of 307 selected profile and local AI tests.
+The Mac also passed 31 PTY tests and three packaged PDF worker tests.
+Windows ARM64 passed `cargo check` for the application and tests.
+The native ZIP for source manifest `6662dc6cb3e1` passed checksum,
+ARM64, strict ad hoc signature and CLI startup checks. Cargo used
+19 jobs on the Mac and 24 on Windows.
+
+- [Apple Silicon parallel profile and local AI tests](target/verification/20261117-mlx-model-lease-macos-6662dc6cb3e1-tests.log)
+- [Apple Silicon MLX lease regression](target/verification/20261117-mlx-model-lease-macos-6662dc6cb3e1-scale.log)
+- [Apple Silicon package verification](target/verification/20261117-mlx-model-lease-macos-6662dc6cb3e1-package.log)
+- [Windows ARM64 compilation check](target/verification/20261117-mlx-model-lease-windows-check.log)
+
+## Native managed Qwen3 and GPT-OSS reasoning
+
+The opt-in Apple Silicon test uses the pinned
+[Qwen3-0.6B-4bit model revision](https://huggingface.co/mlx-community/Qwen3-0.6B-4bit/tree/73e3e38d981303bc594367cd910ea6eb48349da8).
+KorTTY downloads and verifies the runtime from its signed release catalog
+and reviews and imports the model into a private profile. The test sends
+separate chat requests with reasoning set to `None` and `On`. It checks
+answer and reasoning streams and verifies that the first launch moves
+the runtime to ready. It stops the sidecar and removes the imported model.
+
+```sh
+KORTTY_SMOKE_MLX_MODEL=/absolute/path/to/model cargo test --locked -p kortty --bin kortty -- native_signed_mlx_qwen_reasoning_round_trip --ignored --nocapture
+```
+
+The Apple Silicon run installed `mlx-0.31.3-kortty2-macos-aarch64`
+from the signed catalog. Both requests returned an answer. The
+Reasoning stream carried zero bytes for `None` and 619 bytes for
+`On`. The run also passed 307 profile and local AI tests, 31 PTY
+tests and three packaged PDF worker tests. Cargo used 18 jobs
+on the Mac. The native ARM64 ZIP for source manifest `57a21f5af288`
+passed checksum, strict ad hoc signature and CLI startup checks.
+
+- [Apple Silicon signed runtime and Qwen3 test](target/verification/20261117-native-mlx-qwen-macos-57a21f5af288-scale.log)
+- [Apple Silicon component tests](target/verification/20261117-native-mlx-qwen-macos-57a21f5af288-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-native-mlx-qwen-macos-57a21f5af288-package.log)
+
+The companion GPT-OSS test uses the pinned
+[GPT-OSS-20B MXFP4 model revision](https://huggingface.co/mlx-community/gpt-oss-20b-MXFP4-Q4/tree/f356f2747216d7e98fee755df25987459fc19089).
+It requests Low, Medium and High in a private profile. The native
+Qwen3 and GPT-OSS tests also check that a setting from the other
+model family is rejected before streaming any response.
+
+```sh
+KORTTY_SMOKE_MLX_GPT_OSS_MODEL=/absolute/path/to/model cargo test --locked -p kortty --bin kortty -- native_signed_mlx_gpt_oss_reasoning_round_trip --ignored --nocapture
+```
+
+With the same signed runtime, Qwen3 rejected the stale Low setting
+before streaming. GPT-OSS-20B loaded the reviewed model, generated an
+answer with Low and emitted no separate reasoning delta. The test
+stopped at that assertion, leaving Medium and High unverified.
+[Apple Silicon Qwen3 and GPT-OSS test log](target/verification/20261117-native-mlx-reasoning-macos-eed0448e920f-scale.log)
+
+The upstream mlx-lm 0.31.3 tokenizer infers thinking markers from the
+tokenizer vocabulary. Its supported markers omit the GPT-OSS Harmony
+analysis channel. The native diagnostic confirmed that the signed
+runtime sends both the Harmony analysis and final frames in the
+ordinary answer field. Before the decoder change, kortty returned that
+field verbatim.
+[Apple Silicon GPT-OSS Harmony wire diagnostic](target/verification/20261117-native-mlx-harmony-diagnostic-macos-b3bf4ed377aa-scale.log)
+[mlx-lm 0.31.3 tokenizer](https://github.com/ml-explore/mlx-lm/blob/v0.31.3/mlx_lm/tokenizer_utils.py#L237)
+[Harmony response format](https://cookbook.openai.com/articles/openai-harmony)
+
+The reviewed managed GPT-OSS route decodes Harmony before passing
+analysis and final text to the chat stream or returning a buffered
+answer. It accepts ordinary content from a server that already decoded
+the frames. Tests split every marker across separate stream events and
+exercise Unicode, plain responses, incomplete frames and tool-call
+rejection. Buffered model output requires a final frame when it uses
+Harmony framing.
+
+The follow-up Apple Silicon run used the signed
+`mlx-0.31.3-kortty2-macos-aarch64` runtime. GPT-OSS returned the
+expected final answer at Low, Medium and High, with distinct
+reasoning streams. The default buffered completion returned the same
+final answer. GPT-OSS rejected the stale On setting and Qwen3 passed
+On, None and stale Low rejection. Another 309 profile and local AI
+tests, 31 PTY tests and three packaged PDF worker tests passed.
+Cargo used 28 jobs on the Mac. The ad hoc ARM64 ZIP for source
+manifest `55e92e986b87` passed checksum, strict signature and CLI
+startup checks.
+
+- [Apple Silicon model inference](target/verification/20261117-native-mlx-harmony-macos-55e92e986b87-scale.log)
+- [Apple Silicon component tests](target/verification/20261117-native-mlx-harmony-macos-55e92e986b87-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-native-mlx-harmony-macos-55e92e986b87-package.log)
+- [Windows ARM64 Harmony regression tests](target/verification/20261117-managed-gpt-oss-windows-tests.log)
+
+### Signed MLX runtime lifecycle on Apple Silicon
+
+The native lifecycle regression uses the same pinned Qwen3 model
+revision. It cancels a live request after a text delta, checks that
+the active lease prevents removal, and waits for the configured
+one-minute idle stop after dropping the client. A new request then
+starts the sidecar. The test removes the runtime while preserving the
+model registration, reinstalls the same signed release from the
+catalog and runs another request against the preserved model.
+
+```sh
+KORTTY_SMOKE_MLX_MODEL=/absolute/path/to/model cargo test --locked -p kortty --bin kortty -- native_signed_mlx_lifecycle_round_trip --ignored --nocapture
+```
+
+On physical Apple Silicon, the signed `mlx-0.31.3-kortty2-macos-aarch64`
+package passed cancellation and removal protection with an active client.
+The sidecar stopped after 60 seconds and restarted on demand. The same
+signed runtime was removed and reinstalled, then successfully answered a
+request using the preserved Qwen3 registration. The run also passed
+309 profile and local AI tests, 31 PTY tests and three packaged PDF
+worker tests. Cargo used 28 jobs. The ARM64 bundle for source manifest
+`b3c68a9d61fa` passed checksum, strict ad hoc signature and CLI checks.
+
+- [Apple Silicon MLX lifecycle](target/verification/20261117-native-mlx-lifecycle-macos-b3c68a9d61fa-scale.log)
+- [Apple Silicon package verification](target/verification/20261117-native-mlx-lifecycle-macos-b3c68a9d61fa-package.log)
+
+### Signed MLX update and rollback
+
+The update regression uses two published builds of mlx-lm 0.31.3.
+It starts the older signed package with the pinned Qwen3 model and
+clears its pin. In the private test profile, it removes the newer
+package's launcher after installation to exercise validation before
+first launch. It checks recovery of the previous verified runtime,
+reruns inference there and retries the newer signed package.
+
+```sh
+KORTTY_SMOKE_MLX_MODEL=/absolute/path/to/model cargo test --locked -p kortty --bin kortty -- native_signed_mlx_update_and_rollback --ignored --nocapture
+```
+
+The first native run stopped during installation of
+`mlx-0.31.3-kortty1-macos-aarch64`. The signed catalog names a TAR.ZST
+for that build and a ZIP for `kortty2`. The installer tried to read the
+TAR.ZST as ZIP. A separate download matched the catalog's size and
+SHA-256 for `kortty1`. The archive contains regular files, directory
+entries and nine symbolic aliases, all of which point directly to
+regular files in the same directory. The interpreter entrypoint
+`python/bin/python3` is one of those aliases. Inspection found no PAX
+or GNU extension entries. The next installer change must apply the
+existing signed-size and digest checks, bound expansion and validate
+the complete payload. The installer now handles the TAR.ZST and
+materializes its same-directory aliases as private regular files
+whose bytes match their signed targets on installation and subsequent
+verification.
+
+- [Apple Silicon update test failure](target/verification/20261117-native-mlx-rollback-macos-24f4513ef56f-scale.log)
+- [Published MLX runtime catalog](https://github.com/chardonnay/kortty-llama-runtimes/releases/tag/mlx-stable)
+
+After adding the TAR.ZST reader, the older release ran Qwen3 on
+Apple Silicon and the newer release installed. The first fault
+fixture used an unsupported model architecture, which reached the
+request deadline. The damaged-package fixture exercises the
+installation recovery path directly.
+[Apple Silicon TAR.ZST and unsupported-model run](target/verification/20261117-native-mlx-tar-rollback-macos-0c225937eeac-scale.log)
+
+The native repeat passed. It installed and pinned the signed
+`kortty1` TAR.ZST, completed inference and cleared the pin. After
+rejecting the damaged pending `kortty2` ZIP installation, kortty
+restored `kortty1` and completed inference. A second `kortty2`
+installation then started and completed inference. The same Mac run
+passed 311 profile and local AI tests, 31 PTY tests and three packaged
+PDF worker tests. The Windows ARM64 application and tests compiled.
+The Mac used 28 Cargo jobs and verified the ad hoc ARM64 ZIP for
+source manifest `e176c86ab184`.
+
+- [Apple Silicon signed update and rollback](target/verification/20261117-native-mlx-tar-rollback-macos-e176c86ab184-scale.log)
+- [Apple Silicon component tests](target/verification/20261117-native-mlx-tar-rollback-macos-e176c86ab184-tests.log)
+- [Apple Silicon package verification](target/verification/20261117-native-mlx-tar-rollback-macos-e176c86ab184-package.log)
+- [Windows ARM64 compilation check](target/verification/20261117-managed-mlx-tar-windows-check.log)
+
+The process-exit variant launches the verified newer package in the
+private profile and reaps its interpreter before the readiness probe.
+It verifies the reported process exit and recovery, runs inference
+again using the restored package and then retries the update.
+
+```sh
+KORTTY_SMOKE_MLX_MODEL=/absolute/path/to/qwen cargo test --locked -p kortty --bin kortty -- native_signed_mlx_process_exit_and_rollback --ignored --nocapture
+```
+
+On Apple Silicon, the verified `kortty2` interpreter started and was
+reaped before readiness. The startup error reported the process exit
+and restoration of the previous verified `kortty1` runtime. Qwen3
+answered after rollback and again after retrying the `kortty2` update.
+The Mac passed 311 profile and local AI tests, 31 PTY tests and three
+packaged PDF worker tests. Windows ARM64 compiled the application and
+tests. The ad hoc ARM64 ZIP for source manifest `b214c6fe4fda`
+passed checksum, strict signature and CLI startup checks.
+
+- [Apple Silicon process-exit rollback](target/verification/20261117-native-mlx-process-rollback-macos-b214c6fe4fda-scale.log)
+- [Apple Silicon package verification](target/verification/20261117-native-mlx-process-rollback-macos-b214c6fe4fda-package.log)
+- [Windows ARM64 compilation check](target/verification/20261117-managed-mlx-process-windows-check.log)
+
+### Java MLX reasoning adoption
+
+The Apple Silicon regressions import Java v2.26 profile XML through the
+portable settings path, check the reviewed model registration through
+the profile editor and explicitly select the compatible Java reasoning
+setting. They save and reload the native settings before running a
+terminal chat request through the signed runtime. The imported profile
+stays inactive before model review and retains its Java provenance after
+the setting is adopted.
+
+```sh
+KORTTY_SMOKE_MLX_MODEL=/absolute/path/to/qwen cargo test --locked -p kortty --bin kortty -- native_java_qwen_reasoning_adoption --ignored --nocapture
+KORTTY_SMOKE_MLX_GPT_OSS_MODEL=/absolute/path/to/gpt-oss cargo test --locked -p kortty --bin kortty -- native_java_gpt_oss_reasoning_adoption --ignored --nocapture
+```
+
+Both cases passed on physical Apple Silicon with the signed
+`mlx-0.31.3-kortty2-macos-aarch64` runtime. Qwen3 used the saved
+`None` setting and returned the answer with zero reasoning bytes.
+GPT-OSS used the saved `High` setting and returned the same answer
+with 323 bytes of reasoning. The Mac passed 311 profile and local AI
+tests, 31 PTY tests and three packaged PDF worker tests. Cargo used
+28 jobs. The ad hoc ARM64 ZIP for source manifest `64c8cc245af1`
+passed checksum, strict signature and CLI startup checks.
+
+- [Apple Silicon Java setting adoption](target/verification/20261117-native-mlx-java-adoption-macos-64c8cc245af1-scale.log)
+- [Apple Silicon package verification](target/verification/20261117-native-mlx-java-adoption-macos-64c8cc245af1-package.log)
+
+### Native GGUF vision and external file identity
+
+The native-runtime regression uses the Q8 model and projector from a pinned
+[SmolVLM-256M release](https://huggingface.co/ggml-org/SmolVLM-256M-Instruct-GGUF/tree/b9e4379657e1450d04d02eec8e345667265b0a00).
+It installs a signed Metal runtime on macOS or a signed CPU runtime on
+Windows and Linux, imports a private model and projector pair and asks
+for the colors of two generated images. A separate chat
+loads the model through its external file registration. Replacing the
+file with a byte-identical copy exercises identity revalidation. The
+test then removes the stale registration and runs inference after
+registering the replacement. Windows also checks that the active read
+lease prevents the replacement until the managed process releases it.
+
+```sh
+KORTTY_SMOKE_VISION_GGUF=/absolute/path/to/model.gguf \
+KORTTY_SMOKE_VISION_PROJECTOR=/absolute/path/to/mmproj.gguf \
+  cargo test --locked -p kortty --bin kortty -- native_gguf_vision_and_external_reference --ignored --nocapture
+```
+
+The Apple Silicon run used the release-signed
+`llama-b11727-kortty2-macos-aarch64-metal` server. SmolVLM identified
+the red and blue images. Text inference succeeded from the external
+file, failed after a same-size replacement and succeeded again after
+re-registration. Removing the old registration preserved the source.
+The Mac also passed 311 profile and local AI tests, 31 PTY tests and
+three packaged PDF worker tests. Cargo used 28 jobs. The ad hoc ARM64
+bundle for source manifest `624d55d0dfba` passed checksum, strict
+signature and CLI startup checks.
+
+- [Apple Silicon GGUF inference](target/verification/20261117-native-gguf-vision-macos-624d55d0dfba-scale.log)
+- [Apple Silicon package verification](target/verification/20261117-native-gguf-vision-macos-624d55d0dfba-package.log)
+
+The repeat passed under Windows x64 emulation on the ARM64 host with
+`llama-b11727-kortty2-windows-x86_64-cpu`. The two colors matched and
+the runtime lease blocked the rename. After the lease was released,
+the stale registration rejected the same-size replacement and inference
+worked after re-registration. A native Windows x64 run still needs an
+x64 test host. Native Windows ARM64 testing needs a signed ARM64 runtime.
+The stable catalog currently supplies Windows x64 packages.
+
+- [Windows x64 emulated GGUF inference](target/verification/20261117-native-gguf-vision-windows-x64-emulated.log)
+- [Signed runtime catalog](https://github.com/chardonnay/kortty-llama-runtimes/releases/latest/download/runtime-index-v1.json)
+
+Apple Silicon passed the shared version of the test as well. It used
+28 Cargo jobs and verified the ad hoc ARM64 ZIP for source manifest
+`02a4e2fc0d18`.
+
+- [Apple Silicon GGUF repeat](target/verification/20261117-native-gguf-vision-macos-02a4e2fc0d18-scale.log)
+- [Apple Silicon package verification](target/verification/20261117-native-gguf-vision-macos-02a4e2fc0d18-package.log)
+
+The split-file regression uses the same SmolVLM weights split by
+[`llama-gguf-split` from b11727](https://github.com/ggml-org/llama.cpp/releases/tag/b11727).
+It registers the last shard and checks that the registry uses the first
+sibling as the launch path. It then replaces the last shard with a
+byte-identical file and checks that recovery requires re-registration
+and that every source shard survives removal of the old registration.
+
+```sh
+llama-gguf-split --split-max-tensors 128 /absolute/path/to/model.gguf /private/path/split-model
+KORTTY_SMOKE_SPLIT_GGUF=/private/path/split-model-00001-of-00003.gguf \
+  cargo test --locked -p kortty --bin kortty -- native_split_gguf_external_reference --ignored --nocapture
+```
+
+On Apple Silicon, the splitter emitted three shards containing 273
+tensors. The signed Metal runtime answered before and after
+re-registration. The changed final shard was rejected during the
+original registration. The vision and single-file regression also
+passed in the same run, along with 311 profile and local AI tests,
+31 PTY tests and three bundled PDF worker tests. The ad hoc ARM64 ZIP
+for source manifest `f5a364b0f7a4` passed checksum, strict signature
+and CLI startup checks.
+
+- [Apple Silicon split-file and vision tests](target/verification/20261117-native-gguf-split-macos-f5a364b0f7a4-scale.log)
+- [Apple Silicon package verification](target/verification/20261117-native-gguf-split-macos-f5a364b0f7a4-package.log)
+
+The three-shard test passed under Windows x64 emulation on ARM64
+with the signed CPU runtime. The managed read lease prevented the
+rename. After release, the stale registration rejected the replacement
+and re-registration enabled inference again.
+
+- [Windows x64 emulated split-file inference](target/verification/20261117-native-gguf-split-windows-x64-emulated.log)
+
+The native Fedora ARM64 run passed both GGUF tests with the signed
+`llama-b11727-kortty2-linux-aarch64-cpu` runtime. The model identified
+both colors. Inference rejected a byte-identical replacement of the
+external single file and of the last shard in the split set, and
+resumed after re-registration. Fedora also passed 316 profile and
+local AI tests. The GNU linker failed with `R_AARCH64_CALL26`
+relocation overflows. The passing build used 26 Cargo jobs and LLVM
+LLD 22.1.8 from Fedora-signed RPMs extracted into the private test
+directory.
+
+- [Fedora ARM64 GGUF inference](target/verification/20261117-native-gguf-split-fedora-lld-4723d322ebc4-scale.log)
+- [Fedora ARM64 component tests](target/verification/20261117-native-gguf-split-fedora-lld-4723d322ebc4-tests.log)
+- [Fedora ARM64 LLD and Cargo budget](target/verification/20261117-native-gguf-split-fedora-lld-4723d322ebc4-jobs.log)
 
 ## Java knowledge and archive drafts, protected ZIP and Pacman packaging
 
@@ -692,11 +3287,23 @@ workspace version. It validates the desktop, CLI and nested SSH worker
 architectures and signatures, stages the bundle with its existing ticket,
 then creates a read-only image with licenses and an Applications link.
 The command checks the generated image and publishes a SHA-256 file alongside
-it. U4 and V7 track native image mounting, separate disk image signing and
-notarization, and Gatekeeper and app launch after installation.
+it. The native Apple Silicon packager passed 16 tests. It generated and
+mounted read-only images from the current ad hoc app and the previously
+notarized Developer ID app. Both images contained the Applications link and
+licenses. Copying from the images preserved all three ARM64 executables
+byte-for-byte, and strict Codesign and CLI startup passed.
 
-Nine packager tests and strict packager Clippy passed on Windows ARM64.
-Cross-target checks for the application and packager passed for Apple Silicon.
+The copied current app started a local Seatbelt session and denied access
+to the private profile fixture. The copied historical app preserved its
+ticket byte-for-byte and passed Stapler and Gatekeeper with quarantine set.
+The current test image SHA-256 is
+`8830826f5af7c196ce482fd28340d339c6a5c51e8b3b03ee610767b3dd80da63`.
+Developer ID signing, notarization and Gatekeeper assessment of the release
+image remain open in U4 and V7.
+
+[Native DMG copy and signatures](target/verification/20261116-native-dmg-current.log),
+[Historical app ticket and Gatekeeper](target/verification/20261116-native-dmg-notarized.log),
+[Copied app and Seatbelt session](target/verification/20261116-native-dmg-desktop.log).
 
 ## Server-selected chat model and Java scoped restore
 
@@ -704,7 +3311,264 @@ Java HTTP DEFAULT becomes an inactive Server default profile for canonical
 supported loopback chat and OpenAI-compatible HTTPS routes. A retrieved model
 name can describe usage after sending. The actual request omits `model` and
 performs no model inventory lookup. Terminal Chat and native MCP search
-reviews state who chooses the model. Workflows that require a verified model
+reviews state who chooses the model. Standalone terminal Agent Ask and Run
+accept an explicitly selected loopback profile and show the destination and
+server selection in the request review. OpenAI-compatible HTTPS profiles in
+Server default mode also support standalone Ask and Run after the saved
+endpoint trust and the separate Agent opt-in. The HTTPS request review retains
+credential and vault masking, and revocation blocks the reviewed request
+before dispatch.
+Switching between server-selected and named models clears the Agent opt-in.
+AI Manager can adopt a reviewed Java global DEFAULT assignment as the
+Terminal Chat default. The saved preference opens Chat with that profile
+selected for review. Connection-specific selections, explicit text workload
+assignments and managed defaults take priority.
+The imported Java Text role can also be reviewed and adopted for Terminal
+Chat, manual questions and journal note translation. The manual question
+review identifies the server as the model selector. HTTPS note translations
+retain the separate request review.
+AI Manager can adopt a reviewed Java Agent role assignment for standalone
+terminal Ask and Run. Local Preferences offers eligible loopback and HTTPS
+server-selected profiles for the same role. A saved Agent role assignment
+selects that profile ahead of the Coding fallback. An eligible saved
+connection profile takes priority. HTTPS requires the saved Agent opt-in.
+When no Agent assignment takes precedence, the foreground workflow can
+take a server-selected Coding assignment through the same opt-in and
+request review.
+The Apple Silicon terminal Agent suite passed 148 tests. Its loopback
+fixture verified the Coding fallback, precedence of a named Agent role,
+and the reviewed request without a model field. Windows ARM64 passed
+[test compilation for that change](target/verification/20261117-native-agent-coding-fallback-windows.log).
+The ARM64 build from source manifest `67b9870c35e3` passed checksum, strict
+ad hoc app and SSH worker signature, CLI startup, Seatbelt, and packaged
+backup startup checks.
+[Apple Silicon terminal Agent tests](target/verification/20261117-native-agent-coding-fallback-macos-67b9870c35e3-tests.log).
+[Apple Silicon package checks](target/verification/20261117-native-agent-coding-fallback-macos-67b9870c35e3-package.log).
+The request review remains in the send path, and planning, Swarm and
+private sessions use their existing eligible profile routes.
+Apple Silicon passed the Java Agent adoption and persistence, standalone
+loopback Ask, and HTTPS opt-in and revocation regressions. Windows ARM64
+passed test compilation. On the source manifest `368e0d68bdd9`, the native
+Apple Silicon workspace suite passed 4,331 tests with 198 skipped. The
+ARM64 release ZIP passed checksum, strict ad hoc app and SSH worker
+signature, CLI startup, Seatbelt and packaged backup startup checks.
+
+- [Apple Silicon Agent role workspace suite](target/verification/20261117-native-agent-role-macos-368e0d68bdd9-tests.log)
+- [Apple Silicon Agent role package checks](target/verification/20261117-native-agent-role-macos-368e0d68bdd9-package.log)
+- [Windows ARM64 Agent role compilation](target/verification/20261117-native-agent-role-windows.log)
+
+AI Manager can adopt reviewed Java Coding and Security assignments for
+interactive snippet and file assistance. The request review identifies the
+server as the model selector and binds the exact destination and transport.
+The completion request omits the model field. HTTPS uses the existing
+masked-payload review and revalidates saved settings at dispatch.
+The Apple Silicon regressions passed Java role adoption and persistence and
+verified a masked loopback request with no model field. Windows ARM64 passed
+[test compilation](target/verification/20261117-native-snippet-server-default-windows.log).
+Apple Silicon source manifest `e0e1f8bb964e` passed the complete workspace
+suite with 4,331 passed and 198 skipped. The ARM64 release ZIP passed the
+checksum, strict ad hoc app and SSH worker signature, CLI startup,
+Seatbelt, and packaged backup startup checks.
+
+- [Apple Silicon snippet assistance workspace suite](target/verification/20261117-native-snippet-server-default-macos-e0e1f8bb964e-tests.log)
+- [Apple Silicon snippet assistance package check](target/verification/20261117-native-snippet-server-default-macos-e0e1f8bb964e-package.log)
+
+Full code analysis uses the reviewed Coding assignment for single snippets
+and folders. Server-selected requests omit the model field. The saved
+report records server selection and keeps the profile reference and source
+identity. A fresh verification review can use the profile again.
+The HTTPS analysis dispatch rechecks the saved
+configuration, masking policy and vault revision after review.
+
+An HTTPS analysis can offer a separate modularization review after its
+report is saved. The plan, module generation and repair requests can use
+a server-selected profile. The saved split revision binds the endpoint
+and model-selection mode. Each outbound request is masked and requires
+its own approval.
+
+A saved loopback server-selected profile can also plan the split and
+generate or repair local modules. The combined analysis review can
+approve a plan that starts only after the report is saved. Local split
+jobs keep the reviewed profile revision, and the worker verifies it
+before each dispatch and before persisting its result. Older named-model
+jobs retain their existing generation and publication paths.
+The Apple Silicon build from manifest `0ae03a43e1f4` passed 276 snippet
+tests. The loopback fixtures verified the reviewed automatic plan after
+report publication, rejection after a profile-mode change, and generation
+and publication using the original saved profile. The ARM64 ZIP passed
+checksum, strict ad hoc app and SSH worker signatures, CLI startup,
+Seatbelt and packaged backup startup. Windows ARM64 passed test compilation.
+
+- [Apple Silicon local split tests](target/verification/20261117-native-local-split-default-macos-0ae03a43e1f4-tests.log)
+- [Apple Silicon local split package checks](target/verification/20261117-native-local-split-default-macos-0ae03a43e1f4-package.log)
+- [Windows ARM64 local split compilation](target/verification/20261117-native-local-split-default-retry-windows.log)
+
+Reviewed apply requests for a single snippet or a folder can use the
+report's saved loopback server-selected profile. Single-snippet recovery
+stores the profile revision and requires it to match before resuming.
+Dispatch and checkpoint writes recheck that revision. Folder apply checks
+the same authority for each file and before offering the combined result.
+Individual snippets can apply findings through a saved trusted HTTPS
+profile, including server-selected profiles. The preview shows the source.
+Protected values in outbound inputs and returned proposals stop the run.
+The worker checks the saved profile, credential, masking rules and vault
+revision before dispatch and checkpoint persistence. Checkpoint recovery
+retains the profile revision. Folder apply shares this authority and checks
+the complete reviewed project context before opening any connection. A
+failed HTTPS stage discards the pending folder proposals. The folder's
+existing file-selection and publication review follows successful generation.
+Validation against a configured HTTPS gateway remains open.
+The Apple Silicon suite from manifest `1a2ffe6dcdd7` passed 277 snippet
+tests. The HTTPS fixture detected a JSON-escaped vault value and confirmed
+that vault revocation stopped the request before opening a connection or
+saving a checkpoint. The ARM64 ZIP passed checksum, strict ad hoc
+signatures, CLI startup, Seatbelt and packaged backup startup. Windows
+ARM64 passed test compilation before the final test-vault password
+correction.
+
+- [Apple Silicon HTTPS apply snippet tests](target/verification/20261117-native-https-apply-macos-1a2ffe6dcdd7-tests.log)
+- [Apple Silicon HTTPS apply package](target/verification/20261117-native-https-apply-macos-1a2ffe6dcdd7-package.log)
+- [Windows ARM64 HTTPS apply compilation](target/verification/20261117-native-https-apply-retry-windows.log)
+
+Apple Silicon manifest `bb15030ff44d` passed 278 snippet tests. The folder
+fixture rejected a protected value in a context file that was outside the
+selected findings, allowed CRLF source through the review, and confirmed
+that revocation stopped the request before a connection. The ARM64 package
+passed checksum, strict ad hoc signatures, CLI startup, Seatbelt and
+packaged backup startup. Windows ARM64 compiled with 23 of 26 Cargo jobs.
+
+- [Apple Silicon HTTPS folder apply tests](target/verification/20261117-native-https-folder-apply-macos-bb15030ff44d-tests.log)
+- [Apple Silicon HTTPS folder apply package](target/verification/20261117-native-https-folder-apply-macos-bb15030ff44d-package.log)
+- [Windows ARM64 HTTPS folder apply compilation](target/verification/20261117-native-https-folder-apply-retry-windows.log)
+
+The private HTTPS fixture uses an ephemeral CA and a loopback TLS server.
+It compares the wire path, synthetic authorization header and exact
+previewed prompts, and requires omission of the model field. The test
+also verifies that the original files remain untouched until the selected
+replacement is accepted and that the saved source retains CRLF.
+Apple Silicon passed the fixture with TLS 1.2 and 28 of 28 Cargo jobs.
+Fedora ARM64 passed with TLS 1.3 and 26 of 26 Cargo jobs. Windows ARM64
+compiled the test code with 23 of 26 jobs. The fixture uses a test-only CA
+override restricted to loopback and leaves platform certificate trust
+untouched. Apple Silicon also passed 278 regular snippet tests and the
+ARM64 ZIP checks, including checksum, strict ad hoc signatures, CLI
+startup, Seatbelt and packaged backup startup.
+
+- [Apple Silicon HTTPS acceptance](target/verification/20261117-native-folder-tls-macos-f3012126f63c-tests.log)
+- [Fedora ARM64 HTTPS acceptance](target/verification/20261117-native-folder-tls-fedora-lld-f3012126f63c-scale.log)
+- [Windows ARM64 HTTPS compilation](target/verification/20261117-native-folder-tls-windows.log)
+
+Run it from the repository root on macOS or Linux:
+
+```sh
+bash scripts/with-scratch.sh python3 scripts/https-apply-fixture.py \
+  cargo test --locked -p kortty --bin kortty -- \
+  https_folder_apply_transmits_reviewed_source_and_publishes_only_the_accepted_file --ignored
+```
+
+Pass `--analysis-split` to the same fixture script and use the
+`https_analysis_and_split_transmit_separately_reviewed_requests` test
+filter to check the analysis and split workflow. It verifies both
+reviewed request bodies, masks fixture secrets, and requires the first
+report to be saved before the split is separately approved.
+Source manifest `f1074e5c7808` passed both fixtures on Apple Silicon
+with TLS 1.2 and Fedora ARM64 with TLS 1.3. The build budgets selected
+28 of 28 and 26 of 26 Cargo jobs respectively. Windows ARM64 compiled
+the test code with 23 of 26 jobs. Apple Silicon passed the 278 regular
+snippet tests and reproduced the prior ARM64 ZIP checksum. The package
+passed strict ad hoc signatures, CLI startup, Seatbelt and packaged
+backup startup.
+
+- [Apple Silicon HTTPS analysis and split acceptance](target/verification/20261117-native-analysis-split-tls-macos-f1074e5c7808-tests.log)
+- [Fedora ARM64 HTTPS analysis and split acceptance](target/verification/20261117-native-analysis-split-tls-fedora-lld-f1074e5c7808-scale.log)
+- [Windows ARM64 HTTPS analysis and split compilation](target/verification/20261117-native-analysis-split-tls-windows.log)
+Apple Silicon manifest `685d57f3ce51` passed 276 snippet tests. Loopback
+fixtures confirmed that apply omits the model field, offers changes for
+review and writes only the accepted source. The recovery-store fixture
+rejected a replacement profile revision. The ARM64 ZIP passed checksum,
+strict ad hoc signatures, CLI startup, Seatbelt and packaged backup
+startup. Windows ARM64 passed test compilation.
+
+- [Apple Silicon server-selected apply tests](target/verification/20261117-native-apply-default-macos-685d57f3ce51-tests.log)
+- [Apple Silicon server-selected apply package](target/verification/20261117-native-apply-default-macos-685d57f3ce51-package.log)
+- [Windows ARM64 server-selected apply compilation](target/verification/20261117-native-apply-default-windows.log)
+
+Manual and automatic flowcharts from saved analyses can use the saved
+loopback server-selected profile. The source still appears in the request
+review. The worker rechecks the profile before the initial request, before
+any repair and before returning the result. A revoked review stops the
+operation without starting another request.
+Apple Silicon manifest `112ca2ce50da` passed 123 selected analysis tests.
+The separate nine-test diagram suite also passed, including the overlapping
+analysis repair and approval regressions. The automatic loopback fixture
+saved the report, split plan and flowchart in order and verified that every
+request omitted the model field. The ARM64 ZIP passed checksum, strict ad
+hoc signatures, CLI startup, Seatbelt and packaged backup startup.
+Windows ARM64 passed test compilation.
+
+- [Apple Silicon analysis diagram tests](target/verification/20261117-native-diagram-default-macos-112ca2ce50da-tests.log)
+- [Apple Silicon analysis diagram package](target/verification/20261117-native-diagram-default-macos-112ca2ce50da-package.log)
+- [Windows ARM64 analysis diagram compilation](target/verification/20261117-native-diagram-default-windows.log)
+The Apple Silicon suite for manifest `639d62f03c8c` passed 275 snippet
+tests, including separate approval after report storage, a changed model
+selection and vault revocation. The ARM64 ZIP passed checksum, strict
+ad hoc app and SSH worker signatures, CLI startup, Seatbelt, and packaged
+backup startup. Windows ARM64 passed test compilation.
+
+- [Apple Silicon HTTPS split suite](target/verification/20261117-native-analysis-https-split-macos-639d62f03c8c-tests.log)
+- [Apple Silicon HTTPS split package check](target/verification/20261117-native-analysis-https-split-macos-639d62f03c8c-package.log)
+- [Windows ARM64 HTTPS split compilation](target/verification/20261117-native-analysis-https-split-windows.log)
+
+Apple Silicon passed the snippet review, streaming, storage and
+cancellation regression and the folder request and file-identity regression.
+Windows ARM64 passed
+[test compilation](target/verification/20261117-native-full-analysis-default-windows.log).
+A configured HTTPS gateway remains an acceptance case.
+The native Apple Silicon workspace suite from manifest `e75aff4df394`
+passed 4,332 tests with 198 skipped. The ARM64 package passed checksum,
+strict ad hoc app and SSH worker signatures, CLI startup, Seatbelt and
+packaged backup startup.
+
+- [Apple Silicon full analysis workspace tests](target/verification/20261117-native-full-analysis-default-macos-e75aff4df394-tests.log)
+- [Apple Silicon full analysis package check](target/verification/20261117-native-full-analysis-default-macos-e75aff4df394-package.log)
+
+Connection Manager offers server-selected profiles for saved terminal
+connections. The saved assignment takes precedence in Terminal Chat and
+in standalone Agent Ask and Run when the profile is eligible for that
+action. A chat-only HTTPS assignment uses the normal Agent profile for
+Agent actions. Each AI request still goes through its own review.
+Java backup restore preserves connection AI assignments as inactive hints
+for SSH and local shell profiles. Reimport can supplement an unambiguous
+existing match and preserves native assignments and dismissed hints. The native selection can
+be adopted in Connection Manager after AI Manager review and an exact
+profile provenance match. An unresolved hint displays the original Java ID.
+The Apple Silicon restore and connection suite passed 50 selected tests.
+An encrypted Java archive restored SSH and local shell hints with exact
+profile provenance, retained an unresolved ID, and replayed without changes.
+The editor test rejected a candidate with the same ID and a different
+fingerprint. The Windows test compilation passed.
+[Apple Silicon Java connection AI restore](target/verification/20261117-native-java-connection-ai-macos-20c337c4a885-tests.log),
+[Windows test compilation](target/verification/20261117-java-connection-ai-windows-check.log).
+The replay suite also passed on Apple Silicon. It supplemented older
+matching SSH and local shell records, kept an explicit native assignment,
+and preserved a dismissal without creating another local shell profile.
+[Apple Silicon Java connection AI replay](target/verification/20261117-native-java-ai-replay-macos-f17366164cc7-tests.log),
+[Windows test compilation](target/verification/20261117-java-ai-replay-windows-check.log).
+Apple Silicon passed 154 selected tests, including reopening the saved
+local-shell assignment, preselecting it for Chat and eligible Agent actions,
+and using the compatible Agent profile when necessary.
+[Apple Silicon connection AI tests](target/verification/20261117-native-connection-ai-macos-1306df953597-tests.log),
+[Windows test compilation](target/verification/20261117-connection-ai-windows-check.log).
+Apple Silicon passed 172 tests covering role adoption, profile precedence,
+the reviewed manual request with no model field and journal note workflows.
+[Apple Silicon Text role tests](target/verification/20261117-native-text-role-macos-dad082b9cf4b-tests.log),
+[Windows test compilation](target/verification/20261117-server-selected-text-windows-check.log).
+The Apple Silicon suite passed 160 tests, including adoption of the reviewed
+Java default, persistence across reopening, and a preselected Chat request
+that omitted the model after approval. The Windows test compilation passed.
+[Apple Silicon Chat default tests](target/verification/20261117-native-chat-default-macos-df453526ca7c-tests.log),
+[Windows test compilation](target/verification/20261117-server-chat-default-windows-check.log).
+Workflows that require a verified model
 identifier continue to require Manual or resolved Automatic mode. Explicit
 Java reasoning overrides on DEFAULT profiles appear in the restore omission
 report. A server can reject omission, as the native LM Studio API documents.
@@ -716,6 +3580,24 @@ JSON and SSE returned the same text, and SSE finished with `[DONE]`. This was
 a direct HTTP server check. Native desktop review and provider configuration
 remain in the acceptance matrix.
 [Provider verification](target/verification/20261114-server-default-fedora-provider.txt)
+
+The Apple Silicon Agent suite passed 54 tests, including an Ask request to a
+loopback HTTP fixture. The test verified that the fixture received nothing
+before approval, that the approved request omitted `model`, and that the
+Agent accepted the response. The same test checks that Run offers the
+profile as an explicit choice and Planning excludes it.
+[Apple Silicon Agent tests](target/verification/20261117-native-agent-default-macos-99ef21d1d451-tests.log)
+
+Apple Silicon then passed 126 profile and Agent tests, including the saved
+HTTPS Agent opt-in, the exact gateway destination in the request review and
+revocation before dispatch. A separate test using native TLS rejected the
+untrusted private CA. With that CA scoped to the test client, the server
+received the exact mixed-case route with its trailing slash. The
+server-selected request omitted the model and received the SSE response.
+The same source passed the Windows test compilation check.
+[Apple Silicon profiles and Agent](target/verification/20261117-native-agent-https-default-macos-bc98fba1ab27-tests.log),
+[exact HTTPS wire test](target/verification/20261117-native-agent-https-default-macos-bc98fba1ab27-scale.log),
+[Windows test compilation](target/verification/20261117-agent-https-default-windows-check.log).
 
 Java AI Memory documents and dated snapshots rebind canonical Java UUIDs to
 newly added, exactly matched SSH profiles. Case or Java whitespace aliases
@@ -739,14 +3621,69 @@ Strict Windows ARM64 application Clippy, formatting and the Apple Silicon
 application/test cross-check passed.
 [Verification record](target/verification/20261114-server-default-and-scoped-restore.txt)
 
+## Imported Java analysis inspection
+
+The analysis history opens a read-only comparison for any two retained base,
+result, accepted or checkpoint snapshots of the same imported apply run.
+The command resolves the selected record and run again before opening the
+comparison. A preserved Java diagram without a native analysis flowchart
+renders in the history when the native Mermaid parser supports its syntax.
+The original source remains visible when rendering is unavailable.
+
+Apple Silicon and Windows ARM64 passed all seven targeted import and
+comparison tests. Apple Silicon built an ad hoc release ZIP. Windows ARM64
+also passed strict application Clippy. The automated checks cover retained snapshot
+bytes, missing checkpoints, changed blob rejection and native line
+alignment. The desktop restore and inspection workflow remains an acceptance
+test in M1.
+[Apple Silicon test run](target/verification/20261116-java-history-macos-c2df8353568a-tests.log),
+[Windows ARM64 verification](target/verification/20261116-java-history-windows-final.log).
+
 ## Java AI Memory and LM Studio Toolpack migration
 
 The additive Java backup import accepts `memory/MEMORY.md`, valid
 global history names, and archives that contain only global scopes. It
 preserves Markdown bytes and line endings, applies Rust's memory validation,
 and rechecks managed AI Memory policy at startup. Existing destination files
-take precedence. Connection-scoped files and mixed-scope archives still need
-exact ID mapping. Java digest state and external reference grants are excluded.
+take precedence. Connection notes, history, and mixed archives follow unique
+source IDs to newly imported SSH, local shell, and serial profiles. The
+backup preview also offers explicit assignments to existing saved profiles
+of the same type. Each source and destination has at most one assignment.
+Changes to the saved connection catalogue require fresh review. The serial
+editor scope and terminal chat use the saved profile ID. A change to
+the saved device, line settings, or emulation invalidates the reviewed chat
+target. Native desktop use with a physical serial device remains open.
+Java digest state and external reference grants are excluded.
+When Java connection filenames collide, the preview reports the omitted
+documents and history. Archives use their complete source IDs, with duplicate
+normalized IDs rejected.
+Nine targeted tests passed on Apple Silicon and Windows ARM64, including an
+encrypted restore with two colliding filename scopes and one exact archive
+marker.
+
+- [Apple Silicon collision tests](target/verification/20261116-memory-collisions-macos-1734706cae25-tests.log)
+- [Windows ARM64 collision tests](target/verification/20261116-memory-collisions-windows-verified.log)
+
+Thirteen targeted tests passed on Apple Silicon and Windows ARM64. The
+encrypted serial fixture covers explicit selection of an existing profile,
+retaining an edited document, and rejection of catalogue changes before
+queueing and before startup. The Windows ARM64 native dialog displayed the
+collision notice, accepted an existing serial fixture as the destination,
+and queued the reviewed restore. Startup restored the document, history,
+and exact archive marker while retaining the byte-identical saved catalogue.
+The control run with the default selection left the existing scope empty.
+The fixture launcher entered the production review phase with a private
+encrypted backup. macOS and Linux desktop interaction remains open.
+
+- [Apple Silicon destination review tests](target/verification/20261116-reviewed-memory-macos-25264f766243-tests.log)
+- [Windows ARM64 destination review tests](target/verification/20261116-reviewed-memory-windows-verified.log)
+- [Windows ARM64 desktop import and restart results](target/verification/20261116-memory-desktop-windows-result.log)
+
+Five targeted AI Memory tests passed on both Apple Silicon and Windows ARM64.
+They covered the serial restore, archive remapping, preservation of existing
+notes, the scope picker, and the terminal chat's saved settings check.
+[Apple Silicon test run](target/verification/20261116-serial-memory-macos-29517c7f3045-tests.log),
+[Windows ARM64 verification](target/verification/20261116-serial-memory-windows-final.log).
 
 Java stores the LM Studio Toolpack plugin identifier without an allowlist.
 Compatible native endpoint profiles restore the identifier as an inactive
@@ -9240,6 +12177,36 @@ The Windows ARM64 native TLS fixture verified the exact OpenAI-compatible
 and Anthropic request messages. The OpenAI-compatible response-format
 fallback sent the same reviewed messages once more with the format
 field omitted. The private test CA applied to the fixture connection.
+
+Journal questions also accept a reviewed OpenAI-compatible HTTPS profile
+with server-selected model mode. The profile picker labels the mode
+explicitly. macOS ARM64 and Fedora ARM64 used a private TLS fixture to
+verify the exact masked messages, the preserved endpoint path, the omitted
+`model` field, and a grounded quotation after approval. Saving a named
+model invalidated the prior review before another request. The macOS run
+passed 608 journal tests and the Fedora run passed 12 focused question tests,
+with the TLS check run separately on both platforms. Windows ARM64 passed
+the test compilation check. Configured-provider desktop acceptance remains open.
+
+The AI Manager can assign reviewed HTTPS profiles to the Session Journal
+role, including server-selected models. The Viewer and Manager preselect the
+saved role. If the role is unset, the global HTTPS default is available as
+the preference when no configured local answer takes precedence. The local
+evidence option and the per-question approval remain available. Recording
+and Scheduler summaries retain their separate authorization and routing.
+AI Manager exposes the preserved Java `sessionJournalAiProfileId` as an
+inactive role suggestion. The suggestion resolves the exact imported profile
+provenance and requires the reviewed profile to be saved before the role can
+be adopted. Saving the role affects question selection. The separate Java
+automation assignment stays in Journal summary settings.
+
+LM Studio-compatible HTTPS loopback profiles use the existing reviewed HTTPS
+route for journal questions and summaries. The loopback TLS fixture confirms
+the approved path, masked question messages, and the grounded quotation. The
+summary fixture confirms an evidence-free readiness request and a masked
+summary window. Both omit `model` for server selection. Replacing the saved
+model invalidates an outstanding question review, and revoking approval
+stops another summary request. The trust checks use a private test CA.
 
 The Scheduler Jobs list shows retained Session Journal AI totals for each
 saved job. The selected job's Action page shows newest retained activity

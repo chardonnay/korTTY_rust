@@ -104,6 +104,7 @@ impl Workspace {
             .security
             .local_settings(None, self.clipboard.policy.minimum_isolation)?;
         settings.shell = shell;
+        settings.shell_integration &= kortty_pty::validate_shell_integration(shell, None).is_ok();
         Ok(settings)
     }
 

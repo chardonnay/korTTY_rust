@@ -6,9 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use kortty_server_archive::protocol::{
-    CreateFormat, CreatedPayload, PRIVILEGED_PASSWORD_READY, PRIVILEGED_PATH, PrivilegedReply,
-    PrivilegedRequest, read_committed_password, read_privileged_request, require_eof,
-    require_privileged_password_commit, write_privileged_reply,
+    CreateFormat, CreatedPayload, PRIVILEGED_PASSWORD_READY, PRIVILEGED_PATH,
+    PRIVILEGED_UPDATE_PASSWORD_READY, PrivilegedReply, PrivilegedRequest, UpdateReply,
+    read_committed_password, read_privileged_request, require_eof,
+    require_privileged_password_commit, write_privileged_reply, write_update_reply,
 };
 use rustix::fs::{StatxFlags, fgetxattr_query, fremovexattr, statx};
 use serde::Deserialize;
@@ -30,6 +31,33 @@ pub(crate) fn serve() -> io::Result<()> {
 
 pub(crate) fn serve_password() -> io::Result<()> {
     serve_inner(true)
+}
+
+pub(crate) fn serve_update(password_protocol: bool) -> io::Result<()> {
+    let mut output = io::stdout().lock();
+    let rules = match require_installation().and_then(|()| Rules::load(CONFIG)) {
+        Ok(rules) => rules,
+        Err(error) => {
+            return write_update_reply(
+                output,
+                &UpdateReply::Failed {
+                    message: Failure::from(error).message,
+                    outcome_unknown: false,
+                    recovery: None,
+                },
+            );
+        }
+    };
+    umask(Mode::from_bits_truncate(0o077));
+    let committed = Arc::new(AtomicBool::new(false));
+    start_watchdog(Arc::clone(&committed))?;
+    if password_protocol {
+        output.write_all(PRIVILEGED_UPDATE_PASSWORD_READY)?;
+        output.flush()?;
+    }
+    create::serve_privileged_update(io::stdin().lock(), output, &rules, || {
+        committed.store(true, Ordering::Release);
+    })
 }
 
 fn serve_inner(password_protocol: bool) -> io::Result<()> {
@@ -166,21 +194,7 @@ fn finish(
     };
     // The path is checked again, but the stream uses only the file held since
     // creation. A revoked rule prevents copying and leaves the archive in place.
-    let ready = (|| {
-        rules.require_current()?;
-        let (parent, name) = absolute_file(&destination)?;
-        let parent = rules.require_copy_parent(parent)?;
-        let stat = fstat(&file)?;
-        require_private_stat(&stat, false)?;
-        if Mode::from_raw_mode(stat.st_mode) != PRIVATE_FILE
-            || file.metadata()?.len() != payload.bytes
-        {
-            return Err(invalid("The published privileged archive changed"));
-        }
-        parent.require_child(name, &stat)?;
-        file.rewind()
-    })();
-    if ready.is_err() {
+    if prepare_copy(rules, &destination, &mut file, payload).is_err() {
         return write_privileged_reply(output, &PrivilegedReply::Applied { destination });
     }
     write_privileged_reply(
@@ -193,7 +207,28 @@ fn finish(
     stream_archive_copy(output, rules, &mut file, payload)
 }
 
-fn stream_archive_copy(
+pub(super) fn prepare_copy(
+    rules: &Rules,
+    destination: &str,
+    file: &mut File,
+    payload: CreatedPayload,
+) -> io::Result<()> {
+    rules.require_current()?;
+    let (parent, name) = absolute_file(destination)?;
+    let parent = rules.require_copy_parent(parent)?;
+    let stat = fstat(&*file)?;
+    require_private_stat(&stat, false)?;
+    if Mode::from_raw_mode(stat.st_mode) != PRIVATE_FILE
+        || file.metadata()?.len() != payload.bytes
+        || mount_id(file)? != mount_id(&parent.fd)?
+    {
+        return Err(invalid("The published privileged archive changed"));
+    }
+    parent.require_child(name, &stat)?;
+    file.rewind()
+}
+
+pub(super) fn stream_archive_copy(
     output: &mut impl Write,
     rules: &Rules,
     file: &mut File,
@@ -230,6 +265,8 @@ struct Configuration {
     destination_roots: Vec<String>,
     #[serde(default)]
     download_roots: Vec<String>,
+    #[serde(default)]
+    replacement_roots: Vec<String>,
 }
 
 pub(super) struct Rules {
@@ -237,6 +274,7 @@ pub(super) struct Rules {
     sources: Vec<Root>,
     destinations: Vec<Root>,
     downloads: Vec<Root>,
+    replacements: Vec<Root>,
 }
 
 impl Rules {
@@ -245,19 +283,30 @@ impl Rules {
         let options: Configuration = serde_json::from_slice(&bytes)
             .map_err(|_| invalid("Invalid privileged archive configuration"))?;
         let destinations = Root::open_all(options.destination_roots)?;
-        let downloads = if options.download_roots.is_empty() {
-            Vec::new()
-        } else {
-            Root::open_all(options.download_roots)?
+        let open_subset = |paths: Vec<String>| {
+            if paths.is_empty() {
+                return Ok(Vec::new());
+            }
+            let roots = Root::open_all(paths)?;
+            for root in &roots {
+                let destination =
+                    select_root(&destinations, &root.path)?.open_descendant(&root.path)?;
+                if !same_node(&root.identity, &destination.stat)
+                    || root.mount != mount_id(&destination.fd)?
+                {
+                    return Err(outside_scope());
+                }
+            }
+            Ok(roots)
         };
-        for root in &downloads {
-            select_root(&destinations, &root.path)?.open_descendant(&root.path)?;
-        }
+        let downloads = open_subset(options.download_roots)?;
+        let replacements = open_subset(options.replacement_roots)?;
         Ok(Self {
             configuration,
             sources: Root::open_all(options.source_roots)?,
             destinations,
             downloads,
+            replacements,
         })
     }
 
@@ -277,6 +326,26 @@ impl Rules {
         select_root(&self.destinations, parent)?.open_descendant(parent)
     }
 
+    pub(super) fn update_parent(&self, parent: &str, replacing: bool) -> io::Result<Directory> {
+        let destination = self.destination_parent(parent)?;
+        if replacing {
+            let replacement = select_root(&self.replacements, parent)
+                .map_err(|_| invalid("The administrator has not allowed archive replacement here"))?
+                .open_descendant(parent)?;
+            if !same_node(&destination.stat, &replacement.stat)
+                || mount_id(&destination.fd)? != mount_id(&replacement.fd)?
+            {
+                return Err(outside_scope());
+            }
+        }
+        Ok(destination)
+    }
+
+    pub(super) fn hash_update_rules(&self, hash: &mut Sha256) {
+        hash.update(b"kortty-privileged-archive-update-rules-v1\0");
+        self.configuration.hash_into(hash);
+    }
+
     pub(super) fn require_copy_parent(&self, parent: &str) -> io::Result<Directory> {
         select_root(&self.downloads, parent)
             .map_err(|_| invalid("The administrator has not allowed archive downloads here"))?
@@ -294,6 +363,7 @@ impl Rules {
             .iter()
             .chain(&self.destinations)
             .chain(&self.downloads)
+            .chain(&self.replacements)
         {
             root.open_current()?;
         }

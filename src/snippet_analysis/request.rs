@@ -428,6 +428,7 @@ impl Request {
     pub(crate) fn start(
         self,
         profile: Profile,
+        mut before_dispatch: impl FnMut() -> Result<(), String> + Send + 'static,
         emit: impl FnMut(local_ai::StreamDelta) + Send + 'static,
     ) -> Result<Pending<Analysis>, String> {
         if profile.is_cli()
@@ -448,6 +449,7 @@ impl Request {
                     &self.system,
                     &self.input,
                     || {
+                        before_dispatch()?;
                         if let Some(knowledge) = &self.knowledge {
                             knowledge.require_current(client)?;
                         }

@@ -25,9 +25,21 @@ impl Manifest {
         if self.members.len() > MAX_MEMBERS || self.expanded_bytes > MAX_EXPANDED_BYTES {
             return Err(invalid("The archive manifest exceeds its limits"));
         }
+        if Self::from_canonical_members(&self.members)? != *self {
+            return Err(invalid(
+                "The archive manifest does not match its canonical entries",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Builds an ordered manifest, including implicit ancestor directories.
+    pub fn from_canonical_members<'a>(
+        members: impl IntoIterator<Item = &'a Member>,
+    ) -> io::Result<Self> {
         let mut checked = ManifestBuilder::new();
-        for member in &self.members {
-            if normalize(&member.path, Vec::new(), false, false, |_| Ok(()))? != member.path {
+        for member in members {
+            if !canonical_member_path(&member.path)? {
                 return Err(invalid("The archive manifest member path is not canonical"));
             }
             let target = match &member.kind {
@@ -44,13 +56,12 @@ impl Manifest {
             checked.insert_member(&member.path, &member.kind, member.size)?;
             checked.expanded_bytes = expanded;
         }
-        if checked.finish()? != *self {
-            return Err(invalid(
-                "The archive manifest does not match its canonical entries",
-            ));
-        }
-        Ok(())
+        checked.finish()
     }
+}
+
+pub(crate) fn canonical_member_path(path: &str) -> io::Result<bool> {
+    Ok(normalize(path, Vec::new(), false, false, |_| Ok(()))? == path)
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

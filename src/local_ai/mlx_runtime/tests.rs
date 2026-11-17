@@ -90,6 +90,393 @@ fn inputs(directory: &Path, id: &str, day: u8, archive: &[u8], key: &SigningKey)
     }
 }
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "downloads a signed MLX release and requires KORTTY_SMOKE_MLX_MODEL"]
+fn native_signed_mlx_qwen_reasoning_round_trip() {
+    native_signed_mlx_reasoning(
+        "KORTTY_SMOKE_MLX_MODEL",
+        crate::local_ai::mlx_models::ReasoningControls::QwenThinking,
+        &[("none", false), ("on", true)],
+        "low",
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "downloads a signed MLX release and requires KORTTY_SMOKE_MLX_GPT_OSS_MODEL"]
+fn native_signed_mlx_gpt_oss_reasoning_round_trip() {
+    native_signed_mlx_reasoning(
+        "KORTTY_SMOKE_MLX_GPT_OSS_MODEL",
+        crate::local_ai::mlx_models::ReasoningControls::GptOssEffort,
+        &[("low", true), ("medium", true), ("high", true)],
+        "on",
+    );
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn install_native_runtime(root: &Path, expected_id: Option<&str>) -> String {
+    let pending = online::check(root.to_owned()).unwrap();
+    let catalog = pending.reply.recv_blocking().unwrap().unwrap();
+    let choice = catalog
+        .choices()
+        .iter()
+        .find(|choice| expected_id.is_none_or(|id| choice.id == id))
+        .expect("Compatible signed runtime")
+        .clone();
+    println!("Runtime {choice}");
+    let pending = online::download(root.to_owned(), catalog, choice.clone()).unwrap();
+    let installed = pending.reply.recv_blocking().unwrap().unwrap();
+    assert!(installed.activated);
+    assert_eq!(
+        installed.runtime.active_installation_id(),
+        Some(choice.id.as_str())
+    );
+    assert!(installed.runtime.pending_first_launch());
+    choice.id
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+struct StopModel<'a>(&'a Path, &'a str);
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+impl Drop for StopModel<'_> {
+    fn drop(&mut self) {
+        let _ = crate::local_ai::runtime_package::with_stopped_mlx_model(self.0, self.1, || Ok(()));
+    }
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "downloads a signed MLX release and requires KORTTY_SMOKE_MLX_MODEL"]
+fn native_signed_mlx_lifecycle_round_trip() {
+    use std::time::{Duration, Instant};
+
+    use crate::local_ai::runtime_package::{ModelStatus, mlx_model_status, with_stopped_mlx_model};
+    use crate::local_ai::{Client, Error, Profile, ProfileOptions, StreamDelta, mlx_models};
+
+    let source = PathBuf::from(std::env::var_os("KORTTY_SMOKE_MLX_MODEL").unwrap());
+    let private_profile = crate::snippets::tests::Profile::new();
+    let root = private_profile.0.canonicalize().unwrap();
+    let runtime = install_native_runtime(&root, None);
+    let cancelled = AtomicBool::new(false);
+    let registry = mlx_models::Registry::new(&root);
+    let model = registry
+        .import(
+            &mlx_models::Review::prepare(&source, &cancelled).unwrap(),
+            &cancelled,
+        )
+        .unwrap();
+    let model = registry.configure(&model.id, &model.name, 1).unwrap();
+    let stop = StopModel(&root, &model.id);
+    let status = || mlx_model_status(&root, &model.id);
+    let profile = Profile::managed_mlx(
+        root.clone(),
+        &model.id,
+        ProfileOptions {
+            reasoning_effort: Some("none".into()),
+            max_output_tokens: Some(512),
+            timeout: Some(Duration::from_secs(120)),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+
+    let (client, cancel) = Client::new_cancellable(profile.clone());
+    let mut cancel = Some(cancel);
+    let result = client.stream_chat(
+        "Answer in plain text.",
+        &[],
+        "Name the letters of the alphabet one at a time.",
+        || Ok(()),
+        |delta| {
+            if matches!(delta, StreamDelta::Text(_)) {
+                drop(cancel.take());
+            }
+        },
+    );
+    assert!(cancel.is_none(), "The active stream did not emit text");
+    assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+    assert_eq!(status(), ModelStatus::Busy);
+    let plan = review_removal(&root, &cancelled).unwrap().unwrap();
+    let error = remove(&root, &plan, &cancelled).unwrap_err();
+    assert!(error.contains("handling a request"), "{error}");
+    assert_eq!(
+        self::installed(&root).unwrap().active_installation_id(),
+        Some(runtime.as_str())
+    );
+    println!("Cancelled an active stream and refused removal while its lease was held");
+    let idle_since = Instant::now();
+    drop(client);
+    assert_eq!(status(), ModelStatus::Ready);
+    while status() != ModelStatus::Stopped {
+        assert_ne!(status(), ModelStatus::Failed);
+        assert!(
+            idle_since.elapsed() < Duration::from_secs(90),
+            "Sidecar status after idle timeout: {:?}",
+            status()
+        );
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    assert!(idle_since.elapsed() >= Duration::from_secs(60));
+    println!(
+        "Idle sidecar stopped after {} seconds",
+        idle_since.elapsed().as_secs()
+    );
+
+    let answer = || {
+        Client::new(profile.clone())
+            .complete_chat("Answer in one word.", &[], "What is the capital of France?")
+            .unwrap()
+    };
+    assert_answer_is_paris(&answer());
+    assert_eq!(status(), ModelStatus::Ready);
+    println!("The next request restarted the idle sidecar");
+    let plan = review_removal(&root, &cancelled).unwrap().unwrap();
+    assert_eq!(plan.package_count(), 1);
+    assert_eq!(remove(&root, &plan, &cancelled).unwrap(), None);
+    assert_eq!(status(), ModelStatus::Stopped);
+    assert!(
+        self::installed(&root)
+            .unwrap()
+            .active_installation_id()
+            .is_none()
+    );
+    assert!(review_removal(&root, &cancelled).unwrap().is_none());
+    assert_eq!(registry.list().unwrap(), vec![model.clone()]);
+    println!("Removed the runtime with the model registration intact");
+
+    assert_eq!(install_native_runtime(&root, Some(&runtime)), runtime);
+    assert_answer_is_paris(&answer());
+    assert!(!self::installed(&root).unwrap().pending_first_launch());
+    with_stopped_mlx_model(&root, &model.id, || registry.remove(&model.id)).unwrap();
+    drop(stop);
+    assert!(registry.list().unwrap().is_empty());
+    println!("Reinstalled and started the same signed release with the preserved model");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "downloads two signed MLX releases and requires KORTTY_SMOKE_MLX_MODEL"]
+fn native_signed_mlx_update_and_rollback() {
+    native_signed_mlx_recovery(UpdateFailure::DamagedInstallation);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore = "downloads two signed MLX releases and requires KORTTY_SMOKE_MLX_MODEL"]
+fn native_signed_mlx_process_exit_and_rollback() {
+    native_signed_mlx_recovery(UpdateFailure::ProcessExit);
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[derive(Debug)]
+enum UpdateFailure {
+    DamagedInstallation,
+    ProcessExit,
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_signed_mlx_recovery(failure: UpdateFailure) {
+    use std::time::Duration;
+
+    use crate::local_ai::{Client, Error, Profile, ProfileOptions, mlx_models};
+
+    const OLDER: &str = "mlx-0.31.3-kortty1-macos-aarch64";
+    const NEWER: &str = "mlx-0.31.3-kortty2-macos-aarch64";
+
+    let source = PathBuf::from(std::env::var_os("KORTTY_SMOKE_MLX_MODEL").unwrap());
+    let private_profile = crate::snippets::tests::Profile::new();
+    let root = private_profile.0.canonicalize().unwrap();
+    let cancelled = AtomicBool::new(false);
+    let registry = mlx_models::Registry::new(&root);
+    let review = mlx_models::Review::prepare(&source, &cancelled).unwrap();
+    let model = registry.import(&review, &cancelled).unwrap();
+    let _stop = StopModel(&root, &model.id);
+
+    let complete = || {
+        let profile = Profile::managed_mlx(
+            root.clone(),
+            &model.id,
+            ProfileOptions {
+                reasoning_effort: Some("none".into()),
+                max_output_tokens: Some(512),
+                timeout: Some(Duration::from_secs(120)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        Client::new(profile).complete_chat(
+            "Answer in one word.",
+            &[],
+            "What is the capital of France?",
+        )
+    };
+    assert_eq!(install_native_runtime(&root, Some(OLDER)), OLDER);
+    assert_answer_is_paris(&complete().unwrap());
+    let state = self::installed(&root).unwrap();
+    assert!(!state.pending_first_launch());
+    let pin = state.pinned_runtime_id().expect("Older release was pinned");
+    assert_eq!(Some(pin), state.active_runtime_id());
+    let state = unpin(&root, pin, &cancelled).unwrap();
+    assert_eq!(state.active_installation_id(), Some(OLDER));
+    assert!(state.pinned_runtime_id().is_none());
+    println!("Started the older signed release and cleared its pin");
+
+    assert_eq!(install_native_runtime(&root, Some(NEWER)), NEWER);
+    match failure {
+        UpdateFailure::DamagedInstallation => {
+            let pending = Runtime::open(&root, &cancelled).unwrap();
+            let launcher = pending.launcher().to_owned();
+            assert!(launcher.starts_with(root.join("mlx-runtime")));
+            drop(pending);
+            std::fs::remove_file(launcher).unwrap();
+            let failed = complete();
+            assert!(matches!(failed, Err(Error::Runtime(_))), "{failed:?}");
+        }
+        UpdateFailure::ProcessExit => {
+            let failed = crate::local_ai::runtime_package::test_mlx_process_exit_before_ready(
+                &root, &model.id, &cancelled,
+            );
+            let message = failed.to_string();
+            assert!(
+                message.contains("managed model process exited"),
+                "{message}"
+            );
+            assert!(
+                message.contains("Restored the previous verified MLX runtime"),
+                "{message}"
+            );
+        }
+    }
+    let state = self::installed(&root).unwrap();
+    assert_eq!(state.active_installation_id(), Some(OLDER));
+    assert!(!state.pending_first_launch());
+    assert!(state.pinned_runtime_id().is_none());
+    assert_answer_is_paris(&complete().unwrap());
+    println!("Recovered the older verified runtime after {failure:?}");
+
+    assert_eq!(install_native_runtime(&root, Some(NEWER)), NEWER);
+    assert_answer_is_paris(&complete().unwrap());
+    let state = self::installed(&root).unwrap();
+    assert_eq!(state.active_installation_id(), Some(NEWER));
+    assert!(!state.pending_first_launch());
+    assert!(state.pinned_runtime_id().is_none());
+    println!("Retried the update and completed inference with the newer signed release");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn native_signed_mlx_reasoning(
+    source_variable: &str,
+    controls: crate::local_ai::mlx_models::ReasoningControls,
+    settings: &[(&str, bool)],
+    stale_setting: &str,
+) {
+    use std::time::Duration;
+
+    use crate::local_ai::runtime_package::with_stopped_mlx_model;
+    use crate::local_ai::{Client, Error, Profile, ProfileOptions, StreamDelta, mlx_models};
+
+    let source = PathBuf::from(std::env::var_os(source_variable).expect(source_variable));
+    let profile = crate::snippets::tests::Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let cancelled = AtomicBool::new(false);
+    install_native_runtime(&root, None);
+    let registry = mlx_models::Registry::new(&root);
+    let review = mlx_models::Review::prepare(&source, &cancelled).unwrap();
+    let model = registry.import(&review, &cancelled).unwrap();
+    let opened = registry.open(&model.id).unwrap();
+    assert_eq!(opened.reasoning_controls(), controls);
+    drop(opened);
+
+    let stop = StopModel(&root, &model.id);
+    let client = |setting: Option<&str>| {
+        let route = Profile::managed_mlx(
+            root.clone(),
+            &model.id,
+            ProfileOptions {
+                reasoning_effort: setting.map(str::to_owned),
+                max_output_tokens: Some(4096),
+                timeout: Some(Duration::from_secs(300)),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        Client::new(route)
+    };
+    for &(setting, expects_reasoning) in settings {
+        let mut reasoning = String::new();
+        let answer = client(Some(setting))
+            .stream_chat(
+                "Answer in one word.",
+                &[],
+                "What is the capital of France?",
+                || Ok(()),
+                |delta| {
+                    if let StreamDelta::Reasoning(part) = delta {
+                        reasoning.push_str(&part);
+                    }
+                },
+            )
+            .unwrap();
+        assert!(!answer.trim().is_empty(), "Empty answer for {setting}");
+        if controls == mlx_models::ReasoningControls::GptOssEffort {
+            assert_answer_is_paris(&answer);
+        }
+        assert_eq!(
+            !reasoning.trim().is_empty(),
+            expects_reasoning,
+            "Reasoning for {setting}, answer prefix: {:?}",
+            answer.chars().take(256).collect::<String>()
+        );
+        println!(
+            "{controls:?} setting={setting} answer_bytes={} reasoning_bytes={}",
+            answer.len(),
+            reasoning.len()
+        );
+    }
+    assert!(!self::installed(&root).unwrap().pending_first_launch());
+    if controls == mlx_models::ReasoningControls::GptOssEffort {
+        let answer = client(None)
+            .complete_chat("Answer in one word.", &[], "What is the capital of France?")
+            .unwrap();
+        assert_answer_is_paris(&answer);
+        println!(
+            "{controls:?} default buffered answer_bytes={}",
+            answer.len()
+        );
+    }
+    let stale = client(Some(stale_setting)).stream_chat(
+        "Answer in one word.",
+        &[],
+        "What is the capital of France?",
+        || Ok(()),
+        |_| panic!("Unsupported reasoning setting yielded a response delta"),
+    );
+    assert!(
+        matches!(
+            stale,
+            Err(Error::Invalid(mlx_models::UNSUPPORTED_REASONING))
+        ),
+        "{stale:?}"
+    );
+    println!("{controls:?} rejected stale setting={stale_setting}");
+    with_stopped_mlx_model(&root, &model.id, || registry.remove(&model.id)).unwrap();
+    drop(stop);
+    assert!(registry.list().unwrap().is_empty());
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn assert_answer_is_paris(answer: &str) {
+    assert!(
+        answer
+            .trim()
+            .trim_end_matches('.')
+            .eq_ignore_ascii_case("Paris"),
+        "Unexpected answer: {answer:?}"
+    );
+}
+
 #[test]
 fn mlx_signed_local_install_locks_revalidates_and_recovers_the_last_ready_package() {
     let profile = crate::snippets::tests::Profile::new();

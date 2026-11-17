@@ -18,9 +18,11 @@ use crate::{ssh_connection::ExecOpener, ssh_worker};
 mod transfer;
 mod tree;
 mod tree_download;
-pub(crate) use transfer::{MAX_TRANSFER_BYTES, download, upload};
-pub(crate) use tree::{TreeUpload, inspect_tree, upload_tree};
-pub(crate) use tree_download::{download_tree, preview_tree_download};
+pub(crate) use transfer::{MAX_TRANSFER_BYTES, copy_digest, download, upload};
+pub(crate) use tree::{
+    TreeUpload, inspect_tree, preview_tree_upload_merge, upload_tree, upload_tree_merge,
+};
+pub(crate) use tree_download::{download_tree, download_tree_merge, preview_tree_download};
 
 const MAX_HEADER: usize = 8192;
 const MAX_PATH: usize = 2048;
@@ -81,6 +83,15 @@ impl fmt::Display for Failure {
 }
 
 impl std::error::Error for Failure {}
+
+#[derive(Default)]
+pub(crate) struct MergeReport {
+    pub(crate) created: usize,
+    pub(crate) replaced: usize,
+    pub(crate) bytes: u64,
+    pub(crate) recovery_prefix: Option<String>,
+    pub(crate) error: Option<Failure>,
+}
 
 pub fn valid_path(path: &str) -> bool {
     if path.len() > MAX_PATH || path.chars().any(char::is_control) {

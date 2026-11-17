@@ -170,3 +170,90 @@ fn rejects_zip_path_aliases_prefix_conflicts_and_symbolic_links() {
         assert!(!profile.0.join("stage").join("escape").exists());
     }
 }
+
+fn compressed_tar(aliases: &[(&str, &str)]) -> Vec<u8> {
+    let mut archive = tar::Builder::new(Vec::new());
+    for (name, target) in aliases {
+        let mut header = tar::Header::new_ustar();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        archive.append_link(&mut header, name, target).unwrap();
+    }
+    for (name, body) in [
+        ("mlx/python/bin/python3.12", PROGRAM),
+        ("mlx/launcher.py", b"test launcher"),
+    ] {
+        let mut header = tar::Header::new_ustar();
+        header.set_mode(0o644);
+        header.set_size(body.len() as u64);
+        archive.append_data(&mut header, name, body).unwrap();
+    }
+    let raw = archive.into_inner().unwrap();
+    crate::logfile_window::zstandard::encode_chunk(&raw)
+}
+
+fn tar_fixture(installation: &Directory, bytes: &[u8], create: bool) -> io::Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let digest = format!("{:x}", Sha256::digest(bytes));
+    apply_tar_zst(
+        installation.open_private_file("runtime.zip")?,
+        installation,
+        Layout {
+            size: bytes.len() as u64,
+            sha256: &digest,
+            executable: "mlx/python/bin/python3",
+            companion: Some("mlx/launcher.py"),
+            wrapper: Some("mlx"),
+            entries: 12,
+            nodes: 20,
+        },
+        &AtomicBool::new(false),
+        create,
+    )
+}
+
+#[test]
+fn tar_zst_materializes_and_verifies_a_signed_interpreter_alias() {
+    let bytes = compressed_tar(&[("mlx/python/bin/python3", "python3.12")]);
+    let profile = Profile::new();
+    let installation = profile.installation(&bytes);
+    tar_fixture(&installation, &bytes, true).unwrap();
+    let python = profile.0.join("stage/payload/mlx/python/bin/python3");
+    assert!(python.symlink_metadata().unwrap().is_file());
+    assert_eq!(fs::read(&python).unwrap(), PROGRAM);
+    tar_fixture(&installation, &bytes, false).unwrap();
+    fs::write(python, vec![b'x'; PROGRAM.len()]).unwrap();
+    assert!(
+        tar_fixture(&installation, &bytes, false)
+            .unwrap_err()
+            .to_string()
+            .contains("differs")
+    );
+}
+
+#[test]
+fn tar_zst_rejects_external_chained_and_conflicting_aliases() {
+    let entry = "mlx/python/bin/python3";
+    for (aliases, expected) in [
+        (vec![(entry, "other/python3.12")], "sibling file"),
+        (
+            vec![(entry, "python"), ("mlx/python/bin/python", "python3.12")],
+            "signed regular file",
+        ),
+        (
+            vec![
+                (entry, "python3.12"),
+                ("mlx/python/bin/Python3", "python3.12"),
+            ],
+            "conflicting path",
+        ),
+    ] {
+        let bytes = compressed_tar(&aliases);
+        let profile = Profile::new();
+        let installation = profile.installation(&bytes);
+        let error = tar_fixture(&installation, &bytes, true).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error}");
+    }
+}

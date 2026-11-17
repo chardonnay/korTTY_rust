@@ -42,7 +42,7 @@ fn provisioned_ai_profiles_project_without_serializing_definitions() {
     let first = configured.profiles.profile(id).unwrap();
     assert_eq!(first.policy_definition().unwrap().id, "policy-Local");
     assert_eq!(configured.agent_profiles().count(), 1);
-    assert_eq!(configured.journal_question_https_profiles().count(), 1);
+    assert_eq!(configured.journal_https_profiles().count(), 1);
     assert!(id > ProfileId::from(u64::MAX));
     assert_eq!(configured.legacy_policy_alias(id), Some(LEGACY_LOCAL_ALIAS));
     assert_eq!(
@@ -189,7 +189,7 @@ model = "local-fixture"
     assert_eq!(
         config
             .profiles
-            .https_role_choices(local::Role::Agent)
+            .role_specific_choices(local::Role::Agent)
             .count(),
         2
     );
@@ -348,7 +348,7 @@ fn provisioned_ai_profiles_recheck_new_default_and_role_bindings_at_publication(
         .with_policy_profiles(&initial())
         .unwrap();
     let local = baseline.terminal_chat_profile_id().unwrap();
-    let remote = baseline.journal_question_https_profiles().next().unwrap().0;
+    let remote = baseline.journal_https_profiles().next().unwrap().0;
     let mut draft = baseline.clone();
     assert!(draft.profiles.set_default(remote));
     let mut saved = serde_json::to_value(&draft).unwrap();
