@@ -1,13 +1,15 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 pub(crate) use super::sync::Direction;
-use super::{RemoteAction, RemotePath, rsync, sync};
+use super::{ConnectionRef, RemoteAction, RemotePath, privileged, rsync, sync};
 
 pub(crate) const MAX_RSYNC_SOURCES: usize = rsync::MAX_SOURCES;
 
 pub(crate) const REVIEW_REQUIRED: &str = "Review the imported SFTP action and choose a path on this device before running or enabling this job.";
+pub(crate) const STAGING_REVIEW_REQUIRED: &str = "Configure the imported sudo staging action and review the exact transfer before enabling this job.";
 pub(crate) const RSYNC_REVIEW_REQUIRED: &str = "Review the imported rsync action, executable and every destination before running or enabling this job.";
 
 #[derive(Clone, Copy, Deserialize, Eq, PartialEq, Serialize)]
@@ -41,6 +43,7 @@ impl Kind {
 #[serde(untagged)]
 pub(crate) enum Draft {
     Sftp(SftpDraft),
+    StagedSftp(StagedSftpDraft),
     Rsync(RsyncDraft),
 }
 
@@ -48,6 +51,7 @@ impl Draft {
     pub(super) fn validate(&self) -> Result<(), &'static str> {
         match self {
             Self::Sftp(draft) => draft.validate(),
+            Self::StagedSftp(draft) => draft.settings.validate(),
             Self::Rsync(draft) => draft.validate(),
         }
     }
@@ -55,6 +59,7 @@ impl Draft {
     pub(super) fn review_required(&self) -> &'static str {
         match self {
             Self::Sftp(_) => REVIEW_REQUIRED,
+            Self::StagedSftp(_) => STAGING_REVIEW_REQUIRED,
             Self::Rsync(_) => RSYNC_REVIEW_REQUIRED,
         }
     }
@@ -80,6 +85,7 @@ impl SftpDraft {
         let remote = self.remote.clone();
         let direction = self.kind.direction();
         let action = match (mode, direction) {
+            (Mode::Staged(_), _) => return Err("This Java transfer used ordinary SFTP."),
             (Mode::Compare, _) => RemoteAction::Sync(sync::Copy {
                 local,
                 remote,
@@ -106,12 +112,93 @@ impl SftpDraft {
 
 #[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
+pub(crate) struct StagingSettings {
+    pub(crate) kind: Kind,
+    pub(crate) local_hint: String,
+    pub(crate) remote_hint: String,
+}
+
+impl StagingSettings {
+    pub(crate) fn validate(&self) -> Result<(), &'static str> {
+        if !display_path(&self.local_hint) || !display_path(&self.remote_hint) {
+            return Err("Invalid imported sudo staging paths.");
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct StagedSftpDraft {
+    pub(crate) route: ConnectionRef,
+    pub(crate) settings: StagingSettings,
+}
+
+impl StagedSftpDraft {
+    pub(super) fn require_route(
+        &self,
+        selected: Option<&ConnectionRef>,
+        additional: &[ConnectionRef],
+        has_groups: bool,
+    ) -> Result<(), &'static str> {
+        if selected != Some(&self.route) || !additional.is_empty() || has_groups {
+            return Err("Keep the exact saved SSH route for the imported sudo staging action.");
+        }
+        Ok(())
+    }
+
+    pub(super) fn validate_adoption(
+        &self,
+        destination: StagedDestination,
+        local: PathBuf,
+        remote: RemotePath,
+    ) -> Result<(), &'static str> {
+        if remote.root() != "/" || !crate::sftp_window::privileged_file::valid_path(remote.as_str())
+        {
+            return Err("Choose an absolute path on the Linux server for privileged staging.");
+        }
+        let direction = self.settings.kind.direction();
+        let action = if destination.is_folder() {
+            let copy = sync::Copy {
+                local,
+                remote,
+                direction,
+                excludes: String::new(),
+                replace_changed: destination == StagedDestination::ExistingFolder,
+                standing: None,
+                approval: None,
+            };
+            match direction {
+                Direction::Upload => RemoteAction::PrivilegedTreeUpload(copy),
+                Direction::Download => RemoteAction::PrivilegedTreeDownload(copy),
+            }
+        } else {
+            RemoteAction::Privileged(privileged::PrivilegedTransfer {
+                local,
+                remote,
+                direction: match direction {
+                    Direction::Upload => privileged::PrivilegedDirection::Upload,
+                    Direction::Download => privileged::PrivilegedDirection::Download,
+                },
+                replace_existing: destination == StagedDestination::ReplaceFile,
+                standing: None,
+                approval: None,
+            })
+        };
+        action.validate()
+    }
+}
+
+#[derive(Clone, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RsyncDraft {
     pub(crate) direction: sync::Direction,
     pub(crate) java_sources: Vec<String>,
     pub(crate) java_target_root: String,
     pub(crate) java_delete: bool,
     pub(crate) java_sudo: bool,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) java_target_folders: BTreeMap<String, String>,
 }
 
 impl RsyncDraft {
@@ -120,10 +207,41 @@ impl RsyncDraft {
             || self.java_sources.len() > MAX_RSYNC_SOURCES
             || !self.java_sources.iter().all(|path| display_path(path))
             || !display_path(&self.java_target_root)
+            || self.java_target_folders.len() > super::connection::MAX_TARGETS
+            || !self.java_target_folders.iter().all(|(key, name)| {
+                key.parse::<u64>()
+                    .is_ok_and(|id| id != 0 && id.to_string() == *key)
+                    && kortty_server_archive::rsync_tree::valid_name(name)
+            })
+            || (self.direction != Direction::Download && !self.java_target_folders.is_empty())
         {
             return Err("Invalid imported rsync paths.");
         }
         Ok(())
+    }
+
+    pub(super) fn download_destination(
+        &self,
+        profile: u64,
+        grouped: bool,
+        append_source_name: bool,
+    ) -> Option<String> {
+        let mut path = PathBuf::from(
+            self.java_target_root
+                .trim_matches(|character| character <= ' '),
+        );
+        if grouped {
+            let folder = self.java_target_folders.get(&profile.to_string())?;
+            #[cfg(windows)]
+            crate::sftp_window::checked_local_component(folder.as_bytes()).ok()?;
+            path.push(folder);
+        }
+        if append_source_name {
+            let remote = RemotePath::try_from(self.java_sources.first()?.clone()).ok()?;
+            path.push(remote.basename());
+        }
+        super::remote::validate_local_path(&path).ok()?;
+        path.to_str().map(str::to_owned)
     }
 
     pub(super) fn require_native_scope(&self) -> Result<(), &'static str> {
@@ -262,7 +380,7 @@ impl RsyncDraft {
         if existing && !directory {
             match self.direction {
                 Direction::Upload => {
-                    self.passwordless_existing_file_path()?;
+                    self.server_file_path()?;
                 }
                 Direction::Download => {
                     self.existing_local_file_source()?;
@@ -285,7 +403,7 @@ impl RsyncDraft {
         }))
     }
 
-    pub(super) fn passwordless_existing_file_path(&self) -> Result<RemotePath, &'static str> {
+    pub(super) fn server_file_path(&self) -> Result<RemotePath, &'static str> {
         let [source] = self.java_sources.as_slice() else {
             return Err("Choose one Java source file for the protected destination.");
         };
@@ -305,7 +423,7 @@ impl RsyncDraft {
             root
         };
         if !kortty_server_archive::privileged_rsync::valid_path(destination.as_str()) {
-            return Err("Choose a literal absolute Linux destination for the existing file.");
+            return Err("Choose a literal absolute Linux destination for the server file.");
         }
         Ok(destination)
     }
@@ -329,4 +447,19 @@ pub enum Mode {
     File,
     Folder,
     Compare,
+    Staged(StagedDestination),
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub enum StagedDestination {
+    NewFile,
+    ReplaceFile,
+    NewFolder,
+    ExistingFolder,
+}
+
+impl StagedDestination {
+    pub(super) fn is_folder(self) -> bool {
+        matches!(self, Self::NewFolder | Self::ExistingFolder)
+    }
 }

@@ -33,21 +33,33 @@ impl Field {
         }
     }
 
-    fn limits(self) -> RangeInclusive<u16> {
+    fn limits(self) -> RangeInclusive<i32> {
         match self {
-            Self::Width => FixedGeometry::WIDTH,
-            Self::Height => FixedGeometry::HEIGHT,
-            Self::X => FixedGeometry::X,
-            Self::Y => FixedGeometry::Y,
+            Self::Width => {
+                i32::from(*FixedGeometry::WIDTH.start())..=i32::from(*FixedGeometry::WIDTH.end())
+            }
+            Self::Height => {
+                i32::from(*FixedGeometry::HEIGHT.start())..=i32::from(*FixedGeometry::HEIGHT.end())
+            }
+            Self::X | Self::Y => FixedGeometry::POSITION,
         }
     }
 
-    fn value(self, geometry: &mut FixedGeometry) -> &mut u16 {
+    fn value(self, geometry: &FixedGeometry) -> i32 {
         match self {
-            Self::Width => &mut geometry.width,
-            Self::Height => &mut geometry.height,
-            Self::X => &mut geometry.x,
-            Self::Y => &mut geometry.y,
+            Self::Width => geometry.width.into(),
+            Self::Height => geometry.height.into(),
+            Self::X => geometry.x,
+            Self::Y => geometry.y,
+        }
+    }
+
+    fn set(self, geometry: &mut FixedGeometry, value: i32) {
+        match self {
+            Self::Width => geometry.width = value as u16,
+            Self::Height => geometry.height = value as u16,
+            Self::X => geometry.x = value,
+            Self::Y => geometry.y = value,
         }
     }
 }
@@ -58,6 +70,7 @@ pub enum Edit {
     RememberGeometry(bool),
     RememberDashboard(bool),
     Fixed(bool),
+    Maximize(bool),
     Value(Field, String),
 }
 
@@ -83,30 +96,33 @@ impl Editor {
                 }
             }
             Edit::Value(field, mut input) if preferences.use_fixed_geometry => {
-                if let Ok(value) = input.parse::<u16>()
+                if let Ok(value) = input.parse::<i32>()
                     && field.limits().contains(&value)
                 {
-                    *field.value(&mut preferences.fixed) = value;
+                    field.set(&mut preferences.fixed, value);
                     self.invalid[field.index()] = None;
                 } else {
                     input.truncate(input.floor_char_boundary(8));
                     self.invalid[field.index()] = Some(input);
                 }
             }
-            Edit::Value(..) => {}
+            Edit::Maximize(enabled) if preferences.use_fixed_geometry => {
+                preferences.fixed.maximized = enabled;
+            }
+            Edit::Value(..) | Edit::Maximize(_) => {}
         }
     }
 
     pub(super) fn view(
         &self,
-        mut preferences: StartupPreferences,
+        preferences: StartupPreferences,
         target: Option<&Id>,
     ) -> Element<'_, Edit> {
         let enabled = preferences.use_fixed_geometry;
-        let mut field = |field: Field| {
+        let field = |field: Field| {
             self.field(
                 field,
-                *field.value(&mut preferences.fixed),
+                field.value(&preferences.fixed),
                 enabled,
                 target.filter(|_| enabled && matches!(field, Field::Width)),
             )
@@ -116,6 +132,9 @@ impl Editor {
             checkbox(enabled).label(Setting::FixedGeometry.label()).on_toggle(Edit::Fixed),
             row![field(Field::Width), field(Field::Height)].spacing(16),
             row![field(Field::X), field(Field::Y)].spacing(16),
+            checkbox(preferences.fixed.maximized)
+                .label("Start maximized")
+                .on_toggle_maybe(enabled.then_some(Edit::Maximize)),
             text("Applies when opening a new window. A restored project or session uses its saved layout.").size(13),
             cfg!(target_os = "linux").then(|| text("On Wayland, the compositor chooses the window position.").size(13)),
         ].spacing(8).into()
@@ -124,7 +143,7 @@ impl Editor {
     fn field(
         &self,
         field: Field,
-        value: u16,
+        value: i32,
         enabled: bool,
         target: Option<&Id>,
     ) -> Element<'_, Edit> {
@@ -158,5 +177,29 @@ impl Editor {
         ]
         .spacing(3)
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fixed_geometry_editor_accepts_signed_positions_and_optional_maximization() {
+        let mut editor = Editor::default();
+        let mut preferences = StartupPreferences::default();
+        editor.update(&mut preferences, Edit::Maximize(true));
+        assert!(!preferences.fixed.maximized);
+        editor.update(&mut preferences, Edit::Fixed(true));
+        editor.update(&mut preferences, Edit::Value(Field::X, "-1240".into()));
+        editor.update(&mut preferences, Edit::Value(Field::Height, "-1".into()));
+        assert!(!editor.valid());
+        assert_eq!(preferences.fixed.height, FixedGeometry::default().height);
+        editor.update(&mut preferences, Edit::Value(Field::Height, "900".into()));
+        editor.update(&mut preferences, Edit::Maximize(true));
+        assert!(editor.valid());
+        assert_eq!(preferences.fixed.x, -1240);
+        assert_eq!(preferences.fixed.height, 900);
+        assert!(preferences.fixed.maximized);
     }
 }

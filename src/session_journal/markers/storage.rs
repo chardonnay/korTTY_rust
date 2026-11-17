@@ -43,21 +43,9 @@ impl Settings {
 
     pub(crate) fn save(&self, root: &Path, baseline: &Self) -> io::Result<Compiled> {
         let compiled = Compiled::new(self)?;
-        let bytes = Zeroizing::new(serde_json::to_vec(&Stored {
-            version: VERSION,
-            settings: self,
-        })?);
-        check_size(&bytes)?;
+        let bytes = Zeroizing::new(encode(self)?);
         let directory = Directory::open(root, true)?;
-        let lock = directory.open_lock(LOCK)?;
-        require_single_link(&lock)?;
-        lock.try_lock().map_err(|error| match error {
-            TryLockError::WouldBlock => io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "Another kortty instance is saving journal markers. Try again.",
-            ),
-            TryLockError::Error(error) => error,
-        })?;
+        let lock = lock_settings(&directory)?;
         let lock_stamp = FileStamp::read(&lock)?;
         let (current, previous) = read_stored(&directory)?;
         if &current != baseline {
@@ -106,7 +94,29 @@ pub(crate) fn validate_backup(bytes: &[u8]) -> io::Result<()> {
     decode(bytes)?.validate()
 }
 
-fn decode(bytes: &[u8]) -> io::Result<Settings> {
+pub(crate) fn lock_settings(directory: &Directory) -> io::Result<File> {
+    let lock = directory.open_lock(LOCK)?;
+    require_single_link(&lock)?;
+    lock.try_lock().map_err(|error| match error {
+        TryLockError::WouldBlock => io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "Another kortty instance is saving journal markers. Try again.",
+        ),
+        TryLockError::Error(error) => error,
+    })?;
+    Ok(lock)
+}
+
+pub(super) fn encode(settings: &Settings) -> io::Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(&Stored {
+        version: VERSION,
+        settings,
+    })?;
+    check_size(&bytes)?;
+    Ok(bytes)
+}
+
+pub(super) fn decode(bytes: &[u8]) -> io::Result<Settings> {
     check_size(bytes)?;
     let document: Document = serde_json::from_slice(bytes)
         .map_err(|_| invalid("Invalid journal marker settings file."))?;

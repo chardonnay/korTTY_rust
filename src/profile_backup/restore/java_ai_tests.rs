@@ -131,6 +131,129 @@ fn write_backup(path: &Path, password: &Secret, contents: &[u8]) {
 }
 
 #[test]
+fn java_connection_ai_assignments_restore_inactive_with_exact_profile_provenance() {
+    use crate::connection_store::Store;
+
+    const SETTINGS: &[u8] = br#"<globalSettings><aiProfiles>
+        <profile><id>java-chat</id><name>Imported chat</name>
+            <apiUrl>http://127.0.0.1:12345/v1</apiUrl><modelSelectionMode>DEFAULT</modelSelectionMode>
+        </profile>
+    </aiProfiles></globalSettings>"#;
+    const CONNECTIONS: &[u8] = br#"<connections>
+        <connection><name>Imported SSH</name><host>ssh.example.test</host><username>fixture</username>
+            <aiProfileId>java-chat</aiProfileId></connection>
+        <connection><name>Imported shell</name><protocol>LOCAL_SHELL</protocol>
+            <aiProfileId>java-chat</aiProfileId></connection>
+        <connection><name>Unresolved shell</name><protocol>LOCAL_SHELL</protocol>
+            <aiProfileId>missing-chat</aiProfileId></connection>
+    </connections>"#;
+    let scratch = Scratch::new();
+    let path = scratch.0.join("connection-ai.zip");
+    let password = Secret::new("java-archive-password".into());
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    for (name, bytes) in [
+        ("global-settings.xml", SETTINGS),
+        ("connections.xml", CONNECTIONS),
+    ] {
+        zip.start_file(
+            name,
+            SimpleFileOptions::default()
+                .with_aes_encryption_bytes(AesMode::Aes256, password.as_str().as_bytes()),
+        )
+        .unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+    let destination = scratch.0.join("profile");
+    let inspect = || super::super::inspect_java_password(&path, &password).unwrap();
+    let preview = inspect();
+    let (_, _, omitted) = preview.java_review().unwrap();
+    assert!(
+        omitted.iter().any(|line| line
+            == "Java connection AI assignments require review in Connection Manager (2)")
+    );
+    assert!(
+        omitted.iter().any(|line| line
+            == "Java connection AI assignments have no matching profile in the backup (1)")
+    );
+    super::super::queue_restore_at(&destination, preview, RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&destination, || false).unwrap());
+
+    let connections = destination.join("connections.json");
+    let store = Store::open(connections.clone()).unwrap();
+    let config = Configuration::load_from(&destination).unwrap();
+    let source = config.java_profile_source(&ProfileRef::Numeric(1)).unwrap();
+    assert!(config.interactive_chat_transport(1).is_err());
+    let ssh = store
+        .connections()
+        .iter()
+        .find(|entry| entry.name == "Imported SSH")
+        .unwrap();
+    let shell = store
+        .local_profiles()
+        .iter()
+        .find(|entry| entry.name == "Imported shell")
+        .unwrap();
+    for terminal in [&ssh.terminal, &shell.terminal] {
+        assert!(terminal.ai_profile.is_none());
+        assert_eq!(
+            terminal.java_ai_profile.as_ref().unwrap().source(),
+            Some(source)
+        );
+    }
+    let unresolved = store
+        .local_profiles()
+        .iter()
+        .find(|entry| entry.name == "Unresolved shell")
+        .unwrap();
+    let hint = unresolved.terminal.java_ai_profile.as_ref().unwrap();
+    assert_eq!(hint.id(), "missing-chat");
+    assert!(hint.source().is_none());
+    assert!(unresolved.terminal.ai_profile.is_none());
+
+    let expected_ssh = ssh.clone();
+    let mut existing_ssh = expected_ssh.clone();
+    existing_ssh.terminal.java_ai_profile = None;
+    let mut existing_shell = shell.clone();
+    existing_shell.terminal.java_ai_profile = None;
+    let mut existing_unresolved = unresolved.clone();
+    existing_unresolved.terminal.dismiss_java_ai_profile();
+    let mut store = store;
+    store.save(existing_ssh.clone()).unwrap();
+    store.save_local(existing_shell.clone()).unwrap();
+    store.save_local(existing_unresolved.clone()).unwrap();
+    super::super::queue_restore_at(&destination, inspect(), RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&destination, || false).unwrap());
+    let mut store = Store::open(connections.clone()).unwrap();
+    assert_eq!(store.connections(), &[expected_ssh]);
+    assert_eq!(store.local_profiles().len(), 2);
+    assert_eq!(
+        store.local(existing_unresolved.id),
+        Some(&existing_unresolved)
+    );
+    let mut supplemented = store.local(existing_shell.id).unwrap().clone();
+    assert_eq!(
+        supplemented
+            .terminal
+            .java_ai_profile
+            .as_ref()
+            .unwrap()
+            .source(),
+        Some(source)
+    );
+    assert!(supplemented.terminal.ai_profile.is_none());
+    supplemented.terminal.dismiss_java_ai_profile();
+    store.save_local(supplemented).unwrap();
+    existing_ssh.terminal.ai_profile = Some(ProfileRef::Numeric(9));
+    store.save(existing_ssh).unwrap();
+
+    let installed = fs::read(&connections).unwrap();
+    super::super::queue_restore_at(&destination, inspect(), RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&destination, || false).unwrap());
+    assert_eq!(fs::read(connections).unwrap(), installed);
+}
+
+#[test]
 fn java_journal_roles_replay_without_replacing_native_preferences_or_granting_access() {
     use serde_json::json;
 

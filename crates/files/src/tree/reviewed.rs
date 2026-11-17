@@ -7,11 +7,12 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::Storage::FileSystem::{
     FILE_ATTRIBUTE_ARCHIVE, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
     FILE_ATTRIBUTE_NOT_CONTENT_INDEXED, FILE_ATTRIBUTE_READONLY, FILE_ATTRIBUTE_SYSTEM,
-    FILE_BASIC_INFO, FILE_STREAM_INFO, FILE_WRITE_ATTRIBUTES, FileBasicInfo, FileStreamInfo,
-    GetFinalPathNameByHandleW,
+    FILE_BASIC_INFO, FILE_CASE_SENSITIVE_INFO, FILE_STREAM_INFO, FILE_WRITE_ATTRIBUTES,
+    FileBasicInfo, FileCaseSensitiveInfo, FileStreamInfo, GetFinalPathNameByHandleW,
 };
+use windows_sys::Win32::System::SystemServices::FILE_CS_FLAG_CASE_SENSITIVE_DIR;
 
-use crate::ReplacementMetadata;
+use crate::{DirectoryNameRules, ReplacementMetadata};
 
 use super::*;
 
@@ -35,6 +36,24 @@ const SUPPORTED_ATTRIBUTES: u32 = FILE_ATTRIBUTE_ARCHIVE
     | FILE_ATTRIBUTE_SYSTEM;
 
 impl Directory {
+    /// Holds an existing child against rename while its files are reviewed.
+    pub fn open_reviewed_child_for_files(&self, name: &OsStr) -> io::Result<Self> {
+        Self::from_file(self.open_with_share(
+            name,
+            DIRECTORY_READ,
+            FILE_OPEN,
+            FILE_DIRECTORY_FILE,
+            None,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+        )?)
+    }
+
+    /// Recognizes native Windows volumes with stable directory IDs and creation timestamps.
+    pub fn supports_reviewed_parent_birth(&self) -> bool {
+        crate::windows::local_reference_path_on(&self.0, |format| matches!(format, "NTFS" | "ReFS"))
+            .is_ok_and(|path| path.is_some())
+    }
+
     /// Creates a private directory with the rights needed for checked metadata and rename.
     pub fn create_reviewed_tree_stage(&self, name: &OsStr) -> io::Result<Self> {
         Self::from_file(self.create_private_with_share(
@@ -48,6 +67,39 @@ impl Directory {
     /// Refuses a short-name or alternate spelling for the held destination component.
     pub fn require_reviewed_tree_basename(&self, expected: &OsStr) -> io::Result<()> {
         require_reviewed_file_basename(&self.0, expected)
+    }
+
+    /// Returns known name lookup rules for this held Windows directory.
+    pub fn name_lookup_rules(&self) -> Option<DirectoryNameRules> {
+        if !crate::is_local_reference_file(&self.0).ok()? {
+            return None;
+        }
+        let mut info = FILE_CASE_SENSITIVE_INFO::default();
+        // SAFETY: The directory handle and writable result live for the synchronous query.
+        if unsafe {
+            GetFileInformationByHandleEx(
+                self.0.as_raw_handle(),
+                FileCaseSensitiveInfo,
+                (&raw mut info).cast(),
+                size_of_val(&info) as u32,
+            )
+        } != 0
+        {
+            return Some(if info.Flags & FILE_CS_FLAG_CASE_SENSITIVE_DIR != 0 {
+                DirectoryNameRules::Literal
+            } else {
+                DirectoryNameRules::Folded
+            });
+        }
+        match io::Error::last_os_error()
+            .raw_os_error()
+            .map(|code| code as u32)
+        {
+            Some(ERROR_INVALID_FUNCTION | ERROR_INVALID_PARAMETER | ERROR_NOT_SUPPORTED) => {
+                Some(DirectoryNameRules::Folded)
+            }
+            _ => None,
+        }
     }
 
     /// Captures the held directory's access, native identity and revision.

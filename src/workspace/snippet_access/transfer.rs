@@ -114,7 +114,7 @@ impl Workspace {
                 return Err("The selected SSH connection cannot open SFTP.");
             }
         } else if !cfg!(unix)
-            || pane.session.local_shell_pid().is_none()
+            || !pane.session.local_shell_running()
             || pane.session.sandbox_backend().is_some()
             || self.clipboard.policy.minimum_isolation == IsolationLevel::Sandbox
         {

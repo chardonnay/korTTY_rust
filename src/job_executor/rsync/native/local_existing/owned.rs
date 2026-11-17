@@ -58,6 +58,12 @@ impl CreatedTree {
         }
     }
 
+    pub(super) fn forget_published_file(&mut self, name: &str) {
+        if matches!(self.children.get(name), Some(Created::File(_))) {
+            self.children.remove(name);
+        }
+    }
+
     pub(super) fn discard(
         &self,
         parent: &Directory,

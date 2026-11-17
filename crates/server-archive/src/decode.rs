@@ -10,6 +10,9 @@ use crate::{Format, MAX_ARCHIVE_BYTES};
 mod tar;
 mod zip;
 
+#[doc(hidden)]
+pub use zip::{open_checked_zip, validate_zip_update_members};
+
 const LZMA_MEMORY_KIB: usize = 96 * 1024;
 
 /// Visits ordinary files and explicit directories. The returned manifest also

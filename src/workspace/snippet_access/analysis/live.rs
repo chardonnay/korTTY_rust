@@ -233,13 +233,21 @@ mod tests {
         let (listener, _) = listener();
         let config = serde_json::from_value::<Configuration>(json!({
             "profiles": {
-                "profiles": [{"id": 1, "name": "Local fixture", "endpoint": listener.local_addr().unwrap().to_string(), "model": "fixture-model"}],
-                "default": 1, "last_id": 1
-            }
+                "profiles": [
+                    {"id": 1, "name": "Local fixture", "endpoint": listener.local_addr().unwrap().to_string(),
+                     "model": "", "model_mode": "server-default"},
+                    {"id": 2, "name": "Named fallback", "model": "fixture-model"}
+                ],
+                "default": 2, "last_id": 2
+            },
+            "local": {"roles": [null, 1, null, null]}
         })).unwrap();
         let mut workspace = Workspace::default();
         workspace.set_test_ai_configuration(config);
-        workspace.window_settings.snippet_analysis_auto_diagram = false;
+        workspace.window_settings.snippet_analysis_auto_diagram = true;
+        workspace
+            .window_settings
+            .snippet_analysis_auto_modularization = true;
         let (owner, _) = workspace.open_window(false);
         let (id, _) = workspace.install_snippet_surface(owner, window, true);
         let _ = workspace.update_snippets(id, SnippetMessage::Open(snippet));
@@ -262,12 +270,20 @@ mod tests {
             iced_runtime::task::into_stream(workspace.open_snippet_analysis(id, subject)).unwrap();
         let _ = workspace.update(next(&mut loaded));
         let _ = workspace.update_snippet_analysis(id, Action::RequestStart);
+        let page = workspace.snippets[&id].analysis.page(subject).unwrap();
+        let State::Review(review) = &page.state else {
+            panic!("expected a server-selected analysis review");
+        };
+        assert_eq!(review.profile.id, 1);
+        assert!(review.profile.server_selected);
+        assert!(review.diagram.is_none() && review.plan.is_none());
         assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
 
         let (advance, wait) = mpsc::channel();
         let server = thread::spawn(move || {
             let mut socket = accept(&listener);
             let body = request(&mut socket);
+            assert!(body.get("model").is_none());
             assert_eq!(body["stream"], true);
             assert_eq!(body["response_format"]["type"], "json_object");
             assert!(
@@ -356,16 +372,10 @@ mod tests {
         };
         let mut saved = iced_runtime::task::into_stream(saved).unwrap();
         let _ = workspace.update(next(&mut saved));
-        assert_eq!(
-            history
-                .load(subject)
-                .unwrap()
-                .current()
-                .unwrap()
-                .analysis
-                .summary,
-            "DB_PASSWORD=***"
-        );
+        let saved_history = history.load(subject).unwrap();
+        let report = saved_history.current().unwrap();
+        assert_eq!(report.analysis.summary, "DB_PASSWORD=***");
+        assert_eq!(report.provenance.model, "Server selects the model");
 
         let _ = workspace.update_snippet_analysis(id, Action::RequestStart);
         let mut canceled = iced_runtime::task::into_stream(

@@ -20,7 +20,7 @@ use crate::scheduler_window::{
     ArchiveFormat, ConnectionRef, ImportedAiAction, JournalDetail, MAX_ARCHIVE_EXCLUDES,
     MAX_ARCHIVE_SOURCES, MAX_SELECTED_GROUPS, MAX_TARGETS, RemoteAction, RemotePath, SnippetLink,
     SshCommand, SudoMode, SymbolicMode, TargetGroups, agent::Kind, imported_archive,
-    imported_transfer, mode_from_text, owner_id_from_text,
+    imported_privileged, imported_transfer, mode_from_text, owner_id_from_text,
 };
 use crate::session_journal::automation::{Closing, Keep, MAX_DAYS, Options, Retention};
 use crate::snippets::SnippetId;
@@ -33,6 +33,8 @@ const MAX_ARGUMENTS: usize = 64;
 const MAX_TIMES: usize = 24 * 60;
 const DEFAULT_JAVA_SWARM_PARALLELISM: i32 = 4;
 const ARCHIVE_TARGET_ID_PREFIX: &str = "java-archive-";
+const STAGING_TARGET_ID_PREFIX: &str = "java-staging-";
+const PRIVILEGED_TARGET_ID_PREFIX: &str = "java-privileged-";
 
 #[derive(Default)]
 pub(super) struct Review {
@@ -56,7 +58,7 @@ pub(super) enum Omission {
     MissingSnippet,
     InvalidJournalSettings,
     InvalidDependency,
-    ArchiveFanoutLimit,
+    TargetFanoutLimit,
     InvalidGraph,
 }
 
@@ -81,8 +83,8 @@ impl Omission {
                 "Java Scheduler jobs with invalid session journal settings omitted"
             }
             Self::InvalidDependency => "Java Scheduler jobs with missing prerequisites omitted",
-            Self::ArchiveFanoutLimit => {
-                "Multi-target Java Scheduler archives that exceed the Rust job or dependency limits omitted"
+            Self::TargetFanoutLimit => {
+                "Multi-target Java Scheduler jobs that exceed the Rust job or dependency limits omitted"
             }
             Self::InvalidGraph => "Java Scheduler jobs in an invalid dependency graph omitted",
         }
@@ -108,11 +110,56 @@ pub(super) enum Action {
     },
     Ai(ImportedAiAction),
     Remote(Box<RemoteAction>),
-    Archive(Box<imported_archive::Settings>),
+    Privileged(Box<imported_privileged::Settings>),
+    PerRoute(RouteDraft),
     Transfer(Box<imported_transfer::Draft>),
 }
 
+pub(super) enum RouteDraft {
+    Archive(Box<imported_archive::Settings>),
+    StagedSftp(Box<imported_transfer::StagingSettings>),
+    Privileged(Box<imported_privileged::Settings>),
+}
+
+impl RouteDraft {
+    fn target_id(&self, job: &JobId, source_id: &str) -> ParseResult<JobId> {
+        let (prefix, domain) = match self {
+            Self::Archive(_) => (
+                ARCHIVE_TARGET_ID_PREFIX,
+                "kortty/java-scheduler/archive-target/v1\0",
+            ),
+            Self::StagedSftp(_) => (
+                STAGING_TARGET_ID_PREFIX,
+                "kortty/java-scheduler/staging-target/v1\0",
+            ),
+            Self::Privileged(_) => (
+                PRIVILEGED_TARGET_ID_PREFIX,
+                "kortty/java-scheduler/privileged-target/v1\0",
+            ),
+        };
+        let mut digest = Sha256::new();
+        digest.update(domain);
+        digest.update(job.as_str());
+        digest.update(b"\0");
+        digest.update(source_id);
+        let fingerprint = format!("{:x}", digest.finalize());
+        JobId::new(format!("{prefix}{}", &fingerprint[..32]))
+            .map_err(|_| Omission::InvalidDefinition)
+    }
+}
+
 impl Action {
+    pub(super) fn snippet_id(&self) -> Option<SnippetId> {
+        match self {
+            Self::Snippet { id, .. } => Some(*id),
+            Self::Privileged(settings) => match settings.as_ref() {
+                imported_privileged::Settings::Snippet { link, .. } => Some(link.id),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
     fn target_limit(&self) -> usize {
         match self {
             Self::Ai(draft) if draft.kind == Kind::Swarm => MAX_SWARM_TARGETS,
@@ -127,6 +174,7 @@ impl ImportedJob {
         self,
         mut connection: impl FnMut(&str) -> Option<ConnectionRef>,
         mut group: impl FnMut(&str) -> Option<Vec<(String, ConnectionRef)>>,
+        mut rsync_folder: impl FnMut(&str) -> Option<String>,
         has_snippet: impl FnOnce(SnippetId) -> bool,
     ) -> ParseResult<Vec<Job<SshCommand>>> {
         let mut targets = self
@@ -170,24 +218,49 @@ impl ImportedJob {
         if targets.is_empty() {
             return Err(Omission::InvalidTargets);
         }
+        if self.action.snippet_id().is_some_and(|id| !has_snippet(id)) {
+            return Err(Omission::MissingSnippet);
+        }
         let mut imported_transfer = None;
-        let mut archive_settings = None;
+        let mut imported_privileged = None;
+        let mut route_draft = None;
         let (command, snippet, imported_ai, remote) = match self.action {
             Action::Command(command) => (command, None, None, None),
-            Action::Snippet { id, arguments } if has_snippet(id) => (
+            Action::Snippet { id, arguments } => (
                 String::new(),
                 Some(SnippetLink { id, arguments }),
                 None,
                 None,
             ),
-            Action::Snippet { .. } => return Err(Omission::MissingSnippet),
             Action::Ai(draft) => (String::new(), None, Some(draft), None),
             Action::Remote(remote) => (String::new(), None, None, Some(*remote)),
-            Action::Archive(settings) => {
-                archive_settings = Some(settings);
+            Action::Privileged(settings) => {
+                if settings.requires_single_route() {
+                    route_draft = Some(RouteDraft::Privileged(settings));
+                } else {
+                    imported_privileged = Some(Box::new(imported_privileged::Draft {
+                        routes: targets.iter().map(|(_, route)| route.clone()).collect(),
+                        settings: *settings,
+                    }));
+                }
                 (String::new(), None, None, None)
             }
-            Action::Transfer(draft) => {
+            Action::PerRoute(draft) => {
+                route_draft = Some(draft);
+                (String::new(), None, None, None)
+            }
+            Action::Transfer(mut draft) => {
+                if let imported_transfer::Draft::Rsync(rsync) = draft.as_mut()
+                    && rsync.direction == imported_transfer::Direction::Download
+                    && targets.len() > 1
+                {
+                    rsync.java_target_folders = targets
+                        .iter()
+                        .filter_map(|(source, route)| {
+                            Some((route.id.to_string(), rsync_folder(source)?))
+                        })
+                        .collect();
+                }
                 imported_transfer = Some(draft);
                 (String::new(), None, None, None)
             }
@@ -208,6 +281,7 @@ impl ImportedJob {
             agent: None,
             imported_ai,
             imported_transfer,
+            imported_privileged,
             sudo: SudoMode::Disabled,
             virtual_terminal: self.virtual_terminal,
             journal_detail: self.journal_detail,
@@ -215,9 +289,8 @@ impl ImportedJob {
             desktop_notices: Default::default(),
             webhook_targets: Vec::new(),
         };
-        if let Some(settings) = archive_settings {
-            // Each destination gets its own review. Java uses the same saved local
-            // download path for every target, so it is only a display hint here.
+        if let Some(draft) = route_draft {
+            // Each destination gets its own review and native path.
             let count = targets.len();
             return targets
                 .into_iter()
@@ -225,7 +298,7 @@ impl ImportedJob {
                 .map(|(index, (id, route))| {
                     let mut definition = self.definition.clone();
                     if count > 1 {
-                        definition.id = archive_target_id(&definition.id, &id)?;
+                        definition.id = draft.target_id(&definition.id, &id)?;
                         let suffix = format!(" (target {}/{count})", index + 1);
                         let remaining = kortty_diagram::MAX_LABEL_CHARS - suffix.len();
                         definition.name = definition.name.chars().take(remaining).collect();
@@ -233,12 +306,32 @@ impl ImportedJob {
                     }
                     let mut action = action.clone();
                     action.connection = Some(route.clone());
-                    action.remote = Some(RemoteAction::ImportedArchive(Box::new(
-                        imported_archive::Draft {
-                            route,
-                            settings: (*settings).clone(),
-                        },
-                    )));
+                    match &draft {
+                        RouteDraft::Archive(settings) => {
+                            action.remote = Some(RemoteAction::ImportedArchive(Box::new(
+                                imported_archive::Draft {
+                                    route,
+                                    settings: (**settings).clone(),
+                                },
+                            )));
+                        }
+                        RouteDraft::StagedSftp(settings) => {
+                            action.imported_transfer =
+                                Some(Box::new(imported_transfer::Draft::StagedSftp(
+                                    imported_transfer::StagedSftpDraft {
+                                        route,
+                                        settings: (**settings).clone(),
+                                    },
+                                )));
+                        }
+                        RouteDraft::Privileged(settings) => {
+                            action.imported_privileged =
+                                Some(Box::new(imported_privileged::Draft {
+                                    routes: vec![route],
+                                    settings: (**settings).clone(),
+                                }));
+                        }
+                    }
                     reviewed_job(definition, action)
                 })
                 .collect();
@@ -257,17 +350,6 @@ fn reviewed_job(definition: JobDefinition, action: SshCommand) -> ParseResult<Jo
         .map_err(|_| Omission::InvalidDefinition)?;
     definition
         .with_action(action)
-        .map_err(|_| Omission::InvalidDefinition)
-}
-
-fn archive_target_id(job: &JobId, source_id: &str) -> ParseResult<JobId> {
-    let mut digest = Sha256::new();
-    digest.update(b"kortty/java-scheduler/archive-target/v1\0");
-    digest.update(job.as_str());
-    digest.update(b"\0");
-    digest.update(source_id);
-    let fingerprint = format!("{:x}", digest.finalize());
-    JobId::new(format!("{ARCHIVE_TARGET_ID_PREFIX}{}", &fingerprint[..32]))
         .map_err(|_| Omission::InvalidDefinition)
 }
 
@@ -382,20 +464,20 @@ impl Review {
     pub(super) fn archive_drafts(&self) -> usize {
         self.jobs
             .iter()
-            .filter(|job| matches!(job.action, Action::Archive(_)))
+            .filter(|job| matches!(job.action, Action::PerRoute(RouteDraft::Archive(_))))
             .count()
     }
 
     pub(super) fn archive_passwords_to_select(&self) -> usize {
         self.jobs.iter().filter(|job| {
-            matches!(&job.action, Action::Archive(settings) if settings.format == ArchiveFormat::ZipPassword)
+            matches!(&job.action, Action::PerRoute(RouteDraft::Archive(settings)) if settings.format == ArchiveFormat::ZipPassword)
         }).count()
     }
 
     pub(super) fn privileged_archives_to_review(&self) -> usize {
         self.jobs
             .iter()
-            .filter(|job| matches!(&job.action, Action::Archive(settings) if settings.java_sudo))
+            .filter(|job| matches!(&job.action, Action::PerRoute(RouteDraft::Archive(settings)) if settings.java_sudo))
             .count()
     }
 
@@ -403,7 +485,7 @@ impl Review {
         self.jobs
             .iter()
             .filter(|job| {
-                matches!(job.action, Action::Archive(_))
+                matches!(job.action, Action::PerRoute(RouteDraft::Archive(_)))
                     && (job.source_targets.len() > 1 || !job.source_groups.is_empty())
             })
             .count()
@@ -440,17 +522,37 @@ impl Review {
             .count()
     }
 
+    pub(super) fn staging_drafts(&self) -> usize {
+        self.jobs
+            .iter()
+            .filter(|job| matches!(job.action, Action::PerRoute(RouteDraft::StagedSftp(_))))
+            .count()
+    }
+
+    pub(super) fn privileged_drafts(&self) -> usize {
+        self.jobs
+            .iter()
+            .filter(|job| matches!(job.action, Action::Privileged(_)))
+            .count()
+    }
+
     pub(super) fn bind_all(
         self,
         mut connection: impl FnMut(&str) -> Option<ConnectionRef>,
         mut group: impl FnMut(&str) -> Option<Vec<(String, ConnectionRef)>>,
+        mut rsync_folder: impl FnMut(&str) -> Option<String>,
         mut has_snippet: impl FnMut(SnippetId) -> bool,
     ) -> io::Result<BoundReview> {
         let mut source_jobs = Vec::with_capacity(self.jobs.len());
         let mut omitted = self.omitted;
         for incoming in self.jobs {
             let source = incoming.definition.id.clone();
-            match incoming.bind(&mut connection, &mut group, &mut has_snippet) {
+            match incoming.bind(
+                &mut connection,
+                &mut group,
+                &mut rsync_folder,
+                &mut has_snippet,
+            ) {
                 Ok(jobs) => source_jobs.push((source, jobs)),
                 Err(reason) => *omitted.entry(reason).or_default() += 1,
             }
@@ -487,7 +589,7 @@ impl Review {
                 return Err(invalid("Invalid reviewed Java Scheduler graph."));
             };
             source_jobs.remove(index);
-            *omitted.entry(Omission::ArchiveFanoutLimit).or_default() += 1;
+            *omitted.entry(Omission::TargetFanoutLimit).or_default() += 1;
         };
         let mut jobs = Vec::new();
         for (_, bound) in source_jobs {
@@ -580,19 +682,22 @@ fn valid_bound_job(job: &Job<SshCommand>) -> bool {
             &action.imported_ai,
             &action.remote,
             &action.imported_transfer,
+            &action.imported_privileged,
         ) {
-            (Some(link), None, None, None) => {
+            (Some(link), None, None, None, None) => {
                 action.command.is_empty()
                     && link
                         .arguments
                         .iter()
                         .all(|value| bounded(value, 4096, false).is_ok())
             }
-            (None, Some(_), None, None) | (None, None, None, Some(_)) => action.command.is_empty(),
-            (None, None, Some(remote), None) => {
+            (None, Some(_), None, None, None)
+            | (None, None, None, Some(_), None)
+            | (None, None, None, None, Some(_)) => action.command.is_empty(),
+            (None, None, Some(remote), None, None) => {
                 action.command.is_empty() && valid_remote_import(remote)
             }
-            (None, None, None, None) => bounded(&action.command, 16 * 1024, true).is_ok(),
+            (None, None, None, None, None) => bounded(&action.command, 16 * 1024, true).is_ok(),
             _ => false,
         }
         && action.clone().validated().is_ok()
@@ -600,17 +705,22 @@ fn valid_bound_job(job: &Job<SshCommand>) -> bool {
 
 fn valid_bound_id(job: &Job<SshCommand>) -> bool {
     let id = job.id().as_str();
-    let suffix = match id.strip_prefix(ARCHIVE_TARGET_ID_PREFIX) {
-        Some(suffix)
-            if matches!(
-                job.action().remote.as_ref(),
-                Some(RemoteAction::ImportedArchive(_))
-            ) =>
-        {
-            Some(suffix)
-        }
-        Some(_) => None,
-        None => id.strip_prefix("java-"),
+    let suffix = if let Some(suffix) = id.strip_prefix(ARCHIVE_TARGET_ID_PREFIX) {
+        matches!(job.action().remote, Some(RemoteAction::ImportedArchive(_))).then_some(suffix)
+    } else if let Some(suffix) = id.strip_prefix(STAGING_TARGET_ID_PREFIX) {
+        matches!(
+            job.action().imported_transfer.as_deref(),
+            Some(imported_transfer::Draft::StagedSftp(_))
+        )
+        .then_some(suffix)
+    } else if let Some(suffix) = id.strip_prefix(PRIVILEGED_TARGET_ID_PREFIX) {
+        job.action()
+            .imported_privileged
+            .as_ref()
+            .is_some_and(|draft| draft.settings.requires_single_route())
+            .then_some(suffix)
+    } else {
+        id.strip_prefix("java-")
     };
     suffix.is_some_and(|value| {
         value.len() == 32
@@ -659,17 +769,18 @@ fn parse_job(fields: &Fields<'_, '_>, id: JobId) -> ParseResult<ImportedJob> {
     }
     let action_fields = Fields::new(fields.get("action").ok_or(Omission::InvalidDefinition)?)?;
     let mut action = parse_action(&action_fields)?;
+    let file_or_non_shell = matches!(
+        action,
+        Action::Ai(_) | Action::Remote(_) | Action::Transfer(_) | Action::PerRoute(_)
+    ) || matches!(&action, Action::Privileged(settings) if settings.shell_options().is_none());
     let source_targets = parse_targets(fields, action.target_limit())?;
     let source_groups = parse_groups(fields)?;
     if source_targets.is_empty() && source_groups.is_empty() {
         return Err(Omission::InvalidTargets);
     }
-    let virtual_terminal = if action_fields.boolean("ptyEnabled", false)? {
-        if source_targets.len() > 1
-            || matches!(
-                action,
-                Action::Ai(_) | Action::Remote(_) | Action::Transfer(_) | Action::Archive(_)
-            )
+    let mut virtual_terminal = if action_fields.boolean("ptyEnabled", false)? {
+        if file_or_non_shell
+            || (source_targets.len() > 1 && !matches!(action, Action::Privileged(_)))
         {
             return Err(Omission::UnsupportedExecutionOptions);
         }
@@ -677,10 +788,7 @@ fn parse_job(fields: &Fields<'_, '_>, id: JobId) -> ParseResult<ImportedJob> {
     } else {
         None
     };
-    let journal_detail = if matches!(
-        action,
-        Action::Ai(_) | Action::Remote(_) | Action::Transfer(_) | Action::Archive(_)
-    ) {
+    let journal_detail = if file_or_non_shell {
         JournalDetail::Off
     } else {
         match fields.optional_text("journalDetailMode")? {
@@ -723,14 +831,25 @@ fn parse_job(fields: &Fields<'_, '_>, id: JobId) -> ParseResult<ImportedJob> {
     // Java consults this field when constructing commands and AI requests.
     if !matches!(
         action,
-        Action::Remote(_) | Action::Transfer(_) | Action::Archive(_)
-    ) {
+        Action::Remote(_) | Action::Transfer(_) | Action::PerRoute(_)
+    ) && !matches!(&action, Action::Privileged(settings) if settings.shell_options().is_none())
+    {
         working_directory = fields
             .optional_text("workingDirectory")?
             .map(|path| bounded(path, 4096, false).map(str::to_owned))
             .transpose()?;
         if let Action::Ai(draft) = &mut action {
             draft.working_directory = working_directory.take();
+        }
+    }
+    if let Action::Privileged(settings) = &mut action {
+        match settings.as_mut() {
+            imported_privileged::Settings::Command { options, .. }
+            | imported_privileged::Settings::Snippet { options, .. } => {
+                options.working_directory = working_directory.take();
+                options.virtual_terminal = virtual_terminal.take();
+            }
+            imported_privileged::Settings::File { .. } => {}
         }
     }
     let automation_journal = fields
@@ -949,15 +1068,24 @@ fn parse_action(fields: &Fields<'_, '_>) -> ParseResult<Action> {
     }
     let use_sudo = fields.boolean("useSudo", false)?;
     let sudo_staging = fields.boolean("sudoStagingEnabled", false)?;
-    if !matches!(kind, "SFTP_ARCHIVE" | "RSYNC_SYNC") && (use_sudo || sudo_staging) {
+    if !matches!(
+        kind,
+        "SFTP_ARCHIVE" | "RSYNC_SYNC" | "SFTP_UPLOAD" | "SFTP_DOWNLOAD" | "SFTP_SYNC"
+    ) && (sudo_staging || (use_sudo && matches!(kind, "AI_AGENT" | "AI_SWARM")))
+    {
         return Err(Omission::UnsupportedExecutionOptions);
     }
     match kind {
         "COMMAND" => {
-            let command = fields.text("command")?;
-            Ok(Action::Command(
-                bounded(command, 16 * 1024, true)?.to_owned(),
-            ))
+            let text = bounded(fields.text("command")?, 16 * 1024, true)?.to_owned();
+            Ok(if use_sudo {
+                Action::Privileged(Box::new(imported_privileged::Settings::Command {
+                    text,
+                    options: Default::default(),
+                }))
+            } else {
+                Action::Command(text)
+            })
         }
         "SNIPPET_SCRIPT" => {
             let id = fields.text("snippetId")?;
@@ -981,16 +1109,69 @@ fn parse_action(fields: &Fields<'_, '_>) -> ParseResult<Action> {
             {
                 return Err(Omission::InvalidDefinition);
             }
-            Ok(Action::Snippet { id, arguments })
+            Ok(if use_sudo {
+                Action::Privileged(Box::new(imported_privileged::Settings::Snippet {
+                    link: SnippetLink { id, arguments },
+                    options: Default::default(),
+                }))
+            } else {
+                Action::Snippet { id, arguments }
+            })
         }
         "AI_AGENT" => parse_ai_action(fields, Kind::Agent),
         "AI_SWARM" => parse_ai_action(fields, Kind::Swarm),
-        // Java reads the staging switch only for file upload and download.
         "SFTP_ARCHIVE" => parse_archive_draft(fields, use_sudo),
-        "SFTP_UPLOAD" | "SFTP_DOWNLOAD" | "SFTP_SYNC" => parse_transfer_draft(fields, kind),
+        "SFTP_UPLOAD" | "SFTP_DOWNLOAD" | "SFTP_SYNC" => {
+            parse_transfer_draft(fields, kind, use_sudo && sudo_staging)
+        }
         "RSYNC_SYNC" => parse_rsync_draft(fields, use_sudo),
+        _ if use_sudo => parse_privileged_file(fields, kind),
         _ => parse_remote_action(fields, kind).map(|action| Action::Remote(Box::new(action))),
     }
+}
+
+fn parse_privileged_file(fields: &Fields<'_, '_>, kind: &str) -> ParseResult<Action> {
+    use imported_privileged::FileAction;
+
+    let hint = |field| {
+        fields
+            .java_text(field)?
+            .map(|text| bounded(text, 4096, false).map(str::to_owned))
+            .transpose()
+    };
+    let required = |field| hint(field)?.ok_or(Omission::InvalidDefinition);
+    let action = match kind {
+        "SFTP_MKDIR" => FileAction::Mkdir {
+            path: required("remotePath")?,
+        },
+        "SFTP_RENAME" => FileAction::Rename {
+            from: required("remoteSourcePath")?,
+            to: match hint("remoteDestinationPath")? {
+                Some(path) => path,
+                None => required("newName")?,
+            },
+        },
+        "SFTP_CHMOD" => FileAction::Chmod {
+            path: required("remotePath")?,
+            permissions: required("permissions")?,
+        },
+        "SFTP_CHOWN" => FileAction::Chown {
+            path: required("remotePath")?,
+            owner: required("owner")?,
+            group: hint("group")?,
+        },
+        "SFTP_COPY_REMOTE" => FileAction::Copy {
+            from: required("remoteSourcePath")?,
+            to: required("remoteDestinationPath")?,
+        },
+        "SFTP_DELETE" => FileAction::Delete {
+            path: required("remotePath")?,
+        },
+        _ => return Err(Omission::UnsupportedAction),
+    };
+    Ok(Action::Privileged(Box::new(
+        imported_privileged::Settings::File { action },
+    )))
 }
 
 fn parse_archive_draft(fields: &Fields<'_, '_>, use_sudo: bool) -> ParseResult<Action> {
@@ -1056,10 +1237,10 @@ fn parse_archive_draft(fields: &Fields<'_, '_>, use_sudo: bool) -> ParseResult<A
     settings
         .validate()
         .map_err(|_| Omission::InvalidDefinition)?;
-    Ok(Action::Archive(Box::new(settings)))
+    Ok(Action::PerRoute(RouteDraft::Archive(Box::new(settings))))
 }
 
-fn parse_transfer_draft(fields: &Fields<'_, '_>, kind: &str) -> ParseResult<Action> {
+fn parse_transfer_draft(fields: &Fields<'_, '_>, kind: &str, staged: bool) -> ParseResult<Action> {
     use imported_transfer::Kind;
 
     let kind = match kind {
@@ -1074,7 +1255,19 @@ fn parse_transfer_draft(fields: &Fields<'_, '_>, kind: &str) -> ParseResult<Acti
     };
     let path = |name| fields.java_text(name)?.ok_or(Omission::InvalidDefinition);
     let local_hint = bounded(path("localPath")?, 4096, false)?.to_owned();
-    let remote = remote_path(path("remotePath")?)?;
+    let remote = path("remotePath")?;
+    if staged {
+        let settings = imported_transfer::StagingSettings {
+            kind,
+            local_hint,
+            remote_hint: bounded(remote, 4096, false)?.to_owned(),
+        };
+        settings
+            .validate()
+            .map_err(|_| Omission::InvalidDefinition)?;
+        return Ok(Action::PerRoute(RouteDraft::StagedSftp(Box::new(settings))));
+    }
+    let remote = remote_path(remote)?;
     Ok(Action::Transfer(Box::new(imported_transfer::Draft::Sftp(
         imported_transfer::SftpDraft {
             kind,
@@ -1108,6 +1301,7 @@ fn parse_rsync_draft(fields: &Fields<'_, '_>, use_sudo: bool) -> ParseResult<Act
             .to_owned(),
         java_delete: fields.boolean("rsyncDeleteEnabled", false)?,
         java_sudo: use_sudo,
+        java_target_folders: BTreeMap::new(),
     };
     draft.validate().map_err(|_| Omission::InvalidDefinition)?;
     Ok(Action::Transfer(Box::new(imported_transfer::Draft::Rsync(
@@ -1423,17 +1617,12 @@ mod tests {
     fn java_scheduler_backup_reads_pinned_jaxb_jobs_and_binds_reviewed_targets() -> io::Result<()> {
         let review = inspect(XML.as_bytes())?;
         assert_eq!(review.unsupported_sections, 1);
-        assert_eq!(
-            review.omitted,
-            BTreeMap::from([
-                (Omission::UnsupportedExecutionOptions, 1),
-                (Omission::InvalidDependency, 1),
-            ])
-        );
-        let [command, snippet, grouped, agent] = review
+        assert!(review.omitted.is_empty());
+        assert_eq!(review.privileged_drafts(), 1);
+        let [command, snippet, privileged, dependent, grouped, agent] = review
             .jobs
             .try_into()
-            .unwrap_or_else(|_| panic!("expected command, snippet, group and Agent jobs"));
+            .unwrap_or_else(|_| panic!("expected all six reference jobs"));
         assert_eq!(
             command.definition.id.as_str(),
             "java-3f9bab16184b4e13bf71e37331b8843a"
@@ -1486,6 +1675,7 @@ mod tests {
             .bind(
                 |id| (id == PRIMARY).then(|| connection(17, "first.example")),
                 |_| None,
+                |_| None,
                 |_| false,
             )
             .unwrap()
@@ -1511,6 +1701,7 @@ mod tests {
                     _ => None,
                 },
                 |_| None,
+                |_| None,
                 |id| String::from(id) == "3ee665452eaf4ac7b352d9a1a51d75ed",
             )
             .unwrap()
@@ -1521,6 +1712,39 @@ mod tests {
             snippet.action().snippet.as_ref().unwrap().arguments,
             ["literal space", "a'b"]
         );
+        let primary = || connection(17, "first.example");
+        let bind_primary = |job: ImportedJob| {
+            job.bind(
+                |id| (id == PRIMARY).then(primary),
+                |_| None,
+                |_| None,
+                |_| false,
+            )
+            .unwrap()
+            .pop()
+            .unwrap()
+        };
+        let privileged = bind_primary(privileged);
+        assert!(!privileged.enabled());
+        assert_eq!(privileged.action().sudo, SudoMode::Disabled);
+        assert_eq!(
+            privileged.action().require_executable(),
+            Err(imported_privileged::REVIEW_REQUIRED)
+        );
+        let draft = privileged.action().imported_privileged.as_ref().unwrap();
+        assert_eq!(draft.routes, [primary()]);
+        assert!(matches!(
+            &draft.settings,
+            imported_privileged::Settings::Command { text, options }
+                if text == "whoami" && options == &Default::default()
+        ));
+        let dependent = bind_primary(dependent);
+        assert!(!dependent.enabled());
+        assert_eq!(
+            dependent.dependencies(),
+            std::slice::from_ref(privileged.id())
+        );
+        assert_eq!(dependent.action().command, "true");
         assert!(grouped.source_targets.is_empty());
         assert_eq!(grouped.source_groups, ["Ops/Hosts"]);
         let grouped = grouped
@@ -1530,6 +1754,7 @@ mod tests {
                     (group == "Ops/Hosts")
                         .then(|| vec![(SECONDARY.into(), connection(33, "second.example"))])
                 },
+                |_| None,
                 |_| false,
             )
             .unwrap()
@@ -1543,6 +1768,7 @@ mod tests {
             .bind(
                 |id| (id == PRIMARY).then(|| connection(17, "first.example")),
                 |_| None,
+                |_| None,
                 |_| false,
             )
             .unwrap()
@@ -1554,7 +1780,12 @@ mod tests {
         assert!(draft.profile_id.is_none());
         assert!(agent.action().agent.is_none());
         assert!(agent.action().command.is_empty());
-        assert!(JobGraph::new(vec![command, snippet, grouped, agent]).is_ok());
+        assert!(
+            JobGraph::new(vec![
+                command, snippet, privileged, dependent, grouped, agent
+            ])
+            .is_ok()
+        );
         Ok(())
     }
 
@@ -1595,6 +1826,7 @@ mod tests {
                 ]),
                 _ => None,
             },
+            |_| None,
             |_| false,
         )?;
         let stored = decode(&encode(&bound.jobs)?)?;
@@ -1624,6 +1856,7 @@ mod tests {
         let one = inspect(pty.as_bytes())?.bind_all(
             |_| None,
             |_| Some(vec![(PRIMARY.into(), explicit.clone())]),
+            |_| None,
             |_| false,
         )?;
         assert!(one.jobs.jobs()[0].action().virtual_terminal.is_some());
@@ -1635,6 +1868,7 @@ mod tests {
                     (SECONDARY.into(), second.clone()),
                 ])
             },
+            |_| None,
             |_| false,
         )?;
         assert!(two.jobs.jobs().is_empty());
@@ -1673,6 +1907,7 @@ mod tests {
                 .unwrap()
                 .bind(
                     |_| Some(connection(17, "first.example")),
+                    |_| None,
                     |_| None,
                     |_| false,
                 )
@@ -1739,7 +1974,7 @@ mod tests {
                 "COMMAND",
                 command,
                 single.as_str(),
-                "<useSudo>true</useSudo>",
+                "<useSudo>true</useSudo><sudoStagingEnabled>true</sudoStagingEnabled>",
                 Omission::UnsupportedExecutionOptions,
             ),
             (
@@ -1806,7 +2041,7 @@ Keep it read-only</aiPrompt>
             ("<swarmMaxParallelism>-1</swarmMaxParallelism>", true, 1),
         ] {
             let review = inspect(xml("AI_SWARM", text, &targets).as_bytes())?;
-            let bound = review.bind_all(resolve, |_| None, |_| false)?;
+            let bound = review.bind_all(resolve, |_| None, |_| None, |_| false)?;
             let bytes = encode(&bound.jobs)?;
             let stored = decode(&bytes)?;
             let job = &stored.jobs()[0];
@@ -1852,6 +2087,7 @@ Keep it read-only</aiPrompt>
         let grouped_bound = inspect(grouped.as_bytes())?.bind_all(
             |_| None,
             |_| Some(members.clone()),
+            |_| None,
             |_| false,
         )?;
         let stored = decode(&encode(&grouped_bound.jobs)?)?;
@@ -1869,6 +2105,7 @@ Keep it read-only</aiPrompt>
                 ));
                 Some(members)
             },
+            |_| None,
             |_| false,
         )?;
         assert!(overflow.jobs.jobs().is_empty());
@@ -1911,6 +2148,7 @@ Keep it read-only</aiPrompt>
                 SECONDARY => Some(connection(33, "second.example")),
                 _ => None,
             },
+            |_| None,
             |_| None,
             |_| true,
         )?;
@@ -2002,7 +2240,7 @@ Keep it read-only</aiPrompt>
         assert!(
             jobs.next()
                 .unwrap()
-                .bind(|_| None, |_| None, |_| false)
+                .bind(|_| None, |_| None, |_| None, |_| false)
                 .is_err()
         );
         assert!(
@@ -2013,6 +2251,7 @@ Keep it read-only</aiPrompt>
                         if id == PRIMARY { 17 } else { 33 },
                         "fixture.example"
                     )),
+                    |_| None,
                     |_| None,
                     |_| false
                 )
@@ -2029,8 +2268,8 @@ Keep it read-only</aiPrompt>
             SECONDARY => Some(connection(33, "second.example")),
             _ => None,
         };
-        let reviewed = inspect(XML.as_bytes())?.bind_all(lookup, |_| None, |_| true)?;
-        assert_eq!(reviewed.jobs.jobs().len(), 3);
+        let reviewed = inspect(XML.as_bytes())?.bind_all(lookup, |_| None, |_| None, |_| true)?;
+        assert_eq!(reviewed.jobs.jobs().len(), 5);
         assert_eq!(reviewed.omitted[&Omission::GroupTargets], 1);
         let bytes = encode(&reviewed.jobs)?;
         let restored = decode(&bytes)?;
@@ -2050,12 +2289,14 @@ Keep it read-only</aiPrompt>
         let missing_target = inspect(XML.as_bytes())?.bind_all(
             |id| (id == SECONDARY).then(|| connection(33, "second.example")),
             |_| None,
+            |_| None,
             |_| true,
         )?;
         assert!(missing_target.jobs.jobs().is_empty());
-        assert_eq!(missing_target.omitted[&Omission::InvalidTargets], 3);
-        let missing_snippet = inspect(XML.as_bytes())?.bind_all(lookup, |_| None, |_| false)?;
-        assert_eq!(missing_snippet.jobs.jobs().len(), 2);
+        assert_eq!(missing_target.omitted[&Omission::InvalidTargets], 5);
+        let missing_snippet =
+            inspect(XML.as_bytes())?.bind_all(lookup, |_| None, |_| None, |_| false)?;
+        assert_eq!(missing_snippet.jobs.jobs().len(), 4);
         assert_eq!(missing_snippet.omitted[&Omission::MissingSnippet], 1);
 
         let parent_unavailable = XML.replacen(
@@ -2063,12 +2304,29 @@ Keep it read-only</aiPrompt>
             "<connectionId>missing-parent-target</connectionId>",
             1,
         );
-        let omitted =
-            inspect(parent_unavailable.as_bytes())?.bind_all(lookup, |_| None, |_| true)?;
-        assert_eq!(omitted.jobs.jobs().len(), 1);
-        assert!(omitted.jobs.jobs()[0].action().imported_ai.is_some());
+        let omitted = inspect(parent_unavailable.as_bytes())?.bind_all(
+            lookup,
+            |_| None,
+            |_| None,
+            |_| true,
+        )?;
+        assert_eq!(omitted.jobs.jobs().len(), 3);
+        assert!(
+            omitted
+                .jobs
+                .jobs()
+                .iter()
+                .any(|job| job.action().imported_ai.is_some())
+        );
+        assert!(
+            omitted
+                .jobs
+                .jobs()
+                .iter()
+                .any(|job| job.action().imported_privileged.is_some())
+        );
         assert_eq!(omitted.omitted[&Omission::InvalidTargets], 1);
-        assert_eq!(omitted.omitted[&Omission::InvalidDependency], 2);
+        assert_eq!(omitted.omitted[&Omission::InvalidDependency], 1);
         Ok(())
     }
 
@@ -2113,10 +2371,11 @@ Keep it read-only</aiPrompt>
                 _ => None,
             },
             |_| None,
+            |_| None,
             |_| false,
         )?;
         assert_eq!(bound.jobs.jobs().len(), MAX_JOBS - 2);
-        assert_eq!(bound.omitted[&Omission::ArchiveFanoutLimit], 1);
+        assert_eq!(bound.omitted[&Omission::TargetFanoutLimit], 1);
         assert_eq!(bound.omitted[&Omission::InvalidDependency], 1);
         assert!(
             bound

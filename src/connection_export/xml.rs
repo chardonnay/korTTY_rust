@@ -155,12 +155,7 @@ pub(super) fn kortty(
             }
         } else {
             if !profile.shell.is_default() {
-                let preset = match profile.shell {
-                    kortty_pty::LocalShell::PowerShell => "power-shell",
-                    kortty_pty::LocalShell::CommandPrompt => "command-prompt",
-                    kortty_pty::LocalShell::Default => "default",
-                };
-                field(&mut xml, "    ", "rustLocalShell", preset);
+                field(&mut xml, "    ", "rustLocalShell", profile.shell.id());
             }
             if let Some(command) = &profile.command {
                 field(
@@ -287,6 +282,7 @@ fn serial_profile(xml: &mut String, entry: &SerialEntry<'_>) {
             journal: profile.journal,
             paste_line_delay_ms: profile.paste_line_delay_ms,
             strict_terminal_mode: profile.strict_terminal_mode,
+            highlight_set: profile.highlight_set.clone(),
             ..TerminalOverrides::default()
         },
         None,

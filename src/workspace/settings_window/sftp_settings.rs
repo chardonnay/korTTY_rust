@@ -1,7 +1,7 @@
 use super::*;
 use iced::widget::{column, row};
 
-pub(super) mod java;
+pub(in crate::workspace) mod java;
 
 impl Workspace {
     pub(super) fn sftp_settings_page<'a>(&self, dialog: &'a Dialog) -> Element<'a, Desktop> {

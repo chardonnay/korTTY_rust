@@ -68,6 +68,24 @@ impl Manifest {
             hash: Sha256::new_with_prefix(b"kortty-rsync-tree-v1\0"),
         }
     }
+
+    pub fn bounded_transfer(entries: u32, bytes: u64) -> Self {
+        Self {
+            max_bytes: bytes.min(crate::privileged_file_replace::MAX_BYTES),
+            ..Self::bounded(entries, bytes)
+        }
+    }
+
+    /// Hash one held regular file using the manifest's canonical root entry.
+    /// Callers enforce the byte limit of their own file transport.
+    pub fn regular_file(bytes: u64, digest: [u8; 32]) -> Inventory {
+        let mut manifest = Self::bounded(1, bytes);
+        manifest.max_bytes = bytes;
+        manifest
+            .add("", Some((bytes, digest)))
+            .expect("one file fits its own byte count");
+        manifest.finish()
+    }
     /// Visit root-relative entries depth first, sorting each level by UTF-8 bytes.
     pub fn add(&mut self, path: &str, file: Option<(u64, [u8; 32])>) -> io::Result<()> {
         self.entries += 1;
@@ -176,6 +194,29 @@ pub struct ExistingTree {
     pub fingerprint: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum RecurringReceiver {
+    Existing { snapshot: ExistingTree },
+    Vacant { fingerprint: [u8; 32] },
+}
+
+impl RecurringReceiver {
+    pub fn valid(self, directory: bool) -> bool {
+        match self {
+            Self::Existing { snapshot } => {
+                snapshot.fingerprint != [0; 32]
+                    && recurring_inventory_valid(snapshot.inventory, directory)
+            }
+            Self::Vacant { fingerprint } => fingerprint != [0; 32],
+        }
+    }
+}
+
+fn recurring_inventory_valid(inventory: Inventory, directory: bool) -> bool {
+    inventory.valid() && (directory || (inventory.entries == 1 && inventory.files == 1))
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ExistingRequest {
@@ -252,6 +293,43 @@ pub enum ExistingRequestV2 {
         original: ExistingTree,
         delete: DeleteScope,
     },
+    ReviewRecurring {
+        destination: String,
+        directory: bool,
+        delete: DeleteScope,
+    },
+    PrepareRecurring {
+        destination: String,
+        incoming: Inventory,
+        directory: bool,
+        receiver: RecurringReceiver,
+        delete: DeleteScope,
+    },
+}
+
+impl ExistingRequestV2 {
+    fn valid(&self) -> bool {
+        let allowed_scope = |directory, delete: &DeleteScope| {
+            delete.valid() && (directory || *delete == DeleteScope::Retain)
+        };
+        match self {
+            Self::Review { .. } | Self::Prepare { .. } => true,
+            Self::ReviewRecurring {
+                directory, delete, ..
+            } => allowed_scope(*directory, delete),
+            Self::PrepareRecurring {
+                directory,
+                delete,
+                incoming,
+                receiver,
+                ..
+            } => {
+                allowed_scope(*directory, delete)
+                    && recurring_inventory_valid(*incoming, *directory)
+                    && receiver.valid(*directory)
+            }
+        }
+    }
 }
 
 impl From<ExistingRequest> for ExistingRequestV2 {
@@ -292,6 +370,10 @@ pub enum ExistingReply {
     Reviewed {
         original: ExistingTree,
     },
+    ReviewedRecurring {
+        destination: String,
+        receiver: RecurringReceiver,
+    },
     Prepared {
         stage: String,
     },
@@ -315,6 +397,11 @@ pub enum ExistingReply {
         receiver: ExistingTree,
         recovery: String,
     },
+    FirstRecurringPublished {
+        destination: String,
+        vacancy: [u8; 32],
+        receiver: ExistingTree,
+    },
     Aborted,
     Failed {
         message: String,
@@ -336,7 +423,12 @@ pub fn read_frame<T: DeserializeOwned>(input: impl Read) -> io::Result<T> {
 }
 
 pub fn read_existing_v2_request(input: impl Read) -> io::Result<ExistingRequestV2> {
-    read_sized_frame(input, EXISTING_V2_REQUEST_BYTES)
+    let request: ExistingRequestV2 = read_sized_frame(input, EXISTING_V2_REQUEST_BYTES)?;
+    if request.valid() {
+        Ok(request)
+    } else {
+        Err(invalid("Invalid recurring rsync receiver or inventory"))
+    }
 }
 
 pub(crate) fn read_sized_frame<T: DeserializeOwned>(
@@ -362,6 +454,9 @@ pub fn write_existing_v2_request(
     output: impl Write,
     request: &ExistingRequestV2,
 ) -> io::Result<()> {
+    if !request.valid() {
+        return Err(invalid("Invalid recurring rsync receiver or inventory"));
+    }
     write_sized_frame(output, request, EXISTING_V2_REQUEST_BYTES)
 }
 
@@ -386,6 +481,56 @@ fn invalid(message: &'static str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recurring_file_frames_require_an_exact_file_inventory_and_no_deletion_scope() {
+        let mut manifest = Manifest::default();
+        manifest.add("", Some((0, [1; 32]))).unwrap();
+        let inventory = manifest.finish();
+        let frame = |incoming, receiver, delete| ExistingRequestV2::PrepareRecurring {
+            destination: "/srv/receiver".into(),
+            incoming,
+            directory: false,
+            receiver,
+            delete,
+        };
+        let vacant = RecurringReceiver::Vacant {
+            fingerprint: [2; 32],
+        };
+        let mut valid = Vec::new();
+        write_existing_v2_request(&mut valid, &frame(inventory, vacant, DeleteScope::Retain))
+            .unwrap();
+        assert!(
+            matches!(read_existing_v2_request(valid.as_slice()).unwrap(), ExistingRequestV2::PrepareRecurring { receiver, .. } if receiver == vacant)
+        );
+
+        for request in [
+            frame(inventory, vacant, DeleteScope::All),
+            frame(Manifest::default().finish(), vacant, DeleteScope::Retain),
+            frame(
+                inventory,
+                RecurringReceiver::Vacant {
+                    fingerprint: [0; 32],
+                },
+                DeleteScope::Retain,
+            ),
+            frame(
+                inventory,
+                RecurringReceiver::Existing {
+                    snapshot: ExistingTree {
+                        inventory: Manifest::default().finish(),
+                        fingerprint: [1; 32],
+                    },
+                },
+                DeleteScope::Retain,
+            ),
+        ] {
+            let mut invalid = Vec::new();
+            write_frame(&mut invalid, &request).unwrap();
+            assert!(read_existing_v2_request(invalid.as_slice()).is_err());
+            assert!(write_existing_v2_request(Vec::new(), &request).is_err());
+        }
+    }
 
     #[test]
     fn scoped_existing_request_has_a_separate_bounded_frame_and_preserves_v1_shape() {

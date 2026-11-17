@@ -71,6 +71,28 @@ fn invalid_line() -> io::Error {
 }
 
 impl SshWriter {
+    /// Sends a bounded secret to an owned protocol that awaits a later guarded decision.
+    pub fn send_sensitive_frame(
+        &mut self,
+        input: Zeroizing<Vec<u8>>,
+        permitted: impl Fn() -> bool + Send + Sync + 'static,
+    ) -> io::Result<()> {
+        if self.input_closed {
+            return Err(closed());
+        }
+        if !(1..=MAX_SENSITIVE_FRAME_BYTES).contains(&input.len()) {
+            return Err(invalid_line());
+        }
+        let result = self.queue(Command::Data(InputBytes::Sensitive(
+            input,
+            Some(Arc::new(permitted)),
+        )));
+        if result.is_err() {
+            SshAbort(self.shared.clone()).abort();
+        }
+        result
+    }
+
     /// Sends a bounded secret frame and a separately guarded protocol commit marker.
     /// The remote helper must require the marker because closing a channel can
     /// also produce EOF on the helper's input.

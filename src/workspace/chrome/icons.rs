@@ -10,6 +10,7 @@ use crate::terminal_theme::Rgb;
 pub(crate) enum Icon {
     Tab,
     Shell,
+    GitBash,
     PowerShell,
     CommandPrompt,
     Connections,
@@ -112,6 +113,11 @@ impl Icon {
                 "M5 3 H19 Q21 3 21 5 V19 Q21 21 19 21 H5 Q3 21 3 19 V5 Q3 3 5 3",
                 "M7 8 L11 12 L7 16 M13 16 H17",
                 BLUE,
+            ),
+            Self::GitBash => (
+                "M5 3 H19 Q21 3 21 5 V19 Q21 21 19 21 H5 Q3 21 3 19 V5 Q3 3 5 3",
+                "M7 8 L11 12 L7 16 M13 16 H17",
+                "#f05133",
             ),
             Self::PowerShell => (
                 "M7 4 H22 L17 20 H2 Z",

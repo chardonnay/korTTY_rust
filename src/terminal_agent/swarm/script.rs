@@ -109,6 +109,8 @@ impl Prepared {
             Target::Local { shell, .. } => match shell {
                 #[cfg(unix)]
                 Shell::Posix(_) => matches!(self.family, Family::Posix(_)),
+                #[cfg(target_os = "linux")]
+                Shell::FlatpakHost => matches!(self.family, Family::Posix(_)),
                 #[cfg(windows)]
                 Shell::PowerShell(_) => self.family == Family::PowerShell,
                 #[cfg(windows)]

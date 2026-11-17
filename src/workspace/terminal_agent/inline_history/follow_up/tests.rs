@@ -15,6 +15,7 @@ fn run(private: bool) -> Run {
         label: "Fixture".into(),
         reviewed_https: None,
         reviewed_cli: None,
+        server_default: None,
     };
     let secrets = Secrets::default();
     secrets.add(SECRET);

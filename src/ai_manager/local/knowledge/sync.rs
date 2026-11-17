@@ -185,9 +185,10 @@ fn reconcile(
     };
     authorize()?;
     let cache = Cache::new(root.to_owned());
-    let previous = match cache.load_stamped(&previous_scope) {
+    let previous = match cache.load_file_backed(&previous_scope, active) {
         Ok(snapshot) => Some(snapshot),
         Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => return Err(error.to_string()),
         Err(error) => return Err(format!("Could not read the saved index ({error}).")),
     };
     let mut candidate = baseline.as_ref().clone();
@@ -293,7 +294,7 @@ fn reconcile(
                     authorize,
                 )
             } else {
-                cache.save(&index, || {
+                cache.save_checked(&index, active, || {
                     require_current()?;
                     index
                         .check_sources(&scope, active)
@@ -379,13 +380,7 @@ fn require_previous(cache: &Cache, scope: &Scope, stamp: Option<&FileStamp>) -> 
     if let Some(stamp) = stamp {
         return cache.require_current(scope, stamp);
     }
-    match cache.load(scope) {
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error),
-        Ok(_) => Err(io::Error::other(
-            "The knowledge index was created by another operation.",
-        )),
-    }
+    cache.require_absent(scope)
 }
 
 fn status(summary: UpdateSummary, unavailable: usize, boundary_changed: usize) -> String {

@@ -389,6 +389,15 @@ impl Directory {
         })
     }
 
+    pub(crate) fn replace_with_shared_readers(
+        &self,
+        name: &str,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+        check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.replace_with(name, write, check)
+    }
+
     pub(crate) fn replace_with_readable(
         &self,
         name: &str,

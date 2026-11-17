@@ -318,7 +318,7 @@ fn journal_https_answer_rejects_an_unreviewed_or_stale_payload_before_tls() {
         .save_fixture_at(&fixture.0, &Configuration::default())
         .unwrap();
     let saved = Arc::new(Configuration::load_fixture_from(&fixture.0).unwrap());
-    let profiles: Vec<_> = saved.journal_question_https_profiles().collect();
+    let profiles: Vec<_> = saved.journal_https_profiles().collect();
     assert_eq!(profiles.len(), 1);
     assert_eq!(profiles[0].3, format!("{url}/messages"));
     assert!(saved.journal_question_https_transport(2).is_err());
@@ -418,59 +418,138 @@ fn journal_https_native_tls_transmits_only_the_reviewed_answer() {
     assert!(endpoint.ip().is_loopback());
     let ca = fs::read(std::env::var_os("KORTTY_TEST_JOURNAL_HTTPS_CA").unwrap()).unwrap();
     let key_env = "KORTTY_TEST_JOURNAL_HTTPS_KEY";
-    let key = crate::local_ai::credential_value(key_env).unwrap();
     for (mode, model) in [
         ("remote-open-ai", "journal-fixture-openai"),
         ("anthropic", "journal-fixture-anthropic"),
     ] {
-        let fixture = Fixture::new();
-        fixture.journal(
-            "tls",
-            "TLS journal",
-            1,
-            "The deploy failed with exit 7. fixture-secret",
+        check_native_tls_answer(
+            &format!("https://{endpoint}/v1"),
+            mode,
+            model,
+            &ca,
+            key_env,
+            None,
         );
-        let configured: Configuration = serde_json::from_value(json!({
+    }
+}
+
+#[test]
+#[ignore = "requires a private HTTPS journal fixture and its dedicated CA"]
+fn journal_question_server_default_omits_model_and_sends_the_exact_review() {
+    check_server_selected_tls_answer("remote-open-ai-exact");
+}
+
+#[test]
+#[ignore = "requires a private HTTPS journal fixture and its dedicated CA"]
+fn journal_question_loopback_tls_omits_model_and_sends_the_exact_review() {
+    check_server_selected_tls_answer("lm-studio-compatible");
+}
+
+fn check_server_selected_tls_answer(mode: &str) {
+    let _exclusive = exclusive_run();
+    let endpoint = std::env::var("KORTTY_TEST_HTTPS_APPLY_URL").unwrap();
+    let url = url::Url::parse(&endpoint).unwrap();
+    assert_eq!(url.host_str(), Some("127.0.0.1"));
+    assert_eq!(url.path(), "/tenant/v1/journal-question/");
+    let ca = fs::read(std::env::var_os("KORTTY_TEST_HTTPS_APPLY_CA_DER").unwrap()).unwrap();
+    let expected = PathBuf::from(std::env::var_os("KORTTY_TEST_HTTPS_APPLY_EXPECTED").unwrap());
+    check_native_tls_answer(
+        &endpoint,
+        mode,
+        "",
+        &ca,
+        "KORTTY_TEST_HTTPS_APPLY_KEY",
+        Some(&expected),
+    );
+}
+
+fn check_native_tls_answer(
+    endpoint: &str,
+    mode: &str,
+    model: &str,
+    ca: &[u8],
+    key_env: &str,
+    expected: Option<&Path>,
+) {
+    let key = crate::local_ai::credential_value(key_env).unwrap();
+    let fixture = Fixture::new();
+    fixture.journal(
+        "tls",
+        "TLS journal",
+        1,
+        "The deploy failed with exit 7. fixture-secret",
+    );
+    let configuration = |model: &str| -> Configuration {
+        serde_json::from_value(json!({
             "profiles": {
                 "profiles": [{
                     "id": 1, "name": "Loopback HTTPS fixture", "model": model,
-                    "endpoint": format!("https://{endpoint}/v1"), "connection_mode": mode,
+                    "model_mode": if model.is_empty() { "server-default" } else { "manual" },
+                    "endpoint": endpoint, "connection_mode": mode,
                     "trusted_remote_endpoint": true, "credential_env": key_env
                 }],
                 "default": 1, "last_id": 1
-            }
+            },
+            "local": {"roles": [null, null, null, 1]}
         }))
+        .unwrap()
+    };
+    configuration(model)
+        .save_fixture_at(&fixture.0, &Configuration::default())
         .unwrap();
-        configured
-            .save_fixture_at(&fixture.0, &Configuration::default())
-            .unwrap();
-        let saved = Arc::new(Configuration::load_fixture_from(&fixture.0).unwrap());
-        let (profile, limit) = saved.journal_question_https_transport(1).unwrap();
-        let authority =
-            HttpsAuthority::capture(saved, 1, &profile, &ClipboardPolicy::default(), None).unwrap();
-        assert_eq!(authority.completion_secret(), Some(key.as_str()));
-        let unchanged = |text: &str| Ok(text.to_owned());
-        let mut review = Review::prepare(
-            Question::new(
-                &format!("Why did the deploy fail? fixture-secret {}", key.as_str()),
-                &unchanged,
-            )
-            .unwrap(),
-            vec![fixture.source("tls")],
-            false,
+    let saved = Arc::new(Configuration::load_fixture_from(&fixture.0).unwrap());
+    let (profile, limit) = saved.journal_question_https_transport(1).unwrap();
+    assert_eq!(saved.preferred_journal_question_outbound_id(false), Some(1));
+    let authority = HttpsAuthority::capture(
+        saved.clone(),
+        1,
+        &profile,
+        &ClipboardPolicy::default(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(authority.completion_secret(), Some(key.as_str()));
+    let unchanged = |text: &str| Ok(text.to_owned());
+    let mut review = Review::prepare(
+        Question::new(
+            &format!("Why did the deploy fail? fixture-secret {}", key.as_str()),
             &unchanged,
-            &|| false,
+        )
+        .unwrap(),
+        vec![fixture.source("tls")],
+        false,
+        &unchanged,
+        &|| false,
+    )
+    .unwrap();
+    let mask = |text: &str| Ok(masked(text)?.replace(key.as_str(), "***"));
+    review.mask_for_https(&profile, limit, &mask).unwrap();
+    assert!(!review.answer_messages()[1].contains(key.as_str()));
+    if let Some(expected) = expected {
+        fs::write(
+            expected,
+            serde_json::to_vec(&review.answer_messages()).unwrap(),
         )
         .unwrap();
-        let mask = |text: &str| Ok(masked(text)?.replace(key.as_str(), "***"));
-        review.mask_for_https(&profile, limit, &mask).unwrap();
-        assert!(!review.answer_messages()[1].contains(key.as_str()));
-        let (mut worker, _cancel) = Answering::begin_reviewed_https(profile, authority).unwrap();
-        worker.session.trust_test_server(&ca).unwrap();
-        let answer = worker.answer(&review, &|| false, |_| {}).result.unwrap();
-        assert!(answer.ai_used, "expected an HTTPS answer from {mode}");
-        assert_eq!(answer.findings.len(), 1);
-        assert_eq!(answer.findings[0].quote, "The deploy failed with exit 7.");
+    }
+    let (mut worker, _cancel) = Answering::begin_reviewed_https(profile, authority).unwrap();
+    worker.session.trust_test_server(ca).unwrap();
+    let answer = worker.answer(&review, &|| false, |_| {}).result.unwrap();
+    assert!(answer.ai_used, "expected an HTTPS answer from {mode}");
+    assert_eq!(answer.findings.len(), 1);
+    assert_eq!(answer.findings[0].quote, "The deploy failed with exit 7.");
+    if model.is_empty() {
+        configuration("new-model")
+            .save_fixture_at(&fixture.0, &saved)
+            .unwrap();
+        assert!(
+            worker
+                .answer(&review, &|| false, |_| {})
+                .result
+                .unwrap_err()
+                .to_string()
+                .contains("saved HTTPS profile")
+        );
     }
 }
 

@@ -26,12 +26,14 @@ pub(crate) struct JavaImportedRoute {
     pub(crate) id: u64,
     pub(crate) target: LoginTarget,
     pub(crate) jump: Option<LoginTarget>,
+    pub(crate) rsync_folder: Option<String>,
 }
 
 pub(crate) struct JavaConnectionImport {
     pub(crate) contents: Option<Vec<u8>>,
     pub(crate) routes: BTreeMap<String, JavaImportedRoute>,
     pub(crate) memory_ids: BTreeMap<String, u64>,
+    pub(crate) profile_ids: BTreeMap<String, u64>,
     pub(crate) groups: JavaSourceGroups,
 }
 
@@ -43,6 +45,7 @@ pub(crate) struct JavaSourceGroups {
 
 struct JavaGroupMember {
     group: String,
+    source_group: String,
     source_id: Option<String>,
 }
 
@@ -53,7 +56,8 @@ impl JavaSourceGroups {
                 self.incomplete = true;
             }
             Ok(group) if !group.is_empty() => self.members.push(JavaGroupMember {
-                group: group.clone(),
+                group: kortty::normalize_java_group_path(group),
+                source_group: group.clone(),
                 source_id: source_id.map(str::to_owned),
             }),
             Ok(_) => {}
@@ -80,6 +84,28 @@ impl JavaSourceGroups {
                 Some((id, routes.get(id)?))
             })
             .collect::<Option<Vec<_>>>()?;
+        (!members.is_empty()).then_some(members)
+    }
+
+    pub(crate) fn toolbar_members(
+        &self,
+        group: &str,
+        profiles: &BTreeMap<String, u64>,
+    ) -> Option<BTreeSet<u64>> {
+        if self.incomplete {
+            return None;
+        }
+        let mut members = BTreeSet::new();
+        for entry in self
+            .members
+            .iter()
+            .filter(|entry| entry.source_group == group)
+        {
+            let id = entry.source_id.as_deref().and_then(|id| profiles.get(id))?;
+            if !members.insert(*id) {
+                return None;
+            }
+        }
         (!members.is_empty()).then_some(members)
     }
 }
@@ -317,39 +343,50 @@ fn stage_import(
 ) -> io::Result<JavaConnectionImport> {
     let mut routes = BTreeMap::new();
     let mut memory_ids = BTreeMap::new();
+    let mut profile_ids = BTreeMap::new();
     let (candidate, outcome) = options::stage_with_java_library(
         local,
         &imports.entries,
         &imports.local_entries,
         &imports.serial_entries,
         &imports.java_library,
-        |inserted| match inserted {
-            options::Inserted::Ssh(entry, connection) => {
-                if let Some((target, jump)) = &entry.java_route
-                    && connection.matches_route(target, jump.as_ref())
-                    && connection.blocked_server(policy).is_none()
-                {
+        |inserted| {
+            if let Some(id) = inserted.java_favorite_id() {
+                profile_ids.insert(id.to_owned(), inserted.ids().1);
+            }
+            match inserted {
+                options::Inserted::Ssh(entry, connection) => {
+                    if let Some((target, jump)) = &entry.java_route
+                        && connection.matches_route(target, jump.as_ref())
+                        && connection.blocked_server(policy).is_none()
+                    {
+                        if let Some(source) = &entry.java_memory_id {
+                            memory_ids.insert(source.clone(), connection.id);
+                        }
+                        if let Some(source) = &entry.java_id {
+                            routes.insert(
+                                source.clone(),
+                                JavaImportedRoute {
+                                    id: connection.id,
+                                    target: target.clone(),
+                                    jump: jump.clone(),
+                                    rsync_folder: entry.java_rsync_folder.clone(),
+                                },
+                            );
+                        }
+                    }
+                }
+                options::Inserted::Local(entry, profile) => {
                     if let Some(source) = &entry.java_memory_id {
-                        memory_ids.insert(source.clone(), connection.id);
+                        memory_ids.insert(source.clone(), profile.id);
                     }
-                    if let Some(source) = &entry.java_id {
-                        routes.insert(
-                            source.clone(),
-                            JavaImportedRoute {
-                                id: connection.id,
-                                target: target.clone(),
-                                jump: jump.clone(),
-                            },
-                        );
+                }
+                options::Inserted::Serial(entry, profile) => {
+                    if let Some(source) = &entry.java_memory_id {
+                        memory_ids.insert(source.clone(), profile.id);
                     }
                 }
             }
-            options::Inserted::Local(entry, profile) => {
-                if let Some(source) = &entry.java_memory_id {
-                    memory_ids.insert(source.clone(), profile.id);
-                }
-            }
-            options::Inserted::Serial(..) => {}
         },
     )?;
     let contents = (outcome.imported > 0)
@@ -359,6 +396,7 @@ fn stage_import(
         contents,
         routes,
         memory_ids,
+        profile_ids,
         groups: imports.java_groups,
     })
 }
@@ -521,6 +559,7 @@ mod tests {
                 id: document.connections[0].id,
                 target,
                 jump: Some(jump),
+                rsync_folder: Some("Key_route-key-rout".into()),
             },
         );
         assert_eq!(
@@ -529,6 +568,7 @@ mod tests {
                 id: document.connections[1].id,
                 target: password_target,
                 jump: None,
+                rsync_folder: Some("Password_route-password".into()),
             },
         );
         assert_eq!(document.connections[0].login.auth, Auth::StoredKey(17));

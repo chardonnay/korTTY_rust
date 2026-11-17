@@ -10,6 +10,7 @@ use super::chrome::Action;
 const MENU_BAR_SHORTCUT_REQUIRED: &str = "Keep a shortcut available to restore the menu bar.";
 
 mod editor;
+pub(in crate::workspace) mod java;
 pub use editor::Edit;
 pub(super) use editor::Editor;
 

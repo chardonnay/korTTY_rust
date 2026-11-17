@@ -5,7 +5,7 @@ use std::fs::FileTimes;
 
 use kortty_server_archive::rsync_tree::{
     DeleteScope, ExistingDecision, ExistingReply, ExistingRequest, ExistingRequestV2, ExistingTree,
-    read_existing_v2_request,
+    MAX_BYTES, RecurringReceiver, read_existing_v2_request,
 };
 use rustix::fs::{FlockOperation, XattrFlags, fchown, flock, fsetxattr};
 use rustix::process::Gid;
@@ -91,6 +91,84 @@ fn serve_with(
                     version,
                 )
             }
+            ExistingRequestV2::ReviewRecurring {
+                destination,
+                directory,
+                delete,
+            } if version == Version::V3 => {
+                require_receipt_space(&destination)?;
+                let target = RecurringTarget::open(&destination, directory, &delete, None)?;
+                let receiver = target.review()?;
+                Ok(ExistingReply::ReviewedRecurring {
+                    destination,
+                    receiver,
+                })
+            }
+            ExistingRequestV2::PrepareRecurring {
+                destination,
+                incoming,
+                directory,
+                receiver,
+                delete,
+            } if version == Version::V3 => {
+                require_receipt_space(&destination)?;
+                let target =
+                    RecurringTarget::open(&destination, directory, &delete, Some(receiver))?;
+                if target.review()? != receiver {
+                    return Err(changed());
+                }
+                let exchange = Exchange {
+                    input: &mut input,
+                    output: &mut output,
+                    recovery: &mut recovery,
+                };
+                match (target, receiver) {
+                    (RecurringTarget::Tree(target), _) => transact(
+                        *target,
+                        incoming,
+                        &delete,
+                        exchange.input,
+                        exchange.output,
+                        exchange.recovery,
+                        version,
+                    ),
+                    (RecurringTarget::File(target), _) => {
+                        transact_file(&target, incoming, exchange)
+                    }
+                    (
+                        RecurringTarget::VacantTree(target),
+                        RecurringReceiver::Vacant { fingerprint },
+                    ) => transact_first(
+                        target.parent(),
+                        &destination,
+                        fingerprint,
+                        incoming,
+                        exchange,
+                        |stage| target.prepare(stage, incoming),
+                        |stage, candidate, uncertain| {
+                            target.publish(stage, candidate, uncertain, || Ok(()))
+                        },
+                    ),
+                    (
+                        RecurringTarget::VacantFile(target),
+                        RecurringReceiver::Vacant { fingerprint },
+                    ) => transact_first(
+                        target.parent(),
+                        &destination,
+                        fingerprint,
+                        incoming,
+                        exchange,
+                        |stage| target.prepare(stage, incoming),
+                        |stage, candidate, uncertain| {
+                            target.publish(stage, candidate, uncertain, || Ok(()))
+                        },
+                    ),
+                    _ => Err(changed()),
+                }
+            }
+            _ => Err(invalid(
+                "Recurring rsync publication requires helper protocol v3",
+            )),
         }
     })()
     .unwrap_or_else(|error| ExistingReply::Failed {
@@ -99,6 +177,220 @@ fn serve_with(
         recovery: recovery.path,
     });
     write_frame(output, &reply)
+}
+
+enum RecurringTarget<'a> {
+    Tree(Box<Target<'a>>),
+    File(Box<super::existing_file::Target<'a>>),
+    VacantTree(Box<VacantTarget<'a>>),
+    VacantFile(Box<super::existing_file::VacantTarget<'a>>),
+}
+
+impl<'a> RecurringTarget<'a> {
+    fn open(
+        destination: &'a str,
+        directory: bool,
+        delete: &DeleteScope,
+        reviewed: Option<RecurringReceiver>,
+    ) -> io::Result<Self> {
+        let (path, name) = absolute_file(destination)?;
+        let parent = Directory::open_parent(path)?;
+        let _ancestors = lock_receiver_ancestors(path, &parent)?;
+        let vacant = match reviewed {
+            Some(receiver) => matches!(receiver, RecurringReceiver::Vacant { .. }),
+            None => absent(&parent.fd, name)?,
+        };
+        Ok(match (directory, vacant) {
+            (true, false) => Self::Tree(Box::new(Target::open_at(destination, parent)?)),
+            (false, false) => Self::File(Box::new(super::existing_file::Target::open_at(
+                destination,
+                parent,
+            )?)),
+            (true, true) => Self::VacantTree(Box::new(VacantTarget::open_at(
+                destination,
+                parent,
+                delete,
+            )?)),
+            (false, true) => Self::VacantFile(Box::new(
+                super::existing_file::VacantTarget::open_at(destination, parent)?,
+            )),
+        })
+    }
+
+    fn review(&self) -> io::Result<RecurringReceiver> {
+        Ok(match self {
+            Self::Tree(target) => RecurringReceiver::Existing {
+                snapshot: target.review(),
+            },
+            Self::File(target) => RecurringReceiver::Existing {
+                snapshot: target.review(),
+            },
+            Self::VacantTree(target) => RecurringReceiver::Vacant {
+                fingerprint: target.fingerprint()?,
+            },
+            Self::VacantFile(target) => RecurringReceiver::Vacant {
+                fingerprint: target.fingerprint(),
+            },
+        })
+    }
+}
+
+fn require_receipt_space(destination: &str) -> io::Result<()> {
+    let (parent, _) = absolute_file(destination)?;
+    // Reserve space for every byte to expand to three digits when serialized.
+    let snapshot = ExistingTree {
+        inventory: Inventory {
+            entries: MAX_ENTRIES,
+            files: MAX_ENTRIES,
+            bytes: MAX_BYTES,
+            digest: [255; 32],
+        },
+        fingerprint: [255; 32],
+    };
+    for reply in [
+        ExistingReply::FirstRecurringPublished {
+            destination: destination.to_owned(),
+            vacancy: [255; 32],
+            receiver: snapshot,
+        },
+        ExistingReply::PublishedWithReceiver {
+            destination: destination.to_owned(),
+            receiver: snapshot,
+            recovery: format!(
+                "{}/.kortty-{}.kortty-part/{ORIGINAL}",
+                parent.trim_end_matches('/'),
+                "0".repeat(32)
+            ),
+        },
+    ] {
+        write_frame(io::sink(), &reply).map_err(|_| {
+            invalid("The recurring rsync destination is too long for a publication receipt")
+        })?;
+    }
+    Ok(())
+}
+
+struct Exchange<'a, R, W> {
+    input: &'a mut R,
+    output: &'a mut W,
+    recovery: &'a mut Recovery,
+}
+
+impl<R: Read, W: io::Write> Exchange<'_, R, W> {
+    fn begin(&mut self, stage: &UploadStage<'_>) -> io::Result<bool> {
+        write_frame(
+            &mut self.output,
+            &ExistingReply::Prepared {
+                stage: stage.name.clone(),
+            },
+        )?;
+        match read_frame(&mut self.input)? {
+            ExistingDecision::Verify => Ok(true),
+            ExistingDecision::Abort => Ok(false),
+            _ => Err(invalid("The rsync successor has not been verified")),
+        }
+    }
+
+    fn verified(&mut self, successor: Inventory) -> io::Result<ExistingDecision> {
+        write_frame(
+            &mut self.output,
+            &ExistingReply::VerifiedWithRemovals {
+                successor,
+                removed: 0,
+            },
+        )?;
+        read_frame(&mut self.input)
+    }
+}
+
+fn transact_first<C>(
+    parent: &Directory,
+    destination: &str,
+    vacancy: [u8; 32],
+    incoming: Inventory,
+    mut exchange: Exchange<'_, impl Read, impl io::Write>,
+    prepare: impl FnOnce(&UploadStage<'_>) -> io::Result<C>,
+    publish: impl FnOnce(&mut UploadStage<'_>, &C, &mut bool) -> io::Result<ExistingTree>,
+) -> io::Result<ExistingReply> {
+    let mut stage = UploadStage::create_checked(parent)?;
+    if !exchange.begin(&stage)? {
+        stage.discard()?;
+        return Ok(ExistingReply::Aborted);
+    }
+    let candidate = prepare(&stage)?;
+    match exchange.verified(incoming)? {
+        ExistingDecision::Publish => {
+            let receiver = publish(&mut stage, &candidate, &mut exchange.recovery.uncertain)?;
+            stage.discard()?;
+            Ok(ExistingReply::FirstRecurringPublished {
+                destination: destination.to_owned(),
+                vacancy,
+                receiver,
+            })
+        }
+        ExistingDecision::Abort => {
+            stage.discard()?;
+            Ok(ExistingReply::Aborted)
+        }
+        _ => Err(invalid("Unexpected rsync first-publication decision")),
+    }
+}
+
+fn transact_file(
+    target: &super::existing_file::Target<'_>,
+    incoming: Inventory,
+    mut exchange: Exchange<'_, impl Read, impl io::Write>,
+) -> io::Result<ExistingReply> {
+    let mut stage = UploadStage::create_checked(target.parent())?;
+    if !exchange.begin(&stage)? {
+        stage.discard()?;
+        return Ok(ExistingReply::Aborted);
+    }
+    let candidate = target.prepare_successor(&stage, incoming)?;
+    match exchange.verified(incoming)? {
+        ExistingDecision::Quarantine => {
+            let published = target.commit_checked(
+                &mut stage,
+                &candidate,
+                true,
+                exchange.recovery,
+                || Ok(()),
+                |path| confirm_publication(exchange.input, exchange.output, path),
+            )?;
+            if let Some(Published { recovery, receiver }) = published {
+                return Ok(ExistingReply::PublishedWithReceiver {
+                    destination: target.destination().to_owned(),
+                    receiver: receiver.ok_or_else(changed)?,
+                    recovery,
+                });
+            }
+            stage.discard()?;
+            Ok(ExistingReply::Aborted)
+        }
+        ExistingDecision::Abort => {
+            stage.discard()?;
+            Ok(ExistingReply::Aborted)
+        }
+        _ => Err(invalid("Unexpected rsync existing-file decision")),
+    }
+}
+
+fn confirm_publication(
+    input: impl Read,
+    output: impl io::Write,
+    recovery: &str,
+) -> io::Result<bool> {
+    write_frame(
+        output,
+        &ExistingReply::Quarantined {
+            recovery: recovery.to_owned(),
+        },
+    )?;
+    match read_frame(input)? {
+        ExistingDecision::Publish => Ok(true),
+        ExistingDecision::Abort => Ok(false),
+        _ => Err(invalid("Unexpected rsync publication decision")),
+    }
 }
 
 fn transact(
@@ -110,7 +402,7 @@ fn transact(
     recovery: &mut Recovery,
     version: Version,
 ) -> io::Result<ExistingReply> {
-    let mut received = UploadStage::create(&target.parent)?;
+    let mut received = UploadStage::create_checked(&target.parent)?;
     write_frame(
         &mut output,
         &ExistingReply::Prepared {
@@ -148,19 +440,7 @@ fn transact(
                 receipt.then_some(successor),
                 recovery,
                 || Ok(()),
-                |path| {
-                    write_frame(
-                        &mut output,
-                        &ExistingReply::Quarantined {
-                            recovery: path.to_owned(),
-                        },
-                    )?;
-                    match read_frame(input)? {
-                        ExistingDecision::Publish => Ok(true),
-                        ExistingDecision::Abort => Ok(false),
-                        _ => Err(invalid("Unexpected rsync publication decision")),
-                    }
-                },
+                |path| confirm_publication(input, &mut output, path),
             )?;
             let Some(Published { recovery, receiver }) = published else {
                 checked.stage.discard()?;
@@ -210,6 +490,149 @@ pub(in crate::server) struct Target<'a> {
     parent_attributes: Option<[u8; 32]>,
     witness: Witness,
     review: ExistingTree,
+}
+
+pub(in crate::server) struct VacantTarget<'a> {
+    slot: super::existing_file::VacantTarget<'a>,
+    delete: DeleteScope,
+    scan: Scan,
+    parent_attributes: Option<[u8; 32]>,
+}
+
+pub(in crate::server) struct FirstTree {
+    witness: Witness,
+    inventory: Inventory,
+}
+
+impl<'a> VacantTarget<'a> {
+    pub(in crate::server) fn open_at(
+        destination: &'a str,
+        parent: Directory,
+        delete: &DeleteScope,
+    ) -> io::Result<Self> {
+        if !delete.valid() {
+            return Err(changed());
+        }
+        let slot = super::existing_file::VacantTarget::open_at(destination, parent)?;
+        let scan = Scan::Existing { mount: slot.mount };
+        scan.require_entry(&slot.parent().fd, 0o700)?;
+        let parent_attributes = scan.directory_attributes(&slot.parent().fd)?;
+        slot.require_vacant()?;
+        Ok(Self {
+            slot,
+            delete: delete.clone(),
+            scan,
+            parent_attributes,
+        })
+    }
+
+    pub(in crate::server) fn parent(&self) -> &Directory {
+        self.slot.parent()
+    }
+
+    pub(in crate::server) fn fingerprint(&self) -> io::Result<[u8; 32]> {
+        let mut hash = Sha256::new_with_prefix(
+            self.slot
+                .fingerprint_with_domain(b"kortty-rsync-first-recurring-tree-v1\0"),
+        );
+        hash.update(serde_json::to_vec(&self.delete).map_err(io::Error::other)?);
+        Ok(hash.finalize().into())
+    }
+
+    pub(in crate::server) fn require_vacant(&self) -> io::Result<()> {
+        self.slot.require_vacant()?;
+        if self.scan.directory_attributes(&self.parent().fd)? != self.parent_attributes {
+            return Err(changed());
+        }
+        Ok(())
+    }
+
+    pub(in crate::server) fn prepare(
+        &self,
+        stage: &UploadStage<'_>,
+        expected: Inventory,
+    ) -> io::Result<FirstTree> {
+        self.prepare_with(stage, expected, Manifest::default)
+    }
+
+    pub(in crate::server) fn prepare_transfer(
+        &self,
+        stage: &UploadStage<'_>,
+        expected: Inventory,
+    ) -> io::Result<FirstTree> {
+        self.prepare_with(stage, expected, || {
+            Manifest::bounded_transfer(expected.entries, expected.bytes)
+        })
+    }
+
+    fn prepare_with(
+        &self,
+        stage: &UploadStage<'_>,
+        expected: Inventory,
+        manifest: impl Fn() -> Manifest,
+    ) -> io::Result<FirstTree> {
+        self.require_vacant()?;
+        self.slot.verify_stage(stage)?;
+        let received = stage.verify_received_with(expected, manifest())?;
+        require_delete_roots(&self.delete, &received)?;
+        // Recheck the same private tree with the metadata rules of its future receiver.
+        let mut manifest = manifest();
+        let witness = scan(&stage.payload, "", 0, &mut manifest, self.scan)?;
+        stage.require_received(&received)?;
+        if manifest.finish() != expected {
+            return Err(changed());
+        }
+        fsync(&stage.payload.fd)?;
+        fsync(&stage.directory.fd)?;
+        Ok(FirstTree {
+            witness,
+            inventory: expected,
+        })
+    }
+
+    pub(in crate::server) fn publish(
+        &self,
+        stage: &mut UploadStage<'_>,
+        candidate: &FirstTree,
+        outcome_unknown: &mut bool,
+        permit: impl Fn() -> io::Result<()>,
+    ) -> io::Result<ExistingTree> {
+        let _ancestors = lock_receiver_ancestors(self.slot.path, self.parent())?;
+        flock(&stage.payload.fd, FlockOperation::NonBlockingLockExclusive)?;
+        self.slot.verify_stage(stage)?;
+        candidate
+            .witness
+            .require_tree(&stage.payload, self.scan, false)?;
+        let result = stage.publish(self.slot.path, self.slot.name, &candidate.witness, || {
+            permit()?;
+            self.require_vacant()
+        });
+        *outcome_unknown = stage.published;
+        result?;
+
+        let root = Stamp::of(&stage.payload.fd.metadata()?);
+        self.parent()
+            .require_child(self.slot.name, &stage.payload.stat)?;
+        candidate
+            .witness
+            .require_tree(&stage.payload, self.scan, true)?;
+        permit()?;
+        self.slot.verify_parent()?;
+        let proof = tree_proof(
+            self.slot.destination,
+            self.parent(),
+            self.parent_attributes,
+            candidate.inventory,
+            &candidate.witness,
+            &root,
+        )?;
+        self.parent()
+            .require_child(self.slot.name, &stage.payload.stat)?;
+        if !root.matches(&stage.payload.fd, false)? {
+            return Err(changed());
+        }
+        Ok(proof)
+    }
 }
 
 impl<'a> Target<'a> {
@@ -277,17 +700,8 @@ impl<'a> Target<'a> {
         delete: &DeleteScope,
     ) -> io::Result<Successor<'target>> {
         let received_witness = received.verify_received(incoming)?;
-        if !delete.valid_for(|name| {
-            received_witness
-                .children
-                .iter()
-                .any(|(entry, node)| entry == name && matches!(node, Node::Directory(_)))
-        }) {
-            return Err(invalid(
-                "A named rsync deletion root is missing from the checked incoming directories",
-            ));
-        }
-        let stage = UploadStage::create(&self.parent)?;
+        require_delete_roots(delete, &received_witness)?;
+        let stage = UploadStage::create_checked(&self.parent)?;
         let mut manifest = Manifest::default();
         compose(
             &stage.payload,
@@ -312,7 +726,7 @@ impl<'a> Target<'a> {
             ));
         }
         self.verify(false)?;
-        received_witness.require_current(&received.payload)?;
+        received.require_received(&received_witness)?;
         let removed = removed_entries(&self.witness, &witness);
         Ok(Successor {
             stage,
@@ -546,6 +960,21 @@ impl<'a> Target<'a> {
         fsync(&stage.directory.fd)?;
         fsync(&self.parent.fd)?;
         self.verify_parent()
+    }
+}
+
+fn require_delete_roots(delete: &DeleteScope, received: &Witness) -> io::Result<()> {
+    if delete.valid_for(|name| {
+        received
+            .children
+            .iter()
+            .any(|(entry, node)| entry == name && matches!(node, Node::Directory(_)))
+    }) {
+        Ok(())
+    } else {
+        Err(invalid(
+            "A named rsync deletion root is missing from the checked incoming directories",
+        ))
     }
 }
 

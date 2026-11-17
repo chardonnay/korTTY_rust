@@ -279,9 +279,100 @@ The Java preview also lists supported AI Memory files. After restart,
 **AI Manager → AI Memory** shows missing global documents, history and
 archives that the current policy allows. Notes and history can also be
 restored for newly added SSH profiles with an exact Java UUID mapping.
+
+The Java backup can fill unset window and keyboard preferences. This includes
+Coding Agents detection, notifications, badge and dock settings, remote sidebar
+position, and supported shortcuts for native actions. It also includes shell tab
+titles, command timestamps, link detection, background transparency, the terminal
+silence threshold, and the Scheduler menu status. Terminal bell, command,
+program and AI-run notification settings merge field by field. Existing shortcuts and
+the platform's reserved key combinations take precedence. Recording restore
+can fill unset scope, color capture, idle pause and threshold settings. A
+fresh recording profile can also adopt the Java setting for availability
+after restart. Choose any recording folder and FFmpeg executable on this device.
+
+Java startup preferences can fill unset remembered-window and dashboard
+options and the fixed startup geometry. The fixed geometry supports signed
+coordinates and a maximized start. Java restores saved bounds and
+maximization when the geometry record also carries fullscreen metadata.
+
+The restore can fill unset snippet analysis defaults for automatic diagrams,
+modularization proposals, and inclusion of source code in exports. The
+backup preview identifies a source-code export default.
+
+Java backups can fill unset file-editor caret and snippet editor appearance
+fields. An active Java snippet palette supplies the text, background and
+cursor settings. The font family and size come from the snippet editor's
+own settings.
+
+The restore can fill unset terminal selection and paste settings, including
+the Quick Select alphabet and compatible patterns. Java patterns retain
+their original text and use a bounded matcher with Java semantics for the
+supported constructs, including Java character properties such as
+`\p{javaLowerCase}` and `\p{javaWhitespace}`, ASCII and Unicode POSIX
+classes, Java binary Unicode properties, and Unicode scripts and blocks.
+The importer also handles octal and control escapes, paired UTF-16
+escapes, named Unicode scalar escapes such as `\N{LATIN CAPITAL LETTER A}`,
+short category escapes and the previous-match anchor `\G`.
+Lookarounds, backreferences, atomic groups, and
+possessive quantifiers use a matcher with input, repetition, and
+backtracking limits. Backreferences respect the active Java ASCII or
+Unicode case mode. Scoped case, Unicode classes, line settings and
+the comments flag follow Java behavior. Literals and supported bracket
+classes apply Java's Unicode case rules, including in nested classes and
+intersections. Java grapheme escapes use the Unicode 16.0 behavior
+of OpenJDK 25.0.2. The preview counts unsupported
+patterns and identifies an imported paste warning mode of **Off**.
+
+Java backups can fill unset SFTP preferences for parallel transfers, partial
+files, conflicts, idle timeout, and the remote archive directory and ZIP
+compression level. The restore preview calls out the replace-on-conflict
+setting when it is present. Configure local editor commands on this device.
+
+Java backups can also restore custom Journal markers and their ordered rules.
+The restore can fill unset journal palette, theme, font, text scale, link,
+and capture-format preferences. Export watermark and footer settings are
+merged field by field. Choose any journal storage directory on this device.
+
+Existing native rules keep priority. A marker ID collision with different
+settings imports the Java definition under a separate ID and reconnects its
+rules. An existing Rust profile keeps its automatic application setting.
+Imported regular expressions keep their original text. The preview lists
+rules that need pattern review before they can run.
+
+Java backups also restore custom toolbar buttons, separators, icon size and
+the two row visibility settings. Connection and folder buttons resolve to
+exact profiles added by the same import. Unavailable buttons keep their
+original Java targets so you can identify them in **Customize Toolbar…**.
+A saved native toolbar layout takes precedence.
+
 Supported Java SFTP Scheduler jobs import disabled. For a deletion, open the
 job and type the exact remote path before enabling it. Imported copies
 require a new destination.
+
+Java SFTP upload, download, and sync jobs with sudo staging restore one
+disabled draft per saved SSH target. Open **Action** to review the original
+paths, choose absolute paths on this device and the Linux server, and select
+passwordless or vault-backed sudo. Choose a new file, an existing file to
+replace, or a new folder. Select **Use existing server folder** or **Use
+existing local folder** to adopt a merge. Save the disabled job and use the
+corresponding native review before enabling it. For a split job, review each destination
+individually. Dependent jobs retain all split jobs as prerequisites. A saved
+calendar is retained for review. Privileged folder transfers support a manual
+run or a single date and time without prerequisites.
+
+Java Scheduler sudo commands, snippet scripts, and file actions also restore
+disabled. Open **Action**, verify the saved SSH host keys, choose the sudo mode,
+and select **Use native sudo action**. Command and snippet drafts keep the
+working directory and exact target selection. Drafts with a virtual terminal
+and file actions have one job per saved route. Passwordless sudo can keep the
+virtual terminal. Vault-backed sudo uses SSH command execution.
+
+Review the file paths and settings in the native editor. Enter absolute
+server paths, resolve named owners and groups there, and select folder copy
+for a directory source. A recursive deletion requires typing the exact
+server path. Review and approve the native file operation before saving it.
+The adopted job stays disabled until you enable it.
 
 Choose **Review SSH Host Keys…** in the Java backup preview to inspect the endpoint, algorithm and SHA-256 fingerprint. Verify each fingerprint against a trusted source and select the keys you want to add. **Import Selected Keys** applies only that selection to the local trust store, independently of profile restore on restart. Local pins take precedence at conflicts.
 
@@ -309,10 +400,17 @@ profiles. Review and save the matching profile in **Profiles**, then choose
 with no matching profile leaves the reference visible for review. Existing
 assignments stay active until you save a change.
 
-Java AI Memory notes and history can follow SSH and local shell connections
-added by the same restore. Legacy filenames require a unique match among
+Java AI Memory notes and history can follow SSH, local shell, and serial
+connections added by the same restore. Legacy filenames require a unique match among
 the source connections. A mixed archive is restored when all its connection
 scopes match. Existing local Memory files take precedence.
+The preview reports documents and history omitted because Java filenames
+collide. Archives use the full Java IDs in their scope markers.
+
+Use **Review AI Memory Destinations…** in the Java backup preview to assign
+notes to an existing connection of the same type. The preview shows source
+identities and saved destinations. Review the backup again if the saved
+connection catalogue changes before restore.
 
 For a Java Toolpack profile, configure a local API token environment name,
 enter the exact tool names exposed by the installed plugin, and choose **Use
@@ -369,7 +467,13 @@ For the font smoke test, open a local default terminal and a quick connect tab w
 
 Under **Colors**, named profiles provide foreground, background, and cursor colors. **Custom (no profile)** allows custom values for these. Selection color, 16 ANSI colors, and cursor blinking are independently adjustable. **Enable terminal colors** controls incoming SGR color changes. For the smoke test, set the normal red value to `#123456`, save, and execute `printf '\033[41m         \033[0m\n'` in an open pane. The ANSI background must show the saved color. `cargo test --locked -p kortty --bin kortty color` checks saving, the renderer, and OSC color queries on a real PTY.
 
-**Settings → Terminal → Set Up Shell Integration…** displays the startup snippets for Bash, zsh, fish, PowerShell and CMD. The dialog can remain open during terminal use. **Quick Connect → Local Shell → Add shell integration automatically**, or the same choice in a saved local shell profile, loads integration for that launch without editing your startup files. The option is initially off. Supported custom shell executables can use reviewed interactive/login flags. Command/script arguments cannot use automatic integration. On Windows, POSIX shells need a full executable path, such as Git Bash, rather than a WSL launcher alias. PowerShell preserves the existing prompt. CMD uses a drive/path prompt for that session and reports prompt boundaries only, without command duration, exit status or directory evidence.
+**Settings → Terminal → Set Up Shell Integration…** displays the startup snippets for Bash, zsh, fish, PowerShell and CMD. The dialog can remain open during terminal use. **Quick Connect → Local Shell → Add shell integration automatically**, or the same choice in a saved local shell profile, loads integration for that launch without editing your startup files. The option is initially off. Supported custom shell executables can use reviewed interactive/login flags. On Windows, a custom POSIX shell needs a full executable path. Install the snippet inside the distribution for a WSL shell. PowerShell preserves the existing prompt. CMD uses a drive/path prompt for that session and reports prompt boundaries only.
+
+Quick Connect and local shell profiles offer detected platform presets. On
+Windows these include Git Bash, Cygwin and an installed WSL distribution.
+macOS offers Zsh and Bash, and Linux offers Bash. When Git for Windows is
+available, **Customize Toolbar… → Actions → New Git Bash** adds a direct
+login-shell button. Existing Java Git Bash buttons use that action after import.
 
 For SSH, install the matching snippet in the remote user's shell startup file and reconnect. Right-click **Set Up Shell Integration…** to inspect the selected pane's Agent shortcut readiness, including after prompt navigation becomes available. **Previous Prompt** proves that a prompt mark arrived, while Agent shortcuts also require the input-boundary mark and an empty live prompt. `cargo test --locked -p kortty-pty --test shell_integration` checks the available POSIX shells. `cargo test --locked -p kortty-pty --test windows_shell_integration` checks native PowerShell and CMD.
 
@@ -395,7 +499,7 @@ Record an existing shortcut for a second menu action in the **Keyboard** tab. Th
 
 To verify in a local shell, change to a test folder, create a UTF-8 file, and output approximately `./probe.txt:2:3`. Start **Quick Select** and press the marked letter with **Shift**. The editor must display the file at line 2, column 3. `bash scripts/with-scratch.sh cargo test --locked --offline -p kortty -- quick_select terminal_file_editor` checks visible cells, position specifications, and write protection. `bash scripts/with-scratch.sh cargo test --locked --offline -p kortty-pty -- terminal_file_directory` checks the directory change and the rejected process switch.
 
-Under **Global Settings → Terminal → Links**, **Quick select label letters** and **Quick select patterns** modify the selection. The alphabet can consist of 2 to 26 distinct ASCII lowercase letters. The empty field uses the default sequence. One regular expression in Rust syntax is possible per line, up to 16 in total. Invalid inputs are marked before saving. To verify, save `xz` and `[A-Z]{3}-[0-9]{3}`, output `ABC-123` in the terminal, and open **Quick Select**. The marking should start with `x`.
+Under **Global Settings → Terminal → Links**, **Quick select label letters** and **Quick select patterns** modify the selection. The alphabet can consist of 2 to 26 distinct ASCII lowercase letters. The empty field uses the default sequence. Enter one regular expression per line, up to 16 total. New profiles use Rust syntax. The Java backup restore selects the Java syntax option for compatible imported patterns. The editor marks invalid inputs before saving. To verify, save `xz` and `[A-Z]{3}-[0-9]{3}`, output `ABC-123` in the terminal, and open **Quick Select**. The marking should start with `x`.
 
 **Typeahead off** enables the preview for direct keyboard input in a local Xterm pane. It appears after measured delay following confirmed character echo. Search and copy use the confirmed terminal output. The setting applies to the running pane and is off at startup. Programs can disable the echo without visible output. For such inputs, the preview should be off.
 
@@ -810,6 +914,24 @@ file-transfer permission before publishing at the new local path. If the
 copy fails after server publication, the server archive remains available
 and the run reports its path.
 
+Ordinary Linux Scheduler jobs can enable **Reuse reviewed archive paths**
+with the current server helper. Each firing checks the configured paths
+and pins the identity of any existing regular file for that publication.
+The helper retains the previous file under a private recovery path.
+ZIP replaces matching member paths, adds new members and keeps unmatched
+ones. Protected ZIP members are written with AES-256. TAR, TAR.BZ2 and 7z
+are rebuilt from the current sources. A verified local copy can also
+replace an existing file and keep its own recovery path. The run details
+report the recovery locations.
+
+Imported Java ZIP, password ZIP, TAR and TAR.BZ2 jobs preserve the complete
+server path of each member without the leading slash. For example,
+`/etc/hosts` is stored as `etc/hosts`. The Scheduler exposes this
+setting as **Keep complete server paths in archive entries (Java layout)**.
+With **Reuse reviewed archive paths**, matching ZIP entries are updated
+and TAR archives are rebuilt from the current sources. Adopted jobs stay
+disabled and require a separate reuse selection.
+
 For privileged Scheduler archives on Linux, install a reviewed build of the
 same native executable at `/usr/libexec/kortty/kortty-server-archive`.
 The executable and every directory in its path must be root-owned and
@@ -821,7 +943,8 @@ for the delegated operation. For example:
 {
   "source_roots": ["/srv/kortty-source"],
   "destination_roots": ["/srv/kortty-archives"],
-  "download_roots": ["/srv/kortty-archives/client-copies"]
+  "download_roots": ["/srv/kortty-archives/client-copies"],
+  "replacement_roots": ["/srv/kortty-archives/client-copies"]
 }
 ```
 
@@ -834,6 +957,13 @@ and archive paths, and approve the action. The server sends the newly published
 archive through its creation channel. The local file is published after size,
 SHA-256 and current file-transfer permission checks. The root-owned server
 archive remains in place if the copy fails.
+
+`replacement_roots` is optional. Each entry must be within a destination
+root. It permits replacing a root-owned archive with mode `0600` after
+review of the exact source and output. Enable **Reuse reviewed archive
+paths** and approve the action. The helper confirms publication before
+accepting a separate request for a verified copy. Copy requests still
+require a corresponding `download_roots` entry.
 
 The helper requires Linux 5.8 or later for mount IDs and reads its running
 executable identity through `/proc/self/exe`. Every SSH account delegated
@@ -851,6 +981,14 @@ SSH_ACCOUNT ALL=(root) NOPASSWD: NOSETENV: KORTTY_ARCHIVE
 Cmnd_Alias KORTTY_ARCHIVE_PASSWORD = sha256:HEX_DIGEST /usr/libexec/kortty/kortty-server-archive --privileged-create-v2
 Defaults!KORTTY_ARCHIVE_PASSWORD fdexec=always,env_reset,command_timeout=1800
 SSH_ACCOUNT ALL=(root) PASSWD: NOSETENV: KORTTY_ARCHIVE_PASSWORD
+
+Cmnd_Alias KORTTY_ARCHIVE_UPDATE = sha256:HEX_DIGEST /usr/libexec/kortty/kortty-server-archive --privileged-update-v1
+Defaults!KORTTY_ARCHIVE_UPDATE fdexec=always,env_reset,command_timeout=1800
+SSH_ACCOUNT ALL=(root) NOPASSWD: NOSETENV: KORTTY_ARCHIVE_UPDATE
+
+Cmnd_Alias KORTTY_ARCHIVE_UPDATE_PASSWORD = sha256:HEX_DIGEST /usr/libexec/kortty/kortty-server-archive --privileged-update-v2
+Defaults!KORTTY_ARCHIVE_UPDATE_PASSWORD fdexec=always,env_reset,command_timeout=1800
+SSH_ACCOUNT ALL=(root) PASSWD: NOSETENV: KORTTY_ARCHIVE_UPDATE_PASSWORD
 ```
 
 The digest and descriptor execution require the command-specific rule to
@@ -921,7 +1059,19 @@ files owned by the saved login. The job verifies the file digests and server
 metadata again before publication. The original is kept in a private sibling
 folder for recovery. Review a new copy before running again.
 
-For repeated copies, enable **Allow recurring scheduled copies on this device** on an ordinary SFTP folder job. Enable its calendar and select **Condition** dependency mode. Set the approval duration, total firing limit, and per-firing action and MiB limits. **Compare and review…** shows the roots, pinned route, schedule and exact expiry. **Approve recurring runs** authorizes future eligible content under those roots. The calendar window selects due times. A queued or overdue run can start later while the approval is active. Each admitted attempt counts, including an empty scan or an unsuccessful connection. The job checks the roots and hashes current source files before copying missing entries. Manual, Chain and cascade starts use the separate one-use workflow.
+For repeated copies, enable **Allow recurring scheduled copies on this
+device** on an ordinary SFTP folder job. Enable its calendar or select
+**Chain** and choose its predecessors. You can use both automatic triggers
+on the same job. Set the approval duration, total firing limit and
+per-firing action and MiB limits. **Compare and review…** shows the roots,
+pinned route, triggers and exact expiry. **Approve recurring runs**
+authorizes future eligible content under those roots. Each admitted
+attempt counts, including an empty scan or an unsuccessful connection.
+A Chain start uses a fresh successful round of predecessor runs. The
+calendar window selects due times, and a queued run can start later while
+the approval is active. The job checks the roots and hashes current source
+files before copying missing entries. Use one-use approval for manual or
+cascade starts.
 
 To include replacements in a recurring approval, also enable **Replace changed
 local files after review** or **Replace changed server files after review**.
@@ -932,7 +1082,11 @@ approval and host keys before publication.
 
 **SSH · Review privileged folder upload** publishes a reviewed local tree to a new directory on one pinned Linux SSH route. Select passwordless sudo or a saved sudo credential, review the listed files and directories, choose **Approve one run**, and save. The job rechecks the file digests and destination parent before staging. The fixed Python helper publishes the complete root-owned tree in one no-replace operation. The remote filesystem must support Linux `renameat2(RENAME_NOREPLACE)`. A lost reply after publication is reported as uncertain and requires a fresh review.
 
+To upload into an existing protected folder, select **Review changes in an existing server folder**. This uses the installed Linux helper described below. Review the additions and changed files, then approve one manual run or one date and time. The helper verifies all requested payloads in private staging before the first publication. Unchanged files, existing directories and receiver-only entries keep their identity. Changed files retain supported receiver metadata. For each replaced file, the respective private sibling recovery directory holds `original` and `replaced-name`. The journal reports the directories' shared name prefix and the confirmed changes. A later refusal can leave earlier confirmed changes in place.
+
 **SSH · Review privileged folder download** reviews a complete root-owned tree from one pinned Linux SSH route. Choose an absent local directory under a protected parent, review the exact files and directories, choose **Approve one run**, and save. The job consumes the approval before requesting file bodies. It checks each digest and the final source acknowledgement before publishing the complete private tree locally. Both privileged folder actions accept up to 128 entries and 1 GiB.
+
+For an existing destination, select **Review changes in an existing local folder**. The review lists new entries and changed files. The job verifies all source data and rechecks the approved receiver and pinned route before publishing. It preserves the existing folder, unchanged files, and entries found only on the receiver. Replacements retain supported local access metadata and keep the originals in private sibling folders. The run journal reports how to find them. A portable backup retains the paths and sudo mode and restores the job disabled for fresh review.
 
 For **Upload file** or **Download file**, choose **Privileged staging** to enable passwordless sudo or a saved sudo credential on one pinned Linux SSH route. Select **Review paths and SSH route…**, approve the displayed operation, and save the job. The approval covers subsequent runs of the same action on this device. Each run streams one regular file of at most 1 GiB through the fixed `/usr/bin/sudo` and `/usr/bin/python3` helper. The helper uses root-controlled directories and publishes uploads as new root-owned files with mode `0600`. Downloads publish to a new local file after the complete digest is verified. The file transfer and scheduler sudo policies apply. A changed route, path, elevation mode or restored job needs a new approval.
 
@@ -1003,9 +1157,9 @@ remain outside the scope of a named-folder mirror. Review again whenever a
 source or destination changes. Existing-folder mixed uploads require the
 current `kortty-server-archive` v2 rsync helper on Linux.
 
-For a single folder or combined sources targeting an existing directory,
-a download replacing an existing local file, or a passwordless upload
-replacing an existing protected server file, select
+For a single folder or combined sources targeting a reviewed directory,
+a download with a reviewed local receiver, or an upload of one file with
+a reviewed server receiver, select
 **Approve recurring rsync** and set an enabled calendar or Chain mode with
 predecessors. Review the verified routes, destination, source placement,
 expiry, number of firings and shared
@@ -1016,10 +1170,19 @@ expected destination and retains the displaced receiver for recovery. A
 changed destination or an unconfirmed result requires a new review.
 Replacing one existing local file counts its incoming bytes and one entry
 toward the firing limits. The replacement uses the same path and consumes
-zero removals. Recurring approval requires an existing reviewed receiver.
+zero removals. A checked download can also start at a reviewed vacant local
+path. The download first creates the receiver, then matches that exact
+receiver before later replacement.
 Ordinary recurring uploads use the `kortty-server-archive` v3 rsync helper
-on Linux. Passwordless recurring transfers use the current passwordless
-helper and bind the reviewed policy, configured roots, paths and file types.
+on Linux. Select **Allow creation at reviewed vacant server file paths** or
+**Allow creation at reviewed vacant server folder paths** to review the
+exact path with the current helper. The existing parent must be protected
+and owned by the SSH login. A vacant-path review requires a native parent
+creation timestamp and atomic no-replace publication. Later firings use the
+exact receipt to replace the prior file or
+apply the reviewed folder merge or mirror, with recovery. Passwordless
+recurring transfers use the current passwordless helper and bind the
+reviewed policy, configured roots, paths and file types.
 
 To transfer through protected Linux paths, select **Use passwordless sudo**
 before reviewing and saving the rsync job. The review checks the executable,
@@ -1028,8 +1191,22 @@ can create a new file or directory, replace a reviewed regular file, or merge
 or mirror a reviewed existing directory. Select **Replace an existing server
 file** for a regular file and enter the full server path. The helper retains
 the original under a private recovery name and carries the reviewed file's
-permission mode, group and supported attributes to the replacement. A new
-review is required to replace the current version after a successful run.
+permission mode, group and supported attributes to the replacement. With a
+one-time approval, review the current version before running again.
+For a recurring upload, select **Allow creation at reviewed vacant server
+file paths** if a route may start without a receiver. Review the full file
+path on each route. The current Linux helper requires a protected existing
+parent, support for atomic no-replace rename and a native creation timestamp
+for the parent. Both the destination and replacement roots must cover the
+path. A vacant target is created as a private root-owned file with no
+displaced original. Confirmed creation records the file identity for the
+next firing. If another process occupies the path before creation, korTTY
+leaves that file in place.
+For direct or mixed folder uploads, **Allow creation at reviewed vacant
+server folder paths** checks the effective folder and the same server
+roots. The first firing publishes the checked tree without replacing an
+occupant. Later firings use the saved merge or mirror scope and retain the
+previous confirmed tree for recovery.
 Downloads support new local files and directories and reviewed existing
 local files and directories.
 
@@ -1056,7 +1233,7 @@ In root-owned `/etc/kortty/privileged-rsync.json`, use the exact UID and GID
 of the delegated login. Source roots authorize reads, destination roots
 authorize publication at vacant paths, and replacement roots authorize
 reviewed file replacement or directory merge or mirror below a destination
-root. Each account needs a
+root. Each rsync account needs a
 separate root-owned handoff directory outside all source and destination trees.
 The handoff directory and its root-owned ancestors need search access for the
 login. Protect the configuration, helper and permitted directory paths from
@@ -1096,6 +1273,51 @@ the exact local file path for each target of a grouped job. The job and its
 schedule stay disabled until explicitly enabled. Rust portable backups
 keep the configured paths and options for existing receivers. Restored jobs
 start disabled and require new route and receiver approvals.
+
+For protected single-file transfers, select a saved Linux SSH connection and
+choose passwordless or vault-backed sudo under **Privileged staging**. Enable
+replacement for the existing destination, open **Review paths and SSH route…**
+and save the approved job. Each file can be up to 1 GiB. Review binds the
+destination contents and metadata to the saved path, route and host pins.
+An individual upload approval also binds the exact local payload. The journal
+records the protected recovery path for each original.
+
+For recurring jobs, select **Allow recurring automatic replacements on this
+device** and configure an enabled calendar or Chain with predecessors. Choose
+up to 30 days, 128 firings and 1 GiB per firing before approving and saving.
+Each firing reads the current regular file from the approved source path. The
+destination must match the reviewed receiver or the last confirmed replacement.
+The next firing uses the successor fingerprint only after publication is
+confirmed. A changed receiver or unconfirmed publication requires another
+review. Profile backups retain the settings and restore the job disabled.
+
+For replacement uploads, build the Linux helper with
+`cargo build --release --locked -p kortty-server-archive`. Install it at
+`/usr/libexec/kortty/kortty-server-archive` and authorize the fixed command.
+Use `PASSWD` for vault-backed sudo or `NOPASSWD` for passwordless sudo.
+Recurring uploads require the helper build that reports the published
+successor fingerprint. It uses the same fixed sudo command.
+
+```sudoers
+transferuser ALL=(root) PASSWD: /usr/libexec/kortty/kortty-server-archive --privileged-file-replace-v1
+```
+
+For existing protected folder uploads, authorize the folder helper's command.
+
+```sudoers
+transferuser ALL=(root) PASSWD: /usr/libexec/kortty/kortty-server-archive --privileged-tree-merge-v1
+```
+
+Use `destination_roots` and `replace_roots` in the same root-owned
+`/etc/kortty/privileged-rsync.json`. Inline upload accounts use their exact
+`uid`, `gid` and those two lists. The destination scope covers every
+publication. Inspecting and replacing existing files also requires the
+replacement scope. The folder helper supports up to 128 portable UTF-8
+entries and 1 GiB per source and receiver inspection. It requires stable
+directory identities and atomic no-replace rename on the server filesystem.
+Rsync accounts also configure their handoff directory. An administrator can
+restore the original from the journaled recovery location after checking the
+active destination.
 
 Fixed **AI Agent · Scheduled SSH workflow** diagnostics use one saved SSH connection. **AI Swarm · Scheduled SSH workflow** targets several and records each outcome. Choose a canonical absolute server directory, a local or managed AI profile, and a question. For a fixed system or filesystem probe, use **Review AI workflow…**, then **Approve diagnostics**, and save the job. The model can summarize the masked probe results. Run it manually or use a calendar schedule. Managed execution and route policy apply, and saved connections that require interactive login or isolation are ineligible. Restored jobs require fresh approval.
 
@@ -1246,6 +1468,22 @@ When dragging the timeline, the playback pauses and shows the selected image alo
 **Tools → Logfile Manager…** reads terminal logs from `terminal-logs` in the Rust profile. Add the Java folder `~/.kortty/terminal-logs` as needed via **Add Folder…**. The default shortcut in the work area is **Cmd+Shift+X** or **Ctrl+Shift+X**. An existing custom binding takes precedence when loading. The viewer offers search, line jump, **Bottom** and manual refresh. **Hold** protects closed files from deletion. When deleting, kortty rechecks the file identity and the protection markers in the open folder. **Export** can retain the payload or convert it to text, XML or JSON and use gzip, bzip2 or Zstandard. For testing, open an existing Java log file in the viewer, jump to the last line with **Bottom** and export a zstd copy to a new file. `cargo test --locked -p kortty --bin kortty logfile_window` checks among other things file formats, hold, export, file replacement during deletion and a last line without line break.
 
 Separate Logfile Manager and Logfile Viewer windows are modeless and belong to the main window that opened them. Opening the same log again in that main window focuses its existing viewer. The main-window close review also covers unsaved badge edits in its manager.
+
+The viewer remembers **Highlight links**, **Highlight keywords**, and the
+selected terminal highlight set. Select a highlighted link or path to copy
+the complete token. Find matches take priority over link and keyword colors.
+Java backups can restore these viewer preferences and compatible custom
+highlight rules. If a local set already uses the Java ID for different rules,
+the imported set gets a stable ID and the restored viewer selection follows
+it. An existing viewer selection takes precedence. Imported rules carry
+presentation only. Configure notification and snippet actions separately
+in Terminal Highlighting. A missing saved set uses the built-in errors
+and warnings set.
+
+The same restore applies compatible live terminal defaults and remaps
+highlight choices on imported SSH, local shell and serial profiles. Use
+**Keyword highlighting** in the connection editor to inherit the global
+selection, choose a set, or explicitly turn off highlighting for a profile.
 
 **Badges…** applies markers to all selected logs. The preview shows name, symbol, style and color. Custom templates remain available in the local library. For testing, select two completed logs, adopt **Hold** and a custom badge, reopen the manager and check both rows. A single held file must not be deletable via **Delete…**. `cargo test --locked -p kortty --bin kortty logfile_badges_` checks the Java file formats and conflicts with simultaneously modified logs or markers.
 
@@ -1798,7 +2036,7 @@ Under **Configure model**, **CPU threads (0 = auto)** controls the thread count 
 
 In **Profiles**, select **Managed llama.cpp model** and choose a registered model. Assign the profile to a Text, Coding, or Journal role as usual. The request worker starts the signed runtime when needed, and overlapping leases for the same model share its process. Each new connection must belong to the supervised process before the client sends the credential or prompt. The process stays available between requests. New models default to a 10-minute idle timeout, as do older registrations without a saved timeout. Choose 1 to 1,440 minutes or **Never unload while idle**. After the timeout, llama.cpp unloads the model tensors and reloads them on the next request in the same process. A failed first runtime startup restores the previous verified runtime if available. Managed chat profiles handle text and can use image input when their model has a vision projector. Managed embedding models are assigned in Knowledge Stores or Local Preferences.
 
-On Apple Silicon with macOS 14 or later, **Local Models → Managed Apple MLX** reviews local copies of the signed MLX index, detached signature and package ZIP. Leave the ZIP field empty to review a signed catalog update, including any withdrawals. For an online install, choose **Check signed MLX releases**, select a compatible package, and use **Review MLX download…** to check its HTTPS address, size and SHA-256 before confirming. Choosing an older release pins it. Selecting the newest release or choosing **Follow stable MLX releases** resumes stable updates. **Remove installed MLX runtime…** reviews and removes the installed packages. End active model requests before changing the installed runtime. Registered models, profiles and accepted catalog withdrawals remain available for a compatible reinstall. The **Review model import…** form displays the local configuration, tokenizer and safetensors files that will be copied into the private profile. Use **Start**, **Test model** or **Stop** to control the supervised sidecar. The idle timeout is 10 minutes by default and `0` keeps the process running. Create a **Managed Apple MLX model** profile for text requests. Each authenticated request uses the selected local model and the verified process endpoint.
+On Apple Silicon with macOS 14 or later, **Local Models → Managed Apple MLX** reviews local copies of the signed MLX index, detached signature and package archive (ZIP or TAR.ZST). Leave the archive field empty to review a signed catalog update, including any withdrawals. For an online install, choose **Check signed MLX releases**, select a compatible package, and use **Review MLX download…** to check its HTTPS address, size and SHA-256 before confirming. Choosing an older release pins it. Selecting the newest release or choosing **Follow stable MLX releases** resumes stable updates. **Remove installed MLX runtime…** reviews and removes the installed packages. End active model requests before changing the installed runtime. Registered models, profiles and accepted catalog withdrawals remain available for a compatible reinstall. The **Review model import…** form displays the local configuration, tokenizer and safetensors files that will be copied into the private profile. Use **Start**, **Test model** or **Stop** to control the supervised sidecar. The idle timeout is 10 minutes by default and `0` keeps the process running. Create a **Managed Apple MLX model** profile for text requests. Each authenticated request uses the selected local model and the verified process endpoint.
 
 For the release-signed smoke test, set `KORTTY_SMOKE_RUNTIME_INDEX`, `KORTTY_SMOKE_RUNTIME_SIGNATURE`, and `KORTTY_SMOKE_RUNTIME_ZIP` to the absolute local paths of the published artifacts for the current target. Set `KORTTY_SMOKE_GGUF` to a small local test model to include real profile requests, verify shared leases, and check process and credential cleanup. With that fixture, set `KORTTY_SMOKE_GGUF_SLEEP=1` to verify that llama.cpp reports sleeping after the one-minute idle timeout and reloads the model in the same process. Run `cargo test --locked -p kortty --bin kortty stable_channel_runtime_round_trip -- --ignored --nocapture` with the usual isolated test environment.
 
@@ -1903,7 +2141,7 @@ To use a saved knowledge store in a new full-code snippet or folder analysis, as
 
 For **AI → Ask** in a terminal pane and for chat follow-ups, assign a **Text** profile in **Local Preferences** and allow the store for that profile in **Knowledge Stores**. In the request preview, select a store to see the exact masked question and the embedding destination. **Retrieve reviewed query** sends that question. Review the complete prompt with its masked, cited excerpts, then choose **Send reviewed request** to contact the chat model. Choose **No knowledge store** to send a regular chat request. The retrieved prompt context is temporary and stays out of saved chat history.
 
-Terminal AI can include saved memory when **AI Memory** is enabled in AI Manager. Clear **Include saved AI memory** to omit personal files and their approved references from the chat's requests. Chats opened from a running saved SSH or local shell pane can include that profile's memory. Choose the profile in the AI Memory editor to edit it. Connection entries get priority within the personal token budget. The exact preview shows the masked entries. A change to either reviewed memory file or to the saved route requires another preview before sending. Incognito terminal chats omit personal files and references. Set `KORTTY_AI_MEMORY=off` before starting kortty to exclude personal memory from requests.
+Terminal AI can include saved memory when **AI Memory** is enabled in AI Manager. Clear **Include saved AI memory** to omit personal files and their approved references from the chat's requests. Chats opened from a running saved SSH, local shell, or serial pane can include that profile's memory. Choose the profile in the AI Memory editor to edit it. Connection entries get priority within the personal token budget. The exact preview shows the masked entries. A change to either reviewed memory file or to the saved route requires another preview before sending. Incognito terminal chats omit personal files and references. Set `KORTTY_AI_MEMORY=off` before starting kortty to exclude personal memory from requests.
 
 To include previously approved Markdown references in a terminal AI chat, select **Include approved external references** before reviewing the request. The option starts off for each chat. Active `.md` and `.mdc` references in the current memory scopes are eligible under a local home directory. The preview shows the included excerpts separately as untrusted data. They use the remaining memory budget, capped at 1,000 estimated tokens. If an included file or approval changes, review the request again. Managed installations can set `external-files = "deny"` under `[rule.ai-memory]` to prevent inclusion.
 
@@ -2065,8 +2303,22 @@ their directory with `--bin-dir`. The packager checks that both programs load
 inside the runtime before publishing. Install the bundle with
 `flatpak install --user ./kortty-<version>-<arch>.flatpak` and start it with
 `flatpak run io.github.chardonnay.korTTY`. To run the bundled CLI, add
-`--command=kortty-cli` after `flatpak run`. Local terminals use the shell and
-tools inside the Flatpak runtime.
+`--command=kortty-cli` after `flatpak run`.
+
+Ordinary local terminals in Flatpak start the host shell or the configured
+host executable with the host environment and the requested working
+directory. The default shell is resolved on the host. Supported Bash, Zsh,
+and Fish launches can load the same per-launch integration used in native
+local terminals. Terminal file actions and Agent commands that use the
+current directory require an integrated prompt report and a directory shared
+with the app. Approved Agent commands run on the host in the reviewed
+directory. Process-tree-based coding-agent discovery and CLI `--current`
+require a platform-visible shell process.
+
+A policy that requires the Landlock sandbox uses the runtime-contained launch
+path. It uses the verified read-only runtime files, the selected workspace
+and a private scratch directory. The launch stops if the required confinement
+cannot be applied.
 
 On Windows with the native MSVC toolchain, build for the explicit target
 with a static C runtime so the ZIP can run without the Visual C++
@@ -2130,6 +2382,14 @@ bash scripts/with-scratch.sh bash -ec '
 The [porting parity checklist](PORTING-PARITY.md) tracks implementation and
 acceptance against the pinned Java and SithTermFX references.
 
+For native development builds on Windows, macOS and Fedora, run
+`python scripts/cargo-native.py build --locked` (`python3` on macOS or Fedora).
+The wrapper estimates one GiB per Cargo job, reserves memory for the host,
+and caps jobs at the available logical CPUs and Linux cgroup limits. Use
+`--memory-per-job-mib` before the Cargo subcommand for heavier builds or
+`--print-jobs` to inspect the calculated limit. An explicit
+`CARGO_BUILD_JOBS` value takes precedence.
+
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
@@ -2137,6 +2397,12 @@ cargo test --locked --workspace
 ```
 
 On macOS, `bash scripts/with-scratch.sh --zsh-tests cargo test --locked --workspace --all-targets` runs the tests with `/bin/zsh` and standard parallelism. The PTY tests use a separate `ZDOTDIR` with disabled file history. This prevents simultaneously starting test shells from waiting for the same zsh history lock.
+
+Run the opt-in macOS OpenSSH fixture under a private scratch directory
+with a user-owned ancestor, such as `KORTTY_SCRATCH_PARENT="$HOME"`.
+The fixture keeps `StrictModes yes`. OpenSSH rejects its temporary
+authorized-key file when an ancestor such as `/private/tmp` is writable
+by other users.
 
 The CI matrix builds and tests on macOS, Windows, and Linux. For the desktop smoke test, run `echo $$` in a local shell. Create two nested splits. Focus the original pane. Move the tab to another window via **Move tab**. On Windows PowerShell, `$PID` returns the process ID. The second query must show the same ID. Also check the scrollback and the focused pane.
 

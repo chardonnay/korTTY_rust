@@ -3,6 +3,8 @@ use kortty_vault::{CredentialInput, CredentialKind, Secret, Vault};
 use super::*;
 use crate::ssh_key_catalog::{Edit, KeyDraft, KeyInput};
 
+mod java_toolbar;
+
 const ENVIRONMENTS: &[u8] = br#"{"version":1,"custom":[],"colors":{}}"#;
 const OLD_JOBS: &[u8] =
     br#"{"version":1,"definitions":[],"journal":[],"last_runs":{},"high_watermark":0}"#;
@@ -665,19 +667,18 @@ fn java_ssh_memory_follows_a_new_exact_route_and_replays_without_overwriting() {
     let native = crate::connection_store::import::Preview::java_backup(b"<connections><connection><name>Native</name><host>local.example</host></connection></connections>").unwrap();
     let (native, _) = native.portable_java_backup().unwrap();
     directory.publish_copy(CONNECTIONS, &native).unwrap();
+    let preview = inspect();
+    let (_, _, omissions) = preview.java_review().unwrap();
+    assert!(omissions.iter().any(|note| note
+        == "AI Memory documents or history files omitted because Java connection filenames collide (1)"));
     let queued =
-        super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
-    assert!(
-        queued
-            .scheduler_notes
-            .iter()
-            .any(|note| note.ends_with("imported (2)"))
-    );
-    assert!(
-        queued
-            .scheduler_notes
-            .iter()
-            .any(|note| note.ends_with("missing (3)"))
+        super::super::queue_restore_at(&local.0, preview, RestoreMode::JavaAdditive).unwrap();
+    assert_eq!(
+        queued.scheduler_notes,
+        [
+            "Connection AI Memory files omitted because their scopes could not be safely imported (1)",
+            "Connection AI Memory files ready to add where missing (3)",
+        ]
     );
     let mut pending = fs::read(local.0.join(PENDING)).unwrap();
     assert_eq!(pending[PENDING_MAGIC_WITH_MODE.len()], JAVA_MEMORY);
@@ -853,6 +854,164 @@ fn java_memory_restores_legacy_ssh_and_local_shell_ids_only_for_new_profiles() {
         fs::read(local.0.join(DESTINATION)).unwrap(),
         b"Edited locally.\n"
     );
+}
+
+#[test]
+fn java_memory_retains_exact_archive_markers_when_legacy_filenames_collide() {
+    use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let prefix = "a".repeat(71);
+    let first = format!("{prefix}@fixture45694");
+    let second = format!("{prefix}@fixture51370");
+    let stem = format!("{prefix}-81d74748");
+    let connections = format!("<connections>
+        <connection id='{first}'><name>Archive source</name><protocol>LOCAL_SHELL</protocol></connection>
+        <connection id='{second}'><name>Other source</name><protocol>MOSH</protocol></connection>
+        </connections>");
+    let archive = format!(
+        "<!-- kortty:archived scope=connection:{} -->\nVerified archive note.\n",
+        URL_SAFE_NO_PAD.encode(&first)
+    );
+    let source = Scratch::new();
+    let path = source.0.join("java-memory-collision.zip");
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    let options = SimpleFileOptions::default().with_aes_encryption_bytes(AesMode::Aes256, b"pw");
+    for (name, bytes) in [
+        ("connections.xml".into(), connections.as_bytes()),
+        (
+            format!("memory/connections/{stem}.md"),
+            b"Ambiguous note.\n".as_slice(),
+        ),
+        (
+            format!("memory/history/connection-{stem}-20261102-131415-019.md"),
+            b"Ambiguous history.\n".as_slice(),
+        ),
+        ("memory/archive.md".into(), archive.as_bytes()),
+    ] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+    let local = Scratch::new();
+    let preview = super::super::inspect_java_password(&path, &Secret::new("pw".into())).unwrap();
+    let (_, _, omissions) = preview.java_review().unwrap();
+    assert!(omissions.iter().any(|line| line == "AI Memory documents or history files omitted because Java connection filenames collide (2)"));
+    super::super::queue_restore_at(&local.0, preview, RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    assert_eq!(
+        fs::read(local.0.join("memory/archive.md")).unwrap(),
+        b"<!-- kortty:archived scope=connection:MQ -->\nVerified archive note.\n"
+    );
+    assert!(!local.0.join("memory/connections/1.md").exists());
+    assert!(
+        !local
+            .0
+            .join("memory/history/connection-1-20261102-131415-019.md")
+            .exists()
+    );
+}
+
+#[test]
+fn java_memory_binds_new_serial_profiles_and_retains_existing_documents() {
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let source = Scratch::new();
+    let path = source.0.join("java-serial-memory.zip");
+    let mut zip = ZipWriter::new(File::create(&path).unwrap());
+    let options = SimpleFileOptions::default().with_aes_encryption_bytes(AesMode::Aes256, b"pw");
+    for (name, bytes) in [
+        ("connections.xml", b"<connections><connection id='console'><name>Console</name><protocol>SERIAL</protocol><serial><portName>COM7</portName></serial></connection></connections>".as_slice()),
+        ("memory/connections/console.md", b"Use the device console.\n".as_slice()),
+        ("memory/history/connection-console-20261102-131415-019.md", b"Prior serial notes.\n".as_slice()),
+        ("memory/archive.md", b"<!-- kortty:archived scope=connection:Y29uc29sZQ -->\nSerial archive.\n".as_slice()),
+    ] {
+        zip.start_file(name, options).unwrap();
+        zip.write_all(bytes).unwrap();
+    }
+    zip.finish().unwrap();
+    let inspect = || super::super::inspect_java_password(&path, &Secret::new("pw".into())).unwrap();
+    let local = Scratch::new();
+    let restore = || {
+        super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
+        ProfileLease::acquire(&local.0, || false).unwrap();
+    };
+    restore();
+    let mut store = crate::connection_store::Store::open(local.0.join(CONNECTIONS)).unwrap();
+    assert_eq!(
+        store.serial(1).unwrap().connection.device,
+        PathBuf::from("COM7")
+    );
+    let memory = local.0.join("memory/connections/1.md");
+    assert_eq!(fs::read(&memory).unwrap(), b"Use the device console.\n");
+    assert_eq!(
+        fs::read(
+            local
+                .0
+                .join("memory/history/connection-1-20261102-131415-019.md")
+        )
+        .unwrap(),
+        b"Prior serial notes.\n"
+    );
+    assert_eq!(
+        fs::read(local.0.join("memory/archive.md")).unwrap(),
+        b"<!-- kortty:archived scope=connection:MQ -->\nSerial archive.\n"
+    );
+    fs::write(&memory, b"Edited locally.\n").unwrap();
+    restore();
+    assert_eq!(fs::read(&memory).unwrap(), b"Edited locally.\n");
+
+    let history = local
+        .0
+        .join("memory/history/connection-1-20261102-131415-019.md");
+    fs::remove_file(&history).unwrap();
+    restore();
+    assert!(!history.exists());
+
+    let reviewed = || {
+        let mut preview = inspect();
+        preview.prepare_java_memory_review_at(&local.0).unwrap();
+        let review = preview.java_memory_review().unwrap();
+        assert_eq!(review.len(), 1);
+        let (source, choices, default) = review.row(0);
+        assert!(source.contains("Java ID console"));
+        assert!(choices.iter().any(|choice| choice.id == Some(1)));
+        assert_eq!(default.unwrap().id, None);
+        assert!(preview.select_java_memory(0, Some(99)).is_err());
+        preview.select_java_memory(0, Some(1)).unwrap();
+        preview
+    };
+    let stale = reviewed();
+    store.toggle_connection_favorites(&[1], &[]).unwrap();
+    assert!(
+        super::super::queue_restore_at(&local.0, stale, RestoreMode::JavaAdditive)
+            .unwrap_err()
+            .to_string()
+            .contains("Saved connections changed")
+    );
+
+    let catalogue_before = fs::read(local.0.join(CONNECTIONS)).unwrap();
+    super::super::queue_restore_at(&local.0, reviewed(), RestoreMode::JavaAdditive).unwrap();
+    drop(ProfileLease::acquire(&local.0, || false).unwrap());
+    assert_eq!(fs::read(&history).unwrap(), b"Prior serial notes.\n");
+    assert_eq!(fs::read(&memory).unwrap(), b"Edited locally.\n");
+    assert_eq!(
+        fs::read(local.0.join(CONNECTIONS)).unwrap(),
+        catalogue_before
+    );
+
+    fs::remove_file(&history).unwrap();
+    super::super::queue_restore_at(&local.0, reviewed(), RestoreMode::JavaAdditive).unwrap();
+    let serial = store.serial(1).unwrap().clone();
+    store
+        .save_serial(crate::connection_store::SerialProfile {
+            name: "Changed after queue".into(),
+            ..serial
+        })
+        .unwrap();
+    let error = ProfileLease::acquire(&local.0, || false).err().unwrap();
+    assert!(error.to_string().contains("Saved connections changed"));
+    assert!(!history.exists());
 }
 
 #[test]
@@ -1310,6 +1469,70 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         <connectionColorBorderEnabled>false</connectionColorBorderEnabled>
         <splitPaneFocusRingEnabled>false</splitPaneFocusRingEnabled>
         <tabSwitchMostRecentFirst>true</tabSwitchMostRecentFirst>
+        <tabTitleFromShellEnabled>false</tabTitleFromShellEnabled>
+        <commandTimestampsEnabled>true</commandTimestampsEnabled>
+        <terminalLinkDetectionEnabled>false</terminalLinkDetectionEnabled>
+        <jobSchedulerMenuStatusEnabled>false</jobSchedulerMenuStatusEnabled>
+        <terminalBackgroundTransparency>24</terminalBackgroundTransparency>
+        <terminalSilenceSeconds>110</terminalSilenceSeconds>
+        <terminalBellNotificationsEnabled>true</terminalBellNotificationsEnabled>
+        <commandFinishedNotificationsEnabled>false</commandFinishedNotificationsEnabled>
+        <commandFinishedNotificationSeconds>45</commandFinishedNotificationSeconds>
+        <remoteTerminalNotificationsEnabled>false</remoteTerminalNotificationsEnabled>
+        <aiRunToastsEnabled>false</aiRunToastsEnabled>
+        <sftpParallelTransfers>4</sftpParallelTransfers>
+        <sftpResumePartialTransfers>false</sftpResumePartialTransfers>
+        <sftpKeepPartialOnCancel>true</sftpKeepPartialOnCancel>
+        <sftpConflictDefault>overwrite</sftpConflictDefault>
+        <sftpAutoCloseMinutes>15</sftpAutoCloseMinutes>
+        <sftpDefaultZipPath>/srv/archives&amp;reports</sftpDefaultZipPath>
+        <sftpDefaultZipCompression>9</sftpDefaultZipCompression>
+        <sessionJournalPageSchemeId>ocean</sessionJournalPageSchemeId>
+        <sessionJournalPageTheme>dark</sessionJournalPageTheme>
+        <sessionJournalFontScalePercent>135</sessionJournalFontScalePercent>
+        <sessionJournalPageUiFont>Fixture Sans</sessionJournalPageUiFont>
+        <sessionJournalPageMonoFont>Fixture Mono</sessionJournalPageMonoFont>
+        <sessionJournalClickableLinks>false</sessionJournalClickableLinks>
+        <sessionJournalLogFormat>YAML</sessionJournalLogFormat>
+        <sessionJournalStoragePath>/fixture/private-journals</sessionJournalStoragePath>
+        <pdfWatermarkEnabled>true</pdfWatermarkEnabled>
+        <pdfWatermarkText>Archiv &amp; Pr&#252;fung</pdfWatermarkText>
+        <pdfWatermarkColor>#123ABC</pdfWatermarkColor>
+        <exportFooterEnabled>false</exportFooterEnabled>
+        <exportFooterText>Test footer</exportFooterText>
+        <terminalCopyOnSelectEnabled>false</terminalCopyOnSelectEnabled>
+        <pasteWarningMode>off</pasteWarningMode>
+        <pasteLargeWarningKiB>8</pasteLargeWarningKiB>
+        <pasteLineDelayMs>35</pasteLineDelayMs>
+        <terminalQuickSelectAlphabet>asdf</terminalQuickSelectAlphabet>
+        <terminalQuickSelectPatterns>
+            <pattern>[A-Z]{2}-\d+</pattern>
+            <pattern>\Qbuild+tag\E</pattern>
+        </terminalQuickSelectPatterns>
+        <rememberWindowGeometry>false</rememberWindowGeometry>
+        <rememberDashboardState>false</rememberDashboardState>
+        <useFixedWindowGeometry>true</useFixedWindowGeometry>
+        <fixedWindowGeometry>
+            <x>-128.5</x><y>-80</y><width>1400</width><height>900</height>
+            <maximized>true</maximized><fullScreen>true</fullScreen>
+        </fixedWindowGeometry>
+        <codeAnalysisDiagramAutoGenerate>false</codeAnalysisDiagramAutoGenerate>
+        <codeAnalysisProposeModularization>true</codeAnalysisProposeModularization>
+        <snippetAnalysisExportIncludeCode>true</snippetAnalysisExportIncludeCode>
+        <editorCursorStyle>UNDERSCORE</editorCursorStyle>
+        <logfileViewerHighlightLinks>false</logfileViewerHighlightLinks>
+        <logfileViewerHighlightKeywords>false</logfileViewerHighlightKeywords>
+        <logfileViewerKeywordSetId>builtin.network</logfileViewerKeywordSetId>
+        <editorCursorColor>#445566</editorCursorColor>
+        <snippetFontFamily>Fixture Mono</snippetFontFamily><snippetFontSize>19</snippetFontSize>
+        <snippetForegroundColor>#010203</snippetForegroundColor>
+        <selectedSnippetEditorProfileId>custom-fixture</selectedSnippetEditorProfileId>
+        <snippetEditorProfiles><profile><id>custom-fixture</id><builtIn>false</builtIn>
+            <foregroundColor>#AABBCC</foregroundColor><backgroundColor>#102030</backgroundColor>
+            <cursorStyle>LINE</cursorStyle><cursorColor>#DDEEFF</cursorColor>
+        </profile></snippetEditorProfiles>
+        <requireMasterPasswordOnStartup>true</requireMasterPasswordOnStartup>
+        <lastWindowGeometry><x>4800</x><y>3010</y><width>732</width><height>600</height></lastWindowGeometry>
         <showTerminalScrollbar>false</showTerminalScrollbar>
         <hideTerminalScrollbarsInFullscreen>true</hideTerminalScrollbarsInFullscreen>
         <workflowScriptFontSize>21</workflowScriptFontSize>
@@ -1340,6 +1563,17 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
     let directory = Directory::open(&local.0, false).unwrap();
     let initial = br#"{"open_tool_windows_as_tabs":false,"show_terminal_scrollbar":true,
         "remote_sidebar_position":"left","terminal_font":19,"terminal_font_family":"Fixture Mono",
+        "terminal_link_detection_enabled":true,
+        "terminal_notifications":{"bell":false,"command_seconds":90},
+        "sftp_archive":{"level":3},"sftp_resume_partial_transfers":true,
+        "journal_appearance":{"theme":"light"},
+        "session_journal":{"directory":"/fixture/native-journals","clickable_links":true},
+        "export_branding":{"footer_text":"Local footer"},
+        "paste_warning":"always","quick_select":{"alphabet":"xy"},
+        "startup":{"remember_geometry":true,"fixed":{"height":820}},
+        "snippet_analysis_auto_diagram":true,
+        "editor_caret":{"shape":"block"},"snippet_appearance":{"font_size":26,"background":[1,2,3]},
+        "logfile_presentation":{"links":true},
         "legacy_editor_font":{"name":"Preserved","weight":500}}"#;
     directory
         .publish_copy(data::WINDOW_SETTINGS, initial)
@@ -1353,8 +1587,21 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
     assert!(
         entries
             .iter()
-            .any(|line| line == "Display preferences for unset fields (9)")
+            .any(|line| line == "Global preferences for unset fields (69)")
     );
+    assert!(
+        entries
+            .iter()
+            .any(|line| line.contains("Include source code by default"))
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|line| line.contains("Paste warning mode in this backup is Off"))
+    );
+    assert!(entries.iter().any(|line| {
+        line.contains("SFTP conflict default in this backup is Replace regular files")
+    }));
     let pending: serde_json::Value =
         serde_json::from_slice(&preview.snapshot[data::WINDOW_SETTINGS]).unwrap();
     assert_eq!(pending["java_display_preferences"]["manual_scale"], 132);
@@ -1368,6 +1615,72 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
         ("connection_color_border_enabled", json!(false)),
         ("split_pane_focus_ring_enabled", json!(false)),
         ("tab_switch_most_recent_first", json!(true)),
+        ("tab_title_from_shell_enabled", json!(false)),
+        ("command_timestamps_enabled", json!(true)),
+        ("terminal_link_detection_enabled", json!(true)),
+        ("job_menu_status_enabled", json!(false)),
+        ("terminal_transparency", json!(24)),
+        ("terminal_silence_seconds", json!(110)),
+        ("snippet_analysis_auto_diagram", json!(true)),
+        ("snippet_analysis_auto_modularization", json!(true)),
+        ("snippet_analysis_export_include_code", json!(true)),
+        ("editor_caret", json!({"shape":"block","color":[68,85,102]})),
+        (
+            "logfile_presentation",
+            json!({"links":true,"keywords":false,"keyword_set":"builtin.network"}),
+        ),
+        (
+            "snippet_appearance",
+            json!({"font_family":"Fixture Mono","font_size":26,
+            "foreground":[170,187,204],"background":[1,2,3],"cursor_style":"line","cursor_color":[221,238,255]}),
+        ),
+        (
+            "startup",
+            json!({"remember_geometry":true,"remember_dashboard":false,
+            "use_fixed_geometry":true,"fixed":{"width":1400,"height":820,"x":-129,"y":-80,"maximized":true}}),
+        ),
+        ("terminal_copy_on_select_enabled", json!(false)),
+        ("paste_warning", json!("always")),
+        ("paste_large_warning_kib", json!(8)),
+        ("paste_line_delay_ms", json!(35)),
+        (
+            "quick_select",
+            json!({"alphabet":"xy","java_patterns":true,"patterns":[r"[A-Z]{2}-\d+",r"\Qbuild+tag\E"]}),
+        ),
+        (
+            "journal_appearance",
+            json!({"scheme":"ocean","theme":"light","scale":135,
+            "ui_font":"Fixture Sans","mono_font":"Fixture Mono"}),
+        ),
+        (
+            "session_journal",
+            json!({"directory":"/fixture/native-journals",
+            "clickable_links":true,"log_format":"YAML"}),
+        ),
+        (
+            "export_branding",
+            json!({"watermark_enabled":true,"watermark_text":"Archiv & Prüfung",
+            "watermark_color":[18,58,188],"footer_enabled":false,"footer_text":"Local footer"}),
+        ),
+        ("sftp_parallel_transfers", json!(4)),
+        ("sftp_resume_partial_transfers", json!(true)),
+        ("sftp_keep_partial_on_cancel", json!(true)),
+        ("sftp_conflict_default", json!("overwrite")),
+        ("sftp_idle_minutes", json!(15)),
+        (
+            "sftp_archive",
+            json!({"level":3,"remote_directory":"/srv/archives&reports"}),
+        ),
+        (
+            "terminal_notifications",
+            json!({
+                "bell": false,
+                "command_finished": false,
+                "command_seconds": 90,
+                "programs": false,
+                "ai_runs": false
+            }),
+        ),
         ("show_terminal_scrollbar", json!(true)),
         ("hide_terminal_scrollbars_in_fullscreen", json!(true)),
         ("workflow_script_font", json!(21)),
@@ -1386,6 +1699,14 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
     assert!(active.get("java_display_preferences").is_none());
     assert_eq!(active["themes"]["edited"][0]["name"], "Restored Theme");
     active["manual_scale"] = json!(120);
+    active["terminal_transparency"] = json!(40);
+    active["terminal_notifications"]["programs"] = json!(true);
+    active["sftp_archive"]["remote_directory"] = json!("/srv/local archives");
+    active["journal_appearance"]["scale"] = json!(145);
+    active["paste_line_delay_ms"] = json!(20);
+    active["startup"]["fixed"]["x"] = json!(32);
+    active["snippet_analysis_export_include_code"] = json!(false);
+    active["snippet_appearance"]["foreground"] = json!([123, 45, 67]);
     let updated = serde_json::to_vec(&active).unwrap();
     directory
         .replace_file(data::WINDOW_SETTINGS, &updated)
@@ -1393,6 +1714,515 @@ fn java_display_preferences_add_only_unset_fields_and_keep_theme_replay_safe() {
     super::super::queue_restore_at(&local.0, inspect(), RestoreMode::JavaAdditive).unwrap();
     drop(ProfileLease::acquire(&local.0, || false).unwrap());
     assert_eq!(fs::read(installed_path).unwrap(), updated);
+}
+
+#[test]
+fn java_preferences_restore_coding_agents_shortcuts_and_recording_on_restart() {
+    use crate::recording_window::preferences::{self, Preferences, Scope};
+    use serde_json::json;
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let source = Scratch::new();
+    let path = source.0.join("java-preferences.zip");
+    let password = Secret::new("fixture archive password".into());
+    let mut archive = ZipWriter::new(File::create(&path).unwrap());
+    archive
+        .start_file(
+            "global-settings.xml",
+            SimpleFileOptions::default()
+                .with_aes_encryption_bytes(AesMode::Aes256, password.as_str().as_bytes()),
+        )
+        .unwrap();
+    archive
+        .write_all(
+            br#"<globalSettings>
+            <codingAgentDetectionEnabled>false</codingAgentDetectionEnabled>
+            <codingAgentAppBadgeEnabled>false</codingAgentAppBadgeEnabled>
+            <codingAgentNotificationsEnabled>false</codingAgentNotificationsEnabled>
+            <codingAgentPanelAutoVisibility>false</codingAgentPanelAutoVisibility>
+            <codingAgentPanelPlacement>LEFT</codingAgentPanelPlacement>
+            <codingAgentPanelWidth>951.25</codingAgentPanelWidth>
+            <terminalRemoteSidebarPosition>RIGHT</terminalRemoteSidebarPosition>
+            <keyBindingOverrides>
+                <binding>menu.tools.aiManager=Shortcut+Shift+F8</binding>
+                <binding>menu.tools.jobScheduler=Ctrl+Shift+F7</binding>
+                <binding>menu.view.snippetPalette=none</binding>
+                <binding>menu.view.dashboard=Ctrl+R</binding>
+                <binding>menu.foreign.unknown=F4</binding>
+            </keyBindingOverrides>
+            <terminalRecordingEnabled>true</terminalRecordingEnabled>
+            <terminalRecordingFormat>KORTTY_REPLAY</terminalRecordingFormat>
+            <terminalRecordingDefaultScope>WHOLE_TAB</terminalRecordingDefaultScope>
+            <terminalRecordingAutoPauseEnabled>true</terminalRecordingAutoPauseEnabled>
+            <terminalRecordingIdlePauseSeconds>73</terminalRecordingIdlePauseSeconds>
+            <terminalRecordingCaptureColorsEnabled>true</terminalRecordingCaptureColorsEnabled>
+            <terminalRecordingStoragePath>C:\Java\Recorded Sessions</terminalRecordingStoragePath>
+            <terminalRecordingFfmpegPath>C:\Java\ffmpeg.exe</terminalRecordingFfmpegPath>
+        </globalSettings>"#,
+        )
+        .unwrap();
+    archive.finish().unwrap();
+    let parse = || super::super::inspect_java_password(&path, &password).unwrap();
+    let function_key = |number, shortcut, control| {
+        json!({"key": {"function": number}, "shortcut": shortcut,
+            "control": control, "shift": true, "alt": false})
+    };
+    for configured in [false, true] {
+        let local = Scratch::new();
+        let window_path = local.0.join(data::WINDOW_SETTINGS);
+        let recording_path = local.0.join(preferences::FILE);
+        let native_key = function_key(9, true, false);
+        let conflicting_key = function_key(7, false, true);
+        let native_recording_directory = local.0.join("native recordings");
+        if configured {
+            fs::write(
+                &window_path,
+                serde_json::to_vec(&json!({
+                    "coding_agent_notifications_enabled": true,
+                    "coding_agent_dock": {"placement": "right", "width": 880, "future_layout": true},
+                    "key_bindings": {
+                        "ai-manager": native_key, "recordings": conflicting_key,
+                        "future-action": {"extension": "keep"}
+                    }
+                })).unwrap(),
+            ).unwrap();
+            fs::write(
+                &recording_path,
+                serde_json::to_vec(&json!({
+                    "directory": native_recording_directory,
+                    "include_color": false, "idle_seconds": 19,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        let preview = parse();
+        let (_, entries, omissions) = preview.java_review().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|line| line == "Recording preferences for unset fields (5)")
+        );
+        assert!(
+            omissions
+                .iter()
+                .any(|line| line == "Invalid or unsupported Java global preferences omitted (2)")
+        );
+        assert!(omissions.iter().any(|line| line
+            == "Java recording storage and encoder paths require selection on this device (2)"));
+        super::super::queue_restore_at(&local.0, preview, RestoreMode::JavaAdditive).unwrap();
+        assert_eq!(window_path.exists(), configured);
+        assert_eq!(recording_path.exists(), configured);
+        drop(ProfileLease::acquire(&local.0, || false).unwrap());
+        let window_bytes = fs::read(&window_path).unwrap();
+        let window: serde_json::Value = serde_json::from_slice(&window_bytes).unwrap();
+        assert!(window.get("java_display_preferences").is_none());
+        assert_eq!(window["coding_agent_detection_enabled"], false);
+        assert_eq!(window["coding_agent_app_badge_enabled"], false);
+        assert_eq!(window["coding_agent_notifications_enabled"], configured);
+        assert_eq!(window["coding_agent_dock_automatic"], false);
+        assert_eq!(window["remote_sidebar_position"], "right");
+        assert_eq!(window["coding_agent_dock"]["side"], "left");
+        assert_eq!(
+            window["coding_agent_dock"]["placement"],
+            if configured { "right" } else { "left" }
+        );
+        assert_eq!(
+            window["coding_agent_dock"]["width"],
+            if configured { 880 } else { 951 }
+        );
+        let shortcuts = window["key_bindings"].as_object().unwrap();
+        assert_eq!(
+            shortcuts.get("snippet-palette"),
+            Some(&serde_json::Value::Null)
+        );
+        assert!(!shortcuts.contains_key("dashboard"));
+        if configured {
+            assert_eq!(window["coding_agent_dock"]["future_layout"], true);
+            assert_eq!(shortcuts["ai-manager"], native_key);
+            assert_eq!(shortcuts["recordings"], conflicting_key);
+            assert_eq!(shortcuts["future-action"], json!({"extension": "keep"}));
+            assert!(!shortcuts.contains_key("scheduler"));
+        } else {
+            assert_eq!(shortcuts["ai-manager"], function_key(8, true, false));
+            assert_eq!(shortcuts["scheduler"], conflicting_key);
+        }
+        let recording_bytes = fs::read(&recording_path).unwrap();
+        let recording = Preferences::load_from(&recording_path).unwrap();
+        assert!(recording.ffmpeg.is_none());
+        assert_eq!(recording.scope, Scope::WholeTab);
+        assert_eq!(recording.enabled_after_restart, !configured);
+        let options = recording.capture_options();
+        assert_eq!(options.include_style, !configured);
+        assert_eq!(
+            options.idle_after,
+            Some(std::time::Duration::from_secs(if configured {
+                19
+            } else {
+                73
+            }))
+        );
+        if configured {
+            assert_eq!(recording.directory().unwrap(), native_recording_directory);
+        }
+        super::super::queue_restore_at(&local.0, parse(), RestoreMode::JavaAdditive).unwrap();
+        drop(ProfileLease::acquire(&local.0, || false).unwrap());
+        assert_eq!(fs::read(&window_path).unwrap(), window_bytes);
+        assert_eq!(fs::read(&recording_path).unwrap(), recording_bytes);
+    }
+}
+
+#[test]
+fn java_highlight_restore_remaps_live_connections_and_logfile_selection() {
+    use crate::terminal_highlight::{Action, Configuration, Rule, RuleSet};
+    use serde_json::{Value, json};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let source = Scratch::new();
+    let password = Secret::new("fixture archive password".into());
+    const SOURCE_ID: &str = "f827d86d-1531-4cc5-9d0f-f6e5c1a2d850";
+    let connections = format!(
+        r#"<connections>
+        <connection id="{SOURCE_ID}"><name>Ops</name><host>ops.example</host>
+            <username>tester</username><highlightRuleSetId>service-alerts</highlightRuleSetId></connection>
+        <connection><name>Inherit</name><host>other.example</host>
+            <highlightRuleSetId>missing</highlightRuleSetId></connection>
+        <connection><name>Shell</name><protocol>LOCAL_SHELL</protocol>
+            <highlightRuleSetId>none</highlightRuleSetId></connection>
+        <connection><name>Console</name><protocol>SERIAL</protocol>
+            <highlightRuleSetId>service-alerts</highlightRuleSetId>
+            <serial><portName>COM3</portName></serial></connection>
+    </connections>"#
+    );
+    let create_backup = |transactional| {
+        let path = source
+            .0
+            .join(format!("java-highlights-{transactional}.zip"));
+        let mut archive = ZipWriter::new(File::create(&path).unwrap());
+        let options = SimpleFileOptions::default()
+            .with_aes_encryption_bytes(AesMode::Aes256, password.as_str().as_bytes());
+        archive.start_file("connections.xml", options).unwrap();
+        archive.write_all(connections.as_bytes()).unwrap();
+        if transactional {
+            archive
+                .start_file(format!("memory/connections/{SOURCE_ID}.md"), options)
+                .unwrap();
+            archive.write_all(b"Check this service.\n").unwrap();
+        }
+        archive.start_file("global-settings.xml", options).unwrap();
+        archive
+            .write_all(
+                r##"<globalSettings>
+                <logfileViewerHighlightKeywords>true</logfileViewerHighlightKeywords>
+                <logfileViewerKeywordSetId>service-alerts</logfileViewerKeywordSetId>
+                <terminalHighlightingEnabled>false</terminalHighlightingEnabled>
+                <terminalHighlightAlternateScreen>true</terminalHighlightAlternateScreen>
+                <defaultHighlightRuleSetId>service-alerts</defaultHighlightRuleSetId>
+                <terminalTriggersEnabled>true</terminalTriggersEnabled>
+                <highlightRuleSets>
+                    <ruleSet><id>service-alerts</id><name>Service alerts</name><rules>
+                        <rule><pattern>retry [0-9]+</pattern><regex>true</regex>
+                            <foreground>#ed8010</foreground><scope>LINE</scope>
+                            <action>RUN_SNIPPET</action><snippetId>missing</snippetId></rule>
+                        <rule><pattern>exhausted</pattern><bold>true</bold>
+                            <action>NOTIFY</action><notifyWithText>true</notifyWithText></rule>
+                        <rule><pattern>already\p{javaUnknownProperty}</pattern><regex>true</regex></rule>
+                    </rules></ruleSet>
+                    <ruleSet><id>builtin.errors</id><name>Reserved</name></ruleSet>
+                </highlightRuleSets>
+            </globalSettings>"##
+                    .as_bytes(),
+            )
+            .unwrap();
+        archive.finish().unwrap();
+        path
+    };
+    let simple = create_backup(false);
+    let transactional = create_backup(true);
+
+    let native = RuleSet {
+        id: "service-alerts".into(),
+        name: "Service alerts".into(),
+        rules: vec![Rule {
+            pattern: "local only".into(),
+            action: Action::Notify,
+            ..Rule::default()
+        }],
+    };
+    for (collision, local_selection, transaction) in [
+        (false, false, false),
+        (true, false, false),
+        (true, true, true),
+    ] {
+        let local = Scratch::new();
+        let highlights = local.0.join(terminal_highlight::FILE);
+        let window = local.0.join(data::WINDOW_SETTINGS);
+        let path = if transaction { &transactional } else { &simple };
+        if local_selection {
+            fs::write(
+                &highlights,
+                json!({
+                    "sets": [&native], "triggers_enabled": true,
+                    "enabled": true, "alternate_screen": false, "default_set": "builtin.errors"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        } else if collision {
+            fs::write(
+                &highlights,
+                json!({"sets": [&native], "triggers_enabled": true}).to_string(),
+            )
+            .unwrap();
+        }
+        let local_presentation = if local_selection {
+            json!({"links": false, "keyword_set": "builtin.network"})
+        } else {
+            json!({"links": false})
+        };
+        fs::write(
+            &window,
+            json!({"logfile_presentation": local_presentation}).to_string(),
+        )
+        .unwrap();
+        let queue = || {
+            let preview = super::super::inspect_java_password(path, &password).unwrap();
+            let (_, entries, omissions) = preview.java_review().unwrap();
+            assert!(
+                entries
+                    .iter()
+                    .any(|line| line == "Custom highlight sets for presentation (1)")
+            );
+            for message in [
+                "Invalid or unsupported Java highlight sets omitted (1)",
+                "Invalid or unsupported Java highlight rules omitted (1)",
+                "Java highlight trigger actions require separate review (2)",
+            ] {
+                assert!(omissions.iter().any(|line| line == message), "{message}");
+            }
+            super::super::queue_restore_at(&local.0, preview, RestoreMode::JavaAdditive).unwrap();
+        };
+        queue();
+        let connection_path = local.0.join(CONNECTIONS);
+        if transaction {
+            let original = fs::read(&highlights).unwrap();
+            fs::write(&highlights, "{}").unwrap();
+            let error = ProfileLease::acquire(&local.0, || false).err().unwrap();
+            assert!(error.to_string().contains("highlight selections changed"));
+            assert!(!connection_path.exists());
+            fs::write(&highlights, original).unwrap();
+        }
+        drop(ProfileLease::acquire(&local.0, || false).unwrap());
+        let saved_bytes = fs::read(&highlights).unwrap();
+        let saved = Configuration::decode(saved_bytes.clone()).unwrap();
+        assert_eq!(saved.sets.len(), 1 + usize::from(collision));
+        assert_eq!(saved.enabled, local_selection);
+        assert_eq!(saved.alternate_screen, !local_selection);
+        assert_eq!(saved.triggers_enabled, collision);
+        let imported = saved.sets.last().unwrap();
+        if collision {
+            assert_eq!(saved.sets[0], native);
+            assert!(imported.id.starts_with("java-"));
+        } else {
+            assert_eq!(imported.id, "service-alerts");
+        }
+        assert_eq!(imported.name, "Service alerts");
+        assert_eq!(
+            saved.default_set.as_deref(),
+            Some(if local_selection {
+                "builtin.errors"
+            } else {
+                &imported.id
+            })
+        );
+        let catalogue = crate::connection_store::Store::open(connection_path.clone()).unwrap();
+        assert_eq!(catalogue.connections().len(), 2);
+        assert_eq!(
+            catalogue.connections()[0].terminal.highlight_set.as_deref(),
+            Some(imported.id.as_str())
+        );
+        assert!(catalogue.connections()[1].terminal.highlight_set.is_none());
+        assert_eq!(
+            catalogue.local_profiles()[0]
+                .terminal
+                .highlight_set
+                .as_deref(),
+            Some("none")
+        );
+        assert_eq!(
+            catalogue.serial_profiles()[0].highlight_set.as_deref(),
+            Some(imported.id.as_str())
+        );
+        assert_eq!(imported.rules.len(), 2);
+        assert_eq!(imported.rules[0].pattern, "retry [0-9]+");
+        assert_eq!(imported.rules[0].foreground.as_deref(), Some("#ed8010"));
+        assert!(imported.rules[0].whole_line);
+        assert!(imported.rules[1].bold);
+        assert!(
+            imported
+                .rules
+                .iter()
+                .all(|rule| rule.action == Action::None && !rule.notify_with_text)
+        );
+        let window_bytes = fs::read(&window).unwrap();
+        let settings: Value = serde_json::from_slice(&window_bytes).unwrap();
+        assert_eq!(
+            settings["logfile_presentation"],
+            json!({
+                "links": false,
+                "keywords": true,
+                "keyword_set": if local_selection { "builtin.network" } else { imported.id.as_str() },
+            })
+        );
+        let connection_bytes = fs::read(&connection_path).unwrap();
+        queue();
+        drop(ProfileLease::acquire(&local.0, || false).unwrap());
+        assert_eq!(fs::read(&highlights).unwrap(), saved_bytes);
+        assert_eq!(fs::read(&window).unwrap(), window_bytes);
+        assert_eq!(fs::read(&connection_path).unwrap(), connection_bytes);
+    }
+}
+
+#[test]
+fn java_marker_restore_matches_entries_preserves_local_rules_and_replays() {
+    use crate::session_journal::entry_edit::LegacyMarker;
+    use crate::session_journal::markers::{self, Definition, Rule, Settings};
+    use zip::{AesMode, ZipWriter, write::SimpleFileOptions};
+
+    let source = Scratch::new();
+    let path = source.0.join("java-markers.zip");
+    let password = Secret::new("fixture archive password".into());
+    let mut archive = ZipWriter::new(File::create(&path).unwrap());
+    archive
+        .start_file(
+            "global-settings.xml",
+            SimpleFileOptions::default()
+                .with_aes_encryption_bytes(AesMode::Aes256, password.as_str().as_bytes()),
+        )
+        .unwrap();
+    let settings = r#"<globalSettings>
+        <sessionJournalMarkers>
+            <marker><id>review-needed</id><name>Überprüfung &amp; 東京</name><color>#2a73d2</color>
+                <builtIn>false</builtIn><legacyMarker>IMPORTANT</legacyMarker></marker>
+            <marker><id>needs-follow-up</id><color>89dc3a</color></marker>
+            <marker><id>error</id><color>#000000</color><builtIn>true</builtIn></marker>
+        </sessionJournalMarkers>
+        <sessionJournalMarkerRules>
+            <rule><id>one</id><markerId>review-needed</markerId><pattern>^\d+\s+\Qneeds review+\E$</pattern>
+                <regex>true</regex><ignoreCase>true</ignoreCase></rule>
+            <rule><id>two</id><markerId>error</markerId><pattern>needs review+</pattern></rule>
+            <rule><id>three</id><markerId>review-needed</markerId><pattern>unless\p{javaUnknownProperty}</pattern>
+                <regex>true</regex><ignoreCase>false</ignoreCase></rule>
+            <rule><id>four</id><markerId>needs-follow-up</markerId><pattern>(?&lt;=old)info</pattern>
+                <regex>true</regex><enabled>0</enabled></rule>
+            <rule><id>five</id><markerId>does-not-exist</markerId><pattern>missing marker</pattern></rule>
+            <rule><id>six</id><markerId>none</markerId><pattern>dismiss</pattern></rule>
+        </sessionJournalMarkerRules>
+        <sessionJournalMarkerRulesEnabled>true</sessionJournalMarkerRulesEnabled>
+    </globalSettings>"#;
+    archive.write_all(settings.as_bytes()).unwrap();
+    archive.finish().unwrap();
+    let parse = || super::super::inspect_java_password(&path, &password).unwrap();
+
+    for configured in [false, true] {
+        let local = Scratch::new();
+        let marker_path = local.0.join(markers::FILE);
+        let native = Definition {
+            id: "review-needed".to_owned(),
+            name: "Native review".to_owned(),
+            color: Some([16, 32, 48]),
+            legacy: LegacyMarker::Info,
+        };
+        let first_rule = Rule {
+            marker_id: "review-needed".to_owned(),
+            pattern: "native report".to_owned(),
+            ..Rule::default()
+        };
+        if configured {
+            Settings {
+                definitions: vec![native.clone()],
+                rules: vec![first_rule.clone()],
+                enabled: false,
+            }
+            .save(&local.0, &Settings::default())
+            .unwrap();
+        }
+        let preview = parse();
+        let (_, entries, omissions) = preview.java_review().unwrap();
+        assert!(
+            entries
+                .iter()
+                .any(|line| line == "Journal marker definitions (2) and rules (5)")
+        );
+        assert!(
+            omissions
+                .iter()
+                .any(|line| line == "Invalid or unsupported Java marker settings omitted (2)")
+        );
+        assert!(omissions.iter().any(
+            |line| line == "Java journal marker rules kept inactive pending pattern review (1)"
+        ));
+        super::super::queue_restore_at(&local.0, preview, RestoreMode::JavaAdditive).unwrap();
+        assert_eq!(marker_path.exists(), configured);
+        if configured {
+            let directory = Directory::open(&local.0, false).unwrap();
+            let lock = markers::lock_settings(&directory).unwrap();
+            assert!(ProfileLease::acquire(&local.0, || false).is_err());
+            assert!(directory.has_entry(PENDING).unwrap());
+            assert_eq!(
+                Settings::load(&local.0).unwrap().0.rules.as_slice(),
+                std::slice::from_ref(&first_rule)
+            );
+            drop(lock);
+        }
+        drop(ProfileLease::acquire(&local.0, || false).unwrap());
+        let prefix = usize::from(configured);
+        let (saved, compiled) = Settings::load(&local.0).unwrap();
+        assert_eq!(saved.enabled, !configured);
+        assert_eq!(compiled.enabled(), !configured);
+        assert_eq!(saved.definitions.len(), 2 + prefix);
+        assert_eq!(saved.rules.len(), 5 + prefix);
+        if configured {
+            assert_eq!(saved.definitions[0], native);
+            assert_eq!(saved.rules[0], first_rule);
+            assert!(saved.definitions[prefix].id.starts_with("java-"));
+            assert_eq!(
+                compiled.first_match("native report").unwrap().id,
+                "review-needed"
+            );
+        } else {
+            assert_eq!(saved.definitions[0].id, "review-needed");
+        }
+        let imported = &saved.definitions[prefix];
+        assert_eq!(imported.name, "Überprüfung & 東京");
+        assert_eq!(imported.color, Some([42, 115, 210]));
+        assert_eq!(imported.legacy, LegacyMarker::Important);
+        assert_eq!(compiled.find("error").unwrap().color, None);
+        assert_eq!(saved.rules[prefix].marker_id, imported.id);
+        assert!(saved.rules[prefix].java_regex && saved.rules[prefix].enabled);
+        assert_eq!(saved.rules[prefix + 1].marker_id, "error");
+        assert_eq!(
+            saved.rules[prefix + 2].pattern,
+            r"unless\p{javaUnknownProperty}"
+        );
+        assert!(!saved.rules[prefix + 2].enabled && !saved.rules[prefix + 2].ignore_case);
+        assert_eq!(saved.rules[prefix + 3].pattern, "(?<=old)info");
+        assert!(!saved.rules[prefix + 3].enabled);
+        assert_eq!(
+            compiled.first_match("7 NEEDS REVIEW+\r\n").unwrap(),
+            imported
+        );
+        assert_eq!(compiled.first_match("٩ needs review+").unwrap().id, "error");
+        assert_eq!(compiled.first_match("dismiss").unwrap().id, "none");
+        assert!(compiled.first_match("unlessfail").is_none());
+
+        let original = fs::read(&marker_path).unwrap();
+        let portable = data::collect(&local.0).unwrap();
+        assert_eq!(portable[markers::FILE].as_slice(), original.as_slice());
+        super::super::queue_restore_at(&local.0, parse(), RestoreMode::JavaAdditive).unwrap();
+        drop(ProfileLease::acquire(&local.0, || false).unwrap());
+        assert_eq!(fs::read(&marker_path).unwrap(), original);
+    }
 }
 
 #[test]

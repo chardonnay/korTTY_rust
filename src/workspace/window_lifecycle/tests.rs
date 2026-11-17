@@ -18,6 +18,12 @@ fn standalone_startup_uses_fixed_then_remembered_geometry_and_dashboard_independ
         lifecycle.startup(preferences),
         (preferences.fixed.placement(), false, true)
     );
+    preferences.fixed.x = -1240;
+    preferences.fixed.y = -88;
+    preferences.fixed.maximized = true;
+    let (fixed, maximized, dashboard) = lifecycle.startup(preferences);
+    assert_eq!(fixed.position, SavedPosition::new(-1240.0, -88.0));
+    assert!(maximized && dashboard);
 
     preferences.use_fixed_geometry = false;
     preferences.remember_geometry = false;

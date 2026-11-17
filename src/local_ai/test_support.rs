@@ -1,5 +1,6 @@
 //! Test doubles for the local chat endpoint. Production still uses the real HTTP client.
 
+use std::cell::RefCell;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::{MutexGuard, mpsc};
@@ -9,6 +10,32 @@ use serde_json::Value;
 
 use super::*;
 use serde_json::json;
+
+thread_local! {
+    static FIXTURE_CA: RefCell<Option<Vec<u8>>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn with_https_fixture_ca<T>(ca: Vec<u8>, run: impl FnOnce() -> T) -> T {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FIXTURE_CA.with(|slot| slot.take());
+        }
+    }
+    FIXTURE_CA.with(|slot| {
+        assert!(slot.borrow().is_none());
+        slot.replace(Some(ca));
+    });
+    let _restore = Restore;
+    run()
+}
+
+pub(super) fn configure_https_fixture(session: &mut Session) -> Result<(), Error> {
+    FIXTURE_CA.with(|slot| match slot.borrow().as_deref() {
+        Some(ca) => session.trust_test_server(ca),
+        None => Ok(()),
+    })
+}
 
 pub(crate) fn exclusive_run() -> MutexGuard<'static, ()> {
     static RUN_TEST: Mutex<()> = Mutex::new(());
@@ -214,9 +241,14 @@ fn loopback_anthropic_checks_policy_on_a_cached_connection() {
 
 #[test]
 fn server_default_model_sends_no_model_or_inventory_request_on_loopback() {
-    for route in ["external", "compatible", "native"] {
+    for route in ["external", "compatible", "native", "custom"] {
         let (listener, _) = listener();
-        let endpoint = listener.local_addr().unwrap().to_string();
+        let address = listener.local_addr().unwrap();
+        let endpoint = if route == "custom" {
+            format!("http://{address}/tenant/chat-proxy/Invoke/")
+        } else {
+            address.to_string()
+        };
         let profile = if route == "external" {
             Profile::configured_with_server_default(&endpoint, ProfileOptions::default())
         } else {
@@ -236,7 +268,11 @@ fn server_default_model_sends_no_model_or_inventory_request_on_loopback() {
                 )
             } else {
                 (
-                    "POST /v1/chat/completions HTTP/1.1",
+                    if route == "custom" {
+                        "POST /tenant/chat-proxy/Invoke/ HTTP/1.1"
+                    } else {
+                        "POST /v1/chat/completions HTTP/1.1"
+                    },
                     r#"{"model":"reported-only","choices":[{"finish_reason":"stop","message":{"content":"answer"}}]}"#,
                 )
             };

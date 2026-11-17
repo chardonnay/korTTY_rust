@@ -1,10 +1,12 @@
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kortty_jobs::{Cancellation, RunRequest};
 use kortty_server_archive::protocol::{CreateFormat, CreatedPayload, Reply, Request};
+use kortty_server_archive::rsync_tree::{Inventory, Manifest};
 use kortty_ssh::{SshSession, SshTarget, TrustStore, sftp::FileKind};
 use sha2::{Digest, Sha256};
 
@@ -14,7 +16,9 @@ use crate::job_executor::connection;
 use crate::profile;
 use crate::scheduler_window::{Archive, ConnectionRef, RemotePath, SshCommand, sync};
 use crate::sftp_window::{
-    StagedDownload, exchange_server_archive, exchange_server_password_archive,
+    ArchiveUpdateFailure, ReviewedFilePublication, ReviewedFileReceiver, StagedDownload,
+    VacantLocalFilePublication, VacantLocalFileReceiver, exchange_archive_update,
+    exchange_server_archive, exchange_server_password_archive,
 };
 use crate::ssh_connection::ExecOpener;
 
@@ -43,7 +47,8 @@ pub(super) fn run(
     let pins = sync::pins(reference, trust).map_err(|_| {
         Failure::blocked("Verify the SSH route host keys before creating an archive.")
     })?;
-    let require_route = spec.output.is_some() || spec.report_payload || password.is_some();
+    let require_route =
+        archive.reuse_output || spec.output.is_some() || spec.report_payload || password.is_some();
     let require_transfer = spec.report_payload;
     let action = Arc::clone(&request.action);
     let scoped_policy = policy.clone();
@@ -99,29 +104,58 @@ pub(super) fn run(
     }
     authorize()
         .map_err(|_| Failure::blocked("Current policy forbids this server archive route."))?;
+    let cancellation = request.cancellation.clone();
+    let stopped = move || cancellation.is_requested();
     let local = archive
         .download
         .as_deref()
-        .map(StagedDownload::create)
-        .transpose()
-        .map_err(|error| {
-            if error.kind() == io::ErrorKind::AlreadyExists {
-                Failure::failed("The local archive destination already exists.")
-            } else {
-                Failure::failed("Could not create a private local archive stage.")
-            }
-        })?;
-    let cancellation = request.cancellation.clone();
-    let stopped = move || cancellation.is_requested();
+        .map(|path| LocalCopy::prepare(path, archive.reuse_output, &stopped))
+        .transpose()?;
     let mut session =
         super::sync::open_pinned_for_job(target, jumps, &pins, &stopped, request, policy)?;
     let result = (|| {
-        let opener = session
-            .exec_opener()
-            .map(ExecOpener::Direct)
-            .ok_or_else(|| {
-                Failure::blocked("The verified SSH session does not support a command channel.")
-            })?;
+        let opener = session.exec_opener().ok_or_else(|| {
+            Failure::blocked("The verified SSH session does not support a command channel.")
+        })?;
+        if archive.reuse_output {
+            let publication = match exchange_archive_update(
+                &opener,
+                &spec,
+                password,
+                stopped.clone(),
+                authorize.clone(),
+            ) {
+                Ok(publication) => publication,
+                Err(ArchiveUpdateFailure::Uncertain { recovery }) => {
+                    return Ok(update_uncertain_completion(request, recovery.as_deref()));
+                }
+                Err(ArchiveUpdateFailure::BeforePublication | ArchiveUpdateFailure::Refused) => {
+                    check_cancelled(&request.cancellation)?;
+                    authorize().map_err(|_| {
+                        Failure::blocked("The archive update is no longer authorized.")
+                    })?;
+                    return Err(Failure::failed(
+                        "Could not publish the reviewed archive update. Check the Linux helper, source paths and protected output.",
+                    ));
+                }
+            };
+            let copy = local.map(|local| {
+                download_archive(
+                    &mut session,
+                    &archive.target,
+                    publication.payload,
+                    local,
+                    &request.cancellation,
+                    &authorize,
+                )
+            });
+            return Ok(update_completion(
+                request,
+                copy,
+                publication.recovery.as_deref(),
+            ));
+        }
+        let opener = ExecOpener::Direct(opener);
         let reply = exchange_server_archive(
             &opener,
             &Request::ReviewCreation { spec: spec.clone() },
@@ -180,7 +214,10 @@ pub(super) fn run(
                     &request.cancellation,
                     &authorize,
                 );
-                Ok(copy_completion(request, result))
+                Ok(copy_completion(
+                    request,
+                    result.map(|_| ()).map_err(|error| error.failure),
+                ))
             }
             Ok(Reply::Failed {
                 outcome_unknown: false,
@@ -195,6 +232,136 @@ pub(super) fn run(
     })();
     let _ = session.close();
     result
+}
+
+fn append_recovery(
+    mut detail: String,
+    label: &str,
+    recovery: Option<impl std::fmt::Display>,
+) -> String {
+    if let Some(recovery) = recovery {
+        detail.push_str(&format!(" {label} · {recovery}"));
+    }
+    detail
+}
+
+pub(super) fn update_uncertain_completion(
+    request: &RunRequest<SshCommand>,
+    recovery: Option<&str>,
+) -> Completion {
+    let mut completion = Completion::from_result(
+        request.id,
+        Err(Failure::failed(
+            "The archive update outcome is uncertain. Check the remote destination before retrying.",
+        )),
+    );
+    if let Some(recovery) = recovery {
+        completion.append_detail(&format!("Last reported remote recovery · {recovery}"));
+    }
+    completion
+}
+
+pub(super) fn update_completion(
+    request: &RunRequest<SshCommand>,
+    copy: Option<Result<Option<PathBuf>, LocalCopyFailure>>,
+    remote_recovery: Option<&str>,
+) -> Completion {
+    let (outcome, detail) = match copy {
+        Some(Ok(recovery)) => (
+            Ok(0),
+            append_recovery(
+                "Published the reviewed server archive and its verified local copy.".into(),
+                "Local recovery",
+                recovery.as_deref().map(Path::display),
+            ),
+        ),
+        Some(Err(LocalCopyFailure { failure, recovery })) => {
+            let detail = append_recovery(
+                format!("The server archive was published. {}", failure.detail),
+                "Last reported local recovery",
+                recovery.as_deref().map(Path::display),
+            );
+            (Err(failure), detail)
+        }
+        None => (Ok(0), "Published the reviewed server archive.".into()),
+    };
+    let mut completion = Completion::from_result(request.id, outcome);
+    completion.detail = Some(append_recovery(detail, "Remote recovery", remote_recovery));
+    completion
+}
+
+pub(super) struct LocalCopy {
+    stage: StagedDownload,
+    receiver: CopyReceiver,
+}
+
+enum CopyReceiver {
+    Legacy,
+    Vacant(VacantLocalFileReceiver),
+    Existing(Box<ReviewedFileReceiver>),
+}
+
+pub(super) struct LocalCopyFailure {
+    failure: Failure,
+    recovery: Option<PathBuf>,
+}
+
+impl From<Failure> for LocalCopyFailure {
+    fn from(failure: Failure) -> Self {
+        Self {
+            failure,
+            recovery: None,
+        }
+    }
+}
+
+impl LocalCopy {
+    pub(super) fn prepare(
+        path: &Path,
+        reuse: bool,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<Self, Failure> {
+        let receiver = if reuse {
+            match fs::symlink_metadata(path) {
+                Ok(_) => ReviewedFileReceiver::open(path, stopped)
+                    .map(|receiver| CopyReceiver::Existing(Box::new(receiver)))
+                    .map_err(|_| {
+                        Failure::failed(
+                            "Could not verify the existing local archive copy and its parent.",
+                        )
+                    })?,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    VacantLocalFileReceiver::open(path, stopped)
+                        .map(CopyReceiver::Vacant)
+                        .map_err(|_| {
+                            Failure::failed("Could not verify a vacant local archive path.")
+                        })?
+                }
+                Err(_) => return Err(Failure::failed("Could not inspect the local archive path.")),
+            }
+        } else {
+            CopyReceiver::Legacy
+        };
+        let stage = match &receiver {
+            CopyReceiver::Existing(receiver) => receiver.stage(),
+            CopyReceiver::Vacant(receiver) => receiver.stage(),
+            CopyReceiver::Legacy => StagedDownload::create(path),
+        }
+        .map_err(|error| {
+            if error.kind() == io::ErrorKind::AlreadyExists {
+                Failure::failed("The local archive destination already exists.")
+            } else {
+                Failure::failed("Could not create a private local archive stage.")
+            }
+        })?;
+        Ok(Self { stage, receiver })
+    }
+
+    pub(super) fn writer(&self) -> Result<&File, Failure> {
+        self.stage
+            .writer()
+            .map_err(|_| Failure::failed("The private local archive stage was unavailable."))
+    }
 }
 
 pub(super) fn copy_completion(
@@ -220,10 +387,10 @@ fn download_archive(
     session: &mut SshSession,
     path: &RemotePath,
     payload: CreatedPayload,
-    stage: StagedDownload,
+    local: LocalCopy,
     cancellation: &Cancellation,
     authorize: &(impl Fn() -> io::Result<()> + Sync),
-) -> Result<(), Failure> {
+) -> Result<Option<PathBuf>, LocalCopyFailure> {
     payload.validate().map_err(|_| {
         Failure::failed("The server returned an invalid archive local-copy receipt.")
     })?;
@@ -239,14 +406,17 @@ fn download_archive(
         }
         !live.1
     };
-    let result = super::sync::supervise(session, &cancelled, |client, stopped, _| {
-        let attributes = super::verify_entry(client, path.as_str())?;
+    super::sync::supervise(session, &cancelled, |client, stopped, _| {
+        let attributes = super::verify_entry(client, path.as_str())
+            .map_err(|error| before_copy(cancellation, authorize).err().unwrap_or(error))?;
         if attributes.kind() != FileKind::File || attributes.size != Some(payload.bytes) {
+            before_copy(cancellation, authorize)?;
             return Err(Failure::failed(
                 "The published server archive no longer matches its local-copy receipt.",
-            ));
+            )
+            .into());
         }
-        publish_payload(stage, payload, cancellation, stopped, authorize, |output| {
+        publish_payload(local, payload, cancellation, stopped, authorize, |output| {
             client
                 .download_regular(path.as_str().as_bytes(), attributes, output)
                 .map_err(|_| {
@@ -254,11 +424,7 @@ fn download_archive(
                 })
         })
     })
-    .and_then(|result| result);
-    if result.is_err() {
-        before_copy(cancellation, authorize)?;
-    }
-    result
+    .map_err(|error| before_copy(cancellation, authorize).err().unwrap_or(error))?
 }
 
 fn before_copy(
@@ -270,18 +436,16 @@ fn before_copy(
 }
 
 fn publish_payload(
-    stage: StagedDownload,
+    local: LocalCopy,
     payload: CreatedPayload,
     cancellation: &Cancellation,
     stopped: &dyn Fn() -> bool,
     authorize: &impl Fn() -> io::Result<()>,
     download: impl FnOnce(&mut dyn Write) -> Result<u64, Failure>,
-) -> Result<(), Failure> {
+) -> Result<Option<PathBuf>, LocalCopyFailure> {
     before_copy(cancellation, authorize)?;
     let mut output = CheckedOutput {
-        file: stage
-            .writer()
-            .map_err(|_| Failure::failed("The private local archive stage was unavailable."))?,
+        file: local.writer()?,
         hash: Sha256::new(),
         remaining: payload.bytes,
         stopped,
@@ -289,33 +453,96 @@ fn publish_payload(
     let count = download(&mut output);
     before_copy(cancellation, authorize)?;
     if stopped() {
-        return Err(Failure::failed("The local archive copy stopped."));
+        return Err(Failure::failed("The local archive copy stopped.").into());
     }
     if count? != payload.bytes
         || output.remaining != 0
         || <[u8; 32]>::from(output.hash.finalize()) != payload.sha256
     {
-        return Err(Failure::failed(
-            "The copied bytes do not match the published server archive.",
-        ));
+        return Err(
+            Failure::failed("The copied bytes do not match the published server archive.").into(),
+        );
     }
+    publish_verified_copy(local, payload, cancellation, stopped, authorize)
+}
+
+pub(super) fn publish_verified_copy(
+    LocalCopy { stage, receiver }: LocalCopy,
+    payload: CreatedPayload,
+    cancellation: &Cancellation,
+    stopped: &dyn Fn() -> bool,
+    authorize: &impl Fn() -> io::Result<()>,
+) -> Result<Option<PathBuf>, LocalCopyFailure> {
+    before_copy(cancellation, authorize)?;
     let verify = || {
         if stopped() {
             return Err(io::Error::other("The local archive transfer stopped."));
         }
         authorize()
     };
+    if let CopyReceiver::Vacant(receiver) = receiver {
+        return match receiver.publish(stage, copy_inventory(payload)?, &stopped, &verify, |_| {
+            Ok(())
+        }) {
+            Ok(VacantLocalFilePublication::Published(_)) => Ok(None),
+            Ok(VacantLocalFilePublication::Uncertain(_)) => Err(Failure::failed(
+                "The local archive copy is uncertain. Check the local destination before retrying.",
+            )
+            .into()),
+            Err(_) => {
+                before_copy(cancellation, authorize)?;
+                Err(
+                    Failure::failed("The vacant archive destination or staged copy changed.")
+                        .into(),
+                )
+            }
+        };
+    }
+    if let CopyReceiver::Existing(receiver) = receiver {
+        return match receiver.publish(stage, copy_inventory(payload)?, &stopped, &verify, |_| {
+            Ok(())
+        }) {
+            Ok(ReviewedFilePublication::Published { recovery, .. }) => Ok(Some(recovery)),
+            Ok(ReviewedFilePublication::Restored { .. }) => {
+                before_copy(cancellation, authorize)?;
+                Err(Failure::failed(
+                    "The local archive replacement was interrupted. The original file was restored.",
+                ).into())
+            }
+            Ok(ReviewedFilePublication::Uncertain { recovery, .. }) => Err(LocalCopyFailure {
+                failure: Failure::failed(
+                    "The local archive replacement is uncertain. Check the local destination before retrying.",
+                ),
+                recovery,
+            }),
+            Err(_) => {
+                before_copy(cancellation, authorize)?;
+                Err(
+                    Failure::failed("The reviewed local archive changed or could not be replaced.")
+                        .into(),
+                )
+            }
+        };
+    }
     if let Err(error) = stage.publish_checked(|_| verify()) {
         before_copy(cancellation, authorize)?;
-        return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+        return Err((if error.kind() == io::ErrorKind::AlreadyExists {
             Failure::failed("The local archive destination already exists.")
         } else {
             Failure::failed(
                 "The local archive copy could not be confirmed. Check the local destination before retrying.",
             )
-        });
+        }).into());
     }
-    Ok(())
+    Ok(None)
+}
+
+fn copy_inventory(payload: CreatedPayload) -> Result<Inventory, Failure> {
+    let mut manifest = Manifest::default();
+    manifest
+        .add("", Some((payload.bytes, payload.sha256)))
+        .map_err(|_| Failure::failed("Could not verify the staged local archive copy."))?;
+    Ok(manifest.finish())
 }
 
 struct CheckedOutput<'a> {
@@ -346,9 +573,38 @@ impl Write for CheckedOutput<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Seek as _;
     use std::{cell::Cell, fs};
 
     use crate::job_executor::tests::scheduled_request;
+
+    #[test]
+    fn reused_archive_checks_staged_bytes_again_before_first_local_publication() {
+        let profile = crate::snippets::tests::Profile::new();
+        let directory = profile.0.canonicalize().unwrap().join("downloads");
+        crate::private_files::Directory::open(&directory, true).unwrap();
+        let destination = directory.join("checked.tar");
+        let expected = b"expected archive";
+        let payload = CreatedPayload {
+            bytes: expected.len() as u64,
+            sha256: Sha256::digest(expected).into(),
+        };
+        let (_, request) = scheduled_request();
+        let local = LocalCopy::prepare(&destination, true, &|| false)
+            .unwrap_or_else(|error| panic!("{}", error.detail));
+        let mut file = local
+            .writer()
+            .unwrap_or_else(|error| panic!("{}", error.detail));
+        file.write_all(expected).unwrap();
+        file.rewind().unwrap();
+        file.write_all(b"tampered archive").unwrap();
+        assert!(
+            publish_verified_copy(local, payload, &request.cancellation, &|| false, &|| Ok(()))
+                .is_err()
+        );
+        assert!(!destination.exists());
+        assert!(fs::read_dir(&directory).unwrap().next().is_none());
+    }
 
     #[test]
     fn server_archive_local_copy_checks_bytes_authority_and_vacant_destination() {
@@ -369,7 +625,8 @@ mod tests {
             Ok(bytes.len() as u64)
         };
         let run = |authorize: &dyn Fn() -> io::Result<()>, bytes: &[u8], competing: bool| {
-            let stage = StagedDownload::create(&destination).unwrap();
+            let stage = LocalCopy::prepare(&destination, false, &unstopped)
+                .unwrap_or_else(|error| panic!("{}", error.detail));
             publish_payload(
                 stage,
                 receipt,
@@ -404,7 +661,7 @@ mod tests {
         let Err(revoked) = run(&revoked, known, false) else {
             panic!("a revoked local copy was published")
         };
-        let partial = copy_completion(&request, Err(revoked));
+        let partial = copy_completion(&request, Err(revoked.failure));
         assert_eq!(partial.outcome, kortty_jobs::RunOutcome::Blocked);
         assert!(
             partial
@@ -422,7 +679,8 @@ mod tests {
         assert_eq!(fs::read_dir(&profile.0).unwrap().count(), 1);
 
         fs::remove_file(&destination).unwrap();
-        let stage = StagedDownload::create(&destination).unwrap();
+        let stage = LocalCopy::prepare(&destination, false, &unstopped)
+            .unwrap_or_else(|error| panic!("{}", error.detail));
         let result = publish_payload(
             stage,
             receipt,
@@ -435,7 +693,8 @@ mod tests {
                 Ok(count)
             },
         );
-        let completion = copy_completion(&request, result);
+        let completion =
+            copy_completion(&request, result.map(|_| ()).map_err(|error| error.failure));
         assert_eq!(completion.outcome, kortty_jobs::RunOutcome::Cancelled);
         assert!(
             completion

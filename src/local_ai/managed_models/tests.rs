@@ -309,3 +309,192 @@ fn managed_lease_detects_changed_weights_before_launch() {
     registry.remove(&model.id).unwrap();
     assert_eq!(fs::read(source).unwrap(), bytes);
 }
+#[test]
+#[ignore = "downloads a signed runtime and requires local GGUF weights and projector"]
+fn native_gguf_vision_and_external_reference() {
+    use std::time::{Duration, Instant};
+
+    use crate::local_ai::runtime_package;
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+
+    let asset = |name: &str| PathBuf::from(std::env::var_os(name).expect(name));
+    let weights = asset("KORTTY_SMOKE_VISION_GGUF");
+    let projector = asset("KORTTY_SMOKE_VISION_PROJECTOR");
+    let private = crate::snippets::tests::Profile::new();
+    let root = private.0.canonicalize().unwrap();
+    let cancelled = AtomicBool::new(false);
+
+    install_native_gguf_runtime(&root);
+    let registry = Registry::new(root.clone());
+    let pair = registry
+        .import_projector_pair(&weights, &projector, &cancelled)
+        .unwrap();
+    let _stop_pair = StopNativeGguf(&root, &pair.id);
+    assert!(pair.projector_bytes.is_some());
+    let vision = native_gguf_client(&root, &pair.id);
+    for (name, color) in [
+        ("red", tiny_skia::Color::from_rgba8(255, 0, 0, 255)),
+        ("blue", tiny_skia::Color::from_rgba8(0, 0, 255, 255)),
+    ] {
+        let mut image = tiny_skia::Pixmap::new(512, 512).unwrap();
+        image.fill(color);
+        let image = format!(
+            "data:image/png;base64,{}",
+            STANDARD.encode(image.encode_png().unwrap())
+        );
+        let answer = vision
+            .complete_vision_before_guarded(
+                "Answer in one word.",
+                "What is the main color of this image?",
+                &image,
+                false,
+                Instant::now() + Duration::from_secs(120),
+                || Ok(()),
+            )
+            .unwrap();
+        assert!(
+            answer
+                .split(|ch: char| !ch.is_ascii_alphabetic())
+                .any(|word| word.eq_ignore_ascii_case(name)),
+            "{name}: {answer:?}"
+        );
+        println!("Private vision pair identified the {name} image: {answer}");
+    }
+    drop(vision);
+    runtime_package::stop_model(&root, &pair.id).unwrap();
+
+    let source = root.join("external-model.gguf");
+    std::fs::copy(&weights, &source).unwrap();
+    native_external_gguf_round_trip(&root, std::slice::from_ref(&source));
+}
+
+#[test]
+#[ignore = "downloads a signed runtime and requires KORTTY_SMOKE_SPLIT_GGUF"]
+fn native_split_gguf_external_reference() {
+    let selected = PathBuf::from(std::env::var_os("KORTTY_SMOKE_SPLIT_GGUF").unwrap());
+    let names = split::Names::parse(selected.file_name().unwrap().to_str().unwrap()).unwrap();
+    let private = crate::snippets::tests::Profile::new();
+    let root = private.0.canonicalize().unwrap();
+    let files = (0..names.count)
+        .map(|index| {
+            let name = names.name(index);
+            let path = root.join(&name);
+            std::fs::copy(selected.with_file_name(name), &path).unwrap();
+            path
+        })
+        .collect::<Vec<_>>();
+    install_native_gguf_runtime(&root);
+    native_external_gguf_round_trip(&root, &files);
+}
+
+struct StopNativeGguf<'a>(&'a Path, &'a str);
+
+impl Drop for StopNativeGguf<'_> {
+    fn drop(&mut self) {
+        let _ = crate::local_ai::runtime_package::stop_model(self.0, self.1);
+    }
+}
+
+fn install_native_gguf_runtime(root: &Path) {
+    use crate::local_ai::{runtime_index::PackageBackend, runtime_package::online};
+
+    let backend = if cfg!(target_os = "macos") {
+        PackageBackend::Metal
+    } else {
+        PackageBackend::Cpu
+    };
+    let pending = online::check(root.to_owned(), Some(backend)).unwrap();
+    let catalog = pending.reply.recv_blocking().unwrap().unwrap();
+    let choice = catalog.preferred_choice(Some(backend)).unwrap().clone();
+    println!("Runtime {choice}");
+    let download = online::install(root.to_owned(), catalog, choice).unwrap();
+    assert!(matches!(
+        download.pending.reply.recv_blocking().unwrap().unwrap(),
+        online::InstallOutcome::Installed {
+            cleanup_failed: false,
+            ..
+        }
+    ));
+}
+
+fn native_gguf_client(root: &Path, model: &str) -> crate::local_ai::Client {
+    use std::time::Duration;
+
+    use crate::local_ai::{Client, Profile, ProfileOptions};
+
+    Client::new(
+        Profile::managed(
+            root.to_owned(),
+            model,
+            ProfileOptions {
+                max_output_tokens: Some(256),
+                timeout: Some(Duration::from_secs(120)),
+                ..Default::default()
+            },
+        )
+        .unwrap(),
+    )
+}
+
+fn native_external_gguf_round_trip(root: &Path, paths: &[PathBuf]) {
+    use crate::local_ai::{Client, runtime_package};
+
+    let registry = Registry::new(root.to_owned());
+    let cancelled = AtomicBool::new(false);
+    // Register the last shard to verify that launch uses the first sibling.
+    let source = paths.last().unwrap();
+    let sizes = paths
+        .iter()
+        .map(|path| path.metadata().unwrap().len())
+        .collect::<Vec<_>>();
+    let external = registry
+        .reference(source, Purpose::Chat, &cancelled)
+        .unwrap();
+    let _stop_external = StopNativeGguf(root, &external.id);
+    assert_eq!(external.external.as_ref().unwrap().path(), paths[0]);
+    if paths.len() > 1 {
+        assert_eq!(external.shard_bytes, sizes);
+    }
+    let chat = native_gguf_client(root, &external.id);
+    let ask = |chat: &Client| {
+        chat.complete_chat("Give a short answer.", &[], "What color is a ripe banana?")
+    };
+    assert!(!ask(&chat).unwrap().trim().is_empty());
+    let original = root.join("external-original.gguf");
+    #[cfg(windows)]
+    let chat = {
+        let error = std::fs::rename(source, &original).unwrap_err();
+        assert!(matches!(error.raw_os_error(), Some(5 | 32)), "{error}");
+        println!("Windows prevented replacement while the read lease was active");
+        drop(chat);
+        runtime_package::stop_model(root, &external.id).unwrap();
+        native_gguf_client(root, &external.id)
+    };
+    std::fs::rename(source, &original).unwrap();
+    std::fs::copy(&original, source).unwrap();
+    let failed = ask(&chat).unwrap_err().message();
+    assert!(failed.contains("external GGUF changed"), "{failed}");
+    drop(chat);
+    runtime_package::stop_model(root, &external.id).unwrap();
+    registry.remove(&external.id).unwrap();
+    assert!(
+        paths
+            .iter()
+            .zip(sizes)
+            .all(|(path, size)| path.metadata().unwrap().len() == size)
+    );
+    let replacement = registry
+        .reference(source, Purpose::Chat, &cancelled)
+        .unwrap();
+    let _stop_replacement = StopNativeGguf(root, &replacement.id);
+    assert!(
+        !ask(&native_gguf_client(root, &replacement.id))
+            .unwrap()
+            .trim()
+            .is_empty()
+    );
+    println!(
+        "External inference with {} file(s) passed, rejected a same-size replacement and resumed after re-registration",
+        paths.len()
+    );
+}

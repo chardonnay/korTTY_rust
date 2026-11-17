@@ -116,10 +116,7 @@ impl Stage {
         validate_depth(path.len(), false)?;
         let (parent, name) = self.parent(path)?;
         let file = parent.create_file(name)?;
-        #[cfg(windows)]
-        Directory::require_owner_only_file(&file)?;
-        #[cfg(unix)]
-        private_file(&file, 0o600)?;
+        private_regular_file(&file)?;
         Ok(file)
     }
 
@@ -267,11 +264,18 @@ fn require_absent(path: &Path) -> io::Result<()> {
     }
 }
 
-fn private_directory(directory: &Directory) -> io::Result<()> {
+pub(in crate::sftp_window) fn private_directory(directory: &Directory) -> io::Result<()> {
     #[cfg(windows)]
     return directory.require_owner_only();
     #[cfg(unix)]
     private_file(directory.file(), 0o700)
+}
+
+pub(in crate::sftp_window) fn private_regular_file(file: &File) -> io::Result<()> {
+    #[cfg(windows)]
+    return Directory::require_owner_only_file(file);
+    #[cfg(unix)]
+    private_file(file, 0o600)
 }
 
 #[cfg(unix)]

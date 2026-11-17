@@ -295,11 +295,8 @@ fn decode(bytes: &[u8]) -> io::Result<Values> {
     };
     let parallel = field("sftpParallelTransfers")?
         .map(|value| {
-            value
-                .trim()
-                .parse::<i32>()
-                .map(|value| value.clamp(1, i32::from(MAX_PARALLEL)) as u8)
-                .map_err(|_| io::Error::other("Invalid Java parallel transfer count."))
+            parallel_count(&value)
+                .ok_or_else(|| io::Error::other("Invalid Java parallel transfer count."))
         })
         .transpose()?
         .unwrap_or(DEFAULT_PARALLEL);
@@ -329,6 +326,14 @@ fn decode(bytes: &[u8]) -> io::Result<Values> {
         archive_directory,
         archive_level,
     })
+}
+
+pub(in crate::workspace) fn parallel_count(value: &str) -> Option<u8> {
+    value
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .map(|value| value.clamp(1, i32::from(MAX_PARALLEL)) as u8)
 }
 
 fn encode(values: Values) -> String {

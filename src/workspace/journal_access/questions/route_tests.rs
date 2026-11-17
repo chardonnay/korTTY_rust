@@ -8,7 +8,9 @@ use iced::futures::{FutureExt as _, StreamExt as _, executor::block_on, stream::
 use serde_json::json;
 
 use crate::ai_manager::Configuration;
-use crate::local_ai::test_support::{accept, exclusive_run, listener, request};
+use crate::local_ai::test_support::{
+    accept, exclusive_run, fixture_http_response, listener, request, wire_request,
+};
 use crate::session_journal;
 
 use super::super::screenshot_access::tests::Fixture;
@@ -48,24 +50,178 @@ fn prepare_current(workspace: &mut Workspace, id: window::Id, question: &str) {
 }
 
 fn https_configuration(address: std::net::SocketAddr, model: &str) -> Configuration {
+    journal_configuration(address, model, 7, Some(8))
+}
+
+fn journal_configuration(
+    address: std::net::SocketAddr,
+    model: &str,
+    default: u64,
+    role: Option<u64>,
+) -> Configuration {
     serde_json::from_value(json!({
         "profiles": {
             "profiles": [
                 {"id": 7, "name": "Journal HTTPS fixture", "model": model,
+                 "model_mode": if model.is_empty() { "server-default" } else { "manual" },
                  "endpoint": format!("https://{address}/v1"), "connection_mode": "remote-open-ai",
                  "trusted_remote_endpoint": true},
                 {"id": 8, "name": "Journal local fixture", "model": "fixture:local",
                  "endpoint": address.to_string()}
             ],
-            "default": 7, "last_id": 8
+            "default": default, "last_id": 8
         },
-        "local": {"roles": [null, null, null, 8]}
+        "local": {"roles": [null, null, null, role]}
     }))
     .unwrap()
 }
 
 #[test]
+fn journal_question_prefers_the_saved_https_role_and_still_requires_send_approval() {
+    let _exclusive = exclusive_run();
+    let fixture = Fixture::new();
+    let (mut workspace, _, id) = fixture.open(true);
+    let (endpoint, _) = listener();
+    let address = endpoint.local_addr().unwrap();
+    configure(&mut workspace, id, address);
+
+    let profile = crate::snippets::tests::Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let saved = |configuration: Configuration, baseline: &Configuration| {
+        configuration.save_fixture_at(&root, baseline).unwrap();
+        Configuration::load_fixture_from(&root).unwrap()
+    };
+    let explicit = journal_configuration(address, "", 8, Some(7));
+    workspace.set_test_ai_configuration(explicit.clone());
+    let _ = dispatch(&mut workspace, id, Message::Open);
+    assert!(workspace.journal_questions.dialogs[&id].outbound.is_none());
+
+    let explicit = saved(explicit, &Configuration::default());
+    workspace.set_test_ai_configuration(explicit.clone());
+    let _ = dispatch(&mut workspace, id, Message::Open);
+    let dialog = &workspace.journal_questions.dialogs[&id];
+    assert_eq!(dialog.outbound.as_ref().unwrap().id, 7);
+    assert!(dialog.routes.answer.is_none());
+    assert_eq!(dialog.routes.answer_choices[0].label, "Local evidence only");
+    prepare_current(&mut workspace, id, "Where was the failure?");
+    assert!(prepared(&workspace, id).https_ticket().is_some());
+    assert!(
+        iced_runtime::task::into_stream(dispatch(&mut workspace, id, Message::Answer(true)))
+            .is_none()
+    );
+    assert_eq!(endpoint.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+    let fallback = saved(journal_configuration(address, "named", 7, None), &explicit);
+    workspace.set_test_ai_configuration(fallback);
+    let _ = dispatch(&mut workspace, id, Message::Open);
+    assert!(workspace.journal_questions.dialogs[&id].outbound.is_none());
+    workspace.window_settings.journal_ai.endpoint.clear();
+    workspace.window_settings.journal_ai.model.clear();
+    let _ = dispatch(&mut workspace, id, Message::Open);
+    assert_eq!(
+        workspace.journal_questions.dialogs[&id]
+            .outbound
+            .as_ref()
+            .unwrap()
+            .id,
+        7
+    );
+    let _ = dispatch(&mut workspace, id, Message::SelectAnswer(None));
+    assert!(workspace.journal_questions.dialogs[&id].outbound.is_none());
+    assert_eq!(endpoint.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+}
+
+#[test]
+fn journal_question_loopback_server_default_sends_the_review_without_a_model() {
+    let _exclusive = exclusive_run();
+    let fixture = Fixture::new();
+    let (mut workspace, _, id) = fixture.open(true);
+    let (endpoint, _) = listener();
+    let address = endpoint.local_addr().unwrap();
+    configure(&mut workspace, id, address);
+    let profile = crate::snippets::tests::Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let config: Configuration = serde_json::from_value(json!({
+        "profiles": {"profiles": [{
+            "id": 7, "name": "Local Journal gateway",
+            "endpoint": format!("http://{address}/tenant/Invoke/"),
+            "model_mode": "server-default", "connection_mode": "lm-studio-compatible"
+        }], "last_id": 7},
+        "local": {"roles": [null, null, null, 7]}
+    }))
+    .unwrap();
+    workspace.set_test_ai_configuration(config.clone());
+    let _ = dispatch(&mut workspace, id, Message::Open);
+    assert!(
+        workspace.journal_questions.dialogs[&id]
+            .answer_route()
+            .is_none()
+    );
+
+    config
+        .save_fixture_at(&root, &Configuration::default())
+        .unwrap();
+    let saved = Configuration::load_fixture_from(&root).unwrap();
+    assert!(saved.journal_summary_default_id().is_none());
+    assert!(saved.journal_profile(true).unwrap().is_err());
+    workspace.set_test_ai_configuration(saved);
+    prepare(&mut workspace, id);
+    let dialog = &workspace.journal_questions.dialogs[&id];
+    assert_eq!(
+        dialog.answer_route().unwrap().label,
+        format!(
+            "Local Journal gateway · Server selects the model · http://{address}/tenant/Invoke/"
+        )
+    );
+    assert!(dialog.outbound.is_none());
+    let review = &prepared(&workspace, id).review;
+    let messages = review.answer_messages().map(str::to_owned);
+    let quote = "failure from part two";
+    let citation = review
+        .citations
+        .iter()
+        .position(|entry| entry.excerpt.contains(quote))
+        .unwrap()
+        + 1;
+    assert_eq!(endpoint.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+
+    let server = thread::spawn(move || {
+        let mut socket = accept(&endpoint);
+        let body: serde_json::Value =
+            serde_json::from_slice(&wire_request(&mut socket, "POST /tenant/Invoke/ HTTP/1.1"))
+                .unwrap();
+        assert!(body.get("model").is_none());
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][0]["content"], messages[0]);
+        assert_eq!(body["messages"][1]["content"], messages[1]);
+        let answer = json!({"findings": [{"citation": citation, "quote": quote}]}).to_string();
+        let response = json!({"choices": [{"message": {"content": answer}}]}).to_string();
+        socket
+            .get_mut()
+            .write_all(fixture_http_response("200 OK", "", &response).as_bytes())
+            .unwrap();
+    });
+    let task = dispatch(&mut workspace, id, Message::Answer(true));
+    drain(&mut workspace, task);
+    server.join().unwrap();
+    let Stage::Review(_, Some(answer)) = &workspace.journal_questions.dialogs[&id].stage else {
+        panic!("expected the approved local answer");
+    };
+    assert!(answer.ai_used);
+    assert_eq!(answer.findings[0].quote, quote);
+}
+
+#[test]
 fn journal_question_https_requires_saved_selection_and_exact_masked_approval() {
+    check_https_review("fixture-model", "fixture-model");
+}
+
+#[test]
+fn journal_question_server_default_requires_exact_masked_approval() {
+    check_https_review("", "Server selects the model");
+}
+
+fn check_https_review(model: &str, model_label: &str) {
     use kortty_vault::{CredentialInput, Secret, Vault};
 
     let _exclusive = exclusive_run();
@@ -75,7 +231,7 @@ fn journal_question_https_requires_saved_selection_and_exact_masked_approval() {
     let address = endpoint.local_addr().unwrap();
     configure(&mut workspace, id, address);
 
-    let config = https_configuration(address, "fixture-model");
+    let config = https_configuration(address, model);
     workspace.set_test_ai_configuration(config.clone());
     let _ = dispatch(&mut workspace, id, Message::Open);
     let _ = dispatch(&mut workspace, id, Message::SelectAnswer(Some(7)));
@@ -134,7 +290,7 @@ fn journal_question_https_requires_saved_selection_and_exact_masked_approval() {
     assert!(dialog.answer_route().unwrap().profile.is_remote());
     assert_eq!(
         dialog.answer_route().unwrap().label,
-        format!("Journal HTTPS fixture · fixture-model · https://{address}/v1/chat/completions")
+        format!("Journal HTTPS fixture · {model_label} · https://{address}/v1/chat/completions")
     );
     let _ = dispatch(
         &mut workspace,

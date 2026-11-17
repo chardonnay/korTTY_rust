@@ -15,6 +15,7 @@ fn run(history: DesignHistory) -> Run {
         label: "Fixture".into(),
         reviewed_https: None,
         reviewed_cli: None,
+        server_default: None,
     };
     let mut run = Run::from_setup(RunSetup {
         binding: binding::Binding::Live(binding::Live {

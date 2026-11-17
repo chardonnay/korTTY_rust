@@ -48,6 +48,20 @@ impl Spec {
                 Operation::Download { .. } => true,
             }
     }
+
+    pub fn recurring_file_upload(&self) -> bool {
+        self.recurring_upload(false)
+    }
+
+    pub fn recurring_tree_upload(&self) -> bool {
+        self.recurring_upload(true)
+    }
+
+    fn recurring_upload(&self, directory: bool) -> bool {
+        self.valid()
+            && matches!(self.operation, Operation::Upload { directory: selected, replace: true, .. }
+                if selected == directory)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -58,6 +72,10 @@ pub struct Review {
     pub fingerprint: [u8; 32],
     pub inventory: Option<Inventory>,
     pub handoff: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub first_file: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub first_tree: bool,
 }
 
 impl Review {
@@ -65,12 +83,23 @@ impl Review {
         self.spec.valid()
             && valid_path(&self.handoff)
             && self.handoff.len() <= 960
-            && match self.spec.operation {
-                Operation::Upload { replace: false, .. } => self.inventory.is_none(),
-                Operation::Upload { directory, .. } | Operation::Download { directory } => self
-                    .inventory
-                    .is_some_and(|inventory| valid_inventory(inventory, directory)),
+            && if self.first_publication() {
+                self.first_file != self.first_tree
+                    && self.spec.recurring_upload(self.first_tree)
+                    && self.inventory.is_none()
+                    && self.fingerprint != [0; 32]
+            } else {
+                match self.spec.operation {
+                    Operation::Upload { replace: false, .. } => self.inventory.is_none(),
+                    Operation::Upload { directory, .. } | Operation::Download { directory } => self
+                        .inventory
+                        .is_some_and(|inventory| valid_inventory(inventory, directory)),
+                }
             }
+    }
+
+    pub fn first_publication(&self) -> bool {
+        self.first_file || self.first_tree
     }
 
     pub fn contains_payload(&self, path: &str) -> bool {
@@ -130,6 +159,12 @@ pub enum Request {
     Review {
         spec: Spec,
     },
+    ReviewRecurringFileUpload {
+        spec: Spec,
+    },
+    ReviewRecurringTreeUpload {
+        spec: Spec,
+    },
     ReviewSource {
         spec: Spec,
     },
@@ -145,12 +180,22 @@ pub enum Request {
         review: Review,
         incoming: Inventory,
     },
+    PrepareFirstRecurringFileUpload {
+        review: Review,
+        incoming: Inventory,
+    },
+    PrepareFirstRecurringTreeUpload {
+        review: Review,
+        incoming: Inventory,
+    },
 }
 
 impl Request {
     fn valid(&self) -> bool {
         match self {
             Self::Review { spec } => spec.valid(),
+            Self::ReviewRecurringFileUpload { spec } => spec.recurring_file_upload(),
+            Self::ReviewRecurringTreeUpload { spec } => spec.recurring_tree_upload(),
             Self::ReviewSource { spec } => {
                 matches!(spec.operation, Operation::Download { .. }) && spec.valid()
             }
@@ -160,7 +205,8 @@ impl Request {
                     && limits.valid()
             }
             Self::Prepare { review, incoming } => {
-                review.valid()
+                !review.first_publication()
+                    && review.valid()
                     && match review.spec.operation {
                         Operation::Upload { directory, .. } => {
                             incoming.is_some_and(|inventory| valid_inventory(inventory, directory))
@@ -169,8 +215,15 @@ impl Request {
                     }
             }
             Self::PrepareRecurring { review, incoming } => {
-                review.valid()
+                !review.first_publication()
+                    && review.valid()
                     && matches!(review.spec.operation, Operation::Upload { directory, replace: true, .. } if valid_inventory(*incoming, directory))
+            }
+            Self::PrepareFirstRecurringFileUpload { review, incoming } => {
+                review.first_file && review.valid() && valid_inventory(*incoming, false)
+            }
+            Self::PrepareFirstRecurringTreeUpload { review, incoming } => {
+                review.first_tree && review.valid() && valid_inventory(*incoming, true)
             }
         }
     }
@@ -207,6 +260,16 @@ pub enum Reply {
         destination: String,
         receiver: ExistingTree,
         recovery: String,
+    },
+    FirstRecurringFilePublished {
+        destination: String,
+        vacancy: [u8; 32],
+        receiver: ExistingTree,
+    },
+    FirstRecurringTreePublished {
+        destination: String,
+        vacancy: [u8; 32],
+        receiver: ExistingTree,
     },
     Finished {
         inventory: Inventory,
@@ -270,6 +333,8 @@ mod tests {
             fingerprint: [2; 32],
             inventory: Some(Manifest::default().finish()),
             handoff: "/handoff/login".into(),
+            first_file: false,
+            first_tree: false,
         };
         assert!(review.valid());
         let stage = format!(".kortty-{}.kortty-part", "a".repeat(32));
@@ -337,6 +402,8 @@ mod tests {
             fingerprint: [2; 32],
             inventory: Some(file),
             handoff: "/handoff/login".into(),
+            first_file: false,
+            first_tree: false,
         };
         assert!(review.valid());
         assert!(
@@ -367,6 +434,186 @@ mod tests {
     }
 
     #[test]
+    fn first_recurring_file_requires_an_exact_vacancy_and_remains_a_distinct_operation() {
+        let spec = Spec {
+            path: "/incoming/file".into(),
+            operation: Operation::Upload {
+                directory: false,
+                replace: true,
+                delete: DeleteScope::Retain,
+            },
+        };
+        let mut file = Manifest::default();
+        file.add("", Some((9, [8; 32]))).unwrap();
+        let file = file.finish();
+        let mut request_frame = Vec::new();
+        write_request(
+            &mut request_frame,
+            &Request::ReviewRecurringFileUpload { spec: spec.clone() },
+        )
+        .unwrap();
+        assert!(
+            matches!(read_request(request_frame.as_slice()).unwrap(), Request::ReviewRecurringFileUpload { spec: actual } if actual == spec)
+        );
+
+        let mut review = Review {
+            spec,
+            policy: [1; 32],
+            fingerprint: [2; 32],
+            inventory: None,
+            handoff: "/handoff/login".into(),
+            first_file: true,
+            first_tree: false,
+        };
+        request_frame.clear();
+        write_request(
+            &mut request_frame,
+            &Request::PrepareFirstRecurringFileUpload {
+                review: review.clone(),
+                incoming: file,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(read_request(request_frame.as_slice()).unwrap(), Request::PrepareFirstRecurringFileUpload { review: actual, incoming } if actual == review && incoming == file)
+        );
+        assert!(
+            write_request(
+                Vec::new(),
+                &Request::Prepare {
+                    review: review.clone(),
+                    incoming: Some(file)
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            write_request(
+                Vec::new(),
+                &Request::PrepareRecurring {
+                    review: review.clone(),
+                    incoming: file
+                }
+            )
+            .is_err()
+        );
+
+        review.inventory = Some(file);
+        assert!(!review.valid());
+        review.first_file = false;
+        assert!(review.valid());
+        assert!(
+            serde_json::to_value(&review)
+                .unwrap()
+                .get("first_file")
+                .is_none()
+        );
+        assert!(
+            write_request(
+                Vec::new(),
+                &Request::PrepareFirstRecurringFileUpload {
+                    review,
+                    incoming: file
+                }
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn first_recurring_tree_wire_binds_its_own_kind_and_mirror_scope() {
+        let spec = Spec {
+            path: "/incoming/tree".into(),
+            operation: Operation::Upload {
+                directory: true,
+                replace: true,
+                delete: DeleteScope::Named(vec!["named".into()]),
+            },
+        };
+        let mut frame = Vec::new();
+        write_request(
+            &mut frame,
+            &Request::ReviewRecurringTreeUpload { spec: spec.clone() },
+        )
+        .unwrap();
+        assert!(
+            matches!(read_request(frame.as_slice()), Ok(Request::ReviewRecurringTreeUpload { spec: parsed }) if parsed == spec)
+        );
+        assert!(
+            write_request(
+                Vec::new(),
+                &Request::ReviewRecurringFileUpload { spec: spec.clone() }
+            )
+            .is_err()
+        );
+
+        let mut review = Review {
+            spec,
+            policy: [1; 32],
+            fingerprint: [2; 32],
+            inventory: None,
+            handoff: "/handoff/login".into(),
+            first_file: false,
+            first_tree: true,
+        };
+        let mut manifest = Manifest::default();
+        manifest.add("named", None).unwrap();
+        let inventory = manifest.finish();
+        frame.clear();
+        write_request(
+            &mut frame,
+            &Request::PrepareFirstRecurringTreeUpload {
+                review: review.clone(),
+                incoming: inventory,
+            },
+        )
+        .unwrap();
+        assert!(
+            matches!(read_request(frame.as_slice()), Ok(Request::PrepareFirstRecurringTreeUpload { review: parsed, incoming }) if parsed == review && incoming == inventory)
+        );
+        assert!(
+            write_request(
+                Vec::new(),
+                &Request::PrepareRecurring {
+                    review: review.clone(),
+                    incoming: inventory
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            write_request(
+                Vec::new(),
+                &Request::Prepare {
+                    review: review.clone(),
+                    incoming: Some(inventory)
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            write_request(
+                Vec::new(),
+                &Request::PrepareFirstRecurringFileUpload {
+                    review: review.clone(),
+                    incoming: inventory
+                }
+            )
+            .is_err()
+        );
+
+        review.first_file = true;
+        assert!(!review.valid());
+        review.first_tree = false;
+        assert!(!review.valid());
+        review.first_file = false;
+        review.inventory = Some(inventory);
+        assert!(review.valid());
+        let legacy = serde_json::to_value(review).unwrap();
+        assert!(legacy.get("first_file").is_none() && legacy.get("first_tree").is_none());
+    }
+
+    #[test]
     fn recurring_requests_bind_an_existing_receiver_or_a_bounded_approved_source() {
         let empty = Manifest::default().finish();
         let mut review = Review {
@@ -378,6 +625,8 @@ mod tests {
             fingerprint: [2; 32],
             inventory: Some(empty),
             handoff: "/handoff/login".into(),
+            first_file: false,
+            first_tree: false,
         };
         let limits = SourceLimits {
             entries: 0,

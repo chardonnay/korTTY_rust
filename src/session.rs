@@ -264,6 +264,7 @@ struct Shared {
     program_notifications: Mutex<std::collections::VecDeque<kortty_terminal::ProgramNotification>>,
     output_activity: Arc<activity::Clock>,
     local_shell_pid: AtomicU32,
+    flatpak_host_shell: AtomicBool,
     sandbox_backend: Mutex<Option<&'static str>>,
     serial: Option<Arc<SerialConnection>>,
     serial_notice: Mutex<Option<Arc<str>>>,
@@ -467,7 +468,7 @@ impl WriteReply {
 }
 
 enum StreamTransport {
-    Pty(Pty),
+    Pty(Box<Pty>),
     Ssh(crate::ssh_connection::Connected),
     Serial {
         port: Arc<SerialPort>,
@@ -986,6 +987,7 @@ impl Session {
             program_notifications: Mutex::default(),
             output_activity: Arc::default(),
             local_shell_pid: AtomicU32::new(0),
+            flatpak_host_shell: AtomicBool::new(false),
             sandbox_backend: Mutex::default(),
             serial,
             serial_notice: Mutex::new(None),
@@ -1156,6 +1158,16 @@ impl Session {
         };
         let pid = self.shared.local_shell_pid.load(Ordering::Acquire);
         (pid != 0 && !events.is_closed() && self.frame().status == Status::Running).then_some(pid)
+    }
+
+    pub(crate) fn flatpak_host_shell(&self) -> bool {
+        matches!(&self.backend, Backend::Stream { events, .. } if !events.is_closed())
+            && self.shared.flatpak_host_shell.load(Ordering::Acquire)
+            && self.frame().status == Status::Running
+    }
+
+    pub(crate) fn local_shell_running(&self) -> bool {
+        self.local_shell_pid().is_some() || self.flatpak_host_shell()
     }
 
     pub(crate) fn set_coding_agent_detection(&self, enabled: bool) {
@@ -2088,7 +2100,7 @@ impl StreamTransport {
                 let writer = pty
                     .take_writer()
                     .ok_or_else(|| io::Error::other("PTY input handle missing"))?;
-                Ok((Self::Pty(pty), Box::new(reader), Box::new(writer)))
+                Ok((Self::Pty(Box::new(pty)), Box::new(reader), Box::new(writer)))
             }
             StreamSource::Ssh(Some(mut ssh), _) => {
                 let reader = ssh
@@ -2282,9 +2294,11 @@ fn run_session(
     if write_thread.is_ok() {
         let backend = match &transport {
             StreamTransport::Pty(pty) => {
+                let host = pty.uses_flatpak_host();
+                shared.flatpak_host_shell.store(host, Ordering::Release);
                 shared
                     .local_shell_pid
-                    .store(pty.shell_pid(), Ordering::Release);
+                    .store(if host { 0 } else { pty.shell_pid() }, Ordering::Release);
                 pty.sandbox_backend()
             }
             StreamTransport::Ssh(ssh) => ssh.sandbox_backend(),
@@ -2681,6 +2695,47 @@ fn write_terminal_bytes(writer: &mut impl Write, bytes: &[u8]) -> io::Result<()>
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn reply_flatpak_directory(
+    shared: &Shared,
+    reply: Sender<io::Result<PathBuf>>,
+    at_live_prompt: bool,
+) {
+    static LOCAL_HOST: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    let directory = shared
+        .shell_activity
+        .as_ref()
+        .filter(|_| at_live_prompt)
+        .and_then(|activity| {
+            let activity = activity.lock().unwrap_or_else(|error| error.into_inner());
+            let directory = activity.directory_at_prompt()?;
+            let host = directory.host.trim_end_matches('.');
+            let local = host.is_empty()
+                || host.eq_ignore_ascii_case("localhost")
+                || LOCAL_HOST
+                    .get_or_init(kortty_pty::local_hostname)
+                    .as_ref()
+                    .is_some_and(|name| host.eq_ignore_ascii_case(name.trim_end_matches('.')));
+            let path = PathBuf::from(directory.path.as_ref());
+            (local && path.is_absolute()).then_some(path)
+        });
+    let Some(directory) = directory else {
+        let _ = reply.try_send(Err(io::Error::other(
+            "The Flatpak host shell needs a current directory report at its prompt.",
+        )));
+        return;
+    };
+    let worker_reply = reply.clone();
+    if let Err(error) = thread::Builder::new()
+        .name("kortty-flatpak-directory".into())
+        .spawn(move || {
+            let _ = worker_reply.try_send(kortty_pty::flatpak::shared_directory(&directory));
+        })
+    {
+        let _ = reply.try_send(Err(error));
+    }
+}
+
 fn emulate(
     terminal: &mut Terminal,
     shared: &Shared,
@@ -2981,6 +3036,17 @@ fn emulate(
                 }
                 Event::LocalShellDirectory(reply) => {
                     if let StreamTransport::Pty(pty) = transport {
+                        #[cfg(target_os = "linux")]
+                        if pty.uses_flatpak_host() {
+                            reply_flatpak_directory(
+                                shared,
+                                reply,
+                                status == Status::Running
+                                    && !terminal.alternate_screen_active()
+                                    && shared.output_activity.last_output() == applied_output,
+                            );
+                            continue;
+                        }
                         let _ = reply.try_send(pty.shell_directory());
                     }
                     continue;
@@ -4490,6 +4556,7 @@ mod search_tests {
             program_notifications: Mutex::default(),
             output_activity: Arc::default(),
             local_shell_pid: AtomicU32::new(0),
+            flatpak_host_shell: AtomicBool::new(false),
             sandbox_backend: Mutex::default(),
             serial: None,
             serial_notice: Mutex::new(None),

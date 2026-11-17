@@ -187,17 +187,20 @@ fn prepare(
             None,
         )
     };
-    let diagram = (auto_diagram && remote.is_none())
-        .then(|| {
-            let script = source
-                .content
-                .clone()
-                .unwrap_or_else(|| Arc::from(snapshot.files()[0].content.as_str()));
-            AnalysisFlowchartRequest::new(script, false)
-                .ok()
-                .map(|request| request.with_profile(&transport))
-        })
-        .flatten();
+    let diagram = (auto_diagram
+        && remote.is_none()
+        && super::reviewed_local_profile_transport(&config, profile.id, profile.server_selected)
+            .is_ok_and(|(selected, _)| selected == transport))
+    .then(|| {
+        let script = source
+            .content
+            .clone()
+            .unwrap_or_else(|| Arc::from(snapshot.files()[0].content.as_str()));
+        AnalysisFlowchartRequest::new(script, false)
+            .ok()
+            .map(|request| request.with_profile(&transport))
+    })
+    .flatten();
     let cli_review = request.cli_request().map(|request| super::CliReview {
         token: approval,
         command: request.command_review(),

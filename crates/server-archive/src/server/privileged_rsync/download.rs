@@ -61,6 +61,8 @@ fn checked_review(
         fingerprint,
         inventory: Some(inventory),
         handoff,
+        first_file: false,
+        first_tree: false,
     };
     review
         .valid()

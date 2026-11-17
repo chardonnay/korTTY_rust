@@ -830,8 +830,23 @@ mod tests {
         let run = &evidence.apply_runs[0];
         assert!(run.details.is_none());
         assert_eq!(
-            evidence.attachments[&run.result_sha256].as_ref(),
+            evidence
+                .snapshot(run, legacy::Snapshot::Result)
+                .unwrap()
+                .as_ref(),
             "printf 'Wert β'\r\n"
+        );
+        assert_eq!(
+            evidence
+                .snapshot(run, legacy::Snapshot::Base)
+                .unwrap()
+                .as_ref(),
+            "printf 'Wert α'\r\n"
+        );
+        assert!(
+            evidence
+                .snapshot(run, legacy::Snapshot::Checkpoint)
+                .is_none()
         );
         assert!(record.diagram.as_ref().unwrap().validate(1).is_ok());
         assert_eq!(

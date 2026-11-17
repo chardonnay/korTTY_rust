@@ -45,7 +45,7 @@ pub(super) fn resolve(
         )
     } else {
         (
-            configuration.journal_question_https_transport(id).ok()?.0,
+            configuration.journal_summary_https_transport(id).ok()?,
             configuration.journal_summary_https_revision(id).ok()?,
         )
     };

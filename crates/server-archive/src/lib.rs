@@ -4,7 +4,9 @@
 pub mod decode;
 pub mod draft_replace;
 pub mod manifest;
+pub mod privileged_file_replace;
 pub mod privileged_rsync;
+pub mod privileged_tree_merge;
 pub mod protocol;
 pub mod rsync_tree;
 

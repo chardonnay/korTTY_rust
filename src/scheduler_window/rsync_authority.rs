@@ -1,4 +1,4 @@
-//! Revoke existing-tree publication when the saved job changes during a run.
+//! Revoke reviewed rsync publication when the saved job changes during a run.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -10,7 +10,7 @@ use kortty_jobs::{JobDefinition, JobGraph, JobId, RunId, RunRequest, RunTrigger}
 use super::rsync::standing::Lease;
 use super::{ConnectionRef, ConnectionStore, SchedulerWindow, SshCommand};
 
-const REVOKED: &str = "The saved existing-directory rsync approval is no longer active.";
+const REVOKED: &str = "The saved rsync receiver approval is no longer active.";
 
 #[derive(Clone)]
 pub(crate) struct RunContext {
@@ -99,9 +99,7 @@ pub(crate) fn uses_reviewed_receiver(action: &SshCommand) -> bool {
         .remote
         .as_ref()
         .and_then(super::RemoteAction::rsync_transfer)
-        .is_some_and(|(transfer, _)| {
-            transfer.uses_existing_destination() || transfer.uses_passwordless_sudo()
-        })
+        .is_some_and(|(transfer, upload)| transfer.requires_reviewed_receiver(upload))
 }
 
 impl SchedulerWindow {
@@ -117,9 +115,15 @@ impl SchedulerWindow {
         &mut self,
         request: &RunRequest<SshCommand>,
     ) -> Result<Option<RunContext>, String> {
-        if !uses_reviewed_receiver(&request.action) {
+        let Some((transfer, upload)) = request
+            .action
+            .remote
+            .as_ref()
+            .and_then(super::RemoteAction::rsync_transfer)
+            .filter(|(transfer, upload)| transfer.requires_reviewed_receiver(*upload))
+        else {
             return Ok(None);
-        }
+        };
         if request.cancellation.is_requested() {
             return Ok(None);
         }
@@ -136,12 +140,13 @@ impl SchedulerWindow {
             request.trigger,
             RunTrigger::Scheduled | RunTrigger::Dependency
         );
-        let configured = current
-            .action()
-            .remote
-            .as_ref()
-            .and_then(super::RemoteAction::rsync_transfer)
-            .is_some_and(|(transfer, _)| transfer.standing.is_some());
+        if transfer.requires_automatic_receiver(upload) && !automatic {
+            return Err(
+                "This reviewed rsync transfer requires an approved Calendar or Chain firing."
+                    .into(),
+            );
+        }
+        let configured = transfer.standing.is_some();
         let standing = if automatic && configured {
             let occurrence = self
                 .scheduler

@@ -236,8 +236,11 @@ fn reconnect_archives_final_records_without_live_prompt_steps_or_focus() {
 
 #[test]
 fn reconnect_transfers_only_anchored_final_agent_history_between_session_actors() {
-    use crate::session::{Backend, Event, Session};
+    use crate::session::Session;
     use iced::futures::executor::block_on;
+
+    const SOURCE_MARKER: &str = "physical-reconnect-anchor";
+    const REPLACEMENT_MARKER: &str = "physical-reconnect-replacement";
 
     struct Owned(Session);
 
@@ -276,7 +279,10 @@ fn reconnect_transfers_only_anchored_final_agent_history_between_session_actors(
             .collect()
     }
 
+    #[cfg(unix)]
     fn output(session: &Session, marker: &str) {
+        use crate::session::{Backend, Event};
+
         let Backend::Stream { events, actor, .. } = &session.backend else {
             panic!("expected live stream fixture");
         };
@@ -285,56 +291,63 @@ fn reconnect_transfers_only_anchored_final_agent_history_between_session_actors(
             .send_blocking(Event::Output(bytes.into_bytes(), Instant::now()))
             .unwrap();
         actor.unpark();
-        wait(session, marker, |frame| {
-            frame.status == Status::Running
-                && !frame.screen.alternate_screen
-                && !frame.screen.mouse_reporting()
-                && raw_text(frame).contains(marker)
-        });
     }
 
-    #[cfg(unix)]
-    let command = vec![String::from("/bin/cat")];
-    #[cfg(windows)]
-    let command = {
-        let shell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
-            .join("System32/cmd.exe");
-        [
-            shell.to_str().unwrap(),
-            "/d",
-            "/q",
-            "/k",
-            "echo",
-            "kortty-reconnect-ready",
-        ]
-        .map(str::to_owned)
-        .to_vec()
-    };
-    let start = || {
-        Owned(
+    let start = |marker: &str| {
+        #[cfg(unix)]
+        let command = vec![String::from("/bin/cat")];
+        #[cfg(windows)]
+        let command = {
+            let shell = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap())
+                .join("System32/cmd.exe");
+            // The final cmd prompt marks readiness on the same physical row
+            // that the agent history will use as its anchor.
+            vec![
+                shell.to_str().unwrap().into(),
+                "/d".into(),
+                "/q".into(),
+                "/k".into(),
+                format!("prompt {marker}"),
+            ]
+        };
+        let session = Owned(
             Session::start_local(
                 GridSize::default(),
                 kortty_terminal::TerminalProfile::Xterm,
                 kortty_pty::LaunchOptions {
-                    command: Some(command.clone()),
+                    command: Some(command),
                     ..Default::default()
                 },
                 true,
                 None,
             )
             .unwrap(),
-        )
-    };
-    let old = start();
-    let replacement = start();
-    for session in [&old.0, &replacement.0] {
-        wait(session, "terminal startup", |frame| {
+        );
+        #[cfg(unix)]
+        {
+            wait(&session.0, "terminal startup", |frame| {
+                frame.status == Status::Running
+            });
+            output(&session.0, marker);
+        }
+        wait(&session.0, marker, |frame| {
             frame.status == Status::Running
-                && (!cfg!(windows) || raw_text(frame).contains("kortty-reconnect-ready"))
+                && !frame.screen.alternate_screen
+                && !frame.screen.mouse_reporting()
+                && frame
+                    .screen
+                    .row(frame.screen.cursor.row)
+                    .is_some_and(|row| {
+                        row.iter()
+                            .map(|cell| cell.text.as_str())
+                            .collect::<String>()
+                            .contains(marker)
+                    })
         });
-    }
-    output(&old.0, "physical-reconnect-anchor");
-    output(&replacement.0, "physical-reconnect-replacement");
+        session
+    };
+    let old = start(SOURCE_MARKER);
+    let replacement = start(REPLACEMENT_MARKER);
     old.0.publish_agent_history(record(State::Running));
     wait(&old.0, "source anchor", |frame| {
         frame
@@ -348,7 +361,7 @@ fn reconnect_transfers_only_anchored_final_agent_history_between_session_actors(
     pending.transcript.goal = "unarchived running request".into();
     old.0.publish_agent_history(pending);
     let source = wait(&old.0, "source final and pending records", |frame| {
-        raw_text(frame).contains("physical-reconnect-anchor")
+        raw_text(frame).contains(SOURCE_MARKER)
             && frame.inline.as_ref().is_some_and(|inline| {
                 inline
                     .layout
@@ -375,14 +388,14 @@ fn reconnect_transfers_only_anchored_final_agent_history_between_session_actors(
             .iter()
             .map(|cell| cell.text.as_str())
             .collect::<String>()
-            .contains("physical-reconnect-anchor")
+            .contains(SOURCE_MARKER)
     );
     assert!(block_on(
         old.0.reconnect_history_to(&replacement.0).unwrap()
     ));
     let live = replacement.0.frame();
-    assert!(!raw_text(&live).contains("physical-reconnect-anchor"));
-    assert!(raw_text(&live).contains("physical-reconnect-replacement"));
+    assert!(!raw_text(&live).contains(SOURCE_MARKER));
+    assert!(raw_text(&live).contains(REPLACEMENT_MARKER));
     let projection = live.inline.as_ref().unwrap_or_else(|| {
         panic!("replacement projection absent in {:?}, scrollback {}, alternate {}, mouse reporting {}",
             live.status, live.screen.scrollback_lines, live.screen.alternate_screen, live.screen.mouse_reporting());
@@ -401,7 +414,7 @@ fn reconnect_transfers_only_anchored_final_agent_history_between_session_actors(
             .is_some_and(|inline| inline.visible(7, 2))
     });
     let projection = archived.inline.as_ref().unwrap();
-    assert!(raw_text(&archived).contains("physical-reconnect-anchor"));
+    assert!(raw_text(&archived).contains(SOURCE_MARKER));
     assert!(!raw_text(&archived).contains("inert agent answer"));
     assert!(
         (0..archived.screen.rows)

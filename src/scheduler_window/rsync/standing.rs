@@ -3,17 +3,19 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::TryLockError;
 use std::io::{self, Read as _};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
 
 use kortty_jobs::{DependencyMode, FiringOccurrence, Job, JobId, JobSchedule, RunId, TimeZone};
-use kortty_server_archive::rsync_tree::ExistingTree;
+use kortty_server_archive::rsync_tree::{ExistingTree, RecurringReceiver};
 use kortty_ssh::Endpoint;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::super::{RemoteAction, SshCommand, sync::valid_nonce};
+use super::routes::LocalWitness;
 use super::{Approval, ConnectionRef, LocalExistingSnapshot, MixedReceiver, RemotePath};
+use crate::job_executor::rsync::{LocalParentReceipt, VacantFileProof, VacantLocalTreeSnapshot};
 use crate::private_files::{Directory, nonce};
 use crate::ssh_dialog::LoginTarget;
 
@@ -118,47 +120,132 @@ pub(crate) enum Receiver {
         destination: RemotePath,
         snapshot: ExistingTree,
     },
+    VacantRemoteFile {
+        destination: RemotePath,
+        fingerprint: [u8; 32],
+    },
+    VacantRemoteTree {
+        destination: RemotePath,
+        fingerprint: [u8; 32],
+    },
     Local {
         destination: PathBuf,
         snapshot: LocalExistingSnapshot,
+    },
+    VacantLocalTree {
+        destination: PathBuf,
+        snapshot: VacantLocalTreeSnapshot,
     },
     LocalFile {
         destination: PathBuf,
         snapshot: crate::sftp_window::LocalFileSnapshot,
     },
+    VacantLocalFile {
+        destination: PathBuf,
+        snapshot: VacantFileProof,
+    },
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) enum RemoteVacancy {
+    File([u8; 32]),
+    Tree([u8; 32]),
 }
 
 impl Receiver {
     pub(super) fn from_review(review: &Approval) -> io::Result<Self> {
-        let receiver = match review.mixed.as_deref().map(|review| &review.receiver) {
+        let mixed = review.mixed.as_deref();
+        let receiver = match mixed.map(|review| &review.receiver) {
             Some(MixedReceiver::Server {
                 destination,
+                snapshot,
+            }) => {
+                let mixed = mixed.ok_or_else(existing_only)?;
+                if let Some(ordinary) = mixed.ordinary_receiver {
+                    Self::reviewed_remote(destination, true, ordinary)?
+                } else if let Some(snapshot) = snapshot {
+                    Self::Remote {
+                        destination: destination.clone(),
+                        snapshot: *snapshot,
+                    }
+                } else {
+                    let Some(super::MixedPrivilegedReview::Upload(proof)) = &mixed.privileged
+                    else {
+                        return Err(existing_only());
+                    };
+                    if !proof.first_tree
+                        || !proof.valid()
+                        || proof.spec.path != destination.as_str()
+                    {
+                        return Err(existing_only());
+                    }
+                    Self::VacantRemoteTree {
+                        destination: destination.clone(),
+                        fingerprint: proof.fingerprint,
+                    }
+                }
+            }
+            Some(MixedReceiver::Local {
+                destination,
                 snapshot: Some(snapshot),
-            }) => Self::Remote {
+                vacant: None,
+            }) => Self::Local {
                 destination: destination.clone(),
                 snapshot: *snapshot,
             },
             Some(MixedReceiver::Local {
                 destination,
-                snapshot: Some(snapshot),
-            }) => Self::Local {
+                snapshot: None,
+                vacant: Some(snapshot),
+            }) => Self::VacantLocalTree {
                 destination: destination.clone(),
-                snapshot: *snapshot,
+                snapshot: **snapshot,
             },
             Some(_) => return Err(existing_only()),
             None => {
-                if let Some(remote) = &review.existing {
+                if let Some(remote) = &review.ordinary_receiver {
+                    Self::reviewed_remote(&remote.destination, remote.directory, remote.receiver)?
+                } else if let Some(remote) = &review.existing {
                     Self::Remote {
                         destination: remote.destination.clone(),
                         snapshot: remote.snapshot,
+                    }
+                } else if let Some(remote) = review
+                    .privileged
+                    .as_deref()
+                    .filter(|remote| (remote.first_file || remote.first_tree) && remote.valid())
+                {
+                    let destination =
+                        RemotePath::try_from(remote.spec.path.clone()).map_err(io::Error::other)?;
+                    let fingerprint = remote.fingerprint;
+                    if remote.first_tree {
+                        Self::VacantRemoteTree {
+                            destination,
+                            fingerprint,
+                        }
+                    } else {
+                        Self::VacantRemoteFile {
+                            destination,
+                            fingerprint,
+                        }
                     }
                 } else if let Some(local) = &review.existing_download {
                     Self::Local {
                         destination: local.destination.clone(),
                         snapshot: local.snapshot,
                     }
+                } else if let Some(local) = &review.vacant_directory_download {
+                    Self::VacantLocalTree {
+                        destination: local.destination.clone(),
+                        snapshot: local.snapshot,
+                    }
                 } else if let Some(local) = &review.existing_file_download {
                     Self::LocalFile {
+                        destination: local.destination.clone(),
+                        snapshot: local.snapshot,
+                    }
+                } else if let Some(local) = &review.vacant_file_download {
+                    Self::VacantLocalFile {
                         destination: local.destination.clone(),
                         snapshot: local.snapshot,
                     }
@@ -173,32 +260,193 @@ impl Receiver {
             .ok_or_else(needs_review)
     }
 
+    fn reviewed_remote(
+        destination: &RemotePath,
+        directory: bool,
+        receiver: RecurringReceiver,
+    ) -> io::Result<Self> {
+        if !receiver.valid(directory) {
+            return Err(needs_review());
+        }
+        let destination = destination.clone();
+        Ok(match receiver {
+            RecurringReceiver::Existing { snapshot } => Self::Remote {
+                destination,
+                snapshot,
+            },
+            RecurringReceiver::Vacant { fingerprint } if directory => Self::VacantRemoteTree {
+                destination,
+                fingerprint,
+            },
+            RecurringReceiver::Vacant { fingerprint } => Self::VacantRemoteFile {
+                destination,
+                fingerprint,
+            },
+        })
+    }
+
     fn valid(&self) -> bool {
         match self {
             Self::Remote {
                 destination,
                 snapshot,
             } => super::valid_remote(destination.as_str()) && snapshot.inventory.valid(),
+            Self::VacantRemoteFile {
+                destination,
+                fingerprint,
+            }
+            | Self::VacantRemoteTree {
+                destination,
+                fingerprint,
+            } => {
+                kortty_server_archive::privileged_rsync::valid_path(destination.as_str())
+                    && *fingerprint != [0; 32]
+            }
             Self::Local {
                 destination,
                 snapshot,
             } => super::super::remote::validate_local_path(destination).is_ok() && snapshot.valid(),
+            Self::VacantLocalTree {
+                destination,
+                snapshot,
+            } => {
+                super::super::remote::validate_local_path(destination).is_ok()
+                    && snapshot.valid()
+                    && snapshot.first_missing(destination).is_some()
+            }
             Self::LocalFile {
                 destination,
                 snapshot,
             } => super::super::remote::validate_local_path(destination).is_ok() && snapshot.valid(),
+            Self::VacantLocalFile {
+                destination,
+                snapshot,
+            } => {
+                super::super::remote::validate_local_path(destination).is_ok()
+                    && snapshot.valid()
+                    && snapshot.first_missing(destination).is_some()
+            }
         }
     }
 
-    fn same_destination(&self, other: &Self) -> bool {
-        match (self, other) {
+    fn allows_successor(&self, successor: &Self) -> bool {
+        match (self, successor) {
             (Self::Remote { destination: a, .. }, Self::Remote { destination: b, .. }) => a == b,
-            (Self::Local { destination: a, .. }, Self::Local { destination: b, .. }) => a == b,
-            (Self::LocalFile { destination: a, .. }, Self::LocalFile { destination: b, .. }) => {
+            (
+                Self::Local {
+                    destination: a,
+                    snapshot: previous,
+                },
+                Self::Local {
+                    destination: b,
+                    snapshot,
+                },
+            ) => {
                 a == b
+                    && previous
+                        .location()
+                        .is_none_or(|location| snapshot.location() == Some(location))
             }
+            (
+                Self::VacantLocalTree {
+                    destination: a,
+                    snapshot: expected,
+                },
+                Self::Local {
+                    destination: b,
+                    snapshot,
+                },
+            ) => a == b && expected.allows_successor(snapshot),
+            (
+                Self::LocalFile {
+                    destination: a,
+                    snapshot: previous,
+                },
+                Self::LocalFile {
+                    destination: b,
+                    snapshot,
+                },
+            ) => {
+                a == b
+                    && previous
+                        .alias()
+                        .is_none_or(|expected| snapshot.alias() == Some(expected))
+                    && previous
+                        .location()
+                        .is_none_or(|expected| snapshot.location() == Some(expected))
+            }
+            (
+                Self::VacantLocalFile {
+                    destination: a,
+                    snapshot: expected,
+                },
+                Self::LocalFile {
+                    destination: b,
+                    snapshot,
+                },
+            ) => a == b && expected.allows_successor(snapshot),
             _ => false,
         }
+    }
+
+    fn confirms_first_remote(&self, successor: &Self, vacancy: RemoteVacancy) -> bool {
+        let (expected, directory) = match (self, vacancy) {
+            (
+                Self::VacantRemoteFile {
+                    destination,
+                    fingerprint,
+                },
+                RemoteVacancy::File(proof),
+            ) if *fingerprint == proof => (destination, false),
+            (
+                Self::VacantRemoteTree {
+                    destination,
+                    fingerprint,
+                },
+                RemoteVacancy::Tree(proof),
+            ) if *fingerprint == proof => (destination, true),
+            _ => return false,
+        };
+        matches!(successor, Self::Remote { destination, snapshot }
+            if expected == destination && snapshot.fingerprint != [0; 32]
+                && kortty_server_archive::privileged_rsync::valid_inventory(snapshot.inventory, directory))
+    }
+
+    fn local_witness(&self) -> Option<LocalWitness<'_>> {
+        match self {
+            Self::Local { snapshot, .. } => Some(LocalWitness::Tree(snapshot)),
+            Self::VacantLocalTree { snapshot, .. } => Some(LocalWitness::VacantTree(snapshot)),
+            Self::LocalFile { snapshot, .. } => Some(LocalWitness::File(snapshot)),
+            Self::VacantLocalFile { snapshot, .. } => Some(LocalWitness::VacantFile(snapshot)),
+            _ => None,
+        }
+    }
+
+    fn local_destination(&self) -> Option<&Path> {
+        match self {
+            Self::Local { destination, .. }
+            | Self::VacantLocalTree { destination, .. }
+            | Self::LocalFile { destination, .. }
+            | Self::VacantLocalFile { destination, .. } => Some(destination),
+            Self::Remote { .. } | Self::VacantRemoteFile { .. } | Self::VacantRemoteTree { .. } => {
+                None
+            }
+        }
+    }
+
+    fn vacant_parent_keys(&self) -> impl Iterator<Item = [u8; 32]> + '_ {
+        let paths = match self {
+            Self::VacantLocalTree {
+                destination,
+                snapshot,
+            }
+            | Self::VacantLocalFile {
+                destination,
+                snapshot: VacantFileProof::Hierarchy(snapshot),
+            } => snapshot.missing_parent_paths(destination),
+            _ => None,
+        };
+        paths.into_iter().flatten().map(LocalParentReceipt::key_for)
     }
 }
 
@@ -305,7 +553,9 @@ impl Grant {
         job.action()
             .validate_target_selection()
             .map_err(io::Error::other)?;
-        transfer.require_group_review().map_err(io::Error::other)?;
+        transfer
+            .require_group_review(upload)
+            .map_err(io::Error::other)?;
         let mut remote_routes: Vec<(&ConnectionRef, Vec<String>, RemotePath)> = Vec::new();
         let routes = job
             .action()
@@ -320,7 +570,10 @@ impl Grant {
                     return Err(needs_review());
                 }
                 let receiver = Receiver::from_review(review)?;
-                if let Receiver::Remote { destination, .. } = &receiver {
+                if let Receiver::Remote { destination, .. }
+                | Receiver::VacantRemoteFile { destination, .. }
+                | Receiver::VacantRemoteTree { destination, .. } = &receiver
+                {
                     if remote_routes.iter().any(|(previous, pins, path)| {
                         pins == &review.pins
                             && same_login(&previous.target, &reference.target)
@@ -372,6 +625,7 @@ impl Grant {
                 .expiry(self.issued_at)
                 .is_ok_and(|expiry| expiry == self.expires_at)
             && (1..=super::super::connection::MAX_TARGETS).contains(&self.routes.len())
+            && self.local_receivers_distinct()
             && self
                 .routes
                 .iter()
@@ -383,6 +637,33 @@ impl Grant {
                 .routes
                 .iter()
                 .all(|route| route.reference.validate().is_ok() && route.receiver.valid())
+    }
+
+    fn local_receivers_distinct(&self) -> bool {
+        if self.routes.len() < 2 {
+            return true;
+        }
+        let require_aliases = self
+            .routes
+            .iter()
+            .any(|route| matches!(route.receiver, Receiver::VacantLocalFile { .. }));
+        LocalWitness::group_is_distinct(
+            self.routes.iter().filter_map(|route| {
+                Some((
+                    route.receiver.local_destination()?,
+                    route.receiver.local_witness()?,
+                ))
+            }),
+            require_aliases,
+            true,
+        )
+    }
+
+    fn pending_parent_keys(&self) -> BTreeSet<[u8; 32]> {
+        self.routes
+            .iter()
+            .flat_map(|route| route.receiver.vacant_parent_keys())
+            .collect()
     }
 }
 
@@ -429,6 +710,9 @@ pub(crate) struct Stored {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     retired_predecessor_at: Option<SystemTime>,
     current: Option<Current>,
+    // Keep confirmed parent identities across firings while a sibling still needs them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    local_parents: Vec<LocalParentReceipt>,
 }
 
 impl Stored {
@@ -442,6 +726,7 @@ impl Stored {
         self.grant.valid()
             && self.firings <= self.grant.settings.firings
             && (self.firings == 0) == self.current.is_none()
+            && self.valid_local_parents()
             && self.latest_predecessors.len() <= kortty_jobs::MAX_DEPENDENCIES
             && self.current.as_ref().is_none_or(|current| {
                 valid_nonce(&current.nonce)
@@ -450,6 +735,39 @@ impl Stored {
                         .plus(current.budget, self.grant.settings.budget)
                         .is_ok()
             })
+    }
+
+    fn valid_local_parents(&self) -> bool {
+        if self.local_parents.is_empty() {
+            return true;
+        }
+        let mut pending = self.grant.pending_parent_keys();
+        self.firings > 0
+            && self
+                .local_parents
+                .iter()
+                .all(|receipt| receipt.valid() && pending.remove(&receipt.path_key()))
+    }
+
+    fn keep_shared_local_parents(&mut self, created: &[LocalParentReceipt]) -> io::Result<()> {
+        let pending = self.grant.pending_parent_keys();
+        self.local_parents
+            .retain(|receipt| pending.contains(&receipt.path_key()));
+        for receipt in created
+            .iter()
+            .filter(|receipt| pending.contains(&receipt.path_key()))
+        {
+            match self
+                .local_parents
+                .iter()
+                .find(|previous| previous.path_key() == receipt.path_key())
+            {
+                Some(previous) if previous != receipt => return Err(needs_review()),
+                Some(_) => {}
+                None => self.local_parents.push(*receipt),
+            }
+        }
+        Ok(())
     }
 }
 
@@ -489,6 +807,7 @@ impl Store {
                     latest_predecessors,
                     retired_predecessor_at,
                     current: None,
+                    local_parents: Vec::new(),
                 },
             ))
         })
@@ -706,15 +1025,26 @@ impl Lease {
             .ok_or_else(needs_review)
     }
 
+    pub(crate) fn local_parents(&self) -> io::Result<Vec<LocalParentReceipt>> {
+        let index = read_index(&Directory::open(&self.store.0, false)?)?;
+        Ok(self.stored(&index, true)?.local_parents.clone())
+    }
+
     pub(crate) fn reserve(&self, reference: &ConnectionRef, budget: Budget) -> io::Result<()> {
         if budget.deletes != 0 {
             return Err(needs_review());
         }
-        self.change_route(reference, true, Phase::Ready, |current, route, limits| {
-            current.budget = current.budget.plus(budget, limits)?;
-            current.phases[route] = Phase::Reserved;
-            Ok(None)
-        })
+        self.change_route(
+            reference,
+            true,
+            Phase::Ready,
+            None,
+            |current, route, limits| {
+                current.budget = current.budget.plus(budget, limits)?;
+                current.phases[route] = Phase::Reserved;
+                Ok(None)
+            },
+        )
     }
 
     pub(crate) fn arm(&self, reference: &ConnectionRef, removed: u32) -> io::Result<()> {
@@ -722,6 +1052,7 @@ impl Lease {
             reference,
             true,
             Phase::Reserved,
+            None,
             |current, route, limits| {
                 current.budget = current.budget.plus(
                     Budget {
@@ -738,21 +1069,60 @@ impl Lease {
 
     /// Call only with the native engine's confirmed, held successor.
     pub(crate) fn confirm(&self, reference: &ConnectionRef, successor: Receiver) -> io::Result<()> {
+        self.confirm_with_parents(reference, successor, &[])
+    }
+
+    pub(crate) fn confirm_with_parents(
+        &self,
+        reference: &ConnectionRef,
+        successor: Receiver,
+        created: &[LocalParentReceipt],
+    ) -> io::Result<()> {
+        self.finish(reference, successor, created, None)
+    }
+
+    pub(crate) fn confirm_first_remote(
+        &self,
+        reference: &ConnectionRef,
+        successor: Receiver,
+        vacancy: RemoteVacancy,
+    ) -> io::Result<()> {
+        self.finish(reference, successor, &[], Some(vacancy))
+    }
+
+    fn finish(
+        &self,
+        reference: &ConnectionRef,
+        successor: Receiver,
+        created: &[LocalParentReceipt],
+        vacancy: Option<RemoteVacancy>,
+    ) -> io::Result<()> {
         if !successor.valid() {
             return Err(needs_review());
         }
-        self.change_route(reference, false, Phase::Armed, |current, route, _| {
-            current.phases[route] = Phase::Finished;
-            Ok(Some(successor))
-        })
+        self.change_route(
+            reference,
+            false,
+            Phase::Armed,
+            vacancy,
+            |current, route, _| {
+                current.phases[route] = Phase::Finished;
+                Ok(Some((successor, created)))
+            },
+        )
     }
 
-    fn change_route(
+    fn change_route<'receipt>(
         &self,
         reference: &ConnectionRef,
         active: bool,
         phase: Phase,
-        update: impl FnOnce(&mut Current, usize, Budget) -> io::Result<Option<Receiver>>,
+        vacancy: Option<RemoteVacancy>,
+        update: impl FnOnce(
+            &mut Current,
+            usize,
+            Budget,
+        ) -> io::Result<Option<(Receiver, &'receipt [LocalParentReceipt])>>,
     ) -> io::Result<()> {
         self.store.change(|index| {
             let stored = index
@@ -769,12 +1139,29 @@ impl Lease {
             if current.phases[route] != phase {
                 return Err(needs_review());
             }
-            if let Some(receiver) = update(current, route, stored.grant.settings.budget)? {
+            if let Some((receiver, created)) = update(current, route, stored.grant.settings.budget)?
+            {
                 let expected = &mut stored.grant.routes[route].receiver;
-                if !receiver.same_destination(expected) {
+                let confirmed = match vacancy {
+                    Some(vacancy) => expected.confirms_first_remote(&receiver, vacancy),
+                    None => expected.allows_successor(&receiver),
+                };
+                if !confirmed {
                     return Err(needs_review());
                 }
+                if !created.is_empty() {
+                    let mut allowed: BTreeSet<_> = expected.vacant_parent_keys().collect();
+                    if created
+                        .iter()
+                        .any(|receipt| !receipt.valid() || !allowed.remove(&receipt.path_key()))
+                    {
+                        return Err(needs_review());
+                    }
+                }
                 *expected = receiver;
+                if !created.is_empty() || !stored.local_parents.is_empty() {
+                    stored.keep_shared_local_parents(created)?;
+                }
             }
             Ok(())
         })
@@ -812,7 +1199,7 @@ fn existing_only() -> io::Error {
     io::Error::other(EXISTING_RECEIVER_REQUIRED)
 }
 
-pub(super) const EXISTING_RECEIVER_REQUIRED: &str = "Recurring rsync needs a reviewed existing directory, local file, or protected server file on each route.";
+pub(super) const EXISTING_RECEIVER_REQUIRED: &str = "Recurring rsync needs a reviewed receiver on each route. Review vacant local download paths or enable creation for an eligible server upload.";
 
 fn uncertain() -> io::Error {
     io::Error::other(
@@ -871,8 +1258,10 @@ mod tests {
         let approval = grant.approval.clone();
         store.swap(job.id(), grant, |_| true).ok().unwrap();
         let mut action = job.action().clone();
-        let Some(RemoteAction::RsyncUpload(transfer)) = action.remote.as_mut() else {
-            panic!("fixture only uses uploads");
+        let Some(RemoteAction::RsyncUpload(transfer) | RemoteAction::RsyncDownload(transfer)) =
+            action.remote.as_mut()
+        else {
+            panic!("fixture only uses rsync");
         };
         transfer.standing.as_mut().unwrap().approval = Some(approval);
         job.definition().with_action(action).unwrap()
@@ -1013,6 +1402,230 @@ mod tests {
             .unwrap();
         assert!(next.expected_receiver(first).unwrap() == successor);
         assert!(lease.require_current().is_err());
+    }
+
+    #[test]
+    fn recurring_rsync_advances_a_vacant_file_only_to_its_confirmed_successor() {
+        let private = crate::snippets::tests::Profile::new();
+        let path = private.0.canonicalize().unwrap();
+        let destination = path.join("download");
+        let program = path.join("rsync");
+        let reference = json!({
+            "id": 1,
+            "target": {"host": "first.example", "port": 22, "username": "test"}
+        });
+        let settings = Settings {
+            days: 1,
+            firings: 3,
+            budget: Budget {
+                bytes: 10,
+                entries: 1,
+                deletes: 1,
+            },
+        };
+        let action = serde_json::from_value(json!({
+            "connection": reference,
+            "remote": {
+                "kind": "rsync_download", "program": program, "local": destination,
+                "remote": "/source", "standing": {"settings": settings},
+                "approval": {
+                    "program": program, "digest": vec![1_u8; 32],
+                    "reference": reference, "pins": ["SHA256:fixture"],
+                    "download": {"source": "/source", "destination": destination},
+                    "vacant_file_download": {
+                        "destination": destination, "snapshot": {"fingerprint": vec![2_u8; 32]}
+                    }
+                }
+            }
+        }))
+        .unwrap();
+        let job = Job::new(JobId::new("vacant-file").unwrap(), "Vacant file", action)
+            .unwrap()
+            .with_schedule(JobSchedule::default().with_enabled(true));
+        let store = Store::new(path.clone());
+        let (issued, first_at, second_at) = times();
+        let job = save(&store, &job, issued);
+        let route = job.action().targets().next().unwrap();
+        let first = store
+            .claim(
+                &job,
+                &TimeZone::UTC,
+                FiringOccurrence::Calendar(first_at),
+                first_at,
+            )
+            .unwrap();
+        let vacancy = first.expected_receiver(route).unwrap();
+        assert!(matches!(vacancy, Receiver::VacantLocalFile { .. }));
+        let mut manifest = Manifest::default();
+        manifest.add("", Some((5, [3; 32]))).unwrap();
+        let snapshot = serde_json::from_value(json!({
+            "inventory": manifest.finish(),
+            "fingerprint": vec![4_u8; 32],
+            "root_identity": vec![5_u8; 32],
+        }))
+        .unwrap();
+        let successor = Receiver::LocalFile {
+            destination,
+            snapshot,
+        };
+        assert!(first.confirm(route, successor.clone()).is_err());
+        first
+            .reserve(
+                route,
+                Budget {
+                    bytes: 5,
+                    entries: 1,
+                    deletes: 0,
+                },
+            )
+            .unwrap();
+        first.arm(route, 0).unwrap();
+        assert!(first.confirm(route, vacancy.clone()).is_err());
+        assert!(
+            first
+                .confirm(
+                    route,
+                    Receiver::LocalFile {
+                        destination: path.join("other"),
+                        snapshot,
+                    }
+                )
+                .is_err()
+        );
+        let reopened = Store::new(path);
+        let next = || {
+            reopened.claim(
+                &job,
+                &TimeZone::UTC,
+                FiringOccurrence::Calendar(second_at),
+                second_at,
+            )
+        };
+        assert!(next().is_err());
+        first.confirm(route, successor.clone()).unwrap();
+        let second = next().unwrap();
+        assert!(second.expected_receiver(route).unwrap() == successor);
+        second.reserve(route, Budget::default()).unwrap();
+        second.arm(route, 0).unwrap();
+        assert!(second.confirm(route, vacancy).is_err());
+    }
+
+    #[test]
+    fn recurring_rsync_tree_receipts_keep_the_checked_path_and_mount_view() {
+        let profile = crate::snippets::tests::Profile::new();
+        let path = profile.0.canonicalize().unwrap();
+        let destination = path.join("new-tree");
+        let location = |name: u8, mount| {
+            json!({
+                "alias": {"parent": vec![2_u8; 32], "name": {"literal": vec![name; 32]}},
+                "mount": [7, mount],
+            })
+        };
+        let vacant_snapshot: VacantLocalTreeSnapshot = serde_json::from_value(json!({
+            "fingerprint": vec![3_u8; 32], "location": location(4, 1),
+        }))
+        .unwrap();
+        let vacancy = Receiver::VacantLocalTree {
+            destination: destination.clone(),
+            snapshot: vacant_snapshot,
+        };
+        let existing = |name, mount| {
+            serde_json::from_value::<LocalExistingSnapshot>(json!({
+                "inventory": Manifest::default().finish(),
+                "fingerprint": vec![5_u8; 32], "root_identity": vec![6_u8; 32],
+                "location": location(name, mount),
+            }))
+            .unwrap()
+        };
+        let next = |destination, name, mount| Receiver::Local {
+            destination,
+            snapshot: existing(name, mount),
+        };
+        assert!(vacancy.valid());
+        assert!(vacancy.allows_successor(&next(destination.clone(), 4, 1)));
+        assert!(!vacancy.allows_successor(&next(path.join("elsewhere"), 4, 1)));
+        assert!(!vacancy.allows_successor(&next(destination.clone(), 5, 1)));
+        assert!(!vacancy.allows_successor(&next(destination, 4, 2)));
+        let distinct = |name, mount| {
+            let existing = existing(name, mount);
+            LocalWitness::are_distinct(
+                [
+                    LocalWitness::VacantTree(&vacant_snapshot),
+                    LocalWitness::Tree(&existing),
+                ]
+                .into_iter(),
+                false,
+            )
+        };
+        assert!(distinct(5, 1));
+        assert!(!distinct(4, 1));
+        assert_eq!(distinct(5, 2), !cfg!(target_os = "linux"));
+
+        let destination = path.join("new-parent").join("new-tree");
+        let hierarchy = Receiver::VacantLocalTree {
+            destination: destination.clone(),
+            snapshot: serde_json::from_value(json!({
+                "fingerprint": vec![3_u8; 32], "location": location(4, 1), "missing_parents": 1,
+            }))
+            .unwrap(),
+        };
+        let successor = |destination, from, mount| Receiver::Local {
+            destination,
+            snapshot: serde_json::from_value(json!({
+                "inventory": Manifest::default().finish(),
+                "fingerprint": vec![5_u8; 32], "root_identity": vec![6_u8; 32],
+                "location": location(5, mount), "published_from": vec![from; 32],
+            }))
+            .unwrap(),
+        };
+        assert!(hierarchy.valid());
+        assert!(!hierarchy.allows_successor(&next(destination.clone(), 4, 1)));
+        assert!(hierarchy.allows_successor(&successor(destination.clone(), 3, 1)));
+        assert!(!hierarchy.allows_successor(&successor(destination.clone(), 4, 1)));
+        assert!(!hierarchy.allows_successor(&successor(destination, 3, 2)));
+        assert!(!hierarchy.allows_successor(&successor(path.join("elsewhere"), 3, 1)));
+    }
+
+    #[test]
+    fn recurring_rsync_file_hierarchy_receipts_keep_the_checked_path_and_mount_view() {
+        let profile = crate::snippets::tests::Profile::new();
+        let path = profile.0.canonicalize().unwrap();
+        let destination = path.join("new-parent").join("report.txt");
+        let alias =
+            |parent, name| json!({"parent": vec![parent; 32], "name": {"literal": vec![name; 32]}});
+        let vacancy = Receiver::VacantLocalFile {
+            destination: destination.clone(),
+            snapshot: serde_json::from_value(json!({
+                "fingerprint": vec![3_u8; 32], "missing_parents": 1,
+                "location": {"alias": alias(2, 4), "mount": [7, 1]},
+            }))
+            .unwrap(),
+        };
+        let mut manifest = Manifest::default();
+        manifest.add("", Some((5, [3; 32]))).unwrap();
+        let inventory = manifest.finish();
+        let next = |destination, origin, mount| Receiver::LocalFile {
+            destination,
+            snapshot: serde_json::from_value(json!({
+                "inventory": inventory,
+                "fingerprint": vec![5_u8; 32], "root_identity": vec![6_u8; 32],
+                "alias": alias(8, 9),
+                "location": {"alias": alias(8, 9), "mount": [7, mount]},
+                "published_from": origin,
+            }))
+            .unwrap(),
+        };
+        let confirmed = next(destination.clone(), Some(vec![3_u8; 32]), 1);
+        assert!(vacancy.valid() && confirmed.valid());
+        assert!(vacancy.allows_successor(&confirmed));
+        assert!(!vacancy.allows_successor(&next(destination.clone(), None, 1)));
+        assert!(!vacancy.allows_successor(&next(destination.clone(), Some(vec![4_u8; 32]), 1)));
+        assert!(!vacancy.allows_successor(&next(destination, Some(vec![3_u8; 32]), 2)));
+        assert!(!vacancy.allows_successor(&next(
+            path.join("another.txt"),
+            Some(vec![3_u8; 32]),
+            1
+        )));
     }
 
     #[test]

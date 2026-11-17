@@ -6,6 +6,8 @@
 //! Report the build profile with any results.
 //! The ignored `knowledge_candidate_hnsw_scale_profile` fixture measures
 //! in-memory construction and ranking across the supported capacities.
+//! Set `KORTTY_KNOWLEDGE_SCALE_PASSAGES` to 524288 or 1048576 to exercise
+//! larger file-backed snapshots. These tiers require substantial scratch space.
 
 use std::cell::Cell;
 use std::fs;
@@ -24,7 +26,7 @@ use crate::snippets::tests::Profile;
 
 use super::{
     BATCH_SIZE, CHUNK_BYTES, Cache, Entry, Index, LEGACY_MAX_SOURCES, Location, MAX_CHUNKS,
-    Passage, SEARCH_HITS, Scope, SourceKind, Store,
+    MAX_LOCAL_INDEX_PASSAGES, Passage, SEARCH_HITS, Scope, SourceKind, Store,
 };
 use super::{chunks, hnsw, normalize, score, snapshot, source::DEFAULT_TEXT_BYTES};
 
@@ -511,30 +513,153 @@ fn knowledge_corpus_update_reuses_legacy_passages_and_reopens_expanded_snapshot(
     cache.save(&index, || Ok(())).unwrap();
     drop(index);
     drop(previous);
-    let reopened = cache.load(&scope).unwrap();
+    let (reopened, stamp) = cache.load_file_backed(&scope, || Ok(())).unwrap();
+    assert!(reopened.snapshot_vectors.is_some());
+    assert!(reopened.entries.iter().all(|(_, vector)| vector.is_empty()));
     reopened.check_sources(&scope, || Ok(())).unwrap();
     let hits = reopened
         .rank_candidates(&scope, &[1.0, 0.0], 1, || Ok(()))
         .unwrap();
     assert_eq!(hits, [(1.0, MAX_CHUNKS)]);
-    assert_eq!(reopened.entries[hits[0].1].0.text, "New passage");
+    assert_eq!(reopened.passage_text(hits[0].1).unwrap(), "New passage");
+    let mut narrow = scope.clone();
+    narrow.enabled[0] = false;
+    assert!(
+        reopened
+            .entries
+            .iter()
+            .all(|(passage, _)| passage.text.is_empty())
+    );
+    assert_eq!(
+        reopened
+            .rank_candidates(&narrow, &[1.0, 0.0], 1, || Ok(()))
+            .unwrap(),
+        hits
+    );
+    assert_eq!(
+        reopened
+            .rank_exact(&narrow, &[1.0, 0.0], || Ok(()))
+            .unwrap(),
+        hits
+    );
+    let cancellation = reopened.rank_exact(&scope, &[1.0, 0.0], || Err("Cancelled".into()));
+    assert_eq!(cancellation.unwrap_err(), "Cancelled");
+    let (refreshed, summary) = Index::update(
+        &client,
+        &narrow,
+        Some((&scope, &reopened)),
+        false,
+        || Ok(()),
+    )
+    .unwrap();
+    assert_eq!((summary.reused, summary.indexed), (1, 0));
+    assert!(refreshed.snapshot_vectors.is_some());
+    assert!(
+        refreshed
+            .entries
+            .iter()
+            .all(|(passage, _)| passage.text.is_empty())
+    );
+    assert_eq!(refreshed.passage_text(hits[0].1).unwrap(), "New passage");
+    assert!(
+        refreshed
+            .entries
+            .iter()
+            .all(|(_, vector)| vector.is_empty())
+    );
+    assert_eq!(
+        refreshed
+            .rank_exact(&narrow, &[1.0, 0.0], || Ok(()))
+            .unwrap(),
+        hits
+    );
+    let mut preserved = Vec::new();
+    refreshed
+        .for_each_vector(
+            std::iter::once(0..1),
+            || Ok(()),
+            |_, vector| {
+                preserved.extend_from_slice(vector);
+                Ok(())
+            },
+        )
+        .unwrap();
+    assert_eq!(preserved, [0.0, 1.0]);
+    let staging_cache = Cache::new(profile.0.join("staging-publication"));
+    staging_cache.save(&refreshed, || Ok(())).unwrap();
+    let published = staging_cache.load(&scope).unwrap();
+    assert_eq!(published.entries[0].1, [0.0, 1.0]);
+    assert_eq!(published.entries[MAX_CHUNKS].1, [1.0, 0.0]);
+    assert!(cache.save(&reopened, || Ok(())).is_err());
+    cache.require_current(&scope, &stamp).unwrap();
+    let snapshot = fs::read_dir(profile.0.join("knowledge-indexes"))
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| {
+            fs::File::open(entry.path())
+                .and_then(|file| crate::private_files::FileStamp::read(&file))
+                .is_ok_and(|candidate| candidate == stamp)
+        })
+        .unwrap()
+        .path();
+    let file = fs::OpenOptions::new().write(true).open(snapshot).unwrap();
+    file.set_len(0).unwrap();
+    assert!(reopened.rank_exact(&scope, &[1.0, 0.0], || Ok(())).is_err());
+    assert!(reopened.passage_text(hits[0].1).is_err());
+    assert!(reopened.check_sources(&scope, || Ok(())).is_err());
+    let rejected = Index::update(
+        &client,
+        &narrow,
+        Some((&scope, &reopened)),
+        false,
+        || Ok(()),
+    );
+    assert!(rejected.unwrap_err().contains("index changed"));
 }
 
 #[test]
 fn knowledge_large_update_rejects_projected_size_after_the_first_embedding_batch() {
     let profile = Profile::new();
-    let store = large_store(&profile);
+    let mut store = large_store(&profile);
+    let limits = super::IndexLimits {
+        passages: MAX_LOCAL_INDEX_PASSAGES,
+        bytes: 768 * 1024 * 1024,
+    };
+    let first_rejected_count =
+        limits.bytes as usize / (super::MAX_DIMENSIONS * size_of::<f32>()) + 1;
+    let source_count = first_rejected_count.div_ceil(LARGE_RECORDS_PER_FILE);
+    for source in LEGACY_MAX_SOURCES..source_count {
+        add_source(
+            &mut store,
+            profile.0.join(format!("source-{source}.txt")),
+            source,
+            LARGE_RECORDS_PER_FILE,
+        );
+    }
     let (listener, _) = test_support::listener();
     let endpoint = listener.local_addr().unwrap().to_string();
     let scope = Scope::new(&store, &endpoint, MODEL).unwrap();
     let worker = std::thread::spawn(move || {
-        let mut vector = [0.0; 6_144];
+        let mut vector = [0.0; super::MAX_DIMENSIONS];
         vector[0] = 1.0;
         embedding_response(&listener, BATCH_SIZE, &vector, None);
         listener
     });
-    let result = Index::build(&Client::new(scope.profile.clone()), &scope);
-    assert!(result.unwrap_err().contains("exceeds 96 MiB"));
+    let result = Index::refresh(
+        &Client::new(scope.profile.clone()),
+        &scope,
+        None,
+        false,
+        None,
+        limits,
+        || Ok(()),
+    );
+    let limit = limits.bytes / (1024 * 1024);
+    assert!(
+        result
+            .unwrap_err()
+            .contains(&format!("exceeds {limit} MiB"))
+    );
     let listener = worker.join().unwrap();
     assert!(
         matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
@@ -543,6 +668,145 @@ fn knowledge_large_update_rejects_projected_size_after_the_first_embedding_batch
         Cache::new(profile.0.clone()).load(&scope),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound
     ));
+}
+
+#[test]
+#[ignore = "measures the expanded local snapshot at a realistic embedding dimension"]
+fn knowledge_expanded_local_snapshot_profile() {
+    const DIMENSIONS: usize = 1_536;
+    const VECTOR_POOL: usize = 1_024;
+    let passages = match std::env::var("KORTTY_KNOWLEDGE_SCALE_PASSAGES").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("262144") => 262_144,
+        Ok("524288") => 524_288,
+        Ok("1048576") => 1_048_576,
+        other => panic!("unsupported local snapshot profiling tier: {other:?}"),
+    };
+    let profile = Profile::new();
+    let mut store = Store::new("Expanded local snapshot").unwrap();
+    let started = Instant::now();
+    let records = passages / LEGACY_MAX_SOURCES;
+    for source in 0..LEGACY_MAX_SOURCES {
+        add_source(
+            &mut store,
+            profile.0.join(format!("source-{source:02}.txt")),
+            source,
+            records,
+        );
+    }
+    let scope = Scope::new(&store, ENDPOINT, MODEL).unwrap();
+    let mut sources = Vec::with_capacity(scope.sources.len());
+    let mut entries = Vec::with_capacity(passages);
+    let mut vectors = snapshot::VectorStage::new(passages).unwrap();
+    let mut texts = snapshot::TextStage::new().unwrap();
+    let pool: Vec<_> = (0..VECTOR_POOL)
+        .map(|position| vector(DIMENSIONS, position % TOPICS, position))
+        .collect();
+    let query = vector(DIMENSIONS, TOPICS, VECTOR_POOL);
+    for (source, path) in scope.sources.iter().enumerate() {
+        let document = scope.read(source, path, || true).unwrap();
+        sources.push(Some(document.digest));
+        for (location, text) in document.passages() {
+            let position = entries.len();
+            let embedding = if position == passages - 1 {
+                &query
+            } else {
+                &pool[position % VECTOR_POOL]
+            };
+            vectors.write(position, embedding).unwrap();
+            texts.push(text).unwrap();
+            entries.push((
+                Passage {
+                    source,
+                    location,
+                    text: String::new(),
+                },
+                Vec::new(),
+            ));
+        }
+    }
+    let order: Vec<_> = (0..entries.len()).collect();
+    let mut vectors = vectors.finish(order.iter().copied()).unwrap();
+    vectors.stage_texts(texts, &order).unwrap();
+    let index = Index::from_snapshot_parts(
+        scope.digest,
+        sources,
+        entries,
+        DIMENSIONS,
+        None,
+        Some(vectors),
+    )
+    .unwrap();
+    let stage = started.elapsed();
+    let cache = Cache::new(profile.0.clone());
+    let seed_bytes = index.bytes();
+    let started = Instant::now();
+    cache.save(&index, || Ok(())).unwrap();
+    let save = started.elapsed();
+    drop(index);
+    let snapshot = fs::read_dir(profile.0.join("knowledge-indexes"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| {
+            entry
+                .path()
+                .extension()
+                .is_some_and(|extension| extension == "rag")
+        })
+        .unwrap()
+        .metadata()
+        .unwrap()
+        .len();
+    assert!(snapshot > snapshot::byte_limit(true));
+    assert!(snapshot <= snapshot::byte_limit(false));
+    let started = Instant::now();
+    let (index, _) = cache.load_file_backed(&scope, || Ok(())).unwrap();
+    let load = started.elapsed();
+    assert_eq!(index.len(), passages);
+    assert!(index.snapshot_vectors.is_some());
+    let search_bytes = index.bytes();
+    assert!(search_bytes < seed_bytes);
+    index.check_sources(&scope, || Ok(())).unwrap();
+    let started = Instant::now();
+    let ranked = index.rank_candidates(&scope, &query, 1, || Ok(())).unwrap();
+    let rank = started.elapsed();
+    assert_eq!(ranked.len(), 1);
+    assert!(ranked[0].0 > 0.999);
+    assert_eq!(ranked[0].1, passages - 1);
+    let started = Instant::now();
+    let client = Client::new(scope.profile.clone());
+    let (updated, summary) =
+        Index::update(&client, &scope, Some((&scope, &index)), false, || Ok(())).unwrap();
+    let update = started.elapsed();
+    assert_eq!(summary.reused, scope.sources.len());
+    assert_eq!(summary.indexed, 0);
+    assert_eq!(updated.len(), index.len());
+    assert!(updated.snapshot_vectors.is_some());
+    assert_eq!(
+        updated
+            .rank_candidates(&scope, &query, 1, || Ok(()))
+            .unwrap(),
+        ranked
+    );
+    let updated_bytes = updated.bytes();
+    assert!(updated_bytes < search_bytes * 2);
+    let last = ranked[0].1;
+    let expected_text = index.passage_text(last).unwrap().into_owned();
+    assert_eq!(updated.passage_text(last).unwrap(), expected_text);
+    let started = Instant::now();
+    cache.save(&updated, || Ok(())).unwrap();
+    let publish = started.elapsed();
+    let (published, _) = cache.load_file_backed(&scope, || Ok(())).unwrap();
+    assert_eq!(published.passage_text(last).unwrap(), expected_text);
+    println!(
+        "passages={} dimensions={DIMENSIONS} vector_pool={VECTOR_POOL} bytes={snapshot} stage_ms={} save_ms={} load_ms={} rank_ms={} update_ms={} publish_ms={} seed_index_bytes={seed_bytes} search_index_bytes={search_bytes} refresh_base_bytes={search_bytes} updated_index_bytes={updated_bytes}",
+        index.len(),
+        stage.as_millis(),
+        save.as_millis(),
+        load.as_millis(),
+        rank.as_millis(),
+        update.as_millis(),
+        publish.as_millis()
+    );
 }
 
 #[test]

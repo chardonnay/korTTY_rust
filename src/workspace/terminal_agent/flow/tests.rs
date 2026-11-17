@@ -616,22 +616,182 @@ fn learned_sudo_password_is_masked_before_decision_json_escapes_it() {
 }
 
 #[test]
-fn standalone_https_agent_requires_explicit_selection_and_rechecks_saved_opt_in() {
+fn saved_connection_preselects_the_server_model_for_foreground_agent_only() {
+    let mut fixture = Fixture::new(false, false);
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let baseline = Configuration::load_fixture_from(&root).unwrap();
+    let mut draft = serde_json::to_value(&baseline).unwrap();
+    draft["profiles"]["profiles"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            json!({"id": 2, "name": "Connection model", "endpoint": "127.0.0.1:12346",
+            "model_mode": "server-default", "model": ""}),
+            json!({"id": 3, "name": "Chat only", "connection_mode": "remote-open-ai",
+            "endpoint": "https://example.invalid/v1", "trusted_remote_endpoint": true,
+            "model_mode": "server-default", "model": ""}),
+        ]);
+    draft["profiles"]["last_id"] = json!(3);
+    let config: Configuration = serde_json::from_value(draft).unwrap();
+    config.save_fixture_at(&root, &baseline).unwrap();
+    fixture
+        .workspace
+        .set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
+
+    let mut store = Store::open(root.join("connections.json")).unwrap();
+    let mut connection = fixture.workspace.sessions[&fixture.session]
+        .saved_local
+        .clone()
+        .unwrap();
+    connection.terminal.ai_profile = Some(ProfileRef::Numeric(2));
+    store.save_local(connection.clone()).unwrap();
+    fixture.workspace.refresh_saved_terminal_preferences(&store);
+
+    let ask = fixture.open(Mode::Ask);
+    assert_eq!(fixture.run(ask).profile().unwrap().id, 2);
+    let run = fixture.open(Mode::Run);
+    assert_eq!(fixture.run(run).profile().unwrap().id, 2);
+    let plan = fixture.open(Mode::Plan);
+    assert_eq!(fixture.run(plan).profile().unwrap().id, 1);
+
+    connection.terminal.ai_profile = Some(ProfileRef::Numeric(3));
+    store.save_local(connection).unwrap();
+    fixture.workspace.refresh_saved_terminal_preferences(&store);
+    let ask = fixture.open(Mode::Ask);
+    assert_eq!(fixture.run(ask).profile().unwrap().id, 1);
+}
+
+#[test]
+fn standalone_agent_reviews_server_default_before_sending_without_a_model() {
+    use std::io::Write as _;
+
+    use crate::local_ai::test_support::{
+        accept, exclusive_run, fixture_response, listener, request,
+    };
+
+    let _exclusive = exclusive_run();
+    let (listener, _) = listener();
+    let endpoint = listener.local_addr().unwrap().to_string();
     let mut fixture = Fixture::new(false, false);
     let root = fixture.profile.0.canonicalize().unwrap();
     let baseline = Configuration::load_fixture_from(&root).unwrap();
     let mut draft = serde_json::to_value(&baseline).unwrap();
     draft["profiles"] = json!({
+        "profiles": [{"id": 2, "name": "Loopback fixture", "endpoint": endpoint,
+                      "model": "", "model_mode": "server-default"}],
+        "last_id": 2
+    });
+    let saved: Configuration = serde_json::from_value(draft.clone()).unwrap();
+    saved.save_fixture_at(&root, &baseline).unwrap();
+    let saved = Configuration::load_fixture_from(&root).unwrap();
+    assert!(saved.agent_profiles().next().is_none());
+    assert!(saved.agent_transport(2).is_err());
+    fixture.workspace.set_test_ai_configuration(saved.clone());
+
+    let run = fixture.open(Mode::Run);
+    assert!(fixture.run(run).profile().is_none());
+    assert!(fixture.run(run).profiles[0].server_default.is_some());
+    assert!(
+        fixture
+            .workspace
+            .build_agent(fixture.session, Mode::Plan, None, None, false)
+            .is_err()
+    );
+
+    draft["profiles"]["profiles"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({
+            "id": 1, "name": "Manual fallback", "endpoint": endpoint, "model": "fixture",
+        }));
+    draft["profiles"]["default"] = json!(1);
+    draft["local"]["roles"] = json!([null, 2, 1, null]);
+    let named_agent: Configuration = serde_json::from_value(draft.clone()).unwrap();
+    assert!(named_agent.foreground_agent_default_role_id().is_none());
+    draft["local"]["roles"] = json!([null, 2, null, null]);
+    let assigned: Configuration = serde_json::from_value(draft).unwrap();
+    assigned.save_fixture_at(&root, &saved).unwrap();
+    let assigned = Configuration::load_fixture_from(&root).unwrap();
+    assert_eq!(assigned.agent_profile_id(), Some(1));
+    fixture.workspace.set_test_ai_configuration(assigned);
+
+    let id = fixture.open(Mode::Ask);
+    assert_eq!(fixture.run(id).profile().unwrap().id, 2);
+    let _ = fixture.send(id, Message::Goal("Inspect disk usage".into()));
+    let task = fixture.send(id, Message::Start);
+    finish_agent_task(&mut fixture, task);
+    let run = fixture.run(id);
+    assert!(run.phase == Phase::ModelReview);
+    let review = run.model_review.as_ref().unwrap();
+    assert_eq!(
+        review.reviewed_destination(),
+        Some((endpoint.as_str(), "Server selects the model"))
+    );
+    assert!(
+        matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    let epoch = run.epoch;
+    let worker = std::thread::spawn(move || {
+        let mut stream = accept(&listener);
+        let payload = request(&mut stream);
+        assert!(payload.get("model").is_none());
+        stream
+            .get_mut()
+            .write_all(
+                fixture_response(
+                    "200 OK",
+                    "",
+                    r#"{"status":"done","summary":"Inspected","userMessage":"Reviewed answer"}"#,
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+    });
+    let send = fixture.send(
+        id,
+        Message::ReviewModel(request_review::Message::Send(epoch)),
+    );
+    finish_agent_task(&mut fixture, send);
+    worker.join().unwrap();
+    assert!(
+        fixture.run(id).phase == Phase::Finished,
+        "{}",
+        fixture.run(id).notice
+    );
+}
+
+#[test]
+fn standalone_https_agent_requires_explicit_selection_and_rechecks_saved_opt_in() {
+    check_standalone_https_agent_review(false);
+}
+
+#[test]
+fn server_selected_https_agent_requires_a_saved_foreground_opt_in() {
+    check_standalone_https_agent_review(true);
+}
+
+fn check_standalone_https_agent_review(server_default: bool) {
+    let mut fixture = Fixture::new(false, false);
+    let root = fixture.profile.0.canonicalize().unwrap();
+    let baseline = Configuration::load_fixture_from(&root).unwrap();
+    let mut draft = serde_json::to_value(&baseline).unwrap();
+    let destination = if server_default {
+        "https://example.invalid/gateway/complete/"
+    } else {
+        "https://example.invalid/v1/chat/completions"
+    };
+    draft["profiles"] = json!({
         "profiles": [{
             "id": 2,
             "name": "Remote fixture",
-            "connection_mode": "remote-open-ai",
-            "endpoint": "https://example.invalid/v1",
-            "model": "fixture",
+            "connection_mode": if server_default { "remote-open-ai-exact" } else { "remote-open-ai" },
+            "endpoint": destination,
+            "model": if server_default { "" } else { "fixture" },
+            "model_mode": if server_default { "server-default" } else { "manual" },
             "trusted_remote_endpoint": true,
             "reviewed_agent_https": true
         }],
-        "default": 2,
+        "default": if server_default { None } else { Some(2) },
         "last_id": 2
     });
     let saved: Configuration = serde_json::from_value(draft.clone()).unwrap();
@@ -640,15 +800,20 @@ fn standalone_https_agent_requires_explicit_selection_and_rechecks_saved_opt_in(
     assert!(saved.agent_profile_id().is_none());
     assert!(saved.agent_profiles().next().is_none());
     assert!(saved.agent_transport(2).is_err());
+    assert_eq!(
+        saved.reviewed_agent_https_profiles().count(),
+        usize::from(!server_default)
+    );
+    assert_eq!(
+        saved.foreground_agent_default_profiles().count(),
+        usize::from(server_default)
+    );
     fixture.workspace.set_test_ai_configuration(saved.clone());
 
     let id = fixture.open(Mode::Ask);
     assert!(fixture.run(id).profile().is_none());
     let selected = fixture.run(id).profiles[0].clone();
-    assert_eq!(
-        selected.reviewed_https.as_deref(),
-        Some("https://example.invalid/v1/chat/completions")
-    );
+    assert_eq!(selected.reviewed_https.as_deref(), Some(destination));
     let _ = fixture.send(id, Message::Goal("Inspect password=fixture-secret".into()));
     no_task(fixture.send(id, Message::Start));
     assert!(fixture.run(id).phase == Phase::Setup);
@@ -659,6 +824,16 @@ fn standalone_https_agent_requires_explicit_selection_and_rechecks_saved_opt_in(
     let review = run.model_review.as_ref().unwrap();
     assert_eq!(review.send_label(), "Send reviewed HTTPS request");
     assert!(review.transport().0.is_remote());
+    assert_eq!(
+        review.transport().0.uses_server_default_model(),
+        server_default
+    );
+    if server_default {
+        assert_eq!(
+            review.reviewed_destination(),
+            Some((destination, "Server selects the model"))
+        );
+    }
     assert!(!review.input.contains("fixture-secret"));
     assert!(review.classifier.is_none());
     let epoch = run.epoch;

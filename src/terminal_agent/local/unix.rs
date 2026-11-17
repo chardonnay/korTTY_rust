@@ -12,16 +12,7 @@ use super::super::runner::{COMMAND_LIMIT, Cancel, Captured, Outcome, POLL, Statu
 use super::{Shell, exit_status};
 
 pub(super) fn run(shell: &Shell, cwd: &Path, text: &str, cancel: &Cancel) -> io::Result<Outcome> {
-    let mut command = Command::new(shell.executable());
-    command
-        .arg("-c")
-        .arg(text)
-        .current_dir(cwd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
-    let mut process = Process::new(command.spawn()?);
+    let mut process = spawn(shell, cwd, text)?;
     let mut stdout = process.child.stdout.take().ok_or_else(missing_pipe)?;
     let mut stderr = process.child.stderr.take().ok_or_else(missing_pipe)?;
     for pipe in [stdout.as_fd(), stderr.as_fd()] {
@@ -63,6 +54,26 @@ pub(super) fn run(shell: &Shell, cwd: &Path, text: &str, cancel: &Cancel) -> io:
     })
 }
 
+fn spawn(shell: &Shell, cwd: &Path, text: &str) -> io::Result<Process> {
+    #[cfg(target_os = "linux")]
+    if matches!(shell, Shell::FlatpakHost) {
+        let (child, host) = kortty_pty::flatpak::spawn_approved_command(cwd, text)?;
+        let mut process = Process::new(child);
+        process.host = Some(host);
+        return Ok(process);
+    }
+    let mut command = Command::new(shell.executable());
+    command
+        .arg("-c")
+        .arg(text)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    Ok(Process::new(command.spawn()?))
+}
+
 fn missing_pipe() -> io::Error {
     io::Error::other("Local command output pipe was unavailable")
 }
@@ -70,12 +81,19 @@ fn missing_pipe() -> io::Error {
 struct Process {
     child: Child,
     group: Option<process::Pid>,
+    #[cfg(target_os = "linux")]
+    host: Option<kortty_pty::flatpak::HostCommandLease>,
 }
 
 impl Process {
     fn new(child: Child) -> Self {
         let group = process::Pid::from_raw(child.id().cast_signed());
-        Self { child, group }
+        Self {
+            child,
+            group,
+            #[cfg(target_os = "linux")]
+            host: None,
+        }
     }
 
     fn poll_exit(&mut self) -> io::Result<Option<Status>> {
@@ -93,12 +111,22 @@ impl Process {
         // Keep the leader unreaped until all remaining processes in its owned group are stopped.
         let _ = process::kill_process_group(group, process::Signal::KILL);
         self.group = None;
-        self.child.wait().map(exit_status).map(Some)
+        let status = self.child.wait()?;
+        #[cfg(target_os = "linux")]
+        if let Some(mut host) = self.host.take() {
+            return Ok(Some(
+                host.exit_code()?
+                    .map_or(Status::TransportFailed, Status::Exited),
+            ));
+        }
+        Ok(Some(exit_status(status)))
     }
 }
 
 impl Drop for Process {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        drop(self.host.take());
         if let Some(group) = self.group {
             // The leader has not been reaped, so its PID cannot be reused.
             let _ = process::kill_process_group(group, process::Signal::KILL);

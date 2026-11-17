@@ -72,6 +72,7 @@ struct ImportedProfile {
     java_memory_id: Option<String>,
     java_key_id: Option<String>,
     java_route: Option<(LoginTarget, Option<LoginTarget>)>,
+    java_rsync_folder: Option<String>,
     group: String,
     badge: Option<String>,
     has_password: bool,
@@ -90,6 +91,7 @@ struct ImportedLocal {
 struct ImportedSerial {
     profile: SerialProfile,
     group: String,
+    java_memory_id: Option<String>,
     java_favorite_id: Option<String>,
 }
 
@@ -102,6 +104,7 @@ impl ImportedProfile {
             java_memory_id: None,
             java_key_id: None,
             java_route: None,
+            java_rsync_folder: None,
             group,
             badge: None,
             has_password: false,
@@ -157,7 +160,7 @@ pub(crate) enum Access<'a> {
 
 #[derive(Debug)]
 pub(crate) enum ReadOutcome {
-    Preview(Preview),
+    Preview(Box<Preview>),
     ZipPasswordRequired,
     OpenPgpKeyRequired,
 }
@@ -206,7 +209,55 @@ impl Preview {
         options::portable_java_backup(self)
     }
 
+    pub(crate) fn associate_java_ai_profiles(
+        &mut self,
+        sources: &[&crate::ai_manager::JavaProfileSource],
+    ) -> (usize, usize) {
+        let mut matched = 0;
+        let mut unresolved = 0;
+        for hint in self
+            .entries
+            .iter_mut()
+            .map(|entry| &mut entry.connection.terminal)
+            .chain(
+                self.local_entries
+                    .iter_mut()
+                    .map(|entry| &mut entry.profile.terminal),
+            )
+            .filter_map(|terminal| terminal.java_ai_profile.as_mut())
+        {
+            hint.associate_source(sources);
+            if hint.source().is_some() {
+                matched += 1;
+            } else {
+                unresolved += 1;
+            }
+        }
+        (matched, unresolved)
+    }
+
     pub(crate) fn with_java_library(mut self, settings: JavaLibrarySettings) -> Self {
+        if let Some(ids) = &settings.highlight_sets {
+            for overrides in self
+                .entries
+                .iter_mut()
+                .map(|entry| &mut entry.connection.terminal)
+                .chain(
+                    self.local_entries
+                        .iter_mut()
+                        .map(|entry| &mut entry.profile.terminal),
+                )
+            {
+                overrides.remap_java_highlight(ids);
+            }
+            for entry in &mut self.serial_entries {
+                entry.profile.highlight_set = entry
+                    .profile
+                    .highlight_set
+                    .as_deref()
+                    .and_then(|id| crate::terminal_highlight::resolve_java_backup_set(ids, id));
+            }
+        }
         self.java_library = settings;
         self
     }
@@ -214,14 +265,15 @@ impl Preview {
     pub(crate) fn merge_java_backup(
         local: Option<&[u8]>,
         incoming: &[u8],
+        highlight_sets: &std::collections::BTreeMap<String, String>,
     ) -> io::Result<Option<Vec<u8>>> {
-        options::merge_java_backup(local, incoming)
+        options::merge_java_backup(local, incoming, highlight_sets)
     }
 
     #[cfg(test)]
     pub(crate) fn read(path: &Path) -> io::Result<Self> {
         match Self::read_with(path, Access::Plain)? {
-            ReadOutcome::Preview(preview) => Ok(preview),
+            ReadOutcome::Preview(preview) => Ok(*preview),
             ReadOutcome::ZipPasswordRequired => Err(invalid("the connection ZIP needs a password")),
             ReadOutcome::OpenPgpKeyRequired => Err(invalid(
                 "the OpenPGP connection archive needs a private key",
@@ -250,7 +302,8 @@ impl Preview {
             invalid("choose a connection XML, CSV, MobaXterm sessions file, ZIP or OpenPGP archive")
         })?;
         let (content, stamp) = read_stable(path, MAX_BYTES, expected)?;
-        Self::parse_bytes(format, &content).map(|preview| (ReadOutcome::Preview(preview), stamp))
+        Self::parse_bytes(format, &content)
+            .map(|preview| (ReadOutcome::Preview(Box::new(preview)), stamp))
     }
 
     fn parse_bytes(format: Format, content: &[u8]) -> io::Result<Self> {
@@ -401,6 +454,13 @@ pub(crate) fn visit_java_connection_ids(
     bytes: &[u8],
     mut visit: impl FnMut(&str),
 ) -> io::Result<()> {
+    visit_java_connection_records(bytes, |id, _| visit(id))
+}
+
+pub(crate) fn visit_java_connection_records(
+    bytes: &[u8],
+    mut visit: impl FnMut(&str, roxmltree::Node<'_, '_>),
+) -> io::Result<()> {
     if bytes.len() as u64 > MAX_BYTES {
         return Err(invalid("connection import exceeds its size limit"));
     }
@@ -410,7 +470,7 @@ pub(crate) fn visit_java_connection_ids(
             .filter(|entry| xml::has_unqualified_tag(*entry, "connection"))
         {
             if let Some(id) = entry.attribute("id") {
-                visit(id);
+                visit(id, entry);
             }
         }
         Ok(())
@@ -465,6 +525,7 @@ fn serial_bookmark(
     Ok(ImportedSerial {
         profile,
         group: import_group(group)?,
+        java_memory_id: None,
         java_favorite_id: None,
     })
 }

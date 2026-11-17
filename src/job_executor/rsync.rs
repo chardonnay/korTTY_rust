@@ -3,7 +3,10 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use kortty_server_archive::{privileged_rsync, rsync_tree::ExistingTree};
+use kortty_server_archive::{
+    privileged_rsync,
+    rsync_tree::{DeleteScope, ExistingTree, RecurringReceiver},
+};
 use kortty_ssh::TrustStore;
 
 use crate::scheduler_window::rsync::{MixedReview, MixedReviewTarget};
@@ -12,7 +15,12 @@ use crate::scheduler_window::{ConnectionRef, RemotePath};
 use super::Credentials;
 
 mod local_existing_snapshot;
-pub(crate) use local_existing_snapshot::LocalExistingSnapshot;
+pub(crate) use local_existing_snapshot::{
+    LocalExistingSnapshot, LocalParentReceipt, LocalTreeLocation, VacantFileProof,
+    VacantLocalTreeSnapshot,
+};
+
+pub(crate) type BatchParents = Arc<std::sync::Mutex<Vec<LocalParentReceipt>>>;
 
 #[cfg(not(any(unix, windows)))]
 use std::io;
@@ -37,6 +45,35 @@ pub(crate) fn review_local_existing(
     {
         let _ = (path, cancelled);
         Err("Existing local rsync directories are unavailable on this platform.".into())
+    }
+}
+
+pub(crate) fn review_local_vacant_tree(
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> Result<VacantLocalTreeSnapshot, String> {
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    return native::review_local_vacant_tree(path, cancelled).map_err(|error| error.to_string());
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (path, cancelled);
+        Err("Reviewed vacant local rsync directories are unavailable on this platform.".into())
+    }
+}
+
+pub(crate) fn review_local_file_vacancy(
+    path: &Path,
+    cancelled: &AtomicBool,
+) -> Result<VacantFileProof, String> {
+    #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
+    return native::review_local_file_vacancy(path, &|| {
+        cancelled.load(std::sync::atomic::Ordering::Acquire)
+    })
+    .map_err(|error| error.to_string());
+    #[cfg(not(any(windows, target_os = "linux", target_os = "macos")))]
+    {
+        let _ = (path, cancelled);
+        Err("Reviewed vacant local rsync files are unavailable on this platform.".into())
     }
 }
 
@@ -69,6 +106,56 @@ pub(crate) fn preview_existing(
         authority,
     )
     .map_err(|error| error.detail.into())
+}
+
+pub(crate) struct RecurringReceiverTarget<'a> {
+    pub(crate) destination: &'a RemotePath,
+    pub(crate) directory: bool,
+    pub(crate) delete: &'a DeleteScope,
+}
+
+pub(crate) fn preview_recurring_receiver(
+    credentials: Credentials,
+    reference: &ConnectionRef,
+    target: RecurringReceiverTarget<'_>,
+    trust: &TrustStore,
+    cancelled: Arc<AtomicBool>,
+    require_current_routes: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
+) -> Result<RecurringReceiver, String> {
+    #[cfg(any(unix, windows))]
+    {
+        let (session, authority) = open_review_session(
+            credentials,
+            reference,
+            trust,
+            Arc::clone(&cancelled),
+            require_current_routes,
+            true,
+            false,
+        )?;
+        let exec = session
+            .exec_opener()
+            .ok_or("The pinned SSH session cannot review a recurring rsync receiver.")?;
+        native::review_recurring_receiver(
+            &exec,
+            target,
+            move || cancelled.load(std::sync::atomic::Ordering::Acquire),
+            authority,
+        )
+        .map_err(|error| error.detail.into())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = (
+            credentials,
+            reference,
+            target,
+            trust,
+            cancelled,
+            require_current_routes,
+        );
+        Err("Recurring rsync upload receivers are unavailable on this platform.".into())
+    }
 }
 
 #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
@@ -122,6 +209,70 @@ pub(crate) fn preview_privileged(
     cancelled: Arc<AtomicBool>,
     require_current_routes: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
 ) -> Result<privileged_rsync::Review, String> {
+    preview_privileged_destination(
+        credentials,
+        reference,
+        spec,
+        trust,
+        cancelled,
+        require_current_routes,
+        None,
+    )
+}
+
+pub(crate) fn preview_privileged_file_creation(
+    credentials: Credentials,
+    reference: &ConnectionRef,
+    spec: &privileged_rsync::Spec,
+    trust: &TrustStore,
+    cancelled: Arc<AtomicBool>,
+    require_current_routes: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
+) -> Result<privileged_rsync::Review, String> {
+    preview_privileged_destination(
+        credentials,
+        reference,
+        spec,
+        trust,
+        cancelled,
+        require_current_routes,
+        Some(UploadCreation::File),
+    )
+}
+
+pub(crate) fn preview_privileged_tree_creation(
+    credentials: Credentials,
+    reference: &ConnectionRef,
+    spec: &privileged_rsync::Spec,
+    trust: &TrustStore,
+    cancelled: Arc<AtomicBool>,
+    require_current_routes: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
+) -> Result<privileged_rsync::Review, String> {
+    preview_privileged_destination(
+        credentials,
+        reference,
+        spec,
+        trust,
+        cancelled,
+        require_current_routes,
+        Some(UploadCreation::Tree),
+    )
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum UploadCreation {
+    File,
+    Tree,
+}
+
+fn preview_privileged_destination(
+    credentials: Credentials,
+    reference: &ConnectionRef,
+    spec: &privileged_rsync::Spec,
+    trust: &TrustStore,
+    cancelled: Arc<AtomicBool>,
+    require_current_routes: impl Fn() -> std::io::Result<()> + Send + Sync + 'static,
+    creation: Option<UploadCreation>,
+) -> Result<privileged_rsync::Review, String> {
     #[cfg(any(windows, target_os = "linux", target_os = "macos"))]
     {
         let (session, authority) = open_review_session(
@@ -136,11 +287,12 @@ pub(crate) fn preview_privileged(
         let exec = session
             .exec_opener()
             .ok_or("The pinned SSH session cannot review privileged rsync.")?;
-        native::review_privileged(
+        native::review_privileged_destination(
             &exec,
             spec,
             move || cancelled.load(std::sync::atomic::Ordering::Acquire),
             authority,
+            creation,
         )
         .map_err(|failure| failure.detail.to_owned())
     }
@@ -153,6 +305,7 @@ pub(crate) fn preview_privileged(
             trust,
             cancelled,
             require_current_routes,
+            creation,
         );
         Err("Privileged rsync is unavailable on this platform.".into())
     }

@@ -17,6 +17,8 @@ pub(super) use windows::{WORKER_ARGUMENT, worker};
 pub(crate) enum Shell {
     #[cfg(unix)]
     Posix(PathBuf),
+    #[cfg(target_os = "linux")]
+    FlatpakHost,
     #[cfg(windows)]
     PowerShell(PathBuf),
     #[cfg(windows)]
@@ -28,6 +30,8 @@ impl Shell {
         match self {
             #[cfg(unix)]
             Self::Posix(path) => path,
+            #[cfg(target_os = "linux")]
+            Self::FlatpakHost => Path::new("/bin/sh"),
             #[cfg(windows)]
             Self::PowerShell(path) | Self::CommandPrompt(path) => path,
         }

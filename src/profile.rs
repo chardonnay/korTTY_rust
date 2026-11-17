@@ -29,7 +29,6 @@ const MAX_TABS_PER_WINDOW: usize = 32;
 const MAX_TAB_TITLE_CHARS: usize = 120;
 const MAX_TOTAL_PANES: usize = 128;
 const MAX_SPLIT_DEPTH: usize = 16;
-const MAX_POSITION: f32 = 100_000.0;
 const MAX_PLACEMENT_BYTES: u64 = 4096;
 pub(crate) const MIN_TERMINAL_FONT: u8 = 8;
 pub(crate) const MAX_TERMINAL_FONT: u8 = 72;
@@ -78,8 +77,11 @@ pub struct SavedPosition {
 }
 
 impl SavedPosition {
+    pub(crate) const MAX_COORDINATE: i32 = 100_000;
+
     pub fn new(x: f32, y: f32) -> Option<Self> {
-        let limit = -MAX_POSITION..=MAX_POSITION;
+        let coordinate = Self::MAX_COORDINATE as f32;
+        let limit = -coordinate..=coordinate;
         (limit.contains(&x) && limit.contains(&y)).then_some(Self {
             x,
             y,
@@ -706,6 +708,18 @@ fn path() -> io::Result<PathBuf> {
 pub(crate) fn root() -> io::Result<PathBuf> {
     if let Some(root) = RUNTIME_ROOT.get() {
         return Ok(root.clone());
+    }
+    // Subprocess fixtures can use their own home and the native profile path.
+    #[cfg(all(test, target_os = "macos"))]
+    if let Some(root) = env::var_os("KORTTY_TEST_PROFILE_ROOT").map(PathBuf::from)
+        && env::var_os("HOME").unwrap_or_default()
+            == env::var_os("KORTTY_TEST_ORIGINAL_HOME").unwrap_or_default()
+    {
+        return if root.is_absolute() {
+            Ok(root)
+        } else {
+            Err(invalid("test profile directory must be absolute"))
+        };
     }
     let home = || env::var_os("HOME").map(PathBuf::from);
     let directory = if cfg!(windows) {

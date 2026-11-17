@@ -84,6 +84,7 @@ pub enum Message {
     SerialJournal(journal_settings::Edit),
     SerialPasteLineDelay(String),
     SerialStrictTerminalMode(Option<bool>),
+    SerialHighlightSet(String),
     ToggleSerialPin,
     Serial(serial_dialog::Message),
     EditSelected,
@@ -119,6 +120,27 @@ pub enum Scope {
     Teamwork,
     Group(String),
     Tag(String),
+}
+
+impl Message {
+    pub(crate) fn java_ai_adoption(
+        &self,
+    ) -> Option<(
+        &crate::ai_manager::ProfileRef,
+        &crate::ai_manager::JavaProfileSource,
+    )> {
+        match self {
+            Self::Edit(Edit::Terminal(terminal_overrides::Edit::AdoptJavaAiProfile(
+                reference,
+                source,
+            )))
+            | Self::Local(local::Edit::Terminal(terminal_overrides::Edit::AdoptJavaAiProfile(
+                reference,
+                source,
+            ))) => Some((reference, source)),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1267,6 +1289,12 @@ impl ConnectionWindow {
             Message::SerialStrictTerminalMode(value) => {
                 if let Some(draft) = &mut self.serial_draft {
                     draft.strict_terminal_mode = value;
+                    draft.changed = true;
+                }
+            }
+            Message::SerialHighlightSet(value) => {
+                if let Some(draft) = &mut self.serial_draft {
+                    draft.highlight_set = (!value.is_empty()).then_some(value);
                     draft.changed = true;
                 }
             }

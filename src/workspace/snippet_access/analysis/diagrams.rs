@@ -13,7 +13,8 @@ use crate::workspace::dialog_placement;
 use super::{
     AnalysisDiagram, AnalysisFlowchartRequest, Configuration, Event, HistoryChange, Message, Phase,
     PreviewPart, ProfileChoice, ReviewMode, SnippetId, State, Subject, Workspace, history_task,
-    local_ai, preview_parts, preview_phase, record_hash, scope, store,
+    local_ai, preview_parts, preview_phase, record_hash, reviewed_local_profile_guard,
+    reviewed_local_profile_revision, reviewed_local_profile_transport, scope, store,
 };
 
 pub(super) struct Approved {
@@ -22,6 +23,7 @@ pub(super) struct Approved {
     pub(super) profile: ProfileChoice,
     pub(super) transport: local_ai::Profile,
     pub(super) source_hash: String,
+    pub(super) local_profile_revision: Option<[u8; 32]>,
 }
 
 pub(super) struct Review {
@@ -72,7 +74,10 @@ impl Workspace {
                 .filter(|profile| !profile.remote && !profile.cli)
                 .cloned()
                 .ok_or("The analysis AI profile is unavailable.")?;
-            let (transport, limit) = config.code_analysis_transport(profile.id)?;
+            let (transport, limit) =
+                reviewed_local_profile_transport(&config, profile.id, profile.server_selected)?;
+            let local_profile_revision =
+                reviewed_local_profile_revision(&config, &profile.reference, &transport)?;
             let source = record
                 .source
                 .content
@@ -94,6 +99,7 @@ impl Workspace {
                     profile,
                     transport,
                     source_hash: record.source.sha256.clone(),
+                    local_profile_revision,
                 },
                 record: record.id,
                 parts,
@@ -176,7 +182,12 @@ impl Workspace {
                 return Task::none();
             }
         };
-        let pending = match approved.request.start(approved.transport) {
+        let guard = reviewed_local_profile_guard(
+            approved.config,
+            approved.profile.reference,
+            approved.local_profile_revision,
+        );
+        let pending = match approved.request.start(approved.transport, guard) {
             Ok(pending) => pending,
             Err(error) => {
                 page.status = Some(error);
@@ -329,6 +340,10 @@ impl Workspace {
             .filter(|id| self.diagrams.contains_key(id));
         let rendered = saved
             .and_then(|diagram| diagram.parse().ok())
+            .or_else(|| {
+                let historical = record?.java_history.as_ref()?.historical_diagram.as_ref()?;
+                kortty_diagram::parse_mermaid(&historical.mermaid).ok()
+            })
             .map(|diagram| {
                 svg::Handle::from_memory(diagram.layout().to_svg(Theme::Light).into_bytes())
             });

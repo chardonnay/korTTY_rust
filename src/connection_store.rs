@@ -101,6 +101,8 @@ pub(crate) struct SerialProfile {
     pub(crate) paste_line_delay_ms: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) strict_terminal_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) highlight_set: Option<String>,
     #[serde(
         default,
         skip_serializing_if = "crate::session_journal::ConnectionConfig::is_default"
@@ -119,6 +121,7 @@ impl SerialProfile {
             pinned: false,
             paste_line_delay_ms: None,
             strict_terminal_mode: None,
+            highlight_set: None,
             journal: Default::default(),
         }
     }
@@ -166,6 +169,13 @@ impl SerialProfile {
     pub(crate) fn validate(&self) -> io::Result<()> {
         self.journal.validate()?;
         validate_paste_line_delay(self.paste_line_delay_ms)?;
+        if self
+            .highlight_set
+            .as_deref()
+            .is_some_and(|id| !crate::terminal_highlight::valid_id(id))
+        {
+            return Err(invalid("invalid serial highlight set ID"));
+        }
         if !valid_text(&self.name, 160, true)
             || !valid_text(&self.tag, 96, true)
             || !self
@@ -779,6 +789,15 @@ impl Store {
 
     pub(crate) fn has_group(&self, path: &str) -> bool {
         self.document.library.groups.contains(path)
+    }
+
+    pub(crate) fn direct_group_ids<'a>(&'a self, group: &'a str) -> impl Iterator<Item = u64> {
+        self.connections()
+            .iter()
+            .map(|profile| profile.id)
+            .chain(self.local_profiles().iter().map(|profile| profile.id))
+            .chain(self.serial_profiles().iter().map(|profile| profile.id))
+            .filter(move |id| self.group_of(*id) == Some(group))
     }
 
     pub fn in_group<'a>(&'a self, group: &'a str) -> impl Iterator<Item = &'a Connection> {

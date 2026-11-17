@@ -345,7 +345,7 @@ fn read_one_from_archive(path: &Path, access: Access<'_>) -> Preview {
     match Preview::read_with(path, access).unwrap() {
         ReadOutcome::Preview(preview) => {
             assert_eq!(preview.entries().len(), 1);
-            preview
+            *preview
         }
         other => panic!("expected a connection preview, got {other:?}"),
     }

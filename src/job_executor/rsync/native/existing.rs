@@ -1,14 +1,17 @@
-//! Replace a reviewed receiver tree only through the pinned two-phase helper.
+//! Publish reviewed upload receivers through the pinned two-phase helper.
 
 use std::{cell::Cell, sync::Arc};
 
 use kortty_jobs::RunId;
+use kortty_server_archive::privileged_rsync::SourceLimits;
 use kortty_server_archive::rsync_tree::{
     self as protocol, DeleteScope, ExistingDecision, ExistingReply, ExistingRequest,
-    ExistingRequestV2, ExistingTree, Inventory,
+    ExistingRequestV2, ExistingTree, Inventory, RecurringReceiver,
 };
 
+use crate::job_executor::rsync::RecurringReceiverTarget;
 use crate::scheduler_window::RemotePath;
+use crate::scheduler_window::rsync::standing::{Receiver as StandingReceiver, RemoteVacancy};
 
 use super::{
     upload_tree::{Helper, PhasePermission},
@@ -72,6 +75,52 @@ pub(super) fn review_receiver(
     }
 }
 
+pub(in crate::job_executor::rsync) fn review_recurring(
+    exec: &ExecOpener,
+    target: RecurringReceiverTarget<'_>,
+    cancellation: impl Fn() -> bool + Clone + Send + Sync + 'static,
+    authority: ExecutionGuard,
+) -> Result<RecurringReceiver, Failure> {
+    let RecurringReceiverTarget {
+        destination,
+        directory,
+        delete,
+    } = target;
+    if !rsync::valid_remote(destination.as_str())
+        || !delete.valid()
+        || (!directory && *delete != DeleteScope::Retain)
+    {
+        return Err(review_required());
+    }
+    require_authority(Some(&authority))?;
+    require_running(&cancellation).map_err(|_| transfer_stopped())?;
+    let mut helper = Helper::open_existing_v3(exec, cancellation.clone(), authority.clone())?;
+    let permitted = permission(cancellation, authority);
+    let stopped = || !permitted();
+    helper
+        .send_existing_v2(
+            &ExistingRequestV2::ReviewRecurring {
+                destination: destination.as_str().to_owned(),
+                directory,
+                delete: delete.clone(),
+            },
+            &stopped,
+            &permitted,
+        )
+        .map_err(|_| review_required())?;
+    match helper.receive(&stopped) {
+        Ok(ExistingReply::ReviewedRecurring {
+            destination: reviewed,
+            receiver,
+        }) if reviewed == destination.as_str() && receiver.valid(directory) && !stopped() => {
+            Ok(receiver)
+        }
+        _ => Err(Failure::blocked(
+            "Could not review the recurring rsync destination. Check the current Linux helper and the receiver's ownership and filesystem.",
+        )),
+    }
+}
+
 pub(super) fn apply<C: Fn() -> bool>(
     transfer: Transfer<'_, C>,
     listener: Listener,
@@ -86,7 +135,7 @@ pub(super) fn apply<C: Fn() -> bool>(
         id,
         Receiver {
             destination,
-            snapshot,
+            approval: ReceiverApproval::Directory(snapshot),
             scope: &scope,
             projected: None,
         },
@@ -110,11 +159,15 @@ pub(super) fn apply_recurring<C: Fn() -> bool>(
         id,
         Receiver {
             destination,
-            snapshot,
+            approval: ReceiverApproval::Directory(snapshot),
             scope: &scope,
             projected: None,
         },
-        Some(Recurring { reserve, arm }),
+        Some(Recurring {
+            reserve,
+            arm,
+            limits: None,
+        }),
     )
 }
 
@@ -141,9 +194,15 @@ fn action_receiver(
 
 pub(super) struct Receiver<'a> {
     pub(super) destination: &'a RemotePath,
-    pub(super) snapshot: ExistingTree,
+    pub(super) approval: ReceiverApproval,
     pub(super) scope: &'a DeleteScope,
     pub(super) projected: Option<Inventory>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) enum ReceiverApproval {
+    Directory(ExistingTree),
+    Recurring(RecurringReceiver),
 }
 
 pub(super) fn apply_receiver<C: Fn() -> bool>(
@@ -181,13 +240,77 @@ pub(super) fn apply_recurring_receiver<C: Fn() -> bool>(
         Some(Recurring {
             reserve: |_| Ok(()),
             arm,
+            limits: None,
         }),
     )
+}
+
+pub(super) fn apply_ordinary_recurring<C: Fn() -> bool>(
+    transfer: Transfer<'_, C>,
+    listener: Listener,
+    bridge_endpoint: &str,
+    id: RunId,
+    mut review: Receiver<'_>,
+    route: recurring::Route<'_>,
+) -> Result<Completion, Failure> {
+    let ReceiverApproval::Recurring(approved) = review.approval else {
+        return Err(review_required());
+    };
+    let destination = review.destination;
+    let directory = transfer.action.directory;
+    if !approved.valid(directory) {
+        return Err(review_required());
+    }
+    let initial_vacancy = match approved {
+        RecurringReceiver::Vacant { fingerprint } if directory => {
+            Some(RemoteVacancy::Tree(fingerprint))
+        }
+        RecurringReceiver::Vacant { fingerprint } => Some(RemoteVacancy::File(fingerprint)),
+        RecurringReceiver::Existing { .. } => None,
+    };
+    let (receiver, vacancy) = match route.remote_upload(destination, initial_vacancy)? {
+        recurring::RemoteUpload::Existing(snapshot) => {
+            (RecurringReceiver::Existing { snapshot }, None)
+        }
+        recurring::RemoteUpload::VacantFile | recurring::RemoteUpload::VacantTree => {
+            (approved, initial_vacancy)
+        }
+    };
+    if !receiver.valid(directory) {
+        return Err(review_required());
+    }
+    review.approval = ReceiverApproval::Recurring(receiver);
+    let limits = review
+        .projected
+        .is_none()
+        .then(|| route.source_limits(0))
+        .transpose()?;
+    let (completion, successor) = apply_checked(
+        transfer,
+        listener,
+        bridge_endpoint,
+        id,
+        review,
+        Some(Recurring {
+            reserve: |incoming| limits.map_or(Ok(()), |_| route.reserve([incoming], 0)),
+            arm: |removed| route.arm(removed),
+            limits,
+        }),
+    )?;
+    let successor = successor.map(|snapshot| StandingReceiver::Remote {
+        destination: destination.clone(),
+        snapshot,
+    });
+    Ok(match vacancy {
+        Some(vacancy) => route.confirm_first_remote(completion, successor, vacancy),
+        None => route.confirm(completion, successor),
+    })
 }
 
 struct Recurring<R, A> {
     reserve: R,
     arm: A,
+    limits: Option<SourceLimits>,
 }
 
 type NoRecurring = Recurring<fn(Inventory) -> Result<(), Failure>, fn(u32) -> Result<(), Failure>>;
@@ -243,13 +366,34 @@ fn apply_checked<C: Fn() -> bool>(
         executable,
     };
     require_running(&stopped).map_err(|_| transfer_stopped())?;
-    let incoming = match review.projected {
-        Some(incoming) => incoming,
-        None if recurring.is_some() => upload_tree::stage_current_input(&transfer)?,
-        None => upload_tree::stage_input(&transfer)?,
+    let directory = action.directory;
+    let (typed, original, vacancy) = match review.approval {
+        ReceiverApproval::Directory(original) if directory => (None, Some(original), None),
+        ReceiverApproval::Recurring(receiver)
+            if recurring.is_some() && receiver.valid(directory) =>
+        {
+            match receiver {
+                RecurringReceiver::Existing { snapshot } => (Some(receiver), Some(snapshot), None),
+                RecurringReceiver::Vacant { fingerprint } => {
+                    (Some(receiver), None, Some(fingerprint))
+                }
+            }
+        }
+        _ => return Err(review_required()),
+    };
+    let limits = recurring.as_ref().and_then(|recurring| recurring.limits);
+    let incoming = match (review.projected, directory, limits) {
+        (Some(incoming), _, _) => incoming,
+        (None, false, limits) => upload::stage_file(&transfer, limits)?,
+        (None, true, Some(limits)) => upload_tree::stage_bounded_input(
+            &transfer,
+            protocol::Manifest::bounded(limits.entries, limits.bytes),
+        )?,
+        (None, true, None) if recurring.is_some() => upload_tree::stage_current_input(&transfer)?,
+        (None, true, None) => upload_tree::stage_input(&transfer)?,
     };
     let arm = match recurring {
-        Some(Recurring { reserve, arm }) => {
+        Some(Recurring { reserve, arm, .. }) => {
             reserve(incoming)?;
             Some(arm)
         }
@@ -271,12 +415,24 @@ fn apply_checked<C: Fn() -> bool>(
         authority.clone(),
     )?;
     let destination = review.destination.as_str().to_owned();
-    if receipt_required || review.projected.is_some() {
+    if let Some(receiver) = typed {
+        helper.send_existing_v2(
+            &ExistingRequestV2::PrepareRecurring {
+                destination,
+                incoming,
+                directory,
+                receiver,
+                delete: review.scope.clone(),
+            },
+            &stopped,
+            &permitted,
+        )
+    } else if receipt_required || review.projected.is_some() {
         helper.send_existing_v2(
             &ExistingRequestV2::Prepare {
                 destination,
                 incoming,
-                original: review.snapshot,
+                original: original.ok_or_else(review_required)?,
                 delete: review.scope.clone(),
             },
             &stopped,
@@ -287,7 +443,7 @@ fn apply_checked<C: Fn() -> bool>(
             &ExistingRequest::Prepare {
                 destination,
                 incoming,
-                original: review.snapshot,
+                original: original.ok_or_else(review_required)?,
                 delete: *review.scope == DeleteScope::All,
             },
             &stopped,
@@ -300,7 +456,8 @@ fn apply_checked<C: Fn() -> bool>(
         _ => return Err(review_required()),
     };
     let parent = review.destination.parent().trim_end_matches('/');
-    let payload = format!("{parent}/{stage}/{PAYLOAD}");
+    let leaf = if directory { "" } else { "/file" };
+    let payload = format!("{parent}/{stage}/{PAYLOAD}{leaf}");
     let verified = (|| {
         require_running(&stopped).map_err(|_| transfer_stopped())?;
         transfer.run_checked(
@@ -321,7 +478,13 @@ fn apply_checked<C: Fn() -> bool>(
             Ok(ExistingReply::Verified { successor }) if !receipt_required => (successor, 0),
             Ok(ExistingReply::VerifiedWithRemovals { successor, removed })
                 if receipt_required
-                    && removals_match(review.snapshot.inventory, successor, removed) =>
+                    && if vacancy.is_some() || !directory {
+                        removed == 0 && successor == incoming
+                    } else {
+                        original.is_some_and(|original| {
+                            removals_match(original.inventory, successor, removed)
+                        })
+                    } =>
             {
                 (successor, removed)
             }
@@ -352,7 +515,11 @@ fn apply_checked<C: Fn() -> bool>(
         upload_stage: &stage,
         recovery: None,
         publishing: false,
-        previous_fingerprint: receipt_required.then_some(review.snapshot.fingerprint),
+        previous_fingerprint: original
+            .filter(|_| receipt_required)
+            .map(|original| original.fingerprint),
+        vacancy,
+        directory,
         published_receiver: None,
     };
     let status = publication.run(&mut helper, &stopped, &permitted);
@@ -394,9 +561,7 @@ fn removals_match(original: Inventory, successor: Inventory, removed: u32) -> bo
 }
 
 fn review_required() -> Failure {
-    Failure::blocked(
-        "Review the exact source, existing rsync receiver, and pinned SSH route again.",
-    )
+    Failure::blocked("Review the exact source, rsync receiver, and pinned SSH route again.")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -415,6 +580,8 @@ struct Publication<'a> {
     recovery: Option<String>,
     publishing: bool,
     previous_fingerprint: Option<[u8; 32]>,
+    vacancy: Option<[u8; 32]>,
+    directory: bool,
     published_receiver: Option<ExistingTree>,
 }
 
@@ -425,15 +592,20 @@ impl Publication<'_> {
         stopped: &impl Fn() -> bool,
         permitted: &PhasePermission,
     ) -> Status {
-        if helper
-            .send_guarded(&ExistingDecision::Quarantine, stopped, permitted)
-            .is_ok()
+        let mut ready = self.vacancy.is_some();
+        if !ready
+            && helper
+                .send_guarded(&ExistingDecision::Quarantine, stopped, permitted)
+                .is_ok()
             && let Ok(reply) = helper.receive(stopped)
             && let Some(status) = self.observe(reply)
         {
             if status != Status::Quarantined {
                 return status;
             }
+            ready = true;
+        }
+        if ready {
             self.publishing = helper
                 .send_guarded(&ExistingDecision::Publish, stopped, permitted)
                 .is_ok();
@@ -462,7 +634,9 @@ impl Publication<'_> {
     fn observe(&mut self, reply: ExistingReply) -> Option<Status> {
         match reply {
             ExistingReply::Quarantined { recovery }
-                if self.recovery.is_none() && self.valid_recovery(&recovery) =>
+                if self.vacancy.is_none()
+                    && self.recovery.is_none()
+                    && self.valid_recovery(&recovery) =>
             {
                 self.recovery = Some(recovery);
                 Some(Status::Quarantined)
@@ -471,7 +645,8 @@ impl Publication<'_> {
                 destination,
                 successor,
                 recovery,
-            } if self.previous_fingerprint.is_none()
+            } if self.vacancy.is_none()
+                && self.previous_fingerprint.is_none()
                 && self.valid_publication(&destination, successor, &recovery) =>
             {
                 Some(Status::Published)
@@ -480,10 +655,23 @@ impl Publication<'_> {
                 destination,
                 receiver,
                 recovery,
-            } if self
-                .previous_fingerprint
-                .is_some_and(|previous| previous != receiver.fingerprint)
-                && self.valid_publication(&destination, receiver.inventory, &recovery) =>
+            } if self.previous_fingerprint.is_some_and(|previous| {
+                previous != receiver.fingerprint && receiver.fingerprint != [0; 32]
+            }) && self.valid_publication(&destination, receiver.inventory, &recovery) =>
+            {
+                self.published_receiver = Some(receiver);
+                Some(Status::Published)
+            }
+            ExistingReply::FirstRecurringPublished {
+                destination,
+                vacancy,
+                receiver,
+            } if self.publishing
+                && self.vacancy == Some(vacancy)
+                && destination == self.destination.as_str()
+                && self.recovery.is_none()
+                && receiver.inventory == self.successor
+                && receiver.fingerprint != [0; 32] =>
             {
                 self.published_receiver = Some(receiver);
                 Some(Status::Published)
@@ -505,7 +693,8 @@ impl Publication<'_> {
                 recovery,
                 ..
             } => {
-                if let Some(recovery) = recovery
+                if self.vacancy.is_none()
+                    && let Some(recovery) = recovery
                     && self.recovery.is_none()
                     && self.valid_recovery(&recovery)
                 {
@@ -529,7 +718,9 @@ impl Publication<'_> {
         path.strip_prefix(parent)
             .and_then(|path| path.strip_prefix('/'))
             .and_then(|path| path.strip_suffix("/original"))
-            .is_some_and(|stage| stage != self.upload_stage && protocol::valid_stage(stage))
+            .is_some_and(|stage| {
+                protocol::valid_stage(stage) && (stage != self.upload_stage) == self.directory
+            })
     }
 
     fn complete(self, id: RunId, status: Status) -> Completion {
@@ -537,17 +728,19 @@ impl Publication<'_> {
             Ok(0)
         } else {
             Err(Failure::failed(
-                "Could not publish the existing rsync receiver.",
+                "Could not publish the reviewed rsync receiver.",
             ))
         };
         let mut completion = Completion::from_result(id, outcome);
         completion.detail = Some(match status {
-            Status::Published => format!(
-                "Published the verified rsync tree. The original is retained at {}.",
-                self.recovery.as_deref().expect("confirmed publication requires a recovery path"),
-            ),
+            Status::Published => match &self.recovery {
+                Some(recovery) => format!(
+                    "Published the verified rsync receiver. The original is retained at {recovery}."
+                ),
+                None => "Published the verified rsync receiver at the reviewed vacant path.".into(),
+            },
             Status::Restored => "The server confirmed that the original is at the reviewed destination.".into(),
-            Status::Rejected => "The server refused publication before confirming quarantine. Check the receiver and review it again.".into(),
+            Status::Rejected => "The server refused publication. Check the receiver and review it again.".into(),
             Status::Quarantined | Status::Uncertain => match self.recovery.as_deref() {
                 Some(recovery) => format!(
                     "Rsync publication or restoration is uncertain. Check the reviewed destination and the last reported recovery path {recovery} before retrying.",
@@ -584,8 +777,69 @@ mod tests {
             recovery: None,
             publishing: false,
             previous_fingerprint: None,
+            vacancy: None,
+            directory: true,
             published_receiver: None,
         }
+    }
+
+    #[test]
+    fn ordinary_recurring_rsync_requires_the_exact_vacancy_receipt() {
+        let destination = RemotePath::try_from("/srv/project/receiver".to_owned()).unwrap();
+        let mut transaction = publication(&destination);
+        let vacancy = [2; 32];
+        transaction.vacancy = Some(vacancy);
+        let receiver = ExistingTree {
+            inventory: inventory(),
+            fingerprint: [3; 32],
+        };
+        let receipt = |path: &str, vacancy, receiver| ExistingReply::FirstRecurringPublished {
+            destination: path.to_owned(),
+            vacancy,
+            receiver,
+        };
+        assert_eq!(
+            transaction.observe(receipt(destination.as_str(), vacancy, receiver)),
+            None
+        );
+        transaction.publishing = true;
+        for wrong in [
+            receipt("/srv/project/wrong", vacancy, receiver),
+            receipt(destination.as_str(), [4; 32], receiver),
+            receipt(
+                destination.as_str(),
+                vacancy,
+                ExistingTree {
+                    fingerprint: [0; 32],
+                    ..receiver
+                },
+            ),
+            ExistingReply::Quarantined {
+                recovery: RECOVERY.to_owned(),
+            },
+            ExistingReply::Published {
+                destination: destination.as_str().to_owned(),
+                successor: inventory(),
+                recovery: RECOVERY.to_owned(),
+            },
+        ] {
+            assert_eq!(transaction.observe(wrong), None);
+        }
+        assert_eq!(
+            transaction.observe(receipt(destination.as_str(), vacancy, receiver)),
+            Some(Status::Published),
+        );
+        assert_eq!(transaction.published_receiver, Some(receiver));
+        assert!(transaction.recovery.is_none());
+    }
+
+    #[test]
+    fn recurring_rsync_file_requires_recovery_in_its_private_stage() {
+        let destination = RemotePath::try_from("/srv/project/receiver".to_owned()).unwrap();
+        let mut transaction = publication(&destination);
+        transaction.directory = false;
+        assert!(transaction.valid_recovery(&format!("/srv/project/{STAGE}/original")));
+        assert!(!transaction.valid_recovery(RECOVERY));
     }
 
     #[test]

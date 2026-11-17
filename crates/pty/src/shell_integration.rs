@@ -84,7 +84,13 @@ impl ShellIntegrationSnippet {
 /// support separately, including rejection of Windows WSL launcher aliases.
 pub fn validate_shell_integration(shell: LocalShell, command: Option<&[String]>) -> io::Result<()> {
     let Some(command) = command else {
-        return Ok(());
+        return if shell == LocalShell::Wsl {
+            Err(unsupported(
+                "automatic integration requires the shell running inside WSL",
+            ))
+        } else {
+            Ok(())
+        };
     };
     crate::validate_local_command(command)?;
     if !shell.is_default() {

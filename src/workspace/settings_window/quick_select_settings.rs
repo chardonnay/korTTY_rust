@@ -1,4 +1,4 @@
-use iced::widget::{self, column, text, text_editor, text_input};
+use iced::widget::{self, checkbox, column, text, text_editor, text_input};
 use iced::{Element, Font, Task, window};
 
 use crate::terminal_view::quick_select::{
@@ -15,6 +15,7 @@ const MAX_PATTERN_DRAFT_BYTES: usize = (MAX_PATTERNS + 1) * (MAX_PATTERN_BYTES +
 pub enum Edit {
     Alphabet(String),
     Patterns(text_editor::Action),
+    JavaPatterns(bool),
 }
 
 pub(super) struct Editor {
@@ -24,6 +25,7 @@ pub(super) struct Editor {
     patterns: text_editor::Content,
     patterns_id: widget::Id,
     patterns_text: String,
+    java_patterns: bool,
     lines: Vec<Pattern>,
     too_many: bool,
 }
@@ -51,6 +53,7 @@ impl Editor {
             patterns: text_editor::Content::with_text(&patterns_text),
             patterns_id: widget::Id::unique(),
             patterns_text,
+            java_patterns: preferences.java_patterns,
             lines: Vec::new(),
             too_many: false,
         };
@@ -78,6 +81,11 @@ impl Editor {
                     self.validate_patterns();
                 }
             }
+            Edit::JavaPatterns(value) => {
+                self.java_patterns = value;
+                self.lines.clear();
+                self.validate_patterns();
+            }
         }
     }
 
@@ -95,7 +103,7 @@ impl Editor {
                     .find(|old| old.source == source)
                     .map_or_else(
                         || {
-                            Preferences::validate_pattern(source)
+                            Preferences::validate_pattern(source, self.java_patterns)
                                 .err()
                                 .map(|error| error.to_string())
                         },
@@ -135,12 +143,14 @@ impl Editor {
         if alphabet != effective_alphabet(&initial.alphabet) {
             next.alphabet = alphabet.to_owned();
         }
-        if self
-            .lines
-            .iter()
-            .map(|pattern| &pattern.source)
-            .ne(initial.patterns.iter())
+        if self.java_patterns != initial.java_patterns
+            || self
+                .lines
+                .iter()
+                .map(|pattern| &pattern.source)
+                .ne(initial.patterns.iter())
         {
+            next.java_patterns = self.java_patterns;
             next.patterns = self
                 .lines
                 .iter()
@@ -172,6 +182,9 @@ impl Editor {
             ].spacing(4)),
             highlighted(dialog, Setting::QuickSelectPatterns, column![
                 label(Setting::QuickSelectPatterns),
+                checkbox(self.java_patterns)
+                    .label("Use Java regular-expression syntax")
+                    .on_toggle(move |enabled| wrap(id, Edit::JavaPatterns(enabled))),
                 text_editor(&self.patterns)
                     .id(self.patterns_id.clone())
                     .placeholder("One regular expression per line, for example [A-Z]+-\\d+")

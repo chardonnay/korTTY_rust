@@ -115,6 +115,7 @@ fn mixed_transfer(upload: bool, case: Case) {
         destination: reviewed_destination,
         delete: true,
         elevation: crate::scheduler_window::rsync::Elevation::Ordinary,
+        review_vacant: !upload && case == Case::Recurring,
     };
     let credentials = Credentials::resolve_directory_browser(
         reference,

@@ -218,7 +218,7 @@ fn kortty_xml_round_trip_preserves_shared_settings_and_removes_credentials() {
 }
 
 #[test]
-fn local_shell_integration_xml_round_trip_retains_opt_in_and_windows_presets() {
+fn local_shell_integration_xml_round_trip_retains_opt_in_and_native_presets() {
     let scratch = Scratch::new();
     let mut profiles = Vec::new();
     for (index, (shell, command)) in [
@@ -233,6 +233,11 @@ fn local_shell_integration_xml_round_trip_retains_opt_in_and_windows_presets() {
         ),
         (kortty_pty::LocalShell::PowerShell, None),
         (kortty_pty::LocalShell::CommandPrompt, None),
+        (kortty_pty::LocalShell::GitBash, None),
+        (kortty_pty::LocalShell::Cygwin, None),
+        (kortty_pty::LocalShell::Wsl, None),
+        (kortty_pty::LocalShell::Zsh, None),
+        (kortty_pty::LocalShell::Bash, None),
     ]
     .into_iter()
     .enumerate()
@@ -243,7 +248,7 @@ fn local_shell_integration_xml_round_trip_retains_opt_in_and_windows_presets() {
             shell,
             command,
             working_directory: None,
-            shell_integration: true,
+            shell_integration: shell != kortty_pty::LocalShell::Wsl,
             emulation: "xterm-256color".into(),
             terminal: Default::default(),
         });
@@ -266,7 +271,7 @@ fn local_shell_integration_xml_round_trip_retains_opt_in_and_windows_presets() {
     assert_eq!(
         xml.matches("<rustLocalShellIntegration>true</rustLocalShellIntegration>")
             .count(),
-        2
+        6
     );
     let path = scratch.0.join("integrated.xml");
     fs::write(&path, data).unwrap();
@@ -280,7 +285,7 @@ fn local_shell_integration_xml_round_trip_retains_opt_in_and_windows_presets() {
     for (actual, expected) in saved.local_profiles().iter().zip(&profiles) {
         assert_eq!(actual.shell, expected.shell);
         assert_eq!(actual.command, expected.command);
-        assert!(actual.shell_integration);
+        assert_eq!(actual.shell_integration, expected.shell_integration);
     }
 }
 
@@ -410,6 +415,7 @@ fn java_serial_xml_round_trips_device_line_settings_encoding_and_folder() {
     profile.tag = "Lab <bench>".into();
     profile.paste_line_delay_ms = Some(125);
     profile.strict_terminal_mode = Some(false);
+    profile.highlight_set = Some("builtin.network".into());
     let serials = [SerialEntry {
         profile: &profile,
         group: "Hardware/Lab",
@@ -423,6 +429,7 @@ fn java_serial_xml_round_trips_device_line_settings_encoding_and_folder() {
         "<stopBits>ONE_POINT_FIVE</stopBits>",
         "<flowControl>DSR_DTR</flowControl>",
         "<lineEnding>CRLF</lineEnding>",
+        "<highlightRuleSetId>builtin.network</highlightRuleSetId>",
         "Lab &lt;bench&gt;",
     ] {
         assert!(text.contains(expected), "missing {expected}");

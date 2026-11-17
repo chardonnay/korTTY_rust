@@ -25,6 +25,7 @@ pub(crate) mod schedule;
 mod writer;
 
 pub(crate) use openpgp::decrypt_openpgp_document;
+pub(crate) use restore::{JavaMemoryReview, JavaMemoryTarget};
 pub(crate) use restore::{
     PendingJavaCancellation, discard_pending_java, pending_java_cancellation,
 };
@@ -68,6 +69,7 @@ impl Preview {
             + usize::from(self.java_credentials.is_some())
             + self.java.as_ref().map_or(0, |report| {
                 usize::from(report.scheduler.is_some())
+                    + usize::from(report.toolbar.is_some())
                     + report
                         .scoped_memory
                         .as_ref()
@@ -113,6 +115,57 @@ impl Preview {
 
     pub(crate) fn java_host_pins(&self) -> Option<std::sync::Arc<kortty_ssh::KnownHostsFile>> {
         self.java.as_ref()?.host_pins.clone()
+    }
+
+    pub(crate) fn prepare_java_memory_review(mut self) -> Self {
+        if self
+            .java
+            .as_ref()
+            .is_some_and(|report| report.scoped_memory.is_some())
+            && let Err(error) =
+                profile::root().and_then(|root| self.prepare_java_memory_review_at(&root))
+            && let Some(report) = self.java.as_mut()
+        {
+            report.omissions.push(format!(
+                "Could not list existing AI Memory destinations: {error}"
+            ));
+        }
+        self
+    }
+
+    fn prepare_java_memory_review_at(&mut self, root: &Path) -> io::Result<()> {
+        if let Some(source) = self
+            .java
+            .as_mut()
+            .and_then(|report| report.scoped_memory.as_mut())
+        {
+            let current = restore::read_java_connections(root)?;
+            source.review = current
+                .as_deref()
+                .map(|bytes| JavaMemoryReview::read(source, bytes))
+                .transpose()?
+                .flatten();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn java_memory_review(&self) -> Option<&JavaMemoryReview> {
+        self.java.as_ref()?.scoped_memory.as_ref()?.review.as_ref()
+    }
+
+    pub(crate) fn select_java_memory(
+        &mut self,
+        index: usize,
+        target: Option<u64>,
+    ) -> io::Result<()> {
+        let review = self
+            .java_memory_review_mut()
+            .ok_or_else(|| io::Error::other("AI Memory destinations are unavailable."))?;
+        review.select(index, target)
+    }
+
+    pub(crate) fn java_memory_review_mut(&mut self) -> Option<&mut JavaMemoryReview> {
+        self.java.as_mut()?.scoped_memory.as_mut()?.review.as_mut()
     }
 }
 
@@ -220,21 +273,27 @@ pub(crate) fn queue_restore(preview: Preview, mode: RestoreMode) -> io::Result<Q
 
 fn queue_restore_at(root: &Path, preview: Preview, mode: RestoreMode) -> io::Result<QueuedRestore> {
     let is_java = preview.java.is_some();
-    let (scheduler, scoped_memory, connection_library) =
+    let (scheduler, scoped_memory, toolbar, connection_library) =
         preview.java.map_or_else(Default::default, |report| {
             (
                 report.scheduler,
                 report.scoped_memory,
+                report.toolbar,
                 report.connection_library,
             )
         });
-    if preview.java_credentials.is_some() || scheduler.is_some() || scoped_memory.is_some() {
+    if preview.java_credentials.is_some()
+        || scheduler.is_some()
+        || scoped_memory.is_some()
+        || toolbar.is_some()
+    {
         return restore::queue_java_transaction(
             root,
             preview.snapshot,
             preview.java_credentials.map(|prepared| *prepared),
             scheduler,
             scoped_memory,
+            toolbar,
             connection_library,
         );
     }
@@ -265,14 +324,28 @@ pub(crate) fn prepare_java_credentials(
         .ssh
         .as_ref()
         .ok_or_else(|| io::Error::other("No Java SSH credentials are available for review."))?;
-    let review = java_credential_restore::prepare(
+    let highlights = restore::java_highlight_bindings(root, &preview.snapshot)?;
+    let highlight_bindings = restore::highlight_digest(&highlights.set_ids)?;
+    let connection_library = report
+        .connection_library
+        .clone()
+        .with_highlight_sets(highlights.set_ids);
+    let mut review = java_credential_restore::prepare(
         root,
         source,
         source_password,
         vault,
-        report.scheduler.is_some() || report.scoped_memory.is_some(),
-        &report.connection_library,
+        report.scheduler.is_some()
+            || report.scoped_memory.is_some()
+            || report
+                .toolbar
+                .as_ref()
+                .is_some_and(|source| source.connections.is_some()),
+        &connection_library,
     )?;
+    if let Some(prepared) = &mut review.prepared {
+        prepared.highlight_bindings = Some(highlight_bindings);
+    }
     if source.has_passwords && review.passwords.is_none() {
         report
             .omissions

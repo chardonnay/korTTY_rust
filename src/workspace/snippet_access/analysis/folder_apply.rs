@@ -4,9 +4,10 @@ use std::fmt::Write as _;
 use std::ops::Range;
 
 use crate::snippet_analysis::model::{ApplyRun, now_millis};
-use crate::snippet_analysis::request::apply::{Progress, Request as ApplyRequest};
+use crate::snippet_analysis::request::apply::{Observer, Progress, Request as ApplyRequest};
 use crate::snippet_window::analysis::apply::{self as view, Action};
 
+use super::apply::{ApplyContext, Approval};
 use super::*;
 
 const MAX_FILES: usize = 12;
@@ -76,10 +77,8 @@ struct Job {
 
 pub(super) struct Preview {
     revision: Revision,
-    config: Arc<Configuration>,
+    approval: Approval,
     guidance: SkillGuidance,
-    profile: ProfileChoice,
-    transport: local_ai::Profile,
     jobs: Vec<Job>,
     stages: usize,
     prompt: String,
@@ -93,16 +92,18 @@ impl Preview {
         page: &Page,
         pre: SnippetId,
         config: Arc<Configuration>,
+        authority: ApplyContext<'_>,
     ) -> Result<Self, String> {
         let record = page
             .record()
             .filter(|record| record.id == pre)
             .ok_or("Select the analysis with these findings.")?;
-        let profile = page
-            .profile_for_reference(&config, &record.provenance.profile_id)
-            .cloned()
-            .ok_or("Enable the AI profile that produced this report.")?;
-        let (transport, limit) = config.code_analysis_transport(profile.id)?;
+        let approval = Approval::new(
+            Some(Arc::clone(&config)),
+            page,
+            &record.provenance.profile_id,
+            authority,
+        )?;
         let Project {
             revision,
             files,
@@ -112,9 +113,14 @@ impl Preview {
             .iter()
             .map(|file| file.snippet.content().chars().count())
             .sum::<usize>()
-            > limit
+            > approval.limit
         {
             return Err("The project source exceeds the AI profile's selection limit.".into());
+        }
+        if approval.profile.remote {
+            for file in &files {
+                approval.check_source(file.snippet.content())?;
+            }
         }
         let selected = super::apply::selection(page, record);
         if selected.findings.iter().any(|id| {
@@ -175,9 +181,10 @@ impl Preview {
                 &record.source.report_language_code,
                 config.code_text_language(),
             )?
-            .with_profile(&transport)
+            .with_profile(&approval.transport)
             .with_project(Arc::clone(&context));
             let file_prompt = request.preview()?;
+            approval.check_preview(&file_prompt)?;
             let _ = writeln!(prompt, "\nProject file: {}\n{file_prompt}", file.path);
             if prompt.len() > MAX_PREVIEW_BYTES {
                 return Err("Select fewer project files. The apply preview exceeds 4 MiB.".into());
@@ -194,10 +201,8 @@ impl Preview {
         }
         Ok(Self {
             revision,
-            config,
+            approval,
             guidance,
-            profile,
-            transport,
             jobs,
             stages,
             parts: super::apply::parts(&prompt),
@@ -208,7 +213,7 @@ impl Preview {
 
     pub(super) fn view(&self) -> Phase<'_> {
         Phase::ApplyPreview(view::Preview {
-            profile: &self.profile,
+            profile: &self.approval.profile,
             prompt: &self.prompt[self.parts[self.page].clone()],
             page: self.page,
             pages: self.parts.len(),
@@ -365,6 +370,11 @@ impl Workspace {
 
     fn preview_folder_apply(&mut self, id: window::Id, pre: SnippetId) -> Task<Message> {
         let config = self.ai_configuration();
+        let authority = ApplyContext {
+            policy: &self.clipboard.policy,
+            vault: self.vault.as_ref(),
+            vault_change: self.vault_change_revision(),
+        };
         let Some(surface) = self.snippets.get_mut(&id) else {
             return Task::none();
         };
@@ -378,7 +388,7 @@ impl Workspace {
         page.configure(config.as_deref());
         let preview = config
             .ok_or_else(|| "Open AI Manager to enable the report’s AI profile.".into())
-            .and_then(|config| Preview::new(&surface.window, page, pre, config));
+            .and_then(|config| Preview::new(&surface.window, page, pre, config, authority));
         match preview {
             Ok(preview) => {
                 page.state = State::FolderApplyPreview(Box::new(preview));
@@ -413,7 +423,7 @@ impl Workspace {
         let subject = page.subject;
         let unchanged = config
             .as_ref()
-            .is_some_and(|config| config.as_ref() == preview.config.as_ref())
+            .is_some_and(|config| config.as_ref() == preview.approval.config.as_ref())
             && capture(&surface.window, page)
                 .is_ok_and(|project| project.revision == preview.revision);
         let blocked = self.folder_apply_blocked(id, &preview.revision.ids());
@@ -434,13 +444,16 @@ impl Workspace {
         }
         let Preview {
             revision,
-            transport,
+            approval,
             guidance,
             jobs,
             prompt,
             ..
         } = *preview;
         let config = config.expect("the approved configuration was checked");
+        let authorize = approval.dispatch_guard();
+        let remote = approval.profile.remote;
+        let transport = approval.transport;
         let skill_usage = jobs
             .iter()
             .filter_map(|job| {
@@ -450,13 +463,17 @@ impl Workspace {
             })
             .collect();
         let (updates, progress) = async_channel::bounded(1);
-        let mut observer = super::apply::stream_observer(
-            &transport,
-            &prompt,
-            self.vault.as_ref(),
-            self.clipboard.policy.terminal_logging.clone(),
-            updates,
-        );
+        let mut observer = if remote {
+            Observer::new(updates, None)
+        } else {
+            super::apply::stream_observer(
+                &transport,
+                &prompt,
+                self.vault.as_ref(),
+                self.clipboard.policy.terminal_logging.clone(),
+                updates,
+            )
+        };
         let local_ai::Pending { reply, cancel } = match local_ai::start(transport, move |client| {
             let mut proposals = Proposals::default();
             let total = jobs.len();
@@ -465,16 +482,19 @@ impl Workspace {
                     return Err(local_ai::Error::Cancelled.message());
                 }
                 observer.file(index + 1, total);
-                match request.run(client, now_millis(), &observer) {
+                authorize(&[])?;
+                match request.run(client, now_millis(), &observer, &authorize) {
                     Ok(run) => proposals.files.push(Proposal {
                         id,
                         path,
                         run,
                         included: false,
                     }),
+                    Err(error) if remote => return Err(error),
                     Err(error) => proposals.failures.push((path, error)),
                 }
             }
+            authorize(&[])?;
             Ok(proposals)
         }) {
             Ok(pending) => pending,

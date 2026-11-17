@@ -11,7 +11,8 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use kortty_server_archive::rsync_tree::{
     DeleteScope, EXISTING_ARGUMENT, EXISTING_V2_ARGUMENT, EXISTING_V3_ARGUMENT,
     ExistingDecision as Decision, ExistingReply, ExistingRequest, ExistingRequestV2, ExistingTree,
-    Inventory, Manifest, read_frame, valid_stage, write_existing_v2_request, write_frame,
+    Inventory, Manifest, RecurringReceiver, read_frame, valid_stage, write_existing_v2_request,
+    write_frame,
 };
 use rustix::fs::{FlockOperation, XattrFlags, fgetxattr, flock, fsetxattr};
 use sha2::{Digest, Sha256};
@@ -364,6 +365,147 @@ fn recurring_rsync_attests_exact_removals_and_the_published_receiver_identity() 
 }
 
 #[test]
+fn recurring_rsync_file_publishes_vacancy_and_replaces_the_exact_successor() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let destination = fixture.0.join("receiver-file");
+    let delete = DeleteScope::Retain;
+    let reviewed = review_recurring(&destination, false, &delete);
+    let old = b"initial ordinary file";
+    let expected = file_inventory(old);
+    let (mut first, payload) = prepare_recurring(&destination, false, reviewed, &delete, expected);
+    write(&payload.join("file"), old);
+    let old_identity = identity(&payload.join("file"));
+    assert_eq!(first.verify_recurring(), (expected, 0));
+    assert!(!destination.exists());
+    let successor = publish_first(first, &destination, reviewed, expected);
+    assert_eq!(fs::read(&destination).unwrap(), old);
+    assert_eq!(identity(&destination), old_identity);
+    assert_eq!(mode(&destination), 0o600);
+    assert_no_stage(&fixture.0);
+    assert_eq!(review_recurring(&destination, false, &delete), successor);
+
+    let new = b"later ordinary file";
+    let expected = file_inventory(new);
+    let (mut next, payload) = prepare_recurring(&destination, false, successor, &delete, expected);
+    write(&payload.join("file"), new);
+    let next_identity = identity(&payload.join("file"));
+    assert_eq!(next.verify_recurring(), (expected, 0));
+    let displaced = next.quarantine();
+    assert_eq!(displaced, payload.parent().unwrap().join("original"));
+    assert_eq!(identity(&displaced), old_identity);
+    assert_eq!(fs::read(&displaced).unwrap(), old);
+    assert!(!destination.exists());
+    let receiver = publish_recurring(next, &destination, &displaced);
+    assert_eq!(receiver.inventory, expected);
+    assert_eq!(identity(&destination), next_identity);
+    assert_eq!(fs::read(&destination).unwrap(), new);
+    assert_eq!(mode(&destination), 0o600);
+    assert_eq!(fs::read(&displaced).unwrap(), old);
+    assert_eq!(
+        review_recurring(&destination, false, &delete),
+        RecurringReceiver::Existing { snapshot: receiver }
+    );
+}
+
+#[test]
+fn recurring_rsync_directory_checks_vacancy_scope_and_later_mirror_recovery() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let destination = fixture.0.join("receiver-tree");
+    let source = fixture.tree("first-tree");
+    directory(&source.join("scope"));
+    write(&source.join("scope/old"), b"original mirror data");
+    write(&source.join("retained"), b"outside named mirror");
+    let delete = DeleteScope::Named(vec!["scope".into()]);
+    let reviewed = review_recurring(&destination, true, &delete);
+    let expected = inventory(&source);
+    let mismatch =
+        recurring_prepare_helper(&destination, true, reviewed, &DeleteScope::Retain, expected);
+    assert_refused(mismatch.finish(), "changed");
+    assert_no_stage(&fixture.0);
+
+    let (mut first, payload) = prepare_recurring(&destination, true, reviewed, &delete, expected);
+    populate(&source, &payload);
+    let identity_before_publish = identity(&payload);
+    assert_eq!(first.verify_recurring(), (expected, 0));
+    let successor = publish_first(first, &destination, reviewed, expected);
+    assert_eq!(identity(&destination), identity_before_publish);
+    assert_eq!(review_recurring(&destination, true, &delete), successor);
+    assert_no_stage(&fixture.0);
+
+    let later = fixture.tree("later-tree");
+    directory(&later.join("scope"));
+    write(&later.join("scope/new"), b"new mirror data");
+    let (mut next, payload) =
+        prepare_recurring(&destination, true, successor, &delete, inventory(&later));
+    populate(&later, &payload);
+    let (expected_successor, removed) = next.verify_recurring();
+    assert_eq!(removed, 1);
+    let displaced = next.quarantine();
+    assert_eq!(identity(&displaced), identity_before_publish);
+    assert_eq!(inventory(&displaced), expected);
+    let receiver = publish_recurring(next, &destination, &displaced);
+    assert_eq!(receiver.inventory, expected_successor);
+    assert_eq!(receiver.inventory, inventory(&destination));
+    assert!(!destination.join("scope/old").exists());
+    assert_eq!(
+        fs::read(destination.join("retained")).unwrap(),
+        b"outside named mirror"
+    );
+    assert_eq!(
+        fs::read(displaced.join("scope/old")).unwrap(),
+        b"original mirror data"
+    );
+    assert_eq!(
+        review_recurring(&destination, true, &delete),
+        RecurringReceiver::Existing { snapshot: receiver }
+    );
+}
+
+#[test]
+fn recurring_rsync_refuses_extra_file_payload_and_a_late_occupant() {
+    if rustix::process::geteuid().is_root() {
+        return;
+    }
+    let fixture = Fixture::new();
+    let destination = fixture.0.join("receiver-file");
+    let delete = DeleteScope::Retain;
+    let reviewed = review_recurring(&destination, false, &delete);
+    let bytes = b"would publish";
+    let expected = file_inventory(bytes);
+
+    let (mut extra, payload) = prepare_recurring(&destination, false, reviewed, &delete, expected);
+    write(&payload.join("file"), bytes);
+    write(&payload.join("other"), b"unexpected");
+    extra.send(&Decision::Verify);
+    assert_refused(extra.finish(), "too many entries");
+    assert!(!destination.exists());
+    assert_no_stage(&fixture.0);
+
+    let (mut late, payload) = prepare_recurring(&destination, false, reviewed, &delete, expected);
+    write(&payload.join("file"), bytes);
+    assert_eq!(late.verify_recurring(), (expected, 0));
+    let outside = fixture.0.join("keep");
+    write(&outside, b"unrelated file");
+    symlink(&outside, &destination).unwrap();
+    late.send(&Decision::Publish);
+    assert_refused(late.finish(), "already exists");
+    assert_eq!(fs::read_link(&destination).unwrap(), outside);
+    assert_eq!(fs::read(&outside).unwrap(), b"unrelated file");
+    assert_no_stage(&fixture.0);
+    assert_refused(
+        recurring_prepare_helper(&destination, false, reviewed, &delete, expected).finish(),
+        "already exists",
+    );
+    assert_no_stage(&fixture.0);
+}
+
+#[test]
 fn abort_before_and_after_verify_keeps_original_and_discards_stages() {
     if rustix::process::geteuid().is_root() {
         return;
@@ -693,6 +835,104 @@ fn prepare_v2(
     prepared(helper, destination)
 }
 
+fn review_recurring(
+    destination: &Path,
+    directory: bool,
+    delete: &DeleteScope,
+) -> RecurringReceiver {
+    let mut helper = Helper::start_with(EXISTING_V3_ARGUMENT);
+    helper.send_v2(&ExistingRequestV2::ReviewRecurring {
+        destination: destination.to_str().unwrap().to_owned(),
+        directory,
+        delete: delete.clone(),
+    });
+    match helper.finish() {
+        ExistingReply::ReviewedRecurring {
+            destination: reviewed,
+            receiver,
+        } => {
+            assert_eq!(Path::new(&reviewed), destination);
+            assert!(receiver.valid(directory));
+            receiver
+        }
+        reply => panic!("expected a recurring review, got {reply:?}"),
+    }
+}
+
+fn recurring_prepare_helper(
+    destination: &Path,
+    directory: bool,
+    receiver: RecurringReceiver,
+    delete: &DeleteScope,
+    incoming: Inventory,
+) -> Helper {
+    let mut helper = Helper::start_with(EXISTING_V3_ARGUMENT);
+    helper.send_v2(&ExistingRequestV2::PrepareRecurring {
+        destination: destination.to_str().unwrap().to_owned(),
+        incoming,
+        directory,
+        receiver,
+        delete: delete.clone(),
+    });
+    helper
+}
+
+fn prepare_recurring(
+    destination: &Path,
+    directory: bool,
+    receiver: RecurringReceiver,
+    delete: &DeleteScope,
+    incoming: Inventory,
+) -> (Helper, PathBuf) {
+    prepared(
+        recurring_prepare_helper(destination, directory, receiver, delete, incoming),
+        destination,
+    )
+}
+
+fn publish_first(
+    mut helper: Helper,
+    destination: &Path,
+    reviewed: RecurringReceiver,
+    expected: Inventory,
+) -> RecurringReceiver {
+    helper.send(&Decision::Publish);
+    match helper.finish() {
+        ExistingReply::FirstRecurringPublished {
+            destination: published,
+            vacancy,
+            receiver,
+        } => {
+            assert_eq!(Path::new(&published), destination);
+            assert_eq!(
+                reviewed,
+                RecurringReceiver::Vacant {
+                    fingerprint: vacancy
+                }
+            );
+            assert_eq!(receiver.inventory, expected);
+            RecurringReceiver::Existing { snapshot: receiver }
+        }
+        reply => panic!("expected a first publication receipt, got {reply:?}"),
+    }
+}
+
+fn publish_recurring(mut helper: Helper, destination: &Path, displaced: &Path) -> ExistingTree {
+    helper.send(&Decision::Publish);
+    match helper.finish() {
+        ExistingReply::PublishedWithReceiver {
+            destination: published,
+            recovery,
+            receiver,
+        } => {
+            assert_eq!(Path::new(&published), destination);
+            assert_eq!(Path::new(&recovery), displaced);
+            receiver
+        }
+        reply => panic!("expected an existing receiver receipt, got {reply:?}"),
+    }
+}
+
 fn prepared(mut helper: Helper, destination: &Path) -> (Helper, PathBuf) {
     match helper.receive() {
         ExistingReply::Prepared { stage } => {
@@ -778,6 +1018,14 @@ fn inventory(root: &Path) -> Inventory {
 
     let mut manifest = Manifest::default();
     visit(root, root, &mut manifest);
+    manifest.finish()
+}
+
+fn file_inventory(bytes: &[u8]) -> Inventory {
+    let mut manifest = Manifest::default();
+    manifest
+        .add("", Some((bytes.len() as u64, Sha256::digest(bytes).into())))
+        .unwrap();
     manifest.finish()
 }
 
@@ -872,6 +1120,14 @@ impl Helper {
         match self.receive() {
             ExistingReply::Verified { successor } => successor,
             reply => panic!("expected Verified, got {reply:?}"),
+        }
+    }
+
+    fn verify_recurring(&mut self) -> (Inventory, u32) {
+        self.send(&Decision::Verify);
+        match self.receive() {
+            ExistingReply::VerifiedWithRemovals { successor, removed } => (successor, removed),
+            reply => panic!("expected exact verification, got {reply:?}"),
         }
     }
 

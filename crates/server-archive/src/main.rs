@@ -8,6 +8,28 @@ mod server;
 fn main() -> io::Result<()> {
     let mut args = std::env::args_os().skip(1);
     let mode = args.next();
+    if mode.as_deref()
+        == Some(std::ffi::OsStr::new(
+            kortty_server_archive::protocol::UPDATE_ARGUMENT,
+        ))
+        && args.len() == 0
+    {
+        #[cfg(target_os = "linux")]
+        return server::serve_archive_update(io::stdin().lock(), io::stdout().lock());
+        #[cfg(not(target_os = "linux"))]
+        return {
+            use kortty_server_archive::protocol as archive;
+            archive::read_update_request(io::stdin().lock())?;
+            archive::write_update_reply(
+                io::stdout().lock(),
+                &archive::UpdateReply::Failed {
+                    message: "Reviewed server archive updates require a Linux helper".into(),
+                    outcome_unknown: false,
+                    recovery: None,
+                },
+            )
+        };
+    }
     if mode
         .as_deref()
         .is_some_and(|arg| arg == kortty_server_archive::draft_replace::ARGUMENT)
@@ -46,12 +68,47 @@ fn main() -> io::Result<()> {
         return server::privileged_archive::serve_password();
     }
     #[cfg(target_os = "linux")]
+    if args.len() == 0 {
+        use kortty_server_archive::protocol::{
+            PRIVILEGED_UPDATE_ARGUMENT, PRIVILEGED_UPDATE_PASSWORD_ARGUMENT,
+        };
+
+        if mode
+            .as_deref()
+            .is_some_and(|arg| arg == PRIVILEGED_UPDATE_ARGUMENT)
+        {
+            return server::privileged_archive::serve_update(false);
+        }
+        if mode
+            .as_deref()
+            .is_some_and(|arg| arg == PRIVILEGED_UPDATE_PASSWORD_ARGUMENT)
+        {
+            return server::privileged_archive::serve_update(true);
+        }
+    }
+    #[cfg(target_os = "linux")]
     if mode
         .as_deref()
         .is_some_and(|arg| arg == kortty_server_archive::privileged_rsync::ARGUMENT)
         && args.len() == 0
     {
         return server::privileged_rsync::serve();
+    }
+    #[cfg(target_os = "linux")]
+    if mode
+        .as_deref()
+        .is_some_and(|arg| arg == kortty_server_archive::privileged_file_replace::ARGUMENT)
+        && args.len() == 0
+    {
+        return server::privileged_rsync::file_replace::serve();
+    }
+    #[cfg(target_os = "linux")]
+    if mode
+        .as_deref()
+        .is_some_and(|arg| arg == kortty_server_archive::privileged_tree_merge::ARGUMENT)
+        && args.len() == 0
+    {
+        return server::privileged_rsync::tree_merge::serve();
     }
     #[cfg(target_os = "linux")]
     if mode

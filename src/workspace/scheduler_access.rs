@@ -749,6 +749,27 @@ impl Workspace {
             scheduler_window::Message::ReviewPrivileged => {
                 return self.review_scheduler_privileged(id);
             }
+            scheduler_window::Message::ImportedStagingSudo(_)
+            | scheduler_window::Message::PrivilegedStanding(true)
+            | scheduler_window::Message::AdoptImportedTransfer(
+                scheduler_window::imported_transfer::Mode::Staged(_),
+            ) if !self.scheduler_privileged_allowed() => {
+                if let Some(view) = self.scheduler_views.get_mut(&id) {
+                    view.report_status("Application policy forbids privileged staging.".into());
+                }
+                return Task::none();
+            }
+            scheduler_window::Message::ImportedPrivilegedSudo(_)
+            | scheduler_window::Message::AdoptImportedPrivileged
+                if !self.scheduler_privileged_action_allowed(view) =>
+            {
+                if let Some(view) = self.scheduler_views.get_mut(&id) {
+                    view.report_status(
+                        "Application policy forbids this Scheduler sudo action.".into(),
+                    );
+                }
+                return Task::none();
+            }
             scheduler_window::Message::Sudo(mode)
                 if mode != SudoMode::Disabled
                     && (view.editing_regular_transfer()
@@ -759,6 +780,7 @@ impl Workspace {
                 return Task::none();
             }
             scheduler_window::Message::ApprovePrivileged
+            | scheduler_window::Message::PrivilegedReplacementPreviewed(_)
                 if !self.scheduler_privileged_action_allowed(view) =>
             {
                 let task = self.update_scheduler(id, scheduler_window::Message::DiscardPrivileged);
@@ -1061,7 +1083,7 @@ impl Workspace {
     }
 
     fn scheduler_privileged_action_allowed(&self, view: &scheduler_window::SchedulerView) -> bool {
-        if view.editing_privileged_file_action() {
+        if view.editing_privileged_file_action() || view.editing_imported_privileged() {
             self.clipboard.policy.problem.is_none()
                 && self.clipboard.policy.scheduler_sudo_allowed
                 && !self.isolation_required()
@@ -1114,10 +1136,56 @@ impl Workspace {
             )?;
             Ok(scheduler_window::sync::fingerprints(&pins))
         });
-        if let Err(error) = review {
-            view.report_status(error);
+        match review {
+            Ok(Some(preview)) => {
+                let credentials = preview.upload().map(|upload| {
+                    self.scheduler_transfer_review_credentials(&upload.reference, upload.sudo)
+                });
+                Task::future(async move {
+                    Message::Scheduler(
+                        id,
+                        scheduler_window::Message::PrivilegedReplacementPreviewed(
+                            preview.inspect(credentials).await,
+                        ),
+                    )
+                })
+            }
+            Ok(None) => Task::none(),
+            Err(error) => {
+                view.report_status(error);
+                Task::none()
+            }
         }
-        Task::none()
+    }
+
+    fn scheduler_transfer_review_credentials(
+        &self,
+        reference: &scheduler_window::ConnectionRef,
+        sudo: SudoMode,
+    ) -> Result<job_executor::Credentials, &'static str> {
+        let store = profile::connections_path()
+            .and_then(ConnectionStore::open)
+            .map_err(|_| "The saved SSH connections are unavailable.")?;
+        let profile = store
+            .get(reference.id)
+            .ok_or("The saved SSH connection is missing or unavailable.")?;
+        let credentials = job_executor::Credentials::resolve_directory_browser(
+            reference,
+            profile,
+            self.clipboard.policy.server_access(),
+            |id, kind, endpoint| self.vault_credential(id, kind, endpoint),
+        )?;
+        if sudo != SudoMode::Vault {
+            return Ok(credentials);
+        }
+        let job_executor::JobAuth::Saved(saved) =
+            job_executor::JobAuth::Saved(Ok(Box::new(credentials))).with_sudo_passwords(
+                |reference| self.scheduler_sudo_password(reference, store.group_of(reference.id)),
+            )
+        else {
+            unreachable!();
+        };
+        saved.map(|value| *value)
     }
 
     fn refresh_scheduler_agent_profiles(&mut self) {
@@ -2218,33 +2286,8 @@ impl Workspace {
             }
         };
         let ticket = request.ticket.clone();
-        let reference = &request.connection;
-        let credentials = (|| {
-            let store = profile::connections_path()
-                .and_then(ConnectionStore::open)
-                .map_err(|_| "The saved SSH connections are unavailable.")?;
-            let profile = store
-                .get(reference.id)
-                .ok_or("The saved SSH connection is missing or unavailable.")?;
-            let credentials = job_executor::Credentials::resolve_directory_browser(
-                reference,
-                profile,
-                self.clipboard.policy.server_access(),
-                |id, kind, endpoint| self.vault_credential(id, kind, endpoint),
-            )?;
-            if request.sudo != SudoMode::Vault {
-                return Ok(credentials);
-            }
-            let job_executor::JobAuth::Saved(saved) = job_executor::JobAuth::Saved(Ok(Box::new(
-                credentials,
-            )))
-            .with_sudo_passwords(|reference| {
-                self.scheduler_sudo_password(reference, store.group_of(reference.id))
-            }) else {
-                unreachable!();
-            };
-            saved.map(|value| *value)
-        })();
+        let credentials =
+            self.scheduler_transfer_review_credentials(&request.connection, request.sudo);
         let result = match credentials {
             Ok(credentials) => {
                 let pending = job_executor::preview_sftp_sync(request, credentials);
@@ -2458,6 +2501,7 @@ impl Workspace {
             sync: None,
             privileged: None,
             rsync: None,
+            rsync_batch_parents: None,
             group_scope: None,
         };
         let per_firing = |request: &RunRequest<SshCommand>| {

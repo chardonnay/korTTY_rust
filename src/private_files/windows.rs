@@ -275,6 +275,19 @@ impl Directory {
         })
     }
 
+    pub(crate) fn replace_with_shared_readers(
+        &self,
+        name: &str,
+        write: impl FnOnce(&mut File) -> io::Result<()>,
+        check: impl FnOnce() -> io::Result<()>,
+    ) -> io::Result<()> {
+        self.write_staged(false, write, |file| {
+            check()?;
+            self.0
+                .replace_file_with_shared_readers(file, OsStr::new(name))
+        })
+    }
+
     /// Publishes while a caller-held lock protects a checked replacement.
     pub(crate) fn publish_bytes_with_retry(
         &self,

@@ -195,14 +195,17 @@ impl Form {
             }
             Edit::CloseColor => self.color = None,
             Edit::AddRule if self.settings.rules.len() < MAX_RULES => {
-                if let Some(definition) = self.settings.definitions.first() {
-                    self.selected_rule = Some(self.settings.rules.len());
-                    self.settings.rules.push(Rule {
-                        marker_id: definition.id.clone(),
-                        ..Rule::default()
-                    });
-                    self.rules_changed();
-                }
+                let marker_id = self
+                    .settings
+                    .definitions
+                    .first()
+                    .map_or_else(|| "info".to_owned(), |definition| definition.id.clone());
+                self.selected_rule = Some(self.settings.rules.len());
+                self.settings.rules.push(Rule {
+                    marker_id,
+                    ..Rule::default()
+                });
+                self.rules_changed();
             }
             Edit::RemoveRule => {
                 if let Some(index) = self
@@ -253,24 +256,24 @@ impl Form {
     }
 
     fn change_rule(&mut self, index: usize, change: RuleChange) {
+        if let RuleChange::Marker(id) = &change
+            && !self.settings.has_marker(id)
+        {
+            return;
+        }
         let Some(rule) = self.settings.rules.get_mut(index) else {
             return;
         };
         match change {
             RuleChange::Enabled(enabled) => rule.enabled = enabled,
-            RuleChange::Marker(id)
-                if self
-                    .settings
-                    .definitions
-                    .iter()
-                    .any(|definition| definition.id == id) =>
-            {
-                rule.marker_id = id;
-            }
+            RuleChange::Marker(id) => rule.marker_id = id,
             RuleChange::Pattern(pattern) if pattern.len() <= MAX_PATTERN_BYTES => {
                 rule.pattern = pattern
             }
-            RuleChange::Regex(enabled) => rule.regex = enabled,
+            RuleChange::Regex(enabled) => {
+                rule.regex = enabled;
+                rule.java_regex &= enabled;
+            }
             RuleChange::IgnoreCase(enabled) => rule.ignore_case = enabled,
             _ => return,
         }
@@ -407,9 +410,10 @@ impl Form {
     }
 
     fn rules<'a>(&'a self, editable: bool, apply_blocker: Option<&'a str>) -> Element<'a, Event> {
+        let definitions = self.settings.registry();
         let mut rows = column![].spacing(3);
         for (index, rule) in self.settings.rules.iter().enumerate() {
-            rows = rows.push(self.rule_row(index, rule, editable));
+            rows = rows.push(self.rule_row(index, rule, &definitions, editable));
         }
         if self.settings.rules.is_empty() {
             rows = rows.push(text("No rules yet.").size(13));
@@ -428,7 +432,7 @@ impl Form {
                 text("Active").size(12).width(54),
                 text("Marker").size(12).width(142),
                 text("Search term").size(12).width(Length::Fill),
-                text("Regex").size(12).width(50),
+                text("Regex").size(12).width(62),
                 text("Ignore case").size(12).width(71),
             ]
             .spacing(5),
@@ -436,9 +440,7 @@ impl Form {
             row![
                 edit_button(
                     "Add rule",
-                    editable
-                        && !self.settings.definitions.is_empty()
-                        && self.settings.rules.len() < MAX_RULES,
+                    editable && self.settings.rules.len() < MAX_RULES,
                     Edit::AddRule
                 ),
                 edit_button(
@@ -477,30 +479,33 @@ impl Form {
         .into()
     }
 
-    fn rule_row<'a>(&'a self, index: usize, rule: &'a Rule, editable: bool) -> Element<'a, Event> {
+    fn rule_row<'a>(
+        &'a self,
+        index: usize,
+        rule: &'a Rule,
+        definitions: &[Definition],
+        editable: bool,
+    ) -> Element<'a, Event> {
         let revision = self.rule_revision;
         let edit = move |change| Edit::ChangeRule(revision, index, change);
-        let selected = self
-            .settings
-            .definitions
+        let selected = definitions
             .iter()
             .find(|definition| definition.id == rule.marker_id);
         let marker: Element<'_, Event> = if editable {
             pick_list(
-                self.settings
-                    .definitions
-                    .iter()
-                    .map(Choice)
-                    .collect::<Vec<_>>(),
-                selected.map(Choice),
-                move |choice| Event::Edit(edit(RuleChange::Marker(choice.0.id.clone()))),
+                definitions.iter().cloned().map(Choice).collect::<Vec<_>>(),
+                selected.cloned().map(Choice),
+                move |choice| Event::Edit(edit(RuleChange::Marker(choice.0.id))),
             )
             .width(124)
             .into()
         } else {
-            text(selected.map_or("Missing marker", |definition| definition.name.as_str()))
-                .width(124)
-                .into()
+            text(selected.map_or_else(
+                || "Missing marker".to_owned(),
+                |definition| definition.name.clone(),
+            ))
+            .width(124)
+            .into()
         };
         let mut pattern = text_input("Search term", &rule.pattern);
         if editable {
@@ -524,10 +529,13 @@ impl Form {
             .width(142)
             .align_y(Alignment::Center),
             pattern.width(Length::Fill),
-            container(toggle(rule.regex, "", editable, move |value| edit(
-                RuleChange::Regex(value)
-            )))
-            .width(50),
+            container(toggle(
+                rule.regex,
+                if rule.java_regex { "Java" } else { "" },
+                editable,
+                move |value| edit(RuleChange::Regex(value))
+            ))
+            .width(62),
             container(toggle(rule.ignore_case, "", editable, move |value| edit(
                 RuleChange::IgnoreCase(value)
             )))
@@ -539,10 +547,10 @@ impl Form {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct Choice<'a>(&'a Definition);
+#[derive(Clone, PartialEq, Eq)]
+struct Choice(Definition);
 
-impl fmt::Display for Choice<'_> {
+impl fmt::Display for Choice {
     fn fmt(&self, output: &mut fmt::Formatter<'_>) -> fmt::Result {
         output.write_str(&self.0.name)
     }
@@ -568,6 +576,26 @@ fn severity(marker: LegacyMarker) -> &'static str {
         LegacyMarker::Important => "Important",
         LegacyMarker::Error => "Error",
     }
+}
+
+#[cfg(test)]
+#[test]
+fn journal_marker_rule_editor_can_create_and_change_a_builtin_target() {
+    let mut form = Form::new(Settings::default());
+    form.update(Edit::AddRule);
+    assert_eq!(form.settings().rules[0].marker_id, "info");
+    form.update(Edit::ChangeRule(
+        form.rule_revision,
+        0,
+        RuleChange::Marker("error".to_owned()),
+    ));
+    assert_eq!(form.settings().rules[0].marker_id, "error");
+    form.update(Edit::ChangeRule(
+        form.rule_revision,
+        0,
+        RuleChange::Marker("missing".to_owned()),
+    ));
+    assert_eq!(form.settings().rules[0].marker_id, "error");
 }
 
 fn swatch(color: Option<Rgb>) -> Element<'static, Event> {

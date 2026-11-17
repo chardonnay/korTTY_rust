@@ -1,6 +1,7 @@
 use std::io::{self, Write as _};
 use std::path::Path;
 
+use kortty_server_archive::privileged_tree_merge::Payload;
 use serde::Serialize;
 
 use crate::private_files::require_single_link;
@@ -9,14 +10,15 @@ use crate::sftp_window::tree::snapshot::{self, DirectoryStamp, Entry, Manifest, 
 use crate::sftp_window::worker::sync::review_root;
 use crate::sftp_window::{LocalSource, Location, scheduled};
 
-use super::transfer::{MAX_TRANSFER_BYTES, hash_copy};
+use super::transfer::{MAX_TRANSFER_BYTES, copy_digest};
 use super::{
-    Auth, Connection, ExecOpener, Failure, HashAlgorithm, Helper, Response, lowercase_hex,
-    valid_path,
+    Auth, Connection, ExecOpener, Failure, HashAlgorithm, Helper, Response, digest_hex,
+    lowercase_hex, valid_path,
 };
 
-pub(super) const MAX_ENTRIES: usize = 128;
-pub(super) const MAX_PATH_BYTES: usize = 32 * 1024;
+mod merge;
+pub(super) use kortty_server_archive::privileged_tree_merge::{MAX_ENTRIES, MAX_PATH_BYTES};
+pub(crate) use merge::{preview_tree_upload_merge, upload_tree_merge};
 
 pub(crate) struct TreeUpload {
     manifest: Manifest,
@@ -30,12 +32,7 @@ pub(crate) struct TreeUpload {
 struct ReviewedEntry {
     relative: Relative,
     path: String,
-    file: Option<ReviewedFile>,
-}
-
-struct ReviewedFile {
-    size: u64,
-    sha256: String,
+    file: Option<Payload>,
 }
 
 impl TreeUpload {
@@ -96,11 +93,11 @@ impl TreeUpload {
                         .ok_or(Failure::Blocked)?;
                     let source = open_file(&manifest, relative)?;
                     let sha256 =
-                        hash_copy(&mut source.file(), &mut io::sink(), stamp.size, &allowed)?;
+                        copy_digest(&mut source.file(), &mut io::sink(), stamp.size, &allowed)?;
                     source.verify().map_err(|_| Failure::Conflict)?;
-                    hasher.update(sha256.as_bytes());
-                    Some(ReviewedFile {
-                        size: stamp.size,
+                    hasher.update(digest_hex(&sha256)?.as_bytes());
+                    Some(Payload {
+                        bytes: stamp.size,
                         sha256,
                     })
                 }
@@ -276,12 +273,13 @@ pub(crate) fn upload_tree(
         let path = entry.path.as_str();
         if let Some(file) = &entry.file {
             let source = open_file(&plan.manifest, &entry.relative)?;
+            let sha256 = digest_hex(&file.sha256)?;
             channel.send(&EntryFrame::File {
                 path,
-                size: file.size,
-                sha256: &file.sha256,
+                size: file.bytes,
+                sha256: &sha256,
             })?;
-            let hashed = hash_copy(&mut source.file(), &mut channel, file.size, || true)?;
+            let hashed = copy_digest(&mut source.file(), &mut channel, file.bytes, || true)?;
             if hashed != file.sha256 || source.verify().is_err() {
                 return Err(Failure::Conflict);
             }

@@ -116,12 +116,25 @@ impl AnalysisFlowchartRequest {
         &self.input
     }
 
-    pub(crate) fn start(self, profile: Profile) -> Result<local_ai::Pending<Chart>, String> {
+    pub(crate) fn start(
+        self,
+        profile: Profile,
+        before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
+    ) -> Result<local_ai::Pending<Chart>, String> {
         if self.workflow.is_some() {
             return Err("Review the workflow diagram before sending its source.".into());
         }
         local_ai::start(profile, move |client| {
-            generate_with_guidance(client, Family::Flowchart, &self.script, "", self.generation)
+            let chart = generate_with_guidance(
+                client,
+                Family::Flowchart,
+                &self.script,
+                "",
+                self.generation,
+                &before_dispatch,
+            )?;
+            before_dispatch()?;
+            Ok(chart)
         })
     }
 
@@ -354,7 +367,14 @@ impl Draft {
         }
         let family = self.family;
         let pending = local_ai::start(profile, move |client| {
-            generate_with_guidance(client, family, &script, &guidance, Generation::General)
+            generate_with_guidance(
+                client,
+                family,
+                &script,
+                &guidance,
+                Generation::General,
+                &|| Ok(()),
+            )
         })?;
         Ok((pending, usage))
     }
@@ -362,7 +382,7 @@ impl Draft {
 
 #[cfg(test)]
 fn generate(client: &Client, family: Family, script: &str) -> Result<Chart, String> {
-    generate_with_guidance(client, family, script, "", Generation::General)
+    generate_with_guidance(client, family, script, "", Generation::General, &|| Ok(()))
 }
 
 fn generate_with_guidance(
@@ -371,31 +391,49 @@ fn generate_with_guidance(
     script: &str,
     guidance: &str,
     generation: Generation,
+    before_dispatch: &impl Fn() -> Result<(), String>,
 ) -> Result<Chart, String> {
     let result = Source::new(script)
         .map_err(AttemptError::Input)
         .and_then(|source| {
-            attempt(client, family, &source, guidance, None, generation).or_else(
-                |error| match error {
-                    AttemptError::Invalid(reason) if client.active() => {
-                        let repaired =
-                            attempt(client, family, &source, guidance, Some(&reason), generation);
-                        if matches!(generation, Generation::Analysis { .. }) && repaired.is_err() {
-                            Err(AttemptError::Invalid(reason))
-                        } else {
-                            repaired
-                        }
-                    }
-                    error => Err(error),
-                },
+            attempt(
+                client,
+                family,
+                &source,
+                guidance,
+                None,
+                generation,
+                before_dispatch,
             )
+            .or_else(|error| match error {
+                AttemptError::Invalid(reason) if client.active() => {
+                    match attempt(
+                        client,
+                        family,
+                        &source,
+                        guidance,
+                        Some(&reason),
+                        generation,
+                        before_dispatch,
+                    ) {
+                        Err(error)
+                            if !error.review_denied()
+                                && matches!(generation, Generation::Analysis { .. }) =>
+                        {
+                            Err(AttemptError::Invalid(reason))
+                        }
+                        repaired => repaired,
+                    }
+                }
+                error => Err(error),
+            })
         });
     if !client.active() {
         return Err("The diagram request was cancelled".into());
     }
     match result {
         Ok(chart) => Ok(chart),
-        Err(error) if family == Family::Flowchart => {
+        Err(error) if family == Family::Flowchart && !error.review_denied() => {
             let local = if matches!(generation, Generation::Analysis { project: true }) {
                 analysis_flow::project_outline(script)
             } else {
@@ -421,6 +459,10 @@ enum AttemptError {
 }
 
 impl AttemptError {
+    fn review_denied(&self) -> bool {
+        matches!(self, Self::Chat(local_ai::Error::Review(_)))
+    }
+
     fn message(self) -> String {
         match self {
             Self::Input(reason) => reason,
@@ -437,11 +479,12 @@ fn attempt(
     guidance: &str,
     correction: Option<&str>,
     generation: Generation,
+    before_dispatch: &impl Fn() -> Result<(), String>,
 ) -> Result<Chart, AttemptError> {
     let (system, input) = prompts(family, source, guidance, correction, generation);
     let system = client.render_system_prompt(&system);
     let content = client
-        .complete(&system, &input.to_string())
+        .complete_guarded(&system, &input.to_string(), before_dispatch)
         .map_err(|error| match error {
             local_ai::Error::Invalid(reason) => AttemptError::Invalid(reason.into()),
             error => AttemptError::Chat(error),
@@ -648,7 +691,7 @@ mod tests {
         let request = AnalysisFlowchartRequest::new(Arc::from(SCRIPT), false).unwrap();
         let system = request.system().to_owned();
         let input = request.input().to_owned();
-        let pending = request.start(profile).unwrap();
+        let pending = request.start(profile, || Ok(())).unwrap();
         let chart = pending.reply.recv_blocking().unwrap().unwrap();
         assert!(!chart.is_fallback());
         let calls = fixture.join().unwrap();
@@ -658,6 +701,31 @@ mod tests {
             serde_json::from_str(calls[1]["messages"][1]["content"].as_str().unwrap()).unwrap();
         assert!(retry["correctPreviousError"].as_str().is_some());
         assert!(retry.get("skillGuidance").is_none());
+    }
+
+    #[test]
+    fn analysis_flowchart_rechecks_the_profile_before_repair() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let _exclusive = crate::local_ai::test_support::exclusive_run();
+        let (profile, fixture) =
+            start_test_double(vec![fixture_response("200 OK", "", "invalid JSON")]);
+        let request = AnalysisFlowchartRequest::new(Arc::from(SCRIPT), false).unwrap();
+        let calls = AtomicUsize::new(0);
+        let pending = request
+            .start(profile, move || {
+                if calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                    Ok(())
+                } else {
+                    Err("The saved profile changed.".into())
+                }
+            })
+            .unwrap();
+        let Err(error) = pending.reply.recv_blocking().unwrap() else {
+            panic!("a revoked request must not prepare or save a chart");
+        };
+        assert!(error.contains("The saved profile changed."));
+        assert_eq!(fixture.join().unwrap().len(), 1);
     }
 
     #[test]

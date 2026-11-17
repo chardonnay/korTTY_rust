@@ -1324,6 +1324,81 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a private HTTPS journal fixture and its dedicated CA"]
+    fn server_selected_journal_summary_omits_model_and_keeps_evidence_masked() {
+        check_server_selected_journal_summary(false);
+    }
+
+    #[test]
+    #[ignore = "requires a private HTTPS journal fixture and its dedicated CA"]
+    fn loopback_tls_journal_summary_omits_model_and_keeps_evidence_masked() {
+        check_server_selected_journal_summary(true);
+    }
+
+    fn check_server_selected_journal_summary(loopback: bool) {
+        use crate::local_ai::{ProfileOptions, RemoteProtocol, test_support::exclusive_run};
+        use crate::session_journal::{CaptureKind, CaptureRecord, summary_plan::Planner};
+
+        let _exclusive = exclusive_run();
+        let endpoint = std::env::var("KORTTY_TEST_HTTPS_APPLY_URL").unwrap();
+        let url = url::Url::parse(&endpoint).unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.path(), "/v1/chat/completions");
+        let ca =
+            std::fs::read(std::env::var_os("KORTTY_TEST_HTTPS_APPLY_CA_DER").unwrap()).unwrap();
+        let options = ProfileOptions {
+            credential_env: Some("KORTTY_TEST_HTTPS_APPLY_KEY".into()),
+            ..ProfileOptions::default()
+        };
+        let profile = if loopback {
+            Profile::lm_studio_with_server_default(&endpoint, options, false)
+        } else {
+            Profile::openai_with_server_default(&endpoint, RemoteProtocol::OpenAiExact, options)
+        }
+        .unwrap();
+        assert!(Run::begin(profile.clone()).is_err());
+        let approved = std::sync::Arc::new(AtomicBool::new(true));
+        let current = approved.clone();
+        let (mut run, _cancel) = Run::begin_reviewed_https(profile, move || {
+            current
+                .load(Ordering::Relaxed)
+                .then_some(())
+                .ok_or_else(|| "The summary approval was revoked.".into())
+        })
+        .unwrap();
+        run.session.trust_test_server(&ca).unwrap();
+        run.startup_preflight(&|| Ok(())).unwrap();
+        let time = jiff::Timestamp::from_second(1).unwrap();
+        let mut planner = Planner::resume(0);
+        let _ = planner.push(CaptureRecord {
+            sequence: 1,
+            timestamp: time,
+            kind: CaptureKind::Output,
+            text: "build.sh exited 2, token=private-test-token".into(),
+            redacted: false,
+            partial: false,
+            repeat: 1,
+        });
+        let windows = planner.finish_pass(true, true, time);
+        let mask = |text: &str| Ok(text.replace("private-test-token", "***"));
+        let card = run
+            .window(&windows[0], &mask, &mut Reporter::default())
+            .result
+            .unwrap();
+        assert_eq!(card.output, ["build.sh exited 2, token=***"]);
+        assert_eq!(card.summary.keywords, ["build.sh"]);
+        approved.store(false, Ordering::Relaxed);
+        assert_eq!(
+            run.window(&windows[0], &mask, &mut Reporter::default())
+                .result
+                .err()
+                .unwrap()
+                .kind(),
+            io::ErrorKind::PermissionDenied,
+        );
+    }
+
+    #[test]
     #[ignore = "requires the synthetic loopback HTTPS provider fixture and its private CA"]
     fn journal_summary_https_transmits_masked_windows_and_title_and_stops_after_revocation() {
         use std::sync::Arc;

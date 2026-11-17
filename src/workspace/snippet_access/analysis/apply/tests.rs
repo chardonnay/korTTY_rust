@@ -67,6 +67,119 @@ fn interrupted_apply_reviews_completed_changes_locally_and_preserves_partial_aft
 }
 
 #[test]
+fn https_apply_reviews_the_exact_source_and_stops_after_vault_revocation() {
+    use kortty_vault::{CredentialInput, Secret, Vault};
+
+    let scratch = Profile::new();
+    let root = scratch.0.canonicalize().unwrap();
+    let source = "echo fixture\n";
+    let mut library = Library::open(scratch.path()).unwrap();
+    let snippet = library
+        .save(
+            None,
+            Input {
+                name: "HTTPS apply fixture".into(),
+                language: "bash".into(),
+                category: String::new(),
+                content: source.into(),
+            },
+        )
+        .unwrap();
+    let subject = Subject::Snippet(snippet);
+    let window = SnippetWindow::open(scratch.path()).unwrap();
+    let history = store(&window).unwrap();
+    let pre = Record::new(
+        Purpose::Analysis,
+        None,
+        Source::new(source, "bash", "en", "en", "HTTPS apply fixture").unwrap(),
+        Provenance {
+            profile_id: ProfileRef::Numeric(7),
+            ..Provenance::default()
+        },
+        Analysis {
+            improvements: vec![Finding {
+                id: "I1".into(),
+                title: "Improve the command".into(),
+                ..Finding::default()
+            }],
+            ..Analysis::default()
+        },
+    )
+    .unwrap();
+    let pre_id = pre.id;
+    history.append(subject, pre).unwrap();
+    let (listener, _) = listener();
+    let endpoint = format!("https://{}/v1", listener.local_addr().unwrap());
+    let profile: Configuration = serde_json::from_value(json!({
+        "profiles": {"profiles": [{"id": 7, "name": "HTTPS apply", "endpoint": endpoint,
+            "connection_mode": "remote-open-ai", "model": "", "model_mode": "server-default",
+            "trusted_remote_endpoint": true}], "last_id": 7}
+    }))
+    .unwrap();
+    profile
+        .save_fixture_at(&root, &Configuration::default())
+        .unwrap();
+    let secret = r#"protected "quoted" value"#;
+    let path = root.join("fixture-vault");
+    let mut vault = Vault::create(&path, b"https-apply-vault-fixture").unwrap();
+    vault
+        .save(
+            CredentialInput {
+                label: "Fixture".into(),
+                ..CredentialInput::default()
+            },
+            Secret::new(secret.into()),
+        )
+        .unwrap();
+    let mut workspace = Workspace {
+        vault: Some(VaultWindow::with_unlocked_fixture(path, vault)),
+        ..Workspace::default()
+    };
+    workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
+    let (owner, _) = workspace.open_window(false);
+    let (id, _) = workspace.install_snippet_surface(owner, window, true);
+    let _ = workspace.update_snippets(id, SnippetMessage::Open(snippet));
+    let load = workspace.open_snippet_analysis(id, subject);
+    let _ = complete(&mut workspace, load);
+    let update = |workspace: &mut Workspace, action| {
+        workspace.update_snippet_analysis(id, super::super::Action::Apply(action))
+    };
+    let _ = update(&mut workspace, Action::AllFindings(pre_id, true));
+    let _ = update(&mut workspace, Action::Plan(pre_id, false));
+    let page = workspace.snippets[&id].analysis.page(subject).unwrap();
+    let State::ApplyPreview(preview) = &page.state else {
+        panic!("expected an HTTPS source review: {:?}", page.status);
+    };
+    assert!(preview.approval.profile.server_selected);
+    assert!(preview.prompt.contains(source.trim_end()));
+    let review = preview.approval.https.as_ref().unwrap();
+    let escaped = serde_json::to_string(secret).unwrap();
+    assert!(!escaped.contains(secret));
+    assert!(review.check_payload(&escaped).is_err());
+    assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    workspace.vault_change_revision = Arc::new(());
+    let worker = update(&mut workspace, Action::Approve);
+    let _ = complete(&mut workspace, worker);
+    let page = workspace.snippets[&id].analysis.page(subject).unwrap();
+    assert!(
+        page.status
+            .as_deref()
+            .unwrap()
+            .contains("masking policy changed")
+    );
+    assert_eq!(listener.accept().unwrap_err().kind(), ErrorKind::WouldBlock);
+    assert!(
+        history
+            .load(subject)
+            .unwrap()
+            .current()
+            .unwrap()
+            .apply_recovery
+            .is_none()
+    );
+}
+
+#[test]
 fn zero_retention_keeps_one_live_apply_review_and_accepts_only_its_exact_code() {
     let _exclusive = exclusive_run();
     let profile = Profile::new();
@@ -116,10 +229,15 @@ fn zero_retention_keeps_one_live_apply_review_and_accepts_only_its_exact_code() 
     history.append(subject, pre).unwrap();
     let (listener, _) = listener();
     let endpoint = listener.local_addr().unwrap().to_string();
+    let root = profile.0.canonicalize().unwrap();
+    let config: Configuration = serde_json::from_value(json!({
+        "profiles": {"profiles": [{"id": 7, "name": "Local", "model": "", "model_mode": "server-default", "endpoint": endpoint}], "last_id": 7}
+    })).unwrap();
+    config
+        .save_fixture_at(&root, &Configuration::default())
+        .unwrap();
     let mut workspace = Workspace::default();
-    workspace.set_test_ai_configuration(serde_json::from_value(json!({
-        "profiles": {"profiles": [{"id": 7, "name": "Local", "model": "fixture", "endpoint": endpoint}], "default": 7, "last_id": 7}
-    })).unwrap());
+    workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
     let (owner, _) = workspace.open_window(false);
     let (id, _) = workspace.install_snippet_surface(owner, window, true);
     let _ = workspace.update_snippets(id, SnippetMessage::Open(snippet));
@@ -148,6 +266,7 @@ fn zero_retention_keeps_one_live_apply_review_and_accepts_only_its_exact_code() 
         panic!("Expected the reviewed provider request: {:?}", page.status);
     };
     assert!(preview.prompt.contains(before.trim_end()));
+    assert!(preview.approval.profile.server_selected);
     let worker = update(&mut workspace, Action::Approve);
     let page = workspace.snippets[&id].analysis.page(subject).unwrap();
     assert!(
@@ -158,6 +277,7 @@ fn zero_retention_keeps_one_live_apply_review_and_accepts_only_its_exact_code() 
     let provider = thread::spawn(move || {
         let mut socket = accept(&listener);
         let sent = request(&mut socket);
+        assert!(sent.get("model").is_none());
         assert!(
             sent["messages"][1]["content"]
                 .as_str()

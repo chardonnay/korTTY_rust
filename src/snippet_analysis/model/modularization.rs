@@ -26,6 +26,8 @@ pub(crate) struct Job {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) outbound: Option<OutboundBinding>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) local_profile_revision: Option<[u8; 32]>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) generation: Option<Generation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) publication: Option<Publication>,
@@ -109,6 +111,12 @@ impl Job {
                     .is_some_and(|generation| generation.profile_id != binding.profile_id)
         }) {
             return Err("The stored modularization destination is invalid.".into());
+        }
+        if self
+            .local_profile_revision
+            .is_some_and(|revision| revision == [0; 32] || self.outbound.is_some())
+        {
+            return Err("The stored local modularization profile is invalid.".into());
         }
         if let Some(generation) = &self.generation {
             if !self.plan.recommended

@@ -132,13 +132,34 @@ impl Tree {
         moved: bool,
         stopped: &impl Fn() -> bool,
     ) -> io::Result<(Self, Inventory)> {
+        self.recapture_with(directory, stopped, |before, after| {
+            if moved {
+                before.same_after_move(after)
+            } else {
+                before == after
+            }
+        })
+    }
+
+    pub(super) fn recapture_first_publication(
+        &self,
+        directory: &Directory,
+    ) -> io::Result<(Self, Inventory)> {
+        self.recapture_with(
+            directory,
+            &|| false,
+            ReviewedStamp::same_after_first_publication,
+        )
+    }
+
+    fn recapture_with(
+        &self,
+        directory: &Directory,
+        stopped: &impl Fn() -> bool,
+        root_matches: impl FnOnce(&ReviewedStamp, &ReviewedStamp) -> bool,
+    ) -> io::Result<(Self, Inventory)> {
         let (current, inventory) = Self::capture(directory, self.stamp.volume(), stopped)?;
-        let root_matches = if moved {
-            self.stamp.same_after_move(&current.stamp)
-        } else {
-            self.stamp == current.stamp
-        };
-        if root_matches && self.children == current.children {
+        if root_matches(&self.stamp, &current.stamp) && self.children == current.children {
             Ok((current, inventory))
         } else {
             Err(changed())
@@ -300,7 +321,7 @@ fn copy_file(
 pub(super) fn compose(
     destination: &Directory,
     created: &mut CreatedTree,
-    original: View<'_>,
+    original: Option<View<'_>>,
     incoming: View<'_>,
     delete: &DeleteScope,
     stopped: &impl Fn() -> bool,
@@ -310,7 +331,7 @@ pub(super) fn compose(
         delete,
         stopped,
     };
-    writer.directory(destination, created, Some(original), Some(incoming), "")?;
+    writer.directory(destination, created, original, Some(incoming), "")?;
     Ok(writer.manifest.finish())
 }
 

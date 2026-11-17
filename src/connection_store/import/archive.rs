@@ -176,5 +176,5 @@ fn read_zip(
             "the connection ZIP member does not match its declared size",
         ));
     }
-    Preview::parse_bytes(format, &content).map(ReadOutcome::Preview)
+    Preview::parse_bytes(format, &content).map(|preview| ReadOutcome::Preview(Box::new(preview)))
 }

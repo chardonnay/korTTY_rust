@@ -20,6 +20,7 @@ use crate::ssh_key_catalog::{Catalog, ManagedAddition, PreparedManagedAdditions}
 
 #[derive(Default)]
 pub(super) struct Prepared {
+    pub(super) highlight_bindings: Option<[u8; 32]>,
     pub(super) vault: Option<PreparedAdditions>,
     pub(super) connections: Option<Connections>,
     pub(super) keys: Option<ManagedKeys>,
@@ -35,6 +36,7 @@ pub(super) struct Connections {
     pub(super) contents: Zeroizing<Vec<u8>>,
     pub(super) routes: BTreeMap<String, JavaImportedRoute>,
     pub(super) memory_ids: BTreeMap<String, u64>,
+    pub(super) profile_ids: BTreeMap<String, u64>,
     pub(super) groups: JavaSourceGroups,
 }
 
@@ -210,17 +212,19 @@ pub(super) fn prepare(
         .enumerate()
         .map(|(index, identity)| (index, identity.id))
         .collect();
-    let (contents, routes, memory_ids, groups) = if needs_route_lineage {
+    let (contents, routes, memory_ids, profile_ids, groups) = if needs_route_lineage {
         let import = routes.bind_with_routes(&password_ids, &key_ids, policy.server_access())?;
         (
             import.contents,
             import.routes,
             import.memory_ids,
+            import.profile_ids,
             import.groups,
         )
     } else {
         (
             routes.bind(&password_ids, &key_ids)?,
+            BTreeMap::new(),
             BTreeMap::new(),
             BTreeMap::new(),
             JavaSourceGroups::default(),
@@ -231,6 +235,7 @@ pub(super) fn prepare(
         contents: Zeroizing::new(bytes),
         routes,
         memory_ids,
+        profile_ids,
         groups,
     });
     if connections.as_ref().is_some_and(|connections| {
@@ -242,6 +247,7 @@ pub(super) fn prepare(
     }
     Ok(Review {
         prepared: (vault.is_some() || keys.is_some()).then_some(Prepared {
+            highlight_bindings: None,
             vault,
             connections,
             keys,

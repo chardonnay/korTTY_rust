@@ -520,22 +520,34 @@ impl Answering {
         let mut preview = live::reporter(&review.citations, emit);
         let [system, prompt] = review.answer_messages();
         let mut request = |response_format| {
-            let reply = client.stream_structured(
-                system,
-                prompt,
-                response_format,
-                Some(deadline),
-                || {
-                    review
-                        .verify(&cancelled)
-                        .map_err(|error| error.to_string())?;
-                    if let Some(authority) = https {
-                        authority.authorize()?;
-                    }
-                    check_cancel(&cancelled).map_err(|error| error.to_string())
-                },
-                &mut preview,
-            );
+            let authorize = || {
+                review
+                    .verify(&cancelled)
+                    .map_err(|error| error.to_string())?;
+                if let Some(authority) = https {
+                    authority.authorize()?;
+                }
+                check_cancel(&cancelled).map_err(|error| error.to_string())
+            };
+            let reply = if let Some(authority) = https {
+                client.stream_reviewed_structured_before(
+                    [system, prompt],
+                    response_format,
+                    deadline,
+                    authority.completion_secret(),
+                    authorize,
+                    &mut preview,
+                )
+            } else {
+                client.stream_structured(
+                    system,
+                    prompt,
+                    response_format,
+                    Some(deadline),
+                    authorize,
+                    &mut preview,
+                )
+            };
             ObservedUsage::accumulate(usage, ObservedUsage::from_completion(client, reply.is_ok()));
             reply
         };

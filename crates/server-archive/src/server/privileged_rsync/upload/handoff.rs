@@ -92,10 +92,13 @@ impl<'a> Handoff<'a> {
         target: &Directory,
         directory: bool,
         expected: Inventory,
+        permit: &impl Fn() -> io::Result<()>,
     ) -> io::Result<()> {
         self.require_current()?;
+        permit()?;
         let mut copy = CopyTree {
             rules: self.rules,
+            permit,
             mount: self.mount,
             manifest: Manifest::default(),
             limit: expected,
@@ -120,6 +123,7 @@ impl<'a> Handoff<'a> {
             return Err(changed());
         }
         self.require_current()?;
+        permit()?;
         self.rules.require_current()
     }
 
@@ -163,6 +167,7 @@ impl Drop for Handoff<'_> {
 
 struct CopyTree<'a> {
     rules: &'a Rules,
+    permit: &'a dyn Fn() -> io::Result<()>,
     mount: u64,
     manifest: Manifest,
     limit: Inventory,
@@ -176,6 +181,7 @@ impl CopyTree<'_> {
     fn checkpoint(&mut self) -> io::Result<()> {
         if self.checked.elapsed() >= Duration::from_millis(250) {
             self.rules.require_current()?;
+            (self.permit)()?;
             self.checked = Instant::now();
         }
         Ok(())
@@ -210,6 +216,7 @@ impl CopyTree<'_> {
                     if !same_node(&source_directory.stat, &stat) {
                         return Err(changed());
                     }
+                    (self.permit)()?;
                     mkdirat(&target.fd, name.as_str(), PRIVATE_DIRECTORY)?;
                     let target_directory = target.child(&name)?;
                     self.directory(&source_directory, &target_directory, &relative, depth + 1)?;
@@ -260,6 +267,7 @@ impl CopyTree<'_> {
         if Stamp::of(&input.metadata()?) != before {
             return Err(changed());
         }
+        (self.permit)()?;
         let mut output = File::from(openat(
             &target.fd,
             target_name,

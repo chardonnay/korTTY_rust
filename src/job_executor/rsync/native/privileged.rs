@@ -7,13 +7,13 @@ use kortty_server_archive::privileged_rsync::{
     Decision, Operation, Reply, Request, Review, SourceLimits, Spec,
 };
 use kortty_server_archive::rsync_tree::{
-    self as tree_protocol, DeleteScope, ExistingTree, Inventory, projection,
+    self as tree_protocol, ExistingTree, Inventory, projection,
 };
 
+use crate::job_executor::rsync::UploadCreation;
 use crate::scheduler_window::RemotePath;
-use crate::sftp_window::{
-    LocalSource, PrivateTreeDestination, PrivateTreePublishError, scheduled::Client,
-};
+use crate::scheduler_window::rsync::standing::RemoteVacancy;
+use crate::sftp_window::{PrivateTreeDestination, PrivateTreePublishError, scheduled::Client};
 
 use super::{upload_tree::Helper, upload_tree::PhasePermission, *};
 
@@ -27,12 +27,27 @@ pub(in crate::job_executor::rsync) fn review(
     cancelled: impl Fn() -> bool + Clone + Send + Sync + 'static,
     guard: ExecutionGuard,
 ) -> Result<Review, Failure> {
+    review_destination(exec, spec, cancelled, guard, None)
+}
+
+pub(in crate::job_executor::rsync) fn review_destination(
+    exec: &ExecOpener,
+    spec: &Spec,
+    cancelled: impl Fn() -> bool + Clone + Send + Sync + 'static,
+    guard: ExecutionGuard,
+    creation: Option<UploadCreation>,
+) -> Result<Review, Failure> {
     if !spec.valid() {
         return Err(review_required());
     }
     let mut control = Control::open(exec, cancelled.clone(), guard)?;
-    control.request(&Request::Review { spec: spec.clone() }, &cancelled)?;
-    control.reviewed(spec, &cancelled)
+    let request = match creation {
+        Some(UploadCreation::File) => Request::ReviewRecurringFileUpload { spec: spec.clone() },
+        Some(UploadCreation::Tree) => Request::ReviewRecurringTreeUpload { spec: spec.clone() },
+        None => Request::Review { spec: spec.clone() },
+    };
+    control.request(&request, &cancelled)?;
+    control.reviewed(spec, creation, &cancelled)
 }
 
 pub(super) fn review_source(
@@ -81,7 +96,7 @@ pub(super) fn run(
     if upload {
         let limits = context
             .recurring
-            .map(recurring::Route::source_limits)
+            .map(|route| route.source_limits(0))
             .transpose()?;
         let (temp, listener, endpoint) = stage_bridge(context, stopped)?;
         let transfer = context.transfer(action, &temp, stopped);
@@ -91,10 +106,10 @@ pub(super) fn run(
                 tree_protocol::Manifest::bounded(limits.entries, limits.bytes),
             )?,
             (true, None) => upload_tree::stage_input(&transfer)?,
-            (false, _) => stage_file(&transfer, limits)?,
+            (false, _) => upload::stage_file(&transfer, limits)?,
         };
         if let Some(route) = context.recurring {
-            route.reserve([incoming])?;
+            route.reserve([incoming], 0)?;
         }
         Control::from_context(context)?.upload_staged(
             transfer,
@@ -107,47 +122,13 @@ pub(super) fn run(
             },
             id,
         )
-    } else if !action.directory && action.existing_download.is_some() {
+    } else if !action.directory
+        && (action.existing_download.is_some() || action.uses_reviewed_file_creation(false))
+    {
         local_file::run(client, context, action, Some(approved), id, stopped)
     } else {
         download(client, context, action, approved, id, stopped)
     }
-}
-
-fn stage_file<C: Fn() -> bool>(
-    transfer: &Transfer<'_, C>,
-    limits: Option<SourceLimits>,
-) -> Result<Inventory, Failure> {
-    let action = transfer.action;
-    let review = action
-        .approval
-        .as_ref()
-        .and_then(|approval| approval.upload.as_ref())
-        .ok_or_else(review_required)?;
-    let source = LocalSource::open(&action.local).map_err(|_| review_required())?;
-    if limits.is_some_and(|limits| limits.entries == 0 || source.size() > limits.bytes) {
-        return Err(Failure::blocked(
-            "The recurring rsync source exceeds the firing limits.",
-        ));
-    }
-    let staged = transfer
-        .temp
-        .directory()
-        .and_then(|stage| stage.create_file(OsStr::new(PAYLOAD)))
-        .map_err(|_| Failure::failed(CHECK_FAILED))?;
-    let (bytes, digest) = upload::copy_reviewed(&source, &staged, transfer.stopped)
-        .map_err(|_| Failure::failed(CHECK_FAILED))?;
-    if limits.is_none() && (bytes, digest) != (review.bytes, review.digest) {
-        return Err(review_required());
-    }
-    staged
-        .sync_all()
-        .map_err(|_| Failure::failed(CHECK_FAILED))?;
-    let mut manifest = tree_protocol::Manifest::default();
-    manifest
-        .add("", Some((bytes, digest)))
-        .map_err(|_| Failure::failed(CHECK_FAILED))?;
-    Ok(manifest.finish())
 }
 
 fn download(
@@ -158,35 +139,33 @@ fn download(
     id: RunId,
     stopped: &impl Fn() -> bool,
 ) -> Result<Completion, Failure> {
-    let existing = action
-        .approval
-        .as_ref()
-        .and_then(|approval| approval.existing_download.as_deref());
-    let receiver = existing
-        .map(|existing| {
-            action
-                .require_safe_existing_local_program()
-                .map_err(Failure::blocked)?;
-            let snapshot = match context.recurring {
-                Some(route) => route.local(&existing.destination)?,
-                None => existing.snapshot,
-            };
-            local_existing::Receiver::prepare(&existing.destination, snapshot, stopped)
-                .map_err(|_| unavailable_destination())
+    let receiver = (action.directory && action.existing_download.is_some())
+        .then(|| {
+            let parents = context.local_parents()?;
+            local_existing::DirectDownload::prepare(action, context.recurring, &parents, stopped)
         })
         .transpose()?;
     let fresh;
     let approved = if let Some(route) = context.recurring {
-        if receiver.is_none() {
-            return Err(unavailable_destination());
-        }
-        (fresh, _) = fresh_source(context, approved, route.source_limits()?, stopped)?;
-        route.reserve([fresh.inventory.ok_or_else(review_required)?])?;
+        let parent_entries = receiver
+            .as_ref()
+            .ok_or_else(unavailable_destination)?
+            .missing_parent_count();
+        (fresh, _) = fresh_source(
+            context,
+            approved,
+            route.source_limits(parent_entries)?,
+            stopped,
+        )?;
+        route.reserve(
+            [fresh.inventory.ok_or_else(review_required)?],
+            parent_entries,
+        )?;
         &fresh
     } else {
         approved
     };
-    let vacant = (action.directory && existing.is_none())
+    let vacant = (action.directory && receiver.is_none())
         .then(|| PrivateTreeDestination::inspect(&action.local))
         .transpose()
         .map_err(|_| unavailable_destination())?;
@@ -212,7 +191,7 @@ fn download(
         stage
             .publish(|| stopped() || authorize().is_err())
             .map_err(|_| Failure::failed("Could not publish the privileged rsync download."))?;
-    } else if let (Some(existing), Some(receiver)) = (existing, receiver) {
+    } else if let Some(receiver) = receiver {
         let (incoming, _) = tree::receive_existing(
             client,
             transfer,
@@ -222,33 +201,9 @@ fn download(
             Some(scanned),
         )?;
         control.finish_read(expected, stopped)?;
-        let published = receiver.publish(
-            local_existing::Incoming {
-                directory: &incoming,
-                inventory: expected,
-                delete: &if existing.settings.delete {
-                    DeleteScope::All
-                } else {
-                    DeleteScope::Retain
-                },
-            },
-            stopped,
-            &authorize,
-            id,
-            |removed| context.recurring.map_or(Ok(()), |route| route.arm(removed)),
-        )?;
-        return Ok(match context.recurring {
-            Some(route) => route.confirm(
-                published.completion,
-                published
-                    .successor
-                    .map(|snapshot| rsync::standing::Receiver::Local {
-                        destination: existing.destination.clone(),
-                        snapshot,
-                    }),
-            ),
-            None => published.completion,
-        });
+        let (completion, created) =
+            receiver.publish(&incoming, expected, stopped, &authorize, id)?;
+        return Ok(context.record_local_parents(completion, created));
     } else {
         let stage = vacant
             .ok_or_else(unavailable_destination)?
@@ -323,10 +278,19 @@ impl Control {
             .map_err(|_| review_required())
     }
 
-    fn reviewed(&mut self, spec: &Spec, stopped: &impl Fn() -> bool) -> Result<Review, Failure> {
+    fn reviewed(
+        &mut self,
+        spec: &Spec,
+        creation: Option<UploadCreation>,
+        stopped: &impl Fn() -> bool,
+    ) -> Result<Review, Failure> {
         match self.helper.receive_privileged(stopped) {
             Ok(Reply::Reviewed { review })
-                if &review.spec == spec && review.valid() && (self.permitted)() =>
+                if &review.spec == spec
+                    && review.valid()
+                    && (!review.first_file || creation == Some(UploadCreation::File))
+                    && (!review.first_tree || creation == Some(UploadCreation::Tree))
+                    && (self.permitted)() =>
             {
                 Ok(review)
             }
@@ -354,7 +318,7 @@ impl Control {
             ),
         };
         self.request(&request, stopped)?;
-        let review = self.reviewed(spec, stopped)?;
+        let review = self.reviewed(spec, None, stopped)?;
         let expected = review.inventory.ok_or_else(review_required)?;
         if !limits.contains(expected)
             || recurring.is_some_and(|(approved, _)| {
@@ -464,23 +428,42 @@ impl Control {
         id: RunId,
     ) -> Result<Completion, Failure> {
         let stopped = transfer.stopped;
+        if (approved.first_file && !transfer.action.allow_vacant_server_file_upload)
+            || (approved.first_tree && !transfer.action.allow_vacant_server_tree_upload)
+        {
+            return Err(review_required());
+        }
         let destination =
             RemotePath::try_from(approved.spec.path.clone()).map_err(Failure::blocked)?;
         let mut review = Cow::Borrowed(approved);
-        let request = if let Some(route) = route {
-            let snapshot = route.remote(&destination)?;
-            let review = review.to_mut();
-            review.inventory = Some(snapshot.inventory);
-            review.fingerprint = snapshot.fingerprint;
-            Request::PrepareRecurring {
-                review: review.clone(),
-                incoming,
+        let request = match route
+            .map(|route| route.remote_upload(&destination, first_vacancy(approved)))
+            .transpose()?
+        {
+            Some(recurring::RemoteUpload::Existing(snapshot)) => {
+                let review = review.to_mut();
+                review.first_file = false;
+                review.first_tree = false;
+                review.inventory = Some(snapshot.inventory);
+                review.fingerprint = snapshot.fingerprint;
+                Request::PrepareRecurring {
+                    review: review.clone(),
+                    incoming,
+                }
             }
-        } else {
-            Request::Prepare {
+            Some(recurring::RemoteUpload::VacantFile) => Request::PrepareFirstRecurringFileUpload {
+                review: approved.clone(),
+                incoming,
+            },
+            Some(recurring::RemoteUpload::VacantTree) => Request::PrepareFirstRecurringTreeUpload {
+                review: approved.clone(),
+                incoming,
+            },
+            None if first_vacancy(approved).is_none() => Request::Prepare {
                 review: approved.clone(),
                 incoming: Some(incoming),
-            }
+            },
+            None => return Err(review_required()),
         };
         let path = self.prepare(&review, request, stopped)?;
         transfer.run_checked(
@@ -507,15 +490,16 @@ impl Control {
         }
         let (completion, successor) =
             self.publish(&review, candidate, id, route.is_some(), stopped);
-        Ok(match route {
-            Some(route) => route.confirm(
-                completion,
-                successor.map(|snapshot| rsync::standing::Receiver::Remote {
-                    destination,
-                    snapshot,
-                }),
-            ),
-            None => completion,
+        let receiver = successor.map(|snapshot| rsync::standing::Receiver::Remote {
+            destination,
+            snapshot,
+        });
+        Ok(match (route, first_vacancy(&review)) {
+            (Some(route), Some(vacancy)) => {
+                route.confirm_first_remote(completion, receiver, vacancy)
+            }
+            (Some(route), None) => route.confirm(completion, receiver),
+            (None, _) => completion,
         })
     }
 
@@ -534,13 +518,16 @@ impl Control {
             recovery: None,
             published: false,
             recurring,
+            vacancy: first_vacancy(review),
             successor: None,
         };
         let attempt = (|| {
-            if matches!(
-                review.spec.operation,
-                Operation::Upload { replace: true, .. }
-            ) {
+            if receipt.vacancy.is_none()
+                && matches!(
+                    review.spec.operation,
+                    Operation::Upload { replace: true, .. }
+                )
+            {
                 match self.phase(&Decision::Quarantine, stopped)? {
                     Reply::Quarantined { recovery } if valid_recovery(destination, &recovery) => {
                         receipt.recovery = Some(recovery)
@@ -576,6 +563,7 @@ struct Receipt<'a> {
     recovery: Option<String>,
     published: bool,
     recurring: bool,
+    vacancy: Option<RemoteVacancy>,
     successor: Option<ExistingTree>,
 }
 
@@ -583,7 +571,9 @@ impl Receipt<'_> {
     fn observe(&mut self, reply: Reply, id: RunId) -> Option<Completion> {
         match reply {
             Reply::Quarantined { recovery }
-                if self.recovery.is_none() && valid_recovery(self.destination, &recovery) =>
+                if self.vacancy.is_none()
+                    && self.recovery.is_none()
+                    && valid_recovery(self.destination, &recovery) =>
             {
                 self.recovery = Some(recovery);
                 None
@@ -605,6 +595,7 @@ impl Receipt<'_> {
                 receiver,
                 recovery,
             } if self.recurring
+                && self.vacancy.is_none()
                 && self.published
                 && destination == self.destination
                 && receiver.inventory == self.candidate
@@ -613,6 +604,16 @@ impl Receipt<'_> {
                 self.successor = Some(receiver);
                 Some(self.complete(id))
             }
+            Reply::FirstRecurringFilePublished {
+                destination,
+                vacancy,
+                receiver,
+            } => self.observe_first(&destination, RemoteVacancy::File(vacancy), receiver, id),
+            Reply::FirstRecurringTreePublished {
+                destination,
+                vacancy,
+                receiver,
+            } => self.observe_first(&destination, RemoteVacancy::Tree(vacancy), receiver, id),
             Reply::Aborted
             | Reply::Failed {
                 outcome_unknown: false,
@@ -639,6 +640,27 @@ impl Receipt<'_> {
             }
             _ => None,
         }
+    }
+
+    fn observe_first(
+        &mut self,
+        destination: &str,
+        vacancy: RemoteVacancy,
+        receiver: ExistingTree,
+        id: RunId,
+    ) -> Option<Completion> {
+        if self.recurring
+            && self.published
+            && destination == self.destination
+            && Some(vacancy) == self.vacancy
+            && self.recovery.is_none()
+            && receiver.inventory == self.candidate
+            && receiver.fingerprint != [0; 32]
+        {
+            self.successor = Some(receiver);
+            return Some(self.complete(id));
+        }
+        None
     }
 
     fn complete(&self, id: RunId) -> Completion {
@@ -672,6 +694,9 @@ fn checked_candidate(
     candidate: Inventory,
     removed: u32,
 ) -> bool {
+    if review.first_tree {
+        return incoming == candidate && removed == 0;
+    }
     match review.spec.operation {
         Operation::Upload {
             directory: true,
@@ -684,6 +709,16 @@ fn checked_candidate(
         }),
         Operation::Upload { .. } => incoming == candidate && removed == 0,
         Operation::Download { .. } => false,
+    }
+}
+
+fn first_vacancy(review: &Review) -> Option<RemoteVacancy> {
+    if review.first_file {
+        Some(RemoteVacancy::File(review.fingerprint))
+    } else if review.first_tree {
+        Some(RemoteVacancy::Tree(review.fingerprint))
+    } else {
+        None
     }
 }
 
@@ -714,6 +749,7 @@ fn success(id: RunId, detail: String) -> Completion {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kortty_server_archive::rsync_tree::DeleteScope;
 
     #[test]
     fn existing_privileged_file_candidate_binds_the_exact_new_content() {
@@ -737,6 +773,8 @@ mod tests {
             fingerprint: [0; 32],
             inventory: Some(original),
             handoff: "/handoff/login".into(),
+            first_file: false,
+            first_tree: false,
         };
         assert!(checked_candidate(&review, incoming, incoming, 0));
         assert!(!checked_candidate(&review, incoming, original, 0));
@@ -755,6 +793,7 @@ mod tests {
             recovery: None,
             published: false,
             recurring: false,
+            vacancy: None,
             successor: None,
         };
         let reply = |name: &str, recovery: Option<&str>| Reply::Published {
@@ -817,6 +856,7 @@ mod tests {
             recovery: Some(recovery.into()),
             published: false,
             recurring: true,
+            vacancy: None,
             successor: None,
         };
         let receiver = ExistingTree {
@@ -844,6 +884,86 @@ mod tests {
         );
         assert_eq!(
             receipt.observe(reply(), id).unwrap().outcome,
+            RunOutcome::Success
+        );
+        assert_eq!(receipt.successor, Some(receiver));
+    }
+
+    #[test]
+    fn first_recurring_file_receipt_requires_the_approved_vacancy_and_exact_successor() {
+        let id: RunId = serde_json::from_str("1").unwrap();
+        let mut manifest = tree_protocol::Manifest::default();
+        manifest.add("", Some((8, [7; 32]))).unwrap();
+        let candidate = manifest.finish();
+        let destination = "/protected/receiver";
+        let recovery = "/protected/.kortty-00000000000000000000000000000000.kortty-part/original";
+        let vacancy = [4; 32];
+        let receiver = ExistingTree {
+            inventory: candidate,
+            fingerprint: [9; 32],
+        };
+        let reply = |path: &str, vacancy, receiver| Reply::FirstRecurringFilePublished {
+            destination: path.into(),
+            vacancy,
+            receiver,
+        };
+        let mut receipt = Receipt {
+            destination,
+            candidate,
+            recovery: None,
+            published: false,
+            recurring: true,
+            vacancy: Some(RemoteVacancy::File(vacancy)),
+            successor: None,
+        };
+        assert!(
+            receipt
+                .observe(reply(destination, vacancy, receiver), id)
+                .is_none()
+        );
+        receipt.published = true;
+        for invalid in [
+            reply("/protected/other", vacancy, receiver),
+            reply(destination, [5; 32], receiver),
+            reply(
+                destination,
+                vacancy,
+                ExistingTree {
+                    fingerprint: [0; 32],
+                    ..receiver
+                },
+            ),
+            reply(
+                destination,
+                vacancy,
+                ExistingTree {
+                    inventory: tree_protocol::Manifest::default().finish(),
+                    ..receiver
+                },
+            ),
+            Reply::Quarantined {
+                recovery: recovery.into(),
+            },
+            Reply::PublishedWithReceiver {
+                destination: destination.into(),
+                receiver,
+                recovery: recovery.into(),
+            },
+            Reply::FirstRecurringTreePublished {
+                destination: destination.into(),
+                vacancy,
+                receiver,
+            },
+        ] {
+            assert!(receipt.observe(invalid, id).is_none());
+        }
+        assert!(receipt.recovery.is_none());
+        assert!(receipt.successor.is_none());
+        assert_eq!(
+            receipt
+                .observe(reply(destination, vacancy, receiver), id)
+                .unwrap()
+                .outcome,
             RunOutcome::Success
         );
         assert_eq!(receipt.successor, Some(receiver));

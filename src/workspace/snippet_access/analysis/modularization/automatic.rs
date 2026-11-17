@@ -7,6 +7,7 @@ use super::*;
 pub(in crate::workspace::snippet_access::analysis) struct Prepared {
     pub(in crate::workspace::snippet_access::analysis) request: PlanRequest,
     source: SavedSource,
+    local_profile_revision: Option<[u8; 32]>,
 }
 
 struct SavedSource {
@@ -23,6 +24,7 @@ pub(in crate::workspace::snippet_access::analysis) struct Approved {
     guidance: SkillGuidance,
     transport: local_ai::Profile,
     profile: ProfileRef,
+    local_profile_revision: Option<[u8; 32]>,
 }
 
 pub(in crate::workspace::snippet_access::analysis) struct Deferred {
@@ -86,7 +88,7 @@ impl Prepared {
         snapshot: &Snapshot,
         source: &Source,
         rendered_hash: &str,
-        (skills, profile): (&str, &local_ai::Profile),
+        (skills, profile, local_profile_revision): (&str, &local_ai::Profile, Option<[u8; 32]>),
     ) -> Result<Option<Self>, String> {
         let Ok(originals) = capture_originals(window, page, snapshot) else {
             return Ok(None);
@@ -100,6 +102,7 @@ impl Prepared {
         .with_profile(profile);
         Ok(Some(Self {
             request,
+            local_profile_revision,
             source: SavedSource {
                 library: window.latest_library().clone(),
                 originals,
@@ -131,6 +134,7 @@ impl Prepared {
             guidance,
             transport,
             profile,
+            local_profile_revision: self.local_profile_revision,
         }
     }
 }
@@ -185,8 +189,17 @@ impl Deferred {
             Arc::ptr_eq(config, &approved.config)
                 && config
                     .resolve_profile_reference(&approved.profile)
-                    .and_then(|id| config.code_analysis_transport(id).ok())
+                    .and_then(|id| {
+                        reviewed_local_profile_transport(
+                            config,
+                            id,
+                            approved.local_profile_revision.is_some(),
+                        )
+                        .ok()
+                    })
                     .is_some_and(|(transport, _)| transport == approved.transport)
+                && reviewed_local_profile_revision(config, &approved.profile, &approved.transport)
+                    == Ok(approved.local_profile_revision)
         }) && record.is_some_and(|record| {
             record.purpose != Purpose::Verify
                 && record.provenance.profile_id == approved.profile
@@ -284,10 +297,16 @@ impl Workspace {
                 .take()
                 .ok_or("The reviewed split request is no longer available.")?;
             let worker_claim = Arc::clone(&claim);
-            let pending = request.start(deferred.approved.transport.clone(), move |plan| {
-                let _claim = worker_claim;
-                Ok(plan)
-            })?;
+            let guard = reviewed_local_profile_guard(
+                Arc::clone(&deferred.approved.config),
+                deferred.approved.profile.clone(),
+                deferred.approved.local_profile_revision,
+            );
+            let pending =
+                request.start(deferred.approved.transport.clone(), guard, move |plan| {
+                    let _claim = worker_claim;
+                    Ok(plan)
+                })?;
             deferred.claim = Some(claim);
             Ok::<_, String>(pending)
         })();
@@ -364,6 +383,7 @@ impl Workspace {
                 sources: deferred.approved.source.originals.clone(),
                 plan: result?,
                 outbound: None,
+                local_profile_revision: deferred.approved.local_profile_revision,
                 generation: None,
                 publication: None,
                 published: false,
@@ -381,6 +401,11 @@ impl Workspace {
         let pre = deferred.record;
         let source = deferred.approved.source.library.clone();
         let claim = deferred.claim.clone();
+        let save_guard = reviewed_local_profile_guard(
+            Arc::clone(&deferred.approved.config),
+            deferred.approved.profile.clone(),
+            deferred.approved.local_profile_revision,
+        );
         let cancelled = Arc::new(AtomicBool::new(false));
         page.automatic_plan = Some(deferred);
         page.state = State::HistoryWork(
@@ -397,6 +422,7 @@ impl Workspace {
                 let _claim = claim;
                 store.save_modularization_while(subject, pre, None, Some(job), || {
                     !cancelled.load(Ordering::Acquire)
+                        && save_guard().is_ok()
                         && Library::open(source.path().to_path_buf())
                             .is_ok_and(|current| current.same_revision(&source))
                 })

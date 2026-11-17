@@ -66,10 +66,11 @@ impl PlanRequest {
     pub(crate) fn start<T: Send + 'static>(
         self,
         profile: Profile,
+        before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
         complete: impl FnOnce(Plan) -> Result<T, String> + Send + 'static,
     ) -> Result<Pending<T>, String> {
         local_ai::start(profile, move |client| {
-            let answer = send(client, &self.system, &self.input)?;
+            let answer = send(client, &self.system, &self.input, &before_dispatch)?;
             let plan: Plan = decode(
                 &answer,
                 "The response did not contain the requested modularization plan.",
@@ -252,6 +253,7 @@ impl GenerationRequest {
         self,
         profile: Profile,
         mut progress: Progress,
+        before_dispatch: impl Fn() -> Result<(), String> + Send + 'static,
         mut persist: impl FnMut(&Progress) -> Result<(), String> + Send + 'static,
     ) -> Result<Pending<Progress>, String> {
         progress.validate(&self.plan)?;
@@ -259,13 +261,14 @@ impl GenerationRequest {
             if !client.active() {
                 return Err(local_ai::Error::Cancelled.message());
             }
+            before_dispatch()?;
             persist(&progress)?;
             let order: Vec<_> = self.plan.generation_order().collect();
             for file in &order[progress.outputs.len()..] {
                 let content = if file.package_marker() {
                     String::new()
                 } else {
-                    self.generate(client, file, &progress.outputs, &[])?
+                    self.generate(client, file, &progress.outputs, &[], &before_dispatch)?
                 };
                 if !client.active() {
                     return Err(local_ai::Error::Cancelled.message());
@@ -287,8 +290,13 @@ impl GenerationRequest {
             } = &mut progress.repair
             {
                 if let Some(&index) = files.get(*next) {
-                    progress.outputs[index].content =
-                        self.generate(client, order[index], &progress.outputs, diagnostics)?;
+                    progress.outputs[index].content = self.generate(
+                        client,
+                        order[index],
+                        &progress.outputs,
+                        diagnostics,
+                        &before_dispatch,
+                    )?;
                     *next += 1;
                 } else {
                     progress.repair = Repair::Complete;
@@ -305,9 +313,10 @@ impl GenerationRequest {
         file: &Module,
         outputs: &[Output],
         problems: &[String],
+        before_dispatch: &impl Fn() -> Result<(), String>,
     ) -> Result<String, String> {
         let input = self.generation_input(file, outputs, problems)?;
-        let answer = send(client, &self.system, &input)?;
+        let answer = send(client, &self.system, &input, before_dispatch)?;
         decode_file(&answer, &file.path)
     }
 
@@ -395,15 +404,21 @@ fn decode<T: serde::de::DeserializeOwned>(answer: &str, error: &'static str) -> 
     serde_json::from_str(local_ai::reply::strip_fence(answer.trim())).map_err(|_| error.into())
 }
 
-fn send(client: &Client, system: &str, input: &str) -> Result<String, String> {
+fn send(
+    client: &Client,
+    system: &str,
+    input: &str,
+    before_dispatch: &impl Fn() -> Result<(), String>,
+) -> Result<String, String> {
     let deadline = Instant::now() + TIMEOUT;
-    let result = match client.complete_text_before(system, input, true, deadline) {
-        Err(local_ai::Error::UnsupportedResponseFormat) => {
-            client.complete_text_before(system, input, false, deadline)
+    let result =
+        match client.complete_text_before_guarded(system, input, true, deadline, before_dispatch) {
+            Err(local_ai::Error::UnsupportedResponseFormat) => {
+                client.complete_text_before_guarded(system, input, false, deadline, before_dispatch)
+            }
+            response => response,
         }
-        response => response,
-    }
-    .map_err(local_ai::Error::message)?;
+        .map_err(local_ai::Error::message)?;
     if !client.active() {
         return Err(local_ai::Error::Cancelled.message());
     }

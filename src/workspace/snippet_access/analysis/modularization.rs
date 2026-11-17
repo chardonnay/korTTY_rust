@@ -40,6 +40,7 @@ pub(super) struct Preview {
     transport: local_ai::Profile,
     request: Request,
     outbound: Option<Box<OutboundReview>>,
+    local_profile_revision: Option<[u8; 32]>,
     masked_source: bool,
     prompt: String,
     parts: Vec<Range<usize>>,
@@ -459,13 +460,11 @@ fn split_transport(
             config.reviewed_agent_cli_transport(&profile.reference, &profile.endpoint)
         }
         Some(OutboundKind::Https) => config.snippet_analysis_transport(id).and_then(|route| {
-            route
-                .0
-                .is_remote()
+            (route.0.is_remote() && route.0.uses_server_default_model() == profile.server_selected)
                 .then_some(route)
-                .ok_or_else(|| "Choose a trusted HTTPS profile.".into())
+                .ok_or_else(|| "The reviewed HTTPS profile or model selection changed.".into())
         }),
-        None => config.code_analysis_transport(id),
+        None => reviewed_local_profile_transport(config, id, profile.server_selected),
     }
 }
 
@@ -509,9 +508,11 @@ impl Page {
                         return None;
                     }
                     Some(OutboundKind::Https)
-                } else if original.is_some_and(|reference| {
-                    config.resolve_profile_reference(reference) == Some(profile.id)
-                }) {
+                } else if (saved || !profile.server_selected)
+                    && original.is_some_and(|reference| {
+                        config.resolve_profile_reference(reference) == Some(profile.id)
+                    })
+                {
                     None
                 } else {
                     return None;
@@ -895,6 +896,8 @@ impl Workspace {
                 .find(|(profile, _)| Some(profile.id) == selected)
                 .ok_or("The selected modularization profile is unavailable.")?;
             let (transport, limit) = split_transport(&config, &profile, kind)?;
+            let local_profile_revision =
+                reviewed_local_profile_revision(&config, &profile.reference, &transport)?;
             if let Some(followup) = &followup {
                 followup.require_current(&config, &profile, &transport, &capture, record)?;
             }
@@ -1012,7 +1015,9 @@ impl Workspace {
                         "The stored split plan refers to a different source revision.".into(),
                     );
                 }
-                if job.outbound.as_ref() != outbound.as_ref().map(|review| &review.binding) {
+                if job.outbound.as_ref() != outbound.as_ref().map(|review| &review.binding)
+                    || job.local_profile_revision != local_profile_revision
+                {
                     return Err("The split plan's provider or saved profile revision changed. Discard the plan and review a new one.".into());
                 }
                 let existing = job.generation.as_ref();
@@ -1097,6 +1102,7 @@ impl Workspace {
                 transport,
                 request,
                 outbound,
+                local_profile_revision,
                 masked_source,
                 parts: apply::parts(&prompt),
                 prompt,
@@ -1193,6 +1199,12 @@ impl Workspace {
                 })
                 .map(|receipt| (Arc::clone(&preview.config), receipt));
             let capture = preview.capture;
+            let local_profile_revision = preview.local_profile_revision;
+            let local_guard = reviewed_local_profile_guard(
+                Arc::clone(&preview.config),
+                preview.profile.reference.clone(),
+                local_profile_revision,
+            );
             let outbound = preview
                 .outbound
                 .map(|review| {
@@ -1210,8 +1222,10 @@ impl Workspace {
                 .transpose()?;
             match preview.request {
                 Request::Plan(request) => {
-                    let pending = request.start(preview.transport, move |plan| {
+                    let save_guard = local_guard.clone();
+                    let pending = request.start(preview.transport, local_guard, move |plan| {
                         let _claim = claim;
+                        save_guard()?;
                         let job = Job {
                             id: SnippetId::new().map_err(|error| error.to_string())?,
                             revision: 1,
@@ -1220,6 +1234,7 @@ impl Workspace {
                             sources: capture.originals,
                             plan,
                             outbound: None,
+                            local_profile_revision,
                             generation: None,
                             publication: None,
                             published: false,
@@ -1247,18 +1262,30 @@ impl Workspace {
                         .progress
                         .clone();
                     let mut expected = capture.previous;
-                    let pending = request.start(preview.transport, progress, move |progress| {
-                        let _claim = &claim;
-                        job.generation
-                            .as_mut()
-                            .ok_or("The approved generation is unavailable.")?
-                            .progress = progress.clone();
-                        let history = store
-                            .save_modularization(subject, capture.pre, expected, Some(job.clone()))
-                            .map_err(|error| error.to_string())?;
-                        expected = current_version(&history, capture.pre);
-                        Ok(())
-                    })?;
+                    let save_guard = local_guard.clone();
+                    let pending = request.start(
+                        preview.transport,
+                        progress,
+                        local_guard,
+                        move |progress| {
+                            let _claim = &claim;
+                            save_guard()?;
+                            job.generation
+                                .as_mut()
+                                .ok_or("The approved generation is unavailable.")?
+                                .progress = progress.clone();
+                            let history = store
+                                .save_modularization(
+                                    subject,
+                                    capture.pre,
+                                    expected,
+                                    Some(job.clone()),
+                                )
+                                .map_err(|error| error.to_string())?;
+                            expected = current_version(&history, capture.pre);
+                            Ok(())
+                        },
+                    )?;
                     Ok(worker(
                         id,
                         subject,
@@ -1297,6 +1324,7 @@ impl Workspace {
                                 sources: capture.originals,
                                 plan,
                                 outbound: Some(binding),
+                                local_profile_revision: None,
                                 generation: None,
                                 publication: None,
                                 published: false,

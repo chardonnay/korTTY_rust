@@ -9,7 +9,11 @@ mod local_receiver;
 pub(in crate::sftp_window::worker) mod metadata;
 mod remote;
 mod scheduled;
-pub(crate) use local_receiver::{LocalFileSnapshot, ReviewedFilePublication, ReviewedFileReceiver};
+pub(crate) use local_receiver::{
+    FileWitness, LocalFileSnapshot, ReviewedFilePublication, ReviewedFileReceiver,
+    VacantLocalFileAlias, VacantLocalFilePublication, VacantLocalFileReceiver,
+    VacantLocalFileSnapshot,
+};
 pub(in crate::sftp_window::worker) use scheduled::ScheduledReplacement;
 
 pub(crate) struct Request {

@@ -329,7 +329,7 @@ fn portable_reads_refuse_symlinked_sources_and_projects() {
 }
 
 #[test]
-fn portable_jobs_remove_only_device_local_sftp_approval() {
+fn portable_jobs_remove_device_local_sftp_approvals_and_disable_privileged_replacement() {
     let profile = Profile::new();
     let path = profile.0.join("jobs.json");
     let mut jobs = SchedulerStore::open(&path).unwrap();
@@ -340,6 +340,10 @@ fn portable_jobs_remove_only_device_local_sftp_approval() {
             "remote": "/data", "excludes": "*.log", "approval": "0123456789abcdef0123456789abcdef"}
     });
     let elevated_id = JobId::new("privileged").unwrap();
+    let replacement_id = JobId::new("privileged-replacement").unwrap();
+    let repeated_id = JobId::new("privileged-recurring-replacement").unwrap();
+    let merge_id = JobId::new("privileged-folder-merge").unwrap();
+    let merge_upload_id = JobId::new("privileged-folder-upload-merge").unwrap();
     let archive_id = JobId::new("privileged-archive").unwrap();
     let recurring_id = JobId::new("recurring").unwrap();
     let mut recurring = action.clone();
@@ -352,6 +356,21 @@ fn portable_jobs_remove_only_device_local_sftp_approval() {
         "kind": "privileged", "direction": "upload", "local": profile.0.join("binary"),
         "remote": "/protected/file", "approval": "abcdef0123456789abcdef0123456789",
     });
+    let mut replacement = elevated.clone();
+    replacement["remote"]["direction"] = json!("download");
+    replacement["remote"]["replace_existing"] = json!(true);
+    let mut repeated = replacement.clone();
+    repeated["remote"]["standing"] = json!({
+        "days": 7, "limits": {"max_firings": 12, "max_actions": 1, "max_bytes": 1_073_741_824},
+    });
+    let mut folder = elevated.clone();
+    folder["remote"] = json!({
+        "kind": "privileged_tree_download", "direction": "download", "local": profile.0.join("data"),
+        "remote": "/protected/tree", "replace_changed": true, "approval": "a1".repeat(16),
+    });
+    let mut folder_upload = folder.clone();
+    folder_upload["remote"]["kind"] = json!("privileged_tree_upload");
+    folder_upload["remote"]["direction"] = json!("upload");
     let mut archive = action.clone();
     archive["sudo"] = json!("passwordless");
     archive["remote"] = json!({
@@ -368,16 +387,47 @@ fn portable_jobs_remove_only_device_local_sftp_approval() {
             .unwrap()
             .with_schedule(kortty_jobs::JobSchedule::default()),
         Job::new(elevated_id, "Privileged upload", elevated.clone()).unwrap(),
+        Job::new(
+            replacement_id.clone(),
+            "Privileged replacement",
+            replacement.clone(),
+        )
+        .unwrap(),
+        Job::new(
+            repeated_id.clone(),
+            "Recurring privileged replacement",
+            repeated.clone(),
+        )
+        .unwrap()
+        .with_schedule(kortty_jobs::JobSchedule::default().with_enabled(true)),
+        Job::new(merge_id.clone(), "Privileged folder merge", folder.clone()).unwrap(),
+        Job::new(
+            merge_upload_id.clone(),
+            "Privileged folder upload merge",
+            folder_upload.clone(),
+        )
+        .unwrap(),
         Job::new(archive_id, "Privileged archive", archive.clone()).unwrap(),
     ])
     .unwrap();
     jobs.commit_with_actions(&graph, &[], &[]).unwrap();
-    let projected: Value =
-        serde_json::from_slice(&super::portable_jobs(&fs::read(&path).unwrap()).unwrap()).unwrap();
+    let portable = super::portable_jobs(&fs::read(&path).unwrap()).unwrap();
+    let projected: Value = serde_json::from_slice(&portable).unwrap();
+    let restored = SchedulerStore::decode_backup::<SshCommand>(&portable).unwrap();
+    assert!(!restored.job(&replacement_id).unwrap().enabled());
+    let repeating = restored.job(&repeated_id).unwrap();
+    assert!(!repeating.enabled());
+    assert!(repeating.schedule().unwrap().enabled());
+    assert!(!restored.job(&merge_id).unwrap().enabled());
+    assert!(!restored.job(&merge_upload_id).unwrap().enabled());
     for (id, mut expected) in [
         ("reviewed", action),
         ("recurring", recurring),
         ("privileged", elevated),
+        ("privileged-replacement", replacement),
+        ("privileged-recurring-replacement", repeated),
+        ("privileged-folder-merge", folder),
+        ("privileged-folder-upload-merge", folder_upload),
         ("privileged-archive", archive),
     ] {
         expected["remote"]

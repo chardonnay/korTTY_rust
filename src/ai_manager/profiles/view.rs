@@ -60,6 +60,13 @@ impl Editor {
                 if self.catalog.is_marked_default(profile.id) {
                     label.push_str(" · Default");
                 }
+                if self
+                    .catalog
+                    .server_selected_chat_default
+                    .is_some_and(|id| ProfileId::from(id) == profile.id)
+                {
+                    label.push_str(" · Terminal Chat default");
+                }
                 if profile.restore_review && profile.java_embedded_model.is_some() {
                     label.push_str(" · Needs model review");
                 }
@@ -275,10 +282,21 @@ impl Editor {
         reveal: &Reveal,
         compact: bool,
     ) -> iced::widget::Column<'a, Message> {
-        let default = self.catalog.is_marked_default(profile.id);
+        let server_selected = profile.uses_server_default_model();
+        let default = if server_selected {
+            self.catalog
+                .server_selected_chat_default()
+                .is_some_and(|chosen| chosen.id == profile.id)
+        } else {
+            self.catalog.is_marked_default(profile.id)
+        };
         let name = text_input(ProfileSetting::Name.title(), &profile.name)
             .on_input_maybe(editable.then_some(|value| Message::Edit(Field::Name, value)));
-        let mut is_default = checkbox(default).label(ProfileSetting::Default.title());
+        let mut is_default = checkbox(default).label(if server_selected {
+            "Terminal Chat default"
+        } else {
+            ProfileSetting::Default.title()
+        });
         if editable && self.can_set_default(profile.id) {
             let id = profile.id;
             is_default = is_default.on_toggle(move |_| Message::SetDefault(id));
@@ -804,9 +822,13 @@ impl Editor {
                 ProfileSetting::Tokenizer,
                 choice(crate::local_ai::Tokenizer::ALL, profile.tokenizer, editable, Message::Tokenizer),
             )),
-            (profile.remote_protocol().is_some() && profile.policy_definition().is_none() && !profile.uses_server_default_model()).then(||
-                checkbox(profile.allows_reviewed_agent_https())
-                    .label("Allow reviewed Agent, Swarm, and Scheduler requests over HTTPS")
+            (profile.remote_protocol().is_some() && profile.policy_definition().is_none()).then(||
+                checkbox(profile.permits_reviewed_agent_https())
+                    .label(if profile.uses_server_default_model() {
+                        "Allow reviewed Terminal Agent Ask and Run requests over HTTPS"
+                    } else {
+                        "Allow reviewed Agent, Swarm, and Scheduler requests over HTTPS"
+                    })
                     .on_toggle_maybe((editable && profile.trusted_remote_endpoint).then_some(Message::ReviewedAgentHttps))
             ),
             text(if profile.is_cli() {

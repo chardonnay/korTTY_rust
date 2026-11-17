@@ -975,6 +975,12 @@ pub(crate) fn start<T: Send + 'static>(
     run: impl FnOnce(&Client) -> Result<T, String> + Send + 'static,
 ) -> Result<Pending<T>, String> {
     let (session, cancel) = Session::begin(profile).ok_or(WORKERS_BUSY)?;
+    #[cfg(test)]
+    let session = {
+        let mut session = session;
+        test_support::configure_https_fixture(&mut session).map_err(Error::message)?;
+        session
+    };
     start_worker(cancel, move || run(session.client()))
 }
 
@@ -1560,13 +1566,22 @@ impl Client {
     }
 
     pub(crate) fn complete(&self, system: &str, input: &str) -> Result<String, Error> {
+        self.complete_guarded(system, input, || Ok(()))
+    }
+
+    pub(crate) fn complete_guarded(
+        &self,
+        system: &str,
+        input: &str,
+        before_dispatch: impl FnMut() -> Result<(), String>,
+    ) -> Result<String, Error> {
         self.complete_request(
             system,
             RequestContent::Text(input),
             true,
             None,
             false,
-            || Ok(()),
+            before_dispatch,
         )
     }
 
@@ -2064,14 +2079,17 @@ impl Client {
             .map(|(answer, _)| answer)
         } else {
             let response_format = response_format && !self.profile.is_mlx();
-            let request = self.openai_payload(
-                messages,
-                response_format,
-                false,
-                self.openai_reasoning(transport)?,
-            )?;
+            let controls = self.openai_reasoning(transport)?;
+            let request = self.openai_payload(messages, response_format, false, controls)?;
             self.openai_response(transport, request, deadline, before_dispatch, attempt)
                 .and_then(|response| self.read_completion(response, require_complete, attempt))
+                .and_then(|answer| {
+                    if controls == mlx_models::ReasoningControls::GptOssEffort {
+                        streaming::decode_harmony_content(answer).map(|(answer, _)| answer)
+                    } else {
+                        Ok(answer)
+                    }
+                })
         };
         if let Err(error) = self.validate_transport(transport) {
             attempt.agent_completion = None;
@@ -2194,7 +2212,7 @@ impl Client {
         &self,
         transport: &Transport,
     ) -> Result<mlx_models::ReasoningControls, Error> {
-        if !self.profile.is_mlx() || self.profile.options.reasoning_effort.is_none() {
+        if !self.profile.is_mlx() {
             return Ok(mlx_models::ReasoningControls::DefaultOnly);
         }
         // Recheck the leased model and signed runtime immediately before using capabilities.

@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
@@ -7,8 +8,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use iced::keyboard::Modifiers;
 use iced::widget::{
-    button, checkbox, column, container, pick_list, row, scrollable, space, text, text_input,
-    tooltip,
+    button, checkbox, column, container, pick_list, rich_text, row, scrollable, space, text,
+    text_input, tooltip,
 };
 use iced::{Color, Element, Font, Length, Task};
 
@@ -22,6 +23,7 @@ pub(crate) mod catalog;
 mod deletion;
 pub(crate) mod document;
 mod range;
+pub(crate) mod style;
 pub(crate) mod zstandard;
 
 use catalog::{Compression, Entry, Format, Report, badges};
@@ -151,6 +153,10 @@ pub enum Message {
     Jump,
     PageTurn(bool),
     Bottom,
+    HighlightLinks(bool),
+    HighlightKeywords(bool),
+    KeywordSet(style::Choice),
+    CopyLink(style::Link),
 }
 
 #[derive(Clone, Debug)]
@@ -323,6 +329,15 @@ struct Viewer {
     hit: Option<usize>,
     go_line: String,
     scroll: iced::widget::Id,
+    page_revision: u64,
+    styling: RefCell<style::Cache>,
+}
+
+impl Viewer {
+    fn set_page(&mut self, page: Page) {
+        self.page_revision = self.page_revision.wrapping_add(1);
+        self.page = Some(page);
+    }
 }
 
 enum Mode {
@@ -408,6 +423,8 @@ impl Window {
                 hit: None,
                 go_line: String::new(),
                 scroll: iced::widget::Id::unique(),
+                page_revision: 0,
+                styling: RefCell::default(),
             })),
             prompt: None,
             badge_close: None,
@@ -603,7 +620,7 @@ impl Window {
                         if let Mode::Viewer(viewer) = &mut self.mode {
                             viewer.entry = opened.entry;
                             viewer.document = Some(opened.document);
-                            viewer.page = Some(opened.page);
+                            viewer.set_page(opened.page);
                             viewer.hit = None;
                             self.notice.clear();
                         }
@@ -616,7 +633,7 @@ impl Window {
                 match page {
                     Ok(page) => {
                         if let Mode::Viewer(viewer) = &mut self.mode {
-                            viewer.page = Some(page);
+                            viewer.set_page(page);
                             self.notice.clear();
                             return scroll_page(viewer, bottom);
                         }
@@ -629,7 +646,7 @@ impl Window {
                 match found {
                     Ok(Some((line, page))) => {
                         if let Mode::Viewer(viewer) = &mut self.mode {
-                            viewer.page = Some(page);
+                            viewer.set_page(page);
                             viewer.hit = Some(line);
                             self.notice = format!("Found at line {}", line + 1);
                             return scroll_page(viewer, false);
@@ -1018,7 +1035,31 @@ impl Window {
         }
     }
 
-    pub fn view(&self, foreground: Rgb) -> Element<'_, Message> {
+    pub(crate) fn copy_link(&self, link: &style::Link) -> Option<String> {
+        let Mode::Viewer(viewer) = &self.mode else {
+            return None;
+        };
+        if self.pending.is_some()
+            || self.prompt.is_some()
+            || viewer.page_revision != link.revision
+            || !viewer.styling.borrow().permits_link(link)
+        {
+            return None;
+        }
+        viewer
+            .page
+            .as_ref()?
+            .lines
+            .get(link.line)?
+            .get(link.range.clone())
+            .map(str::to_owned)
+    }
+
+    pub(crate) fn view<'a>(
+        &'a self,
+        foreground: Rgb,
+        styling: style::Context<'a>,
+    ) -> Element<'a, Message> {
         if let Some(token) = self.badge_close {
             let prompt = column![
                 text("Discard unsaved logfile badge changes?").size(18),
@@ -1049,7 +1090,7 @@ impl Window {
         let usable = idle && self.prompt.is_none();
         let body = match &self.mode {
             Mode::Manager(manager) => manager_view(manager, usable, foreground),
-            Mode::Viewer(viewer) => viewer_view(viewer, usable),
+            Mode::Viewer(viewer) => viewer_view(viewer, usable, styling),
         };
         let mut footer = row![
             text(&self.notice).width(Length::Fill),
@@ -1398,7 +1439,11 @@ fn scroll_page(viewer: &Viewer, bottom: bool) -> Task<Message> {
     )
 }
 
-fn viewer_view(viewer: &Viewer, usable: bool) -> Element<'_, Message> {
+fn viewer_view<'a>(
+    viewer: &'a Viewer,
+    usable: bool,
+    styling: style::Context<'a>,
+) -> Element<'a, Message> {
     let current = viewer.page.as_ref().map_or(0, |page| page.first);
     let total = viewer
         .document
@@ -1428,17 +1473,32 @@ fn viewer_view(viewer: &Viewer, usable: bool) -> Element<'_, Message> {
     .spacing(7);
     let mut lines = column![].spacing(2).padding(6);
     if let Some(page) = &viewer.page {
-        for (index, line) in page.lines.iter().enumerate() {
-            let index = page.first + index;
+        let mut cache = viewer.styling.borrow_mut();
+        cache.prepare(page, viewer.page_revision, &styling, viewer.query.trim());
+        for (row, line) in page.lines.iter().enumerate() {
+            let index = page.first + row;
+            let decorated = cache.line(
+                line,
+                row,
+                viewer.page_revision,
+                styling.palette,
+                viewer.hit == Some(index),
+            );
+            let rendered = rich_text(decorated)
+                .font(Font::MONOSPACE)
+                .wrapping(text::Wrapping::None)
+                .size(13);
+            let rendered = if usable && styling.preferences.links {
+                rendered.on_link_click(Message::CopyLink)
+            } else {
+                rendered
+            };
             let content = row![
                 text(format!("{:>7}", index + 1))
                     .width(70)
                     .font(Font::MONOSPACE)
                     .size(13),
-                text(line)
-                    .font(Font::MONOSPACE)
-                    .wrapping(text::Wrapping::None)
-                    .size(13),
+                rendered,
             ]
             .spacing(8);
             if viewer.hit == Some(index) {
@@ -1487,9 +1547,43 @@ fn viewer_view(viewer: &Viewer, usable: bool) -> Element<'_, Message> {
     ]
     .spacing(7)
     .align_y(iced::Alignment::Center);
+    let choices: Vec<_> = styling
+        .options
+        .iter()
+        .map(|(id, name)| style::Choice {
+            id: id.clone(),
+            name: name.clone(),
+        })
+        .collect();
+    let selected = choices
+        .iter()
+        .find(|choice| choice.id == styling.preferences.keyword_set)
+        .or_else(|| {
+            choices
+                .iter()
+                .find(|choice| choice.id == style::DEFAULT_SET)
+        })
+        .cloned();
+    let keyword_set: Element<'_, Message> = if usable && styling.preferences.keywords {
+        pick_list(choices, selected, Message::KeywordSet).into()
+    } else {
+        text(selected.map(|choice| choice.name).unwrap_or_default()).into()
+    };
+    let presentation = row![
+        checkbox(styling.preferences.links)
+            .label("Highlight links")
+            .on_toggle_maybe(usable.then_some(Message::HighlightLinks)),
+        checkbox(styling.preferences.keywords)
+            .label("Highlight keywords")
+            .on_toggle_maybe(usable.then_some(Message::HighlightKeywords)),
+        keyword_set,
+    ]
+    .spacing(12)
+    .align_y(iced::Alignment::Center);
     column![
         text(viewer.entry.path.display().to_string()).size(13),
         find,
+        presentation,
         container(lines)
             .style(container::bordered_box)
             .width(Length::Fill)

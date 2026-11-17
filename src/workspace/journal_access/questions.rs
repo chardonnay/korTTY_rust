@@ -261,25 +261,10 @@ impl Workspace {
     }
 
     fn question_routes(&self, configuration: &crate::ai_manager::Configuration) -> Routes {
-        let answer = self
-            .configured_journal_ai(false)
-            .filter(|profile| !profile.is_remote() && !profile.is_cli())
-            .map(|profile| {
-                let settings = &self.window_settings.journal_ai;
-                let label = (!self.uses_legacy_journal_profile())
-                    .then(|| configuration.journal_summary_default_id())
-                    .flatten()
-                    .and_then(|selected| {
-                        configuration
-                            .agent_profiles()
-                            .find(|(id, _, _, _)| *id == selected)
-                    })
-                    .map_or_else(
-                        || format!("{} · {}", settings.model, settings.endpoint),
-                        |(_, name, model, endpoint)| format!("{name} · {model} · {endpoint}"),
-                    );
-                Route { profile, label }
-            });
+        let answer = configuration
+            .journal_question_loopback_server_default()
+            .map(|(profile, label)| Route { profile, label })
+            .or_else(|| self.local_question_route(configuration));
         let embedding = configuration
             .journal_embedding_profile()
             .map(|(profile, label)| Route { profile, label });
@@ -293,7 +278,7 @@ impl Workspace {
             .into(),
         }];
         if configuration.saved_root().is_some() {
-            answer_choices.extend(configuration.journal_question_https_profiles().map(
+            answer_choices.extend(configuration.journal_https_profiles().map(
                 |(id, name, model, destination)| AnswerChoice {
                     id: Some(id),
                     label: format!("{name} · {model} · {destination}"),
@@ -313,6 +298,30 @@ impl Workspace {
             embedding,
             answer_choices,
         }
+    }
+
+    fn local_question_route(
+        &self,
+        configuration: &crate::ai_manager::Configuration,
+    ) -> Option<Route> {
+        self.configured_journal_ai(false)
+            .filter(|profile| !profile.is_remote() && !profile.is_cli())
+            .map(|profile| {
+                let settings = &self.window_settings.journal_ai;
+                let label = (!self.uses_legacy_journal_profile())
+                    .then(|| configuration.journal_summary_default_id())
+                    .flatten()
+                    .and_then(|selected| {
+                        configuration
+                            .agent_profiles()
+                            .find(|(id, _, _, _)| *id == selected)
+                    })
+                    .map_or_else(
+                        || format!("{} · {}", settings.model, settings.endpoint),
+                        |(_, name, model, endpoint)| format!("{name} · {model} · {endpoint}"),
+                    );
+                Route { profile, label }
+            })
     }
 
     pub(in crate::workspace) fn revalidate_journal_questions(&mut self) {
@@ -417,7 +426,8 @@ impl Workspace {
                 };
                 if self.question_scope(id, &root).is_some() {
                     let routes = self.question_routes(&configuration);
-                    let preferred = configuration.preferred_journal_question_cli_id();
+                    let preferred = configuration
+                        .preferred_journal_question_outbound_id(routes.answer.is_some());
                     self.journal_questions.dialogs.insert(
                         id,
                         Dialog {

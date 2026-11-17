@@ -335,7 +335,7 @@ impl Run {
             Classification::Closed => column![
                 text(review.title()).size(15),
                 review
-                    .outbound_destination()
+                    .reviewed_destination()
                     .map(|(destination, model)| text(format!("{model} · {destination}")).size(13)),
                 review.quota.label().map(|forecast| text(forecast).size(13)),
                 review.knowledge_view(self.epoch, ready),

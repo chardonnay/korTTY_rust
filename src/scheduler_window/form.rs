@@ -11,6 +11,7 @@ use kortty::ssh_runtime::account_lookup::Kind as AccountKind;
 use kortty_jobs::{
     Date, DependencyMode, Job, JobDefinition, JobGraph, JobId, JobSchedule, Time, Weekday,
 };
+use kortty_server_archive::protocol::ArchiveMemberLayout;
 
 use crate::ai_manager::ProfileRef;
 use crate::connection_store::Store as ConnectionStore;
@@ -30,11 +31,12 @@ use super::remote::{
 use super::script::{
     Language, MAX_ARGUMENT_TEXT_BYTES, MAX_COMMAND_BYTES, Script, SnippetLink, arguments_from_lines,
 };
-use super::sync::standing::{Limits, MAX_BYTES, Settings};
+use super::sync::standing::{Limits, MAX_BYTES, MAX_REPLACEMENT_BYTES, Settings};
 use super::working_directory::parent_path;
 use super::{
     ConnectionChoice, ConnectionRef, DirectoryField, ImportedAiAction, JournalDetail, Message,
-    SnippetChoice, SshCommand, SudoMode, TargetGroups, imported_archive, imported_transfer,
+    SnippetChoice, SshCommand, SudoMode, TargetGroups, imported_archive, imported_privileged,
+    imported_transfer,
 };
 
 const DAYS: [(Weekday, &str); 7] = [
@@ -50,6 +52,14 @@ const MAX_FIELD_BYTES: usize = 4096;
 const MIB: f64 = 1_048_576.0;
 const SWARM_PARALLELISM_CHOICES: [u8; kortty_jobs::MAX_SWARM_PARALLELISM] =
     [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16];
+
+fn java_archive_exclude_help(format: ArchiveFormat) -> &'static str {
+    if format.is_zip() {
+        "Relative globs match complete ZIP entry paths such as etc/hosts. A relative match for a directory excludes only its own entry. A leading / matches the absolute server path and excludes a matching directory tree."
+    } else {
+        "TAR checks relative globs against the complete archive path and at directory boundaries. A leading / matches the absolute server path. Matching directories are excluded with their contents."
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 pub enum Field {
@@ -131,6 +141,10 @@ pub(super) struct Draft {
     sync_standing_mib: String,
     rsync_program: String,
     rsync_existing: Option<super::rsync::ExistingDestination>,
+    rsync_allow_vacant_directory_download: bool,
+    rsync_allow_vacant_file_download: bool,
+    rsync_allow_vacant_server_file_upload: bool,
+    rsync_allow_vacant_server_tree_upload: bool,
     rsync_mixed: bool,
     rsync_elevation: super::rsync::Elevation,
     rsync_sources: text_editor::Content,
@@ -149,11 +163,15 @@ pub(super) struct Draft {
     imported_ai: Option<Box<ImportedAiAction>>,
     imported_archive: Option<Box<imported_archive::Draft>>,
     imported_transfer: Option<Box<imported_transfer::Draft>>,
+    imported_privileged: Option<Box<imported_privileged::Draft>>,
+    imported_sudo_mode: Option<SudoMode>,
     pub(super) agent_probe: super::agent::Probe,
     swarm_parallelism: String,
     agent_approval: Option<Box<super::agent::Approval>>,
     pub(super) archive_format: ArchiveFormat,
+    archive_member_layout: ArchiveMemberLayout,
     pub(super) archive_server_only: bool,
+    archive_reuse_output: bool,
     pub(super) archive_password: Option<String>,
     archive_level: String,
     archive_download: String,
@@ -173,7 +191,9 @@ pub(super) struct Draft {
     recursive_delete: bool,
     privileged_copy_tree: bool,
     local_file: String,
+    privileged_replace_existing: bool,
     privileged_approval: Option<String>,
+    privileged_standing: bool,
     pub enabled: bool,
     pub schedule_enabled: bool,
     pub virtual_terminal: TerminalDraft,
@@ -229,6 +249,10 @@ impl Default for Draft {
             sync_standing_mib: (standing.limits.max_bytes as f64 / MIB).to_string(),
             rsync_program: String::new(),
             rsync_existing: None,
+            rsync_allow_vacant_directory_download: false,
+            rsync_allow_vacant_file_download: false,
+            rsync_allow_vacant_server_file_upload: false,
+            rsync_allow_vacant_server_tree_upload: false,
             rsync_mixed: false,
             rsync_elevation: super::rsync::Elevation::Ordinary,
             rsync_sources: text_editor::Content::new(),
@@ -247,11 +271,15 @@ impl Default for Draft {
             imported_ai: None,
             imported_archive: None,
             imported_transfer: None,
+            imported_privileged: None,
+            imported_sudo_mode: None,
             agent_probe: super::agent::Probe::default(),
             swarm_parallelism: "4".into(),
             agent_approval: None,
             archive_format: ArchiveFormat::default(),
+            archive_member_layout: ArchiveMemberLayout::default(),
             archive_server_only: false,
+            archive_reuse_output: false,
             archive_password: None,
             archive_level: "6".into(),
             archive_download: String::new(),
@@ -271,7 +299,9 @@ impl Default for Draft {
             recursive_delete: false,
             privileged_copy_tree: false,
             local_file: String::new(),
+            privileged_replace_existing: false,
             privileged_approval: None,
+            privileged_standing: false,
             enabled: true,
             schedule_enabled: false,
             virtual_terminal: TerminalDraft::from_options(None),
@@ -344,7 +374,10 @@ impl Draft {
         matches!(
             self.source,
             Source::Command | Source::Script | Source::Snippet
-        )
+        ) || self
+            .imported_privileged
+            .as_deref()
+            .is_some_and(|draft| draft.settings.shell_options().is_some())
     }
 
     pub(super) fn automation_estimate_subject(&self) -> Option<super::automation_journal::Subject> {
@@ -539,6 +572,13 @@ impl Draft {
         if let Some(imported) = &action.imported_transfer {
             draft.source = Source::ImportedTransfer;
             draft.imported_transfer = Some(imported.clone());
+            if let imported_transfer::Draft::StagedSftp(staged) = imported.as_ref() {
+                draft.remote_path.clone_from(&staged.settings.remote_hint);
+            }
+        }
+        if let Some(imported) = &action.imported_privileged {
+            draft.source = Source::ImportedPrivileged;
+            draft.imported_privileged = Some(imported.clone());
         }
         if let Some(remote) = &action.remote {
             match remote {
@@ -631,9 +671,13 @@ impl Draft {
                         excludes,
                         download,
                         server_output,
+                        reuse_output,
+                        member_layout,
                     } = archive;
                     draft.source = Source::RemoteArchive;
                     draft.archive_server_only = !matches!(remote, RemoteAction::Archive(_));
+                    draft.archive_reuse_output = *reuse_output;
+                    draft.archive_member_layout = *member_layout;
                     if let RemoteAction::PrivilegedArchive(archive) = remote {
                         draft.privileged_approval.clone_from(&archive.approval);
                     }
@@ -711,6 +755,13 @@ impl Draft {
                     draft.local_file = transfer.local.to_string_lossy().into_owned();
                     draft.rsync_program = transfer.program.to_string_lossy().into_owned();
                     draft.rsync_existing = transfer.existing.or(transfer.existing_download);
+                    draft.rsync_allow_vacant_directory_download =
+                        transfer.allow_vacant_directory_download;
+                    draft.rsync_allow_vacant_file_download = transfer.allow_vacant_file_download;
+                    draft.rsync_allow_vacant_server_file_upload =
+                        transfer.allow_vacant_server_file_upload;
+                    draft.rsync_allow_vacant_server_tree_upload =
+                        transfer.allow_vacant_server_tree_upload;
                     draft.rsync_mixed = transfer.mixed.is_some();
                     draft.rsync_elevation = transfer.elevation;
                     draft.rsync_sources = text_editor::Content::with_text(
@@ -744,7 +795,15 @@ impl Draft {
                     };
                     draft.remote_path = transfer.remote.as_str().into();
                     draft.local_file = transfer.local.to_string_lossy().into_owned();
+                    draft.privileged_replace_existing = transfer.replace_existing;
                     draft.privileged_approval = transfer.approval.clone();
+                    if let Some(settings) = transfer.standing {
+                        draft.privileged_standing = true;
+                        draft.sync_standing_days = settings.days.to_string();
+                        draft.sync_standing_firings = settings.limits.max_firings.to_string();
+                        draft.sync_standing_mib =
+                            (settings.limits.max_bytes as f64 / MIB).to_string();
+                    }
                 }
                 operation @ (RemoteAction::Upload {
                     local,
@@ -852,13 +911,23 @@ impl Draft {
             {
                 self.privileged_approval = None;
             }
+            if self.privileged_standing
+                && matches!(
+                    field,
+                    Field::SyncStandingDays | Field::SyncStandingFirings | Field::SyncStandingMib
+                )
+            {
+                self.privileged_approval = None;
+            }
             if matches!(field, Field::RsyncProgram)
                 || matches!(
                     self.source,
                     Source::RsyncUpload | Source::RsyncDownloadTree | Source::RsyncUploadTree
                 ) && matches!(field, Field::LocalFile | Field::RemotePath)
                 || self.source == Source::RsyncDownload
-                    && self.rsync_existing.is_some()
+                    && (self.rsync_existing.is_some()
+                        || self.rsync_allow_vacant_file_download
+                        || self.rsync_standing)
                     && matches!(field, Field::LocalFile | Field::RemotePath)
                 || self.source.is_rsync()
                     && (!self.additional_connections.is_empty()
@@ -899,8 +968,137 @@ impl Draft {
         self.imported_archive.is_some()
     }
 
+    pub(super) fn has_imported_privileged(&self) -> bool {
+        self.imported_privileged.is_some()
+    }
+
+    fn imported_staging(&self) -> Option<&imported_transfer::StagedSftpDraft> {
+        match self.imported_transfer.as_deref() {
+            Some(imported_transfer::Draft::StagedSftp(staged)) => Some(staged),
+            _ => None,
+        }
+    }
+
+    pub(super) fn imported_route(&self) -> Option<&ConnectionRef> {
+        self.imported_archive
+            .as_ref()
+            .map(|imported| &imported.route)
+            .or_else(|| self.imported_staging().map(|imported| &imported.route))
+    }
+
+    pub(super) fn select_imported_sudo(&mut self, mode: SudoMode) {
+        if (self.imported_staging().is_some() || self.has_imported_privileged())
+            && mode != SudoMode::Disabled
+        {
+            self.imported_sudo_mode = Some(mode);
+        }
+    }
+
     pub(super) fn requires_import_review(&self) -> bool {
-        self.has_imported_ai() || self.has_imported_transfer() || self.has_imported_archive()
+        self.has_imported_ai()
+            || self.has_imported_transfer()
+            || self.has_imported_archive()
+            || self.has_imported_privileged()
+    }
+
+    pub(super) fn adopt_imported_privileged(
+        &mut self,
+        store: &ConnectionStore,
+        trust: &kortty_ssh::TrustStore,
+        policy: &crate::clipboard_policy::ClipboardPolicy,
+        snippets: &Path,
+    ) -> Result<bool, &'static str> {
+        use imported_privileged::Settings;
+
+        let imported = self
+            .imported_privileged
+            .as_deref()
+            .ok_or(imported_privileged::REVIEW_REQUIRED)?;
+        let mode = self
+            .imported_sudo_mode
+            .ok_or("Choose passwordless or vault-backed sudo.")?;
+        imported.validate(
+            self.connection.iter().chain(&self.additional_connections),
+            self.target_groups.is_some(),
+        )?;
+        self.require_current_groups(store)?;
+        imported.require_current_routes(store, trust, policy)?;
+        if let Settings::Snippet { link, .. } = &imported.settings {
+            link.command(snippets)?;
+        }
+
+        let settings = self
+            .imported_privileged
+            .take()
+            .expect("validated imported action")
+            .settings;
+        let file_action = settings.shell_options().is_none();
+        if let Some(options) = settings.shell_options() {
+            self.working_directory = options.working_directory.clone().unwrap_or_default();
+            self.virtual_terminal = TerminalDraft::from_options(
+                options
+                    .virtual_terminal
+                    .filter(|_| mode == SudoMode::Passwordless),
+            );
+        }
+        match settings {
+            Settings::Command { text, .. } => {
+                self.source = Source::Command;
+                self.command = text_editor::Content::with_text(&text);
+            }
+            Settings::Snippet { link, .. } => {
+                self.source = Source::Snippet;
+                self.snippet_id = Some(link.id);
+                self.script_arguments = text_editor::Content::with_text(&link.arguments.join("\n"));
+            }
+            Settings::File { action } => self.set_imported_file_settings(action),
+        }
+        self.imported_sudo_mode = None;
+        self.privileged_approval = None;
+        self.sudo = mode;
+        self.enabled = false;
+        Ok(file_action)
+    }
+
+    fn set_imported_file_settings(&mut self, action: imported_privileged::FileAction) {
+        use imported_privileged::FileAction;
+
+        match action {
+            FileAction::Mkdir { path } => {
+                self.source = Source::RemoteMkdir;
+                self.remote_path = path;
+            }
+            FileAction::Rename { from, to } => {
+                self.source = Source::RemoteRename;
+                self.remote_path = from;
+                self.remote_destination = to;
+            }
+            FileAction::Chmod { path, permissions } => {
+                self.source = Source::RemoteChmod;
+                self.remote_path = path;
+                self.remote_mode = permissions;
+            }
+            FileAction::Chown { path, owner, group } => {
+                self.source = Source::RemoteChown;
+                self.remote_path = path;
+                self.remote_uid = owner;
+                self.remote_gid = group.unwrap_or_default();
+                self.reviewed_uid = None;
+                self.reviewed_gid = None;
+            }
+            FileAction::Copy { from, to } => {
+                self.source = Source::RemoteCopy;
+                self.remote_path = from;
+                self.remote_destination = to;
+                self.privileged_copy_tree = false;
+            }
+            FileAction::Delete { path } => {
+                self.source = Source::RemoteDelete;
+                self.remote_path = path;
+                self.recursive_delete = true;
+                self.remote_delete_confirmation.clear();
+            }
+        }
     }
 
     pub(super) fn adopt_imported_archive(
@@ -942,12 +1140,14 @@ impl Draft {
         );
         self.remote_path = archive.target.as_str().to_owned();
         self.archive_format = archive.format;
+        self.archive_member_layout = archive.member_layout;
         self.archive_level = archive.level.to_string();
         self.archive_download = archive
             .download
             .as_deref()
             .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
         self.archive_password = archive.password_credential;
+        self.archive_reuse_output = archive.reuse_output;
         self.sudo = if imported.settings.java_sudo {
             SudoMode::Passwordless
         } else {
@@ -971,6 +1171,9 @@ impl Draft {
         use super::sync::Direction;
         use imported_transfer::Mode;
 
+        if let Mode::Staged(destination) = mode {
+            return self.adopt_imported_staging(destination);
+        }
         let Some(imported_transfer::Draft::Sftp(imported)) = self.imported_transfer.as_deref()
         else {
             return Err(imported_transfer::REVIEW_REQUIRED);
@@ -988,6 +1191,7 @@ impl Draft {
             (Mode::Folder, Direction::Download) => Source::RemoteDownloadFolder,
             (Mode::Compare, Direction::Upload) => Source::SyncUpload,
             (Mode::Compare, Direction::Download) => Source::SyncDownload,
+            (Mode::Staged(_), _) => unreachable!("staged transfers have a separate draft"),
         };
         self.remote_path = imported.remote.as_str().into();
         self.imported_transfer = None;
@@ -996,6 +1200,44 @@ impl Draft {
         if mode == Mode::Compare {
             self.schedule_enabled = false;
         }
+        Ok(())
+    }
+
+    fn adopt_imported_staging(
+        &mut self,
+        destination: imported_transfer::StagedDestination,
+    ) -> Result<(), &'static str> {
+        use imported_transfer::{Direction, StagedDestination};
+
+        let staged = self
+            .imported_staging()
+            .ok_or(imported_transfer::STAGING_REVIEW_REQUIRED)?;
+        staged.require_route(
+            self.connection.as_ref(),
+            &self.additional_connections,
+            self.target_groups.is_some(),
+        )?;
+        let sudo = self
+            .imported_sudo_mode
+            .filter(|mode| *mode != SudoMode::Disabled)
+            .ok_or("Choose passwordless or vault-backed sudo for this transfer.")?;
+        let remote: RemotePath = self.remote_path.clone().try_into()?;
+        staged.validate_adoption(destination, PathBuf::from(&self.local_file), remote)?;
+        self.source = match (destination.is_folder(), staged.settings.kind.direction()) {
+            (true, Direction::Upload) => Source::PrivilegedTreeUpload,
+            (true, Direction::Download) => Source::PrivilegedTreeDownload,
+            (false, Direction::Upload) => Source::RemoteUpload,
+            (false, Direction::Download) => Source::RemoteDownload,
+        };
+        self.imported_transfer = None;
+        self.imported_sudo_mode = None;
+        self.enabled = false;
+        self.sudo = sudo;
+        self.privileged_replace_existing = destination == StagedDestination::ReplaceFile;
+        self.privileged_standing = false;
+        self.privileged_approval = None;
+        self.sync_replace_changed = destination == StagedDestination::ExistingFolder;
+        self.sync_approval = None;
         Ok(())
     }
 
@@ -1027,13 +1269,17 @@ impl Draft {
         if self.connection.is_none() {
             return Err("Choose a saved SSH target before configuring rsync.");
         }
-        let protected_file = (existing
-            && !directory
-            && !mixed
-            && imported.direction == Direction::Upload
-            && elevation == super::rsync::Elevation::Passwordless)
-            .then(|| imported.passwordless_existing_file_path())
-            .transpose()?;
+        let server_file = if !directory && !mixed && imported.direction == Direction::Upload {
+            if existing {
+                Some(imported.server_file_path()?)
+            } else if elevation == super::rsync::Elevation::Ordinary {
+                imported.server_file_path().ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         self.source = match (imported.direction, directory || mixed) {
             (Direction::Download, false) => Source::RsyncDownload,
             (Direction::Download, true) => Source::RsyncDownloadTree,
@@ -1042,6 +1288,10 @@ impl Draft {
         };
         self.rsync_program.clear();
         self.rsync_existing = settings;
+        self.rsync_allow_vacant_directory_download = false;
+        self.rsync_allow_vacant_file_download = false;
+        self.rsync_allow_vacant_server_file_upload = false;
+        self.rsync_allow_vacant_server_tree_upload = false;
         self.rsync_mixed = mixed;
         self.rsync_elevation = elevation;
         self.local_file.clear();
@@ -1057,16 +1307,8 @@ impl Draft {
             };
             self.rsync_sources =
                 text_editor::Content::with_text(&imported.java_sources[1..].join("\n"));
-            if existing && !directory && self.additional_connections.is_empty() {
-                let source = imported.existing_local_file_source()?;
-                let destination =
-                    Path::new(imported.java_target_root.trim()).join(source.basename());
-                if super::remote::validate_local_path(&destination).is_ok() {
-                    self.local_file = destination.to_string_lossy().into_owned();
-                }
-            }
         }
-        if let Some(path) = protected_file {
+        if let Some(path) = server_file {
             self.remote_path = path.as_str().to_owned();
         } else if (existing || mixed) && imported.direction == Direction::Upload {
             let root = imported.java_target_root.trim_end_matches('/');
@@ -1083,6 +1325,31 @@ impl Draft {
             self.rsync_standing_id = None;
         }
         self.rsync_destinations.clear();
+        if imported.direction == Direction::Download {
+            let grouped = !self.additional_connections.is_empty();
+            let append_source_name = !mixed
+                && imported.java_sources.len() == 1
+                && (!directory || (!existing && !imported.java_sources[0].ends_with('/')));
+            let default = |route: &ConnectionRef| {
+                imported.download_destination(route.id, grouped, append_source_name)
+            };
+            self.local_file = self
+                .connection
+                .as_ref()
+                .and_then(default)
+                .unwrap_or_default();
+            self.rsync_destinations.extend(
+                self.additional_connections
+                    .iter()
+                    .filter_map(|route| Some((route.id, default(route)?))),
+            );
+        } else if !self.remote_path.is_empty() {
+            self.rsync_destinations.extend(
+                self.additional_connections
+                    .iter()
+                    .map(|route| (route.id, self.remote_path.clone())),
+            );
+        }
         self.rsync_approval = None;
         self.rsync_import = Some(Box::new(imported.clone()));
         self.imported_transfer = None;
@@ -1137,6 +1404,10 @@ impl Draft {
                     Source::RsyncDownload | Source::RsyncDownloadTree
                 )
             }),
+            allow_vacant_directory_download: self.rsync_allow_vacant_directory_download,
+            allow_vacant_file_download: self.rsync_allow_vacant_file_download,
+            allow_vacant_server_file_upload: self.rsync_allow_vacant_server_file_upload,
+            allow_vacant_server_tree_upload: self.rsync_allow_vacant_server_tree_upload,
             additional_sources: if mixed.is_some() {
                 Vec::new()
             } else {
@@ -1244,6 +1515,15 @@ impl Draft {
             self.rsync_approval = None;
             self.rsync_standing_id = None;
             self.rsync_standing = enabled;
+            if !enabled {
+                if self.rsync_allow_vacant_server_file_upload
+                    && self.rsync_elevation == super::rsync::Elevation::Ordinary
+                {
+                    self.rsync_existing = None;
+                }
+                self.rsync_allow_vacant_server_file_upload = false;
+                self.rsync_allow_vacant_server_tree_upload = false;
+            }
         }
     }
 
@@ -1267,7 +1547,11 @@ impl Draft {
         {
             return Err("Keep the passwordless elevation mode of the imported Java action.");
         }
-        if !enabled && self.source == Source::RsyncUpload && self.rsync_existing.is_some() {
+        if !enabled
+            && self.source == Source::RsyncUpload
+            && self.rsync_existing.is_some()
+            && !self.rsync_allow_vacant_server_file_upload
+        {
             return Err("Clear the existing file destination before choosing ordinary rsync.");
         }
         let elevation = if enabled {
@@ -1426,6 +1710,13 @@ impl Draft {
             return false;
         }
         self.rsync_existing = settings;
+        if settings.is_none() {
+            self.rsync_allow_vacant_directory_download = false;
+            self.rsync_allow_vacant_server_file_upload = false;
+            self.rsync_allow_vacant_server_tree_upload = false;
+        } else {
+            self.rsync_allow_vacant_file_download = false;
+        }
         self.rsync_approval = None;
         self.rsync_standing_id = None;
         true
@@ -1441,6 +1732,57 @@ impl Draft {
             }
         };
         self.change_rsync_existing(|settings| enabled.then(|| settings.unwrap_or(initial)))
+    }
+
+    pub(super) fn set_rsync_allow_vacant_directory_download(&mut self, enabled: bool) -> bool {
+        if !self.supports_vacant_rsync_directory()
+            || self.rsync_allow_vacant_directory_download == enabled
+        {
+            return false;
+        }
+        self.rsync_allow_vacant_directory_download = enabled;
+        self.rsync_approval = None;
+        self.rsync_standing_id = None;
+        true
+    }
+
+    pub(super) fn set_rsync_allow_vacant_file_download(&mut self, enabled: bool) -> bool {
+        if (enabled && !self.supports_vacant_rsync_file())
+            || self.rsync_allow_vacant_file_download == enabled
+        {
+            return false;
+        }
+        self.rsync_allow_vacant_file_download = enabled;
+        self.rsync_approval = None;
+        self.rsync_standing_id = None;
+        true
+    }
+
+    pub(super) fn set_rsync_allow_vacant_server_file_upload(&mut self, enabled: bool) -> bool {
+        if (enabled && !self.supports_vacant_rsync_server_file())
+            || self.rsync_allow_vacant_server_file_upload == enabled
+        {
+            return false;
+        }
+        self.rsync_allow_vacant_server_file_upload = enabled;
+        if self.rsync_elevation == super::rsync::Elevation::Ordinary {
+            self.rsync_existing = enabled.then_some(super::rsync::ExistingDestination::FILE);
+        }
+        self.rsync_approval = None;
+        self.rsync_standing_id = None;
+        true
+    }
+
+    pub(super) fn set_rsync_allow_vacant_server_tree_upload(&mut self, enabled: bool) -> bool {
+        if (enabled && !self.supports_vacant_rsync_server_tree())
+            || self.rsync_allow_vacant_server_tree_upload == enabled
+        {
+            return false;
+        }
+        self.rsync_allow_vacant_server_tree_upload = enabled;
+        self.rsync_approval = None;
+        self.rsync_standing_id = None;
+        true
     }
 
     pub(super) fn change_rsync_mixed(&mut self, enabled: bool) -> bool {
@@ -1483,6 +1825,11 @@ impl Draft {
             }
         }
         self.rsync_mixed = enabled;
+        self.rsync_allow_vacant_directory_download = false;
+        self.rsync_allow_vacant_file_download = false;
+        self.rsync_allow_vacant_server_file_upload = false;
+        self.rsync_allow_vacant_server_tree_upload = false;
+        self.rsync_standing_id = None;
         self.rsync_approval = None;
         true
     }
@@ -1492,10 +1839,49 @@ impl Draft {
             || self.source == Source::RsyncDownloadTree && super::rsync::LOCAL_EXISTING_SUPPORTED
     }
 
+    fn supports_vacant_rsync_directory(&self) -> bool {
+        self.source == Source::RsyncDownloadTree
+            && super::rsync::LOCAL_EXISTING_SUPPORTED
+            && self.rsync_existing.is_some()
+            && (self.rsync_mixed || self.rsync_sources.text().trim().is_empty())
+    }
+
     fn supports_rsync_existing_file(&self) -> bool {
         self.source == Source::RsyncUpload
-            && self.rsync_elevation == super::rsync::Elevation::Passwordless
+            && (self.rsync_elevation == super::rsync::Elevation::Passwordless
+                || self.rsync_allow_vacant_server_file_upload)
             || self.source == Source::RsyncDownload && super::rsync::LOCAL_EXISTING_SUPPORTED
+    }
+
+    fn supports_vacant_rsync_file(&self) -> bool {
+        self.source == Source::RsyncDownload
+            && super::rsync::LOCAL_EXISTING_SUPPORTED
+            && self.rsync_existing.is_none()
+            && !self.rsync_mixed
+            && self.rsync_sources.text().trim().is_empty()
+    }
+
+    fn supports_vacant_rsync_server_file(&self) -> bool {
+        self.source == Source::RsyncUpload
+            && self.rsync_standing
+            && (self.supports_ordinary_rsync_server_file()
+                || self.rsync_existing == Some(super::rsync::ExistingDestination::FILE))
+            && !self.rsync_mixed
+            && self.rsync_sources.text().trim().is_empty()
+    }
+
+    fn supports_ordinary_rsync_server_file(&self) -> bool {
+        self.source == Source::RsyncUpload
+            && self.rsync_elevation == super::rsync::Elevation::Ordinary
+            && !self.rsync_mixed
+            && self.rsync_sources.text().trim().is_empty()
+    }
+
+    fn supports_vacant_rsync_server_tree(&self) -> bool {
+        self.source == Source::RsyncUploadTree
+            && self.rsync_standing
+            && self.rsync_existing.is_some()
+            && (self.rsync_mixed || self.rsync_sources.text().trim().is_empty())
     }
 
     pub(super) fn edit_sync_excludes(&mut self, action: text_editor::Action) {
@@ -1503,7 +1889,9 @@ impl Draft {
     }
 
     pub(super) fn edit_rsync_sources(&mut self, action: text_editor::Action) -> bool {
-        if self.rsync_existing.is_some() && !self.rsync_mixed {
+        if (self.rsync_existing.is_some() && !self.rsync_mixed)
+            || self.rsync_allow_vacant_file_download
+        {
             return false;
         }
         let changed = edit_bounded(
@@ -1525,7 +1913,13 @@ impl Draft {
     }
 
     pub(super) fn set_sync_replace_changed(&mut self, enabled: bool) {
-        if !matches!(self.source, Source::SyncUpload | Source::SyncDownload) {
+        if !matches!(
+            self.source,
+            Source::SyncUpload
+                | Source::SyncDownload
+                | Source::PrivilegedTreeUpload
+                | Source::PrivilegedTreeDownload
+        ) {
             return;
         }
         if self.sync_replace_changed != enabled {
@@ -1534,45 +1928,98 @@ impl Draft {
         self.sync_replace_changed = enabled;
     }
 
-    fn sync_standing_settings(&self) -> Result<Settings, String> {
+    fn sync_standing_settings(&self, replacement: bool) -> Result<Settings, String> {
+        let maximum = if replacement {
+            MAX_REPLACEMENT_BYTES
+        } else {
+            MAX_BYTES
+        };
         let bytes = self
             .sync_standing_mib
             .trim()
             .parse::<f64>()
             .ok()
             .map(|mib| mib * MIB)
-            .filter(|bytes| (1.0..=MAX_BYTES as f64).contains(bytes) && bytes.fract() == 0.0)
+            .filter(|bytes| (1.0..=maximum as f64).contains(bytes) && bytes.fract() == 0.0)
             .ok_or_else(|| format!(
                 "Enter an SFTP transfer limit up to {} MiB that represents a whole number of bytes",
-                MAX_BYTES as f64 / MIB,
+                maximum as f64 / MIB,
             ))?;
-        let settings =
-            Settings {
-                days: self
-                    .sync_standing_days
+        let settings = Settings {
+            days: self
+                .sync_standing_days
+                .trim()
+                .parse()
+                .map_err(|_| "Enter the number of days the SFTP approval should last")?,
+            limits: Limits {
+                max_firings: self
+                    .sync_standing_firings
                     .trim()
                     .parse()
-                    .map_err(|_| "Enter the number of days the SFTP approval should last")?,
-                limits: Limits {
-                    max_firings: self
-                        .sync_standing_firings
-                        .trim()
-                        .parse()
-                        .map_err(|_| "Enter the maximum number of SFTP firings")?,
-                    max_actions: self.sync_standing_actions.trim().parse().map_err(
+                    .map_err(|_| "Enter the maximum number of SFTP firings")?,
+                max_actions: if replacement {
+                    1
+                } else {
+                    self.sync_standing_actions.trim().parse().map_err(
                         |_| "Enter the maximum number of files and folders per SFTP firing",
-                    )?,
-                    max_bytes: bytes as u64,
+                    )?
                 },
-            };
-        settings.validate().map_err(|error| error.to_string())?;
+                max_bytes: bytes as u64,
+            },
+        };
+        if replacement {
+            settings.validate_replacement()
+        } else {
+            settings.validate()
+        }
+        .map_err(|error| error.to_string())?;
         Ok(settings)
+    }
+
+    fn standing_limits_view(&self, replacement: bool) -> Element<'_, Message> {
+        column![
+            text("Enable a calendar or choose Chain with predecessors on the Job page.").size(12),
+            form_row(
+                "Approval duration (days)",
+                input(Field::SyncStandingDays, "Days", &self.sync_standing_days)
+            ),
+            form_row(
+                "Maximum firings",
+                input(
+                    Field::SyncStandingFirings,
+                    "Firings",
+                    &self.sync_standing_firings
+                )
+            ),
+            (!replacement).then(|| form_row(
+                "Files and folders per firing",
+                input(
+                    Field::SyncStandingActions,
+                    "Maximum count",
+                    &self.sync_standing_actions
+                )
+            )),
+            form_row(
+                "MiB per firing",
+                input(
+                    Field::SyncStandingMib,
+                    "Maximum MiB",
+                    &self.sync_standing_mib
+                )
+            ),
+        ]
+        .spacing(6)
+        .into()
     }
 
     pub fn select_source(&mut self, source: Source) {
         if self.has_imported_archive()
             || self.has_imported_transfer()
-            || source == Source::ImportedTransfer
+            || self.has_imported_privileged()
+            || matches!(
+                source,
+                Source::ImportedTransfer | Source::ImportedPrivileged
+            )
             || self.rsync_import.is_some()
                 && (!source.is_rsync()
                     || self.source.is_rsync_upload() != source.is_rsync_upload()
@@ -1589,10 +2036,16 @@ impl Draft {
             self.remote_delete_confirmation.clear();
             self.recursive_delete = false;
             self.privileged_copy_tree = false;
+            self.privileged_replace_existing = false;
+            self.privileged_standing = false;
             self.privileged_approval = None;
             if self.source.is_rsync() || source.is_rsync() {
                 self.rsync_approval = None;
                 self.rsync_existing = None;
+                self.rsync_allow_vacant_directory_download = false;
+                self.rsync_allow_vacant_file_download = false;
+                self.rsync_allow_vacant_server_file_upload = false;
+                self.rsync_allow_vacant_server_tree_upload = false;
                 if self.rsync_mixed {
                     self.rsync_mixed = false;
                     self.rsync_sources = text_editor::Content::new();
@@ -1603,9 +2056,19 @@ impl Draft {
                     self.rsync_elevation = super::rsync::Elevation::Ordinary;
                 }
             }
-            if matches!(self.source, Source::SyncUpload | Source::SyncDownload)
-                || matches!(source, Source::SyncUpload | Source::SyncDownload)
-            {
+            if matches!(
+                self.source,
+                Source::SyncUpload
+                    | Source::SyncDownload
+                    | Source::PrivilegedTreeUpload
+                    | Source::PrivilegedTreeDownload
+            ) || matches!(
+                source,
+                Source::SyncUpload
+                    | Source::SyncDownload
+                    | Source::PrivilegedTreeUpload
+                    | Source::PrivilegedTreeDownload
+            ) {
                 self.sync_replace_changed = false;
                 self.sync_approval = None;
             }
@@ -1714,7 +2177,37 @@ impl Draft {
             return;
         }
         self.privileged_approval = None;
+        if mode == SudoMode::Disabled {
+            self.privileged_replace_existing = false;
+            self.privileged_standing = false;
+        }
         self.sudo = mode;
+    }
+
+    fn can_replace_privileged_file(&self) -> bool {
+        self.regular_transfer() && self.sudo != SudoMode::Disabled
+    }
+
+    pub(super) fn set_privileged_replace_existing(&mut self, enabled: bool) -> bool {
+        if !self.can_replace_privileged_file() || self.privileged_replace_existing == enabled {
+            return false;
+        }
+        self.privileged_replace_existing = enabled;
+        self.privileged_standing = false;
+        self.privileged_approval = None;
+        true
+    }
+
+    pub(super) fn set_privileged_standing(&mut self, enabled: bool) -> bool {
+        if !self.can_replace_privileged_file()
+            || !self.privileged_replace_existing
+            || self.privileged_standing == enabled
+        {
+            return false;
+        }
+        self.privileged_standing = enabled;
+        self.privileged_approval = None;
+        true
     }
 
     pub fn set_recursive_delete(&mut self, recursive: bool) {
@@ -2019,6 +2512,9 @@ impl Draft {
             return false;
         }
         self.archive_format = format;
+        if !format.supports_server_member_paths() {
+            self.archive_member_layout = ArchiveMemberLayout::SourceBasename;
+        }
         self.privileged_approval = None;
         true
     }
@@ -2040,11 +2536,43 @@ impl Draft {
             return false;
         }
         self.archive_server_only = enabled;
+        self.archive_reuse_output = false;
+        self.archive_member_layout = ArchiveMemberLayout::SourceBasename;
         self.sudo = SudoMode::Disabled;
         self.privileged_approval = None;
         if !self.archive_formats().contains(&self.archive_format) {
             self.archive_format = ArchiveFormat::Zip;
         }
+        true
+    }
+
+    pub(super) fn set_archive_server_path(&mut self, preserve: bool) -> bool {
+        let layout = if preserve {
+            ArchiveMemberLayout::ServerPath
+        } else {
+            ArchiveMemberLayout::SourceBasename
+        };
+        if !self.privileged_archive()
+            || self.has_imported_archive()
+            || !self.archive_format.supports_server_member_paths()
+            || self.archive_member_layout == layout
+        {
+            return false;
+        }
+        self.archive_member_layout = layout;
+        self.privileged_approval = None;
+        true
+    }
+
+    pub(super) fn set_archive_reuse_output(&mut self, enabled: bool) -> bool {
+        if !self.privileged_archive()
+            || self.has_imported_archive()
+            || self.archive_reuse_output == enabled
+        {
+            return false;
+        }
+        self.archive_reuse_output = enabled;
+        self.privileged_approval = None;
         true
     }
 
@@ -2178,6 +2706,7 @@ impl Draft {
             agent: None,
             imported_ai: None,
             imported_transfer: self.imported_transfer.clone(),
+            imported_privileged: self.imported_privileged.clone(),
             sudo: self.sudo,
             virtual_terminal: if self.source.is_remote() || self.source.is_agent() {
                 None
@@ -2199,7 +2728,7 @@ impl Draft {
         };
         let remote_path = || self.remote_path.clone().try_into();
         match self.source {
-            Source::ImportedTransfer => {}
+            Source::ImportedTransfer | Source::ImportedPrivileged => {}
             Source::Command => action.command = self.command.text(),
             Source::Script => {
                 action.script = Some(Script::from_lines(
@@ -2287,6 +2816,8 @@ impl Draft {
                     download: (!self.archive_download.is_empty())
                         .then(|| PathBuf::from(&self.archive_download)),
                     server_output: self.server_output(&authorize)?,
+                    reuse_output: self.archive_server_only && self.archive_reuse_output,
+                    member_layout: self.archive_member_layout,
                 };
                 action.remote = Some(match (self.archive_server_only, self.sudo) {
                     (true, SudoMode::Disabled) => RemoteAction::ServerArchive(archive),
@@ -2315,6 +2846,11 @@ impl Draft {
                     },
                     local: PathBuf::from(&self.local_file),
                     remote: remote_path()?,
+                    replace_existing: self.privileged_replace_existing,
+                    standing: self
+                        .privileged_standing
+                        .then(|| self.sync_standing_settings(true))
+                        .transpose()?,
                     approval: self.privileged_approval.clone(),
                 }));
             }
@@ -2352,10 +2888,10 @@ impl Draft {
                     } else {
                         self.sync_excludes.text().trim_end_matches('\n').to_owned()
                     },
-                    replace_changed: !self.privileged_tree() && self.sync_replace_changed,
+                    replace_changed: self.sync_replace_changed,
                     approval: self.sync_approval.clone(),
                     standing: (self.sync_standing && !self.privileged_tree())
-                        .then(|| self.sync_standing_settings())
+                        .then(|| self.sync_standing_settings(false))
                         .transpose()?,
                 };
                 action.remote = Some(match self.source {
@@ -2506,7 +3042,9 @@ impl Draft {
             ) => Some((copy, true)),
             _ => None,
         };
-        if let Some((copy, privileged)) = scheduled_copy {
+        if let Some((copy, privileged)) = scheduled_copy
+            && (!privileged || definition.enabled)
+        {
             copy.validate_job_schedule(
                 definition.schedule.as_ref(),
                 definition.mode,
@@ -2590,7 +3128,8 @@ impl Draft {
                 .on_toggle_maybe((!self.requires_import_review()).then_some(Message::Enabled)),
             form_row("Name", input(Field::Name, "Job name", &self.name)),
             form_row("Connection", self.connection_view(connections)),
-            (!self.has_unresolved_imported_ai() || self.has_connection_groups()).then(|| {
+            (self.imported_route().is_none() && !self.has_imported_privileged()
+                && (!self.has_unresolved_imported_ai() || self.has_connection_groups())).then(|| {
                 form_row("Connection groups", self.connection_groups_view(connection_groups))
             }),
             (!self.source.is_remote()).then(|| form_row("Working directory", row![
@@ -2678,6 +3217,9 @@ impl Draft {
         if let Some(imported) = &self.imported_transfer {
             return self.imported_transfer_view(imported, permissions.privileged);
         }
+        if let Some(imported) = &self.imported_privileged {
+            return self.imported_privileged_view(imported, snippets, permissions.privileged);
+        }
         let ActionPermissions {
             browse: can_browse,
             privileged: privileged_allowed,
@@ -2699,8 +3241,35 @@ impl Draft {
                 }
             }
             if privileged_allowed && self.sudo != SudoMode::Disabled {
+                if self.can_replace_privileged_file() {
+                    fields = fields.push(
+                        checkbox(self.privileged_replace_existing)
+                            .label(if self.source == Source::RemoteUpload {
+                                "Review replacement of an existing server file"
+                            } else {
+                                "Review replacement of an existing local file"
+                            })
+                            .on_toggle(Message::PrivilegedReplaceExisting),
+                    );
+                }
+                if self.privileged_replace_existing {
+                    fields = fields.push(
+                        checkbox(self.privileged_standing)
+                            .label("Allow recurring automatic replacements on this device")
+                            .on_toggle(Message::PrivilegedStanding),
+                    );
+                    if self.privileged_standing {
+                        fields = fields.push(self.standing_limits_view(true));
+                    }
+                }
                 fields = fields
-                    .push(text("Privileged staging requires one saved SSH route, verified host keys and a new destination. It supports one regular file on Linux.").size(12))
+                    .push(text(if self.privileged_replace_existing && self.source == Source::RemoteUpload {
+                        "Requires the Linux server helper with configured replacement roots. Both files can be up to 1 GiB."
+                    } else if self.privileged_replace_existing {
+                        "Requires one saved Linux SSH route and verified host keys. Each replacement retains the original local file."
+                    } else {
+                        "Requires one saved Linux SSH route, verified host keys and a new destination for one regular file."
+                    }).size(12))
                     .push(
                         button("Review paths and SSH route…").on_press_maybe(
                             (can_browse && self.connection.is_some() && self.additional_connections.is_empty())
@@ -2713,8 +3282,12 @@ impl Draft {
             if privileged_allowed {
                 column![
                     form_row("Privileged staging", self.sudo_view()),
-                    text(if self.source == Source::PrivilegedTreeDownload {
+                    text(if self.source == Source::PrivilegedTreeDownload && self.sync_replace_changed {
+                        "Requires a pinned Linux SSH route, a protected source and an existing local folder. Review missing entries and changed regular files before publishing."
+                    } else if self.source == Source::PrivilegedTreeDownload {
                         "Requires a pinned Linux SSH route, a protected server folder, and an absent local destination. Reviews the entire tree up to 128 entries and 1 GiB."
+                    } else if self.sync_replace_changed {
+                        "Requires a pinned Linux SSH route and the installed privileged folder helper. Review missing entries and changed files within the configured server roots."
                     } else {
                         "Requires a pinned Linux SSH route and an absent destination folder. Uploads up to 128 reviewed entries and 1 GiB as root with private permissions."
                     }).size(12),
@@ -2958,8 +3531,17 @@ impl Draft {
     }
 
     fn connection_view<'a>(&'a self, connections: &'a [ConnectionChoice]) -> Element<'a, Message> {
-        if let Some(imported) = &self.imported_archive {
-            return text(route_label(&imported.route)).into();
+        if let Some(imported) = &self.imported_privileged {
+            return imported
+                .routes
+                .iter()
+                .fold(column![].spacing(4), |rows, route| {
+                    rows.push(text(route_label(route)))
+                })
+                .into();
+        }
+        if let Some(route) = self.imported_route() {
+            return text(route_label(route)).into();
         }
         if let Some(source) = &self.target_groups {
             return self.group_connections_view(connections, source);
@@ -3128,6 +3710,7 @@ impl Draft {
         passwords: &'a [CredentialChoice],
     ) -> Element<'a, Message> {
         let settings = &imported.settings;
+        let server_paths = settings.member_layout() == ArchiveMemberLayout::ServerPath;
         let source_paths = settings
             .sources
             .iter()
@@ -3144,7 +3727,12 @@ impl Draft {
             } else {
                 format!("{} · compression {}", settings.format, settings.level)
             })),
-            text("Rust creates a private archive at a new destination and names entries relative to each source's file or folder name.").size(12),
+            text(if server_paths {
+                "The adopted archive preserves complete server paths, as in Java. For example, /etc/hosts is stored as etc/hosts."
+            } else {
+                "Archive entries start with each source's file or folder name."
+            }).size(12),
+            text("Adoption keeps the job disabled. Existing archive paths require a separate reuse selection.").size(12),
         ].spacing(8);
         if settings.java_sudo {
             fields = fields.push(text("Java requested sudo. This job needs the installed Rust archive helper and a new review of the selected sudo mode and SSH route.").size(12));
@@ -3157,7 +3745,11 @@ impl Draft {
         }
         fields = fields
             .push(form_row("Rust exclude patterns", text_editor(&self.archive_excludes).placeholder("One optional exclude glob per line").height(Length::Fixed(90.0)).on_action(Message::EditArchiveExcludes)))
-            .push(text("Review the exclusions for this archive. Relative globs start with the source name. A leading / matches the absolute server path. TAR also checks from each directory boundary.").size(12));
+            .push(text(if server_paths {
+                java_archive_exclude_help(settings.format)
+            } else {
+                "Review the exclusions for this archive. Relative globs start with the source name. A leading / matches the absolute server path. TAR also checks from each directory boundary."
+            }).size(12));
         if let Some(local) = &settings.local_hint {
             fields = fields
                 .push(form_row(
@@ -3214,6 +3806,109 @@ impl Draft {
         )
     }
 
+    fn imported_privileged_view<'a>(
+        &'a self,
+        imported: &'a imported_privileged::Draft,
+        snippets: &'a [SnippetChoice],
+        privileged_allowed: bool,
+    ) -> Element<'a, Message> {
+        use imported_privileged::{FileAction, Settings};
+
+        let mut fields = column![text("Imported Java sudo action").size(17)].spacing(8);
+        fields = match &imported.settings {
+            Settings::Command { text: command, .. } => fields.push(form_row(
+                "Command",
+                scrollable(text(command.as_str()).font(iced::Font::MONOSPACE))
+                    .height(128)
+                    .width(Length::Fill),
+            )),
+            Settings::Snippet { link, .. } => {
+                let snippet = snippets.iter().find(|choice| choice.id == link.id);
+                let fields = fields.push(form_row(
+                    "Shared snippet",
+                    text(
+                        snippet
+                            .map_or("Linked snippet unavailable", |choice| choice.label.as_str()),
+                    ),
+                ));
+                if link.arguments.is_empty() {
+                    fields
+                } else {
+                    fields.push(form_row(
+                        "Arguments",
+                        scrollable(text(link.arguments.join("\n")).font(iced::Font::MONOSPACE))
+                            .height(96)
+                            .width(Length::Fill),
+                    ))
+                }
+            }
+            Settings::File { action } => {
+                let mut fields = action.fields().into_iter().fold(
+                    fields.push(form_row("File action", text(action.label()))),
+                    |rows, (label, value)| {
+                        rows.push(form_row(label, text(value).wrapping(text::Wrapping::Glyph)))
+                    },
+                );
+                let note = match action {
+                    FileAction::Chown { .. } => Some(
+                        "Review names on the server or enter the numeric IDs in the native action.",
+                    ),
+                    FileAction::Copy { .. } => {
+                        Some("Choose a file or folder source in the native action.")
+                    }
+                    FileAction::Delete { .. } => {
+                        Some("Repeat the absolute server path before reviewing recursive deletion.")
+                    }
+                    _ => None,
+                };
+                if let Some(note) = note {
+                    fields = fields.push(text(note).size(12));
+                }
+                fields
+            }
+        };
+        if let Some(options) = imported.settings.shell_options() {
+            if let Some(path) = &options.working_directory {
+                fields = fields.push(form_row("Working directory", text(path.as_str())));
+            }
+            if let Some(terminal) = options.virtual_terminal {
+                fields = fields.push(form_row(
+                    "Virtual terminal",
+                    text(format!(
+                        "{} × {} · Passwordless sudo",
+                        terminal.columns, terminal.rows
+                    )),
+                ));
+                if self.imported_sudo_mode == Some(SudoMode::Vault) {
+                    fields = fields
+                        .push(text("Vault-backed sudo uses a non-PTY SSH exec channel.").size(12));
+                }
+            }
+        }
+        if privileged_allowed {
+            fields = fields.push(form_row(
+                "Sudo",
+                pick_list(
+                    &SudoMode::ALL[1..],
+                    self.imported_sudo_mode,
+                    Message::ImportedPrivilegedSudo,
+                )
+                .placeholder("Choose a sudo mode"),
+            ));
+        } else {
+            fields = fields
+                .push(text("Application policy forbids this Scheduler sudo action.").size(12));
+        }
+        fields
+            .push(
+                button("Use native sudo action").on_press_maybe(
+                    (privileged_allowed && self.imported_sudo_mode.is_some())
+                        .then_some(Message::AdoptImportedPrivileged),
+                ),
+            )
+            .into()
+    }
+
     fn imported_transfer_view<'a>(
         &'a self,
         imported: &'a imported_transfer::Draft,
@@ -3223,6 +3918,9 @@ impl Draft {
 
         let imported = match imported {
             Draft::Sftp(imported) => imported,
+            Draft::StagedSftp(staged) => {
+                return self.imported_staging_view(staged, privileged_allowed);
+            }
             Draft::Rsync(imported) => {
                 return self.imported_rsync_view(imported, privileged_allowed);
             }
@@ -3249,6 +3947,79 @@ impl Draft {
                 button("Compare folders").on_press_maybe(ready.then_some(Message::AdoptImportedTransfer(Mode::Compare))),
             ].spacing(6).wrap(),
         ].spacing(8).into()
+    }
+
+    fn imported_staging_view<'a>(
+        &'a self,
+        staged: &'a imported_transfer::StagedSftpDraft,
+        privileged_allowed: bool,
+    ) -> Element<'a, Message> {
+        use imported_transfer::{Mode, StagedDestination};
+
+        let ready = privileged_allowed
+            && self.imported_sudo_mode.is_some()
+            && !self.local_file.is_empty()
+            && !self.remote_path.is_empty();
+        let adopt = |destination| {
+            ready.then_some(Message::AdoptImportedTransfer(Mode::Staged(destination)))
+        };
+        column![
+            text(staged.settings.kind.label()).size(16),
+            form_row(
+                "Path from Java",
+                text(&staged.settings.local_hint).wrapping(text::Wrapping::Glyph)
+            ),
+            form_row(
+                "Server path from Java",
+                text(&staged.settings.remote_hint).wrapping(text::Wrapping::Glyph)
+            ),
+            form_row("SSH target", text(route_label(&staged.route))),
+            form_row(
+                "Local path",
+                input(
+                    Field::LocalFile,
+                    "Absolute path on this device",
+                    &self.local_file
+                )
+            ),
+            form_row(
+                "Server path",
+                input(Field::RemotePath, "Absolute Linux path", &self.remote_path)
+            ),
+            if privileged_allowed {
+                form_row(
+                    "Privileged staging",
+                    pick_list(
+                        [SudoMode::Passwordless, SudoMode::Vault],
+                        self.imported_sudo_mode,
+                        Message::ImportedStagingSudo,
+                    )
+                    .placeholder("Choose sudo authorization"),
+                )
+            } else {
+                text("Application policy forbids privileged staging.")
+                    .size(12)
+                    .into()
+            },
+            row![
+                button("Use new file").on_press_maybe(adopt(StagedDestination::NewFile)),
+                button("Replace existing file")
+                    .on_press_maybe(adopt(StagedDestination::ReplaceFile)),
+                button("Use new folder").on_press_maybe(adopt(StagedDestination::NewFolder)),
+                button(
+                    if staged.settings.kind.direction() == imported_transfer::Direction::Download {
+                        "Use existing local folder"
+                    } else {
+                        "Use existing server folder"
+                    }
+                )
+                .on_press_maybe(adopt(StagedDestination::ExistingFolder)),
+            ]
+            .spacing(6)
+            .wrap(),
+        ]
+        .spacing(8)
+        .into()
     }
 
     fn imported_rsync_view<'a>(
@@ -3480,6 +4251,8 @@ impl Draft {
                         if self.source.is_rsync_upload() {
                             if grouped_rsync {
                                 "Primary server destination"
+                            } else if self.rsync_allow_vacant_server_file_upload {
+                                "Server destination file"
                             } else if protected_file {
                                 "Existing server file"
                             } else if rsync_batch || self.rsync_existing.is_some() {
@@ -3495,8 +4268,13 @@ impl Draft {
                         row![
                             input(
                                 Field::RemotePath,
-                                if self.source == Source::RemoteArchive {
+                                if self.source == Source::RemoteArchive && self.archive_reuse_output
+                                {
+                                    "Absolute archive path on the SSH server"
+                                } else if self.source == Source::RemoteArchive {
                                     "Absolute new archive path on the SSH server"
+                                } else if self.rsync_allow_vacant_server_file_upload {
+                                    "Absolute file path on the SSH server"
                                 } else if protected_file {
                                     "Absolute existing file path on the SSH server"
                                 } else {
@@ -3587,20 +4365,42 @@ impl Draft {
                             .push(text("The vault must be unlocked when the job starts. AES-256 protects file contents. File names remain visible.").size(12));
                     }
                     archive = archive.push(form_row("Local archive path", input(Field::ArchiveDownload, "Optional absolute local archive path", &self.archive_download)));
+                    let server_paths = self.archive_member_layout == ArchiveMemberLayout::ServerPath;
+                    if self.archive_server_only {
+                        if self.archive_format.supports_server_member_paths() {
+                            archive = archive.push(checkbox(server_paths).label("Keep complete server paths in archive entries (Java layout)").on_toggle(Message::ArchiveServerPath));
+                        }
+                        archive = archive.push(checkbox(self.archive_reuse_output).label("Reuse reviewed archive paths").on_toggle(Message::ArchiveReuseOutput));
+                        if self.archive_reuse_output {
+                            archive = archive.push(text("Archive reuse requires the Linux helper. ZIP keeps unmatched entries. TAR, TAR.BZ2 and 7z are rebuilt from the current sources. Previous files are kept for recovery.").size(12));
+                        }
+                    }
                     if self.server_output_enabled() {
                         archive = archive
                             .push(form_row("Output owner", self.owner_id_entry(AccountKind::User, can_browse)))
                             .push(form_row("Output group", self.owner_id_entry(AccountKind::Group, can_browse)))
                             .push(form_row("Output permissions", input(Field::ArchiveMode, "Three octal digits, defaults to 600", &self.archive_mode)))
-                            .push(text("A local copy requires file-transfer permission and a new local path. The server archive is kept if the local copy fails.").size(12));
+                            .push(text("A local copy requires file-transfer permission. The server archive is kept if the local copy fails.").size(12));
                     }
                     if self.privileged_archive() && self.sudo != SudoMode::Disabled {
-                        archive = archive.push(text("A local copy requires file-transfer permission, an administrator-enabled download root and a new local path.").size(12));
+                        archive = archive.push(text(if self.archive_reuse_output {
+                            "A local copy requires file-transfer permission and a server path within a configured protected download root. Reuse also checks any existing local copy before replacing it."
+                        } else {
+                            "A local copy requires file-transfer permission, a server path within a configured protected download root and a new local path."
+                        }).size(12));
                     }
                     archive
-                        .push(text("Glob paths start with the source name. A leading / matches the absolute remote path. TAR also checks from each directory boundary.").size(12))
-                        .push(text(if self.privileged_archive() && self.sudo != SudoMode::Disabled {
+                        .push(text(if server_paths {
+                            java_archive_exclude_help(self.archive_format)
+                        } else {
+                            "Glob paths start with the source name. A leading / matches the absolute remote path. TAR also checks from each directory boundary."
+                        }).size(12))
+                        .push(text(if self.privileged_archive() && self.sudo != SudoMode::Disabled && self.archive_reuse_output {
+                            "Creates or updates a root-owned archive with private permissions. Each run checks the reviewed output paths and verified SSH route."
+                        } else if self.privileged_archive() && self.sudo != SudoMode::Disabled {
                             "Creates a new root-owned archive with private permissions using one saved Linux SSH connection and verified host keys."
+                        } else if self.archive_server_only && self.archive_reuse_output {
+                            "Rechecks the saved output paths and SSH route before each publication."
                         } else if self.archive_server_only {
                             "Creates an archive at a new path with the saved output attributes using the server archive helper and one verified SSH route."
                         } else {
@@ -3630,7 +4430,11 @@ impl Draft {
                     .push(form_row("Local path", input(Field::LocalFile, "Absolute new local folder", &self.local_file)))
                     .push(text("Creates the local folder after the download completes. Links and special files are skipped.").size(12)),
                 Source::PrivilegedTreeDownload => editor
-                    .push(form_row("Local destination", input(Field::LocalFile, "Absolute new local folder", &self.local_file)))
+                    .push(form_row("Local destination", input(Field::LocalFile,
+                        if self.sync_replace_changed { "Absolute existing local folder" } else { "Absolute new local folder" }, &self.local_file)))
+                    .push(checkbox(self.sync_replace_changed)
+                        .label("Review changes in an existing local folder")
+                        .on_toggle(Message::SyncReplaceChanged))
                     .push(text("Save one approval for Run Now or one scheduled date and time.").size(12)),
                 Source::SyncUpload | Source::SyncDownload | Source::PrivilegedTreeUpload => {
                     let editor = editor
@@ -3640,7 +4444,11 @@ impl Draft {
                             .height(Length::Fixed(80.0))
                             .on_action(Message::EditSyncExcludes)));
                     if self.privileged_tree() {
-                        editor.push(text("Save one approval for Run Now or one scheduled date and time.").size(12))
+                        editor
+                            .push(checkbox(self.sync_replace_changed)
+                                .label("Review changes in an existing server folder")
+                                .on_toggle(Message::SyncReplaceChanged))
+                            .push(text("Save one approval for Run Now or one scheduled date and time.").size(12))
                     } else {
                         let editor = editor.push(checkbox(self.sync_replace_changed)
                             .label(if self.source == Source::SyncDownload {
@@ -3651,19 +4459,16 @@ impl Draft {
                             .on_toggle(Message::SyncReplaceChanged));
                         let editor = editor.push(
                             checkbox(self.sync_standing)
-                                .label("Allow recurring scheduled copies on this device")
+                                .label("Allow recurring automatic copies on this device")
                                 .on_toggle(Message::SyncStanding),
                         );
                         let editor = if self.sync_standing {
                             editor
-                                .push(form_row("Approval duration (days)", input(Field::SyncStandingDays, "Days", &self.sync_standing_days)))
-                                .push(form_row("Maximum firings", input(Field::SyncStandingFirings, "Firings", &self.sync_standing_firings)))
-                                .push(form_row("Files and folders per firing", input(Field::SyncStandingActions, "Maximum count", &self.sync_standing_actions)))
-                                .push(form_row("MiB per firing", input(Field::SyncStandingMib, "Maximum MiB", &self.sync_standing_mib)))
+                                .push(self.standing_limits_view(false))
                                 .push(text(if self.sync_replace_changed {
                                     "Each calendar firing can replace eligible changed files and copy missing entries within these limits. The original files stay in private recovery folders."
                                 } else {
-                                    "The saved calendar can copy missing files and folders within these limits. Each authorized firing counts toward the total."
+                                    "Each approved firing can copy missing files and folders within these limits. Calendar and Chain starts share the firing allowance."
                                 }).size(12))
                         } else if self.sync_replace_changed {
                             editor.push(text("Compare regular file contents. Each replaced file retains its original in a private sibling folder. Save one approval for one run.").size(12))
@@ -3688,14 +4493,16 @@ impl Draft {
                     } else if self.source == Source::RsyncDownloadTree {
                         form_row(if grouped_rsync { "Primary local destination" } else { "Local destination" }, input(Field::LocalFile,
                             if self.rsync_mixed { "Absolute local destination folder" }
+                            else if self.rsync_allow_vacant_directory_download && self.rsync_existing.is_some_and(|settings| !settings.include_source_name) { "Absolute local folder path" }
                             else if self.rsync_existing.is_some() { "Absolute existing local folder" } else { "Absolute new local folder path" }, &self.local_file))
                     } else {
                         form_row(if grouped_rsync { "Primary local destination" } else { "Local destination" }, input(Field::LocalFile,
                             if self.rsync_existing.is_some() { "Absolute existing local file path" }
+                            else if grouped_rsync && self.rsync_standing { "Absolute local file path" }
                             else { "Absolute new local file path" }, &self.local_file))
                     }))
                     .push(grouped_rsync.then(|| self.rsync_destination_fields(rsync_batch)))
-                    .push((self.rsync_mixed || self.rsync_elevation == super::rsync::Elevation::Ordinary && self.rsync_existing.is_none()).then(|| form_row(if self.rsync_mixed { "Sources" } else { "Additional sources" }, text_editor(&self.rsync_sources)
+                    .push((self.rsync_mixed || self.rsync_elevation == super::rsync::Elevation::Ordinary && self.rsync_existing.is_none() && !self.rsync_allow_vacant_file_download).then(|| form_row(if self.rsync_mixed { "Sources" } else { "Additional sources" }, text_editor(&self.rsync_sources)
                         .placeholder(if self.rsync_mixed { "Absolute file or folder paths, one per line" } else { "Optional absolute source paths, one per line" })
                         .height(Length::Fixed(74.0))
                         .on_action(Message::EditRsyncSources))))
@@ -3704,14 +4511,17 @@ impl Draft {
                         (true, _, true) => "Use a trailing / to transfer a folder’s contents. Mixed uploads require the current kortty server helper. Each target is checked and published as one folder.",
                         (true, Source::RsyncDownloadTree, false) => "Download ordinary directories. Requires native rsync 3.4.1 or later in the rsync 3 series and pinned saved SSH routes.",
                         (true, Source::RsyncUploadTree, false) => "Upload reviewed directories. Requires native rsync 3.4.1 or later, pinned saved SSH routes, and the current kortty server helper on Linux or macOS.",
+                        (true, Source::RsyncUpload, false) if self.rsync_allow_vacant_server_file_upload => "Review the exact server file on each route. The current Linux helper checks its parent and verifies creation and replacement.",
                         (true, Source::RsyncUpload, false) if protected_file => "Replace the reviewed protected file through the configured Linux helper. A successful run retains the original for recovery.",
                         (true, Source::RsyncDownload, false) if self.rsync_existing.is_some() => "Replace the reviewed local file. A successful run retains the original for recovery.",
+                        (true, Source::RsyncDownload, false) if grouped_rsync && self.rsync_standing && !rsync_batch => "Review the exact local file path for each saved SSH route. A successful replacement retains the prior file for recovery.",
+                        (true, Source::RsyncDownload, false) if self.rsync_allow_vacant_file_download => "Review the exact vacant file path and any parent folders the transfer will create.",
                         (true, _, false) => "Transfer regular files to vacant paths. Requires native rsync 3.4.1 or later in the rsync 3 series and pinned saved SSH routes.",
                         (false, _, _) => "Scheduled rsync is unavailable on this platform.",
                     }).size(12))
                     .push(cfg!(windows).then(|| text("Choose an installed Windows rsync executable, such as rsync.exe from MSYS2. The transfer uses the saved SSH route.").size(12)))
-                    .push((self.rsync_elevation == super::rsync::Elevation::Ordinary && self.rsync_existing.is_none()).then(|| text("For multiple sources, enter an existing destination folder. Each source keeps its name. Limits are 16 sources, 4,096 entries and 256 MiB total. A later failure can leave already completed items in place.").size(12)))
-                    .push(self.rsync_standing_controls(privileged_allowed))
+                    .push((self.rsync_elevation == super::rsync::Elevation::Ordinary && self.rsync_existing.is_none() && !self.rsync_allow_vacant_file_download).then(|| text("For multiple sources, enter an existing destination folder. Each source keeps its name. Limits are 16 sources, 4,096 entries and 256 MiB total. A later failure can leave already completed items in place.").size(12)))
+                    .push(self.rsync_standing_controls(rsync_batch, privileged_allowed))
                     .push(self.rsync_passwordless_controls(privileged_allowed))
                     .push(button("Review rsync transfer…").on_press_maybe(
                         (cfg!(any(unix, windows)) && (self.rsync_elevation != super::rsync::Elevation::Passwordless || privileged_allowed))
@@ -3766,9 +4576,14 @@ impl Draft {
 
     fn rsync_standing_controls(
         &self,
+        batch: bool,
         privileged_allowed: bool,
     ) -> iced::widget::Column<'_, Message> {
-        let supported = self.rsync_existing.is_some() || self.rsync_mixed;
+        let vacant_file = self.supports_vacant_rsync_file();
+        let ordinary_file = self.supports_ordinary_rsync_server_file();
+        let supported = self.rsync_existing.is_some()
+            || self.rsync_mixed
+            || ((vacant_file || ordinary_file) && !batch);
         let elevated = self.rsync_elevation == super::rsync::Elevation::Passwordless;
         let mut controls = column![].spacing(6);
         if supported || self.rsync_standing {
@@ -3783,7 +4598,33 @@ impl Draft {
         }
         if self.rsync_standing {
             controls = controls
-                .push(text("Set a calendar or choose Chain with predecessors. The review checks the existing destination on each route.").size(12))
+                .push(text("Set a calendar or choose Chain with predecessors.").size(12))
+                .push(self.supports_vacant_rsync_server_file().then(|| {
+                    checkbox(self.rsync_allow_vacant_server_file_upload)
+                        .label("Allow creation at reviewed vacant server file paths")
+                        .on_toggle_maybe(
+                            (!elevated || privileged_allowed || self.rsync_allow_vacant_server_file_upload)
+                                .then_some(Message::RsyncAllowVacantServerFile),
+                        )
+                }))
+                .push(self.supports_vacant_rsync_server_tree().then(|| {
+                    checkbox(self.rsync_allow_vacant_server_tree_upload)
+                        .label("Allow creation at reviewed vacant server folder paths")
+                        .on_toggle_maybe(
+                            (!elevated || privileged_allowed || self.rsync_allow_vacant_server_tree_upload)
+                                .then_some(Message::RsyncAllowVacantServerTree),
+                        )
+                }))
+                .push(text(match (vacant_file && !batch, self.additional_connections.is_empty()) {
+                    (true, false) => "Choose one server file and a separate local path for each route. The review shows which files will be created or replaced and any parent folders to be created.",
+                    (true, true) => "Choose one server file and a vacant local path. The review shows any parent folders to be created. For a file already on disk, select Replace an existing local file.",
+                    (false, _) if self.rsync_mixed && self.source == Source::RsyncDownloadTree => "Choose a local folder path for each route. The review shows any parent folders to be created and where unmatched entries can be removed.",
+                    (false, _) if self.rsync_allow_vacant_directory_download => "The review shows which destination folders will be created or replaced and where unmatched entries can be removed.",
+                    (false, _) if self.rsync_allow_vacant_server_file_upload => "The review shows whether each route will create or replace its server file.",
+                    (false, _) if self.rsync_allow_vacant_server_tree_upload => "The Linux helper checks creation and replacement permissions. The review shows what each route will create or replace.",
+                    (false, _) if ordinary_file => "Allow creation at reviewed vacant server file paths to review the file on each route.",
+                    (false, _) => "The review checks the destination on each route.",
+                }).size(12))
                 .push(form_row("Approval duration (days)", input(Field::RsyncStandingDays, "Days", &self.rsync_standing_days)))
                 .push(form_row("Maximum firings", input(Field::RsyncStandingFirings, "Firings", &self.rsync_standing_firings)))
                 .push(form_row("Entries per firing", input(Field::RsyncStandingEntries, "Maximum entries", &self.rsync_standing_entries)))
@@ -3823,10 +4664,22 @@ impl Draft {
         if self.supports_rsync_existing_file() {
             let upload = self.source.is_rsync_upload();
             let elevated = self.rsync_elevation == super::rsync::Elevation::Passwordless;
+            let allow_vacant_file = (self.supports_vacant_rsync_file() && !self.rsync_standing
+                || self.rsync_allow_vacant_file_download)
+                .then(|| {
+                    checkbox(self.rsync_allow_vacant_file_download)
+                        .label("Allow creation at reviewed vacant file paths")
+                        .on_toggle_maybe(
+                            (!elevated
+                                || privileged_allowed
+                                || self.rsync_allow_vacant_file_download)
+                                .then_some(Message::RsyncAllowVacantFile),
+                        )
+                });
             return column![
-                checkbox(settings.is_some())
+                (!upload || elevated).then(|| checkbox(settings.is_some())
                     .label(if upload {
-                        "Replace an existing server file"
+                        "Review the server file destination"
                     } else {
                         "Replace an existing local file"
                     })
@@ -3835,8 +4688,10 @@ impl Draft {
                             && !batch
                             && (!elevated || privileged_allowed || settings.is_some()))
                         .then_some(Message::RsyncExisting)
-                    ),
-            ];
+                    )),
+                allow_vacant_file,
+            ]
+            .spacing(6);
         }
         let upload = self.source.is_rsync_upload();
         let elevated = self.rsync_elevation == super::rsync::Elevation::Passwordless;
@@ -3845,9 +4700,18 @@ impl Draft {
                 .label("Transfer mixed file and folder sources")
                 .on_toggle_maybe(editable.then_some(Message::RsyncMixed))
         });
+        let allow_vacant = self.supports_vacant_rsync_directory().then(|| {
+            checkbox(self.rsync_allow_vacant_directory_download)
+                .label("Allow creation at reviewed vacant paths")
+                .on_toggle_maybe(
+                    (!elevated || privileged_allowed || self.rsync_allow_vacant_directory_download)
+                        .then_some(Message::RsyncAllowVacantDirectory),
+                )
+        });
         if self.rsync_mixed {
             return column![
                 mixed,
+                allow_vacant,
                 checkbox(settings.is_some_and(|settings| settings.delete))
                     .label("Delete unmatched entries in synchronized folders")
                     .on_toggle_maybe(editable.then_some(Message::RsyncMirror)),
@@ -3857,9 +4721,10 @@ impl Draft {
         column![
             mixed,
             checkbox(settings.is_some())
-                .label(if upload { "Use an existing server folder" } else { "Use an existing local folder" })
+                .label(if upload && elevated { "Review the server destination folder" } else if upload { "Use an existing server folder" } else { "Review the local destination folder" })
                 .on_toggle_maybe((editable && !batch).then_some(Message::RsyncExisting)),
             settings.map(|settings| column![
+                allow_vacant,
                 checkbox(settings.include_source_name)
                     .label(if upload { "Include the local folder name under each server destination" } else { "Include the server folder name under each local destination" })
                     .on_toggle_maybe(editable.then_some(Message::RsyncIncludeSourceName)),
@@ -3872,6 +4737,8 @@ impl Draft {
                     "Review the protected server folder again after each successful run."
                 } else if upload {
                     "Requires the current kortty server helper and an ordinary Linux login. Review the server folder again after each successful run."
+                } else if self.rsync_allow_vacant_directory_download {
+                    "The review shows any missing parent folders the transfer will create."
                 } else {
                     "Review the local folder again after each successful run."
                 }).size(12),
@@ -3888,11 +4755,30 @@ impl Draft {
         ) {
             (true, true, _) => "Absolute server destination folder",
             (true, false, _) => "Absolute local destination folder",
+            (false, true, _) if self.rsync_allow_vacant_server_file_upload => {
+                "Absolute server file path"
+            }
+            (false, true, _) if self.rsync_allow_vacant_server_tree_upload => {
+                "Absolute server folder path"
+            }
             (false, true, true) if protected_file => "Absolute existing server file",
             (false, true, true) => "Absolute existing server folder",
             (false, true, false) => "Absolute new server path",
             (false, false, true) if protected_file => "Absolute existing local file",
+            (false, false, true)
+                if self.rsync_allow_vacant_directory_download
+                    && self
+                        .rsync_existing
+                        .is_some_and(|settings| !settings.include_source_name) =>
+            {
+                "Absolute local folder path"
+            }
             (false, false, true) => "Absolute existing local folder",
+            (false, false, false)
+                if self.source == Source::RsyncDownload && self.rsync_standing =>
+            {
+                "Absolute local file path"
+            }
             (false, false, false) => "Absolute new local path",
         };
         self.additional_connections.iter().fold(
@@ -3947,6 +4833,7 @@ fn edit_bounded(
 pub enum Source {
     Command,
     ImportedTransfer,
+    ImportedPrivileged,
     Script,
     Snippet,
     RemoteMkdir,
@@ -4004,6 +4891,7 @@ impl Source {
         matches!(
             self,
             Self::ImportedTransfer
+                | Self::ImportedPrivileged
                 | Self::RemoteMkdir
                 | Self::RemoteRename
                 | Self::RemoteChmod
@@ -4044,6 +4932,7 @@ impl std::fmt::Display for Source {
         formatter.write_str(match self {
             Self::Command => "Command",
             Self::ImportedTransfer => "Imported Java SFTP transfer",
+            Self::ImportedPrivileged => "Imported Java sudo action",
             Self::Script => "Script",
             Self::Snippet => "Shared snippet",
             Self::RemoteMkdir => "SFTP · Create directory",
@@ -4267,4 +5156,62 @@ fn parse_time(value: &str) -> Result<Time, String> {
 
 fn time_text(time: Time) -> String {
     format!("{:02}:{:02}", time.hour(), time.minute())
+}
+
+#[test]
+fn java_group_rsync_adoption_prefills_route_layout_without_approval() {
+    use super::rsync::Elevation;
+    use serde_json::json;
+
+    let profile = crate::snippets::tests::Profile::new();
+    let root = profile.0.canonicalize().unwrap().join("Java copy\u{2003}");
+    let first =
+        json!({"id": 1, "target": {"host": "first.example", "port": 22, "username": "operator"}});
+    let second =
+        json!({"id": 2, "target": {"host": "second.example", "port": 22, "username": "operator"}});
+    let command = serde_json::from_value(json!({
+        "connection": first, "additional_connections": [second],
+        "imported_transfer": {
+            "direction": "download", "java_sources": ["/work/report"],
+            "java_target_root": root, "java_delete": false, "java_sudo": false,
+            "java_target_folders": { "1": "One-b04d413f", "2": "Two-9c0719d8" },
+        },
+    }))
+    .unwrap();
+    let job = Job::new(
+        JobId::new("java-group-layout").unwrap(),
+        "Java group",
+        command,
+    )
+    .unwrap()
+    .with_enabled(false);
+    for (directory, existing, mixed, append_name) in [
+        (false, false, false, true),
+        (false, true, false, true),
+        (true, false, false, true),
+        (true, true, false, false),
+        (true, true, true, false),
+    ] {
+        let mut draft = Draft::from_job(&job);
+        draft
+            .configure_imported_rsync(directory, existing, mixed, Elevation::Ordinary)
+            .unwrap();
+        assert!(draft.rsync_candidate().is_none());
+        let transfer = draft.rsync_transfer().unwrap();
+        let actual = [
+            transfer.local,
+            PathBuf::from(&transfer.routes[0].destination),
+        ];
+        let expected = ["One-b04d413f", "Two-9c0719d8"].map(|folder| {
+            let path = root.join(folder);
+            if append_name {
+                path.join("report")
+            } else {
+                path
+            }
+        });
+        assert_eq!(actual, expected);
+        assert!(transfer.approval.is_none() && transfer.routes[0].approval.is_none());
+        assert!(!root.exists());
+    }
 }

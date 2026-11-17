@@ -57,13 +57,6 @@ pub(crate) struct Copy {
 }
 
 impl Copy {
-    pub(super) fn validate_replacement(&self, privileged: bool) -> Result<(), &'static str> {
-        if self.replace_changed && privileged {
-            return Err("Changed-file replacement requires an ordinary SFTP copy.");
-        }
-        Ok(())
-    }
-
     pub(super) fn validate_job_schedule(
         &self,
         schedule: Option<&JobSchedule>,
@@ -71,17 +64,20 @@ impl Copy {
         predecessors: &[JobId],
         privileged: bool,
     ) -> Result<(), &'static str> {
-        self.validate_replacement(privileged)?;
         if self.standing.is_none() {
             return validate_scheduling(schedule, mode, predecessors, privileged);
         }
-        if privileged || mode != DependencyMode::Gate || !schedule.is_some_and(JobSchedule::enabled)
-        {
-            return Err(
-                "Recurring SFTP copies require an enabled calendar and Condition dependency mode.",
-            );
+        if privileged {
+            return Err("Recurring SFTP copies require an ordinary SFTP copy.");
         }
-        Ok(())
+        match mode {
+            DependencyMode::Gate if schedule.is_some_and(JobSchedule::enabled) => Ok(()),
+            DependencyMode::Gate => {
+                Err("Enable a calendar or select Chain with predecessors for recurring SFTP.")
+            }
+            DependencyMode::Chain if predecessors.is_empty() => Err(CHAIN_PREDECESSORS),
+            DependencyMode::Chain => Ok(()),
+        }
     }
 
     pub(super) fn standing_scope(
@@ -134,7 +130,6 @@ impl Copy {
         connection: &ConnectionRef,
         schedule: Option<&JobSchedule>,
     ) -> io::Result<[u8; 32]> {
-        self.validate_replacement(false).map_err(io::Error::other)?;
         let domain = if self.replace_changed {
             "kortty-scheduled-sftp-replace-changed-v1"
         } else {
@@ -212,7 +207,6 @@ impl Copy {
         schedule: Option<&JobSchedule>,
         sudo: SudoMode,
     ) -> io::Result<[u8; 32]> {
-        self.validate_replacement(true).map_err(io::Error::other)?;
         let scope = self.scope(connection, schedule)?;
         let bytes = serde_json::to_vec(&("kortty-scheduled-privileged-tree-v1", scope, sudo))?;
         let mut hasher = HashAlgorithm::Sha256
@@ -300,7 +294,7 @@ pub(crate) struct RunContext {
     trigger: RunTrigger,
     cancellation: Cancellation,
     cascade_receipt: Option<Receipt>,
-    standing: Option<(standing::Approval, standing::Firing)>,
+    standing: Option<(standing::Approval, standing::Admission)>,
 }
 
 impl RunContext {
@@ -324,7 +318,7 @@ impl RunContext {
         Ok(current)
     }
 
-    pub(crate) fn standing_approval(&self) -> Option<&(standing::Approval, standing::Firing)> {
+    pub(crate) fn standing_approval(&self) -> Option<&(standing::Approval, standing::Admission)> {
         self.standing.as_ref()
     }
 }
@@ -339,6 +333,7 @@ pub(crate) struct Review {
 pub(super) enum SaveApproval {
     OneUse(Receipt),
     Standing(standing::Approval),
+    RecurringReplacement(standing::Approval),
 }
 
 pub(super) enum ApprovalRollback {
@@ -350,7 +345,7 @@ impl SaveApproval {
     pub(super) fn nonce(&self) -> &str {
         match self {
             Self::OneUse(receipt) => &receipt.approval,
-            Self::Standing(approval) => &approval.approval,
+            Self::Standing(approval) | Self::RecurringReplacement(approval) => &approval.approval,
         }
     }
 }
@@ -425,6 +420,10 @@ impl Store {
             }
             SaveApproval::Standing(approval) => {
                 let prior = self.swap_standing(job, approval.clone(), keep)?;
+                Ok(ApprovalRollback::Standing(approval, prior))
+            }
+            SaveApproval::RecurringReplacement(approval) => {
+                let prior = self.swap_replacement(job, approval.clone(), keep)?;
                 Ok(ApprovalRollback::Standing(approval, prior))
             }
         }

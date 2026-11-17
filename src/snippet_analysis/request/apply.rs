@@ -320,7 +320,7 @@ impl Request {
         started: u64,
         checkpoint: Option<Arc<Checkpoint>>,
         observer: Observer,
-        authorize: impl Fn() -> Result<(), String> + Send + 'static,
+        authorize: impl Fn(&[&str]) -> Result<(), String> + Send + 'static,
         mut persist: impl FnMut(Option<&Checkpoint>) -> Result<(), String> + Send + 'static,
     ) -> Result<Pending<Completion>, String> {
         require_checkpoint_source(checkpoint.as_deref())?;
@@ -350,9 +350,10 @@ impl Request {
         client: &Client,
         started: u64,
         observer: &Observer,
+        authorize: &impl Fn(&[&str]) -> Result<(), String>,
     ) -> Result<ApplyRun, String> {
         let mut progress = self.initial();
-        self.run_stages(client, &mut progress, observer, &|| Ok(()), |_| Ok(()))?;
+        self.run_stages(client, &mut progress, observer, authorize, |_| Ok(()))?;
         self.finish(progress, started, self.selection.clone())
     }
 
@@ -410,7 +411,7 @@ impl Request {
         client: &Client,
         progress: &mut Checkpoint,
         observer: &Observer,
-        authorize: &dyn Fn() -> Result<(), String>,
+        authorize: &dyn Fn(&[&str]) -> Result<(), String>,
         mut persist: impl FnMut(&Checkpoint) -> Result<(), String>,
     ) -> Result<(), String> {
         let mut structured = true;
@@ -423,6 +424,7 @@ impl Request {
             if !client.active() {
                 return Err(local_ai::Error::Cancelled.message());
             }
+            authorize(&[&progress.code])?;
             let input = self.stage_input(&progress.code, stage, index)?;
             let answer = send(
                 client,
@@ -432,6 +434,7 @@ impl Request {
                 authorize,
                 observer.attempt(index + 1, self.stage_count(), stage, false),
             )?;
+            authorize(&[&answer])?;
             let proposal = match self.parse_stage(&answer, &progress.code, stage, index) {
                 Ok(proposal) => proposal,
                 Err(error) => {
@@ -445,6 +448,7 @@ impl Request {
                         authorize,
                         observer.attempt(index + 1, self.stage_count(), stage, true),
                     )?;
+                    authorize(&[&answer])?;
                     self.parse_stage(&answer, &progress.code, stage, index)
                         .map_err(|error| format!("Apply stage {} failed: {error}", index + 1))?
                 }
@@ -455,6 +459,7 @@ impl Request {
             if !client.active() {
                 return Err(local_ai::Error::Cancelled.message());
             }
+            authorize(&[&proposal.code])?;
             progress.code_sha256 =
                 content_hash(&proposal.code).map_err(|error| error.to_string())?;
             progress.code = proposal.code.into();
@@ -647,7 +652,7 @@ fn send(
     system: &str,
     input: &str,
     structured: &mut bool,
-    authorize: &dyn Fn() -> Result<(), String>,
+    authorize: &dyn Fn(&[&str]) -> Result<(), String>,
     mut live: live::Attempt<'_>,
 ) -> Result<String, String> {
     let deadline = Instant::now() + STAGE_TIMEOUT;
@@ -660,7 +665,7 @@ fn send(
             Some(deadline),
             || {
                 if client.active() {
-                    authorize()
+                    authorize(&[system, input])
                 } else {
                     Err(local_ai::Error::Cancelled.message())
                 }

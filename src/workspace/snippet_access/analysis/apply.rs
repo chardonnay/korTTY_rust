@@ -11,7 +11,7 @@ use crate::snippet_analysis::request::apply::{
 };
 use crate::snippet_window::analysis::apply::{self as view, Action};
 use crate::terminal_logging::{Policy, Redactor, Secrets};
-use crate::vault_window::VaultWindow;
+use crate::vault_window::{JournalQuestionSecrets, VaultWindow};
 
 use super::*;
 
@@ -31,37 +31,212 @@ struct Plan {
     pre_hash: String,
     rendered_hash: String,
     provenance: Provenance,
+    profile_revision: Option<[u8; 32]>,
     request: Arc<Request>,
     guidance: Option<SkillGuidance>,
     stale: bool,
 }
 
-struct Approval {
-    config: Arc<Configuration>,
-    profile: ProfileChoice,
+pub(super) struct Approval {
+    pub(super) config: Arc<Configuration>,
+    pub(super) profile: ProfileChoice,
+    pub(super) transport: local_ai::Profile,
+    pub(super) limit: usize,
+    profile_revision: Option<[u8; 32]>,
+    https: Option<Arc<HttpsApply>>,
+}
+
+pub(super) struct ApplyContext<'a> {
+    pub(super) policy: &'a ClipboardPolicy,
+    pub(super) vault: Option<&'a VaultWindow>,
+    pub(super) vault_change: Weak<()>,
+}
+
+struct HttpsApply {
+    policy: Policy,
+    vault: JournalQuestionSecrets,
+    vault_change: Weak<()>,
+    vault_revision: Option<Weak<()>>,
     transport: local_ai::Profile,
+    credential: Option<zeroize::Zeroizing<String>>,
+}
+
+impl HttpsApply {
+    fn require_current(&self, config: &Configuration) -> Result<(), String> {
+        let installed = ClipboardPolicy::load();
+        if installed.problem.is_some()
+            || !installed.ai_allowed
+            || !self
+                .policy
+                .equivalent_redactions(&installed.terminal_logging)
+            || self.vault_change.strong_count() == 0
+            || self
+                .vault_revision
+                .as_ref()
+                .is_some_and(|revision| revision.strong_count() == 0)
+            || self.transport.completion_secret() != self.credential
+            || !config
+                .reload_saved()
+                .is_ok_and(|current| current == *config)
+        {
+            return Err("The saved HTTPS profile, credentials, or masking policy changed. Review the apply request again.".into());
+        }
+        self.transport.require_current_policy_authority()
+    }
+
+    fn check_payload(&self, input: &str) -> Result<(), String> {
+        // Source lines and selected findings can contain JSON-escaped private values.
+        let mut decoded = Vec::new();
+        let mut start = None;
+        let mut escaped = false;
+        for (offset, byte) in input.bytes().enumerate() {
+            if start.is_some() && byte == b'\\' && !escaped {
+                escaped = true;
+                continue;
+            }
+            if byte == b'"' && !escaped {
+                if let Some(begin) = start.take() {
+                    if let Ok(value) = serde_json::from_str::<String>(&input[begin..=offset]) {
+                        decoded.push(zeroize::Zeroizing::new(value));
+                    }
+                } else {
+                    start = Some(offset);
+                }
+            } else if byte == b'\n' || byte == b'\r' {
+                start = None;
+            }
+            escaped = false;
+        }
+        let fields = || std::iter::once(input).chain(decoded.iter().map(|value| value.as_str()));
+        let secrets = Secrets::default();
+        if let Some(credential) = &self.credential {
+            secrets.add(credential);
+        }
+        for field in fields() {
+            self.vault.add_matches(field, &secrets);
+        }
+        let redactor = Redactor::for_journal(
+            secrets
+                .seal()
+                .map_err(|_| "Could not establish the HTTPS apply mask.")?,
+            self.policy.clone(),
+        );
+        for field in fields() {
+            // The shared mask normalizes line endings for inspection. The
+            // apply request and any accepted replacement keep the source's endings.
+            let normalized = field
+                .contains('\r')
+                .then(|| zeroize::Zeroizing::new(field.replace("\r\n", "\n").replace('\r', "\n")));
+            let expected = normalized.as_ref().map_or(field, |text| text.as_str());
+            let masked = zeroize::Zeroizing::new(super::super::super::terminal_ai::mask::prompt(
+                &redactor, field,
+            )?);
+            if masked.as_str() != expected {
+                return Err("This HTTPS apply request contains protected text. Use a local profile or remove the protected text from the reviewed inputs.".into());
+            }
+        }
+        Ok(())
+    }
 }
 
 impl Approval {
-    fn new(
+    pub(super) fn check_preview(&self, prompt: &str) -> Result<(), String> {
+        if let Some(review) = &self.https {
+            review.require_current(&self.config)?;
+            review.check_payload(prompt)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn check_source(&self, source: &str) -> Result<(), String> {
+        if source.chars().count() > self.limit {
+            return Err("The source exceeds the AI profile's selection limit.".into());
+        }
+        if let Some(review) = &self.https {
+            review.check_payload(source)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn dispatch_guard(
+        &self,
+    ) -> impl Fn(&[&str]) -> Result<(), String> + Clone + Send + 'static {
+        let https = self.https.clone();
+        let checked_config = Arc::clone(&self.config);
+        let local_guard = reviewed_local_profile_guard(
+            Arc::clone(&self.config),
+            self.profile.reference.clone(),
+            if https.is_none() {
+                self.profile_revision
+            } else {
+                None
+            },
+        );
+        move |fields| {
+            if let Some(review) = &https {
+                review.require_current(&checked_config)?;
+                for field in fields {
+                    review.check_payload(field)?;
+                }
+                Ok(())
+            } else {
+                local_guard()
+            }
+        }
+    }
+
+    pub(super) fn new(
         config: Option<Arc<Configuration>>,
         page: &Page,
         profile_reference: &ProfileRef,
-        source: &str,
+        context: ApplyContext<'_>,
     ) -> Result<Self, String> {
         let config = config.ok_or("Open AI Manager to configure the report’s AI profile.")?;
         let profile = page
             .profile_for_reference(&config, profile_reference)
             .cloned()
             .ok_or("Enable the AI profile that produced this report.")?;
-        let (transport, limit) = config.code_analysis_transport(profile.id)?;
-        if source.chars().count() > limit {
-            return Err("The source exceeds the AI profile's selection limit.".into());
-        }
+        let (transport, limit) = if profile.remote {
+            config
+                .saved_root()
+                .ok_or("Save the trusted HTTPS profile before applying findings.")?;
+            let route = config.snippet_analysis_transport(profile.id)?;
+            if !route.0.is_remote() {
+                return Err("Choose a trusted HTTPS profile.".into());
+            }
+            route
+        } else {
+            reviewed_local_profile_transport(&config, profile.id, profile.server_selected)?
+        };
+        let (profile_revision, https) = if profile.remote {
+            let revision = config
+                .agent_profile_reference_revision(&profile.reference)
+                .ok_or("The HTTPS profile revision is unavailable.")?;
+            let review = HttpsApply {
+                policy: context.policy.terminal_logging.clone(),
+                vault: context
+                    .vault
+                    .map(VaultWindow::journal_question_secrets)
+                    .unwrap_or_default(),
+                vault_change: context.vault_change,
+                vault_revision: context.vault.and_then(VaultWindow::credential_revision),
+                credential: transport.completion_secret(),
+                transport: transport.clone(),
+            };
+            (Some(revision), Some(Arc::new(review)))
+        } else {
+            (
+                reviewed_local_profile_revision(&config, &profile.reference, &transport)?,
+                None,
+            )
+        };
         Ok(Self {
             config,
             profile,
             transport,
+            limit,
+            profile_revision,
+            https,
         })
     }
 }
@@ -518,6 +693,11 @@ impl Workspace {
         allow_stale: bool,
     ) -> Task<Message> {
         let config = self.ai_configuration();
+        let context = ApplyContext {
+            policy: &self.clipboard.policy,
+            vault: self.vault.as_ref(),
+            vault_change: self.vault_change_revision(),
+        };
         let Some(surface) = self.snippets.get_mut(&id) else {
             return Task::none();
         };
@@ -559,12 +739,8 @@ impl Workspace {
                         .into(),
                 );
             }
-            let approval = Approval::new(
-                config,
-                page,
-                &record.provenance.profile_id,
-                &snapshot.files()[0].content,
-            )?;
+            let approval = Approval::new(config, page, &record.provenance.profile_id, context)?;
+            approval.check_source(&snapshot.files()[0].content)?;
             let rendered = snapshot.render()?;
             let instructions = page.instructions.clone();
             let selection = match review_selection {
@@ -596,6 +772,7 @@ impl Workspace {
             )?
             .with_profile(&approval.transport);
             let prompt = request.preview()?;
+            approval.check_preview(&prompt)?;
             Ok(Preview {
                 recovery: Box::new(Recovery {
                     plan: Plan {
@@ -611,6 +788,7 @@ impl Workspace {
                             ..Provenance::default()
                         },
                         request: Arc::new(request),
+                        profile_revision: approval.profile_revision,
                         guidance: Some(guidance),
                         stale,
                     },
@@ -641,6 +819,11 @@ impl Workspace {
 
     fn preview_snippet_apply_recovery(&mut self, id: window::Id) -> Task<Message> {
         let config = self.ai_configuration();
+        let context = ApplyContext {
+            policy: &self.clipboard.policy,
+            vault: self.vault.as_ref(),
+            vault_change: self.vault_change_revision(),
+        };
         let Some(surface) = self.snippets.get_mut(&id) else {
             return Task::none();
         };
@@ -656,18 +839,22 @@ impl Workspace {
                 Some("Open the original snippet revision to recover this request.".into());
             return page.reset_scroll();
         }
-        let approval = match Approval::new(
-            config,
-            page,
-            &recovery.plan.provenance.profile_id,
-            recovery.plan.request.source(),
-        ) {
-            Ok(approval) => approval,
-            Err(error) => {
-                page.status = Some(error);
-                return Task::none();
-            }
-        };
+        let approval =
+            match Approval::new(config, page, &recovery.plan.provenance.profile_id, context) {
+                Ok(approval) => approval,
+                Err(error) => {
+                    page.status = Some(error);
+                    return Task::none();
+                }
+            };
+        if let Err(error) = approval.check_source(recovery.plan.request.source()) {
+            page.status = Some(error);
+            return Task::none();
+        }
+        if approval.profile_revision != recovery.plan.profile_revision {
+            page.status = Some("The saved profile changed. Restore it or discard this checkpoint and review a new apply request.".into());
+            return Task::none();
+        }
         if let Err(error) = recovery
             .plan
             .request
@@ -687,6 +874,10 @@ impl Workspace {
                 return Task::none();
             }
         };
+        if let Err(error) = approval.check_preview(&prompt) {
+            page.status = Some(error);
+            return Task::none();
+        }
         let State::RecoverApply(recovery) = std::mem::replace(&mut page.state, State::Ready) else {
             unreachable!("the recovery state was checked");
         };
@@ -758,14 +949,19 @@ impl Workspace {
                 )
             });
         let (updates, progress) = async_channel::bounded(1);
-        let observer = stream_observer(
-            &approval.transport,
-            &prompt,
-            self.vault.as_ref(),
-            self.clipboard.policy.terminal_logging.clone(),
-            updates,
-        );
+        let observer = if approval.https.is_some() {
+            Observer::new(updates, None)
+        } else {
+            stream_observer(
+                &approval.transport,
+                &prompt,
+                self.vault.as_ref(),
+                self.clipboard.policy.terminal_logging.clone(),
+                updates,
+            )
+        };
         let spawn = || {
+            let before_dispatch = approval.dispatch_guard();
             let claim = Claim::new(&surface.window, subject)?;
             let store = store(&surface.window).map_err(|error| error.to_string())?;
             let request = plan.request.recovery_snapshot()?;
@@ -785,18 +981,22 @@ impl Workspace {
             let worker_claim = Arc::clone(&claim);
             let worker_selection = plan.request.selection().clone();
             let library_path = surface.window.latest_library().path().to_owned();
+            let profile_revision = approval.profile_revision;
+            let before_save = before_dispatch.clone();
             let pending = Arc::clone(&plan.request).start_with_checkpoints(
                 approval.transport,
                 started_at,
                 recovery.checkpoint.clone(),
                 observer,
-                move || {
+                move |fields| {
+                    before_dispatch(fields)?;
                     hardening::managed_current(&worker_selection, &library_path)
                         .then_some(())
                         .ok_or_else(|| hardening::MANAGED_HEADER_CHANGED.into())
                 },
                 move |checkpoint| {
                     let _active_claim = &worker_claim;
+                    before_save(&[])?;
                     let boundary = checkpoint.map_or(0, Checkpoint::completed);
                     if boundary > completed {
                         completed = boundary;
@@ -818,10 +1018,11 @@ impl Workspace {
                                 elapsed_millis: milliseconds(elapsed + started.elapsed()),
                                 profile_name: profile_name.clone(),
                                 model: model.clone(),
+                                profile_revision,
                                 request: request.clone(),
                                 checkpoint: checkpoint.clone(),
                             },
-                            || true,
+                            || before_save(&[]).is_ok(),
                         )
                         .map_err(|error| error.to_string())?;
                     progress.revision = Some(revision);
@@ -1394,6 +1595,7 @@ pub(super) fn restore_saved(page: &mut Page, window: &SnippetWindow, pre: Snippe
                     ..Provenance::default()
                 },
                 request: Arc::new(request),
+                profile_revision: point.profile_revision,
                 guidance: None,
                 stale,
             },
@@ -1463,7 +1665,7 @@ pub(super) fn can_plan(
         && page
             .record()
             .is_some_and(|record| record.apply_recovery.is_none())
-        && profile.is_some_and(|profile| !profile.remote)
+        && profile.is_some()
 }
 
 fn find_review(page: &Page, pre: SnippetId, run: SnippetId) -> Option<Review> {

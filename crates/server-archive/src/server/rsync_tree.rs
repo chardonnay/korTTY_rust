@@ -6,6 +6,8 @@ use kortty_server_archive::rsync_tree::{
 use super::*;
 
 const PAYLOAD: &str = "payload";
+#[cfg(target_os = "linux")]
+const REPLACED_NAME: &str = "replaced-name";
 
 #[cfg(target_os = "linux")]
 mod existing;
@@ -13,14 +15,18 @@ mod existing;
 mod existing_file;
 #[cfg(target_os = "linux")]
 pub(super) use existing::{
-    Published as ExistingPublication, Recovery as ExistingRecovery, Target as ExistingTarget,
+    FirstTree as CheckedTree, Published as ExistingPublication, Recovery as ExistingRecovery,
+    Target as ExistingTarget, VacantTarget as VacantTree,
 };
 #[cfg(target_os = "linux")]
 pub(crate) use existing::{
     serve as serve_existing, serve_v2 as serve_existing_v2, serve_v3 as serve_existing_v3,
 };
 #[cfg(target_os = "linux")]
-pub(super) use existing_file::{FILE as RECEIVED_FILE, Target as ExistingFile};
+pub(super) use existing_file::{
+    CheckedFile, FILE as RECEIVED_FILE, Target as ExistingFile, VacantTarget as VacantFile,
+    directory_fingerprint,
+};
 
 #[cfg(target_os = "linux")]
 fn lock_receiver_ancestors(path: &str, expected: &Directory) -> io::Result<Vec<Directory>> {
@@ -115,24 +121,76 @@ pub(super) struct UploadStage<'a> {
     name: String,
     directory: Directory,
     pub(super) payload: Directory,
+    mount: Option<u64>,
     owned: bool,
     pub(super) published: bool,
+    #[cfg(target_os = "linux")]
+    replaced_name: Option<Stat>,
 }
 
 impl<'a> UploadStage<'a> {
     pub(super) fn create(parent: &'a Directory) -> io::Result<Self> {
+        Self::create_on(parent, None, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn create_checked(parent: &'a Directory) -> io::Result<Self> {
+        Self::create_on(
+            parent,
+            Some(super::draft_replace::mount_id(&parent.fd)?),
+            None,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn create_for_transfer(
+        parent: &'a Directory,
+        prefix: [u8; 8],
+        original_name: &str,
+    ) -> io::Result<Self> {
+        use io::Write as _;
+
+        let mut stage = Self::create_on(
+            parent,
+            Some(super::draft_replace::mount_id(&parent.fd)?),
+            Some(prefix),
+        )?;
+        let mut file = File::from(openat(
+            &stage.directory.fd,
+            REPLACED_NAME,
+            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            PRIVATE_FILE,
+        )?);
+        stage.replaced_name = Some(fstat(&file)?);
+        fchmod(&file, PRIVATE_FILE)?;
+        file.write_all(original_name.as_bytes())?;
+        file.sync_all()?;
+        fsync(&stage.directory.fd)?;
+        Ok(stage)
+    }
+
+    fn create_on(
+        parent: &'a Directory,
+        mount: Option<u64>,
+        prefix: Option<[u8; 8]>,
+    ) -> io::Result<Self> {
         let mut nonce = [0; 16];
         getrandom::fill(&mut nonce).map_err(io::Error::other)?;
+        if let Some(prefix) = prefix {
+            nonce[..prefix.len()].copy_from_slice(&prefix);
+        }
         let name = format!(".kortty-{}.kortty-part", hex::encode(nonce));
         mkdirat(&parent.fd, name.as_str(), PRIVATE_DIRECTORY)?;
         let directory = parent.child(&name)?;
         let owned = |name: &str, parent: &Directory| {
             let child = parent.child(name)?;
             parent.require_child(name, &child.stat)?;
+            require_stage_mount(&child.fd, mount)?;
             require_private(&child.fd, 0o700)?;
             Ok::<_, io::Error>(child)
         };
         let result = (|| {
+            require_stage_mount(&directory.fd, mount)?;
             require_private(&directory.fd, 0o700)?;
             parent.require_child(&name, &directory.stat)?;
             // Confirm the filesystem supports atomic no-replace before receiving.
@@ -155,11 +213,16 @@ impl<'a> UploadStage<'a> {
                 name,
                 directory,
                 payload,
+                mount,
                 owned: true,
                 published: false,
+                #[cfg(target_os = "linux")]
+                replaced_name: None,
             }),
             Err(error) => {
-                if parent.require_child(&name, &directory.stat).is_ok() {
+                if parent.require_child(&name, &directory.stat).is_ok()
+                    && require_stage_mount(&directory.fd, mount).is_ok()
+                {
                     let _ = unlinkat(&directory.fd, PAYLOAD, AtFlags::REMOVEDIR);
                     let _ = unlinkat(&parent.fd, name.as_str(), AtFlags::REMOVEDIR);
                 }
@@ -180,6 +243,9 @@ impl<'a> UploadStage<'a> {
         self.parent
             .require_child(&self.name, &self.directory.stat)?;
         self.directory.require_child(PAYLOAD, &self.payload.stat)?;
+        require_stage_mount(&current.fd, self.mount)?;
+        require_stage_mount(&self.directory.fd, self.mount)?;
+        require_stage_mount(&self.payload.fd, self.mount)?;
         require_private(&self.directory.fd, 0o700)?;
         require_private(&self.payload.fd, 0o700)
     }
@@ -191,8 +257,21 @@ impl<'a> UploadStage<'a> {
     }
 
     pub(super) fn verify_received(&self, expected: Inventory) -> io::Result<Witness> {
-        let mut manifest = Manifest::default();
-        let witness = scan(&self.payload, "", 0, &mut manifest, Scan::Received)?;
+        self.verify_received_with(expected, Manifest::default())
+    }
+
+    fn verify_received_with(
+        &self,
+        expected: Inventory,
+        mut manifest: Manifest,
+    ) -> io::Result<Witness> {
+        let witness = scan(
+            &self.payload,
+            "",
+            0,
+            &mut manifest,
+            Scan::Received { mount: self.mount },
+        )?;
         if manifest.finish() != expected {
             return Err(invalid(
                 "The received rsync tree differs from the reviewed inventory",
@@ -208,7 +287,7 @@ impl<'a> UploadStage<'a> {
         witness: &Witness,
         permit: impl FnOnce() -> io::Result<()>,
     ) -> io::Result<()> {
-        witness.require_current(&self.payload)?;
+        self.require_received(witness)?;
         self.verify(path)?;
         permit()?;
         match renameat_with(
@@ -243,6 +322,7 @@ impl<'a> UploadStage<'a> {
         self.owned = false;
         self.parent
             .require_child(&self.name, &self.directory.stat)?;
+        require_stage_mount(&self.directory.fd, self.mount)?;
         if !self.published {
             self.directory.require_child(PAYLOAD, &self.payload.stat)?;
             let mut limit = MAX_ENTRIES as usize + 2;
@@ -251,14 +331,24 @@ impl<'a> UploadStage<'a> {
                 self.payload.fd.metadata()?.dev(),
                 0,
                 &mut limit,
+                self.mount,
             )?;
             self.directory.require_child(PAYLOAD, &self.payload.stat)?;
             unlinkat(&self.directory.fd, PAYLOAD, AtFlags::REMOVEDIR)?;
         }
         self.parent
             .require_child(&self.name, &self.directory.stat)?;
+        #[cfg(target_os = "linux")]
+        if let Some(note) = &self.replaced_name {
+            self.directory.require_child(REPLACED_NAME, note)?;
+            unlinkat(&self.directory.fd, REPLACED_NAME, AtFlags::empty())?;
+        }
         unlinkat(&self.parent.fd, self.name.as_str(), AtFlags::REMOVEDIR)?;
         Ok(())
+    }
+
+    fn require_received(&self, witness: &Witness) -> io::Result<()> {
+        witness.require_tree(&self.payload, Scan::Received { mount: self.mount }, false)
     }
 
     fn failure(&mut self, error: io::Error) -> Failure {
@@ -307,10 +397,6 @@ enum Node {
 }
 
 impl Witness {
-    fn require_current(&self, directory: &Directory) -> io::Result<()> {
-        self.require_tree(directory, Scan::Received, false)
-    }
-
     fn require_tree(&self, directory: &Directory, scan: Scan, moved: bool) -> io::Result<()> {
         scan.require_mount(&directory.fd)?;
         if !self.stamp.matches(&directory.fd, moved)? {
@@ -389,7 +475,9 @@ impl Stamp {
 
 #[derive(Clone, Copy)]
 enum Scan {
-    Received,
+    Received {
+        mount: Option<u64>,
+    },
     #[cfg(target_os = "linux")]
     Existing {
         mount: u64,
@@ -397,22 +485,21 @@ enum Scan {
 }
 
 impl Scan {
-    fn require_mount(self, _file: &File) -> io::Result<()> {
-        #[cfg(target_os = "linux")]
-        if let Self::Existing { mount } = self
-            && super::draft_replace::mount_id(_file)? != mount
-        {
-            return Err(invalid("The reviewed rsync tree crosses a mount boundary"));
-        }
-        Ok(())
+    fn require_mount(self, file: &File) -> io::Result<()> {
+        let mount = match self {
+            Self::Received { mount } => mount,
+            #[cfg(target_os = "linux")]
+            Self::Existing { mount } => Some(mount),
+        };
+        require_stage_mount(file, mount)
     }
 
     fn require_entry(self, file: &File, mode: u32) -> io::Result<()> {
+        self.require_mount(file)?;
         match self {
-            Self::Received => require_private(file, mode),
+            Self::Received { .. } => require_private(file, mode),
             #[cfg(target_os = "linux")]
             Self::Existing { .. } => {
-                self.require_mount(file)?;
                 let metadata = file.metadata()?;
                 if metadata.uid() != geteuid().as_raw()
                     || metadata.mode() & 0o7022 != 0
@@ -432,7 +519,7 @@ impl Scan {
 
     #[cfg(target_os = "linux")]
     fn directory_attributes(self, file: &File) -> io::Result<Option<[u8; 32]>> {
-        if matches!(self, Self::Received) {
+        if matches!(self, Self::Received { .. }) {
             return Ok(None);
         }
         let mut digest = Sha256::new();
@@ -444,6 +531,16 @@ impl Scan {
         }
         Ok(Some(digest.finalize().into()))
     }
+}
+
+fn require_stage_mount(_file: &File, _mount: Option<u64>) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(mount) = _mount
+        && super::draft_replace::mount_id(_file)? != mount
+    {
+        return Err(invalid("The reviewed rsync tree crosses a mount boundary"));
+    }
+    Ok(())
 }
 
 fn scan(
@@ -501,7 +598,7 @@ fn scan(
                     return Err(invalid("The received rsync file changed"));
                 }
                 directory.require_child(&name, &held)?;
-                if matches!(purpose, Scan::Received) {
+                if matches!(purpose, Scan::Received { .. }) {
                     fsync(&file)?;
                 }
                 manifest.add(&path, Some((size, digest)))?;
@@ -518,7 +615,7 @@ fn scan(
     if Stamp::of(&directory.fd.metadata()?) != before {
         return Err(invalid("The received rsync directory changed"));
     }
-    if matches!(purpose, Scan::Received) {
+    if matches!(purpose, Scan::Received { .. }) {
         fsync(&directory.fd)?;
     }
     Ok(Witness {
@@ -548,7 +645,14 @@ fn names(directory: &Directory, limit: usize) -> io::Result<Vec<String>> {
     Ok(names)
 }
 
-fn discard(directory: &Directory, device: u64, depth: usize, limit: &mut usize) -> io::Result<()> {
+fn discard(
+    directory: &Directory,
+    device: u64,
+    depth: usize,
+    limit: &mut usize,
+    mount: Option<u64>,
+) -> io::Result<()> {
+    require_stage_mount(&directory.fd, mount)?;
     if depth > MAX_DEPTH {
         return Err(invalid("The private rsync stage exceeds its cleanup depth"));
     }
@@ -575,7 +679,7 @@ fn discard(directory: &Directory, device: u64, depth: usize, limit: &mut usize) 
             if child.fd.metadata()?.dev() != device {
                 return Err(invalid("The private rsync stage crosses a filesystem"));
             }
-            discard(&child, device, depth + 1, limit)?;
+            discard(&child, device, depth + 1, limit, mount)?;
             AtFlags::REMOVEDIR
         } else {
             AtFlags::empty()

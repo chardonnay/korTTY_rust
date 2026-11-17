@@ -1,10 +1,13 @@
-//! Guarded publication of an individually reviewed privileged rsync receiver.
+//! Guarded publication of an individually reviewed rsync receiver file.
 
+use std::fs::FileTimes;
 use std::io::Seek as _;
 use std::os::fd::AsRawFd as _;
 
+use kortty_server_archive::MAX_ARCHIVE_BYTES;
+use kortty_server_archive::protocol::CreatedPayload;
 use kortty_server_archive::rsync_tree::{ExistingTree, MAX_BYTES};
-use rustix::fs::{FlockOperation, flock};
+use rustix::fs::{FlockOperation, StatxFlags, flock, statx};
 
 use super::super::draft_replace::{mount_id, read_xattrs};
 use super::existing::{Published, Recovery, copy_metadata};
@@ -20,6 +23,7 @@ pub(in crate::server) struct Target<'a> {
     parent: Directory,
     parent_attributes: BTreeMap<String, Vec<u8>>,
     mount: u64,
+    max_bytes: u64,
     original: CheckedFile,
 }
 
@@ -27,18 +31,220 @@ pub(in crate::server) struct CheckedFile {
     file: File,
     stamp: Stamp,
     inventory: Inventory,
+    digest: [u8; 32],
     attributes: BTreeMap<String, Vec<u8>>,
+}
+
+/// A checked file slot that may be published once without replacing an occupant.
+pub(in crate::server) struct VacantTarget<'a> {
+    pub(super) destination: &'a str,
+    pub(super) path: &'a str,
+    pub(super) name: &'a str,
+    parent: Directory,
+    parent_attributes: BTreeMap<String, Vec<u8>>,
+    pub(super) mount: u64,
+    birth: (i64, u32),
+}
+
+impl<'a> VacantTarget<'a> {
+    pub(in crate::server) fn open_at(destination: &'a str, parent: Directory) -> io::Result<Self> {
+        let (path, name) = absolute_file(destination)?;
+        if parent.stat.st_uid != geteuid().as_raw() || parent.stat.st_mode & 0o7022 != 0 {
+            return Err(changed());
+        }
+        let target = Self {
+            destination,
+            path,
+            name,
+            parent_attributes: read_xattrs(&parent.fd)?,
+            mount: mount_id(&parent.fd)?,
+            birth: parent_birth(&parent)?,
+            parent,
+        };
+        target.require_vacant()?;
+        Ok(target)
+    }
+
+    pub(in crate::server) fn parent(&self) -> &Directory {
+        &self.parent
+    }
+
+    pub(in crate::server) fn fingerprint(&self) -> [u8; 32] {
+        self.fingerprint_with_domain(b"kortty-rsync-first-recurring-file-v1\0")
+    }
+
+    pub(super) fn fingerprint_with_domain(&self, domain: &[u8]) -> [u8; 32] {
+        let mut hash = Sha256::new_with_prefix(domain);
+        hash_parent(
+            &mut hash,
+            self.destination,
+            &self.parent,
+            self.mount,
+            &self.parent_attributes,
+        );
+        hash.update(self.birth.0.to_be_bytes());
+        hash.update(self.birth.1.to_be_bytes());
+        hash.finalize().into()
+    }
+
+    pub(in crate::server) fn require_vacant(&self) -> io::Result<()> {
+        self.verify_parent()?;
+        require_absent(&self.parent.fd, self.name)
+    }
+
+    pub(in crate::server) fn prepare(
+        &self,
+        stage: &UploadStage<'_>,
+        expected: Inventory,
+    ) -> io::Result<CheckedFile> {
+        self.prepare_bounded(stage, expected, MAX_BYTES)
+    }
+
+    pub(in crate::server) fn prepare_transfer(
+        &self,
+        stage: &UploadStage<'_>,
+        expected: Inventory,
+    ) -> io::Result<CheckedFile> {
+        self.prepare_bounded(
+            stage,
+            expected,
+            kortty_server_archive::privileged_file_replace::MAX_BYTES,
+        )
+    }
+
+    fn prepare_bounded(
+        &self,
+        stage: &UploadStage<'_>,
+        expected: Inventory,
+        limit: u64,
+    ) -> io::Result<CheckedFile> {
+        self.require_vacant()?;
+        self.verify_stage(stage)?;
+        require_file_payload(stage)?;
+        let file = CheckedFile::open_bounded(&stage.payload, FILE, self.mount, limit)?;
+        if file.inventory != expected || file.stamp.mode & 0o7777 != 0o600 {
+            return Err(invalid(
+                "The received private rsync file differs from the verified input",
+            ));
+        }
+        fsync(&file.file)?;
+        fsync(&stage.payload.fd)?;
+        fsync(&stage.directory.fd)?;
+        Ok(file)
+    }
+
+    pub(in crate::server) fn publish(
+        &self,
+        stage: &UploadStage<'_>,
+        file: &CheckedFile,
+        outcome_unknown: &mut bool,
+        permit: impl Fn() -> io::Result<()>,
+    ) -> io::Result<ExistingTree> {
+        let _ancestors = lock_receiver_ancestors(self.path, &self.parent)?;
+        flock(&file.file, FlockOperation::NonBlockingLockExclusive)?;
+        self.verify_stage(stage)?;
+        file.require_payload(stage, true)?;
+        permit()?;
+        self.require_vacant()?;
+        self.verify_stage(stage)?;
+        file.require_payload(stage, false)?;
+        match renameat_with(
+            &stage.payload.fd,
+            FILE,
+            &self.parent.fd,
+            self.name,
+            RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => *outcome_unknown = true,
+            Err(Errno::EXIST | Errno::NOTEMPTY) => {
+                return Err(invalid("The reviewed server destination already exists"));
+            }
+            Err(error) => {
+                *outcome_unknown = file.require_at(&stage.payload, FILE, false).is_err();
+                return Err(error.into());
+            }
+        }
+        let renamed = file.require_at(&self.parent, self.name, true)?;
+        fsync(&stage.payload.fd)?;
+        fsync(&self.parent.fd)?;
+        permit()?;
+        self.verify_parent()?;
+        self.parent.require_child(self.name, &fstat(&file.file)?)?;
+        if !renamed.matches(&file.file, false)? || read_xattrs(&file.file)? != file.attributes {
+            return Err(changed());
+        }
+        Ok(file_proof(
+            self.destination,
+            &self.parent,
+            self.mount,
+            &self.parent_attributes,
+            file,
+            &renamed,
+        ))
+    }
+
+    pub(super) fn verify_parent(&self) -> io::Result<()> {
+        let current = checked_parent(self.path, &self.parent, self.mount, &self.parent_attributes)?;
+        if parent_birth(&current)? != self.birth {
+            return Err(changed());
+        }
+        Ok(())
+    }
+
+    pub(super) fn verify_stage(&self, stage: &UploadStage<'_>) -> io::Result<()> {
+        stage.verify(self.path)?;
+        if !same_node(&stage.parent.stat, &self.parent.stat)
+            || mount_id(&stage.directory.fd)? != self.mount
+            || mount_id(&stage.payload.fd)? != self.mount
+        {
+            return Err(changed());
+        }
+        Ok(())
+    }
 }
 
 impl<'a> Target<'a> {
     pub(in crate::server) fn open_at(destination: &'a str, parent: Directory) -> io::Result<Self> {
+        Self::open_bounded_at(destination, parent, MAX_BYTES)
+    }
+
+    pub(in crate::server) fn open_archive_at(
+        destination: &'a str,
+        parent: Directory,
+    ) -> io::Result<Self> {
+        Self::open_bounded_at(destination, parent, MAX_ARCHIVE_BYTES)
+    }
+
+    pub(in crate::server) fn open_transfer_at(
+        destination: &'a str,
+        parent: Directory,
+    ) -> io::Result<Self> {
+        Self::open_transfer_limited(
+            destination,
+            parent,
+            kortty_server_archive::privileged_file_replace::MAX_BYTES,
+        )
+    }
+
+    pub(in crate::server) fn open_transfer_limited(
+        destination: &'a str,
+        parent: Directory,
+        remaining: u64,
+    ) -> io::Result<Self> {
+        let limit = kortty_server_archive::privileged_file_replace::MAX_BYTES;
+        let mut target = Self::open_bounded_at(destination, parent, remaining.min(limit))?;
+        target.max_bytes = limit;
+        Ok(target)
+    }
+
+    fn open_bounded_at(destination: &'a str, parent: Directory, max: u64) -> io::Result<Self> {
         let (path, name) = absolute_file(destination)?;
         if parent.stat.st_uid != geteuid().as_raw() || parent.stat.st_mode & 0o7022 != 0 {
             return Err(changed());
         }
         let mount = mount_id(&parent.fd)?;
         let parent_attributes = read_xattrs(&parent.fd)?;
-        let original = CheckedFile::open(&parent, name, mount)?;
+        let original = CheckedFile::open_bounded(&parent, name, mount, max)?;
         let target = Self {
             destination,
             path,
@@ -46,6 +252,7 @@ impl<'a> Target<'a> {
             parent,
             parent_attributes,
             mount,
+            max_bytes: max,
             original,
         };
         target.require_current()?;
@@ -56,6 +263,15 @@ impl<'a> Target<'a> {
         self.proof(&self.original, &self.original.stamp)
     }
 
+    pub(in crate::server) fn content(
+        &self,
+    ) -> kortty_server_archive::privileged_file_replace::Payload {
+        kortty_server_archive::privileged_file_replace::Payload {
+            bytes: self.original.inventory.bytes,
+            sha256: self.original.digest,
+        }
+    }
+
     pub(in crate::server) fn parent(&self) -> &Directory {
         &self.parent
     }
@@ -64,24 +280,29 @@ impl<'a> Target<'a> {
         self.destination
     }
 
+    pub(in crate::server) fn original_archive(&self) -> io::Result<(File, CreatedPayload)> {
+        self.require_current()?;
+        let payload = self.original.archive_payload()?;
+        Ok((self.original.file.try_clone()?, payload))
+    }
+
+    pub(in crate::server) fn retain_archive_metadata(&self, file: &File) -> io::Result<()> {
+        self.require_current()?;
+        let modified = file.metadata()?.modified()?;
+        copy_metadata(&self.original.file, file)?;
+        file.set_times(FileTimes::new().set_modified(modified))?;
+        self.require_current()
+    }
+
     fn proof(&self, file: &CheckedFile, stamp: &Stamp) -> ExistingTree {
-        let mut hash = Sha256::new_with_prefix(b"kortty-rsync-existing-file-v1\0");
-        hash.update((self.destination.len() as u32).to_be_bytes());
-        hash.update(self.destination.as_bytes());
-        hash.update(self.parent.stat.st_dev.to_be_bytes());
-        hash.update(self.parent.stat.st_ino.to_be_bytes());
-        hash.update(self.parent.stat.st_mode.to_be_bytes());
-        hash.update(self.parent.stat.st_uid.to_be_bytes());
-        hash.update(self.parent.stat.st_gid.to_be_bytes());
-        hash.update(self.mount.to_be_bytes());
-        hash_attributes(&mut hash, &self.parent_attributes);
-        stamp.hash_into(&mut hash);
-        hash.update(file.inventory.digest);
-        hash_attributes(&mut hash, &file.attributes);
-        ExistingTree {
-            inventory: file.inventory,
-            fingerprint: hash.finalize().into(),
-        }
+        file_proof(
+            self.destination,
+            &self.parent,
+            self.mount,
+            &self.parent_attributes,
+            file,
+            stamp,
+        )
     }
 
     pub(in crate::server) fn prepare_successor(
@@ -91,15 +312,16 @@ impl<'a> Target<'a> {
     ) -> io::Result<CheckedFile> {
         self.require_current()?;
         self.verify_stage(stage)?;
-        let received = CheckedFile::open(&stage.payload, FILE, self.mount)?;
+        require_file_payload(stage)?;
+        let received = CheckedFile::open_bounded(&stage.payload, FILE, self.mount, self.max_bytes)?;
         if received.inventory != expected || received.stamp.mode & 0o7777 != 0o600 {
             return Err(invalid(
                 "The received rsync file differs from the reviewed input",
             ));
         }
         copy_metadata(&self.original.file, &received.file)?;
-        let successor = CheckedFile::inspect(received.file)?;
-        successor.require_at(&stage.payload, FILE, false)?;
+        let successor = CheckedFile::inspect_bounded(received.file, self.max_bytes)?;
+        successor.require_payload(stage, false)?;
         if successor.inventory != expected
             || successor.stamp.uid != self.original.stamp.uid
             || successor.stamp.gid != self.original.stamp.gid
@@ -141,10 +363,10 @@ impl<'a> Target<'a> {
             Err(error) => return Err(error.into()),
         }
         self.verify_stage(stage)?;
-        successor.require_at(&stage.payload, FILE, false)?;
         if recurring {
             flock(&successor.file, FlockOperation::NonBlockingLockExclusive)?;
         }
+        successor.require_payload(stage, recurring)?;
         self.require_current()?;
         let path = format!(
             "{}/{}/{ORIGINAL}",
@@ -181,8 +403,10 @@ impl<'a> Target<'a> {
                 return Ok(None);
             }
             self.verify_stage(stage)?;
+            successor.require_payload(stage, recurring)?;
             self.original.require_at(&stage.directory, ORIGINAL, true)?;
-            successor.require_at(&stage.payload, FILE, false)?;
+            self.verify_stage(stage)?;
+            successor.require_payload(stage, false)?;
             self.verify_parent()?;
             permit()?;
             renameat_with(
@@ -238,7 +462,7 @@ impl<'a> Target<'a> {
         Ok(None)
     }
 
-    fn require_current(&self) -> io::Result<()> {
+    pub(in crate::server) fn require_current(&self) -> io::Result<()> {
         self.verify_parent()?;
         self.original
             .require_at(&self.parent, self.name, false)
@@ -256,17 +480,7 @@ impl<'a> Target<'a> {
     }
 
     fn verify_parent(&self) -> io::Result<()> {
-        let current = Directory::open_parent(self.path)?;
-        if !same_node(&self.parent.stat, &current.stat)
-            || current.stat.st_uid != self.parent.stat.st_uid
-            || current.stat.st_gid != self.parent.stat.st_gid
-            || current.stat.st_mode != self.parent.stat.st_mode
-            || mount_id(&current.fd)? != self.mount
-            || read_xattrs(&current.fd)? != self.parent_attributes
-        {
-            return Err(changed());
-        }
-        Ok(())
+        checked_parent(self.path, &self.parent, self.mount, &self.parent_attributes).map(|_| ())
     }
 
     fn checked_recovery(&self, stage: &UploadStage<'_>, path: &str) -> Option<String> {
@@ -306,8 +520,89 @@ impl<'a> Target<'a> {
     }
 }
 
+fn checked_parent(
+    path: &str,
+    parent: &Directory,
+    mount: u64,
+    attributes: &BTreeMap<String, Vec<u8>>,
+) -> io::Result<Directory> {
+    let current = Directory::open_parent(path)?;
+    if !same_node(&parent.stat, &current.stat)
+        || current.stat.st_uid != parent.stat.st_uid
+        || current.stat.st_gid != parent.stat.st_gid
+        || current.stat.st_mode != parent.stat.st_mode
+        || mount_id(&current.fd)? != mount
+        || read_xattrs(&current.fd)? != *attributes
+    {
+        return Err(changed());
+    }
+    Ok(current)
+}
+
+fn parent_birth(parent: &Directory) -> io::Result<(i64, u32)> {
+    let stat = statx(&parent.fd, "", AtFlags::EMPTY_PATH, StatxFlags::BTIME)?;
+    let birth = (stat.stx_btime.tv_sec, stat.stx_btime.tv_nsec);
+    if stat.stx_mask & StatxFlags::BTIME.bits() == 0 || birth == (0, 0) {
+        return Err(invalid(
+            "The reviewed rsync parent needs a stable creation timestamp",
+        ));
+    }
+    Ok(birth)
+}
+
+fn hash_parent(
+    hash: &mut Sha256,
+    destination: &str,
+    parent: &Directory,
+    mount: u64,
+    attributes: &BTreeMap<String, Vec<u8>>,
+) {
+    hash.update((destination.len() as u32).to_be_bytes());
+    hash.update(destination.as_bytes());
+    hash.update(parent.stat.st_dev.to_be_bytes());
+    hash.update(parent.stat.st_ino.to_be_bytes());
+    hash.update(parent.stat.st_mode.to_be_bytes());
+    hash.update(parent.stat.st_uid.to_be_bytes());
+    hash.update(parent.stat.st_gid.to_be_bytes());
+    hash.update(mount.to_be_bytes());
+    hash_attributes(hash, attributes);
+}
+
+pub(in crate::server) fn directory_fingerprint(
+    path: &str,
+    directory: &Directory,
+) -> io::Result<[u8; 32]> {
+    let mount = mount_id(&directory.fd)?;
+    let birth = parent_birth(directory)?;
+    let attributes = read_xattrs(&directory.fd)?;
+    let mut hash = Sha256::new_with_prefix(b"kortty-protected-directory-v1\0");
+    hash_parent(&mut hash, path, directory, mount, &attributes);
+    hash.update(birth.0.to_be_bytes());
+    hash.update(birth.1.to_be_bytes());
+    Ok(hash.finalize().into())
+}
+
+fn file_proof(
+    destination: &str,
+    parent: &Directory,
+    mount: u64,
+    attributes: &BTreeMap<String, Vec<u8>>,
+    file: &CheckedFile,
+    stamp: &Stamp,
+) -> ExistingTree {
+    let mut hash = Sha256::new_with_prefix(b"kortty-rsync-existing-file-v1\0");
+    hash_parent(&mut hash, destination, parent, mount, attributes);
+    stamp.hash_into(&mut hash);
+    hash.update(file.inventory.digest);
+    hash_attributes(&mut hash, &file.attributes);
+    ExistingTree {
+        inventory: file.inventory,
+        fingerprint: hash.finalize().into(),
+    }
+}
+
 impl CheckedFile {
-    fn open(parent: &Directory, name: &str, mount: u64) -> io::Result<Self> {
+    fn open_bounded(parent: &Directory, name: &str, mount: u64, max: u64) -> io::Result<Self> {
         let pin = openat(
             &parent.fd,
             name,
@@ -321,6 +616,7 @@ impl CheckedFile {
             || original.uid != geteuid().as_raw()
             || original.links != 1
             || original.mode & 0o7022 != 0
+            || original.size > max
             || mount_id(&held)? != mount
         {
             return Err(changed());
@@ -330,7 +626,7 @@ impl CheckedFile {
             OFlags::RDONLY | OFlags::CLOEXEC,
             Mode::empty(),
         )?);
-        let checked = Self::inspect(file)?;
+        let checked = Self::inspect_bounded(file, max)?;
         if checked.stamp != original {
             return Err(changed());
         }
@@ -338,10 +634,51 @@ impl CheckedFile {
         Ok(checked)
     }
 
-    fn inspect(file: File) -> io::Result<Self> {
+    pub(in crate::server) fn generated_archive(
+        stage: &UploadStage<'_>,
+        file: File,
+        expected: CreatedPayload,
+    ) -> io::Result<Self> {
+        expected.validate()?;
+        require_file_payload(stage)?;
+        let stat = fstat(&file)?;
+        stage.payload.require_child(FILE, &stat)?;
+        if FileType::from_raw_mode(stat.st_mode) != FileType::RegularFile
+            || stat.st_uid != geteuid().as_raw()
+            || stat.st_nlink != 1
+            || stat.st_mode & 0o7022 != 0
+            || u64::try_from(stat.st_size).ok() != Some(expected.bytes)
+            || mount_id(&file)? != mount_id(&stage.payload.fd)?
+        {
+            return Err(changed());
+        }
+        let checked = Self::inspect_bounded(file, MAX_ARCHIVE_BYTES)?;
+        if checked.archive_payload()? != expected {
+            return Err(changed());
+        }
+        checked.require_payload(stage, false)?;
+        fsync(&checked.file)?;
+        fsync(&stage.payload.fd)?;
+        fsync(&stage.directory.fd)?;
+        Ok(checked)
+    }
+
+    fn archive_payload(&self) -> io::Result<CreatedPayload> {
+        let payload = CreatedPayload {
+            bytes: self.stamp.size,
+            sha256: self.digest,
+        };
+        payload.validate()?;
+        Ok(payload)
+    }
+
+    fn inspect_bounded(file: File, max: u64) -> io::Result<Self> {
         let stamp = Stamp::of(&file.metadata()?);
+        if stamp.size > max {
+            return Err(invalid("The reviewed file exceeds its size limit"));
+        }
         let attributes = read_xattrs(&file)?;
-        let inventory = file_inventory(&file, stamp.size)?;
+        let (inventory, digest) = file_content(&file, stamp.size)?;
         if !stamp.matches(&file, false)? {
             return Err(changed());
         }
@@ -349,6 +686,7 @@ impl CheckedFile {
             file,
             stamp,
             inventory,
+            digest,
             attributes,
         })
     }
@@ -366,18 +704,42 @@ impl CheckedFile {
         parent.require_child(name, &fstat(&self.file)?)?;
         Ok(current)
     }
+
+    fn require_payload(&self, stage: &UploadStage<'_>, hash_bytes: bool) -> io::Result<()> {
+        require_file_payload(stage)?;
+        self.require_at(&stage.payload, FILE, false)?;
+        if hash_bytes {
+            if file_inventory(&self.file, self.stamp.size)? != self.inventory {
+                return Err(changed());
+            }
+            require_file_payload(stage)?;
+            self.require_at(&stage.payload, FILE, false)?;
+        }
+        Ok(())
+    }
 }
 
-fn file_inventory(mut file: &File, bytes: u64) -> io::Result<Inventory> {
-    if bytes > MAX_BYTES {
+fn require_file_payload(stage: &UploadStage<'_>) -> io::Result<()> {
+    if !names(&stage.payload, 1)?
+        .iter()
+        .map(String::as_str)
+        .eq([FILE])
+    {
         return Err(invalid(
-            "The privileged rsync receiver exceeds the file size limit",
+            "The private rsync payload must contain exactly one file",
         ));
     }
+    Ok(())
+}
+
+fn file_inventory(file: &File, bytes: u64) -> io::Result<Inventory> {
+    file_content(file, bytes).map(|(inventory, _)| inventory)
+}
+
+fn file_content(mut file: &File, bytes: u64) -> io::Result<(Inventory, [u8; 32])> {
     file.rewind()?;
-    let mut manifest = Manifest::default();
-    manifest.add("", Some((bytes, hash(file, bytes)?)))?;
-    Ok(manifest.finish())
+    let digest = hash(file, bytes)?;
+    Ok((Manifest::regular_file(bytes, digest), digest))
 }
 
 fn hash_attributes(hash: &mut Sha256, attributes: &BTreeMap<String, Vec<u8>>) {
@@ -391,7 +753,7 @@ fn hash_attributes(hash: &mut Sha256, attributes: &BTreeMap<String, Vec<u8>>) {
 }
 
 fn changed() -> io::Error {
-    invalid("The reviewed privileged rsync file changed or is unavailable")
+    invalid("The reviewed rsync file changed or is unavailable")
 }
 
 #[cfg(test)]
@@ -463,6 +825,87 @@ mod tests {
         let expected = file_inventory(&file, NEW.len() as u64).unwrap();
         let successor = target.prepare_successor(&stage, expected).unwrap();
         (stage, successor)
+    }
+
+    fn first_candidate<'target>(
+        target: &'target VacantTarget<'_>,
+    ) -> (UploadStage<'target>, CheckedFile) {
+        use std::io::Write as _;
+
+        let stage = UploadStage::create(target.parent()).unwrap();
+        let mut file = File::from(
+            openat(
+                &stage.payload.fd,
+                FILE,
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW,
+                PRIVATE_FILE,
+            )
+            .unwrap(),
+        );
+        file.write_all(NEW).unwrap();
+        file.sync_all().unwrap();
+        let expected = file_inventory(&file, NEW.len() as u64).unwrap();
+        let successor = target.prepare(&stage, expected).unwrap();
+        (stage, successor)
+    }
+
+    #[test]
+    fn first_recurring_privileged_file_returns_the_exact_existing_receiver() {
+        let fixture = Fixture::new();
+        let destination = fixture.destination();
+        fs::remove_file(&destination).unwrap();
+        let path = destination.to_str().unwrap();
+        let parent =
+            || Directory::open_parent(fixture.0.join("receiver").to_str().unwrap()).unwrap();
+        let vacant = VacantTarget::open_at(path, parent()).unwrap();
+        let original = vacant.fingerprint();
+        let (mut stage, file) = first_candidate(&vacant);
+        assert!(!destination.exists());
+        assert_eq!(
+            VacantTarget::open_at(path, parent()).unwrap().fingerprint(),
+            original
+        );
+
+        let mut published = false;
+        let receipt = vacant
+            .publish(&stage, &file, &mut published, || Ok(()))
+            .unwrap();
+        stage.discard().unwrap();
+        assert!(published);
+        assert_eq!(receipt, fixture.target(path).unwrap().review());
+        assert_eq!(fs::read(&destination).unwrap(), NEW);
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o7777,
+            0o600
+        );
+        assert!(VacantTarget::open_at(path, parent()).is_err());
+        assert_eq!(
+            fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn first_recurring_privileged_file_leaves_a_late_occupant_untouched() {
+        let fixture = Fixture::new();
+        let destination = fixture.destination();
+        fs::remove_file(&destination).unwrap();
+        let path = destination.to_str().unwrap();
+        let parent = Directory::open_parent(fixture.0.join("receiver").to_str().unwrap()).unwrap();
+        let vacant = VacantTarget::open_at(path, parent).unwrap();
+        let (mut stage, file) = first_candidate(&vacant);
+        let mut published = false;
+        let error = vacant.publish(&stage, &file, &mut published, || {
+            fs::write(&destination, OLD)
+        });
+        assert!(error.is_err());
+        assert!(!published);
+        stage.discard().unwrap();
+        assert_eq!(fs::read(&destination).unwrap(), OLD);
+        assert_eq!(
+            fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+            1
+        );
     }
 
     #[test]

@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 use std::io::Cursor;
 use std::sync::Weak;
 
-use kortty_server_archive::protocol::{self, CreateReview, CreateSpec, OutputMetadata};
+use kortty_server_archive::protocol::{
+    self, ArchiveMemberLayout, CreateReview, CreateSpec, OutputMetadata,
+};
 use kortty_ssh::sftp::{UploadMetadata, UploadOwner, UploadStage};
 
 use crate::job_executor::{BrowserArchiveManifest, scan_browser_archive};
@@ -195,6 +197,8 @@ fn request_archive(directory: &[u8], selected: &[Entry], options: Options) -> io
         password_credential: None,
         download: None,
         server_output: None,
+        reuse_output: false,
+        member_layout: ArchiveMemberLayout::SourceBasename,
     };
     archive.validate().map_err(io::Error::other)?;
     Ok(archive)

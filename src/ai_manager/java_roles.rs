@@ -8,8 +8,8 @@ use iced::{Element, Length, Task};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    Configuration, Dialog, JavaJournalProfileHint, JavaProfileSource, Message, Page, invalid,
-    local, profiles,
+    Configuration, Dialog, JavaAiProfileHint, JavaProfileSource, Message, Page, invalid, local,
+    profiles,
 };
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -20,6 +20,9 @@ pub enum Role {
     Coding,
     Agent,
     Security,
+    // The journal hint is stored with the separate recording and automation assignments.
+    #[serde(skip)]
+    Journal,
 }
 
 impl Role {
@@ -30,6 +33,7 @@ impl Role {
             Self::Coding => Some(local::Role::Coding),
             Self::Agent => Some(local::Role::Agent),
             Self::Security => Some(local::Role::Security),
+            Self::Journal => Some(local::Role::Journal),
         }
     }
 
@@ -48,14 +52,14 @@ const FIELDS: [(Role, &str); 5] = [
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(transparent)]
-pub(in crate::ai_manager) struct Hints(BTreeMap<Role, JavaJournalProfileHint>);
+pub(in crate::ai_manager) struct Hints(BTreeMap<Role, JavaAiProfileHint>);
 
 impl Hints {
     pub(super) fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    pub(super) fn iter(&self) -> impl Iterator<Item = (Role, &JavaJournalProfileHint)> {
+    pub(super) fn iter(&self) -> impl Iterator<Item = (Role, &JavaAiProfileHint)> {
         self.0.iter().map(|(role, hint)| (*role, hint))
     }
 
@@ -122,7 +126,7 @@ pub(in crate::ai_manager) fn read<'a>(
                 };
                 hints.insert(
                     role,
-                    JavaJournalProfileHint {
+                    JavaAiProfileHint {
                         id: id.into(),
                         source: source(catalog, id).cloned(),
                     },
@@ -142,6 +146,11 @@ fn source<'a>(catalog: &'a profiles::Catalog, id: &str) -> Option<&'a JavaProfil
 
 impl Configuration {
     pub(super) fn java_role_profile(&self, role: Role) -> Option<&profiles::Profile> {
+        if role == Role::Journal {
+            return self
+                .profiles
+                .profile(self.resolve_imported_journal_summary_profile(false)?);
+        }
         let source = self.java_roles.0.get(&role)?.source()?;
         let mut matches = self
             .profiles
@@ -161,7 +170,7 @@ impl Dialog {
         }
         role.local()
             .map_or_else(
-                || profile.can_be_default(),
+                || profile.can_be_default() || profile.can_be_server_selected_chat_default(),
                 |role| profile.allows_role(role),
             )
             .then_some(profile)
@@ -174,13 +183,15 @@ impl Dialog {
             && !self.local.busy()
             && role.local().map_or_else(
                 || {
-                    self.profile_policy.edit
-                        && self
-                            .profiles
-                            .catalog()
-                            .default_profile()
-                            .map(|selected| selected.id)
-                            != Some(profile.id)
+                    self.profile_policy.edit && {
+                        let catalog = self.profiles.catalog();
+                        let selected = if profile.uses_server_default_model() {
+                            catalog.server_selected_chat_default()
+                        } else {
+                            catalog.default_profile()
+                        };
+                        selected.map(|selected| selected.id) != Some(profile.id)
+                    }
                 },
                 |role| self.local_state.profile(role) != Some(&profile.reference()),
             )
@@ -192,22 +203,33 @@ impl Dialog {
         {
             let id = profile.id;
             let reference = profile.reference();
+            let label = if role == Role::Default && profile.uses_server_default_model() {
+                "Terminal Chat default"
+            } else {
+                role.label()
+            };
             if let Some(role) = role.local() {
                 self.local_state.set_profile(role, Some(reference));
             } else {
                 self.profiles.stage_default(id);
             }
-            self.notice = format!("{} selected. Save to apply the assignment.", role.label());
+            self.notice = format!("{label} selected. Save to apply the assignment.");
         }
         Task::none()
     }
 
     pub(super) fn java_roles_view(&self) -> Option<Element<'_, Message>> {
-        if self.saved.java_roles.is_empty() {
+        let journal = self.saved.imported_journal_summary_profile(false);
+        if self.saved.java_roles.is_empty() && journal.is_none() {
             return None;
         }
         let mut content = column![text("Imported Java profile roles").size(16)].spacing(6);
-        for (role, hint) in self.saved.java_roles.iter() {
+        for (role, hint) in self
+            .saved
+            .java_roles
+            .iter()
+            .chain(journal.map(|hint| (Role::Journal, hint)))
+        {
             let profile = self.saved.java_role_profile(role);
             let description = match profile {
                 None => format!(
@@ -274,6 +296,248 @@ mod tests {
         ],"default":1,"last_id":2},
         "local":{"roles":[null,2,null,null]}
     }"#;
+
+    #[test]
+    fn java_server_selected_assignments_are_reviewed_and_persisted() {
+        let fixture = br#"<globalSettings>
+            <defaultAiProfileId>java-auto</defaultAiProfileId>
+            <textAiProfileId>java-text</textAiProfileId>
+            <terminalAgentAiProfileId>java-auto</terminalAgentAiProfileId>
+            <codingAiProfileId>java-text</codingAiProfileId>
+            <securityCheckAiProfileId>java-auto</securityCheckAiProfileId>
+            <aiProfiles><profile><id>java-auto</id><name>Imported default</name>
+                <apiUrl>https://review.example.test/v1</apiUrl>
+                <modelSelectionMode>DEFAULT</modelSelectionMode>
+            </profile><profile><id>java-text</id><name>Imported text</name>
+                <apiUrl>http://127.0.0.1:12348/v1</apiUrl>
+                <modelSelectionMode>DEFAULT</modelSelectionMode>
+            </profile></aiProfiles>
+        </globalSettings>"#;
+        let scratch = crate::snippets::tests::Profile::new();
+        let root = scratch.0.canonicalize().unwrap();
+        let policy = ClipboardPolicy::default();
+        let (incoming, _) = portable_java_profiles(fixture).unwrap();
+        let merged = merge_java_profiles(Some(NATIVE_SETTINGS), &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        let mut baseline = Configuration::decode(&merged).unwrap();
+        let id = baseline.java_role_profile(Role::Default).unwrap().id;
+        let text = baseline.java_role_profile(Role::Text).unwrap().id;
+        let make_dialog = |config: &Configuration| {
+            let mut dialog = Dialog::new(
+                Arc::new(config.clone()),
+                root.clone(),
+                Vec::new(),
+                true,
+                None,
+            );
+            dialog.page = Page::LocalPreferences;
+            dialog
+        };
+        let mut dialog = make_dialog(&baseline);
+        let _ = dialog.adopt_java_role(Role::Default);
+        let _ = dialog.adopt_java_role(Role::Text);
+        let _ = dialog.adopt_java_role(Role::Agent);
+        let _ = dialog.adopt_java_role(Role::Coding);
+        let _ = dialog.adopt_java_role(Role::Security);
+        assert!(dialog.local_state.profile(local::Role::Text).is_none());
+        assert!(dialog.local_state.profile(local::Role::Agent).is_none());
+        assert_eq!(
+            dialog.local_state.profile(local::Role::Coding),
+            Some(&profiles::ProfileRef::Numeric(2))
+        );
+        assert!(dialog.local_state.profile(local::Role::Security).is_none());
+        assert!(
+            dialog
+                .profiles
+                .catalog()
+                .server_selected_chat_default()
+                .is_none()
+        );
+
+        let mut editor = profiles::Editor::new(baseline.profiles.clone());
+        editor.update(profiles::Message::Select(id), true);
+        editor.update(profiles::Message::TrustRemote(true), true);
+        editor.update(profiles::Message::Select(text), true);
+        editor.update(profiles::Message::TrustLocal(true), true);
+        baseline.profiles = editor.catalog().clone();
+        baseline
+            .save_against(&root, &Configuration::default())
+            .unwrap();
+        let baseline = Configuration::load_from(&root).unwrap();
+        let mut dialog = make_dialog(&baseline);
+        let _ = dialog.adopt_java_role(Role::Default);
+        let _ = dialog.adopt_java_role(Role::Agent);
+        assert!(dialog.local_state.profile(local::Role::Agent).is_none());
+        let mut next = baseline.clone();
+        next.profiles = dialog.profiles.catalog().clone();
+        next.save_against(&root, &baseline).unwrap();
+        let reopened = Configuration::load_from(&root).unwrap();
+        assert_eq!(reopened.server_selected_chat_preference_id(), Some(id));
+        assert_eq!(reopened.terminal_chat_profile_id(), Some(1));
+        assert_eq!(reopened.agent_profile_id(), Some(2));
+
+        let mut editor = profiles::Editor::new(reopened.profiles.clone());
+        editor.update(profiles::Message::Select(id), true);
+        editor.update(profiles::Message::ReviewedAgentHttps(true), true);
+        let mut opted_in = reopened.clone();
+        opted_in.profiles = editor.catalog().clone();
+        opted_in.save_against(&root, &reopened).unwrap();
+        let reopened = Configuration::load_from(&root).unwrap();
+        let mut dialog = make_dialog(&reopened);
+        let _ = dialog.adopt_java_role(Role::Text);
+        let _ = dialog.adopt_java_role(Role::Agent);
+        let _ = dialog.adopt_java_role(Role::Coding);
+        let _ = dialog.adopt_java_role(Role::Security);
+        let mut next = reopened.clone();
+        next.local = dialog.local_state.clone();
+        next.save_against(&root, &reopened).unwrap();
+        let reopened = Configuration::load_from(&root).unwrap();
+        assert_eq!(reopened.server_selected_chat_preference_id(), Some(text));
+        assert_eq!(reopened.preferred_manual_profile_id(), Some(text));
+        assert_eq!(reopened.terminal_chat_profile_id(), Some(1));
+        assert_eq!(reopened.foreground_agent_default_role_id(), Some(id));
+        assert_eq!(reopened.agent_profile_id(), Some(1));
+        assert_eq!(
+            reopened.preferred_snippet_assistance_profile_id(Action::Complete, None, |_| true),
+            Some(text)
+        );
+        assert_eq!(
+            reopened
+                .preferred_snippet_assistance_profile_id(Action::SecurityReview, None, |_| true),
+            Some(id)
+        );
+        assert_eq!(reopened.preferred_snippet_analysis_profile_id(), Some(text));
+        assert!(
+            reopened
+                .snippet_analysis_transport(text)
+                .unwrap()
+                .0
+                .uses_server_default_model()
+        );
+        assert!(reopened.code_analysis_transport(text).is_err());
+        let (_, _, model, destination, remote) = reopened
+            .snippet_assistance_profiles()
+            .find(|(candidate, ..)| *candidate == id)
+            .unwrap();
+        assert!(model.is_none() && remote);
+        assert!(
+            reopened
+                .snippet_assistance_transport(id, model, &destination, remote)
+                .unwrap()
+                .0
+                .uses_server_default_model()
+        );
+        assert!(
+            reopened
+                .snippet_assistance_transport(id, model, &destination, false)
+                .is_err()
+        );
+        let translation = reopened
+            .journal_note_translation_profile()
+            .unwrap()
+            .unwrap();
+        assert_eq!(translation.id, text);
+        assert!(translation.transport.uses_server_default_model());
+        assert!(
+            reopened
+                .profiles
+                .role_specific_choices(local::Role::Text)
+                .any(|(id, _)| id == text)
+        );
+        assert!(
+            reopened
+                .profiles
+                .role_specific_choices(local::Role::Coding)
+                .any(|(id, _)| id == text)
+        );
+    }
+
+    #[test]
+    fn java_journal_question_role_reuses_the_recording_hint_after_review() {
+        let fixture = br#"<globalSettings>
+            <sessionJournalAiProfileId>java-journal</sessionJournalAiProfileId>
+            <automationJournalAiProfileId>java-automation</automationJournalAiProfileId>
+            <aiProfiles><profile><id>java-journal</id><name>Journal gateway</name>
+                <apiUrl>https://review.example.test/tenant/v1/chat/completions</apiUrl>
+                <modelSelectionMode>DEFAULT</modelSelectionMode>
+            </profile><profile><id>java-automation</id><name>Automation</name>
+                <apiUrl>http://127.0.0.1:12348/v1</apiUrl><model>fixture</model>
+            </profile></aiProfiles>
+        </globalSettings>"#;
+        let (incoming, _) = portable_java_profiles(fixture).unwrap();
+        let policy = ClipboardPolicy::default();
+        let merged = merge_java_profiles(Some(NATIVE_SETTINGS), &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        let mut baseline = Configuration::decode(&merged).unwrap();
+        let id = baseline.java_role_profile(Role::Journal).unwrap().id;
+        let automation = baseline
+            .resolve_imported_journal_summary_profile(true)
+            .unwrap();
+        assert_ne!(id, automation);
+
+        let scratch = crate::snippets::tests::Profile::new();
+        let root = scratch.0.canonicalize().unwrap();
+        let make_dialog = |config: &Configuration| {
+            let mut dialog = Dialog::new(
+                Arc::new(config.clone()),
+                root.clone(),
+                Vec::new(),
+                true,
+                None,
+            );
+            dialog.page = Page::LocalPreferences;
+            dialog
+        };
+        let mut dialog = make_dialog(&baseline);
+        assert!(dialog.java_roles_view().is_some());
+        let _ = dialog.adopt_java_role(Role::Journal);
+        assert!(dialog.local_state.profile(local::Role::Journal).is_none());
+
+        let mut editor = profiles::Editor::new(baseline.profiles.clone());
+        editor.update(profiles::Message::Select(id), true);
+        editor.update(profiles::Message::TrustRemote(true), true);
+        baseline.profiles = editor.catalog().clone();
+        baseline
+            .save_against(&root, &Configuration::default())
+            .unwrap();
+        let baseline = Configuration::load_from(&root).unwrap();
+        assert!(
+            baseline
+                .preferred_journal_question_outbound_id(false)
+                .is_none()
+        );
+
+        let mut dialog = make_dialog(&baseline);
+        let _ = dialog.adopt_java_role(Role::Journal);
+        assert_eq!(
+            dialog.local_state.profile(local::Role::Journal),
+            Some(&profiles::ProfileRef::Numeric(u64::try_from(id).unwrap()))
+        );
+        assert!(
+            Configuration::load_from(&root)
+                .unwrap()
+                .preferred_journal_question_outbound_id(false)
+                .is_none()
+        );
+        let mut next = baseline.clone();
+        next.local = dialog.local_state.clone();
+        next.save_against(&root, &baseline).unwrap();
+        let reopened = Configuration::load_from(&root).unwrap();
+        assert_eq!(
+            reopened.preferred_journal_question_outbound_id(false),
+            Some(id)
+        );
+        assert_eq!(
+            reopened.resolve_imported_journal_summary_profile(true),
+            Some(automation)
+        );
+        assert!(reopened.journal_summary_default_id().is_none());
+        let queue = crate::session_journal::summary_queue::Queue::load(&root).unwrap();
+        assert!(queue.preferences().automation_grant().is_none());
+        assert!(queue.preferences().https.is_none());
+    }
 
     #[test]
     fn java_roles_restore_additively_without_assigning_existing_or_imported_profiles() {

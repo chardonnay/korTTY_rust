@@ -5,7 +5,7 @@ use iced::{Element, Length};
 use kortty_terminal::TextEncoding;
 
 use super::{HighlightChoices, journal_settings, view::ViewChoices};
-use crate::ai_manager::ProfileRef;
+use crate::ai_manager::{JavaProfileSource, ProfileRef};
 use crate::connection_store::{ANSI_NAMES, TerminalOverrides, ThemeOverride};
 use crate::terminal_agent::design::{Choice as AgentDesignChoice, valid_id as valid_design_id};
 use crate::terminal_theme::{BoldTextMode, CursorStyle, Rgb, Themes};
@@ -31,6 +31,8 @@ pub enum Edit {
     PasteLineDelay(String),
     StrictTerminalMode(Option<bool>),
     AiProfile(Option<ProfileRef>),
+    AdoptJavaAiProfile(ProfileRef, JavaProfileSource),
+    DismissJavaAiProfile,
     AiAgentDisabled(bool),
     AiAgentDesign(Option<String>),
     AiSkill(u64, bool),
@@ -102,7 +104,10 @@ impl Draft {
                 return false;
             }
             Edit::Reset => {
+                self.options.dismiss_java_ai_profile();
+                let dismissed = self.options.java_ai_profile_dismissed;
                 *self = Self::new(&TerminalOverrides::default());
+                self.options.java_ai_profile_dismissed = dismissed;
                 self.show = true;
             }
             Edit::Theme(value) => self.options.theme = value,
@@ -128,7 +133,29 @@ impl Draft {
             Edit::ConfirmClose(value) => self.options.confirm_close = value,
             Edit::PasteLineDelay(value) => self.paste_line_delay = value.chars().take(8).collect(),
             Edit::StrictTerminalMode(value) => self.options.strict_terminal_mode = value,
-            Edit::AiProfile(value) => self.options.ai_profile = value,
+            Edit::AiProfile(value) => {
+                self.options.ai_profile = value;
+                self.options.dismiss_java_ai_profile();
+            }
+            Edit::AdoptJavaAiProfile(reference, source) => {
+                if self
+                    .options
+                    .java_ai_profile
+                    .as_ref()
+                    .and_then(|hint| hint.source())
+                    != Some(&source)
+                {
+                    return false;
+                }
+                self.options.ai_profile = Some(reference);
+                self.options.dismiss_java_ai_profile();
+            }
+            Edit::DismissJavaAiProfile => {
+                if self.options.java_ai_profile.is_none() {
+                    return false;
+                }
+                self.options.dismiss_java_ai_profile();
+            }
             Edit::AiAgentDisabled(value) => self.options.ai_agent_disabled = value,
             Edit::AiAgentDesign(value) => {
                 if !value.as_deref().is_none_or(valid_design_id) {
@@ -221,6 +248,39 @@ impl Draft {
         }
         let (ai_choices, selected) =
             ai_profile_choices(view.ai_profiles, self.options.ai_profile.as_ref());
+        let java_ai_profile = self.options.java_ai_profile.as_ref().map(|hint| {
+            let target = hint.source().and_then(|source| {
+                view.java_ai_profiles
+                    .iter()
+                    .find(|(candidate, _, _)| candidate == source)
+            });
+            let (label, adopt) = match target {
+                Some((source, reference, name)) => (
+                    format!("Imported Java AI profile · {name}"),
+                    Some(Edit::AdoptJavaAiProfile(reference.clone(), source.clone())),
+                ),
+                None if hint.source().is_some() => (
+                    format!(
+                        "Imported Java AI profile · {} · Review the profile in AI Manager",
+                        hint.id()
+                    ),
+                    None,
+                ),
+                None => (
+                    format!(
+                        "Imported Java AI profile · {} · Profile unavailable from this backup",
+                        hint.id()
+                    ),
+                    None,
+                ),
+            };
+            row![
+                text(label).width(Length::Fill),
+                button("Use imported profile").on_press_maybe(adopt),
+                button("Dismiss").on_press(Edit::DismissJavaAiProfile)
+            ]
+            .spacing(8)
+        });
         let mut designs = view.ai_agent_designs.to_vec();
         let design_id = self.options.ai_agent_design.as_deref().unwrap_or_default();
         let selected_design = designs
@@ -238,20 +298,12 @@ impl Draft {
                 designs.push(unavailable.clone());
                 Some(unavailable)
             });
-        let (sets, selected_set) =
-            highlight_choices(&view.highlighting, self.options.highlight_set.as_deref());
+        let highlighting = highlight_picker(
+            &view.highlighting,
+            self.options.highlight_set.as_deref(),
+            Edit::HighlightSet,
+        );
         let (themes, selected_theme) = theme_choices(view.themes, self.options.theme.as_ref());
-        let mut highlighting = column![
-            pick_list(sets, Some(selected_set), |choice: HighlightChoice| {
-                Edit::HighlightSet(choice.id)
-            })
-            .width(Length::Fill)
-        ]
-        .spacing(4);
-        if !view.highlighting.enabled {
-            highlighting =
-                highlighting.push(text("Terminal highlighting is off globally.").size(12));
-        }
         let mut choices = column![
             self.journal.view(view.journal_max_parts).map(Edit::Journal),
             labeled("Keyword highlighting", highlighting),
@@ -332,6 +384,7 @@ impl Draft {
                 ))
                 .width(Length::Fill)
             ),
+            java_ai_profile,
             checkbox(self.options.ai_agent_disabled)
                 .label("Disable terminal AI agent execution for this connection")
                 .on_toggle(Edit::AiAgentDisabled),
@@ -447,6 +500,25 @@ struct HighlightChoice {
     label: String,
 }
 
+pub(super) fn highlight_picker<'a, Message: Clone + 'a>(
+    catalog: &HighlightChoices<'_>,
+    stored: Option<&str>,
+    on_change: impl Fn(String) -> Message + 'a,
+) -> Element<'a, Message> {
+    let (sets, selected) = highlight_choices(catalog, stored);
+    let mut picker = column![
+        pick_list(sets, Some(selected), move |choice: HighlightChoice| {
+            on_change(choice.id)
+        })
+        .width(Length::Fill)
+    ]
+    .spacing(4);
+    if !catalog.enabled {
+        picker = picker.push(text("Terminal highlighting is off globally.").size(12));
+    }
+    picker.into()
+}
+
 impl fmt::Display for HighlightChoice {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.label)
@@ -495,6 +567,37 @@ fn highlight_choices(
 
 #[derive(Clone, PartialEq, Eq)]
 struct AiChoice(Option<ProfileRef>, String);
+
+#[test]
+fn imported_ai_profile_adoption_requires_matching_provenance_and_replaces_the_hint() {
+    let source = |fingerprint: u8| -> JavaProfileSource {
+        serde_json::from_value(serde_json::json!({
+            "id": "java-chat",
+            "fingerprint": vec![fingerprint; 32],
+        }))
+        .unwrap()
+    };
+    let mut hint = crate::ai_manager::JavaAiProfileHint::from_id("java-chat").unwrap();
+    let exact = source(1);
+    hint.associate_source(&[&exact]);
+    let options = TerminalOverrides {
+        java_ai_profile: Some(hint),
+        ..TerminalOverrides::default()
+    };
+    let mut dismissed = Draft::new(&options);
+    assert!(dismissed.update(Edit::DismissJavaAiProfile));
+    let dismissed = dismissed.value().unwrap();
+    assert!(dismissed.java_ai_profile.is_none() && dismissed.java_ai_profile_dismissed);
+    let mut draft = Draft::new(&options);
+    let reference = ProfileRef::Numeric(4);
+    assert!(!draft.update(Edit::AdoptJavaAiProfile(reference.clone(), source(2))));
+    assert!(draft.value().unwrap().ai_profile.is_none());
+    assert!(draft.update(Edit::AdoptJavaAiProfile(reference.clone(), exact)));
+    let saved = draft.value().unwrap();
+    assert_eq!(saved.ai_profile, Some(reference));
+    assert!(saved.java_ai_profile.is_none());
+    assert!(saved.java_ai_profile_dismissed);
+}
 
 fn ai_profile_choices(
     profiles: &[(Option<u64>, ProfileRef, String)],

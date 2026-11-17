@@ -16,6 +16,8 @@ pub(super) use pool::{Lease, acquire as acquire_model};
 pub(crate) use pool::{ModelStatus, model_status, shutdown, stop_model, with_stopped_model};
 pub(crate) use pool::{mlx_model_status, with_mlx_maintenance, with_stopped_mlx_model};
 pub(in crate::local_ai) use pool::{trust_changed, with_mlx_maintenance_io};
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(super) use process::test_mlx_process_exit_before_ready;
 
 use std::collections::BTreeSet;
 use std::fs::File;

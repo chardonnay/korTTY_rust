@@ -6,12 +6,20 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::path::{Component, Path};
 
+use serde::Serialize;
+
 use super::Directory;
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct ReviewedVolume(pub(super) u64, pub(super) u64);
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+impl ReviewedVolume {
+    pub(crate) fn mount_identity(self) -> (u64, u64) {
+        (self.0, self.1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct ReviewedStamp {
     pub(super) volume: ReviewedVolume,
     pub(super) identity: [u8; 16],
@@ -28,6 +36,15 @@ pub(crate) struct ReviewedStamp {
 impl ReviewedStamp {
     pub(crate) fn volume(&self) -> ReviewedVolume {
         self.volume
+    }
+
+    pub(crate) fn for_tree_parent(self) -> Self {
+        Self {
+            size: 0,
+            modified: (0, 0),
+            changed: (0, 0),
+            ..self
+        }
     }
 
     pub(crate) fn hash_into(&self, hasher: &mut impl Hasher) {
@@ -49,6 +66,19 @@ impl ReviewedStamp {
             changed: other.changed,
             ..*self
         } == *other
+    }
+
+    pub(crate) fn same_after_first_publication(&self, other: &Self) -> bool {
+        // Windows may restore the creation time associated with a recently
+        // removed destination name when the new file is renamed into place.
+        #[cfg(windows)]
+        let expected = Self {
+            created: other.created,
+            ..*self
+        };
+        #[cfg(unix)]
+        let expected = *self;
+        expected.same_after_move(other)
     }
 }
 
@@ -82,13 +112,39 @@ pub(crate) fn open_reviewed_tree_parent(path: &Path) -> io::Result<Directory> {
 }
 
 pub(crate) fn open_reviewed_tree_child(parent: &Directory, name: &OsStr) -> io::Result<Directory> {
+    open_reviewed_child(parent, name, true)
+}
+
+pub(crate) fn open_reviewed_tree_child_for_files(
+    parent: &Directory,
+    name: &OsStr,
+) -> io::Result<Directory> {
+    // The file publisher holds shared locks on the same ancestors.
+    open_reviewed_child(parent, name, false)
+}
+
+fn open_reviewed_child(parent: &Directory, name: &OsStr, exclusive: bool) -> io::Result<Directory> {
     check_component(name)?;
     #[cfg(unix)]
-    let child = super::unix::hold_reviewed_child(parent, name)?;
+    let child = {
+        use rustix::fs::FlockOperation;
+        let lock = if exclusive {
+            FlockOperation::NonBlockingLockExclusive
+        } else {
+            FlockOperation::NonBlockingLockShared
+        };
+        super::unix::hold_reviewed_child(parent, name, lock)?
+    };
     #[cfg(windows)]
-    let child = Directory::from_file(parent.child_for_reviewed_removal(name, true)?)?;
-    #[cfg(windows)]
-    child.require_reviewed_tree_basename(name)?;
+    let child = {
+        let directory = if exclusive {
+            Directory::from_file(parent.child_for_reviewed_removal(name, true)?)?
+        } else {
+            parent.open_reviewed_child_for_files(name)?
+        };
+        directory.require_reviewed_tree_basename(name)?;
+        directory
+    };
     if reviewed_directory_stamp(&child)?.volume() != reviewed_tree_volume(parent)? {
         return Err(changed());
     }
@@ -119,6 +175,14 @@ pub(crate) fn create_reviewed_tree_file(parent: &Directory, name: &OsStr) -> io:
     return parent.create_file(name);
     #[cfg(windows)]
     return parent.create_replacement_file(name);
+}
+
+pub(crate) fn create_reviewed_tree_read_write_file(
+    parent: &Directory,
+    name: &OsStr,
+) -> io::Result<File> {
+    check_component(name)?;
+    parent.create_read_write_file(name)
 }
 
 pub(crate) fn remove_empty_reviewed_tree_stage(
@@ -245,12 +309,64 @@ pub(crate) fn reviewed_tree_parent_stamp(directory: &Directory) -> io::Result<Re
     let stamp = super::unix::reviewed_stamp(directory.file(), true, true)?;
     #[cfg(windows)]
     let stamp = reviewed_directory_stamp(directory)?;
-    Ok(ReviewedStamp {
-        size: 0,
-        modified: (0, 0),
-        changed: (0, 0),
-        ..stamp
-    })
+    Ok(stamp.for_tree_parent())
+}
+
+// A durable shared-parent receipt must distinguish a reused directory identity.
+#[cfg(target_os = "linux")]
+pub(crate) fn reviewed_tree_parent_birth(
+    directory: &Directory,
+    _: &ReviewedStamp,
+) -> Option<(i64, u32)> {
+    use rustix::fs::{AtFlags, StatxFlags, fstatfs, statx};
+
+    let file = directory.file();
+    // ext, Btrfs, XFS, F2FS and tmpfs can expose a native birth timestamp.
+    let kind = fstatfs(file).ok()?.f_type as u32;
+    if !matches!(
+        kind,
+        0xef53 | 0x9123_683e | 0x5846_5342 | 0xf2f5_2010 | 0x0102_1994
+    ) {
+        return None;
+    }
+    let stat = statx(file, "", AtFlags::EMPTY_PATH, StatxFlags::BTIME).ok()?;
+    let birth = (stat.stx_btime.tv_sec, stat.stx_btime.tv_nsec);
+    (stat.stx_mask & StatxFlags::BTIME.bits() != 0 && birth != (0, 0)).then_some(birth)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn reviewed_tree_parent_birth(
+    directory: &Directory,
+    _: &ReviewedStamp,
+) -> Option<(i64, u32)> {
+    let file = directory.file();
+    let filesystem = rustix::fs::fstatfs(file)
+        .ok()?
+        .f_fstypename
+        .map(|byte| byte as u8);
+    if std::ffi::CStr::from_bytes_until_nul(&filesystem)
+        .ok()?
+        .to_bytes()
+        != b"apfs"
+    {
+        return None;
+    }
+    let birth = file
+        .metadata()
+        .ok()?
+        .created()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some((i64::try_from(birth.as_secs()).ok()?, birth.subsec_nanos()))
+}
+
+#[cfg(windows)]
+pub(crate) fn reviewed_tree_parent_birth(
+    directory: &Directory,
+    stamp: &ReviewedStamp,
+) -> Option<(i64, u32)> {
+    (stamp.created > 0 && directory.supports_reviewed_parent_birth()).then_some((stamp.created, 0))
 }
 
 pub(crate) fn reviewed_directory_stamp(directory: &Directory) -> io::Result<ReviewedStamp> {

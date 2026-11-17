@@ -29,7 +29,9 @@ pub(crate) mod virtual_terminal;
 pub(crate) use connection::{BatchAuth, Credentials, JobAuth, SavedAuth};
 pub(crate) use output::CapturedOutput;
 pub(crate) use remote::sync::preview as preview_sftp_sync;
-pub(crate) use remote::{BrowserArchiveManifest, scan_browser_archive};
+pub(crate) use remote::{
+    BrowserArchiveManifest, preview_privileged_file_upload, scan_browser_archive,
+};
 pub(crate) type ArchivePassword = Result<Option<kortty_vault::Secret>, &'static str>;
 type BorrowedArchivePassword<'a> = Result<Option<&'a str>, &'static str>;
 
@@ -105,6 +107,7 @@ pub(crate) struct ExecutionPolicy {
     pub(crate) sync: Option<crate::scheduler_window::sync::RunContext>,
     pub(crate) privileged: Option<crate::scheduler_window::privileged::RunContext>,
     pub(crate) rsync: Option<crate::scheduler_window::rsync_authority::RunContext>,
+    pub(crate) rsync_batch_parents: Option<rsync::BatchParents>,
     pub(crate) group_scope: Option<std::sync::Arc<SshCommand>>,
 }
 
@@ -130,9 +133,7 @@ impl ExecutionPolicy {
         self.rsync
             .as_ref()
             .ok_or_else(|| {
-                Failure::blocked(
-                    "The existing-directory upload requires a current saved rsync approval.",
-                )
+                Failure::blocked("This transfer requires a current saved rsync approval.")
             })?
             .require_current(run, job, reference)
             .map_err(Failure::blocked)
@@ -173,6 +174,7 @@ impl ExecutionPolicy {
             sync: None,
             privileged: None,
             rsync: None,
+            rsync_batch_parents: None,
             group_scope: None,
         }
     }
@@ -769,6 +771,7 @@ mod tests {
             sync: None,
             privileged: None,
             rsync: None,
+            rsync_batch_parents: None,
             group_scope: None,
             file_transfer_allowed: true,
             sudo_allowed: policy.scheduler_sudo_allowed,
@@ -1134,6 +1137,7 @@ mod tests {
             agent: None,
             imported_ai: None,
             imported_transfer: None,
+            imported_privileged: None,
             sudo: SudoMode::Disabled,
             virtual_terminal: None,
             automation_journal: None,

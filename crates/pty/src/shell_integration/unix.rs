@@ -39,19 +39,21 @@ impl Startup {
             command,
             snippet,
             arguments,
-            &env::temp_dir(),
+            &trusted_directory(&env::temp_dir())?,
             env::var_os("ZDOTDIR").as_deref(),
         )
     }
 
-    fn prepare_at(
+    /// The caller supplies a canonical directory whose ancestors were checked
+    /// in the same filesystem namespace as the shell that will read the files.
+    pub(crate) fn prepare_at(
         command: &mut Command,
         snippet: Snippet,
         arguments: &[String],
-        temp: &Path,
+        base: &Path,
         zdotdir: Option<&OsStr>,
     ) -> io::Result<Self> {
-        let path = private_directory(temp)?;
+        let path = private_directory(base)?;
         let directory = match OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
@@ -129,21 +131,27 @@ impl Drop for Startup {
     }
 }
 
-fn private_directory(base: &Path) -> io::Result<PathBuf> {
+fn trusted_directory(base: &Path) -> io::Result<PathBuf> {
     let base = base.canonicalize()?;
-    // SAFETY: geteuid does not take pointers and has no mutable process state.
-    let uid = unsafe { libc::geteuid() };
     for directory in base.ancestors() {
         let metadata = directory.symlink_metadata()?;
-        let trusted_owner = metadata.uid() == 0 || metadata.uid() == uid;
-        let private_or_sticky = metadata.mode() & 0o022 == 0 || metadata.mode() & 0o1000 != 0;
-        if !metadata.is_dir() || !trusted_owner || !private_or_sticky {
+        if !metadata.is_dir() || !trusted_permissions(metadata.uid(), metadata.mode()) {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
                 "unsafe shell startup directory",
             ));
         }
     }
+    Ok(base)
+}
+
+pub(crate) fn trusted_permissions(owner: u32, mode: u32) -> bool {
+    // SAFETY: geteuid does not take pointers and has no mutable process state.
+    let uid = unsafe { libc::geteuid() };
+    (owner == 0 || owner == uid) && (mode & 0o022 == 0 || mode & 0o1000 != 0)
+}
+
+fn private_directory(base: &Path) -> io::Result<PathBuf> {
     let template = base.join("kortty-shell-integration.XXXXXX");
     let mut bytes = CString::new(template.as_os_str().as_bytes())?.into_bytes_with_nul();
     // SAFETY: mkdtemp writes the six trailing X bytes in this writable C string
@@ -178,7 +186,7 @@ mod tests {
 
     #[test]
     fn cleanup_is_anchored_to_the_created_startup_directory() {
-        let root = private_directory(&env::temp_dir()).unwrap();
+        let root = private_directory(&trusted_directory(&env::temp_dir()).unwrap()).unwrap();
         let home = root.join("existing");
         fs::create_dir(&home).unwrap();
         let protected = home.join(ZSH_RC);

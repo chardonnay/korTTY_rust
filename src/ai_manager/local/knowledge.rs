@@ -1,6 +1,8 @@
 //! A bounded semantic index over approved text and PDF sources.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::borrow::Cow;
+use std::cmp::{Ordering, Reverse};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
@@ -39,7 +41,8 @@ const MAX_SOURCES: usize = 5_000;
 const LEGACY_MAX_SOURCES: usize = 32;
 const CHUNK_BYTES: usize = 4096;
 const MAX_CHUNKS: usize = 8_192;
-const MAX_INDEX_PASSAGES: usize = 16_384;
+const MAX_LOCAL_INDEX_PASSAGES: usize = 5_000_000;
+const MAX_QDRANT_INDEX_PASSAGES: usize = 16_384;
 const MAX_DIMENSIONS: usize = 16_384;
 const BATCH_SIZE: usize = 16;
 const SEARCH_HITS: usize = 5;
@@ -700,6 +703,31 @@ impl fmt::Display for Location {
 
 type Entry = (Passage, Vec<f32>);
 
+#[derive(Clone, Copy)]
+struct RankedPassage(f32, usize);
+
+impl PartialEq for RankedPassage {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+
+impl Eq for RankedPassage {}
+
+impl PartialOrd for RankedPassage {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for RankedPassage {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.0
+            .total_cmp(&other.0)
+            .then_with(|| other.1.cmp(&self.1))
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) struct QdrantReceipt {
     pub(super) generation: qdrant::Generation,
@@ -710,6 +738,7 @@ pub(crate) struct Index {
     scope: [u8; 32],
     sources: Vec<Option<[u8; 32]>>,
     entries: Vec<Entry>,
+    snapshot_vectors: Option<snapshot::SnapshotVectors>,
     dimensions: usize,
     graph: Option<hnsw::Graph>,
     pub(super) qdrant_receipt: Option<QdrantReceipt>,
@@ -723,6 +752,27 @@ pub(crate) struct UpdateSummary {
     pub(super) removed: usize,
 }
 
+#[derive(Clone, Copy)]
+struct IndexLimits {
+    passages: usize,
+    bytes: u64,
+}
+
+impl IndexLimits {
+    fn for_scope(scope: &Scope, automatic_qdrant: Option<bool>) -> Self {
+        let qdrant = scope.qdrant.is_some();
+        let passages = match (qdrant, automatic_qdrant) {
+            (true, Some(false)) => MAX_CHUNKS,
+            (true, _) => MAX_QDRANT_INDEX_PASSAGES,
+            (false, _) => MAX_LOCAL_INDEX_PASSAGES,
+        };
+        Self {
+            passages,
+            bytes: snapshot::byte_limit(qdrant),
+        }
+    }
+}
+
 impl fmt::Debug for Index {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -733,6 +783,7 @@ impl fmt::Debug for Index {
 }
 
 impl Index {
+    #[cfg(test)]
     fn from_parts(
         scope: [u8; 32],
         sources: Vec<Option<[u8; 32]>>,
@@ -740,20 +791,41 @@ impl Index {
         dimensions: usize,
         graph: Option<hnsw::Graph>,
     ) -> io::Result<Self> {
+        Self::from_snapshot_parts(scope, sources, entries, dimensions, graph, None)
+    }
+
+    fn from_snapshot_parts(
+        scope: [u8; 32],
+        sources: Vec<Option<[u8; 32]>>,
+        entries: Vec<Entry>,
+        dimensions: usize,
+        graph: Option<hnsw::Graph>,
+        snapshot_vectors: Option<snapshot::SnapshotVectors>,
+    ) -> io::Result<Self> {
         let invalid = || {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 "Invalid knowledge index entries",
             )
         };
-        if entries.len() > MAX_INDEX_PASSAGES
+        if entries.len() > MAX_LOCAL_INDEX_PASSAGES
             || sources.len() > MAX_SOURCES
             || entries.is_empty() != (dimensions == 0)
             || dimensions > MAX_DIMENSIONS
             || graph
                 .as_ref()
                 .is_some_and(|graph| graph.len() != entries.len())
-            || entries.iter().any(|(_, vector)| vector.len() != dimensions)
+            || snapshot_vectors
+                .as_ref()
+                .is_some_and(|vectors| graph.is_some() || vectors.len() != entries.len())
+            || entries.iter().any(|(_, vector)| {
+                vector.len()
+                    != if snapshot_vectors.is_some() {
+                        0
+                    } else {
+                        dimensions
+                    }
+            })
         {
             return Err(invalid());
         }
@@ -779,6 +851,7 @@ impl Index {
             scope,
             sources,
             entries,
+            snapshot_vectors,
             dimensions,
             graph,
             qdrant_receipt: None,
@@ -786,8 +859,143 @@ impl Index {
         })
     }
 
-    fn source_entries(&self, source: usize) -> &[Entry] {
-        &self.entries[self.source_ranges[source].clone()]
+    fn passage_text(&self, position: usize) -> Result<Cow<'_, str>, String> {
+        if let Some(snapshot) = self
+            .snapshot_vectors
+            .as_ref()
+            .filter(|snapshot| snapshot.has_texts())
+        {
+            return snapshot.with_texts(|reader| {
+                reader
+                    .read(position)
+                    .map(|text| Cow::Owned(text.to_owned()))
+                    .map_err(|_| retrieval::changed_index())
+            });
+        }
+        Ok(Cow::Borrowed(&self.entries[position].0.text))
+    }
+
+    fn matches_passages(
+        &self,
+        source: usize,
+        staged: &[Entry],
+        start: usize,
+        texts: Option<&mut snapshot::TextStage>,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        if let Some(texts) = texts {
+            return texts.with_texts(|reader| {
+                self.compare_passages(source, staged, start, Some(reader), check)
+            });
+        }
+        self.compare_passages(source, staged, start, None, check)
+    }
+
+    fn compare_passages(
+        &self,
+        source: usize,
+        staged: &[Entry],
+        start: usize,
+        mut texts: Option<&mut snapshot::SnapshotTextReader<'_>>,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<bool, String> {
+        let range = self.source_ranges[source].clone();
+        if range.len() != staged.len() {
+            return Ok(false);
+        }
+        let compare = |read: &mut dyn FnMut(usize, &str) -> Result<bool, String>| {
+            for (offset, (position, (passage, _))) in range.zip(staged).enumerate() {
+                check()?;
+                let text = if let Some(reader) = &mut texts {
+                    reader
+                        .read(start + offset)
+                        .map_err(|error| error.to_string())?
+                } else {
+                    &passage.text
+                };
+                if self.entries[position].0.location != passage.location || !read(position, text)? {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        };
+        if let Some(snapshot) = self
+            .snapshot_vectors
+            .as_ref()
+            .filter(|snapshot| snapshot.has_texts())
+        {
+            snapshot.with_texts(|reader| {
+                compare(&mut |position, text| {
+                    reader
+                        .read(position)
+                        .map(|saved| saved == text)
+                        .map_err(|_| retrieval::changed_index())
+                })
+            })
+        } else {
+            compare(&mut |position, text| Ok(self.entries[position].0.text == text))
+        }
+    }
+
+    fn append_passages(
+        &self,
+        source: usize,
+        destination_source: usize,
+        output: &mut Vec<Entry>,
+        texts: &mut Option<snapshot::TextStage>,
+        stage_allowed: bool,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let range = self.source_ranges[source].clone();
+        let append = |read: &mut dyn FnMut(usize) -> Result<String, String>| {
+            for position in range {
+                check()?;
+                let text = read(position)?;
+                let text = store_passage_text(texts, output, stage_allowed, &text)
+                    .map_err(|error| error.to_string())?;
+                output.push((
+                    Passage {
+                        source: destination_source,
+                        location: self.entries[position].0.location,
+                        text,
+                    },
+                    Vec::new(),
+                ));
+            }
+            Ok(())
+        };
+        if let Some(snapshot) = self
+            .snapshot_vectors
+            .as_ref()
+            .filter(|snapshot| snapshot.has_texts())
+        {
+            snapshot.with_texts(|reader| {
+                append(&mut |position| {
+                    reader
+                        .read(position)
+                        .map(str::to_owned)
+                        .map_err(|_| retrieval::changed_index())
+                })
+            })
+        } else {
+            append(&mut |position| Ok(self.entries[position].0.text.clone()))
+        }
+    }
+
+    fn for_each_vector(
+        &self,
+        ranges: impl Iterator<Item = Range<usize>>,
+        check: impl Fn() -> Result<(), String>,
+        mut visit: impl FnMut(usize, &[f32]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if let Some(snapshot) = &self.snapshot_vectors {
+            return snapshot.for_each_vector(ranges, self.dimensions, check, visit);
+        }
+        for position in ranges.flatten() {
+            check()?;
+            visit(position, &self.entries[position].1)?;
+        }
+        Ok(())
     }
 
     fn enabled_entries(&self, scope: &Scope) -> usize {
@@ -798,6 +1006,44 @@ impl Index {
             .filter(|(enabled, _)| **enabled)
             .map(|(_, range)| range.len())
             .sum()
+    }
+
+    fn reuse_source_vectors(
+        &self,
+        source: usize,
+        start: usize,
+        entries: &mut [Entry],
+        stage: Option<&mut snapshot::VectorStage>,
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        let range = self.source_ranges[source].clone();
+        let previous_start = range.start;
+        let target_position = |position| start + position - previous_start;
+        match stage {
+            Some(stage) => {
+                if let Some(snapshot) = &self.snapshot_vectors {
+                    return snapshot.for_each_encoded_vector(
+                        std::iter::once(range),
+                        self.dimensions,
+                        check,
+                        |position, encoded| {
+                            stage
+                                .write_encoded(target_position(position), encoded)
+                                .map_err(|error| error.to_string())
+                        },
+                    );
+                }
+                self.for_each_vector(std::iter::once(range), check, |position, vector| {
+                    stage
+                        .write(target_position(position), vector)
+                        .map_err(|error| error.to_string())
+                })
+            }
+            None => self.for_each_vector(std::iter::once(range), check, |position, vector| {
+                entries[target_position(position)].1 = vector.to_vec();
+                Ok(())
+            }),
+        }
     }
 
     fn search_graph(&self, enabled: usize) -> Option<&hnsw::Graph> {
@@ -819,7 +1065,15 @@ impl Index {
         rebuild: bool,
         authorize: impl Fn() -> Result<(), String>,
     ) -> Result<(Self, UpdateSummary), String> {
-        Self::refresh(client, scope, previous, rebuild, None, authorize)
+        Self::refresh(
+            client,
+            scope,
+            previous,
+            rebuild,
+            None,
+            IndexLimits::for_scope(scope, None),
+            authorize,
+        )
     }
 
     fn reconcile(
@@ -835,6 +1089,7 @@ impl Index {
             previous,
             false,
             Some(expanded_qdrant),
+            IndexLimits::for_scope(scope, Some(expanded_qdrant)),
             authorize,
         )
     }
@@ -845,6 +1100,7 @@ impl Index {
         previous: Option<(&Scope, &Self)>,
         rebuild: bool,
         automatic_qdrant: Option<bool>,
+        limits: IndexLimits,
         authorize: impl Fn() -> Result<(), String>,
     ) -> Result<(Self, UpdateSummary), String> {
         authorize()?;
@@ -871,9 +1127,15 @@ impl Index {
                 .count();
         }
         let mut entries = Vec::new();
+        let mut texts = None;
+        let stage_allowed = scope.qdrant.is_none();
+        let mut reused = Vec::new();
         let mut disabled = Vec::new();
-        let header = snapshot::V4_BASE_BYTES
-            + 33 * scope.sources.len()
+        let header = if scope.qdrant.is_some() {
+            snapshot::V4_BASE_BYTES
+        } else {
+            snapshot::V8_BASE_BYTES
+        } + 33 * scope.sources.len()
             + scope
                 .qdrant
                 .as_ref()
@@ -881,11 +1143,8 @@ impl Index {
         let mut payload = header;
         let mut sources = Vec::with_capacity(scope.sources.len());
         let legacy_qdrant = scope.qdrant.is_some() && automatic_qdrant == Some(false);
-        let max_passages = if legacy_qdrant {
-            MAX_CHUNKS
-        } else {
-            MAX_INDEX_PASSAGES
-        };
+        let max_passages = limits.passages;
+        let max_snapshot_bytes = limits.bytes;
         for (source, path) in scope.sources.iter().enumerate() {
             check_active(client)?;
             let previous_source = previous_positions.as_ref().and_then(|(positions, index)| {
@@ -894,7 +1153,7 @@ impl Index {
             if !scope.enabled[source] {
                 sources.push(previous_source.and_then(|(old, index)| index.sources[old]));
                 if let Some((old, index)) = previous_source {
-                    disabled.push((source, index.source_entries(old)));
+                    disabled.push((source, old, index));
                 }
                 continue;
             }
@@ -914,12 +1173,13 @@ impl Index {
                     require_passage_count(entries.len() + 1, max_passages)
                         .map_err(io::Error::other)?;
                     payload += snapshot::encoded_entry_bytes(text.len(), 0);
-                    require_index_bytes(payload).map_err(io::Error::other)?;
+                    require_index_bytes(payload, max_snapshot_bytes).map_err(io::Error::other)?;
+                    let text = store_passage_text(&mut texts, &mut entries, stage_allowed, text)?;
                     entries.push((
                         Passage {
                             source,
                             location,
-                            text: text.into(),
+                            text,
                         },
                         Vec::new(),
                     ));
@@ -931,25 +1191,18 @@ impl Index {
             let digest = summary_source.digest;
             scope.require_approved(source, path, digest)?;
             sources.push(Some(digest));
-            let staged = &mut entries[start..];
-            let cached = previous_source
-                .filter(|&(old, index)| !rebuild && index.sources[old] == Some(digest))
-                .map(|(old, index)| index.source_entries(old))
-                .filter(|cached| {
-                    cached
-                        .iter()
-                        .zip(staged.iter())
-                        .all(|((old, _), (new, _))| {
-                            old.location == new.location && old.text == new.text
-                        })
-                        && cached.len() == staged.len()
-                });
-            if let Some(cached) = cached {
+            let staged = &entries[start..];
+            if let Some((old, index)) = previous_source
+                && !rebuild
+                && index.sources[old] == Some(digest)
+                && index
+                    .matches_passages(old, staged, start, texts.as_mut(), || check_active(client))?
+            {
                 summary.reused += 1;
-                for ((_, previous), (_, current)) in cached.iter().zip(staged) {
-                    payload += previous.len() * size_of::<f32>();
-                    require_index_bytes(payload)?;
-                    *current = previous.clone();
+                payload += staged.len() * index.dimensions * size_of::<f32>();
+                require_index_bytes(payload, max_snapshot_bytes)?;
+                if !staged.is_empty() {
+                    reused.push((start, old, index));
                 }
             } else {
                 summary.indexed += 1;
@@ -958,17 +1211,37 @@ impl Index {
         let old_dimensions = previous.map_or(0, |(_, index)| index.dimensions);
         let disabled_payload = disabled
             .iter()
-            .flat_map(|(_, entries)| *entries)
-            .map(|(passage, vector)| {
-                snapshot::encoded_entry_bytes(passage.text.len(), vector.len())
+            .flat_map(|&(_, old, index)| {
+                index.source_ranges[old]
+                    .clone()
+                    .map(move |position| (index, position))
+            })
+            .map(|(index, position)| {
+                let length = index
+                    .snapshot_vectors
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.text_length(position))
+                    .unwrap_or_else(|| index.entries[position].0.text.len());
+                snapshot::encoded_entry_bytes(length, index.dimensions)
             })
             .sum::<usize>();
         let disabled_count = disabled
             .iter()
-            .map(|(_, entries)| entries.len())
+            .map(|&(_, old, index)| index.source_ranges[old].len())
             .sum::<usize>();
         let keep_disabled = |dimensions| old_dimensions == 0 || old_dimensions == dimensions;
         let enabled_count = entries.len();
+        let potential_count = enabled_count + disabled_count;
+        let mut stage = (scope.qdrant.is_none() && potential_count > MAX_CHUNKS)
+            .then(|| snapshot::VectorStage::new(potential_count))
+            .transpose()
+            .map_err(|error| format!("Could not stage knowledge vectors ({error})."))?;
+        let reused_dimensions = (!reused.is_empty()).then_some(old_dimensions);
+        for (start, old, index) in reused {
+            index.reuse_source_vectors(old, start, &mut entries, stage.as_mut(), || {
+                check_active(client)
+            })?;
+        }
         let collection_dimensions = scope.qdrant.as_ref().map(|settings| settings.dimensions);
         let dimensions = if entries.is_empty() {
             if automatic_qdrant.is_none() {
@@ -983,7 +1256,9 @@ impl Index {
             embed_missing(
                 client,
                 &mut entries,
-                collection_dimensions,
+                stage.as_mut(),
+                texts.as_mut(),
+                (reused_dimensions, collection_dimensions),
                 &authorize,
                 |dimensions, projected| {
                     if collection_dimensions.is_some_and(|expected| expected != dimensions) {
@@ -995,7 +1270,7 @@ impl Index {
                     } else {
                         0
                     };
-                    require_index_bytes(header + projected + retained)
+                    require_index_bytes(header + projected + retained, max_snapshot_bytes)
                 },
             )?
         };
@@ -1014,28 +1289,61 @@ impl Index {
                 }
             }
         } else if disabled_count != 0 {
-            require_passage_count(entries.len() + disabled_count, max_passages)?;
-            for (source, saved) in disabled {
-                entries.extend(saved.iter().map(|(passage, vector)| {
-                    (
-                        Passage {
-                            source,
-                            ..passage.clone()
-                        },
-                        vector.clone(),
-                    )
-                }));
+            require_passage_count(potential_count, max_passages)?;
+            if enabled_count == 0 {
+                require_index_bytes(header + disabled_payload, max_snapshot_bytes)?;
             }
+            for (source, old, index) in disabled {
+                let start = entries.len();
+                index.append_passages(
+                    old,
+                    source,
+                    &mut entries,
+                    &mut texts,
+                    stage_allowed,
+                    || check_active(client),
+                )?;
+                index.reuse_source_vectors(old, start, &mut entries, stage.as_mut(), || {
+                    check_active(client)
+                })?;
+            }
+        }
+        let bytes = header + staged_payload(&entries, texts.as_ref(), dimensions);
+        let snapshot_vectors = if let Some(stage) = stage {
+            let mut order: Vec<_> = (0..entries.len()).collect();
+            if entries.len() > enabled_count {
+                order.sort_by_key(|&position| entries[position].0.source);
+            }
+            let mut vectors = stage
+                .finish(order.iter().copied())
+                .map_err(|error| error.to_string())?;
+            if entries.len() > MAX_CHUNKS {
+                if let Some(texts) = texts {
+                    vectors
+                        .stage_texts(texts, &order)
+                        .map_err(|error| error.to_string())?;
+                }
+                Some(vectors)
+            } else {
+                // An embedding dimension change discarded the disabled sources.
+                vectors.for_each_vector(
+                    std::iter::once(0..entries.len()),
+                    dimensions,
+                    || check_active(client),
+                    |position, vector| {
+                        entries[position].1 = vector.to_vec();
+                        Ok(())
+                    },
+                )?;
+                None
+            }
+        } else {
+            None
+        };
+        if entries.len() > enabled_count {
             entries.sort_by_key(|(passage, _)| passage.source);
         }
-        let bytes = header
-            + entries
-                .iter()
-                .map(|(passage, vector)| {
-                    snapshot::encoded_entry_bytes(passage.text.len(), vector.len())
-                })
-                .sum::<usize>();
-        require_index_bytes(bytes)?;
+        require_index_bytes(bytes, max_snapshot_bytes)?;
         let graph = if scope.qdrant.is_none()
             && (EXACT_SEARCH_LIMIT + 1..=MAX_CHUNKS).contains(&entries.len())
         {
@@ -1055,9 +1363,19 @@ impl Index {
         } else {
             None
         };
-        require_index_bytes(bytes + graph.as_ref().map_or(0, hnsw::Graph::encoded_bytes))?;
-        let index = Self::from_parts(scope.digest, sources, entries, dimensions, graph)
-            .map_err(|error| error.to_string())?;
+        require_index_bytes(
+            bytes + graph.as_ref().map_or(0, hnsw::Graph::encoded_bytes),
+            max_snapshot_bytes,
+        )?;
+        let index = Self::from_snapshot_parts(
+            scope.digest,
+            sources,
+            entries,
+            dimensions,
+            graph,
+            snapshot_vectors,
+        )
+        .map_err(|error| error.to_string())?;
         authorize()?;
         index.check_sources(scope, || check_active(client))?;
         Ok((index, summary))
@@ -1079,6 +1397,10 @@ impl Index {
                 })
                 .sum::<usize>()
             + self.graph.as_ref().map_or(0, hnsw::Graph::bytes)
+            + self
+                .snapshot_vectors
+                .as_ref()
+                .map_or(0, snapshot::SnapshotVectors::bytes)
     }
 
     #[cfg(test)]
@@ -1114,18 +1436,18 @@ impl Index {
             authorize()?;
             settings.require_vault_key(vault_key.as_deref())?;
         }
-        Ok(ranked
+        ranked
             .into_iter()
             .map(|(score, index)| {
                 let (passage, _) = &self.entries[index];
-                format!(
+                Ok(format!(
                     "{} · {} · {score:.3}\n{}",
                     scope.sources[passage.source].display(),
                     passage.location,
-                    passage.text
-                )
+                    self.passage_text(index)?
+                ))
             })
-            .collect())
+            .collect()
     }
 
     fn query_vector(
@@ -1205,34 +1527,102 @@ impl Index {
                 return Ok(candidates);
             }
         }
-        let mut exact = self.rank_exact(scope, vector, check)?;
-        exact.truncate(limit);
-        Ok(exact)
+        if limit >= enabled {
+            return Ok(self.ranked_exact(scope, vector, check)?.collect());
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let mut best: BinaryHeap<Reverse<RankedPassage>> = BinaryHeap::with_capacity(limit);
+        self.score_enabled(scope, vector, check, |candidate| {
+            if best.len() < limit {
+                best.push(Reverse(candidate));
+            } else if let Some(mut worst) = best.peek_mut()
+                && candidate > worst.0
+            {
+                *worst = Reverse(candidate);
+            }
+        })?;
+        Ok(best
+            .into_sorted_vec()
+            .into_iter()
+            .map(|Reverse(RankedPassage(score, position))| (score, position))
+            .collect())
     }
 
+    #[cfg(test)]
     fn rank_exact(
         &self,
         scope: &Scope,
         vector: &[f32],
         check: impl Fn() -> Result<(), String>,
     ) -> Result<Vec<(f32, usize)>, String> {
-        let mut ranked = Vec::with_capacity(self.enabled_entries(scope));
-        for (enabled, range) in scope.enabled.iter().zip(&self.source_ranges) {
-            if *enabled {
-                for position in range.clone() {
-                    check()?;
-                    ranked.push((score(vector, &self.entries[position].1), position));
-                }
-            }
+        Ok(self.ranked_exact(scope, vector, check)?.collect())
+    }
+
+    fn ranked_exact(
+        &self,
+        scope: &Scope,
+        vector: &[f32],
+        check: impl Fn() -> Result<(), String>,
+    ) -> Result<impl Iterator<Item = (f32, usize)>, String> {
+        let mut scores = Vec::with_capacity(self.enabled_entries(scope));
+        self.score_enabled(scope, vector, check, |candidate| scores.push(candidate))?;
+        let mut scores = BinaryHeap::from(scores);
+        Ok(std::iter::from_fn(move || {
+            scores
+                .pop()
+                .map(|RankedPassage(score, position)| (score, position))
+        }))
+    }
+
+    fn score_enabled(
+        &self,
+        scope: &Scope,
+        vector: &[f32],
+        check: impl Fn() -> Result<(), String>,
+        mut visit: impl FnMut(RankedPassage),
+    ) -> Result<(), String> {
+        let ranges = scope
+            .enabled
+            .iter()
+            .zip(&self.source_ranges)
+            .filter_map(|(enabled, range)| enabled.then_some(range.clone()));
+        if self.snapshot_vectors.is_some() && vector.len() != self.dimensions {
+            return Err("The query embedding dimension does not match the index.".into());
         }
-        ranked.sort_unstable_by(|a, b| b.0.total_cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        Ok(ranked)
+        self.for_each_vector(ranges, check, |position, values| {
+            visit(RankedPassage(score(vector, values), position));
+            Ok(())
+        })
     }
 
     pub(super) fn check_sources(
         &self,
         scope: &Scope,
         check_active: impl Fn() -> Result<(), String>,
+    ) -> Result<(), String> {
+        if let Some(snapshot) = self
+            .snapshot_vectors
+            .as_ref()
+            .filter(|snapshot| snapshot.has_texts())
+        {
+            return snapshot.with_texts(|reader| {
+                self.check_sources_with(scope, check_active, |position, text| {
+                    Ok(reader.read(position)? == text)
+                })
+            });
+        }
+        self.check_sources_with(scope, check_active, |position, text| {
+            Ok(self.entries[position].0.text == text)
+        })
+    }
+
+    fn check_sources_with(
+        &self,
+        scope: &Scope,
+        check_active: impl Fn() -> Result<(), String>,
+        mut matches_text: impl FnMut(usize, &str) -> io::Result<bool>,
     ) -> Result<(), String> {
         if !scope.same_as(self) || scope.sources.len() != self.sources.len() {
             return Err(
@@ -1250,16 +1640,19 @@ impl Index {
                         .into(),
                 );
             };
-            let mut stored = self.source_entries(position).iter();
+            let mut stored = self.source_ranges[position].clone();
             let mut passages_match = true;
             let document = scan_source(
                 path,
                 scope.size_limits[position],
                 || check_active().is_ok(),
                 |location, text| {
-                    passages_match &= stored.next().is_some_and(|(passage, _)| {
-                        passage.location == location && passage.text == text
-                    });
+                    passages_match &= if let Some(position) = stored.next() {
+                        self.entries[position].0.location == location
+                            && matches_text(position, text)?
+                    } else {
+                        false
+                    };
                     Ok(())
                 },
             );
@@ -1311,18 +1704,53 @@ fn require_source_digests(
     check_active()
 }
 
+fn store_passage_text(
+    stage: &mut Option<snapshot::TextStage>,
+    entries: &mut [Entry],
+    stage_allowed: bool,
+    text: &str,
+) -> io::Result<String> {
+    if stage_allowed && stage.is_none() && entries.len() == MAX_CHUNKS {
+        let mut file = snapshot::TextStage::new()?;
+        for (passage, _) in entries {
+            file.push(&std::mem::take(&mut passage.text))?;
+        }
+        *stage = Some(file);
+    }
+    if let Some(file) = stage {
+        file.push(text)?;
+        Ok(String::new())
+    } else {
+        Ok(text.to_owned())
+    }
+}
+
+fn staged_payload(
+    entries: &[Entry],
+    texts: Option<&snapshot::TextStage>,
+    dimensions: usize,
+) -> usize {
+    entries
+        .iter()
+        .enumerate()
+        .map(|(position, (passage, _))| {
+            let length = texts.map_or_else(|| passage.text.len(), |texts| texts.length(position));
+            snapshot::encoded_entry_bytes(length, dimensions)
+        })
+        .sum()
+}
+
 fn embed_missing(
     client: &Client,
     entries: &mut [Entry],
-    dimensions_hint: Option<usize>,
+    mut stage: Option<&mut snapshot::VectorStage>,
+    mut texts: Option<&mut snapshot::TextStage>,
+    (reused_dimensions, dimensions_hint): (Option<usize>, Option<usize>),
     authorize: impl Fn() -> Result<(), String>,
     budget: impl Fn(usize, usize) -> Result<(), String>,
 ) -> Result<usize, String> {
     let entry_count = entries.len();
-    let text_bytes = entries
-        .iter()
-        .map(|(passage, _)| snapshot::encoded_entry_bytes(passage.text.len(), 0))
-        .sum::<usize>();
+    let text_bytes = staged_payload(entries, texts.as_deref(), 0);
     let check_budget = |dimensions| {
         if !(1..=MAX_DIMENSIONS).contains(&dimensions) {
             return Err("The embedding dimensions are invalid or changed".into());
@@ -1332,30 +1760,52 @@ fn embed_missing(
             text_bytes + entry_count * dimensions * size_of::<f32>(),
         )
     };
-    let mut dimensions = entries
-        .iter()
-        .find_map(|(_, vector)| (!vector.is_empty()).then_some(vector.len()));
+    let mut dimensions = reused_dimensions;
     let reusing = dimensions.is_some();
     if let Some(dimensions) = dimensions.or(dimensions_hint) {
         check_budget(dimensions)?;
     }
-    let mut pending = entries.iter_mut().filter(|(_, vector)| vector.is_empty());
+    let mut pending = entries.iter_mut().enumerate();
     loop {
-        let batch: Vec<_> = pending.by_ref().take(BATCH_SIZE).collect();
+        let batch: Vec<_> = pending
+            .by_ref()
+            .filter(|(position, (_, vector))| {
+                vector.is_empty()
+                    && !stage
+                        .as_ref()
+                        .is_some_and(|stage| stage.contains(*position))
+            })
+            .take(BATCH_SIZE)
+            .collect();
         if batch.is_empty() {
             break;
         }
         check_active(client)?;
         authorize()?;
-        let input: Vec<_> = batch
-            .iter()
-            .map(|(passage, _)| passage.text.as_str())
-            .collect();
-        let embeddings = client.embed(&input)?;
+        let embeddings = if let Some(texts) = &mut texts {
+            let input: Vec<String> = texts.with_texts(|reader| {
+                batch
+                    .iter()
+                    .map(|(position, _)| {
+                        reader
+                            .read(*position)
+                            .map(str::to_owned)
+                            .map_err(|error| error.to_string())
+                    })
+                    .collect()
+            })?;
+            client.embed(&input.iter().map(String::as_str).collect::<Vec<_>>())?
+        } else {
+            let input: Vec<_> = batch
+                .iter()
+                .map(|(_, (passage, _))| passage.text.as_str())
+                .collect();
+            client.embed(&input)?
+        };
         if embeddings.len() != batch.len() {
             return Err("The service returned the wrong number of embedding vectors".into());
         }
-        for ((_, target), mut vector) in batch.into_iter().zip(embeddings) {
+        for ((position, (_, target)), mut vector) in batch.into_iter().zip(embeddings) {
             if dimensions.is_none() {
                 check_budget(vector.len())?;
             }
@@ -1364,7 +1814,13 @@ fn embed_missing(
                 return Err("The embedding dimensions changed. Choose Rebuild index to replace all vectors.".into());
             }
             normalize(&mut vector, expected)?;
-            *target = vector;
+            if let Some(stage) = &mut stage {
+                stage
+                    .write(position, &vector)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                *target = vector;
+            }
         }
     }
     dimensions.ok_or_else(|| "The embedding service returned no vectors".into())
@@ -1380,11 +1836,11 @@ fn require_passage_count(count: usize, limit: usize) -> Result<(), String> {
     }
 }
 
-fn require_index_bytes(bytes: usize) -> Result<(), String> {
-    if bytes as u64 > snapshot::MAX_BYTES {
+fn require_index_bytes(bytes: usize, limit: u64) -> Result<(), String> {
+    if bytes as u64 > limit {
         Err(format!(
             "The knowledge index exceeds {} MiB. Select fewer files or an embedding model with fewer dimensions.",
-            snapshot::MAX_BYTES / (1024 * 1024)
+            limit / (1024 * 1024)
         ))
     } else {
         Ok(())
@@ -1817,13 +2273,17 @@ mod tests {
 
     #[test]
     fn index_refuses_more_than_the_passage_limit_before_embedding() {
+        let limits = IndexLimits {
+            passages: 16_384,
+            bytes: snapshot::byte_limit(false),
+        };
         let fixture = crate::snippets::tests::Profile::new();
         let (listener, _) = test_support::listener();
         let endpoint = listener.local_addr().unwrap().to_string();
         let mut store = Store::new("Passage limit fixture").unwrap();
         // End every chunk at a newline and cross the local corpus limit with
         // two explicitly reviewed files.
-        let mut full = vec![b'x'; MAX_INDEX_PASSAGES / 2 * CHUNK_BYTES];
+        let mut full = vec![b'x'; limits.passages / 2 * CHUNK_BYTES];
         for end in (CHUNK_BYTES - 1..full.len()).step_by(CHUNK_BYTES) {
             full[end] = b'\n';
         }
@@ -1840,11 +2300,11 @@ mod tests {
         fs::write(&extra, "One more passage").unwrap();
         store.add_source(extra).unwrap();
         let scope = Scope::new(&store, &endpoint, "fixture:embedding").unwrap();
-        let error = Index::build(&Client::new(scope.profile.clone()), &scope).unwrap_err();
+        let client = Client::new(scope.profile.clone());
+        let refresh = || Index::refresh(&client, &scope, None, false, None, limits, || Ok(()));
+        let error = refresh().unwrap_err();
         assert!(
-            error.contains(&format!(
-                "supports up to {MAX_INDEX_PASSAGES} text passages"
-            )),
+            error.contains(&format!("supports up to {} text passages", limits.passages)),
             "{error}"
         );
         let mut appended = std::fs::OpenOptions::new()
@@ -1853,7 +2313,7 @@ mod tests {
             .unwrap();
         appended.write_all(b"x").unwrap();
         drop(appended);
-        let error = Index::build(&Client::new(scope.profile.clone()), &scope).unwrap_err();
+        let error = refresh().unwrap_err();
         assert!(error.contains(ConfiguredFileTooLarge::MESSAGE), "{error}");
         assert_eq!(
             listener.accept().unwrap_err().kind(),

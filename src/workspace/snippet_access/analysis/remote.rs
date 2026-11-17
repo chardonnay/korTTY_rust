@@ -464,20 +464,163 @@ mod tests {
         workspace: &mut Workspace,
         task: iced::Task<super::super::Message>,
     ) -> iced::Task<super::super::Message> {
-        let mut stream =
-            iced_runtime::task::into_stream(task).expect("scheduled CLI analysis step");
+        let mut stream = iced_runtime::task::into_stream(task).expect("scheduled analysis step");
         let deadline = Instant::now() + Duration::from_secs(8);
         loop {
             match stream.next().now_or_never() {
                 Some(Some(iced_runtime::Action::Output(message))) => {
-                    return workspace.update(message);
+                    let provisional = matches!(
+                        &message,
+                        super::super::Message::SnippetAnalysis(
+                            _,
+                            super::super::Event::Streaming(..)
+                        )
+                    );
+                    let next = workspace.update(message);
+                    if !provisional {
+                        return next;
+                    }
                 }
-                Some(None) => panic!("The CLI analysis step ended without a result"),
+                Some(None) => panic!("The analysis step ended without a result"),
                 _ => {}
             }
-            assert!(Instant::now() < deadline, "The CLI analysis step timed out");
+            assert!(Instant::now() < deadline, "The analysis step timed out");
             thread::sleep(Duration::from_millis(5));
         }
+    }
+
+    #[test]
+    #[ignore = "requires the private HTTPS analysis and split fixture and its dedicated CA"]
+    fn https_analysis_and_split_transmit_separately_reviewed_requests() {
+        use crate::ai_manager::ProfileRef;
+        use crate::local_ai::test_support::{exclusive_run, with_https_fixture_ca};
+        use crate::snippet_window::analysis::modularization as split;
+
+        let _exclusive = exclusive_run();
+        let endpoint = std::env::var("KORTTY_TEST_HTTPS_APPLY_URL").unwrap();
+        let url = url::Url::parse(&endpoint).unwrap();
+        assert_eq!(url.host_str(), Some("127.0.0.1"));
+        assert_eq!(url.path(), "/tenant/v1/workflow/");
+        let ca =
+            std::fs::read(std::env::var_os("KORTTY_TEST_HTTPS_APPLY_CA_DER").unwrap()).unwrap();
+        let expected =
+            std::path::PathBuf::from(std::env::var_os("KORTTY_TEST_HTTPS_APPLY_EXPECTED").unwrap());
+        let scratch = Profile::new();
+        let root = scratch.0.canonicalize().unwrap();
+        crate::profile::set_runtime_root(root.clone());
+        let mut library = Library::open(scratch.path()).unwrap();
+        let folder = library.create_folder(None, "Operations").unwrap();
+        let snippet = library
+            .save_with_metadata(
+                None,
+                Input {
+                    name: "Deploy".into(),
+                    language: "bash".into(),
+                    category: String::new(),
+                    content: "DB_PASSWORD=source-secret\nprintf verified\n".into(),
+                },
+                Some(Metadata {
+                    folder_path: "Operations".into(),
+                    ..Metadata::default()
+                }),
+            )
+            .unwrap();
+        let draft: Configuration = serde_json::from_value(json!({
+            "profiles": { "profiles": [{
+                "id": 1, "name": "Trusted private fixture", "connection_mode": "remote-open-ai-exact",
+                "endpoint": endpoint, "trusted_remote_endpoint": true,
+                "model": "", "model_mode": "server-default",
+                "credential_env": "KORTTY_TEST_HTTPS_APPLY_KEY"
+            }], "last_id": 1 },
+            "local": {"roles": [null, 1, null, null]}
+        })).unwrap();
+        draft
+            .save_fixture_at(&root, &Configuration::default())
+            .unwrap();
+        let mut workspace = Workspace::default();
+        workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
+        workspace
+            .window_settings
+            .snippet_analysis_auto_modularization = true;
+        let (owner, _) = workspace.open_window(false);
+        let window = SnippetWindow::open(scratch.path()).unwrap();
+        let history = super::super::store(&window).unwrap();
+        let (id, _) = workspace.install_snippet_surface(owner, window, true);
+        let subject = Subject::Folder(folder);
+        let load = workspace.open_snippet_analysis(id, subject);
+        let _ = complete(&mut workspace, load);
+        let update =
+            |workspace: &mut Workspace, action| workspace.update_snippet_analysis(id, action);
+        let _ = update(
+            &mut workspace,
+            Action::Instructions("token=instruction-secret".into()),
+        );
+        let _ = update(&mut workspace, Action::RequestStart);
+        let page = workspace.snippets[&id].analysis.page(subject).unwrap();
+        let State::Review(review) = &page.state else {
+            panic!("expected HTTPS analysis review: {:?}", page.status);
+        };
+        assert!(review.profile.server_selected);
+        assert!(review.request.input().contains("DB_PASSWORD=***"));
+        assert!(review.request.input().contains("token=***"));
+        assert!(!review.request.input().contains("-secret"));
+        std::fs::write(
+            &expected,
+            serde_json::to_vec(&[review.request.system(), review.request.input()]).unwrap(),
+        )
+        .unwrap();
+        let analysis =
+            with_https_fixture_ca(ca.clone(), || update(&mut workspace, Action::ConfirmStart));
+        let save = complete(&mut workspace, analysis);
+        let _ = complete(&mut workspace, save);
+        let saved = history.load(subject).unwrap();
+        let record = saved.current().unwrap();
+        assert_eq!(record.provenance.profile_id, ProfileRef::Numeric(1));
+        assert_eq!(record.analysis.summary, "Verified the reviewed code.");
+        assert!(record.modularization.is_none());
+        let page = workspace.snippets[&id].analysis.page(subject).unwrap();
+        let State::Modularization(pane) = &page.state else {
+            panic!("expected separate HTTPS split review: {:?}", page.status);
+        };
+        let super::super::Phase::Modularization(split::Phase::OutboundPreview(preview)) =
+            pane.view()
+        else {
+            panic!("expected outbound split prompt");
+        };
+        let (system, input) = preview
+            .prompt
+            .strip_prefix("System prompt\n")
+            .unwrap()
+            .split_once("\n\nUser prompt\n")
+            .unwrap();
+        assert!(input.contains("DB_PASSWORD=***"));
+        assert!(!input.contains("-secret"));
+        std::fs::write(
+            expected.with_extension("split.json"),
+            serde_json::to_vec(&[system, input]).unwrap(),
+        )
+        .unwrap();
+        let approval = preview.approval;
+        let plan = with_https_fixture_ca(ca, || {
+            update(
+                &mut workspace,
+                Action::Modularization(split::Action::ConfirmOutbound(approval)),
+            )
+        });
+        let reload = complete(&mut workspace, plan);
+        let _ = complete(&mut workspace, reload);
+        let saved = history.load(subject).unwrap();
+        let job = saved.current().unwrap().modularization.as_ref().unwrap();
+        assert_eq!(job.plan.rationale, "Extract the helper.");
+        assert!(job.outbound.is_some());
+        assert_eq!(
+            Library::open(scratch.path())
+                .unwrap()
+                .get(snippet)
+                .unwrap()
+                .content(),
+            "DB_PASSWORD=source-secret\nprintf verified\n"
+        );
     }
 
     #[test]

@@ -51,7 +51,7 @@ main() {
   # Canonical Unix socket paths must also fit when the checkout path is long.
   # Resolve macOS's /tmp symlink for consumers that refuse symlink traversal.
   local temp_root
-  temp_root="$(cd -- /tmp && pwd -P)"
+  temp_root="$(cd -- "${KORTTY_SCRATCH_PARENT:-/tmp}" && pwd -P)"
   scratch_dir="$(mktemp -d "${temp_root}/kortty.XXXXXXXX")"
   export TMPDIR="${scratch_dir}"
   export TMP="${scratch_dir}"
@@ -64,7 +64,9 @@ main() {
     fi
     export SHELL=/bin/zsh
     export ZDOTDIR="${scratch_dir}/zsh"
-    mkdir -m 700 -- "${ZDOTDIR}"
+    export KORTTY_TEST_PROFILE_ROOT="${scratch_dir}/profile"
+    export KORTTY_TEST_ORIGINAL_HOME="${HOME-}"
+    mkdir -m 700 -- "${ZDOTDIR}" "${KORTTY_TEST_PROFILE_ROOT}"
     # macOS zsh otherwise shares one history lock across concurrent test PTYs.
     printf '%s\n' 'unset HISTFILE' 'SAVEHIST=0' > "${ZDOTDIR}/.zshrc"
   fi

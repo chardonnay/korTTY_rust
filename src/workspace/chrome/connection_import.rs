@@ -209,7 +209,7 @@ impl Dialog {
                                     let store =
                                         profile::connections_path().and_then(Store::open)?;
                                     Ok(Review::Preview(Arc::new(LoadedPreview {
-                                        preview: Arc::new(preview),
+                                        preview: Arc::from(preview),
                                         store,
                                     })))
                                 }

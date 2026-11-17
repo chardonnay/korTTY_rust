@@ -286,16 +286,20 @@ fn receiver_with_directory(
     let compatibility = flags
         .strip_prefix(if directory { "-sre." } else { "-se." })
         .ok_or_else(invalid)?;
-    let (stage, payload) = remote.rsplit_once('/').ok_or_else(invalid)?;
+    let stage = remote
+        .strip_suffix("/payload")
+        .or_else(|| {
+            if directory {
+                None
+            } else {
+                remote.strip_suffix("/payload/file")
+            }
+        })
+        .ok_or_else(invalid)?;
     let stage_name = stage.rsplit('/').next().ok_or_else(invalid)?;
-    let stage_id = stage_name
-        .strip_prefix(".kortty-")
-        .and_then(|name| name.strip_suffix(".kortty-part"));
     if !valid_compatibility(compatibility)
         || !crate::scheduler_window::rsync::valid_remote(remote)
-        || payload != "payload"
-        || !stage_id
-            .is_some_and(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        || !kortty_server_archive::rsync_tree::valid_stage(stage_name)
     {
         return Err(invalid());
     }
@@ -399,6 +403,11 @@ mod tests {
         let (remote_command, preamble) = receiver(&argv, destination).unwrap();
         assert_eq!(remote_command, "rsync --server -se.LsfxCIvu");
         assert!(receiver(&argv, "/srv/ordinary/payload").is_err());
+        let file = format!("{destination}/file");
+        assert!(receiver(&argv, &file).is_ok());
+        assert!(receiver(&argv, &format!("{destination}/another")).is_err());
+        let tree = [HOST, "rsync", "--server", "-sre.LsfxCIvu"].map(str::to_owned);
+        assert!(receiver_with_directory(&tree, &file, true).is_err());
         let mut extra = argv.to_vec();
         extra.push("--delete".into());
         assert!(receiver(&extra, destination).is_err());

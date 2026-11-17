@@ -55,13 +55,14 @@ mod highlight_settings;
 mod logging_settings;
 mod quick_select_settings;
 mod search_input;
-mod sftp_settings;
+pub(super) mod sftp_settings;
 mod snippet_editor_settings;
 mod startup_settings;
 mod theme_settings;
 mod video_settings;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum Section {
     Font,
     Colors,
@@ -103,7 +104,7 @@ impl Section {
         Self::Sftp,
     ];
 
-    fn label(self) -> &'static str {
+    pub(super) fn label(self) -> &'static str {
         match self {
             Self::Font => "Font",
             Self::Colors => "Colors",

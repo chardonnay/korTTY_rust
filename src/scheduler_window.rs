@@ -37,6 +37,7 @@ mod connection;
 pub(crate) mod firing;
 mod form;
 pub(crate) mod imported_archive;
+pub(crate) mod imported_privileged;
 pub(crate) mod imported_transfer;
 mod journal_retention_java;
 mod journal_search;
@@ -165,6 +166,8 @@ pub struct SshCommand {
     pub(crate) imported_ai: Option<ImportedAiAction>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) imported_transfer: Option<Box<imported_transfer::Draft>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) imported_privileged: Option<Box<imported_privileged::Draft>>,
     #[serde(default, skip_serializing_if = "SudoMode::is_disabled")]
     pub(crate) sudo: SudoMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -297,7 +300,19 @@ impl SshCommand {
             }
             ActionSource::Agent(agent) => agent.validate(&self)?,
             ActionSource::ImportedAi(draft) => draft.validate()?,
-            ActionSource::ImportedTransfer(draft) => draft.validate()?,
+            ActionSource::ImportedTransfer(draft) => {
+                draft.validate()?;
+                if let imported_transfer::Draft::StagedSftp(staged) = draft {
+                    staged.require_route(
+                        self.connection.as_ref(),
+                        &self.additional_connections,
+                        self.target_groups.is_some(),
+                    )?;
+                }
+            }
+            ActionSource::ImportedPrivileged(draft) => {
+                draft.validate(self.targets(), self.target_groups.is_some())?;
+            }
         }
         if let Some(options) = self.virtual_terminal {
             options.validate()?;
@@ -319,11 +334,12 @@ impl SshCommand {
 
     pub(crate) fn require_executable(&self) -> Result<(), &'static str> {
         self.require_resolved_action()?;
-        if let Some((transfer, _)) = self.remote.as_ref().and_then(RemoteAction::rsync_transfer)
+        if let Some((transfer, upload)) =
+            self.remote.as_ref().and_then(RemoteAction::rsync_transfer)
             && (!self.additional_connections.is_empty() || !transfer.routes.is_empty())
         {
             self.validate_target_selection()?;
-            transfer.require_group_review()?;
+            transfer.require_group_review(upload)?;
         }
         Ok(())
     }
@@ -334,6 +350,9 @@ impl SshCommand {
         }
         if let Some(draft) = self.imported_transfer.as_ref() {
             return Err(draft.review_required());
+        }
+        if self.imported_privileged.is_some() {
+            return Err(imported_privileged::REVIEW_REQUIRED);
         }
         if let Some(action) = &self.remote {
             action.require_executable()?;
@@ -359,6 +378,10 @@ impl SshCommand {
             && self.agent.is_none()
             && self.imported_ai.is_none()
             && self.imported_transfer.is_none()
+            && self
+                .imported_privileged
+                .as_deref()
+                .is_none_or(|draft| draft.settings.shell_options().is_some())
     }
 
     pub(crate) fn validate_elevation(&self) -> Result<(), &'static str> {
@@ -542,6 +565,9 @@ impl SshCommand {
             }
             ActionSource::ImportedAi(_) => return Err(IMPORTED_AI_REVIEW_REQUIRED),
             ActionSource::ImportedTransfer(draft) => return Err(draft.review_required()),
+            ActionSource::ImportedPrivileged(_) => {
+                return Err(imported_privileged::REVIEW_REQUIRED);
+            }
         };
         self.with_working_directory(command)
     }
@@ -593,7 +619,10 @@ impl SshCommand {
     }
 
     fn source(&self) -> Result<ActionSource<'_>, &'static str> {
-        if self.imported_ai.is_some() || self.imported_transfer.is_some() {
+        if self.imported_ai.is_some()
+            || self.imported_transfer.is_some()
+            || self.imported_privileged.is_some()
+        {
             if self.connection.is_none()
                 || !self.command.is_empty()
                 || self.working_directory.is_some()
@@ -609,9 +638,14 @@ impl SshCommand {
                     "An imported action draft requires saved SSH targets and no executable action",
                 );
             }
-            return match (&self.imported_ai, &self.imported_transfer) {
-                (Some(draft), None) => Ok(ActionSource::ImportedAi(draft)),
-                (None, Some(draft)) => Ok(ActionSource::ImportedTransfer(draft)),
+            return match (
+                &self.imported_ai,
+                &self.imported_transfer,
+                &self.imported_privileged,
+            ) {
+                (Some(draft), None, None) => Ok(ActionSource::ImportedAi(draft)),
+                (None, Some(draft), None) => Ok(ActionSource::ImportedTransfer(draft)),
+                (None, None, Some(draft)) => Ok(ActionSource::ImportedPrivileged(draft)),
                 _ => Err("Choose one action for the SSH job"),
             };
         }
@@ -664,6 +698,7 @@ enum ActionSource<'a> {
     Agent(&'a agent::Action),
     ImportedAi(&'a ImportedAiAction),
     ImportedTransfer(&'a imported_transfer::Draft),
+    ImportedPrivileged(&'a imported_privileged::Draft),
 }
 
 #[derive(Clone, Eq, PartialEq)]
@@ -746,6 +781,9 @@ pub enum Message {
     Edit(Field, String),
     AdoptImportedArchive,
     AdoptImportedTransfer(imported_transfer::Mode),
+    ImportedStagingSudo(SudoMode),
+    ImportedPrivilegedSudo(SudoMode),
+    AdoptImportedPrivileged,
     ConfigureImportedRsync {
         directory: bool,
     },
@@ -769,6 +807,10 @@ pub enum Message {
     EditRsyncSources(text_editor::Action),
     RsyncDestination(u64, String),
     RsyncExisting(bool),
+    RsyncAllowVacantDirectory(bool),
+    RsyncAllowVacantFile(bool),
+    RsyncAllowVacantServerFile(bool),
+    RsyncAllowVacantServerTree(bool),
     RsyncMixed(bool),
     RsyncIncludeSourceName(bool),
     RsyncMirror(bool),
@@ -779,7 +821,10 @@ pub enum Message {
     ReviewSync,
     SyncPreviewed(String, Result<Arc<sync::Review>, String>),
     ApproveSync,
+    PrivilegedReplaceExisting(bool),
+    PrivilegedStanding(bool),
     ReviewPrivileged,
+    PrivilegedReplacementPreviewed(privileged::ReplacementPreviewed),
     ApprovePrivileged,
     DiscardPrivileged,
     DiscardSync,
@@ -822,6 +867,8 @@ pub enum Message {
     DiscardAgentReview,
     ArchiveFormat(ArchiveFormat),
     ArchiveServerOnly(bool),
+    ArchiveServerPath(bool),
+    ArchiveReuseOutput(bool),
     ArchivePassword(CredentialChoice),
     OpenCredentialVault,
     Sudo(SudoMode),
@@ -1151,6 +1198,10 @@ impl SchedulerView {
         self.draft.privileged_file_action() || self.draft.privileged_archive()
     }
 
+    pub(crate) fn editing_imported_privileged(&self) -> bool {
+        self.draft.has_imported_privileged()
+    }
+
     pub(crate) fn editing_privileged_tree(&self) -> bool {
         self.draft.privileged_tree()
     }
@@ -1417,6 +1468,7 @@ impl SchedulerWindow {
         if view.graph_revision != self.graph_revision {
             view.graph_revision = self.graph_revision;
             view.ownership_review = None;
+            let stale_sftp = view.sync_review.discard_standing();
             let stale_proposal = view
                 .agent_review
                 .as_ref()
@@ -1434,7 +1486,9 @@ impl SchedulerWindow {
                 let graph = self.scheduler.graph();
                 view.load_draft(graph.job(id).or_else(|| graph.jobs().first()));
             }
-            if !view.close_pending() && (view.confirm.take().is_some() || stale_proposal) {
+            if !view.close_pending()
+                && (view.confirm.take().is_some() || stale_proposal || stale_sftp)
+            {
                 view.status =
                     Some("Jobs changed. Review the current settings and try again.".into());
             }
@@ -1950,6 +2004,35 @@ impl SchedulerWindow {
     }
 
     fn apply_view(&mut self, view: &mut SchedulerView, message: Message, now: SystemTime) {
+        let edits_sftp_authority = matches!(
+            &message,
+            Message::ScheduleEnabled(_)
+                | Message::Dependency(..)
+                | Message::Mode(_)
+                | Message::Weekday(..)
+                | Message::AllWeekdays(_)
+                | Message::AddFixedTimes
+                | Message::RemoveFixedTime(_)
+                | Message::SyncStanding(_)
+                | Message::SyncReplaceChanged(_)
+                | Message::Edit(
+                    Field::From
+                        | Field::Until
+                        | Field::WindowStart
+                        | Field::WindowEnd
+                        | Field::Interval
+                        | Field::Age
+                        | Field::SyncStandingDays
+                        | Field::SyncStandingFirings
+                        | Field::SyncStandingActions
+                        | Field::SyncStandingMib,
+                    _,
+                )
+        );
+        if edits_sftp_authority && view.sync_review.discard_standing() {
+            view.status =
+                Some("The recurring SFTP settings changed. Review the folders again.".into());
+        }
         match message {
             Message::Page(page) => {
                 view.page = page;
@@ -2025,6 +2108,46 @@ impl SchedulerWindow {
                     Err(error) => view.status = Some(error),
                 }
             }
+            Message::ImportedStagingSudo(mode)
+                if self.can_edit()
+                    && view.page == Page::Action
+                    && !view.draft.has_imported_privileged() =>
+            {
+                view.draft.select_imported_sudo(mode);
+            }
+            Message::ImportedPrivilegedSudo(mode)
+                if self.can_edit()
+                    && view.page == Page::Action
+                    && view.draft.has_imported_privileged() =>
+            {
+                view.draft.select_imported_sudo(mode);
+            }
+            Message::AdoptImportedPrivileged
+                if self.can_edit()
+                    && view.page == Page::Action
+                    && view.draft.has_imported_privileged() =>
+            {
+                let result = self.current_connection_store().and_then(|store| {
+                    let trust = crate::ssh_connection::trust_store()
+                        .map_err(|_| "Could not access the SSH host-key trust store.")?;
+                    let policy = crate::clipboard_policy::ClipboardPolicy::load();
+                    view.draft
+                        .adopt_imported_privileged(&store, &trust, &policy, &self.snippet_path)
+                        .map_err(str::to_owned)
+                });
+                match result {
+                    Ok(file_action) => {
+                        view.dirty = true;
+                        view.privileged_review = privileged::DraftReview::default();
+                        view.status = Some(if file_action {
+                            "Check the native file settings and approve the exact privileged action before enabling this job."
+                        } else {
+                            "Verify the native command settings and save the job before enabling it."
+                        }.into());
+                    }
+                    Err(error) => view.status = Some(error),
+                }
+            }
             Message::AdoptImportedTransfer(mode)
                 if self.can_edit() && view.page == Page::Action =>
             {
@@ -2035,8 +2158,13 @@ impl SchedulerWindow {
                 }) {
                     Ok(()) => {
                         view.dirty = true;
-                        view.status =
-                            Some("Review the native transfer settings and save the job.".into());
+                        let status = match mode {
+                            imported_transfer::Mode::Staged(_) => {
+                                "Review and approve this privileged transfer before enabling the job."
+                            }
+                            _ => "Review the native transfer settings and save the job.",
+                        };
+                        view.status = Some(status.into());
                     }
                     Err(error) => view.status = Some(error),
                 }
@@ -2124,6 +2252,39 @@ impl SchedulerWindow {
             Message::RsyncExisting(enabled) => {
                 view.dirty |= view.draft.choose_existing_rsync_destination(enabled);
             }
+            Message::RsyncAllowVacantDirectory(enabled) => {
+                if view
+                    .draft
+                    .set_rsync_allow_vacant_directory_download(enabled)
+                {
+                    view.rsync_review = rsync::Editor::default();
+                    view.dirty = true;
+                }
+            }
+            Message::RsyncAllowVacantFile(enabled) => {
+                if view.draft.set_rsync_allow_vacant_file_download(enabled) {
+                    view.rsync_review = rsync::Editor::default();
+                    view.dirty = true;
+                }
+            }
+            Message::RsyncAllowVacantServerFile(enabled) => {
+                if view
+                    .draft
+                    .set_rsync_allow_vacant_server_file_upload(enabled)
+                {
+                    view.rsync_review = rsync::Editor::default();
+                    view.dirty = true;
+                }
+            }
+            Message::RsyncAllowVacantServerTree(enabled) => {
+                if view
+                    .draft
+                    .set_rsync_allow_vacant_server_tree_upload(enabled)
+                {
+                    view.rsync_review = rsync::Editor::default();
+                    view.dirty = true;
+                }
+            }
             Message::RsyncMixed(enabled) => {
                 view.dirty |= view.draft.change_rsync_mixed(enabled);
             }
@@ -2171,6 +2332,25 @@ impl SchedulerWindow {
             Message::ApproveSync => {
                 if let Err(error) = self.approve_sync(view) {
                     view.status = Some(error);
+                }
+            }
+            Message::PrivilegedReplaceExisting(enabled)
+                if self.can_edit() && view.page == Page::Action =>
+            {
+                if view.draft.set_privileged_replace_existing(enabled) {
+                    view.privileged_review = privileged::DraftReview::default();
+                    view.dirty = true;
+                }
+            }
+            Message::PrivilegedReplacementPreviewed(preview) => {
+                self.finish_privileged_preview(view, preview);
+            }
+            Message::PrivilegedStanding(enabled)
+                if self.can_edit() && view.page == Page::Action =>
+            {
+                if view.draft.set_privileged_standing(enabled) {
+                    view.privileged_review = privileged::DraftReview::default();
+                    view.dirty = true;
                 }
             }
             Message::ApprovePrivileged => {
@@ -2275,6 +2455,18 @@ impl SchedulerWindow {
             Message::ArchiveServerOnly(enabled) => {
                 view.dirty |= view.draft.set_archive_server_only(enabled);
             }
+            Message::ArchiveServerPath(preserve) => {
+                if view.draft.set_archive_server_path(preserve) {
+                    view.privileged_review = privileged::DraftReview::default();
+                    view.dirty = true;
+                }
+            }
+            Message::ArchiveReuseOutput(enabled) => {
+                if view.draft.set_archive_reuse_output(enabled) {
+                    view.privileged_review = privileged::DraftReview::default();
+                    view.dirty = true;
+                }
+            }
             Message::ArchivePassword(choice) => {
                 if self
                     .archive_passwords
@@ -2285,7 +2477,11 @@ impl SchedulerWindow {
                 }
             }
             Message::OpenCredentialVault => {}
-            Message::Sudo(mode) if !view.draft.has_imported_archive() => {
+            Message::Sudo(mode)
+                if !view.draft.has_imported_archive()
+                    && !view.draft.has_imported_transfer()
+                    && !view.draft.has_imported_privileged() =>
+            {
                 view.draft.select_sudo(mode);
                 view.dirty = true;
             }
@@ -2297,9 +2493,15 @@ impl SchedulerWindow {
                 }
                 view.dirty = true;
             }
-            Message::ConnectionSelected(connection)
-                if !view.draft.has_connection_groups() && !view.draft.has_imported_archive() =>
-            {
+            Message::ConnectionSelected(_)
+            | Message::ConnectionAdded(_)
+            | Message::ConnectionRemoved(_)
+            | Message::ConnectionGroupAdded(_)
+            | Message::ConnectionGroupRemoved(_)
+            | Message::RefreshConnectionGroups
+                if view.draft.imported_route().is_some()
+                    || view.draft.has_imported_privileged() => {}
+            Message::ConnectionSelected(connection) if !view.draft.has_connection_groups() => {
                 view.draft.select_connection(connection);
                 view.dirty = true;
             }
@@ -2563,7 +2765,12 @@ impl SchedulerWindow {
         if self.scheduler.graph().job(&id).is_some_and(|job| {
             matches!(&job.action().remote, Some(RemoteAction::Sync(copy)) if copy.standing.is_some())
         }) {
-            return Err("Recurring SFTP copies start through their approved calendar.".into());
+            return Err("Recurring SFTP copies start through an approved calendar or Chain.".into());
+        }
+        if self.scheduler.graph().job(&id).is_some_and(|job| {
+            matches!(&job.action().remote, Some(RemoteAction::Privileged(transfer)) if transfer.standing.is_some())
+        }) {
+            return Err("Recurring protected replacements start through an approved calendar or Chain.".into());
         }
         let blockers = self
             .scheduler
@@ -2927,9 +3134,7 @@ impl SchedulerWindow {
                     ))
                 };
             }
-        } else if let Some(approval) =
-            sync_receipt.or_else(|| privileged_receipt.map(sync::SaveApproval::OneUse))
-        {
+        } else if let Some(approval) = sync_receipt.or(privileged_receipt) {
             let rollback = self
                 .sync_store
                 .save_approval(&id, approval, |id| self.scheduler.graph().job(id).is_some())
@@ -3073,6 +3278,7 @@ impl SchedulerWindow {
         self.can_run()
             && !view.draft.has_imported_archive()
             && !view.draft.has_imported_transfer()
+            && !view.draft.has_imported_privileged()
             && if view.dirty {
                 self.can_edit()
             } else {

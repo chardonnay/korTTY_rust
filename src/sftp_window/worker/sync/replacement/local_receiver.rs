@@ -7,14 +7,17 @@ use std::hash::Hasher;
 use std::io::{self, Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 
+use kortty_files::DirectoryNameRules;
 use kortty_server_archive::rsync_tree::{Inventory, MAX_BYTES, Manifest};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
+use crate::job_executor::rsync::LocalTreeLocation;
 use crate::private_files::{FileStamp, require_single_link};
 use crate::sftp_window::StagedDownload;
 use crate::sftp_window::files::LocalStamp;
 use crate::sftp_window::local_tree::{self, Directory, Entry, ReviewedStamp};
+use crate::sftp_window::privileged_file::MAX_TRANSFER_BYTES;
 use crate::sftp_window::tree::single_file::FilePublishError;
 use crate::sftp_window::tree::snapshot::Entry as SnapshotEntry;
 use crate::sftp_window::worker::resume::persist::Identity;
@@ -28,21 +31,39 @@ pub(crate) struct LocalFileSnapshot {
     pub(crate) inventory: Inventory,
     pub(crate) fingerprint: [u8; 32],
     pub(crate) root_identity: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) alias: Option<VacantLocalFileAlias>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) location: Option<LocalTreeLocation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) published_from: Option<[u8; 32]>,
 }
 
 impl LocalFileSnapshot {
     pub(crate) fn valid(&self) -> bool {
-        single_file(self.inventory)
+        single_file(self.inventory, MAX_BYTES)
+            && valid_location(self.alias(), self.location())
+            && self
+                .published_from
+                .is_none_or(|proof| proof != [0; 32] && self.location.is_some())
     }
 
     pub(crate) fn aliases(&self, other: &Self) -> bool {
         self.root_identity == other.root_identity
     }
+
+    pub(crate) fn alias(&self) -> Option<&VacantLocalFileAlias> {
+        self.alias.as_ref()
+    }
+
+    pub(crate) fn location(&self) -> Option<&LocalTreeLocation> {
+        self.location.as_ref()
+    }
 }
 
 pub(crate) enum ReviewedFilePublication {
     Published {
-        successor: LocalFileSnapshot,
+        successor: Box<LocalFileSnapshot>,
         recovery: PathBuf,
     },
     Restored {
@@ -54,6 +75,303 @@ pub(crate) enum ReviewedFilePublication {
     },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VacantLocalFileSnapshot {
+    fingerprint: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    alias: Option<VacantLocalFileAlias>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    location: Option<LocalTreeLocation>,
+}
+
+impl VacantLocalFileSnapshot {
+    pub(crate) fn valid(&self) -> bool {
+        self.fingerprint != [0; 32] && valid_location(self.alias(), self.location())
+    }
+
+    pub(crate) fn alias(&self) -> Option<&VacantLocalFileAlias> {
+        self.alias.as_ref()
+    }
+
+    pub(crate) fn location(&self) -> Option<&LocalTreeLocation> {
+        self.location.as_ref()
+    }
+}
+
+fn valid_location(
+    alias: Option<&VacantLocalFileAlias>,
+    location: Option<&LocalTreeLocation>,
+) -> bool {
+    alias.is_none_or(VacantLocalFileAlias::valid)
+        && location.is_none_or(|location| location.valid() && alias == Some(location.alias()))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct VacantLocalFileAlias {
+    parent: [u8; 32],
+    name: AliasName,
+}
+
+impl VacantLocalFileAlias {
+    pub(crate) fn capture(directory: &Directory, parent: &ReviewedStamp, name: &OsStr) -> Self {
+        let mut identity = Fingerprint(Sha256::new_with_prefix(
+            b"kortty-local-rsync-file-parent-id-v1\0",
+        ));
+        parent.hash_identity_into(&mut identity);
+        Self {
+            parent: identity.0.finalize().into(),
+            name: AliasName::capture(directory, name),
+        }
+    }
+
+    pub(crate) fn valid(&self) -> bool {
+        self.parent != [0; 32]
+    }
+
+    pub(crate) fn aliases(&self, other: &Self) -> bool {
+        self.parent == other.parent && self.name.aliases(other.name)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AliasName {
+    Literal([u8; 32]),
+    Normalized([u8; 32]),
+    FoldedAscii([u8; 32]),
+    Indeterminate,
+}
+
+impl AliasName {
+    fn capture(directory: &Directory, name: &OsStr) -> Self {
+        let bytes = name.as_encoded_bytes();
+        #[cfg(windows)]
+        let rules = directory.name_lookup_rules();
+        #[cfg(unix)]
+        let rules = kortty_files::directory_name_rules(directory.file());
+        // A Windows short spelling can resolve to a different long name in the same directory.
+        if cfg!(windows) && bytes.contains(&b'~') {
+            return Self::Indeterminate;
+        }
+        match rules {
+            Some(DirectoryNameRules::Literal) => Self::Literal(Sha256::digest(bytes).into()),
+            Some(DirectoryNameRules::Normalized) => {
+                use unicode_normalization::UnicodeNormalization as _;
+
+                let Some(name) = name.to_str() else {
+                    return Self::Indeterminate;
+                };
+                let normalized: String = name.nfd().collect();
+                Self::Normalized(Sha256::digest(normalized.as_bytes()).into())
+            }
+            Some(DirectoryNameRules::Folded) if bytes.is_ascii() => {
+                Self::FoldedAscii(Sha256::digest(bytes.to_ascii_uppercase()).into())
+            }
+            _ => Self::Indeterminate,
+        }
+    }
+
+    fn aliases(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Literal(left), Self::Literal(right))
+            | (Self::Normalized(left), Self::Normalized(right))
+            | (Self::FoldedAscii(left), Self::FoldedAscii(right)) => left == right,
+            // The filesystem's normalization or case table could equate the names.
+            _ => true,
+        }
+    }
+}
+
+pub(crate) enum VacantLocalFilePublication {
+    Published(Box<LocalFileSnapshot>),
+    Uncertain(io::Error),
+}
+
+pub(crate) struct VacantLocalFileReceiver {
+    path: PathBuf,
+    parent: Directory,
+    parent_identity: Identity,
+    parent_stamp: ReviewedStamp,
+}
+
+impl VacantLocalFileReceiver {
+    pub(crate) fn inspect(
+        path: &Path,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<VacantLocalFileSnapshot> {
+        let receiver = Self::open(path, stopped)?;
+        let snapshot = receiver.snapshot();
+        if snapshot.valid() {
+            Ok(snapshot)
+        } else {
+            Err(changed())
+        }
+    }
+
+    pub(crate) fn prepare(
+        path: &Path,
+        expected: VacantLocalFileSnapshot,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<Self> {
+        let receiver = Self::open(path, stopped)?;
+        let mut current = receiver.snapshot();
+        if expected.alias.is_none() {
+            current.alias = None;
+        }
+        if expected.location.is_none() {
+            current.location = None;
+        }
+        if expected.valid() && expected == current {
+            Ok(receiver)
+        } else {
+            Err(changed())
+        }
+    }
+
+    pub(crate) fn open(path: &Path, stopped: &impl Fn() -> bool) -> io::Result<Self> {
+        require_running(stopped)?;
+        let (parent_path, name) = checked_location(path)?;
+        crate::sftp_window::files::local_name(name.to_str().ok_or_else(changed)?.as_bytes())?;
+        if !path
+            .as_os_str()
+            .as_encoded_bytes()
+            .ends_with(name.as_encoded_bytes())
+        {
+            return Err(changed());
+        }
+        let parent = local_tree::open_reviewed_tree_parent(parent_path)?;
+        let receiver = Self {
+            path: path.to_path_buf(),
+            parent_stamp: local_tree::reviewed_tree_parent_stamp(&parent)?,
+            parent_identity: Identity::directory(&parent)?,
+            parent,
+        };
+        receiver.require_vacant()?;
+        require_running(stopped)?;
+        Ok(receiver)
+    }
+
+    pub(crate) fn stage(&self) -> io::Result<StagedDownload> {
+        self.require_vacant()?;
+        let stage = StagedDownload::stage_for_reviewed_file(&self.path, &self.parent_identity)?;
+        self.require_vacant()?;
+        Ok(stage)
+    }
+
+    pub(crate) fn publish(
+        self,
+        stage: StagedDownload,
+        incoming: Inventory,
+        stopped: &impl Fn() -> bool,
+        authorize: &impl Fn() -> io::Result<()>,
+        arm: impl FnOnce(u32) -> io::Result<()>,
+    ) -> io::Result<VacantLocalFilePublication> {
+        require_running(stopped)?;
+        authorize()?;
+        let _ancestors = local_tree::hold_reviewed_file_ancestors(self.parent_path())?;
+        self.require_vacant()?;
+        if stage.destination().as_os_str() != self.path.as_os_str()
+            || !single_file(incoming, MAX_BYTES)
+        {
+            return Err(changed());
+        }
+        stage.verify_reviewed_parent(&self.parent_identity)?;
+        let input = FileWitness::capture(stage.writer()?, stopped)?;
+        if input.inventory != incoming || input.stamp.volume() != self.parent_stamp.volume() {
+            return Err(changed());
+        }
+        let stamp = FileStamp::read(stage.writer()?)?;
+        stage.verify_partial(&stamp)?;
+        let guard = |file: &File| {
+            require_running(stopped)?;
+            authorize()?;
+            self.require_vacant()?;
+            require_single_link(file)?;
+            if local_tree::reviewed_file_stamp(file)? == input.stamp {
+                Ok(())
+            } else {
+                Err(changed())
+            }
+        };
+        let publish = stage.publish_with_receipt(
+            true,
+            |file| {
+                guard(file)?;
+                arm(0)?;
+                guard(file)
+            },
+            |parent, name, file| {
+                local_tree::sync_reviewed_tree_directory(parent)?;
+                let witness = FileWitness::capture(file, &|| false)?;
+                if !input.stamp.same_after_first_publication(&witness.stamp)
+                    || witness.inventory != incoming
+                    || !parent.same_as(&self.parent)?
+                    || name != self.name()
+                {
+                    return Err(changed());
+                }
+                #[cfg(windows)]
+                kortty_files::tree::require_reviewed_file_basename(file, name)?;
+                require_bound_parent(self.parent_path(), &self.parent, &self.parent_stamp)?;
+                require_named_file(&self.parent, self.name(), &witness.stamp)?;
+                Ok(file_snapshot(
+                    &self.path,
+                    &self.parent,
+                    &self.parent_stamp,
+                    &witness,
+                ))
+            },
+        );
+        match publish {
+            Ok(snapshot) => Ok(VacantLocalFilePublication::Published(Box::new(snapshot))),
+            Err(FilePublishError::Before(error)) => Err(error),
+            Err(FilePublishError::Uncertain(error)) => {
+                Ok(VacantLocalFilePublication::Uncertain(error))
+            }
+        }
+    }
+
+    fn name(&self) -> &OsStr {
+        self.path.file_name().expect("checked receiver filename")
+    }
+
+    fn parent_path(&self) -> &Path {
+        self.path.parent().expect("checked receiver parent")
+    }
+
+    fn snapshot(&self) -> VacantLocalFileSnapshot {
+        let mut proof = path_fingerprint(b"kortty-vacant-local-rsync-file-v1\0", &self.path);
+        self.parent_stamp.hash_into(&mut proof);
+        let alias = VacantLocalFileAlias::capture(&self.parent, &self.parent_stamp, self.name());
+        VacantLocalFileSnapshot {
+            fingerprint: proof.0.finalize().into(),
+            alias: Some(alias),
+            location: Some(LocalTreeLocation::new(
+                alias,
+                self.parent_stamp.volume().mount_identity(),
+            )),
+        }
+    }
+
+    fn require_vacant(&self) -> io::Result<()> {
+        require_bound_parent(self.parent_path(), &self.parent, &self.parent_stamp)?;
+        #[cfg(windows)]
+        return self.parent.require_absent_after_removal(self.name());
+        #[cfg(unix)]
+        match rustix::fs::statat(
+            self.parent.file(),
+            self.name(),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+        ) {
+            Err(rustix::io::Errno::NOENT) => Ok(()),
+            Ok(_) => Err(changed()),
+            Err(error) => Err(error.into()),
+        }
+    }
+}
+
 pub(crate) struct ReviewedFileReceiver {
     path: PathBuf,
     parent: Directory,
@@ -61,6 +379,7 @@ pub(crate) struct ReviewedFileReceiver {
     parent_stamp: ReviewedStamp,
     original: SnapshotEntry,
     witness: FileWitness,
+    max_bytes: u64,
 }
 
 impl ReviewedFileReceiver {
@@ -71,27 +390,54 @@ impl ReviewedFileReceiver {
         Self::open(path, stopped).map(|receiver| receiver.snapshot(&receiver.witness))
     }
 
+    pub(crate) fn fingerprint(&self) -> [u8; 32] {
+        self.snapshot(&self.witness).fingerprint
+    }
+
+    pub(in crate::sftp_window) fn content(&self) -> (u64, [u8; 32]) {
+        (self.witness.inventory.bytes, self.witness.digest)
+    }
+
+    pub(crate) fn inspect_transfer(
+        path: &Path,
+        stopped: &impl Fn() -> bool,
+    ) -> io::Result<LocalFileSnapshot> {
+        Self::open_transfer(path, stopped).map(|receiver| receiver.snapshot(&receiver.witness))
+    }
+
     pub(crate) fn prepare(
         path: &Path,
-        expected: LocalFileSnapshot,
+        mut expected: LocalFileSnapshot,
         stopped: &impl Fn() -> bool,
     ) -> io::Result<Self> {
         let receiver = Self::open(path, stopped)?;
-        if expected.valid() && expected == receiver.snapshot(&receiver.witness) {
+        let mut current = receiver.snapshot(&receiver.witness);
+        if expected.alias.is_none() {
+            current.alias = None;
+        }
+        if expected.location.is_none() {
+            current.location = None;
+        }
+        let valid = expected.valid();
+        expected.published_from = None;
+        if valid && expected == current {
             Ok(receiver)
         } else {
             Err(changed())
         }
     }
 
-    fn open(path: &Path, stopped: &impl Fn() -> bool) -> io::Result<Self> {
+    pub(crate) fn open(path: &Path, stopped: &impl Fn() -> bool) -> io::Result<Self> {
+        Self::open_bounded(path, stopped, MAX_BYTES)
+    }
+
+    pub(crate) fn open_transfer(path: &Path, stopped: &impl Fn() -> bool) -> io::Result<Self> {
+        Self::open_bounded(path, stopped, MAX_TRANSFER_BYTES)
+    }
+
+    fn open_bounded(path: &Path, stopped: &impl Fn() -> bool, max_bytes: u64) -> io::Result<Self> {
         require_running(stopped)?;
-        let (parent_path, name) = path.parent().zip(path.file_name()).ok_or_else(changed)?;
-        reportable(
-            &parent_path
-                .join(".kortty-00000000000000000000000000000000.kortty-part")
-                .join(name),
-        )?;
+        let (parent_path, name) = checked_location(path)?;
         let parent = local_tree::open_reviewed_tree_parent(parent_path)?;
         let parent_stamp = local_tree::reviewed_tree_parent_stamp(&parent)?;
         let parent_identity = Identity::directory(&parent)?;
@@ -100,7 +446,7 @@ impl ReviewedFileReceiver {
         };
         #[cfg(windows)]
         kortty_files::tree::require_reviewed_file_basename(&file, name)?;
-        let witness = FileWitness::capture(&file, stopped)?;
+        let witness = FileWitness::capture_bounded(&file, stopped, max_bytes)?;
         if witness.stamp.volume() != parent_stamp.volume() {
             return Err(changed());
         }
@@ -115,6 +461,7 @@ impl ReviewedFileReceiver {
             parent_stamp,
             original,
             witness,
+            max_bytes,
         };
         receiver.require_parent()?;
         receiver.require_named(&receiver.witness.stamp)?;
@@ -136,15 +483,27 @@ impl ReviewedFileReceiver {
         authorize: &impl Fn() -> io::Result<()>,
         arm: impl FnOnce(u32) -> io::Result<()>,
     ) -> io::Result<ReviewedFilePublication> {
+        self.publish_with_recovery_prefix(stage, incoming, stopped, authorize, arm, None)
+    }
+
+    pub(in crate::sftp_window) fn publish_with_recovery_prefix(
+        self,
+        stage: StagedDownload,
+        incoming: Inventory,
+        stopped: &impl Fn() -> bool,
+        authorize: &impl Fn() -> io::Result<()>,
+        arm: impl FnOnce(u32) -> io::Result<()>,
+        recovery_prefix: Option<&str>,
+    ) -> io::Result<ReviewedFilePublication> {
         require_running(stopped)?;
         authorize()?;
         let _ancestors = local_tree::hold_reviewed_file_ancestors(self.parent_path())?;
         self.require_parent()?;
         self.require_named(&self.witness.stamp)?;
-        if stage.destination() != self.path || !single_file(incoming) {
+        if stage.destination() != self.path || !single_file(incoming, self.max_bytes) {
             return Err(changed());
         }
-        let input = FileWitness::capture(stage.writer()?, stopped)?;
+        let input = FileWitness::capture_bounded(stage.writer()?, stopped, self.max_bytes)?;
         if input.inventory != incoming || input.stamp.volume() != self.parent_stamp.volume() {
             return Err(changed());
         }
@@ -186,7 +545,7 @@ impl ReviewedFileReceiver {
             }
             local_tree::copy_reviewed_file_metadata(original, file)?;
             file.sync_all()?;
-            let final_file = FileWitness::capture(file, stopped)?;
+            let final_file = FileWitness::capture_bounded(file, stopped, self.max_bytes)?;
             if final_file.inventory != incoming || !final_file.stamp.same_identity(&input.stamp) {
                 return Err(changed().into());
             }
@@ -196,7 +555,7 @@ impl ReviewedFileReceiver {
         };
         let after = |parent: &Directory, name: &OsStr, file: &File| {
             local_tree::sync_reviewed_tree_directory(parent)?;
-            let witness = FileWitness::capture(file, &|| false)?;
+            let witness = FileWitness::capture_bounded(file, &|| false, self.max_bytes)?;
             let before = file_before_publish.borrow();
             let before = before.as_ref().ok_or_else(changed)?;
             if !before.stamp.same_after_move(&witness.stamp)
@@ -218,7 +577,7 @@ impl ReviewedFileReceiver {
                 name: self.name(),
                 parent: &self.parent_identity,
                 original: (&self.original, self.witness.digest),
-                backup_prefix: None,
+                backup_prefix: recovery_prefix,
             },
             stage,
             stopped,
@@ -230,7 +589,7 @@ impl ReviewedFileReceiver {
         match result {
             Ok(LocalCommit::Published { receipt, recovery }) => {
                 Ok(ReviewedFilePublication::Published {
-                    successor: receipt,
+                    successor: Box::new(receipt),
                     recovery,
                 })
             }
@@ -256,58 +615,110 @@ impl ReviewedFileReceiver {
     }
 
     fn require_parent(&self) -> io::Result<()> {
-        let parent = local_tree::open_reviewed_tree_parent(self.parent_path())?;
-        if self.parent.same_as(&parent)?
-            && local_tree::reviewed_tree_parent_stamp(&parent)? == self.parent_stamp
-        {
-            Ok(())
-        } else {
-            Err(changed())
-        }
+        require_bound_parent(self.parent_path(), &self.parent, &self.parent_stamp)
     }
 
     fn require_named(&self, expected: &ReviewedStamp) -> io::Result<()> {
-        let Entry::File(current) = local_tree::entry(&self.parent, self.name())? else {
-            return Err(changed());
-        };
-        if local_tree::reviewed_file_stamp(&current)? == *expected {
-            Ok(())
-        } else {
-            Err(changed())
-        }
+        require_named_file(&self.parent, self.name(), expected)
     }
 
     fn snapshot(&self, file: &FileWitness) -> LocalFileSnapshot {
-        let mut identity = Fingerprint(Sha256::new_with_prefix(b"kortty-local-rsync-file-id-v1\0"));
-        file.stamp.hash_identity_into(&mut identity);
-        let mut proof = Fingerprint(Sha256::new_with_prefix(b"kortty-local-rsync-file-v1\0"));
-        let path = self.path.as_os_str().as_encoded_bytes();
-        proof.write_usize(path.len());
-        proof.write(path);
-        self.parent_stamp.hash_into(&mut proof);
-        file.stamp.hash_into(&mut proof);
-        proof.write(&file.inventory.digest);
-        LocalFileSnapshot {
-            inventory: file.inventory,
-            fingerprint: proof.0.finalize().into(),
-            root_identity: identity.0.finalize().into(),
-        }
+        file_snapshot(&self.path, &self.parent, &self.parent_stamp, file)
     }
 }
 
-struct FileWitness {
-    stamp: ReviewedStamp,
+fn require_bound_parent(
+    path: &Path,
+    expected: &Directory,
+    stamp: &ReviewedStamp,
+) -> io::Result<()> {
+    let parent = local_tree::open_reviewed_tree_parent(path)?;
+    if expected.same_as(&parent)? && local_tree::reviewed_tree_parent_stamp(&parent)? == *stamp {
+        Ok(())
+    } else {
+        Err(changed())
+    }
+}
+
+fn require_named_file(parent: &Directory, name: &OsStr, stamp: &ReviewedStamp) -> io::Result<()> {
+    let Entry::File(file) = local_tree::entry(parent, name)? else {
+        return Err(changed());
+    };
+    if local_tree::reviewed_file_stamp(&file)? == *stamp {
+        Ok(())
+    } else {
+        Err(changed())
+    }
+}
+
+fn file_snapshot(
+    path: &Path,
+    directory: &Directory,
+    parent: &ReviewedStamp,
+    file: &FileWitness,
+) -> LocalFileSnapshot {
+    let mut identity = Fingerprint(Sha256::new_with_prefix(b"kortty-local-rsync-file-id-v1\0"));
+    file.stamp.hash_identity_into(&mut identity);
+    let mut proof = path_fingerprint(b"kortty-local-rsync-file-v1\0", path);
+    parent.hash_into(&mut proof);
+    file.stamp.hash_into(&mut proof);
+    proof.write(&file.inventory.digest);
+    let alias = VacantLocalFileAlias::capture(
+        directory,
+        parent,
+        path.file_name().expect("checked receiver filename"),
+    );
+    LocalFileSnapshot {
+        inventory: file.inventory,
+        fingerprint: proof.0.finalize().into(),
+        root_identity: identity.0.finalize().into(),
+        alias: Some(alias),
+        location: Some(LocalTreeLocation::new(
+            alias,
+            parent.volume().mount_identity(),
+        )),
+        published_from: None,
+    }
+}
+
+fn path_fingerprint(domain: &[u8], path: &Path) -> Fingerprint {
+    let mut proof = Fingerprint(Sha256::new_with_prefix(domain));
+    let path = path.as_os_str().as_encoded_bytes();
+    proof.write_usize(path.len());
+    proof.write(path);
+    proof
+}
+
+pub(crate) struct FileWitness {
+    pub(crate) stamp: ReviewedStamp,
     digest: [u8; 32],
-    inventory: Inventory,
+    pub(crate) inventory: Inventory,
 }
 
 impl FileWitness {
-    fn capture(mut file: &File, stopped: &impl Fn() -> bool) -> io::Result<Self> {
+    pub(crate) fn snapshot(
+        &self,
+        path: &Path,
+        directory: &Directory,
+        parent: &ReviewedStamp,
+    ) -> LocalFileSnapshot {
+        file_snapshot(path, directory, parent, self)
+    }
+
+    pub(crate) fn capture(file: &File, stopped: &impl Fn() -> bool) -> io::Result<Self> {
+        Self::capture_bounded(file, stopped, MAX_BYTES)
+    }
+
+    fn capture_bounded(
+        mut file: &File,
+        stopped: &impl Fn() -> bool,
+        max_bytes: u64,
+    ) -> io::Result<Self> {
         require_running(stopped)?;
         require_single_link(file)?;
         let stamp = local_tree::reviewed_file_stamp(file)?;
         let bytes = file.metadata()?.len();
-        if bytes > MAX_BYTES {
+        if bytes > max_bytes {
             return Err(changed());
         }
         file.rewind()?;
@@ -326,12 +737,10 @@ impl FileWitness {
         }
         require_running(stopped)?;
         let digest = hash.finalize().into();
-        let mut manifest = Manifest::default();
-        manifest.add("", Some((bytes, digest)))?;
         Ok(Self {
             stamp,
             digest,
-            inventory: manifest.finish(),
+            inventory: Manifest::regular_file(bytes, digest),
         })
     }
 }
@@ -349,8 +758,18 @@ impl Hasher for Fingerprint {
     }
 }
 
-fn single_file(inventory: Inventory) -> bool {
-    inventory.valid() && inventory.entries == 1 && inventory.files == 1
+fn single_file(inventory: Inventory, max_bytes: u64) -> bool {
+    inventory.bytes <= max_bytes && inventory.entries == 1 && inventory.files == 1
+}
+
+fn checked_location(path: &Path) -> io::Result<(&Path, &OsStr)> {
+    let (parent, name) = path.parent().zip(path.file_name()).ok_or_else(changed)?;
+    reportable(
+        &parent
+            .join(".kortty-00000000000000000000000000000000.kortty-part")
+            .join(name),
+    )?;
+    Ok((parent, name))
 }
 
 fn reportable(path: &Path) -> io::Result<()> {
@@ -496,13 +915,18 @@ mod tests {
 
     use super::*;
 
-    fn fixture(bytes: &[u8]) -> (Profile, PathBuf) {
+    fn vacant_fixture() -> (Profile, PathBuf) {
         let profile = Profile::new();
         let root = profile.0.canonicalize().unwrap();
         let directory = Directory::open_path(&root).unwrap();
         let workspace = OsStr::new("workspace");
         drop(local_tree::create_reviewed_tree_stage(&directory, workspace).unwrap());
         let destination = root.join(workspace).join("receiver.txt");
+        (profile, destination)
+    }
+
+    fn fixture(bytes: &[u8]) -> (Profile, PathBuf) {
+        let (profile, destination) = vacant_fixture();
         write_fixture_file(&destination, bytes);
         (profile, destination)
     }
@@ -514,8 +938,7 @@ mod tests {
         file.write_all(bytes).unwrap();
     }
 
-    fn staged(receiver: &ReviewedFileReceiver, bytes: &[u8]) -> (StagedDownload, Inventory) {
-        let stage = receiver.stage().unwrap();
+    fn staged(stage: StagedDownload, bytes: &[u8]) -> (StagedDownload, Inventory) {
         stage.writer().unwrap().write_all(bytes).unwrap();
         let incoming = FileWitness::capture(stage.writer().unwrap(), &|| false)
             .unwrap()
@@ -533,7 +956,7 @@ mod tests {
         }
         let old = ReviewedFileReceiver::inspect(&destination, &|| false).unwrap();
         let receiver = ReviewedFileReceiver::prepare(&destination, old, &|| false).unwrap();
-        let (stage, incoming) = staged(&receiver, b"new bytes");
+        let (stage, incoming) = staged(receiver.stage().unwrap(), b"new bytes");
         let publication = receiver
             .publish(stage, incoming, &|| false, &|| Ok(()), |removed| {
                 assert_eq!(removed, 0);
@@ -549,7 +972,7 @@ mod tests {
             panic!("the checked file must publish");
         };
         assert_eq!(
-            successor,
+            *successor,
             ReviewedFileReceiver::inspect(&destination, &|| false).unwrap()
         );
         assert_eq!(successor.inventory, incoming);
@@ -574,7 +997,7 @@ mod tests {
         let other = ReviewedFileReceiver::inspect(&destination, &|| false).unwrap();
         assert_eq!(other.inventory, successor.inventory);
         assert!(!other.aliases(&successor));
-        assert!(ReviewedFileReceiver::prepare(&destination, successor, &|| false).is_err());
+        assert!(ReviewedFileReceiver::prepare(&destination, *successor, &|| false).is_err());
     }
 
     #[test]
@@ -583,7 +1006,7 @@ mod tests {
             let (_fixture, destination) = fixture(b"old");
             let old = ReviewedFileReceiver::inspect(&destination, &|| false).unwrap();
             let receiver = ReviewedFileReceiver::prepare(&destination, old, &|| false).unwrap();
-            let (stage, incoming) = staged(&receiver, b"new");
+            let (stage, incoming) = staged(receiver.stage().unwrap(), b"new");
             let authorization = || {
                 if !destination.exists() {
                     if occupant {
@@ -631,7 +1054,7 @@ mod tests {
         fs::remove_file(link).unwrap();
         let old = ReviewedFileReceiver::inspect(&destination, &|| false).unwrap();
         let receiver = ReviewedFileReceiver::prepare(&destination, old, &|| false).unwrap();
-        let (stage, _) = staged(&receiver, b"new");
+        let (stage, _) = staged(receiver.stage().unwrap(), b"new");
         assert!(
             receiver
                 .publish(
@@ -644,5 +1067,167 @@ mod tests {
                 .is_err()
         );
         assert_eq!(fs::read(&destination).unwrap(), b"old");
+    }
+
+    #[test]
+    fn checked_vacant_file_returns_a_receipt_for_the_next_replacement() {
+        let (_fixture, destination) = vacant_fixture();
+        let vacant = VacantLocalFileReceiver::inspect(&destination, &|| false).unwrap();
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::FileTimesExt as _;
+            use std::time::{Duration, UNIX_EPOCH};
+
+            let previous = File::create(&destination).unwrap();
+            let earlier = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+            previous
+                .set_times(fs::FileTimes::new().set_created(earlier))
+                .unwrap();
+            drop(previous);
+            fs::remove_file(&destination).unwrap();
+        }
+        let receiver = VacantLocalFileReceiver::prepare(&destination, vacant, &|| false).unwrap();
+        let (stage, incoming) = staged(receiver.stage().unwrap(), b"first");
+        let result = receiver
+            .publish(stage, incoming, &|| false, &|| Ok(()), |removed| {
+                assert_eq!(removed, 0);
+                assert!(!destination.exists());
+                Ok(())
+            })
+            .unwrap();
+        let VacantLocalFilePublication::Published(successor) = result else {
+            panic!("the checked vacant file must publish");
+        };
+        assert_eq!(successor.inventory, incoming);
+        assert_eq!(vacant.alias(), successor.alias());
+        assert_eq!(fs::read(&destination).unwrap(), b"first");
+        assert_eq!(
+            fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+            1
+        );
+        assert!(VacantLocalFileReceiver::inspect(&destination, &|| false).is_err());
+
+        let receiver = ReviewedFileReceiver::prepare(&destination, *successor, &|| false).unwrap();
+        let (stage, incoming) = staged(receiver.stage().unwrap(), b"second");
+        let result = receiver
+            .publish(stage, incoming, &|| false, &|| Ok(()), |_| Ok(()))
+            .unwrap();
+        let ReviewedFilePublication::Published { recovery, .. } = result else {
+            panic!("the exact first publication must be replaceable");
+        };
+        assert_eq!(fs::read(&recovery).unwrap(), b"first");
+        assert_eq!(fs::read(&destination).unwrap(), b"second");
+    }
+
+    #[test]
+    fn checked_vacant_file_leaves_an_occupant_created_during_arming_untouched() {
+        let (_fixture, destination) = vacant_fixture();
+        let vacant = VacantLocalFileReceiver::inspect(&destination, &|| false).unwrap();
+        let receiver = VacantLocalFileReceiver::prepare(&destination, vacant, &|| false).unwrap();
+        let (stage, incoming) = staged(receiver.stage().unwrap(), b"incoming");
+        assert!(
+            receiver
+                .publish(stage, incoming, &|| false, &|| Ok(()), |_| {
+                    fs::write(&destination, b"intervening file")
+                })
+                .is_err()
+        );
+        assert_eq!(fs::read(&destination).unwrap(), b"intervening file");
+        assert_eq!(
+            fs::read_dir(destination.parent().unwrap()).unwrap().count(),
+            1
+        );
+    }
+
+    #[test]
+    fn checked_vacant_file_rejects_a_changed_path_or_parent() {
+        let (_fixture, destination) = vacant_fixture();
+        let vacant = VacantLocalFileReceiver::inspect(&destination, &|| false).unwrap();
+        assert!(
+            VacantLocalFileReceiver::prepare(
+                &destination.with_file_name("another.txt"),
+                vacant,
+                &|| false,
+            )
+            .is_err()
+        );
+        let parent = destination.parent().unwrap();
+        fs::rename(parent, parent.with_file_name("previous workspace")).unwrap();
+        let root = Directory::open_path(parent.parent().unwrap()).unwrap();
+        drop(local_tree::create_reviewed_tree_stage(&root, parent.file_name().unwrap()).unwrap());
+        assert!(VacantLocalFileReceiver::prepare(&destination, vacant, &|| false).is_err());
+        assert!(VacantLocalFileReceiver::inspect(&destination, &|| false).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checked_vacant_file_refuses_a_dangling_link() {
+        let (_fixture, destination) = vacant_fixture();
+        std::os::unix::fs::symlink("missing-target", &destination).unwrap();
+        assert!(VacantLocalFileReceiver::inspect(&destination, &|| false).is_err());
+    }
+
+    #[test]
+    fn local_file_review_accepts_legacy_snapshots_without_an_alias() {
+        let (_fixture, destination) = vacant_fixture();
+        let vacant = VacantLocalFileReceiver::inspect(&destination, &|| false).unwrap();
+        let mut previous = serde_json::to_value(vacant).unwrap();
+        previous.as_object_mut().unwrap().remove("alias").unwrap();
+        previous
+            .as_object_mut()
+            .unwrap()
+            .remove("location")
+            .unwrap();
+        let legacy: VacantLocalFileSnapshot = serde_json::from_value(previous.clone()).unwrap();
+        assert!(legacy.alias().is_none());
+        assert_eq!(serde_json::to_value(legacy).unwrap(), previous);
+        VacantLocalFileReceiver::prepare(&destination, legacy, &|| false).unwrap();
+
+        write_fixture_file(&destination, b"existing");
+        let existing = ReviewedFileReceiver::inspect(&destination, &|| false).unwrap();
+        assert!(existing.alias().unwrap().aliases(vacant.alias().unwrap()));
+        let mut previous = serde_json::to_value(existing).unwrap();
+        previous.as_object_mut().unwrap().remove("alias").unwrap();
+        previous
+            .as_object_mut()
+            .unwrap()
+            .remove("location")
+            .unwrap();
+        let legacy: LocalFileSnapshot = serde_json::from_value(previous.clone()).unwrap();
+        assert!(legacy.alias().is_none());
+        assert_eq!(serde_json::to_value(legacy).unwrap(), previous);
+        ReviewedFileReceiver::prepare(&destination, legacy, &|| false).unwrap();
+    }
+
+    #[test]
+    fn local_file_alias_binding_checks_physical_parent_and_native_name_rules() {
+        let alias = |parent, name| VacantLocalFileAlias { parent, name };
+        let first = alias([1; 32], AliasName::FoldedAscii([2; 32]));
+        let same = alias([1; 32], AliasName::FoldedAscii([2; 32]));
+        let other = alias([1; 32], AliasName::FoldedAscii([3; 32]));
+        let indeterminate = alias([1; 32], AliasName::Indeterminate);
+        let elsewhere = alias([2; 32], AliasName::Indeterminate);
+        assert!(first.aliases(&same));
+        assert!(!first.aliases(&other));
+        assert!(first.aliases(&indeterminate));
+        assert!(!first.aliases(&elsewhere));
+
+        let (_fixture, destination) = vacant_fixture();
+        let exact = VacantLocalFileReceiver::inspect(&destination, &|| false).unwrap();
+        let upper =
+            VacantLocalFileReceiver::inspect(&destination.with_file_name("RECEIVER.TXT"), &|| {
+                false
+            })
+            .unwrap();
+        let exact = exact.alias().unwrap();
+        let upper = upper.alias().unwrap();
+        assert_eq!(exact.parent, upper.parent);
+        assert_eq!(
+            exact.aliases(upper),
+            matches!(
+                exact.name,
+                AliasName::FoldedAscii(_) | AliasName::Indeterminate
+            )
+        );
     }
 }

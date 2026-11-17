@@ -365,6 +365,45 @@ impl Dialog {
         host_import_allowed: bool,
     ) -> Element<'a, Message> {
         let mut entries = column![].spacing(4);
+        if let Some(review) = preview.java_memory_review().filter(|review| review.open) {
+            let start = review.page * MEMORY_SCOPE_PAGE_SIZE;
+            let end = (start + MEMORY_SCOPE_PAGE_SIZE).min(review.len());
+            entries = entries.push(text("Choose the saved profiles that should receive these Java AI Memory notes. Terminal AI can use the notes in requests for the selected profile.").size(13));
+            for index in start..end {
+                let (source, choices, selected) = review.row(index);
+                let revision = self.revision;
+                entries = entries.push(
+                    column![
+                        text(source).size(13),
+                        pick_list(
+                            choices,
+                            selected.cloned(),
+                            move |target: profile_backup::JavaMemoryTarget| {
+                                Message::SelectJavaMemory(revision, index, target.id)
+                            }
+                        )
+                        .width(Length::Fill),
+                    ]
+                    .spacing(4),
+                );
+            }
+            if review.len() > MEMORY_SCOPE_PAGE_SIZE {
+                entries = entries.push(
+                    row![
+                        button("Previous").on_press_maybe(
+                            (start > 0).then_some(Message::JavaMemoryPage(self.revision, false))
+                        ),
+                        text(format!("{}–{} of {}", start + 1, end, review.len())),
+                        button("Next").on_press_maybe(
+                            (end < review.len())
+                                .then_some(Message::JavaMemoryPage(self.revision, true))
+                        ),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center),
+                );
+            }
+        }
         for entry in imported
             .iter()
             .chain(omissions.iter())
@@ -417,6 +456,11 @@ impl Dialog {
             review_credentials.then(|| self.java_credential_fields(vault_ready, review_keys)),
             password_summary.map(|(ready, omitted)| text(format!("SSH passwords ready to add: {ready}. Passwords omitted: {omitted}."))),
             key_summary.map(|(ready, omitted)| text(format!("Managed SSH keys ready to add: {ready}. Keys omitted: {omitted}."))),
+            preview.java_memory_review().map(|review| row![
+                button(if review.open { "Hide AI Memory Destinations" } else { "Review AI Memory Destinations…" })
+                    .on_press(Message::ShowJavaMemory(self.revision)),
+                text(format!("Existing profiles selected: {}", review.assignment_count())).size(13),
+            ].spacing(8).align_y(Alignment::Center)),
             has_host_pins.then(|| button("Review SSH Host Keys…").on_press_maybe(host_import_allowed.then_some(Message::ReviewHostPins(self.revision)))),
             imported_host_pins.map(|report| text(format!("SSH host keys added: {}. Already trusted: {}. Conflicts: {}. Need fresh review: {}.", report.added.len(), report.already_trusted, report.conflicts.len(), report.needs_review)).size(13)),
             self.error.as_ref().map(|error| text(error).size(13)),

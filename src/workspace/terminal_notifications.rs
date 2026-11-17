@@ -39,11 +39,15 @@ impl Default for Preferences {
 }
 
 impl Preferences {
+    pub(super) const COMMAND_SECONDS: std::ops::RangeInclusive<u16> = 1..=3600;
+
     pub(super) fn valid(&self) -> bool {
-        (1..=3600).contains(&self.command_seconds)
+        Self::COMMAND_SECONDS.contains(&self.command_seconds)
     }
     pub(super) fn normalize(&mut self) {
-        self.command_seconds = self.command_seconds.clamp(1, 3600);
+        self.command_seconds = self
+            .command_seconds
+            .clamp(*Self::COMMAND_SECONDS.start(), *Self::COMMAND_SECONDS.end());
     }
     pub(super) fn edit(&mut self, edit: Edit) {
         match edit {
@@ -51,7 +55,9 @@ impl Preferences {
             Edit::Commands(value) => self.command_finished = value,
             Edit::Programs(value) => self.programs = value,
             Edit::AiRuns(value) => self.ai_runs = value,
-            Edit::Seconds(value) if (1..=3600).contains(&value) => self.command_seconds = value,
+            Edit::Seconds(value) if Self::COMMAND_SECONDS.contains(&value) => {
+                self.command_seconds = value;
+            }
             Edit::Seconds(_) => {}
         }
     }

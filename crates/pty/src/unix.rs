@@ -4,7 +4,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -15,7 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::shell_integration::unix::{Startup, default_snippet};
-use crate::{JobProcessIdentity, LaunchOptions, Size, closed};
+use crate::{JobProcessIdentity, LaunchOptions, LocalShell, Size, closed};
 
 #[path = "unix/job_processes.rs"]
 mod job_processes;
@@ -40,6 +40,7 @@ type SharedFile = Arc<Mutex<Option<File>>>;
 
 pub(crate) struct Control {
     child: Child,
+    host_shell: bool,
     executable: Option<shell_directory::Executable>,
     master: Option<Arc<File>>,
     wake: Option<UnixStream>,
@@ -112,7 +113,14 @@ impl Control {
         self.child.id()
     }
 
+    pub(crate) fn uses_flatpak_host(&self) -> bool {
+        self.host_shell
+    }
+
     pub(crate) fn job_process_probe(&self) -> Option<JobProcessProbe> {
+        if self.host_shell {
+            return None;
+        }
         Some(JobProcessProbe {
             master: Arc::downgrade(self.master.as_ref()?),
             shell: self.child.id(),
@@ -130,6 +138,10 @@ impl Control {
         term: &str,
         options: &LaunchOptions,
     ) -> io::Result<(Self, PtyReader, PtyWriter)> {
+        #[cfg(target_os = "linux")]
+        let host_shell = crate::flatpak::routes_to_host(options);
+        #[cfg(target_os = "macos")]
+        let host_shell = false;
         #[cfg(all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64"),
@@ -178,10 +190,9 @@ impl Control {
         let read_signal = signal.try_clone()?;
         let output = Arc::new(Mutex::new(Some(master.try_clone()?)));
         let input = Arc::new(Mutex::new(Some(master.try_clone()?)));
-        let (program, arguments) = match &options.command {
-            Some(words) => (OsString::from(&words[0]), &words[1..]),
-            None => (default_shell(), &[][..]),
-        };
+        #[cfg(target_os = "macos")]
+        let (program, arguments) = native_program(options)?;
+        #[cfg(target_os = "macos")]
         let executable = shell_directory::Executable::read(Path::new(&program)).ok();
         #[cfg(target_os = "macos")]
         let (mut command, attestation) = match restrictions.as_ref().zip(sandbox_directory.as_ref())
@@ -193,21 +204,21 @@ impl Control {
             }
             None => (Command::new(program), None),
         };
-        #[cfg(not(target_os = "macos"))]
-        let mut command = Command::new(program);
-        let startup = if options.shell_integration && options.sandbox.is_none() {
-            let snippet = default_snippet(command.get_program()).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "the selected local shell does not support automatic integration",
-                )
-            })?;
-            Some(Startup::prepare(&mut command, snippet, arguments)?)
+        #[cfg(target_os = "macos")]
+        let startup = native_startup(&mut command, arguments, options)?;
+        #[cfg(target_os = "linux")]
+        let (mut command, startup, executable) = if host_shell {
+            let (command, startup) = crate::flatpak::pty_command(options, term)?;
+            (command, startup, None)
         } else {
-            command.args(arguments);
-            None
+            let (program, arguments) = native_program(options)?;
+            let executable = shell_directory::Executable::read(Path::new(&program)).ok();
+            let mut command = Command::new(program);
+            let startup = native_startup(&mut command, arguments, options)?;
+            (command, startup, executable)
         };
-        if options.sandbox.is_none()
+        if !host_shell
+            && options.sandbox.is_none()
             && let Some(directory) = &options.working_directory
         {
             command.current_dir(directory);
@@ -250,7 +261,11 @@ impl Control {
                 let request = libc::c_ulong::from(libc::TIOCSCTTY);
                 #[cfg(target_os = "linux")]
                 let request = libc::TIOCSCTTY;
-                os_result(libc::ioctl(libc::STDIN_FILENO, request, 0))?;
+                // Flatpak's host service attaches the forwarded slave as the
+                // host shell's controlling terminal.
+                if !host_shell {
+                    os_result(libc::ioctl(libc::STDIN_FILENO, request, 0))?;
+                }
                 #[cfg(all(
                     target_os = "linux",
                     any(target_arch = "x86_64", target_arch = "aarch64"),
@@ -294,6 +309,7 @@ impl Control {
         Ok((
             Self {
                 child,
+                host_shell,
                 executable,
                 master: Some(Arc::new(master)),
                 wake: Some(wake),
@@ -333,6 +349,9 @@ impl Control {
     }
 
     pub(crate) fn shutdown(&mut self) -> io::Result<()> {
+        // Give the host shell a chance to forward SIGHUP to its jobs while
+        // the Flatpak client still holds the live terminal.
+        let host_exit = self.host_shell.then(|| self.reap());
         if let Some(master) = self.master.take() {
             // Closing this socket wakes both pollers on the other endpoint.
             self.wake.take();
@@ -346,7 +365,7 @@ impl Control {
                 .take();
             drop(master);
         }
-        self.reap()?;
+        host_exit.unwrap_or_else(|| self.reap())?;
         self.startup.take();
         #[cfg(all(
             target_os = "linux",
@@ -379,6 +398,32 @@ impl Control {
         signal_group(group, libc::SIGKILL)?;
         self.child.wait()?;
         Ok(())
+    }
+}
+
+fn native_program(options: &LaunchOptions) -> io::Result<(OsString, &[String])> {
+    match &options.command {
+        Some(words) => Ok((OsString::from(&words[0]), &words[1..])),
+        None => Ok((shell_program(options.shell)?.into_os_string(), &[])),
+    }
+}
+
+fn native_startup(
+    command: &mut Command,
+    arguments: &[String],
+    options: &LaunchOptions,
+) -> io::Result<Option<Startup>> {
+    if options.shell_integration && options.sandbox.is_none() {
+        let snippet = default_snippet(command.get_program()).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the selected local shell does not support automatic integration",
+            )
+        })?;
+        Startup::prepare(command, snippet, arguments).map(Some)
+    } else {
+        command.args(arguments);
+        Ok(None)
     }
 }
 
@@ -435,6 +480,36 @@ impl Write for PtyWriter {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+pub(crate) fn shell_program(preset: LocalShell) -> io::Result<PathBuf> {
+    let name = match preset {
+        LocalShell::Default => return Ok(default_shell().into()),
+        LocalShell::Bash => "bash",
+        LocalShell::Zsh => "zsh",
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "the selected local shell requires Windows",
+            ));
+        }
+    };
+    let path = env::var_os("PATH").unwrap_or_default();
+    env::split_paths(&path)
+        .chain([PathBuf::from("/bin"), PathBuf::from("/usr/bin")])
+        .filter(|directory| directory.is_absolute())
+        .map(|directory| directory.join(name))
+        .find(|program| {
+            program.metadata().is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{preset} is not installed"),
+            )
+        })
 }
 
 pub(crate) fn default_shell() -> OsString {
@@ -590,7 +665,7 @@ fn child_pid_running(pid: u32) -> io::Result<bool> {
 /// Sets limits in the disposable PDF parser before it accepts any document bytes.
 pub fn limit_pdf_worker() -> io::Result<()> {
     let limits: [(_, libc::rlim_t); 3] = [
-        (libc::RLIMIT_AS, 1024 * 1024 * 1024),
+        (libc::RLIMIT_AS, pdf_worker_address_limit()?),
         (libc::RLIMIT_CPU, 6),
         (libc::RLIMIT_CORE, 0),
     ];
@@ -603,14 +678,59 @@ pub fn limit_pdf_worker() -> io::Result<()> {
         if unsafe { libc::getrlimit(resource, &mut limit) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        limit.rlim_max = limit.rlim_max.min(cap);
-        limit.rlim_cur = limit.rlim_cur.min(limit.rlim_max);
+        let maximum = limit.rlim_max.min(cap);
+        if maximum == limit.rlim_max {
+            continue;
+        }
+        limit.rlim_max = maximum;
+        limit.rlim_cur = limit.rlim_cur.min(maximum);
         // SAFETY: The setter reads the valid structure and only reduces this process's limits.
         if unsafe { libc::setrlimit(resource, &limit) } != 0 {
             return Err(io::Error::last_os_error());
         }
     }
     Ok(())
+}
+
+const PDF_WORKER_MEMORY_BUDGET: libc::rlim_t = 1024 * 1024 * 1024;
+
+#[cfg(not(target_os = "macos"))]
+fn pdf_worker_address_limit() -> io::Result<libc::rlim_t> {
+    Ok(PDF_WORKER_MEMORY_BUDGET)
+}
+
+#[cfg(target_os = "macos")]
+fn pdf_worker_address_limit() -> io::Result<libc::rlim_t> {
+    use std::mem::MaybeUninit;
+
+    let mut info = MaybeUninit::<libc::mach_task_basic_info>::uninit();
+    let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
+    // SAFETY: This requests the current task's VM accounting. The buffer
+    // has the size and alignment for the flavor and count given to Mach.
+    #[allow(
+        deprecated,
+        reason = "Use the Mach task token from the existing libc interface"
+    )]
+    let status = unsafe {
+        libc::task_info(
+            libc::mach_task_self(),
+            libc::MACH_TASK_BASIC_INFO,
+            info.as_mut_ptr().cast(),
+            &mut count,
+        )
+    };
+    if status != libc::KERN_SUCCESS || count != libc::MACH_TASK_BASIC_INFO_COUNT {
+        return Err(io::Error::other(
+            "Could not measure the PDF worker's address space",
+        ));
+    }
+    // SAFETY: Mach returned the complete task information record.
+    let baseline = unsafe { info.assume_init() }.virtual_size;
+    // dyld and the allocator reserve large virtual regions before main.
+    // Apply the budget to additional mappings after the worker starts.
+    baseline
+        .checked_add(PDF_WORKER_MEMORY_BUDGET)
+        .ok_or_else(|| io::Error::other("PDF worker address space limit overflow"))
 }
 
 #[cfg(test)]

@@ -64,13 +64,22 @@ pub(crate) fn is_messages_path(host: Option<&str>, path: &str) -> bool {
             && lower.contains("/v1/messages")
 }
 
+pub(super) fn is_openai_chat_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let last = lower.rsplit('/').next().unwrap_or_default();
+    !matches!(last, "" | "v1" | "responses" | "embeddings" | "models")
+        && !lower.ends_with("/api/v1/chat")
+        && !lower.ends_with(MINIMAX_NATIVE_PATH)
+        && !is_messages_path(None, &lower)
+}
+
 pub(crate) fn remote_api_base(endpoint: &str, protocol: RemoteProtocol) -> Result<String, String> {
     let endpoint = endpoint.trim();
     let invalid =
         || "Enter an HTTPS API URL without credentials, a query, or a fragment.".to_owned();
     if endpoint.len() > 2048
         || !(endpoint.starts_with("https://")
-            || protocol == RemoteProtocol::AnthropicExact
+            || protocol.is_exact_completion()
                 && super::lm_studio_endpoint::strip_ascii_prefix(endpoint, "https://").is_some())
         || endpoint.chars().any(|character| {
             character.is_whitespace() || character.is_control() || character == '\\'
@@ -101,22 +110,24 @@ pub(crate) fn remote_api_base(endpoint: &str, protocol: RemoteProtocol) -> Resul
             super::lm_studio_endpoint::strip_ascii_prefix(endpoint, "https://")
                 .and_then(|rest| rest.split_once('/'))
                 .ok_or_else(invalid)?;
-        let path = raw_path.strip_suffix('/').unwrap_or(raw_path);
+        let path = url.path().strip_suffix('/').unwrap_or(url.path());
         let matches_protocol = match protocol {
             RemoteProtocol::AnthropicExact => is_messages_path(url.host_str(), url.path()),
-            _ => path.to_ascii_lowercase().ends_with("/chat/completions"),
+            _ => is_openai_chat_path(path) && !is_messages_path(url.host_str(), url.path()),
         };
         if protocol.is_anthropic() && (authority.contains('%') || authority.ends_with(':'))
             || url.path().strip_prefix('/') != Some(raw_path)
             || !matches_protocol
-            || path
+            || raw_path
+                .strip_suffix('/')
+                .unwrap_or(raw_path)
                 .split('/')
                 .any(|segment| matches!(segment, "" | "." | ".."))
         {
             return Err(if protocol.is_anthropic() {
                 "Enter a complete Anthropic Messages HTTPS URL with an unambiguous path."
             } else {
-                "Enter a complete HTTPS /chat/completions URL with an unambiguous path."
+                "Enter a complete OpenAI-compatible HTTPS chat URL with an unambiguous path."
             }
             .into());
         }
@@ -761,6 +772,7 @@ mod tests {
             endpoint,
             "https://gateway.example/tenant/v1/chat/completions/",
             "https://gateway.example/tenant/v1/CHAT/COMPLETIONS",
+            "https://gateway.example/tenant/chat-proxy/Invoke/",
         ] {
             assert_eq!(remote_destination(valid, protocol).unwrap(), valid);
         }
@@ -768,6 +780,11 @@ mod tests {
             "http://gateway.example/v1/chat/completions/",
             "https://gateway.example/tenant/v1",
             "https://gateway.example/v1/responses",
+            "https://gateway.example/api/v1/chat",
+            "https://gateway.example/v1/messages",
+            "https://gateway.example/v1/text/chatcompletion_v2",
+            "https://api.anthropic.com/v1/messages/proxy",
+            "https://gateway.example/",
             "https://gateway.example/tenant//chat/completions/",
             "https://gateway.example/v1/chat/completions//",
             "https://gateway.example/tenant/../v1/chat/completions/",

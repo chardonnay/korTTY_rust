@@ -455,6 +455,17 @@ impl Sidecar {
         request_deadline: Instant,
         cancelled: &AtomicBool,
     ) -> io::Result<Arc<Self>> {
+        Self::start_mlx_observing(profile, id, authority, request_deadline, cancelled, |_| {})
+    }
+
+    fn start_mlx_observing(
+        profile: &Path,
+        id: &str,
+        authority: Option<&PolicyModelAuthority>,
+        request_deadline: Instant,
+        cancelled: &AtomicBool,
+        before_ready: impl FnOnce(&Self),
+    ) -> io::Result<Arc<Self>> {
         if !mlx_runtime::supported() {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -549,6 +560,7 @@ impl Sidecar {
         let Assets::Mlx(assets) = &sidecar.assets else {
             unreachable!("started MLX sidecar")
         };
+        before_ready(&sidecar);
         if let Err(error) = sidecar.wait_ready(model_id, deadline, cancelled) {
             sidecar.stop()?;
             check_cancelled(cancelled)?;
@@ -760,6 +772,32 @@ impl Sidecar {
             );
         }
     }
+}
+
+#[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
+pub(in crate::local_ai) fn test_mlx_process_exit_before_ready(
+    profile: &Path,
+    id: &str,
+    cancelled: &AtomicBool,
+) -> io::Error {
+    let result = Sidecar::start_mlx_observing(
+        profile,
+        id,
+        None,
+        Instant::now() + STARTUP_TIMEOUT,
+        cancelled,
+        |sidecar| {
+            sidecar.validate().expect("The signed child was started");
+            println!(
+                "Stopping signed MLX process {} before readiness",
+                sidecar.pid
+            );
+            sidecar.stop().expect("The signed child was reaped");
+        },
+    );
+    result
+        .err()
+        .expect("The exited process must fail readiness")
 }
 
 fn check_start(deadline: Instant, cancelled: &AtomicBool) -> io::Result<()> {

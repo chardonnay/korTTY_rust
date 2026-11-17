@@ -1293,6 +1293,20 @@ fn scheduled_journal_provider_approval_is_independent_and_excludes_earlier_runs(
 
 #[test]
 fn journal_summary_https_approval_is_persisted_and_revoked_by_scope() {
+    check_summary_https_approval(Some("fixture-model"), false);
+}
+
+#[test]
+fn journal_summary_https_approval_binds_server_selected_model_mode() {
+    check_summary_https_approval(None, false);
+}
+
+#[test]
+fn journal_summary_loopback_tls_approval_requires_a_trusted_endpoint() {
+    check_summary_https_approval(None, true);
+}
+
+fn check_summary_https_approval(model: Option<&str>, loopback: bool) {
     use crate::ai_manager::Configuration;
 
     let _exclusive = exclusive_run();
@@ -1301,18 +1315,25 @@ fn journal_summary_https_approval_is_persisted_and_revoked_by_scope() {
     let (scratch, mut workspace, old_capture, source) = seeded(address);
     let profile_root = scratch.0.canonicalize().unwrap();
     let journal_root = source.directory().parent().unwrap().to_owned();
-    let configured = |model| -> Configuration {
+    let configured = |model: Option<&str>, trusted: bool| -> Configuration {
         serde_json::from_value(json!({
             "profiles": {
-                "profiles": [{"id": 1, "name": "HTTPS fixture", "model": model,
+                "profiles": [{"id": 1, "name": "HTTPS fixture", "model": model.unwrap_or_default(),
+                    "model_mode": if model.is_some() { "manual" } else { "server-default" },
                     "endpoint": format!("https://{address}/v1"),
-                    "connection_mode": "remote-open-ai", "trusted_remote_endpoint": true}],
-                "default": 1, "last_id": 1
+                    "connection_mode": if loopback { "lm-studio-compatible" } else { "remote-open-ai" },
+                    "trusted_remote_endpoint": trusted}],
+                "default": model.map(|_| 1), "last_id": 1
             }
         }))
         .unwrap()
     };
-    configured("fixture-model")
+    assert!(
+        configured(model, false)
+            .journal_summary_https_transport(1)
+            .is_err()
+    );
+    configured(model, true)
         .save_fixture_at(&profile_root, &Configuration::default())
         .unwrap();
     let original = Configuration::load_fixture_from(&profile_root).unwrap();
@@ -1335,6 +1356,10 @@ fn journal_summary_https_approval_is_persisted_and_revoked_by_scope() {
         remote
             .label
             .contains(&format!("https://{address}/v1/chat/completions"))
+    );
+    assert_eq!(
+        remote.label.contains("Server selects the model"),
+        model.is_none()
     );
     assert!(
         workspace
@@ -1406,6 +1431,7 @@ fn journal_summary_https_approval_is_persisted_and_revoked_by_scope() {
     let transport = workspace
         .journal_summary_profile(automatic.profile.as_ref(), false)
         .unwrap();
+    assert_eq!(transport.uses_server_default_model(), model.is_none());
     let authority = https::Authority::new(
         Arc::clone(&configuration),
         automatic.clone(),
@@ -1414,7 +1440,7 @@ fn journal_summary_https_approval_is_persisted_and_revoked_by_scope() {
     );
     authority.authorize().unwrap();
 
-    configured("changed-model")
+    configured(Some("changed-model"), true)
         .save_fixture_at(&profile_root, &original)
         .unwrap();
     assert!(authority.authorize().is_err());

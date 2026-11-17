@@ -6,6 +6,7 @@ import sys
 import time
 
 SUDO_READY = b"KORTTY-PRIVILEGED-ARCHIVE-V2\n"
+SUDO_UPDATE_READY = b"KORTTY-PRIVILEGED-ARCHIVE-UPDATE-V2\n"
 SUDO_COMMIT = b"KORTTY-PRIVILEGED-ARCHIVE-COMMIT\n"
 
 
@@ -21,13 +22,15 @@ def read_frame(input_stream):
     return header + body
 
 
-def authenticate(root, mode, command, input_stream, output):
+def authenticate(root, mode, command, input_stream, output, update):
     if not mode.startswith("sudo-"):
         assert command == (root / "command").read_text()
         return True
+    action = "update" if update else "create"
+    greeting = SUDO_UPDATE_READY if update else SUDO_READY
     matched = re.fullmatch(
         r"exec /usr/bin/sudo -k -S -p '(\[kortty-sudo-[0-9a-f]{32}\] )' "
-        r"-u root -- /usr/libexec/kortty/kortty-server-archive --privileged-create-v2",
+        rf"-u root -- /usr/libexec/kortty/kortty-server-archive --privileged-{action}-v2",
         command,
     )
     assert matched, "expected the exact credential-bearing helper invocation"
@@ -63,15 +66,46 @@ def authenticate(root, mode, command, input_stream, output):
             output.write(SUDO_READY)
             output.flush()
         else:
-            output.write(SUDO_READY)
+            output.write(greeting)
             output.flush()
             return True
         if input_stream.read(1):
             (root / "unexpected-data").touch()
         return False
-    output.write(SUDO_READY)
+    output.write(greeting)
     output.flush()
     return True
+
+
+def update_archive(root, mode, input_stream, output):
+    (root / "update-channel").touch(exist_ok=False)
+
+    def expect(frame):
+        assert read_frame(input_stream) == (root / f"expected-{frame}").read_bytes(), frame
+        (root / f"{frame}-seen").touch()
+
+    def reply(frame):
+        output.write((root / frame).read_bytes())
+        output.flush()
+
+    expect("review")
+    reply("review")
+    expect("prepare")
+    if (root / "expected-password").is_file():
+        reply("password-required")
+        assert read_frame(input_stream) == (root / "expected-password").read_bytes()
+        (root / "archive-password-seen").touch()
+    reply("prepared")
+    expect("quarantine")
+    reply("quarantined")
+    expect("publish")
+    reply("published")
+    if mode.endswith("copy-revoked"):
+        assert input_stream.read(1) == b""
+        (root / "copy-not-requested").touch()
+    elif "copy" in mode:
+        expect("fetch-copy")
+        reply("copy")
 
 
 def main():
@@ -79,9 +113,13 @@ def main():
     mode = (root / "mode").read_text()
     input_stream = sys.stdin.buffer
     output = sys.stdout.buffer
+    update = mode.startswith(("update-", "sudo-update-"))
     if not authenticate(
-        root, mode, os.environ.get("SSH_ORIGINAL_COMMAND", ""), input_stream, output
+        root, mode, os.environ.get("SSH_ORIGINAL_COMMAND", ""), input_stream, output, update
     ):
+        return
+    if update:
+        update_archive(root, mode, input_stream, output)
         return
     assert read_frame(input_stream) == (root / "expected-review").read_bytes()
     (root / "review-seen").touch()

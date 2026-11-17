@@ -118,6 +118,7 @@ pub(super) struct WindowSettings {
     pub(super) workflow_single_language: bool,
     pub(super) workflow_script_font: u8,
     pub(super) job_menu_status_enabled: bool,
+    pub(super) logfile_presentation: crate::logfile_window::style::Preferences,
     pub(super) job_scheduler_journal_retention_days: u16,
     pub(super) connection_color_border_enabled: bool,
     pub(super) split_pane_focus_ring_enabled: bool,
@@ -223,6 +224,7 @@ impl Default for WindowSettings {
             workflow_single_language: false,
             workflow_script_font: DEFAULT_WORKFLOW_FONT,
             job_menu_status_enabled: true,
+            logfile_presentation: Default::default(),
             job_scheduler_journal_retention_days: 0,
             connection_color_border_enabled: true,
             split_pane_focus_ring_enabled: true,
@@ -479,15 +481,18 @@ impl WindowSettings {
             settings.quick_select.alphabet = DEFAULT_ALPHABET.into();
         }
         settings.quick_select.patterns.truncate(MAX_PATTERNS);
-        settings
-            .quick_select
-            .patterns
-            .retain(|pattern| QuickSelectPreferences::validate_pattern(pattern).is_ok());
+        let java_patterns = settings.quick_select.java_patterns;
+        settings.quick_select.patterns.retain(|pattern| {
+            QuickSelectPreferences::validate_pattern(pattern, java_patterns).is_ok()
+        });
         Ok(settings)
     }
 
     pub(super) fn validate_backup(bytes: &[u8]) -> io::Result<()> {
         let settings = Self::decode(bytes)?;
+        if !crate::terminal_highlight::valid_id(&settings.logfile_presentation.keyword_set) {
+            return Err(io::Error::other("Invalid logfile highlight set ID"));
+        }
         settings.validate_job_journal_retention()?;
         settings.app_logging.validate()?;
         settings.session_journal.validate()?;

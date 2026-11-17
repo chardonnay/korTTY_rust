@@ -57,6 +57,7 @@ pub struct ProfileChoice {
     label: String,
     reviewed_https: Option<String>,
     reviewed_cli: Option<String>,
+    server_default: Option<String>,
 }
 
 impl fmt::Display for ProfileChoice {
@@ -79,6 +80,12 @@ impl ProfileChoice {
         }
         if let Some(destination) = &self.reviewed_cli {
             config.reviewed_agent_cli_transport(&self.reference, destination)
+        } else if let Some(destination) = &self.server_default {
+            config.foreground_agent_default_transport(
+                &self.reference,
+                destination,
+                self.reviewed_https.is_some(),
+            )
         } else if let Some(destination) = &self.reviewed_https {
             config.reviewed_agent_https_transport(&self.reference, destination)
         } else {
@@ -324,9 +331,27 @@ fn profile_choices(config: &crate::ai_manager::Configuration) -> Vec<ProfileChoi
                 label: format!("{name} · {model}"),
                 reviewed_https: None,
                 reviewed_cli: None,
+                server_default: None,
             })
         })
         .collect()
+}
+
+fn server_default_profile_choices(
+    config: &crate::ai_manager::Configuration,
+) -> impl Iterator<Item = ProfileChoice> {
+    config
+        .foreground_agent_default_profiles()
+        .filter_map(|(id, name, destination, remote)| {
+            Some(ProfileChoice {
+                id,
+                reference: config.profile_reference(id)?,
+                label: format!("{name} · Server selects the model"),
+                reviewed_https: remote.then(|| destination.clone()),
+                reviewed_cli: None,
+                server_default: Some(destination),
+            })
+        })
 }
 
 fn https_profile_choices(
@@ -341,6 +366,7 @@ fn https_profile_choices(
                 label: format!("{name} · {model} · HTTPS"),
                 reviewed_https: Some(destination),
                 reviewed_cli: None,
+                server_default: None,
             })
         })
 }
@@ -357,6 +383,7 @@ fn cli_profile_choices(
                 label: format!("{name} · {model} · CLI"),
                 reviewed_https: None,
                 reviewed_cli: Some(destination),
+                server_default: None,
             })
         })
 }
@@ -930,6 +957,9 @@ impl Workspace {
                     .terminal_overrides(pane)
                     .and_then(|settings| settings.ai_profile.as_ref());
                 if !tab.incognito && matches!(mode, Mode::Ask | Mode::Run) {
+                    if !swarm {
+                        profiles.extend(server_default_profile_choices(&config));
+                    }
                     profiles.extend(https_profile_choices(&config));
                     if local_ai::cli::allowed(&policy, false)
                         && local_ai::cli::allowed(&self.clipboard.policy, false)
@@ -938,15 +968,24 @@ impl Workspace {
                     }
                 }
                 let role_https = config.preferred_agent_https_id();
+                let foreground_role = config.foreground_agent_default_role_id().filter(|id| {
+                    profiles
+                        .iter()
+                        .any(|profile| profile.id == *id && profile.server_default.is_some())
+                });
+                let connection_id = connection
+                    .and_then(|reference| config.resolve_profile_reference(reference))
+                    .filter(|id| {
+                        !config.is_server_selected_profile(*id)
+                            || profiles.iter().any(|profile| profile.id == *id)
+                    });
                 let preferred = profile_override.or_else(|| {
-                    let connection_id = connection
-                        .and_then(|reference| config.resolve_profile_reference(reference));
                     if connection_id.is_some() || matches!(connection, Some(ProfileRef::Policy(_)))
                     {
                         connection_id
                     } else {
-                        config
-                            .agent_profile_id()
+                        foreground_role
+                            .or_else(|| config.agent_profile_id())
                             .or_else(|| config.preferred_agent_cli_id())
                             .or(role_https)
                     }
@@ -956,6 +995,7 @@ impl Workspace {
                     profiles.iter().find(|profile| {
                         profile.id == id
                             && (profile.reviewed_https.is_none()
+                                || profile.server_default.is_some()
                                 || profile_override.is_some()
                                 || role_https == Some(id)
                                 || matches!(profile.reference, ProfileRef::Policy(_)))
@@ -970,20 +1010,23 @@ impl Workspace {
                     }
                     profile
                 } else if let Some(profile) = preferred {
-                    profile_pending =
-                        profile.reviewed_https.is_some() && profile_override.is_none();
+                    profile_pending = if profile.server_default.is_some() {
+                        connection_id != Some(profile.id) && foreground_role != Some(profile.id)
+                    } else {
+                        profile.reviewed_https.is_some() && profile_override.is_none()
+                    };
                     profile.clone()
                 } else if fallback_allowed
                     && cli_fallback
-                    && let Some(profile) = profiles
-                        .iter()
-                        .find(|profile| !profile.is_reviewed_outbound())
+                    && let Some(profile) = profiles.iter().find(|profile| {
+                        !profile.is_reviewed_outbound() && profile.server_default.is_none()
+                    })
                 {
                     profile.clone()
                 } else if fallback_allowed
-                    && let Some(outbound) = profiles
-                        .iter()
-                        .find(|profile| profile.is_reviewed_outbound())
+                    && let Some(outbound) = profiles.iter().find(|profile| {
+                        profile.is_reviewed_outbound() || profile.server_default.is_some()
+                    })
                 {
                     profile_pending = true;
                     outbound.clone()

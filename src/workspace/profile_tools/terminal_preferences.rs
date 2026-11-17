@@ -1,7 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::clipboard_policy::PasteWarningMode;
-use crate::connection_store::{Connection, LocalProfile, Store, TabColor, TerminalOverrides};
+use crate::connection_store::{
+    Connection, LocalProfile, SerialProfile, Store, TabColor, TerminalOverrides,
+};
 use crate::profile;
 use crate::ssh_dialog::LoginTarget;
 use crate::workspace::SshTarget;
@@ -10,6 +12,7 @@ use crate::workspace::SshTarget;
 pub(in crate::workspace) struct SavedTerminalPreferences {
     ssh: BTreeMap<u64, Preferences>,
     local: BTreeMap<u64, TerminalOverrides>,
+    serial_highlights: BTreeMap<u64, String>,
 }
 
 struct Preferences {
@@ -61,6 +64,11 @@ impl SavedTerminalPreferences {
             .iter()
             .map(|profile| (profile.id, profile.terminal.clone()))
             .collect();
+        self.serial_highlights = store
+            .serial_profiles()
+            .iter()
+            .filter_map(|profile| Some((profile.id, profile.highlight_set.clone()?)))
+            .collect();
     }
 
     pub(super) fn remember(&mut self, id: u64, store: Option<&Store>) {
@@ -74,6 +82,18 @@ impl SavedTerminalPreferences {
 
     pub(in crate::workspace) fn remember_local(&mut self, profile: &LocalProfile) {
         self.local.insert(profile.id, profile.terminal.clone());
+    }
+
+    pub(in crate::workspace) fn remember_serial_highlight(&mut self, profile: &SerialProfile) {
+        if let Some(id) = &profile.highlight_set {
+            self.serial_highlights.insert(profile.id, id.clone());
+        } else {
+            self.serial_highlights.remove(&profile.id);
+        }
+    }
+
+    pub(in crate::workspace) fn serial_highlight(&self, id: u64) -> Option<&str> {
+        self.serial_highlights.get(&id).map(String::as_str)
     }
 
     pub(in crate::workspace) fn local_terminal(&self, id: u64) -> Option<&TerminalOverrides> {

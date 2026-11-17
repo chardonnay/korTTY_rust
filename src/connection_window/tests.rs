@@ -182,6 +182,7 @@ fn grouped_serial_favorites_pins_tags_and_duplicate_are_persisted() {
         kortty_terminal::TerminalProfile::Vt220,
     );
     draft.tag = "Switches".into();
+    draft.highlight_set = Some("builtin.errors".into());
     let id = store.save_serial_in_group(draft, Some(&folder)).unwrap();
     let mut manager = ConnectionWindow::open(profile.path()).unwrap();
     assert_eq!(
@@ -201,6 +202,19 @@ fn grouped_serial_favorites_pins_tags_and_duplicate_are_persisted() {
     let copy = manager.serial_draft.as_ref().unwrap().profile().unwrap();
     assert!(!copy.pinned);
     assert_eq!(copy.tag, "Switches");
+    assert_eq!(copy.highlight_set.as_deref(), Some("builtin.errors"));
+    let _ = manager.update(Message::SerialHighlightSet("none".into()));
+    assert_eq!(
+        manager
+            .serial_draft
+            .as_ref()
+            .unwrap()
+            .profile()
+            .unwrap()
+            .highlight_set
+            .as_deref(),
+        Some("none")
+    );
     assert_eq!(manager.draft_group.as_deref(), Some(folder.as_str()));
     complete_persisted(&mut manager, Message::Save);
     let mut store = Store::open(profile.path()).unwrap();
@@ -1129,6 +1143,7 @@ fn native_workbench_keeps_reference_side_widths_at_default_and_minimum_size() {
             passphrases: &[],
             keys: &[],
             ai_profiles: &[],
+            java_ai_profiles: &[],
             ai_skills: &[],
             ai_agent_designs: &[],
             highlighting: HighlightChoices::default(),
@@ -1176,6 +1191,7 @@ fn long_scope_titles_keep_list_and_map_visible_at_minimum_width() {
             passphrases: &[],
             keys: &[],
             ai_profiles: &[],
+            java_ai_profiles: &[],
             ai_skills: &[],
             ai_agent_designs: &[],
             highlighting: HighlightChoices::default(),

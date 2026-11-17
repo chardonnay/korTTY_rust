@@ -36,10 +36,11 @@ impl Request {
     }
 
     pub(crate) fn texts(left: (String, String), right: (String, String)) -> Self {
-        Self([left, right].map(|(label, code)| Source {
-            label,
-            code: code.into(),
-        }))
+        Self::shared([left, right].map(|(label, code)| (label, code.into())))
+    }
+
+    pub(crate) fn shared(sources: [(String, Arc<str>); 2]) -> Self {
+        Self(sources.map(|(label, code)| Source { label, code }))
     }
 
     pub(crate) fn compare(self) -> Result<Comparison, &'static str> {

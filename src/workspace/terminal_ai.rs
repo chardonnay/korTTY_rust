@@ -657,6 +657,7 @@ struct ConnectionMemory {
 enum MemoryTarget {
     Ssh(Box<SshTarget>),
     Local(Box<crate::connection_store::LocalProfile>),
+    Serial(Box<crate::connection_store::SerialProfile>),
 }
 
 impl MemoryTarget {
@@ -666,6 +667,9 @@ impl MemoryTarget {
         }
         if let Some(local) = &pane.saved_local {
             return Some(Self::Local(Box::new(local.clone())));
+        }
+        if let Some(serial) = &pane.saved_serial {
+            return Some(Self::Serial(Box::new(serial.clone())));
         }
         pane.ssh
             .as_ref()
@@ -677,6 +681,7 @@ impl MemoryTarget {
         match self {
             Self::Ssh(target) => target.saved_id(),
             Self::Local(profile) => Some(profile.id),
+            Self::Serial(profile) => Some(profile.id),
         }
     }
 
@@ -684,6 +689,7 @@ impl MemoryTarget {
         match self {
             Self::Ssh(target) => target.host(),
             Self::Local(profile) => &profile.name,
+            Self::Serial(profile) => &profile.name,
         }
     }
 }
@@ -707,6 +713,16 @@ impl ConnectionMemory {
                 &store
                     .local(id)
                     .filter(|saved| saved.same_launch(profile))?
+                    .name
+            }
+            MemoryTarget::Serial(profile) => {
+                &store
+                    .serial(id)
+                    .filter(|saved| {
+                        profile
+                            .profile()
+                            .is_some_and(|emulation| saved.matches(&profile.connection, emulation))
+                    })?
                     .name
             }
         };
@@ -965,6 +981,11 @@ impl Chat {
         } else {
             preferred
                 .filter(available)
+                .or_else(|| {
+                    config
+                        .server_selected_chat_preference_id()
+                        .filter(available)
+                })
                 .or_else(|| {
                     if allow_cli_preselection {
                         config.preferred_terminal_chat_cli_id()
@@ -3651,6 +3672,61 @@ mod tests {
     }
 
     #[test]
+    fn terminal_chat_uses_a_saved_connection_profile_before_the_chat_default() {
+        use crate::connection_store::{LocalProfile, TerminalOverrides};
+
+        let config: Configuration = serde_json::from_value(json!({"profiles": {
+            "last_id": 8, "server_selected_chat_default": 7,
+            "profiles": [
+                {"id": 7, "name": "Chat default", "endpoint": "127.0.0.1:12345",
+                 "model_mode": "server-default", "model": ""},
+                {"id": 8, "name": "Connection profile", "endpoint": "127.0.0.1:12346",
+                 "model_mode": "server-default", "model": ""}
+            ]
+        }}))
+        .unwrap();
+        let root = crate::snippets::tests::Profile::new();
+        let path = root.0.join("connections.json");
+        let mut store = Store::open(path.clone()).unwrap();
+        let id = store
+            .save_local(LocalProfile {
+                id: 0,
+                name: "Saved shell".into(),
+                shell: Default::default(),
+                command: None,
+                working_directory: None,
+                shell_integration: false,
+                emulation: "xterm-256color".into(),
+                terminal: TerminalOverrides {
+                    ai_profile: Some(ProfileRef::Numeric(8)),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        let store = Store::open(path).unwrap();
+        let mut workspace = Workspace::default();
+        workspace.set_test_ai_configuration(config);
+        let (owner, _) = workspace.open_window(false);
+        let grid = GridSize::default();
+        let session = workspace.store_session(
+            Session::disconnected_ibm(crate::session::IbmKind::Tn3270e),
+            grid,
+            14,
+        );
+        workspace.add_tab(owner, session);
+        workspace.sessions.get_mut(&session).unwrap().saved_local = store.local(id).cloned();
+        workspace.refresh_saved_terminal_preferences(&store);
+
+        let _ = workspace.install_terminal_chat(owner, session, Action::Ask, "Fixture", false);
+        let id = workspace
+            .hosted_tool_in(owner, tool_tabs::Kind::AiChat)
+            .unwrap();
+        let chat = &workspace.terminal_chats[&id];
+        assert_eq!(chat.selected_choice().unwrap().id, 8);
+        assert!(chat.review.is_none());
+    }
+
+    #[test]
     fn server_default_model_requires_chat_review_and_is_omitted_on_send() {
         let _exclusive = exclusive_run();
         let (server, _) = listener();
@@ -3666,14 +3742,21 @@ mod tests {
         assert!(config.terminal_chat_profiles().next().is_none());
         assert!(config.terminal_chat_transport(7).is_err());
         assert!(config.agent_transport(7).is_err());
-        assert!(config.snippet_analysis_transport(7).is_err());
+        assert!(config.code_analysis_transport(7).is_err());
         assert!(config.journal_summary_transport(7, false).is_err());
         assert_eq!(config.interactive_chat_profiles().count(), 1);
 
-        let mut workspace = Workspace::default();
-        workspace.set_test_ai_configuration(config.clone());
         let redactor =
             Redactor::for_journal(Secrets::default().seal().unwrap(), Default::default());
+        let selectable = Chat::new(&config, Action::Ask, "", redactor.clone(), None).unwrap();
+        assert!(selectable.selected_choice().is_none());
+        let mut document = document;
+        document["profiles"]["server_selected_chat_default"] = json!(7);
+        let config: Configuration = serde_json::from_value(document.clone()).unwrap();
+        assert_eq!(config.server_selected_chat_preference_id(), Some(7));
+        assert!(config.default_ai_profile_reference().is_none());
+        let mut workspace = Workspace::default();
+        workspace.set_test_ai_configuration(config.clone());
         let mut chat = Chat::new(
             &config,
             Action::Ask,
@@ -3682,12 +3765,11 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(chat.selected_choice().is_none());
+        assert_eq!(chat.selected_choice().unwrap().id, 7);
         chat.include_memory = false;
         chat.question = text_editor::Content::with_text("What happened here?");
         let id = window::Id::unique();
         workspace.terminal_chats.insert(id, chat);
-        let _ = workspace.update_terminal_ai(id, Message::Profile(7));
         review_request(&mut workspace, id);
         let chat = &workspace.terminal_chats[&id];
         let review = chat
@@ -3861,7 +3943,7 @@ mod tests {
             .unwrap();
         let config = Configuration::load_fixture_from(&root).unwrap();
         assert!(config.agent_transport(7).is_err());
-        assert!(config.snippet_analysis_transport(7).is_err());
+        assert!(config.code_analysis_transport(7).is_err());
         assert!(config.journal_summary_transport(7, false).is_err());
         assert!(reviewed_transport(&config, 7, true).is_err());
         let mut workspace = Workspace::default();
@@ -6072,6 +6154,44 @@ mod tests {
                 .contains("saved connection changed")
         );
         assert!(load().is_none());
+    }
+
+    #[test]
+    fn terminal_ask_binds_memory_to_the_saved_serial_settings() {
+        use crate::connection_store::SerialProfile;
+        use crate::session::SerialConnection;
+        use kortty_terminal::TerminalProfile;
+
+        let fixture = crate::snippets::tests::Profile::new();
+        let catalog = crate::profile::connections_path_at(&fixture.0);
+        let mut store = Store::open(catalog.clone()).unwrap();
+        let id = store
+            .save_serial(SerialProfile::new(
+                "Console",
+                SerialConnection {
+                    device: "COM7".into(),
+                    ..SerialConnection::default()
+                },
+                TerminalProfile::default(),
+            ))
+            .unwrap();
+        let profile = store.serial(id).unwrap().clone();
+        let connection = ConnectionMemory {
+            catalog,
+            target: MemoryTarget::Serial(Box::new(profile.clone())),
+        };
+        assert_eq!(connection.current_id(), Some(id));
+        store
+            .save_serial(SerialProfile {
+                name: "Renamed".into(),
+                ..profile.clone()
+            })
+            .unwrap();
+        assert_eq!(connection.current_id(), Some(id));
+        let mut changed = profile;
+        changed.connection.device = "COM8".into();
+        store.save_serial(changed).unwrap();
+        assert_eq!(connection.current_id(), None);
     }
 
     #[test]

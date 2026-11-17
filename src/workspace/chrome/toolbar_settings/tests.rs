@@ -150,6 +150,9 @@ fn promotes_available_tools_in_place_in_older_toolbar_layouts() -> io::Result<()
     let scratch = Scratch::new()?;
     let path = scratch.0.join("toolbar.json");
     let mut layout = Layout::default();
+    layout.terminal.items = vec![Item::Unavailable(JavaTarget::Action(
+        "toolbar.gitBash".into(),
+    ))];
     layout.tools.items = vec![
         Item::Separator,
         Item::Reference(Reference::Logfile),
@@ -164,6 +167,7 @@ fn promotes_available_tools_in_place_in_older_toolbar_layouts() -> io::Result<()
     ];
     save_to(&path, layout)?;
     let upgraded = load_from(&path)?;
+    assert_eq!(upgraded.terminal.items, [Item::Action(Action::GitBash)]);
     assert_eq!(
         upgraded.tools.items,
         [

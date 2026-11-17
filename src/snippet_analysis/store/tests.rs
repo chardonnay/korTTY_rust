@@ -401,6 +401,7 @@ fn zero_cap_preserves_live_review_and_acceptance_without_retaining_source() {
         elapsed_millis: 0,
         profile_name: before.provenance.profile_name.clone(),
         model: before.provenance.model.clone(),
+        profile_revision: None,
         request: request.recovery_snapshot().unwrap(),
         checkpoint: None,
     };
@@ -557,6 +558,7 @@ fn staged_apply_recovery_reopens_and_atomically_converts_the_latest_checkpoint()
         elapsed_millis: 0,
         profile_name: pre.provenance.profile_name.clone(),
         model: pre.provenance.model.clone(),
+        profile_revision: Some([7; 32]),
         request: request.recovery_snapshot().unwrap(),
         checkpoint: None,
     };
@@ -587,6 +589,10 @@ fn staged_apply_recovery_reopens_and_atomically_converts_the_latest_checkpoint()
         })
     };
     save(None, &recovery).unwrap();
+    let mut rebound = recovery.clone();
+    rebound.revision = SnippetId::new().unwrap();
+    rebound.profile_revision = Some([8; 32]);
+    assert!(save(Some(initial), &rebound).is_err());
     let mut skipped = recovery.clone();
     skipped.revision = SnippetId::new().unwrap();
     skipped.checkpoint = Some(checkpoint(finished, 2, 4));

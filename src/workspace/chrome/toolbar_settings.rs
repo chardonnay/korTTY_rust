@@ -14,6 +14,7 @@ use crate::profile;
 use super::toolbar_item_context::{Context, Event as ItemEvent};
 use super::{Action, Icon, WorkspaceMessage, settings_window, wrap};
 
+pub(crate) mod java;
 #[cfg(test)]
 mod tests;
 
@@ -118,10 +119,41 @@ impl Reference {
 #[serde(rename_all = "kebab-case")]
 pub enum Item {
     Action(Action),
+    Settings(settings_window::Section),
     Reference(Reference),
     Connection(u64),
     Folder(String),
+    Unavailable(JavaTarget),
     Separator,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum JavaTarget {
+    Action(String),
+    Connection(String),
+    Folder(String),
+}
+
+impl JavaTarget {
+    pub(super) fn presentation(&self) -> (Icon, &str) {
+        match self {
+            Self::Action(target) => (
+                match target.as_str() {
+                    "toolbar.gitBash" => Icon::GitBash,
+                    "toolbar.settings.resources" => Icon::Resources,
+                    "toolbar.settings.security" => Icon::Security,
+                    "toolbar.settings.privacy" => Icon::Privacy,
+                    "toolbar.settings.language" => Icon::Language,
+                    "toolbar.settings.translation" => Icon::Translation,
+                    _ => Icon::Gear,
+                },
+                target,
+            ),
+            Self::Connection(target) => (Icon::Server, target),
+            Self::Folder(target) => (Icon::Group, target),
+        }
+    }
 }
 
 impl Item {
@@ -141,8 +173,15 @@ impl Item {
 
     pub(super) fn accepts(&self, group: Group) -> bool {
         match self {
-            Self::Action(_) | Self::Reference(_) => group != Group::Connections,
-            Self::Connection(_) | Self::Folder(_) => group == Group::Connections,
+            Self::Action(_)
+            | Self::Settings(_)
+            | Self::Reference(_)
+            | Self::Unavailable(JavaTarget::Action(_)) => group != Group::Connections,
+            Self::Connection(_)
+            | Self::Folder(_)
+            | Self::Unavailable(JavaTarget::Connection(_) | JavaTarget::Folder(_)) => {
+                group == Group::Connections
+            }
             Self::Separator => true,
         }
     }
@@ -155,6 +194,12 @@ impl Item {
                     path.len() <= MAX_FOLDER_PATH_BYTES
                         && !path.chars().any(char::is_control)
                         && path.split('/').all(|part| !part.trim().is_empty())
+                }
+                Self::Unavailable(target) => {
+                    let (_, value) = target.presentation();
+                    value.len() <= MAX_FOLDER_PATH_BYTES
+                        && !value.trim().is_empty()
+                        && !value.chars().any(char::is_control)
                 }
                 _ => true,
             }
@@ -586,14 +631,32 @@ impl Toolbar {
                 name: connection.name.clone(),
                 incognito: connection.incognito,
             })
+            .chain(
+                store
+                    .local_profiles()
+                    .iter()
+                    .map(|profile| ConnectionChoice {
+                        id: profile.id,
+                        name: profile.name.clone(),
+                        incognito: false,
+                    }),
+            )
+            .chain(
+                store
+                    .serial_profiles()
+                    .iter()
+                    .map(|profile| ConnectionChoice {
+                        id: profile.id,
+                        name: profile.name.clone(),
+                        incognito: false,
+                    }),
+            )
             .collect();
         self.folders = store
             .groups()
             .map(|path| FolderChoice {
                 path: path.to_owned(),
-                populated: store
-                    .in_group(path)
-                    .any(|connection| store.group_of(connection.id) == Some(path)),
+                populated: store.direct_group_ids(path).next().is_some(),
             })
             .collect();
     }
@@ -870,6 +933,9 @@ fn load_from(path: &Path) -> io::Result<Layout> {
                     *item = Item::Action(Action::SessionJournals)
                 }
                 Item::Reference(Reference::Logfile) => *item = Item::Action(Action::LogfileManager),
+                Item::Unavailable(JavaTarget::Action(target)) if target == "toolbar.gitBash" => {
+                    *item = Item::Action(Action::GitBash)
+                }
                 Item::Reference(Reference::Keyboard) => {
                     *item = Item::Action(Action::KeyboardSettings)
                 }
@@ -905,7 +971,7 @@ fn decode_profile(bytes: &[u8]) -> io::Result<Profile> {
     Ok(profile)
 }
 
-fn save_to(path: &Path, layout: Layout) -> io::Result<()> {
+fn encode_profile(layout: Layout) -> io::Result<Vec<u8>> {
     if !layout.valid() {
         return Err(invalid_profile());
     }
@@ -914,7 +980,11 @@ fn save_to(path: &Path, layout: Layout) -> io::Result<()> {
     if bytes.len() as u64 > MAX_PROFILE_BYTES {
         return Err(invalid_profile());
     }
-    profile::save_atomic(path, &bytes)
+    Ok(bytes)
+}
+
+fn save_to(path: &Path, layout: Layout) -> io::Result<()> {
+    profile::save_atomic(path, &encode_profile(layout)?)
 }
 
 fn invalid_profile() -> io::Error {
