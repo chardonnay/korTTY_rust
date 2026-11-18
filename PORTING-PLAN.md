@@ -2380,9 +2380,11 @@ the Rust publisher signatures.
 
 U1 evidence is recorded in
 [shared MLX policy and release checks](PORTING-PARITY.md#shared-mlx-update-policy-managed-download-restrictions-and-python-parameters).
-The repository CI matrix covers macOS, Ubuntu and Windows format checks,
-Clippy, tests and release staging. The PR #7 merge passed that matrix at
-`e3c1760`. See [current evidence and distribution](#current-evidence-and-distribution).
+Run native format checks, Clippy, tests and release staging locally on
+macOS, Linux and Windows. GitHub's equivalent Native Rust CI matrix is
+available on manual dispatch. The PR #7 merge passed the hosted matrix
+at `e3c1760`. See [local verification](README.md#verification) and
+[current evidence and distribution](#current-evidence-and-distribution).
 Publisher packages and clean-system acceptance remain in V7.
 
 ## Native acceptance and release gates

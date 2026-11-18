@@ -2348,22 +2348,12 @@ with a static C runtime so the ZIP can run without the Visual C++
 Redistributable.
 
 ```powershell
-$target = (rustc -vV | Select-String '^host: ').Line.Substring(6)
-$previousRustFlags = $env:RUSTFLAGS
-try {
-    $env:RUSTFLAGS = '-C target-feature=+crt-static'
-    cargo build --release --locked --workspace --target $target
-    if ($LASTEXITCODE -ne 0) { throw "Release build failed ($LASTEXITCODE)" }
-    $binDir = "target/$target/release"
-    & "./$binDir/kortty-package.exe" --target $target --bin-dir $binDir
-    if ($LASTEXITCODE -ne 0) { throw "Package staging failed ($LASTEXITCODE)" }
-} finally {
-    $env:RUSTFLAGS = $previousRustFlags
-}
+./scripts/release-windows.ps1
 ```
 
-On Windows, add `--windows-msi` to stage an MSI with the ZIP and its own
-SHA-256 sidecar. Install WiX Toolset 4 or later and the matching
+Run `./scripts/release-windows.ps1 -PackageArguments @('--windows-msi')` to
+stage an MSI with the ZIP and its own SHA-256 sidecar. Install WiX Toolset 4
+or later and the matching
 `WixToolset.UI.wixext` extension. The installer supports x64 and ARM64 native
 payloads and keeps the desktop, CLI and SSH worker in the same directory. Its
 per-machine `kortty Rust` product and default directory allow the Java
@@ -2405,6 +2395,9 @@ bash scripts/with-scratch.sh bash -ec '
 The [porting parity checklist](PORTING-PARITY.md) tracks implementation and
 acceptance against the pinned Java and SithTermFX references.
 
+Run native tests and release builds locally on the target OS. GitHub runs the
+Native Rust CI workflow only on manual dispatch. Code scanning runs separately.
+
 For native development builds on Windows, macOS and Fedora, run
 `python scripts/cargo-native.py build --locked` (`python3` on macOS or Fedora).
 The wrapper estimates one GiB per Cargo job, reserves memory for the host,
@@ -2416,10 +2409,22 @@ and caps jobs at the available logical CPUs and Linux cgroup limits. Use
 ```sh
 cargo fmt --all --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
-cargo test --locked --workspace
 ```
 
-On macOS, `bash scripts/with-scratch.sh --zsh-tests cargo test --locked --workspace --all-targets` runs the tests with `/bin/zsh` and standard parallelism. The PTY tests use a separate `ZDOTDIR` with disabled file history. This prevents simultaneously starting test shells from waiting for the same zsh history lock.
+Run the native suite with the command for your platform.
+
+| Platform | Command |
+| --- | --- |
+| Windows (PowerShell) | `./scripts/test-windows.ps1` |
+| macOS | `bash scripts/with-scratch.sh --zsh-tests cargo test --locked --workspace --all-targets` |
+| Linux | `SHELL=/bin/sh bash scripts/with-scratch.sh cargo test --locked --workspace --all-targets` |
+
+The Windows script gives tests a private directory for temporary files and
+application data. For focused checks, pass Cargo test arguments, for example
+`./scripts/test-windows.ps1 -CargoArguments @('-p', 'kortty-pty', '--lib')`.
+The macOS suite uses `/bin/zsh` with its own `ZDOTDIR` and file history disabled.
+Run the release commands above when a native package is needed. Follow
+[AGENTS.md](AGENTS.md) for build cleanup and package verification.
 
 Run the opt-in macOS OpenSSH fixture under a private scratch directory
 with a user-owned ancestor, such as `KORTTY_SCRATCH_PARENT="$HOME"`.

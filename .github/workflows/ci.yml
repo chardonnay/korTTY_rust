@@ -1,8 +1,7 @@
 name: Native Rust CI
 
 on:
-  push:
-  pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -66,41 +65,11 @@ jobs:
 
       - name: Run Windows tests
         if: runner.os == 'Windows'
-        env:
-          SHELL: /bin/sh
         shell: pwsh
-        run: |
-          $scratchRoot = Get-Item -LiteralPath $env:RUNNER_TEMP
-          $scratchPath = Join-Path $scratchRoot.FullName ("kortty-tests-" + [Guid]::NewGuid().ToString("N"))
-          $scratch = New-Item -ItemType Directory -Path $scratchPath
-          try {
-            $testOwner = [Security.Principal.WindowsIdentity]::GetCurrent().User
-            $testAccess = [Security.AccessControl.DirectorySecurity]::new()
-            $testAccess.SetOwner($testOwner)
-            $testAccess.SetAccessRuleProtection($true, $false)
-            $testInheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
-            $testRule = [Security.AccessControl.FileSystemAccessRule]::new($testOwner, [Security.AccessControl.FileSystemRights]::FullControl, $testInheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
-            $testAccess.SetAccessRule($testRule)
-            Set-Acl -LiteralPath $scratch.FullName -AclObject $testAccess
-            $env:TEMP = $scratch.FullName
-            $env:TMP = $scratch.FullName
-            $env:LOCALAPPDATA = $scratch.FullName
-            $env:APPDATA = Join-Path $scratch.FullName "roaming"
-            New-Item -ItemType Directory -Path $env:APPDATA | Out-Null
-            cargo +stable test --locked --workspace --all-targets
-            exit $LASTEXITCODE
-          } finally {
-            $scratch = Get-Item -LiteralPath $scratchPath
-            if ($scratch.Parent.FullName -ne $scratchRoot.FullName -or
-                ($scratch.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-              throw "Unexpected test scratch directory: $scratchPath"
-            }
-            Remove-Item -LiteralPath $scratch.FullName -Recurse -Force
-          }
+        run: ./scripts/test-windows.ps1
 
-      # Publish the successful dev build before cleaning it. PRs can restore the default branch's cache.
       - name: Save Cargo development cache
-        if: github.event_name == 'push' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch) && steps.cargo-cache.outputs.cache-hit != 'true'
+        if: steps.cargo-cache.outputs.cache-hit != 'true'
         uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: *cargo-cache-paths
@@ -122,12 +91,5 @@ jobs:
       - name: Build and stage native Windows release
         if: runner.os == 'Windows'
         env:
-          RUSTFLAGS: -C target-feature=+crt-static
           KORTTY_AI_CATALOG_PUBLIC_KEY: ${{ vars.KORTTY_AI_CATALOG_PUBLIC_KEY }}
-        run: |
-          $target = (rustc +stable -vV | Select-String '^host: ').Line.Substring(6)
-          cargo +stable build --locked --workspace --release --target $target
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $binDir = "target/$target/release"
-          & "./$binDir/kortty-package.exe" --target $target --bin-dir $binDir
-          exit $LASTEXITCODE
+        run: ./scripts/release-windows.ps1
