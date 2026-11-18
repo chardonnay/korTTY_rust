@@ -412,7 +412,8 @@ fn teamwork_default_vault_password_is_bound_to_the_effective_target_and_scope() 
 
     let fixture = TeamworkFixture::new();
     let vault_path = fixture.0.join("vault.bin");
-    let mut vault = Vault::create(&vault_path, b"teamwork-auth-test-master").unwrap();
+    let mut vault =
+        Vault::create(&vault_path, &crate::vault_window::test_vault_password()[..]).unwrap();
     let credential = vault
         .save(
             CredentialInput {
@@ -508,10 +509,10 @@ fn teamwork_vault_unlock_resumes_the_same_target_after_the_prompt_closes() {
     use crate::vault_window::{Completion, Message as VaultMessage, VaultWindow};
     use kortty_vault::{CredentialInput, Secret, Vault};
 
-    const MASTER: &[u8] = b"teamwork-unlock-test-master";
+    let master_password = crate::vault_window::test_vault_password();
     let fixture = TeamworkFixture::new();
     let path = fixture.0.join("vault.bin");
-    let mut vault = Vault::create(&path, MASTER).unwrap();
+    let mut vault = Vault::create(&path, &master_password[..]).unwrap();
     let credential = vault
         .save(
             CredentialInput {
@@ -539,7 +540,11 @@ fn teamwork_vault_unlock_resumes_the_same_target_after_the_prompt_closes() {
     assert!(workspace.pending_ssh_mut(owner).is_none());
     let _ = workspace.update_vault(
         unlock,
-        VaultMessage::Completed(Completion::unlock_fixture(&path, MASTER, true)),
+        VaultMessage::Completed(Completion::unlock_fixture(
+            &path,
+            &master_password[..],
+            true,
+        )),
     );
     assert!(workspace.vault_id.is_none());
     assert!(workspace.pending_ssh_mut(owner).is_none());
@@ -563,7 +568,7 @@ fn cancelling_teamwork_vault_unlock_preserves_the_source_and_rejects_a_changed_p
 
     let fixture = TeamworkFixture::new();
     let path = fixture.0.join("vault.bin");
-    drop(Vault::create(&path, b"teamwork-cancel-test-master").unwrap());
+    drop(Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap());
     let catalog = fixture.catalog_with_auth("shared.example", "operator", "");
     let selection = fixture.selection(&catalog);
     let mut workspace = Workspace::default();

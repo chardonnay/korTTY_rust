@@ -56,22 +56,28 @@ impl InputMethod {
             }
         }
 
+        if styles.is_null() {
+            return None;
+        }
+
         let mut preedit_style = None;
         let mut none_style = None;
 
         unsafe {
-            std::slice::from_raw_parts((*styles).supported_styles, (*styles).count_styles as _)
-                .iter()
-                .for_each(|style| match *style {
-                    XIM_PREEDIT_STYLE => {
-                        preedit_style = Some(Style::Preedit(*style));
-                    },
-                    XIM_NOTHING_STYLE if preedit_style.is_none() => {
-                        preedit_style = Some(Style::Nothing(*style))
-                    },
-                    XIM_NONE_STYLE => none_style = Some(Style::None(*style)),
-                    _ => (),
-                });
+            let supported = (*styles).supported_styles;
+            let count = usize::from((*styles).count_styles);
+            if !supported.is_null() && count != 0 {
+                for &style in std::slice::from_raw_parts(supported, count) {
+                    match style {
+                        XIM_PREEDIT_STYLE => preedit_style = Some(Style::Preedit(style)),
+                        XIM_NOTHING_STYLE if preedit_style.is_none() => {
+                            preedit_style = Some(Style::Nothing(style))
+                        },
+                        XIM_NONE_STYLE => none_style = Some(Style::None(style)),
+                        _ => (),
+                    }
+                }
+            }
 
             (xconn.xlib.XFree)(styles.cast());
         };

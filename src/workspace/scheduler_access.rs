@@ -3477,7 +3477,9 @@ mod tests {
     fn webhook_summary_masks_saved_and_pattern_credentials_and_bounds_text() {
         let scratch = Scratch::new();
         let path = scratch.0.join("vault.bin");
-        let mut vault = kortty_vault::Vault::create(&path, b"scheduler summary fixture").unwrap();
+        let mut vault =
+            kortty_vault::Vault::create(&path, &crate::vault_window::test_vault_password()[..])
+                .unwrap();
         for secret in ["fixture-value-which-must-stay-private", "fixture password"] {
             vault
                 .save(
@@ -3510,7 +3512,8 @@ mod tests {
 
         let scratch = Scratch::new();
         let vault_path = scratch.0.join("vault.bin");
-        let mut vault = Vault::create(&vault_path, b"scheduler webhook fixture").unwrap();
+        let mut vault =
+            Vault::create(&vault_path, &crate::vault_window::test_vault_password()[..]).unwrap();
         let credential = vault
             .save_webhook(
                 CredentialInput {

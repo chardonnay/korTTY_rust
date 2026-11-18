@@ -3856,7 +3856,9 @@ mod menu_tests {
         #[cfg(not(unix))]
         std::fs::create_dir(&scratch.0).unwrap();
         let path = scratch.0.join("vault.bin");
-        let password = b"app-test-master-password";
+        let password = crate::vault_window::test_vault_password();
+        let mut wrong_password = password.clone();
+        wrong_password[0] ^= 1;
 
         let mut workspace = Workspace::default();
         let (owner, _) = workspace.open_window(false);
@@ -3867,7 +3869,7 @@ mod menu_tests {
         assert_eq!(workspace.update(invoke.clone()).units(), 0);
         assert!(!path.exists());
 
-        drop(EncryptedVault::create(&path, password).unwrap());
+        drop(EncryptedVault::create(&path, &password[..]).unwrap());
         workspace.vault = Some(VaultWindow::open(path.clone()).unwrap());
         assert!(workspace.chrome_enabled(owner, UnlockVault));
         let _ = workspace.update(WorkspaceMessage::Chrome(Message::Invoke(
@@ -3907,12 +3909,16 @@ mod menu_tests {
         );
         let _ = workspace.update(WorkspaceMessage::Vault(
             prompt,
-            VaultMessage::Completed(Completion::unlock_fixture(&path, b"wrong password", false)),
+            VaultMessage::Completed(Completion::unlock_fixture(
+                &path,
+                &wrong_password[..],
+                false,
+            )),
         ));
         assert_eq!(workspace.vault_id, Some(prompt));
         let _ = workspace.update(WorkspaceMessage::Vault(
             prompt,
-            VaultMessage::Completed(Completion::unlock_fixture(&path, password, true)),
+            VaultMessage::Completed(Completion::unlock_fixture(&path, &password[..], true)),
         ));
         assert!(workspace.vault_id.is_none());
         assert!(workspace.owner_dialog(owner).is_none());

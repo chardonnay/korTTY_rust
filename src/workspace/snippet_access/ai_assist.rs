@@ -1760,7 +1760,8 @@ mod tests {
         let mut editor = SnippetWindow::open(scratch.path()).unwrap();
         let _ = editor.update(snippet_window::Message::Open(snippet));
         let path = root.join("test-vault.bin");
-        let mut vault = Vault::create(&path, b"snippet-assist-fixture").unwrap();
+        let mut vault =
+            Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap();
         vault
             .save(
                 CredentialInput {
@@ -1952,7 +1953,8 @@ mod tests {
             .unwrap();
         let saved = Configuration::load_fixture_from(&root).unwrap();
         let path = root.join("vault.bin");
-        let mut vault = Vault::create(&path, b"editor-cli-fixture").unwrap();
+        let mut vault =
+            Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap();
         vault
             .save(
                 CredentialInput {

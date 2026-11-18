@@ -987,7 +987,7 @@ impl XkbKeymap {
                 &mut keysyms,
             );
 
-            if count == 1 {
+            if count == 1 && !keysyms.is_null() {
                 *keysyms
             } else {
                 0

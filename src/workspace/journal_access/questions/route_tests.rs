@@ -338,7 +338,7 @@ fn check_https_review(model: &str, model_label: &str) {
     workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
     let secret = r#"sensitive "quoted" journal vault value"#;
     let path = root.join("test-vault.bin");
-    let mut vault = Vault::create(&path, b"journal-question-fixture").unwrap();
+    let mut vault = Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap();
     vault
         .save(
             CredentialInput {
@@ -458,7 +458,8 @@ fn journal_question_https_revokes_prepared_review_on_vault_lock_and_saved_route_
     let saved = Configuration::load_fixture_from(&root).unwrap();
     workspace.set_test_ai_configuration(saved.clone());
     let vault_path = root.join("test-vault.bin");
-    let vault = Vault::create(&vault_path, b"journal-revocation-fixture").unwrap();
+    let vault =
+        Vault::create(&vault_path, &crate::vault_window::test_vault_password()[..]).unwrap();
     workspace.vault = Some(crate::vault_window::VaultWindow::with_unlocked_fixture(
         vault_path, vault,
     ));
@@ -603,7 +604,7 @@ fn journal_question_cli_reviews_exact_masked_files_for_single_and_cross_journal_
     workspace.set_test_ai_configuration(Configuration::load_fixture_from(&root).unwrap());
 
     let path = root.join("test-vault.bin");
-    let mut vault = Vault::create(&path, b"journal-question-cli-fixture").unwrap();
+    let mut vault = Vault::create(&path, &crate::vault_window::test_vault_password()[..]).unwrap();
     vault
         .save(
             CredentialInput {
