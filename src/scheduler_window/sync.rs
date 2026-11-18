@@ -350,7 +350,7 @@ pub(super) enum SaveApproval {
 
 pub(super) enum ApprovalRollback {
     OneUse(Receipt, Option<Receipt>),
-    Standing(standing::Approval, Option<standing::Stored>),
+    Standing(standing::Approval, Option<Box<standing::Stored>>),
 }
 
 impl SaveApproval {
@@ -434,15 +434,15 @@ impl Store {
             }
             SaveApproval::Standing(approval) => {
                 let prior = self.swap_standing(job, approval.clone(), keep)?;
-                Ok(ApprovalRollback::Standing(approval, prior))
+                Ok(ApprovalRollback::Standing(approval, prior.map(Box::new)))
             }
             SaveApproval::RecurringReplacement(approval) => {
                 let prior = self.swap_replacement(job, approval.clone(), keep)?;
-                Ok(ApprovalRollback::Standing(approval, prior))
+                Ok(ApprovalRollback::Standing(approval, prior.map(Box::new)))
             }
             SaveApproval::RecurringTree(approval, create_root) => {
                 let prior = self.swap_tree(job, approval.clone(), create_root, keep)?;
-                Ok(ApprovalRollback::Standing(approval, prior))
+                Ok(ApprovalRollback::Standing(approval, prior.map(Box::new)))
             }
         }
     }
@@ -455,7 +455,7 @@ impl Store {
         match rollback {
             ApprovalRollback::OneUse(receipt, prior) => self.restore(job, &receipt, prior),
             ApprovalRollback::Standing(approval, prior) => {
-                self.restore_standing(job, &approval, prior)
+                self.restore_standing(job, &approval, prior.map(|stored| *stored))
             }
         }
     }

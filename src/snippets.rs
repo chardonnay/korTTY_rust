@@ -594,6 +594,7 @@ impl Library {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn save(
         &mut self,
         editing: Option<SnippetId>,
@@ -629,6 +630,7 @@ impl Library {
         self.commit(candidate)
     }
 
+    #[cfg(test)]
     pub(crate) fn save_with_metadata(
         &mut self,
         editing: Option<SnippetId>,
@@ -638,6 +640,7 @@ impl Library {
         self.store_snippet(editing, None, input, metadata, None)
     }
 
+    #[cfg(test)]
     pub(crate) fn create_with_id(
         &mut self,
         id: SnippetId,

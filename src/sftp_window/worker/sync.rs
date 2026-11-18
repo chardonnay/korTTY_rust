@@ -226,7 +226,7 @@ enum ActionKind {
     Folder(Location, DirectoryStamp),
     File {
         source: Location,
-        stamp: SnapshotEntry,
+        stamp: Box<SnapshotEntry>,
         parent: (Location, DirectoryStamp),
         digest: Option<[u8; 32]>,
     },
@@ -448,7 +448,7 @@ impl CopyPlan {
                     files += 1;
                     ActionKind::File {
                         source: source.location(path)?,
-                        stamp: stamp.clone(),
+                        stamp: Box::new(stamp.clone()),
                         parent: source.parent(path).ok_or_else(|| {
                             io::Error::other("A source folder could not be verified")
                         })?,
