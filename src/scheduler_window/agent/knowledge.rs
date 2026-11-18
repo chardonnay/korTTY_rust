@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::ai_manager::{Configuration, KnowledgeAuthority, ProfileRef, RetrievedKnowledge};
 use crate::workspace::terminal_agent::knowledge_review::Review;
 
-use super::{Classification, Message, Model, SchedulerView, SchedulerWindow, generation_grant};
+use super::{Message, SchedulerView, SchedulerWindow};
 
 const CHANGED: &str =
     "The scheduled knowledge store or its sources changed. Review this job again.";
@@ -163,50 +163,10 @@ impl SchedulerWindow {
             .ok_or("The model review is unavailable.")?;
         self.agent_review_current(view, review)?;
         let review = view.agent_review.as_mut().expect("checked review");
-        let standing = review.standing();
-        let firing = review.per_firing();
-        let Model {
-            prompts, skills, ..
-        } = review.model.as_mut().expect("checked model");
-        let skills = skills
-            .as_mut()
-            .filter(|skills| matches!(skills.classification, Classification::Closed))
-            .ok_or("Finish the skill review before changing knowledge excerpts.")?;
-        let updated = prompts
-            .iter()
-            .map(|prompt| {
-                (**prompt)
-                    .clone()
-                    .with_knowledge(knowledge.clone(), standing)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        for prompt in &updated {
-            prompt.cli_review_input(standing)?;
-        }
-        let generation = firing
-            .then(|| generation_grant(&updated, &review.approval.targets))
-            .transpose()?;
-        let advisory = review
-            .approval
-            .advisory
-            .as_ref()
-            .map(|grant| {
-                let pins = grant
-                    .reviewed_pins()
-                    .ok_or("The reviewed read-only skill assignments are unavailable.")?;
-                grant.clone().with_reviewed_prompts(
-                    &updated,
-                    &review.approval.targets,
-                    pins.to_vec(),
-                )
-            })
-            .transpose()?;
-        skills.renew_preview()?;
-        *prompts = updated.into_iter().map(Arc::new).collect();
-        review.approval.generation = generation;
-        review.approval.advisory = advisory;
-        review.approval.knowledge = if standing { knowledge } else { None };
-        review.approval.comparison = None;
-        skills.proposal_quota(prompts, standing)
+        review.replace_proposal_context(
+            "Finish the skill review before changing knowledge excerpts.",
+            |prompt, standing| prompt.with_knowledge(knowledge.clone(), standing),
+            |approval, standing| approval.knowledge = standing.then(|| knowledge.clone()).flatten(),
+        )
     }
 }

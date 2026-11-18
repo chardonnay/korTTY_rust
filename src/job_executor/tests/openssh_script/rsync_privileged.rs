@@ -196,6 +196,7 @@ impl Fixture {
             credentials,
             &self.reference,
             spec,
+            rsync::PrivilegedPreviewMode::Standard,
             &self.trust,
             Arc::new(AtomicBool::new(false)),
             || Ok(()),

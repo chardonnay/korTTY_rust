@@ -1,7 +1,7 @@
 //! Bounded, device-local authorization for recurring scheduled SFTP copies.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{self, Read as _};
+use std::io;
 use std::time::{Duration, SystemTime};
 
 use kortty_jobs::{
@@ -9,12 +9,12 @@ use kortty_jobs::{
 };
 use serde::{Deserialize, Serialize};
 
+use super::super::standing_index;
 use super::{Lock, Store, nonce, require_running, valid_nonce, wait_claim_lock};
 use crate::private_files::Directory;
 
 const FILE: &str = "job-sftp-standing-reviews.json";
 const LOCK: &str = ".job-sftp-standing-reviews.lock";
-const MAX_INDEX_BYTES: u64 = 4 * 1024 * 1024;
 const DAY: u64 = 24 * 60 * 60;
 pub(crate) const MAX_DAYS: u16 = 30;
 pub(crate) const MAX_FIRINGS: u16 = 128;
@@ -819,11 +819,7 @@ impl Store {
             return Err(invalid_index());
         }
         let bytes = serde_json::to_vec(&index)?;
-        if bytes.len() as u64 > MAX_INDEX_BYTES {
-            return Err(invalid_index());
-        }
-        directory.replace_file(FILE, &bytes)?;
-        directory.sync()?;
+        standing_index::write(&directory, FILE, &bytes, invalid_index)?;
         Ok(result)
     }
 }
@@ -850,21 +846,7 @@ fn armed_replacement<'a>(
 }
 
 fn read_index(directory: &Directory) -> io::Result<Index> {
-    let file = match directory.open_private_file(FILE) {
-        Ok(file) => file,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Index::new()),
-        Err(error) => return Err(error),
-    };
-    let mut bytes = Vec::new();
-    file.take(MAX_INDEX_BYTES + 1).read_to_end(&mut bytes)?;
-    if bytes.len() as u64 > MAX_INDEX_BYTES {
-        return Err(invalid_index());
-    }
-    let index: Index = serde_json::from_slice(&bytes)?;
-    if !valid_index(&index) {
-        return Err(invalid_index());
-    }
-    Ok(index)
+    standing_index::read(directory, FILE, valid_index, invalid_index)
 }
 
 fn valid_index(index: &Index) -> bool {

@@ -228,10 +228,11 @@ fn preview_vacancy(
         |_, _, _| Err("unexpected credential"),
     )
     .unwrap();
-    rsync::preview_privileged_file_creation(
+    rsync::preview_privileged(
         credentials,
         &fixture.reference,
         spec,
+        rsync::PrivilegedPreviewMode::VacantFile,
         &fixture.trust,
         Arc::new(AtomicBool::new(false)),
         || Ok(()),
