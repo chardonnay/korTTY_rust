@@ -11,7 +11,7 @@ use std::ptr::null;
 const MAX_ARGUMENTS: usize = 24;
 
 /// Launches an already approved executable with piped stdin/stdout and its own process group.
-/// Uses execve so a malformed image returns ENOEXEC without invoking a shell interpreter.
+/// Calls execve directly to avoid falling back to a shell on an image-loading error.
 pub fn spawn_cli(
     executable: &Path,
     argv0: &Path,
@@ -88,6 +88,8 @@ fn spawn(
 mod tests {
     use std::io::Write as _;
     use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+    #[cfg(target_os = "macos")]
+    use std::os::unix::process::ExitStatusExt as _;
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
@@ -131,7 +133,7 @@ mod tests {
 
             // A concurrent test can briefly inherit the writable descriptor between fork and exec.
             let deadline = Instant::now() + Duration::from_secs(2);
-            let error = loop {
+            let outcome = loop {
                 match spawn_cli(&malformed, &malformed, &[], &scratch.0) {
                     Err(error)
                         if error.raw_os_error() == Some(libc::ETXTBSY)
@@ -139,24 +141,40 @@ mod tests {
                     {
                         std::thread::sleep(Duration::from_millis(10));
                     }
-                    Err(error) => break error,
-                    Ok(mut child) => {
-                        let _ = child.wait();
-                        panic!("the malformed CLI image unexpectedly launched");
-                    }
+                    outcome => break outcome,
                 }
             };
-            let code = error.raw_os_error();
-            let rejected = code == Some(libc::ENOEXEC);
-            #[cfg(target_os = "macos")]
-            let rejected = rejected
-                || name == "image"
-                    && matches!(
-                        code,
-                        Some(libc::EBADEXEC | libc::EBADARCH | libc::EBADMACHO)
+            match outcome {
+                Err(error) => {
+                    let code = error.raw_os_error();
+                    let rejected = code == Some(libc::ENOEXEC);
+                    #[cfg(target_os = "macos")]
+                    let rejected = rejected
+                        || name == "image"
+                            && matches!(
+                                code,
+                                Some(libc::EBADEXEC | libc::EBADARCH | libc::EBADMACHO)
+                            );
+                    assert!(rejected, "unexpected rejection for {name}: {error}");
+                }
+                Ok(mut child) => {
+                    let status = child.wait()?;
+                    // XNU kills the process when the Mach-O loader fails after
+                    // committing to exec. The parent can already have a child handle.
+                    #[cfg(target_os = "macos")]
+                    assert_eq!(
+                        (name, status.signal()),
+                        ("image", Some(libc::SIGKILL)),
+                        "unexpected exit for {name}: {status}"
                     );
-            assert!(rejected, "unexpected image rejection: {error}");
-            assert!(!scratch.0.join("fallback-marker").exists());
+                    #[cfg(not(target_os = "macos"))]
+                    panic!("the malformed CLI {name} unexpectedly launched: {status}");
+                }
+            }
+            assert!(
+                !scratch.0.join("fallback-marker").exists(),
+                "a shell ran the malformed {name} fixture"
+            );
         }
         Ok(())
     }
