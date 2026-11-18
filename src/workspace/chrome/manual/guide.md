@@ -34,7 +34,7 @@ The Connection Manager can display a network map of the saved targets, jump rout
 
 ### Shell integration and Agent shortcuts {#connection-shell-integration}
 
-For a local terminal, enable **Add shell integration automatically** in Quick Connect or the saved local shell profile. Supported shells include Bash, zsh, fish, PowerShell and CMD. Automatic setup applies only to that launch. For SSH, open **Settings → Terminal → Set Up Shell Integration…**, install the matching snippet in the remote user's startup file and reconnect.
+For a local terminal, enable **Add shell integration automatically** in Quick Connect or the saved local shell profile. Supported shells include Bash, zsh, fish, PowerShell and CMD. Automatic setup applies only to that launch. **Settings → Terminal → Allow automatic integration for local shells** controls whether opted-in launches use the wrapper. The separate command-marks setting controls whether korTTY uses marks from shells that already emit them. For SSH, open **Settings → Terminal → Set Up Shell Integration…**, install the matching snippet in the remote user's startup file and reconnect.
 
 Enable **AI Manager → General → Enable terminal agent shortcuts**. At an empty live prompt, type **agent** and press **Tab** to see matching commands. Add a goal and press **Enter** to open the Agent. The terminal must use Xterm with UTF-8 and have shell command marks enabled. Right-click **Set Up Shell Integration…** to see readiness for that exact pane. The built-in Agent can also be opened from **AI → AI Agent…**.
 

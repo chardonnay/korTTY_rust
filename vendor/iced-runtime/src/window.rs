@@ -159,8 +159,16 @@ pub enum Action {
     /// Runs the closure with a reference to the [`Window`] with the given [`Id`].
     Run(Id, Box<dyn FnOnce(&dyn Window) + Send>),
 
-    /// Operate on the exact window at a position in native surface units.
-    OperateAt(Id, (f64, f64), PositionedOperation),
+    /// Operate on the exact window at a given native position.
+    OperateAt(Id, NativePosition, PositionedOperation),
+
+    /// Deliver a native file event with its client position.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    DesktopFiles(Id, (f64, f64), Vec<std::path::PathBuf>, bool),
+
+    /// Withdraw the current native file hover.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    DesktopFilesLeft(Id),
 
     /// Screenshot the viewport of the window.
     Screenshot(Id, oneshot::Sender<Screenshot>),
@@ -476,12 +484,21 @@ where
     })
 }
 
-/// Operates on the exact window at a position in native surface units.
+/// The units used by a native source to report a window-relative point.
+#[derive(Debug, Clone, Copy)]
+pub enum NativePosition {
+    /// Logical coordinates in a native surface before application scaling.
+    Surface((f64, f64)),
+    /// Physical window coordinates in pixels.
+    Physical((f64, f64)),
+}
+
+/// Operates on the exact window at a given native position.
 /// The factory receives the logical position for that window. It receives
 /// `None` if the window is gone or the position is invalid.
 pub fn operate_at<T>(
     id: Id,
-    surface_point: (f64, f64),
+    position: NativePosition,
     make: impl FnOnce(Option<Point>) -> Box<dyn Operation<T>> + Send + 'static,
 ) -> Task<T>
 where
@@ -490,7 +507,7 @@ where
     task::channel(move |sender| {
         crate::Action::Window(Action::OperateAt(
             id,
-            surface_point,
+            position,
             Box::new(move |point| {
                 Box::new(operation::map(make(point), move |value| {
                     let _ = sender.clone().try_send(value);

@@ -518,6 +518,9 @@ impl Workspace {
                     Phase::Approval,
                     "Review the next exact command and its destination.",
                 );
+                if let Some(task) = self.continue_agent_commands(id, run)? {
+                    return Ok(task);
+                }
             }
             _ => {}
         }

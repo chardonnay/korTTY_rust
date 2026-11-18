@@ -200,6 +200,12 @@ impl Workspace {
             .unwrap_or(&record.source.language);
         let input_supported = !is_declarative(language);
         match edit {
+            Edit::ExpandClassic => {
+                page.hardening.update(Edit::ExpandClassic, input_supported);
+                self.window_settings.snippet_analysis_hardening_expanded =
+                    Some(page.hardening.classic_open());
+                self.save_window_settings(Some(id));
+            }
             Edit::SaveClassic | Edit::SaveInput => {
                 let mut next = self.window_settings.clone();
                 if matches!(edit, Edit::SaveClassic) {

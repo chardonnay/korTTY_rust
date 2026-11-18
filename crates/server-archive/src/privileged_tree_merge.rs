@@ -20,6 +20,11 @@ pub struct Request {
     pub root: String,
     pub entries: Vec<Entry>,
     pub review_only: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub receiver_receipt: bool,
+    /// Create the entire root at a reviewed vacant name before later merge runs.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub create_root: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -37,7 +42,8 @@ impl Entry {
 
 impl Request {
     pub fn valid(&self) -> bool {
-        if self.entries.len() > MAX_ENTRIES
+        if (self.create_root && !self.receiver_receipt)
+            || self.entries.len() > MAX_ENTRIES
             || self.root.len() > 2048
             || !self.root.strip_prefix('/').is_some_and(|path| {
                 path.split('/').all(|name| {
@@ -91,14 +97,26 @@ pub enum Change {
 #[serde(deny_unknown_fields)]
 pub struct Review {
     pub fingerprint: [u8; 32],
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receiver: Option<[u8; 32]>,
     pub changes: Vec<Change>,
 }
 
 impl Review {
     /// A missing directory and its descendants are published as one checked entry.
     pub fn publications(&self, request: &Request) -> Option<Vec<Vec<usize>>> {
-        if self.fingerprint == [0; 32] || self.changes.len() != request.entries.len() {
+        if self.fingerprint == [0; 32]
+            || self.changes.len() != request.entries.len()
+            || (request.receiver_receipt != self.receiver.is_some())
+            || self.receiver == Some([0; 32])
+        {
             return None;
+        }
+        if request.create_root {
+            // The root itself is one publication, including for an empty source.
+            return (request.valid()
+                && self.changes.iter().all(|change| *change == Change::Create))
+            .then(|| vec![(0..request.entries.len()).collect()]);
         }
         let mut publications: Vec<Vec<usize>> = Vec::new();
         let mut directories = BTreeMap::<_, Option<usize>>::from([("", None)]);
@@ -158,7 +176,10 @@ pub enum Reply {
     Applied {
         index: usize,
     },
-    Complete,
+    Complete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        receiver: Option<[u8; 32]>,
+    },
     Aborted,
     Failed {
         outcome_unknown: bool,
@@ -189,7 +210,65 @@ mod tests {
                 })
                 .collect(),
             review_only: false,
+            receiver_receipt: false,
+            create_root: false,
         }
+    }
+
+    #[test]
+    fn protected_tree_receiver_receipt_is_explicit_and_legacy_frames_stay_unchanged() {
+        let legacy = serde_json::json!({"root":"/protected", "entries":[], "review_only":false});
+        let mut request: Request = serde_json::from_value(legacy.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&request).unwrap(), legacy);
+        let mut review = Review {
+            fingerprint: [2; 32],
+            receiver: None,
+            changes: Vec::new(),
+        };
+        assert!(review.publications(&request).is_some());
+        request.receiver_receipt = true;
+        assert!(review.publications(&request).is_none());
+        review.receiver = Some([0; 32]);
+        assert!(review.publications(&request).is_none());
+        review.receiver = Some([7; 32]);
+        assert!(review.publications(&request).is_some());
+        request.receiver_receipt = false;
+        assert!(review.publications(&request).is_none());
+        let legacy_complete = serde_json::json!({"status":"complete"});
+        let reply: Reply = serde_json::from_value(legacy_complete.clone()).unwrap();
+        assert!(matches!(reply, Reply::Complete { receiver: None }));
+        assert_eq!(serde_json::to_value(reply).unwrap(), legacy_complete);
+        let receipt = Reply::Complete {
+            receiver: Some([7; 32]),
+        };
+        let decoded: Reply =
+            serde_json::from_value(serde_json::to_value(receipt).unwrap()).unwrap();
+        assert!(matches!(decoded, Reply::Complete { receiver: Some(value) } if value == [7;32]));
+    }
+
+    #[test]
+    fn protected_tree_creation_requires_receipt_and_one_whole_root_publication() {
+        let mut request = request(&[("empty", None), ("empty/child", None)]);
+        request.create_root = true;
+        assert!(!request.valid());
+        request.receiver_receipt = true;
+        assert!(request.valid());
+        let mut review = Review {
+            fingerprint: [2; 32],
+            receiver: Some([3; 32]),
+            changes: vec![Change::Create; 2],
+        };
+        assert_eq!(review.publications(&request), Some(vec![vec![0, 1]]));
+        review.changes[0] = Change::Keep;
+        assert!(review.publications(&request).is_none());
+        request.entries.clear();
+        review.changes.clear();
+        assert_eq!(review.publications(&request), Some(vec![vec![]]));
+        let decoded: Request =
+            serde_json::from_value(serde_json::to_value(&request).unwrap()).unwrap();
+        assert!(decoded.valid() && decoded.create_root && decoded.receiver_receipt);
+        request.root = "/protected/../escape".into();
+        assert!(review.publications(&request).is_none());
     }
 
     #[test]
@@ -228,6 +307,7 @@ mod tests {
         ]);
         let mut review = Review {
             fingerprint: [2; 32],
+            receiver: None,
             changes: vec![
                 Change::Create,
                 Change::Create,

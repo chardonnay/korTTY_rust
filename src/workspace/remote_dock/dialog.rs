@@ -14,6 +14,12 @@ use super::{
     Desktop, Message as DockMessage, RemoteSidebarPosition, Target, Workspace, completion,
 };
 
+mod terminal_upload;
+pub(in crate::workspace) use terminal_upload::DesktopUploadBatch;
+use terminal_upload::TerminalUpload;
+#[cfg(target_os = "linux")]
+pub(in crate::workspace) use terminal_upload::TerminalUploadTarget;
+
 const PICKER_PAGE: usize = 120;
 const MAX_LOCAL_SELECTION: usize = 256;
 
@@ -45,6 +51,7 @@ enum Mode {
         context: Context,
         request: Request,
     },
+    TerminalUpload(Box<TerminalUpload>),
 }
 
 struct Context {
@@ -86,6 +93,8 @@ pub enum Message {
     Pick(u64, usize, bool),
     Enter(u64, usize),
     Listed(u64, Result<Arc<Directory>, String>),
+    TerminalUploadCompleted(super::Completion),
+    TerminalUploadResolve(u64, crate::sftp_window::ConflictChoice),
 }
 
 impl Workspace {
@@ -106,6 +115,7 @@ impl Workspace {
             Mode::Choose(choice) if choice.download.is_some() => "Select Target Folder",
             Mode::Choose(_) => "Upload to Remote Files",
             Mode::Confirm { .. } => "Confirm File Transfer",
+            Mode::TerminalUpload(_) => "Upload to SSH Terminal",
         })
     }
 
@@ -258,6 +268,7 @@ impl Workspace {
         let (kind, size) = match &mode {
             Mode::Choose(_) => (DialogKind::RemoteChooser, Size::new(560.0, 460.0)),
             Mode::Confirm { .. } => (DialogKind::RemoteTransferConfirm, Size::new(480.0, 230.0)),
+            Mode::TerminalUpload(_) => (DialogKind::RemoteTransferConfirm, Size::new(570.0, 265.0)),
             Mode::Hide { .. } => (DialogKind::RemoteHide, Size::new(480.0, 230.0)),
         };
         let (id, task) = self.open_placed_dialog(
@@ -294,6 +305,9 @@ impl Workspace {
         }
         if matches!(message, Message::Cancel) {
             return self.cancel_remote_dialog(id).unwrap_or_else(Task::none);
+        }
+        if matches!(dialog.mode, Mode::TerminalUpload(_)) {
+            return self.update_terminal_upload(id, message);
         }
         if matches!(message, Message::Proceed) {
             if let Mode::Choose(choice) = &mut dialog.mode {
@@ -436,6 +450,7 @@ impl Workspace {
         id: window::Id,
     ) -> Option<Task<Desktop>> {
         let dialog = self.remote_dialogs.0.remove(&id)?;
+        self.stop_terminal_upload(dialog.mode);
         Some(Task::batch([
             self.close_placed_dialog(id),
             window::gain_focus(dialog.owner),
@@ -449,13 +464,18 @@ impl Workspace {
         let Some(id) = self.remote_dialog_for_owner(owner) else {
             return Task::none();
         };
-        self.remote_dialogs.0.remove(&id);
+        if let Some(dialog) = self.remote_dialogs.0.remove(&id) {
+            self.stop_terminal_upload(dialog.mode);
+        }
         self.close_placed_dialog(id)
     }
 
     pub(super) fn close_remote_transfer_dialogs(&mut self) -> Task<Desktop> {
         let dialogs = std::mem::take(&mut self.remote_dialogs.0);
-        Task::batch(dialogs.into_keys().map(|id| self.close_placed_dialog(id)))
+        Task::batch(dialogs.into_iter().map(|(id, dialog)| {
+            self.stop_terminal_upload(dialog.mode);
+            self.close_placed_dialog(id)
+        }))
     }
 
     pub(in crate::workspace) fn remote_dialog_view(
@@ -504,6 +524,7 @@ impl Workspace {
                 ].spacing(10).into()
             }
             Mode::Choose(choice) => choice.view(id),
+            Mode::TerminalUpload(upload) => upload.view(id),
         };
         Some(
             container(body)

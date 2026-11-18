@@ -120,7 +120,7 @@ impl ProfileAuthority {
             .configuration
             .reload_saved()
             .ok()
-            .filter(crate::ai_manager::Configuration::enabled)
+            .filter(crate::ai_manager::Configuration::agent_execution_enabled)
             .and_then(|config| config.agent_profile_reference_revision(&self.reference))
             == Some(self.revision)
         {
@@ -132,7 +132,8 @@ impl ProfileAuthority {
 
     fn check_current(&self, workspace: &Workspace) -> Result<(), String> {
         if workspace.ai_configuration().is_some_and(|config| {
-            config.agent_profile_reference_revision(&self.reference) == Some(self.revision)
+            config.agent_execution_enabled()
+                && config.agent_profile_reference_revision(&self.reference) == Some(self.revision)
         }) {
             self.check()
         } else {
@@ -396,7 +397,7 @@ fn commands(run: &Run) -> Vec<ExactCommand> {
         .collect()
 }
 
-fn ordinary(command: &Command) -> bool {
+pub(in crate::workspace::terminal_agent) fn ordinary(command: &Command) -> bool {
     // Keep explicit elevation invocations in the single-target review even when
     // the model supplied them as plain text instead of using the elevation field.
     let elevated = command

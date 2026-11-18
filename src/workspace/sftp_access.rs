@@ -305,6 +305,11 @@ impl Workspace {
         incognito: bool,
     ) -> Task<Message> {
         state.set_incognito(incognito);
+        state.configure_comparison_ai_font(self.window_settings.sftp_comparison_ai_font_size);
+        state.configure_hidden_entries(
+            self.window_settings.sftp_show_hidden_local.unwrap_or(true),
+            self.window_settings.sftp_show_hidden_remote.unwrap_or(true),
+        );
         configure_sftp_preferences(
             &mut state,
             &self.window_settings,
@@ -498,6 +503,20 @@ impl Workspace {
                     });
                 return match result {
                     comparison_ai::Update::None => Task::none(),
+                    comparison_ai::Update::SaveFontSize(size) => {
+                        let mut next = self.window_settings.clone();
+                        next.sftp_comparison_ai_font_size = Some(size);
+                        match crate::profile::window_settings_path()
+                            .and_then(|path| next.save(&path))
+                        {
+                            Ok(()) => self.window_settings = next,
+                            Err(error) => self.notice(
+                                id,
+                                format!("Could not save the comparison AI font size ({error})"),
+                            ),
+                        }
+                        Task::none()
+                    }
                     comparison_ai::Update::Task(task) => task.map(move |event| {
                         Message::Sftp(
                             id,
@@ -535,6 +554,18 @@ impl Workspace {
             sftp_window::Message::SetConflictDefault(preference) => {
                 self.save_sftp_conflict_default(id, preference);
                 return Task::none();
+            }
+            sftp_window::Message::Hidden(side) => {
+                let Some(state) = self.sftp.get_mut(&id) else {
+                    return Task::none();
+                };
+                let previous = state.shows_hidden_entries(side);
+                let task = state.update(sftp_window::Message::Hidden(side));
+                let show = state.shows_hidden_entries(side);
+                if !state.incognito() && show != previous {
+                    self.save_sftp_hidden_entries(id, side, show);
+                }
+                return task.map(move |message| Message::Sftp(id, message));
             }
             sftp_window::Message::ShowEditor(document, editor) => {
                 if self.clipboard.policy.problem.is_some()
@@ -591,6 +622,25 @@ impl Workspace {
                 .update(message)
                 .map(move |message| Message::Sftp(id, message))
         })
+    }
+
+    fn save_sftp_hidden_entries(&mut self, id: window::Id, side: sftp_window::Side, show: bool) {
+        let mut next = self.window_settings.clone();
+        let preference = match side {
+            sftp_window::Side::Local => &mut next.sftp_show_hidden_local,
+            sftp_window::Side::Remote => &mut next.sftp_show_hidden_remote,
+        };
+        if *preference == Some(show) {
+            return;
+        }
+        *preference = Some(show);
+        match crate::profile::window_settings_path().and_then(|path| next.save(&path)) {
+            Ok(()) => self.window_settings = next,
+            Err(error) => self.notice(
+                id,
+                format!("Could not save hidden file visibility ({error})"),
+            ),
+        }
     }
 
     fn save_sftp_conflict_default(&mut self, id: window::Id, preference: ConflictDefault) {

@@ -74,6 +74,14 @@ jobs:
           $scratchPath = Join-Path $scratchRoot.FullName ("kortty-tests-" + [Guid]::NewGuid().ToString("N"))
           $scratch = New-Item -ItemType Directory -Path $scratchPath
           try {
+            $testOwner = [Security.Principal.WindowsIdentity]::GetCurrent().User
+            $testAccess = [Security.AccessControl.DirectorySecurity]::new()
+            $testAccess.SetOwner($testOwner)
+            $testAccess.SetAccessRuleProtection($true, $false)
+            $testInheritance = [Security.AccessControl.InheritanceFlags]::ContainerInherit -bor [Security.AccessControl.InheritanceFlags]::ObjectInherit
+            $testRule = [Security.AccessControl.FileSystemAccessRule]::new($testOwner, [Security.AccessControl.FileSystemRights]::FullControl, $testInheritance, [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)
+            $testAccess.SetAccessRule($testRule)
+            Set-Acl -LiteralPath $scratch.FullName -AclObject $testAccess
             $env:TEMP = $scratch.FullName
             $env:TMP = $scratch.FullName
             $env:LOCALAPPDATA = $scratch.FullName

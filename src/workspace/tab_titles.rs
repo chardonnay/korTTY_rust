@@ -13,6 +13,8 @@ use crate::connection_store::{
 use crate::profile;
 use crate::scheduler_window::{DEFAULT_JOURNAL_RETENTION_DAYS, MAX_JOURNAL_RETENTION_DAYS};
 use crate::session::CodingAgentState;
+use crate::snippet_analysis::model::{DEFAULT_CONTENT_BYTES, valid_content_limit};
+use crate::snippet_analysis::store::{DEFAULT_HISTORY_LIMIT, HISTORY_LIMITS};
 use crate::terminal_theme::{
     Appearance, BoldTextMode, Colors, MONOSPACED, Scheme, Themes, installed_font,
 };
@@ -32,7 +34,6 @@ const DEFAULT_TERMINAL_TITLE: &str = "Terminal";
 pub(super) const REMOTE_SIDEBAR_MIN_WIDTH: u16 = 200;
 pub(super) const REMOTE_SIDEBAR_MAX_WIDTH: u16 = 1200;
 const REMOTE_SIDEBAR_DEFAULT_WIDTH: u16 = 300;
-pub(super) const DEFAULT_JOURNAL_EDIT_SPLIT: u16 = 6200;
 pub(super) const MIN_TERMINAL_SILENCE_SECONDS: u16 = 5;
 pub(super) const MAX_TERMINAL_SILENCE_SECONDS: u16 = 3600;
 pub(super) const MIN_MANUAL_SCALE: u16 = 70;
@@ -41,10 +42,6 @@ pub(super) const DEFAULT_MANUAL_SCALE: u16 = 100;
 pub(super) const MIN_WORKFLOW_FONT: u8 = 8;
 pub(super) const MAX_WORKFLOW_FONT: u8 = 48;
 const DEFAULT_WORKFLOW_FONT: u8 = 14;
-
-fn default_journal_edit_split(value: &u16) -> bool {
-    *value == DEFAULT_JOURNAL_EDIT_SPLIT
-}
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -70,9 +67,19 @@ impl Display for RemoteSidebarPosition {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 #[serde(default)]
 pub(super) struct WindowSettings {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) journal_live_log_height: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) scheduler_journal_divider: Option<u16>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(super) java_update_opt_in: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) java_teamwork: Option<super::backup_data::teamwork::Proposals>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) java_swarm_journal: Option<crate::session_journal::automation::Options>,
     pub(super) startup: StartupPreferences,
     pub(super) prevent_system_sleep: bool,
     #[serde(skip_serializing_if = "super::open_recent::Preferences::is_default")]
@@ -85,6 +92,10 @@ pub(super) struct WindowSettings {
     pub(super) journal_ai: crate::session_journal::topic_ai_settings::Preferences,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub(super) journal_note_translation_language: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_translation_target_language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_alternative_count: Option<u8>,
     #[serde(
         skip_serializing_if = "crate::session_journal::export_branding::Preferences::is_default"
     )]
@@ -97,18 +108,52 @@ pub(super) struct WindowSettings {
     pub(super) sftp_resume_partial_transfers: bool,
     pub(super) sftp_keep_partial_on_cancel: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sftp_show_hidden_local: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sftp_show_hidden_remote: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) sftp_comparison_ai_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) sftp_idle_minutes: Option<u16>,
     #[serde(skip_serializing_if = "crate::sftp_window::ArchivePreferences::is_default")]
     pub(super) sftp_archive: crate::sftp_window::ArchivePreferences,
     pub(super) manual_scale: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ascii_art_preview_font_size: Option<f64>,
     #[serde(skip_serializing_if = "crate::editor_window::caret::Preferences::is_default")]
     pub(super) editor_caret: crate::editor_window::caret::Preferences,
     #[serde(skip_serializing_if = "crate::snippet_window::structure::Preferences::is_default")]
     pub(super) snippet_structure: crate::snippet_window::structure::Preferences,
+    #[serde(
+        skip_serializing_if = "crate::snippet_window::analysis::panel::Preferences::is_default"
+    )]
+    pub(super) snippet_analysis_panel: crate::snippet_window::analysis::panel::Preferences,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_apply_progress_dock: Option<bool>,
     #[serde(skip_serializing_if = "crate::snippet_window::appearance::Preferences::is_default")]
     pub(super) snippet_appearance: crate::snippet_window::appearance::Preferences,
     pub(super) snippet_analysis_auto_diagram: bool,
     pub(super) snippet_analysis_auto_modularization: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_analysis_report_font_size: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_analysis_history_limit: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_history_limit: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_analysis_content_limit: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_analysis_hardening_expanded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_analysis_diagram_options_expanded: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_analysis_project_diagram_visible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) snippet_diagram_horizontal: Option<bool>,
+    #[serde(skip_serializing_if = "crate::diagram_window::appearance::Preferences::is_empty")]
+    pub(super) snippet_diagram_appearance: crate::diagram_window::appearance::Preferences,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(super) custom_snippet_code_languages: Vec<String>,
     #[serde(
         skip_serializing_if = "crate::snippet_analysis::model::hardening::Preferences::is_default"
     )]
@@ -118,6 +163,10 @@ pub(super) struct WindowSettings {
     pub(super) workflow_single_language: bool,
     pub(super) workflow_script_font: u8,
     pub(super) job_menu_status_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) scheduler_diagram_horizontal: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) scheduler_diagram_color_mode: Option<crate::scheduler_window::DiagramColorMode>,
     pub(super) logfile_presentation: crate::logfile_window::style::Preferences,
     pub(super) job_scheduler_journal_retention_days: u16,
     pub(super) connection_color_border_enabled: bool,
@@ -125,10 +174,21 @@ pub(super) struct WindowSettings {
     pub(super) tab_title_from_shell_enabled: bool,
     pub(super) tab_switch_most_recent_first: bool,
     pub(super) prompt_navigation_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) automatic_local_shell_integration: Option<bool>,
     pub(super) command_timestamps_enabled: bool,
+    pub(super) confirm_busy_terminal_close: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) skip_terminal_group_close_confirmation: Option<bool>,
     pub(super) terminal_silence_seconds: u16,
     pub(super) terminal_link_detection_enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) terminal_drag_drop: Option<bool>,
     pub(super) serial_default_encoding: kortty_terminal::TextEncoding,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) ssh_default_encoding: Option<super::ssh_access::DefaultEncoding>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) java_ssh_encoding_hint: Option<kortty_terminal::TextEncoding>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) terminal_columns: Option<u16>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +216,8 @@ pub(super) struct WindowSettings {
     pub(super) ai_agent_design: crate::terminal_agent::design::Preset,
     #[serde(skip_serializing_if = "crate::terminal_agent::design::Catalog::is_default")]
     pub(super) ai_agent_designs: crate::terminal_agent::design::Catalog,
+    #[serde(skip_serializing_if = "super::terminal_agent::design::DockPreferences::is_empty")]
+    pub(super) ai_agent_panel: super::terminal_agent::design::DockPreferences,
     #[serde(skip_serializing_if = "BoldTextMode::is_default")]
     pub(super) terminal_bold_text_mode: BoldTextMode,
     pub(super) hide_terminal_scrollbars_in_fullscreen: bool,
@@ -183,8 +245,16 @@ pub(super) struct WindowSettings {
     pub(super) journal_dock: super::journal_dock::Preferences,
     #[serde(skip_serializing_if = "super::journal_appearance::Preferences::is_default")]
     pub(super) journal_appearance: super::journal_appearance::Preferences,
-    #[serde(skip_serializing_if = "default_journal_edit_split")]
-    pub(super) journal_edit_split: u16,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) journal_edit_split: Option<u16>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) journal_manager_geometry: Option<super::journal_access::dialog_geometry::Geometry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) journal_viewer_geometry: Option<super::journal_access::dialog_geometry::Geometry>,
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(super) java_dialog_geometry: super::backup_data::dialog_geometry::Placements,
+    #[serde(skip_serializing_if = "super::backup_data::JavaLocalDock::is_empty")]
+    pub(super) java_local_dock: super::backup_data::JavaLocalDock,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(super) journal_marker_geometry: Option<super::journal_access::dialog_geometry::Geometry>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -195,6 +265,11 @@ pub(super) struct WindowSettings {
 impl Default for WindowSettings {
     fn default() -> Self {
         Self {
+            journal_live_log_height: None,
+            scheduler_journal_divider: None,
+            java_update_opt_in: false,
+            java_teamwork: None,
+            java_swarm_journal: None,
             startup: StartupPreferences::default(),
             prevent_system_sleep: false,
             open_recent: super::open_recent::Preferences::default(),
@@ -202,28 +277,52 @@ impl Default for WindowSettings {
             session_journal: crate::session_journal::Settings::default(),
             journal_ai: crate::session_journal::topic_ai_settings::Preferences::default(),
             journal_note_translation_language: String::new(),
+            snippet_translation_target_language: None,
+            snippet_alternative_count: None,
             journal_marker_geometry: None,
+            journal_manager_geometry: None,
+            journal_viewer_geometry: None,
+            java_dialog_geometry: Default::default(),
+            java_local_dock: Default::default(),
             journal_screenshot_geometry: None,
             export_branding: crate::session_journal::export_branding::Preferences::default(),
             snippet_analysis_export_include_code: false,
             open_tool_windows_as_tabs: false,
             sftp_conflict_default: Default::default(),
             sftp_parallel_transfers: crate::sftp_window::parallel::DEFAULT_PARALLEL,
+            sftp_show_hidden_local: None,
+            sftp_show_hidden_remote: None,
+            sftp_comparison_ai_font_size: None,
             sftp_resume_partial_transfers: true,
             sftp_keep_partial_on_cancel: false,
             sftp_idle_minutes: None,
             sftp_archive: Default::default(),
             manual_scale: DEFAULT_MANUAL_SCALE,
+            ascii_art_preview_font_size: None,
             editor_caret: crate::editor_window::caret::Preferences::default(),
             snippet_structure: crate::snippet_window::structure::Preferences::default(),
+            snippet_analysis_panel: Default::default(),
+            snippet_apply_progress_dock: None,
             snippet_appearance: crate::snippet_window::appearance::Preferences::default(),
             snippet_analysis_auto_diagram: true,
             snippet_analysis_auto_modularization: false,
+            snippet_analysis_report_font_size: None,
+            snippet_analysis_history_limit: None,
+            snippet_history_limit: None,
+            snippet_analysis_content_limit: None,
+            snippet_analysis_hardening_expanded: None,
+            snippet_analysis_diagram_options_expanded: None,
+            snippet_analysis_project_diagram_visible: None,
+            snippet_diagram_horizontal: None,
+            snippet_diagram_appearance: Default::default(),
+            custom_snippet_code_languages: Vec::new(),
             snippet_hardening: Default::default(),
             workflow_header_defaults: WorkflowHeaderDefaults::default(),
             workflow_single_language: false,
             workflow_script_font: DEFAULT_WORKFLOW_FONT,
             job_menu_status_enabled: true,
+            scheduler_diagram_horizontal: None,
+            scheduler_diagram_color_mode: None,
             logfile_presentation: Default::default(),
             job_scheduler_journal_retention_days: 0,
             connection_color_border_enabled: true,
@@ -231,10 +330,16 @@ impl Default for WindowSettings {
             tab_title_from_shell_enabled: true,
             tab_switch_most_recent_first: false,
             prompt_navigation_enabled: true,
+            automatic_local_shell_integration: None,
             command_timestamps_enabled: false,
             terminal_silence_seconds: 30,
             terminal_link_detection_enabled: true,
+            terminal_drag_drop: None,
             serial_default_encoding: kortty_terminal::TextEncoding::default(),
+            confirm_busy_terminal_close: true,
+            skip_terminal_group_close_confirmation: None,
+            ssh_default_encoding: None,
+            java_ssh_encoding_hint: None,
             terminal_columns: None,
             terminal_rows: None,
             terminal_copy_on_select_enabled: true,
@@ -255,6 +360,7 @@ impl Default for WindowSettings {
             coding_agent_dock: super::coding_agent_dock::Preferences::default(),
             ai_agent_design: Default::default(),
             ai_agent_designs: Default::default(),
+            ai_agent_panel: Default::default(),
             terminal_bold_text_mode: BoldTextMode::default(),
             hide_terminal_scrollbars_in_fullscreen: false,
             terminal_transparency: 0,
@@ -274,7 +380,7 @@ impl Default for WindowSettings {
             terminal_effects: crate::terminal_effects::Preferences::default(),
             journal_dock: super::journal_dock::Preferences::default(),
             journal_appearance: super::journal_appearance::Preferences::default(),
-            journal_edit_split: DEFAULT_JOURNAL_EDIT_SPLIT,
+            journal_edit_split: None,
         }
     }
 }
@@ -304,6 +410,10 @@ impl WindowSettings {
         self.show_terminal_scrollbar && !(fullscreen && self.hide_terminal_scrollbars_in_fullscreen)
     }
 
+    pub(super) fn automatic_local_shell_integration(&self) -> bool {
+        self.automatic_local_shell_integration.unwrap_or(true)
+    }
+
     fn decode_sidebar_width<'de, D: serde::Deserializer<'de>>(
         deserializer: D,
     ) -> Result<u16, D::Error> {
@@ -320,7 +430,9 @@ impl WindowSettings {
     pub(super) fn terminal_appearance(&self) -> Appearance {
         Appearance {
             bold_text_mode: self.terminal_bold_text_mode,
-            ..self.colors.appearance(self.themes.appearance())
+            ..self
+                .colors
+                .appearance(self.themes.terminal_scheme(self.colors.cursor_style))
         }
     }
 
@@ -462,6 +574,9 @@ impl WindowSettings {
             !name.trim().is_empty() && name != MONOSPACED && !name.chars().any(char::is_control)
         });
         settings.snippet_appearance.normalize();
+        if !crate::snippet_window::languages::valid(&settings.custom_snippet_code_languages) {
+            settings.custom_snippet_code_languages.clear();
+        }
         settings.paste_large_warning_kib = settings
             .paste_large_warning_kib
             .min(paste_protection::MAX_PASTE_KIB);
@@ -474,6 +589,8 @@ impl WindowSettings {
         if settings.journal_ai.validate().is_err() {
             settings.journal_ai = crate::session_journal::topic_ai_settings::Preferences {
                 auto_screenshot_analysis: settings.journal_ai.auto_screenshot_analysis,
+                summaries_enabled: settings.journal_ai.summaries_enabled,
+                screenshot_analysis_enabled: settings.journal_ai.screenshot_analysis_enabled,
                 ..Default::default()
             };
         }
@@ -490,6 +607,38 @@ impl WindowSettings {
 
     pub(super) fn validate_backup(bytes: &[u8]) -> io::Result<()> {
         let settings = Self::decode(bytes)?;
+        if settings
+            .ascii_art_preview_font_size
+            .is_some_and(|size| !super::ascii_art::valid_preview_font(size))
+        {
+            return Err(io::Error::other("Invalid ASCII Art preview font size"));
+        }
+        settings.validate_analysis_retention()?;
+        if settings
+            .journal_live_log_height
+            .is_some_and(|height| !super::journal_dock::LIVE_LOG_HEIGHT.contains(&height))
+        {
+            return Err(io::Error::other("Invalid Live Journal log height"));
+        }
+        if settings
+            .scheduler_journal_divider
+            .is_some_and(|parts| !crate::scheduler_window::JOURNAL_DIVIDER_RANGE.contains(&parts))
+        {
+            return Err(io::Error::other(
+                "Invalid Scheduler journal divider position",
+            ));
+        }
+        if let Some(proposals) = &settings.java_teamwork {
+            proposals.validate()?;
+        }
+        if let Some(options) = &settings.java_swarm_journal {
+            super::backup_data::validate_java_swarm_journal(options)?;
+        }
+        super::backup_data::dialog_geometry::validate(&settings.java_dialog_geometry)?;
+        settings.java_local_dock.validate()?;
+        if !settings.ai_agent_panel.valid() {
+            return Err(io::Error::other("Invalid Agent panel width"));
+        }
         if !crate::terminal_highlight::valid_id(&settings.logfile_presentation.keyword_set) {
             return Err(io::Error::other("Invalid logfile highlight set ID"));
         }
@@ -498,6 +647,7 @@ impl WindowSettings {
         settings.session_journal.validate()?;
         settings.journal_ai.validate()?;
         settings.quick_select.validate()?;
+        settings.validate_snippet_languages()?;
         settings.validate_silence_threshold()?;
         settings.validate_application_updates()?;
         if !super::session_restore::OutputPreferences::LINES
@@ -573,6 +723,7 @@ impl WindowSettings {
     }
 
     fn encoded(&self) -> io::Result<Vec<u8>> {
+        self.validate_analysis_retention()?;
         self.validate_job_journal_retention()?;
         self.validate_sftp()?;
         self.validate_initial_terminal_size()?;
@@ -583,6 +734,7 @@ impl WindowSettings {
         self.session_journal.validate()?;
         self.journal_ai.validate()?;
         self.quick_select.validate()?;
+        self.validate_snippet_languages()?;
         self.validate_silence_threshold()?;
         if !self.themes.valid() {
             return Err(io::Error::other("invalid terminal theme settings"));
@@ -592,6 +744,51 @@ impl WindowSettings {
             return Err(io::Error::other("window settings exceed the size limit"));
         }
         Ok(bytes)
+    }
+
+    fn validate_snippet_languages(&self) -> io::Result<()> {
+        if self.snippet_alternative_count.is_some_and(|count| {
+            !crate::snippet_window::ai_assist::ALTERNATIVE_COUNTS.contains(&count)
+        }) {
+            return Err(io::Error::other("Invalid snippet alternative count"));
+        }
+        if !crate::snippet_window::languages::valid(&self.custom_snippet_code_languages) {
+            return Err(io::Error::other("Invalid saved snippet language catalogue"));
+        }
+        if self
+            .snippet_translation_target_language
+            .as_deref()
+            .is_some_and(|language| {
+                crate::snippet_window::ai_assist::translation_language(language).is_none()
+            })
+        {
+            return Err(io::Error::other(
+                "Invalid saved snippet translation language",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_analysis_retention(&self) -> io::Result<()> {
+        if self
+            .snippet_history_limit
+            .is_some_and(|limit| !crate::snippets::history::LIMITS.contains(&limit))
+        {
+            return Err(io::Error::other("Invalid snippet version history limit"));
+        }
+        if self
+            .snippet_analysis_history_limit
+            .is_some_and(|value| !HISTORY_LIMITS.contains(&value))
+        {
+            return Err(io::Error::other("Invalid snippet analysis history limit"));
+        }
+        if self
+            .snippet_analysis_content_limit
+            .is_some_and(|limit| !valid_content_limit(limit))
+        {
+            return Err(io::Error::other("Invalid snippet analysis source limit"));
+        }
+        Ok(())
     }
 
     fn validate_job_journal_retention(&self) -> io::Result<()> {
@@ -649,6 +846,22 @@ impl WindowSettings {
         kortty_ssh::KeepAlive::new(self.ssh_keepalive_enabled, self.ssh_keepalive_interval)
             .map(|_| ())
     }
+}
+
+pub(crate) fn analysis_history_limit_at(profile: &Path) -> u8 {
+    WindowSettings::read(&profile.join("window-settings.json"))
+        .ok()
+        .and_then(|settings| settings.snippet_analysis_history_limit)
+        .filter(|value| HISTORY_LIMITS.contains(value))
+        .unwrap_or(DEFAULT_HISTORY_LIMIT)
+}
+
+pub(crate) fn analysis_content_limit_at(profile: &Path) -> usize {
+    WindowSettings::read(&profile.join("window-settings.json"))
+        .ok()
+        .and_then(|settings| settings.snippet_analysis_content_limit)
+        .filter(|&limit| valid_content_limit(limit))
+        .unwrap_or(DEFAULT_CONTENT_BYTES)
 }
 
 impl Workspace {
@@ -937,10 +1150,10 @@ mod tests {
         );
         assert!(fresh.journal_ai.auto_screenshot_analysis);
         assert_eq!(
-            fresh.appearance.design,
+            fresh.appearance.design(),
             appearance::Design::AtlantaFxPrimerDark
         );
-        assert!(fresh.appearance.animations);
+        assert!(fresh.appearance.animations());
         let preferences = WindowSettings {
             open_tool_windows_as_tabs: true,
             manual_scale: 140,
@@ -974,8 +1187,8 @@ mod tests {
         assert_eq!(old_profile.manual_scale, DEFAULT_MANUAL_SCALE);
         assert!(old_profile.connection_color_border_enabled);
         assert!(old_profile.split_pane_focus_ring_enabled);
-        assert_eq!(old_profile.appearance.design, appearance::Design::Normal);
-        assert!(old_profile.appearance.animations);
+        assert_eq!(old_profile.appearance.design(), appearance::Design::Normal);
+        assert!(old_profile.appearance.animations());
         assert!(old_profile.prompt_navigation_enabled);
         assert!(!old_profile.command_timestamps_enabled);
         assert!(!old_profile.clipboard_read_enabled && !old_profile.clipboard_write_enabled);

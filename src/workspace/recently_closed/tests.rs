@@ -69,6 +69,12 @@ fn reopens_a_fresh_single_pane_shell_with_its_title_tab_group_and_original_font(
     tab_state.focused = split;
 
     let _ = workspace.update(Desktop::CloseTab(owner, tab));
+    let Some((request, SerialClose::Tab(target))) = workspace.windows[&owner].pending_serial_close
+    else {
+        panic!("expected split tab confirmation");
+    };
+    assert_eq!(target, tab);
+    let _ = workspace.update(Desktop::ConfirmSerialClose(owner, request, true));
     let rows = workspace.recently_closed_menu_rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1, "original shell");
@@ -139,10 +145,16 @@ fn explicit_window_close_is_one_entry_and_reopens_in_another_window_when_occupie
     let (closing, _) = workspace.open_window(false);
     let (requesting, _) = workspace.open_window(false);
     add_shell(&mut workspace, requesting, false, "existing");
-    add_shell(&mut workspace, closing, false, "first");
+    let (_, first) = add_shell(&mut workspace, closing, false, "first");
     add_shell(&mut workspace, closing, false, "second");
+    wait_running(&workspace, first);
 
     let _ = workspace.request_close(closing, SerialClose::Window);
+    let Some((request, SerialClose::Window)) = workspace.windows[&closing].pending_serial_close
+    else {
+        panic!("expected window confirmation for a connected terminal");
+    };
+    let _ = workspace.update(Desktop::ConfirmSerialClose(closing, request, true));
     let rows = workspace.recently_closed_menu_rows();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1, "Window: first, second");

@@ -124,7 +124,12 @@ impl Workspace {
             window.cancel_paste();
             window.pending_ibm = None;
             window.pending_serial = None;
-            window.pending_serial_close = None;
+            if !matches!(
+                window.pending_serial_close,
+                Some((_, super::SerialClose::Quit))
+            ) {
+                window.pending_serial_close = None;
+            }
             window.transfer_open = false;
         }
     }

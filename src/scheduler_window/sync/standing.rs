@@ -301,6 +301,8 @@ pub(crate) struct Stored {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     replacement: Option<Replacement>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    tree: Option<Box<TreeState>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     latest_calendar: Option<SystemTime>,
     // A Chain round requires every predecessor to finish after the previous firing.
     // Keep the cutoff when an approval or its dependency set changes.
@@ -315,6 +317,20 @@ impl Stored {
 
     fn valid(&self) -> bool {
         self.approval.valid(self.replacement.is_some())
+            && !(self.replacement.is_some() && self.tree.is_some())
+            && self.tree.as_ref().is_none_or(|state| {
+                state.receiver != [0; 32]
+                    && state.receiver == self.approval.anchors
+                    && state.successor.is_none_or(|receiver| {
+                        state.create_root
+                            && !self.claims.is_empty()
+                            && receiver != [0; 32]
+                            && receiver != state.receiver
+                    })
+                    && state
+                        .pending
+                        .is_none_or(|firing| self.claims.last() == Some(&firing))
+            })
             && self.replacement.as_ref().is_none_or(|state| {
                 state.fingerprint != [0; 32]
                     && state
@@ -379,6 +395,31 @@ pub(crate) struct ReplacementApproval {
     pub(crate) fingerprint: [u8; 32],
 }
 
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct TreeState {
+    receiver: [u8; 32],
+    pending: Option<Firing>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    create_root: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successor: Option<[u8; 32]>,
+}
+
+impl TreeState {
+    fn matches(&self, expected: &TreeApproval) -> bool {
+        self.successor.unwrap_or(self.receiver) == expected.receiver
+            && (self.create_root && self.successor.is_none()) == expected.create_root
+    }
+}
+
+#[derive(Clone, Eq, PartialEq)]
+pub(crate) struct TreeApproval {
+    pub(crate) approval: Approval,
+    pub(crate) receiver: [u8; 32],
+    pub(crate) create_root: bool,
+}
+
 type Index = BTreeMap<JobId, Stored>;
 
 impl Store {
@@ -390,7 +431,7 @@ impl Store {
         now: SystemTime,
     ) -> io::Result<Approval> {
         let stored = self.load_current_standing(job, approval, scope, now)?;
-        if stored.replacement.is_some() {
+        if stored.replacement.is_some() || stored.tree.is_some() {
             return Err(needs_review());
         }
         Ok(stored.approval)
@@ -408,6 +449,9 @@ impl Store {
         if admission.is_some_and(|admission| !stored.can_admit_replacement(job, admission)) {
             return Err(needs_review());
         }
+        if stored.tree.is_some() {
+            return Err(needs_review());
+        }
         let state = stored.replacement.ok_or_else(needs_review)?;
         if state.pending.is_some() {
             return Err(io::Error::other(
@@ -417,6 +461,123 @@ impl Store {
         Ok(ReplacementApproval {
             approval: stored.approval,
             fingerprint: state.fingerprint,
+        })
+    }
+
+    pub(crate) fn load_tree(
+        &self,
+        job: &JobId,
+        approval: Option<&str>,
+        scope: [u8; 32],
+        now: SystemTime,
+        admission: Option<&Admission>,
+    ) -> io::Result<TreeApproval> {
+        let stored = self.load_current_standing(job, approval, scope, now)?;
+        if stored.replacement.is_some()
+            || admission.is_some_and(|admission| !stored.can_admit_replacement(job, admission))
+        {
+            return Err(needs_review());
+        }
+        let state = stored.tree.ok_or_else(needs_review)?;
+        if state.pending.is_some() {
+            return Err(io::Error::other(
+                "The previous protected folder run is unconfirmed. Review the receiver again.",
+            ));
+        }
+        Ok(TreeApproval {
+            approval: stored.approval,
+            receiver: state.successor.unwrap_or(state.receiver),
+            create_root: state.create_root && state.successor.is_none(),
+        })
+    }
+
+    pub(super) fn swap_tree(
+        &self,
+        job: &JobId,
+        approval: Approval,
+        create_root: bool,
+        keep: impl Fn(&JobId) -> bool,
+    ) -> io::Result<Option<Stored>> {
+        if approval.anchors == [0; 32] {
+            return Err(needs_review());
+        }
+        let tree = TreeState {
+            receiver: approval.anchors,
+            pending: None,
+            create_root,
+            successor: None,
+        };
+        self.swap_standing_receipt(job, approval, None, Some(Box::new(tree)), keep)
+    }
+
+    pub(crate) fn arm_tree(
+        &self,
+        job: &JobId,
+        expected: &TreeApproval,
+        admission: &Admission,
+        usage: (usize, u64),
+        stopped: &dyn Fn() -> bool,
+    ) -> io::Result<()> {
+        require_running(stopped)?;
+        if !expected.approval.limits.allows(usage.0, usage.1) {
+            return Err(needs_review());
+        }
+        self.change_standing(Some(stopped), |index| {
+            require_running(stopped)?;
+            let stored = index
+                .get_mut(job)
+                .filter(|stored| {
+                    stored.approval == expected.approval
+                        && stored.approval.active_at(SystemTime::now())
+                        && stored.can_admit_replacement(job, admission)
+                        && stored
+                            .tree
+                            .as_ref()
+                            .is_some_and(|state| state.matches(expected) && state.pending.is_none())
+                })
+                .ok_or_else(needs_review)?;
+            stored.admit(admission)?;
+            stored.tree.as_mut().ok_or_else(needs_review)?.pending = Some(admission.firing());
+            Ok(())
+        })
+    }
+
+    pub(crate) fn require_tree_claimed(
+        &self,
+        job: &JobId,
+        expected: &TreeApproval,
+        firing: Firing,
+    ) -> io::Result<()> {
+        self.standing_snapshot()?
+            .get(job)
+            .filter(|stored| {
+                stored.approval.active_at(SystemTime::now()) && armed_tree(stored, expected, firing)
+            })
+            .map(|_| ())
+            .ok_or_else(needs_review)
+    }
+
+    pub(crate) fn finish_tree(
+        &self,
+        job: &JobId,
+        expected: &TreeApproval,
+        firing: Firing,
+        receiver: [u8; 32],
+    ) -> io::Result<()> {
+        if receiver == [0; 32] || (receiver == expected.receiver) == expected.create_root {
+            return Err(needs_review());
+        }
+        self.change_standing(Some(&|| false), |index| {
+            let stored = index
+                .get_mut(job)
+                .filter(|stored| armed_tree(stored, expected, firing))
+                .ok_or_else(needs_review)?;
+            let state = stored.tree.as_mut().ok_or_else(needs_review)?;
+            if expected.create_root {
+                state.successor = Some(receiver);
+            }
+            state.pending = None;
+            Ok(())
         })
     }
 
@@ -445,7 +606,7 @@ impl Store {
         approval: Approval,
         keep: impl Fn(&JobId) -> bool,
     ) -> io::Result<Option<Stored>> {
-        self.swap_standing_receipt(job, approval, None, keep)
+        self.swap_standing_receipt(job, approval, None, None, keep)
     }
 
     pub(in crate::scheduler_window) fn swap_replacement(
@@ -458,7 +619,7 @@ impl Store {
             fingerprint: approval.anchors,
             pending: None,
         };
-        self.swap_standing_receipt(job, approval, Some(replacement), keep)
+        self.swap_standing_receipt(job, approval, Some(replacement), None, keep)
     }
 
     fn swap_standing_receipt(
@@ -466,6 +627,7 @@ impl Store {
         job: &JobId,
         approval: Approval,
         replacement: Option<Replacement>,
+        tree: Option<Box<TreeState>>,
         keep: impl Fn(&JobId) -> bool,
     ) -> io::Result<Option<Stored>> {
         if !approval.valid(replacement.is_some()) || !approval.active_at(SystemTime::now()) {
@@ -482,6 +644,7 @@ impl Store {
                     approval,
                     claims: Vec::new(),
                     replacement,
+                    tree,
                     latest_calendar,
                     latest_firing_started_at,
                 },
@@ -534,6 +697,7 @@ impl Store {
                 .filter(|stored| {
                     stored.approval == *expected
                         && stored.replacement.is_none()
+                        && stored.tree.is_none()
                         && stored.approval.active_at(SystemTime::now())
                         && stored.has_capacity()
                         && !stored.claims.contains(&admission.firing())
@@ -555,6 +719,7 @@ impl Store {
             .filter(|stored| {
                 stored.approval == *expected
                     && stored.replacement.is_none()
+                    && stored.tree.is_none()
                     && stored.approval.active_at(now)
                     && stored.claims.contains(&firing)
             })
@@ -663,6 +828,15 @@ impl Store {
     }
 }
 
+fn armed_tree(stored: &Stored, expected: &TreeApproval, firing: Firing) -> bool {
+    stored.approval == expected.approval
+        && stored
+            .tree
+            .as_ref()
+            .is_some_and(|state| state.matches(expected) && state.pending == Some(firing))
+        && stored.claims.last() == Some(&firing)
+}
+
 fn armed_replacement<'a>(
     stored: &'a Stored,
     expected: &ReplacementApproval,
@@ -714,6 +888,271 @@ mod tests {
     use crate::scheduler_window::tests::Profile;
     use kortty_jobs::{JobGraph, RunOutcome, Scheduler};
     use std::num::NonZeroU32;
+
+    #[test]
+    fn recurring_protected_tree_creation_advances_only_confirmed_receiver_and_never_reuses_vacancy()
+    {
+        let profile = Profile::temporary();
+        let store = Store::new(profile.file().parent().unwrap());
+        let job = JobId::new("create-protected-tree").unwrap();
+        let approval = Approval::new(
+            [2; 32],
+            vec!["Pinned server".into()],
+            [3; 32],
+            SystemTime::now() + Duration::from_secs(DAY),
+            Limits {
+                max_firings: 3,
+                max_actions: 8,
+                max_bytes: 32,
+            },
+        )
+        .unwrap();
+        store
+            .swap_tree(&job, approval.clone(), true, |_| true)
+            .unwrap();
+        let now = SystemTime::now();
+        let first = calendar_admission(&job, firing(1, 1), now);
+        let load = |store: &Store, admission| {
+            store.load_tree(
+                &job,
+                Some(&approval.approval),
+                approval.scope,
+                now,
+                admission,
+            )
+        };
+        let vacancy = load(&store, Some(&first)).unwrap();
+        assert!(vacancy.create_root);
+        assert_eq!(vacancy.receiver, [3; 32]);
+        assert!(
+            store
+                .finish_tree(&job, &vacancy, first.firing(), [4; 32])
+                .is_err()
+        );
+        store
+            .arm_tree(&job, &vacancy, &first, (3, 8), &|| false)
+            .unwrap();
+        let reopened = Store::new(profile.file().parent().unwrap());
+        assert!(load(&reopened, None).is_err());
+        for invalid in [[0; 32], vacancy.receiver] {
+            assert!(
+                reopened
+                    .finish_tree(&job, &vacancy, first.firing(), invalid)
+                    .is_err()
+            );
+        }
+        reopened
+            .finish_tree(&job, &vacancy, first.firing(), [4; 32])
+            .unwrap();
+        let receiver = load(&Store::new(profile.file().parent().unwrap()), None).unwrap();
+        assert!(!receiver.create_root);
+        assert_eq!(receiver.receiver, [4; 32]);
+        assert!(
+            store
+                .require_tree_claimed(&job, &vacancy, first.firing())
+                .is_err()
+        );
+        assert!(
+            store
+                .finish_tree(&job, &vacancy, first.firing(), [5; 32])
+                .is_err()
+        );
+        let second = calendar_admission(&job, firing(1, 2), now + Duration::from_secs(1));
+        assert!(
+            store
+                .arm_tree(&job, &vacancy, &second, (1, 1), &|| false)
+                .is_err()
+        );
+        store
+            .arm_tree(&job, &receiver, &second, (1, 1), &|| false)
+            .unwrap();
+        // A later merge may only confirm the first created receiver, never a replacement root.
+        assert!(
+            store
+                .finish_tree(&job, &receiver, second.firing(), [5; 32])
+                .is_err()
+        );
+        store
+            .finish_tree(&job, &receiver, second.firing(), [4; 32])
+            .unwrap();
+        assert_eq!(load(&store, None).unwrap().receiver, [4; 32]);
+    }
+
+    #[test]
+    fn recurring_protected_tree_requires_confirmed_completion_and_preserves_pending_on_reopen() {
+        let profile = Profile::temporary();
+        let root = profile.file().parent().unwrap().to_owned();
+        let store = Store::new(&root);
+        let job = JobId::new("protected-tree").unwrap();
+        let approval = Approval::new(
+            [2; 32],
+            vec!["Pinned server".into()],
+            [3; 32],
+            SystemTime::now() + Duration::from_secs(DAY),
+            Limits {
+                max_firings: 2,
+                max_actions: 8,
+                max_bytes: 32,
+            },
+        )
+        .unwrap();
+        let now = approval.issued_at;
+        let first = calendar_admission(&job, firing(1, 1), now);
+        let second = calendar_admission(&job, firing(2, 1), now + Duration::from_secs(1));
+        store
+            .swap_tree(&job, approval.clone(), false, |_| true)
+            .unwrap();
+        let load = |store: &Store, admission| {
+            store.load_tree(
+                &job,
+                Some(&approval.approval),
+                approval.scope,
+                SystemTime::now(),
+                admission,
+            )
+        };
+        assert!(
+            store
+                .load_standing(&job, Some(&approval.approval), approval.scope, now)
+                .is_err()
+        );
+        assert!(
+            store
+                .load_replacement(&job, Some(&approval.approval), approval.scope, now, None)
+                .is_err()
+        );
+        let receipt = load(&store, Some(&first)).unwrap();
+        assert!(
+            store
+                .arm_tree(&job, &receipt, &first, (9, 1), &|| false)
+                .is_err()
+        );
+        assert!(
+            store
+                .arm_tree(&job, &receipt, &first, (1, 33), &|| false)
+                .is_err()
+        );
+        assert!(
+            store
+                .arm_tree(&job, &receipt, &first, (1, 1), &|| true)
+                .is_err()
+        );
+        store
+            .arm_tree(&job, &receipt, &first, (3, 8), &|| false)
+            .unwrap();
+        let reopened = Store::new(&root);
+        assert!(load(&reopened, Some(&second)).is_err());
+        assert!(
+            reopened
+                .finish_tree(&job, &receipt, second.firing(), [3; 32])
+                .is_err()
+        );
+        assert!(
+            reopened
+                .finish_tree(&job, &receipt, first.firing(), [0; 32])
+                .is_err()
+        );
+        assert!(
+            reopened
+                .finish_tree(&job, &receipt, first.firing(), [4; 32])
+                .is_err()
+        );
+        reopened
+            .require_tree_claimed(&job, &receipt, first.firing())
+            .unwrap();
+        reopened
+            .finish_tree(&job, &receipt, first.firing(), [3; 32])
+            .unwrap();
+        assert!(load(&reopened, Some(&first)).is_err());
+        let replay = calendar_admission(&job, firing(2, 2), now);
+        assert!(load(&reopened, Some(&replay)).is_err());
+        let receipt = load(&reopened, Some(&second)).unwrap();
+        reopened
+            .arm_tree(&job, &receipt, &second, (0, 0), &|| false)
+            .unwrap();
+        reopened
+            .require_tree_claimed(&job, &receipt, second.firing())
+            .unwrap();
+        reopened
+            .finish_tree(&job, &receipt, second.firing(), [3; 32])
+            .unwrap();
+        let third = calendar_admission(&job, firing(3, 1), now + Duration::from_secs(2));
+        assert!(load(&reopened, Some(&third)).is_err());
+    }
+
+    #[test]
+    fn recurring_protected_tree_reapproval_revokes_pending_workers_and_retains_calendar_cutoff() {
+        let profile = Profile::temporary();
+        let root = profile.file().parent().unwrap().to_owned();
+        let store = Store::new(&root);
+        let job = JobId::new("protected-tree-reapproval").unwrap();
+        let create = || {
+            Approval::new(
+                [2; 32],
+                vec!["Pinned server".into()],
+                [3; 32],
+                SystemTime::now() + Duration::from_secs(DAY),
+                Settings::default().limits,
+            )
+            .unwrap()
+        };
+        let original = create();
+        let now = original.issued_at;
+        let first = calendar_admission(&job, firing(1, 1), now);
+        store
+            .swap_tree(&job, original.clone(), false, |_| true)
+            .unwrap();
+        let receipt = store
+            .load_tree(
+                &job,
+                Some(&original.approval),
+                original.scope,
+                now,
+                Some(&first),
+            )
+            .unwrap();
+        store
+            .arm_tree(&job, &receipt, &first, (1, 1), &|| false)
+            .unwrap();
+        let replacement = create();
+        store
+            .swap_tree(&job, replacement.clone(), false, |_| true)
+            .unwrap();
+        assert!(
+            store
+                .require_tree_claimed(&job, &receipt, first.firing())
+                .is_err()
+        );
+        assert!(
+            store
+                .finish_tree(&job, &receipt, first.firing(), [3; 32])
+                .is_err()
+        );
+        let same_event = calendar_admission(&job, firing(2, 1), now);
+        assert!(
+            store
+                .load_tree(
+                    &job,
+                    Some(&replacement.approval),
+                    replacement.scope,
+                    SystemTime::now(),
+                    Some(&same_event)
+                )
+                .is_err()
+        );
+        let next = calendar_admission(&job, firing(2, 2), now + Duration::from_secs(1));
+        assert!(
+            store
+                .load_tree(
+                    &job,
+                    Some(&replacement.approval),
+                    replacement.scope,
+                    SystemTime::now(),
+                    Some(&next)
+                )
+                .is_ok()
+        );
+    }
 
     #[test]
     fn recurring_protected_replacement_persists_only_confirmed_receivers() {

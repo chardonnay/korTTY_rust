@@ -227,7 +227,11 @@ impl Draft {
     }
 
     pub(crate) fn swarm_view(&self, profiles: Vec<SummaryProvider>) -> Element<'_, Event> {
-        self.view_with_input(None, false, profiles)
+        self.view_with_input(
+            Some("Include reviewed commands sent to each target"),
+            false,
+            profiles,
+        )
     }
 
     fn view_with_input(

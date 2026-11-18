@@ -322,7 +322,7 @@ fn front_client(point: NSPoint, main: MainThreadMarker) -> Option<TabHit> {
     client_point(&window, number, window.convertPointFromScreen(point))
 }
 
-fn client_point(window: &NSWindow, number: isize, point: NSPoint) -> Option<TabHit> {
+pub(super) fn client_point(window: &NSWindow, number: isize, point: NSPoint) -> Option<TabHit> {
     let view = window.contentView()?;
     let content = view.bounds();
     let point = view.convertPoint_fromView(point, None);

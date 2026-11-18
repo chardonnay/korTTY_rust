@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use iced::widget::{
-    button, column, container, pick_list, row, rule, scrollable, space, stack, text, text_input,
-    tooltip,
+    button, checkbox, column, container, pick_list, row, rule, scrollable, space, stack, text,
+    text_input, tooltip,
 };
 use iced::{Alignment, Color, Element, Length, Theme};
 
@@ -19,7 +19,8 @@ use crate::terminal_theme::Themes;
 use super::color::ColorDraft;
 use super::selection::{RowKey, VisualRow};
 use super::{
-    ConnectionWindow, CredentialChoice, FolderDialog, Message, Scope, TeamworkAuthDraft, os_badge,
+    ConnectionWindow, CredentialChoice, FolderDialog, JavaTeamworkAuth, Message, Scope,
+    TeamworkAuthDraft, os_badge,
 };
 
 pub(super) mod icons;
@@ -62,6 +63,116 @@ struct TeamworkAuthChoice {
 impl fmt::Display for TeamworkAuthChoice {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(&self.label)
+    }
+}
+
+impl JavaTeamworkAuth {
+    fn choices(
+        &self,
+        passwords: &[CredentialChoice],
+        keys: &[KeyChoice],
+    ) -> Vec<TeamworkAuthChoice> {
+        use teamwork::DefaultAuth;
+
+        let username = self
+            .username
+            .as_deref()
+            .filter(|value| crate::ssh_dialog::valid_username(value))
+            .unwrap_or_default();
+        let mut options = Vec::new();
+        if self.credential.is_some() {
+            options.extend(passwords.iter().map(|choice| TeamworkAuthChoice {
+                value: DefaultAuth::Password {
+                    credential: choice.id.clone(),
+                },
+                label: format!("Vault password · {}", choice.label),
+            }));
+        }
+        if self.key.is_some() || self.username.is_some() {
+            options.extend(keys.iter().map(|choice| TeamworkAuthChoice {
+                value: DefaultAuth::Key {
+                    id: choice.id,
+                    username: username.to_owned(),
+                },
+                label: format!("SSH key · {}", choice.name),
+            }));
+        }
+        if self.temporary_key == Some(true) {
+            options.push(TeamworkAuthChoice {
+                value: DefaultAuth::TemporaryKey {
+                    username: username.to_owned(),
+                },
+                label: "Temporary SSH key".into(),
+            });
+        }
+        options
+    }
+
+    fn view<'a>(
+        &'a self,
+        choices: &ViewChoices<'_>,
+        editable: bool,
+        ordered: Option<&teamwork::OrderedAuth>,
+    ) -> Element<'a, Message> {
+        let mut body = column![text("Imported Java authentication").size(14)].spacing(4);
+        for (label, reference) in [
+            ("Java credential ID", &self.credential),
+            ("Java SSH key ID", &self.key),
+            ("Java SSH username", &self.username),
+        ] {
+            if let Some(reference) = reference {
+                body = body.push(
+                    text(format!("{label} · {reference}"))
+                        .size(13)
+                        .wrapping(text::Wrapping::WordOrGlyph),
+                );
+            }
+        }
+        if let Some(value) = self.temporary_key {
+            body = body.push(
+                text(if value {
+                    "Java temporary key preference · On"
+                } else {
+                    "Java temporary key preference · Off"
+                })
+                .size(13),
+            );
+        }
+        if editable {
+            let mut options = self.choices(choices.passwords, choices.keys);
+            if let Some(ordered) = ordered {
+                for option in &mut options {
+                    let mut settings = ordered.clone();
+                    let selected = option.value.ordered();
+                    if let Some(credential) = selected.credential {
+                        settings.credential = Some(credential);
+                    }
+                    if let Some(key) = selected.key {
+                        settings.key = Some(key);
+                    }
+                    settings.temporary_key |= selected.temporary_key;
+                    if let Some(username) = &self.username {
+                        settings.username.clone_from(username);
+                    }
+                    option.value = teamwork::DefaultAuth::Ordered(settings);
+                }
+            }
+            if !options.is_empty() {
+                body = body.push(
+                    pick_list(options, None::<TeamworkAuthChoice>, |choice| {
+                        Message::TeamworkAuthEdit(choice.value)
+                    })
+                    .placeholder("Select local authentication for the draft"),
+                );
+            } else if self.credential.is_some() || self.key.is_some() {
+                body = body.push(
+                    text("Add or unlock the local credential or SSH key to map this reference.")
+                        .size(13)
+                        .wrapping(text::Wrapping::WordOrGlyph),
+                );
+            }
+        }
+        body.into()
     }
 }
 
@@ -116,6 +227,89 @@ fn teamwork_auth_choices(
         label: label.into(),
     };
     (options, selected, false)
+}
+
+fn ordered_teamwork_controls<'a>(
+    settings: &'a teamwork::OrderedAuth,
+    choices: &ViewChoices<'_>,
+    editable: bool,
+) -> Element<'a, Message> {
+    use teamwork::DefaultAuth;
+
+    let choice = |settings, label: String| TeamworkAuthChoice {
+        value: DefaultAuth::Ordered(settings),
+        label,
+    };
+    let mut no_password = settings.clone();
+    no_password.credential = None;
+    let mut passwords = vec![choice(no_password, "No vault password".into())];
+    passwords.extend(choices.passwords.iter().map(|password| {
+        let mut next = settings.clone();
+        next.credential = Some(password.id.clone());
+        choice(next, password.label.clone())
+    }));
+    let password = passwords
+        .iter()
+        .find(|option| option.value.credential() == settings.credential.as_deref())
+        .cloned()
+        .unwrap_or_else(|| choice(settings.clone(), "Saved vault password unavailable".into()));
+
+    let mut no_key = settings.clone();
+    no_key.key = None;
+    let mut keys = vec![choice(no_key, "No registered SSH key".into())];
+    keys.extend(choices.keys.iter().map(|key| {
+        let mut next = settings.clone();
+        next.key = Some(key.id);
+        choice(next, key.name.clone())
+    }));
+    let key = keys
+        .iter()
+        .find(|option| option.value.key() == settings.key)
+        .cloned()
+        .unwrap_or_else(|| choice(settings.clone(), "Saved SSH key unavailable".into()));
+
+    let mut controls = column![text("Use the first available method").size(13)].spacing(6);
+    if editable {
+        controls = controls.push(
+            row![
+                pick_list(passwords, Some(password), |option| {
+                    Message::TeamworkAuthEdit(option.value)
+                }),
+                pick_list(keys, Some(key), |option| Message::TeamworkAuthEdit(
+                    option.value
+                )),
+                checkbox(settings.temporary_key)
+                    .label("Temporary SSH key")
+                    .on_toggle(move |temporary_key| {
+                        let mut next = settings.clone();
+                        next.temporary_key = temporary_key;
+                        Message::TeamworkAuthEdit(DefaultAuth::Ordered(next))
+                    }),
+                text_input("SSH username (optional)", &settings.username)
+                    .on_input(move |username| {
+                        let mut next = settings.clone();
+                        next.username = username;
+                        Message::TeamworkAuthEdit(DefaultAuth::Ordered(next))
+                    })
+                    .width(180),
+            ]
+            .spacing(8)
+            .align_y(Alignment::Center)
+            .wrap(),
+        );
+    } else {
+        controls = controls.push(text(format!(
+            "{} · {} · {}",
+            password.label,
+            key.label,
+            if settings.temporary_key {
+                "Temporary SSH key"
+            } else {
+                "No temporary SSH key"
+            }
+        )));
+    }
+    controls.into()
 }
 
 fn discard_confirmation() -> Element<'static, Message> {
@@ -317,7 +511,13 @@ impl ConnectionWindow {
 
         let editable = self.can_edit_teamwork_auth();
         let (options, selected, available) = teamwork_auth_choices(&auth.draft, choices);
-        let picker: Element<'_, Message> = if editable {
+        let ordered = match &auth.draft {
+            DefaultAuth::Ordered(settings) => Some(settings),
+            _ => None,
+        };
+        let picker: Element<'_, Message> = if let Some(settings) = ordered {
+            ordered_teamwork_controls(settings, choices, editable)
+        } else if editable {
             pick_list(options, Some(selected), |choice: TeamworkAuthChoice| {
                 Message::TeamworkAuthEdit(choice.value)
             })
@@ -351,7 +551,7 @@ impl ConnectionWindow {
                 picker,
                 username,
                 button("Apply").on_press_maybe(
-                    (available && self.teamwork_auth_change().is_some())
+                    ((available || ordered.is_some()) && self.teamwork_auth_change().is_some())
                         .then_some(Message::SaveTeamworkAuth)
                 ),
                 button("Discard changes")
@@ -365,11 +565,18 @@ impl ConnectionWindow {
             .wrap()
         ]
         .spacing(4);
+        if ordered.is_none() && editable {
+            body = body.push(
+                button("Set fallback methods").on_press(Message::TeamworkAuthEdit(
+                    DefaultAuth::Ordered(auth.draft.ordered()),
+                )),
+            );
+        }
         let issue = if self.teamwork_auth_saving {
             Some("Saving Teamwork authentication…".into())
         } else if auth.conflict {
             Some("The saved default changed in another window. Discard this draft to use the current setting.".into())
-        } else if !available {
+        } else if !available && ordered.is_none() {
             Some("Choose an available credential or SSH key before applying changes.".into())
         } else {
             auth.draft.validate().err().map(|error| error.to_string())
@@ -381,6 +588,9 @@ impl ConnectionWindow {
                     .style(text::secondary)
                     .wrapping(text::Wrapping::WordOrGlyph),
             );
+        }
+        if let Some(proposal) = &self.java_teamwork_auth {
+            body = body.push(proposal.view(choices, editable, ordered));
         }
         container(body)
             .padding([7, 10])
@@ -1635,6 +1845,60 @@ fn selectable(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style 
             base
         }
     }
+}
+
+#[cfg(test)]
+#[test]
+fn java_teamwork_auth_mapping_builds_only_locally_selectable_drafts() {
+    use teamwork::DefaultAuth;
+
+    let proposal = JavaTeamworkAuth {
+        credential: Some("java-password".into()),
+        key: Some("27".into()),
+        username: Some("operator".into()),
+        temporary_key: Some(true),
+    };
+    let passwords = [CredentialChoice {
+        id: "local-password".into(),
+        label: "Operations".into(),
+        username: "vault-user".into(),
+    }];
+    let keys = [KeyChoice {
+        id: 42,
+        name: "Team key".into(),
+    }];
+    let options = proposal
+        .choices(&passwords, &keys)
+        .into_iter()
+        .map(|option| option.value)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        options,
+        [
+            DefaultAuth::Password {
+                credential: "local-password".into()
+            },
+            DefaultAuth::Key {
+                id: 42,
+                username: "operator".into()
+            },
+            DefaultAuth::TemporaryKey {
+                username: "operator".into()
+            },
+        ]
+    );
+    let mut draft = TeamworkAuthDraft::new(DefaultAuth::Prompt);
+    assert!(draft.change().is_none());
+    draft.draft = options[1].clone();
+    assert_eq!(
+        draft.change(),
+        Some((DefaultAuth::Prompt, options[1].clone()))
+    );
+    let unavailable = JavaTeamworkAuth {
+        temporary_key: Some(false),
+        ..proposal
+    };
+    assert!(unavailable.choices(&[], &[]).is_empty());
 }
 
 #[cfg(test)]

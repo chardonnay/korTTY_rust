@@ -6,7 +6,9 @@ use roxmltree::Node;
 use serde::{Deserialize, Serialize};
 
 use crate::profile::RemoteProjectTool;
-use crate::sftp_window::{ArchivePreferences, ConflictDefault, parallel::MAX_PARALLEL};
+use crate::sftp_window::{
+    ArchivePreferences, ConflictDefault, comparison_ai, parallel::MAX_PARALLEL,
+};
 use crate::workspace::settings_window::sftp_settings::java::parallel_count;
 
 use super::{RawFields, java_flag, merge_unset_section, preference, preference_value};
@@ -20,6 +22,12 @@ pub(super) struct Preferences {
     sftp_resume_partial_transfers: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sftp_keep_partial_on_cancel: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sftp_show_hidden_local: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sftp_show_hidden_remote: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sftp_comparison_ai_font_size: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     sftp_conflict_default: Option<ConflictDefault>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -89,6 +97,16 @@ impl Preferences {
                 omitted,
                 java_flag,
             ),
+            sftp_show_hidden_local: preference(root, "sftpShowHiddenLocal", omitted, java_flag),
+            sftp_show_hidden_remote: preference(root, "sftpShowHiddenRemote", omitted, java_flag),
+            sftp_comparison_ai_font_size: preference(root, "sftpDiffAiFontSize", omitted, |text| {
+                text.parse::<i32>().ok().map(|size| {
+                    size.clamp(
+                        i32::from(comparison_ai::MIN_FONT_SIZE),
+                        i32::from(comparison_ai::MAX_FONT_SIZE),
+                    ) as u8
+                })
+            }),
             sftp_conflict_default: preference(
                 root,
                 "sftpConflictDefault",
@@ -113,6 +131,9 @@ impl Preferences {
             self.sftp_parallel_transfers.is_some(),
             self.sftp_resume_partial_transfers.is_some(),
             self.sftp_keep_partial_on_cancel.is_some(),
+            self.sftp_show_hidden_local.is_some(),
+            self.sftp_show_hidden_remote.is_some(),
+            self.sftp_comparison_ai_font_size.is_some(),
             self.sftp_conflict_default.is_some(),
             self.sftp_idle_minutes.is_some(),
         ]
@@ -129,6 +150,9 @@ impl Preferences {
         if self
             .sftp_parallel_transfers
             .is_some_and(|value| !(1..=MAX_PARALLEL).contains(&value))
+            || self.sftp_comparison_ai_font_size.is_some_and(|size| {
+                !(comparison_ai::MIN_FONT_SIZE..=comparison_ai::MAX_FONT_SIZE).contains(&size)
+            })
             || self
                 .sftp_idle_minutes
                 .is_some_and(|value| value > RemoteProjectTool::MAX_IDLE_MINUTES)
@@ -170,6 +194,58 @@ impl Preferences {
 #[cfg(test)]
 mod tests {
     use super::super::{merge_java_window_settings, portable_java_preferences};
+
+    #[test]
+    fn java_sftp_comparison_ai_font_clamps_and_preserves_a_native_choice() {
+        for (java, expected) in [("-5", 9), ("19", 19), ("500", 32)] {
+            let xml = format!(
+                "<globalSettings><sftpDiffAiFontSize>{java}</sftpDiffAiFontSize></globalSettings>"
+            );
+            let imported = portable_java_preferences(xml.as_bytes(), None).unwrap();
+            assert_eq!((imported.count, imported.omitted), (1, 0));
+            let incoming = imported.contents.unwrap();
+            let restored = merge_java_window_settings(None, &incoming, &Default::default())
+                .unwrap()
+                .unwrap();
+            let settings = super::super::WindowSettings::decode(&restored).unwrap();
+            assert_eq!(settings.sftp_comparison_ai_font_size, Some(expected));
+            assert!(
+                merge_java_window_settings(
+                    Some(br#"{"sftp_comparison_ai_font_size":21}"#),
+                    &incoming,
+                    &Default::default(),
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn java_sftp_hidden_preferences_restore_independently() {
+        let imported = portable_java_preferences(
+            br#"<globalSettings>
+                <sftpShowHiddenLocal>false</sftpShowHiddenLocal>
+                <sftpShowHiddenRemote>false</sftpShowHiddenRemote>
+            </globalSettings>"#,
+            None,
+        )
+        .unwrap();
+        assert_eq!((imported.count, imported.omitted), (2, 0));
+        let incoming = imported.contents.unwrap();
+        let native = br#"{"sftp_show_hidden_local":true}"#;
+        let restored = merge_java_window_settings(Some(native), &incoming, &Default::default())
+            .unwrap()
+            .unwrap();
+        let settings = super::super::WindowSettings::decode(&restored).unwrap();
+        assert_eq!(settings.sftp_show_hidden_local, Some(true));
+        assert_eq!(settings.sftp_show_hidden_remote, Some(false));
+        assert!(
+            merge_java_window_settings(Some(&restored), &incoming, &Default::default())
+                .unwrap()
+                .is_none()
+        );
+    }
 
     #[test]
     fn java_sftp_restore_preserves_explicit_disabled_and_empty_values() {

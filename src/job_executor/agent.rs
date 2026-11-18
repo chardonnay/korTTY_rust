@@ -243,7 +243,7 @@ fn run(
         fresh_web,
         ..
     } = context;
-    require_target_groups(&request.action, &connection_store)?;
+    require_agent_scope(&request.action, &connection_store)?;
     let references: Vec<_> = request.action.targets().collect();
     require_approved_profile(&approval.profile, &transport).map_err(Failure::blocked)?;
     if targets.len() != references.len() || approval.targets.len() != references.len() {
@@ -305,7 +305,7 @@ fn run(
         swarm::check_target(approved, &connection_store, &trust, vault_revision)
             .map_err(Failure::blocked)?;
         let authorize = || {
-            require_target_groups(&request.action, &connection_store)
+            require_agent_scope(&request.action, &connection_store)
                 .map_err(|error| error.detail)?;
             require_approved_profile(&approval.profile, &transport)?;
             let policy = current_route_policy(agent.kind, &[reference], &load_policy)?;
@@ -611,8 +611,7 @@ fn run(
         let dispatch_action = Arc::clone(&request.action);
         let dispatch_store = connection_store.clone();
         let before_dispatch = move || {
-            require_target_groups(&dispatch_action, &dispatch_store)
-                .map_err(|error| error.detail)?;
+            require_agent_scope(&dispatch_action, &dispatch_store).map_err(|error| error.detail)?;
             let current = dispatch_policy();
             require_policy(&current, kind)?;
             if !current
@@ -866,7 +865,7 @@ fn run_proposal(
     let sealed = seal_targets(&targets).map_err(Failure::blocked)?;
     let initial_mask = Redactor::for_journal(sealed.clone(), log_policy);
     let authorize = || {
-        require_target_groups(&request.action, &connection_store).map_err(|error| error.detail)?;
+        require_agent_scope(&request.action, &connection_store).map_err(|error| error.detail)?;
         require_approved_profile(&approval.profile, &transport)?;
         current_route_policy(action.kind, &references, load_policy)
     };
@@ -1037,7 +1036,17 @@ fn agent_journal_route_current(
         && swarm::check_target(approved, connection_store, trust, vault_revision).is_ok()
 }
 
-fn require_target_groups(action: &SshCommand, connection_store: &Path) -> Result<(), Failure> {
+fn require_agent_scope(action: &SshCommand, connection_store: &Path) -> Result<(), Failure> {
+    let root = connection_store
+        .parent()
+        .ok_or_else(|| Failure::blocked("The saved Agent settings location is unavailable."))?;
+    let config = crate::ai_manager::Configuration::load_from(root)
+        .map_err(|_| Failure::blocked("The saved Agent execution settings are unavailable."))?;
+    if !config.agent_execution_enabled() {
+        return Err(Failure::blocked(
+            "Agent command execution is disabled in AI Manager.",
+        ));
+    }
     if action.target_groups.is_none() {
         return Ok(());
     }
@@ -1811,6 +1820,19 @@ mod tests {
     }
 
     #[test]
+    fn scheduled_agent_scope_reloads_the_global_execution_preference() {
+        let fixture = scheduled_diagnostic_fixture(false);
+        let store = &fixture.context.connection_store;
+        assert!(require_agent_scope(&fixture.request.action, store).is_ok());
+        let root = store.parent().unwrap();
+        let baseline = crate::ai_manager::Configuration::load_fixture_from(root).unwrap();
+        let disabled: crate::ai_manager::Configuration =
+            serde_json::from_value(json!({"general":{"agent_execution_enabled":false}})).unwrap();
+        disabled.save_fixture_at(root, &baseline).unwrap();
+        assert!(require_agent_scope(&fixture.request.action, store).is_err());
+    }
+
+    #[test]
     fn scheduled_group_membership_change_blocks_before_probe_or_model() {
         use crate::scheduler_window::TargetGroups;
 
@@ -1830,7 +1852,7 @@ mod tests {
             groups: vec![group.clone()],
             explicit: vec![],
         });
-        assert!(require_target_groups(action, &context.connection_store).is_ok());
+        assert!(require_agent_scope(action, &context.connection_store).is_ok());
 
         let mut added = saved;
         added.id = 0;

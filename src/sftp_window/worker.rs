@@ -41,6 +41,7 @@ pub(in crate::sftp_window) mod ordinary_access;
 pub(super) use folder_budget::FolderBudget;
 pub(super) mod ownership;
 pub(crate) use ownership::resolve_scheduler_account;
+pub(super) mod recursive_delete;
 pub(in crate::sftp_window) mod resume;
 pub(super) mod server_copy;
 mod source_link;
@@ -280,6 +281,17 @@ struct Command {
 }
 
 impl Worker {
+    pub(super) fn review_deletion(&self, root: Location, entries: Vec<Entry>) -> Operation {
+        Operation::ReviewDeletion(
+            recursive_delete::Request {
+                root,
+                entries,
+                worker: Arc::downgrade(&self.control),
+            },
+            sync::Cancel::default(),
+        )
+    }
+
     pub(crate) fn bind_policy_route(&self, target: &SshTarget) {
         let bound = self.control.route.get_or_init(|| target.clone());
         debug_assert_eq!(bound, target);
@@ -374,6 +386,12 @@ impl Worker {
                     let ownership = command.operation.ownership_cancel().cloned();
                     let archive = command.operation.archive_cancel().cloned();
                     let transfer = command.operation.transfer_cancel().cloned();
+                    let deletion = match &command.operation {
+                        Operation::DeleteSelection { cancel, .. }
+                        | Operation::ReviewDeletion(_, cancel)
+                        | Operation::ApplyDeletion(_, cancel) => Some(cancel.clone()),
+                        _ => None,
+                    };
                     let extracting = command.operation.is_server_extract();
                     let publishing_draft = matches!(&command.operation, Operation::ReviewDraftFile(..) | Operation::PublishDraftFile(..));
                     let browsing_draft = matches!(&command.operation, Operation::BrowseDraftDestination(_));
@@ -428,7 +446,7 @@ impl Worker {
                         },
                         Err(error) => Err(error.clone()),
                     };
-                    if let Some(cancel) = ownership.or(archive).or(transfer) {
+                    if let Some(cancel) = ownership.or(archive).or(transfer).or(deletion) {
                         cancel.finish();
                     }
                     let disconnected = match reply.as_deref() {
@@ -761,6 +779,13 @@ pub(crate) enum Operation {
         selected: Option<Entry>,
         input: String,
     },
+    DeleteSelection {
+        directory: Location,
+        entries: Vec<Entry>,
+        cancel: sync::Cancel,
+    },
+    ReviewDeletion(recursive_delete::Request, sync::Cancel),
+    ApplyDeletion(Arc<recursive_delete::Plan>, sync::Cancel),
     ChangeOwnership {
         directory: Vec<u8>,
         selected: Vec<Entry>,
@@ -832,6 +857,9 @@ impl Operation {
             | Self::OpenTerminalEditor(_)
             | Self::SaveEditor { .. }
             | Self::Change { .. }
+            | Self::DeleteSelection { .. }
+            | Self::ReviewDeletion(..)
+            | Self::ApplyDeletion(..)
             | Self::ChangeOwnership { .. }
             | Self::ReviewRemoteOwnership(..)
             | Self::ApplyRemoteOwnership(..) => false,
@@ -915,6 +943,7 @@ pub enum Reply {
         home: Vec<u8>,
     },
     Listed(Arc<Directory>),
+    RecursiveDeletionReviewed(Arc<recursive_delete::Plan>),
     MeasuredFolders(browser::Sizes),
     Searched(Arc<search::Review>),
     SearchRevealed(Arc<Directory>, Option<EntryName>),
@@ -1477,6 +1506,26 @@ fn execute(
             change(client, &directory, operation, selected.as_ref(), &input)?;
             changed(client, &directory, "File operation completed".into())
         }
+        Operation::DeleteSelection {
+            directory,
+            entries,
+            cancel,
+        } => delete_selection(client, &directory, &entries, || {
+            cancel.stopped() || control.is_closed()
+        }),
+        Operation::ReviewDeletion(request, cancel) => recursive_delete::review(
+            client,
+            request.root,
+            &request.entries,
+            request.worker,
+            &|| cancel.stopped() || control.is_closed(),
+        )
+        .map(|plan| Reply::RecursiveDeletionReviewed(Arc::new(plan))),
+        Operation::ApplyDeletion(plan, cancel) => {
+            recursive_delete::apply(client, &plan, control, &|| {
+                cancel.stopped() || control.is_closed()
+            })
+        }
         Operation::ChangeOwnership {
             directory,
             selected,
@@ -1921,19 +1970,7 @@ fn change(
         None
     };
     if let (Some(entry), Some(path)) = (selected, source.as_ref()) {
-        let current = match path {
-            Location::Local(path) => {
-                let metadata = fs::symlink_metadata(path)?;
-                (files::local_kind(&metadata), Some(metadata.len()))
-            }
-            Location::Remote(path) => {
-                let attrs = client.lstat(path)?;
-                (remote_kind(attrs), attrs.size)
-            }
-        };
-        if current.0 != entry.kind || entry.size.is_some_and(|size| Some(size) != current.1) {
-            return Err(io::Error::other("selected entry changed; refresh the directory").into());
-        }
+        verify_change_source(client, path, entry)?;
     }
     match (operation, source, destination) {
         (Change::NewFolder, None, Some(Location::Local(path))) => fs::create_dir(path)?,
@@ -1944,20 +1981,12 @@ fn change(
         (Change::Rename, Some(Location::Remote(from)), Some(Location::Remote(to))) => {
             client.rename(from, to)?
         }
-        (Change::Delete, Some(Location::Local(path)), None) => {
-            let metadata = fs::symlink_metadata(&path)?;
-            if metadata.is_dir() {
-                fs::remove_dir(path)?;
-            } else {
-                fs::remove_file(path)?;
-            }
-        }
-        (Change::Delete, Some(Location::Remote(path)), None) => {
-            if client.lstat(&path)?.kind() == FileKind::Directory {
-                client.remove_dir(path)?;
-            } else {
-                client.remove_file(path)?;
-            }
+        (Change::Delete, Some(path), None) => {
+            remove_leaf(
+                client,
+                &path,
+                selected.is_some_and(|entry| entry.kind == EntryKind::Directory),
+            )?;
         }
         (Change::Permissions, Some(Location::Local(path)), None) => {
             files::set_permissions(&path, mode(input)?)?
@@ -1971,6 +2000,126 @@ fn change(
         _ => return Err(io::Error::other("invalid file operation").into()),
     }
     Ok(())
+}
+
+fn verify_change_source(client: &mut Client, path: &Location, entry: &Entry) -> Result<()> {
+    let (kind, size) = match path {
+        Location::Local(path) => {
+            let metadata = fs::symlink_metadata(path)?;
+            (files::local_kind(&metadata), Some(metadata.len()))
+        }
+        Location::Remote(path) => {
+            let attrs = client.lstat(path)?;
+            (remote_kind(attrs), attrs.size)
+        }
+    };
+    if kind != entry.kind || entry.size.is_some_and(|expected| Some(expected) != size) {
+        return Err(io::Error::other("selected entry changed; refresh the directory").into());
+    }
+    Ok(())
+}
+
+fn remove_leaf(client: &mut Client, path: &Location, directory: bool) -> Result<()> {
+    match (path, directory) {
+        (Location::Local(path), true) => fs::remove_dir(path)?,
+        (Location::Local(path), false) => fs::remove_file(path)?,
+        (Location::Remote(path), true) => client.remove_dir(path)?,
+        (Location::Remote(path), false) => client.remove_file(path)?,
+    }
+    Ok(())
+}
+
+fn delete_selection(
+    client: &mut Client,
+    directory: &Location,
+    entries: &[Entry],
+    stopped: impl Fn() -> bool,
+) -> Result<Reply> {
+    if entries.is_empty() || entries.len() > super::MAX_SELECTION {
+        return Err(io::Error::other("Invalid delete selection").into());
+    }
+    let mut names = std::collections::HashSet::new();
+    let mut paths = Vec::with_capacity(entries.len());
+    let stopped_note = |completed| {
+        format!(
+            "Deletion stopped · Deleted {completed} of {} entries",
+            entries.len()
+        )
+    };
+    for entry in entries {
+        if stopped() {
+            return Ok(Reply::Changed {
+                directory: None,
+                note: stopped_note(0),
+            });
+        }
+        let valid = match &entry.name {
+            EntryName::Local(name) => {
+                let mut parts = Path::new(name).components();
+                matches!(parts.next(), Some(std::path::Component::Normal(part)) if part == name.as_os_str())
+                    && parts.next().is_none()
+            }
+            EntryName::Remote(name) => files::validate_remote_name(name).is_ok(),
+        };
+        let path = directory
+            .with(&entry.name)
+            .filter(|_| valid && names.insert(&entry.name))
+            .ok_or_else(|| {
+                io::Error::other("Delete selection contains an invalid or duplicate name")
+            })?;
+        verify_change_source(client, &path, entry)
+            .map_err(|error| error.context(format!(" · {}", entry.display)))?;
+        paths.push(path);
+    }
+    for (completed, (entry, path)) in entries.iter().zip(&paths).enumerate() {
+        let result = (|| {
+            if stopped() {
+                return Ok(false);
+            }
+            verify_change_source(client, path, entry)?;
+            if stopped() {
+                return Ok(false);
+            }
+            remove_leaf(client, path, entry.kind == EntryKind::Directory).map_err(|error| {
+                if error.disconnected {
+                    error.context(" · The last server removal could not be confirmed")
+                } else {
+                    error
+                }
+            })?;
+            Ok::<_, Failure>(true)
+        })();
+        match result {
+            Ok(true) => {}
+            Ok(false) if completed == 0 => {
+                return Ok(Reply::Changed {
+                    directory: None,
+                    note: stopped_note(0),
+                });
+            }
+            Ok(false) => return changed(client, directory, stopped_note(completed)),
+            Err(error) => {
+                let note = format!(
+                    "Deleted {completed} of {} entries · {} ({})",
+                    entries.len(),
+                    entry.display,
+                    error.message
+                );
+                if error.disconnected {
+                    return Err(Failure {
+                        message: note,
+                        ..error
+                    });
+                }
+                return changed(client, directory, note);
+            }
+        }
+    }
+    changed(
+        client,
+        directory,
+        format!("Deleted {} entries", entries.len()),
+    )
 }
 
 fn mode(input: &str) -> io::Result<u32> {

@@ -17,8 +17,14 @@ const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 #[cfg(test)]
 mod tests;
 
-pub(super) fn run(shell: &Shell, cwd: &Path, text: &str, cancel: &Cancel) -> io::Result<Outcome> {
-    run_executable(shell, cwd, text, cancel, &std::env::current_exe()?)
+pub(super) fn run(
+    shell: &Shell,
+    cwd: &Path,
+    text: &str,
+    cancel: &Cancel,
+    started: impl FnOnce(),
+) -> io::Result<Outcome> {
+    run_executable(shell, cwd, text, cancel, &std::env::current_exe()?, started)
 }
 
 fn run_executable(
@@ -27,6 +33,7 @@ fn run_executable(
     text: &str,
     cancel: &Cancel,
     executable: &Path,
+    started: impl FnOnce(),
 ) -> io::Result<Outcome> {
     let kind = match shell {
         Shell::PowerShell(_) => "powershell",
@@ -56,6 +63,7 @@ fn run_executable(
     input.write_all(&(text.len() as u32).to_be_bytes())?;
     input.write_all(text.as_bytes())?;
     drop(input);
+    started();
     let stdout = process.child.stdout.take().ok_or_else(missing_pipe)?;
     let stderr = process.child.stderr.take().ok_or_else(missing_pipe)?;
     let deadline = Instant::now() + COMMAND_LIMIT;

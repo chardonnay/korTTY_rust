@@ -14,6 +14,59 @@ use super::*;
 const MAX_RELATIVE_BYTES: usize = 4096;
 const MAX_TOTAL_PATH_BYTES: usize = 8 * 1024 * 1024;
 
+#[cfg(unix)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+pub(in crate::sftp_window) struct LocalLeaf {
+    // Identity and metadata expected to survive a rename, excluding access time.
+    metadata: [i128; 10],
+    changed: [i128; 2],
+}
+
+#[cfg(unix)]
+impl LocalLeaf {
+    pub(in crate::sftp_window) fn from_stat(stat: &rustix::fs::Stat) -> Self {
+        Self {
+            metadata: [
+                stat.st_dev.into(),
+                stat.st_ino.into(),
+                stat.st_mode.into(),
+                stat.st_uid.into(),
+                stat.st_gid.into(),
+                stat.st_nlink.into(),
+                stat.st_rdev.into(),
+                stat.st_size.into(),
+                stat.st_mtime.into(),
+                stat.st_mtime_nsec.into(),
+            ],
+            changed: [stat.st_ctime.into(), stat.st_ctime_nsec.into()],
+        }
+    }
+
+    pub(in crate::sftp_window) fn same_after_rename(&self, other: &Self) -> bool {
+        self.metadata == other.metadata
+    }
+}
+
+#[cfg(windows)]
+#[derive(Clone, PartialEq, Eq, serde::Serialize)]
+pub(in crate::sftp_window) struct LocalLeaf {
+    identity: Identity,
+    data: Vec<u8>,
+}
+
+#[cfg(windows)]
+impl LocalLeaf {
+    pub(in crate::sftp_window) fn capture(file: &std::fs::File) -> io::Result<Option<Self>> {
+        let Some(data) = kortty_files::tree::reviewed_link_data(file)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            identity: Identity::capture(file)?,
+            data,
+        }))
+    }
+}
+
 #[derive(Clone, Default, Eq, Ord, PartialEq, PartialOrd)]
 pub(in crate::sftp_window) struct Relative {
     bytes: Vec<u8>,
@@ -83,7 +136,12 @@ pub(in crate::sftp_window) enum Entry {
         stamp: LocalStamp,
         identity: Identity,
     },
+    LocalLeaf(LocalLeaf),
     Remote(Attributes),
+    RemoteLink {
+        attributes: Attributes,
+        target: Vec<u8>,
+    },
     Blocked,
 }
 
@@ -91,14 +149,25 @@ pub(in crate::sftp_window) enum Entry {
 pub(in crate::sftp_window) enum Kind {
     Folder,
     File,
+    Link,
     Blocked,
 }
 
 impl Entry {
+    pub(in crate::sftp_window) fn reviewable_for_deletion(&self) -> bool {
+        match self {
+            Self::LocalLeaf(_) => true,
+            Self::Remote(attributes) if known_special_mode(attributes.permissions) => true,
+            _ => self.kind() != Kind::Blocked,
+        }
+    }
+
     pub(in crate::sftp_window) fn kind(&self) -> Kind {
         match self {
             Self::LocalFolder(_) => Kind::Folder,
             Self::LocalFile { .. } => Kind::File,
+            Self::LocalLeaf(_) => Kind::Blocked,
+            Self::RemoteLink { .. } => Kind::Link,
             Self::Remote(attributes) => match attributes.kind() {
                 FileKind::Directory => Kind::Folder,
                 FileKind::File => Kind::File,
@@ -132,11 +201,29 @@ impl Entry {
                     identity: bi,
                 },
             ) => a == b && ai == bi,
+            (Self::LocalLeaf(a), Self::LocalLeaf(b)) => a == b,
             (Self::Remote(a), Self::Remote(b)) => unchanged(*a, *b),
+            (
+                Self::RemoteLink {
+                    attributes: a,
+                    target: at,
+                },
+                Self::RemoteLink {
+                    attributes: b,
+                    target: bt,
+                },
+            ) => unchanged(*a, *b) && at == bt,
             (Self::Blocked, Self::Blocked) => true,
             _ => false,
         }
     }
+}
+
+pub(in crate::sftp_window) fn known_special_mode(mode: Option<u32>) -> bool {
+    matches!(
+        mode.map(|mode| mode & 0o170000),
+        Some(0o010000 | 0o020000 | 0o060000 | 0o140000)
+    )
 }
 
 #[derive(Clone)]
@@ -149,6 +236,22 @@ pub(in crate::sftp_window) struct Manifest {
     pub(in crate::sftp_window) root: Location,
     pub(in crate::sftp_window) entries: BTreeMap<Relative, Entry>,
     stamp: DirectoryStamp,
+}
+
+pub(in crate::sftp_window) fn read_selected(
+    client: &mut Sftp<impl Read, impl Write>,
+    root: Location,
+    selected: &HashSet<Vec<u8>>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Manifest> {
+    let excluded = |path: &[u8]| {
+        !selected.contains(path.split(|&byte| byte == b'/').next().unwrap_or_default())
+    };
+    let mut walk = Walk::new(&excluded, cancelled);
+    // Include private-looking folders in the review instead of hiding them.
+    walk.remote_search = true;
+    walk.review_leaves = true;
+    walk.read(client, root)
 }
 
 pub(in crate::sftp_window) fn read_pair(
@@ -262,6 +365,10 @@ impl Manifest {
                 }
                 Entry::Remote(attributes) => serde_json::to_vec(&(fields, 2, remote(*attributes)))?,
                 Entry::Blocked => serde_json::to_vec(&(fields, 3))?,
+                Entry::RemoteLink { attributes, target } => {
+                    serde_json::to_vec(&(fields, 4, remote(*attributes), target))?
+                }
+                Entry::LocalLeaf(stamp) => serde_json::to_vec(&(fields, 5, stamp))?,
             };
             write(&bytes);
         }
@@ -378,6 +485,7 @@ struct Walk<'a> {
     remaining: usize,
     path_bytes: usize,
     remote_search: bool,
+    review_leaves: bool,
     local_read_only: bool,
     validate_remote: Option<&'a dyn Fn(Attributes) -> io::Result<()>>,
 }
@@ -390,6 +498,7 @@ impl<'a> Walk<'a> {
             remaining: MAX_ENTRIES,
             path_bytes: MAX_TOTAL_PATH_BYTES,
             remote_search: false,
+            review_leaves: false,
             local_read_only: false,
             validate_remote: None,
         }
@@ -485,6 +594,21 @@ impl<'a> Walk<'a> {
                         stamp: LocalStamp::capture(&file.metadata()?),
                         identity: Identity::capture(&file)?,
                     },
+                    local::Entry::Skip if self.review_leaves => {
+                        let entry = review_local_leaf(dir, name)?;
+                        #[cfg(windows)]
+                        if let Entry::LocalLeaf(stamp) = &entry {
+                            self.path_bytes = self
+                                .path_bytes
+                                .checked_sub(stamp.data.len())
+                                .ok_or_else(|| {
+                                    io::Error::other(
+                                        "Folder comparison exceeds its path data limit",
+                                    )
+                                })?;
+                        }
+                        entry
+                    }
                     local::Entry::Skip => Entry::Blocked,
                 }
             };
@@ -539,7 +663,19 @@ impl<'a> Walk<'a> {
                         return Err(io::Error::other("A remote comparison folder changed").into());
                     }
                 }
-                Entry::Remote(attributes)
+                if self.review_leaves && attributes.kind() == FileKind::Symlink {
+                    let target = client.read_link(&child)?;
+                    if !unchanged(attributes, client.lstat(&child)?) {
+                        return Err(io::Error::other("A remote symbolic link changed").into());
+                    }
+                    self.path_bytes =
+                        self.path_bytes.checked_sub(target.len()).ok_or_else(|| {
+                            io::Error::other("Folder comparison exceeds its path data limit")
+                        })?;
+                    Entry::RemoteLink { attributes, target }
+                } else {
+                    Entry::Remote(attributes)
+                }
             } else {
                 Entry::Blocked
             };
@@ -575,6 +711,27 @@ impl<'a> Walk<'a> {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn review_local_leaf(dir: &local::Directory, name: &OsStr) -> io::Result<Entry> {
+    use rustix::fs::{AtFlags, FileType, statat};
+
+    let stat = statat(dir.file(), name, AtFlags::SYMLINK_NOFOLLOW)?;
+    Ok(match FileType::from_raw_mode(stat.st_mode) {
+        FileType::Symlink
+        | FileType::Fifo
+        | FileType::Socket
+        | FileType::CharacterDevice
+        | FileType::BlockDevice => Entry::LocalLeaf(LocalLeaf::from_stat(&stat)),
+        _ => Entry::Blocked,
+    })
+}
+
+#[cfg(windows)]
+fn review_local_leaf(dir: &local::Directory, name: &OsStr) -> io::Result<Entry> {
+    let link = dir.open_link_for_review(name, false)?;
+    Ok(LocalLeaf::capture(&link)?.map_or(Entry::Blocked, Entry::LocalLeaf))
 }
 
 fn local_name_bytes(name: &OsStr) -> &[u8] {

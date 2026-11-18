@@ -683,7 +683,7 @@ mod tests {
             pane.session.scrollback_config_requested(),
             workspace.window_settings.scrollback_config()
         );
-        assert!(!workspace.pane_needs_close_confirmation(session));
+        assert!(!workspace.pane_needs_close_confirmation(session, false));
     }
 
     #[test]

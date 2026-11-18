@@ -93,6 +93,7 @@ pub(super) fn controls<'a>(
     controls: &Controls<'a>,
     stale: bool,
     project: bool,
+    represented_run: Option<SnippetId>,
 ) -> Column<'a, WindowMessage> {
     let selected = controls.selection;
     let has_findings = !record.analysis.improvements.is_empty();
@@ -159,7 +160,11 @@ pub(super) fn controls<'a>(
             }).size(13));
         }
     }
-    for run in &record.apply_runs {
+    for run in record
+        .apply_runs
+        .iter()
+        .filter(|run| Some(run.id) != represented_run)
+    {
         body = body.push(
             row![
                 text(format!(

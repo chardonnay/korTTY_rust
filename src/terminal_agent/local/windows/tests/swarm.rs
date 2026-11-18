@@ -42,6 +42,7 @@ fn native_swarm_powershell_script_preserves_reviewed_source_and_literal_argument
         &review.command,
         &Cancel::default(),
         &executable,
+        || {},
     )
     .unwrap();
     assert_eq!(result.status, Status::Exited(29));

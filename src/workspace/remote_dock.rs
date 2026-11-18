@@ -23,7 +23,9 @@ mod dialog;
 mod follow;
 mod model;
 mod view;
-pub(super) use dialog::{Dialogs, Message as DialogMessage};
+#[cfg(target_os = "linux")]
+pub(super) use dialog::TerminalUploadTarget;
+pub(super) use dialog::{DesktopUploadBatch, Dialogs, Message as DialogMessage};
 use follow::Follow;
 pub(crate) use follow::mcp_ssh_prompt_is_verified;
 pub(super) use follow::{ForeignShell, foreign_shell};
@@ -272,6 +274,13 @@ impl Workspace {
     }
 
     pub(super) fn remote_dock_subscription(&self) -> Subscription<Desktop> {
+        if self
+            .windows
+            .values()
+            .any(|window| window.pending_terminal_upload.is_some())
+        {
+            return Subscription::run(dock_clock);
+        }
         if self.window_settings.remote_sidebar_position == RemoteSidebarPosition::Hidden {
             return Subscription::none();
         }
@@ -1106,6 +1115,7 @@ impl Workspace {
     pub(super) fn remote_dock_tick(&mut self) -> Task<Desktop> {
         let now = Instant::now();
         let mut tasks = Vec::new();
+        tasks.push(self.finish_desktop_terminal_uploads(now));
         let closing = self.remote_browser_closing.len();
         self.remote_browser_closing
             .retain(|_, done| !done.is_closed());

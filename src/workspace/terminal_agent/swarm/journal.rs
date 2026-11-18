@@ -2,6 +2,7 @@
 
 use std::io::{self, Read};
 use std::path::Path;
+use std::sync::atomic::Ordering;
 
 use iced::widget::{button, column, row, text};
 use iced::{Element, Task, window};
@@ -13,16 +14,40 @@ use crate::scheduler_window::{
 };
 use crate::session_journal::automation::{Options, Retention};
 use crate::session_journal::viewer::Source;
+use crate::terminal_agent::swarm::journal::{Activity, Evidence};
 
-use super::{ClipboardPolicy, Desktop, Message, RunMessage, Workspace, snippet};
+use super::{ClipboardPolicy, Desktop, Message, Run, RunMessage, Workspace, snippet};
 
 pub(super) use crate::session_journal::automation::INTERACTIVE_SWARM_SOURCE as SOURCE;
 const SETTINGS: &str = "swarm-journal-settings.json";
 const MAX_SETTINGS_BYTES: u64 = 4096;
 
+pub(super) fn evidence(run: &Run) -> Evidence {
+    let activity = run
+        .activity
+        .iter()
+        .enumerate()
+        .filter_map(|(index, text)| {
+            let identity = run.presentation.identity(index);
+            match run.journal_commands.get(&identity) {
+                None => Some(Activity::Output(text.clone())),
+                Some(Some(dispatch)) if dispatch.load(Ordering::Acquire) => text
+                    .strip_prefix("$ ")
+                    .map(|command| Activity::Command(command.to_owned())),
+                _ => None,
+            }
+        })
+        .collect();
+    Evidence {
+        activity,
+        truncated: run.presentation.identity(0) != 0,
+    }
+}
+
 pub(super) struct State {
     pub(super) draft: SwarmJournalDraft,
     pub(super) links: Vec<Source>,
+    pub(super) java_proposal: Option<Options>,
     estimate: Option<AutomationEstimate>,
     pending: bool,
     epoch: u64,
@@ -33,6 +58,7 @@ impl Default for State {
         Self {
             draft: SwarmJournalDraft::from_options(Some(&defaults())),
             links: Vec::new(),
+            java_proposal: None,
             estimate: None,
             pending: false,
             epoch: 0,
@@ -41,6 +67,17 @@ impl Default for State {
 }
 
 impl State {
+    pub(super) fn adopt_java(&mut self) -> io::Result<bool> {
+        let Some(options) = &self.java_proposal else {
+            return Ok(false);
+        };
+        crate::workspace::backup_data::validate_java_swarm_journal(options)?;
+        self.draft = SwarmJournalDraft::from_options(Some(options));
+        self.java_proposal = None;
+        self.clear_estimate();
+        Ok(true)
+    }
+
     pub(super) fn load_defaults(&mut self) -> io::Result<()> {
         let root = crate::profile::root()?;
         let options = load(&root)?;
@@ -84,6 +121,10 @@ impl State {
             .wrap(),
         ]
         .spacing(6);
+        if self.java_proposal.is_some() {
+            controls = controls
+                .push(button("Use Java journal settings").on_press(Message::AdoptJavaJournal));
+        }
         if self.pending {
             controls = controls.push(text("Reading journal usage…").size(12));
         } else if let Some(estimate) = &self.estimate {
@@ -95,10 +136,8 @@ impl State {
     }
 
     pub(super) fn edit(&mut self, edit: SwarmJournalEdit) {
-        if !matches!(edit, SwarmJournalEdit::Input(_)) {
-            self.draft.edit(edit);
-            self.clear_estimate();
-        }
+        self.draft.edit(edit);
+        self.clear_estimate();
     }
 
     pub(super) fn clear_estimate(&mut self) {
@@ -208,9 +247,8 @@ fn load(root: &Path) -> io::Result<Options> {
             "The Swarm journal defaults exceed their size limit.",
         ));
     }
-    let mut options: Options = serde_json::from_slice(&bytes)?;
+    let options: Options = serde_json::from_slice(&bytes)?;
     options.validate()?;
-    options.capture_input = false;
     Ok(options)
 }
 
@@ -235,12 +273,45 @@ mod tests {
     use crate::session_journal::automation::{Closing, Keep};
 
     #[test]
+    fn adopting_java_swarm_journal_updates_only_the_current_draft() -> io::Result<()> {
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize()?;
+        let native = Options {
+            max_runs: 20,
+            ..defaults()
+        };
+        let _ = save(&root, &native, || Ok(()))?;
+        let proposal = Options {
+            enabled: true,
+            capture_input: true,
+            closing: Closing::Failures,
+            retention: Retention::Days { days: 30 },
+            unresolved_summary_profile: Some("legacy-profile".into()),
+            ..Options::default()
+        };
+        let mut state = State {
+            draft: SwarmJournalDraft::from_options(Some(&load(&root)?)),
+            java_proposal: Some(proposal.clone()),
+            pending: true,
+            ..State::default()
+        };
+        assert_eq!(state.draft.build_options().unwrap(), native);
+        assert!(state.adopt_java()?);
+        assert_eq!(state.draft.build_options().unwrap(), proposal);
+        assert!(!state.pending);
+        assert!(!state.adopt_java()?);
+        assert_eq!(load(&root)?, native);
+        Ok(())
+    }
+
+    #[test]
     fn swarm_journal_defaults_persist_and_recheck_policy_before_publication() -> io::Result<()> {
         let profile = crate::snippets::tests::Profile::new();
         let root = profile.0.canonicalize()?;
         assert_eq!(load(&root)?, defaults());
         let options = Options {
             enabled: true,
+            capture_input: true,
             closing: Closing::Failures,
             keep: Keep::Failures,
             retention: Retention::Days { days: 30 },

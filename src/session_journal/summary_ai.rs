@@ -200,6 +200,7 @@ pub(crate) struct Run {
     session: Session,
     structured: AtomicBool,
     authorize_reviewed: Option<Authorization>,
+    reviewed_credential: Option<Zeroizing<String>>,
     cli: bool,
     system_suffix: &'static str,
 }
@@ -212,17 +213,18 @@ impl Run {
                 "Review the selected profile before summarizing a journal",
             ));
         }
-        Self::begin_bound(profile, None)
+        Self::begin_bound(profile, None, None)
     }
 
     pub(crate) fn begin_reviewed_https(
         profile: Profile,
+        credential: Option<Zeroizing<String>>,
         authorize: impl Fn() -> Result<(), String> + Send + Sync + 'static,
     ) -> io::Result<(Self, Cancel)> {
         if !profile.is_remote() {
             return Err(invalid("The reviewed HTTPS profile changed"));
         }
-        Self::begin_bound(profile, Some(Arc::new(authorize)))
+        Self::begin_bound(profile, Some(Arc::new(authorize)), credential)
     }
 
     pub(crate) fn begin_reviewed_cli(
@@ -232,7 +234,7 @@ impl Run {
         if !profile.is_cli() {
             return Err(invalid("The reviewed CLI profile changed"));
         }
-        Self::begin_bound(profile, Some(Arc::new(authorize)))
+        Self::begin_bound(profile, Some(Arc::new(authorize)), None)
     }
 
     pub(crate) fn begin_startup_local(
@@ -242,12 +244,13 @@ impl Run {
         if profile.is_remote() || profile.is_cli() {
             return Err(invalid("Choose a current local journal AI profile"));
         }
-        Self::begin_bound(profile, Some(Arc::new(authorize)))
+        Self::begin_bound(profile, Some(Arc::new(authorize)), None)
     }
 
     fn begin_bound(
         profile: Profile,
         authorize_reviewed: Option<Authorization>,
+        reviewed_credential: Option<Zeroizing<String>>,
     ) -> io::Result<(Self, Cancel)> {
         let cli = profile.is_cli();
         let system_suffix = profile.structured_system_suffix().unwrap_or_default();
@@ -259,6 +262,7 @@ impl Run {
                 session,
                 structured: AtomicBool::new(true),
                 authorize_reviewed,
+                reviewed_credential,
                 cli,
                 system_suffix,
             },
@@ -282,6 +286,15 @@ impl Run {
         self.client().profile()
     }
 
+    pub(crate) fn probe_credential(&self) -> Result<Option<Zeroizing<String>>, Error> {
+        if self.profile().is_remote() {
+            // Cache the credential that this run is authorized to send.
+            Ok(self.reviewed_credential.clone())
+        } else {
+            self.profile().probe_credential()
+        }
+    }
+
     pub(crate) fn check_probe_authority(&self) -> io::Result<()> {
         self.check_active()?;
         self.profile()
@@ -292,6 +305,23 @@ impl Run {
                     "The journal AI profile changed",
                 )
             })?;
+        if self.profile().is_remote() {
+            match self.profile().current_probe_credential() {
+                Ok(current) if current == self.reviewed_credential => {}
+                Err(Error::Credential) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::NotConnected,
+                        "The configured journal AI credential is unavailable or invalid",
+                    ));
+                }
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "The journal AI credential changed",
+                    ));
+                }
+            }
+        }
         self.authorize()
             .map_err(|error| io::Error::new(io::ErrorKind::PermissionDenied, error))
     }
@@ -307,9 +337,6 @@ impl Run {
             ready: bool,
         }
         let system = format!("{PROBE}{}", self.system_suffix);
-        let credential = before_dispatch
-            .is_some()
-            .then(|| self.profile().completion_secret());
         let authorize = || {
             self.authorize()?;
             before_dispatch.map_or(Ok(()), |check| check())
@@ -319,16 +346,23 @@ impl Run {
             if self.cli {
                 self.client()
                     .complete_cli_before_guarded(&system, "{}", deadline, authorize)
-            } else if let Some(credential) =
-                credential.as_ref().filter(|_| self.profile().is_remote())
-            {
+            } else if self.profile().is_remote() && before_dispatch.is_some() {
                 self.client().complete_reviewed_https_before(
                     &system,
                     "{}",
                     format,
                     deadline,
-                    credential.clone(),
+                    self.reviewed_credential.clone(),
                     authorize,
+                )
+            } else if self.profile().is_remote() {
+                self.client().stream_reviewed_structured_before(
+                    [&system, "{}"],
+                    format,
+                    deadline,
+                    self.reviewed_credential.as_deref().map(String::as_str),
+                    authorize,
+                    |_| {},
                 )
             } else if self.authorize_reviewed.is_some() {
                 self.client().stream_structured(
@@ -631,6 +665,15 @@ impl Run {
                         .client()
                         .complete_cli_before_guarded(&system, prompt, deadline, authorize),
                 }
+            } else if self.profile().is_remote() {
+                self.client().stream_reviewed_structured_before(
+                    [&system, prompt],
+                    format,
+                    deadline,
+                    self.reviewed_credential.as_deref().map(String::as_str),
+                    authorize,
+                    |delta| buffer.push(stage, delta, evidence, mask, reporter),
+                )
             } else {
                 self.client().stream_structured(
                     &system,
@@ -1346,20 +1389,24 @@ mod tests {
         assert_eq!(url.path(), "/v1/chat/completions");
         let ca =
             std::fs::read(std::env::var_os("KORTTY_TEST_HTTPS_APPLY_CA_DER").unwrap()).unwrap();
-        let options = ProfileOptions {
-            credential_env: Some("KORTTY_TEST_HTTPS_APPLY_KEY".into()),
-            ..ProfileOptions::default()
+        let make_profile = |key: &str| {
+            let options = ProfileOptions {
+                credential_env: Some(key.into()),
+                ..ProfileOptions::default()
+            };
+            if loopback {
+                Profile::lm_studio_with_server_default(&endpoint, options, false)
+            } else {
+                Profile::openai_with_server_default(&endpoint, RemoteProtocol::OpenAiExact, options)
+            }
+            .unwrap()
         };
-        let profile = if loopback {
-            Profile::lm_studio_with_server_default(&endpoint, options, false)
-        } else {
-            Profile::openai_with_server_default(&endpoint, RemoteProtocol::OpenAiExact, options)
-        }
-        .unwrap();
+        let profile = make_profile("KORTTY_TEST_HTTPS_APPLY_KEY");
         assert!(Run::begin(profile.clone()).is_err());
         let approved = std::sync::Arc::new(AtomicBool::new(true));
         let current = approved.clone();
-        let (mut run, _cancel) = Run::begin_reviewed_https(profile, move || {
+        let credential = profile.completion_secret();
+        let (mut run, cancel) = Run::begin_reviewed_https(profile, credential.clone(), move || {
             current
                 .load(Ordering::Relaxed)
                 .then_some(())
@@ -1367,6 +1414,23 @@ mod tests {
         })
         .unwrap();
         run.session.trust_test_server(&ca).unwrap();
+        assert_eq!(run.probe_credential().unwrap(), credential);
+        for stale in [Some(Zeroizing::new("previous-fixture-key".into())), None] {
+            run.reviewed_credential = stale;
+            assert_eq!(
+                run.check_probe_authority().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied,
+            );
+            assert_eq!(
+                run.preflight().unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied
+            );
+            assert_eq!(
+                run.startup_preflight(&|| Ok(())).unwrap_err().kind(),
+                io::ErrorKind::PermissionDenied,
+            );
+        }
+        run.reviewed_credential = credential.clone();
         run.startup_preflight(&|| Ok(())).unwrap();
         let time = jiff::Timestamp::from_second(1).unwrap();
         let mut planner = Planner::resume(0);
@@ -1381,6 +1445,15 @@ mod tests {
         });
         let windows = planner.finish_pass(true, true, time);
         let mask = |text: &str| Ok(text.replace("private-test-token", "***"));
+        run.reviewed_credential = Some(Zeroizing::new("previous-fixture-key".into()));
+        assert_eq!(
+            run.window(&windows[0], &mask, &mut Reporter::default())
+                .result
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::PermissionDenied,
+        );
+        run.reviewed_credential = credential.clone();
         let card = run
             .window(&windows[0], &mask, &mut Reporter::default())
             .result
@@ -1395,6 +1468,34 @@ mod tests {
                 .unwrap()
                 .kind(),
             io::ErrorKind::PermissionDenied,
+        );
+        approved.store(true, Ordering::Relaxed);
+        drop(cancel);
+        assert_eq!(
+            run.preflight().unwrap_err().kind(),
+            io::ErrorKind::Interrupted
+        );
+        drop(run);
+
+        let missing = "KORTTY_TEST_REMOVED_JOURNAL_CREDENTIAL";
+        assert!(std::env::var_os(missing).is_none());
+        let (mut run, _cancel) =
+            Run::begin_reviewed_https(make_profile(missing), credential, || Ok(())).unwrap();
+        run.session.trust_test_server(&ca).unwrap();
+        assert_eq!(
+            run.check_probe_authority().unwrap_err().kind(),
+            io::ErrorKind::NotConnected,
+        );
+        assert_eq!(
+            run.startup_preflight(&|| Ok(())).unwrap_err().kind(),
+            io::ErrorKind::NotConnected,
+        );
+        assert_eq!(
+            run.window(&windows[0], &mask, &mut Reporter::default())
+                .result
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::NotConnected,
         );
     }
 
@@ -1426,7 +1527,8 @@ mod tests {
         assert!(Run::begin(profile.clone()).is_err());
         let approved = Arc::new(AtomicBool::new(true));
         let current = Arc::clone(&approved);
-        let (mut run, _cancel) = Run::begin_reviewed_https(profile, move || {
+        let credential = profile.completion_secret();
+        let (mut run, _cancel) = Run::begin_reviewed_https(profile, credential, move || {
             current
                 .load(Ordering::Relaxed)
                 .then_some(())

@@ -453,6 +453,24 @@ impl Workspace {
             }
             Message::SelectAnswer(profile) => self.select_journal_question_answer(id, profile),
             Message::Prepare => return self.prepare_journal_question(id),
+            Message::Ranked(ticket, result) => {
+                let Some(dialog) = self.journal_questions.dialogs.get_mut(&id) else {
+                    return Task::none();
+                };
+                let automatic = dialog.configuration.journal_semantic_search()
+                    && result.is_ok()
+                    && dialog
+                        .work
+                        .as_ref()
+                        .is_some_and(|work| work.ticket == ticket);
+                let task = dialog.integrate(id, Message::Ranked(ticket, result));
+                if automatic && let Stage::Ranking(ranking) = &dialog.stage {
+                    let semantic =
+                        dialog.routes.embedding.is_some() && !ranking.candidates.is_empty();
+                    return self.prepare_ranked_journal_question(id, semantic);
+                }
+                return task;
+            }
             Message::ReadEvidence(semantic) => {
                 return self.prepare_ranked_journal_question(id, semantic);
             }
@@ -1319,6 +1337,12 @@ impl Dialog {
                     text_input("What happened in the journal?", &self.input)
                         .on_input_maybe(idle.then_some(Message::Edit)),
                 );
+                if self.configuration.journal_semantic_search() {
+                    view = view.push(text(self.routes.embedding.as_ref().map_or_else(
+                        || "Semantic search is enabled, but no local embedding model is available. Cross-journal preparation uses lexical ranking.".into(),
+                        |route| format!("Cross-journal preparation uses {}. The masked question and new or changed search cards are sent to this local embedding model. Evidence is reviewed before an answer request.", route.label),
+                    )).size(13));
+                }
                 if self.routes.answer_choices.len() > 1 {
                     let selected = self.outbound.as_ref().map(|answer| answer.id);
                     let choice = self

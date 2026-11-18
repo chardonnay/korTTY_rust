@@ -842,22 +842,31 @@ pub(super) fn preview_tree(
     };
     let auth = authorization(request.sudo, Some(&mut credentials)).map_err(|error| error.detail)?;
     let copy = request.copy;
-    let plan = (copy.direction == sync::Direction::Upload)
+    let mut plan = (copy.direction == sync::Direction::Upload)
         .then(|| {
             file::TreeUpload::scan(&copy.local, copy.remote.as_str(), &copy.excludes, &allowed)
         })
         .transpose()
         .map_err(tree_detail)?;
+    if copy.standing.is_some()
+        && let Some(plan) = &mut plan
+    {
+        plan.request_receiver_receipt();
+        if !copy.replace_changed {
+            plan.request_root_creation();
+        }
+    }
     let (target, jumps) = credentials.into_route().map_err(|error| error.detail)?;
     let mut session = super::sync::open_pinned(target, jumps, pins, || !allowed())
         .map_err(|error| error.detail)?;
     let opener = tree_opener(&session).map_err(|error| error.detail)?;
     let preview = if let Some(plan) = plan {
-        if copy.replace_changed {
+        if copy.replace_changed || copy.standing.is_some() {
             file::preview_tree_upload_merge(opener, copy.remote.as_str(), &plan, auth, allowed)
         } else {
             file::inspect_tree(opener, copy.remote.as_str(), auth, allowed)
                 .and_then(|witness| plan.preview(&witness))
+                .map(|preview| (preview, None))
         }
     } else {
         file::preview_tree_download(
@@ -867,13 +876,15 @@ pub(super) fn preview_tree(
             auth,
             allowed,
             copy.replace_changed,
+            copy.standing.is_some(),
         )
     };
     let _ = session.close();
+    let (preview, receiver) = preview.map_err(tree_detail)?;
     Ok(sync::Review {
-        preview: preview.map_err(tree_detail)?,
+        preview,
         pins: sync::fingerprints(pins),
-        standing_roots: None,
+        standing_roots: copy.standing.is_some().then_some(receiver).flatten(),
     })
 }
 
@@ -884,7 +895,10 @@ pub(super) fn run_tree(
     saved_auth: SavedAuth,
     trust_store: impl FnOnce() -> io::Result<TrustStore>,
 ) -> Result<Completion, Failure> {
-    if !matches!(request.trigger, RunTrigger::Manual | RunTrigger::Scheduled) {
+    if !matches!(
+        request.trigger,
+        RunTrigger::Manual | RunTrigger::Scheduled | RunTrigger::Dependency
+    ) {
         return Err(Failure::blocked(TREE_REVIEW));
     }
     let reference = request
@@ -900,13 +914,45 @@ pub(super) fn run_tree(
     if !policy.file_transfer_allowed || !policy.sudo_allowed || !allowed_now(reference) {
         return Err(Failure::blocked(DENIED));
     }
-    let receipt = context
-        .store
-        .load(&request.job, copy.approval.as_deref(), context.scope)
+    let standing = context.standing_approval();
+    if standing.is_some() != copy.standing.is_some()
+        || (request.trigger == RunTrigger::Dependency && standing.is_none())
+    {
+        return Err(Failure::blocked(TREE_REVIEW));
+    }
+    let tree_receipt = standing
+        .map(|(captured, admission)| {
+            let receipt = context.store.load_tree(
+                &request.job,
+                copy.approval.as_deref(),
+                context.scope,
+                std::time::SystemTime::now(),
+                Some(admission),
+            )?;
+            if receipt.approval != *captured {
+                return Err(io::Error::other(TREE_REVIEW));
+            }
+            Ok(receipt)
+        })
+        .transpose()
         .map_err(|_| Failure::blocked(TREE_REVIEW))?;
+    let receipt = if tree_receipt.is_some() {
+        None
+    } else {
+        Some(
+            context
+                .load_receipt(copy.approval.as_deref())
+                .map_err(|_| Failure::blocked(TREE_REVIEW))?,
+        )
+    };
     let trust = trust_store().map_err(|_| Failure::blocked(TREE_REVIEW))?;
     let pins = sync::pins(reference, &trust).map_err(|_| Failure::blocked(TREE_REVIEW))?;
-    if sync::fingerprints(&pins) != receipt.pins {
+    let reviewed_pins = tree_receipt
+        .as_ref()
+        .map(|receipt| &receipt.approval.pins)
+        .or_else(|| receipt.as_ref().map(|receipt| &receipt.pins))
+        .ok_or_else(|| Failure::blocked(TREE_REVIEW))?;
+    if &sync::fingerprints(&pins) != reviewed_pins {
         return Err(Failure::blocked(TREE_REVIEW));
     }
     let deadline = Instant::now() + TRANSFER_DEADLINE;
@@ -919,12 +965,23 @@ pub(super) fn run_tree(
         !stopped.is_requested() && Instant::now() < deadline && allowed_now(&checked_reference)
     };
     let gate_error = || gate_failure(cancellation, reference, deadline);
-    let plan = (copy.direction == sync::Direction::Upload)
+    let mut plan = (copy.direction == sync::Direction::Upload)
         .then(|| {
             file::TreeUpload::scan(&copy.local, copy.remote.as_str(), &copy.excludes, &allowed)
         })
         .transpose()
         .map_err(|error| gate_error().unwrap_or_else(|| Failure::blocked(tree_detail(error))))?;
+    if copy.standing.is_some()
+        && let Some(plan) = &mut plan
+    {
+        plan.request_receiver_receipt();
+        if tree_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.create_root)
+        {
+            plan.request_root_creation();
+        }
+    }
     let (target, jumps) = connection::route(&request.action, saved_auth, &policy.server_access)?;
     let mut session =
         super::sync::open_pinned_for_job(target, jumps, &pins, || !allowed(), request, policy)?;
@@ -932,29 +989,38 @@ pub(super) fn run_tree(
     let pins_current = || {
         policy.require_target_groups(&request.action).is_ok()
             && sync::pins(reference, &trust).is_ok_and(|current| current == pins)
-            && (!copy.replace_changed
+            && (!(copy.replace_changed || standing.is_some())
                 || privileged::saved_route_current(
                     &crate::profile::connections_path_at(context.store.profile()),
                     reference,
                 ))
     };
     let claim = |proof| {
+        let Some(receipt) = receipt.as_ref() else {
+            return Err(file::Failure::Blocked);
+        };
         if proof != receipt.proof || !pins_current() {
             return Err(file::Failure::Conflict);
         }
         context
             .store
-            .claim(&request.job, &receipt)
+            .claim(&request.job, receipt)
             .map_err(|_| file::Failure::Blocked)?;
         claimed.set(true);
         Ok(())
     };
     let publication_allowed = || {
         pins_current()
-            && context
-                .store
-                .require_claimed(&request.job, &receipt)
-                .is_ok()
+            && if let (Some(receipt), Some((_, admission))) = (&tree_receipt, standing) {
+                context
+                    .store
+                    .require_tree_claimed(&request.job, receipt, admission.firing())
+                    .is_ok()
+            } else {
+                receipt.as_ref().is_some_and(|receipt| {
+                    context.store.require_claimed(&request.job, receipt).is_ok()
+                })
+            }
     };
     let opener = tree_opener(&session)?;
     let failure = |error| {
@@ -968,7 +1034,32 @@ pub(super) fn run_tree(
             Failure::blocked(tree_detail(error))
         }
     };
-    if copy.replace_changed {
+    if copy.replace_changed || standing.is_some() {
+        let claim_merge = |review: file::MergeClaim| {
+            if let (Some(receipt), Some((_, admission))) = (&tree_receipt, standing) {
+                if review.receiver != Some(receipt.receiver) || !pins_current() {
+                    return Err(file::Failure::Conflict);
+                }
+                context
+                    .store
+                    .arm_tree(
+                        &request.job,
+                        receipt,
+                        admission,
+                        (review.actions, review.bytes),
+                        &|| {
+                            cancellation.is_requested()
+                                || Instant::now() >= deadline
+                                || !allowed_now(reference)
+                        },
+                    )
+                    .map_err(|_| file::Failure::Blocked)?;
+                claimed.set(true);
+                Ok(())
+            } else {
+                claim(review.proof)
+            }
+        };
         let merged = if let Some(plan) = plan {
             file::upload_tree_merge(
                 opener,
@@ -976,7 +1067,20 @@ pub(super) fn run_tree(
                 &plan,
                 auth,
                 allowed,
-                claim,
+                claim_merge,
+                publication_allowed,
+            )
+        } else if tree_receipt
+            .as_ref()
+            .is_some_and(|receipt| receipt.create_root)
+        {
+            file::download_tree_create(
+                opener,
+                copy.remote.as_str(),
+                &copy.local,
+                auth,
+                allowed,
+                claim_merge,
                 publication_allowed,
             )
         } else {
@@ -986,16 +1090,22 @@ pub(super) fn run_tree(
                 &copy.local,
                 auth,
                 allowed,
-                claim,
+                claim_merge,
                 publication_allowed,
             )
         };
         let _ = session.close();
         let merged = merged.map_err(failure)?;
-        let mut completed = Completion::from_result(
-            request.id,
-            merged.error.map_or(Ok(0), |error| Err(failure(error))),
-        );
+        let outcome = if let Some(error) = merged.error {
+            Err(failure(error))
+        } else if let (Some(receipt), Some((_, admission))) = (&tree_receipt, standing) {
+            merged.receiver.ok_or_else(|| io::Error::other("Missing protected folder completion receipt"))
+                .and_then(|receiver| context.store.finish_tree(&request.job, receipt, admission.firing(), receiver))
+                .map(|()| 0).map_err(|_| Failure::failed("The protected folder was published but its completion could not be saved. Review the receiver again."))
+        } else {
+            Ok(0)
+        };
+        let mut completed = Completion::from_result(request.id, outcome);
         completed.append_detail(&format!(
             "Published {} new folder entries and replaced {} files ({} bytes).",
             merged.created, merged.replaced, merged.bytes

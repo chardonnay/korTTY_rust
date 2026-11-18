@@ -1,7 +1,8 @@
 use std::fmt::Write as _;
 
 use iced::widget::{
-    Id, button, column, container, keyed_column, pick_list, row, rule, scrollable, text, tooltip,
+    Id, button, column, container, keyed_column, pick_list, row, rule, scrollable, slider, text,
+    tooltip,
 };
 use iced::{Alignment, Element, Length, window};
 use serde::{Deserialize, Serialize};
@@ -18,8 +19,7 @@ use super::super::{Message as Desktop, local_dock};
 use super::images::{self, widget as images_widget};
 use super::{Action, Message};
 
-const MIN_WIDTH: u16 = 240;
-const MAX_WIDTH: u16 = 1_600;
+pub(in crate::workspace) const WIDTH_RANGE: std::ops::RangeInclusive<u16> = 240..=1_600;
 const DEFAULT_WIDTH: u16 = 380;
 const MAX_VISIBLE_CARDS: usize = 80;
 pub(super) const CARD_TEXT_LIMIT: usize = 480;
@@ -56,7 +56,10 @@ pub(in crate::workspace) fn clamp_width(width: f32) -> u16 {
         return DEFAULT_WIDTH;
     }
     width
-        .clamp(f32::from(MIN_WIDTH), f32::from(MAX_WIDTH))
+        .clamp(
+            f32::from(*WIDTH_RANGE.start()),
+            f32::from(*WIDTH_RANGE.end()),
+        )
         .round() as u16
 }
 
@@ -98,6 +101,7 @@ pub(super) struct Panel<'a> {
     pub(super) timeline: &'a [TimelineEntry],
     pub(super) timeline_limited: bool,
     pub(super) tail: Option<&'a str>,
+    pub(super) tail_height: u8,
     pub(super) notice: Option<&'a str>,
     pub(super) note_editor: Option<Element<'a, Desktop>>,
     pub(super) links: Option<LinkContext>,
@@ -119,7 +123,21 @@ pub(super) struct PanelActions<'a> {
     pub(super) automatic_screenshot_ai: Option<Element<'a, Desktop>>,
     pub(super) open_viewer: Option<Desktop>,
     pub(super) toggle_log: Option<Desktop>,
+    pub(super) resize_log: Option<LogHeightAction>,
     pub(super) more: Option<Element<'a, Desktop>>,
+}
+
+#[derive(Clone, Copy)]
+pub(super) struct LogHeightAction {
+    pub(super) owner: window::Id,
+    pub(super) tab: u64,
+    pub(super) run: u64,
+}
+
+impl LogHeightAction {
+    fn dispatch(self, action: Action) -> Desktop {
+        Desktop::JournalDock(self.owner, Message::Bound(self.tab, self.run, action))
+    }
 }
 
 pub(super) fn panel<'a>(
@@ -177,13 +195,37 @@ pub(super) fn panel<'a>(
             data.images,
         ))
         .width(Length::Fill)
-        .height(Length::FillPortion(2));
+        .height(if data.tail.is_some() {
+            Length::FillPortion(u16::from(100 - data.tail_height))
+        } else {
+            Length::Fill
+        });
         let mut content = column![cards].height(Length::Fill).spacing(5);
         if let Some(tail) = data.tail {
             content = content
                 .push(rule::horizontal(1))
                 .push(page_text(appearance, "Live Log", 13.0))
-                .push(tail_view(data.scroll_key, tail, appearance));
+                .push(actions.resize_log.map(|action| {
+                    row![
+                        page_text(
+                            appearance,
+                            format!("Log height {}%", data.tail_height),
+                            12.0
+                        ),
+                        slider(super::LIVE_LOG_HEIGHT, data.tail_height, move |height| {
+                            action.dispatch(Action::LiveLogHeight(height))
+                        })
+                        .on_release(action.dispatch(Action::FinishLiveLogResize)),
+                    ]
+                    .spacing(8)
+                    .align_y(Alignment::Center)
+                }))
+                .push(tail_view(
+                    data.scroll_key,
+                    tail,
+                    appearance,
+                    data.tail_height,
+                ));
         }
         let content = appearance.wrap(container(content).padding(4).width(Length::Fill).into());
         body = body.push(keyed_column([(data.scroll_key, content)]).height(Length::Fill));
@@ -426,7 +468,7 @@ pub(super) fn tail_id(scroll_key: u64) -> Id {
     Id::from(format!("kortty-live-journal-tail-{scroll_key}"))
 }
 
-fn tail_view(scroll_key: u64, tail: &str, appearance: Content) -> Element<'_, Desktop> {
+fn tail_view(scroll_key: u64, tail: &str, appearance: Content, height: u8) -> Element<'_, Desktop> {
     let colors = appearance.palette.colors;
     let (content, font, color) = if tail.is_empty() {
         ("No captured output yet.", appearance.ui_font, colors.muted)
@@ -443,7 +485,7 @@ fn tail_view(scroll_key: u64, tail: &str, appearance: Content) -> Element<'_, De
     .id(tail_id(scroll_key))
     .anchor_bottom()
     .width(Length::Fill)
-    .height(Length::FillPortion(1))
+    .height(Length::FillPortion(u16::from(height)))
     .into()
 }
 

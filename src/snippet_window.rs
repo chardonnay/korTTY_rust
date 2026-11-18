@@ -5,10 +5,11 @@ use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use iced::widget::{
-    self, button, checkbox, column, mouse_area, row, scrollable, text, text_editor, text_input,
-    tooltip,
+    self, button, checkbox, column, mouse_area, pick_list, row, scrollable, slider, text,
+    text_editor, text_input, tooltip,
 };
 use iced::{Alignment, Element, Length, Task};
 
@@ -29,6 +30,7 @@ mod details;
 pub(crate) mod diagrams;
 pub(crate) mod draft_store;
 pub(crate) mod folders;
+pub(crate) mod languages;
 mod managed_headers;
 pub(crate) mod recovery;
 pub(crate) mod session;
@@ -72,6 +74,10 @@ pub enum Message {
     Reload,
     Name(String),
     Language(String),
+    RememberLanguage(String),
+    LineNumbers(bool),
+    WordWrap(bool),
+    HistoryVersion(u32),
     Category(String),
     Edit(text_editor::Action),
     CompleteLua,
@@ -105,6 +111,15 @@ pub(crate) struct AnalysisPane<'a> {
     pub(crate) tabs: Vec<(AnalysisSubject, &'a str)>,
     pub(crate) active: Option<AnalysisSubject>,
     pub(crate) page: Option<Element<'a, Message>>,
+    pub(crate) side: Option<analysis::panel::Preferences>,
+    pub(crate) progress_extent: f32,
+}
+
+const LIBRARY_WIDTH: f32 = 290.0;
+const INSET: f32 = 12.0;
+
+pub(crate) fn analysis_available_width(window_width: f32) -> f32 {
+    window_width - LIBRARY_WIDTH - INSET * 3.0
 }
 
 impl fmt::Debug for Message {
@@ -141,6 +156,9 @@ pub(crate) enum Update {
     FocusFolderName(widget::Id),
     DeleteFolder(snippets::folders::Id, Vec<SnippetId>),
     Changed,
+    RememberLanguage(String),
+    LineNumbers(bool),
+    WordWrap(bool),
     CloseConfirmed,
     CloseCancelled,
     ReadClipboard(u64),
@@ -163,6 +181,14 @@ pub(crate) enum Update {
     },
 }
 
+pub(crate) struct EditorPreferences<'a> {
+    pub(crate) appearance: Appearance,
+    pub(crate) caret: caret::Preferences,
+    pub(crate) languages: &'a [String],
+    pub(crate) line_numbers: bool,
+    pub(crate) word_wrap: bool,
+}
+
 impl fmt::Debug for Update {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
@@ -172,6 +198,9 @@ impl fmt::Debug for Update {
             Self::FocusFolderName(_) => "FocusFolderName",
             Self::DeleteFolder(..) => "DeleteFolder",
             Self::Changed => "Changed",
+            Self::RememberLanguage(_) => "RememberLanguage",
+            Self::LineNumbers(_) => "LineNumbers",
+            Self::WordWrap(_) => "WordWrap",
             Self::CloseConfirmed => "CloseConfirmed",
             Self::CloseCancelled => "CloseCancelled",
             Self::ReadClipboard(_) => "ReadClipboard",
@@ -226,11 +255,14 @@ struct Draft {
     lua_completion: Option<lua::Completion>,
     last_ai: Option<Arc<ai_assist::Change>>,
     assist_connection: Option<crate::ai_manager::ProfileRef>,
+    versions: Vec<snippets::history::Revision>,
+    version_selected: Option<u32>,
+    version_due: Option<Instant>,
 }
 
 impl Draft {
     fn new(entry: Option<&Snippet>) -> Self {
-        Self {
+        let mut draft = Self {
             id: entry.map(Snippet::id),
             diagram_session: Arc::new(()),
             analysis_revision: Arc::new(()),
@@ -253,7 +285,15 @@ impl Draft {
             lua_completion: None,
             last_ai: None,
             assist_connection: None,
-        }
+            versions: entry.map_or_else(Vec::new, |entry| entry.history().to_vec()),
+            version_selected: None,
+            version_due: None,
+        };
+        draft.capture_version(
+            entry.map_or_else(|| Arc::from(""), Snippet::shared_content),
+            0,
+        );
+        draft
     }
 
     fn edit(&mut self, action: text_editor::Action) {
@@ -279,11 +319,60 @@ impl Draft {
             self.content.move_to(cursor);
         } else if current != previous {
             self.analysis_revision = Arc::new(());
-            self.recovery.changed();
-            self.structure.changed(Some(std::time::Instant::now()));
-            self.content_changed = true;
-            self.dirty = true;
+            self.source_changed();
         }
+    }
+
+    fn source_changed(&mut self) {
+        let now = Instant::now();
+        self.version_due = Some(now + Duration::from_millis(500));
+        self.version_selected = None;
+        self.mark_source_changed(now);
+    }
+
+    fn mark_source_changed(&mut self, now: Instant) {
+        self.recovery.changed();
+        self.structure.changed(Some(now));
+        self.content_changed = true;
+        self.dirty = true;
+    }
+
+    fn capture_version(&mut self, content: Arc<str>, global_limit: u8) {
+        self.version_due = None;
+        if (!content.trim().is_empty() || self.versions.is_empty())
+            && !content.contains('\0')
+            && self
+                .versions
+                .last()
+                .is_none_or(|version| version.content != content)
+        {
+            self.versions
+                .push(snippets::history::Revision::capture(content));
+        }
+        snippets::history::trim(
+            &mut self.versions,
+            self.metadata.history_max_size.unwrap_or(global_limit),
+        );
+    }
+
+    fn navigate_version(&mut self, index: u32, global_limit: u8) -> bool {
+        let Some(version) = self.versions.get(index as usize).cloned() else {
+            return false;
+        };
+        if self.version_due.is_some() {
+            self.capture_version(self.content.text().into(), global_limit);
+        }
+        self.version_selected = self
+            .versions
+            .iter()
+            .position(|item| item == &version)
+            .and_then(|index| u32::try_from(index).ok());
+        if self.content.text() == version.content.as_ref() {
+            return false;
+        }
+        self.replace_content(text_editor::Content::with_text(&version.content));
+        self.mark_source_changed(Instant::now());
+        true
     }
 
     fn is_lua(&self) -> bool {
@@ -344,9 +433,28 @@ pub(crate) struct SnippetWindow {
     structure: structure::State,
     tools: tools::Panel,
     editor_id: widget::Id,
+    history_limit: u8,
 }
 
 impl SnippetWindow {
+    pub(crate) fn set_history_limit(&mut self, limit: u8) {
+        self.history_limit = limit;
+    }
+
+    pub(crate) fn history_needs_tick(&self) -> bool {
+        self.tabs
+            .editors(&self.draft)
+            .any(|draft| draft.version_due.is_some())
+    }
+
+    pub(crate) fn poll_history(&mut self, now: Instant) {
+        for draft in self.tabs.editors_mut(&mut self.draft) {
+            if draft.version_due.is_some_and(|due| now >= due) {
+                draft.capture_version(draft.content.text().into(), self.history_limit);
+            }
+        }
+    }
+
     pub(crate) fn seed_workflow(&mut self, input: snippets::Input, metadata: snippets::Metadata) {
         self.tabs.new_draft(&mut self.draft);
         self.draft.name = input.name;
@@ -360,6 +468,7 @@ impl SnippetWindow {
         self.draft.dirty = true;
         self.draft.recovery = recovery::State::memory_only();
         self.draft.structure.changed(None);
+        self.draft.version_due = Some(Instant::now());
         self.library_selection = None;
     }
 
@@ -370,6 +479,7 @@ impl SnippetWindow {
         let library_selection = draft.id;
         let mut window = Self {
             library,
+            history_limit: snippets::history::DEFAULT_LIMIT,
             pending_library: None,
             saved_diagrams: diagrams::State::default(),
             draft,
@@ -809,12 +919,7 @@ impl SnippetWindow {
             && accept
         {
             self.draft.replace_content(replacement);
-            self.draft.recovery.changed();
-            self.draft
-                .structure
-                .changed(Some(std::time::Instant::now()));
-            self.draft.content_changed = true;
-            self.draft.dirty = true;
+            self.draft.source_changed();
         }
         self.apply_pending_library();
     }
@@ -910,6 +1015,8 @@ impl SnippetWindow {
             Message::Open(id) => Some(*id),
             Message::Name(_)
             | Message::Language(_)
+            | Message::RememberLanguage(_)
+            | Message::HistoryVersion(_)
             | Message::Category(_)
             | Message::Save
             | Message::Delete
@@ -1169,6 +1276,26 @@ impl SnippetWindow {
                 self.draft.dirty |= self.draft.language != language;
                 self.draft.language = language;
             }
+            Message::RememberLanguage(language)
+                if !self.tabs.is_empty()
+                    && !languages::built_in(&language)
+                    && languages::normalize(&language).as_ref() == Some(&language)
+                    && languages::normalize(&self.draft.language).as_ref() == Some(&language) =>
+            {
+                self.update_inner(Message::Language(language.clone()));
+                return Update::RememberLanguage(language);
+            }
+            Message::LineNumbers(enabled) if !self.tabs.is_empty() => {
+                return Update::LineNumbers(enabled);
+            }
+            Message::WordWrap(enabled) if !self.tabs.is_empty() => {
+                return Update::WordWrap(enabled);
+            }
+            Message::HistoryVersion(index) if !self.tabs.is_empty() => {
+                if self.draft.navigate_version(index, self.history_limit) {
+                    self.tabs.pin();
+                }
+            }
             Message::Category(category) if category.len() <= snippets::MAX_CATEGORY_BYTES => {
                 self.tabs.pin();
                 if self.draft.category != category {
@@ -1273,12 +1400,7 @@ impl SnippetWindow {
                     selection: None,
                 });
                 self.draft.lua_completion = None;
-                self.draft.recovery.changed();
-                self.draft
-                    .structure
-                    .changed(Some(std::time::Instant::now()));
-                self.draft.content_changed = true;
-                self.draft.dirty = true;
+                self.draft.source_changed();
                 self.status = Some("Formatted the snippet buffer.".into());
                 return Update::FocusEditor;
             }
@@ -1552,6 +1674,9 @@ impl SnippetWindow {
             .as_ref()
             .filter(|_| !self.draft.content_changed)
             .map_or_else(|| self.draft.content.text().into(), Snippet::shared_content);
+        self.draft
+            .capture_version(Arc::clone(&content), self.history_limit);
+        let versions = self.draft.versions.clone();
         let input = snippets::Input {
             name: self.draft.name.clone(),
             language: self.draft.language.clone(),
@@ -1574,13 +1699,16 @@ impl SnippetWindow {
                         .retain(|diagram| diagram.captured_for(&input.content));
                     omitted_diagrams = metadata.diagrams.len() != initial;
                 }
-                self.library.create_with_id(key, input, metadata)
+                self.library
+                    .save_with_history(None, Some(key), input, Some(metadata), versions)
             })
-        } else if self.draft.metadata_changed {
-            self.library
-                .save_with_metadata(id, input, Some(self.draft.metadata.clone()))
         } else {
-            self.library.save(id, input)
+            let metadata = self
+                .draft
+                .metadata_changed
+                .then(|| self.draft.metadata.clone());
+            self.library
+                .save_with_history(id, None, input, metadata, versions)
         };
         match saved {
             Ok(id) => {
@@ -1742,12 +1870,19 @@ impl SnippetWindow {
     pub(crate) fn view<'a>(
         &'a self,
         content_theme: iced::Theme,
-        appearance: Appearance,
-        caret_preferences: caret::Preferences,
+        preferences: EditorPreferences<'a>,
         open_elsewhere: bool,
         transfer: transfer::Context<'a>,
         analysis: AnalysisPane<'a>,
+        available_width: f32,
     ) -> Element<'a, Message> {
+        let EditorPreferences {
+            appearance,
+            caret: caret_preferences,
+            languages: custom_languages,
+            line_numbers,
+            word_wrap,
+        } = preferences;
         if let Some(page) = transfer.page {
             return transfer::view(page);
         }
@@ -1887,7 +2022,7 @@ impl SnippetWindow {
                 .wrap(),
             ]
             .spacing(8)
-            .width(290)
+            .width(LIBRARY_WIDTH)
             .height(Length::Fill)
             .into()
         });
@@ -1948,14 +2083,21 @@ impl SnippetWindow {
         let tab_strip = scrollable(tab_strip).direction(scrollable::Direction::Horizontal(
             scrollable::Scrollbar::default(),
         ));
-        if let Some(page) = analysis.page {
+        let available = analysis_available_width(available_width) - analysis.progress_extent;
+        let side_width = analysis
+            .side
+            .and_then(|panel| panel.fitted_width(available));
+        let mut page = analysis.page;
+        if side_width.is_none()
+            && let Some(page) = page.take()
+        {
             let pane = column![tab_strip, page]
                 .width(Length::Fill)
                 .height(Length::Fill)
                 .spacing(8);
             return row![library, pane]
-                .padding(12)
-                .spacing(12)
+                .padding(INSET)
+                .spacing(INSET)
                 .height(Length::Fill)
                 .into();
         }
@@ -1984,7 +2126,7 @@ impl SnippetWindow {
         };
         let is_lua = self.draft.is_lua();
         let code = move || {
-            caret::view(
+            caret::view_with_layout(
                 text_editor(&self.draft.content)
                     .id(self.editor_id.clone())
                     .height(Length::Fill)
@@ -2004,10 +2146,12 @@ impl SnippetWindow {
                 appearance,
                 appearance.size,
                 caret_preferences,
+                line_numbers.then_some(&self.draft.content),
+                Some(word_wrap),
             )
         };
         let structure_available = !self.tabs.is_preview();
-        let structure_visible = structure_available && self.structure_preferences().visible;
+        let structure_visible = structure_available && self.structure_preferences().visible();
         let tool_context = self.tool_context();
         let can_complete_lua = is_lua && !self.tabs.is_empty();
         let mut source_tools = row![];
@@ -2018,6 +2162,14 @@ impl SnippetWindow {
         for button in self.tools.actions(tool_context) {
             source_tools = source_tools.push(Element::new(button).map(Message::Tools));
         }
+        let language = languages::normalize(&self.draft.language);
+        let remember_language = language.clone().filter(|token| {
+            !languages::built_in(token)
+                && !custom_languages.contains(token)
+                && custom_languages.len() < languages::MAX_CUSTOM
+        });
+        let selected_language =
+            language.filter(|token| languages::built_in(token) || custom_languages.contains(token));
         let editor = column![
             self.recovery_banner(),
             tab_strip,
@@ -2028,12 +2180,40 @@ impl SnippetWindow {
                 text_input("Category", &self.draft.category).on_input(Message::Category)
             ]
             .spacing(6),
+            row![
+                pick_list(
+                    languages::choices(custom_languages),
+                    selected_language,
+                    Message::Language
+                )
+                .placeholder("Code languages"),
+                button("Remember language")
+                    .on_press_maybe(remember_language.map(Message::RememberLanguage)),
+                checkbox(line_numbers)
+                    .label("Line numbers")
+                    .on_toggle(Message::LineNumbers),
+                checkbox(word_wrap)
+                    .label("Word wrap")
+                    .on_toggle(Message::WordWrap),
+            ]
+            .spacing(6)
+            .wrap(),
             self.custom_header_save_blocked(None)
                 .then(
                     || text("Managed policy blocks creating new Script-Header snippets.").size(13)
                 ),
             (can_complete_lua || tool_context.is_some()).then(|| source_tools.spacing(6).wrap()),
             self.tools.view().map(|panel| panel.map(Message::Tools)),
+            (self.draft.versions.len() > 1).then(|| {
+                let last = u32::try_from(self.draft.versions.len() - 1).unwrap_or(u32::MAX - 1);
+                let selected = self.draft.version_selected.unwrap_or(last).min(last);
+                row![
+                    text(format!("Version {} of {}", selected + 1, last + 1)).size(13),
+                    slider(0..=last, selected, Message::HistoryVersion),
+                ]
+                .align_y(Alignment::Center)
+                .spacing(8)
+            }),
             self.draft
                 .lua_completion
                 .as_ref()
@@ -2125,9 +2305,34 @@ impl SnippetWindow {
         } else {
             editor.into()
         };
+        let editor: Element<'_, Message> = if let (Some(width), Some(page)) = (side_width, page) {
+            use crate::horizontal_divider::{self, Grow};
+            let divider = widget::canvas(horizontal_divider::program(
+                width,
+                Grow::Left,
+                move |width| {
+                    Message::Analysis(analysis::Message::ResizeSidePanel { available, width })
+                },
+                None,
+            ))
+            .width(horizontal_divider::WIDTH)
+            .height(Length::Fill);
+            row![
+                editor,
+                divider,
+                widget::container(page)
+                    .width(width + analysis.progress_extent)
+                    .height(Length::Fill),
+            ]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+        } else {
+            editor
+        };
         row![library, editor]
-            .padding(12)
-            .spacing(12)
+            .padding(INSET)
+            .spacing(INSET)
             .height(Length::Fill)
             .into()
     }

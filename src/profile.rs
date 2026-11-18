@@ -120,12 +120,16 @@ pub struct WindowPlacement {
 }
 
 impl WindowPlacement {
+    pub(crate) const WIDTH: std::ops::RangeInclusive<u16> = 320..=8192;
+    pub(crate) const HEIGHT: std::ops::RangeInclusive<u16> = 200..=8192;
+
     fn valid(self) -> bool {
         Self::valid_size(self.width, self.height) && self.position.is_none_or(SavedPosition::valid)
     }
 
     pub fn valid_size(width: f32, height: f32) -> bool {
-        (320.0..=8192.0).contains(&width) && (200.0..=8192.0).contains(&height)
+        (f32::from(*Self::WIDTH.start())..=f32::from(*Self::WIDTH.end())).contains(&width)
+            && (f32::from(*Self::HEIGHT.start())..=f32::from(*Self::HEIGHT.end())).contains(&height)
     }
 }
 

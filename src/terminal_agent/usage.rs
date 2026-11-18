@@ -922,7 +922,8 @@ mod tests {
             }
             let requests = endpoint.join().unwrap();
             assert_eq!(requests.len(), 1);
-            assert!(system.contains("requires user approval"));
+            assert!(system.contains("Mutating commands require approval"));
+            assert!(system.contains("read-only commands may proceed"));
             assert!(system.contains("Inspect the masked *** path."));
             assert_eq!(requests[0]["messages"][0]["content"], system);
             assert_eq!(requests[0]["messages"][1]["content"], input);

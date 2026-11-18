@@ -2,14 +2,70 @@
 
 use std::path::Path;
 
+use crate::sftp_window::tree::snapshot::known_special_mode;
+
 use super::super::server_copy::Folder;
 use super::*;
 
 pub(super) mod local;
 
-pub(super) enum Outcome {
+pub(in crate::sftp_window::worker) enum Outcome {
     Removed(Option<Failure>),
     KeptNotEmpty,
+}
+
+pub(in crate::sftp_window::worker) fn remove_reviewed(
+    client: &mut Client,
+    parent: &(Location, DirectoryStamp),
+    target: &Location,
+    expected: &SnapshotEntry,
+    stopped: &impl Fn() -> bool,
+) -> Result<Outcome> {
+    let guard = || {
+        if stopped() {
+            return Err(io::Error::other("Deletion stopped").into());
+        }
+        Ok(())
+    };
+    guard()?;
+    match (&parent.0, &parent.1, target, expected) {
+        (
+            Location::Local(parent),
+            DirectoryStamp::Local(identity),
+            Location::Local(path),
+            expected,
+        ) => local::remove(
+            parent,
+            local_child(parent, path)?,
+            identity,
+            expected,
+            &guard,
+        ),
+        (
+            Location::Remote(parent_path),
+            DirectoryStamp::Remote(_),
+            Location::Remote(path),
+            expected,
+        ) => {
+            let entry = match expected {
+                SnapshotEntry::Remote(attributes) => (*attributes, None),
+                SnapshotEntry::RemoteLink { attributes, target } => {
+                    (*attributes, Some(target.as_slice()))
+                }
+                _ => return Err(invalid_plan().into()),
+            };
+            remove_remote(
+                client,
+                parent_path,
+                path,
+                &parent.1,
+                entry,
+                stopped,
+                &|_| guard(),
+            )
+        }
+        _ => Err(invalid_plan().into()),
+    }
 }
 
 pub(super) struct Plan {
@@ -41,7 +97,7 @@ impl Plan {
                 .sum::<usize>();
         for path in review.destination_only(to) {
             let expected = target.entries.get(path).ok_or_else(invalid_plan)?;
-            if expected.kind() == Kind::Blocked {
+            if matches!(expected.kind(), Kind::Link | Kind::Blocked) {
                 return Err(invalid_plan());
             }
             if copy.actions.len() + actions.len() == MAX_ACTIONS {
@@ -231,7 +287,7 @@ impl Remove {
                     parent,
                     path,
                     &self.parent.1,
-                    expected,
+                    (expected, None),
                     stopped,
                     &guard,
                 )
@@ -275,18 +331,18 @@ fn remove_remote(
     parent: &[u8],
     path: &[u8],
     parent_stamp: &DirectoryStamp,
-    expected: Attributes,
+    expected: (Attributes, Option<&[u8]>),
     stopped: &impl Fn() -> bool,
     guard: &impl Fn(&mut Client) -> Result<()>,
 ) -> Result<Outcome> {
     let folder = Folder::read(client, parent.to_vec(), stopped)?;
     let owner = folder.owner();
-    if !folder.trusted(owner) || !protected_target(expected, owner) {
+    if !folder.trusted(owner) || !protected_target(expected.0, owner) {
         return Err(io::Error::other("Choose protected server removal entries and folders").into());
     }
     parent_stamp.verify(client, &Location::Remote(parent.to_vec()), false)?;
     verify_remote_entry(client, path, expected)?;
-    let directory = expected.kind() == FileKind::Directory;
+    let directory = expected.0.kind() == FileKind::Directory;
     if directory && !empty_remote(client, path)? {
         return Ok(Outcome::KeptNotEmpty);
     }
@@ -346,16 +402,35 @@ fn remove_remote(
 }
 
 fn protected_target(entry: Attributes, owner: u32) -> bool {
-    matches!(entry.kind(), FileKind::File | FileKind::Directory)
+    let kind = entry.kind();
+    // The verified parent protects the link entry. Symlink mode bits do
+    // not control whether that entry can be replaced or unlinked.
+    (matches!(
+        kind,
+        FileKind::File | FileKind::Directory | FileKind::Symlink
+    ) || known_special_mode(entry.permissions))
         && entry.uid.is_some_and(|uid| uid == owner || uid == 0)
         && entry.gid.is_some()
-        && entry.permissions.is_some_and(|mode| mode & 0o022 == 0)
+        && entry
+            .permissions
+            .is_some_and(|mode| kind == FileKind::Symlink || mode & 0o022 == 0)
         && entry.modified.is_some()
         && entry.size.is_some()
 }
 
-fn verify_remote_entry(client: &mut Client, path: &[u8], expected: Attributes) -> Result<()> {
-    if !unchanged(expected, client.lstat(path)?) || client.canonicalize(path)? != path {
+fn verify_remote_entry(
+    client: &mut Client,
+    path: &[u8],
+    (expected, link_target): (Attributes, Option<&[u8]>),
+) -> Result<()> {
+    if !unchanged(expected, client.lstat(path)?) {
+        return Err(io::Error::other("The reviewed server removal entry changed").into());
+    }
+    let same = match link_target {
+        Some(target) => expected.kind() == FileKind::Symlink && client.read_link(path)? == target,
+        None => expected.kind() != FileKind::Symlink && client.canonicalize(path)? == path,
+    };
+    if !same {
         return Err(io::Error::other("The reviewed server removal entry changed").into());
     }
     Ok(())

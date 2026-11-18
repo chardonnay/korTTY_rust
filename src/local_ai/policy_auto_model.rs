@@ -113,7 +113,7 @@ impl LmStudioAutoModel {
         connection: &Connection,
         credential: Option<&str>,
         deadline: Option<Instant>,
-        require_current: impl Fn() -> Result<(), Error>,
+        require_current: impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
         let model = resolve_with_preference(
             connection,
@@ -219,7 +219,7 @@ pub(super) fn resolve(
     connection: &Connection,
     credential: Option<&str>,
     deadline: Option<Instant>,
-    require_current: impl Fn() -> Result<(), Error>,
+    require_current: impl FnMut() -> Result<(), Error>,
 ) -> Result<String, Error> {
     resolve_with_preference(connection, None, credential, deadline, require_current)
 }
@@ -229,7 +229,7 @@ fn resolve_with_preference(
     preferred: Option<&str>,
     credential: Option<&str>,
     deadline: Option<Instant>,
-    require_current: impl Fn() -> Result<(), Error>,
+    mut require_current: impl FnMut() -> Result<(), Error>,
 ) -> Result<String, Error> {
     let cutoff = Instant::now() + TIMEOUT;
     let deadline = deadline.map_or(cutoff, |deadline| deadline.min(cutoff));
@@ -241,7 +241,7 @@ fn resolve_with_preference(
         request = request.header("authorization", bearer_header(credential)?);
     }
 
-    let remaining = checkpoint(connection, deadline, &require_current)?;
+    let remaining = checkpoint(connection, deadline, &mut require_current)?;
     #[cfg(target_os = "macos")]
     let _power = kortty_macos::AppNapActivity::begin();
     let result = (|| {
@@ -257,14 +257,14 @@ fn resolve_with_preference(
         let bytes = response_bytes(&mut response, true)?;
         select_loaded_model(&bytes, credential, preferred)
     })();
-    checkpoint(connection, deadline, &require_current)?;
+    checkpoint(connection, deadline, &mut require_current)?;
     result
 }
 
 fn checkpoint(
     connection: &Connection,
     deadline: Instant,
-    require_current: &impl Fn() -> Result<(), Error>,
+    require_current: &mut impl FnMut() -> Result<(), Error>,
 ) -> Result<Duration, Error> {
     if !connection.active() {
         return Err(Error::Cancelled);

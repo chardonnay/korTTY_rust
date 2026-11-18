@@ -1,8 +1,9 @@
 //! Native activity windows and status for an exact terminal stream.
 
-use iced::widget::{button, column, container, row, text};
+use iced::widget::{button, canvas, column, container, row, text};
 use iced::{Alignment, Color, Element, Length, Size, window};
 
+use crate::horizontal_divider::{self, Grow};
 use crate::session::SessionId;
 use crate::terminal_agent::design::{Arrangement, History, Layout, Status};
 
@@ -16,10 +17,25 @@ mod placement;
 mod presentation;
 mod status;
 
-pub(in crate::workspace) use placement::{Slot, compose, history_slot, status_slot};
+pub(in crate::workspace) use placement::{
+    DockPlacement, DockPreferences, Slot, compose, status_slot,
+};
 use presentation::Dock;
 pub(crate) use presentation::Message;
 pub(super) use presentation::Presentation;
+
+#[derive(Clone, Copy)]
+pub(crate) struct DockResize {
+    expected: DockPreferences,
+    side: Slot,
+    width: Option<f32>,
+}
+
+impl DockResize {
+    fn message(self, id: window::Id, width: Option<f32>) -> Desktop {
+        Desktop::TerminalAgent(id, AgentMessage::DockResize(Self { width, ..self }))
+    }
+}
 
 pub(super) fn window(layout: Layout) -> (dialog_placement::Kind, window::Settings) {
     let (kind, size, minimum, level) = if layout.arrangement == Arrangement::Floating {
@@ -254,6 +270,69 @@ fn pane_status(
 }
 
 impl Workspace {
+    pub(in crate::workspace) fn cancel_agent_dock_resizes(&mut self) {
+        for run in self.terminal_agents.runs.values_mut() {
+            run.presentation.dock_resize = None;
+        }
+    }
+
+    pub(super) fn resize_agent_dock(
+        &mut self,
+        id: window::Id,
+        resize: DockResize,
+    ) -> Option<window::Id> {
+        let dock = self.window_settings.ai_agent_panel;
+        if dock != resize.expected {
+            return None;
+        }
+        let current = self.terminal_agents.runs.get(&id).and_then(|run| {
+            if run.swarm
+                || run.closing
+                || run.design.arrangement != Arrangement::Normal
+                || dock.history_slot(run.design) != Some(resize.side)
+                || !matches!(resize.side, Slot::Left | Slot::Right)
+            {
+                return None;
+            }
+            let source = run.binding.live().ok()?;
+            let (owner, pane, _) = self.agent_pane(source.session)?;
+            (source.stream == pane.stream_generation
+                && self
+                    .terminal_agents
+                    .agent_activity_for_stream(source.session, source.stream)
+                    .is_some_and(|(current, _)| current == id)
+                && self.owner_dialog(owner).is_none()
+                && self.hosted_close_prompt(owner).is_none()
+                && !self.terminal_only_fullscreen_active(owner))
+            .then_some(owner)
+        });
+        let owner = current?;
+        let preview = &mut self
+            .terminal_agents
+            .runs
+            .get_mut(&id)
+            .expect("checked run")
+            .presentation
+            .dock_resize;
+        if let Some(width) = resize.width {
+            if width.is_finite() {
+                let range = DockPreferences::WIDTH_RANGE;
+                let width = width
+                    .clamp(f32::from(*range.start()), f32::from(*range.end()))
+                    .round() as u16;
+                *preview = Some((dock, width));
+            }
+        } else if let Some((expected, width)) = preview.take()
+            && expected == dock
+            && dock.width != Some(width)
+        {
+            self.window_settings.ai_agent_panel.width = Some(width);
+            self.cancel_agent_dock_resizes();
+            return Some(owner);
+        }
+        None
+    }
+
     pub(in crate::workspace) fn decorate_agent_terminal<'a>(
         &'a self,
         session: SessionId,
@@ -285,11 +364,48 @@ impl Workspace {
             };
         }
         let picture_in_picture = run.design.arrangement == Arrangement::PictureInPicture;
-        let history_position = (!picture_in_picture)
-            .then(|| history_slot(run.design.history))
-            .flatten();
-        let history = history_position.map(|_| {
-            history_panel(run, palette).map(move |message| Desktop::TerminalAgent(id, message))
+        let dock = self.window_settings.ai_agent_panel;
+        let history_position = dock.history_slot(run.design);
+        let side_width = run
+            .presentation
+            .dock_resize
+            .filter(|(expected, _)| *expected == dock)
+            .map_or_else(
+                || dock.side_width(cell.width * 40.0),
+                |(_, width)| f32::from(width),
+            );
+        let history = history_position.map(|side| {
+            let history =
+                history_panel(run, palette).map(move |message| Desktop::TerminalAgent(id, message));
+            if run.design.arrangement != Arrangement::Normal
+                || !matches!(side, Slot::Left | Slot::Right)
+            {
+                return history;
+            }
+            let left = side == Slot::Left;
+            let extent = placement::fitted_side_width(
+                bounds.width,
+                side_width,
+                left && status_position == Slot::Right,
+            );
+            let resize = DockResize {
+                expected: dock,
+                side,
+                width: None,
+            };
+            let grip = canvas(horizontal_divider::program(
+                extent,
+                if left { Grow::Right } else { Grow::Left },
+                move |width| resize.message(id, Some(width)),
+                Some(resize.message(id, None)),
+            ))
+            .width(horizontal_divider::WIDTH)
+            .height(Length::Fill);
+            if left {
+                row![history, grip].height(Length::Fill).into()
+            } else {
+                row![grip, history].height(Length::Fill).into()
+            }
         });
         let status = if adaptive_side && run.design.history == History::Timeline {
             // Both roles resolve to Java d02. Keep its single history presenter.
@@ -321,12 +437,81 @@ impl Workspace {
             history_position,
             status_position,
             bounds,
-            if rail { 84.0 } else { cell.width * 40.0 },
+            (side_width, if rail { 84.0 } else { side_width }),
         );
         if picture_in_picture {
             pip::decorate(agents, id, run, terminal, reduced_motion, palette)
         } else {
             terminal
         }
+    }
+}
+
+#[cfg(test)]
+mod dock_tests {
+    use super::*;
+    use crate::terminal_agent::Mode;
+    use crate::workspace::terminal_agent::flow::tests::Fixture;
+
+    #[test]
+    fn dock_drag_previews_then_commits_and_rejects_stale_layout_and_stream() {
+        let mut fixture = Fixture::with_endpoint(false, false, "127.0.0.1:12345");
+        let run = fixture.open(Mode::Ask);
+        let workspace = &mut fixture.workspace;
+        let panel = DockPreferences {
+            placement: Some(DockPlacement::Left),
+            width: None,
+        };
+        workspace.window_settings.ai_agent_panel = panel;
+        let resize = DockResize {
+            expected: panel,
+            side: Slot::Left,
+            width: None,
+        };
+        let move_to = |width| DockResize {
+            width: Some(width),
+            ..resize
+        };
+
+        assert!(workspace.resize_agent_dock(run, move_to(430.5)).is_none());
+        assert_eq!(workspace.window_settings.ai_agent_panel, panel);
+        assert_eq!(
+            workspace.terminal_agents.runs[&run]
+                .presentation
+                .dock_resize,
+            Some((panel, 431))
+        );
+        assert!(workspace.resize_agent_dock(run, resize).is_some());
+        assert_eq!(workspace.window_settings.ai_agent_panel.width, Some(431));
+
+        assert!(workspace.resize_agent_dock(run, move_to(590.0)).is_none());
+        assert!(
+            workspace.terminal_agents.runs[&run]
+                .presentation
+                .dock_resize
+                .is_none()
+        );
+        let updated = DockResize {
+            expected: workspace.window_settings.ai_agent_panel,
+            ..resize
+        };
+        workspace
+            .sessions
+            .get_mut(&fixture.session)
+            .unwrap()
+            .stream_generation += 1;
+        assert!(
+            workspace
+                .resize_agent_dock(
+                    run,
+                    DockResize {
+                        width: Some(550.0),
+                        ..updated
+                    }
+                )
+                .is_none()
+        );
+        assert!(workspace.resize_agent_dock(run, updated).is_none());
+        assert_eq!(workspace.window_settings.ai_agent_panel.width, Some(431));
     }
 }

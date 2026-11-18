@@ -212,6 +212,93 @@ fn storable(ch: char) -> bool {
     matches!(ch, '\t' | '\n' | '\r') || (!ch.is_control() && !matches!(ch, '\u{fffe}' | '\u{ffff}'))
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct JavaPreferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    auto_detect: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    learned_rules: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    statistics: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Preference {
+    Enabled,
+    AutoDetect,
+    LearnedRules,
+    Statistics,
+}
+
+impl Preference {
+    pub(super) const ALL: [Self; 4] = [
+        Self::Enabled,
+        Self::AutoDetect,
+        Self::LearnedRules,
+        Self::Statistics,
+    ];
+
+    pub(super) fn java_field(self) -> &'static str {
+        match self {
+            Self::Enabled => "aiSkillsEnabled",
+            Self::AutoDetect => "aiSkillAutoDetectionEnabled",
+            Self::LearnedRules => "aiSkillAutoCreate",
+            Self::Statistics => "aiSkillStatisticsEnabled",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Enabled => "AI skills",
+            Self::AutoDetect => "Automatic skill selection",
+            Self::LearnedRules => "Saving learned rules in skills",
+            Self::Statistics => "Local skill statistics",
+        }
+    }
+}
+
+impl JavaPreferences {
+    pub(super) fn get(&self, preference: Preference) -> Option<bool> {
+        match preference {
+            Preference::Enabled => self.enabled,
+            Preference::AutoDetect => self.auto_detect,
+            Preference::LearnedRules => self.learned_rules,
+            Preference::Statistics => self.statistics,
+        }
+    }
+
+    pub(super) fn set(&mut self, preference: Preference, value: bool) {
+        *match preference {
+            Preference::Enabled => &mut self.enabled,
+            Preference::AutoDetect => &mut self.auto_detect,
+            Preference::LearnedRules => &mut self.learned_rules,
+            Preference::Statistics => &mut self.statistics,
+        } = Some(value);
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        Preference::ALL
+            .into_iter()
+            .all(|preference| self.get(preference).is_none())
+    }
+
+    pub(super) fn merge(&mut self, incoming: Self) -> bool {
+        let mut changed = false;
+        for preference in Preference::ALL {
+            if self.get(preference).is_none()
+                && let Some(value) = incoming.get(preference)
+            {
+                self.set(preference, value);
+                changed = true;
+            }
+        }
+        changed
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub(super) struct Store {

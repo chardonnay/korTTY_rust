@@ -22,6 +22,10 @@ pub(super) struct StartupPreferences {
     pub(super) remember_dashboard: bool,
     pub(super) use_fixed_geometry: bool,
     pub(super) fixed: FixedGeometry,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) java_last_geometry: Option<FixedGeometry>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) java_dashboard_visible: Option<bool>,
 }
 
 impl Default for StartupPreferences {
@@ -32,6 +36,8 @@ impl Default for StartupPreferences {
             remember_dashboard: true,
             use_fixed_geometry: false,
             fixed: FixedGeometry::default(),
+            java_last_geometry: None,
+            java_dashboard_visible: None,
         }
     }
 }
@@ -78,11 +84,20 @@ impl FixedGeometry {
     }
 
     fn placement(self) -> WindowPlacement {
-        let geometry = self.clamped();
+        self.clamped().remembered_placement()
+    }
+
+    pub(super) fn remembered_valid(self) -> bool {
+        let placement = self.remembered_placement();
+        WindowPlacement::valid_size(placement.width, placement.height)
+            && placement.position.is_some()
+    }
+
+    fn remembered_placement(self) -> WindowPlacement {
         WindowPlacement {
-            width: f32::from(geometry.width),
-            height: f32::from(geometry.height),
-            position: SavedPosition::new(geometry.x as f32, geometry.y as f32),
+            width: f32::from(self.width),
+            height: f32::from(self.height),
+            position: SavedPosition::new(self.x as f32, self.y as f32),
         }
     }
 }
@@ -268,20 +283,20 @@ fn saved_position(point: Point, scale: f32) -> Option<SavedPosition> {
 
 #[derive(Default)]
 pub(super) struct Lifecycle {
-    last: LastWindow,
+    last: Option<LastWindow>,
     persistence: Option<Persistence>,
     #[cfg(target_os = "macos")]
     events: Option<async_channel::Receiver<kortty_macos::NativeEvent>>,
 }
 
 struct Persistence {
-    written: LastWindow,
+    written: Option<LastWindow>,
     deadline: Option<Instant>,
 }
 
 impl Lifecycle {
     pub fn initialize() -> Self {
-        let last = profile::load_last_window().unwrap_or_default();
+        let last = profile::load_last_window().ok();
         Self {
             last,
             persistence: Some(Persistence {
@@ -296,12 +311,12 @@ impl Lifecycle {
     pub(super) fn startup(&self, preferences: StartupPreferences) -> (WindowPlacement, bool, bool) {
         let (placement, maximized) = if preferences.use_fixed_geometry {
             (preferences.fixed.placement(), preferences.fixed.maximized)
-        } else if let Some(placement) = self
-            .last
-            .placement()
-            .filter(|_| preferences.remember_geometry)
+        } else if let Some((placement, maximized)) = preferences
+            .remember_geometry
+            .then(|| self.remembered_startup_geometry(preferences.java_last_geometry))
+            .flatten()
         {
-            (placement, self.last.maximized)
+            (placement, maximized)
         } else {
             (
                 WindowPlacement {
@@ -315,7 +330,30 @@ impl Lifecycle {
         (
             placement,
             maximized,
-            preferences.remember_dashboard && self.last.dashboard_visible,
+            preferences.remember_dashboard && self.remembered_dashboard(preferences),
+        )
+    }
+
+    fn remembered_startup_geometry(
+        &self,
+        imported: Option<FixedGeometry>,
+    ) -> Option<(WindowPlacement, bool)> {
+        self.last
+            .and_then(|last| {
+                last.placement()
+                    .map(|placement| (placement, last.maximized))
+            })
+            .or_else(|| {
+                imported
+                    .filter(|geometry| geometry.remembered_valid())
+                    .map(|geometry| (geometry.remembered_placement(), geometry.maximized))
+            })
+    }
+
+    fn remembered_dashboard(&self, preferences: StartupPreferences) -> bool {
+        self.last.map_or_else(
+            || preferences.java_dashboard_visible.unwrap_or(false),
+            |last| last.dashboard_visible,
         )
     }
 
@@ -325,15 +363,23 @@ impl Lifecycle {
         preferences: StartupPreferences,
         closing: bool,
     ) {
-        if window.geometry.recordable
+        let capture_geometry = window.geometry.recordable
             && !window.geometry.connection_specific
-            && !preferences.use_fixed_geometry
-        {
-            self.last
-                .set_placement(window.placement(), window.maximized());
+            && !preferences.use_fixed_geometry;
+        let capture_dashboard = closing && preferences.remember_dashboard;
+        if !capture_geometry && !capture_dashboard {
+            return;
         }
-        if closing && preferences.remember_dashboard {
-            self.last.dashboard_visible = window.dashboard.visible();
+        let last = self.last.get_or_insert_with(|| {
+            let mut last = LastWindow::default();
+            last.dashboard_visible = preferences.java_dashboard_visible.unwrap_or(false);
+            last
+        });
+        if capture_geometry {
+            last.set_placement(window.placement(), window.maximized());
+        }
+        if capture_dashboard {
+            last.dashboard_visible = window.dashboard.visible();
         }
     }
 
@@ -341,7 +387,7 @@ impl Lifecycle {
         self.persistence
             .as_ref()
             .filter(|persistence| persistence.written != self.last)
-            .map(|_| self.last)
+            .and(self.last)
     }
 
     fn queue_save(&mut self) -> Task<Message> {
@@ -404,7 +450,7 @@ impl Lifecycle {
             && profile::save_last_window(window).is_ok()
             && let Some(persistence) = &mut self.persistence
         {
-            persistence.written = window;
+            persistence.written = Some(window);
         }
     }
 

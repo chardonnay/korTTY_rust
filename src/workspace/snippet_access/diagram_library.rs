@@ -104,6 +104,11 @@ impl Workspace {
         };
         match result {
             Ok(mut diagram) => {
+                diagram.configure_snippet_layout(self.snippet_diagram_direction());
+                diagram.configure_snippet_appearance(
+                    self.window_settings.snippet_diagram_appearance,
+                    self.journal_system_dark(),
+                );
                 diagram.configure_ai(ai_allowed, self.ai_configuration());
                 let (id, opened) = self.open_placed_dialog(
                     DialogKind::Diagram,

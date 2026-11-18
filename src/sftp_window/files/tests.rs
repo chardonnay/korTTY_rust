@@ -144,7 +144,10 @@ fn overwrite_preserves_mode_and_rejects_a_changed_destination() {
     stage.writer().write_all(b"replacement").unwrap();
     stage.publish(&target, Some(&expected)).unwrap();
     assert_eq!(fs::read(&target).unwrap(), b"replacement");
-    assert_eq!(local_mode(&fs::metadata(&target).unwrap()), Some(0o640));
+    assert_eq!(
+        local_mode(&fs::metadata(&target).unwrap()).unwrap() & 0o777,
+        0o640
+    );
     assert!(!stage_path.exists());
 
     let expected = local_existing(&target).unwrap().unwrap();

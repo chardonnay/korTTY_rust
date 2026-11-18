@@ -137,7 +137,7 @@ pub(super) fn key(run: &Run, scope: &Scope) -> io::Result<Key> {
     Ok(Key {
         profile: run.profile().clone(),
         scope: scope.clone(),
-        credential: credential_digest(run.profile().probe_credential())?,
+        credential: credential_digest(run.probe_credential())?,
     })
 }
 
@@ -280,6 +280,7 @@ impl Recording {
         let preferences = queue.preferences();
         let (grant, choice) = recording_route(preferences, Some(&journal_root), self.receipt_start);
         if !preferences.enabled
+            || !settings.journal_ai.allows_summaries()
             || self.scope.approval.as_ref() != grant
             || self.choice.as_ref() != choice
             || self.full_output != preferences.full_output
@@ -512,10 +513,11 @@ impl Recording {
     fn run(self, control: &Arc<Control>) -> io::Result<Option<[u8; 32]>> {
         self.require_current()?;
         let profile = self.profile.clone();
+        let credential = profile.completion_secret();
         let scope = self.scope.clone();
         let authority = move || self.require_current().map_err(|_| CHANGED.into());
         let (run, cancel) = if profile.is_remote() {
-            Run::begin_reviewed_https(profile, authority)
+            Run::begin_reviewed_https(profile, credential, authority)
         } else if profile.is_cli() {
             Run::begin_reviewed_cli(profile, authority)
         } else {

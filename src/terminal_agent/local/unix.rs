@@ -11,8 +11,15 @@ use zeroize::Zeroizing;
 use super::super::runner::{COMMAND_LIMIT, Cancel, Captured, Outcome, POLL, Status};
 use super::{Shell, exit_status};
 
-pub(super) fn run(shell: &Shell, cwd: &Path, text: &str, cancel: &Cancel) -> io::Result<Outcome> {
+pub(super) fn run(
+    shell: &Shell,
+    cwd: &Path,
+    text: &str,
+    cancel: &Cancel,
+    started: impl FnOnce(),
+) -> io::Result<Outcome> {
     let mut process = spawn(shell, cwd, text)?;
+    started();
     let mut stdout = process.child.stdout.take().ok_or_else(missing_pipe)?;
     let mut stderr = process.child.stderr.take().ok_or_else(missing_pipe)?;
     for pipe in [stdout.as_fd(), stderr.as_fd()] {
@@ -181,13 +188,16 @@ mod tests {
     fn agent_local_command_kills_owned_background_processes_before_returning() {
         let profile = Profile::new();
         let command = "( sleep 1; printf leaked > escaped ) >/dev/null 2>&1 & printf '%s\\n' \"$!\"; printf 'stderr marker' >&2; exit 7";
+        let mut started = false;
         let result = run(
             &Shell::Posix(PathBuf::from("/bin/sh")),
             &profile.0,
             command,
             &Cancel::default(),
+            || started = true,
         )
         .unwrap();
+        assert!(started);
         assert_eq!(result.status, Status::Exited(7));
         let child = result.stdout.text().trim().parse::<u32>().unwrap();
         assert!(child > 1);

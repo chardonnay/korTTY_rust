@@ -20,7 +20,7 @@ use crate::workspace::SshTarget;
 use super::*;
 
 use super::download_access;
-mod removal;
+pub(super) mod removal;
 pub(in crate::sftp_window) mod replacement;
 pub(crate) use replacement::{
     FileWitness, LocalFileSnapshot, ReviewedFilePublication, ReviewedFileReceiver,
@@ -455,7 +455,7 @@ impl CopyPlan {
                         digest: None,
                     }
                 }
-                Kind::Blocked => continue,
+                Kind::Link | Kind::Blocked => continue,
             };
             if actions.len() == max_actions {
                 return Err(io::Error::other(if standing.is_some() {

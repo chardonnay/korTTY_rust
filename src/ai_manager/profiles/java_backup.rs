@@ -10,7 +10,10 @@ use super::{
     Catalog, ConnectionMode, JavaProfileSource, MAX_PROFILES, ModelMode, Profile, ProfileId,
     Reasoning, Vision, cli_profile,
 };
-use crate::ai_manager::{JavaAiProfileHint, JavaJournalEvidence, JavaJournalProfiles};
+use crate::ai_manager::{
+    JavaAgentShortcut, JavaAiProfileHint, JavaJournalEvidence, JavaJournalPreferences,
+    JavaJournalProfiles,
+};
 use crate::local_ai::cli::{self, catalog::Provider};
 use crate::local_ai::web_search::{McpMode, McpSettings};
 use crate::local_ai::{self, PromptPreset, RemoteProtocol, Tokenizer, UsageBudget};
@@ -169,6 +172,21 @@ pub(in crate::ai_manager) struct Report {
     pub(in crate::ai_manager) web_keys_omitted: usize,
     pub(in crate::ai_manager) journal_profiles: JavaJournalProfiles,
     pub(in crate::ai_manager) journal_evidence_omitted: bool,
+    pub(in crate::ai_manager) journal_preferences_omitted: bool,
+    pub(in crate::ai_manager) memory_tokens: Option<u16>,
+    pub(in crate::ai_manager) memory_tokens_omitted: bool,
+    pub(in crate::ai_manager) memory_preferences: crate::ai_manager::memory::JavaPreferences,
+    pub(in crate::ai_manager) memory_preferences_omitted: usize,
+    pub(in crate::ai_manager) skill_preferences: crate::ai_manager::skills::JavaPreferences,
+    pub(in crate::ai_manager) skill_preferences_omitted: usize,
+    pub(in crate::ai_manager) agent_shortcut: Option<JavaAgentShortcut>,
+    pub(in crate::ai_manager) agent_shortcut_omitted: bool,
+    pub(in crate::ai_manager) agent_execution_enabled: Option<bool>,
+    pub(in crate::ai_manager) agent_execution_omitted: bool,
+    pub(in crate::ai_manager) agent_confirm_mutating: Option<bool>,
+    pub(in crate::ai_manager) agent_confirmation_omitted: bool,
+    pub(in crate::ai_manager) journal_semantic_search: Option<bool>,
+    pub(in crate::ai_manager) journal_semantic_search_omitted: bool,
 }
 
 fn document(bytes: &[u8]) -> io::Result<Document<'_>> {
@@ -335,7 +353,103 @@ pub(in crate::ai_manager) fn decode(bytes: &[u8]) -> io::Result<(Catalog, Report
             .find(|source| source.id() == id)
             .cloned(),
     };
+    match scalar(root, "aiMemoryMaxTokens").and_then(|value| {
+        value
+            .map(|value| value.parse::<i32>().map_err(|_| ()))
+            .transpose()
+    }) {
+        Ok(tokens) => {
+            report.memory_tokens = tokens.map(crate::ai_manager::memory::java_token_budget)
+        }
+        Err(()) => report.memory_tokens_omitted = true,
+    }
+    for preference in crate::ai_manager::skills::Preference::ALL {
+        match scalar(root, preference.java_field()).and_then(|value| {
+            value
+                .map(|value| match value {
+                    "true" | "1" => Ok(true),
+                    "false" | "0" => Ok(false),
+                    _ => Err(()),
+                })
+                .transpose()
+        }) {
+            Ok(Some(value)) => report.skill_preferences.set(preference, value),
+            Ok(None) => {}
+            Err(()) => report.skill_preferences_omitted += 1,
+        }
+    }
+    match scalar(root, "aiMemoryEnabled").and_then(|value| {
+        value
+            .map(|value| match value {
+                "true" | "1" => Ok(true),
+                "false" | "0" => Ok(false),
+                _ => Err(()),
+            })
+            .transpose()
+    }) {
+        Ok(enabled) => report.memory_preferences.enabled = enabled,
+        Err(()) => report.memory_preferences_omitted += 1,
+    }
+    match scalar(root, "aiMemoryLearningMode").and_then(|value| {
+        value
+            .map(|value| match value {
+                "PROPOSE" => Ok(crate::ai_manager::memory::Learning::Propose),
+                "OFF" => Ok(crate::ai_manager::memory::Learning::Off),
+                _ => Err(()),
+            })
+            .transpose()
+    }) {
+        Ok(learning) => report.memory_preferences.learning = learning,
+        Err(()) => report.memory_preferences_omitted += 1,
+    }
+    match scalar(root, "sessionJournalSemanticSearchEnabled").and_then(|value| {
+        value
+            .map(|value| match value {
+                "true" | "1" => Ok(true),
+                "false" | "0" => Ok(false),
+                _ => Err(()),
+            })
+            .transpose()
+    }) {
+        Ok(enabled) => report.journal_semantic_search = enabled,
+        Err(()) => report.journal_semantic_search_omitted = true,
+    }
+    match scalar(root, "terminalAgentExecutionEnabled").and_then(|value| {
+        value
+            .map(|value| match value {
+                "true" | "1" => Ok(true),
+                "false" | "0" => Ok(false),
+                _ => Err(()),
+            })
+            .transpose()
+    }) {
+        Ok(enabled) => report.agent_execution_enabled = enabled,
+        Err(()) => report.agent_execution_omitted = true,
+    }
+    match scalar(root, "terminalAgentConfirmMutatingCommandSets").and_then(|value| {
+        value
+            .map(|value| match value {
+                "true" | "1" => Ok(true),
+                "false" | "0" => Ok(false),
+                _ => Err(()),
+            })
+            .transpose()
+    }) {
+        Ok(enabled) => report.agent_confirm_mutating = enabled,
+        Err(()) => report.agent_confirmation_omitted = true,
+    }
+    match agent_shortcut(root) {
+        Ok(shortcut) => report.agent_shortcut = shortcut,
+        Err(()) => report.agent_shortcut_omitted = true,
+    }
     report.journal_profiles = JavaJournalProfiles {
+        preferences: match journal_preferences(root) {
+            Ok(preferences) => preferences,
+            Err(()) => {
+                report.journal_preferences_omitted = true;
+                None
+            }
+        },
         recording: regular.map(hint),
         automation: automation.map(hint),
         evidence: match journal_evidence(root) {
@@ -377,6 +491,62 @@ fn web_hint(
         _ => return Err(()),
     };
     hint.supports(mode).then_some(Some(hint)).ok_or(())
+}
+
+fn agent_shortcut(root: Node<'_, '_>) -> Result<Option<JavaAgentShortcut>, ()> {
+    let name = scalar_text(root, "terminalAgentCommandName")?.map(|name| {
+        let name = if name.chars().all(java_whitespace) {
+            "agent"
+        } else {
+            trim_java(name)
+        };
+        name.to_owned()
+    });
+    if name.as_ref().is_some_and(|name| !name.is_ascii()) {
+        return Err(());
+    }
+    let case_insensitive = scalar(root, "terminalAgentCommandNameCaseInsensitive")?
+        .map(|value| match value {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(()),
+        })
+        .transpose()?;
+    if name.is_none() && case_insensitive.is_none() {
+        return Ok(None);
+    }
+    let hint = JavaAgentShortcut {
+        name,
+        case_insensitive,
+    };
+    hint.validate().map_err(|_| ())?;
+    Ok(Some(hint))
+}
+
+fn journal_preferences(root: Node<'_, '_>) -> Result<Option<JavaJournalPreferences>, ()> {
+    let interval_minutes = scalar(root, "sessionJournalSummarizeIntervalMinutes")?
+        .map(|value| {
+            value
+                .parse::<i32>()
+                .map(|value| value.clamp(1, 240) as u16)
+                .map_err(|_| ())
+        })
+        .transpose()?;
+    let automatic_title = scalar(root, "sessionJournalAiTitleEnabled")?
+        .map(|value| match value {
+            "true" | "1" => Ok(true),
+            "false" | "0" => Ok(false),
+            _ => Err(()),
+        })
+        .transpose()?;
+    Ok(
+        (interval_minutes.is_some() || automatic_title.is_some()).then_some(
+            JavaJournalPreferences {
+                interval_minutes,
+                automatic_title,
+            },
+        ),
+    )
 }
 
 fn journal_evidence(root: Node<'_, '_>) -> Result<Option<JavaJournalEvidence>, ()> {

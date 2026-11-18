@@ -40,6 +40,42 @@ const MIN_TOKENS: u16 = 500;
 const MAX_TOKENS: u16 = 4_000;
 const DEFAULT_TOKENS: u16 = 1_500;
 
+pub(super) fn java_token_budget(value: i32) -> u16 {
+    value.clamp(i32::from(MIN_TOKENS), i32::from(MAX_TOKENS)) as u16
+}
+
+pub(super) fn valid_token_budget(value: u16) -> bool {
+    (MIN_TOKENS..=MAX_TOKENS).contains(&value)
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(super) struct JavaPreferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(super) learning: Option<Learning>,
+}
+
+impl JavaPreferences {
+    pub(super) fn is_empty(&self) -> bool {
+        self.enabled.is_none() && self.learning.is_none()
+    }
+
+    pub(super) fn merge(&mut self, incoming: Self) -> bool {
+        let mut changed = false;
+        if self.enabled.is_none() && incoming.enabled.is_some() {
+            self.enabled = incoming.enabled;
+            changed = true;
+        }
+        if self.learning.is_none() && incoming.learning.is_some() {
+            self.learning = incoming.learning;
+            changed = true;
+        }
+        changed
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub(crate) struct Settings {
@@ -129,6 +165,9 @@ impl fmt::Display for Scope {
 
 #[derive(Clone)]
 pub(crate) enum Message {
+    UseImportedTokenBudget,
+    UseImportedActivation,
+    UseImportedLearning,
     ToggleOrganizationRule(usize),
     Enable(bool),
     Learning(Learning),
@@ -237,6 +276,8 @@ pub(crate) struct State {
     organization_open: HashSet<usize>,
     settings: Settings,
     token_input: String,
+    imported_token_budget: Option<u16>,
+    imported_preferences: JavaPreferences,
     initial_settings: Settings,
     base: Option<Snapshot>,
     editor: text_editor::Content,
@@ -272,6 +313,8 @@ impl State {
             policy: AiMemoryPolicy::default(),
             organization_open: HashSet::new(),
             token_input: settings.max_tokens.to_string(),
+            imported_token_budget: None,
+            imported_preferences: JavaPreferences::default(),
             initial_settings: settings.clone(),
             settings,
             base: None,
@@ -287,6 +330,16 @@ impl State {
             cleanup_epoch: 0,
             notice: None,
         }
+    }
+
+    pub(super) fn with_imported_token_budget(mut self, tokens: Option<u16>) -> Self {
+        self.imported_token_budget = tokens.filter(|value| valid_token_budget(*value));
+        self
+    }
+
+    pub(super) fn with_imported_preferences(mut self, preferences: JavaPreferences) -> Self {
+        self.imported_preferences = preferences;
+        self
     }
 
     pub(super) fn set_policy(&mut self, policy: &AiMemoryPolicy, ai_allowed: bool) {
@@ -520,6 +573,23 @@ impl State {
             };
         }
         match message {
+            Message::UseImportedActivation if self.editable => {
+                if let Some(enabled) = self.imported_preferences.enabled {
+                    self.settings.enabled = enabled;
+                }
+            }
+            Message::UseImportedLearning if self.editable && self.policy.learning.is_none() => {
+                if let Some(learning) = self.imported_preferences.learning {
+                    self.settings.learning = learning;
+                }
+            }
+            Message::UseImportedTokenBudget if self.editable && self.can_adjust_budget() => {
+                if let Some(tokens) = self.imported_token_budget {
+                    let tokens = tokens.min(*self.budget_range().end());
+                    self.settings.max_tokens = tokens;
+                    self.token_input = tokens.to_string();
+                }
+            }
             Message::Enable(enabled) if self.editable => self.settings.enabled = enabled,
             Message::Learning(learning) if self.editable && self.policy.learning.is_none() => {
                 self.settings.learning = learning;
@@ -1101,6 +1171,40 @@ impl State {
             self.organization_rules(),
             text("Memory settings").size(19),
             enabled,
+            self.imported_preferences.enabled.map(|enabled| row![
+                text(format!(
+                    "Imported from Java: Memory {}",
+                    if enabled { "on" } else { "off" }
+                ))
+                .size(13),
+                button("Use imported activation preference")
+                    .on_press_maybe(can_change_settings.then_some(Message::UseImportedActivation)),
+            ]
+            .spacing(10)
+            .wrap()),
+            self.imported_preferences.learning.map(|learning| row![
+                text(format!("Imported from Java: learning · {learning}")).size(13),
+                button("Use imported learning preference").on_press_maybe(
+                    (can_change_settings && self.policy.learning.is_none())
+                        .then_some(Message::UseImportedLearning)
+                ),
+            ]
+            .spacing(10)
+            .wrap()),
+            self.imported_token_budget.map(|tokens| row![
+                text(format!("Imported from Java: {tokens} tokens")).size(13),
+                button("Use imported budget").on_press_maybe(
+                    (self.editable && self.can_adjust_budget() && !self.pending)
+                        .then_some(Message::UseImportedTokenBudget)
+                ),
+                (tokens > *self.budget_range().end()).then(|| text(format!(
+                    "Adoption is limited to {} tokens by managed policy.",
+                    self.budget_range().end()
+                ))
+                .size(13)),
+            ]
+            .spacing(10)
+            .wrap()),
             row![
                 text("Learning").width(140),
                 learning,
@@ -1880,6 +1984,79 @@ content = "Use the approved incident procedure."
         assert_eq!(store::load(&directory, &scope)?.text, current);
         assert!(references::registry(&directory)?.entries[0].active);
         Ok(())
+    }
+
+    #[test]
+    fn imported_memory_activation_and_learning_require_independent_policy_checked_adoption() {
+        let settings = Settings {
+            enabled: false,
+            learning: Learning::Off,
+            max_tokens: 700,
+        };
+        let imported = JavaPreferences {
+            enabled: Some(true),
+            learning: Some(Learning::Propose),
+        };
+        let mut state = State::new(settings.clone(), PathBuf::new(), Vec::new(), true)
+            .with_imported_preferences(imported);
+        assert_eq!(state.settings(), &settings);
+        assert!(!state.is_dirty());
+        let _ = state.update(Message::UseImportedLearning);
+        assert_eq!(state.settings().learning, Learning::Propose);
+        assert!(!state.settings().enabled);
+        assert_eq!(state.settings().max_tokens, 700);
+        let _ = state.update(Message::UseImportedActivation);
+        assert!(state.settings().enabled);
+        let mut managed = State::new(settings.clone(), PathBuf::new(), Vec::new(), true)
+            .with_imported_preferences(imported);
+        let mut policy = AiMemoryPolicy::default();
+        policy.learning = Some(AiMemoryLearningMode::Off);
+        managed.set_policy(&policy, true);
+        let _ = managed.update(Message::UseImportedLearning);
+        assert_eq!(managed.settings().learning, Learning::Off);
+        managed.set_policy(&policy, false);
+        let _ = managed.update(Message::UseImportedActivation);
+        assert!(!managed.settings().enabled);
+        let mut readonly = State::new(settings.clone(), PathBuf::new(), Vec::new(), false)
+            .with_imported_preferences(imported);
+        let _ = readonly.update(Message::UseImportedActivation);
+        let _ = readonly.update(Message::UseImportedLearning);
+        assert_eq!(readonly.settings(), &settings);
+    }
+
+    #[test]
+    fn imported_memory_budget_requires_adoption_and_obeys_live_policy() {
+        let settings = Settings {
+            enabled: false,
+            learning: Learning::Off,
+            max_tokens: 750,
+        };
+        let mut state = State::new(settings.clone(), PathBuf::new(), Vec::new(), true)
+            .with_imported_token_budget(Some(3_500));
+        assert_eq!(state.settings(), &settings);
+        assert!(!state.is_dirty());
+        let mut policy = AiMemoryPolicy::default();
+        policy.max_tokens = Some(900);
+        state.set_policy(&policy, true);
+        let _ = state.update(Message::UseImportedTokenBudget);
+        assert_eq!(state.settings().max_tokens, 900);
+        assert!(!state.settings().enabled);
+        assert_eq!(state.settings().learning, Learning::Off);
+        assert!(state.is_dirty());
+        assert!(state.settings_valid());
+        policy.max_tokens = Some(300);
+        state.set_policy(&policy, true);
+        let _ = state.update(Message::UseImportedTokenBudget);
+        assert_eq!(state.settings().max_tokens, 900);
+        assert_eq!(state.effective_budget(), 300);
+        policy.max_tokens = None;
+        state.set_policy(&policy, false);
+        let _ = state.update(Message::UseImportedTokenBudget);
+        assert_eq!(state.settings().max_tokens, 900);
+        let mut read_only = State::new(settings.clone(), PathBuf::new(), Vec::new(), false)
+            .with_imported_token_budget(Some(3_500));
+        let _ = read_only.update(Message::UseImportedTokenBudget);
+        assert_eq!(read_only.settings(), &settings);
     }
 
     #[test]

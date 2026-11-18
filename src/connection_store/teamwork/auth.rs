@@ -31,6 +31,16 @@ pub(crate) enum DefaultAuth {
     TemporaryKey {
         username: String,
     },
+    Ordered(OrderedAuth),
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OrderedAuth {
+    pub(crate) credential: Option<String>,
+    pub(crate) key: Option<u64>,
+    pub(crate) username: String,
+    pub(crate) temporary_key: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -40,8 +50,54 @@ pub(crate) enum AuthSave {
 }
 
 impl DefaultAuth {
+    pub(crate) fn ordered(&self) -> OrderedAuth {
+        let mut ordered = OrderedAuth::default();
+        match self {
+            Self::Prompt => {}
+            Self::Password { credential } => ordered.credential = Some(credential.clone()),
+            Self::Key { id, username } => {
+                ordered.key = Some(*id);
+                ordered.username = username.clone();
+            }
+            Self::TemporaryKey { username } => {
+                ordered.temporary_key = true;
+                ordered.username = username.clone();
+            }
+            Self::Ordered(ordered) => return ordered.clone(),
+        }
+        ordered
+    }
+
+    pub(crate) fn credential(&self) -> Option<&str> {
+        match self {
+            Self::Password { credential } => Some(credential),
+            Self::Ordered(ordered) => ordered.credential.as_deref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn key(&self) -> Option<u64> {
+        match self {
+            Self::Key { id, .. } => Some(*id),
+            Self::Ordered(ordered) => ordered.key,
+            _ => None,
+        }
+    }
+
     pub(crate) fn validate(&self) -> io::Result<()> {
         match self {
+            Self::Ordered(ordered) => {
+                if let Some(credential) = &ordered.credential {
+                    validate_credential_id(credential)?;
+                }
+                if ordered.key == Some(0) {
+                    return Err(invalid("Select a registered SSH key."));
+                }
+                Self::TemporaryKey {
+                    username: ordered.username.clone(),
+                }
+                .validate()
+            }
             Self::Password { credential } => validate_credential_id(credential),
             Self::Key { id: 0, .. } => Err(invalid("Select a registered SSH key.")),
             Self::Key { username, .. } | Self::TemporaryKey { username }
@@ -151,11 +207,23 @@ mod tests {
         ));
         assert_eq!(DefaultAuth::load(root).unwrap(), temporary);
 
+        let ordered = DefaultAuth::Ordered(OrderedAuth {
+            credential: Some("credential-123".into()),
+            key: Some(42),
+            username: "ops".into(),
+            temporary_key: true,
+        });
+        assert!(matches!(
+            ordered.save(root, &temporary).unwrap(),
+            AuthSave::Saved
+        ));
+        assert_eq!(DefaultAuth::load(root).unwrap(), ordered);
+
         let corrupt = br#"{"method":"temporary-key","username":"ops","key":"unused"}"#;
         let directory = Directory::open(root, false).unwrap();
         directory.replace_file(FILE, corrupt).unwrap();
         assert!(DefaultAuth::load(root).is_err());
-        assert!(prompt.save(root, &temporary).is_err());
+        assert!(prompt.save(root, &ordered).is_err());
         assert_eq!(std::fs::read(root.join(FILE)).unwrap(), corrupt);
     }
 }

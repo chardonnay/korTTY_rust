@@ -16,7 +16,1901 @@ open until a result is recorded for the tested revision and environment. Both
 Mosh modes are out of scope. The editor has a reduced native scope with structure
 navigation for classes, functions, variables, and placeholders.
 
+## Porting plan source audit on 2026-11-18
+
+The audit compared Java tag `v2.26.0` (`b235d91f2035`) with the Rust working
+tree based on the PR #7 merge (`e3c1760a576f`). It included local changes
+and checked the existing native records. The [implementation backlog](PORTING-PLAN.md#confirmed-implementation-work)
+records the Java controls, Rust entry points and remaining user-visible work.
+
+- All 15 values of Java `JobActionType` reach the Rust importer dispatch.
+  Target and option support vary. Java resolves shared Teamwork connections
+  for jobs. The native interactive route records the shared source, while the
+  Scheduler persists a local numeric ID and endpoints. [Java resolver](https://github.com/chardonnay/korTTY/blob/v2.26.0/src/main/java/de/kortty/jobscheduler/JobSchedulerConnectionResolver.java) · [Native importer](src/profile_backup/java_scheduler.rs) · [Native target](src/scheduler_window/connection.rs)
+- The tagged editor has a programming-language migration action and lets
+  the user choose individual findings from the standalone security report.
+  Rust can read historical migration options and request fixes for the entire
+  standalone report. The SFTP draft stores one preview against the right
+  file. Java also offers the left file against the draft. [Java snippet actions](https://github.com/chardonnay/korTTY/blob/v2.26.0/app-docs/site/docs/en/features/snippets.md) · [Native security action](src/workspace/snippet_access/ai_assist.rs) · [Native draft](src/sftp_window/compare/ai.rs)
+- A repeat of the field-name inventory covered the original 42 readers plus
+  the six additional files in `src/workspace/backup_data/`. Of 346 declared
+  Java fields, 197 appeared as quoted names in those reader prefixes and
+  149 did not. For example, the delegated Skills parser handles
+  `aiSkillsEnabled` outside those prefixes. The [field audit](PORTING-PLAN.md#remaining-field-and-identity-audit)
+  identifies specific outstanding mappings after checking the readers and
+  native controls.
+- Existing records establish focused Journal credential tests on all three
+  ARM64 platforms, recurring protected folder state and editor tests,
+  direct and jump OpenSSH recursive deletion on Fedora and Apple Silicon,
+  and the Fedora desktop X11 text gesture. The post-merge snippet alternatives
+  checkpoint has 35 Fedora tests and Windows app/test Clippy. The November 18
+  reconciliation added documentation only. [Journal](#reviewed-journal-credentials-after-pr-7) · [Protected folders](#recurring-protected-folder-creation-and-confirmed-receiver-progression) · [SFTP](#sftp-hidden-entries) · [X11](#x11-text-drops-in-terminal-panes) · [Alternatives](#selectable-snippet-alternatives)
+
+GitHub reports successful format, Clippy, test, release-build and staging
+steps on Windows, macOS and Ubuntu for the merge commit. Acceptance for the
+later local changes remains scoped to the individual records. [Merge CI](https://github.com/chardonnay/korTTY_rust/actions/runs/44106367721)
+
+## Porting continuation on 2026-11-18
+
+### SFTP hidden entries
+
+The SFTP Manager stores local and server visibility separately. Java
+backup values fill unset fields. New standalone, attached and project
+views inherit the preferences. Incognito views keep changes in memory.
+The Java visibility shortcut now routes to the focused file listing.
+Native desktop interaction and restart checks remain open.
+
+Apple Silicon passed 37 backup merge, SFTP and project file-view tests.
+Windows ARM64 application and test-target Clippy passed with warnings
+denied for project code.
+[Apple Silicon](target/verification/20261118-sftp-hidden-macos.log)
+and [Windows](target/verification/20261118-sftp-hidden-windows.log).
+
+The Apple Silicon shortcut checkpoint passed eight tests. The widget
+fixture switched between both lists and checked focus loss, repeated
+keys, and extra modifiers. Windows ARM64 application and test-target
+Clippy passed with warnings denied for project code.
+[Apple Silicon](target/verification/20261118-sftp-hidden-shortcut-macos-final.log)
+and [Windows](target/verification/20261118-sftp-hidden-shortcut-windows-final.log).
+
+The SFTP path shortcut focuses and selects the current path in the
+active pane. The widget fixture replaced the highlighted path in each
+pane, starting from a list click or focus in a filter field. Changing
+the server route retains that pane's hidden-file toggle. Apple Silicon
+passed 12 SFTP and project file-view tests. Windows ARM64 application
+and test-target Clippy passed with warnings denied for project code.
+[Apple Silicon](target/verification/20261118-sftp-path-shortcut-macos.log)
+and [Windows](target/verification/20261118-sftp-path-shortcut-windows.log).
+
+The focused list handles F2, Delete and Command/Ctrl+Backspace through
+the existing single-entry dialogs. The tests exercise both pane targets,
+selection checks and the confirmation boundary. Apple Silicon passed
+14 SFTP and project file-view tests. Windows ARM64 application and
+test-target Clippy passed with warnings denied for project code.
+Native keyboard acceptance and Java's multi-entry recursive deletion
+remain open.
+[Apple Silicon](target/verification/20261118-sftp-file-shortcuts-macos.log)
+and [Windows](target/verification/20261118-sftp-file-shortcuts-windows.log).
+
+Delete now accepts multiple entries from one SFTP pane. The confirmation
+lists the directory and selected names. The worker checks each name,
+kind and available size before the first deletion. It stops on an error
+and reports how many entries were removed. Empty folders and links are
+handled without recursive traversal. Apple Silicon passed ten focused
+tests, including a local fixture where one changed entry prevented the
+whole selection from being deleted. Windows ARM64 application and
+test-target Clippy passed with warnings denied for project code.
+Live server and desktop acceptance, nonempty folder deletion and
+cancellation during deletion remain open.
+[Apple Silicon](target/verification/20261118-sftp-batch-delete-macos.log)
+and [Windows](target/verification/20261118-sftp-batch-delete-windows.log).
+
+The SFTP delete workflow now supports stopping a running selection and
+asks before closing a view with a deletion in progress. A local fixture
+stopped before any removal and after one confirmed removal. A protocol
+fixture lost the reply to a server removal and verified that the
+confirmed count excludes that entry and reports its uncertain outcome.
+Apple Silicon passed 12 focused tests. Windows ARM64 application and
+test-target Clippy passed with warnings denied for project code. Exact
+recursive review and removal, native desktop interaction and live
+server acceptance remain open.
+[Apple Silicon](target/verification/20261118-sftp-delete-cancel-macos.log)
+and [Windows](target/verification/20261118-sftp-delete-cancel-windows.log).
+
+The SFTP Manager can preview and delete nonempty trees of regular files
+and folders. Apply consumes one review on the same worker, compares the
+current tree, and uses the existing reviewed removals in child-first
+order. A native fixture checked the descendant preview, rejection after
+an added file, preservation of an unselected sibling, successful removal
+and replay rejection. Seven Apple Silicon tests and Windows ARM64
+application and test-target Clippy passed. Recursive link and special
+entries, other server targets and live desktop/server acceptance remain
+open.
+[Apple Silicon](target/verification/20261118-sftp-recursive-delete-macos.log)
+and [Windows](target/verification/20261118-sftp-recursive-delete-windows.log).
+
+A native Apple Silicon OpenSSH SFTP subsystem fixture exercised the
+SFTP Manager's review and confirmation events over pipes. The first
+review became stale after a file appeared and both files remained.
+A fresh review removed the four selected tree entries, refreshed the
+server pane, kept the unselected sibling and left no quarantine behind.
+The existing native reviewed synchronization removal test also passed.
+[Apple Silicon OpenSSH](target/verification/20261118-sftp-recursive-openssh-macos.log).
+
+A second native Apple Silicon test exercised the regular SFTP Manager
+worker over loopback OpenSSH using public-key authentication and a pinned
+host key. A file added after review caused the worker to refuse deletion
+and preserve both files. A fresh review removed exactly four entries,
+refreshed the listing with the unselected sibling, and left no quarantine
+directory. The worker and SSH subprocess exited. The passing run used
+a private directory under the test account's home with OpenSSH
+`StrictModes` enabled. Native desktop input and other server routes
+remain open.
+[Authenticated Apple Silicon OpenSSH](target/verification/20261118-sftp-recursive-pinned-macos-final.log).
+
+Recursive server deletion now reviews symbolic links with SFTP
+`LSTAT` and `READLINK`. The review binds the stored target bytes. The
+worker moves and removes the link entry through the verified private
+quarantine. The authenticated Apple Silicon OpenSSH fixture refused a
+changed link target, then removed a dangling link, a directory link and
+a separately selected link in a fresh review of seven entries. Both
+unselected targets remained intact.
+[Apple Silicon OpenSSH link removal](target/verification/20261118-sftp-recursive-links-macos.log).
+
+Recursive server deletion also reviews recognized POSIX special entries
+inside selected folders. The worker checks their type and metadata and
+uses the same protected quarantine and unlink operation. The native
+Apple Silicon OpenSSH repeat refused a FIFO replaced by a regular file
+and then removed the restored FIFO and a Unix-domain socket in a fresh
+review of nine entries. The first run exposed that the multi-selection
+control excluded a separately marked special entry. The native fixture
+did not exercise device nodes.
+Windows ARM64 test-target Clippy passed.
+[Native fixture](target/verification/20261118-sftp-recursive-special-macos-final.log)
+and [Windows ARM64 Clippy](target/verification/20261118-sftp-recursive-special-windows.log).
+
+The SFTP Manager now accepts recognized server special entries in a
+mixed selection for reviewed deletion. Transfer buttons and pointer drag
+require a copyable selection, and transfer dispatch rejects a partial
+selection. The Apple Silicon selection test verified transfer eligibility
+before and after adding a FIFO. The authenticated OpenSSH test selected
+the FIFO with a folder and a link, refused a stale review after the FIFO
+became a regular file, and removed nine entries after a fresh review.
+Windows ARM64 test-target Clippy passed. Native desktop interaction
+remains open.
+[Native tests](target/verification/20261118-sftp-recursive-mixed-macos.log)
+and [Windows ARM64 Clippy](target/verification/20261118-sftp-recursive-mixed-windows.log).
+
+Unix local recursive deletion now reviews symbolic links and recognized
+special entries using descriptor-relative, no-follow metadata. The
+worker checks the entry before and after relocation to a private
+quarantine and unlinks it there. The Apple Silicon fixture rejected a
+replaced directory link, then removed a directory link, a dangling
+link and a separately selected FIFO together with the reviewed folder.
+The unselected link target remained intact. A separate test cancelled
+after relocation and verified that the dangling link returned to its
+original name. Nine targeted native tests passed, including the
+authenticated server regression, and Windows ARM64 test-target Clippy
+passed. Native Fedora coverage is recorded below.
+[Apple Silicon tests](target/verification/20261118-sftp-recursive-local-macos-final.log)
+and [Windows ARM64 Clippy](target/verification/20261118-sftp-recursive-local-windows.log).
+
+Windows local recursive deletion now reviews symbolic links and drive-path
+junctions by file ID and reparse data and removes the exact reviewed handle.
+The native ARM64 test selected a folder and a sibling junction, rejected a
+replacement junction after review, and removed both original selections
+after a fresh review while preserving their target. The reparse parser
+test verified that volume mount points are excluded. This account could
+not create a symbolic link, so native symlink coverage remains open.
+Windows ARM64 test-target Clippy and three Apple Silicon local removal
+regression tests passed.
+[Windows ARM64 runtime](target/verification/20261118-sftp-recursive-junctions-windows.log),
+[Windows ARM64 Clippy](target/verification/20261118-sftp-recursive-junctions-windows-clippy-final.log)
+and [Apple Silicon regressions](target/verification/20261118-sftp-recursive-junctions-macos-regression.log).
+
+Eight focused tests passed natively on Fedora ARM64. The local fixture
+refused a replaced directory link, then removed five reviewed entries
+including a directory link, a dangling link, a FIFO and a Unix-domain
+socket. The original target remained intact. The authenticated loopback
+OpenSSH fixture exercised the regular SFTP Manager worker with a pinned
+host key and public-key login. It rejected stale reviews and removed
+nine reviewed entries after fresh confirmation. Device nodes and native
+desktop input remain unverified.
+[Fedora ARM64 tests](target/verification/20261118-sftp-recursive-fedora.log).
+
+The direct and jump-route fixtures both passed natively on Apple Silicon
+and Fedora ARM64. The jump fixture used independent test keys and
+explicit host pins for both loopback OpenSSH daemons. The jump daemon
+logged public-key authentication and the forwarding channel, and the
+target daemon logged public-key authentication and the SFTP subsystem.
+The same worker assertions covered refused stale reviews, removal of
+nine confirmed entries, a refreshed listing and preservation of
+unselected targets. Native desktop input and configured deployment
+routes remain open.
+[Apple Silicon](target/verification/20261118-sftp-recursive-jump-macos.log)
+and [Fedora ARM64](target/verification/20261118-sftp-recursive-jump-fedora.log).
+
+### SFTP comparison AI font size
+
+The AI panel in the file comparison now adjusts question, streaming
+response and finished answer text from 9 to 32 points, with a 13-point
+default. Ordinary views save the setting for reopening. Incognito
+changes remain in the current view. Java `sftpDiffAiFontSize` fills
+the unset native preference and clamps the saved integer as in the
+Java dialog. The encrypted Java-backup fixture verified restore and
+preservation of a subsequent native choice on additive replay. The
+Apple Silicon file-comparison, SFTP preference and restore groups passed
+with the packaged-app fixture ignored. Windows ARM64 test-target Clippy
+passed. Native desktop interaction remains open.
+[Apple Silicon tests](target/verification/20261118-sftp-ai-font-macos-verified.log)
+and [Windows ARM64 Clippy](target/verification/20261118-sftp-ai-font-windows.log).
+
+### Java guide zoom
+
+The Java backup reader imports `guideFontScalePercent` into the native
+Manual even when Java's separate application font scale is automatic.
+The value clamps to the Java and native reader range of 70–250%. Existing
+native zoom takes precedence. Backups that lack the guide field retain
+the earlier compatibility fallback from an explicitly saved manual UI
+scale. Malformed and duplicate guide fields are reported as omissions.
+Apple Silicon passed 57 focused tests across guide import, Manual
+behavior and backup restore, with the packaged-app fixture ignored.
+Windows ARM64 test-target Clippy passed. Native desktop reopening remains
+open.
+[Apple Silicon tests](target/verification/20261118-java-guide-zoom-macos.log)
+and [Windows ARM64 Clippy](target/verification/20261118-java-guide-zoom-windows.log).
+
+### Java ASCII Art preview zoom
+
+Java backup restore reads `asciiArtPreviewFontSize` as a fractional
+size. Finite values clamp to Java's 6–40 range. Invalid values are
+reported as omissions. The ASCII Art window applies the imported size
+when its native preferences have no saved zoom. Existing integer zoom
+values remain readable, and the native preview and zoom controls use the
+effective size. [Fedora ARM64](target/verification/20261118-java-ascii-art-zoom-fedora.log)
+passed 18 backup-data tests and 16 ASCII Art tests.
+[Windows ARM64](target/verification/20261118-java-ascii-art-zoom-windows.log)
+passed application and test-target Clippy. Live dialog acceptance remains open.
+
+### Remembered snippet translation language
+
+The snippet assistant prefills the last translation language when it opens.
+A valid translation review remembers the choice without sending the
+request. The request preview includes the language only for translation.
+Java `snippetTranslationTargetLanguage` fills an unset preference and
+keeps valid Unicode names. Saved native choices take precedence.
+[Fedora ARM64](target/verification/20261118-snippet-translation-fedora.log)
+passed 33 focused backup, request and assistant tests.
+[Windows ARM64 application and test-target Clippy](target/verification/20261118-snippet-translation-windows.log)
+passed. Native editor and restart acceptance remain open.
+
+### Selectable snippet alternatives
+
+Snippet assistance requests structured code alternatives for the marked
+selection or the complete snippet. The returned candidates are bounded
+and deduplicated. A candidate opens a diff and can replace the reviewed
+range through the normal Apply action. The existing source revision,
+masking, placeholder and Undo checks apply. The Snippet Editor setting
+accepts 1–10 alternatives and defaults to three. Java backup restore
+fills an unset value from `aiSnippetAlternativeSolutionCount`.
+[Fedora ARM64](target/verification/20261118-snippet-alternatives-fedora.log)
+passed 35 focused backup, candidate and assistant tests.
+[Windows ARM64 Clippy](target/verification/20261118-snippet-alternatives-windows.log)
+passed for the app and test targets. The interactive workflow with a
+configured provider remains open.
+
+### Custom snippet language choices
+
+The snippet editor combines built-in choices with up to 128 remembered
+language labels. Remembering a label normalizes it and verifies that it
+still matches the active draft. Java backup restore appends distinct
+custom labels, preserves native order, and filters built-in aliases and
+invalid tokens. The encrypted-backup fixture restored a new language
+alongside two existing choices and replayed without changes. Apple
+Silicon passed 23 editor and 37 backup restore tests. The packaged-app
+restore fixture was ignored. Windows ARM64 test-target Clippy passed.
+Native desktop interaction remains open.
+[Apple Silicon tests](target/verification/20261118-snippet-languages-macos-final.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-languages-windows-final.log).
+
+### Code-analysis report presentation
+
+Native code-analysis reports now have a saved 9–32 point text size
+for the summary, findings and dependencies, with a 14-point default.
+New analysis tabs initialize the classic hardening section from its
+last saved expansion state. Java `codeAnalysisFontSize` and
+`codeAnalysisHardeningExpanded` fill the two unset Rust preferences.
+The import fixture checked clamping and field-by-field precedence.
+The encrypted archive fixture verified restoration and preservation of
+new native choices on additive replay. Sixty-five focused Apple Silicon
+tests and Windows ARM64 test-target Clippy passed. Native desktop
+interaction remains open.
+[Apple Silicon tests](target/verification/20261118-analysis-presentation-macos.log)
+and [Windows ARM64 Clippy](target/verification/20261118-analysis-presentation-windows.log).
+
+The analysis preview and its enlarged flowchart now share a saved
+Diagram options toggle. Collapsing it leaves the preview available.
+Java `codeAnalysisDiagramOptionsExpanded` fills the unset Rust preference.
+Tests verified analysis-window ownership and the encrypted backup
+round trip, including precedence of an explicit native collapsed state.
+Sixty-nine Apple Silicon analysis, diagram and restore tests passed.
+Windows ARM64 test-target Clippy passed. Native desktop interaction
+remains open.
+[Apple Silicon tests](target/verification/20261118-analysis-diagram-options-macos.log)
+and [Windows ARM64 Clippy](target/verification/20261118-analysis-diagram-options-windows.log).
+
+Project analyses can hide their diagram area and save that choice for
+subsequent project reports. The setting controls presentation only.
+Java `codeAnalysisProjectDiagramVisible` fills the unset Rust preference.
+The native test checked the project and single-snippet scopes alongside
+automatic generation. The encrypted Java archive restored the hidden
+state and preserved a later native choice on replay. Sixty-six Apple
+Silicon analysis and restore tests passed, as did Windows ARM64
+test-target Clippy. Interactive desktop acceptance remains open.
+[Apple Silicon tests](target/verification/20261118-project-diagram-visibility-macos.log)
+and [Windows ARM64 Clippy](target/verification/20261118-project-diagram-visibility-windows.log).
+
+Snippet diagrams and analysis previews share a persisted vertical or
+horizontal layout. The renderer reapplies the layout when a saved
+analysis chart is replaced. Java `snippetDiagramLayout` fills the unset
+preference, with vertical as the default. The encrypted backup fixture
+restored horizontal and preserved a later native vertical choice on
+replay. Seventy-one targeted Apple Silicon tests and Windows ARM64
+test-target Clippy passed. Native desktop interaction remains open.
+[Apple Silicon tests](target/verification/20261118-snippet-diagram-layout-macos.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-diagram-layout-windows.log).
+
+Snippet diagrams and analysis previews share a saved system, light or
+dark palette. A custom RGB canvas applies to the light palette. The
+same palette and canvas drive SVG and PNG diagram exports. Java
+`snippetDiagramColorMode` and `snippetDiagramBackgroundColor` fill
+unset Rust fields independently. The encrypted fixture preserved a
+native dark mode while importing a light canvas value, and replay
+preserved a later native canvas. Eighty-six focused Apple Silicon tests
+passed, including the exact SVG color and PNG pixel check. Windows ARM64
+test-target Clippy passed. Interactive desktop acceptance remains open.
+[Apple Silicon tests](target/verification/20261118-snippet-diagram-appearance-macos-final.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-diagram-appearance-windows-final.log).
+
+### Saved snippet hardening choices
+
+Java backup restore imports the eleven classic and five input-hardening
+options, the input-hardening switch, and the file-size limit. A saved empty
+selection stays empty. The size is in MiB, with zero meaning unlimited.
+Missing settings leave Rust defaults in place. Additive restore preserves
+each saved Rust field independently. Snippet Analysis and Terminal
+Workflow use the resulting preferences in their existing review flows.
+The encrypted fixture verified that a native cleared selection survives
+restore and that a later native size edit survives replay. Apple Silicon
+passed 82 focused tests, with the packaged startup fixture skipped.
+Windows ARM64 test-target Clippy passed. Native desktop interaction
+remains open.
+[Apple Silicon tests](target/verification/20261118-snippet-hardening-restore-macos.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-hardening-restore-windows.log).
+
+### Snippet editor line numbers
+
+The Snippets editor and preview share a saved line-number toggle with
+the Snippet Editor Appearance settings. The gutter labels logical
+lines, skips wrapped continuation rows, and follows the shaped editor
+viewport while scrolling. Java `snippetLineNumbers` fills the unset
+choice. A later native choice takes precedence on additive restore.
+Twenty-nine targeted Apple Silicon tests passed, including a raster
+check for wrapped and scrolled rows, the settings save, and encrypted
+Java restore and replay. Windows ARM64 test-target Clippy passed.
+Interactive desktop acceptance remains open.
+[Apple Silicon tests](target/verification/20261118-snippet-line-numbers-macos-final.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-line-numbers-windows-final.log).
+
+### Snippet editor word wrap
+
+The Snippets editor, preview, and Snippet Editor Appearance settings
+share a saved Word wrap toggle. Profiles without that setting continue
+to wrap. Turning it off enables a horizontal scrollbar, horizontal
+wheel scrolling, and caret tracking. The text, selection, and click
+positions use the same offset, and the line-number gutter stays fixed.
+The wrapped view breaks long tokens that exceed its width.
+Java `snippetWordWrap` fills the unset Rust choice. A subsequent native
+choice takes precedence on additive restore.
+Thirty focused Apple Silicon tests passed, including scroll and click
+handling, caret tracking, overlong tokens, right-to-left scroll
+coordinates, and the encrypted restore and replay fixture. Windows
+ARM64 test-target Clippy passed. Native desktop interaction remains
+open.
+[Apple Silicon tests](target/verification/20261118-snippet-word-wrap-macos-verified.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-word-wrap-windows-verified.log).
+
+### Saved analysis report count
+
+Snippet Editor settings set the number of saved reports per snippet or
+folder, from 1 to 20 with a default of five. Additive Java restore
+imports `snippetAnalysisHistoryMaxSize` when the Rust preference is
+unset. A new report triggers retention. Pinned reports and protected
+recovery or verification records can keep the history above the target.
+Changing the setting or opening a history leaves existing reports in
+place. The report publication checks for a concurrent setting change.
+Apple Silicon passed 58 focused tests covering the store, settings
+save, and encrypted Java restore and replay. Windows ARM64 test-target
+Clippy passed. The interactive desktop check remains open.
+[Apple Silicon tests](target/verification/20261118-snippet-analysis-history-limit-macos-final.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-analysis-history-limit-windows-final.log).
+
+Lowering the limit in Settings previews how many reports and current
+snippets or folders would be affected as their next regular analyses
+are saved. The preview reads history snapshots in a background worker
+and uses the same removal rules as publication. A superseded request
+stops between histories and its result never replaces the current
+estimate.
+Apple Silicon passed 28 focused tests. The preview matched eventual
+publication for a snippet and folder, preserved a pinned report,
+excluded orphaned histories, and discarded superseded results.
+Windows ARM64 test-target Clippy passed.
+[Apple Silicon tests](target/verification/20261118-snippet-retention-preview-macos.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-retention-preview-windows.log).
+
+### Stored snippet-analysis source limit
+
+Snippet Editor settings accept zero to omit new source bodies, or
+256 KiB–5 MiB per UTF-8 field, with a 1 MiB default. Java
+`snippetAnalysisMaxStoredContentBytes` fills the unset preference,
+preserving exact byte values within that range. New reports, apply
+snapshots and recovery checkpoints enforce the user limit within
+managed policy. Earlier snapshots remain available under the managed
+ceiling and the file budget. Omitted bodies keep their hashes.
+The desktop settings show the managed ceiling and disable the input
+when managed policy disables source storage.
+Analysis requests have their own source and provider payload limits.
+Thirty-five focused Apple Silicon tests passed, covering UTF-8
+boundaries, existing snapshots, zero-byte proposals, managed policy,
+concurrent preference changes, settings validation and Java restore.
+Windows ARM64 test-target Clippy passed. Native desktop interaction
+remains open.
+[Apple Silicon tests](target/verification/20261118-snippet-source-limit-macos-final.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-source-limit-windows-final.log).
+
+### Snippet source history
+
+The editor records source snapshots after 500 ms of inactivity and
+captures a pending version on save. The version slider loads source
+into the active draft. Saving publishes the displayed source and its
+history together. Snapshots stay with their editor tab during window
+transfers. The global choice is 1–99 versions, with a default of 30.
+Snippet Details supports a per-snippet override, including zero for no
+count limit within the existing snippet library storage budget.
+Private Java profile restore retains the original timestamps, source
+versions and per-snippet overrides. Individual JSON, XML and YAML
+exports include the current source.
+Apple Silicon passed 55 focused tests covering capture timing,
+navigation, save and reopen, migration, and snippet export contents.
+The GnuPG interoperability fixture was skipped. Windows ARM64
+test-target Clippy passed. Interactive desktop acceptance remains open.
+[Apple Silicon tests](target/verification/20261118-snippet-versions-macos.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-versions-windows.log).
+
+### Snippet Structure panel preferences
+
+Java profile restore fills unset Structure visibility and width
+independently. The imported width is in logical pixels and follows
+Java's 160–800 range. Opening the panel or filtering its contents leaves
+an unset width available for restore. A successful resize records the
+requested width. A narrower window fits the panel to the available
+space while preserving that requested width. Explicitly hiding the
+panel persists that choice.
+Apple Silicon passed 63 focused tests, including explicit preference
+changes, fitting to a narrower window, and encrypted restore and replay.
+Windows ARM64 test-target Clippy passed. Interactive desktop acceptance
+remains open.
+[Apple Silicon tests](target/verification/20261118-snippet-structure-preferences-macos.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-structure-preferences-windows.log).
+
+### Snippet analysis side panel
+
+A ready snippet analysis can appear alongside its matching source
+editor. The divider changes its requested width. A narrow window
+temporarily displays the full analysis tab while preserving that width.
+Review and running states use the full tab. Source jumps keep a visible
+side panel open and make the editor visible when the analysis occupied
+the full tab. An enabled panel reopens existing saved history when the
+user opens its editor. Java's `snippetAnalysisPanelVisible` and
+`snippetAnalysisPanelWidth` fill the unset preferences independently.
+Apple Silicon passed 20 focused tests covering layout bounds, reopening,
+editor guards, and encrypted restore and replay. Windows ARM64
+test-target Clippy passed. Dragging the divider and source jumps still
+need interactive desktop acceptance.
+[Apple Silicon tests](target/verification/20261118-snippet-analysis-panel-macos.log)
+and [Windows ARM64 Clippy](target/verification/20261118-snippet-analysis-panel-windows.log).
+
+### Snippet apply-progress dock
+
+The active snippet and folder apply runs show progress before the first
+stream update and as new stages arrive. The same controls display
+progress within the report or in a column at the right edge. The dock
+fits alongside a source editor and report when space permits. Narrow
+layouts show progress within the report. The latest saved run,
+interrupted checkpoint, and imported Java run are scoped to the
+selected report. The saved native proposal opens the existing review.
+Live and same-session runs follow the saved placement. A restored run
+can be moved into the dock explicitly. Java `snippetAiProgressDockVisible`
+fills the unset preference.
+
+Fourteen focused tests passed on [native Apple Silicon](target/verification/20261118-snippet-progress-dock-macos.log).
+[Windows ARM64 Clippy](target/verification/20261118-snippet-progress-dock-windows.log)
+passed with warnings denied. Interactive desktop verification remains open.
+
+### Separate window and tab-batch close preference
+
+Terminal Settings exposes the Java global skip option separately from
+the busy-terminal preference used by individual tabs and panes.
+Enabling it skips the ordinary terminal confirmation for window close,
+application quit, Close All, Close Other Tabs, and Close Tabs to the
+Right. Active serial sessions and unsaved hosted tools retain their
+confirmation paths. Java backup restore fills the unset global option
+independently of the terminal default. A saved native choice takes
+precedence.
+
+Sixteen focused tests passed on [native Apple Silicon](target/verification/20261118-group-close-macos.log),
+including the pseudo-terminal serial batch and independent backup import.
+The app and its test targets passed [Windows ARM64 Clippy](target/verification/20261118-group-close-windows.log).
+Verify the checkbox and dialog flow interactively on native desktops.
+
+Window close and application quit now check all running terminal panes,
+including idle connections. A single tab and partial tab batches still
+check for busy or split terminals. Twenty focused tests passed on
+[native Apple Silicon](target/verification/20261118-window-close-macos.log),
+including a real idle local PTY, canceled window close and quit, serial
+batch confirmation, recently closed history, and dirty-editor quit.
+[Windows ARM64 Clippy](target/verification/20261118-window-close-windows.log)
+passed for the app and its test targets.
+
+Application quit now asks in each affected window. It leaves the main
+windows and sessions open until each terminal review is accepted.
+Approvals apply to the observed session and stream generation in that
+window. A new or reconnected stream requires another review. Cancel
+discards the approvals, and stale button events are ignored.
+Nineteen focused tests passed on [native Apple Silicon](target/verification/20261118-quit-windows-macos.log),
+including cancellation in the second window, a renewed review after
+adding a session, and final PTY shutdown.
+[Windows ARM64 Clippy](target/verification/20261118-quit-windows-windows.log)
+passed for the app and its test targets.
+
+### Java app design and animation preferences
+
+The Java backup importer resolves all 17 pinned application design IDs
+and their enum spellings to the matching native designs. It merges the
+app design and animation preference individually. Native saves preserve
+an explicit Normal design or enabled animations, and an absent value
+keeps its existing fallback. Invalid Java values are reported as
+omitted. App appearance uses its existing settings path after restart.
+
+Fifteen focused tests passed on [native Apple Silicon](target/verification/20261118-java-appearance-macos.log).
+They cover design IDs, additive restore, serialized preferences, the
+appearance settings save, and terminal and editor colors.
+[Windows ARM64 Clippy](target/verification/20261118-java-appearance-windows.log)
+passed for the app and test targets. Desktop inspection after restart
+remains open.
+
+### Java global setting for automatic local shell integration
+
+Java `shellIntegrationEnabled` fills the native setting for automatic
+local startup wrappers when unset. The Terminal settings checkbox
+controls future launches from saved local profiles and Quick Connect.
+The separate per-launch opt-in, supported shell and emulation checks,
+and sandbox restrictions still apply. Command marks emitted by
+already-integrated local or remote shells keep their own control.
+
+Thirty focused tests passed on [native Apple Silicon](target/verification/20261118-local-shell-policy-macos.log),
+including encrypted Java restore, replay over an explicit native
+choice, and Quick Connect availability. [Windows ARM64 Clippy](target/verification/20261118-local-shell-policy-windows.log)
+passed for the app and its test targets. Interactive launch and
+settings verification remains open.
+
+### Wayland text drops in terminal panes
+
+Native Wayland accepts copy-only UTF-8 text offers up to 64 KiB. An
+offer containing file URIs keeps the existing file route. The terminal
+resolves the text target through the pane bounds at the drop point,
+then binds the paste to that pane and stream generation. The usual paste
+protection applies. Managed internal clipboard, mirrored input, modal
+state and unavailable targets reject the drop. Java
+`terminalDragDropEnabled` fills the unset native setting.
+
+Six focused [Fedora ARM64 tests](target/verification/20261118-wayland-text-drop-fedora-lld.log)
+passed for target hit testing, paste protection and encrypted Java
+restore. The first build hit a GNU ld ARM64 relocation overflow. The
+successful run temporarily staged signed Fedora LLVM lld packages.
+[Windows ARM64 Clippy](target/verification/20261118-wayland-text-drop-windows.log)
+passed for the app and test targets. Live Wayland compositor testing
+and other desktop text backends remain open.
+
+### Wayland file drops in SSH terminal panes
+
+Native Wayland file offers can open an SFTP upload review on the SSH
+split they hit. The separate SFTP channel resolves the tracked shell
+directory or uses its start directory. The review shows the canonical
+destination before any upload. The stream, shell context and transfer
+policy stay bound to the upload through completion. The dialog uses the
+existing queue and conflict controls. Closing it stops its channel.
+
+Four focused [Fedora ARM64 tests](target/verification/20261118-wayland-terminal-upload-fedora-retry.log)
+passed, including actual transfer through pinned OpenSSH, rejection
+after a directory change, and the existing sidebar transfer.
+The retry placed the test server's private files under the account's
+home with StrictModes enabled. [Windows ARM64 Clippy](target/verification/20261118-wayland-terminal-upload-windows.log)
+passed for the app and test targets. Live Wayland drag gestures remain open.
+
+### Native terminal file drops on Windows, macOS and X11
+
+The terminal canvas uses the native file-drop cursor to capture a drop
+within its bounds and bind it to its terminal stream. The main window
+groups paths from the same drop, removes duplicates, and rejects a batch
+whose target changes. It opens the same reviewed SSH upload dialog as
+Wayland. This route works with the remote-files sidebar hidden.
+
+Five focused [Fedora ARM64 tests](target/verification/20261118-native-terminal-drop-fedora.log)
+passed, including a pinned OpenSSH batch with two files, duplicate
+events and a stale-stream rejection. Three focused tests passed on
+[Apple Silicon](target/verification/20261118-native-terminal-drop-macos.log).
+[Windows ARM64 Clippy](target/verification/20261118-native-terminal-drop-windows.log)
+passed for the app and test targets. Live Explorer, Finder and X11 drag
+gestures remain open.
+
+### AppKit text drops in terminal panes
+
+AppKit accepts external plain-text Copy offers up to 64 KiB. File offers
+retain the native file handlers. The text route uses the native drop
+point and reuses Wayland's terminal pane and stream checks. Both routes
+use the existing paste protection and honor managed clipboard policy,
+mirrored input restrictions and the terminal drag-and-drop setting.
+
+Five [Apple Silicon app tests](target/verification/20261118-appkit-text-drop-macos-final.log)
+passed for pane hit testing, paste protection and terminal canvas input.
+Three [AppKit component tests](target/verification/20261118-appkit-text-drop-component.log)
+passed for selector compatibility, class layout and UTF-8 text bounds
+and representation. Five [Fedora ARM64 tests](target/verification/20261118-appkit-text-drop-fedora.log)
+passed for the shared route and existing Wayland registration.
+Live macOS drag gestures remain open.
+
+### Windows OLE text drops in terminal panes
+
+The Windows OLE drop target accepts Unicode text Copy offers up to 64 KiB
+and prioritizes native file offers. The client drop point selects the exact
+terminal pane through the same stream checks, clipboard policy and paste
+protection used by AppKit. File offers emit the existing Iced file events.
+
+Five [native Windows ARM64 component tests](target/verification/20261118-ole-text-drop-windows-native.log)
+passed, including registration and revocation, Unicode validation and a
+COM file data round trip. [Windows ARM64 Clippy](target/verification/20261118-ole-text-drop-windows.log)
+passed for the app and test targets. Five [Apple Silicon app tests](target/verification/20261118-ole-text-drop-macos.log)
+passed on the shared route and its terminal input and paste checks. Live
+Windows drag gestures from external sources and across DPI settings remain
+open.
+
+### X11 text drops in terminal panes
+
+An Xdnd proxy receives Copy offers, translates root coordinates into
+client pixels and forwards Unicode text into the shared terminal pane and
+paste checks. It reads text on drop, accepts bounded incremental transfers
+and prioritizes file offers. File batches still emit the existing Iced
+file events. KorTTY's outbound file source binds the selection request to
+the advertised proxy client when the target uses a proxy.
+
+The Winit 0.30.13 patch forwards Xdnd messages addressed to the client
+window when that window advertises a valid proxy. The
+[GTK 4 trace before the patch](target/verification/20261118-x11-desktop-live-diagnostic.log)
+showed a drag starting at the advertised proxy and then addressing
+the window directly as the pointer moved. Both message paths now reach
+the same receiver.
+
+In [the Fedora ARM64 GTK 4 desktop run](target/verification/20261118-x11-desktop-live-fedora-final.log),
+pointer drags on private Xvfb at 100 and 200 percent and on Mutter
+Xwayland at 100 percent placed the Unicode marker only in the inactive
+right split and focused it. Drops over application chrome left both panes
+and their focus unchanged. Both applications used their X11 backends
+during the Xwayland test.
+[Windows ARM64 application and test targets](target/verification/20261118-xdnd-winit-windows.log)
+compiled with the updated Winit dependency.
+
+Three [Fedora ARM64 component tests](target/verification/20261118-x11-desktop-drop-fedora-final.log)
+passed for Unicode payload validation, incoming text and file offers on
+private Xvfb, and outgoing Copy with direct and proxied targets. The
+[Fedora app check](target/verification/20261118-x11-desktop-drop-fedora-final.log)
+and [Windows ARM64 app check](target/verification/20261118-x11-shared-windows.log)
+compiled the shared coordinate and pane routing with test targets.
+Live drops from ordinary text editors and file managers, the
+Wayland-to-Xwayland bridge, application zoom and tool overlays remain open.
+
+### Global Java terminal theme selection
+
+Java backup restore uses the exact global theme ID after merging the
+catalogue. Imported custom themes resolve to their assigned local IDs.
+The font option fills an unset native preference, and the Java base
+cursor shape and blink setting remain effective. An existing native
+selection or custom base palette retains precedence. Edited Java built-in
+themes restore at their original IDs if the native preset has no saved
+edit. Colors, supported fonts and Agent panel settings follow the
+restored definition. Legacy image paths remain inactive metadata.
+Native desktop restore acceptance remains open.
+
+Apple Silicon passed 72 backup merge, theme and Settings tests. One
+pre-existing opt-in theme test remained ignored. Windows ARM64 Clippy
+passed for the application and test targets with warnings denied for
+project code.
+[Apple Silicon](target/verification/20261118-java-global-theme-macos.log)
+and [Windows](target/verification/20261118-java-global-theme-windows.log).
+
+The pinned Java source comparison matched all 14 built-in names, terminal
+colors, fonts and cursor styles. The subsequent edited-preset checkpoint
+passed 77 Apple Silicon backup, theme, archive and Settings tests.
+Windows ARM64 application and test-target Clippy passed with warnings
+denied for project code.
+[Apple Silicon](target/verification/20261118-java-edited-themes-macos.log)
+and [Windows](target/verification/20261118-java-edited-themes-windows.log).
+
+### Terminal close confirmation
+
+Terminal Settings controls confirmation for busy and split terminals.
+The Java global value restores into an unset Rust preference.
+Connection-level and Teamwork overrides take precedence. Serial sessions
+retain their confirmation. SSH prompt state and terminal alternate
+screen state contribute to the busy check. Local shells also inspect
+live child processes at close time, including background jobs. Flatpak
+host shells use the terminal activity signals available in the
+sandbox. Native desktop acceptance remains open.
+
+Apple Silicon passed 91 focused tests for Java restore, terminal close
+rules, tab actions, Settings, and saved connection overrides. Windows
+ARM64 application and test-target Clippy passed with warnings denied
+for project code.
+[Apple Silicon result](target/verification/20261118-java-terminal-close-macos-final.log)
+and [Windows Clippy result](target/verification/20261118-java-terminal-close-windows-final.log).
+
+The native PTY regression passed on Windows ARM64, Fedora ARM64, and
+Apple Silicon. It verified an idle shell, a live background process,
+and the return to idle. Apple Silicon also passed 16 application tests
+covering close decisions and window lifecycle. The Windows PSEC fixture
+verified that the idle broker and shell do not trigger the process check
+and that starting a child inside the sandbox does. Windows application
+and test-target Clippy passed with warnings denied for project code.
+[Apple Silicon](target/verification/20261118-local-close-process-macos-verified.log),
+[Fedora](target/verification/20261118-local-close-process-fedora-final.log),
+[Windows PTY](target/verification/20261118-local-close-process-windows-test.log),
+[Windows PSEC](target/verification/20261118-local-close-process-windows-sandbox.log),
+and [Windows Clippy](target/verification/20261118-local-close-process-windows-clippy-final.log).
+
+### Global SSH character encoding
+
+Terminal Settings can select the emulation default, UTF-8, Latin-1,
+Latin-9, or Windows-1252 for SSH terminal connections. Saved and
+Teamwork overrides have priority. The selection applies to newly
+connected streams. Java backups restore confirmed values. An older
+unconfirmed non-default value appears as a Settings suggestion and
+requires explicit adoption and Save. Local shell and serial defaults
+remain independent. Live SSH character and reconnect acceptance
+remains open.
+
+Apple Silicon passed 98 focused tests for import, SSH workspace
+routing, Settings, and window preferences. Two opt-in OpenSSH
+fixtures remained ignored. Windows ARM64 passed strict application
+and test-target Clippy and both terminal codec tests.
+[Apple Silicon result](target/verification/20261118-java-ssh-encoding-macos-final.log),
+[Windows Clippy result](target/verification/20261118-java-ssh-encoding-windows-final.log)
+and [Windows codec result](target/verification/20261118-terminal-codec-windows.log).
+
 ## Pull-request preparation on 2026-11-17
+
+### Java global terminal defaults
+
+The Java global terminal settings bean now restores supported font,
+initial dimensions, scrollback, SSH keepalive, timestamps, bold mode,
+colors and cursor preferences. A saved native field takes precedence.
+An explicit Java cursor blink flag wins over the old cursor style's
+blink bit. Explicitly customized ANSI colors fill unset native entries.
+Selection and palette values from backups without the customization
+flag are ignored. Global SSH encoding, legacy theme selection, close
+confirmation and desktop acceptance remain open.
+
+Apple Silicon passed 74 focused tests for backup preferences, terminal
+themes, window settings and Settings workflows. The pinned Java theme
+round-trip remained ignored because it requires its Java classpath.
+Windows ARM64 application and test-target Clippy passed with warnings
+denied for project code.
+[Apple Silicon result](target/verification/20261117-java-terminal-defaults-macos-final.log)
+and [Windows Clippy result](target/verification/20261117-java-terminal-defaults-windows-final.log).
+
+### Java Agent panel placement and width
+
+Agent Design settings offer a design default and bottom, left, and right
+history placement for regular pane activity. The side-width setting uses
+the Java limits, and the runtime fits the panel to the terminal space.
+The Java backup parser fills each unset preference independently.
+Inline history, adaptive arrangement, floating windows, and
+picture-in-picture retain their placement behavior. Desktop acceptance
+remains open.
+
+Apple Silicon passed 54 distinct focused tests covering preference
+restore, Agent layout and preview, and window settings. Windows ARM64
+application and test-target Clippy passed with warnings denied for
+project code.
+[Apple Silicon result](target/verification/20261117-java-agent-dock-macos-final.log)
+and [Windows Clippy result](target/verification/20261117-java-agent-dock-windows-final.log).
+
+### Agent panel View menu and divider
+
+View → AI Agent Panel selects bottom, left, right, or the design default.
+The in-window and macOS menus share the checked actions. A side panel
+offers a divider next to the terminal. Dragging previews the fitted
+width, and completion saves the preference for the current run and
+terminal stream. The menu and Settings discard in-progress resize
+previews when the dock preference changes. Live native menu, pointer
+interaction, and restart acceptance remain open.
+
+Apple Silicon passed 66 focused tests covering menu routing, the Agent
+layout and divider events, settings preview, and Java preference import.
+Windows ARM64 application and test-target Clippy passed with warnings
+denied for project code.
+[Apple Silicon result](target/verification/20261117-agent-dock-interaction-macos.log)
+and [Windows Clippy result](target/verification/20261117-agent-dock-interaction-windows.log).
+
+### Java local file browser defaults
+
+Java backup restore retains local browser placement, width and hidden-file
+visibility. The native dock file takes precedence for placement and width.
+Older files can inherit the hidden-files default. Changing the checkbox
+persists the default for future windows. The Java last-root path appears as
+an omission. The in-window menu bar toggle is session-only in Java
+v2.26.0 and Rust.
+
+Apple Silicon passed 31 focused backup, local dock and window settings
+tests, including the legacy dock-file fixture. Windows ARM64 application
+and test-target Clippy passed with warnings denied for project code.
+[Apple Silicon result](target/verification/20261117-java-local-dock-macos-final.log)
+and [Windows Clippy result](target/verification/20261117-java-local-dock-windows-final.log).
+
+### Native local file browser startup folder
+
+Successful user navigation remembers an absolute path in the private
+native dock preferences. New file browser instances reopen it, with a
+home-directory fallback for an unavailable folder. Startup fallback,
+refresh, and failed navigation leave the remembered path in place.
+Legacy dock preferences remain readable. The path is excluded from
+portable backups. Native desktop restart acceptance remains open.
+
+Apple Silicon passed 48 focused tests, including native path round-trip
+and missing-directory fallback. Windows ARM64 application and test-target
+Clippy passed with warnings denied for project code.
+[Apple Silicon result](target/verification/20261117-local-dock-root-macos.log)
+and [Windows Clippy result](target/verification/20261117-local-dock-root-windows.log).
+
+### Java remembered main-window startup state
+
+The backup importer retains the last Java main-window bounds and
+maximized state, and the last Dashboard visibility. A native record
+takes precedence for each startup choice. Active fixed bounds take
+precedence for window geometry. The native settings for remembering
+geometry and the Dashboard govern the restored values. Closing a
+hidden Dashboard can persist that choice even with fixed window bounds
+and no earlier native record. Native desktop restart acceptance remains
+open.
+
+Apple Silicon passed 52 focused tests for backup import, startup and
+window lifecycle, the settings editor, and profile persistence.
+Windows ARM64 application and test-target Clippy passed with warnings
+denied for project code.
+[Apple Silicon result](target/verification/20261117-java-startup-macos.log)
+and [Windows Clippy result](target/verification/20261117-java-startup-windows.log).
+
+### Java tool window and named dialog geometry
+
+Java backups restore six explicit geometry fields for AI Manager, Saved
+Chats, ASCII Art, Snippet Manager, Job Scheduler, and the Guide Viewer.
+The named window list restores the three exact keys for Journal Markers,
+Journal Export, and Journal Note. Duplicate and unsupported mappings
+are reported as omissions. Native remembered bounds and existing
+per-dialog fallbacks take precedence. The import uses the shared native
+placement path for detached windows and respects the preference to
+disable remembered geometry. Native desktop acceptance remains open.
+
+Apple Silicon passed 33 focused tests covering backup conversion,
+placement precedence, Journal geometry compatibility, and window settings.
+Windows ARM64 application and test-target Clippy passed with warnings
+denied for project code.
+[Apple Silicon result](target/verification/20261117-java-dialog-geometry-macos.log)
+and [Windows Clippy result](target/verification/20261117-java-dialog-geometry-windows.log).
+
+### Java Journal dialog geometry
+
+Backups can restore the normal bounds of Journal Manager, Journal Viewer,
+and Screenshot Editor. The portable preferences keep each dialog's
+geometry independently. New detached dialogs use a restored value as a
+fallback under native screen fitting and the existing remember-geometry
+setting. Native per-dialog bounds take precedence once saved. Hosted
+Journal tabs use the host window's layout. Native desktop acceptance
+with restored dialogs remains open.
+
+Apple Silicon passed 36 focused tests, including the three-field backup
+fixture and the Journal Manager opening path with native precedence.
+Windows ARM64 application and test-target Clippy passed with warnings
+denied for project code.
+[Apple Silicon result](target/verification/20261117-java-journal-geometry-macos-final.log)
+and [Windows Clippy result](target/verification/20261117-java-journal-geometry-windows-final.log).
+
+### Java Journal panel and editor layout
+
+Java backup restore fills unset Live Journal placement, panel width, and
+Journal viewer editor divider preferences. Placement is case-insensitive,
+and dimensions are mapped into the native layout bounds. A saved native
+field takes precedence, including an explicitly saved 62 percent viewer
+split. New terminal windows use the saved panel layout and newly opened
+Journal viewers use the saved split. Desktop interaction acceptance
+remains open.
+
+Apple Silicon passed all 39 focused tests for Java preference import,
+Journal dock behavior, the entry editor, window settings, and Java AI
+restore. Windows ARM64 application and test-target Clippy passed with
+warnings denied for project code.
+[Apple Silicon result](target/verification/20261117-java-journal-layout-macos.log)
+and [Windows Clippy result](target/verification/20261117-java-journal-layout-windows.log).
+
+### Java interactive Swarm journal defaults
+
+The Java backup preview identifies an inactive Swarm journal suggestion.
+Restore preserves the first imported suggestion across replay and leaves
+saved interactive defaults in place. In the Swarm window, **Use Java
+journal settings** copies the recording, summary, keep, retention, storage
+and deduplication choices into the current draft. **Save journal defaults**
+persists that draft separately. The explicit profile picker can offer the
+matching native profile after review when the backup supplied an exact
+source match. The native journal policy and summary route checks still
+apply. Native desktop and live provider acceptance remain open.
+
+Apple Silicon passed 117 focused tests covering preference import,
+Scheduler parsing and restore, Swarm, and the journal editor. Two
+environment-dependent OpenSSH fixtures remained ignored. Windows ARM64
+application and test-target Clippy passed with warnings denied for project
+code.
+[Apple Silicon result](target/verification/20261117-java-swarm-journal-macos-final.log)
+and [Windows Clippy result](target/verification/20261117-java-swarm-journal-windows-final.log).
+
+### Interactive Swarm journal command input
+
+The Swarm editor exposes optional command input capture. Saved defaults
+and adoption of a Java backup retain the choice. The local and SSH
+execution paths signal dispatch before a command can become a journal
+input record. Probe and unstarted command previews stay outside the
+published journal. Output remains available with the input option off.
+The writer applies journal redaction and the run's known secrets at
+publication. Live desktop acceptance with attached and saved SSH
+targets remains open.
+
+Apple Silicon passed 165 focused tests covering Swarm, Agent command
+review, the native shell runner, backup migration, and automation journals.
+Two OpenSSH fixtures remained ignored. Windows ARM64 application and
+test-target Clippy passed with warnings denied for project code.
+[Apple Silicon result](target/verification/20261117-swarm-journal-input-macos-verified.log)
+and [Windows Clippy result](target/verification/20261117-swarm-journal-input-windows-verified.log).
+
+### Java Journal AI switches
+
+The backup importer restores the Java summary and screenshot analysis
+switches into individually unset native settings. Settings → Logging exposes
+both controls. Summary authorization checks the summary switch in the
+desktop, recording preflight, scheduled probe and HTTPS authority checks.
+Screenshot analysis checks its own switch for manual descriptions, capture
+automation and the Scheduler closing pass. It retains the separate image
+input and automatic analysis choices. An imported switch does not select or
+enable a Journal AI profile, authorize a remote route, or grant recording
+consent. Native dialog and live provider acceptance remain open.
+
+Apple Silicon passed 14 preference import tests, 27 summary tests, five
+screenshot analysis tests and 16 logging settings tests. The LM Studio TLS
+fixture remained ignored. Windows ARM64 strict Clippy passed.
+[Apple Silicon result](target/verification/20261117-java-journal-ai-switches-macos-final.log)
+and [Windows Clippy result](target/verification/20261117-java-journal-ai-switches-windows-final.log).
+
+### Live Journal log height
+
+The native Live Journal dock exposes a slider that allocates 15–85 percent
+of the space shared by the timeline and live output. The default is 44
+percent. The log remains anchored at the bottom and closing it returns the
+space to the timeline. The current log binding gates edits, and the profile
+remembers the height across dock reopens and application restarts.
+Java backup restore translates the saved viewport percentage to the native
+dock allocation, with an existing native choice taking precedence.
+Desktop acceptance with a running capture remains open.
+
+Apple Silicon passed six Journal dock tests, thirteen preference import tests
+and twelve capture access tests. Windows ARM64 application/test-target Clippy
+passed with warnings denied for project code.
+[Apple Silicon result](target/verification/20261117-live-log-height-macos.log)
+and [Windows Clippy result](target/verification/20261117-live-log-height-windows-clippy.log).
+
+### Scheduler journal divider persistence
+
+The Scheduler journal remembers the table/detail split across Scheduler views
+and app restarts. New views use the saved position, starting at 72 percent on a
+fresh profile. Resizing clamps to Java's 20–90 percent bounds, coalesces drag
+events before saving and flushes a pending change on shutdown. Java backup
+restore fills this setting when the native value is unset. Invalid or
+nonfinite positions are rejected. Native interactive layout acceptance remains
+open.
+
+Apple Silicon passed 210 Scheduler tests, 12 preference import tests and 41
+workspace Scheduler tests. Eight OpenSSH fixtures remained ignored. Windows
+ARM64 strict application/test-target Clippy passed.
+[Apple Silicon divider record](target/verification/20261117-scheduler-journal-divider-macos.log)
+and [Windows Clippy record](target/verification/20261117-scheduler-journal-divider-windows-clippy.log).
+
+### Java maintenance settings import
+
+The Java backup importer fills individually unset log retention and update
+interval fields with values normalized to the Java limits. A Java retention
+of zero keeps logs without an age cutoff. A local log directory and its saved
+retention take precedence over imported preferences. The preview reports that
+a Java log folder needs local selection. A saved disabled update preference
+can fill an unset field. A saved enabled preference appears in Rust update
+settings and requires explicit opt-in through the existing checkbox and Save.
+Java update history and telemetry consent remain outside this migration.
+
+Apple Silicon passed 11 preference import tests, 65 backup restore tests,
+the native update opt-in test and 20 application logging tests. The packaged
+startup fixture remained ignored. Windows ARM64 strict application/test-target
+Clippy passed.
+[Apple Silicon maintenance record](target/verification/20261117-java-maintenance-macos.log)
+and [Windows Clippy record](target/verification/20261117-java-maintenance-windows-clippy.log).
+
+### Java Teamwork settings import
+
+The Connection Manager can now edit an ordered Teamwork default for interactive
+SSH and SFTP. A locally available, endpoint-scoped password takes precedence
+over a registered key, then an explicitly enabled temporary key. The selection
+occurs before authentication. Existing single-method settings keep their
+format, and applying a fallback draft preserves the native checks for current
+local choices and concurrent edits. The Java mapping picker can fill each
+slot in this draft separately. Shared entries with their own authentication
+references retain their existing handling.
+
+Apple Silicon passed 60 Teamwork tests and all 45 Connection Manager module
+tests. The loopback Git daemon fixture remained ignored. The Teamwork selection
+fixture confirms that an eligible password wins and that a password outside the
+endpoint scope leaves the configured temporary-key fallback available. Windows
+ARM64 strict application/test-target Clippy passed.
+[Apple Silicon fallback record](target/verification/20261117-teamwork-fallback-macos.log)
+and [Windows Clippy record](target/verification/20261117-teamwork-fallback-windows-clippy.log).
+
+The Java Scheduler additionally resolves Teamwork password and registered-key
+defaults. Rust's saved Scheduler references currently resolve through the local
+connection store. Teamwork route identities and Scheduler adoption are tracked
+separately in the porting plan.
+
+Interactive Teamwork SSH and SFTP now bind the selected route to its source
+origin and external ID, exact group, target and jump endpoints, authentication
+methods and default-auth eligibility. The serializable reference keeps foreign
+credential IDs out of the binding. The login still revalidates visibility and
+the complete connection settings. The Scheduler picker, job persistence and
+execution paths still need integration with this reference.
+
+The final Apple Silicon run passed the new route round-trip fixture, 61 Teamwork
+tests and 34 SSH access tests. One Git-daemon and two external SSH fixtures
+remained ignored. Windows ARM64 strict Clippy passed after the route reference
+was shared across cloned selections to keep palette actions compact.
+[Apple Silicon route record](target/verification/20261117-teamwork-reviewed-route-macos-final.log)
+and [Windows Clippy record](target/verification/20261117-teamwork-reviewed-route-windows-final.log).
+
+Java backup preview reports inactive Teamwork suggestions separately from
+global settings applied to unset native values. Teamwork Settings exposes
+disabled source drafts, a separate default interval action, and the imported
+credential, key, username and temporary-key references. In Connection Manager,
+the Teamwork authentication panel displays those Java references beside a
+picker of eligible local methods. Explicitly selecting a registered or
+temporary key carries the reviewed Java username into the draft. Apply uses
+the native checks for current availability and saved-state conflicts. Java IDs
+remain reference text, including numeric-looking IDs. Source kind, ID,
+previous enabled state and interval are
+retained in the suggestion. The native source editor validates the resulting
+configuration before save, including edited file paths and duplicate origins.
+A replay of the Java restore preserves the previously imported suggestion set.
+Native desktop interaction remains open.
+
+Apple Silicon passed all seven Teamwork Settings tests and 147 profile-backup
+tests. The GnuPG interoperability and packaged startup cases remained ignored. Windows ARM64
+application and test-target Clippy passed with warnings denied for project
+code. [Apple Silicon test record](target/verification/20261117-java-teamwork-macos.log).
+
+With the mapping picker in place, Apple Silicon passed the five Teamwork
+authentication tests, the Java restore fixture and all 45 Connection Manager
+module tests. Windows ARM64 strict application/test-target Clippy passed.
+[Apple Silicon mapping record](target/verification/20261117-java-teamwork-auth-macos.log)
+and [Windows Clippy record](target/verification/20261117-java-teamwork-auth-windows-clippy.log).
+
+### Recurring protected folder creation and confirmed receiver progression
+
+Calendar and Chain approval can now start at a reviewed absent protected folder
+in either direction and sudo mode. The first firing publishes one complete
+private tree with no replacement of an intervening destination. Successful
+completion advances the device-local grant from its reviewed vacancy to the
+confirmed created receiver. Subsequent runs use the existing-folder merge path
+and must match that receiver. Source bytes may change within the reviewed scope
+and firing limits; a separately created or replaced root is never adopted.
+
+The approval index preserves the creation phase, pending firing and confirmed
+successor across reopen. A zero, unchanged-vacancy, wrong-firing or stale-worker
+completion cannot advance it. Pending creation blocks further automatic runs
+until explicit reapproval. After progression, a merge can confirm only the same
+receiver. Approval duration, consumed firings, Calendar/Chain cutoffs, action and
+payload limits, current route, pins, groups, sudo policy and revocation checks
+remain in force. The root creation counts as an action even for an empty source.
+
+Uploads use an explicit `create_root` opt-in in the fixed Rust folder helper.
+Legacy requests omit the field and retain their previous wire shape and merge
+behavior. Creation requires a receiver receipt, a currently permitted parent,
+a bound vacancy and privately verified complete payloads. It publishes the root
+once, then confirms the same held receiver through its public name before
+returning a successor. The receipt uses the same policy/path/metadata/birth
+identity contract as subsequent protected merges. A root publication that cannot
+be fully confirmed retains the pending device-local state.
+
+Downloads bind the parent and vacant name before requesting source payloads.
+They verify every digest and the final source acknowledgement before local
+publication. The destination vacancy and current grant are rechecked at each
+publication attempt, including Windows retries. The returned receipt must match
+both the staged root and the published receiver. Local creation and existing
+merges share the same receiver identity representation. Filesystems without
+stable directory birth identity remain ineligible for recurring approval.
+
+The form retains the reviewed creation/merge choice and recurring limits across
+reopen, and discloses that later runs may replace eligible files while keeping
+recovery originals. The Scheduler fixture covers sixteen combinations of
+direction, sudo mode, initial receiver phase and optional Calendar with Chain.
+It verifies actual predecessor admission, rejection of a forged trigger, sudo
+scope changes, reopen and the persisted transition to the confirmed receiver.
+
+Live pinned SSH execution through the installed updated helper, actual vault
+interaction, configured native Scheduler review/recovery and updated release
+packages remain open. This does not close T3/Q1/Q2 or the overall porting goal.
+
+Verification uses the [final source manifest](target/verification/20261117-protected-root-creation-final-source.sha256),
+SHA-256 `62da690f5f86c001da68b4959e1569464c16f05ac10b84f27acc4e6277fe7adb`.
+All 2,309 non-document source files matched that snapshot after the runtime checks.
+The subsequent Windows CI-only ACL correction is recorded separately below;
+application and server source remain identical to the tested snapshot.
+Apple Silicon passed the new durable-state and local-publication fixtures, the
+expanded sixteen-combination editor fixture, all 209 Scheduler tests and 31
+privileged tests; one explicit OpenSSH fixture remained ignored.
+[macOS results](target/verification/20261117-protected-root-creation-macos-complete.log).
+
+Fedora ARM64 passed four common wire tests, all four protected-tree server tests
+and ten rsync receiver regressions, plus strict server-component Clippy. Its
+application passed the same three focused fixtures, all 209 Scheduler tests and
+31 privileged tests; 46 explicit helper/SSH/sudo fixtures remained ignored.
+[Fedora results](target/verification/20261117-protected-root-creation-fedora-lld.log).
+The default GNU linker failed the large application test executable with
+`R_AARCH64_CALL26` relocation overflows. The successful repetition used LLD
+22.1.8, extracted privately from signature-verified Fedora RPMs. Rust application
+and server source, the normal development profile and test selection were
+unchanged. This is a native test-linker prerequisite, not live helper acceptance.
+
+Windows ARM64 passed the same three focused fixtures and 210 Scheduler tests;
+one disposable OpenSSH fixture remained ignored.
+[Windows runtime results](target/verification/20261117-protected-root-creation-windows-runtime.log).
+Application/test-target strict Clippy and server-component strict Clippy passed.
+[Application Clippy](target/verification/20261117-protected-root-creation-windows-app-final.log),
+[server Clippy](target/verification/20261117-protected-root-creation-windows-clippy.log).
+The first Windows runtime fixture inherited a writable parent ACL and correctly
+failed the receiver-protection check. The runner was corrected to create a
+current-user-only inheritable ACL for its private runtime directory; application
+source and authorization checks were unchanged for the successful rerun.
+The Windows CI scratch setup now establishes the same current-user ownership
+and inheritable private ACL before executing the workspace tests. This retains
+the existing cleanup and environment isolation. CI execution for these local
+changes remains pending a new pull request.
+The exact CI PowerShell block passed a local ownership and child-inheritance
+check. [CI ACL record](target/verification/20261117-protected-root-creation-windows-ci-acl.log),
+workflow SHA-256 `cc6d42c293f4546e700497ea4ad941be361e78b283e96a361123f19c799e02b1`.
+The initial native copied-source archive omitted Markdown included by vendored
+crates; its replacement included tracked documentation and was rebuilt.
+
+The native wrappers removed their source copies, private profiles and linker
+tools. The recorded macOS and Fedora run directories were verified absent.
+Windows runtime and CI-ACL fixture directories were removed after their owned
+test processes exited. Development cleanup removed 3.3 GiB on Windows, 2.1 GiB
+on macOS and 4.1 GiB in the successful Fedora run. Automatic approval review
+rejected removal of `target/.scratch/protected-root-creation-20261117` with
+"blocked by policy" and supplied no further reason. Its local source archive
+and verification launchers remain (11 MiB); no alternate deletion was attempted.
+The measured checkout and target sizes were 6.7 GiB and 6.6 GiB. Existing verified
+distribution archives remain unchanged; no package was built for this snapshot.
+
+### Recurring protected folder merges into existing receivers
+
+The receiver-witness groundwork is now connected to Calendar and Chain approval
+for existing protected folder receivers, in upload and download directions and
+with passwordless or separately provisioned vault-backed sudo. The form retains
+recurring limits across reopen and offers the option only for an existing-folder
+merge. Ordinary SFTP source changes keep their earlier preference behavior.
+Protected scope binds the selected route, paths, direction, excludes, schedule,
+predecessors/freshness, time zone, limits and sudo mode. Manual/cascade starts do
+not reuse a recurring grant, and the runtime checks the actual active firing.
+
+The device-local approval index has a separate protected-tree state; ordinary
+SFTP and protected single-file receipts cannot be reused as tree authority.
+A matching receiver and bounded action/payload claim is persisted before any
+publication. It consumes the firing allowance and records an outstanding run.
+Only a complete, confirmed merge with the same receiver clears that state.
+Uncertain/failed publication or process interruption leaves it pending across
+reopen, blocking later automatic publication until explicit reapproval. New
+approval invalidates old workers while retaining calendar and Chain cutoffs.
+Existing per-entry recovery copies remain available in the reported locations.
+
+Download preview and claim limits include all source payload streamed by the
+helper, including unchanged files. Reapproval, pins, route membership, current
+policy and receipt state are rechecked at publication. A published batch whose
+completion cannot be persisted is reported as requiring a new receiver review.
+The managed and credential checks remain independent of the standing grant.
+
+Native verification passed on macOS Apple Silicon and Fedora ARM64. New fixtures exercise pending persistence,
+limits, cancellation before claim, replay, completion identity, exhaustion,
+reapproval revocation and retained cutoffs. The editor fixture covers eight
+combinations of direction, sudo mode and Chain/optional Calendar, including
+reopen, scope changes and rejection of a forged firing trigger.
+
+Both platforms passed the two focused durable-state tests, the editor fixture
+and all 208 Scheduler tests. The privileged selection passed 30 tests on each
+platform; one macOS and 46 Fedora cases remained ignored because they require
+explicit native/helper fixtures. These results do not establish live SSH or
+desktop acceptance. Windows ARM64 strict application/test-target Clippy,
+formatting and whitespace checks passed.
+
+- [macOS final results](target/verification/20261117-protected-tree-standing-native-macos-final.log).
+- [Fedora final results](target/verification/20261117-protected-tree-standing-native-fedora-final.log).
+- [Windows Clippy](target/verification/20261117-protected-tree-standing-windows-clippy-verified.log).
+- [Final source manifest](target/verification/20261117-protected-tree-standing-native-final-source.sha256), SHA-256 `2b17bc5fd81fc8d66f058c805b3fd82a9ba0547e6663c88a92e635ef9fa4a9a7`.
+
+Native scratch wrappers removed their run directories and development outputs.
+Windows development cleanup removed 534.2 MiB. The older 62 MiB scratch directory
+remains because automatic approval review rejected its cleanup; new helpers from
+this verification were removed. The latest measured checkout and target sizes
+were 6.7 GiB and 6.5 GiB, respectively. Packages were not rebuilt for this snapshot.
+
+This implements existing-receiver recurrence, not the entire T3/Q2 backlog.
+First publication into a vacant protected receiver still needs its own
+vacancy-to-owned-receiver progression. Live pinned SSH/helper execution, actual
+vault/password interaction, native desktop approval/recovery, further supported
+metadata cases and current packages remain open.
+
+### Protected folder receiver receipts: recurring-transfer groundwork
+
+The protected tree-merge protocol now has an explicitly requested receiver
+receipt. Without that request, the request, review and completion JSON retain
+the legacy field shape. A requested receipt must be present and nonzero before
+the client accepts the review. The Linux helper binds it to its policy revision
+and the held root directory's path, identity, mount, birth time, ownership,
+permissions and extended attributes, using the existing descriptor checks.
+It confirms the same receipt only after every publication and a final scope
+check. The client also requires a matching completion and successful helper exit.
+An uncertain or partially completed merge never produces a success receipt.
+
+Local protected downloads derive a corresponding receiver witness from the
+reviewed root metadata and native birth identity. Platforms/filesystems without
+that identity retain one-use behavior but cannot provide this durable witness.
+Per-entry content proofs and race checks remain separate: legitimate payload
+changes do not change the root witness, while a replaced root does. Download
+publication returns the witness only after the full merge and final directory
+checks, retaining the existing recovery behavior.
+
+The internal pre-transfer claim now carries the exact proof, optional receiver,
+action count and payload bytes. Protected downloads charge the complete streamed
+manifest, including unchanged files, because the existing helper streams them.
+Uploads charge the changed payload that the helper actually receives.
+
+At this checkpoint the work was groundwork, and validation still rejected
+recurring privileged copies. The later existing-receiver entry connects this
+protocol to scoped Scheduler approval and execution. Persistent per-firing
+admission, pending/completed receipt state, failure recovery, calendar/Chain and
+sudo-mode binding, existing/vacant receiver progression in both directions,
+the native review/limits UI, and live helper acceptance still need to be connected
+and verified. Current one-use approvals remain in place.
+Targeted verification passed on native Apple Silicon and Fedora ARM64. Both
+passed the three merge protocol tests, three local protected-folder tests and
+18 Scheduler sync tests. The broader privileged selection passed 30 tests on
+each platform (one ignored on macOS, 46 on Fedora). The focused protected-folder
+selection had two additional ignored Linux cases. Fedora also passed the new
+server-binary receiver-anchor test with real directory and file changes; that
+Linux-only code is absent on macOS. A separate scheduled-prefix selection
+matched no tests and is not counted as coverage. Windows ARM64 application and
+server-archive test Clippy passed with warnings denied. Formatting and diff
+checks passed. These results do not cover a deployed privileged helper or a
+recurring protected-folder job.
+
+The first native harness failed in artifact selection after building the server
+unit-test executables: a nested Python string produced an invalid newline escape.
+The selector was corrected before the successful runs. No application test was
+run by that failed harness.
+
+- [Source manifest](target/verification/20261117-protected-tree-receipts-native-source.sha256), SHA-256 `8ad916f9a5efd9d5582c15068099d316d689d8d2a8314c673eb776e577b6efe9`.
+- [Apple Silicon execution](target/verification/20261117-protected-tree-receipts-native-macos-final.log).
+- [Fedora execution](target/verification/20261117-protected-tree-receipts-native-fedora-final.log).
+- [Windows static checks](target/verification/20261117-protected-tree-receipts-windows-clippy-final.log).
+- [Cleanup record](target/verification/20261117-protected-tree-receipts-windows-cleanup.log).
+
+All non-document tracked files matched the tested source manifest. The failed
+and successful Mac run directories and both Fedora run directories were verified
+absent. The final runs cleaned 4,608 files (2.1 GiB) on macOS and 4,499 files
+(4.1 GiB) on Fedora. Windows cleanup removed 3,299 development files (534.5 MiB).
+New test helpers were removed and no local Cargo, rustc, Clippy or LLD processes
+remained. Disk usage is 6.7 GiB for the checkout, 6.5 GiB for `target` and 62 MiB
+for the existing private scratch directory. Its source archive was reused.
+Previously rejected old scratch cleanup remains unresolved; those files were
+preserved. Existing release packages were not rebuilt for this change.
+
+### Java AI skill preferences after PR #7
+
+The pinned Java global fields `aiSkillsEnabled`, `aiSkillAutoDetectionEnabled`,
+`aiSkillAutoCreate` and `aiSkillStatisticsEnabled` now import as independently
+optional, inactive hints. Their native destinations are the existing skill
+library, automatic selection, learned-rule saving and statistics switches.
+Both references default these switches to true. Java's `RuleTargetPolicy`
+uses `aiSkillAutoCreate` to allow learned rules in skills; this import does not
+create a skill or turn a learned proposal into an automatic write.
+
+The importer reports malformed or duplicate values per field, retaining valid
+siblings. An additive replay fills only absent hints and leaves existing native
+preferences and skill definitions intact. Portable settings retain the hints.
+The Java restore preview reports their presence or managed-policy omission,
+including a backup that contains only these preferences and no AI profiles.
+
+Each hint has an explicit adoption action on the Skills page. Adoption follows
+the normal editor actions: disabling automatic selection retains its existing
+confirmation, managed learning/statistics overrides remain effective, and a
+read-only AI Manager cannot adopt a value. Adoption changes the dialog draft;
+only the normal Save changes runtime configuration.
+
+Apple Silicon and Fedora ARM64 passed the two explicit adoption/policy fixtures
+and the inactive/additive import fixture. Each platform passed 340 AI Manager
+tests (12 ignored on macOS, 10 on Fedora), 147 profile-backup tests (two ignored
+on macOS, one on Fedora), and 246 Agent tests (three ignored). The saved-runtime
+fixture verifies retained native behavior before Save and disabled pinned-skill
+guidance, learned rules and statistics after adoption, Save and reload. Windows
+ARM64 application/test Clippy passed with warnings denied; formatting and diff
+checks passed. The source check found no new baseline-derived encoding damage.
+
+- [Four-field semantic audit](target/verification/20261117-java-skill-field-audit.json).
+- [Native source manifest](target/verification/20261117-java-skills-native-source.sha256), SHA-256 `f2ab1b4844f94f342bb70682e221a5c1aa4ba9e457a68331c905b4d8818a786a`.
+- [Apple Silicon execution](target/verification/20261117-java-skills-native-macos.log).
+- [Fedora execution](target/verification/20261117-java-skills-native-fedora.log).
+- [Windows static checks](target/verification/20261117-java-skills-windows-clippy-final.log).
+- [Cleanup record](target/verification/20261117-java-skills-windows-cleanup.log).
+
+Every non-document tracked file matched the native verification snapshot. Both
+native run directories were verified absent. Mac cleanup removed 4,161 files
+(2.0 GiB), Fedora cleanup removed 4,061 files (3.7 GiB), and Windows cleanup
+removed 3,257 development files (534.2 MiB). Newly created test helpers were
+removed; no local Cargo, rustc, Clippy or LLD processes remained. Disk usage is
+6.7 GiB for the checkout, 6.5 GiB for `target` and 62 MiB for the existing private
+scratch directory. Its source archive was reused. The earlier automatic-review
+rejection of old scratch cleanup remains unresolved; those files were preserved.
+Current packages were not rebuilt for these changes.
+
+Native desktop and cross-host adoption acceptance and the full global-field
+reconciliation remain open. These four mappings do not close M1.
+
+### Agent root-bypass option after PR #7
+
+The pinned Java `root=true` shortcut option now reaches the native run. The
+Setup page also exposes an explicit per-run automatic-approval choice. It is
+false for new runs and is not restored as execution authority from history.
+After the independently reviewed environment probe succeeds, it requests
+continuation of ordinary and elevated commands in that run. As in Java,
+permitted root bypass precedes inline `ask=true`; managed Confirm and the saved
+global mutating-command confirmation preference still override root bypass.
+
+The ephemeral grant binds the saved AI configuration and profile revision.
+Command, directory, stream, SSH route, sandbox and redaction checks still run.
+Background dispatch rereads saved authority. Pause, failed commands, cancellation,
+run closure and invalidated grants end the root request. Typed passwordless sudo
+uses the existing SSH command route. Typed password sudo requests a separate
+choice of vault or manual authentication when necessary and can reuse this run's
+matching authenticated sudo terminal. It does not select or submit a vault
+password automatically. The authentication controls identify that choice
+separately from command approval. Local or otherwise unsupported typed sudo
+targets remain blocked.
+
+Grants now share an explicit revocation marker with their background copies.
+Removing a grant or dropping its run invalidates those copies. Pausing a run
+also advances an outstanding approved-directory epoch, so a delayed directory
+reply cannot launch a command after pause/resume. This applies to ordinary and
+read-only continuation as well as root bypass. Commands already started retain
+the existing cancellation semantics.
+
+Final Apple Silicon and Fedora ARM64 runs passed four focused root-bypass
+fixtures and the existing read-only, command-shape and continuation selections.
+Each platform also passed 246 Agent tests (three ignored), 27 Agent backend tests,
+58 Scheduler-Agent tests and 337 AI Manager tests (12 ignored on macOS, 10 on
+Fedora). Fixtures cover parser and plan-option propagation, root/ask precedence
+after probe review, managed Confirm, saved preference revocation before dispatch,
+shared-copy revocation on pause, rejection of a late directory reply after
+pause/resume, and refusal of local sudo. Windows ARM64 application/test Clippy
+passed with warnings denied; formatting and diff checks passed. The earlier
+source also passed its selected native tests before the shared-revocation fix.
+
+- [Final source manifest](target/verification/20261117-agent-root-native-final-source.sha256), SHA-256 `86474e599f9c940e225082aed378d69018704e66b1dc83afd88dbf878f9f60e5`.
+- [Apple Silicon execution](target/verification/20261117-agent-root-native-macos-final.log).
+- [Fedora execution](target/verification/20261117-agent-root-native-fedora-final.log).
+- [Windows static checks](target/verification/20261117-agent-root-windows-clippy-final.log).
+- [Windows cleanup](target/verification/20261117-agent-root-windows-cleanup.log).
+
+Every non-document tracked file matched the final verification snapshot before
+updating these documentation results. Both Mac and both Fedora run directories
+were verified absent after scratch-wrapper exit. Each native run cleaned 4,161
+files (2.0 GiB) on macOS or 4,061 files (3.7 GiB) on Fedora. Windows cleanup removed
+3,257 development files (534.2 MiB); no local Cargo, rustc, Clippy or LLD processes
+remained. The two newly created test helpers were removed. Disk usage remains
+6.7 GiB for the checkout, 6.5 GiB for `target` and 62 MiB for the existing private
+scratch directory, whose source archive was reused. The earlier automatic-review
+rejection of older scratch cleanup remains unresolved; those files were preserved.
+Existing release packages were not rebuilt for this change.
+
+Live SSH root execution, credential interaction, native desktop acceptance,
+full workspace tests and current package verification remain open. These targeted
+results do not establish whole-Agent or release parity.
+
+### Automatic read-only Agent dispatch and per-run confirmation after PR #7
+
+Agent Run can continue a model-labelled read-only command set after the user
+approves the environment probe and that probe succeeds. Every command in the
+set must remain ordinary and free of recognized elevation. Java's heredoc and
+write-redirection checks promote known mutation shapes to confirmation; native
+command-word checks also cover absolute paths, wrapper commands, newlines and
+PowerShell file operations. These heuristics are not an OS permission boundary.
+An explicit model `needs_confirmation` status promotes command risk even when
+the model labels it read-only.
+
+The inline `ask` option now reaches the run instead of being discarded. The
+Setup checkbox can also require confirmation for every command in that run.
+This mode disables automatic read-only dispatch and future-command grants.
+Automatic dispatch retains destination, directory, stream, profile revision,
+saved configuration and managed-policy checks. Managed Confirm permits eligible
+read-only commands; it still blocks broad grants for mutating commands. The
+global mutating-command preference has matching UI text.
+
+The final source passed native Apple Silicon and Fedora ARM64 execution:
+242 Agent tests (three ignored), 27 Agent backend tests, 58 Scheduler-Agent
+tests and 337 AI Manager tests (12 ignored on macOS, 10 on Fedora). The new
+automatic-dispatch and command-shape fixtures and two continuation fixtures
+also passed as explicit focused selections. Windows ARM64 application/test
+Clippy passed with warnings denied; formatting and diff checks passed. This
+is targeted runtime coverage, not a full workspace or live-SSH acceptance run.
+
+The first native runs failed three older tests: one asserted obsolete prompt
+text, and two assumed manual per-command mode without selecting it. The prompt
+assertion now verifies the new contract, and the two manual-flow scenarios
+explicitly select per-command confirmation. Four edited UI files also contained
+encoding damage; the original Unicode punctuation was restored before the final
+verification snapshot. No new baseline-derived encoding damage remained in the
+changed files.
+
+- [Verified source manifest](target/verification/20261117-agent-readonly-native-verified-source.sha256), SHA-256 `cc4afe31c9686be33a9a55eca30d8c98bdb358d5f646ebf59374a875701574bb`.
+- [Apple Silicon execution](target/verification/20261117-agent-readonly-native-macos-verified.log).
+- [Fedora execution](target/verification/20261117-agent-readonly-native-fedora-verified.log).
+- [Windows static checks](target/verification/20261117-agent-readonly-windows-clippy-current.log).
+- [Windows cleanup](target/verification/20261117-agent-readonly-windows-cleanup.log).
+
+Every non-document tracked file still matched the verified source manifest after
+verification. Documentation was then updated to record these results. Each Mac
+run cleaned 4,161 development files (2.0 GiB); each Fedora run cleaned 4,061 files
+(3.7 GiB). All three Mac run directories and both Fedora run directories were
+verified absent after wrapper exit. Windows cleanup removed 3,257 development
+files (534.2 MiB); no local Cargo, rustc, Clippy or LLD processes remained.
+Disk usage is 6.7 GiB for the checkout and 6.5 GiB for `target`. The existing
+private scratch directory remains 62 MiB; its source archive was reused. The
+earlier automatic-review rejection of its cleanup remains unresolved; no
+alternative deletion method was attempted. Existing release packages were not
+rebuilt or used as evidence for these source changes.
+
+The later root-bypass entry implements the option. Live SSH, native desktop
+interaction, broader runtime targets and current package acceptance remain open.
+
+### Agent command confirmation and per-run continuation after PR #7
+
+Java `terminalAgentConfirmMutatingCommandSets` now restores as an inactive
+optional hint. Additive import, omission reporting, portable replay and explicit
+AI Manager adoption preserve native preferences until Save. The searchable
+native preference defaults to false, matching Java. True prevents the new
+run-wide continuation action; managed Confirm mode overrides an opt-out.
+
+An ordinary command review can explicitly approve future ordinary commands
+for the same standalone run or Swarm target. This does not create approval just
+by importing, adopting a setting or starting a run. The ephemeral grant binds
+the saved AI configuration and selected profile revision. Existing destination,
+stream, directory, secret masking and route checks still run for every step.
+Saved settings and policy are checked again at background dispatch. Pause,
+failed commands, elevation requests, changed profiles/settings and run closure
+end the grant. It is not serialized or reused by a new run or target. Typed
+sudo/password requests and recognized elevation tools retain separate approval.
+
+New source fixtures cover ordinary continuation into the existing directory/
+dispatch review path, rejection after a saved confirmation change, policy
+Confirm, pause and elevation boundaries, inactive import, replay and saved AI
+Manager adoption. Apple Silicon passed both new grant fixtures, 238 Agent tests
+(three ignored), 27 Agent backend tests, 58 Scheduler-Agent tests and 337 AI
+Manager tests (12 ignored). Fedora ARM64 passed the same selections: two new
+fixtures, 238 Agent tests (three ignored), 27 backend tests, 58 Scheduler-Agent
+tests and 337 AI Manager tests (10 ignored). Fedora used privately extracted,
+signature-checked LLD packages. Final Windows ARM64 application/test Clippy
+passed with warnings denied. The initial native compile failed on a borrowed
+PathBuf in a new test; the fixture was corrected before the successful runs.
+
+- [Final source manifest](target/verification/20261117-agent-confirmation-native-final-source.sha256), SHA-256 `8e1c3644d1e3ae66e188167c60af02696efaae2aabc15af0a25075b108d802d6`.
+- [Apple Silicon execution](target/verification/20261117-agent-confirmation-native-macos-final.log).
+- [Fedora execution](target/verification/20261117-agent-confirmation-native-fedora.log).
+- [Final Windows static checks](target/verification/20261117-agent-confirmation-windows-clippy-final.log).
+- [Cleanup record](target/verification/20261117-agent-confirmation-windows-cleanup.log).
+
+This is partial approval-flow parity. Java also dispatches read-only commands
+without a confirmation when its command-shape checks and per-run options permit
+it, and supports inline ask-before-every-command and root-bypass choices. The later automatic-dispatch entry implements read-only and inline ask behavior;
+the later root-bypass entry implements that option; broader acceptance remains open. The current native grant
+covers ordinary commands; it does not waive elevation/password approvals.
+Native interaction, live SSH grant/revocation, other target runtime checks,
+full workspace and current release-package verification remain open.
+
+The broader [global-field triage](target/verification/20261117-java-global-field-triage.json)
+enumerates 346 top-level non-static Java fields and searches literal references
+in 42 listed conversion-source prefixes, with source hashes retained. It finds
+123 referenced fields and 223 without a literal reference in that search.
+All entries still require semantic classification, including dynamically or
+indirectly imported fields. The triage is not a count of unimplemented features.
+
+Windows cleanup removed 3,257 development files (534.2 MiB). The initial Mac
+compile removed 4,157 files (1.3 GiB); the successful Mac run removed 4,161 files
+(2.0 GiB). Both Mac directories `/private/tmp/kortty.BZsPaetI` and
+`/private/tmp/kortty.ar7aWJyd`, and Fedora `/var/tmp/kortty.nbqLPdh8`, were verified
+absent after scratch-wrapper exit. Fedora removed 4,061 development files
+(3.7 GiB). No local Cargo, rustc, Clippy or LLD processes remained. Disk usage
+is 6.7 GiB for the checkout, 6.5 GiB for `target` and 62 MiB for the existing
+private scratch directory. The current source archive was reused. The earlier
+policy-blocked scratch removal remains unresolved; no alternate deletion method
+was attempted.
+
+### Global Agent execution preference and Java adoption after PR #7
+
+Java `terminalAgentExecutionEnabled` now imports as an inactive, optional AI
+Manager hint. The native execution preference defaults to true, matching Java.
+The importer reports invalid values and managed-policy omissions. Additive
+replay preserves an existing hint and native settings; portable backup retains
+the suggestion. The searchable General-page setting and explicit imported-value
+adoption use the normal AI Manager Save before runtime behavior changes.
+
+The native switch gates live Agent Run, implementing a plan, executing Swarm,
+saved Agent targets and scheduled Agent diagnostics. Ask, planning and ordinary
+snippet operations retain their independent policy checks. Reconciliation stops
+pending or active Run operations through the existing cancellation mechanism.
+Before command/model dispatch, Agent authority rereads saved execution settings.
+Swarm batch authority checks the current switch alongside the reviewed profile.
+Scheduled workers recheck it at their scope/dispatch boundaries, even when a
+job or command was already approved. Managed execution restrictions are still
+required in addition to the user preference.
+
+The source tests verify inactive import, native precedence, portable replay,
+invalid input reporting, saved adoption, mode availability and reconciliation,
+background dispatch after a saved revocation, preservation of Ask/Plan/snippet
+checks, and scheduled dispatch after a settings change. Apple Silicon passed
+the explicit gate fixture, 236 Agent tests (three ignored), 27 Agent backend
+tests, 58 Scheduler-Agent tests and 335 AI Manager tests (12 ignored). Windows
+ARM64 application/test Clippy passed with warnings denied for the final source.
+The platform/SSH interaction matrix, native cancellation of a long-running
+command after a real dialog change, full workspace and package checks remain
+open.
+
+- [Native source manifest](target/verification/20261117-agent-execution-native-source.sha256), SHA-256 `fb6459bc40d52b51d5c500d77d864368782313cb781bc1f0195dd2d0d9717ca2`.
+- [Apple Silicon tests and cleanup](target/verification/20261117-agent-execution-native-macos.log).
+- [Final Windows static checks](target/verification/20261117-agent-execution-windows-clippy-final.log).
+- [Windows cleanup](target/verification/20261117-agent-execution-windows-cleanup.log).
+
+Windows cleanup removed 3,257 development files (534.2 MiB); the Mac removed
+4,161 files (2.0 GiB). `/private/tmp/kortty.75ZRI0BJ` was verified absent after
+scratch-wrapper exit. No local Cargo, rustc, Clippy or LLD processes remained.
+Disk usage is 6.7 GiB for the checkout, 6.5 GiB for `target` and 62 MiB for the
+existing private scratch directory. The current source archive was reused.
+The previously policy-blocked scratch removal remains unresolved; no alternate
+deletion method was attempted.
+
+The confirmation preference and ordinary per-run continuation were subsequently
+implemented in the entry above. The later automatic-dispatch entry implements read-only and inline
+confirmation behavior. The later root-bypass entry implements that option. Complete global-field reconciliation remains open.
+
+### Memory activation and learning migration after PR #7
+
+Java `aiMemoryEnabled` and `aiMemoryLearningMode` now import as independently
+optional, inactive AI Manager hints. The pinned Java enum has the same Propose
+and Off modes as Rust: detected rules require confirmation in Propose mode;
+Off disables proposals. Boolean input follows the existing Java XML reader
+contract. Invalid activation or mode values are reported independently, while
+a valid sibling remains available. Missing fields preserve existing choices.
+Additive replay fills only absent hint fields and retains native settings;
+portable backup preserves the hints.
+
+The Memory page offers separate adoption actions for activation and learning.
+Neither changes the token budget or writes Memory content. Read-only application
+settings and disabled features block adoption; a managed learning mode blocks
+adopting a different user preference. The normal AI Manager Save uses the
+existing configuration snapshot check and establishes the choice for runtime
+Memory use and automatic proposal detection. The saved hints remain distinct
+from active settings.
+
+Windows ARM64 application/test Clippy passed with warnings denied. Apple
+Silicon passed the explicit adoption/save/reload/runtime fixture, 86 Memory
+tests and 333 AI Manager tests (12 ignored). Coverage includes independent
+adoption, native precedence, replay, portable persistence, individual malformed
+fields, policy and read-only guards, unchanged token budget, and absence of
+Memory file creation by preference adoption. Native dialog adoption, wider
+Memory migration workflows, other target runtime checks and current release
+packages remain open.
+
+- [Native source manifest](target/verification/20261117-memory-preferences-native-source.sha256), SHA-256 `897963d4e978b501adf5a7c426e1a4c7bd5c50864477ad746de569cf285efdce`.
+- [Windows static checks](target/verification/20261117-memory-preferences-windows-clippy.log).
+- [Apple Silicon execution and cleanup](target/verification/20261117-memory-preferences-native-macos.log).
+- [Windows cleanup](target/verification/20261117-memory-preferences-windows-cleanup.log).
+
+Windows cleanup removed 3,257 development files (534.2 MiB). The Mac removed
+4,161 files (2.0 GiB), and `/private/tmp/kortty.MoqmCjrI` was verified absent
+after scratch-wrapper exit. No local Cargo, rustc, Clippy or LLD processes
+remained. Disk usage is 6.7 GiB for the checkout, 6.5 GiB for `target` and
+62 MiB for the existing private scratch directory. The current source archive
+was reused for this run, avoiding another retained source copy. The earlier
+policy-blocked scratch removal remains unresolved; no alternate deletion
+method was attempted.
+
+### Saved semantic Journal search and Java adoption after PR #7
+
+Java `sessionJournalSemanticSearchEnabled` now imports as an inactive AI
+Manager hint. Additive replay preserves an existing hint and all native
+preferences; malformed values and policy omissions are reported. Explicit
+adoption in AI Manager General and the normal Save establish the native
+cross-journal preparation default. The setting is included in AI Manager
+search. Import alone does not activate embedding requests.
+
+When enabled, preparing a cross-journal question automatically applies the
+existing local semantic ranking path. The question page names the local
+embedding model and describes the masked query and changed search cards that
+will be sent. Evidence is still reviewed before requesting an answer. Missing
+models or candidates use lexical preparation; embedding failures retain the
+existing lexical fallback. Stale ranking deliveries cannot initiate embedding
+after a configuration change. Incremental, model-bound vector persistence and
+per-question manual semantic selection remain available.
+
+The native Apple Silicon fixture verifies that an inactive imported hint does
+not trigger requests, absent models use lexical preparation, changed
+configurations discard queued work, and enabled preparation sends exactly one
+embedding batch containing the query and one masked card. No answer request is
+sent by preparation. The initial fixture incorrectly expected two HTTP requests;
+it timed out waiting for the second because ranking batches query and cards.
+The fixture was corrected to assert both batch inputs. No application change
+was needed for that test correction.
+
+The final Apple Silicon source passed that explicit fixture, 617 Journal tests
+(12 ignored) and 330 AI Manager tests (12 ignored). Windows ARM64 application
+and test Clippy passed with warnings denied for the final source. This does not
+close real-provider, native dialog, full workspace or release-package gates.
+
+- [Final native source manifest](target/verification/20261117-journal-semantic-native-final-source.sha256), SHA-256 `7579418b7e0f41348e328c2b4d3d4104cc39c7a5a9ab47d245387b73b31a9461`.
+- [Final Apple Silicon execution](target/verification/20261117-journal-semantic-native-macos-final.log).
+- [Final Windows static checks](target/verification/20261117-journal-semantic-windows-clippy-final.log).
+- [Windows cleanup](target/verification/20261117-journal-semantic-windows-cleanup.log).
+
+Both Mac runs cleaned their development profile (4,161 files / 2.0 GiB each).
+Their run directories `/private/tmp/kortty.RDgiCdfj` and
+`/private/tmp/kortty.5n1R4OJH` were verified absent after scratch-wrapper exit.
+Windows cleanup removed 3,257 development files (534.2 MiB). No local Cargo,
+rustc, Clippy or LLD processes remained. Disk usage is 6.7 GiB for the checkout,
+6.5 GiB for `target` and 62 MiB for the existing private scratch directory.
+The scratch removal previously blocked by automatic policy remains unresolved;
+no alternate deletion method was attempted.
+
+A further global-field source check found that the earlier five-name backlog
+was not exhaustive. At that checkpoint, no import readers had been implemented
+for `aiMemoryEnabled`, `aiMemoryLearningMode`, `terminalAgentExecutionEnabled`
+or `terminalAgentConfirmMutatingCommandSets`. The Memory fields have since been
+implemented in the entry above. The execution preference was subsequently
+implemented as well; the mutating-command confirmation workflow and full
+field-by-family inventory remain in the plan. Completing the initial named set is not complete
+Java data migration.
+
+### Agent command name migration after PR #7
+
+Java `terminalAgentCommandName` and
+`terminalAgentCommandNameCaseInsensitive` now import as independently optional,
+inactive AI Manager hints. The reader follows Java's ASCII command character
+rules, trims the name and resolves blank names to `agent`. Invalid names,
+invalid booleans and names beyond the native input bound are reported as
+omitted. Additive replay fills absent hint fields and preserves every native
+shortcut preference. Portable backup retains the suggestions.
+
+The AI Manager General page displays the imported name and case setting.
+Explicit adoption changes only the specified fields. It preserves the shortcut
+enablement switch and requires the normal Save before local and SSH prompt
+recognition sees the new settings. Save uses the existing configuration snapshot
+check, so a concurrent import cannot be overwritten by a stale dialog.
+
+The former 32-byte native alias limit was narrower than Java's validator.
+Rust now accepts aliases up to 8 KiB, with the same ASCII letters, digits,
+hyphens and underscores and an initial letter. The input-capture budget now
+includes the full alias, prompt and options budgets. Java does not impose this
+alias length cap; names above 8 KiB remain an explicit native input limit and
+are reported as omitted rather than truncated.
+
+Windows ARM64 application/test Clippy passed with warnings denied for the final
+source. Apple Silicon passed 615 Journal tests (12 ignored), 328 AI Manager
+tests (12 ignored) and 36 shortcut tests (one live SSH fixture ignored). The
+new cases cover independent hint merging, native precedence, portable replay,
+blank and invalid names, read-only settings, adoption and saved restart state
+without enabling shortcuts, Run/Ask/Plan recognition for long names, the exact
+8 KiB alias/prompt boundary and actual local-shell input with a longer
+case-insensitive name. The configured live SSH test, native desktop adoption,
+other native architectures and current release packages remain open.
+
+- [Native source manifest](target/verification/20261117-agent-command-native-source.sha256), SHA-256 `5ac62d53cf347f267199e6377ab5e8b2b056de11094bf1553530b74ef2989f64`.
+- [Windows final static checks](target/verification/20261117-agent-command-windows-clippy-final.log).
+- [Apple Silicon native execution and cleanup](target/verification/20261117-agent-command-native-macos.log).
+- [Windows cleanup](target/verification/20261117-agent-command-windows-cleanup.log).
+
+Windows cleanup removed 3,257 development files (534.2 MiB); the Mac removed
+4,161 files (2.0 GiB). The Mac run `/private/tmp/kortty.00cBH0Hq` was verified
+absent after the scratch wrapper exited. No local Cargo, rustc, Clippy or LLD
+processes remained. Disk usage is 6.7 GiB for the checkout, 6.5 GiB for `target`
+and 52 MiB for the existing private scratch directory. The latter includes the
+retained source archives and helpers; its previously policy-blocked removal
+remains unresolved. No alternate deletion method was attempted.
+
+### AI Memory token budget migration after PR #7
+
+Java `aiMemoryMaxTokens` now restores as an inactive AI Manager suggestion,
+with the same 500–4,000 token bounds as Java and native Rust Memory settings.
+The import preview reports supported hints, malformed values and managed-policy
+omissions. Additive replay preserves an earlier hint and every existing native
+Memory preference. Portable backups preserve the hint without applying it.
+
+The Memory page displays the imported budget. Explicit adoption updates only
+the proposed token budget, within the current managed cap. It does not enable
+Memory or learning. Disabled features, read-only application settings and caps
+below the editable minimum block adoption. The normal AI Manager Save persists
+the choice and checks the configuration against its original snapshot, so a
+concurrent import requires reopening and reviewing the current settings.
+
+Windows ARM64 application/test Clippy passed with warnings denied. On Apple
+Silicon, the same source passed 41 Memory tests, eight AI backup tests, 27 Java
+profile-import tests and 615 Journal tests (12 ignored). These include the new
+Memory adoption/policy and portable-replay fixtures, plus the earlier Journal
+interval/title adoption and changed-source cases. This is targeted execution
+evidence; native dialog adoption, broader desktop acceptance, full workspace
+revalidation and current release packaging remain open.
+
+- [Native source manifest](target/verification/20261117-memory-budget-native-source.sha256), SHA-256 `0f3e7bd2d7e7847e51a8b6ffad388195e7d1fb15365b3162f897cd413d7304d2`.
+- [Windows static checks](target/verification/20261117-memory-budget-windows-clippy.log).
+- [Apple Silicon execution and cleanup](target/verification/20261117-memory-budget-native-macos.log).
+- [Windows cleanup](target/verification/20261117-memory-budget-windows-cleanup.log).
+
+Windows cleanup removed 3,257 development files (534.2 MiB); the Mac removed
+4,161 files (2.0 GiB). The Mac run directory `/private/tmp/kortty.lHrE5nQQ` was
+verified absent after the scratch wrapper exited. No local Cargo, rustc, Clippy
+or LLD processes remained. Disk usage is 6.7 GiB for the checkout and 6.5 GiB for
+`target`. The existing local private scratch directory is now 42 MiB including
+the retained source archive and helper. Its previously policy-blocked removal
+remains unresolved; no alternate deletion method was attempted.
+
+### Journal interval and title preference migration after PR #7
+
+Java `sessionJournalSummarizeIntervalMinutes` and
+`sessionJournalAiTitleEnabled` now restore as optional, inactive suggestions.
+The interval follows Java's 1–240 minute bounds. Additive replay preserves
+existing suggestion fields and fills missing fields independently. Portable
+backups retain the hints. The import preview reports supported suggestions,
+invalid preferences and managed-policy omissions.
+
+Journal summary settings display the imported values and require explicit
+adoption before Save. A changed imported source blocks Save, including after
+manual edits to one of the two fields. Adoption does not enable automatic
+summaries, select an outbound profile or approve separate title requests.
+Existing native values remain until adoption. Native desktop and cross-host
+adoption acceptance remain open.
+
+Windows ARM64 passed 609 Journal tests (10 ignored), seven AI backup tests and
+27 Java profile-import tests. Application and test Clippy passed with warnings
+denied. The first Journal run had one harness failure because its RUSTC value
+pointed to the Rustup launcher, which cannot resolve a toolchain after the CLI
+fixture changes its private user directory. Repeating with the actual compiler
+executable passed all selected tests without source changes. This does not
+claim a full workspace or package verification.
+
+- [Source manifest](target/verification/20261117-journal-preferences-source.sha256), SHA-256 `f96ce2e6c6b855177588c58f4729f5727de5b7e414a494eb49e1248969acced7`.
+- [Windows static checks](target/verification/20261117-journal-preferences-windows-clippy.log).
+- [Windows final execution](target/verification/20261117-journal-preferences-windows-tests-final.log).
+
+Development-profile cleanup removed 6,235 files (3.2 GiB). No Cargo, rustc or
+LLD processes remained. Disk usage is 6.7 GiB for the checkout and 6.5 GiB for
+`target`. The existing private scratch directory is 32 MiB, including the
+retained source archives and new Cargo artifact listing. Its previously
+policy-blocked removal remains unresolved; no alternate deletion method was
+attempted. See [cleanup](target/verification/20261117-journal-preferences-windows-cleanup.log).
+
+### Scheduler diagram preferences after PR #7
+
+The follow-up also reads Java's `sessionJournalNoteTranslationLanguage` into
+an unset native Journal note translation preference. The existing language
+validator bounds accepted text. The fixture covers trimming, native precedence,
+replay and rejection of empty or control-character input. Source manifest
+`94e140faf0376a978b7ccfb46f22ba8626b115a39d2e71a920f1ca84ddfbdc23`
+passed 613 Journal tests (12 ignored), 206 Scheduler tests, the explicit
+diagram-import fixture and four Journal TLS cases on Apple Silicon. The
+translation import fixture passed in the Journal selection. Windows ARM64
+application/test Clippy passed with warnings denied for this source. Fedora
+ARM64 passed 614 Journal tests (12 ignored), 206 Scheduler tests, the explicit
+diagram-import fixture and all four Journal TLS cases with LLD. The first Fedora
+attempt with GNU ld failed on ARM64 call relocations. Its source and build
+directory were removed. The repeat uses extracted, signature-checked Fedora
+LLD packages inside its private run directory.
+
+- [Apple Silicon migration and Journal tests](target/verification/20261117-journal-language-native-macos.log)
+- [Windows static checks](target/verification/20261117-journal-language-windows-clippy.log)
+- [Fedora native tests](target/verification/20261117-journal-language-native-fedora-lld.log)
+
+Both native run directories were verified removed after development-profile
+cleanup. Windows development artifacts were cleaned. Automatic approval
+review rejected deleting the local task scratch directory and its explicit
+source archive/helper files as blocked by policy. Its 31.47 MiB remain under
+`target/.scratch/journal-credential-20261117`. The final logical checkout
+size was 6.57 GiB, including 6.41 GiB in `target`.
+[Cleanup record](target/verification/20261117-journal-language-cleanup.txt).
+
+Java v2.26.0 stores dependency-diagram orientation and Auto, Light, or Dark
+color mode in its global settings. Native window settings now retain these
+preferences across Scheduler views and restart. The diagram controls save
+changes through the existing window-settings writer. A system-theme update
+refreshes Auto diagrams, including hosted views. The Java backup importer
+fills only unset values and reports unsupported color modes.
+
+Windows ARM64 passed the two focused tests for additive import, repeated
+restore, native precedence and automatic color resolution. The Scheduler
+selection passed 207 tests with one OpenSSH fixture ignored.
+Application and test-target Clippy passed with warnings denied. Native
+desktop/restart/export acceptance remains open.
+
+- [Preference tests](target/verification/20261117-scheduler-diagram-windows.log)
+- [Scheduler tests](target/verification/20261117-scheduler-diagram-windows-suite.log)
+- [Clippy](target/verification/20261117-scheduler-diagram-windows-clippy.log)
+
+### Reviewed Journal credentials after PR #7
+
+The resumed implementation binds summary startup probes, streamed text requests
+and response-format retries to the credential captured by the summary authority.
+The startup success cache uses that same credential snapshot. HTTPS question
+dispatch retains its captured credential through the shared streaming path.
+Reviewed LM Studio capability and automatic-model checks revalidate the approval
+and credential before their metadata requests. The completion header uses the
+validated attempt credential.
+
+Windows ARM64 passed 606 regular Journal tests with 10 ignored and four private
+TLS fixtures with TLS 1.3. Apple Silicon passed 612 regular Journal tests with
+12 ignored and the same four fixtures with TLS 1.2 on source manifest
+`bf19c116594c8be69026e5d63ccee8295847e4c37f81c7326cb285e0063cbad7`.
+The summary fixtures verify stale or removed credentials, revocation and
+cancellation, plus a retry after the server rejects the structured format.
+They receive exactly the probe and two summary attempts. The question fixtures
+receive exactly one reviewed request. Secrets remain masked in the evidence.
+
+The first Windows regular run needed an explicit path to the installed compiler
+for a CLI fixture subprocess with a private home. The fixture certificate command
+now supplies its own OpenSSL configuration on Windows. The successful repeat
+retains the isolated application profile and temporary directory.
+
+- [Windows Journal and TLS results](target/verification/20261117-journal-credential-windows-lld.log)
+- [Apple Silicon Journal and TLS results](target/verification/20261117-journal-credential-native-final-macos.log)
+- [Native source manifest](target/verification/20261117-journal-credential-native-final-source.sha256)
+
+Windows application/test Clippy passed with warnings denied after the
+cache-key follow-up and Scheduler diagram preferences. The Fedora follow-up
+above passed the updated Journal/TLS and migration fixtures.
+The Mac run cleaned its development artifacts and private run directory.
+These targeted runs precede a new release package.
 
 The current checkpoint is prepared on `port/java-v2.26-current-state-20261117`
 from `main` at `8fdb5d4`. Formatting is applied. Clippy follow-up groups the

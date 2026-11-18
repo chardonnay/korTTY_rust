@@ -4,9 +4,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use iced::{Size, Task, widget::svg, window};
-use kortty_diagram::Theme;
+use kortty_diagram::{DiagramKind, Direction, Theme};
 
 use crate::diagram_window::DiagramWindow;
+use crate::diagram_window::appearance;
 use crate::snippet_window::Message as SnippetMessage;
 use crate::workspace::dialog_placement;
 
@@ -54,7 +55,98 @@ pub(super) struct Run {
     _cancel: local_ai::Cancel,
 }
 
+fn preview(
+    record: &crate::snippet_analysis::model::Record,
+    direction: Direction,
+    (theme, background): (Theme, Option<[u8; 3]>),
+) -> Option<svg::Handle> {
+    let mut diagram = record
+        .diagram
+        .as_ref()
+        .and_then(|diagram| diagram.parse().ok())
+        .or_else(|| {
+            let historical = record.java_history.as_ref()?.historical_diagram.as_ref()?;
+            kortty_diagram::parse_mermaid(&historical.mermaid).ok()
+        })?;
+    if diagram.kind() != DiagramKind::Sequence {
+        diagram.set_direction(direction);
+    }
+    Some(svg::Handle::from_memory(
+        diagram
+            .layout()
+            .to_svg_with_background(theme, background)
+            .into_bytes(),
+    ))
+}
+
 impl Workspace {
+    pub(in crate::workspace) fn set_snippet_diagram_appearance(
+        &mut self,
+        id: window::Id,
+        preferences: appearance::Preferences,
+    ) {
+        self.window_settings.snippet_diagram_appearance = preferences;
+        self.refresh_snippet_diagram_appearance();
+        self.save_window_settings(Some(id));
+    }
+
+    pub(in crate::workspace) fn refresh_snippet_diagram_appearance(&mut self) {
+        let preferences = self.window_settings.snippet_diagram_appearance;
+        let system_dark = self.journal_system_dark();
+        for window in self
+            .diagrams
+            .values_mut()
+            .filter(|window| window.snippet_layout().is_some())
+        {
+            window.configure_snippet_appearance(preferences, system_dark);
+        }
+        self.refresh_snippet_diagram_previews();
+    }
+
+    fn refresh_snippet_diagram_previews(&mut self) {
+        let direction = self.snippet_diagram_direction();
+        let colors = self
+            .window_settings
+            .snippet_diagram_appearance
+            .colors(self.journal_system_dark());
+        for surface in self.snippets.values_mut() {
+            for page in &mut surface.analysis.pages {
+                page.diagram_preview = page
+                    .record()
+                    .and_then(|record| preview(record, direction, colors));
+            }
+        }
+    }
+
+    pub(in crate::workspace) fn snippet_diagram_direction(&self) -> Direction {
+        if self.window_settings.snippet_diagram_horizontal == Some(true) {
+            Direction::LeftToRight
+        } else {
+            Direction::TopToBottom
+        }
+    }
+
+    pub(in crate::workspace) fn set_snippet_diagram_layout(
+        &mut self,
+        id: window::Id,
+        horizontal: bool,
+    ) {
+        if self.window_settings.snippet_diagram_horizontal == Some(horizontal) {
+            return;
+        }
+        self.window_settings.snippet_diagram_horizontal = Some(horizontal);
+        let direction = self.snippet_diagram_direction();
+        for window in self
+            .diagrams
+            .values_mut()
+            .filter(|window| window.snippet_layout().is_some())
+        {
+            window.configure_snippet_layout(direction);
+        }
+        self.refresh_snippet_diagram_previews();
+        self.save_window_settings(Some(id));
+    }
+
     pub(super) fn review_snippet_diagram(&mut self, id: window::Id) -> Task<Message> {
         let config = self.ai_configuration();
         let Some(page) = self
@@ -307,10 +399,13 @@ impl Workspace {
                 ..window::Settings::default()
             },
         );
-        self.diagrams.insert(
-            diagram_id,
-            DiagramWindow::with_saved_chart(size, source.as_deref(), chart),
+        let mut diagram_window = DiagramWindow::with_saved_chart(size, source.as_deref(), chart);
+        diagram_window.configure_snippet_layout(self.snippet_diagram_direction());
+        diagram_window.configure_snippet_appearance(
+            self.window_settings.snippet_diagram_appearance,
+            self.journal_system_dark(),
         );
+        self.diagrams.insert(diagram_id, diagram_window);
         if let Some(page) = self
             .snippets
             .get_mut(&id)
@@ -326,6 +421,11 @@ impl Workspace {
         id: window::Id,
         subject: Subject,
     ) -> Task<Message> {
+        let direction = self.snippet_diagram_direction();
+        let colors = self
+            .window_settings
+            .snippet_diagram_appearance
+            .colors(self.journal_system_dark());
         let Some(page) = self
             .snippets
             .get_mut(&id)
@@ -338,15 +438,7 @@ impl Workspace {
         let diagram_id = page
             .diagram_window
             .filter(|id| self.diagrams.contains_key(id));
-        let rendered = saved
-            .and_then(|diagram| diagram.parse().ok())
-            .or_else(|| {
-                let historical = record?.java_history.as_ref()?.historical_diagram.as_ref()?;
-                kortty_diagram::parse_mermaid(&historical.mermaid).ok()
-            })
-            .map(|diagram| {
-                svg::Handle::from_memory(diagram.layout().to_svg(Theme::Light).into_bytes())
-            });
+        let rendered = record.and_then(|record| preview(record, direction, colors));
         if let Some(id) = diagram_id
             && let Some(record) = record
             && let Some(saved) = saved

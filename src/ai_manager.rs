@@ -142,6 +142,51 @@ struct JavaJournalProfiles {
     automation: Option<JavaAiProfileHint>,
     #[serde(skip_serializing_if = "Option::is_none")]
     evidence: Option<JavaJournalEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    preferences: Option<JavaJournalPreferences>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct JavaJournalPreferences {
+    interval_minutes: Option<u16>,
+    automatic_title: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+struct JavaAgentShortcut {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    case_insensitive: Option<bool>,
+}
+
+impl JavaAgentShortcut {
+    fn validate(&self) -> io::Result<()> {
+        if self.name.is_none() && self.case_insensitive.is_none() {
+            return Err(invalid("Empty imported Java Agent command preferences"));
+        }
+        shortcut::Aliases::new(
+            self.name.as_deref().unwrap_or_default(),
+            self.case_insensitive.unwrap_or(false),
+        )
+        .map(|_| ())
+        .map_err(invalid)
+    }
+
+    fn merge(&mut self, incoming: Self) -> bool {
+        let mut added = false;
+        if self.name.is_none() && incoming.name.is_some() {
+            self.name = incoming.name;
+            added = true;
+        }
+        if self.case_insensitive.is_none() && incoming.case_insensitive.is_some() {
+            self.case_insensitive = incoming.case_insensitive;
+            added = true;
+        }
+        added
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -153,7 +198,10 @@ struct JavaJournalEvidence {
 
 impl JavaJournalProfiles {
     fn is_empty(&self) -> bool {
-        self.recording.is_none() && self.automation.is_none() && self.evidence.is_none()
+        self.recording.is_none()
+            && self.automation.is_none()
+            && self.evidence.is_none()
+            && self.preferences.is_none()
     }
 
     fn hints(&self) -> impl Iterator<Item = &JavaAiProfileHint> {
@@ -161,6 +209,14 @@ impl JavaJournalProfiles {
     }
 
     fn validate(&self) -> io::Result<()> {
+        if self.preferences.is_some_and(|preferences| {
+            preferences
+                .interval_minutes
+                .is_some_and(|interval| !(1..=240).contains(&interval))
+                || (preferences.interval_minutes.is_none() && preferences.automatic_title.is_none())
+        }) {
+            return Err(invalid("Invalid imported Java Journal preferences"));
+        }
         if self
             .hints()
             .any(|hint| hint.source().is_some_and(|source| source.id() != hint.id()))
@@ -279,6 +335,20 @@ pub(crate) struct Configuration {
     local: local::State,
     skills: skills::Store,
     memory: memory::Settings,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    java_memory_tokens: Option<u16>,
+    #[serde(skip_serializing_if = "memory::JavaPreferences::is_empty")]
+    java_memory_preferences: memory::JavaPreferences,
+    #[serde(skip_serializing_if = "skills::JavaPreferences::is_empty")]
+    java_skill_preferences: skills::JavaPreferences,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    java_agent_shortcut: Option<JavaAgentShortcut>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    java_agent_execution_enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    java_agent_confirm_mutating: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    java_journal_semantic_search: Option<bool>,
     #[serde(skip_serializing_if = "JavaJournalProfiles::is_empty")]
     java_journal_profiles: JavaJournalProfiles,
     #[serde(skip_serializing_if = "java_roles::Hints::is_empty")]
@@ -383,6 +453,13 @@ impl Default for Configuration {
             local: local::State::default(),
             skills: skills::Store::default(),
             memory: memory::Settings::default(),
+            java_memory_tokens: None,
+            java_memory_preferences: memory::JavaPreferences::default(),
+            java_skill_preferences: skills::JavaPreferences::default(),
+            java_agent_shortcut: None,
+            java_agent_execution_enabled: None,
+            java_agent_confirm_mutating: None,
+            java_journal_semantic_search: None,
             java_journal_profiles: JavaJournalProfiles::default(),
             java_roles: java_roles::Hints::default(),
             java_model_hints: java_models::Hints::default(),
@@ -401,6 +478,10 @@ struct General {
     code_text_language: CodeTextLanguage,
     chat_terminal_actions: ChatTerminalActions,
     show_agent_setup: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    journal_semantic_search: bool,
+    agent_execution_enabled: bool,
+    agent_confirm_mutating: bool,
     #[serde(skip_serializing_if = "shortcut::Preferences::is_default")]
     agent_shortcut: shortcut::Preferences,
 }
@@ -413,6 +494,9 @@ impl Default for General {
             code_text_language: CodeTextLanguage::default(),
             chat_terminal_actions: ChatTerminalActions::default(),
             show_agent_setup: true,
+            journal_semantic_search: false,
+            agent_execution_enabled: true,
+            agent_confirm_mutating: false,
             agent_shortcut: Default::default(),
         }
     }
@@ -637,6 +721,12 @@ impl Configuration {
             .map(|evidence| (evidence.limits, evidence.chunking))
     }
 
+    pub(crate) fn imported_journal_preferences(&self) -> Option<(Option<u16>, Option<bool>)> {
+        self.java_journal_profiles
+            .preferences
+            .map(|preferences| (preferences.interval_minutes, preferences.automatic_title))
+    }
+
     pub(crate) fn resolve_imported_journal_summary_profile(
         &self,
         automation: bool,
@@ -706,6 +796,15 @@ impl Configuration {
     }
 
     fn validate(&self) -> io::Result<()> {
+        if self
+            .java_memory_tokens
+            .is_some_and(|tokens| !memory::valid_token_budget(tokens))
+        {
+            return Err(invalid("Invalid imported Java AI Memory token budget"));
+        }
+        if let Some(shortcut) = &self.java_agent_shortcut {
+            shortcut.validate()?;
+        }
         if self.version != VERSION
             || !(1..=MAX_TIMEOUT_MINUTES).contains(&self.general.timeout_minutes)
         {
@@ -1063,6 +1162,10 @@ impl Configuration {
         self.local.journal_embedding(self.saved_root())
     }
 
+    pub(crate) fn journal_semantic_search(&self) -> bool {
+        self.general.journal_semantic_search
+    }
+
     pub(crate) fn journal_question_loopback_server_default(
         &self,
     ) -> Option<(local_ai::Profile, String)> {
@@ -1227,6 +1330,23 @@ impl Configuration {
 
     pub(crate) fn agent_shortcut_aliases(&self) -> Option<shortcut::Aliases> {
         self.general.agent_shortcut.enabled_aliases()
+    }
+
+    pub(crate) fn agent_execution_enabled(&self) -> bool {
+        self.enabled() && self.general.agent_execution_enabled
+    }
+
+    pub(crate) fn agent_requires_command_confirmation(&self) -> bool {
+        self.general.agent_confirm_mutating
+    }
+
+    pub(crate) fn current_agent_execution_enabled(&self) -> bool {
+        if self.saved_root().is_some() {
+            self.reload_saved()
+                .is_ok_and(|current| current.agent_execution_enabled())
+        } else {
+            self.agent_execution_enabled()
+        }
     }
 
     pub(crate) fn show_agent_setup(&self) -> bool {
@@ -2292,6 +2412,13 @@ pub(crate) enum Message {
     AgentShortcutEnabled(bool),
     AgentShortcutName(String),
     AgentShortcutCaseInsensitive(bool),
+    AdoptJavaAgentShortcut,
+    AgentExecutionEnabled(bool),
+    AdoptJavaAgentExecution,
+    AgentConfirmMutating(bool),
+    AdoptJavaAgentConfirmation,
+    JournalSemanticSearch(bool),
+    AdoptJavaJournalSemanticSearch,
     Profiles(profiles::Message),
     Skills(skills::Message),
     Memory(memory::Message),
@@ -2482,14 +2609,18 @@ impl Dialog {
                 profiles
             },
             profile_policy: ProfilePolicy::load(),
-            skills: skills::Editor::default().with_statistics_root(profile.clone()),
+            skills: skills::Editor::default()
+                .with_statistics_root(profile.clone())
+                .with_imported_preferences(saved.java_skill_preferences),
             skill_store: saved.skills.clone(),
             memory: memory::State::new(
                 saved.memory.clone(),
                 profile.join("memory"),
                 scopes,
                 editable,
-            ),
+            )
+            .with_imported_token_budget(saved.java_memory_tokens)
+            .with_imported_preferences(saved.java_memory_preferences),
             local: {
                 let mut local = local::Dialog::new(profile);
                 local.install_model_catalog(saved.model_catalog.clone());
@@ -2985,6 +3116,40 @@ impl Dialog {
             }
             Message::AgentShortcutCaseInsensitive(enabled) if editable => {
                 self.general.agent_shortcut.case_insensitive = enabled;
+            }
+            Message::AdoptJavaAgentShortcut if editable => {
+                if let Some(imported) = &self.saved.java_agent_shortcut {
+                    if let Some(name) = &imported.name {
+                        self.general.agent_shortcut.name.clone_from(name);
+                    }
+                    if let Some(case) = imported.case_insensitive {
+                        self.general.agent_shortcut.case_insensitive = case;
+                    }
+                }
+            }
+            Message::AgentExecutionEnabled(enabled) if editable => {
+                self.general.agent_execution_enabled = enabled;
+            }
+            Message::AdoptJavaAgentExecution if editable => {
+                if let Some(enabled) = self.saved.java_agent_execution_enabled {
+                    self.general.agent_execution_enabled = enabled;
+                }
+            }
+            Message::AgentConfirmMutating(enabled) if editable => {
+                self.general.agent_confirm_mutating = enabled;
+            }
+            Message::AdoptJavaAgentConfirmation if editable => {
+                if let Some(enabled) = self.saved.java_agent_confirm_mutating {
+                    self.general.agent_confirm_mutating = enabled;
+                }
+            }
+            Message::JournalSemanticSearch(enabled) if editable => {
+                self.general.journal_semantic_search = enabled;
+            }
+            Message::AdoptJavaJournalSemanticSearch if editable => {
+                if let Some(enabled) = self.saved.java_journal_semantic_search {
+                    self.general.journal_semantic_search = enabled;
+                }
             }
             Message::Profiles(profiles::Message::Test) if profile_editable => {
                 return self.request(false);
@@ -3517,6 +3682,13 @@ impl Dialog {
                 local: self.local_state.clone(),
                 skills: self.skill_store.clone(),
                 memory: self.memory.settings().clone(),
+                java_memory_tokens: self.saved.java_memory_tokens,
+                java_memory_preferences: self.saved.java_memory_preferences,
+                java_skill_preferences: self.saved.java_skill_preferences,
+                java_agent_shortcut: self.saved.java_agent_shortcut.clone(),
+                java_agent_execution_enabled: self.saved.java_agent_execution_enabled,
+                java_agent_confirm_mutating: self.saved.java_agent_confirm_mutating,
+                java_journal_semantic_search: self.saved.java_journal_semantic_search,
                 java_journal_profiles: self.saved.java_journal_profiles.clone(),
                 java_roles: self.saved.java_roles.clone(),
                 java_model_hints: self.saved.java_model_hints.clone(),
@@ -4273,7 +4445,32 @@ impl Dialog {
                     .align_y(Alignment::Center)
                     .wrap(),
             ),
+            text("Journal search").size(19),
+            self.revealed.wrap(search::Setting::JournalSemanticSearch, checkbox(self.general.journal_semantic_search)
+                .label("Use local semantic ranking when preparing cross-journal questions")
+                .on_toggle_maybe(self.editable().then_some(Message::JournalSemanticSearch))),
+            text("Preparing a cross-journal question sends its masked text and new or changed search cards to the configured local embedding model. Lexical ranking is used if no model is available. Answer requests still require review.").size(13),
+            self.saved.java_journal_semantic_search.map(|enabled| row![
+                text(format!("Imported from Java: semantic search {}", if enabled { "on" } else { "off" })).size(13),
+                button("Use imported search preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaJournalSemanticSearch)),
+            ].spacing(8).wrap()),
             text("Terminal AI Agent").size(19),
+            self.revealed.wrap(search::Setting::AgentConfirmation,
+                checkbox(self.general.agent_confirm_mutating).label("Require approval for mutating Agent command sets")
+                    .on_toggle_maybe(self.editable().then_some(Message::AgentConfirmMutating))),
+            text("When unchecked, a command review can explicitly approve future ordinary commands for that run and target. Managed confirmation policy overrides this choice. Elevation and password requests keep their separate approvals.").size(13),
+            self.saved.java_agent_confirm_mutating.map(|enabled| row![
+                text(format!("Imported from Java: command confirmation {}", if enabled { "on" } else { "off" })).size(13),
+                button("Use imported confirmation preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentConfirmation)),
+            ].spacing(8).wrap()),
+            self.revealed.wrap(search::Setting::AgentExecution,
+                checkbox(self.general.agent_execution_enabled).label("Allow Agent command execution")
+                    .on_toggle_maybe(self.editable().then_some(Message::AgentExecutionEnabled))),
+            text("Disabling execution blocks Agent Run, executing AI Swarm and scheduled Agent diagnostics. Ask, planning and ordinary snippets remain available, subject to policy. Existing Agent operations stop when their permissions are rechecked.").size(13),
+            self.saved.java_agent_execution_enabled.map(|enabled| row![
+                text(format!("Imported from Java: Agent execution {}", if enabled { "on" } else { "off" })).size(13),
+                button("Use imported execution preference").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentExecution)),
+            ].spacing(8).wrap()),
             self.revealed.wrap(
                 shortcut_setting,
                 column![
@@ -4281,6 +4478,13 @@ impl Dialog {
                     row![text("Base command name"), self.revealed.input(shortcut_setting, self.editable(), name)]
                         .spacing(8).align_y(Alignment::Center).wrap(),
                     case,
+                    self.saved.java_agent_shortcut.as_ref().map(|imported| column![
+                        text(format!("Imported from Java · command: {} · ignore case: {}",
+                            imported.name.as_deref().unwrap_or("not specified"),
+                            imported.case_insensitive.map_or("not specified", |value| if value { "on" } else { "off" }))).size(13),
+                        button("Use imported command preferences").on_press_maybe(self.editable().then_some(Message::AdoptJavaAgentShortcut)),
+                        text("Adoption preserves whether terminal agent shortcuts are enabled. Save to apply the name to local and SSH shell prompts.").size(13),
+                    ].spacing(4)),
                     text("Type the base command, or add -ask or -plan, at a shell prompt with OSC 133 integration. Tab offers variants or recent prompts. Enter submits the alias.").size(13),
                     text("For local terminals, enable automatic shell integration in Quick Connect or the saved shell profile. For SSH, install the matching snippet on the remote host and reconnect. Right-click the terminal → Set Up Shell Integration… shows shortcut readiness.").size(13),
                 ].spacing(6),
@@ -4865,6 +5069,282 @@ mod tests {
                 .chat_terminal_actions(),
             ChatTerminalActions::InsertOnly
         );
+    }
+
+    #[test]
+    fn imported_skill_switches_change_runtime_only_after_adoption_and_save() {
+        use iced::futures::{StreamExt, executor::block_on};
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let (bytes, _) = backup::portable_java_profiles(br#"<globalSettings><aiSkillsEnabled>false</aiSkillsEnabled><aiSkillAutoDetectionEnabled>false</aiSkillAutoDetectionEnabled><aiSkillAutoCreate>false</aiSkillAutoCreate><aiSkillStatisticsEnabled>false</aiSkillStatisticsEnabled></globalSettings>"#).unwrap();
+        let config = Configuration::decode(&bytes).unwrap();
+        config
+            .save_against(&root, &Configuration::default())
+            .unwrap();
+        let before = config
+            .skills
+            .selection("Ansible automation", skills::Target::Agent, &[1])
+            .guidance(&[]);
+        assert!(!before.is_empty());
+        let mut readonly = Dialog::new(
+            Arc::new(config.clone()),
+            root.clone(),
+            Vec::new(),
+            false,
+            None,
+        );
+        let _ = readonly.update(Message::Skills(skills::Message::UseImported(
+            skills::Preference::Enabled,
+        )));
+        assert_eq!(
+            serde_json::to_value(&readonly.skill_store).unwrap()["enabled"],
+            true
+        );
+        let mut dialog = Dialog::new(Arc::new(config), root.clone(), Vec::new(), true, None);
+        for preference in skills::Preference::ALL {
+            let _ = dialog.update(Message::Skills(skills::Message::UseImported(preference)));
+            if preference == skills::Preference::AutoDetect {
+                let _ = dialog.update(Message::Skills(skills::Message::Confirm));
+            }
+        }
+        assert!(
+            !Configuration::load_fixture_from(&root)
+                .unwrap()
+                .skills
+                .selection("Ansible automation", skills::Target::Agent, &[1])
+                .guidance(&[])
+                .is_empty()
+        );
+        let mut outcomes = iced_runtime::task::into_stream(dialog.update(Message::Save)).unwrap();
+        let Some(iced_runtime::Action::Output(event)) = block_on(outcomes.next()) else {
+            panic!("expected saved settings");
+        };
+        assert!(matches!(event, Message::Saved(Ok(_))));
+        let _ = dialog.update(event);
+        let saved = Configuration::load_fixture_from(&root).unwrap();
+        assert!(
+            saved
+                .skills
+                .selection("Ansible automation", skills::Target::Agent, &[1])
+                .guidance(&[])
+                .is_empty()
+        );
+        assert!(!saved.skills.learned_rules_enabled());
+        assert!(!saved.skills.statistics_enabled(None));
+        assert_eq!(
+            serde_json::to_value(&saved.skills).unwrap()["auto_detect"],
+            false
+        );
+    }
+
+    #[test]
+    fn imported_agent_confirmation_requires_adoption_and_save() {
+        use iced::futures::{StreamExt, executor::block_on};
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let (bytes, _) = backup::portable_java_profiles(br#"<globalSettings><terminalAgentConfirmMutatingCommandSets>true</terminalAgentConfirmMutatingCommandSets></globalSettings>"#).unwrap();
+        let config = Configuration::decode(&bytes).unwrap();
+        config
+            .save_against(&root, &Configuration::default())
+            .unwrap();
+        let mut dialog = Dialog::new(Arc::new(config), root.clone(), Vec::new(), true, None);
+        let _ = dialog.update(Message::Search("mutating confirmation".into()));
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(search::Setting::AgentConfirmation)
+        );
+        let _ = dialog.update(Message::AdoptJavaAgentConfirmation);
+        assert!(dialog.general.agent_confirm_mutating);
+        assert!(
+            !Configuration::load_fixture_from(&root)
+                .unwrap()
+                .agent_requires_command_confirmation()
+        );
+        let mut outcomes = iced_runtime::task::into_stream(dialog.update(Message::Save)).unwrap();
+        let Some(iced_runtime::Action::Output(event)) = block_on(outcomes.next()) else {
+            panic!("expected saved settings");
+        };
+        assert!(matches!(event, Message::Saved(Ok(_))));
+        let _ = dialog.update(event);
+        assert!(
+            Configuration::load_fixture_from(&root)
+                .unwrap()
+                .agent_requires_command_confirmation()
+        );
+    }
+
+    #[test]
+    fn java_agent_execution_adoption_preserves_the_live_gate_until_save() {
+        use iced::futures::{StreamExt, executor::block_on};
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let (bytes, _) = backup::portable_java_profiles(br#"<globalSettings><terminalAgentExecutionEnabled>false</terminalAgentExecutionEnabled></globalSettings>"#).unwrap();
+        let config = Configuration::decode(&bytes).unwrap();
+        config
+            .save_against(&root, &Configuration::default())
+            .unwrap();
+        let mut dialog = Dialog::new(Arc::new(config), root.clone(), Vec::new(), true, None);
+        let _ = dialog.update(Message::Search("Agent command execution".into()));
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(search::Setting::AgentExecution)
+        );
+        let _ = dialog.update(Message::AdoptJavaAgentExecution);
+        assert!(!dialog.general.agent_execution_enabled);
+        assert!(
+            Configuration::load_fixture_from(&root)
+                .unwrap()
+                .agent_execution_enabled()
+        );
+        let mut outcomes = iced_runtime::task::into_stream(dialog.update(Message::Save)).unwrap();
+        let Some(iced_runtime::Action::Output(event)) = block_on(outcomes.next()) else {
+            panic!("expected saved settings");
+        };
+        assert!(matches!(event, Message::Saved(Ok(_))));
+        let _ = dialog.update(event);
+        assert!(
+            !Configuration::load_fixture_from(&root)
+                .unwrap()
+                .agent_execution_enabled()
+        );
+    }
+
+    #[test]
+    fn imported_memory_switches_affect_runtime_only_after_adoption_and_save() {
+        use iced::futures::{StreamExt, executor::block_on};
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let (bytes, _) = backup::portable_java_profiles(br#"<globalSettings><aiMemoryEnabled>false</aiMemoryEnabled><aiMemoryLearningMode>OFF</aiMemoryLearningMode></globalSettings>"#).unwrap();
+        let config = Configuration::decode(&bytes).unwrap();
+        config
+            .save_against(&root, &Configuration::default())
+            .unwrap();
+        let policy = AiMemoryPolicy::default();
+        assert!(config.memory_enabled(&policy));
+        assert!(config.automatic_rule_learning(&policy));
+        let mut dialog = Dialog::new(Arc::new(config), root.clone(), Vec::new(), true, None);
+        dialog.page = Page::Memory;
+        let _ = dialog.update(Message::Memory(memory::Message::UseImportedLearning));
+        assert_eq!(dialog.memory.settings().learning, memory::Learning::Off);
+        assert!(dialog.memory.settings().enabled);
+        let _ = dialog.update(Message::Memory(memory::Message::UseImportedActivation));
+        assert!(!dialog.memory.settings().enabled);
+        assert!(
+            Configuration::load_fixture_from(&root)
+                .unwrap()
+                .memory_enabled(&policy)
+        );
+        let mut outcomes = iced_runtime::task::into_stream(dialog.update(Message::Save)).unwrap();
+        let Some(iced_runtime::Action::Output(event)) = block_on(outcomes.next()) else {
+            panic!("expected saved settings");
+        };
+        assert!(matches!(event, Message::Saved(Ok(_))));
+        let _ = dialog.update(event);
+        let saved = Configuration::load_fixture_from(&root).unwrap();
+        assert!(!saved.memory_enabled(&policy));
+        assert!(!saved.automatic_rule_learning(&policy));
+        assert_eq!(
+            saved.memory.max_tokens,
+            memory::Settings::default().max_tokens
+        );
+        assert!(!root.join("memory").exists());
+    }
+
+    #[test]
+    fn imported_journal_semantic_search_requires_adoption_and_saved_preferences() {
+        use iced::futures::{StreamExt, executor::block_on};
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let (bytes, _) = backup::portable_java_profiles(br#"<globalSettings><sessionJournalSemanticSearchEnabled>true</sessionJournalSemanticSearchEnabled></globalSettings>"#).unwrap();
+        let config = Configuration::decode(&bytes).unwrap();
+        config
+            .save_against(&root, &Configuration::default())
+            .unwrap();
+        let mut readonly = Dialog::new(
+            Arc::new(config.clone()),
+            root.clone(),
+            Vec::new(),
+            false,
+            None,
+        );
+        let _ = readonly.update(Message::AdoptJavaJournalSemanticSearch);
+        assert!(!readonly.general.journal_semantic_search);
+        let mut dialog = Dialog::new(Arc::new(config), root.clone(), Vec::new(), true, None);
+        let _ = dialog.update(Message::Search("journal semantic".into()));
+        let _ = dialog.update(Message::SearchChoose);
+        assert_eq!(
+            dialog.revealed.setting,
+            Some(search::Setting::JournalSemanticSearch)
+        );
+        let _ = dialog.update(Message::AdoptJavaJournalSemanticSearch);
+        assert!(dialog.general.journal_semantic_search);
+        assert!(
+            !Configuration::load_fixture_from(&root)
+                .unwrap()
+                .journal_semantic_search()
+        );
+        let mut outcomes = iced_runtime::task::into_stream(dialog.update(Message::Save)).unwrap();
+        let Some(iced_runtime::Action::Output(event)) = block_on(outcomes.next()) else {
+            panic!("expected saved settings");
+        };
+        assert!(matches!(event, Message::Saved(Ok(_))));
+        let _ = dialog.update(event);
+        assert!(
+            Configuration::load_fixture_from(&root)
+                .unwrap()
+                .journal_semantic_search()
+        );
+    }
+
+    #[test]
+    fn imported_agent_commands_require_adoption_and_save_without_enabling_shortcuts() {
+        use iced::futures::{StreamExt, executor::block_on};
+
+        let profile = crate::snippets::tests::Profile::new();
+        let root = profile.0.canonicalize().unwrap();
+        let (bytes, _) = backup::portable_java_profiles(br#"<globalSettings><terminalAgentCommandName>Inspect</terminalAgentCommandName><terminalAgentCommandNameCaseInsensitive>true</terminalAgentCommandNameCaseInsensitive></globalSettings>"#).unwrap();
+        let imported = Configuration::decode(&bytes).unwrap();
+        imported
+            .save_against(&root, &Configuration::default())
+            .unwrap();
+        let mut readonly = Dialog::new(
+            Arc::new(imported.clone()),
+            root.clone(),
+            Vec::new(),
+            false,
+            None,
+        );
+        let _ = readonly.update(Message::AdoptJavaAgentShortcut);
+        assert!(readonly.general.agent_shortcut.name.is_empty());
+        let mut dialog = Dialog::new(Arc::new(imported), root.clone(), Vec::new(), true, None);
+        assert!(dialog.general.agent_shortcut.name.is_empty());
+        let _ = dialog.update(Message::AdoptJavaAgentShortcut);
+        assert!(dialog.dirty());
+        assert_eq!(dialog.general.agent_shortcut.name, "Inspect");
+        assert!(dialog.general.agent_shortcut.case_insensitive);
+        assert!(!dialog.general.agent_shortcut.enabled);
+        assert!(
+            Configuration::load_fixture_from(&root)
+                .unwrap()
+                .general
+                .agent_shortcut
+                .name
+                .is_empty()
+        );
+        let mut outcomes = iced_runtime::task::into_stream(dialog.update(Message::Save)).unwrap();
+        let Some(iced_runtime::Action::Output(event)) = block_on(outcomes.next()) else {
+            panic!("expected saved settings");
+        };
+        assert!(matches!(event, Message::Saved(Ok(_))));
+        let _ = dialog.update(event);
+        let mut saved = Configuration::load_fixture_from(&root).unwrap();
+        assert!(saved.agent_shortcut_aliases().is_none());
+        saved.general.agent_shortcut.enabled = true;
+        let aliases = saved.agent_shortcut_aliases().unwrap();
+        assert!(aliases.alias_mode("INSPECT-ASK") == Some(crate::terminal_agent::Mode::Ask));
+        assert!(aliases.alias_mode("agent-ask").is_none());
     }
 
     #[test]

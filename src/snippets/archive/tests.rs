@@ -9,6 +9,31 @@ const FIXTURES: [(&str, &str); 3] = [
     ("library.yaml", include_str!("fixtures/library.yaml")),
 ];
 
+#[test]
+fn java_profile_history_is_private_and_preserves_utf8_timestamps_and_override() {
+    let source = br#"<snippets>
+        <snippet>
+            <id>00000000-0000-4000-8000-000000000001</id>
+            <name>Versioned</name><language>sh</language>
+            <content>printf current</content>
+            <historyMaxSize>0</historyMaxSize>
+            <history><entry><content>printf &#x6771;&#x4eac;</content><timestamp>1720000000123</timestamp></entry></history>
+        </snippet>
+    </snippets>"#;
+    let (bytes, ..) = crate::snippets::portable_java_backup(Some(source), None).unwrap();
+    let library = Library::analysis_backup_catalogue(&bytes).unwrap();
+    let entry = &library.entries()[0];
+    assert_eq!(entry.metadata().history_max_size, Some(0));
+    assert_eq!(entry.history()[0].content.as_ref(), "printf 東京");
+    assert_eq!(entry.history()[0].timestamp, 1720000000123);
+    for format in [Format::Json, Format::Xml, Format::Yaml] {
+        let export = format.write(library.entries()).unwrap();
+        assert!(export.contains("printf current"));
+        assert!(!export.contains("東京"));
+        assert!(!export.contains("historyMaxSize"));
+    }
+}
+
 fn imported(paths: Vec<PathBuf>) -> Imports {
     let Outcome::Imported(entries) = Action::Import(paths).run().unwrap() else {
         panic!("expected imported snippets");

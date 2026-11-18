@@ -342,7 +342,7 @@ fn openssh_remote_dock_coalesces_listing_transfers_files_and_only_closes_its_cha
     let _ = server.join().unwrap();
 }
 
-fn check_open_sftp_here(session: Session, target: SshTarget, directory: &Path) {
+fn report_terminal_directory(session: &Session, target: &SshTarget, directory: &Path) {
     let mut uri = url::Url::from_file_path(directory).unwrap();
     uri.set_host(Some(target.host())).unwrap();
     let quoted_path = directory.to_str().unwrap().replace('\'', "'\\''");
@@ -358,6 +358,113 @@ fn check_open_sftp_here(session: Session, target: SshTarget, directory: &Path) {
             .is_some_and(|report| report.path.as_bytes() == directory.as_os_str().as_bytes())
             .then_some(())
     });
+}
+
+#[test]
+#[ignore = "requires OpenSSH ssh-keygen, sshd with internal-sftp, and a usable local account"]
+fn openssh_terminal_drop_reviews_exact_folder_and_stops_on_context_change() {
+    use crate::workspace::remote_dock::{DialogMessage, Message as DockMessage};
+    use iced::futures::{StreamExt, executor::block_on};
+
+    let fixture = TempDirectory::new("terminal-drop");
+    let root = fixture.0.canonicalize().unwrap();
+    let destination = root.join("destination");
+    let other = root.join("other");
+    fs::create_dir(&destination).unwrap();
+    fs::create_dir(&other).unwrap();
+    let local = root.join("payload.txt");
+    let second = root.join("second.txt");
+    fs::write(&local, b"terminal drop").unwrap();
+    fs::write(&second, b"second file").unwrap();
+    let (session, target, server) = connect(&root);
+    session.send(b"PS1='$ '\r".to_vec()).unwrap();
+    report_terminal_directory(&session, &target, &destination);
+
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    let id = workspace.store_session(session, initial_grid(TerminalProfile::Xterm), 14);
+    workspace.sessions.get_mut(&id).unwrap().ssh = Some(target);
+    workspace.add_tab(owner, id);
+    let tab = workspace.windows[&owner].active_tab_id().unwrap();
+    let capture =
+        |workspace: &Workspace| workspace.terminal_upload_target(owner, tab, id, 0).unwrap();
+    let wait_for_worker = |task| {
+        let mut actions = iced_runtime::task::into_stream(task).unwrap();
+        block_on(async {
+            while let Some(action) = actions.next().await {
+                if let iced_runtime::Action::Output(
+                    message @ WorkspaceMessage::RemoteDock(
+                        _,
+                        DockMessage::Dialog(DialogMessage::TerminalUploadCompleted(_)),
+                    ),
+                ) = action
+                {
+                    return message;
+                }
+            }
+            panic!("missing SFTP worker completion");
+        })
+    };
+    let action =
+        |dialog, message| WorkspaceMessage::RemoteDock(dialog, DockMessage::Dialog(message));
+    let drop_file = |stream, path| WorkspaceMessage::TerminalFileDropped(owner, id, stream, path);
+    let _ = workspace.update(drop_file(0, local.clone()));
+    let _ = workspace.update(drop_file(1, second.clone()));
+    let rejected =
+        workspace.finish_desktop_terminal_uploads(Instant::now() + Duration::from_secs(1));
+    assert_eq!(rejected.units(), 0);
+    assert!(workspace.remote_dialog_for_owner(owner).is_none());
+
+    for path in [local.clone(), local, second] {
+        let _ = workspace.update(drop_file(0, path));
+    }
+    let task = workspace.finish_desktop_terminal_uploads(Instant::now() + Duration::from_secs(1));
+    let dialog = workspace.remote_dialog_for_owner(owner).unwrap();
+    let _ = workspace.update(wait_for_worker(task));
+    assert!(!destination.join("payload.txt").exists());
+    let task = workspace.update(action(dialog, DialogMessage::Proceed));
+    let task = workspace.update(wait_for_worker(task));
+    let _ = workspace.update(wait_for_worker(task));
+    assert_eq!(
+        fs::read(destination.join("payload.txt")).unwrap(),
+        b"terminal drop"
+    );
+    assert!(!other.join("payload.txt").exists());
+    assert_eq!(
+        fs::read(destination.join("second.txt")).unwrap(),
+        b"second file"
+    );
+    let _ = workspace.update(action(dialog, DialogMessage::Cancel));
+
+    let pending = root.join("pending.txt");
+    fs::write(&pending, b"bound to the original destination").unwrap();
+    let task = workspace
+        .open_terminal_upload(owner, capture(&workspace), vec![pending])
+        .unwrap();
+    let dialog = workspace.remote_dialog_for_owner(owner).unwrap();
+    let _ = workspace.update(wait_for_worker(task));
+    let pane = &workspace.sessions[&id];
+    report_terminal_directory(&pane.session, pane.ssh.as_ref().unwrap(), &other);
+    let before = workspace.update(action(dialog, DialogMessage::Proceed));
+    assert_eq!(before.units(), 0);
+    assert!(!destination.join("pending.txt").exists());
+    assert!(!other.join("pending.txt").exists());
+    let _ = workspace.update(action(dialog, DialogMessage::Cancel));
+    assert_eq!(
+        workspace.sessions[&id].session.frame().status,
+        Status::Running
+    );
+    let stopped = workspace.sessions[&id].session.stop();
+    wait_for(|| stopped.is_closed().then_some(()));
+    for done in std::mem::take(&mut workspace.pending_shutdown) {
+        wait_for(|| done.is_closed().then_some(()));
+    }
+    let _ = server.join().unwrap();
+}
+
+fn check_open_sftp_here(session: Session, target: SshTarget, directory: &Path) {
+    report_terminal_directory(&session, &target, directory);
+    let quoted_path = directory.to_str().unwrap().replace('\'', "'\\''");
 
     let mut workspace = Workspace::default();
     let (owner, _) = workspace.open_window(false);

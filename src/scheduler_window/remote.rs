@@ -219,9 +219,9 @@ impl RemoteAction {
                     _ => None,
                 };
                 if let Some(settings) = &copy.standing
-                    && (privileged_direction.is_some() || settings.validate().is_err())
+                    && settings.validate().is_err()
                 {
-                    return Err("Choose valid recurring SFTP limits for an ordinary folder copy.");
+                    return Err("Choose valid recurring folder transfer limits.");
                 }
                 if let Some(direction) = privileged_direction {
                     if copy.direction != direction

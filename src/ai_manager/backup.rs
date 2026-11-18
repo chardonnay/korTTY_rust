@@ -224,6 +224,22 @@ pub(crate) struct JavaProfileReport {
     pub(crate) role_hints_omitted: usize,
     pub(crate) journal_evidence_hint: bool,
     pub(crate) journal_evidence_omitted: bool,
+    pub(crate) journal_preferences_hint: bool,
+    pub(crate) journal_preferences_omitted: bool,
+    pub(crate) memory_tokens_hint: bool,
+    pub(crate) memory_tokens_omitted: bool,
+    pub(crate) memory_preferences_hint: bool,
+    pub(crate) memory_preferences_omitted: usize,
+    pub(crate) skill_preferences_hint: bool,
+    pub(crate) skill_preferences_omitted: usize,
+    pub(crate) agent_shortcut_hint: bool,
+    pub(crate) agent_shortcut_omitted: bool,
+    pub(crate) agent_execution_hint: bool,
+    pub(crate) agent_execution_omitted: bool,
+    pub(crate) agent_confirmation_hint: bool,
+    pub(crate) agent_confirmation_omitted: bool,
+    pub(crate) journal_semantic_search_hint: bool,
+    pub(crate) journal_semantic_search_omitted: bool,
     sources: Vec<JavaProfileSource>,
 }
 
@@ -239,6 +255,13 @@ pub(crate) fn portable_java_profiles(bytes: &[u8]) -> io::Result<(Vec<u8>, JavaP
         profiles,
         java_journal_profiles: report.journal_profiles,
         java_roles: report.roles,
+        java_memory_tokens: report.memory_tokens,
+        java_memory_preferences: report.memory_preferences,
+        java_skill_preferences: report.skill_preferences,
+        java_agent_shortcut: report.agent_shortcut,
+        java_agent_execution_enabled: report.agent_execution_enabled,
+        java_agent_confirm_mutating: report.agent_confirm_mutating,
+        java_journal_semantic_search: report.journal_semantic_search,
         ..Configuration::default()
     };
     let encoded = encode_java_profiles(&settings)?;
@@ -262,6 +285,22 @@ pub(crate) fn portable_java_profiles(bytes: &[u8]) -> io::Result<(Vec<u8>, JavaP
             role_hints_omitted: report.roles_omitted,
             journal_evidence_hint: settings.java_journal_profiles.evidence.is_some(),
             journal_evidence_omitted: report.journal_evidence_omitted,
+            journal_preferences_hint: settings.java_journal_profiles.preferences.is_some(),
+            journal_preferences_omitted: report.journal_preferences_omitted,
+            memory_tokens_hint: settings.java_memory_tokens.is_some(),
+            memory_tokens_omitted: report.memory_tokens_omitted,
+            memory_preferences_hint: !settings.java_memory_preferences.is_empty(),
+            memory_preferences_omitted: report.memory_preferences_omitted,
+            skill_preferences_hint: !settings.java_skill_preferences.is_empty(),
+            skill_preferences_omitted: report.skill_preferences_omitted,
+            agent_shortcut_hint: settings.java_agent_shortcut.is_some(),
+            agent_shortcut_omitted: report.agent_shortcut_omitted,
+            agent_execution_hint: settings.java_agent_execution_enabled.is_some(),
+            agent_execution_omitted: report.agent_execution_omitted,
+            agent_confirmation_hint: settings.java_agent_confirm_mutating.is_some(),
+            agent_confirmation_omitted: report.agent_confirmation_omitted,
+            journal_semantic_search_hint: settings.java_journal_semantic_search.is_some(),
+            journal_semantic_search_omitted: report.journal_semantic_search_omitted,
             sources: settings.profiles.java_profile_sources().cloned().collect(),
         },
     ))
@@ -306,6 +345,43 @@ pub(crate) fn merge_java_profiles(
             .profiles
             .restore_missing_toolpack_hints(&incoming.profiles);
     let added = local.profiles.merge_java_profiles(incoming.profiles)?;
+    let confirmation_added = local.java_agent_confirm_mutating.is_none()
+        && incoming.java_agent_confirm_mutating.is_some();
+    if confirmation_added {
+        local.java_agent_confirm_mutating = incoming.java_agent_confirm_mutating;
+    }
+    let execution_added = local.java_agent_execution_enabled.is_none()
+        && incoming.java_agent_execution_enabled.is_some();
+    if execution_added {
+        local.java_agent_execution_enabled = incoming.java_agent_execution_enabled;
+    }
+    let skill_preferences_added = local
+        .java_skill_preferences
+        .merge(incoming.java_skill_preferences);
+    let memory_preferences_added = local
+        .java_memory_preferences
+        .merge(incoming.java_memory_preferences);
+    let semantic_search_added = local.java_journal_semantic_search.is_none()
+        && incoming.java_journal_semantic_search.is_some();
+    if semantic_search_added {
+        local.java_journal_semantic_search = incoming.java_journal_semantic_search;
+    }
+    let agent_shortcut_added = if let Some(incoming) = incoming.java_agent_shortcut {
+        match local.java_agent_shortcut.as_mut() {
+            Some(current) => current.merge(incoming),
+            None => {
+                local.java_agent_shortcut = Some(incoming);
+                true
+            }
+        }
+    } else {
+        false
+    };
+    let memory_tokens_added =
+        local.java_memory_tokens.is_none() && incoming.java_memory_tokens.is_some();
+    if memory_tokens_added {
+        local.java_memory_tokens = incoming.java_memory_tokens;
+    }
     let role_hints_added = local.java_roles.merge(incoming.java_roles);
     let model_hints_added = java_ai_hints_allowed(policy)
         && local
@@ -324,6 +400,21 @@ pub(crate) fn merge_java_profiles(
     if hints_added {
         journal.evidence = incoming_journal.evidence;
     }
+    if let Some(incoming) = incoming_journal.preferences {
+        if let Some(current) = journal.preferences.as_mut() {
+            if current.interval_minutes.is_none() && incoming.interval_minutes.is_some() {
+                current.interval_minutes = incoming.interval_minutes;
+                hints_added = true;
+            }
+            if current.automatic_title.is_none() && incoming.automatic_title.is_some() {
+                current.automatic_title = incoming.automatic_title;
+                hints_added = true;
+            }
+        } else {
+            journal.preferences = Some(incoming);
+            hints_added = true;
+        }
+    }
     for (current, incoming) in [
         (&mut journal.recording, incoming_journal.recording),
         (&mut journal.automation, incoming_journal.automation),
@@ -334,6 +425,13 @@ pub(crate) fn merge_java_profiles(
         }
     }
     if added == 0
+        && !confirmation_added
+        && !execution_added
+        && !memory_preferences_added
+        && !skill_preferences_added
+        && !semantic_search_added
+        && !agent_shortcut_added
+        && !memory_tokens_added
         && !hints_added
         && !toolpack_hints_added
         && !role_hints_added
@@ -448,6 +546,62 @@ pub(crate) fn safe_memory(path: &str, bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod java_profile_tests {
+    #[test]
+    fn java_skill_preferences_are_inactive_additive_and_report_invalid_siblings() {
+        use crate::ai_manager::skills::Preference;
+        let (bytes, report) = portable_java_profiles(br#"<globalSettings><aiSkillsEnabled>false</aiSkillsEnabled><aiSkillAutoDetectionEnabled>invalid</aiSkillAutoDetectionEnabled><aiSkillAutoCreate>0</aiSkillAutoCreate><aiSkillStatisticsEnabled>false</aiSkillStatisticsEnabled></globalSettings>"#).unwrap();
+        assert!(report.skill_preferences_hint);
+        assert_eq!(report.skill_preferences_omitted, 1);
+        let config = Configuration::decode(&bytes).unwrap();
+        assert_eq!(config.skills, super::super::skills::Store::default());
+        assert_eq!(
+            config.java_skill_preferences.get(Preference::Enabled),
+            Some(false)
+        );
+        assert_eq!(
+            config.java_skill_preferences.get(Preference::AutoDetect),
+            None
+        );
+        let (later, _) = portable_java_profiles(br#"<globalSettings><aiSkillsEnabled>true</aiSkillsEnabled><aiSkillAutoDetectionEnabled>false</aiSkillAutoDetectionEnabled></globalSettings>"#).unwrap();
+        let merged = merge_java_profiles(Some(&bytes), &later, &ClipboardPolicy::default())
+            .unwrap()
+            .unwrap();
+        let restored = Configuration::decode(&merged).unwrap();
+        assert_eq!(
+            restored.java_skill_preferences.get(Preference::Enabled),
+            Some(false)
+        );
+        assert_eq!(
+            restored.java_skill_preferences.get(Preference::AutoDetect),
+            Some(false)
+        );
+        assert_eq!(restored.skills, config.skills);
+        assert!(
+            merge_java_profiles(Some(&merged), &later, &ClipboardPolicy::default())
+                .unwrap()
+                .is_none()
+        );
+        let portable = serde_json::to_vec(&restored).unwrap();
+        assert_eq!(
+            Configuration::decode(&portable)
+                .unwrap()
+                .java_skill_preferences,
+            restored.java_skill_preferences
+        );
+        let (_, duplicates) = portable_java_profiles(br#"<globalSettings><aiSkillsEnabled>true</aiSkillsEnabled><aiSkillsEnabled>false</aiSkillsEnabled><aiSkillStatisticsEnabled>1</aiSkillStatisticsEnabled></globalSettings>"#).unwrap();
+        assert_eq!(duplicates.skill_preferences_omitted, 1);
+        assert!(duplicates.skill_preferences_hint);
+        let denied = ClipboardPolicy {
+            ai_profile_creation_allowed: false,
+            ..ClipboardPolicy::default()
+        };
+        assert!(
+            merge_java_profiles(None, &later, &denied)
+                .unwrap()
+                .is_none()
+        );
+    }
+
     use std::path::PathBuf;
 
     use super::*;
@@ -600,6 +754,355 @@ mod java_profile_tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn java_command_confirmation_import_preserves_native_preferences_until_adoption() {
+        let import = |value| {
+            portable_java_profiles(format!("<globalSettings><terminalAgentConfirmMutatingCommandSets>{value}</terminalAgentConfirmMutatingCommandSets></globalSettings>").as_bytes()).unwrap()
+        };
+        let (incoming, report) = import("true");
+        assert!(report.agent_confirmation_hint);
+        let policy = ClipboardPolicy::default();
+        let merged = merge_java_profiles(None, &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        let config = Configuration::decode(&portable_settings(&merged).unwrap()).unwrap();
+        assert!(!config.agent_requires_command_confirmation());
+        assert_eq!(config.java_agent_confirm_mutating, Some(true));
+        let (disabled, _) = import("false");
+        assert!(
+            merge_java_profiles(Some(&merged), &disabled, &policy)
+                .unwrap()
+                .is_none()
+        );
+        let (bad, report) = import("invalid");
+        assert!(report.agent_confirmation_omitted);
+        assert!(
+            Configuration::decode(&bad)
+                .unwrap()
+                .java_agent_confirm_mutating
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn java_agent_execution_import_does_not_activate_or_override_native_settings() {
+        let import = |value| {
+            portable_java_profiles(format!("<globalSettings><terminalAgentExecutionEnabled>{value}</terminalAgentExecutionEnabled></globalSettings>").as_bytes()).unwrap()
+        };
+        let (incoming, report) = import("0");
+        assert!(report.agent_execution_hint);
+        let policy = ClipboardPolicy::default();
+        let merged = merge_java_profiles(None, &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        let config = Configuration::decode(&portable_settings(&merged).unwrap()).unwrap();
+        assert_eq!(config.java_agent_execution_enabled, Some(false));
+        assert!(config.agent_execution_enabled());
+        let (enabled, _) = import("true");
+        assert!(
+            merge_java_profiles(Some(&merged), &enabled, &policy)
+                .unwrap()
+                .is_none()
+        );
+        let native: Configuration = serde_json::from_value(
+            serde_json::json!({"general":{"agent_execution_enabled":false}}),
+        )
+        .unwrap();
+        let merged = merge_java_profiles(
+            Some(&serde_json::to_vec(&native).unwrap()),
+            &enabled,
+            &policy,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            !Configuration::decode(&merged)
+                .unwrap()
+                .agent_execution_enabled()
+        );
+        let (bad, report) = import("invalid");
+        assert!(report.agent_execution_omitted);
+        assert!(
+            Configuration::decode(&bad)
+                .unwrap()
+                .java_agent_execution_enabled
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn java_memory_activation_and_learning_fill_only_missing_hints_and_report_individual_errors() {
+        use super::super::memory::{JavaPreferences, Learning};
+        let import = |fields: &str| {
+            portable_java_profiles(format!("<globalSettings>{fields}</globalSettings>").as_bytes())
+                .unwrap()
+        };
+        let (enabled, report) = import("<aiMemoryEnabled>0</aiMemoryEnabled>");
+        assert!(report.memory_preferences_hint);
+        let mut native = Configuration::default();
+        native.memory.max_tokens = 700;
+        let policy = ClipboardPolicy::default();
+        let merged = merge_java_profiles(
+            Some(&serde_json::to_vec(&native).unwrap()),
+            &enabled,
+            &policy,
+        )
+        .unwrap()
+        .unwrap();
+        let (learning, _) = import(
+            "<aiMemoryEnabled>true</aiMemoryEnabled><aiMemoryLearningMode>OFF</aiMemoryLearningMode>",
+        );
+        let merged = merge_java_profiles(Some(&merged), &learning, &policy)
+            .unwrap()
+            .unwrap();
+        assert!(
+            merge_java_profiles(Some(&merged), &learning, &policy)
+                .unwrap()
+                .is_none()
+        );
+        let config = Configuration::decode(&portable_settings(&merged).unwrap()).unwrap();
+        assert_eq!(config.memory, native.memory);
+        assert_eq!(
+            config.java_memory_preferences,
+            JavaPreferences {
+                enabled: Some(false),
+                learning: Some(Learning::Off)
+            }
+        );
+        let (invalid, report) = import(
+            "<aiMemoryEnabled>true</aiMemoryEnabled><aiMemoryLearningMode>INVALID</aiMemoryLearningMode>",
+        );
+        assert_eq!(report.memory_preferences_omitted, 1);
+        assert_eq!(
+            Configuration::decode(&invalid)
+                .unwrap()
+                .java_memory_preferences,
+            JavaPreferences {
+                enabled: Some(true),
+                learning: None
+            }
+        );
+        let (invalid, report) = import(
+            "<aiMemoryEnabled>invalid</aiMemoryEnabled><aiMemoryLearningMode>PROPOSE</aiMemoryLearningMode>",
+        );
+        assert_eq!(report.memory_preferences_omitted, 1);
+        assert_eq!(
+            Configuration::decode(&invalid)
+                .unwrap()
+                .java_memory_preferences,
+            JavaPreferences {
+                enabled: None,
+                learning: Some(Learning::Propose)
+            }
+        );
+        assert!(Configuration::default().java_memory_preferences.is_empty());
+    }
+
+    #[test]
+    fn java_semantic_search_preference_remains_an_inactive_additive_hint() {
+        let import = |value| {
+            portable_java_profiles(format!("<globalSettings><sessionJournalSemanticSearchEnabled>{value}</sessionJournalSemanticSearchEnabled></globalSettings>").as_bytes()).unwrap()
+        };
+        let (incoming, report) = import("1");
+        assert!(report.journal_semantic_search_hint);
+        let policy = ClipboardPolicy::default();
+        let merged = merge_java_profiles(None, &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        let config = Configuration::decode(&portable_settings(&merged).unwrap()).unwrap();
+        assert_eq!(config.java_journal_semantic_search, Some(true));
+        assert!(!config.journal_semantic_search());
+        let (disabled, _) = import("false");
+        assert!(
+            merge_java_profiles(Some(&merged), &disabled, &policy)
+                .unwrap()
+                .is_none()
+        );
+        let mut native = Configuration::default();
+        native.general.journal_semantic_search = true;
+        let merged = merge_java_profiles(
+            Some(&serde_json::to_vec(&native).unwrap()),
+            &disabled,
+            &policy,
+        )
+        .unwrap()
+        .unwrap();
+        let config = Configuration::decode(&merged).unwrap();
+        assert!(config.journal_semantic_search());
+        assert_eq!(config.java_journal_semantic_search, Some(false));
+        let (bad, report) = import("invalid");
+        assert!(report.journal_semantic_search_omitted);
+        assert!(
+            Configuration::decode(&bad)
+                .unwrap()
+                .java_journal_semantic_search
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn java_agent_commands_merge_independent_hints_without_replacing_native_settings() {
+        let import = |fields: &str| {
+            portable_java_profiles(format!("<globalSettings>{fields}</globalSettings>").as_bytes())
+                .unwrap()
+        };
+        let name = "inspect".repeat(8);
+        let (incoming, report) = import(&format!(
+            "<terminalAgentCommandName> {name} </terminalAgentCommandName>"
+        ));
+        assert!(report.agent_shortcut_hint);
+        assert!(!report.agent_shortcut_omitted);
+        let mut native = Configuration::default();
+        native.general.agent_shortcut.name = "native".into();
+        native.general.agent_shortcut.enabled = true;
+        let allowed = ClipboardPolicy::default();
+        let merged = merge_java_profiles(
+            Some(&serde_json::to_vec(&native).unwrap()),
+            &incoming,
+            &allowed,
+        )
+        .unwrap()
+        .unwrap();
+        let (second, _) = import(
+            "<terminalAgentCommandName>other</terminalAgentCommandName><terminalAgentCommandNameCaseInsensitive>1</terminalAgentCommandNameCaseInsensitive>",
+        );
+        let merged = merge_java_profiles(Some(&merged), &second, &allowed)
+            .unwrap()
+            .unwrap();
+        assert!(
+            merge_java_profiles(Some(&merged), &second, &allowed)
+                .unwrap()
+                .is_none()
+        );
+        let config = Configuration::decode(&portable_settings(&merged).unwrap()).unwrap();
+        assert_eq!(config.general.agent_shortcut, native.general.agent_shortcut);
+        assert_eq!(
+            config.java_agent_shortcut.unwrap(),
+            super::super::JavaAgentShortcut {
+                name: Some(name),
+                case_insensitive: Some(true)
+            }
+        );
+        let (blank, _) = import("<terminalAgentCommandName> </terminalAgentCommandName>");
+        assert_eq!(
+            Configuration::decode(&blank)
+                .unwrap()
+                .java_agent_shortcut
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("agent")
+        );
+        for fields in [
+            "<terminalAgentCommandName>two commands</terminalAgentCommandName>",
+            "<terminalAgentCommandNameCaseInsensitive>invalid</terminalAgentCommandNameCaseInsensitive>",
+        ] {
+            let (bad, report) = import(fields);
+            assert!(report.agent_shortcut_omitted);
+            assert!(
+                Configuration::decode(&bad)
+                    .unwrap()
+                    .java_agent_shortcut
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn java_memory_budget_roundtrips_as_an_inactive_additive_hint() {
+        let import = |value| {
+            portable_java_profiles(format!("<globalSettings><aiMemoryMaxTokens>{value}</aiMemoryMaxTokens></globalSettings>").as_bytes()).unwrap()
+        };
+        let (incoming, report) = import("9000");
+        assert!(report.memory_tokens_hint);
+        assert!(!report.memory_tokens_omitted);
+        let mut native = Configuration::default();
+        native.memory.enabled = false;
+        native.memory.max_tokens = 700;
+        let policy = ClipboardPolicy::default();
+        let encoded = serde_json::to_vec(&native).unwrap();
+        let merged = merge_java_profiles(Some(&encoded), &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        let portable = portable_settings(&merged).unwrap();
+        let current = Configuration::decode(&portable).unwrap();
+        assert_eq!(current.java_memory_tokens, Some(4000));
+        assert_eq!(current.memory, native.memory);
+        let (low, _) = import("-1");
+        assert_eq!(
+            Configuration::decode(&low).unwrap().java_memory_tokens,
+            Some(500)
+        );
+        assert!(
+            merge_java_profiles(Some(&merged), &low, &policy)
+                .unwrap()
+                .is_none()
+        );
+        let (bad, report) = import("invalid");
+        assert!(report.memory_tokens_omitted);
+        assert!(
+            Configuration::decode(&bad)
+                .unwrap()
+                .java_memory_tokens
+                .is_none()
+        );
+        let mut invalid = current;
+        invalid.java_memory_tokens = Some(499);
+        assert!(Configuration::decode(&serde_json::to_vec(&invalid).unwrap()).is_err());
+    }
+
+    #[test]
+    fn imported_journal_preferences_merge_missing_fields_without_overwriting_or_granting() {
+        let policy = ClipboardPolicy::default();
+        let import = |fields: &str| {
+            portable_java_profiles(format!("<globalSettings>{fields}</globalSettings>").as_bytes())
+                .unwrap()
+        };
+        let (initial, report) = import(
+            "<sessionJournalSummarizeIntervalMinutes>999</sessionJournalSummarizeIntervalMinutes>",
+        );
+        assert!(report.journal_preferences_hint);
+        let initial = merge_java_profiles(None, &initial, &policy)
+            .unwrap()
+            .unwrap();
+        let (incoming, _) = import(
+            "<sessionJournalSummarizeIntervalMinutes>-3</sessionJournalSummarizeIntervalMinutes><sessionJournalAiTitleEnabled>true</sessionJournalAiTitleEnabled>",
+        );
+        let merged = merge_java_profiles(Some(&initial), &incoming, &policy)
+            .unwrap()
+            .unwrap();
+        assert!(
+            merge_java_profiles(Some(&merged), &incoming, &policy)
+                .unwrap()
+                .is_none()
+        );
+        let portable = portable_settings(&merged).unwrap();
+        let config = Configuration::decode(&portable).unwrap();
+        assert_eq!(
+            config.imported_journal_preferences(),
+            Some((Some(240), Some(true)))
+        );
+        assert!(config.profiles.default_profile().is_none());
+        assert_eq!(
+            Configuration::decode(&incoming)
+                .unwrap()
+                .imported_journal_preferences(),
+            Some((Some(1), Some(true)))
+        );
+        let (invalid, report) = import(
+            "<sessionJournalAiTitleEnabled>invalid</sessionJournalAiTitleEnabled><sessionJournalAiMaxLines>17</sessionJournalAiMaxLines>",
+        );
+        assert!(report.journal_preferences_omitted);
+        let invalid = Configuration::decode(&invalid).unwrap();
+        assert!(invalid.imported_journal_preferences().is_none());
+        assert!(invalid.imported_journal_evidence_limits().is_some());
+        assert!(
+            Configuration::default()
+                .imported_journal_preferences()
+                .is_none()
+        );
     }
 
     #[test]

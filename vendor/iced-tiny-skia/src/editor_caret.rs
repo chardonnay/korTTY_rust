@@ -19,6 +19,8 @@ pub struct TextEditorCaret {
     pub shape: TextEditorCaretShape,
     pub clip_bounds: Option<Rectangle>,
     pub fallback_cell_width: f32,
+    /// Keep the shaped horizontal caret position supplied by the widget.
+    pub use_widget_x: bool,
 }
 
 impl TextEditorCaret {
@@ -56,17 +58,20 @@ impl Scope {
             && let Selection::Caret(position) = editor.selection()
         {
             let buffer = editor.buffer();
-            bounds.x = origin.x + position.x;
+            if !self.appearance.use_widget_x {
+                bounds.x = origin.x + position.x;
+            }
+            let caret_x = bounds.x - origin.x;
             bounds.y = origin.y + position.y;
             bounds.height = buffer.metrics().line_height;
             if let Some(run) = buffer
                 .layout_runs()
                 .find(|run| (run.line_top - position.y).abs() < 0.5)
                 && let Some(glyph) = run.glyphs.iter().find(|glyph| {
-                    glyph.x <= position.x + 0.1 && glyph.x + glyph.w > position.x + 0.1
+                    glyph.x <= caret_x + 0.1 && glyph.x + glyph.w > caret_x + 0.1
                 })
             {
-                bounds.width = (glyph.x + glyph.w - position.x).max(1.0);
+                bounds.width = (glyph.x + glyph.w - caret_x).max(1.0);
             }
         }
         match self.appearance.shape {

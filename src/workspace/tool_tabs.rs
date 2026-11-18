@@ -48,7 +48,7 @@ enum CloseScope {
         Arc<WorkspaceLayout>,
         Vec<(u64, SessionId)>,
     ),
-    Quit(bool),
+    Quit(super::QuitTerminalApprovals),
 }
 
 #[derive(Default)]
@@ -462,10 +462,24 @@ impl Workspace {
         )
     }
 
-    pub(super) fn guard_hosted_quit(&mut self, serial_confirmed: bool) -> Option<Task<Message>> {
-        self.guard_tool_close(
-            CloseScope::Quit(serial_confirmed),
-            self.quit_close_targets(),
+    pub(super) fn guard_hosted_quit(
+        &mut self,
+        approved: super::QuitTerminalApprovals,
+    ) -> Option<Task<Message>> {
+        self.guard_tool_close(CloseScope::Quit(approved), self.quit_close_targets())
+    }
+
+    pub(super) fn focus_pending_hosted_quit(&mut self) -> Option<Task<Message>> {
+        let pending = self
+            .tool_close
+            .0
+            .as_ref()
+            .filter(|pending| matches!(pending.scope, CloseScope::Quit(_)))?;
+        let awaiting = pending.awaiting;
+        Some(
+            awaiting
+                .and_then(|id| self.focus_close_target(id))
+                .unwrap_or_else(Task::none),
         )
     }
 
@@ -730,6 +744,19 @@ impl Workspace {
             }
             return task;
         }
+        let pending = match pending {
+            PendingClose {
+                scope: CloseScope::Quit(approved),
+                targets,
+                ..
+            } if self.next_quit_terminal_review(&approved).is_some() => {
+                for target in targets {
+                    self.cancel_close_target(target);
+                }
+                return self.continue_quit(approved);
+            }
+            pending => pending,
+        };
         let mut tasks = Vec::new();
         for target in pending.targets {
             match target {
@@ -781,7 +808,7 @@ impl Workspace {
             CloseScope::Tab => Task::none(),
             CloseScope::Window(owner, user) => self.close_window_inner(owner, user),
             CloseScope::Batch(owner, batch) => self.apply_tab_batch_close(owner, batch),
-            CloseScope::Quit(confirmed) => self.quit_confirmed(confirmed),
+            CloseScope::Quit(approved) => self.continue_quit(approved),
             CloseScope::Project(..) => unreachable!("project handled before removing tool tabs"),
         });
         Task::batch(tasks)

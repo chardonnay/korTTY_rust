@@ -18,6 +18,7 @@ pub(super) const REMOVE: u8 = 13;
 pub(super) const MKDIR: u8 = 14;
 pub(super) const RMDIR: u8 = 15;
 pub(super) const REALPATH: u8 = 16;
+pub(super) const READLINK: u8 = 19;
 pub(super) const STAT: u8 = 17;
 pub(super) const RENAME: u8 = 18;
 pub(super) const STATUS: u8 = 101;

@@ -139,7 +139,10 @@ struct Page {
     outbound_followup: Option<modularization::automatic::OutboundFollowup>,
     cli_save: Option<Arc<remote::CliAuthority>>,
     diagram_preview: Option<iced::widget::svg::Handle>,
+    diagram_background_draft: Option<String>,
     diagram_window: Option<window::Id>,
+    dock_saved_progress: bool,
+    session_apply_runs: HashSet<SnippetId>,
 }
 
 enum State {
@@ -353,6 +356,20 @@ pub(crate) enum HistoryChange {
     DiscardRecovery,
 }
 
+pub(super) struct Presentation {
+    pub(super) side_panel: analysis::panel::Preferences,
+    pub(super) side_space: f32,
+    pub(super) apply_progress_dock: bool,
+    pub(super) auto_diagram: bool,
+    pub(super) auto_plan: bool,
+    pub(super) report_font: Option<u8>,
+    pub(super) diagram_options_expanded: bool,
+    pub(super) project_diagram_visible: bool,
+    pub(super) snippet_diagram_horizontal: bool,
+    pub(super) diagram_appearance: crate::diagram_window::appearance::Preferences,
+    pub(super) system_dark: bool,
+}
+
 impl Tabs {
     pub(super) fn editor(&mut self) {
         self.invalidate_knowledge_reviews();
@@ -386,21 +403,29 @@ impl Tabs {
 
     pub(super) fn view(
         &self,
-        auto_diagram: bool,
-        auto_plan: bool,
+        presentation: Presentation,
         window: &SnippetWindow,
         config: Option<&Configuration>,
         cli: bool,
     ) -> AnalysisPane<'_> {
+        let current = self.active.and_then(|subject| self.page(subject));
+        let side = (self.export.is_none() && presentation.side_panel.visible())
+            .then_some(presentation.side_panel)
+            .filter(|_| current.is_some_and(|page| page.can_dock(window)));
+        let mut progress_extent = 0.0;
         let page = self.export.as_ref().map(reports::view).or_else(|| {
-            let page = self.page(self.active?)?;
-            Some(analysis::view(&page.view(
-                auto_diagram,
-                auto_plan,
-                window,
-                config,
-                cli,
-            )))
+            let page = current?;
+            let side_space = presentation.side_space;
+            let mut view = page.view(presentation, window, config, cli);
+            if view.progress_requested {
+                let panel_width = side.and_then(|panel| panel.fitted_width(side_space));
+                let available = panel_width.map_or(side_space - 420.0, |width| {
+                    analysis::panel::remaining_space(side_space, width)
+                });
+                view.progress_dock_width = analysis::progress::dock_width(available);
+                progress_extent = view.progress_dock_width.unwrap_or_default();
+            }
+            Some(analysis::view(&view))
         });
         AnalysisPane {
             tabs: self
@@ -410,6 +435,8 @@ impl Tabs {
                 .collect(),
             active: self.active,
             page,
+            side,
+            progress_extent,
         }
     }
 
@@ -473,7 +500,10 @@ impl Page {
             outbound_followup: None,
             cli_save: None,
             diagram_preview: None,
+            diagram_background_draft: None,
             diagram_window: None,
+            dock_saved_progress: false,
+            session_apply_runs: HashSet::new(),
         }
     }
 
@@ -505,10 +535,62 @@ impl Page {
             .is_some_and(|record| self.hash.as_deref() != Some(record.source.sha256.as_str()))
     }
 
+    fn can_dock(&self, window: &SnippetWindow) -> bool {
+        matches!(self.state, State::Ready)
+            && matches!(self.subject, Subject::Snippet(id) if window.selected_id() == Some(id))
+    }
+
+    fn apply_progress(&self) -> Option<analysis::progress::Content<'_>> {
+        use analysis::progress::Content;
+
+        match &self.state {
+            State::Applying(run) => Some(Content::Live {
+                status: run.status(),
+                update: run.live.as_ref(),
+            }),
+            State::FolderApplying(run) => Some(Content::Live {
+                status: "Generating changes for review…",
+                update: run.live.as_ref(),
+            }),
+            State::SavingApply(_) => Some(Content::Live {
+                status: "Saving the apply proposal…",
+                update: None,
+            }),
+            State::ReviewApply(review) => {
+                let view = review.details(false, false);
+                Some(Content::Saved {
+                    record: view.pre_id,
+                    run: view.run,
+                    review: false,
+                })
+            }
+            State::Ready => {
+                let record = self.record()?;
+                if let Some(recovery) = &record.apply_recovery {
+                    let (completed, total) = recovery.stage_progress();
+                    Some(Content::Interrupted { completed, total })
+                } else if let Some(run) = record.apply_runs.first() {
+                    Some(Content::Saved {
+                        record: record.id,
+                        run,
+                        review: true,
+                    })
+                } else {
+                    record
+                        .java_history
+                        .as_ref()?
+                        .apply_runs
+                        .last()
+                        .map(Content::Imported)
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn view(
         &self,
-        auto_diagram: bool,
-        auto_plan: bool,
+        presentation: Presentation,
         window: &SnippetWindow,
         config: Option<&Configuration>,
         cli: bool,
@@ -557,7 +639,21 @@ impl Page {
             .filter(|file| file.included)
             .map(|file| file.bytes)
             .sum::<usize>();
+        let apply_progress = self.apply_progress();
+        let progress_requested = presentation.apply_progress_dock
+            && apply_progress.is_some_and(|content| {
+                self.dock_saved_progress || content.follows_live(&self.session_apply_runs)
+            });
         analysis::View {
+            side_open: self.can_dock(window)
+                && presentation.side_panel.visible()
+                && presentation
+                    .side_panel
+                    .fitted_width(presentation.side_space)
+                    .is_some(),
+            side_panel: self
+                .can_dock(window)
+                .then_some(presentation.side_panel.visible()),
             subject: self.subject,
             name: &self.name,
             profiles: &self.profiles,
@@ -584,11 +680,9 @@ impl Page {
                 }
                 _ => None,
             },
-            apply_live: match &self.state {
-                State::Applying(run) => run.live.as_ref(),
-                State::FolderApplying(run) => run.live.as_ref(),
-                _ => None,
-            },
+            apply_progress,
+            progress_requested,
+            progress_dock_width: None,
             stale: self.stale(),
             status: self.status.as_deref(),
             instructions: &self.instructions,
@@ -602,8 +696,18 @@ impl Page {
                 .record()
                 .and_then(|record| verification::preferred_run(record, self.hash.as_deref())),
             show_resolved: self.show_resolved,
-            auto_diagram,
-            auto_plan,
+            auto_diagram: presentation.auto_diagram,
+            auto_plan: presentation.auto_plan,
+            diagram_options_expanded: presentation.diagram_options_expanded,
+            project_diagram_visible: presentation.project_diagram_visible,
+            snippet_diagram_horizontal: presentation.snippet_diagram_horizontal,
+            diagram_appearance: presentation.diagram_appearance,
+            diagram_background_draft: self.diagram_background_draft.as_deref(),
+            system_dark: presentation.system_dark,
+            report_font: presentation
+                .report_font
+                .unwrap_or(analysis::DEFAULT_REPORT_FONT)
+                .clamp(analysis::MIN_REPORT_FONT, analysis::MAX_REPORT_FONT),
             diagram_preview: self.diagram_preview.as_ref(),
             can_generate_diagram: self.record().is_some_and(|record| {
                 record.source.content.is_some()
@@ -747,6 +851,30 @@ impl Page {
 }
 
 impl Workspace {
+    pub(super) fn reopen_snippet_analysis_panel(&mut self, id: window::Id) -> Task<Message> {
+        if !self.window_settings.snippet_analysis_panel.visible() {
+            return Task::none();
+        }
+        let subject = self.snippets.get(&id).and_then(|surface| {
+            let window = &surface.window;
+            let snippet = window.selected_id()?;
+            let subject = Subject::Snippet(snippet);
+            (surface.analysis.active.is_none()
+                && window.owns_editor(snippet)
+                && (surface
+                    .analysis
+                    .page(subject)
+                    .is_some_and(|page| page.record().is_some())
+                    || store(window)
+                        .and_then(|store| store.has_history(subject))
+                        .unwrap_or(false)))
+            .then_some(subject)
+        });
+        subject.map_or_else(Task::none, |subject| {
+            self.open_snippet_analysis(id, subject)
+        })
+    }
+
     pub(in crate::workspace) fn refresh_snippet_analysis_profile_choices(
         &mut self,
         configuration: Option<&Configuration>,
@@ -889,6 +1017,11 @@ impl Workspace {
         let mut page = Page::loading(subject, token);
         page.hardening =
             analysis::hardening::Draft::new(self.window_settings.snippet_hardening.clone());
+        page.hardening.set_classic_open(
+            self.window_settings
+                .snippet_analysis_hardening_expanded
+                .unwrap_or(false),
+        );
         page.configure(config.as_deref());
         page.suggest_skills(&surface.window, config.as_deref());
         let store = store(&surface.window);
@@ -928,6 +1061,21 @@ impl Workspace {
         {
             return Task::none();
         }
+        if let Action::ProgressDock(visible) = action {
+            if let Some(page) = self
+                .snippets
+                .get_mut(&id)
+                .and_then(|surface| surface.analysis.current_mut())
+                .filter(|page| page.apply_progress().is_some())
+            {
+                page.dock_saved_progress = visible;
+                if self.window_settings.snippet_apply_progress_dock != Some(visible) {
+                    self.window_settings.snippet_apply_progress_dock = Some(visible);
+                    self.save_window_settings(Some(id));
+                }
+            }
+            return Task::none();
+        }
         if self.snippets.get(&id).is_some_and(|surface| {
             surface.window.analysis_apply_locked()
                 || surface
@@ -941,6 +1089,33 @@ impl Workspace {
             return Task::none();
         }
         match action {
+            Action::SidePanel(_) | Action::ResizeSidePanel { .. } => {
+                let dockable = self.snippets.get(&id).is_some_and(|surface| {
+                    surface
+                        .analysis
+                        .active
+                        .and_then(|subject| surface.analysis.page(subject))
+                        .is_some_and(|page| page.can_dock(&surface.window))
+                });
+                if dockable {
+                    let preferences = &mut self.window_settings.snippet_analysis_panel;
+                    match action {
+                        Action::SidePanel(visible) if preferences.visible != Some(visible) => {
+                            preferences.visible = Some(visible);
+                            self.save_window_settings(Some(id));
+                        }
+                        Action::ResizeSidePanel { available, width } if preferences.visible() => {
+                            if let Some(width) = preferences.resized_width(width, available) {
+                                preferences.width = Some(width);
+                                self.snippet_structure_save_at =
+                                    Some(Instant::now() + super::STRUCTURE_PREFERENCE_DELAY);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                return Task::none();
+            }
             Action::Apply(action) => return self.update_snippet_apply(id, action),
             Action::Modularization(action) => {
                 return self.update_snippet_modularization(id, action);
@@ -963,6 +1138,92 @@ impl Workspace {
             Action::ConfirmCli(token) => return self.start_snippet_analysis(id, Some(token)),
             Action::Diagram => return self.open_saved_snippet_diagram(id),
             Action::GenerateDiagram => return self.review_snippet_diagram(id),
+            Action::ProjectDiagramVisible(visible) => {
+                let subject = self
+                    .snippets
+                    .get(&id)
+                    .and_then(|surface| surface.analysis.active);
+                if matches!(subject, Some(Subject::Folder(_)))
+                    && self
+                        .window_settings
+                        .snippet_analysis_project_diagram_visible
+                        != Some(visible)
+                {
+                    self.window_settings
+                        .snippet_analysis_project_diagram_visible = Some(visible);
+                    self.save_window_settings(Some(id));
+                }
+                return Task::none();
+            }
+            Action::DiagramOptions(expanded) => {
+                if self
+                    .snippets
+                    .get(&id)
+                    .and_then(|surface| {
+                        surface
+                            .analysis
+                            .active
+                            .and_then(|subject| surface.analysis.page(subject))
+                    })
+                    .and_then(Page::record)
+                    .is_some()
+                {
+                    self.set_analysis_diagram_options(id, expanded);
+                }
+                return Task::none();
+            }
+            Action::DiagramAppearance(edit) => {
+                let preferences = self.window_settings.snippet_diagram_appearance;
+                let system_dark = self.journal_system_dark();
+                if let Some(page) = self
+                    .snippets
+                    .get_mut(&id)
+                    .and_then(|surface| surface.analysis.current_mut())
+                    .filter(|page| page.record().is_some())
+                    && let Some(next) =
+                        preferences.edit(system_dark, &mut page.diagram_background_draft, edit)
+                {
+                    self.set_snippet_diagram_appearance(id, next);
+                }
+                return Task::none();
+            }
+            Action::DiagramLayout(horizontal) => {
+                if self
+                    .snippets
+                    .get(&id)
+                    .and_then(|surface| {
+                        surface
+                            .analysis
+                            .active
+                            .and_then(|subject| surface.analysis.page(subject))
+                    })
+                    .and_then(Page::record)
+                    .is_some()
+                {
+                    self.set_snippet_diagram_layout(id, horizontal);
+                }
+                return Task::none();
+            }
+            Action::ReportFont(size) => {
+                if (analysis::MIN_REPORT_FONT..=analysis::MAX_REPORT_FONT).contains(&size)
+                    && self
+                        .snippets
+                        .get(&id)
+                        .and_then(|surface| {
+                            surface
+                                .analysis
+                                .active
+                                .and_then(|subject| surface.analysis.page(subject))
+                        })
+                        .and_then(Page::record)
+                        .is_some()
+                    && self.window_settings.snippet_analysis_report_font_size != Some(size)
+                {
+                    self.window_settings.snippet_analysis_report_font_size = Some(size);
+                    self.save_window_settings(Some(id));
+                }
+                return Task::none();
+            }
             Action::AutoDiagram(enabled) => {
                 if self.window_settings.snippet_analysis_auto_diagram != enabled {
                     self.window_settings.snippet_analysis_auto_diagram = enabled;
@@ -1013,7 +1274,13 @@ impl Workspace {
             }
             Action::Export => return self.export_current_snippet_analysis(id),
             Action::Reports(action) => return self.update_snippet_analysis_reports(id, action),
-            Action::Jump { file, line } => return self.jump_from_snippet_analysis(id, file, line),
+            Action::Jump {
+                file,
+                line,
+                keep_panel,
+            } => {
+                return self.jump_from_snippet_analysis(id, file, line, keep_panel);
+            }
             _ => {}
         }
         let Some(surface) = self.snippets.get_mut(&id) else {
@@ -2079,6 +2346,7 @@ impl Workspace {
         id: window::Id,
         file: Option<String>,
         line: usize,
+        keep_panel: bool,
     ) -> Task<Message> {
         let Some(surface) = self.snippets.get(&id) else {
             return Task::none();
@@ -2119,6 +2387,9 @@ impl Workspace {
         let Some(surface) = self.snippets.get_mut(&id) else {
             return open;
         };
+        if !keep_panel {
+            surface.analysis.editor();
+        }
         if surface.window.jump_to_analysis_line(snippet, line) {
             Task::batch([
                 open,
@@ -2485,6 +2756,226 @@ mod tests {
     use crate::ai_manager::ProfileId;
     use crate::snippet_analysis::model::ProjectFileNote;
     use crate::snippets::{Input, Library, Metadata, tests::Profile};
+
+    #[test]
+    fn apply_progress_dock_follows_current_session_runs_and_respects_available_space() {
+        use crate::snippet_analysis::model::{ApplyRun, ChangeReason};
+
+        let scratch = Profile::new();
+        let mut library = Library::open(scratch.path()).unwrap();
+        let snippet = library
+            .save(
+                None,
+                Input {
+                    name: "Example".into(),
+                    language: "bash".into(),
+                    category: String::new(),
+                    content: "echo ok".into(),
+                },
+            )
+            .unwrap();
+        let subject = Subject::Snippet(snippet);
+        let mut window = SnippetWindow::open(scratch.path()).unwrap();
+        let _ = window.update(SnippetMessage::Open(snippet));
+        let mut record = Record::new(
+            Purpose::Analysis,
+            None,
+            Source::new("echo ok", "bash", "en", "en", "Example").unwrap(),
+            Provenance::default(),
+            Analysis::default(),
+        )
+        .unwrap();
+        let run = ApplyRun::new(
+            "echo ok".into(),
+            "printf ok".into(),
+            Selection {
+                findings: vec!["I1".into()],
+                ..Selection::default()
+            },
+            vec![ChangeReason {
+                id: "I1".into(),
+                reason: "Use printf".into(),
+                anchor: None,
+            }],
+            1,
+        )
+        .unwrap();
+        let run_id = run.id;
+        record.apply_runs.push(run);
+        let mut page = Page::loading(subject, 1);
+        page.state = State::Ready;
+        page.history = Some(Arc::new(History {
+            subject,
+            records: vec![record],
+            revision: 1,
+            updated_at: 1,
+        }));
+        let mut tabs = Tabs {
+            active: Some(subject),
+            pages: vec![page],
+            export: None,
+        };
+        let presentation = |space, enabled| Presentation {
+            side_panel: analysis::panel::Preferences {
+                visible: Some(true),
+                width: Some(520),
+            },
+            side_space: space,
+            apply_progress_dock: enabled,
+            auto_diagram: false,
+            auto_plan: false,
+            report_font: None,
+            diagram_options_expanded: false,
+            project_diagram_visible: true,
+            snippet_diagram_horizontal: false,
+            diagram_appearance: Default::default(),
+            system_dark: false,
+        };
+        let rendered = tabs.view(presentation(1200.0, true), &window, None, false);
+        assert_eq!(rendered.progress_extent, 0.0);
+        assert!(rendered.side.is_some());
+        drop(rendered);
+        tabs.pages[0].session_apply_runs.insert(run_id);
+        assert_eq!(
+            tabs.view(presentation(1200.0, true), &window, None, false)
+                .progress_extent,
+            400.0
+        );
+        assert_eq!(
+            tabs.view(presentation(700.0, true), &window, None, false)
+                .progress_extent,
+            0.0
+        );
+        assert_eq!(
+            tabs.view(presentation(1200.0, false), &window, None, false)
+                .progress_extent,
+            0.0
+        );
+        tabs.pages[0].session_apply_runs.clear();
+        tabs.pages[0].dock_saved_progress = true;
+        assert_eq!(
+            tabs.view(presentation(1200.0, true), &window, None, false)
+                .progress_extent,
+            400.0
+        );
+    }
+
+    #[test]
+    fn visible_analysis_panel_reopens_only_for_an_editor_with_saved_history() {
+        let scratch = Profile::new();
+        let mut library = Library::open(scratch.path()).unwrap();
+        let id = library
+            .save(
+                None,
+                Input {
+                    name: "Example".into(),
+                    language: "bash".into(),
+                    category: String::new(),
+                    content: "echo ok".into(),
+                },
+            )
+            .unwrap();
+        let subject = Subject::Snippet(id);
+        let mut editor = SnippetWindow::open(scratch.path()).unwrap();
+        let _ = editor.update(SnippetMessage::Open(id));
+        let history = store(&editor).unwrap();
+        let mut workspace = Workspace::default();
+        workspace.window_settings.snippet_analysis_panel.visible = Some(true);
+        let (owner, _) = workspace.open_window(false);
+        let (window, _) = workspace.install_snippet_surface(owner, editor, true);
+        assert!(workspace.snippets[&window].analysis.active.is_none());
+
+        history
+            .append(
+                subject,
+                Record::new(
+                    Purpose::Analysis,
+                    None,
+                    Source::new("echo ok", "bash", "en", "en", "Example").unwrap(),
+                    Provenance::default(),
+                    Analysis::default(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        let _ = workspace.reopen_snippet_analysis_panel(window);
+        let surface = workspace.snippets.get_mut(&window).unwrap();
+        assert_eq!(surface.analysis.active, Some(subject));
+        let page = surface.analysis.page_mut(subject).unwrap();
+        assert!(!page.can_dock(&surface.window));
+        page.state = State::Ready;
+        assert!(page.can_dock(&surface.window));
+        let _ = surface.window.update(SnippetMessage::New);
+        assert!(!page.can_dock(&surface.window));
+    }
+
+    #[test]
+    fn project_diagram_visibility_is_independent_of_single_snippet_and_auto_generation() {
+        let scratch = Profile::new();
+        let window = SnippetWindow::open(scratch.path()).unwrap();
+        let folder = Subject::Folder(
+            crate::snippets::folders::Id::from_java_uuid("f0ae8771-f373-4988-b6c3-45336e174e1a")
+                .unwrap(),
+        );
+        let snippet = Subject::Snippet(SnippetId::new().unwrap());
+        for (subject, visible) in [(folder, false), (snippet, true)] {
+            let page = Page::loading(subject, 1);
+            let view = page.view(
+                Presentation {
+                    side_panel: Default::default(),
+                    side_space: 0.0,
+                    apply_progress_dock: true,
+                    auto_diagram: true,
+                    auto_plan: false,
+                    report_font: None,
+                    diagram_options_expanded: false,
+                    project_diagram_visible: false,
+                    snippet_diagram_horizontal: false,
+                    diagram_appearance: Default::default(),
+                    system_dark: false,
+                },
+                &window,
+                None,
+                false,
+            );
+            assert_eq!(view.diagram_visible(), visible);
+            assert!(view.auto_diagram);
+        }
+    }
+
+    #[test]
+    fn analysis_diagram_options_only_apply_to_windows_owned_by_an_analysis_page() {
+        let scratch = Profile::new();
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let (window, _) = workspace.install_snippet_surface(
+            owner,
+            SnippetWindow::open(scratch.path()).unwrap(),
+            true,
+        );
+        let diagram = window::Id::unique();
+        let standalone = window::Id::unique();
+        let subject = Subject::Snippet(SnippetId::new().unwrap());
+        let mut page = Page::loading(subject, 1);
+        page.diagram_window = Some(diagram);
+        workspace
+            .snippets
+            .get_mut(&window)
+            .unwrap()
+            .analysis
+            .pages
+            .push(page);
+        workspace
+            .window_settings
+            .snippet_analysis_diagram_options_expanded = None;
+        assert_eq!(workspace.analysis_diagram_options(diagram), Some(false));
+        assert_eq!(workspace.analysis_diagram_options(standalone), None);
+        workspace
+            .window_settings
+            .snippet_analysis_diagram_options_expanded = Some(true);
+        assert_eq!(workspace.analysis_diagram_options(diagram), Some(true));
+        assert_eq!(workspace.analysis_diagram_options(standalone), None);
+    }
 
     #[test]
     fn snippet_rerun_preserves_exact_saved_policy_or_legacy_reference() {

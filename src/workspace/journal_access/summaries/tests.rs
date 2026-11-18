@@ -1464,8 +1464,9 @@ fn check_summary_https_approval(model: Option<&str>, loopback: bool) {
     let _ = summary(&mut workspace, manager, Event::SaveSettings);
     assert!(authority.authorize().is_err());
     assert_eq!(Queue::load(&profile_root).unwrap().pending().len(), 1);
+    let credential = authority.credential();
     let (run, _cancel) =
-        Run::begin_reviewed_https(transport, move || authority.authorize()).unwrap();
+        Run::begin_reviewed_https(transport, credential, move || authority.authorize()).unwrap();
     assert_eq!(
         run.preflight().unwrap_err().kind(),
         ErrorKind::PermissionDenied

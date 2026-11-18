@@ -300,7 +300,7 @@ impl Workspace {
         }
         if !preferences.enabled
             || !preferences.vision_enabled
-            || !crate::session_journal::topic_ai_settings::vision_allowed(policy)
+            || !preferences.allows_screenshot_analysis(policy)
             || !policy
                 .terminal_logging
                 .journal_ai_screenshot_analysis()

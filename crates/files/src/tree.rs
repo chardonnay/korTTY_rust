@@ -39,10 +39,12 @@ use windows_sys::Win32::Storage::FileSystem::{
 use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
 mod lease;
+mod links;
 mod owners;
 mod reviewed;
 mod security;
 pub use lease::{ExternalLease, SmbReadLease};
+pub use links::reviewed_link_data;
 pub use owners::FileOwnerNames;
 pub use reviewed::{
     ReviewedTreeMetadata, copy_reviewed_tree_file_metadata, require_reviewed_file_basename,
@@ -711,6 +713,16 @@ impl Directory {
             return Err(invalid("The reviewed local entry changed"));
         }
         Ok(file)
+    }
+
+    /// Opens the entry itself for metadata or deletion, without following a reparse point.
+    pub fn open_link_for_review(&self, name: &OsStr, remove: bool) -> io::Result<File> {
+        let (access, share) = if remove {
+            (FILE_READ_ATTRIBUTES | SYNCHRONIZE | DELETE, FILE_SHARE_READ)
+        } else {
+            (FILE_READ_ATTRIBUTES | SYNCHRONIZE, SHARE_ALL)
+        };
+        self.open_with_share(name, access, FILE_OPEN, 0, None, share)
     }
 
     /// Checks the name after the disposition handle closed, without following links.

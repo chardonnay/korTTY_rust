@@ -6,10 +6,10 @@ use zeroize::{Zeroize as _, Zeroizing};
 use super::Mode;
 
 pub(crate) const DEFAULT_ALIAS: &str = "agent";
-pub(crate) const MAX_ALIAS_BYTES: usize = 32;
+pub(crate) const MAX_ALIAS_BYTES: usize = 8192;
 const MAX_PROMPT_BYTES: usize = 8192;
 const MAX_OPTIONS_BYTES: usize = 512;
-const MAX_INPUT_BYTES: usize = MAX_PROMPT_BYTES + MAX_OPTIONS_BYTES + 64;
+const MAX_INPUT_BYTES: usize = MAX_PROMPT_BYTES + MAX_OPTIONS_BYTES + MAX_ALIAS_BYTES + 64;
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -45,6 +45,8 @@ pub(crate) struct Invocation<'a> {
     pub(crate) mode: Mode,
     pub(crate) goal: &'a str,
     pub(crate) profile: Option<&'a str>,
+    pub(crate) ask_confirmation: bool,
+    pub(crate) auto_approve_root: bool,
 }
 
 pub(crate) enum Parsed<'a> {
@@ -67,7 +69,7 @@ impl Aliases {
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         {
             return Err(
-                "Enter an agent alias of at most 32 letters, digits, hyphens or underscores, beginning with a letter.",
+                "Enter an agent alias of at most 8 KiB using letters, digits, hyphens or underscores, beginning with a letter.",
             );
         }
         Ok(Self {
@@ -116,10 +118,17 @@ impl Aliases {
             );
         }
         let mut profile = None;
+        let mut ask_confirmation = false;
+        let mut auto_approve_root = false;
         if mode == Mode::Ask && rest.trim_start().starts_with('(') {
             return Parsed::Rejected("The Ask shortcut takes a question after the alias.");
         }
-        if let Err(error) = parse_options(&mut rest, &mut profile) {
+        if let Err(error) = parse_options(
+            &mut rest,
+            &mut profile,
+            &mut ask_confirmation,
+            &mut auto_approve_root,
+        ) {
             return Parsed::Rejected(error);
         }
         if mode == Mode::Run
@@ -130,7 +139,12 @@ impl Aliases {
         {
             mode = Mode::Plan;
             rest = flag;
-            if let Err(error) = parse_options(&mut rest, &mut profile) {
+            if let Err(error) = parse_options(
+                &mut rest,
+                &mut profile,
+                &mut ask_confirmation,
+                &mut auto_approve_root,
+            ) {
                 return Parsed::Rejected(error);
             }
         }
@@ -150,6 +164,8 @@ impl Aliases {
                 mode,
                 goal,
                 profile,
+                ask_confirmation,
+                auto_approve_root,
             })
         }
     }
@@ -211,6 +227,8 @@ fn boundary(tail: &str) -> bool {
 fn parse_options<'a>(
     rest: &mut &'a str,
     profile: &mut Option<&'a str>,
+    ask_confirmation: &mut bool,
+    auto_approve_root: &mut bool,
 ) -> Result<(), &'static str> {
     let Some(open) = rest.trim_start().strip_prefix('(') else {
         return Ok(());
@@ -231,10 +249,11 @@ fn parse_options<'a>(
         match key.trim().to_ascii_lowercase().as_str() {
             "profile" if !value.is_empty() && value.len() <= 128 => *profile = Some(value),
             "profile" => return Err("Enter a profile name after profile=."),
-            "ask" if boolean(value).is_some() => {}
-            "root" if boolean(value) == Some(false) => {}
-            "root" if boolean(value) == Some(true) => {
-                return Err("Approve elevated commands individually in the agent activity window.");
+            "ask" if boolean(value).is_some() => {
+                *ask_confirmation = boolean(value).unwrap_or(false);
+            }
+            "root" if boolean(value).is_some() => {
+                *auto_approve_root = boolean(value).unwrap_or(false);
             }
             "root" | "ask" => return Err("Enter true or false for the agent approval option."),
             _ => return Err("Unknown agent shortcut option."),
@@ -399,6 +418,56 @@ mod tests {
     use super::*;
 
     #[test]
+    fn inline_root_bypass_preserves_plan_options_and_last_value() {
+        let aliases = Aliases::new("agent", false).unwrap();
+        for command in [
+            "agent(root=true,ask=true) inspect",
+            "agent-plan(root=yes,ask=yes) inspect",
+            "agent(root=on) -plan(ask=1) inspect",
+        ] {
+            assert!(
+                matches!(aliases.parse(command), Parsed::Ready(invocation) if invocation.auto_approve_root && invocation.ask_confirmation)
+            );
+        }
+        assert!(
+            matches!(aliases.parse("agent(root=true,root=false) inspect"), Parsed::Ready(invocation) if !invocation.auto_approve_root)
+        );
+        assert!(matches!(
+            aliases.parse("agent(root=invalid) inspect"),
+            Parsed::Rejected(_)
+        ));
+    }
+
+    #[test]
+    fn inline_ask_option_is_carried_into_the_invocation() {
+        let aliases = Aliases::new("agent", false).unwrap();
+        assert!(
+            matches!(aliases.parse("agent(ask=yes) inspect"), Parsed::Ready(invocation) if invocation.ask_confirmation)
+        );
+        assert!(
+            matches!(aliases.parse("agent(ask=no) inspect"), Parsed::Ready(invocation) if !invocation.ask_confirmation)
+        );
+    }
+
+    #[test]
+    fn long_java_command_names_keep_all_modes_and_the_full_prompt_budget() {
+        let name = "inspect".repeat(8);
+        let aliases = Aliases::new(&name, true).unwrap();
+        for (suffix, expected) in [("", Mode::Run), ("-ask", Mode::Ask), ("-plan", Mode::Plan)] {
+            assert!(
+                aliases.alias_mode(&format!("{}{suffix}", name.to_uppercase())) == Some(expected)
+            );
+        }
+        let name = "a".repeat(MAX_ALIAS_BYTES);
+        let goal = "b".repeat(MAX_PROMPT_BYTES);
+        let aliases = Aliases::new(&name, false).unwrap();
+        assert!(
+            matches!(aliases.parse(&format!("{name}-ask {goal}")), Parsed::Ready(invocation) if invocation.mode == Mode::Ask && invocation.goal == goal)
+        );
+        assert!(Aliases::new(&format!("{name}a"), false).is_err());
+    }
+
+    #[test]
     fn agent_alias_completion_only_matches_captured_variants_and_empty_goals() {
         let aliases = Aliases::new("inspect", true).unwrap();
         assert_eq!(
@@ -444,7 +513,7 @@ mod tests {
         assert!(matches!(aliases.parse("inspect-plan"), Parsed::Incomplete));
         assert!(matches!(
             aliases.parse("inspect(root=true) elevated"),
-            Parsed::Rejected(_)
+            Parsed::Ready(invocation) if invocation.auto_approve_root
         ));
         assert!(matches!(
             aliases.parse(&format!("inspect {}", "a".repeat(MAX_PROMPT_BYTES + 1))),

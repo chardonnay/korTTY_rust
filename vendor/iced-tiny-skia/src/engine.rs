@@ -378,14 +378,8 @@ impl Engine {
                     return;
                 };
 
-                let physical_bounds =
-                    Rectangle::new(*position, editor.bounds) * transformation;
-
-                if !clip_bounds.intersects(&physical_bounds) {
-                    return;
-                }
-
-                let clip_mask = clip_mask.clip(clip_bounds, physical_bounds);
+                // The viewport is fixed even when the shaped text origin scrolls.
+                let clip_mask = Some(clip_mask.viewport(clip_bounds));
 
                 self.text_pipeline.draw_editor(
                     editor,

@@ -3,7 +3,7 @@ use std::fmt;
 use kortty_terminal::{Color, CursorShape, Palette, Style};
 use serde::{Deserialize, Serialize};
 
-use super::{Rgb, Scheme};
+use super::{CursorStyle, Rgb, Scheme};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -58,6 +58,8 @@ pub(crate) struct Colors {
     pub(crate) foreground: Option<Rgb>,
     pub(crate) background: Option<Rgb>,
     pub(crate) cursor: Option<Rgb>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) cursor_style: Option<CursorStyle>,
     pub(crate) cursor_blink: Option<bool>,
     pub(crate) sgr_enabled: bool,
     pub(crate) selection: Rgb,
@@ -70,6 +72,7 @@ impl Default for Colors {
             foreground: None,
             background: None,
             cursor: None,
+            cursor_style: None,
             cursor_blink: None,
             sgr_enabled: true,
             selection: Self::DEFAULT_SELECTION,
@@ -87,7 +90,10 @@ impl Colors {
 
     pub(crate) fn appearance(self, scheme: Option<Scheme>) -> Appearance {
         let defaults = Scheme::default();
-        let style = scheme.unwrap_or(defaults).cursor_style;
+        let style = scheme
+            .map(|theme| theme.cursor_style)
+            .or(self.cursor_style)
+            .unwrap_or(defaults.cursor_style);
         let (cursor_shape, blinking) = style.behavior();
         let foreground = scheme.map(|theme| theme.foreground).or(self.foreground);
         let background = scheme.map(|theme| theme.background).or(self.background);

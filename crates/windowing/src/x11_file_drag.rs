@@ -430,7 +430,7 @@ impl Worker<'_> {
             };
             if let Some(version) = self.property(recipient, self.atoms.XdndAware, AtomEnum::ATOM)?
                 && version >= 3
-                && let Some(client) = self.client(window)?
+                && let Some(client) = self.client(recipient)?
             {
                 return Ok(Some(Target {
                     window,
@@ -688,21 +688,45 @@ mod tests {
     #[test]
     #[ignore = "requires a private X server with XTEST and X-Resource"]
     fn native_xdnd_copy_requires_the_selected_target_and_drop() -> Result<()> {
+        native_xdnd_copy(false)?;
+        native_xdnd_copy(true)
+    }
+
+    fn native_xdnd_copy(proxied: bool) -> Result<()> {
         use x11rb::protocol::xproto::{BUTTON_PRESS_EVENT, BUTTON_RELEASE_EVENT};
         use x11rb::protocol::xtest::ConnectionExt as _;
 
         let (source, screen) = x11rb::connect(None)?;
-        let (target, _) = x11rb::connect(None)?;
+        let (host, _) = x11rb::connect(None)?;
+        let (proxy, _) = x11rb::connect(None)?;
         let (stranger, _) = x11rb::connect(None)?;
         let root = source.setup().roots[screen].root;
         let source_window = mapped_window(&source, root, 10)?;
-        let target_window = mapped_window(&target, root, 210)?;
+        let target_window = mapped_window(&host, root, 210)?;
         let stranger_window = mapped_window(&stranger, root, 410)?;
-        let atoms = Atoms::new(&target)?.reply()?;
+        let (target, recipient) = if proxied {
+            (&proxy, mapped_window(&proxy, root, 610)?)
+        } else {
+            (&host, target_window)
+        };
+        let atoms = Atoms::new(target)?.reply()?;
+        if proxied {
+            for (connection, window) in [(&host, target_window), (&proxy, recipient)] {
+                connection
+                    .change_property32(
+                        PropMode::REPLACE,
+                        window,
+                        atoms.XdndProxy,
+                        AtomEnum::WINDOW,
+                        &[recipient],
+                    )?
+                    .check()?;
+            }
+        }
         target
             .change_property32(
                 PropMode::REPLACE,
-                target_window,
+                recipient,
                 atoms.XdndAware,
                 AtomEnum::ATOM,
                 &[VERSION],
@@ -755,17 +779,17 @@ mod tests {
         source
             .warp_pointer(x11rb::NONE, root, 0, 0, 0, 0, 230, 30)?
             .check()?;
-        let enter = message(&target, atoms.XdndEnter)?;
+        let enter = message(target, atoms.XdndEnter)?;
         assert_eq!(enter.window, target_window);
         assert_eq!(
             enter.data.as_data32(),
             [selection_owner, VERSION << 24, atoms.URI_LIST, 0, 0]
         );
-        let position = message(&target, atoms.XdndPosition)?;
+        let position = message(target, atoms.XdndPosition)?;
         assert_eq!(position.data.as_data32()[4], atoms.XdndActionCopy);
         let timestamp = position.data.as_data32()[3];
         assert_ne!(timestamp, 0);
-        assert!(convert(&target, &atoms, target_window, timestamp)?.is_none());
+        assert!(convert(target, &atoms, recipient, timestamp)?.is_none());
         target
             .send_event(
                 false,
@@ -782,11 +806,14 @@ mod tests {
         source
             .xtest_fake_input(BUTTON_RELEASE_EVENT, 1, 0, root, 0, 0, 0)?
             .check()?;
-        let dropped = message(&target, atoms.XdndDrop)?;
+        let dropped = message(target, atoms.XdndDrop)?;
         assert_eq!(dropped.data.as_data32()[0], selection_owner);
         let timestamp = dropped.data.as_data32()[2];
         assert!(convert(&stranger, &atoms, stranger_window, timestamp)?.is_none());
-        let files = convert(&target, &atoms, target_window, timestamp)?.ok_or("no URI data")?;
+        if proxied {
+            assert!(convert(&host, &atoms, target_window, timestamp)?.is_none());
+        }
+        let files = convert(target, &atoms, recipient, timestamp)?.ok_or("no URI data")?;
         assert_eq!(files.as_slice(), file_uris(&paths).unwrap().as_ref());
         assert_eq!(std::fs::read(&paths[0])?, b"first fixture");
         assert_eq!(std::fs::read(&paths[1])?, b"second fixture");

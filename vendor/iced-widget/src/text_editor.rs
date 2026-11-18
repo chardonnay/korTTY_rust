@@ -53,7 +53,7 @@ use crate::core::{
 };
 
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, Ref, RefCell};
 use std::fmt;
 use std::ops;
 use std::ops::DerefMut;
@@ -62,6 +62,19 @@ use std::sync::Arc;
 pub use text::editor::{
     Action, Cursor, Edit, Line, LineEnding, Motion, Position, Selection,
 };
+
+mod horizontal;
+
+/// Measurements of the shaped lines in the editor's visible viewport.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct HorizontalMetrics {
+    /// Leftmost position of the visible lines. Right-aligned text can overflow to the left.
+    pub left: f32,
+    /// Rightmost position of the visible lines that can overflow to the right.
+    pub right: f32,
+    /// Horizontal position of the active caret, when visible vertically.
+    pub caret_x: Option<f32>,
+}
 
 /// A multi-line text input.
 ///
@@ -119,6 +132,7 @@ pub struct TextEditor<
     max_height: f32,
     padding: Padding,
     wrapping: Wrapping,
+    horizontal_metrics: Option<fn(&Renderer::Editor) -> HorizontalMetrics>,
     class: Theme::Class<'a>,
     key_binding: Option<Box<dyn Fn(KeyPress) -> Option<Binding<Message>> + 'a>>,
     on_edit: Option<Box<dyn Fn(Action) -> Message + 'a>>,
@@ -151,6 +165,7 @@ where
             max_height: f32::INFINITY,
             padding: Padding::new(5.0),
             wrapping: Wrapping::default(),
+            horizontal_metrics: None,
             class: <Theme as Catalog>::default(),
             key_binding: None,
             on_edit: None,
@@ -256,6 +271,16 @@ where
         self
     }
 
+    /// Disables wrapping and enables horizontal navigation with shaped metrics.
+    pub fn horizontal_scroll(
+        mut self,
+        metrics: fn(&Renderer::Editor) -> HorizontalMetrics,
+    ) -> Self {
+        self.wrapping = Wrapping::None;
+        self.horizontal_metrics = Some(metrics);
+        self
+    }
+
     /// Highlights the [`TextEditor`] using the given syntax and theme.
     #[cfg(feature = "highlighter")]
     pub fn highlight(
@@ -298,6 +323,7 @@ where
             max_height: self.max_height,
             padding: self.padding,
             wrapping: self.wrapping,
+            horizontal_metrics: self.horizontal_metrics,
             class: self.class,
             key_binding: self.key_binding,
             on_edit: self.on_edit,
@@ -353,21 +379,29 @@ where
         let bounds = layout.bounds();
         let internal = self.content.0.borrow_mut();
 
-        let text_bounds = bounds.shrink(self.padding);
-        let translation = text_bounds.position() - Point::ORIGIN;
+        let text_bounds = bounds.shrink(self.content_padding());
+        let viewport = self.horizontal_viewport(state, &internal.editor, text_bounds.width);
+        let translation = text_bounds.position() - Point::ORIGIN
+            - Vector::new(viewport.offset, 0.0);
 
-        let cursor = match internal.editor.selection() {
+        let mut cursor = match internal.editor.selection() {
             Selection::Caret(position) => position,
             Selection::Range(ranges) => {
                 ranges.first().cloned().unwrap_or_default().position()
             }
         };
+        if let Some(x) = viewport.caret_x() {
+            cursor.x = x;
+        }
 
         let line_height = self.line_height.to_absolute(
             self.text_size.unwrap_or_else(|| renderer.default_size()),
         );
 
-        let position = cursor + translation;
+        let mut position = cursor + translation;
+        if self.horizontal_metrics.is_some() {
+            position.x = position.x.clamp(text_bounds.x, text_bounds.x + text_bounds.width);
+        }
 
         InputMethod::Enabled {
             cursor: Rectangle::new(
@@ -377,6 +411,32 @@ where
             purpose: input_method::Purpose::Normal,
             preedit: state.preedit.as_ref().map(input_method::Preedit::as_ref),
         }
+    }
+
+    /// Returns the padding around the text, including a requested scrollbar.
+    pub fn content_padding(&self) -> Padding {
+        let mut padding = self.padding;
+        if self.horizontal_metrics.is_some() {
+            padding.bottom += horizontal::RESERVED_HEIGHT;
+        }
+        padding
+    }
+
+    fn horizontal_viewport(
+        &self,
+        state: &State<Highlighter>,
+        editor: &Renderer::Editor,
+        width: f32,
+    ) -> horizontal::Viewport {
+        let Some(metrics) = self.horizontal_metrics else {
+            let viewport = horizontal::Viewport::default();
+            state.horizontal.set(viewport);
+            return viewport;
+        };
+        let mut viewport = state.horizontal.get();
+        viewport.sync(metrics(editor), editor.cursor().position, width);
+        state.horizontal.set(viewport);
+        viewport
     }
 }
 
@@ -430,6 +490,11 @@ where
     /// Returns the amount of lines of the [`Content`].
     pub fn line_count(&self) -> usize {
         self.0.borrow().editor.line_count()
+    }
+
+    /// Borrows the shaped editor for decorations aligned to its viewport.
+    pub fn editor(&self) -> Ref<'_, R::Editor> {
+        Ref::map(self.0.borrow(), |internal| &internal.editor)
     }
 
     /// Returns the text of the line at the given index, if it exists.
@@ -527,6 +592,7 @@ pub struct State<Highlighter: text::Highlighter> {
     last_click: Option<mouse::Click>,
     drag_click: Option<mouse::click::Kind>,
     partial_scroll: f32,
+    horizontal: Cell<horizontal::Viewport>,
     last_theme: RefCell<Option<String>>,
     highlighter: RefCell<Highlighter>,
     highlighter_settings: Highlighter::Settings,
@@ -602,6 +668,7 @@ where
             last_click: None,
             drag_click: None,
             partial_scroll: 0.0,
+            horizontal: Cell::default(),
             last_theme: RefCell::default(),
             highlighter: RefCell::new(Highlighter::new(
                 &self.highlighter_settings,
@@ -649,8 +716,9 @@ where
             .min_height(self.min_height)
             .max_height(self.max_height);
 
+        let padding = self.content_padding();
         internal.editor.update(
-            limits.shrink(self.padding).max(),
+            limits.shrink(padding).max(),
             self.font.unwrap_or_else(|| renderer.default_font()),
             self.text_size.unwrap_or_else(|| renderer.default_size()),
             self.line_height,
@@ -669,7 +737,7 @@ where
                     limits
                         .height(min_bounds.height)
                         .max()
-                        .expand(Size::new(0.0, self.padding.y())),
+                        .expand(Size::new(0.0, padding.y())),
                 )
             }
         }
@@ -730,11 +798,32 @@ where
             _ => {}
         }
 
+        let padding = self.content_padding();
+        let bounds = layout.bounds();
+        let text_bounds = bounds.shrink(padding);
+        let mut horizontal = self.horizontal_viewport(
+            state, &self.content.editor(), text_bounds.width,
+        );
+        if self.horizontal_metrics.is_some() {
+            let handled = horizontal.update(event, cursor, bounds, text_bounds);
+            state.horizontal.set(horizontal);
+            if handled {
+                shell.request_redraw();
+                shell.capture_event();
+                return;
+            }
+        }
+        let translate = |mut position: Point| {
+            if self.horizontal_metrics.is_some() {
+                position.x = position.x.clamp(0.0, text_bounds.width) + horizontal.offset;
+            }
+            position
+        };
         if let Some(update) = Update::from_event(
             event,
             state,
             layout.bounds(),
-            self.padding,
+            padding,
             cursor,
             self.key_binding.as_deref(),
         ) {
@@ -742,7 +831,7 @@ where
                 Update::Click(click) => {
                     let action = match click.kind() {
                         mouse::click::Kind::Single => {
-                            Action::Click(click.position())
+                            Action::Click(translate(click.position()))
                         }
                         mouse::click::Kind::Double => Action::SelectWord,
                         mouse::click::Kind::Triple => Action::SelectLine,
@@ -756,7 +845,7 @@ where
                     shell.capture_event();
                 }
                 Update::Drag(position) => {
-                    shell.publish(on_edit(Action::Drag(position)));
+                    shell.publish(on_edit(Action::Drag(translate(position))));
                 }
                 Update::Release => {
                     state.drag_click = None;
@@ -984,7 +1073,9 @@ where
             style.background,
         );
 
-        let text_bounds = bounds.shrink(self.padding);
+        let text_bounds = bounds.shrink(self.content_padding());
+        let horizontal = self.horizontal_viewport(state, &internal.editor, text_bounds.width);
+        let origin = text_bounds.position() - Vector::new(horizontal.offset, 0.0);
 
         if internal.editor.is_empty() {
             if let Some(placeholder) = self.placeholder.clone() {
@@ -1010,17 +1101,24 @@ where
         } else {
             renderer.fill_editor(
                 &internal.editor,
-                text_bounds.position(),
+                origin,
                 style.value,
                 text_bounds,
             );
         }
 
-        let translation = text_bounds.position() - Point::ORIGIN;
+        let translation = origin - Point::ORIGIN;
 
         if let Some(focus) = state.focus.as_ref() {
             match internal.editor.selection() {
-                Selection::Caret(position) if focus.is_cursor_visible() => {
+                Selection::Caret(mut position) if focus.is_cursor_visible() => {
+                    if let Some(x) = horizontal.caret_x() {
+                        position.x = x;
+                        let edge = horizontal.offset + text_bounds.width;
+                        if x == edge && text_bounds.width >= 1.0 {
+                            position.x -= 1.0;
+                        }
+                    }
                     let cursor =
                         Rectangle::new(
                             position + translation,
@@ -1062,17 +1160,39 @@ where
                 Selection::Caret(_) => {}
             }
         }
+        if let Some((track, thumb)) = horizontal.scrollbar(text_bounds) {
+            for (bounds, color) in [
+                (track, style.placeholder.scale_alpha(0.25)),
+                (thumb, style.placeholder),
+            ] {
+                renderer.fill_quad(
+                    renderer::Quad {
+                        bounds,
+                        border: Border { radius: 3.0.into(), ..Border::default() },
+                        ..renderer::Quad::default()
+                    },
+                    color,
+                );
+            }
+        }
     }
 
     fn mouse_interaction(
         &self,
-        _tree: &widget::Tree,
+        tree: &widget::Tree,
         layout: Layout<'_>,
         cursor: mouse::Cursor,
         _viewport: &Rectangle,
         _renderer: &Renderer,
     ) -> mouse::Interaction {
         let is_disabled = self.on_edit.is_none();
+        let text_bounds = layout.bounds().shrink(self.content_padding());
+        if let Some((track, _)) = tree.state
+            .downcast_ref::<State<Highlighter>>().horizontal.get().scrollbar(text_bounds)
+            && cursor.is_over(track)
+        {
+            return mouse::Interaction::Pointer;
+        }
 
         if cursor.is_over(layout.bounds()) {
             if is_disabled {

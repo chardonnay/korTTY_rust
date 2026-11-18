@@ -7,7 +7,7 @@ use super::super::appearance::{Design, Preferences};
 use super::Message;
 
 pub(super) fn view(preferences: Preferences, id: window::Id) -> Element<'static, Message> {
-    let design = preferences.design;
+    let design = preferences.design();
     let step = |forward, arrow, label| {
         tooltip(
             button(arrow)
@@ -30,7 +30,7 @@ pub(super) fn view(preferences: Preferences, id: window::Id) -> Element<'static,
     .align_y(Alignment::Center);
     column![
         controls,
-        checkbox(preferences.animations)
+        checkbox(preferences.animations())
             .label("Enable design animations")
             .on_toggle(move |enabled| Message::DesignAnimations(id, enabled)),
         text("Applies to app windows and dialogs. Terminal sessions and editor content keep their own color settings.")
@@ -41,7 +41,7 @@ pub(super) fn view(preferences: Preferences, id: window::Id) -> Element<'static,
 }
 
 fn preview(preferences: Preferences) -> Element<'static, Message> {
-    let Some(palette) = preferences.design.palette() else {
+    let Some(palette) = preferences.design().palette() else {
         return container(text("No preview is available for this design.").size(13))
             .center_x(452)
             .center_y(276)

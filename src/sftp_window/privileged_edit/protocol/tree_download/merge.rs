@@ -12,6 +12,7 @@ use sha2::{Digest as _, Sha256};
 use crate::sftp_window::local_tree::{self, Directory, Entry, ReviewedStamp};
 use crate::sftp_window::tree::privileged_download::{
     Destination, PublishError, Stage, private_directory, private_regular_file,
+    receiver_for_directory,
 };
 use crate::sftp_window::tree::single_file::FilePublishError;
 use crate::sftp_window::worker::resume::persist::Identity;
@@ -58,6 +59,11 @@ impl DirectoryBinding {
 }
 
 impl Scope {
+    fn receiver(&self) -> Result<Option<[u8; 32]>, Failure> {
+        let root = self.directories.get(&Vec::new()).ok_or(Failure::Conflict)?;
+        receiver_for_directory(&self.root, &root.directory).map_err(|_| Failure::Conflict)
+    }
+
     fn current(&self) -> io::Result<()> {
         for (parts, expected) in &self.directories {
             let current = if let Some((name, parent)) = parts.split_last() {
@@ -87,6 +93,10 @@ enum Target {
 }
 
 impl Plan {
+    pub(super) fn receiver(&self) -> Result<Option<[u8; 32]>, Failure> {
+        self.scope.receiver()
+    }
+
     pub(super) fn inspect(
         manifest: &Manifest,
         root: &Path,
@@ -436,6 +446,14 @@ impl Prepared {
                 return report;
             }
         }
+        if self.scope.current().is_err() {
+            report.error = Some(Failure::Uncertain);
+        } else {
+            match self.scope.receiver() {
+                Ok(receiver) => report.receiver = receiver,
+                Err(error) => report.error = Some(error),
+            }
+        }
         report
     }
 }
@@ -614,6 +632,8 @@ mod tests {
         let same_file =
             ReviewedFileReceiver::inspect_transfer(&root.join("b-same"), &|| false).unwrap();
         let plan = inspect(&manifest, &root);
+        let receiver = plan.receiver().unwrap();
+        assert!(receiver.is_some());
         assert_eq!(plan.preview.paths.len(), 4);
         assert_eq!(plan.preview.replacements.len(), 1);
         assert_eq!(plan.preview.replacements[0].target, "existing/a-change");
@@ -624,6 +644,8 @@ mod tests {
         assert!(!root.join("new-tree").exists());
         let result = prepared.publish(&|| false, &|| true);
         assert_eq!(result.error, None);
+        assert_eq!(result.receiver, receiver);
+        assert_eq!(inspect(&manifest, &root).receiver().unwrap(), receiver);
         assert_eq!((result.created, result.replaced), (4, 1));
         assert_eq!(fs::read(changed).unwrap(), b"replacement bytes");
         assert_eq!(
@@ -657,18 +679,33 @@ mod tests {
     }
 
     #[test]
+    fn protected_folder_receiver_receipt_rejects_a_replaced_root() {
+        let (_profile, root, manifest, _) = fixture();
+        let before = inspect(&manifest, &root).receiver().unwrap();
+        assert!(before.is_some());
+        fs::rename(&root, root.with_file_name("prior-receiver")).unwrap();
+        let parent = Directory::open_path(root.parent().unwrap()).unwrap();
+        let _replacement =
+            local_tree::create_reviewed_tree_stage(&parent, OsStr::new("receiver")).unwrap();
+        assert_ne!(inspect(&manifest, &root).receiver().unwrap(), before);
+    }
+
+    #[test]
     fn protected_folder_download_merge_refuses_a_changed_receiver_before_later_publications() {
         let (_profile, root, manifest, wire) = fixture();
         let changed = root.join("existing").join("a-change");
         let plan = inspect(&manifest, &root);
         let reviewed = plan.preview.proof;
+        let receiver = plan.receiver().unwrap();
         let prepared = plan
             .receive(&manifest, &mut wire.as_slice(), &|| false)
             .unwrap();
         fs::write(&changed, b"external change").unwrap();
         assert_ne!(inspect(&manifest, &root).preview.proof, reviewed);
+        assert_eq!(inspect(&manifest, &root).receiver().unwrap(), receiver);
         let result = prepared.publish(&|| false, &|| true);
         assert_eq!(result.error, Some(Failure::Conflict));
+        assert_eq!(result.receiver, None);
         assert_eq!((result.created, result.replaced), (0, 0));
         assert_eq!(fs::read(changed).unwrap(), b"external change");
         assert!(!root.join("new-file").exists());

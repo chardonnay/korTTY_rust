@@ -332,6 +332,12 @@ where
                                 )
                                 .with_visible(false);
 
+                                #[cfg(target_os = "windows")]
+                                let window_attributes = {
+                                    use winit::platform::windows::WindowAttributesExtWindows;
+                                    window_attributes.with_drag_and_drop(false)
+                                };
+
                                 #[cfg(target_arch = "wasm32")]
                                 let window_attributes = {
                                     use winit::platform::web::WindowAttributesExtWebSys;
@@ -677,6 +683,34 @@ async fn run_instance<P>(
                     exit_on_close_request,
                     system_theme,
                 );
+
+                #[cfg(any(target_os = "linux", target_os = "windows"))]
+                {
+                    #[cfg(target_os = "windows")]
+                    use kortty_windowing::windows_desktop_drop as desktop_drop;
+                    #[cfg(target_os = "linux")]
+                    use kortty_windowing::x11_desktop_drop as desktop_drop;
+                    use desktop_drop::Event;
+                    use winit::raw_window_handle::HasWindowHandle as _;
+
+                    let proxy = proxy.clone();
+                    window.desktop_drop = window.raw.window_handle().ok().and_then(|handle| {
+                        desktop_drop::register(handle, move |event| {
+                            let action = match event {
+                                Event::Files {
+                                    point,
+                                    paths,
+                                    dropped,
+                                } => {
+                                    runtime::window::Action::DesktopFiles(id, point, paths, dropped)
+                                }
+                                Event::Left => runtime::window::Action::DesktopFilesLeft(id),
+                            };
+                            proxy.send_action(Action::Window(action));
+                            true
+                        })
+                    });
+                }
 
                 window
                     .raw
@@ -1119,6 +1153,8 @@ async fn run_instance<P>(
                                 .remove(&id)
                                 .map(|(_, cursor)| cursor)
                                 .unwrap_or_else(|| window.state.cursor());
+                            #[cfg(any(target_os = "linux", target_os = "windows"))]
+                            let cursor = window.state.take_desktop_drop_cursor().unwrap_or(cursor);
                             let (ui_state, statuses) = user_interfaces
                                 .get_mut(&id)
                                 .expect("Get user interface")
@@ -1577,11 +1613,11 @@ fn run_action<'a, P, C>(
                     f(window);
                 }
             }
-            window::Action::OperateAt(id, surface_point, make) => {
+            window::Action::OperateAt(id, position, make) => {
                 let mut target = window_manager.get_mut(id).zip(interfaces.get_mut(&id));
                 let point = target
                     .as_ref()
-                    .and_then(|(window, _)| window.state.surface_position(surface_point));
+                    .and_then(|(window, _)| window.state.position(position));
                 let mut current = Some(make(point));
                 while let Some(mut operation) = current.take() {
                     if let Some((window, ui)) = target.as_mut().filter(|_| point.is_some()) {
@@ -1590,6 +1626,31 @@ fn run_action<'a, P, C>(
                     if let operation::Outcome::Chain(next) = operation.finish() {
                         current = Some(next);
                     }
+                }
+            }
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            window::Action::DesktopFiles(id, point, paths, dropped) => {
+                if let Some(window) = window_manager.get_mut(id) {
+                    window.state.set_desktop_drop_position(point);
+                    events.extend(paths.into_iter().map(|path| {
+                        (
+                            id,
+                            core::Event::Window(if dropped {
+                                core::window::Event::FileDropped(path)
+                            } else {
+                                core::window::Event::FileHovered(path)
+                            }),
+                        )
+                    }));
+                }
+            }
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            window::Action::DesktopFilesLeft(id) => {
+                if window_manager.get_mut(id).is_some() {
+                    events.push((
+                        id,
+                        core::Event::Window(core::window::Event::FilesHoveredLeft),
+                    ));
                 }
             }
             window::Action::Screenshot(id, channel) => {

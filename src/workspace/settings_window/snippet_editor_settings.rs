@@ -1,9 +1,15 @@
 use std::fmt;
+use std::sync::{Arc, Weak};
 
-use iced::widget::{button, column, container, pick_list, row, text, text_input};
-use iced::{Alignment, Element};
+use iced::widget::{button, checkbox, column, container, pick_list, row, text, text_input};
+use iced::{Alignment, Element, Task, window};
 
 use crate::editor_window::caret::Shape;
+use crate::snippet_analysis::model::{DEFAULT_CONTENT_BYTES, valid_content_limit};
+use crate::snippet_analysis::store::{
+    DEFAULT_HISTORY_LIMIT, HISTORY_LIMITS, RetentionPreview, Store,
+};
+use crate::snippet_window::ai_assist::{ALTERNATIVE_COUNTS, DEFAULT_ALTERNATIVE_COUNT};
 use crate::snippet_window::appearance::{MAX_FONT_SIZE, Preferences};
 use crate::terminal_theme::{Rgb, installed_families, installed_font};
 
@@ -31,6 +37,8 @@ pub enum Edit {
     Family(Option<String>),
     Size(String),
     CursorStyle(Option<Shape>),
+    LineNumbers(bool),
+    WordWrap(bool),
     Color(Color, String),
 }
 
@@ -40,9 +48,116 @@ pub(super) struct Editor {
     foreground: Option<String>,
     background: Option<String>,
     cursor: Option<String>,
+    content_limit: Option<String>,
+    history_preview: Option<HistoryPreview>,
+}
+
+enum HistoryPreview {
+    Counting(Arc<()>),
+    Ready(RetentionPreview),
+    Unavailable,
 }
 
 impl Editor {
+    pub(super) fn update_content_limit(&mut self, saved: &mut Option<usize>, mut value: String) {
+        if value.len() <= 16
+            && let Ok(limit) = value.parse::<usize>()
+            && valid_content_limit(limit)
+        {
+            *saved = Some(limit);
+            self.content_limit = None;
+        } else {
+            value.truncate(value.floor_char_boundary(16));
+            self.content_limit = Some(value);
+        }
+    }
+
+    pub(super) fn preview_history_limit(
+        &mut self,
+        id: window::Id,
+        initial: u8,
+        limit: u8,
+    ) -> Task<Desktop> {
+        self.history_preview = None;
+        if limit >= initial {
+            return Task::none();
+        }
+        let token = Arc::new(());
+        let ticket = Arc::downgrade(&token);
+        let worker_ticket = ticket.clone();
+        self.history_preview = Some(HistoryPreview::Counting(token));
+        Task::perform(
+            async move {
+                if worker_ticket.strong_count() == 0 {
+                    return None;
+                }
+                let (send, receive) = async_channel::bounded(1);
+                std::thread::Builder::new()
+                    .name("kortty-analysis-retention-preview".into())
+                    .spawn(move || {
+                        let count = || {
+                            let path = crate::snippets::profile_path().ok()?;
+                            let store = Store::new(path.parent()?.to_path_buf());
+                            let library = crate::snippets::Library::open(path).ok()?;
+                            store
+                                .preview_retention(&library, limit, || {
+                                    worker_ticket.strong_count() != 0
+                                })
+                                .ok()
+                        };
+                        if worker_ticket.strong_count() != 0 {
+                            let _ = send.send_blocking(count());
+                        }
+                    })
+                    .ok()?;
+                receive.recv().await.ok().flatten()
+            },
+            move |result| {
+                Desktop::Settings(Message::SnippetAnalysisHistoryPreview(
+                    id,
+                    ticket.clone(),
+                    result,
+                ))
+            },
+        )
+    }
+
+    pub(super) fn finish_history_preview(
+        &mut self,
+        ticket: Weak<()>,
+        result: Option<RetentionPreview>,
+    ) {
+        if let Some(HistoryPreview::Counting(current)) = &self.history_preview
+            && ticket.ptr_eq(&Arc::downgrade(current))
+        {
+            self.history_preview =
+                Some(result.map_or(HistoryPreview::Unavailable, HistoryPreview::Ready));
+        }
+    }
+
+    fn history_preview_text(&self) -> Option<String> {
+        Some(match self.history_preview.as_ref()? {
+            HistoryPreview::Counting(_) => "Counting reports affected by this limit…".into(),
+            HistoryPreview::Ready(preview) if preview.reports == 0 => {
+                "No reports would be removed at this limit.".into()
+            }
+            HistoryPreview::Ready(preview) => {
+                let reports = preview.reports;
+                let subjects = preview.subjects;
+                let report_label = if reports == 1 { "report" } else { "reports" };
+                let subject_label = if subjects == 1 {
+                    "snippet or folder"
+                } else {
+                    "snippets or folders"
+                };
+                format!(
+                    "{reports} saved {report_label} would be removed across {subjects} {subject_label} as their next analyses are saved."
+                )
+            }
+            HistoryPreview::Unavailable => "Could not count affected reports.".into(),
+        })
+    }
+
     pub(super) fn update(&mut self, preferences: &mut Preferences, edit: Edit) {
         match edit {
             Edit::Family(family) => {
@@ -68,6 +183,8 @@ impl Editor {
                 }
             }
             Edit::CursorStyle(style) => preferences.cursor_style = style,
+            Edit::LineNumbers(enabled) => preferences.line_numbers = Some(enabled),
+            Edit::WordWrap(enabled) => preferences.word_wrap = Some(enabled),
             Edit::Color(channel, mut value) => {
                 value.truncate(value.floor_char_boundary(12));
                 let (color, input) = match channel {
@@ -94,6 +211,7 @@ impl Editor {
             (Setting::SnippetForeground, &self.foreground),
             (Setting::SnippetBackground, &self.background),
             (Setting::SnippetCursorColor, &self.cursor),
+            (Setting::SnippetAnalysisContentLimit, &self.content_limit),
         ]
         .into_iter()
         .find_map(|(setting, value)| value.is_some().then_some(setting))
@@ -121,7 +239,7 @@ impl fmt::Display for CursorStyle {
     }
 }
 
-pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
+pub(super) fn view(dialog: &Dialog, managed_content_limit: Option<usize>) -> Element<'_, Desktop> {
     let id = dialog.id;
     let preferences = &dialog.draft.preferences.snippet_appearance;
     let editor = &dialog.snippet_appearance;
@@ -170,6 +288,18 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
         )
     };
     let appearance = dialog.draft.preferences.snippet_editor_appearance();
+    let content_limit = dialog
+        .draft
+        .preferences
+        .snippet_analysis_content_limit
+        .unwrap_or(DEFAULT_CONTENT_BYTES)
+        .to_string();
+    let storage_locked = managed_content_limit == Some(0);
+    let displayed_limit = if storage_locked {
+        "0"
+    } else {
+        editor.content_limit.as_deref().unwrap_or(&content_limit)
+    };
     column![
         text("Snippet Editor Appearance").size(18),
         text("These settings apply to snippet editors and previews. Inherited fonts and text colors follow the terminal. Inherited cursor settings follow the file editor.").size(13),
@@ -198,6 +328,16 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
                 .width(160),
         ].align_y(Alignment::Center).spacing(8)),
         color_row(Color::Cursor, preferences.cursor_color, editor.cursor.as_deref()),
+        highlighted(dialog, Setting::SnippetLineNumbers,
+            checkbox(preferences.line_numbers.unwrap_or_default())
+                .label(Setting::SnippetLineNumbers.label())
+                .on_toggle(move |enabled| edit(Edit::LineNumbers(enabled))),
+        ),
+        highlighted(dialog, Setting::SnippetWordWrap,
+            checkbox(preferences.word_wrap.unwrap_or(true))
+                .label(Setting::SnippetWordWrap.label())
+                .on_toggle(move |enabled| edit(Edit::WordWrap(enabled))),
+        ),
         text("Preview").size(16),
         container(text("AaBbCcDdEe 0123456789")
             .font(appearance.font)
@@ -205,5 +345,116 @@ pub(super) fn view(dialog: &Dialog) -> Element<'_, Desktop> {
             .color(appearance.foreground.color()))
             .padding(12)
             .style(move |_| container::Style::default().background(appearance.background.color())),
+        highlighted(dialog, Setting::SnippetAnalysisHistory, column![
+            row![
+                text(Setting::SnippetAnalysisHistory.label()),
+                pick_list(
+                    HISTORY_LIMITS.collect::<Vec<_>>(),
+                    Some(dialog.draft.preferences.snippet_analysis_history_limit.unwrap_or(DEFAULT_HISTORY_LIMIT)),
+                    move |limit| Desktop::Settings(Message::SnippetAnalysisHistory(id, limit)),
+                ),
+            ].align_y(Alignment::Center).spacing(8),
+            text("The limit applies when a new report is saved. Pinned reports and records needed for recovery are kept.").size(13),
+            editor.history_preview_text().map(|preview| text(preview).size(13)),
+        ].spacing(4)),
+        highlighted(dialog, Setting::SnippetVersionHistory, row![
+            text(Setting::SnippetVersionHistory.label()),
+            pick_list(
+                crate::snippets::history::LIMITS.collect::<Vec<_>>(),
+                Some(dialog.draft.preferences.snippet_history_limit.unwrap_or(crate::snippets::history::DEFAULT_LIMIT)),
+                move |limit| Desktop::Settings(Message::SnippetVersionHistory(id, limit)),
+            ),
+        ].align_y(Alignment::Center).spacing(8)),
+        highlighted(dialog, Setting::SnippetAlternativeCount, row![
+            text(Setting::SnippetAlternativeCount.label()),
+            pick_list(
+                ALTERNATIVE_COUNTS.collect::<Vec<_>>(),
+                Some(dialog.draft.preferences.snippet_alternative_count.unwrap_or(DEFAULT_ALTERNATIVE_COUNT)),
+                move |count| Desktop::Settings(Message::SnippetAlternativeCount(id, count)),
+            ),
+        ].align_y(Alignment::Center).spacing(8)),
+        highlighted(dialog, Setting::SnippetAnalysisContentLimit, column![
+            row![
+                text(Setting::SnippetAnalysisContentLimit.label()),
+                dialog.reveal_input(
+                    Setting::SnippetAnalysisContentLimit,
+                    !storage_locked,
+                    text_input("1048576", displayed_limit)
+                        .on_input_maybe((!storage_locked).then_some(move |value| {
+                            Desktop::Settings(Message::SnippetAnalysisContentLimit(id, value))
+                        }))
+                        .width(130),
+                ),
+            ].align_y(Alignment::Center).spacing(8),
+            text("Use 0 to omit new source text, or enter 262144 to 5242880 bytes. Lowering your limit preserves earlier source snapshots.").size(13),
+            managed_content_limit.map(|limit| text(if limit == 0 {
+                "Managed policy disables source storage.".to_owned()
+            } else {
+                format!("Managed policy permits up to {limit} bytes per field.")
+            }).size(13)),
+            editor.content_limit.as_ref().map(|_| text("Enter 0 or a size from 262144 to 5242880 bytes.").size(13).style(text::danger)),
+        ].spacing(4)),
     ].spacing(10).into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn source_limit_rejects_out_of_range_input_and_keeps_explicit_zero() {
+        let mut editor = Editor::default();
+        let mut limit = None;
+        for input in ["1", "5242881", "00000000000000001"] {
+            editor.update_content_limit(&mut limit, input.into());
+            assert_eq!(limit, None);
+            assert_eq!(
+                editor.first_problem(),
+                Some(Setting::SnippetAnalysisContentLimit)
+            );
+        }
+        editor.update_content_limit(&mut limit, "262145".into());
+        assert_eq!(limit, Some(262145));
+        assert!(editor.first_problem().is_none());
+        editor.update_content_limit(&mut limit, "0".into());
+        assert_eq!(limit, Some(0));
+        assert!(editor.first_problem().is_none());
+    }
+
+    #[test]
+    fn a_superseded_history_preview_cannot_change_the_visible_count() {
+        let id = window::Id::unique();
+        let mut editor = Editor::default();
+        let _ = editor.preview_history_limit(id, DEFAULT_HISTORY_LIMIT, 4);
+        let Some(HistoryPreview::Counting(first)) = &editor.history_preview else {
+            panic!("expected the first estimate");
+        };
+        let first = Arc::downgrade(first);
+        let _ = editor.preview_history_limit(id, DEFAULT_HISTORY_LIMIT, 3);
+        let Some(HistoryPreview::Counting(second)) = &editor.history_preview else {
+            panic!("expected a replacement estimate");
+        };
+        let second = Arc::downgrade(second);
+        assert_eq!(first.strong_count(), 0);
+        editor.finish_history_preview(first, Some(RetentionPreview::default()));
+        assert!(matches!(
+            editor.history_preview,
+            Some(HistoryPreview::Counting(_))
+        ));
+        editor.finish_history_preview(
+            second,
+            Some(RetentionPreview {
+                reports: 3,
+                subjects: 2,
+            }),
+        );
+        assert!(
+            editor
+                .history_preview_text()
+                .unwrap()
+                .contains("3 saved reports")
+        );
+        let _ = editor.preview_history_limit(id, DEFAULT_HISTORY_LIMIT, DEFAULT_HISTORY_LIMIT);
+        assert!(editor.history_preview_text().is_none());
+    }
 }

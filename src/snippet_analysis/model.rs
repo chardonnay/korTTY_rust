@@ -26,8 +26,13 @@ pub(crate) use apply::{
 };
 pub(crate) use verification::Verification;
 
-pub(super) const DEFAULT_CONTENT_BYTES: usize = 1024 * 1024;
-pub(super) const MAX_CONTENT_BYTES: usize = 5 * DEFAULT_CONTENT_BYTES;
+pub(crate) const DEFAULT_CONTENT_BYTES: usize = 1024 * 1024;
+pub(crate) const MIN_CONTENT_BYTES: usize = 256 * 1024;
+pub(crate) const MAX_CONTENT_BYTES: usize = 5 * DEFAULT_CONTENT_BYTES;
+
+pub(crate) fn valid_content_limit(limit: usize) -> bool {
+    limit == 0 || (MIN_CONTENT_BYTES..=MAX_CONTENT_BYTES).contains(&limit)
+}
 
 pub(super) fn source_fits(content: &str, limit: usize) -> bool {
     limit != 0 && content.len() <= limit
@@ -148,7 +153,8 @@ impl fmt::Debug for Source {
 }
 
 impl Source {
-    /// Hashes the exact analysed UTF-8 bytes even when the body exceeds retention limits.
+    /// Captures a candidate source and hashes the exact UTF-8 bytes. The store
+    /// applies the current user and managed limits when publishing the record.
     pub(crate) fn new(
         content: &str,
         language: &str,
@@ -156,7 +162,7 @@ impl Source {
         code_text_language_code: &str,
         snippet_name: &str,
     ) -> io::Result<Self> {
-        let content_truncated = content.len() > DEFAULT_CONTENT_BYTES;
+        let content_truncated = content.len() > MAX_CONTENT_BYTES;
         let line_count = content.bytes().filter(|&byte| byte == b'\n').count()
             + usize::from(!content.is_empty() && !content.ends_with('\n'));
         Ok(Self {
@@ -169,6 +175,17 @@ impl Source {
             line_count,
             snippet_name: snippet_name.into(),
         })
+    }
+
+    pub(super) fn apply_retention(&mut self, limit: usize) {
+        if self
+            .content
+            .as_ref()
+            .is_some_and(|content| !source_fits(content, limit))
+        {
+            self.content = None;
+            self.content_truncated = true;
+        }
     }
 }
 

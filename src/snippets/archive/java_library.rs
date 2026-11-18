@@ -89,16 +89,8 @@ fn read_snippet(
             | "lastUsed"
             | "createdAt"
             | "modifiedAt"
-            | "historyMaxSize"
             | "codeTextLanguageCode" => {
                 xml_text(field)?;
-            }
-            "history" => {
-                for version in xml_elements(field)? {
-                    if !xml_is(version, "entry") {
-                        return Err(invalid("Invalid Java snippet history entry"));
-                    }
-                }
             }
             "folderPath" | "savedDiagrams" => {
                 return Err(invalid(

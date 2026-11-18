@@ -203,6 +203,8 @@ fn eight_turn_agent_reviews_every_command_and_settles_one_final_advice_with_repa
     });
 
     let id = fixture.open(Mode::Run);
+    // This scenario exercises the explicit per-command review mode.
+    no_task(fixture.send(id, Message::ConfirmEveryCommand(true)));
     fixture.run_mut(id).design.history = crate::terminal_agent::design::History::InlineBlocks;
     prepare_local_run(
         &mut fixture,

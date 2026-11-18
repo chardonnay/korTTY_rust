@@ -12,7 +12,7 @@ use kortty_ssh::{
     Authentication, ConnectError, ConnectOptions, Endpoint, HostKey, HostKeyStatus, StartupChannel,
     TrustStore,
 };
-use kortty_terminal::TerminalProfile;
+use kortty_terminal::{TerminalProfile, TextEncoding};
 use serde::{Deserialize, Serialize};
 
 use crate::connection_store::{Connection, Store, teamwork};
@@ -224,16 +224,55 @@ pub(super) struct TeamworkUnlock {
 
 #[derive(Clone)]
 pub(super) struct TeamworkSelection {
-    identity: teamwork::Identity,
+    route: Arc<teamwork::ReviewedRoute>,
     store_path: PathBuf,
     connection: Box<Connection>,
-    default_auth_eligible: bool,
 }
 
 #[derive(Clone, Copy)]
 pub(super) struct TeamworkTerminalInput {
     pub(super) paste_line_delay_ms: Option<u16>,
     strict: bool,
+    encoding: Option<TextEncoding>,
+    pub(super) confirm_close: Option<bool>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum DefaultEncoding {
+    #[default]
+    Emulation,
+    Text(TextEncoding),
+}
+
+impl DefaultEncoding {
+    pub(super) const ALL: [Self; 5] = [
+        Self::Emulation,
+        Self::Text(TextEncoding::Utf8),
+        Self::Text(TextEncoding::Latin1),
+        Self::Text(TextEncoding::Latin9),
+        Self::Text(TextEncoding::Windows1252),
+    ];
+
+    fn resolve(
+        self,
+        saved: Option<TextEncoding>,
+        teamwork: Option<TextEncoding>,
+    ) -> Option<TextEncoding> {
+        saved.or(teamwork).or(match self {
+            Self::Emulation => None,
+            Self::Text(encoding) => Some(encoding),
+        })
+    }
+}
+
+impl fmt::Display for DefaultEncoding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Emulation => formatter.write_str("Emulation default"),
+            Self::Text(encoding) => encoding.fmt(formatter),
+        }
+    }
 }
 
 impl TeamworkSelection {
@@ -243,20 +282,16 @@ impl TeamworkSelection {
 
     pub(super) fn new(entry: &teamwork::Entry, store_path: PathBuf) -> Self {
         Self {
-            identity: entry.identity().clone(),
+            route: Arc::new(entry.into()),
             store_path,
             connection: Box::new(entry.connection.clone()),
-            default_auth_eligible: entry.default_auth_eligible,
         }
     }
 
     pub(super) fn matches_catalog(&self, workspace: &Workspace) -> bool {
         workspace
-            .teamwork_entry(&self.identity, &self.store_path)
-            .is_some_and(|entry| {
-                entry.connection == *self.connection
-                    && entry.default_auth_eligible == self.default_auth_eligible
-            })
+            .teamwork_entry(self.route.identity(), &self.store_path)
+            .is_some_and(|entry| entry.connection == *self.connection && self.route.matches(entry))
     }
 }
 
@@ -1149,11 +1184,8 @@ impl Workspace {
                 return window::gain_focus(vault);
             }
             if self.vault_id.is_none()
-                && selection.default_auth_eligible
-                && matches!(
-                    self.teamwork_auth_default(),
-                    teamwork::DefaultAuth::Password { .. }
-                )
+                && selection.route.default_auth_eligible
+                && self.teamwork_auth_default().credential().is_some()
                 && self.vault_unlock_available()
             {
                 let open = self.show_vault_unlock(owner);
@@ -2083,6 +2115,8 @@ impl Workspace {
             TeamworkTerminalInput {
                 strict: options.strict_terminal_mode == Some(true),
                 paste_line_delay_ms: options.paste_line_delay_ms,
+                encoding: options.encoding,
+                confirm_close: options.confirm_close,
             }
         });
         let saved_journal = *journal_config;
@@ -2221,7 +2255,14 @@ impl Workspace {
                     logging,
                     crate::session::StreamOptions {
                         strict_escapes: Some(strict),
-                        encoding: overrides.and_then(|settings| settings.encoding),
+                        encoding: self
+                            .window_settings
+                            .ssh_default_encoding
+                            .unwrap_or_default()
+                            .resolve(
+                                overrides.and_then(|settings| settings.encoding),
+                                teamwork_terminal.and_then(|settings| settings.encoding),
+                            ),
                         scrollback: self.terminal_scrollback(overrides),
                     },
                 ) {

@@ -8,6 +8,7 @@ use super::super::screenshot_access::{
     tests::{Fixture, REFERENCE},
 };
 use super::*;
+use crate::session_journal::topic_ai_settings;
 
 fn configure(workspace: &mut Workspace) {
     workspace.window_settings.journal_ai = topic_ai_settings::Preferences {
@@ -15,8 +16,23 @@ fn configure(workspace: &mut Workspace) {
         endpoint: "127.0.0.1:11434".into(),
         model: "fixture-vision".into(),
         vision_enabled: true,
-        auto_screenshot_analysis: true,
+        ..topic_ai_settings::Preferences::default()
     };
+}
+
+#[test]
+fn disabling_journal_screenshot_analysis_preserves_the_configured_text_profile() {
+    let mut workspace = Workspace::default();
+    configure(&mut workspace);
+    assert!(workspace.journal_screenshot_analysis_available());
+    assert!(workspace.journal_automatic_screenshot_analysis_enabled());
+    workspace
+        .window_settings
+        .journal_ai
+        .screenshot_analysis_enabled = Some(false);
+    assert!(!workspace.journal_screenshot_analysis_available());
+    assert!(!workspace.journal_automatic_screenshot_analysis_enabled());
+    assert!(workspace.configured_journal_ai(false).is_some());
 }
 
 #[test]

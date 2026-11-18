@@ -192,12 +192,122 @@ fn history_round_trip_deduplicates_source_blobs_and_retains_full_hash() {
     assert!(!format!("{second:?}").contains("first\\r\\nsecond"));
 
     let oversized = "é".repeat(super::super::model::DEFAULT_CONTENT_BYTES / 2 + 1);
-    let third = record(&oversized);
-    assert!(third.source.content.is_none());
-    assert!(third.source.content_truncated);
+    let mut third = record(&oversized);
+    assert!(third.source.content.is_some());
     assert_eq!(third.source.sha256, content_hash(&oversized).unwrap());
     store.append(subject, third.clone()).unwrap();
+    third
+        .source
+        .apply_retention(super::super::model::DEFAULT_CONTENT_BYTES);
+    assert!(third.source.content.is_none());
+    assert!(third.source.content_truncated);
     assert_eq!(store.load(subject).unwrap().current(), Some(&third));
+}
+
+#[test]
+fn personal_source_limits_apply_only_to_new_utf8_source_and_proposals() {
+    use crate::snippet_analysis::model::{
+        ChangeReason, DEFAULT_CONTENT_BYTES, MIN_CONTENT_BYTES, Selection,
+    };
+
+    let (_profile, store, managed) = setup_with_limit(MAX_CONTENT_BYTES);
+    let subject = Subject::Snippet(SnippetId::new().unwrap());
+    let set_limit = |limit: usize| {
+        crate::profile::save_atomic(
+            &store.profile.join("window-settings.json"),
+            &serde_json::to_vec(&serde_json::json!({"snippet_analysis_content_limit": limit}))
+                .unwrap(),
+        )
+        .unwrap();
+    };
+    set_limit(2 * DEFAULT_CONTENT_BYTES);
+    let larger_than_default = "é".repeat(DEFAULT_CONTENT_BYTES / 2 + 1);
+    let large = record(&larger_than_default);
+    assert!(
+        store.append(subject, large.clone()).unwrap().records[0]
+            .source
+            .content
+            .is_some()
+    );
+
+    set_limit(MIN_CONTENT_BYTES);
+    let exact_text = "é".repeat(MIN_CONTENT_BYTES / 2);
+    let exact = record(&exact_text);
+    let over = record(&(exact_text + "x"));
+    store.append(subject, exact.clone()).unwrap();
+    let saved = store.append(subject, over.clone()).unwrap();
+    assert_eq!(saved.records[2], large);
+    assert_eq!(saved.records[1], exact);
+    assert!(saved.records[0].source.content_truncated);
+    assert_eq!(saved.records[0].source.sha256, over.source.sha256);
+
+    set_limit(0);
+    let pinned = store.set_pinned(subject, large.id, true).unwrap();
+    assert!(pinned.records[2].source.content.is_some());
+    let duplicate_source = record(&larger_than_default);
+    let saved = store.append(subject, duplicate_source).unwrap();
+    assert!(saved.records[0].source.content.is_none());
+    assert_eq!(saved.records[0].source.sha256, large.source.sha256);
+    assert_eq!(store.load(subject).unwrap(), saved);
+
+    let mut proposal = ApplyRun::new(
+        "printf previous".into(),
+        "printf new".into(),
+        Selection {
+            findings: vec!["I1".into()],
+            ..Selection::default()
+        },
+        vec![ChangeReason {
+            id: "I1".into(),
+            reason: "Update the output".into(),
+            anchor: None,
+        }],
+        1,
+    )
+    .unwrap();
+    let original = record("printf previous");
+    proposal.provenance = original.provenance.clone();
+    set_limit(DEFAULT_CONTENT_BYTES);
+    store.append(subject, original.clone()).unwrap();
+    set_limit(0);
+    let updated = store
+        .append_apply_while(
+            subject,
+            original.id,
+            &original.source.sha256,
+            proposal.clone(),
+            || true,
+        )
+        .unwrap();
+    let original = updated.current().unwrap();
+    assert!(original.source.content.is_some());
+    let stored = &original.apply_runs[0];
+    assert!(!stored.has_review_source());
+    assert!(stored.matches_live(&proposal));
+    assert_eq!(stored.after_sha256, proposal.after_sha256);
+
+    set_limit(DEFAULT_CONTENT_BYTES);
+    let checks = Cell::new(0);
+    let error = store
+        .append_while(subject, record("unsaved"), || {
+            if checks.replace(checks.get() + 1) == 1 {
+                set_limit(0);
+            }
+            true
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(store.load(subject).unwrap(), updated);
+
+    set_limit(MAX_CONTENT_BYTES);
+    managed.store(0, Ordering::Release);
+    let scrubbed = store.set_pinned(subject, large.id, false).unwrap();
+    assert!(
+        scrubbed
+            .records
+            .iter()
+            .all(|record| record.source.content.is_none())
+    );
 }
 
 #[test]
@@ -257,16 +367,12 @@ fn a_tighter_policy_during_publication_leaves_the_previous_history_intact() {
     let next = record("new source");
     let checks = Cell::new(0);
     let error = store
-        .update_while(
-            subject,
-            || {
-                if checks.replace(checks.get() + 1) == 1 {
-                    limit.store(0, Ordering::Release);
-                }
-                true
-            },
-            |history| insert_record(history, next.clone()),
-        )
+        .append_while(subject, next.clone(), || {
+            if checks.replace(checks.get() + 1) == 1 {
+                limit.store(0, Ordering::Release);
+            }
+            true
+        })
         .unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     assert_eq!(store.load(subject).unwrap(), previous);
@@ -793,7 +899,8 @@ fn history_mutations_use_latest_revision_preserve_pins_and_allow_idempotent_retr
     let pinned = store.set_pinned(subject, retained.id, true).unwrap();
     assert_eq!(pinned.revision, 2);
 
-    let writes: Vec<_> = (0..RETENTION + 2)
+    let retention = usize::from(DEFAULT_HISTORY_LIMIT);
+    let writes: Vec<_> = (0..retention + 2)
         .map(|index| {
             let store = store.clone();
             std::thread::spawn(move || {
@@ -807,8 +914,8 @@ fn history_mutations_use_latest_revision_preserve_pins_and_allow_idempotent_retr
         write.join().unwrap();
     }
     let history = store.load(subject).unwrap();
-    assert_eq!(history.records.len(), RETENTION);
-    assert_eq!(history.revision, (RETENTION + 4) as u64);
+    assert_eq!(history.records.len(), retention);
+    assert_eq!(history.revision, (retention + 4) as u64);
     assert!(history.records.last().unwrap().pinned);
     assert_eq!(history.records.last().unwrap().id, retained.id);
     assert_eq!(store.append(subject, retained.clone()).unwrap(), history);
@@ -821,6 +928,126 @@ fn history_mutations_use_latest_revision_preserve_pins_and_allow_idempotent_retr
             .any(|record| record.id == retained.id)
     );
     assert_eq!(store.remove(subject, retained.id).unwrap(), updated);
+}
+
+#[test]
+fn profile_history_limit_trims_on_new_reports_and_checks_changes_before_publication() {
+    let (_profile, store) = setup();
+    let subject = Subject::Snippet(SnippetId::new().unwrap());
+    let path = store.profile.join("window-settings.json");
+    let set_limit = |limit: u8| {
+        let encoded = serde_json::to_vec(&serde_json::json!({
+            "snippet_analysis_history_limit": limit
+        }))
+        .unwrap();
+        crate::profile::save_atomic(&path, &encoded).unwrap();
+    };
+    set_limit(8);
+    let pinned = record("oldest");
+    store.append(subject, pinned.clone()).unwrap();
+    store.set_pinned(subject, pinned.id, true).unwrap();
+    for index in 1..8 {
+        store
+            .append(subject, record(&format!("report {index}")))
+            .unwrap();
+    }
+    let original = store.load(subject).unwrap();
+    assert_eq!(original.records.len(), 8);
+
+    set_limit(2);
+    assert_eq!(store.load(subject).unwrap(), original);
+    let checks = Cell::new(0);
+    let error = store
+        .append_while(subject, record("interrupted"), || {
+            if checks.replace(checks.get() + 1) == 1 {
+                set_limit(8);
+            }
+            true
+        })
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(store.load(subject).unwrap(), original);
+
+    set_limit(2);
+    let newest = record("newest");
+    let trimmed = store.append(subject, newest.clone()).unwrap();
+    assert_eq!(trimmed.records.len(), 2);
+    assert_eq!(trimmed.current(), Some(&newest));
+    assert_eq!(trimmed.records.last().unwrap().id, pinned.id);
+    assert_eq!(store.load(subject).unwrap(), trimmed);
+}
+
+#[test]
+fn retention_preview_matches_the_next_publication_for_each_existing_subject() {
+    let (profile, store) = setup();
+    let mut library = Library::open(profile.path()).unwrap();
+    let snippet = Subject::Snippet(
+        library
+            .save(
+                None,
+                crate::snippets::Input {
+                    name: "Example".into(),
+                    language: "sh".into(),
+                    category: "Tests".into(),
+                    content: "printf example".into(),
+                },
+            )
+            .unwrap(),
+    );
+    let folder = Subject::Folder(library.create_folder(None, "Operations").unwrap());
+    let unused_folder = Subject::Folder(library.create_folder(None, "Unused").unwrap());
+    let orphan = Subject::Snippet(SnippetId::new().unwrap());
+    let pin = record("pinned");
+    store.append(snippet, pin.clone()).unwrap();
+    store.set_pinned(snippet, pin.id, true).unwrap();
+    for subject in [snippet, folder, orphan] {
+        store.append(subject, record("earlier")).unwrap();
+        store.append(subject, record("later")).unwrap();
+    }
+    let existing = [snippet, folder, orphan].map(|subject| store.load(subject).unwrap());
+    let preview = store.preview_retention(&library, 2, || true).unwrap();
+    assert_eq!(
+        preview,
+        RetentionPreview {
+            reports: 3,
+            subjects: 2
+        }
+    );
+    assert_eq!(
+        store
+            .preview_retention(&library, 2, || false)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::Interrupted
+    );
+    assert_eq!(
+        [snippet, folder, orphan].map(|subject| store.load(subject).unwrap()),
+        existing
+    );
+    assert!(store.load(unused_folder).unwrap().records.is_empty());
+
+    crate::profile::save_atomic(
+        &store.profile.join("window-settings.json"),
+        br#"{"snippet_analysis_history_limit":2}"#,
+    )
+    .unwrap();
+    let removals: usize = [snippet, folder]
+        .into_iter()
+        .zip(existing)
+        .map(|(subject, old)| {
+            let new = store.append(subject, record("next")).unwrap();
+            old.records.len() + 1 - new.records.len()
+        })
+        .sum();
+    assert_eq!(removals, preview.reports);
+    assert!(
+        store
+            .load(snippet)
+            .unwrap()
+            .records
+            .iter()
+            .any(|record| record.id == pin.id)
+    );
 }
 
 #[test]

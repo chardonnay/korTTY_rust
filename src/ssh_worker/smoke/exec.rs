@@ -33,6 +33,7 @@ fn isolated_worker_exec_preserves_shell_and_separates_output() {
         .execute(
             "printf 'exec-out'; printf 'exec-err' >&2; exit 23",
             &Cancel::default(),
+            || {},
         )
         .unwrap();
     assert_eq!(outcome.status, Status::Exited(23));
@@ -68,7 +69,7 @@ fn isolated_worker_exec_preserves_shell_and_separates_output() {
     // already-started process immediately when the exec channel closes.
     thread::sleep(Duration::from_millis(1200));
     let outcome = target
-        .execute("printf reopened", &Cancel::default())
+        .execute("printf reopened", &Cancel::default(), || {})
         .unwrap();
     assert_eq!(outcome.status, Status::Exited(0));
     assert_eq!(&*outcome.stdout.text(), "reopened");

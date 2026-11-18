@@ -71,6 +71,10 @@ fn agent_shortcut_default_and_plan_and_menu_keep_setup() {
         assert!(fixture.run(id).mode == Mode::Plan && fixture.run(id).phase == Phase::Setup);
         assert_eq!(fixture.run(id).epoch, 0);
     }
+    let confirmed = submit(&mut fixture, "agent(ask=true) inspect this");
+    assert!(fixture.run(confirmed).confirm_every_command);
+    let root = submit(&mut fixture, "agent-plan(root=true,ask=true) plan this");
+    assert!(fixture.run(root).auto_approve_root && fixture.run(root).confirm_every_command);
 }
 
 #[test]

@@ -16,10 +16,12 @@ mod auth;
 mod cache;
 mod git;
 mod local_entries;
-pub(crate) use auth::{AuthSave, DefaultAuth};
+mod reviewed_route;
+pub(crate) use auth::{AuthSave, DefaultAuth, OrderedAuth};
 pub(crate) use git::GitUrl;
 pub(crate) use local_entries::HiddenEntry;
 pub(super) use local_entries::{Favorites, HiddenEntries};
+pub(crate) use reviewed_route::ReviewedRoute;
 
 pub(crate) const MAX_SOURCES: usize = 16;
 const MAX_ACTIVE_SOURCES: usize = 2 * MAX_SOURCES;

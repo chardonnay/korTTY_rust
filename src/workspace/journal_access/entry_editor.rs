@@ -19,6 +19,11 @@ const DEFAULT_SPLIT: u16 = 6200;
 const MIN_SPLIT: u16 = 3200;
 const MAX_SPLIT: u16 = 7400;
 const BASIS_POINTS: f32 = 10_000.0;
+pub(in crate::workspace) const SPLIT_RANGE: std::ops::RangeInclusive<u16> = MIN_SPLIT..=MAX_SPLIT;
+
+pub(in crate::workspace) fn split_parts(ratio: f64) -> u16 {
+    ((ratio.clamp(0.0, 1.0) * f64::from(BASIS_POINTS)).round() as u16).clamp(MIN_SPLIT, MAX_SPLIT)
+}
 
 #[derive(Clone, Debug)]
 pub(crate) enum Event {
@@ -148,7 +153,7 @@ impl State {
 
     pub(super) fn resize(&mut self, ratio: f32) {
         if ratio.is_finite() {
-            self.set_split((ratio.clamp(0.0, 1.0) * BASIS_POINTS).round() as u16);
+            self.set_split(split_parts(f64::from(ratio)));
         }
     }
 

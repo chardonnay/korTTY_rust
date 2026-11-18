@@ -1827,7 +1827,7 @@ impl Client {
         if !self.profile.supports_lm_studio_metadata() {
             return Ok(());
         }
-        let capabilities = self.lm_studio_capabilities(Some(deadline), guard)?;
+        let capabilities = self.lm_studio_capabilities(Some(deadline), None, guard)?;
         match capabilities.and_then(|capabilities| capabilities.vision) {
             Some(true) => Ok(()),
             Some(false) => Err(Error::Review("The selected LM Studio model does not support image input.".into())),
@@ -1839,7 +1839,8 @@ impl Client {
     fn lm_studio_capabilities(
         &self,
         deadline: Option<Instant>,
-        authorize: impl Fn() -> Result<(), Error>,
+        reviewed: Option<&UsageAttempt>,
+        mut authorize: impl FnMut() -> Result<(), Error>,
     ) -> Result<Option<LmStudioCapabilities>, Error> {
         if matches!(&self.profile.target, Target::LmStudio(endpoint) if !endpoint.supports_metadata())
         {
@@ -1857,17 +1858,21 @@ impl Client {
             return Err(Error::TimedOut);
         }
         let transport = self.transport(Some(deadline))?;
-        let credential = self.profile.current_probe_credential()?;
+        let current_credential = || match reviewed {
+            Some(attempt) => self.completion_credential(attempt),
+            None => self.profile.current_probe_credential(),
+        };
+        let credential = current_credential()?;
         let secret = credential.as_deref().map(String::as_str);
         let key = LmStudioMetadataKey {
             endpoint: transport.connection.base.clone(),
             model: self.profile.model.clone(),
             credential: lm_studio_credential_digest(secret),
         };
-        let require_current = || {
+        let mut require_current = || {
             self.validate_transport(transport)?;
             authorize()?;
-            if self.profile.current_probe_credential()? != credential {
+            if current_credential()? != credential {
                 return Err(Error::Review(
                     "The model credential changed. Review the request again.".into(),
                 ));
@@ -1888,7 +1893,7 @@ impl Client {
             &transport.connection,
             secret,
             deadline,
-            require_current,
+            &mut require_current,
         );
         require_current()?;
         let capabilities = match response {
@@ -1911,7 +1916,12 @@ impl Client {
         Ok(capabilities)
     }
 
-    fn require_lm_studio_reasoning(&self, deadline: Option<Instant>) -> Result<(), Error> {
+    fn require_lm_studio_reasoning(
+        &self,
+        deadline: Option<Instant>,
+        attempt: &UsageAttempt,
+        mut before_dispatch: impl FnMut() -> Result<(), String>,
+    ) -> Result<(), Error> {
         let Some(option) = self
             .profile
             .options
@@ -1921,8 +1931,14 @@ impl Client {
         else {
             return Ok(());
         };
+        let reviewed = attempt.reviewed_https_credential.as_ref().map(|_| attempt);
         let available = self
-            .lm_studio_capabilities(deadline, || Ok(()))?
+            .lm_studio_capabilities(deadline, reviewed, || {
+                if reviewed.is_some() {
+                    before_dispatch().map_err(Error::Review)?;
+                }
+                Ok(())
+            })?
             .and_then(|capabilities| capabilities.reasoning);
         if available.is_some_and(|reasoning| {
             !reasoning
@@ -2034,7 +2050,7 @@ impl Client {
         self.require_text_for_mlx(messages)?;
         let transport = self.transport(deadline)?;
         if self.profile.uses_lm_studio_protocol() {
-            self.require_lm_studio_reasoning(deadline)?;
+            self.require_lm_studio_reasoning(deadline, attempt, &mut before_dispatch)?;
         }
         let deadline =
             self.before_completion_dispatch(transport, deadline, &mut before_dispatch, attempt)?;
@@ -2250,7 +2266,7 @@ impl Client {
         &self,
         transport: &Transport,
         deadline: Option<Instant>,
-        before_dispatch: impl FnOnce() -> Result<(), String>,
+        mut before_dispatch: impl FnMut() -> Result<(), String>,
         attempt: &UsageAttempt,
     ) -> Result<Option<Instant>, Error> {
         let deadline = if let Some(resolved) = &self.profile.lm_studio_auto {
@@ -2263,6 +2279,9 @@ impl Client {
                 deadline,
                 || {
                     self.require_transport_policy(ClipboardPolicy::load)?;
+                    if attempt.reviewed_https_credential.is_some() {
+                        before_dispatch().map_err(Error::Review)?;
+                    }
                     self.completion_credential(attempt).map(drop)
                 },
             )?;
@@ -2280,7 +2299,14 @@ impl Client {
                 &transport.connection,
                 credential.as_deref().map(String::as_str),
                 deadline,
-                || self.require_transport_policy(ClipboardPolicy::load),
+                || {
+                    self.require_transport_policy(ClipboardPolicy::load)?;
+                    if attempt.reviewed_https_credential.is_some() {
+                        before_dispatch().map_err(Error::Review)?;
+                        self.completion_credential(attempt)?;
+                    }
+                    Ok(())
+                },
             )?;
             deadline
         } else {
@@ -2488,10 +2514,10 @@ impl Client {
                 let (name, value) = remote_header(secret, protocol)?;
                 request = request.header(name, value);
             }
-        } else if let Some(header) = self
-            .request_authorization(transport, attempt.credential.as_deref().map(String::as_str))?
-        {
-            request = request.header("authorization", header);
+        } else if let Some(lease) = &transport.lease {
+            request = request.header("authorization", lease.sidecar().authorization().clone());
+        } else if let Some(secret) = &attempt.credential {
+            request = request.header("authorization", bearer_header(secret)?);
         }
         let mut request = request.config().http_status_as_error(false);
         if let Some(deadline) = deadline {

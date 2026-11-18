@@ -343,6 +343,10 @@ pub enum Action {
     AgentDesign,
     Cut,
     GitBash,
+    AgentPanelDesign,
+    AgentPanelBottom,
+    AgentPanelLeft,
+    AgentPanelRight,
 }
 
 #[derive(Clone, Copy)]
@@ -368,11 +372,13 @@ pub enum Branch {
     LiveJournal,
     MultiExec,
     CodingAgents,
+    AgentPanel,
 }
 
 impl Branch {
     #[cfg(target_os = "macos")]
-    const ALL: [Self; 10] = [
+    const ALL: [Self; 11] = [
+        Self::AgentPanel,
         Self::Security,
         Self::FileBrowser,
         Self::Panes,
@@ -397,6 +403,7 @@ impl Branch {
             Self::LiveJournal => "Live Journal",
             Self::MultiExec => "Multi-exec",
             Self::CodingAgents => "Coding Agents",
+            Self::AgentPanel => "AI Agent Panel",
         }
     }
 
@@ -412,6 +419,7 @@ impl Branch {
             Self::LiveJournal => "View › Live Journal",
             Self::MultiExec => "View › Multi-exec",
             Self::CodingAgents => "View › Coding Agents",
+            Self::AgentPanel => "View › AI Agent Panel",
         }
     }
 
@@ -425,7 +433,8 @@ impl Branch {
             | Self::TerminalEffects
             | Self::LiveJournal
             | Self::MultiExec
-            | Self::CodingAgents => Category::View,
+            | Self::CodingAgents
+            | Self::AgentPanel => Category::View,
             Self::RecentlyClosed | Self::OpenRecent => Category::File,
         }
     }
@@ -443,6 +452,13 @@ impl Branch {
                 Item(Isolation),
             ],
             Self::FileBrowser => &[Item(FilesLeft), Item(FilesRight)],
+            Self::AgentPanel => &[
+                Item(AgentPanelBottom),
+                Item(AgentPanelLeft),
+                Item(AgentPanelRight),
+                Separator,
+                Item(AgentPanelDesign),
+            ],
             Self::RemoteSidebar => &[
                 Item(RemoteSidebarLeft),
                 Item(RemoteSidebarRight),
@@ -673,6 +689,7 @@ impl Category {
                 Item(CustomizeToolbar),
                 Separator,
                 Submenu(Branch::FileBrowser),
+                Submenu(Branch::AgentPanel),
                 Submenu(Branch::LiveJournal),
                 Submenu(Branch::CodingAgents),
                 Submenu(Branch::RemoteSidebar),
@@ -889,6 +906,10 @@ impl Action {
             TerminalAgentPlan => "AI Planning…",
             AgentSwarm => "AI Swarm…",
             AgentDesign => "AI Agent Design…",
+            AgentPanelDesign => "Design Default",
+            AgentPanelBottom => "Dock Bottom",
+            AgentPanelLeft => "Dock Left",
+            AgentPanelRight => "Dock Right",
             TeamworkSettings => "Teamwork Settings…",
             LogfileManager => "Logfile Manager…",
             SessionProcesses => "Session Processes…",
@@ -1010,6 +1031,17 @@ impl Action {
         )
     }
 
+    fn agent_panel_placement(self) -> Option<super::terminal_agent::design::DockPlacement> {
+        use super::terminal_agent::design::DockPlacement;
+        Some(match self {
+            AgentPanelDesign => DockPlacement::Design,
+            AgentPanelBottom => DockPlacement::Bottom,
+            AgentPanelLeft => DockPlacement::Left,
+            AgentPanelRight => DockPlacement::Right,
+            _ => return None,
+        })
+    }
+
     #[cfg(target_os = "macos")]
     fn from_native(id: u16) -> Option<Self> {
         Self::shortcut_catalog().find_map(|(action, _, _)| (action as u16 == id).then_some(action))
@@ -1123,7 +1155,7 @@ impl Workspace {
     }
 
     fn chrome_colors(&self) -> ChromeColors {
-        if let Some(palette) = self.window_settings.appearance.design.palette() {
+        if let Some(palette) = self.window_settings.appearance.design().palette() {
             ChromeColors::from_design(palette)
         } else {
             self.window_settings
@@ -1498,6 +1530,17 @@ impl Workspace {
                 self.sync_native_menus();
                 return Task::none();
             }
+            AgentPanelDesign | AgentPanelBottom | AgentPanelLeft | AgentPanelRight => {
+                let placement = action.agent_panel_placement();
+                if self.window_settings.ai_agent_panel.placement != placement {
+                    self.cancel_agent_dock_resizes();
+                    self.window_settings.ai_agent_panel.placement = placement;
+                    self.save_window_settings(Some(id));
+                }
+                #[cfg(target_os = "macos")]
+                self.sync_native_menus();
+                return Task::none();
+            }
             QuickConnect => return self.show_quick_connect(id),
             QuickSelect => return self.start_quick_select(id),
             CodingAgentsLeft | CodingAgentsRight | ToggleCodingAgents => {
@@ -1606,6 +1649,10 @@ impl Workspace {
             | TerminalOnlyFullscreen
             | CodingAgentsLeft
             | CodingAgentsRight
+            | AgentPanelDesign
+            | AgentPanelBottom
+            | AgentPanelLeft
+            | AgentPanelRight
             | ToggleCodingAgents
             | NextBlockedCodingAgent
             | HideTerminalScrollbarsFullscreen => self.windows.contains_key(&id),
@@ -1896,6 +1943,15 @@ impl Workspace {
             CodingAgentsLeft => self.coding_agent_panel_placement(id) == CodingAgentPlacement::Left,
             CodingAgentsRight => {
                 self.coding_agent_panel_placement(id) == CodingAgentPlacement::Right
+            }
+            AgentPanelDesign | AgentPanelBottom | AgentPanelLeft | AgentPanelRight => {
+                action.agent_panel_placement()
+                    == Some(
+                        self.window_settings
+                            .ai_agent_panel
+                            .placement
+                            .unwrap_or_default(),
+                    )
             }
             ToggleActionToolbar => self.chrome.toolbar.layout(id).actions_visible(),
             ToggleConnectionToolbar => self.chrome.toolbar.layout(id).visible(Group::Connections),
@@ -2662,6 +2718,10 @@ fn native_menu_requires_focused_owner(action: Action) -> bool {
             | HideTerminalScrollbarsFullscreen
             | CodingAgentsLeft
             | CodingAgentsRight
+            | AgentPanelDesign
+            | AgentPanelBottom
+            | AgentPanelLeft
+            | AgentPanelRight
             | ToggleCodingAgents
             | NextBlockedCodingAgent
             | TerminalAgent
@@ -3447,6 +3507,45 @@ mod menu_tests {
         assert_ne!(new_owner, source);
         assert_ne!(new_owner, destination);
         assert_eq!(workspace.windows[&new_owner].active_tab_id(), Some(tab));
+    }
+
+    #[test]
+    fn agent_panel_view_commands_share_one_checked_placement_catalog() {
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let panel = [
+            AgentPanelBottom,
+            AgentPanelLeft,
+            AgentPanelRight,
+            AgentPanelDesign,
+        ];
+        assert!(
+            Category::View
+                .entries()
+                .iter()
+                .any(|entry| matches!(entry, Submenu(Branch::AgentPanel)))
+        );
+        for action in panel {
+            let placement = action.agent_panel_placement();
+            assert!(placement.is_some());
+            workspace.window_settings.ai_agent_panel.placement = placement;
+            assert!(workspace.chrome_enabled(owner, action));
+            assert!(
+                Action::shortcut_catalog()
+                    .any(|(entry, _, path)| entry == action && path == "View › AI Agent Panel")
+            );
+            for item in panel {
+                assert_eq!(
+                    workspace.chrome_checked(owner, &workspace.windows[&owner], item),
+                    item == action
+                );
+            }
+            #[cfg(target_os = "macos")]
+            {
+                assert_eq!(Action::from_native(action as u16), Some(action));
+                assert!(native_menu_requires_focused_owner(action));
+            }
+        }
     }
 
     #[test]

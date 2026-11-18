@@ -20,12 +20,20 @@ use super::Message as WindowMessage;
 pub(crate) mod apply;
 pub(crate) mod hardening;
 pub(crate) mod modularization;
+pub(crate) mod panel;
+pub(crate) mod progress;
 
 #[derive(Clone)]
 pub enum Message {
     Tab(Subject),
     Editor,
     Close,
+    SidePanel(bool),
+    ProgressDock(bool),
+    ResizeSidePanel {
+        available: f32,
+        width: f32,
+    },
     Profile(ProfileRef),
     Instructions(String),
     Skill(u64, bool),
@@ -59,6 +67,11 @@ pub enum Message {
     },
     Diagram,
     GenerateDiagram,
+    DiagramOptions(bool),
+    DiagramLayout(bool),
+    DiagramAppearance(crate::diagram_window::appearance::Edit),
+    ProjectDiagramVisible(bool),
+    ReportFont(u8),
     AutoDiagram(bool),
     AutoModularization(bool),
     Export,
@@ -66,6 +79,7 @@ pub enum Message {
     Jump {
         file: Option<String>,
         line: usize,
+        keep_panel: bool,
     },
 }
 
@@ -195,6 +209,8 @@ pub(crate) enum Phase<'a> {
 }
 
 pub(crate) struct View<'a> {
+    pub(crate) side_panel: Option<bool>,
+    pub(crate) side_open: bool,
     pub(crate) subject: Subject,
     pub(crate) name: &'a str,
     pub(crate) profiles: &'a [ProfileChoice],
@@ -209,7 +225,9 @@ pub(crate) struct View<'a> {
     pub(crate) record: Option<SnippetId>,
     pub(crate) phase: Phase<'a>,
     pub(crate) live: Option<LivePreview<'a>>,
-    pub(crate) apply_live: Option<&'a crate::snippet_analysis::request::apply::Progress>,
+    pub(crate) apply_progress: Option<progress::Content<'a>>,
+    pub(crate) progress_requested: bool,
+    pub(crate) progress_dock_width: Option<f32>,
     pub(crate) stale: bool,
     pub(crate) status: Option<&'a str>,
     pub(crate) can_export: bool,
@@ -220,10 +238,27 @@ pub(crate) struct View<'a> {
     pub(crate) show_resolved: bool,
     pub(crate) auto_diagram: bool,
     pub(crate) auto_plan: bool,
+    pub(crate) report_font: u8,
     pub(crate) diagram_preview: Option<&'a svg::Handle>,
     pub(crate) can_generate_diagram: bool,
+    pub(crate) diagram_options_expanded: bool,
+    pub(crate) project_diagram_visible: bool,
+    pub(crate) snippet_diagram_horizontal: bool,
+    pub(crate) diagram_appearance: crate::diagram_window::appearance::Preferences,
+    pub(crate) diagram_background_draft: Option<&'a str>,
+    pub(crate) system_dark: bool,
     pub(crate) modularization: modularization::Controls,
     pub(crate) scroll: iced::widget::Id,
+}
+
+pub(crate) const DEFAULT_REPORT_FONT: u8 = 14;
+pub(crate) const MIN_REPORT_FONT: u8 = 9;
+pub(crate) const MAX_REPORT_FONT: u8 = 32;
+
+impl View<'_> {
+    pub(crate) fn diagram_visible(&self) -> bool {
+        self.project_diagram_visible || !matches!(self.subject, Subject::Folder(_))
+    }
 }
 
 pub(crate) struct LivePreview<'a> {
@@ -245,6 +280,18 @@ impl fmt::Display for HistoryChoice {
 }
 
 pub(crate) fn view<'a>(state: &View<'a>) -> Element<'a, WindowMessage> {
+    let report = report_view(state);
+    if let (Some(content), Some(width)) = (state.apply_progress, state.progress_dock_width) {
+        row![report, progress::dock(content, width)]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+    } else {
+        report
+    }
+}
+
+fn report_view<'a>(state: &View<'a>) -> Element<'a, WindowMessage> {
     let project = matches!(state.subject, Subject::Folder(_));
     let history = state
         .history
@@ -272,6 +319,17 @@ pub(crate) fn view<'a>(state: &View<'a>) -> Element<'a, WindowMessage> {
             (!matches!(state.phase, Phase::SavingApply(_))).then_some(wrap(Message::Editor))
         ),
         button("Close analysis").on_press_maybe((!running).then_some(wrap(Message::Close))),
+        state.side_panel.map(|visible| checkbox(visible)
+            .label("Show beside editor")
+            .on_toggle(|visible| wrap(Message::SidePanel(visible)))),
+        state
+            .apply_progress
+            .map(|_| checkbox(state.progress_requested)
+                .label("Dock apply progress")
+                .on_toggle(|visible| wrap(Message::ProgressDock(visible)))),
+        project.then(|| checkbox(state.project_diagram_visible)
+            .label("Show project diagram")
+            .on_toggle(|visible| wrap(Message::ProjectDiagramVisible(visible)))),
     ]
     .spacing(8)
     .align_y(Alignment::Center)
@@ -458,6 +516,7 @@ pub(crate) fn view<'a>(state: &View<'a>) -> Element<'a, WindowMessage> {
     };
     let key = (phase_key, record.map(|record| record.id), preview_page);
     let progress = match state.phase {
+        _ if state.apply_progress.is_some() => None,
         Phase::Running { status } | Phase::SavingApply(status) => Some(notice(status)),
         _ => None,
     };
@@ -515,35 +574,10 @@ fn results<'a>(
             .style(container::secondary),
         );
     }
-    if let Some(progress) = state.apply_live {
-        let file = progress.file.map_or_else(String::new, |(file, total)| {
-            format!("File {file} of {total} · ")
-        });
-        let status = if progress.repair {
-            "Repairing response"
-        } else {
-            "Generating proposal"
-        };
-        let heading = format!(
-            "{file}Stage {} of {} · {status} · {} answer bytes received",
-            progress.stage, progress.stages, progress.answer_bytes
-        );
-        body = body.push(
-            container(
-                column![
-                    text(heading).size(14),
-                    (!progress.reason.is_empty()).then(|| column![
-                        text("Provisional change reason").size(13),
-                        text(&progress.reason).wrapping(Wrapping::WordOrGlyph),
-                    ]
-                    .spacing(4)),
-                ]
-                .spacing(7),
-            )
-            .padding(9)
-            .width(Length::Fill)
-            .style(container::secondary),
-        );
+    if let Some(content) = state.apply_progress
+        && state.progress_dock_width.is_none()
+    {
+        body = body.push(progress::inline(content));
     }
     if matches!(state.phase, Phase::Ready) {
         body = body
@@ -593,10 +627,9 @@ fn results<'a>(
         .iter()
         .find(|choice| choice.id == record.id)
         .cloned();
+    let show_diagram = state.diagram_visible();
     let mut tools = row![
-        record
-            .diagram
-            .is_some()
+        (show_diagram && record.diagram.is_some())
             .then(|| action("Enlarge flowchart", Message::Diagram)),
         button("Export report…").on_press_maybe(state.can_export.then_some(wrap(Message::Export))),
         button("Compare reports")
@@ -652,7 +685,13 @@ fn results<'a>(
         ));
     }
     if matches!(state.phase, Phase::Ready) {
-        body = body.push(apply::controls(record, &state.apply, state.stale, project));
+        body = body.push(apply::controls(
+            record,
+            &state.apply,
+            state.stale,
+            project,
+            state.apply_progress.and_then(progress::Content::review_run),
+        ));
         if record.purpose != Purpose::Verify {
             body = body.push(modularization::controls(
                 record.modularization.as_deref(),
@@ -660,13 +699,18 @@ fn results<'a>(
             ));
         }
     }
-    body.push(report(
+    body = body.push(report(
         record,
         project,
         state.can_jump,
+        state.side_open,
         state.apply.selection,
-    ))
-    .push(flowchart(state, record))
+        state.report_font,
+    ));
+    if show_diagram {
+        body = body.push(flowchart(state, record));
+    }
+    body
 }
 
 fn profile_picker<'a>(state: &View<'a>) -> Element<'a, WindowMessage> {
@@ -945,19 +989,47 @@ fn flowchart<'a>(state: &View<'a>, record: &'a Record) -> Column<'a, WindowMessa
     let mut body = column![
         row![
             text("Flowchart").size(16),
-            button(if record.diagram.is_some() {
-                "Regenerate…"
+            button(if state.diagram_options_expanded {
+                "Hide diagram options"
             } else {
-                "Generate…"
+                "Diagram options"
             })
-            .on_press_maybe(
-                (ready && state.can_generate_diagram).then_some(wrap(Message::GenerateDiagram))
-            ),
+            .on_press(wrap(Message::DiagramOptions(
+                !state.diagram_options_expanded
+            ))),
+            state
+                .diagram_options_expanded
+                .then(|| button(if record.diagram.is_some() {
+                    "Regenerate…"
+                } else {
+                    "Generate…"
+                })
+                .on_press_maybe(
+                    (ready && state.can_generate_diagram).then_some(wrap(Message::GenerateDiagram))
+                )),
+            state.diagram_options_expanded.then(|| {
+                button(if state.snippet_diagram_horizontal {
+                    "Horizontal"
+                } else {
+                    "Vertical"
+                })
+                .on_press(wrap(Message::DiagramLayout(
+                    !state.snippet_diagram_horizontal,
+                )))
+            }),
         ]
         .spacing(6)
         .wrap(),
     ]
     .spacing(6);
+    if state.diagram_options_expanded {
+        body = body.push(
+            state
+                .diagram_appearance
+                .controls(state.system_dark, state.diagram_background_draft)
+                .map(|edit| wrap(Message::DiagramAppearance(edit))),
+        );
+    }
     if let Some(diagram) = &record.diagram {
         if diagram.fallback {
             body = body.push(notice(
@@ -1012,12 +1084,26 @@ fn report<'a>(
     record: &'a Record,
     project: bool,
     can_jump: bool,
+    keep_panel: bool,
     selected: Option<&crate::snippet_analysis::model::Selection>,
+    font_size: u8,
 ) -> Column<'a, WindowMessage> {
     let analysis = &record.analysis;
     let provenance = &record.provenance;
+    let font = f32::from(font_size);
     let mut body = column![
-        text("Report").size(17),
+        row![
+            text("Report").size(17),
+            button("A−").on_press_maybe(
+                (font_size > MIN_REPORT_FONT).then_some(wrap(Message::ReportFont(font_size - 1)))
+            ),
+            text(format!("{font_size} pt")),
+            button("A+").on_press_maybe(
+                (font_size < MAX_REPORT_FONT).then_some(wrap(Message::ReportFont(font_size + 1)))
+            ),
+        ]
+        .spacing(6)
+        .align_y(Alignment::Center),
         text(history_choice(record).label).size(13),
         (!project).then(|| {
             text(format!(
@@ -1033,8 +1119,9 @@ fn report<'a>(
             provenance.skill_names.join(", ")
         ))
         .size(13)),
-        (!analysis.summary.is_empty())
-            .then(|| text(&analysis.summary).wrapping(Wrapping::WordOrGlyph)),
+        (!analysis.summary.is_empty()).then(|| text(&analysis.summary)
+            .size(font)
+            .wrapping(Wrapping::WordOrGlyph)),
     ]
     .spacing(8);
     if let Some(history) = &record.java_history {
@@ -1133,8 +1220,10 @@ fn report<'a>(
                     finding,
                     project,
                     can_jump,
+                    keep_panel,
                     badge,
                     selected.map(|selection| (record.id, selection.findings.contains(&finding.id))),
+                    font,
                 ));
             }
         }
@@ -1151,6 +1240,7 @@ fn report<'a>(
                 selected
                     .filter(|_| !dependency.suggestion.trim().is_empty())
                     .map(|selection| (record.id, selection.dependencies.contains(&dependency.id))),
+                font,
             ));
         }
     }
@@ -1192,8 +1282,10 @@ fn finding_card(
     finding: &Finding,
     project: bool,
     can_jump: bool,
+    keep_panel: bool,
     verification_badge: Option<String>,
     apply_selection: Option<(SnippetId, bool)>,
+    font_size: f32,
 ) -> Element<'_, WindowMessage> {
     let rank = severity_rank(&finding.severity);
     let mut title: Row<'_, WindowMessage> = row![
@@ -1211,7 +1303,7 @@ fn finding_card(
             }),
         text(&finding.id).size(12),
         text(&finding.title)
-            .size(14)
+            .size(font_size)
             .wrapping(Wrapping::WordOrGlyph),
         verification_badge.map(|label| text(label).size(12)),
     ];
@@ -1224,6 +1316,7 @@ fn finding_card(
                     wrap(Message::Jump {
                         file: finding.file.clone(),
                         line,
+                        keep_panel,
                     })
                 })),
         );
@@ -1236,12 +1329,15 @@ fn finding_card(
                     .size(12)
                     .wrapping(Wrapping::WordOrGlyph)
             }),
-            (!finding.detail.is_empty())
-                .then(|| text(&finding.detail).wrapping(Wrapping::WordOrGlyph)),
+            (!finding.detail.is_empty()).then(|| text(&finding.detail)
+                .size(font_size)
+                .wrapping(Wrapping::WordOrGlyph)),
             (!finding.recommendation.is_empty()).then(|| {
                 column![
                     text("Recommendation").size(12),
-                    text(&finding.recommendation).wrapping(Wrapping::WordOrGlyph),
+                    text(&finding.recommendation)
+                        .size(font_size)
+                        .wrapping(Wrapping::WordOrGlyph),
                 ]
                 .spacing(3)
             }),
@@ -1254,6 +1350,7 @@ fn dependency_card(
     dependency: &Dependency,
     verification_badge: Option<String>,
     apply_selection: Option<(SnippetId, bool)>,
+    font_size: f32,
 ) -> Element<'_, WindowMessage> {
     card(
         column![
@@ -1267,17 +1364,22 @@ fn dependency_card(
                     )))),
                 text(&dependency.id).size(12),
                 text(&dependency.kind).size(12),
-                text(&dependency.name).wrapping(Wrapping::WordOrGlyph),
+                text(&dependency.name)
+                    .size(font_size)
+                    .wrapping(Wrapping::WordOrGlyph),
                 verification_badge.map(|label| text(label).size(12)),
             ]
             .spacing(6)
             .wrap(),
-            (!dependency.purpose.is_empty())
-                .then(|| text(&dependency.purpose).wrapping(Wrapping::WordOrGlyph)),
+            (!dependency.purpose.is_empty()).then(|| text(&dependency.purpose)
+                .size(font_size)
+                .wrapping(Wrapping::WordOrGlyph)),
             (!dependency.suggestion.is_empty()).then(|| {
                 column![
                     text("Reduce or replace").size(12),
-                    text(&dependency.suggestion).wrapping(Wrapping::WordOrGlyph),
+                    text(&dependency.suggestion)
+                        .size(font_size)
+                        .wrapping(Wrapping::WordOrGlyph),
                 ]
                 .spacing(3)
             }),

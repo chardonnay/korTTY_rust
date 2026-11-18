@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 use iced::{Element, Task, window};
 use serde_json::json;
@@ -105,12 +106,16 @@ pub enum Message {
     ConfirmDirectory(u64),
     Approve(u64),
     ApproveBatch(u64),
+    ApproveRemaining(u64),
+    ConfirmEveryCommand(bool),
+    AutoApproveRoot(bool),
     Answer(u64, String),
     Implement(u64),
     Planning(planning::Message),
     History(history::Message),
     ActivityExport(activity_export::Message),
     Design(design::Message),
+    DockResize(design::DockResize),
     ChatFollowUp(u64, String),
     ContinueInChat(u64),
     DismissChatHandoff(u64),
@@ -259,10 +264,15 @@ struct Run {
     learned_sudo: Option<crate::terminal_logging::RedactionSecrets>,
     notice: String,
     activity: VecDeque<String>,
+    journal_commands: HashMap<usize, Option<Arc<AtomicBool>>>,
     swarm_conclusion: Option<String>,
     final_evidence: final_evidence::Evidence,
     commands: VecDeque<ReviewedCommand>,
     batch_commands: Option<Box<swarm::batch::Pending>>,
+    run_approval: Option<policy::RunApproval>,
+    confirm_every_command: bool,
+    auto_approve_root: bool,
+    probe_reviewed: bool,
     epoch: u64,
     turns: usize,
     questions: usize,
@@ -427,10 +437,15 @@ impl Run {
             learned_sudo: None,
             notice: String::new(),
             activity: VecDeque::new(),
+            journal_commands: HashMap::new(),
             swarm_conclusion: None,
             final_evidence: final_evidence::Evidence::default(),
             commands: VecDeque::new(),
             batch_commands: None,
+            run_approval: None,
+            confirm_every_command: false,
+            auto_approve_root: false,
+            probe_reviewed: false,
             epoch: 0,
             turns: 0,
             questions: 0,
@@ -441,6 +456,15 @@ impl Run {
             ai_cancel: None,
             password: None,
             sudo_terminal: None,
+        }
+    }
+
+    fn revoke_command_approval(&mut self) -> bool {
+        if let Some(approval) = self.run_approval.take() {
+            approval.revoke();
+            true
+        } else {
+            false
         }
     }
 
@@ -494,6 +518,9 @@ impl Run {
         self.epoch += 1;
         self.phase = phase;
         if phase.finished() {
+            self.probe_reviewed = false;
+            self.auto_approve_root = false;
+            self.revoke_command_approval();
             self.model_review = None;
             self.sudo_terminal = None;
             self.chat_handoff_notice = Some(notice.into());
@@ -506,13 +533,28 @@ impl Run {
 
     fn record(&mut self, text: String) {
         if self.activity.len() == MAX_ACTIVITY {
+            self.journal_commands.remove(&self.presentation.identity(0));
             self.activity.pop_front();
             self.presentation.evict();
         }
         self.activity.push_back(text);
     }
 
+    fn record_command(&mut self, preview: String, probe: bool) -> Option<Arc<AtomicBool>> {
+        let dispatch = (self.swarm && !probe).then(|| Arc::new(AtomicBool::new(false)));
+        self.record(preview);
+        if self.swarm {
+            self.journal_commands.insert(
+                self.presentation.identity(self.activity.len() - 1),
+                dispatch.clone(),
+            );
+        }
+        dispatch
+    }
+
     fn stop(&mut self, notice: &str) {
+        self.auto_approve_root = false;
+        self.revoke_command_approval();
         self.cancel.request();
         self.ai_cancel = None;
         self.model_review = None;
@@ -531,6 +573,7 @@ impl Run {
     }
 
     fn block(&mut self, error: String) {
+        self.revoke_command_approval();
         self.next(Phase::Blocked, &error);
         self.commands.clear();
         self.batch_commands = None;
@@ -540,8 +583,20 @@ impl Run {
     }
 }
 
+impl Run {
+    fn ordinary_command_review(&self) -> bool {
+        self.mode == Mode::Run
+            && self.phase == Phase::Approval
+            && self.profile().is_some()
+            && self.commands.front().is_some_and(|command| {
+                command.sudo.is_none() && swarm::batch::ordinary(&command.proposal)
+            })
+    }
+}
+
 impl Drop for Run {
     fn drop(&mut self) {
+        self.revoke_command_approval();
         self.cancel.request();
     }
 }
@@ -677,11 +732,12 @@ impl State {
         id: window::Id,
         palette: Option<palette::Palette>,
         swarm_animation: bool,
-        batch_allowed: bool,
+        approvals: impl Into<policy::Approvals>,
         web_available: bool,
         summary_profiles: impl FnOnce() -> Vec<crate::scheduler_window::AutomationSummaryProvider>,
     ) -> Option<Element<'_, Message>> {
         use iced::widget::container;
+        let approvals = approvals.into();
 
         let view = if let Some(dialog) = self.workflows.get(&id) {
             dialog.view().map(Message::Workflow)
@@ -691,13 +747,16 @@ impl State {
             id,
             swarm_animation,
             palette,
-            batch_allowed,
+            approvals,
             web_available,
             summary_profiles,
         ) {
             view.map(Message::Swarm)
         } else {
-            self.runs.get(&id).filter(|run| !run.swarm)?.view(palette)
+            self.runs
+                .get(&id)
+                .filter(|run| !run.swarm)?
+                .view(palette, approvals.remaining)
         };
         Some(if let Some(palette) = palette {
             palette::panel(
@@ -718,8 +777,17 @@ impl Workspace {
             id,
             self.agent_window_palette(id),
             self.swarm_status_animated(id),
-            self.clipboard.policy.ai_agent_execution
-                == crate::clipboard_policy::AiAgentExecution::Allow,
+            policy::Approvals {
+                batch: self.clipboard.policy.ai_agent_execution
+                    == crate::clipboard_policy::AiAgentExecution::Allow,
+                remaining: self.clipboard.policy.ai_agent_execution
+                    == crate::clipboard_policy::AiAgentExecution::Allow
+                    && self.ai_configuration().is_some_and(|config| {
+                        config.saved_root().is_some()
+                            && config.agent_execution_enabled()
+                            && !config.agent_requires_command_confirmation()
+                    }),
+            },
             self.swarm_web_available(id),
             || self.automation_summary_providers(),
         )
@@ -783,6 +851,7 @@ impl Workspace {
         if mode != Mode::Run {
             return Ok(());
         }
+        self.require_agent_execution_enabled()?;
         if self
             .terminal_overrides(pane)
             .is_some_and(|settings| settings.ai_agent_disabled)
@@ -1115,6 +1184,12 @@ impl Workspace {
     ) -> Task<Desktop> {
         if let Message::ChatHandoffLoaded(loaded) = message {
             return self.finish_agent_chat(loaded);
+        }
+        if let Message::DockResize(resize) = message {
+            if let Some(owner) = self.resize_agent_dock(id, resize) {
+                self.save_window_settings(Some(owner));
+            }
+            return Task::none();
         }
         if let Message::PipOwned(run_id, message) = message {
             let current = self.terminal_agents.runs.get(&run_id).is_some_and(|run| {

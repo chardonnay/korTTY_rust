@@ -24,30 +24,29 @@ impl AuthSnapshot {
     ) -> (LoginTarget, Self) {
         let mut login = selected.connection.login.endpoint.clone();
         let preference = selected
+            .route
             .default_auth_eligible
             .then(|| workspace.teamwork_auth_default().clone());
-        let method = match &preference {
-            Some(DefaultAuth::Password { credential }) => {
-                match eligible_password(workspace, credential, &login) {
-                    Some(target) => {
-                        login = target;
-                        AppliedAuth::Password(credential.clone())
-                    }
-                    None => AppliedAuth::Prompt,
-                }
-            }
-            Some(DefaultAuth::Key { id, username })
-                if crate::ssh_key_catalog::Catalog::open_profile()
-                    .is_ok_and(|catalog| catalog.get(*id).is_some()) =>
-            {
-                set_username(&mut login, username);
-                AppliedAuth::Key(*id)
-            }
-            Some(DefaultAuth::TemporaryKey { username }) => {
-                set_username(&mut login, username);
-                AppliedAuth::TemporaryKey
-            }
-            _ => AppliedAuth::Prompt,
+        let ordered = preference
+            .as_ref()
+            .map(DefaultAuth::ordered)
+            .unwrap_or_default();
+        let method = if let Some(credential) = ordered.credential
+            && let Some(target) = eligible_password(workspace, &credential, &login)
+        {
+            login = target;
+            AppliedAuth::Password(credential)
+        } else if let Some(id) = ordered.key
+            && crate::ssh_key_catalog::Catalog::open_profile()
+                .is_ok_and(|catalog| catalog.get(id).is_some())
+        {
+            set_username(&mut login, &ordered.username);
+            AppliedAuth::Key(id)
+        } else if ordered.temporary_key {
+            set_username(&mut login, &ordered.username);
+            AppliedAuth::TemporaryKey
+        } else {
+            AppliedAuth::Prompt
         };
         (login, Self { preference, method })
     }
@@ -90,7 +89,10 @@ impl AuthSnapshot {
     }
 
     pub(super) fn notice(&self) -> Option<String> {
-        (self.method == AppliedAuth::Prompt && self.preference.as_ref().is_some_and(|preference| *preference != DefaultAuth::Prompt))
+        (self.method == AppliedAuth::Prompt && self.preference.as_ref().is_some_and(|preference| {
+            let ordered = preference.ordered();
+            ordered.credential.is_some() || ordered.key.is_some() || ordered.temporary_key
+        }))
             .then(|| "The Teamwork authentication default is unavailable for this login. Enter authentication to connect.".into())
     }
 }

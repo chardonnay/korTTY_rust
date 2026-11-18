@@ -138,7 +138,7 @@ impl PolicyAutoModel {
         connection: &Connection,
         credential: Option<&str>,
         deadline: Option<Instant>,
-        authorize: impl Fn() -> Result<(), Error>,
+        authorize: impl FnMut() -> Result<(), Error>,
     ) -> Result<(), Error> {
         let model = policy_auto_model::resolve(connection, credential, deadline, authorize)
             .map_err(|error| match error {

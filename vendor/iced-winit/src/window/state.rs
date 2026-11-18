@@ -3,6 +3,7 @@ use crate::core::{Color, Point, Size};
 use crate::core::{mouse, theme, window};
 use crate::graphics::Viewport;
 use crate::program::{self, Program};
+use crate::runtime;
 
 use winit::event::{Touch, WindowEvent};
 use winit::window::Window;
@@ -22,6 +23,8 @@ where
     viewport: Viewport,
     surface_version: u64,
     cursor_position: Option<winit::dpi::PhysicalPosition<f64>>,
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    desktop_drop_position: Option<(f64, f64)>,
     modifiers: winit::keyboard::ModifiersState,
     theme: Option<P::Theme>,
     theme_mode: theme::Mode,
@@ -77,6 +80,8 @@ where
             viewport,
             surface_version: 0,
             cursor_position: None,
+            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            desktop_drop_position: None,
             modifiers: winit::keyboard::ModifiersState::default(),
             theme,
             theme_mode,
@@ -105,8 +110,12 @@ where
         self.viewport.scale_factor()
     }
 
-    pub fn surface_position(&self, point: (f64, f64)) -> Option<Point> {
-        let scale = f64::from(self.scale_factor);
+    pub fn position(&self, position: runtime::window::NativePosition) -> Option<Point> {
+        let (point, scale) = match position {
+            runtime::window::NativePosition::Surface(point) => (point, self.scale_factor),
+            runtime::window::NativePosition::Physical(point) => (point, self.viewport.scale_factor()),
+        };
+        let scale = f64::from(scale);
         let logical = Point::new((point.0 / scale) as f32, (point.1 / scale) as f32);
         let size = self.logical_size();
         (scale.is_finite()
@@ -123,6 +132,21 @@ where
             })
             .map(mouse::Cursor::Available)
             .unwrap_or(mouse::Cursor::Unavailable)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn set_desktop_drop_position(&mut self, point: (f64, f64)) {
+        self.desktop_drop_position = Some(point);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    pub fn take_desktop_drop_cursor(&mut self) -> Option<mouse::Cursor> {
+        self.desktop_drop_position.take().map(|(x, y)| {
+            mouse::Cursor::Available(conversion::cursor_position(
+                winit::dpi::PhysicalPosition::new(x, y),
+                self.viewport.scale_factor(),
+            ))
+        })
     }
 
     pub fn file_drop_cursor(&self, _window: &Window) -> mouse::Cursor {

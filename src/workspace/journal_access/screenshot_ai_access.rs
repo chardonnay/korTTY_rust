@@ -12,7 +12,6 @@ use iced::{Element, Task, window};
 use crate::local_ai::{self, Cancel, Profile};
 use crate::session_journal::screenshot_ai::{self, Analysis};
 use crate::session_journal::screenshot_analysis_store::{self, Outcome};
-use crate::session_journal::topic_ai_settings;
 use crate::session_journal::viewer::Screenshot;
 use crate::session_journal::{Capture, PublishedScreenshot, Status, TimelineEntry};
 
@@ -107,7 +106,9 @@ impl fmt::Debug for Saved {
 
 impl Workspace {
     pub(in crate::workspace) fn journal_screenshot_analysis_available(&self) -> bool {
-        topic_ai_settings::vision_allowed(&self.clipboard.policy)
+        self.window_settings
+            .journal_ai
+            .allows_screenshot_analysis(&self.clipboard.policy)
             && self.configured_journal_ai(true).is_some()
     }
 
@@ -206,7 +207,10 @@ impl Workspace {
         if self.exiting
             || self.scheduler_draining
             || !self.ai_features_enabled()
-            || !topic_ai_settings::vision_allowed(&self.clipboard.policy)
+            || !self
+                .window_settings
+                .journal_ai
+                .allows_screenshot_analysis(&self.clipboard.policy)
         {
             return None;
         }

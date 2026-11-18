@@ -18,6 +18,111 @@ impl Drop for Server {
 }
 
 #[test]
+#[ignore = "requires an installed OpenSSH sftp-server with POSIX rename"]
+fn openssh_recursive_deletion_rejects_a_stale_review_and_reloads_the_remaining_directory() {
+    let profile = crate::snippets::tests::Profile::new();
+    let root = profile.0.canonicalize().unwrap();
+    let (_, remote) = roots(&root);
+    let context = context(&root);
+    let selected = remote.join("selected");
+    let nested = selected.join("nested");
+    let original = nested.join("original.txt");
+    let late = nested.join("late.txt");
+    let retained = remote.join("retained.txt");
+    private_dir(&selected);
+    private_dir(&nested);
+    private_file(&original, b"original").unwrap();
+    private_file(&retained, b"retain this sibling").unwrap();
+    let (mut server, reader) = open_server(&remote);
+    let writer = Box::new(server.0.stdin.take().unwrap()) as _;
+    let mut client: Client = Sftp::new(reader, writer).unwrap();
+    assert!(client.supports_atomic_replace());
+
+    super::upload::window(&context, |window, incoming, control| {
+        let path = remote.as_os_str().as_bytes();
+        let name = EntryName::Remote(b"selected".to_vec());
+        let review = |window: &mut SftpWindow, client: &mut Client| {
+            window
+                .remote
+                .load(Arc::new(list_remote(client, path).unwrap()));
+            let _ = window.update(WindowMessage::Select(Side::Remote, name.clone()));
+            let _ = window.update(WindowMessage::Change(
+                Side::Remote,
+                crate::sftp_window::Change::Delete,
+            ));
+            let _ = window.update(WindowMessage::ReviewDeletion);
+            let command = incoming
+                .try_recv()
+                .expect("queue a read-only recursive review");
+            assert!(matches!(&command.operation, Operation::ReviewDeletion(..)));
+            let reply = finish_command(window, client, control, command);
+            let Reply::RecursiveDeletionReviewed(plan) = reply.as_ref() else {
+                panic!("expected a recursive deletion review: {reply:?}");
+            };
+            plan.paths().to_vec()
+        };
+        assert_eq!(
+            review(window, &mut client),
+            [
+                "selected",
+                "selected/nested",
+                "selected/nested/original.txt"
+            ]
+        );
+        assert_eq!(fs::read(&original).unwrap(), b"original");
+        private_file(&late, b"appeared after review").unwrap();
+        let _ = window.update(WindowMessage::ConfirmChange);
+        let command = incoming.try_recv().expect("queue the reviewed deletion");
+        assert!(matches!(&command.operation, Operation::ApplyDeletion(..)));
+        let ticket = window.busy.as_ref().unwrap().id;
+        let reply = execute(
+            &mut client,
+            command.operation,
+            control,
+            RemoteEditorPolicy::Deny,
+        )
+        .map(Arc::new);
+        assert!(
+            reply
+                .as_ref()
+                .is_err_and(|error| error.message.contains("selected tree changed"))
+        );
+        let _ = window.update(WindowMessage::Done(ticket, reply));
+        assert_eq!(fs::read(&original).unwrap(), b"original");
+        assert_eq!(fs::read(&late).unwrap(), b"appeared after review");
+        assert_eq!(fs::read_dir(&remote).unwrap().count(), 2);
+
+        assert_eq!(
+            review(window, &mut client),
+            [
+                "selected",
+                "selected/nested",
+                "selected/nested/late.txt",
+                "selected/nested/original.txt"
+            ]
+        );
+        let _ = window.update(WindowMessage::ConfirmChange);
+        let command = incoming.try_recv().expect("queue the fresh deletion");
+        let reply = finish_command(window, &mut client, control, command);
+        assert!(
+            matches!(reply.as_ref(), Reply::Changed { directory: Some(_), note }
+            if note == "Deleted 4 of 4 reviewed entries"),
+            "{reply:?}"
+        );
+        assert!(
+            window
+                .remote
+                .entries()
+                .all(|entry| entry.display == "retained.txt")
+        );
+        assert_eq!(window.remote.entries().len(), 1);
+    });
+    assert!(!selected.exists());
+    assert_eq!(fs::read(&retained).unwrap(), b"retain this sibling");
+    assert_eq!(fs::read_dir(&remote).unwrap().count(), 1);
+}
+
+#[test]
 #[ignore = "requires an installed OpenSSH sftp-server"]
 fn openssh_reviewed_folder_copy_publishes_without_replacement() {
     let profile = crate::snippets::tests::Profile::new();

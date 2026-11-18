@@ -33,9 +33,9 @@ const DEFAULT_PLACEMENT: WindowPlacement = WindowPlacement {
     height: 620.0,
     position: None,
 };
-const FONT_SIZE: u8 = 12;
-const FONT_MIN: u8 = 6;
-const FONT_MAX: u8 = 40;
+const FONT_SIZE: f64 = 12.0;
+const FONT_MIN: f64 = 6.0;
+const FONT_MAX: f64 = 40.0;
 const MAX_SOURCE_BYTES: usize = 4096;
 const MAX_SOURCE_LINES: usize = 100;
 const MAX_PREFERENCES: u64 = 4096;
@@ -87,7 +87,8 @@ pub struct RenderedPicture {
 struct Preferences {
     // Older profiles stored this dialog's geometry alongside its display preferences.
     placement: WindowPlacement,
-    zoom: u8,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    zoom: Option<f64>,
     format: Format,
     ai_size: picture::Size,
     image_size: picture::Size,
@@ -97,7 +98,7 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             placement: DEFAULT_PLACEMENT,
-            zoom: FONT_SIZE,
+            zoom: None,
             format: Format::default(),
             ai_size: picture::Size::default(),
             image_size: picture::Size::default(),
@@ -138,7 +139,7 @@ impl Preferences {
         {
             prefs.placement.position = None;
         }
-        prefs.zoom = prefs.zoom.clamp(FONT_MIN, FONT_MAX);
+        prefs.zoom = prefs.zoom.and_then(clamp_preview_font);
         prefs.format.gap = prefs.format.gap.min(20);
         if prefs.format.output != Output::None {
             prefs.format.comment = Comment::None;
@@ -149,6 +150,22 @@ impl Preferences {
     fn save(self) -> io::Result<()> {
         profile::save_atomic(&Self::path()?, &serde_json::to_vec(&self)?)
     }
+
+    fn zoom(self) -> f64 {
+        self.zoom.unwrap_or(FONT_SIZE)
+    }
+
+    fn apply_imported_zoom(&mut self, imported: Option<f64>) {
+        self.zoom = self.zoom.or_else(|| imported.and_then(clamp_preview_font));
+    }
+}
+
+pub(super) fn clamp_preview_font(size: f64) -> Option<f64> {
+    size.is_finite().then(|| size.clamp(FONT_MIN, FONT_MAX))
+}
+
+pub(super) fn valid_preview_font(size: f64) -> bool {
+    (FONT_MIN..=FONT_MAX).contains(&size)
 }
 
 pub(super) struct Dialog {
@@ -332,7 +349,7 @@ impl Dialog {
         ]
         .spacing(6)
         .align_y(Alignment::Center);
-        let zoom = self.preferences.zoom;
+        let zoom = self.preferences.zoom();
         let copy = tooltip(
             button("Copy to Clipboard")
                 .on_press_maybe(self.can_copy(ai_allowed).then_some(Message::Copy)),
@@ -347,7 +364,7 @@ impl Dialog {
         let bottom = row![
             text("Zoom"),
             button("−").on_press_maybe((zoom > FONT_MIN).then_some(Message::Zoom(-1))),
-            text(format!("{} %", (u16::from(zoom) * 100 + 6) / 12)).width(46),
+            text(format!("{:.0} %", (zoom * 100.0 / FONT_SIZE).round())).width(46),
             button("+").on_press_maybe((zoom < FONT_MAX).then_some(Message::Zoom(1))),
             button("⟲").on_press(Message::Zoom(0)),
             space::horizontal(),
@@ -460,7 +477,7 @@ impl Dialog {
         let preview = container(
             text(self.preview())
                 .font(Font::MONOSPACE)
-                .size(f32::from(self.preferences.zoom))
+                .size(self.preferences.zoom() as f32)
                 .wrapping(iced::widget::text::Wrapping::None),
         )
         .padding(7)
@@ -567,7 +584,8 @@ impl Workspace {
         if let Some(id) = self.ascii_art_for_owner(owner) {
             return window::gain_focus(id);
         }
-        let preferences = Preferences::load();
+        let mut preferences = Preferences::load();
+        preferences.apply_imported_zoom(self.window_settings.ascii_art_preview_font_size);
         let (id, open) = self.open_placed_dialog_with_fallback(
             DialogKind::AsciiArt,
             window::Settings {
@@ -755,13 +773,10 @@ impl Workspace {
                     .request_picture()
                     .map(move |message| Desktop::AsciiArt(id, message));
             }
-            Message::Zoom(0) => dialog.preferences.zoom = FONT_SIZE,
+            Message::Zoom(0) => dialog.preferences.zoom = Some(FONT_SIZE),
             Message::Zoom(step) => {
-                dialog.preferences.zoom = dialog
-                    .preferences
-                    .zoom
-                    .saturating_add_signed(step)
-                    .clamp(FONT_MIN, FONT_MAX);
+                dialog.preferences.zoom =
+                    clamp_preview_font(dialog.preferences.zoom() + f64::from(step));
             }
             Message::Comment(style) => dialog.preferences.format.comment(style),
             Message::Output(style) => dialog.preferences.format.output(style),
@@ -850,5 +865,24 @@ impl Workspace {
             move |result| Message::ImageLoaded(token, path.clone(), result),
         )
         .map(move |message| Desktop::AsciiArt(id, message))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn imported_zoom_only_fills_an_unset_ascii_art_preference() {
+        let mut current: Preferences = serde_json::from_str(r#"{"zoom":18}"#).unwrap();
+        current.apply_imported_zoom(Some(15.5));
+        assert_eq!(current.zoom(), 18.0);
+
+        let mut unset: Preferences = serde_json::from_str("{}").unwrap();
+        assert_eq!(unset.zoom(), 12.0);
+        unset.apply_imported_zoom(Some(15.5));
+        let reopened: Preferences =
+            serde_json::from_slice(&serde_json::to_vec(&unset).unwrap()).unwrap();
+        assert_eq!(reopened.zoom(), 15.5);
     }
 }

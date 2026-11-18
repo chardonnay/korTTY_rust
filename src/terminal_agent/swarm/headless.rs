@@ -19,30 +19,6 @@ pub(crate) struct Execution {
 }
 
 impl Execution {
-    pub(crate) fn run_guarded(
-        self,
-        command: &str,
-        cancel: &Cancel,
-        before_dispatch: impl Fn() -> Result<(), String>,
-    ) -> Result<Outcome, String> {
-        self.run_checked(
-            command,
-            cancel,
-            crate::ssh_connection::trust_store,
-            before_dispatch,
-        )
-    }
-
-    pub(crate) fn run_checked(
-        self,
-        command: &str,
-        cancel: &Cancel,
-        trust_store: impl FnOnce() -> io::Result<TrustStore>,
-        before_dispatch: impl Fn() -> Result<(), String>,
-    ) -> Result<Outcome, String> {
-        self.run_checked_with_start(command, cancel, trust_store, before_dispatch, || {})
-    }
-
     pub(crate) fn run_checked_with_start(
         self,
         command: &str,

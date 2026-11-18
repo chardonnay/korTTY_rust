@@ -168,7 +168,12 @@ fn native_replay_button_emits_only_an_isolated_settings_demo_event() {
     };
     let mut renderer = Renderer::new(Font::DEFAULT, 14.0.into());
     let mut ui = UserInterface::build(
-        view(&demo, layout, owner),
+        view(
+            &demo,
+            layout,
+            super::super::DockPreferences::default(),
+            owner,
+        ),
         Size::new(760.0, 700.0),
         Cache::default(),
         &mut renderer,

@@ -312,6 +312,23 @@ impl<R: Read, W: Write> Sftp<R, W> {
         self.path_attributes(wire::LSTAT, path.as_ref())
     }
 
+    /// Reads the target stored in a symbolic link without resolving it.
+    pub fn read_link(&mut self, path: impl AsRef<[u8]>) -> Result<Vec<u8>, Error> {
+        let fields = path_fields(path.as_ref(), false)?;
+        self.request(wire::READLINK, &fields, wire::NAME, |decoder| {
+            if decoder.u32()? != 1 {
+                return Err(Error::Protocol(
+                    "SFTP READLINK did not return a single name",
+                ));
+            }
+            let target = decode_entry(decoder)?.name;
+            if target.is_empty() || target.contains(&0) {
+                return Err(Error::Protocol("invalid SFTP link target"));
+            }
+            Ok(target)
+        })
+    }
+
     /// Copies one remote file into a caller-owned writer and flushes it.
     ///
     /// On failure the writer may contain partial data. To protect an existing

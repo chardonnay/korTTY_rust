@@ -32,6 +32,7 @@ pub(crate) enum Message {
     AutoDetect(bool),
     LearnedRulesEnabled(bool),
     UsageStatistics(bool),
+    UseImported(super::Preference),
     Select(u64),
     Add,
     Delete,
@@ -138,6 +139,7 @@ pub(in crate::ai_manager) struct Editor {
     external: Option<external::Panel>,
     statistics_root: Option<PathBuf>,
     statistics_policy: Option<bool>,
+    imported_preferences: super::JavaPreferences,
     statistics: Option<statistics_view::Panel>,
     notice: Option<String>,
 }
@@ -182,6 +184,14 @@ impl Form {
 }
 
 impl Editor {
+    pub(in crate::ai_manager) fn with_imported_preferences(
+        mut self,
+        preferences: super::JavaPreferences,
+    ) -> Self {
+        self.imported_preferences = preferences;
+        self
+    }
+
     pub(in crate::ai_manager) fn with_statistics_root(mut self, root: PathBuf) -> Self {
         self.statistics_root = Some(root);
         self
@@ -414,6 +424,17 @@ impl Editor {
             }
             Message::ShowHidden(value) => self.show_hidden = value,
             Message::Sort(sort) => self.sort = sort,
+            Message::UseImported(preference) => {
+                if let Some(value) = self.imported_preferences.get(preference) {
+                    let message = match preference {
+                        super::Preference::Enabled => Message::EnableLibrary(value),
+                        super::Preference::AutoDetect => Message::AutoDetect(value),
+                        super::Preference::LearnedRules => Message::LearnedRulesEnabled(value),
+                        super::Preference::Statistics => Message::UsageStatistics(value),
+                    };
+                    return self.update(store, message, profile);
+                }
+            }
             Message::EnableLibrary(value) => store.enabled = value,
             Message::AutoDetect(true) => store.auto_detect = true,
             Message::AutoDetect(false) if store.auto_detect => {
@@ -890,6 +911,38 @@ impl Editor {
         ]
         .spacing(14)
         .wrap();
+        let mut imported = column![].spacing(4);
+        if !self.imported_preferences.is_empty() {
+            imported = imported.push(
+                text("Imported Java skill preferences remain inactive until adopted and saved.")
+                    .size(13),
+            );
+            for preference in super::Preference::ALL {
+                if let Some(value) = self.imported_preferences.get(preference) {
+                    let allowed = match preference {
+                        super::Preference::LearnedRules => self.skill_creation_override.is_none(),
+                        super::Preference::Statistics => self.statistics_policy.is_none(),
+                        _ => true,
+                    };
+                    imported = imported.push(
+                        row![
+                            text(format!(
+                                "{}: {}",
+                                preference.label(),
+                                if value { "enabled" } else { "disabled" }
+                            ))
+                            .size(13),
+                            button("Use imported value").on_press_maybe(
+                                (allowed && !self.busy())
+                                    .then_some(Message::UseImported(preference))
+                            ),
+                        ]
+                        .spacing(8)
+                        .wrap(),
+                    );
+                }
+            }
+        }
         let query = self.search.trim().to_lowercase();
         let mut visible: Vec<_> = store
             .skills
@@ -1003,6 +1056,7 @@ impl Editor {
         .height(Length::Fill);
         column![
             header,
+            (!self.imported_preferences.is_empty()).then_some(imported),
             self.skill_creation_override.map(|_| text(
                 "Learning rules into skills is managed by policy."
             )
@@ -1297,6 +1351,48 @@ fn edit_document(content: &mut text_editor::Content, action: text_editor::Action
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn imported_skill_switches_keep_confirmation_and_managed_overrides() {
+        use super::*;
+        let mut hints = super::super::JavaPreferences::default();
+        for preference in super::super::Preference::ALL {
+            hints.set(preference, false);
+        }
+        let mut editor = Editor::default().with_imported_preferences(hints);
+        editor.set_statistics_policy(Some(true));
+        editor.set_skill_creation_override(Some(false));
+        let mut store = Store::default();
+        let _ = editor.update(
+            &mut store,
+            Message::UseImported(super::super::Preference::LearnedRules),
+            None,
+        );
+        let _ = editor.update(
+            &mut store,
+            Message::UseImported(super::super::Preference::Statistics),
+            None,
+        );
+        assert!(store.learned_rules_enabled && store.usage_statistics);
+        let _ = editor.update(
+            &mut store,
+            Message::UseImported(super::super::Preference::AutoDetect),
+            None,
+        );
+        assert!(store.auto_detect);
+        assert!(matches!(
+            editor.confirmation,
+            Some(Confirmation::DisableAutoDetection)
+        ));
+        let _ = editor.update(&mut store, Message::Confirm, None);
+        assert!(!store.auto_detect);
+        editor.set_statistics_policy(None);
+        editor.set_skill_creation_override(None);
+        for preference in super::super::Preference::ALL {
+            let _ = editor.update(&mut store, Message::UseImported(preference), None);
+        }
+        assert!(!store.enabled && !store.learned_rules_enabled && !store.usage_statistics);
+    }
+
     use iced::advanced::{Layout, layout, widget::Tree};
     use iced::futures::{StreamExt as _, executor::block_on};
     use iced::{Pixels, Renderer, Size};

@@ -32,6 +32,7 @@ mod changed_upload;
 mod privileged_archive;
 #[cfg(target_os = "linux")]
 mod privileged_file_replace;
+mod recursive_deletion;
 #[cfg(target_os = "linux")]
 mod rsync_existing;
 #[cfg(any(target_os = "linux", target_os = "macos"))]

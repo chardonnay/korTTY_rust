@@ -7,6 +7,28 @@ use crate::snippets::tests::Profile;
 use super::*;
 
 #[test]
+fn remembered_language_rechecks_the_active_draft_and_normalizes_the_choice() {
+    let profile = Profile::new();
+    let mut window = SnippetWindow::open(profile.path()).unwrap();
+    window.update(Message::New);
+    window.update(Message::Language("Gleam".into()));
+    assert!(matches!(
+        window.update(Message::RememberLanguage("fennel".into())),
+        Update::None
+    ));
+    assert!(matches!(
+        window.update(Message::RememberLanguage("gleam".into())),
+        Update::RememberLanguage(language) if language == "gleam"
+    ));
+    assert_eq!(window.draft.language, "gleam");
+    window.update(Message::Language("python3".into()));
+    assert!(matches!(
+        window.update(Message::RememberLanguage("python".into())),
+        Update::None
+    ));
+}
+
+#[test]
 fn snippet_editor_tab_switch_damage_matches_a_full_render() {
     use iced::advanced::graphics::{Viewport, damage, text::Editor};
     use iced::advanced::renderer::Renderer as _;
@@ -78,6 +100,55 @@ fn snippet_editor_tab_switch_damage_matches_a_full_render() {
         assert_eq!(partial.data(), full.data());
         previous = current;
     }
+}
+
+#[test]
+fn snippet_source_history_debounces_and_saves_a_restored_version() {
+    let profile = Profile::new();
+    let mut library = Library::open(profile.path()).unwrap();
+    let original = "printf original";
+    let id = library
+        .save(
+            None,
+            snippets::Input {
+                name: "History".into(),
+                language: "sh".into(),
+                category: String::new(),
+                content: original.into(),
+            },
+        )
+        .unwrap();
+    let mut window = SnippetWindow::open(profile.path()).unwrap();
+    window.update(Message::Open(id));
+    window.set_history_limit(2);
+    window.update(Message::Edit(text_editor::Action::Edit(
+        text_editor::Edit::Insert('x'),
+    )));
+    window.update(Message::Edit(text_editor::Action::Edit(
+        text_editor::Edit::Insert('y'),
+    )));
+    let edited = window.draft.content.text();
+    let due = window.draft.version_due.unwrap();
+    assert!(window.history_needs_tick());
+    window.poll_history(due - Duration::from_millis(1));
+    assert_eq!(window.draft.versions.len(), 1);
+    window.poll_history(due);
+    assert_eq!(window.draft.versions.len(), 2);
+    assert_eq!(window.draft.versions[1].content.as_ref(), edited);
+    assert!(!window.history_needs_tick());
+
+    window.update(Message::HistoryVersion(0));
+    assert_eq!(window.draft.content.text(), original);
+    assert_eq!(library.get(id).unwrap().content(), original);
+    assert!(window.draft.dirty);
+    assert!(matches!(window.update(Message::Save), Update::Changed));
+    library.reload().unwrap();
+    let entry = library.get(id).unwrap();
+    assert_eq!(entry.history().len(), 2);
+    assert_eq!(entry.history()[0].content.as_ref(), edited);
+    assert_eq!(entry.history()[1].content.as_ref(), original);
+    let reopened = SnippetWindow::open(profile.path()).unwrap();
+    assert_eq!(reopened.draft.versions.len(), 2);
 }
 
 #[test]

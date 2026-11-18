@@ -35,6 +35,7 @@ pub(super) mod swarm_comparison;
 
 pub(super) const TITLE: &str = "JobScheduler";
 const MAX_RUNNING_JOBS: usize = 4;
+const JOURNAL_DIVIDER_SAVE_DELAY: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy, Hash)]
 struct Clock(Duration);
@@ -209,9 +210,18 @@ impl Workspace {
     fn place_scheduler_view(
         &mut self,
         source: window::Id,
-        view: SchedulerView,
+        mut view: SchedulerView,
         hosted: bool,
     ) -> Task<Message> {
+        view.apply_journal_divider(self.window_settings.scheduler_journal_divider);
+        if let Some(scheduler) = &self.scheduler {
+            scheduler.apply_diagram_preferences(
+                &mut view,
+                self.window_settings.scheduler_diagram_horizontal,
+                self.window_settings.scheduler_diagram_color_mode,
+                self.journal_system_dark(),
+            );
+        }
         if hosted {
             let id = window::Id::unique();
             self.scheduler_views.insert(id, view);
@@ -422,6 +432,37 @@ impl Workspace {
         message: scheduler_window::Message,
     ) -> Task<Message> {
         let message = match message {
+            scheduler_window::Message::ResizeJournal(event) => {
+                let Some((scheduler, view)) = self
+                    .scheduler
+                    .as_mut()
+                    .zip(self.scheduler_views.get_mut(&id))
+                else {
+                    return Task::none();
+                };
+                let previous = view.journal_divider();
+                let _ =
+                    scheduler.update_view(view, scheduler_window::Message::ResizeJournal(event));
+                let current = view.journal_divider();
+                if previous == current || self.exiting {
+                    return Task::none();
+                }
+                self.window_settings.scheduler_journal_divider = current;
+                let owner = self
+                    .scheduler_owners
+                    .get(&id)
+                    .copied()
+                    .or_else(|| self.hosted_tool_owner(id));
+                let queued = self
+                    .scheduler_journal_divider_save
+                    .replace((Instant::now() + JOURNAL_DIVIDER_SAVE_DELAY, owner))
+                    .is_some();
+                return if queued {
+                    Task::none()
+                } else {
+                    self.delay_scheduler_journal_divider_save(JOURNAL_DIVIDER_SAVE_DELAY)
+                };
+            }
             scheduler_window::Message::JournalStatsReady(request, result) => {
                 let root =
                     (!self.exiting && !self.scheduler_draining && !self.scheduler_views.is_empty())
@@ -898,6 +939,10 @@ impl Workspace {
             return Task::none();
         };
         let cancel = matches!(message, scheduler_window::Message::CancelRun(_));
+        let diagram_changed = matches!(
+            message,
+            scheduler_window::Message::DiagramDirection | scheduler_window::Message::DiagramTheme
+        );
         let preview_journals = matches!(
             message,
             scheduler_window::Message::Page(scheduler_window::Page::Journal)
@@ -906,6 +951,17 @@ impl Workspace {
         );
         scheduler.set_swarm_chats_allowed(swarm_chats_allowed);
         let requests = scheduler.update_view(view, message);
+        if diagram_changed {
+            let (horizontal, color) = view.diagram_preferences();
+            self.window_settings.scheduler_diagram_horizontal = horizontal;
+            self.window_settings.scheduler_diagram_color_mode = color;
+            let owner = self
+                .scheduler_owners
+                .get(&id)
+                .copied()
+                .or_else(|| self.hosted_tool_owner(id));
+            self.save_window_settings(owner);
+        }
         self.sync_scheduler_views();
         let task = self.enqueue_jobs(requests);
         let task = if preview_journals {
@@ -1209,6 +1265,7 @@ impl Workspace {
         job_executor::agent::require_policy(&self.clipboard.policy, kind)?;
         job_executor::agent::require_policy(current, kind)?;
         self.ai_configuration()
+            .filter(|config| config.agent_execution_enabled())
             .ok_or("AI is unavailable under the current settings.")
     }
 
@@ -1901,7 +1958,7 @@ impl Workspace {
             );
         }
         let profile_current = |current: &Configuration| {
-            current.enabled()
+            current.agent_execution_enabled()
                 && agent::ProfileChoice::for_reference(current, &profile.id).as_ref()
                     == Some(profile)
                 && profile
@@ -2326,14 +2383,59 @@ impl Workspace {
         task
     }
 
-    fn sync_scheduler_views(&mut self) {
+    pub(super) fn sync_scheduler_views(&mut self) {
         if let Some(scheduler) = &self.scheduler {
             let journal_root = self.journal_directory().ok();
+            let system_dark = self.journal_system_dark();
             for view in self.scheduler_views.values_mut() {
                 view.retain_run_detail_journal_root(journal_root.as_deref());
+                scheduler.apply_diagram_preferences(
+                    view,
+                    self.window_settings.scheduler_diagram_horizontal,
+                    self.window_settings.scheduler_diagram_color_mode,
+                    system_dark,
+                );
                 scheduler.sync_view(view);
             }
         }
+    }
+
+    pub(super) fn save_scheduler_journal_divider_when_ready(&mut self) -> Task<Message> {
+        let Some((due, _)) = self.scheduler_journal_divider_save else {
+            return Task::none();
+        };
+        let remaining = due.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            self.flush_scheduler_journal_divider();
+            Task::none()
+        } else {
+            self.delay_scheduler_journal_divider_save(remaining)
+        }
+    }
+
+    pub(super) fn flush_scheduler_journal_divider(&mut self) {
+        if let Some((_, owner)) = self.scheduler_journal_divider_save.take() {
+            self.save_window_settings(owner);
+        }
+    }
+
+    fn delay_scheduler_journal_divider_save(&mut self, delay: Duration) -> Task<Message> {
+        let (send, receive) = async_channel::bounded(1);
+        if thread::Builder::new()
+            .name("kortty-scheduler-journal-divider".into())
+            .spawn(move || {
+                thread::sleep(delay);
+                let _ = send.try_send(());
+            })
+            .is_err()
+        {
+            self.flush_scheduler_journal_divider();
+            return Task::none();
+        }
+        Task::future(async move {
+            let _ = receive.recv().await;
+            Message::SaveSchedulerJournalDivider
+        })
     }
 
     fn save_scheduler_journal_retention(&mut self, id: window::Id, days: u16) {
@@ -3645,7 +3747,7 @@ mod tests {
             workspace.update_scheduler(second, scheduler_window::Message::ScheduleEnabled(true));
         assert!(workspace.hosted_scheduler_dirty(second));
 
-        assert!(workspace.guard_hosted_quit(false).is_some());
+        assert!(workspace.guard_hosted_quit(Default::default()).is_some());
         let token = workspace.scheduler_views[&first].hosted_close.unwrap();
         let _ =
             workspace.update_scheduler(second, scheduler_window::Message::HostedClose(token, true));

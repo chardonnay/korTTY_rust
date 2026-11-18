@@ -43,6 +43,7 @@ impl Dock {
 
 #[derive(Default)]
 pub(in crate::workspace::terminal_agent) struct Presentation {
+    pub(super) dock_resize: Option<(super::DockPreferences, u16)>,
     pub(in crate::workspace::terminal_agent) pip: super::pip::Panel,
     pub(in crate::workspace::terminal_agent) model_usage: usage::Usage,
     first: usize,
@@ -76,7 +77,7 @@ impl Presentation {
             .unwrap_or_else(|| len.saturating_sub(1))
     }
 
-    pub(super) fn identity(&self, index: usize) -> usize {
+    pub(in crate::workspace::terminal_agent) fn identity(&self, index: usize) -> usize {
         self.first.saturating_add(index)
     }
 

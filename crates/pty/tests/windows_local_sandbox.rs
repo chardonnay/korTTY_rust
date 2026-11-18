@@ -41,6 +41,10 @@ mod windows {
                 run_windows_local_sandbox_broker(args.into_iter().skip(2)).unwrap_or(1),
             );
         }
+        if args.get(1).is_some_and(|arg| arg == "--sandbox-hold") {
+            thread::sleep(Duration::from_secs(2));
+            return;
+        }
         if args.get(1).is_some_and(|arg| arg == "--sandbox-fixture") {
             std::panic::set_hook(Box::new(|info| {
                 let _ = fs::write("fixture-error", info.to_string());
@@ -194,7 +198,25 @@ mod windows {
             unsafe { WaitForSingleObject(shell.as_raw_handle(), 0) },
             WAIT_TIMEOUT
         );
+        let probe = running.job_process_probe().unwrap();
+        assert!(
+            !probe.has_running_children(),
+            "an idle broker and shell are expected"
+        );
+        let mut writer = running.take_writer().unwrap();
+        writer
+            .write_all(b".\\sandbox-fixture.exe --sandbox-hold\r")
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !probe.has_running_children() {
+            assert!(
+                Instant::now() < deadline,
+                "expected a sandboxed child in the job"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
         running.shutdown().unwrap();
+        assert!(!probe.has_running_children());
         assert_eq!(
             unsafe { WaitForSingleObject(shell.as_raw_handle(), 5000) },
             WAIT_OBJECT_0

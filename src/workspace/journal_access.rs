@@ -969,9 +969,9 @@ impl Workspace {
             viewer.entry_flow.set_applying_markers(applying_markers);
             viewer.entry_flow.set_screenshot_saving(screenshot_saving);
             let _ = viewer.resize_timeline(scale);
-            viewer
-                .entry_editor
-                .set_split(self.window_settings.journal_edit_split);
+            if let Some(split) = self.window_settings.journal_edit_split {
+                viewer.entry_editor.set_split(split);
+            }
         }
         Task::batch([
             open,
@@ -998,19 +998,27 @@ impl Workspace {
             let id = window::Id::unique();
             (id, self.host_tool(owner, kind, id), None)
         } else {
-            let dialog_kind = if kind == Kind::SessionJournalManager {
-                DialogKind::JournalManager
+            let (dialog_kind, geometry) = if kind == Kind::SessionJournalManager {
+                (
+                    DialogKind::JournalManager,
+                    self.window_settings.journal_manager_geometry,
+                )
             } else {
-                DialogKind::JournalViewer
+                (
+                    DialogKind::JournalViewer,
+                    self.window_settings.journal_viewer_geometry,
+                )
             };
-            let (id, opened) = self.open_placed_dialog(
+            let minimum = Size::new(620.0, 400.0);
+            let (id, opened) = self.open_placed_dialog_with_fallback(
                 dialog_kind,
                 window::Settings {
                     size,
-                    min_size: Some(Size::new(620.0, 400.0)),
+                    min_size: Some(minimum),
                     exit_on_close_request: false,
                     ..window::Settings::default()
                 },
+                geometry.map(|geometry| geometry.placement(minimum)),
             );
             (id, opened.map(|_| Desktop::Noop), Some(owner))
         };

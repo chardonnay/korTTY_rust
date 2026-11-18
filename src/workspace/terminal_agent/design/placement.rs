@@ -2,6 +2,7 @@
 
 use iced::widget::{column, container, opaque, row, space, stack};
 use iced::{Element, Length, Size};
+use serde::{Deserialize, Serialize};
 
 use crate::terminal_agent::design::{History, Status};
 
@@ -10,9 +11,97 @@ pub(in crate::workspace) enum Slot {
     Top,
     TopDrawer,
     Bottom,
+    Left,
     Right,
     OverlayTop,
     OverlayBottom,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum DockPlacement {
+    #[default]
+    Design,
+    Bottom,
+    Left,
+    Right,
+}
+
+impl DockPlacement {
+    pub(in crate::workspace) const ALL: [Self; 4] =
+        [Self::Design, Self::Bottom, Self::Left, Self::Right];
+}
+
+impl std::fmt::Display for DockPlacement {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Design => "Design default",
+            Self::Bottom => "Bottom",
+            Self::Left => "Left",
+            Self::Right => "Right",
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(in crate::workspace) struct DockPreferences {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::workspace) placement: Option<DockPlacement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::workspace) width: Option<u16>,
+}
+
+impl DockPreferences {
+    pub(in crate::workspace) const WIDTH_RANGE: std::ops::RangeInclusive<u16> = 200..=600;
+    const DEFAULT_WIDTH: u16 = 320;
+
+    pub(in crate::workspace) fn is_empty(&self) -> bool {
+        self.placement.is_none() && self.width.is_none()
+    }
+
+    pub(in crate::workspace) fn valid(self) -> bool {
+        self.width
+            .is_none_or(|width| Self::WIDTH_RANGE.contains(&width))
+    }
+
+    pub(in crate::workspace) fn width(self) -> u16 {
+        self.width
+            .filter(|width| Self::WIDTH_RANGE.contains(width))
+            .unwrap_or(Self::DEFAULT_WIDTH)
+    }
+
+    pub(in crate::workspace) fn side_width(self, design_width: f32) -> f32 {
+        if self.width.is_some()
+            || matches!(
+                self.placement,
+                Some(DockPlacement::Left | DockPlacement::Right)
+            )
+        {
+            f32::from(self.width())
+        } else {
+            design_width
+        }
+    }
+
+    pub(in crate::workspace) fn history_slot(
+        self,
+        layout: crate::terminal_agent::design::Layout,
+    ) -> Option<Slot> {
+        use crate::terminal_agent::design::Arrangement;
+        if layout.arrangement == Arrangement::PictureInPicture {
+            return None;
+        }
+        if layout.arrangement != Arrangement::Normal || layout.history.inline_style().is_some() {
+            return history_slot(layout.history);
+        }
+        match self.placement.unwrap_or_default() {
+            DockPlacement::Design => history_slot(layout.history),
+            DockPlacement::Bottom => Some(Slot::Bottom),
+            DockPlacement::Left => Some(Slot::Left),
+            DockPlacement::Right => Some(Slot::Right),
+        }
+    }
 }
 
 pub(in crate::workspace) fn history_slot(history: History) -> Option<Slot> {
@@ -41,7 +130,7 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
     history_slot: Option<Slot>,
     status_slot: Slot,
     bounds: Size,
-    side_width: f32,
+    side_widths: (f32, f32),
 ) -> Element<'a, M> {
     let mut center = column![container(terminal).width(Length::Fill).height(Length::Fill)]
         .width(Length::Fill)
@@ -51,16 +140,21 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
         .height(Length::Fill)
         .spacing(3);
     let mut has_right = false;
+    let mut left = None;
     if let Some(history) = history {
-        if history_slot == Some(Slot::Right) {
-            right = right.push(history);
-            has_right = true;
-        } else {
-            center = center.push(
-                container(history)
-                    .width(Length::Fill)
-                    .height((bounds.height * 0.4).min(260.0)),
-            );
+        match history_slot {
+            Some(Slot::Right) => {
+                right = right.push(history);
+                has_right = true;
+            }
+            Some(Slot::Left) => left = Some(history),
+            _ => {
+                center = center.push(
+                    container(history)
+                        .width(Length::Fill)
+                        .height((bounds.height * 0.4).min(260.0)),
+                )
+            }
         }
     }
     let mut overlay = None;
@@ -72,6 +166,12 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
                     .height(Length::Fill)
             }
             Slot::Bottom => center = center.push(status),
+            Slot::Left => {
+                left = Some(match left {
+                    Some(history) => column![history, status].into(),
+                    None => status,
+                });
+            }
             Slot::Right => {
                 right = right.push(status);
                 has_right = true;
@@ -85,17 +185,25 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
             Slot::OverlayTop | Slot::OverlayBottom => overlay = Some(status),
         }
     }
-    let center: Element<'a, M> = if has_right {
-        row![
-            center,
-            container(right)
-                .width(side_width.min(bounds.width * 0.45))
-                .height(Length::Fill)
-        ]
-        .spacing(3)
-        .width(Length::Fill)
-        .height(Length::Fill)
-        .into()
+    let center: Element<'a, M> = if has_right || left.is_some() {
+        let mut content = row![].spacing(3).width(Length::Fill).height(Length::Fill);
+        let both = has_right && left.is_some();
+        if let Some(left) = left {
+            content = content.push(
+                container(left)
+                    .width(fitted_side_width(bounds.width, side_widths.0, both))
+                    .height(Length::Fill),
+            );
+        }
+        content = content.push(center);
+        if has_right {
+            content = content.push(
+                container(right)
+                    .width(fitted_side_width(bounds.width, side_widths.1, both))
+                    .height(Length::Fill),
+            );
+        }
+        content.into()
     } else {
         center.into()
     };
@@ -132,6 +240,10 @@ pub(in crate::workspace) fn compose<'a, M: 'a>(
     } else {
         center
     }
+}
+
+pub(super) fn fitted_side_width(available: f32, requested: f32, both_sides: bool) -> f32 {
+    requested.min(available * if both_sides { 0.30 } else { 0.45 })
 }
 
 #[cfg(test)]

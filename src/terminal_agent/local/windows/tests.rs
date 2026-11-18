@@ -38,6 +38,7 @@ fn native_agent_windows_worker_runs_exact_shell_and_owns_background_children() {
         &command,
         &Cancel::default(),
         &executable,
+        || {},
     )
     .unwrap();
     assert_eq!(result.status, Status::Exited(19));
@@ -71,6 +72,7 @@ fn native_agent_windows_worker_runs_exact_shell_and_owns_background_children() {
         &command,
         &Cancel::default(),
         &executable,
+        || {},
     )
     .unwrap();
     assert_eq!(result.status, Status::Exited(13));

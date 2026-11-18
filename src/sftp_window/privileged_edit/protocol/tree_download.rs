@@ -130,7 +130,8 @@ pub(crate) fn preview_tree_download(
     auth: Auth,
     allowed: impl Fn() -> bool + Send + Sync + 'static,
     merge: bool,
-) -> Result<scheduled::Preview, Failure> {
+    recurring: bool,
+) -> Result<(scheduled::Preview, Option<[u8; 32]>), Failure> {
     if !valid_path(path) {
         return Err(Failure::Blocked);
     }
@@ -144,10 +145,18 @@ pub(crate) fn preview_tree_download(
     let manifest = Manifest::read(&mut channel)?;
     channel.finish().map_err(|_| channel.failure())?;
     let Some(destination) = destination else {
-        let plan = merge::Plan::inspect(&manifest, local, roots, &|| !channel.gate.running())?;
-        return Ok(plan.preview);
+        let mut plan = merge::Plan::inspect(&manifest, local, roots, &|| !channel.gate.running())?;
+        let receiver = plan.receiver()?;
+        if recurring {
+            plan.preview.bytes = manifest.size;
+        }
+        return Ok((plan.preview, receiver));
     };
-    Ok(scheduled::Preview {
+    let receiver = recurring
+        .then(|| destination.vacancy_receipt())
+        .transpose()
+        .map_err(|_| Failure::Blocked)?;
+    let mut preview = scheduled::Preview {
         proof: manifest.proof(&destination)?,
         replacements: Vec::new(),
         roots,
@@ -162,7 +171,11 @@ pub(crate) fn preview_tree_download(
             })
             .collect(),
         bytes: manifest.size,
-    })
+    };
+    if recurring {
+        preview.paths.insert(0, (true, "Receiver root".into()));
+    }
+    Ok((preview, receiver))
 }
 
 fn review_roots(path: &str, local: &Path) -> Result<[String; 2], Failure> {
@@ -188,6 +201,68 @@ pub(crate) fn download_tree(
     let (mut channel, manifest, token) = begin_download(&opener, path, auth, allowed)?;
     channel.gate.check().map_err(|_| channel.failure())?;
     claim(manifest.proof(&destination)?)?;
+    let stage = receive_new_tree(&mut channel, &manifest, destination, &token)?;
+    stage
+        .publish(|| channel.gate.running() && publication_allowed() && channel.gate.running())
+        .map_err(|error| publication_failure(error, &channel))?;
+    Ok((manifest.entries.len(), manifest.size))
+}
+
+pub(crate) fn download_tree_create(
+    opener: ExecOpener,
+    path: &str,
+    local: &Path,
+    auth: Auth,
+    allowed: impl Fn() -> bool + Send + Sync + 'static,
+    claim: impl FnOnce(super::MergeClaim) -> Result<(), Failure>,
+    publication_allowed: impl Fn() -> bool,
+) -> Result<MergeReport, Failure> {
+    if !valid_path(path) {
+        return Err(Failure::Blocked);
+    }
+    let destination = Destination::inspect(local).map_err(|_| Failure::Blocked)?;
+    let vacancy = destination
+        .vacancy_receipt()
+        .map_err(|_| Failure::Blocked)?;
+    let (mut channel, manifest, token) = begin_download(&opener, path, auth, allowed)?;
+    channel.gate.check().map_err(|_| channel.failure())?;
+    claim(super::MergeClaim {
+        proof: manifest.proof(&destination)?,
+        receiver: Some(vacancy),
+        actions: manifest.entries.len() + 1,
+        bytes: manifest.size,
+    })?;
+    let stage = receive_new_tree(&mut channel, &manifest, destination, &token)?;
+    let receiver = stage
+        .publish_with_receiver(vacancy, || {
+            channel.gate.running() && publication_allowed() && channel.gate.running()
+        })
+        .map_err(|error| publication_failure(error, &channel))?;
+    Ok(MergeReport {
+        created: manifest.entries.len() + 1,
+        bytes: manifest.size,
+        receiver: Some(receiver),
+        ..MergeReport::default()
+    })
+}
+
+fn publication_failure(error: PublishError, channel: &Connection) -> Failure {
+    match error {
+        PublishError::Denied | PublishError::Refused if !channel.gate.running() => {
+            channel.failure()
+        }
+        PublishError::Denied => Failure::Blocked,
+        PublishError::Refused => Failure::Conflict,
+        PublishError::Uncertain => Failure::Uncertain,
+    }
+}
+
+fn receive_new_tree(
+    channel: &mut Connection,
+    manifest: &Manifest,
+    destination: Destination,
+    token: &str,
+) -> Result<crate::sftp_window::tree::privileged_download::Stage, Failure> {
     let mut stage = destination.stage().map_err(|_| Failure::Conflict)?;
     channel
         .write_all(token.as_bytes())
@@ -196,7 +271,7 @@ pub(crate) fn download_tree(
         channel.gate.check().map_err(|_| channel.failure())?;
         if let Some(file) = &entry.file {
             let mut output = stage.file(&entry.parts).map_err(|_| Failure::Blocked)?;
-            if hash_copy(&mut channel, &mut output, file.size, || true)? != file.sha256 {
+            if hash_copy(&mut *channel, &mut output, file.size, || true)? != file.sha256 {
                 return Err(Failure::Conflict);
             }
             output.sync_all().map_err(|_| Failure::Failed)?;
@@ -206,18 +281,8 @@ pub(crate) fn download_tree(
                 .map_err(|_| Failure::Blocked)?;
         }
     }
-    finish_download(&mut channel, &manifest.witness)?;
-    stage
-        .publish(|| channel.gate.running() && publication_allowed() && channel.gate.running())
-        .map_err(|error| match error {
-            PublishError::Denied | PublishError::Refused if !channel.gate.running() => {
-                channel.failure()
-            }
-            PublishError::Denied => Failure::Blocked,
-            PublishError::Refused => Failure::Conflict,
-            PublishError::Uncertain => Failure::Uncertain,
-        })?;
-    Ok((manifest.entries.len(), manifest.size))
+    finish_download(channel, &manifest.witness)?;
+    Ok(stage)
 }
 
 pub(crate) fn download_tree_merge(
@@ -226,7 +291,7 @@ pub(crate) fn download_tree_merge(
     local: &Path,
     auth: Auth,
     allowed: impl Fn() -> bool + Send + Sync + 'static,
-    claim: impl FnOnce([u8; 32]) -> Result<(), Failure>,
+    claim: impl FnOnce(super::MergeClaim) -> Result<(), Failure>,
     publication_allowed: impl Fn() -> bool,
 ) -> Result<MergeReport, Failure> {
     if !valid_path(path) {
@@ -238,7 +303,10 @@ pub(crate) fn download_tree_merge(
     let stopped = || !gate.running();
     let plan = merge::Plan::inspect(&manifest, local, roots, &stopped)?;
     gate.check().map_err(|_| channel.failure())?;
-    claim(plan.preview.proof)?;
+    let mut approval = super::MergeClaim::from_preview(&plan.preview, plan.receiver()?);
+    // This helper streams unchanged source files too, so charge the entire payload.
+    approval.bytes = manifest.size;
+    claim(approval)?;
     channel
         .write_all(token.as_bytes())
         .map_err(|_| channel.failure())?;

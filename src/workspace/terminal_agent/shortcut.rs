@@ -381,6 +381,8 @@ impl Workspace {
             let direct = invocation.mode != super::Mode::Plan && !config.show_agent_setup();
             let mut run = self.build_agent(session, invocation.mode, None, profile, !direct)?;
             run.goal = invocation.goal.to_owned();
+            run.confirm_every_command = invocation.ask_confirmation;
+            run.auto_approve_root = invocation.auto_approve_root;
             let direct = direct && !run.profile_pending;
             Ok((run, direct))
         })();
@@ -796,6 +798,38 @@ while ($null -ne ($line = [Console]::ReadLine())) {
             );
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn agent_shortcut_custom_java_name_and_case_apply_to_local_shell_input() {
+        let mut fixture = Fixture::new();
+        let name = "inspect".repeat(8);
+        fixture.workspace.set_test_ai_configuration(
+            serde_json::from_value(serde_json::json!({
+                "general": {"agent_shortcut": {"enabled": true, "name": name, "case_insensitive": true}},
+                "profiles": {
+                    "profiles": [{"id":1,"name":"Fixture","endpoint":"127.0.0.1:12345","model":"fixture"}],
+                    "default":1, "last_id":1
+                }
+            })).unwrap(),
+        );
+        fixture.type_text("agent-ask ordinary shell input");
+        fixture.enter();
+        fixture.wait_for_prompt("line=agent-ask ordinary shell input");
+        assert!(fixture.workspace.terminal_agents.runs.is_empty());
+        fixture.type_text(&format!("{}-ASK Inspect the fixture", name.to_uppercase()));
+        fixture.enter();
+        assert_eq!(fixture.workspace.terminal_agents.runs.len(), 1);
+        let run = fixture
+            .workspace
+            .terminal_agents
+            .runs
+            .values()
+            .next()
+            .unwrap();
+        assert_eq!(run.mode, Mode::Ask);
+        assert_eq!(run.goal, "Inspect the fixture");
+        assert!(run.phase == Phase::Setup);
     }
 
     #[test]

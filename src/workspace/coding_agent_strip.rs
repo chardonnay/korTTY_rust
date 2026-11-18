@@ -85,7 +85,7 @@ impl Workspace {
         let summary = self.coding_agent_summary();
         let mut chips = summary.chips().peekable();
         chips.peek()?;
-        let animated = window.focused && self.window_settings.appearance.animations;
+        let animated = window.focused && self.window_settings.appearance.animations();
         let mut strip = row![].spacing(6).align_y(Alignment::Center);
         for (index, (state, glyph, count)) in chips.enumerate() {
             if index != 0 {

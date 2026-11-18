@@ -112,6 +112,7 @@ mod ssh_keys_ui;
 mod tab_context;
 mod tab_drag;
 mod tab_titles;
+pub(crate) use tab_titles::{analysis_content_limit_at, analysis_history_limit_at};
 mod tab_watch;
 mod teamwork_auth;
 mod teamwork_settings;
@@ -119,6 +120,8 @@ mod teamwork_sync;
 pub(crate) mod terminal_agent;
 pub(crate) mod terminal_ai;
 pub(crate) use terminal_ai::mask::prompt as mask_ai_prompt;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+mod desktop_text_drop;
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 mod native_file_drag;
 mod terminal_commands;
@@ -127,6 +130,8 @@ mod terminal_effect_access;
 mod terminal_file_access;
 pub(crate) mod terminal_link_dialog;
 mod terminal_notifications;
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+mod terminal_text_drop;
 mod tool_tabs;
 mod transparency;
 mod tunnel_access;
@@ -265,6 +270,9 @@ pub enum Message {
     TerminalFileLoaded(u64, Result<editor_window::Document, String>),
     LocalDock(window::Id, local_dock::Message),
     RemoteDock(window::Id, remote_dock::Message),
+    TerminalFileDropped(window::Id, SessionId, u64, std::path::PathBuf),
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    DesktopTextDrop(desktop_text_drop::Message),
     RemoteDockTick,
     AiManager(ai_access::Message),
     TerminalAi(window::Id, terminal_ai::Message),
@@ -349,6 +357,7 @@ pub enum Message {
     Sftp(window::Id, sftp_window::Message),
     OpenScheduler(window::Id),
     Scheduler(window::Id, scheduler_window::Message),
+    SaveSchedulerJournalDivider,
     OpenSnippets(window::Id),
     Snippets(window::Id, crate::snippet_window::Message),
     SnippetRecovery(snippet_access::recovery::Event),
@@ -465,6 +474,8 @@ pub struct Workspace {
     exit_placement_pending: bool,
     local_dock: local_dock::Preference,
     remote_dialogs: remote_dock::Dialogs,
+    #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+    desktop_text_drop: desktop_text_drop::State,
     remote_manager_closing: HashMap<SessionId, Receiver<()>>,
     remote_browser_closing: HashMap<SessionId, Receiver<()>>,
     session_restore: session_restore::Restore,
@@ -518,6 +529,8 @@ pub struct Workspace {
     scheduler: Option<SchedulerWindow>,
     scheduler_owners: HashMap<window::Id, window::Id>,
     scheduler_views: HashMap<window::Id, scheduler_window::SchedulerView>,
+    scheduler_journal_divider_save: Option<(std::time::Instant, Option<window::Id>)>,
+    journal_live_log_height_save: Option<(std::time::Instant, window::Id)>,
     scheduler_workers: usize,
     scheduler_queue: VecDeque<RunRequest<SshCommand>>,
     scheduler_agent_sequences:
@@ -538,6 +551,7 @@ pub struct Workspace {
     closing_tunnel_owners: HashMap<SessionId, tunnel_access::ClosingOwner>,
     quit_waiting_for: Option<window::Id>,
     quit_sftp_waiting: Option<window::Id>,
+    quit_terminal_review: Option<QuitTerminalReview>,
     exiting: bool,
 }
 
@@ -570,6 +584,7 @@ struct Window {
     pending_tunnels: Option<SessionId>,
     pending_snippet_run: Option<snippet_access::RunPrompt>,
     pending_serial_close: Option<(u64, SerialClose)>,
+    pending_terminal_upload: Option<remote_dock::DesktopUploadBatch>,
     projects: Option<project_access::Panel>,
     clipboard_settings: bool,
     notice: Option<String>,
@@ -699,6 +714,7 @@ enum LocalLaunchView {
 }
 
 struct PendingPaste {
+    drop_stream: Option<u64>,
     request: u64,
     tab: u64,
     targets: Vec<SessionId>,
@@ -739,6 +755,16 @@ enum SerialClose {
         session: SessionId,
     },
     Quit,
+}
+
+type QuitTerminalStreams = Vec<(SessionId, u64)>;
+type QuitTerminalApprovals = HashMap<window::Id, QuitTerminalStreams>;
+
+struct QuitTerminalReview {
+    owner: window::Id,
+    request: u64,
+    streams: QuitTerminalStreams,
+    approved: QuitTerminalApprovals,
 }
 
 enum PaneInput {
@@ -972,8 +998,9 @@ impl Workspace {
             Ok(writer) => workspace.snippet_session = Some(writer),
             Err(error) => eprintln!("kortty: could not start snippet workspace writer: {error}"),
         }
-        workspace.local_dock = local_dock::Preference::load();
         workspace.window_settings = tab_titles::WindowSettings::load();
+        workspace.local_dock =
+            local_dock::Preference::load(workspace.window_settings.java_local_dock);
         workspace.refresh_terminal_backgrounds();
         workspace.dialog_placement = dialog_placement::State::initialize(
             workspace.window_settings.startup.remember_geometry,
@@ -1200,6 +1227,8 @@ impl Workspace {
                 self.wayland_drag_preparation_subscription(),
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
                 self.native_file_drag_subscription(),
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                self.desktop_text_drop.subscription(),
                 self.remote_dock_subscription(),
                 self.project_sftp_subscription(),
                 self.control.subscription(),
@@ -1437,6 +1466,9 @@ impl Workspace {
         let task = self.update_message(message);
         #[cfg(target_os = "linux")]
         self.revalidate_wayland_file_drops();
+        self.revalidate_terminal_uploads();
+        #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+        self.revalidate_desktop_text_drop();
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         self.revalidate_native_file_drag();
         self.revalidate_agent_cursor();
@@ -1732,6 +1764,12 @@ impl Workspace {
                         wayland_file_drop,
                         #[cfg(target_os = "macos")]
                         appkit_drag,
+                        #[cfg(any(
+                            target_os = "linux",
+                            target_os = "macos",
+                            target_os = "windows"
+                        ))]
+                        self.register_desktop_text_drop(id),
                         self.start_local_dock(id),
                         self.detect_transparent_surface(id),
                     ])
@@ -1792,6 +1830,8 @@ impl Workspace {
                 return self.exit_with_placement();
             }
             Message::Window(id, window::Event::Closed) => {
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                self.desktop_text_drop.forget(id);
                 #[cfg(target_os = "linux")]
                 self.wayland_file_drop.forget(id);
                 #[cfg(any(target_os = "macos", target_os = "windows"))]
@@ -1915,6 +1955,37 @@ impl Workspace {
             Message::AgentShortcut(action) => return self.update_agent_shortcut(action),
             Message::AsciiArt(id, message) => return self.update_ascii_art(id, message),
             Message::Diagram(id, diagram_window::Message::Close) => return self.close_window(id),
+            Message::Diagram(id, diagram_window::Message::SnippetAppearance(edit)) => {
+                if let Some(preferences) = self
+                    .diagrams
+                    .get_mut(&id)
+                    .and_then(|diagram| diagram.edit_snippet_appearance(edit))
+                {
+                    self.set_snippet_diagram_appearance(id, preferences);
+                }
+                return Task::none();
+            }
+            Message::Diagram(id, diagram_window::Message::AnalysisOptions(expanded)) => {
+                if self.diagrams.contains_key(&id) && self.analysis_diagram_options(id).is_some() {
+                    self.set_analysis_diagram_options(id, expanded);
+                }
+                return Task::none();
+            }
+            Message::Diagram(id, diagram_window::Message::ToggleDirection)
+                if self
+                    .diagrams
+                    .get(&id)
+                    .and_then(DiagramWindow::snippet_layout)
+                    .is_some() =>
+            {
+                if self.diagrams[&id].can_change_direction() {
+                    self.set_snippet_diagram_layout(
+                        id,
+                        self.snippet_diagram_direction() == kortty_diagram::Direction::TopToBottom,
+                    );
+                }
+                return Task::none();
+            }
             Message::Diagram(id, diagram_window::Message::SaveToSnippet) => {
                 return self.save_library_diagram(id);
             }
@@ -1956,6 +2027,11 @@ impl Workspace {
                 }
                 return self.update_remote_dock(id, message);
             }
+            Message::TerminalFileDropped(owner, session, stream, path) => {
+                self.queue_desktop_terminal_upload(owner, session, stream, path);
+            }
+            #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+            Message::DesktopTextDrop(message) => return self.update_desktop_text_drop(message),
             Message::RemoteDockTick => return self.remote_dock_tick(),
             Message::Recording(message) => return self.update_recording(message),
             Message::AiManager(message) => return self.update_ai_manager(message),
@@ -2153,12 +2229,12 @@ impl Workspace {
                 let Some((_, action)) = pending else {
                     return Task::none();
                 };
+                if matches!(action, SerialClose::Quit) {
+                    return self.answer_quit_terminal_review(id, request, confirmed);
+                }
                 let close = self.finish_close_all_confirmation(id, request);
                 if confirmed {
                     return Task::batch([close, self.apply_close(id, action)]);
-                }
-                if matches!(action, SerialClose::Quit) {
-                    window_lifecycle::reply_to_native_quit(false);
                 }
                 if let SerialClose::TabBatch(batch) = action {
                     self.cancel_tab_batch_close(id, batch);
@@ -2515,6 +2591,9 @@ impl Workspace {
             Message::Sftp(id, message) => return self.update_sftp(id, message),
             Message::OpenScheduler(id) => return self.show_scheduler(id),
             Message::Scheduler(id, message) => return self.update_scheduler(id, message),
+            Message::SaveSchedulerJournalDivider => {
+                return self.save_scheduler_journal_divider_when_ready();
+            }
             Message::OpenSnippets(id) => return self.show_snippets(id),
             Message::Snippets(id, message) => return self.update_snippets(id, message),
             Message::SnippetRecovery(event) => return self.update_snippet_recovery(event),
@@ -2582,58 +2661,7 @@ impl Workspace {
                     return Task::none();
                 }
                 window.paste_request = None;
-                if let Some(raw) = text
-                    && self.current_targets(id, tab, &targets)
-                    && let [target] = targets.as_slice()
-                {
-                    if raw.len() > usize::from(paste_protection::MAX_PASTE_KIB) * 1024 {
-                        self.notice(id, "Clipboard text exceeds 64 KiB".into());
-                    } else {
-                        let text = sanitize_paste(&raw);
-                        if text.contains(['\n', '\t'])
-                            && targets.iter().any(|id| {
-                                self.sessions
-                                    .get(id)
-                                    .is_some_and(|pane| pane.frame.ibm.is_some())
-                            })
-                        {
-                            self.notice(
-                                id,
-                                "IBM panes accept a single line of clipboard text without tabs"
-                                    .into(),
-                            );
-                        } else if !text.is_empty() {
-                            let mode = self.paste_warning_for(*target);
-                            match paste_protection::decide(
-                                &raw,
-                                mode,
-                                self.window_settings.paste_large_warning_kib,
-                                self.all_paste_targets_bracketed(&targets),
-                            ) {
-                                paste_protection::Decision::Confirm(warning) => {
-                                    if let Some(window) = self.windows.get_mut(&id) {
-                                        window.pending_paste = Some(PendingPaste {
-                                            request,
-                                            tab,
-                                            targets,
-                                            text,
-                                            preview: paste_protection::preview(&raw),
-                                            warning,
-                                            mode,
-                                            raw_bytes: raw.len(),
-                                        });
-                                    }
-                                }
-                                decision => self.send_paste(
-                                    id,
-                                    &targets,
-                                    &text,
-                                    decision == paste_protection::Decision::RequireBrackets,
-                                ),
-                            }
-                        }
-                    }
-                }
+                self.review_paste(id, request, tab, targets, text, None);
             }
             Message::ConfirmPaste(id, request, send) => {
                 if let Some(paste) = self
@@ -2649,6 +2677,9 @@ impl Workspace {
                     && send
                     && self.current_targets(id, paste.tab, &paste.targets)
                     && let [target] = paste.targets.as_slice()
+                    && paste.drop_stream.is_none_or(|stream| {
+                        self.external_text_drop_allowed(id, paste.tab, *target, stream)
+                    })
                 {
                     if self.paste_warning_for(*target) > paste.mode {
                         self.notice(
@@ -2793,7 +2824,7 @@ impl Workspace {
                 size,
                 geometry: window_lifecycle::Geometry::new(size, placement.position),
                 transparency,
-                local_files: local_dock::Browser::default(),
+                local_files: local_dock::Browser::new(self.local_dock.show_hidden()),
                 journal_dock: journal_dock::Dock::new(self.window_settings.journal_dock),
                 coding_agent_dock: coding_agent_dock::Dock::new(
                     self.window_settings.coding_agent_dock,
@@ -2819,6 +2850,7 @@ impl Workspace {
                 pending_tunnels: None,
                 pending_snippet_run: None,
                 pending_serial_close: None,
+                pending_terminal_upload: None,
                 projects: None,
                 clipboard_settings: false,
                 notice: None,
@@ -3539,6 +3571,7 @@ impl Workspace {
         let mut options = settings.launch_options()?;
         options.shell_integration = settings.shell_integration
             && settings.isolation != IsolationLevel::Sandbox
+            && self.window_settings.automatic_local_shell_integration()
             && self.window_settings.prompt_navigation_enabled
             && shell_integration::supports_marks(profile);
         let terminal = local.as_ref().map(|profile| &profile.terminal);
@@ -4299,38 +4332,91 @@ impl Workspace {
         }
     }
 
-    fn pane_needs_close_confirmation(&self, session: SessionId) -> bool {
+    fn pane_needs_close_confirmation(&self, session: SessionId, split: bool) -> bool {
         self.sessions.get(&session).is_some_and(|pane| {
             let frame = pane.session.frame();
-            matches!(frame.status, Status::Starting | Status::Running)
-                && (frame.serial.is_some()
-                    || self
-                        .terminal_overrides(pane)
+            let connection = self
+                .terminal_overrides(pane)
+                .and_then(|settings| settings.confirm_close)
+                .or_else(|| {
+                    pane.teamwork_terminal_input
                         .and_then(|settings| settings.confirm_close)
-                        .unwrap_or(false))
+                });
+            terminal_close_requires_confirmation(
+                &frame.status,
+                frame.serial.is_some(),
+                connection,
+                self.window_settings.confirm_busy_terminal_close,
+                || {
+                    split
+                        || frame.screen.alternate_screen
+                        || shell_is_busy_for_close(
+                            frame.shell_activity().code_prompt.state,
+                            pane.ssh.is_some(),
+                        )
+                        || pane.session.local_shell_has_running_children()
+                },
+            )
         })
     }
 
     fn tab_needs_close_confirmation(&self, tab: &Tab) -> bool {
+        let split = tab.grid.iter().count() > 1;
         tab.grid
             .iter()
-            .any(|(_, session)| self.pane_needs_close_confirmation(*session))
+            .any(|(_, session)| self.pane_needs_close_confirmation(*session, split))
+    }
+
+    fn group_close_needs_terminal_confirmation(&self, tab: &Tab) -> bool {
+        if self.window_settings.skip_terminal_group_close_confirmation != Some(true) {
+            return self.tab_needs_close_confirmation(tab);
+        }
+        self.tab_has_active_terminal(tab, false)
+    }
+
+    fn terminal_requires_window_close_review(pane: &PaneSession, include_non_serial: bool) -> bool {
+        let frame = pane.session.frame();
+        if frame.serial.is_some() {
+            matches!(frame.status, Status::Starting | Status::Running)
+        } else {
+            include_non_serial && frame.status == Status::Running
+        }
+    }
+
+    fn tab_has_active_terminal(&self, tab: &Tab, include_non_serial: bool) -> bool {
+        tab.grid.iter().any(|(_, session)| {
+            self.sessions.get(session).is_some_and(|pane| {
+                Self::terminal_requires_window_close_review(pane, include_non_serial)
+            })
+        })
+    }
+
+    fn window_close_needs_terminal_confirmation(&self, window: &Window) -> bool {
+        let include_non_serial =
+            self.window_settings.skip_terminal_group_close_confirmation != Some(true);
+        window
+            .terminal_tabs()
+            .any(|tab| self.tab_has_active_terminal(tab, include_non_serial))
     }
 
     fn request_close(&mut self, id: window::Id, action: SerialClose) -> Task<Message> {
+        if self.windows.get(&id).is_some_and(|window| {
+            matches!(window.pending_serial_close, Some((_, SerialClose::Quit)))
+        }) {
+            return window::gain_focus(id);
+        }
         let confirm = self.windows.get(&id).is_some_and(|window| match action {
-            SerialClose::Window => window
-                .terminal_tabs()
-                .any(|tab| self.tab_needs_close_confirmation(tab)),
+            SerialClose::Window => self.window_close_needs_terminal_confirmation(window),
             SerialClose::Tab(tab) => window
                 .terminal_tabs()
                 .find(|state| state.id == tab)
                 .is_some_and(|tab| self.tab_needs_close_confirmation(tab)),
             SerialClose::TabBatch(request) => {
-                self.tab_batch_all_count(id, request).is_some()
+                (self.window_settings.skip_terminal_group_close_confirmation != Some(true)
+                    && self.tab_batch_all_count(id, request).is_some())
                     || self.tab_batch_needs_close_confirmation(id, request)
             }
-            SerialClose::Pane { session, .. } => self.pane_needs_close_confirmation(session),
+            SerialClose::Pane { session, .. } => self.pane_needs_close_confirmation(session, false),
             SerialClose::Quit => false,
         });
         if confirm {
@@ -4376,7 +4462,7 @@ impl Workspace {
                     return self.close_pane(id, pane);
                 }
             }
-            SerialClose::Quit => return self.quit_confirmed(true),
+            SerialClose::Quit => unreachable!("quit is handled by its review"),
         }
         Task::none()
     }
@@ -4722,10 +4808,75 @@ impl Workspace {
     }
 
     fn quit(&mut self) -> Task<Message> {
-        self.quit_confirmed(false)
+        if let Some(review) = &self.quit_terminal_review {
+            if self.windows.get(&review.owner).is_some_and(|window| {
+                matches!(window.pending_serial_close, Some((request, SerialClose::Quit))
+                    if request == review.request)
+            }) {
+                return window::gain_focus(review.owner);
+            }
+            self.quit_terminal_review = None;
+        }
+        if let Some(task) = self.focus_pending_hosted_quit() {
+            return task;
+        }
+        self.continue_quit(QuitTerminalApprovals::new())
     }
 
-    fn quit_confirmed(&mut self, serial_confirmed: bool) -> Task<Message> {
+    fn answer_quit_terminal_review(
+        &mut self,
+        owner: window::Id,
+        request: u64,
+        confirmed: bool,
+    ) -> Task<Message> {
+        if !self
+            .quit_terminal_review
+            .as_ref()
+            .is_some_and(|review| review.owner == owner && review.request == request)
+        {
+            return Task::none();
+        }
+        let mut review = self
+            .quit_terminal_review
+            .take()
+            .expect("validated quit review");
+        if !confirmed {
+            window_lifecycle::reply_to_native_quit(false);
+            return Task::none();
+        }
+        review.approved.insert(owner, review.streams);
+        self.continue_quit(review.approved)
+    }
+
+    fn next_quit_terminal_review(
+        &self,
+        approved: &QuitTerminalApprovals,
+    ) -> Option<(window::Id, QuitTerminalStreams)> {
+        let include_non_serial =
+            self.window_settings.skip_terminal_group_close_confirmation != Some(true);
+        self.windows
+            .iter()
+            .filter_map(|(&id, window)| {
+                let prior = approved.get(&id);
+                let streams: Vec<_> = window
+                    .terminal_tabs()
+                    .flat_map(|tab| tab.grid.iter().map(|(_, &session)| session))
+                    .filter_map(|session| {
+                        let pane = self.sessions.get(&session)?;
+                        Self::terminal_requires_window_close_review(pane, include_non_serial)
+                            .then_some((session, pane.stream_generation))
+                    })
+                    .collect();
+                streams
+                    .iter()
+                    .any(|stream| prior.is_none_or(|prior| !prior.contains(stream)))
+                    .then_some((window.number, id, streams))
+            })
+            .min_by_key(|(number, _, _)| *number)
+            .map(|(_, id, streams)| (id, streams))
+    }
+
+    fn continue_quit(&mut self, approved: QuitTerminalApprovals) -> Task<Message> {
         if self.exiting || self.scheduler_draining || self.exit_placement_pending {
             return Task::none();
         }
@@ -4793,37 +4944,30 @@ impl Workspace {
         if let Some(task) = self.request_toolbar_quit() {
             return task;
         }
-        if let Some((&id, state)) = self
-            .sftp
-            .iter_mut()
-            .find(|(id, state)| !self.project_files.contains_key(*id) && state.transfer_running())
-        {
+        if let Some((&id, state)) = self.sftp.iter_mut().find(|(id, state)| {
+            !self.project_files.contains_key(*id)
+                && (state.transfer_running() || state.deletion_running())
+        }) {
             state.request_close();
             self.quit_sftp_waiting = Some(id);
             return window::gain_focus(id);
         }
         self.quit_sftp_waiting = None;
-        if !serial_confirmed {
-            let serial_window = self
-                .windows
-                .iter()
-                .filter(|(_, window)| {
-                    window
-                        .terminal_tabs()
-                        .any(|tab| self.tab_needs_close_confirmation(tab))
-                })
-                .min_by_key(|(_, window)| window.number)
-                .map(|(id, _)| *id);
-            if let Some(id) = serial_window {
-                let request = self.allocate();
-                if let Some(window) = self.windows.get_mut(&id) {
-                    window.cancel_paste();
-                    window.pending_serial_close = Some((request, SerialClose::Quit));
-                }
-                return window::gain_focus(id);
+        if let Some((owner, streams)) = self.next_quit_terminal_review(&approved) {
+            let request = self.allocate();
+            if let Some(window) = self.windows.get_mut(&owner) {
+                window.cancel_paste();
+                window.pending_serial_close = Some((request, SerialClose::Quit));
             }
+            self.quit_terminal_review = Some(QuitTerminalReview {
+                owner,
+                request,
+                streams,
+                approved,
+            });
+            return window::gain_focus(owner);
         }
-        if let Some(task) = self.guard_hosted_quit(serial_confirmed) {
+        if let Some(task) = self.guard_hosted_quit(approved) {
             return task;
         }
         for window in self.windows.values_mut() {
@@ -4872,6 +5016,7 @@ impl Workspace {
 
     fn exit_with_placement(&mut self) -> Task<Message> {
         self.flush_last_journal_dock_resize();
+        self.flush_live_log_height();
         self.flush_coding_agent_dock_resizes();
         self.flush_snippet_structure_preferences();
         self.save_ascii_art_on_quit();
@@ -4891,10 +5036,12 @@ impl Workspace {
         self.cancel_obsolete_journal_note_translations();
         self.finish_all_journals();
         self.stop_all_terminal_files();
+        self.stop_all_terminal_uploads();
         self.drain_automatic_backup();
         self.stop_all_remote_docks();
         self.flush_transparency();
         self.flush_journal_appearance();
+        self.flush_scheduler_journal_divider();
         self.finish_session_restore();
         self.vault = None;
         self.vault_change_revision = Arc::new(());
@@ -5038,6 +5185,99 @@ impl Workspace {
                 .get(id)
                 .is_some_and(|pane| pane.frame.ibm.is_some())
         })
+    }
+
+    fn review_paste(
+        &mut self,
+        id: window::Id,
+        request: u64,
+        tab: u64,
+        targets: Vec<SessionId>,
+        text: Option<String>,
+        drop_stream: Option<u64>,
+    ) {
+        if let Some(raw) = text
+            && self.current_targets(id, tab, &targets)
+            && let [target] = targets.as_slice()
+            && drop_stream
+                .is_none_or(|stream| self.external_text_drop_allowed(id, tab, *target, stream))
+        {
+            if raw.len() > usize::from(paste_protection::MAX_PASTE_KIB) * 1024 {
+                self.notice(id, "Clipboard text exceeds 64 KiB".into());
+            } else {
+                let text = sanitize_paste(&raw);
+                if text.contains(['\n', '\t'])
+                    && targets.iter().any(|id| {
+                        self.sessions
+                            .get(id)
+                            .is_some_and(|pane| pane.frame.ibm.is_some())
+                    })
+                {
+                    self.notice(
+                        id,
+                        "IBM panes accept a single line of clipboard text without tabs".into(),
+                    );
+                } else if !text.is_empty() {
+                    let mode = self.paste_warning_for(*target);
+                    match paste_protection::decide(
+                        &raw,
+                        mode,
+                        self.window_settings.paste_large_warning_kib,
+                        self.all_paste_targets_bracketed(&targets),
+                    ) {
+                        paste_protection::Decision::Confirm(warning) => {
+                            if let Some(window) = self.windows.get_mut(&id) {
+                                window.pending_paste = Some(PendingPaste {
+                                    request,
+                                    drop_stream,
+                                    tab,
+                                    targets,
+                                    text,
+                                    preview: paste_protection::preview(&raw),
+                                    warning,
+                                    mode,
+                                    raw_bytes: raw.len(),
+                                });
+                            }
+                        }
+                        decision => self.send_paste(
+                            id,
+                            &targets,
+                            &text,
+                            decision == paste_protection::Decision::RequireBrackets,
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    fn external_text_drop_allowed(
+        &self,
+        owner: window::Id,
+        tab: u64,
+        session: SessionId,
+        stream: u64,
+    ) -> bool {
+        self.window_settings.terminal_drag_drop != Some(false)
+            && self.clipboard.policy.problem.is_none()
+            && self.clipboard.policy.read_allowed
+            && !self.clipboard.policy.internal
+            && self
+                .windows
+                .get(&owner)
+                .and_then(Window::tab)
+                .is_some_and(|active| {
+                    active.id == tab
+                        && active.grid.iter().any(|(_, id)| *id == session)
+                        && !self.tab_broadcast_active(active)
+                })
+            && !self.multi_exec_member(session)
+            && self.sessions.get(&session).is_some_and(|pane| {
+                pane.stream_generation == stream
+                    && pane.session.frame().status == Status::Running
+                    && !pane.session.is_pacing_paste()
+            })
     }
 
     fn all_paste_targets_bracketed(&self, targets: &[SessionId]) -> bool {
@@ -5994,7 +6234,10 @@ impl Workspace {
         }
         if let Some(diagram) = self.diagrams.get(&id) {
             return diagram
-                .view(self.editor_content_theme())
+                .view(
+                    self.editor_content_theme(),
+                    self.analysis_diagram_options(id),
+                )
                 .map(move |message| Message::Diagram(id, message));
         }
         if let Some(view) = self.agent_window_view(id) {
@@ -6024,7 +6267,7 @@ impl Workspace {
             && !matches!(action, SerialClose::TabBatch(batch) if self.tab_batch_all_count(id, batch).is_some())
         {
             let prompt = match action {
-                SerialClose::Quit => "Close the open terminal sessions and quit?",
+                SerialClose::Quit => "Close this window's terminal sessions before quitting?",
                 SerialClose::Window => "Close this window and its terminal sessions?",
                 SerialClose::Tab(_) => "Close this tab and its terminal sessions?",
                 SerialClose::TabBatch(_) => "Close these tabs and their terminal sessions?",
@@ -6035,7 +6278,7 @@ impl Workspace {
                 row![
                     button("Cancel").on_press(Message::ConfirmSerialClose(id, request, false)),
                     button(if matches!(action, SerialClose::Quit) {
-                        "Quit"
+                        "Continue"
                     } else {
                         "Close"
                     })
@@ -6679,6 +6922,7 @@ impl Workspace {
             let view: Element<'_, Message> = iced::widget::responsive(move |bounds| {
                 let terminal = TerminalView {
                     session: session_id,
+                    stream_generation: session_state.stream_generation,
                     frame: self.highlight.frame(session_id, frame),
                     font_size,
                     font,
@@ -6687,7 +6931,7 @@ impl Workspace {
                     scale_factor: window.scale_factor,
                     background_transparency: transparency,
                     focused: focus && window.focused,
-                    reduced_motion: !self.window_settings.appearance.animations,
+                    reduced_motion: !self.window_settings.appearance.animations(),
                     typeahead_enabled: session_state.typeahead_enabled && !mirrored,
                     owner: id,
                     agent_cursor: self.agent_cursor_review(id, session_id, frame),
@@ -6762,6 +7006,12 @@ impl Workspace {
                 } else {
                     terminal_view::with_scrollback(view, scrollbar)
                 };
+                #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+                let view: Element<'_, Message> = container(view)
+                    .id(terminal_text_drop::terminal_drop_id(session_id))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into();
                 let view = if let Some(search) = &session_state.search {
                     column![
                         transparency::chrome(horizontal(
@@ -6783,7 +7033,7 @@ impl Workspace {
                     view,
                     bounds,
                     terminal_view::cell_size(font_size, font),
-                    !self.window_settings.appearance.animations,
+                    !self.window_settings.appearance.animations(),
                 )
             })
             .into();
@@ -6862,11 +7112,202 @@ fn horizontal<'a>(contents: impl Into<Element<'a, Message>>) -> Element<'a, Mess
         .into()
 }
 
+fn shell_is_busy_for_close(prompt: crate::session::PromptState, ssh: bool) -> bool {
+    use crate::session::PromptState;
+
+    prompt == PromptState::Busy || (ssh && prompt == PromptState::Unknown)
+}
+
+fn terminal_close_requires_confirmation(
+    status: &Status,
+    serial: bool,
+    connection: Option<bool>,
+    confirm_busy: bool,
+    busy_or_split: impl FnOnce() -> bool,
+) -> bool {
+    matches!(status, Status::Starting | Status::Running)
+        && (serial
+            || connection
+                .unwrap_or_else(|| *status == Status::Running && confirm_busy && busy_or_split()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
 
     use super::*;
+
+    #[test]
+    fn terminal_close_confirms_busy_and_split_connections_and_preserves_overrides() {
+        use crate::session::PromptState;
+
+        for (prompt, ssh, expected) in [
+            (PromptState::Ready, false, false),
+            (PromptState::Ready, true, false),
+            (PromptState::Busy, false, true),
+            (PromptState::Busy, true, true),
+            (PromptState::Unknown, false, false),
+            (PromptState::Unknown, true, true),
+        ] {
+            assert_eq!(shell_is_busy_for_close(prompt, ssh), expected);
+            assert_eq!(
+                terminal_close_requires_confirmation(&Status::Running, false, None, true, || {
+                    shell_is_busy_for_close(prompt, ssh)
+                }),
+                expected
+            );
+        }
+        for (status, serial, connection, global, busy_or_split, expected) in [
+            (Status::Running, false, None, true, true, true),
+            (Status::Running, false, None, false, true, false),
+            (Status::Running, false, Some(false), true, true, false),
+            (Status::Running, false, Some(true), false, false, true),
+            (Status::Starting, false, None, true, true, false),
+            (Status::Running, true, Some(false), false, false, true),
+            (Status::Disconnected, true, Some(true), true, true, false),
+        ] {
+            assert_eq!(
+                terminal_close_requires_confirmation(&status, serial, connection, global, || {
+                    busy_or_split
+                }),
+                expected
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    fn add_idle_terminal(workspace: &mut Workspace, owner: window::Id) -> SessionId {
+        use std::time::{Duration, Instant};
+
+        let grid = GridSize::default();
+        let session = Session::start_local(
+            grid,
+            TerminalProfile::Xterm,
+            kortty_pty::LaunchOptions {
+                command: Some(vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "IFS= read -r line".into(),
+                ]),
+                ..Default::default()
+            },
+            false,
+            None,
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while session.frame().status != Status::Running {
+            assert!(Instant::now() < deadline, "local fixture did not connect");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let session = workspace.store_session(session, grid, 14);
+        workspace.add_tab(owner, session);
+        session
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn idle_local_terminal_requires_window_and_quit_confirmation() {
+        use std::time::{Duration, Instant};
+
+        let mut workspace = Workspace::default();
+        let (owner, _) = workspace.open_window(false);
+        let session = add_idle_terminal(&mut workspace, owner);
+
+        let window = &workspace.windows[&owner];
+        assert!(!workspace.tab_needs_close_confirmation(window.tab().unwrap()));
+        assert!(!workspace.group_close_needs_terminal_confirmation(window.tab().unwrap()));
+
+        let _ = workspace.update(Message::Window(owner, window::Event::CloseRequested));
+        let Some((request, SerialClose::Window)) = workspace.windows[&owner].pending_serial_close
+        else {
+            panic!("an idle connected terminal should require window confirmation");
+        };
+        let _ = workspace.update(Message::ConfirmSerialClose(owner, request, false));
+        assert!(workspace.sessions.contains_key(&session));
+
+        workspace
+            .window_settings
+            .skip_terminal_group_close_confirmation = Some(false);
+        let _ = workspace.quit();
+        let Some((request, SerialClose::Quit)) = workspace.windows[&owner].pending_serial_close
+        else {
+            panic!("an idle connected terminal should require application quit confirmation");
+        };
+        let _ = workspace.update(Message::ConfirmSerialClose(owner, request, false));
+        assert!(workspace.sessions.contains_key(&session));
+
+        workspace
+            .window_settings
+            .skip_terminal_group_close_confirmation = Some(true);
+        assert!(!workspace.window_close_needs_terminal_confirmation(&workspace.windows[&owner]));
+        workspace
+            .window_settings
+            .skip_terminal_group_close_confirmation = Some(false);
+        let terminal = &workspace.sessions[&session].session;
+        terminal.send(b"done\r".to_vec()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while terminal.frame().status != Status::Exited(Some(0)) {
+            assert!(Instant::now() < deadline, "local fixture did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let _ = terminal.stop().recv_blocking();
+        assert!(!workspace.window_close_needs_terminal_confirmation(&workspace.windows[&owner]));
+        workspace.stop_session(session);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quit_reviews_each_window_before_closing_any_terminal() {
+        let mut workspace = Workspace::default();
+        let (first, _) = workspace.open_window(false);
+        let (second, _) = workspace.open_window(false);
+        let original = add_idle_terminal(&mut workspace, first);
+        let sibling = add_idle_terminal(&mut workspace, second);
+        let pending = |workspace: &Workspace, owner| {
+            let Some((request, SerialClose::Quit)) = workspace.windows[&owner].pending_serial_close
+            else {
+                panic!("expected quit review for the window");
+            };
+            request
+        };
+
+        let _ = workspace.quit();
+        let first_request = pending(&workspace, first);
+        let _ = workspace.quit();
+        assert_eq!(pending(&workspace, first), first_request);
+        let _ = workspace.update(Message::ConfirmSerialClose(first, first_request, true));
+        let second_request = pending(&workspace, second);
+        assert_eq!(workspace.sessions.len(), 2);
+        let _ = workspace.update(Message::ConfirmSerialClose(second, second_request, false));
+        assert!(workspace.quit_terminal_review.is_none());
+        assert!(!workspace.exiting);
+        assert!(workspace.sessions.contains_key(&original));
+        assert!(workspace.sessions.contains_key(&sibling));
+
+        let _ = workspace.quit();
+        let fresh_request = pending(&workspace, first);
+        assert_ne!(fresh_request, first_request);
+        let _ = workspace.update(Message::ConfirmSerialClose(first, first_request, true));
+        assert_eq!(pending(&workspace, first), fresh_request);
+        let _ = workspace.update(Message::ConfirmSerialClose(first, fresh_request, true));
+        let second_request = pending(&workspace, second);
+        let added = add_idle_terminal(&mut workspace, first);
+        let _ = workspace.update(Message::ConfirmSerialClose(second, second_request, true));
+        let changed_request = pending(&workspace, first);
+        assert_eq!(workspace.sessions.len(), 3);
+        let shutdown = [original, sibling, added]
+            .map(|session| workspace.sessions[&session].session.shutdown_handle());
+        let _ = workspace.update(Message::ConfirmSerialClose(first, changed_request, true));
+        assert!(workspace.exiting);
+        assert!(workspace.quit_terminal_review.is_none());
+        for session in [original, sibling, added] {
+            assert!(!workspace.sessions.contains_key(&session));
+        }
+        for pending in shutdown {
+            let _ = pending.recv_blocking();
+        }
+    }
 
     #[test]
     fn initial_terminal_dimensions_inherit_each_axis() {

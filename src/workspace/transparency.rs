@@ -172,7 +172,7 @@ impl Workspace {
             .windows
             .get(&id)
             .is_some_and(|window| self.terminal_transparency(id, window) > 0);
-        if let Some(palette) = self.window_settings.appearance.design.palette() {
+        if let Some(palette) = self.window_settings.appearance.design().palette() {
             self.theme_cache.resolve_application(palette, transparent)
         } else {
             self.theme_cache

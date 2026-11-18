@@ -169,7 +169,7 @@ pub(super) fn advise_target(
     let trust = trust.clone();
     let dispatch_scope = Arc::clone(&scope);
     let check_dispatch = move || {
-        super::require_target_groups(
+        super::require_agent_scope(
             &dispatch_scope.request.action,
             &dispatch_scope.connection_store,
         )

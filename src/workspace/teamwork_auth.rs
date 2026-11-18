@@ -3,7 +3,7 @@
 use iced::{Task, window};
 
 use crate::connection_store::teamwork::{AuthSave, DefaultAuth};
-use crate::connection_window::ConnectionWindow;
+use crate::connection_window::{ConnectionWindow, JavaTeamworkAuth};
 use crate::profile;
 use crate::vault_window::Kind;
 
@@ -50,6 +50,14 @@ impl Workspace {
         } else {
             window.set_teamwork_auth(Some(auth.saved.clone()));
             window.set_teamwork_auth_saving(auth.pending.is_some());
+            if let Some(proposals) = &self.window_settings.java_teamwork {
+                window.set_java_teamwork_auth(JavaTeamworkAuth {
+                    credential: proposals.credential.clone(),
+                    key: proposals.key.clone(),
+                    username: proposals.username.clone(),
+                    temporary_key: proposals.temporary_key,
+                });
+            }
         }
     }
 
@@ -72,20 +80,20 @@ impl Workspace {
         if before != auth.saved {
             return Task::none();
         }
-        if matches!(candidate, DefaultAuth::Key { .. }) {
+        if candidate.key().is_some() {
             self.refresh_ssh_key_choices();
         }
-        let available = match &candidate {
-            DefaultAuth::Password { credential } => self
-                .credential_choices(Kind::Password)
-                .iter()
-                .any(|choice| choice.id == *credential),
-            DefaultAuth::Key { id, .. } => {
-                self.ssh_key_choices.iter().any(|choice| choice.id == *id)
-            }
-            DefaultAuth::Prompt | DefaultAuth::TemporaryKey { .. } => true,
-        };
-        if !available {
+        let password_available = candidate.credential().is_none_or(|credential| {
+            before.credential() == Some(credential)
+                || self
+                    .credential_choices(Kind::Password)
+                    .iter()
+                    .any(|choice| choice.id == credential)
+        });
+        let key_available = candidate.key().is_none_or(|id| {
+            before.key() == Some(id) || self.ssh_key_choices.iter().any(|choice| choice.id == id)
+        });
+        if !password_available || !key_available {
             if let Some(manager) = self.connection_managers.get_mut(&id) {
                 manager
                     .window

@@ -3,6 +3,59 @@ use std::fs::File;
 use crate::JobProcessIdentity;
 
 #[cfg(target_os = "linux")]
+pub(super) fn has_running_children(shell: u32) -> bool {
+    use std::io::Read as _;
+
+    if !crate::process_usage::procfs_uses_our_pid_namespace() {
+        return false;
+    }
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{shell}/task")) else {
+        return false;
+    };
+    tasks.take(1024).flatten().any(|task| {
+        let mut children = String::new();
+        let Ok(file) = File::open(task.path().join("children")) else {
+            return false;
+        };
+        if file.take(32 * 1024).read_to_string(&mut children).is_err() {
+            return false;
+        }
+        // A capped read can end halfway through a PID.
+        children
+            .split_inclusive(' ')
+            .filter_map(|child| child.strip_suffix(' ')?.parse::<u32>().ok())
+            .any(|child| {
+                let Ok(record) = std::fs::read(format!("/proc/{child}/stat")) else {
+                    return false;
+                };
+                linux_live_stat_fields(&record)
+                    .and_then(|mut fields| fields.next()?.parse::<u32>().ok())
+                    == Some(shell)
+            })
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn has_running_children(shell: u32) -> bool {
+    let Ok(pid) = libc::pid_t::try_from(shell) else {
+        return false;
+    };
+    let mut children = [0_i32; 1024];
+    // SAFETY: the output buffer holds the given byte capacity for process IDs.
+    let count = unsafe {
+        libc::proc_listchildpids(
+            pid,
+            children.as_mut_ptr().cast(),
+            size_of_val(&children) as i32,
+        )
+    };
+    let count = usize::try_from(count).unwrap_or(0).min(children.len());
+    children[..count]
+        .iter()
+        .any(|&child| macos_live_process(child).is_some_and(|info| info.pbi_ppid == shell))
+}
+
+#[cfg(target_os = "linux")]
 pub(super) fn find<T>(
     master: &File,
     shell: u32,
@@ -87,6 +140,15 @@ fn linux_inspect<T>(
 
 #[cfg(target_os = "linux")]
 fn parse_linux_member(record: &[u8]) -> Option<(u32, u32, u64)> {
+    let mut fields = linux_live_stat_fields(record)?;
+    let group = fields.nth(1)?.parse().ok()?;
+    let session = fields.next()?.parse().ok()?;
+    let started = fields.nth(15)?.parse().ok()?;
+    Some((group, session, started))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_live_stat_fields(record: &[u8]) -> Option<std::str::SplitAsciiWhitespace<'_>> {
     // The command name can contain spaces, right parentheses and non-UTF-8 bytes.
     let end = record.iter().rposition(|&byte| byte == b')')?;
     let mut fields = std::str::from_utf8(&record[end + 1..])
@@ -95,10 +157,29 @@ fn parse_linux_member(record: &[u8]) -> Option<(u32, u32, u64)> {
     if matches!(fields.next()?, "Z" | "X" | "x") {
         return None;
     }
-    let group = fields.nth(1)?.parse().ok()?;
-    let session = fields.next()?.parse().ok()?;
-    let started = fields.nth(15)?.parse().ok()?;
-    Some((group, session, started))
+    Some(fields)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_live_process(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
+    let mut record = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
+    let size = size_of::<libc::proc_bsdinfo>() as i32;
+    // SAFETY: the output has the SDK's structure and writable size for this flavor.
+    if unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            record.as_mut_ptr().cast(),
+            size,
+        )
+    } != size
+    {
+        return None;
+    }
+    // SAFETY: libproc reported that the entire record was initialized.
+    let record = unsafe { record.assume_init() };
+    (record.pbi_pid == pid as u32 && record.pbi_status != libc::SZOMB).then_some(record)
 }
 
 #[cfg(target_os = "macos")]
@@ -108,29 +189,8 @@ pub(super) fn find<T>(
     previous: Option<JobProcessIdentity>,
     inspect: impl Fn(&str, &[&str]) -> Option<T>,
 ) -> Option<(JobProcessIdentity, T)> {
-    fn info(pid: libc::pid_t) -> Option<libc::proc_bsdinfo> {
-        let mut record = std::mem::MaybeUninit::<libc::proc_bsdinfo>::uninit();
-        let size = size_of::<libc::proc_bsdinfo>() as i32;
-        // SAFETY: the output has the SDK's structure and writable size for this flavor.
-        if unsafe {
-            libc::proc_pidinfo(
-                pid,
-                libc::PROC_PIDTBSDINFO,
-                0,
-                record.as_mut_ptr().cast(),
-                size,
-            )
-        } != size
-        {
-            return None;
-        }
-        // SAFETY: libproc reported that the entire record was initialized.
-        let record = unsafe { record.assume_init() };
-        (record.pbi_pid == pid as u32 && record.pbi_status != libc::SZOMB).then_some(record)
-    }
-
     let shell = libc::pid_t::try_from(shell).ok()?;
-    let anchor = info(shell)?;
+    let anchor = macos_live_process(shell)?;
     let group = libc::pid_t::try_from(anchor.e_tpgid).ok()?;
     if group <= 0 {
         return None;
@@ -140,7 +200,7 @@ pub(super) fn find<T>(
             return None;
         }
         let member = || {
-            let record = info(pid)?;
+            let record = macos_live_process(pid)?;
             // SAFETY: getsid only queries the numeric PID's process session.
             (unsafe { libc::getsid(pid) } == shell
                 && record.pbi_pgid == group as u32
@@ -183,7 +243,7 @@ pub(super) fn find<T>(
                 .copied()
                 .find_map(examine)
         })?;
-    info(shell)
+    macos_live_process(shell)
         .is_some_and(|current| current.e_tpgid == anchor.e_tpgid)
         .then_some(found)
 }

@@ -67,9 +67,6 @@ impl Copy {
         if self.standing.is_none() {
             return validate_scheduling(schedule, mode, predecessors, privileged);
         }
-        if privileged {
-            return Err("Recurring SFTP copies require an ordinary SFTP copy.");
-        }
         match mode {
             DependencyMode::Gate if schedule.is_some_and(JobSchedule::enabled) => Ok(()),
             DependencyMode::Gate => {
@@ -98,6 +95,20 @@ impl Copy {
             job.dependencies(),
             job.max_age_minutes(),
         )?;
+        let scope = if job.action().sudo == SudoMode::Disabled {
+            scope
+        } else {
+            let bytes = serde_json::to_vec(&(
+                "kortty-standing-protected-tree-v1",
+                scope,
+                job.action().sudo,
+            ))?;
+            HashAlgorithm::Sha256
+                .digest(&bytes)
+                .map_err(io::Error::other)?
+                .try_into()
+                .expect("SHA-256 size")
+        };
         let bytes = serde_json::to_vec(&(
             "kortty-scheduled-sftp-standing-v1",
             job.id(),
@@ -334,6 +345,7 @@ pub(super) enum SaveApproval {
     OneUse(Receipt),
     Standing(standing::Approval),
     RecurringReplacement(standing::Approval),
+    RecurringTree(standing::Approval, bool),
 }
 
 pub(super) enum ApprovalRollback {
@@ -345,7 +357,9 @@ impl SaveApproval {
     pub(super) fn nonce(&self) -> &str {
         match self {
             Self::OneUse(receipt) => &receipt.approval,
-            Self::Standing(approval) | Self::RecurringReplacement(approval) => &approval.approval,
+            Self::Standing(approval)
+            | Self::RecurringReplacement(approval)
+            | Self::RecurringTree(approval, _) => &approval.approval,
         }
     }
 }
@@ -424,6 +438,10 @@ impl Store {
             }
             SaveApproval::RecurringReplacement(approval) => {
                 let prior = self.swap_replacement(job, approval.clone(), keep)?;
+                Ok(ApprovalRollback::Standing(approval, prior))
+            }
+            SaveApproval::RecurringTree(approval, create_root) => {
+                let prior = self.swap_tree(job, approval.clone(), create_root, keep)?;
                 Ok(ApprovalRollback::Standing(approval, prior))
             }
         }

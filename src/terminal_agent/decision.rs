@@ -1,4 +1,4 @@
-//! Bounded model decisions. A parsed command still needs an exact user review.
+//! Bounded model decisions retaining explicit confirmation and command-shape risk.
 
 use std::fmt;
 
@@ -105,7 +105,7 @@ enum FinalStatus {
 
 impl Decision {
     pub(super) fn parse(text: &str, can_execute: bool) -> Result<Self, &'static str> {
-        let response: Response = parse_response(text)?;
+        let mut response: Response = parse_response(text)?;
         validate_message(&response.summary, &response.user_message)?;
         if !matches!(response.status, Status::NeedsInput)
             && (response.question.is_some() || !response.answers.is_empty())
@@ -131,6 +131,13 @@ impl Decision {
                     !valid_command(&command.command) || !valid_text(&command.purpose, 512, false)
                 }) {
                     return Err("A proposed command is invalid or contains a masked value.");
+                }
+                for command in &mut response.commands {
+                    if matches!(response.status, Status::NeedsConfirmation)
+                        || requires_confirmation_by_shape(&command.command)
+                    {
+                        command.risk = Risk::RequiresConfirmation;
+                    }
                 }
                 Action::Commands(response.commands)
             }
@@ -186,6 +193,200 @@ fn parse_response<T: DeserializeOwned>(text: &str) -> Result<T, &'static str> {
     serde_json::from_str(text).map_err(|_| "The agent must return one valid decision object.")
 }
 
+/// Java's shape checks plus native command-word checks, not an OS permission boundary.
+pub(crate) fn requires_confirmation_by_shape(command: &str) -> bool {
+    use std::{collections::VecDeque, sync::OnceLock};
+    let command = command.trim_matches(|character| character <= '\u{20}');
+    static MUTATING: OnceLock<regex::Regex> = OnceLock::new();
+    static DELIMITER: OnceLock<regex::Regex> = OnceLock::new();
+    let mut checked = String::with_capacity(command.len());
+    let mut pending = VecDeque::<String>::new();
+    let (mut heredoc_quote, mut heredoc_escape) = (None, false);
+    let delimiter = DELIMITER.get_or_init(|| {
+        regex::Regex::new(r#"^\s*(?:'([^']+)'|"([^"]+)"|([^\s;|&<>]+))"#)
+            .expect("fixed heredoc expression")
+    });
+    for line in command.split('\n') {
+        if let Some(end) = pending.front() {
+            if line == end || line.trim_start_matches('\t') == end {
+                pending.pop_front();
+            }
+            continue;
+        }
+        checked.push_str(line);
+        checked.push('\n');
+        let bytes = line.as_bytes();
+        for at in 0..bytes.len() {
+            let byte = bytes[at];
+            if heredoc_escape {
+                heredoc_escape = false;
+                continue;
+            }
+            if byte == b'\\' && heredoc_quote != Some(b'\'') {
+                heredoc_escape = true;
+                continue;
+            }
+            if let Some(quote) = heredoc_quote {
+                if byte == quote {
+                    heredoc_quote = None;
+                }
+                continue;
+            }
+            if matches!(byte, b'\'' | b'"') {
+                heredoc_quote = Some(byte);
+                continue;
+            }
+            if bytes[at..].starts_with(b"<<")
+                && (at == 0 || bytes[at - 1] != b'<')
+                && bytes.get(at + 2) != Some(&b'<')
+            {
+                let start = at + 2 + usize::from(bytes.get(at + 2) == Some(&b'-'));
+                if let Some(captures) = delimiter.captures(&line[start..])
+                    && let Some(end) = (1..=3).find_map(|group| captures.get(group))
+                    && !end.as_str().trim().is_empty()
+                {
+                    pending.push_back(end.as_str().to_owned());
+                }
+            }
+        }
+    }
+    if MUTATING.get_or_init(|| regex::Regex::new(r"(?i-u)(^|[;&|()]\s*)(?:chmod|chown|chgrp|rm|rmdir|mv|cp|mkdir|touch|ln|tee|dd|truncate|install)\b").expect("fixed mutation expression")).is_match(&checked) { return true; }
+    if invoked_mutation(&checked) {
+        return true;
+    }
+    let bytes = checked.as_bytes();
+    let (mut single, mut double, mut escaped) = (false, false, false);
+    for (at, &byte) in bytes.iter().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if byte == b'\\' && !single {
+            escaped = true;
+            continue;
+        }
+        if byte == b'\'' && !double {
+            single = !single;
+            continue;
+        }
+        if byte == b'"' && !single {
+            double = !double;
+            continue;
+        }
+        if byte == b'>'
+            && !single
+            && !double
+            && !matches!(
+                at.checked_sub(1).and_then(|index| bytes.get(index)),
+                Some(b'<' | b'=' | b'-')
+            )
+            && !matches!(bytes.get(at + 1), Some(b'=' | b'&'))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn invoked_mutation(command: &str) -> bool {
+    let mut sanitized = String::with_capacity(command.len());
+    let (mut quote, mut escaped) = (None, false);
+    for character in command.chars() {
+        if escaped {
+            sanitized.push(if quote.is_none() { character } else { ' ' });
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            sanitized.push(if quote.is_none() { character } else { ' ' });
+            escaped = true;
+            continue;
+        }
+        if let Some(current) = quote {
+            if character == current {
+                quote = None;
+            }
+            sanitized.push(' ');
+        } else if matches!(character, '\'' | '"') {
+            quote = Some(character);
+            sanitized.push(' ');
+        } else {
+            sanitized.push(character);
+        }
+    }
+    for segment in sanitized.split([';', '|', '&', '(', ')', '{', '}', '\n']) {
+        for word in segment.split_whitespace() {
+            if word.starts_with('-')
+                || word.split_once('=').is_some_and(|(name, _)| {
+                    !name.is_empty()
+                        && name
+                            .bytes()
+                            .all(|value| value.is_ascii_alphanumeric() || value == b'_')
+                })
+            {
+                continue;
+            }
+            let name = word
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(word)
+                .to_ascii_lowercase();
+            if matches!(
+                name.as_str(),
+                "env"
+                    | "command"
+                    | "builtin"
+                    | "exec"
+                    | "nohup"
+                    | "time"
+                    | "nice"
+                    | "ionice"
+                    | "stdbuf"
+                    | "setsid"
+            ) {
+                continue;
+            }
+            if matches!(
+                name.as_str(),
+                "chmod"
+                    | "chown"
+                    | "chgrp"
+                    | "rm"
+                    | "rmdir"
+                    | "mv"
+                    | "cp"
+                    | "mkdir"
+                    | "touch"
+                    | "ln"
+                    | "tee"
+                    | "dd"
+                    | "truncate"
+                    | "install"
+                    | "del"
+                    | "erase"
+                    | "copy"
+                    | "move"
+                    | "md"
+                    | "rd"
+                    | "ren"
+                    | "new-item"
+                    | "set-content"
+                    | "add-content"
+                    | "remove-item"
+                    | "copy-item"
+                    | "move-item"
+                    | "rename-item"
+                    | "set-acl"
+                    | "out-file"
+            ) {
+                return true;
+            }
+            break;
+        }
+    }
+    false
+}
+
 fn validate_message(summary: &str, message: &str) -> Result<(), &'static str> {
     if valid_text(summary, 256, false) && valid_text(message, 8192, true) {
         Ok(())
@@ -216,6 +417,45 @@ fn valid_text(value: &str, max: usize, multiline: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn command_shapes_preserve_java_heredoc_checks_and_native_mutation_boundaries() {
+        for command in [
+            "chmod +x /tmp/find_xml.pl",
+            "cat > /tmp/script << 'EOF'\nprint('hello');\nEOF",
+            "printf x\n/bin/rm file",
+            "env X=1 command /bin/touch file",
+            "printf '%s' '<<EOF'\nrm file",
+            r"Microsoft.PowerShell.Management\Remove-Item file",
+            "Get-Content file | Out-File other",
+            "Remove-Item file",
+            "echo text >> file",
+        ] {
+            assert!(requires_confirmation_by_shape(command), "{command}");
+        }
+        for command in [
+            "find . -name '*.xml' -type f -printf '%s %p\\n' | sort -nr | head",
+            "cat << 'EOF'\nrm a > b\nEOF",
+            "printf '%s' 'a>b'",
+            "printf x >&2",
+            "Get-Content file",
+        ] {
+            assert!(!requires_confirmation_by_shape(command), "{command}");
+        }
+    }
+
+    #[test]
+    fn explicit_confirmation_and_known_mutation_promote_model_read_only_risk() {
+        for (status, command) in [
+            ("needs_confirmation", "pwd"),
+            ("run_commands", "touch file"),
+        ] {
+            let response = serde_json::json!({"status":status,"summary":"Inspect","userMessage":"Check","commands":[{"command":command,"purpose":"Fixture","risk":"read_only"}]}).to_string();
+            assert!(
+                matches!(Decision::parse(&response, true).unwrap().action, Action::Commands(commands) if commands[0].risk == Risk::RequiresConfirmation)
+            );
+        }
+    }
 
     #[test]
     fn agent_decision_requires_approval_capability_and_preserves_command_bytes() {

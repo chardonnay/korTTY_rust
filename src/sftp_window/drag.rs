@@ -647,6 +647,7 @@ pub(super) struct Panel {
     listing: Arc<Directory>,
     opposite_listing: Arc<Directory>,
     selected: Arc<[EntryName]>,
+    copyable_selection: bool,
 }
 
 impl Panel {
@@ -656,6 +657,7 @@ impl Panel {
             listing: Arc::clone(panel.directory.as_ref()?),
             opposite_listing: Arc::clone(other.directory.as_ref()?),
             selected: panel.selected.iter().cloned().collect(),
+            copyable_selection: panel.copyable_selection(),
         })
     }
 
@@ -668,16 +670,19 @@ impl Panel {
     }
 
     pub(super) fn row(&self, entry: &Entry) -> Item {
+        let selected = self.selected.contains(&entry.name);
         Item {
-            source: entry.kind.copyable().then(|| Source {
-                side: self.side,
-                listing: Arc::clone(&self.listing),
-                opposite_listing: Arc::clone(&self.opposite_listing),
-                names: if self.selected.contains(&entry.name) {
-                    Arc::clone(&self.selected)
-                } else {
-                    Arc::new([entry.name.clone()])
-                },
+            source: (entry.kind.copyable() && (!selected || self.copyable_selection)).then(|| {
+                Source {
+                    side: self.side,
+                    listing: Arc::clone(&self.listing),
+                    opposite_listing: Arc::clone(&self.opposite_listing),
+                    names: if selected {
+                        Arc::clone(&self.selected)
+                    } else {
+                        Arc::new([entry.name.clone()])
+                    },
+                }
             }),
             destination: (entry.kind == EntryKind::Directory)
                 .then(|| self.destination(Some(entry.name.clone()))),

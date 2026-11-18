@@ -534,6 +534,27 @@ fn saved_tab_group_changes_only_when_the_connection_folder_changes() {
     assert!(workspace.capture_layout().unwrap().validate().is_ok());
 }
 
+#[test]
+fn group_close_preference_skips_the_close_all_prompt() {
+    let mut workspace = Workspace::default();
+    let (owner, _) = workspace.open_window(false);
+    let tab = add_disconnected(&mut workspace, owner, false);
+    let _ = workspace.request_close_all_tabs(owner);
+    let Some((token, SerialClose::TabBatch(_))) = workspace.windows[&owner].pending_serial_close
+    else {
+        panic!("Close All should ask by default");
+    };
+    let _ = workspace.update(Desktop::ConfirmSerialClose(owner, token, false));
+    assert!(workspace.terminal_tab(owner, tab).is_some());
+
+    workspace
+        .window_settings
+        .skip_terminal_group_close_confirmation = Some(true);
+    let _ = workspace.request_close_all_tabs(owner);
+    assert!(workspace.windows[&owner].pending_serial_close.is_none());
+    assert!(workspace.terminal_tab(owner, tab).is_none());
+}
+
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 #[test]
 fn serial_batch_asks_once_and_does_not_close_tabs_added_after_confirmation() {
@@ -546,6 +567,9 @@ fn serial_batch_asks_once_and_does_not_close_tabs_added_after_confirmation() {
     use crate::session::{SerialConnection, Status};
 
     let mut workspace = Workspace::default();
+    workspace
+        .window_settings
+        .skip_terminal_group_close_confirmation = Some(true);
     let (owner, _) = workspace.open_window(false);
     let anchor = add_disconnected(&mut workspace, owner, false);
     let peer = openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();

@@ -174,7 +174,7 @@ pub(super) fn lm_studio_catalog_guarded(
     connection: &Connection,
     credential: Option<&str>,
     deadline: Instant,
-    before_dispatch: impl Fn() -> Result<(), Error>,
+    mut before_dispatch: impl FnMut() -> Result<(), Error>,
 ) -> Result<LmStudioCatalog, Error> {
     let authorization = credential.map(bearer_header).transpose()?;
     let catalog = match read_lm_studio_catalog::<NativeModels>(
@@ -182,7 +182,7 @@ pub(super) fn lm_studio_catalog_guarded(
         "/api/v1/models",
         authorization.as_ref(),
         deadline,
-        &before_dispatch,
+        &mut before_dispatch,
     ) {
         Ok(response) => response.catalog(),
         Err(Error::Status(404 | 405 | 501)) => read_lm_studio_catalog::<LegacyModels>(
@@ -190,7 +190,7 @@ pub(super) fn lm_studio_catalog_guarded(
             "/api/v0/models",
             authorization.as_ref(),
             deadline,
-            &before_dispatch,
+            &mut before_dispatch,
         )?
         .catalog(),
         Err(error) => return Err(error),
@@ -203,7 +203,7 @@ fn read_lm_studio_catalog<T: DeserializeOwned>(
     path: &str,
     authorization: Option<&ureq::http::HeaderValue>,
     deadline: Instant,
-    before_dispatch: &impl Fn() -> Result<(), Error>,
+    before_dispatch: &mut impl FnMut() -> Result<(), Error>,
 ) -> Result<T, Error> {
     before_dispatch()?;
     let remaining = deadline.saturating_duration_since(Instant::now());
